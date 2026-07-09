@@ -123,7 +123,10 @@ impl FinalGateCriteriaRunnerAdapter {
         if let Some(wd) = working_dir {
             tool_input["working_dir"] = json!(wd);
         }
-        let raw = self.run_tool("run_command", tool_input, ExecMode::Real).await.ok()?;
+        let raw = self
+            .run_tool("run_command", tool_input, ExecMode::Real)
+            .await
+            .ok()?;
         crate::tool_runner_server::extract_exit_code(&raw).map(|e| e as i64)
     }
 
@@ -138,7 +141,10 @@ impl FinalGateCriteriaRunnerAdapter {
     ) -> Result<CriterionResult, PortError> {
         let timeout_s = c.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
         let (passed, mut evidence) = match c.criterion_type.as_str() {
-            "run_command" => self.check_run_command(&c.spec, &c.expected, mode, timeout_s).await,
+            "run_command" => {
+                self.check_run_command(&c.spec, &c.expected, mode, timeout_s)
+                    .await
+            }
             "design_verify" => Self::check_design_verify(&c.spec),
             // Criteri STRUTTURALI (ADR 0018 leva 3): PURI, i fatti sono gia'
             // nella spec (estratti dallo stato in FinalGateNode::build_criteria).
@@ -146,10 +152,14 @@ impl FinalGateCriteriaRunnerAdapter {
             "tool_capability" => Self::check_tool_capability(&c.spec),
             "completion_confirmed" => Self::check_completion_confirmed(&c.spec),
             "service_logs_clean" => {
-                self.check_service_logs_clean(&c.spec, mode, timeout_s).await
+                self.check_service_logs_clean(&c.spec, mode, timeout_s)
+                    .await
             }
             "http" => self.check_http(&c.spec, &c.expected, mode, timeout_s).await,
-            "file_exists" => self.check_file_exists(&c.spec, &c.expected, mode, timeout_s).await,
+            "file_exists" => {
+                self.check_file_exists(&c.spec, &c.expected, mode, timeout_s)
+                    .await
+            }
             "outputs_exist" => self.check_outputs_exist(&c.spec, mode, timeout_s).await?,
             // Anti-placeholder grafo import: non ancora portato (F3) -> inconclusive.
             "no_orphan_imported" | "imported_code_mounted" => (
@@ -180,7 +190,10 @@ impl FinalGateCriteriaRunnerAdapter {
     // design_verify (P5): resa visiva conforme al figma. PURO - lo similarity_score
     // e' gia' nella spec (estratto dalla history da build_criteria), niente vision qui.
     fn check_design_verify(spec: &Value) -> (bool, Value) {
-        let score = spec.get("similarity_score").and_then(Value::as_i64).unwrap_or(0);
+        let score = spec
+            .get("similarity_score")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let min = spec.get("min_score").and_then(Value::as_i64).unwrap_or(0);
         let passed = score >= min;
         let verdict = if passed {
@@ -191,7 +204,10 @@ impl FinalGateCriteriaRunnerAdapter {
 al figma ed esegui di nuovo nexus_visual_compare finche similarity_score >= {min}"
             )
         };
-        (passed, json!({ "similarity_score": score, "min_score": min, "verdict": verdict }))
+        (
+            passed,
+            json!({ "similarity_score": score, "min_score": min, "verdict": verdict }),
+        )
     }
 
     // ── Criteri STRUTTURALI (ADR 0018 leva 3): puri, fatti nella spec ────────
@@ -221,19 +237,32 @@ il lavoro con i tool prima di chiudere"
         )
     }
 
-    /// tool_capability: un task software con ZERO tool esposti e' una
-    /// misconfigurazione del catalogo/whitelist (non colpa del task).
+    /// tool_capability: un task software con ZERO tool esposti e senza tool call
+    /// gia' osservate e' una misconfigurazione del catalogo/whitelist. La history
+    /// con tool_use e' un segnale strutturato che il catalogo era disponibile
+    /// durante il lavoro, anche se `tools_json` non e' arrivato al gate/resume.
     fn check_tool_capability(spec: &Value) -> (bool, Value) {
         let tools_count = spec.get("tools_count").and_then(Value::as_i64).unwrap_or(0);
-        let passed = tools_count > 0;
-        let verdict = if passed {
+        let has_tool_calls = spec
+            .get("has_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let passed = tools_count > 0 || has_tool_calls;
+        let verdict = if tools_count > 0 {
             format!("{tools_count} tool esposti al modello")
+        } else if has_tool_calls {
+            "catalogo tool non presente nello stato finale, ma la history contiene \
+tool_use gia' osservati: capacita' tool confermata dal segnale strutturato"
+                .to_string()
         } else {
             "ZERO tool esposti su un task software: misconfigurazione modello/\
 whitelist (verificare supports_tool_use e le whitelist agent.tools.*)"
                 .to_string()
         };
-        (passed, json!({ "tools_count": tools_count, "verdict": verdict }))
+        (
+            passed,
+            json!({ "tools_count": tools_count, "has_tool_calls": has_tool_calls, "verdict": verdict }),
+        )
     }
 
     /// completion_confirmed: la chiusura va CONFERMATA da una dichiarazione
@@ -293,11 +322,19 @@ task_complete (outcome + summary)"
         // -> evidence.error (parita' col try/except Python), non propaga.
         let raw = match self.run_tool("run_command", tool_input, mode).await {
             Ok(s) => s,
-            Err(e) => return (false, json!({ "error": format!("execute_tool: {e}"), "command": cmd })),
+            Err(e) => {
+                return (
+                    false,
+                    json!({ "error": format!("execute_tool: {e}"), "command": cmd }),
+                )
+            }
         };
         // exit_code STRUTTURATO dal punto unico (stesso parser del path gRPC).
         let actual_exit = crate::tool_runner_server::extract_exit_code(&raw);
-        let expected_exit = expected.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+        let expected_exit = expected
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let exit_ok = actual_exit.map(|a| a as i64) == Some(expected_exit);
 
         // RETE DI SICUREZZA (regola H): alcuni build ESCONO 0 anche quando il
@@ -354,8 +391,7 @@ task_complete (outcome + summary)"
         let baseline_exit = spec.get("baseline_exit_code").and_then(Value::as_i64);
         let preexisting_bootstrap = !exit_ok
             && error_files.is_empty()
-            && baseline_exit
-                .is_some_and(|b| b != 0 && actual_exit.map(|a| a as i64) == Some(b));
+            && baseline_exit.is_some_and(|b| b != 0 && actual_exit.map(|a| a as i64) == Some(b));
         let passed = if delta_applicable {
             // Chiude se il task non ha lasciato errori nei file che ha toccato,
             // anche se il progetto ha debito preesistente altrove.
@@ -442,7 +478,10 @@ task_complete (outcome + summary)"
                 json!({ "skipped": "service_logs_clean: command/patterns mancanti (N/A)" }),
             );
         }
-        let raw = match self.run_tool("run_command", json!({ "command": cmd }), mode).await {
+        let raw = match self
+            .run_tool("run_command", json!({ "command": cmd }), mode)
+            .await
+        {
             Ok(s) => s,
             // Inconclusivo (non un fallimento): non blocchiamo la chiusura su un
             // errore di lettura log (parita' Python: ritorna passed=true).
@@ -527,7 +566,12 @@ task_complete (outcome + summary)"
         };
         let m = match reqwest::Method::from_bytes(method.as_bytes()) {
             Ok(m) => m,
-            Err(_) => return (false, json!({ "error": format!("metodo HTTP invalido: {method}"), "url": url })),
+            Err(_) => {
+                return (
+                    false,
+                    json!({ "error": format!("metodo HTTP invalido: {method}"), "url": url }),
+                )
+            }
         };
         let mut rb = self
             .http_client
@@ -549,7 +593,12 @@ task_complete (outcome + summary)"
         }
         let resp = match rb.send().await {
             Ok(r) => r,
-            Err(e) => return (false, json!({ "error": format!("http call: {e}"), "url": url })),
+            Err(e) => {
+                return (
+                    false,
+                    json!({ "error": format!("http call: {e}"), "url": url }),
+                )
+            }
         };
         let actual = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
@@ -596,7 +645,12 @@ task_complete (outcome + summary)"
             .await
         {
             Ok(s) => s,
-            Err(e) => return (false, json!({ "error": format!("execute_tool: {e}"), "path": path })),
+            Err(e) => {
+                return (
+                    false,
+                    json!({ "error": format!("execute_tool: {e}"), "path": path }),
+                )
+            }
         };
         let head = raw.chars().take(80).collect::<String>().to_lowercase();
         let list_error = raw.starts_with('\u{274C}')
@@ -606,7 +660,10 @@ task_complete (outcome + summary)"
             || head.contains("not found");
         if list_error {
             // list_files in errore: trattiamo come "non esiste" (parita' fallback).
-            let expected_exists = expected.get("exists").and_then(Value::as_bool).unwrap_or(true);
+            let expected_exists = expected
+                .get("exists")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
             let passed = !expected_exists; // exists=false == expected_exists?
             return (
                 passed,
@@ -620,8 +677,13 @@ task_complete (outcome + summary)"
             );
         }
         // Match del basename come token isolato (boundary spazio/slash/quote).
-        let exists = raw.lines().any(|line| line_contains_basename(line, basename));
-        let expected_exists = expected.get("exists").and_then(Value::as_bool).unwrap_or(true);
+        let exists = raw
+            .lines()
+            .any(|line| line_contains_basename(line, basename));
+        let expected_exists = expected
+            .get("exists")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         (
             exists == expected_exists,
             json!({
@@ -644,13 +706,25 @@ task_complete (outcome + summary)"
         mode: ExecMode,
         timeout_s: f64,
     ) -> Result<(bool, Value), PortError> {
-        let run_id = spec.get("run_id").and_then(Value::as_str).unwrap_or("").trim();
+        let run_id = spec
+            .get("run_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if run_id.is_empty() {
-            return Ok((true, json!({ "skipped": "outputs_exist senza run_id: N/A" })));
+            return Ok((
+                true,
+                json!({ "skipped": "outputs_exist senza run_id: N/A" }),
+            ));
         }
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
-            Err(_) => return Ok((true, json!({ "skipped": "outputs_exist run_id non-UUID: N/A" }))),
+            Err(_) => {
+                return Ok((
+                    true,
+                    json!({ "skipped": "outputs_exist run_id non-UUID: N/A" }),
+                ))
+            }
         };
         // Tool mutativi file del run da agent_steps (status completed), ordinati.
         let mutator_names: Vec<&str> = OUTPUT_PATH_KEYS.iter().map(|(t, _)| *t).collect();
@@ -684,7 +758,10 @@ task_complete (outcome + summary)"
             }
         }
         if paths.is_empty() {
-            return Ok((true, json!({ "skipped": "nessuno step mutativo file nel run: N/A" })));
+            return Ok((
+                true,
+                json!({ "skipped": "nessuno step mutativo file nel run: N/A" }),
+            ));
         }
         let mut missing: Vec<String> = Vec::new();
         let mut checked: Vec<String> = Vec::new();
@@ -909,10 +986,8 @@ mod tests {
 
     #[sqlx::test]
     async fn run_command_build_fallisce_su_exit_non_zero(pool: PgPool) {
-        let exec = FakeToolExecutor::with(&[(
-            "run_command",
-            &["error[E0432]\nEXIT CODE: 101\nboom"],
-        )]);
+        let exec =
+            FakeToolExecutor::with(&[("run_command", &["error[E0432]\nEXIT CODE: 101\nboom"])]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
             .run(
@@ -958,17 +1033,17 @@ mod tests {
         );
         assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(true));
         let verdict = res[0].evidence["verdict"].as_str().unwrap_or_default();
-        assert!(verdict.contains("PRE-ESISTENTE"), "verdict dichiara il debito: {verdict}");
+        assert!(
+            verdict.contains("PRE-ESISTENTE"),
+            "verdict dichiara il debito: {verdict}"
+        );
     }
 
     #[sqlx::test]
     async fn run_command_fallimento_diverso_dalla_baseline_boccia(pool: PgPool) {
         // Exit diverso dalla baseline = comportamento NUOVO (possibile rottura
         // introdotta dal run, es. config cancellata): resta bloccante.
-        let exec = FakeToolExecutor::with(&[(
-            "run_command",
-            &["boom di bootstrap\nEXIT CODE: 2"],
-        )]);
+        let exec = FakeToolExecutor::with(&[("run_command", &["boom di bootstrap\nEXIT CODE: 2"])]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
             .run(
@@ -981,7 +1056,10 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(!res[0].passed, "exit 2 con baseline 1: non identico -> boccia");
+        assert!(
+            !res[0].passed,
+            "exit 2 con baseline 1: non identico -> boccia"
+        );
         assert_eq!(res[0].evidence["preexisting_bootstrap"], json!(false));
     }
 
@@ -1082,7 +1160,8 @@ mod tests {
     /// toccati -> criterio ASSOLUTO come prima (exit != 0 -> fallisce).
     #[sqlx::test]
     async fn run_command_delta_senza_file_toccati_e_failclosed(pool: PgPool) {
-        let out = "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 args\nEXIT CODE: 2";
+        let out =
+            "src/app/pages/BookingPage.tsx(156,7): error TS2554: Expected 2 args\nEXIT CODE: 2";
         let exec = FakeToolExecutor::with(&[("run_command", &[out])]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
@@ -1109,7 +1188,11 @@ mod tests {
         let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool);
         runner
             .run(
-                vec![spec("run_command", json!({ "command": "x" }), json!({ "exit_code": 0 }))],
+                vec![spec(
+                    "run_command",
+                    json!({ "command": "x" }),
+                    json!({ "exit_code": 0 }),
+                )],
                 ExecMode::Replay,
             )
             .await
@@ -1122,10 +1205,8 @@ mod tests {
 
     #[sqlx::test]
     async fn service_logs_clean_passa_senza_pattern_hit(pool: PgPool) {
-        let exec = FakeToolExecutor::with(&[(
-            "run_command",
-            &["INFO server avviato\nINFO richiesta ok"],
-        )]);
+        let exec =
+            FakeToolExecutor::with(&[("run_command", &["INFO server avviato\nINFO richiesta ok"])]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
             .run(
@@ -1185,6 +1266,50 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn tool_capability_passa_se_history_ha_tool_call(pool: PgPool) {
+        // Regressione: il final_gate puo' vedere tools_json vuoto/assente su
+        // resume/fan-in, ma la history porta tool_use gia' osservati. Quel segnale
+        // strutturato dimostra che il catalogo era disponibile nel run.
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "tool_capability",
+                    json!({ "tools_count": 0, "has_tool_calls": true }),
+                    json!({ "capable": true }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(res[0].passed, "history tool_use conferma capacita' tool");
+        assert_eq!(res[0].evidence["tools_count"], json!(0));
+        assert_eq!(res[0].evidence["has_tool_calls"], json!(true));
+    }
+
+    #[sqlx::test]
+    async fn tool_capability_fallisce_senza_catalogo_ne_history(pool: PgPool) {
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(
+                vec![spec(
+                    "tool_capability",
+                    json!({ "tools_count": 0, "has_tool_calls": false }),
+                    json!({ "capable": true }),
+                )],
+                ExecMode::Real,
+            )
+            .await
+            .expect("ok");
+        assert!(
+            !res[0].passed,
+            "zero catalogo e zero tool_use resta misconfigurazione"
+        );
+    }
+
+    #[sqlx::test]
     async fn http_in_replay_e_inconclusive_senza_chiamata(pool: PgPool) {
         // FIX FINDING F2c-2: il criterio http in modalita' Replay (shadow) NON
         // deve eseguire reqwest. Si esercita con un URL irraggiungibile: se la
@@ -1203,7 +1328,10 @@ mod tests {
             )
             .await
             .expect("ok");
-        assert!(res[0].passed, "Replay -> inconclusive (passed=true, non conteggiato)");
+        assert!(
+            res[0].passed,
+            "Replay -> inconclusive (passed=true, non conteggiato)"
+        );
         assert_eq!(res[0].evidence["inconclusive"], json!(true));
         // Nessuna evidence di una chiamata avvenuta (no status, no error di rete).
         assert!(res[0].evidence.get("status").is_none());
@@ -1212,14 +1340,16 @@ mod tests {
 
     #[sqlx::test]
     async fn file_exists_trova_basename_nel_listing(pool: PgPool) {
-        let exec = FakeToolExecutor::with(&[(
-            "list_files",
-            &["- README.md\n- src/\n- variables.txt"],
-        )]);
+        let exec =
+            FakeToolExecutor::with(&[("list_files", &["- README.md\n- src/\n- variables.txt"])]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
             .run(
-                vec![spec("file_exists", json!({ "path": "variables.txt" }), json!({}))],
+                vec![spec(
+                    "file_exists",
+                    json!({ "path": "variables.txt" }),
+                    json!({}),
+                )],
                 ExecMode::Real,
             )
             .await
@@ -1237,7 +1367,11 @@ mod tests {
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
             .run(
-                vec![spec("outputs_exist", json!({ "run_id": run.to_string() }), json!({}))],
+                vec![spec(
+                    "outputs_exist",
+                    json!({ "run_id": run.to_string() }),
+                    json!({}),
+                )],
                 ExecMode::Real,
             )
             .await
@@ -1267,7 +1401,11 @@ mod tests {
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
             .run(
-                vec![spec("outputs_exist", json!({ "run_id": run.to_string() }), json!({}))],
+                vec![spec(
+                    "outputs_exist",
+                    json!({ "run_id": run.to_string() }),
+                    json!({}),
+                )],
                 ExecMode::Real,
             )
             .await
@@ -1281,7 +1419,10 @@ mod tests {
         let exec = FakeToolExecutor::with(&[]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
-            .run(vec![spec("inventato", json!({}), json!({}))], ExecMode::Real)
+            .run(
+                vec![spec("inventato", json!({}), json!({}))],
+                ExecMode::Real,
+            )
             .await
             .expect("ok");
         assert!(!res[0].passed);
@@ -1314,8 +1455,14 @@ mod tests {
         assert!(line_contains_basename("\"variables.txt\"", "variables.txt"));
         assert!(line_contains_basename("dir/variables.txt", "variables.txt"));
         // NON deve matchare un substring di un nome piu' lungo.
-        assert!(!line_contains_basename("- variables.txt.bak", "variables.txt"));
-        assert!(!line_contains_basename("- myvariables.txt", "variables.txt"));
+        assert!(!line_contains_basename(
+            "- variables.txt.bak",
+            "variables.txt"
+        ));
+        assert!(!line_contains_basename(
+            "- myvariables.txt",
+            "variables.txt"
+        ));
     }
 
     #[test]
@@ -1353,11 +1500,16 @@ mod tests {
     #[test]
     fn check_tool_capability_tabella() {
         use serde_json::json;
-        let (ok, _) = FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({"tools_count": 12}));
+        let (ok, _) =
+            FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({"tools_count": 12}));
         assert!(ok);
-        let (ko, ev) = FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({"tools_count": 0}));
+        let (ko, ev) =
+            FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({"tools_count": 0}));
         assert!(!ko);
-        assert!(ev["verdict"].as_str().unwrap().contains("misconfigurazione"));
+        assert!(ev["verdict"]
+            .as_str()
+            .unwrap()
+            .contains("misconfigurazione"));
         // Fatto assente -> 0 -> fallisce (fail-closed: e' il gate a decidere).
         let (ko2, _) = FinalGateCriteriaRunnerAdapter::check_tool_capability(&json!({}));
         assert!(!ko2);
@@ -1374,7 +1526,11 @@ mod tests {
             assert!(ok, "outcome {o} dichiarato deve passare");
         }
         // Assente o vuoto -> fallisce con invito a task_complete.
-        for spec in [json!({}), json!({"declared_outcome": null}), json!({"declared_outcome": "  "})] {
+        for spec in [
+            json!({}),
+            json!({"declared_outcome": null}),
+            json!({"declared_outcome": "  "}),
+        ] {
             let (ko, ev) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(&spec);
             assert!(!ko, "spec {spec} deve fallire");
             assert!(ev["verdict"].as_str().unwrap().contains("task_complete"));
@@ -1390,12 +1546,18 @@ mod tests {
         let (ko, _) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(
             &json!({"declared_outcome": null, "subagent_completed": false}),
         );
-        assert!(!ko, "nessuna dichiarazione e nessun subagente completato -> fallisce");
+        assert!(
+            !ko,
+            "nessuna dichiarazione e nessun subagente completato -> fallisce"
+        );
         // La dichiarazione del padre prevale sul verdict del subagente.
         let (ok, ev) = FinalGateCriteriaRunnerAdapter::check_completion_confirmed(
             &json!({"declared_outcome": "done", "subagent_completed": true}),
         );
         assert!(ok);
-        assert!(ev["verdict"].as_str().unwrap().contains("esito dichiarato: done"));
+        assert!(ev["verdict"]
+            .as_str()
+            .unwrap()
+            .contains("esito dichiarato: done"));
     }
 }

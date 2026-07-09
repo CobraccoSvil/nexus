@@ -4,6 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { getProjectServicesStatus, getOutputEvents } from "../../lib/api-client";
 import { promptFromDebugEntry } from "../../lib/chat-prompts";
+import {
+  useProjectStore,
+  selectServiceLogsRecent,
+  selectServicesRefreshAt,
+} from "../../lib/project-dispatcher";
 
 export type DebugLevel = "ERROR" | "WARN" | "INFO" | "DEBUG";
 
@@ -139,9 +144,55 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
   });
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const [serviceNames, setServiceNames] = useState<string[]>([]);
+  const serviceLogsRecent = useProjectStore(selectServiceLogsRecent);
+  const servicesRefreshAt = useProjectStore(selectServicesRefreshAt);
   const lineBufferRef = useRef<string[]>([]);
   const seenLogIdsRef = useRef<Set<string>>(new Set());
-  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const ingestServiceLogEvents = useCallback(async (units: string[]) => {
+    if (!projectId || units.length === 0) return;
+    for (const unit of units) {
+      try {
+        const res = await getOutputEvents(projectId, `svc:${unit}`, 30);
+        if (!res.events || res.events.length === 0) continue;
+
+        const shortName = unit
+          .replace(/\.service$/, "")
+          .replace(/^[^-]+-/, "");
+
+        const newEntries: DebugEntry[] = [];
+        for (const ev of res.events) {
+          const dedupKey = `${ev.id}|${ev.createdAt ?? ""}|${(ev.text || "").slice(0, 50)}`;
+          if (seenLogIdsRef.current.has(dedupKey)) continue;
+          seenLogIdsRef.current.add(dedupKey);
+
+          const lines = (ev.text || "").split(/\r?\n/);
+          const parsed = parseLines(lines, shortName);
+          if (parsed.length > 0) {
+            newEntries.push(...parsed);
+          } else if (ev.level === "error" || ev.level === "warn") {
+            newEntries.push({
+              id: `svc-${ev.id}`,
+              level: ev.level === "error" ? "ERROR" : "WARN",
+              timestamp: ev.createdAt
+                ? new Date(ev.createdAt).toLocaleTimeString("it-IT")
+                : new Date().toLocaleTimeString("it-IT"),
+              message: ev.title || ev.text,
+              raw: ev.text,
+              source: shortName,
+              expanded: false,
+            });
+          }
+        }
+
+        if (newEntries.length > 0) {
+          setEntries((prev) => [...prev, ...newEntries].slice(-800));
+        }
+      } catch {
+        // ignora errori di fetch
+      }
+    }
+  }, [projectId]);
 
   // Carica lista servizi del progetto. Includiamo, oltre agli `active`:
   //  - `managed_by === 'detached'` (WSL: systemd --user non attivo, l'unit gira
@@ -169,67 +220,47 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
       })
       .catch(() => {});
     return () => { active = false; };
-  }, [projectId]);
+  }, [projectId, servicesRefreshAt]);
 
-  // Polling log journalctl dei servizi
+  // Righe log live via SSE ServiceLogLine (store dispatcher).
   useEffect(() => {
-    if (!projectId || serviceNames.length === 0) return;
+    if (serviceLogsRecent.length === 0) return;
+    const latest = serviceLogsRecent[0];
+    const dedupKey = `sse|${latest.ts}|${latest.unit}|${latest.line.slice(0, 50)}`;
+    if (seenLogIdsRef.current.has(dedupKey)) return;
+    seenLogIdsRef.current.add(dedupKey);
 
-    const fetchServiceLogs = async () => {
-      for (const unit of serviceNames) {
-        try {
-          const res = await getOutputEvents(projectId, `svc:${unit}`, 30);
-          if (!res.events || res.events.length === 0) continue;
+    const shortName = latest.unit
+      .replace(/\.service$/, "")
+      .replace(/^[^-]+-/, "");
+    const parsed = parseLines([latest.line], shortName);
+    if (parsed.length > 0) {
+      setEntries((prev) => [...prev, ...parsed].slice(-800));
+      return;
+    }
+    const level: DebugLevel =
+      latest.level === "error" ? "ERROR" :
+      latest.level === "warn" ? "WARN" :
+      latest.level === "debug" ? "DEBUG" : "INFO";
+    setEntries((prev) => [
+      ...prev,
+      {
+        id: `sse-${latest.ts}-${latest.unit}`,
+        level,
+        timestamp: new Date(latest.ts).toLocaleTimeString("it-IT"),
+        message: latest.line,
+        raw: latest.line,
+        source: shortName,
+        expanded: false,
+      },
+    ].slice(-800));
+  }, [serviceLogsRecent]);
 
-          const shortName = unit
-            .replace(/\.service$/, "")
-            .replace(/^[^-]+-/, "");
-
-          const newEntries: DebugEntry[] = [];
-          for (const ev of res.events) {
-            // P4: chiave composta (id + createdAt + prefisso testo). ev.id
-            // non e' garantito univoco dal backend: con la sola id le righe
-            // NUOVE con id duplicato venivano scartate. Cosi' anche le righe
-            // post-restart (createdAt diverso) non si perdono.
-            const dedupKey = `${ev.id}|${ev.createdAt ?? ""}|${(ev.text || "").slice(0, 50)}`;
-            if (seenLogIdsRef.current.has(dedupKey)) continue;
-            seenLogIdsRef.current.add(dedupKey);
-
-            const lines = (ev.text || "").split(/\r?\n/);
-            const parsed = parseLines(lines, shortName);
-            if (parsed.length > 0) {
-              newEntries.push(...parsed);
-            } else if (ev.level === "error" || ev.level === "warn") {
-              newEntries.push({
-                id: `svc-${ev.id}`,
-                level: ev.level === "error" ? "ERROR" : "WARN",
-                timestamp: ev.createdAt
-                  ? new Date(ev.createdAt).toLocaleTimeString("it-IT")
-                  : new Date().toLocaleTimeString("it-IT"),
-                message: ev.title || ev.text,
-                raw: ev.text,
-                source: shortName,
-                expanded: false,
-              });
-            }
-          }
-
-          if (newEntries.length > 0) {
-            setEntries((prev) => [...prev, ...newEntries].slice(-800));
-          }
-        } catch {
-          // ignora errori di fetch
-        }
-      }
-    };
-
-    fetchServiceLogs();
-    pollTimerRef.current = setInterval(fetchServiceLogs, 5000);
-
-    return () => {
-      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-    };
-  }, [projectId, serviceNames]);
+  // Caricamento iniziale/storico log servizio (SSE ServiceLogLine copre il live).
+  useEffect(() => {
+    if (serviceNames.length === 0) return;
+    void ingestServiceLogEvents(serviceNames);
+  }, [serviceNames, ingestServiceLogEvents]);
 
   // Righe dal terminale (prop terminalLines, accumulata incrementalmente dal
   // BottomPanelManager). L'array cresce nel tempo: processiamo SOLO le righe

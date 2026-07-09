@@ -460,7 +460,8 @@ fn command_result_hint(exit_code: i32, stdout: &str, stderr: &str, command: &str
     } else if exit_code == 0 && stdout.trim().is_empty() && stderr.trim().is_empty() {
         "\n[NESSUN RISULTATO: il comando è completato con successo ma non ha prodotto output. \
          Per grep/sed questo significa che il pattern non è stato trovato o il file è vuoto. \
-         Non riprovare lo stesso comando — prova un pattern diverso o usa read_file.]".to_string()
+         Non riprovare lo stesso comando — prova un pattern diverso o usa read_file.]"
+            .to_string()
     } else if exit_code == 1 && stdout.trim().is_empty() {
         "\n[EXIT CODE 1 + output vuoto: per grep significa nessuna corrispondenza trovata.]"
             .to_string()
@@ -918,8 +919,16 @@ pub(crate) async fn ensure_project_db_url(
     let admin_user = load_setting_or(db, "nexus_app_admin_user", "nexus_admin").await;
     let admin_pwd = load_setting_or(db, "nexus_app_admin_password", "nexus_admin_secret").await;
 
-    provision_app_database(&host, &port, &user, &admin_user, &admin_pwd, &db_name, project_id)
-        .await;
+    provision_app_database(
+        &host,
+        &port,
+        &user,
+        &admin_user,
+        &admin_pwd,
+        &db_name,
+        project_id,
+    )
+    .await;
 
     let url = format!("postgresql://{user}:{pwd}@{host}:{port}/{db_name}");
 

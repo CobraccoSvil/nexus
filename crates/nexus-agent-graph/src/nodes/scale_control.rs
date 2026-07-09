@@ -408,7 +408,7 @@ mod tests {
     use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{ExecMode, PortError};
     use crate::runtime::ports::{OrchestrationContext, OrchestrationMove};
-    use crate::runtime::ports::{RecoveryMove, ScaleTier, StallContext};
+    use crate::runtime::ports::{RecoveryMove, ScaleTier, StallContext, SupervisorContext};
     use crate::runtime::{AgentNodeCtx, NullEventSink, StubMetaReasonerPort};
     use crate::state::AgentState;
     use sqlx::postgres::PgPoolOptions;
@@ -443,6 +443,14 @@ mod tests {
         ) -> Result<Option<ScaleMove>, PortError> {
             Ok(Some(self.0.clone()))
         }
+
+        async fn supervise(
+            &self,
+            _ctx: SupervisorContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
+            Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
+        }
     }
 
     /// Porta reasoner che ritorna sempre errore su `assess_scale` (ramo degrado).
@@ -472,6 +480,14 @@ mod tests {
             _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
             Err(PortError::ProviderUnavailable("test".to_string().into()))
+        }
+
+        async fn supervise(
+            &self,
+            _ctx: SupervisorContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
+            Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
     }
 
@@ -640,7 +656,10 @@ mod tests {
         assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
         let scale_ctx = ScaleControlNode::read_context(&state).expect("ctx presente");
         let key = fallback_cache_key(&scale_ctx);
-        assert!(after.extra.get(&key).is_none(), "gate non superato -> niente mossa");
+        assert!(
+            after.extra.get(&key).is_none(),
+            "gate non superato -> niente mossa"
+        );
     }
 
     #[tokio::test]
@@ -666,10 +685,9 @@ mod tests {
         let after = apply(&state, delta);
         assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
         // La mossa in cache e' invariata (il nodo l'ha riusata, non riscritta).
-        let mv: ScaleMove = serde_json::from_value(
-            after.extra.get(&key).expect("mossa cache presente").clone(),
-        )
-        .expect("mossa cache deserializzabile");
+        let mv: ScaleMove =
+            serde_json::from_value(after.extra.get(&key).expect("mossa cache presente").clone())
+                .expect("mossa cache deserializzabile");
         assert_eq!(
             mv,
             ScaleMove::UpscaleTo {
@@ -849,7 +867,10 @@ mod tests {
         assert_eq!(after.stop_reason, Some(StopReason::ScaleResolved));
         let scale_ctx = ScaleControlNode::read_context(&state).expect("ctx presente");
         let key = fallback_cache_key(&scale_ctx);
-        let persisted = after.extra.get(&key).expect("AdjustSizing deve essere persistito");
+        let persisted = after
+            .extra
+            .get(&key)
+            .expect("AdjustSizing deve essere persistito");
         let mv: ScaleMove =
             serde_json::from_value(persisted.clone()).expect("mossa deserializzabile");
         assert_eq!(

@@ -689,11 +689,10 @@ async fn auto_populate_escalations(db: &sqlx::PgPool) -> Result<(), String> {
     // Soglia DB-driven (regola G). Default = valore di bootstrap del setting
     // (mig 0475), usato solo se la chiave manca o non e' parsabile come i32.
     const DEFAULT_THRESHOLD_TOKENS: i32 = 16000;
-    let threshold: i32 =
-        nexus_auth::get_setting(db, "routing.escalation_budget_threshold_tokens")
-            .await
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(DEFAULT_THRESHOLD_TOKENS);
+    let threshold: i32 = nexus_auth::get_setting(db, "routing.escalation_budget_threshold_tokens")
+        .await
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(DEFAULT_THRESHOLD_TOKENS);
 
     // UNA query: deriva il target dalla vista. Il sub-select sceglie il modello
     // dello stesso provider con tier strettamente superiore, tool-capable, il

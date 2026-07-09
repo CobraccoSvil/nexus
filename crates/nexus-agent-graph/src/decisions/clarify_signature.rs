@@ -28,7 +28,11 @@ use sha1::{Digest, Sha1};
 /// che riconosce la ri-emissione della STESSA domanda (il caso email: identica
 /// ad ogni giro).
 pub fn normalize_question(question: &str) -> String {
-    question.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Firma di una domanda-chiarimento: sha1 esadecimale (12 char) della domanda
@@ -86,7 +90,8 @@ mod tests {
         let sig = clarify_signature("test");
         assert_eq!(sig.len(), 12, "12 char esadecimali (6 byte)");
         assert!(
-            sig.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            sig.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "hex lowercase"
         );
     }

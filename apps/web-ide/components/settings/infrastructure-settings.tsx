@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
+import { useProjectStore, selectProviderHealthChangedAt } from "../../lib/project-dispatcher/store";
 import type { SettingEntry } from "./provider-settings";
 import type { EnvironmentCheck } from "../../lib/api-client";
 import { getEnvironmentStatus, fixEnvironment } from "../../lib/api-client";
@@ -217,11 +218,14 @@ export function InfrastructureSettings({
     setRefreshing(false);
   }, [items]);
 
+  const providerHealthAt = useProjectStore(selectProviderHealthChangedAt);
   useEffect(() => {
     void checkAllHealth();
-    const timer = setInterval(() => void checkAllHealth(), 30_000);
-    return () => clearInterval(timer);
   }, [checkAllHealth]);
+  useEffect(() => {
+    if (providerHealthAt === 0) return;
+    void checkAllHealth();
+  }, [providerHealthAt, checkAllHealth]);
 
   const getStatusDot = (status: ServiceHealth["status"]) => {
     const colors = {

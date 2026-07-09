@@ -622,7 +622,8 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         .await
         .unwrap_or_default();
         for (id, pid) in running_services {
-            let alive = matches!(pid, Some(p) if p > 0 && crate::process_util::process_alive(p as u32));
+            let alive =
+                matches!(pid, Some(p) if p > 0 && crate::process_util::process_alive(p as u32));
             if alive {
                 continue;
             }

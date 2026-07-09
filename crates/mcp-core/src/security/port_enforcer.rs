@@ -26,7 +26,6 @@ use crate::security::{record_audit, AuditEntry};
 /// con overhead CPU (<0.1% su ss + /proc scan).
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 /// Richiede il pool DB per cross-referencing PID-progetto e il registry dei
 /// canali per emettere notifiche real-time al frontend.
@@ -146,8 +145,7 @@ async fn chain_violation_to_remediation(
             .ok()
             .flatten();
     let allocated =
-        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id)
-            .await;
+        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id).await;
 
     // Localizza il sorgente della porta (best-effort).
     let file_finding = if let Some(root) = root.filter(|r| !r.is_empty()) {

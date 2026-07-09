@@ -532,10 +532,16 @@ pub(crate) async fn compact_session_core(
     // template DB system.session_compact_structured (output JSON: riassunto +
     // decisioni durature -> worklog); altrimenti il prompt legacy testuale.
     // Fallback al legacy se il template e' vuoto (regola H).
-    let structured_compact = nexus_auth::get_setting(&state.db, "agent.worklog.compact_writes_decisions")
-        .await
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true);
+    let structured_compact =
+        nexus_auth::get_setting(&state.db, "agent.worklog.compact_writes_decisions")
+            .await
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true);
     const LEGACY_COMPACT_PROMPT: &str = "Riassumi questa conversazione estraendo: le decisioni chiave prese, i cambiamenti al codice effettuati, i contesti e le conoscenze apprese utili per il progetto. Sii conciso e strutturato con bullet points.";
     let compact_instruction = if structured_compact {
         let tpl = nexus_types::get_template_or_default(

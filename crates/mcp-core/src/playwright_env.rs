@@ -93,8 +93,9 @@ pub fn default_cache_root() -> Result<PathBuf, String> {
             return Ok(PathBuf::from(trimmed));
         }
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| "variabile HOME non impostata: impossibile localizzare la cache Playwright".to_string())?;
+    let home = std::env::var("HOME").map_err(|_| {
+        "variabile HOME non impostata: impossibile localizzare la cache Playwright".to_string()
+    })?;
     Ok(PathBuf::from(home).join(".cache").join("ms-playwright"))
 }
 
@@ -156,7 +157,9 @@ mod tests {
     }
 
     fn make_headless_shell_rev(root: &Path, rev: u64) {
-        let dir = root.join(format!("chromium_headless_shell-{rev}/chrome-headless-shell-linux64"));
+        let dir = root.join(format!(
+            "chromium_headless_shell-{rev}/chrome-headless-shell-linux64"
+        ));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("chrome-headless-shell"), b"x").unwrap();
     }
@@ -171,7 +174,10 @@ mod tests {
         make_headless_shell_rev(&tmp, 1228);
 
         let exe = resolve_chromium_executable(&tmp).expect("deve trovare il chromium");
-        assert!(exe.ends_with("chromium-1228/chrome-linux64/chrome"), "scelto: {exe:?}");
+        assert!(
+            exe.ends_with("chromium-1228/chrome-linux64/chrome"),
+            "scelto: {exe:?}"
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -186,7 +192,10 @@ mod tests {
         make_chromium_rev(&tmp, 1217, true);
 
         let exe = resolve_chromium_executable(&tmp).expect("deve ripiegare su 1217");
-        assert!(exe.ends_with("chromium-1217/chrome-linux64/chrome"), "scelto: {exe:?}");
+        assert!(
+            exe.ends_with("chromium-1217/chrome-linux64/chrome"),
+            "scelto: {exe:?}"
+        );
 
         fs::remove_dir_all(&tmp).ok();
     }
@@ -206,7 +215,8 @@ mod tests {
 
     #[test]
     fn errors_when_cache_root_missing() {
-        let tmp = std::env::temp_dir().join(format!("nexus_pw_env_missing_{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("nexus_pw_env_missing_{}", uuid::Uuid::new_v4()));
         // tmp NON creata di proposito.
         let err = resolve_chromium_executable(&tmp).unwrap_err();
         assert!(err.contains("non leggibile"), "errore: {err}");

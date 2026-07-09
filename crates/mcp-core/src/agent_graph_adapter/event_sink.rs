@@ -25,9 +25,7 @@ use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{EventSink, SseEvent};
 
-use crate::agent_types::{
-    AITraceEvent, AgentMetaStep, AgentStep, AgentStepEvent, AgentStepStatus,
-};
+use crate::agent_types::{AITraceEvent, AgentMetaStep, AgentStep, AgentStepEvent, AgentStepStatus};
 
 /// Accumulatore per-turno della traccia gateway (`AITraceEvent`).
 ///
@@ -456,7 +454,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn setup() -> (SseEventSinkAdapter, broadcast::Receiver<AgentStepEvent>, Uuid) {
+    fn setup() -> (
+        SseEventSinkAdapter,
+        broadcast::Receiver<AgentStepEvent>,
+        Uuid,
+    ) {
         let (tx, rx) = broadcast::channel::<AgentStepEvent>(16);
         let run_id = Uuid::new_v4();
         (SseEventSinkAdapter::new(tx, run_id), rx, run_id)

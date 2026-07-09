@@ -96,11 +96,7 @@ pub fn classify_attachment_kind(mime_type: &str) -> &'static str {
 pub fn sanitize_attachment_filename(name: &str) -> String {
     // Prendi solo l'ultimo componente: scarta eventuali separatori inviati dal client.
     let trimmed = name.trim();
-    let last_component = trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let last_component = trimmed.rsplit(['/', '\\']).next().unwrap_or("").trim();
 
     let mut out = String::with_capacity(last_component.len());
     let mut last_was_underscore = false;
@@ -152,13 +148,12 @@ fn ensure_path_within(base: &Path, candidate: &Path) -> Result<(), ApiError> {
                     "Percorso allegato non sicuro: contiene componenti '..'",
                 ));
             }
-            Component::RootDir | Component::Prefix(_)
-                if !candidate.starts_with(base) => {
-                    return Err(api_error(
-                        StatusCode::BAD_REQUEST,
-                        "Percorso allegato non sicuro: root assoluta",
-                    ));
-                }
+            Component::RootDir | Component::Prefix(_) if !candidate.starts_with(base) => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Percorso allegato non sicuro: root assoluta",
+                ));
+            }
             _ => {}
         }
     }

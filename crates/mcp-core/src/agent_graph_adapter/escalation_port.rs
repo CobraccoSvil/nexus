@@ -357,9 +357,7 @@ impl EscalationPort for PgEscalationPort {
         // Telemetria: caricata SOLO in Real. In Replay resterebbe non-deterministica
         // (parita' shadow), quindi telemetria default (sano) -> il ranking si riduce a
         // tier + ordine d'ingresso, replay-stabile (come le altre decisioni gata mode).
-        let candidates = self
-            .enrich_candidates(pmt, mode == ExecMode::Real)
-            .await;
+        let candidates = self.enrich_candidates(pmt, mode == ExecMode::Real).await;
 
         Ok(EscalationInputs { candidates, policy })
     }
@@ -515,10 +513,7 @@ mod tests {
     /// Come [`seed_catalog`] ma con `context_window` esplicita (ultimo campo) per
     /// esercitare il filtro finestra-aware. Tuple:
     /// (provider, model, tier, input_cost, is_enabled, supports_tool_use, context_window).
-    async fn seed_catalog_window(
-        pool: &PgPool,
-        rows: &[(&str, &str, &str, f64, bool, bool, i64)],
-    ) {
+    async fn seed_catalog_window(pool: &PgPool, rows: &[(&str, &str, &str, f64, bool, bool, i64)]) {
         for (provider, model, tier, in_cost, enabled, tool, window) in rows {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
@@ -541,14 +536,12 @@ mod tests {
 
     /// Marca un provider come disponibile inserendone la API key in `settings`.
     async fn set_api_key(pool: &PgPool, provider: &str, value: &str) {
-        sqlx::query(
-            "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers')",
-        )
-        .bind(format!("{provider}_api_key"))
-        .bind(value)
-        .execute(pool)
-        .await
-        .expect("insert api key");
+        sqlx::query("INSERT INTO settings (key, value, category) VALUES ($1, $2, 'providers')")
+            .bind(format!("{provider}_api_key"))
+            .bind(value)
+            .execute(pool)
+            .await
+            .expect("insert api key");
     }
 
     /// La catena e' DERIVATA dal catalog (vista v_model_escalation_chain): enumera
@@ -575,14 +568,15 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
+            .escalation_inputs(
+                None,
+                Some("anthropic"),
+                Some("claude-haiku-4-5"),
+                ExecMode::Real,
+            )
             .await
             .expect("fail-open: mai PortError");
-        let models: Vec<&str> = inputs
-            .candidates
-            .iter()
-            .map(|c| c.model.as_str())
-            .collect();
+        let models: Vec<&str> = inputs.candidates.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(
             models,
             vec!["claude-sonnet-4-6", "claude-opus-4-6"],
@@ -608,7 +602,12 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
+            .escalation_inputs(
+                None,
+                Some("anthropic"),
+                Some("claude-haiku-4-5"),
+                ExecMode::Real,
+            )
             .await
             .expect("fail-open");
         let tiers: Vec<(&str, Option<&str>)> = inputs
@@ -634,7 +633,10 @@ mod tests {
         create_schema(&pool).await;
         seed_catalog(&pool, &[("openai", "gpt-x", "heavy", 1.0, true, true)]).await;
         let port = PgEscalationPort::new(pool.clone());
-        assert_eq!(port.model_tier("openai", "gpt-x").await.as_deref(), Some("heavy"));
+        assert_eq!(
+            port.model_tier("openai", "gpt-x").await.as_deref(),
+            Some("heavy")
+        );
         // Non in catalog -> None (default a valle).
         assert_eq!(port.model_tier("openai", "ignoto").await, None);
         // Argomenti vuoti -> None.
@@ -654,24 +656,49 @@ mod tests {
             &pool,
             &[
                 // corrente: rank basso, finestra GRANDE (1M).
-                ("deepseek", "deepseek-v4-flash", "medium", 0.10, true, true, 1_000_000),
+                (
+                    "deepseek",
+                    "deepseek-v4-flash",
+                    "medium",
+                    0.10,
+                    true,
+                    true,
+                    1_000_000,
+                ),
                 // piu' capace per rank ma finestra PICCOLA -> escluso (downgrade window).
-                ("deepseek", "deepseek-chat", "heavy", 1.0, true, true, 131_072),
+                (
+                    "deepseek",
+                    "deepseek-chat",
+                    "heavy",
+                    1.0,
+                    true,
+                    true,
+                    131_072,
+                ),
                 // piu' capace E finestra >= corrente -> ammesso.
-                ("deepseek", "deepseek-reasoner", "heavy", 2.0, true, true, 1_000_000),
+                (
+                    "deepseek",
+                    "deepseek-reasoner",
+                    "heavy",
+                    2.0,
+                    true,
+                    true,
+                    1_000_000,
+                ),
             ],
         )
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("deepseek"), Some("deepseek-v4-flash"), ExecMode::Real)
+            .escalation_inputs(
+                None,
+                Some("deepseek"),
+                Some("deepseek-v4-flash"),
+                ExecMode::Real,
+            )
             .await
             .expect("fail-open");
-        let models: Vec<&str> = inputs
-            .candidates
-            .iter()
-            .map(|c| c.model.as_str())
-            .collect();
+        let models: Vec<&str> = inputs.candidates.iter().map(|c| c.model.as_str()).collect();
         assert_eq!(
             models,
             vec!["deepseek-reasoner"],
@@ -687,11 +714,22 @@ mod tests {
         create_schema(&pool).await;
         seed_catalog_window(
             &pool,
-            &[("deepseek", "deepseek-v4-flash", "medium", 0.10, true, true, 1_000_000)],
+            &[(
+                "deepseek",
+                "deepseek-v4-flash",
+                "medium",
+                0.10,
+                true,
+                true,
+                1_000_000,
+            )],
         )
         .await;
         let port = PgEscalationPort::new(pool.clone());
-        assert_eq!(port.model_window("deepseek", "deepseek-v4-flash").await, 1_000_000);
+        assert_eq!(
+            port.model_window("deepseek", "deepseek-v4-flash").await,
+            1_000_000
+        );
         // Modello non in catalog -> 0 (finestra ignota, filtro inattivo).
         assert_eq!(port.model_window("deepseek", "ignoto").await, 0);
         // Argomenti vuoti -> 0.
@@ -708,7 +746,12 @@ mod tests {
         // leggere la vista, quindi non serve alcun seed del catalog.
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
+            .escalation_inputs(
+                None,
+                Some("anthropic"),
+                Some("claude-haiku-4-5"),
+                ExecMode::Real,
+            )
             .await
             .expect("fail-open");
         assert!(
@@ -726,10 +769,18 @@ mod tests {
         // la vista non viene nemmeno interrogata (nessun seed catalog necessario).
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("anthropic"), Some("claude-haiku-4-5"), ExecMode::Real)
+            .escalation_inputs(
+                None,
+                Some("anthropic"),
+                Some("claude-haiku-4-5"),
+                ExecMode::Real,
+            )
             .await
             .expect("fail-open");
-        assert!(inputs.candidates.is_empty(), "api key vuota -> provider non disponibile");
+        assert!(
+            inputs.candidates.is_empty(),
+            "api key vuota -> provider non disponibile"
+        );
     }
 
     /// Provider/model assenti -> Tier 1 saltato (catena vuota), nessun cooldown.
@@ -814,7 +865,12 @@ mod tests {
         .expect("update failures");
         let port = PgEscalationPort::new(pool.clone());
         let pick = port
-            .failover_provider(Some("google"), Some("g"), Some("heavy"), &["google".to_string()])
+            .failover_provider(
+                Some("google"),
+                Some("g"),
+                Some("heavy"),
+                &["google".to_string()],
+            )
             .await
             .expect("fail-open")
             .expect("un sostituto sano esiste");
@@ -835,9 +891,12 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let pick = port
-            .failover_provider(Some("google"), Some("gemini-heavy"), Some("heavy"), &[
-                "google".to_string(),
-            ])
+            .failover_provider(
+                Some("google"),
+                Some("gemini-heavy"),
+                Some("heavy"),
+                &["google".to_string()],
+            )
             .await
             .expect("fail-open")
             .expect("resta deepseek");
@@ -861,9 +920,12 @@ mod tests {
         .await;
         let port = PgEscalationPort::new(pool.clone());
         let pick = port
-            .failover_provider(Some("google"), Some("gemini-heavy"), None, &[
-                "google".to_string(),
-            ])
+            .failover_provider(
+                Some("google"),
+                Some("gemini-heavy"),
+                None,
+                &["google".to_string()],
+            )
             .await
             .expect("fail-open")
             .expect("un sostituto esiste");

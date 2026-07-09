@@ -46,8 +46,7 @@ impl std::fmt::Debug for AppStateWikiAi {
 }
 
 impl WikiAiServices for AppStateWikiAi {
-    fn embed_text(&self, model: &str, text: &str)
-        -> BoxFuture<'_, anyhow::Result<Vec<f32>>> {
+    fn embed_text(&self, model: &str, text: &str) -> BoxFuture<'_, anyhow::Result<Vec<f32>>> {
         let model = model.to_string();
         let text = text.to_string();
         Box::pin(async move {

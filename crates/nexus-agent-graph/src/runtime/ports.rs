@@ -208,6 +208,13 @@ pub struct LlmRequest {
     /// Tetto di token di output per il turno (`max_tokens`). `None` = default del
     /// provider risolto a monte.
     pub max_tokens: Option<i64>,
+    /// Formato di risposta richiesto al provider nel contratto gateway
+    /// provider-agnostico (es. `{"type":"json_object"}`). `None` = nessun
+    /// vincolo: il provider usa il proprio default.
+    pub response_format: Option<Value>,
+    /// Configurazione thinking/reasoning esplicita del turno. `None` lascia al
+    /// gateway il comportamento storico DB-driven/provider-specifico.
+    pub thinking: Option<ThinkingConfig>,
     /// Metadati per la registrazione usage lato gateway concreto (telemetria
     /// token/costo per run): `run_id` del run corrente. `None` per le chiamate
     /// fuori-run (es. test). Opaco al nodo.
@@ -232,6 +239,16 @@ pub struct LlmRequest {
     /// Il trait [`LlmGateway`] resta invariato (firma `complete()` non cambia):
     /// `purpose` viaggia nel payload, l'impl decide se guardarlo.
     pub purpose: Option<String>,
+}
+
+/// Configurazione thinking provider-agnostica trasportata fino al gateway LLM.
+/// Il gateway concreto la traduce nel dialetto del provider (Anthropic thinking,
+/// Gemini thinkingConfig, DeepSeek thinking.type, ecc.).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 /// Uso/consumo token riportato dal gateway (forma normalizzata cross-provider).
@@ -917,8 +934,7 @@ pub trait NextActionsDeriver: Send + Sync {
     /// blocco `<suggested_actions>`, rimosso a monte dal punto unico
     /// deterministico). Ritorna le scelte (vuoto = nessuna). Best-effort: errore
     /// -> `Ok(vec![])`, mai `PortError` nel flusso normale.
-    async fn derive(&self, cleaned_text: &str)
-        -> Result<Vec<NextActionChoice>, PortError>;
+    async fn derive(&self, cleaned_text: &str) -> Result<Vec<NextActionChoice>, PortError>;
 }
 
 /// Astrazione della LISTA dei provider AI in cooldown billing/quota (fonte unica:
@@ -1839,4 +1855,27 @@ pub trait MetaReasonerPort: Send + Sync {
         ctx: ScaleContext,
         mode: ExecMode,
     ) -> Result<Option<ScaleMove>, PortError>;
+
+    /// Consulta il supervisore worker (`automation.supervisor_monitoring`) sul
+    /// contesto `ctx` secondo `mode`. QUARTO scope disgiunto (regola L):
+    /// [`SupervisorContext`] -> [`crate::decisions::supervisor::SupervisorDecision`].
+    ///
+    /// - `Real` -> consulta l'LLM (purpose `supervisor_monitoring`, regola G).
+    ///   Guasto infrastrutturale -> `Err(PortError::ProviderUnavailable)`.
+    /// - `Replay` -> `Ok(Some(Continue))` senza I/O (parita' shadow: il Python
+    ///   non aveva supervisore nativo).
+    async fn supervise(
+        &self,
+        ctx: SupervisorContext,
+        mode: ExecMode,
+    ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError>;
+}
+
+/// Payload per il template `automation.supervisor_monitoring` (placeholder
+/// `{{task}}`, `{{steps_summary}}`, `{{anomaly_block}}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorContext {
+    pub task: String,
+    pub steps_summary: String,
+    pub anomaly_block: String,
 }

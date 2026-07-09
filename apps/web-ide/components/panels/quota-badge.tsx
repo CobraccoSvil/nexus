@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useProjectStore, selectOperationalRefreshAt } from "../../lib/project-dispatcher";
 
 interface QuotaBadgeProps {
   projectId: string;
@@ -23,11 +24,12 @@ interface QuotaData {
 
 /**
  * Badge compatto per l'header: mostra porte/container in uso vs quota.
- * Polling ogni 15s. Colore rosso se utilizzo >= 90%, arancione >= 70%.
+ * Aggiornamento via SSE operativo (PortAllocated/Released, job, ...).
  */
 export function QuotaBadge({ projectId }: QuotaBadgeProps) {
   const tc = useThemeColors();
   const [data, setData] = useState<QuotaData | null>(null);
+  const operationalRefreshAt = useProjectStore(selectOperationalRefreshAt);
 
   const fetchData = useCallback(async () => {
     try {
@@ -42,10 +44,8 @@ export function QuotaBadge({ projectId }: QuotaBadgeProps) {
   }, [projectId]);
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 15000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
+    void fetchData();
+  }, [fetchData, operationalRefreshAt]);
 
   if (!data) return null;
 

@@ -73,10 +73,7 @@ impl AgentStepStore for PgAgentStepStore {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let tool_input = block
-            .get("input")
-            .cloned()
-            .unwrap_or_else(|| block.clone());
+        let tool_input = block.get("input").cloned().unwrap_or_else(|| block.clone());
         let tool_result: Option<String> = result.map(|r| match r {
             Value::String(s) => s,
             other => other.to_string(),
@@ -111,7 +108,8 @@ impl AgentStepStore for PgAgentStepStore {
             // 0 righe = guard scattato: o retry idempotente (step gia' presente,
             // benigno) o RUN NON TRACCIATO in agent_runs -> lo step e' PERSO.
             Ok(r) if r.rows_affected() == 0 => {
-                self.warn_if_untracked(run_uuid, step_index, &tool_name).await;
+                self.warn_if_untracked(run_uuid, step_index, &tool_name)
+                    .await;
             }
             Ok(_) => {}
         }
@@ -218,7 +216,14 @@ mod tests {
         let block = json!({"name": "read_file"});
         for _ in 0..3 {
             store
-                .persist_step(&run_id.to_string(), 1, 0, block.clone(), None, ExecMode::Real)
+                .persist_step(
+                    &run_id.to_string(),
+                    1,
+                    0,
+                    block.clone(),
+                    None,
+                    ExecMode::Real,
+                )
                 .await
                 .expect("ok");
         }
@@ -227,7 +232,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count");
-        assert_eq!(count, 1, "3 retry sullo stesso (run, step_index) -> 1 sola riga");
+        assert_eq!(
+            count, 1,
+            "3 retry sullo stesso (run, step_index) -> 1 sola riga"
+        );
     }
 
     #[sqlx::test]
@@ -236,7 +244,14 @@ mod tests {
         // run_id NON presente in agent_runs: il guard EXISTS impedisce la FK orfana.
         let store = PgAgentStepStore::new(pool.clone());
         store
-            .persist_step(&Uuid::new_v4().to_string(), 0, 0, json!({}), None, ExecMode::Real)
+            .persist_step(
+                &Uuid::new_v4().to_string(),
+                0,
+                0,
+                json!({}),
+                None,
+                ExecMode::Real,
+            )
             .await
             .expect("best-effort Ok");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_steps")

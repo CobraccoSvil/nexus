@@ -378,12 +378,11 @@ pub async fn index_project_bootstrap_vectors(
         .await
         .unwrap_or_else(|_| "project_context".to_string());
 
-    let cleanup_error = match vector_memory::delete_project_bootstrap_points(&state.db, project_id)
-        .await
-    {
-        Err(error) => Some(format!("cleanup index precedente: {error}")),
-        Ok(()) => None,
-    };
+    let cleanup_error =
+        match vector_memory::delete_project_bootstrap_points(&state.db, project_id).await {
+            Err(error) => Some(format!("cleanup index precedente: {error}")),
+            Ok(()) => None,
+        };
 
     let outcome =
         embed_and_upsert_bootstrap_docs(state, project_id, &documents, cleanup_error).await;
@@ -630,10 +629,17 @@ async fn index_single_code_file(
         };
 
         let point_id = code_point_id(project_id, relative_path, chunk_index);
-        let payload =
-            code_point_payload(project_id, relative_path, chunk_index, &ui_labels, ext, chunk_text);
+        let payload = code_point_payload(
+            project_id,
+            relative_path,
+            chunk_index,
+            &ui_labels,
+            ext,
+            chunk_text,
+        );
 
-        match vector_memory::upsert_code_index_point(&state.db, &point_id, &embedding, payload).await
+        match vector_memory::upsert_code_index_point(&state.db, &point_id, &embedding, payload)
+            .await
         {
             Ok(()) => outcome.chunks_indexed += 1,
             Err(e) => {
@@ -642,7 +648,8 @@ async fn index_single_code_file(
                 );
                 outcome.failed += 1;
                 if outcome.first_error.is_none() {
-                    outcome.first_error = Some(format!("upsert fallito per '{relative_path}': {e}"));
+                    outcome.first_error =
+                        Some(format!("upsert fallito per '{relative_path}': {e}"));
                 }
             }
         }
@@ -910,8 +917,14 @@ async fn embed_and_upsert_code_chunks(
             }
         };
         let point_id = code_point_id(project_id, relative_path, chunk_index);
-        let payload =
-            code_point_payload(project_id, relative_path, chunk_index, ui_labels, ext, chunk_text);
+        let payload = code_point_payload(
+            project_id,
+            relative_path,
+            chunk_index,
+            ui_labels,
+            ext,
+            chunk_text,
+        );
 
         if let Ok(()) =
             vector_memory::upsert_code_index_point(db, &point_id, &embedding, payload).await

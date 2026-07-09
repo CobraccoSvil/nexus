@@ -30,6 +30,15 @@ pub(crate) struct ChatMessageView {
     /// True quando il messaggio e' auto-generato dal sistema (es. auto-continuazione).
     /// La UI nasconde questi messaggi per non confondere l'utente.
     pub(crate) synthetic: bool,
+    /// Origine del messaggio quando e' sintetico/di sistema (metadata.source, es.
+    /// "process_resume" per i risvegli automatici dell'agente). Segnale STRUTTURATO
+    /// (regola M) per la UI: distingue un turno svegliato dal sistema da uno avviato
+    /// dall'utente, senza pattern-matching sul testo. None per i messaggi ordinari.
+    pub(crate) source: Option<String>,
+    /// Sottotipo del messaggio sintetico (metadata.kind), es. l'esito del risveglio
+    /// process_resume (success/failed/cap). Con `source` copre il badge senza il
+    /// testo. None se assente.
+    pub(crate) synthetic_kind: Option<String>,
     /// Stato CANONICO del run che ha prodotto questo messaggio assistant
     /// (agent_runs.status via LEFT JOIN su run_message_id). None per i messaggi
     /// utente o quando il messaggio non e' collegato a un run. Permette alla UI
@@ -112,9 +121,19 @@ pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessage
             .get("synthetic")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        source: metadata
+            .get("source")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        synthetic_kind: metadata
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         // Colonna opzionale presente solo nelle query che fanno il LEFT JOIN su
         // agent_runs (es. list_chat_messages). Altrove resta None senza errore.
-        run_status: row.try_get::<Option<String>, _>("run_status").unwrap_or(None),
+        run_status: row
+            .try_get::<Option<String>, _>("run_status")
+            .unwrap_or(None),
         reasoning: metadata
             .get("reasoning")
             .and_then(Value::as_str)

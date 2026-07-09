@@ -54,6 +54,8 @@ export interface BottomPanelManagerProps {
   onClearPanel?: (tab: PanelTab) => void;
   onRefreshPanel?: (tab: PanelTab) => void;
   onSendToChat?: (message: string) => void;
+  /** Problemi: nasconde la voce e invia il prompt dedicato (gestito da ide-shell). */
+  onSendProblemToChat?: (item: ProblemItem) => void;
   onAutoSendToChat?: (message: string) => void;
   onKillPort?: (port: number) => void | Promise<void>;
   agentRunEndSignal?: number;
@@ -112,6 +114,7 @@ export function BottomPanelManager({
   onClearPanel,
   onRefreshPanel,
   onSendToChat,
+  onSendProblemToChat,
   onAutoSendToChat,
   onKillPort,
   agentRunEndSignal,
@@ -244,7 +247,31 @@ export function BottomPanelManager({
                     {item.source}{item.filePath ? ` • ${item.filePath}${item.line ? `:${item.line}` : ""}` : ""}
                   </div>
                 </button>
-                {onSendToChat && (
+                {onSendProblemToChat ? (
+                  <button
+                    type="button"
+                    onClick={() => onSendProblemToChat(item)}
+                    title="Invia in chat un prompt per risolvere"
+                    style={{
+                      flexShrink: 0,
+                      marginLeft: 2,
+                      background: "rgba(239,68,68,0.85)",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 3,
+                      padding: "0 6px",
+                      fontSize: 10,
+                      cursor: "pointer",
+                      verticalAlign: "middle",
+                      lineHeight: "16px",
+                      height: 16,
+                      fontWeight: 600,
+                    }}
+                    aria-label="Chiedi a Nexus"
+                  >
+                    ↗ chat
+                  </button>
+                ) : onSendToChat && (
                   <button
                     type="button"
                     onClick={() => {

@@ -99,9 +99,7 @@ pub async fn find_or_allocate(
             // `active_port_action`.
             let occupant = super::port_recovery::port_occupant(p).await;
             let tracked = match &occupant {
-                Some((pid, _)) => {
-                    super::port_recovery::is_tracked_pid(db, project_id, *pid).await
-                }
+                Some((pid, _)) => super::port_recovery::is_tracked_pid(db, project_id, *pid).await,
                 None => false,
             };
             // try_free_port ha side effect (kill dell'albero occupante): si
@@ -549,13 +547,25 @@ mod tests {
     #[test]
     fn porta_attiva_decisione_per_occupante() {
         // Occupante tracciato (servizio legittimo): riusa, mai killare.
-        assert_eq!(active_port_action(true, false), ActivePortAction::ReuseTracked);
+        assert_eq!(
+            active_port_action(true, false),
+            ActivePortAction::ReuseTracked
+        );
         // `freed` e' irrilevante se tracciato (try_free_port non viene invocato).
-        assert_eq!(active_port_action(true, true), ActivePortAction::ReuseTracked);
+        assert_eq!(
+            active_port_action(true, true),
+            ActivePortAction::ReuseTracked
+        );
         // Orfano non tracciato liberato: riusa la stessa porta.
-        assert_eq!(active_port_action(false, true), ActivePortAction::ReuseFreed);
+        assert_eq!(
+            active_port_action(false, true),
+            ActivePortAction::ReuseFreed
+        );
         // Orfano non liberabile: MAI ritornare la porta occupata, rialloca.
-        assert_eq!(active_port_action(false, false), ActivePortAction::ReallocateNew);
+        assert_eq!(
+            active_port_action(false, false),
+            ActivePortAction::ReallocateNew
+        );
     }
 
     /// Crea uno schema minimo: solo le colonne usate dall'upsert + i due vincoli
@@ -670,7 +680,10 @@ mod tests {
         .await
         .expect("fetch port")
         .get::<i32, _>("port");
-        assert_eq!(port, 21055, "DO UPDATE deve aggiornare la porta della riga esistente");
+        assert_eq!(
+            port, 21055,
+            "DO UPDATE deve aggiornare la porta della riga esistente"
+        );
     }
 
     #[sqlx::test]
@@ -683,12 +696,13 @@ mod tests {
         upsert_alloc(&pool, proj, 21001, "backend").await;
         upsert_alloc(&pool, proj, 21002, "frontend").await;
 
-        let total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM nexus_port_allocations WHERE project_id = $1")
-            .bind(proj)
-            .fetch_one(&pool)
-            .await
-            .expect("count total")
-            .get::<i64, _>("n");
+        let total: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM nexus_port_allocations WHERE project_id = $1")
+                .bind(proj)
+                .fetch_one(&pool)
+                .await
+                .expect("count total")
+                .get::<i64, _>("n");
         assert_eq!(total, 2, "label distinte devono restare righe distinte");
     }
 
@@ -810,8 +824,13 @@ mod tests {
             "l'upsert di find_or_allocate non popola service_unit (nasce NULL)"
         );
 
-        super::link_allocation_to_service_unit(&pool, proj, "backend", "beaty-book-backend.service")
-            .await;
+        super::link_allocation_to_service_unit(
+            &pool,
+            proj,
+            "backend",
+            "beaty-book-backend.service",
+        )
+        .await;
 
         assert_eq!(
             lookup_service_unit(&pool, proj, "backend").await.as_deref(),

@@ -59,15 +59,14 @@ import type { PanelTab } from "./panels/bottom-panel-manager";
 import {
   useProjectDispatcher,
   useProjectStore,
-  selectPlaywrightRuns,
+  useOperationalRefresh,
   selectPlaywrightConfigChangedAt,
-  selectPorts,
-  selectFilesRecent,
   selectGitStatus,
-  selectRunConfigsChangedAt,
+  selectProviderHealthChangedAt,
 } from "../lib/project-dispatcher";
 import { isBinaryDocPath } from "../lib/file-kind";
-import { ACTION_AGENT_HINT } from "../lib/chat-prompts";
+import { useHealthSnapshot } from "../lib/hooks/use-health-snapshot";
+import { ACTION_AGENT_HINT, promptFromProblem } from "../lib/chat-prompts";
 import {
   EMPTY_GROUPS,
   basename,
@@ -142,19 +141,14 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [liveHealth, setLiveHealth] = useState<{ database: boolean; redis: boolean; neural_core: boolean; tools_grpc?: boolean }>(
     dashboard.health ?? { database: false, redis: false, neural_core: false, tools_grpc: false }
   );
+  const onHealthSnapshot = useCallback((health: Awaited<ReturnType<typeof getHealth>>) => {
+    setLiveHealth(health.components);
+  }, []);
+  useHealthSnapshot(onHealthSnapshot);
   useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const h = await getHealth();
-        if (!cancelled) setLiveHealth(h.components);
-      } catch {
-        if (!cancelled) setLiveHealth({ database: false, redis: false, neural_core: false, tools_grpc: false });
-      }
-    };
-    refresh();
-    const id = window.setInterval(refresh, 10000);
-    return () => { cancelled = true; window.clearInterval(id); };
+    void getHealth()
+      .then((h) => setLiveHealth(h.components))
+      .catch(() => setLiveHealth({ database: false, redis: false, neural_core: false, tools_grpc: false }));
   }, []);
   const [projects, setProjects] = useState<UserProjectSummary[]>([]);
   const [activeProject, setActiveProject] = useState<UserProjectDetails | null>(null);
@@ -280,6 +274,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   >([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [problemItems, setProblemItems] = useState<ProblemItem[]>([]);
+  // Problemi nascosti dopo "↗ chat": riappaiono al termine del run agente se
+  // il refetch li trova ancora aperti nel DB.
+  const [hiddenProblemIds, setHiddenProblemIds] = useState<Set<string>>(() => new Set());
   const [outputChannels, setOutputChannels] = useState<OutputChannel[]>([]);
   const [selectedOutputChannel, setSelectedOutputChannel] = useState("System");
   const [outputEvents, setOutputEvents] = useState<OutputEvent[]>([]);
@@ -425,16 +422,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   }, []);
 
   // Dispatcher centrale: connessione SSE unica per progetto, alimenta lo store
-  // Zustand da cui i pannelli leggono in tempo reale (eliminando il polling 4-8s).
+  // Zustand da cui i pannelli leggono trigger di invalidazione (REST resta display).
   useProjectDispatcher(activeProject?.id);
-  // Lo store del dispatcher e' la NUOVA fonte di verita' per i pannelli.
-  // Per ora `playwrightRunsFromDispatcher` viene mergeato con `playwrightRuns`
-  // (state legacy) per compatibilita' durante la migrazione. Il polling esistente
-  // (useEffect linee ~898 e ~943) verra' rimosso in una fase successiva.
-  const playwrightRunsFromDispatcher = useProjectStore(selectPlaywrightRuns);
   const playwrightConfigChangedAt = useProjectStore(selectPlaywrightConfigChangedAt);
-  const portsFromDispatcher = useProjectStore(selectPorts);
-  const filesRecentFromDispatcher = useProjectStore(selectFilesRecent);
 
   // Auto-refresh pannello Playwright quando il dispatcher rileva playwright.config.*
   useEffect(() => {
@@ -448,21 +438,34 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     }
   }, [playwrightConfigChangedAt, activeProject]);
 
-  // Auto-refresh problemItems quando arriva FindingsUpdated dal dispatcher:
-  // l'evento non contiene gli items, quindi il refetch via API e' la fonte di
-  // verita' del conteggio (problemItems.length). Niente badge accumulato.
-  // P2-fe: reagisce a OGNI evento FindingsUpdated (findingsUpdate.ts cambia
-  // sempre), non al solo badge numerico - che restava uguale nel caso "1
-  // risolto + 1 nuovo" (lista mai aggiornata) e con badge 0 saltava (lista
-  // non svuotata). Il refetch e' la fonte di verita'.
-  const findingsUpdate = useProjectStore((s) => s.findingsUpdate);
+  // Problemi: refetch completo delegato a useOperationalRefresh (sotto).
+  // Manteniamo solo la pulizia hidden ids quando la lista DB cambia.
+
+  const visibleProblemItems = useMemo(
+    () => problemItems.filter((item) => !hiddenProblemIds.has(item.id)),
+    [problemItems, hiddenProblemIds],
+  );
+
+  // Rimuovi id nascosti che non esistono piu' nel DB (problema risolto altrove).
   useEffect(() => {
-    if (!activeProject || !findingsUpdate) return;
-    void getProjectProblems(activeProject.id)
-      .then((res) => setProblemItems(res.items ?? []))
-      .catch(() => { /* ignora */ });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [findingsUpdate]);
+    if (hiddenProblemIds.size === 0) return;
+    const openIds = new Set(problemItems.map((item) => item.id));
+    setHiddenProblemIds((prev) => {
+      const next = new Set([...prev].filter((id) => openIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [problemItems, hiddenProblemIds.size]);
+
+  // Cambio progetto: reset lista nascosti (evita leak tra progetti).
+  useEffect(() => {
+    setHiddenProblemIds(new Set());
+  }, [activeProject?.id]);
+
+  // Fine run agente: ripristina problemi nascosti; il refetch e' SSE (operationalRefresh).
+  useEffect(() => {
+    if (!agentRunEndSignal) return;
+    setHiddenProblemIds(new Set());
+  }, [agentRunEndSignal]);
 
   // Auto-refresh gitState quando arriva GitStatusChanged dal dispatcher.
   // Il payload e' magro (branch, ahead, behind, modified_count) ma noi
@@ -583,7 +586,19 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   // accumulato dal dispatcher: badge_increment sommava +inc per ogni evento problema
   // senza riconciliarsi col DB, gonfiando il contatore (es. 1128 vs ~30 reali)
   // durante sessioni con molti run. La fonte di verita' e' il DB.
-  const problemCount = problemItems.length;
+  const problemCount = visibleProblemItems.length;
+
+  const handleSendProblemToChat = useCallback((item: ProblemItem) => {
+    setHiddenProblemIds((prev) => {
+      const next = new Set(prev);
+      next.add(item.id);
+      return next;
+    });
+    setPendingChatMessage(promptFromProblem(item));
+    setPendingAutoSend(true);
+    setPendingExternalAutomation("confirm");
+    setPendingAgentTypeHint(ACTION_AGENT_HINT);
+  }, []);
 
   const cycleLayoutMode = useCallback(() => {
     setLayoutMode((current) => {
@@ -654,28 +669,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     [],
   );
 
-  // Quando il dispatcher segnala file modificati (dall'agente), triggera un
-  // refresh dei pannelli operativi (problemi, porte, playwright) per allineare
-  // l'UI in tempo reale senza aspettare il polling.
-  const filesRefreshRef = useRef(0);
-  useEffect(() => {
-    if (!activeProject?.id || filesRecentFromDispatcher.length === 0) return;
-    // Evita il refresh al primo mount (solo sui cambiamenti successivi)
-    const count = filesRecentFromDispatcher.length;
-    if (filesRefreshRef.current === 0) {
-      filesRefreshRef.current = count;
-      return;
-    }
-    if (count !== filesRefreshRef.current) {
-      filesRefreshRef.current = count;
-      void refreshOperationalViews(activeProject.id);
-      // Anche il file tree va rinfrescato: openProject ritorna tree fresh.
-      // Senza questo, la sidebar non mostra file nuovi creati dall'agente.
-      void openProject(activeProject.id)
-        .then((opened) => setTreeNodes(opened.tree))
-        .catch(() => { /* ignora */ });
-    }
-  }, [filesRecentFromDispatcher.length, activeProject?.id, refreshOperationalViews]);
+  // P2: unico hook per invalidazione operativa (SSE -> REST refetch).
+  useOperationalRefresh(activeProject?.id, refreshOperationalViews);
 
   const loadOutputEvents = useCallback(
     async (projectId: string, channel: string) => {
@@ -903,16 +898,19 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   }, []);
   refreshProviderStatusRef.current = refreshProviderStatus;
 
+  const providerHealthAt = useProjectStore(selectProviderHealthChangedAt);
   useEffect(() => {
     void refreshProviderStatus();
-    // Polling rapido (15s) così quando un provider va in cooldown per errore
-    // (es. credit too low) il LED giallo compare quasi subito senza dover
-    // ricaricare la pagina.
-    const timer = window.setInterval(() => {
-      void refreshProviderStatus();
-    }, 15000);
-    return () => window.clearInterval(timer);
   }, [refreshProviderStatus]);
+  useEffect(() => {
+    if (providerHealthAt === 0) return;
+    void refreshProviderStatus();
+  }, [providerHealthAt, refreshProviderStatus]);
+
+  const onProviderHealthSnapshot = useCallback(() => {
+    void refreshProviderStatus();
+  }, [refreshProviderStatus]);
+  useHealthSnapshot(onProviderHealthSnapshot);
 
   // Ref per leggere outputChannels corrente senza includerlo nelle dep (evita loop)
   const outputChannelsRef = useRef<OutputChannel[]>([]);
@@ -934,31 +932,6 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     } catch { /* ignora */ }
   }, []);
 
-  // Polling canali output (non ancora cablato al dispatcher). Le porte sono
-  // ora gestite dal dispatcher: vedi `portsFromDispatcher`. Intervallo: 10s
-  // se nessun processo attivo, 4s con processi attivi (per stream live dei log).
-  useEffect(() => {
-    if (!activeProject) return;
-    const tick = async () => {
-      try {
-        const channelsRes = await getOutputChannels(activeProject.id);
-        setOutputChannels(channelsRes.channels ?? []);
-        if (activePanelTabRef.current === "output" && selectedOutputChannelRef.current) {
-          void loadOutputEvents(activeProject.id, selectedOutputChannelRef.current);
-        }
-      } catch { /* ignora */ }
-    };
-    const getInterval = () =>
-      outputChannelsRef.current.some((ch) => ch.label?.startsWith("●")) ? 4000 : 10000;
-    let timer = window.setInterval(tick, getInterval());
-    const adjustTimer = () => {
-      window.clearInterval(timer);
-      timer = window.setInterval(tick, getInterval());
-    };
-    const adjTimer = window.setInterval(adjustTimer, 5000);
-    return () => { window.clearInterval(timer); window.clearInterval(adjTimer); };
-  }, [activeProject, loadOutputEvents]);
-
   useEffect(() => {
     if (typeof document === "undefined") return;
     const onFullscreenChange = () => {
@@ -977,41 +950,6 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     // activeProject viene letto solo per .id (gia' in deps come activeProject?.id).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.id, selectedOutputChannel, loadOutputEvents]);
-
-  // Polling Fix M45 RIMOSSO: ora i pannelli operativi (porte, playwright,
-  // problemi) si aggiornano in tempo reale via dispatcher SSE — vedi
-  // `useProjectDispatcher(activeProject?.id)` sopra. Resta solo un refresh
-  // Auto-refresh run configs via dispatcher SSE (RunConfigChanged).
-  // Fallback polling 120s per sicurezza (es. modifica diretta DB).
-  const runConfigsChangedAt = useProjectStore(selectRunConfigsChangedAt);
-  useEffect(() => {
-    const projectId = activeProject?.id;
-    if (!projectId || runConfigsChangedAt === 0) return;
-    const refresh = async () => {
-      try {
-        const runConfigsRes = await getRunConfigs(projectId);
-        setRunConfigs(runConfigsRes.configs ?? []);
-      } catch {
-        /* best-effort */
-      }
-    };
-    void refresh();
-  }, [activeProject?.id, runConfigsChangedAt]);
-
-  useEffect(() => {
-    const projectId = activeProject?.id;
-    if (!projectId) return;
-    const refresh = async () => {
-      try {
-        const runConfigsRes = await getRunConfigs(projectId);
-        setRunConfigs(runConfigsRes.configs ?? []);
-      } catch {
-        /* best-effort */
-      }
-    };
-    const interval = window.setInterval(refresh, 120_000);
-    return () => window.clearInterval(interval);
-  }, [activeProject?.id]);
 
   useEffect(() => {
     if (!activeProject || !workbenchReady) return;
@@ -1655,7 +1593,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         editorGroups={editorGroups}
         activeEditorGroupId={activeEditorGroupId}
         activeProject={activeProject}
-        problemItems={problemItems}
+        problemItems={visibleProblemItems}
         onSetActiveGroup={setActiveEditorGroupId}
         onSetEditorGroups={setEditorGroups}
         onSaveActive={() => void saveActiveEditor()}
@@ -2044,19 +1982,21 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             activePanelTab={activePanelTab}
             onSelectPanelTab={(tab) => setActivePanelTab(tab)}
             project={activeProject}
-            problemItems={problemItems}
+            problemItems={visibleProblemItems}
+            onSendProblemToChat={handleSendProblemToChat}
             outputChannels={outputChannels}
             selectedOutputChannel={selectedOutputChannel}
             outputEvents={outputEvents}
-            ports={portsFromDispatcher.length > 0
-              ? portsFromDispatcher.map((p) => ({ port: p.port, label: p.label, state: "listen" }))
-              : ports}
-            playwrightRuns={playwrightRunsFromDispatcher.length > 0 ? playwrightRunsFromDispatcher : playwrightRuns}
+            ports={ports}
+            playwrightRuns={playwrightRuns}
             playwrightConfigured={playwrightConfigured}
             onOpenFile={(path, line) => void openFileInGroup(path, line)}
             onSelectOutputChannel={setSelectedOutputChannel}
             onRefreshPanel={(tab) => {
               if (!activeProject) return;
+              if (tab === "problems") {
+                setHiddenProblemIds(new Set());
+              }
               if (tab === "services" || tab === "output") {
                 void loadOutputEvents(activeProject.id, selectedOutputChannel);
                 return;
@@ -2065,7 +2005,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             }}
             onClearPanel={(tab) => {
               switch (tab) {
-                case "problems": setProblemItems([]); break;
+                case "problems":
+                  setHiddenProblemIds(new Set());
+                  setProblemItems([]);
+                  break;
                 case "services":
                 case "output":
                   setOutputEvents([]);
@@ -2081,8 +2024,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                     }
                   } catch { /* ignora */ }
                   break;  // output = alias legacy
-                case "ports": setPorts([]); break;
+                case "ports":
+                  useProjectStore.getState().clearPanelPorts();
+                  setPorts([]);
+                  break;
                 case "playwright":
+                  useProjectStore.getState().clearPanelPlaywright();
                   setPlaywrightRuns([]);
                   if (activeProject) {
                     void clearPlaywrightRuns(activeProject.id).catch((err) => {

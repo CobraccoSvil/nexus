@@ -140,36 +140,7 @@ export function ProjectExplorer({
       // aggiorna solo i nodi root, preservando `expanded` e le subdir caricate.
       setNodesByPath((prev) => ({ ...prev, "": initialNodes ?? prev[""] ?? [] }));
     }
-  }, [project, project?.id, initialNodes]);
-
-  // Fix M36: polling lieve sulla root ogni 8s per rilevare nuovi file/dir
-  // generati dall'agente (write_file via gRPC ToolRunner). Senza questo
-  // l'Explorer restava con la snapshot on-mount e l'utente vedeva
-  // "Nessun file disponibile" anche se l'agente aveva appena scritto file.
-  // Confronto su lunghezza + lista nomi: se diversi -> ricarica e invalida
-  // anche le subdir gia caricate (loaded paths) per allinearle.
-  useEffect(() => {
-    if (!project?.id) return;
-    const refreshRoot = async () => {
-      try {
-        const response = await getProjectTree(project.id, "");
-        setNodesByPath((prev) => {
-          const current = prev[""] ?? [];
-          const changed =
-            current.length !== response.nodes.length ||
-            current.some((n, i) => n.path !== response.nodes[i]?.path);
-          if (!changed) return prev;
-          // Aggiorna solo la root preservando le subdir gia' caricate, cosi'
-          // le cartelle espanse non si svuotano durante il polling.
-          return { ...prev, "": response.nodes };
-        });
-      } catch {
-        // Best-effort: ignora errori transitori (auth/network)
-      }
-    };
-    const interval = window.setInterval(refreshRoot, 8_000);
-    return () => window.clearInterval(interval);
-  }, [project?.id]);
+  }, [project?.id, initialNodes]);
 
   // Ascolta evento dispatcher FileChanged per refresh immediato dopo op.
   // Pattern: tool_delete_file / write_file in mcp-core emettono ProjectEvent::FileChanged

@@ -152,6 +152,42 @@ pub async fn agent_stream(
                 replay_events.push(Event::default().event("agent_step").data(data));
             }
         }
+        // Replay meta-step dal DB: chiude la stessa race degli step per gli
+        // eventi semantici emessi prima che il client apra lo stream (es.
+        // Consiglio delle Competenze). Fonte strutturata, nessun parsing testo.
+        if let Ok(rows) = sqlx::query(
+            "SELECT kind, title, payload, correlation_id, created_at
+             FROM nexus_agent_meta_steps WHERE run_id = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(rid)
+        .fetch_all(&proj_pool)
+        .await
+        {
+            for r in rows {
+                let kind: String = r.try_get("kind").unwrap_or_default();
+                if kind.is_empty() {
+                    continue;
+                }
+                let title: String = r.try_get("title").unwrap_or_default();
+                let payload: Value = r.try_get("payload").unwrap_or(json!({}));
+                let correlation_id: Option<String> = r.try_get("correlation_id").unwrap_or(None);
+                let created_at: chrono::DateTime<chrono::Utc> = r
+                    .try_get("created_at")
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let data = json!({
+                    "runId": rid.to_string(),
+                    "metaStep": {
+                        "kind": kind,
+                        "title": title,
+                        "payload": payload,
+                        "correlationId": correlation_id,
+                        "createdAt": created_at.to_rfc3339(),
+                    },
+                })
+                .to_string();
+                replay_events.push(Event::default().event("agent_meta_step").data(data));
+            }
+        }
         // Se il run e' gia' terminato, emette agent_final con final_answer
         if let Ok(Some(run_row)) =
             sqlx::query("SELECT status, final_answer FROM agent_runs WHERE id = $1")
@@ -276,8 +312,7 @@ pub async fn get_active_run_for_session(
     // sono vuote a flag ON: leggerle li' faceva sparire il run attivo al refresh.
     let run_pool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
-    let run_row = sqlx::query(
-        &format!(
+    let run_row = sqlx::query(&format!(
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at
          FROM agent_runs
@@ -286,9 +321,8 @@ pub async fn get_active_run_for_session(
            AND nexus_agent_type IS DISTINCT FROM 'subagent'
          ORDER BY created_at DESC
          LIMIT 1",
-            crate::agent_types::ACTIVE_RUN_STATUS_SQL
-        ),
-    )
+        crate::agent_types::ACTIVE_RUN_STATUS_SQL
+    ))
     .bind(session_id)
     .bind(user_id)
     .fetch_optional(&run_pool)
@@ -555,8 +589,9 @@ pub async fn get_session_meta_steps(
             .flatten()
             .unwrap_or_else(|| json!({}));
         let correlation_id: Option<String> = row.try_get("correlation_id").ok().flatten();
-        let created_at: chrono::DateTime<chrono::Utc> =
-            row.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now());
+        let created_at: chrono::DateTime<chrono::Utc> = row
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now());
         runs.entry(run_id.to_string()).or_default().push(json!({
             "kind": kind,
             "title": title,

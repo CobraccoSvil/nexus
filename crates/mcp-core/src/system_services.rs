@@ -269,8 +269,9 @@ async fn run_control(
     let act = action.as_str();
 
     if detached {
-        let shell =
-            format!("( systemctl --user {act} '{unit}' || systemctl {act} '{unit}' ) >/dev/null 2>&1 &");
+        let shell = format!(
+            "( systemctl --user {act} '{unit}' || systemctl {act} '{unit}' ) >/dev/null 2>&1 &"
+        );
         tokio::process::Command::new("bash")
             .args(["-lc", &shell])
             .spawn()
@@ -412,8 +413,7 @@ pub(crate) async fn get_system_services(State(state): State<AppState>) -> Json<V
         .into_iter()
         .filter(|e| e.panel_shown)
         .collect();
-    let services =
-        futures::future::join_all(shown.iter().map(|e| probe_entry(&state.db, e))).await;
+    let services = futures::future::join_all(shown.iter().map(|e| probe_entry(&state.db, e))).await;
     Json(json!({ "services": services }))
 }
 

@@ -88,8 +88,9 @@ use nexus_agent_graph::decisions::orchestration_reason::validate_orch_move;
 use nexus_agent_graph::decisions::scale_reason::validate_scale_move;
 use nexus_agent_graph::runtime::ports::{
     ExecMode, MetaReasonerPort, OrchestrationContext, OrchestrationMove, PortError, RecoveryMove,
-    ScaleContext, ScaleMove, StallContext,
+    ScaleContext, ScaleMove, StallContext, SupervisorContext,
 };
+use nexus_agent_graph::decisions::supervisor::{validate_supervisor_response, SupervisorDecision};
 
 use crate::internal_routing::{resolve_purpose_model_db, PurposeResolution};
 use crate::orchestrator::NeuralCoreClient;
@@ -180,6 +181,19 @@ const SCALE_TIMEOUT_DEFAULT: u64 = 15;
 /// oggetto JSON (`{"move","tier","confidence"}`). Basso di proposito (budget/costo:
 /// il controller gira di frequente, non deve esplodere in token).
 const SCALE_MAX_TOKENS: u32 = 256;
+
+/// Purpose (regola G) del supervisore worker.
+const SUPERVISOR_PURPOSE: &str = "supervisor_monitoring";
+
+/// Template del supervisore (placeholder {{task}}, {{steps_summary}}, {{anomaly_block}}).
+const SUPERVISOR_TEMPLATE_KEY: &str = "automation.supervisor_monitoring";
+
+/// Timeout (s) della chiamata LLM del supervisore.
+const SUPERVISOR_TIMEOUT_SETTING: &str = "agent.supervisor.timeout_s";
+
+const SUPERVISOR_TIMEOUT_DEFAULT: u64 = 25;
+
+const SUPERVISOR_MAX_TOKENS: u32 = 512;
 
 /// Parametri STATICI (const) che distinguono i 3 scope del meta-reasoner LLM
 /// (recovery / orchestrazione / scala). Il FLUSSO a 6 passi e' UNICO
@@ -427,12 +441,9 @@ impl PgMetaReasonerPort {
             (spec.addendum_template_key, spec.addendum_enabled_setting)
         {
             if self.setting_enabled(add_setting).await {
-                let addendum = crate::prompt_templates::get_template_or_default(
-                    &self.db,
-                    &tpl_cache,
-                    add_key,
-                )
-                .await;
+                let addendum =
+                    crate::prompt_templates::get_template_or_default(&self.db, &tpl_cache, add_key)
+                        .await;
                 if addendum.trim().is_empty() {
                     tracing::warn!(
                         target: "nexus_meta_reasoner",
@@ -463,8 +474,7 @@ impl PgMetaReasonerPort {
             }
         };
         let user_text = format!("{}\n{ctx_json}", spec.user_prefix);
-        let messages =
-            serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
+        let messages = serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
         let timeout_s = self
             .setting_timeout_s(spec.timeout_setting, spec.timeout_default)
             .await;
@@ -612,6 +622,109 @@ impl PgMetaReasonerPort {
             }
         }
     }
+
+    /// Consulta il supervisore worker (template `automation.supervisor_monitoring`).
+    async fn consult_supervisor_llm(
+        &self,
+        ctx: &SupervisorContext,
+    ) -> Result<Option<SupervisorDecision>, PortError> {
+        let (provider, model) = match resolve_purpose_model_db(&self.db, SUPERVISOR_PURPOSE).await {
+            PurposeResolution::Resolved {
+                provider, model, ..
+            } => (provider, model),
+            PurposeResolution::NotFound => {
+                tracing::error!(
+                    target: "nexus_supervisor",
+                    purpose = SUPERVISOR_PURPOSE,
+                    "supervisor: purpose assente in nexus_purpose_model; degrado a continue"
+                );
+                return Ok(Some(SupervisorDecision::Continue));
+            }
+            PurposeResolution::NoCapableModel { tier } => {
+                return Err(PortError::ProviderUnavailable(
+                    format!(
+                        "supervisor: nessun modello del tier '{tier}' per purpose '{SUPERVISOR_PURPOSE}'"
+                    )
+                    .into(),
+                ));
+            }
+            PurposeResolution::MatrixUnavailable(e) => {
+                return Err(PortError::ProviderUnavailable(
+                    format!("supervisor: routing non disponibile: {e}").into(),
+                ));
+            }
+        };
+
+        let tpl_cache = crate::prompt_templates::TemplateCache::new();
+        let template = crate::prompt_templates::get_template_or_default(
+            &self.db,
+            &tpl_cache,
+            SUPERVISOR_TEMPLATE_KEY,
+        )
+        .await;
+        if template.trim().is_empty() {
+            tracing::error!(
+                target: "nexus_supervisor",
+                key = SUPERVISOR_TEMPLATE_KEY,
+                "supervisor: template assente/vuoto; degrado a continue"
+            );
+            return Ok(Some(SupervisorDecision::Continue));
+        }
+
+        let user_text = template
+            .replace("{{task}}", &ctx.task)
+            .replace("{{steps_summary}}", &ctx.steps_summary)
+            .replace("{{anomaly_block}}", &ctx.anomaly_block);
+        let messages = serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
+        let timeout_s = self
+            .setting_timeout_s(SUPERVISOR_TIMEOUT_SETTING, SUPERVISOR_TIMEOUT_DEFAULT)
+            .await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_s),
+            self.neural.generate_agent_turn(
+                &provider,
+                &model,
+                &messages,
+                "[]",
+                SUPERVISOR_MAX_TOKENS,
+                "",
+            ),
+        )
+        .await;
+
+        let value = match resp {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "nexus_supervisor",
+                    error = %e,
+                    "supervisor: chiamata LLM fallita, degrado a continue"
+                );
+                return Ok(Some(SupervisorDecision::Continue));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "nexus_supervisor",
+                    timeout_s,
+                    "supervisor: timeout LLM, degrado a continue"
+                );
+                return Ok(Some(SupervisorDecision::Continue));
+            }
+        };
+
+        let text = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let decision = match nexus_types::llm_json::extract_json_block(text) {
+            Some(v) => validate_supervisor_response(&v),
+            None => SupervisorDecision::Continue,
+        };
+        tracing::info!(target: "nexus_supervisor", "supervisor: decisione emessa");
+        Ok(Some(decision))
+    }
 }
 
 #[async_trait]
@@ -688,6 +801,18 @@ impl MetaReasonerPort for PgMetaReasonerPort {
         }
         self.consult_scale_llm(&ctx).await
     }
+
+    /// Supervisore worker: consultato quando `SupervisorMode != none` (scelta UI).
+    async fn supervise(
+        &self,
+        ctx: SupervisorContext,
+        mode: ExecMode,
+    ) -> Result<Option<SupervisorDecision>, PortError> {
+        if mode != ExecMode::Real {
+            return Ok(Some(SupervisorDecision::Continue));
+        }
+        self.consult_supervisor_llm(&ctx).await
+    }
 }
 
 #[cfg(test)]
@@ -729,7 +854,11 @@ mod tests {
     #[tokio::test]
     async fn replay_ritorna_none_senza_llm() {
         let res = port().recover(stall_ctx(), ExecMode::Replay).await;
-        assert_eq!(res.expect("ok"), None, "Replay -> Ok(None) senza consultare l'LLM");
+        assert_eq!(
+            res.expect("ok"),
+            None,
+            "Replay -> Ok(None) senza consultare l'LLM"
+        );
     }
 
     /// Il gate `Replay` precede ogni accesso al DB: anche con un pool non
@@ -739,7 +868,10 @@ mod tests {
         // Chiamata ripetuta: deterministica, nessun panico, nessuna connessione.
         for _ in 0..3 {
             assert_eq!(
-                port().recover(stall_ctx(), ExecMode::Replay).await.expect("ok"),
+                port()
+                    .recover(stall_ctx(), ExecMode::Replay)
+                    .await
+                    .expect("ok"),
                 None
             );
         }
@@ -751,8 +883,8 @@ mod tests {
     #[test]
     fn validate_move_su_risposta_malformata_e_fallback() {
         // Forma JSON che NON deserializza in RecoveryMove -> Fallback.
-        let parsed = nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#)
-            .expect("json parsabile");
+        let parsed =
+            nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#).expect("json parsabile");
         assert_eq!(validate_move(&parsed), RecoveryMove::Fallback);
         // Testo senza JSON -> extract_json_block None (l'impl mappa a Fallback).
         assert!(nexus_types::llm_json::extract_json_block("nessun json qui").is_none());
@@ -796,8 +928,8 @@ mod tests {
     #[test]
     fn validate_orch_move_su_risposta_malformata_e_fallback() {
         // Enum sconosciuto -> Fallback (non deserializza in OrchestrationMove).
-        let parsed = nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#)
-            .expect("json parsabile");
+        let parsed =
+            nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#).expect("json parsabile");
         assert_eq!(
             validate_orch_move(&parsed, false, false),
             OrchestrationMove::Fallback
@@ -865,8 +997,8 @@ mod tests {
     #[test]
     fn validate_scale_move_su_risposta_malformata_e_keep() {
         // Enum sconosciuto -> KeepTier (non deserializza in ScaleMove).
-        let parsed = nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#)
-            .expect("json parsabile");
+        let parsed =
+            nexus_types::llm_json::extract_json_block(r#"{"move":"boh"}"#).expect("json parsabile");
         assert_eq!(validate_scale_move(&parsed), ScaleMove::KeepTier);
         // Testo senza JSON -> extract_json_block None (l'impl mappa a KeepTier).
         assert!(nexus_types::llm_json::extract_json_block("nessun json qui").is_none());

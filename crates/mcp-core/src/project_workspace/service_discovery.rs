@@ -285,9 +285,7 @@ pub(super) async fn execution_signature(
             .find(|a| a.as_str() != "run" && !a.starts_with('-'))
             .cloned();
         if let Some(name) = script {
-            if let Ok(content) =
-                tokio::fs::read_to_string(format!("{cwd}/package.json")).await
-            {
+            if let Ok(content) = tokio::fs::read_to_string(format!("{cwd}/package.json")).await {
                 if let Ok(pkg) = serde_json::from_str::<Value>(&content) {
                     if let Some(v) = pkg
                         .get("scripts")
@@ -539,8 +537,9 @@ mod tests {
         assert_eq!(sig.len(), 1);
         // Lo stesso processo via cross-env mantiene la stessa signature -> la dedup
         // riconosce "pnpm run dev:backend" (espanso) e "nodemon ... src/app.ts".
-        let sig2 =
-            entrypoint_files("cross-env PORT=21976 nodemon --watch src/app.ts --exec tsx src/app.ts");
+        let sig2 = entrypoint_files(
+            "cross-env PORT=21976 nodemon --watch src/app.ts --exec tsx src/app.ts",
+        );
         assert_eq!(sig, sig2);
         // cwd allucinato (backend/src/app.ts): il basename collassa lo stesso, cosi'
         // la variante con cwd inventato resta riconoscibile come duplicato.

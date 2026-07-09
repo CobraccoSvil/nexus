@@ -116,7 +116,10 @@ async fn load_settings(db: &PgPool) -> Result<DistillerSettings> {
         let raw = raw.trim();
         match key.as_str() {
             "agent.learned_instructions.distiller_enabled" => {
-                out.enabled = matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+                out.enabled = matches!(
+                    raw.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                );
             }
             "agent.learned_instructions.distiller_interval_secs" => {
                 if let Ok(v) = raw.parse::<u64>() {
@@ -414,7 +417,9 @@ async fn distill_project(
 
     // Risolve provider/modello dal PUNTO UNICO (regola G/L).
     let (provider, model) = match resolve_purpose_model(state, PURPOSE).await {
-        PurposeResolution::Resolved { provider, model, .. } => (provider, model),
+        PurposeResolution::Resolved {
+            provider, model, ..
+        } => (provider, model),
         PurposeResolution::NoCapableModel { tier } => {
             anyhow::bail!("nessun modello del tier '{tier}' per purpose {PURPOSE}")
         }
@@ -427,9 +432,12 @@ async fn distill_project(
     };
 
     // Prompt da template DB (regola D), placeholder sostituiti.
-    let template =
-        nexus_types::get_template_or_default(&state.db, &state.template_cache, DISTILL_TEMPLATE_KEY)
-            .await;
+    let template = nexus_types::get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        DISTILL_TEMPLATE_KEY,
+    )
+    .await;
     if template.trim().is_empty() {
         anyhow::bail!("template {DISTILL_TEMPLATE_KEY} vuoto");
     }
@@ -440,7 +448,10 @@ async fn distill_project(
             &serde_json::to_string(&known_json).unwrap_or_else(|_| "[]".into()),
         )
         .replace("{{evidence}}", evidence.trim())
-        .replace("{{max_active}}", &settings.max_active_per_project.to_string());
+        .replace(
+            "{{max_active}}",
+            &settings.max_active_per_project.to_string(),
+        );
 
     // Niente prompt/evidenza nei log (regola F): solo metadati.
     tracing::info!(%project_id, %provider, %model, wl = wl_rows.len(), wiki = wiki_rows.len(), "learned_instructions: invio LLM");
@@ -512,16 +523,25 @@ async fn apply_operations(
         let kind = op.get("op").and_then(Value::as_str).unwrap_or("");
         let res = match kind {
             "add" => {
-                let rule_text = op.get("rule_text").and_then(Value::as_str).unwrap_or("").trim();
+                let rule_text = op
+                    .get("rule_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
                 if rule_text.is_empty() {
                     continue;
                 }
                 let category = normalize_category(op.get("category").and_then(Value::as_str));
                 let rationale = op.get("rationale").and_then(Value::as_str).unwrap_or("");
-                let confidence = op.get("confidence").and_then(Value::as_f64).unwrap_or(0.5).clamp(0.0, 1.0);
+                let confidence = op
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0);
                 let hash = content_hash(rule_text);
                 // active solo se confidence alta E c'e' budget; altrimenti proposed.
-                let status = if confidence >= settings.auto_activate_confidence && active_budget > 0 {
+                let status = if confidence >= settings.auto_activate_confidence && active_budget > 0
+                {
                     active_budget -= 1;
                     "active"
                 } else {
@@ -548,15 +568,27 @@ async fn apply_operations(
                 .await
             }
             "update" => {
-                let Some(id) = op.get("id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) else {
+                let Some(id) = op
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                else {
                     continue;
                 };
-                let rule_text = op.get("rule_text").and_then(Value::as_str).unwrap_or("").trim();
+                let rule_text = op
+                    .get("rule_text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
                 if rule_text.is_empty() {
                     continue;
                 }
                 let rationale = op.get("rationale").and_then(Value::as_str).unwrap_or("");
-                let confidence = op.get("confidence").and_then(Value::as_f64).unwrap_or(0.5).clamp(0.0, 1.0);
+                let confidence = op
+                    .get("confidence")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0);
                 let hash = content_hash(rule_text);
                 sqlx::query(
                     "UPDATE nexus_learned_instructions \
@@ -574,7 +606,11 @@ async fn apply_operations(
                 .await
             }
             "confirm" => {
-                let Some(id) = op.get("id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) else {
+                let Some(id) = op
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                else {
                     continue;
                 };
                 sqlx::query(
@@ -588,7 +624,11 @@ async fn apply_operations(
                 .await
             }
             "retire" => {
-                let Some(id) = op.get("id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) else {
+                let Some(id) = op
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                else {
                     continue;
                 };
                 sqlx::query(
@@ -606,7 +646,9 @@ async fn apply_operations(
         match res {
             Ok(r) if r.rows_affected() > 0 => applied += 1,
             Ok(_) => {}
-            Err(e) => tracing::warn!(%project_id, op = kind, error = %e, "learned_instructions: operazione fallita"),
+            Err(e) => {
+                tracing::warn!(%project_id, op = kind, error = %e, "learned_instructions: operazione fallita")
+            }
         }
     }
     Ok(applied)
@@ -627,7 +669,11 @@ fn normalize_category(raw: Option<&str>) -> String {
 /// Hash del testo regola NORMALIZZATO (lowercase, spazi collassati): dedup
 /// robusto a differenze cosmetiche di formattazione tra distillazioni.
 fn content_hash(rule_text: &str) -> String {
-    let normalized = rule_text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = rule_text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -644,7 +690,13 @@ fn bad_request(msg: &str) -> (StatusCode, Json<Value>) {
 }
 
 const VALID_STATUSES: [&str; 4] = ["proposed", "active", "rejected", "retired"];
-const VALID_CATEGORIES: [&str; 5] = ["convention", "preference", "environment", "tooling", "process"];
+const VALID_CATEGORIES: [&str; 5] = [
+    "convention",
+    "preference",
+    "environment",
+    "tooling",
+    "process",
+];
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -765,7 +817,10 @@ pub async fn patch_learned_instruction(
     })?;
 
     if res.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "regola non trovata" }))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "regola non trovata" })),
+        ));
     }
     Ok(Json(json!({ "id": iid.to_string(), "status": "updated" })))
 }
@@ -782,7 +837,8 @@ pub async fn distill_now(
     State(state): State<AppState>,
     Json(body): Json<DistillNowBody>,
 ) -> AdminResult {
-    let pid = Uuid::parse_str(&body.project_id).map_err(|_| bad_request("project_id non valido"))?;
+    let pid =
+        Uuid::parse_str(&body.project_id).map_err(|_| bad_request("project_id non valido"))?;
     let settings = current_settings(&state.db).await;
     match distill_project(&state, &settings, pid).await {
         Ok(applied) => Ok(Json(json!({ "ok": true, "applied": applied }))),
@@ -823,7 +879,10 @@ mod tests {
         // L'LLM puo' incapsulare in un fence: extract_json_block deve estrarre.
         let raw = "```json\n{\"operations\":[{\"op\":\"add\",\"category\":\"tooling\",\"rule_text\":\"Usa pnpm\",\"confidence\":0.9}]}\n```";
         let parsed = nexus_types::llm_json::extract_json_block(raw).expect("json estratto");
-        let ops = parsed.get("operations").and_then(Value::as_array).expect("operations");
+        let ops = parsed
+            .get("operations")
+            .and_then(Value::as_array)
+            .expect("operations");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].get("op").and_then(Value::as_str), Some("add"));
     }

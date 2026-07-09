@@ -54,6 +54,9 @@ importers:
       ts-node:
         specifier: ^10.9.2
         version: 10.9.2(@types/node@24.12.2)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
 
   apps/vscode-ext:
     dependencies:
@@ -64,6 +67,9 @@ importers:
       '@types/vscode':
         specifier: ^1.85.0
         version: 1.85.0
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
 
   apps/web-ide:
     dependencies:
@@ -128,6 +134,9 @@ importers:
       eslint-plugin-react-hooks:
         specifier: ^7.0.1
         version: 7.0.1(eslint@9.39.4(jiti@2.7.0))
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
 
   packages/audit:
     dependencies:
@@ -232,7 +241,11 @@ importers:
         specifier: ^5.8.3
         version: 5.9.3
 
-  packages/types: {}
+  packages/types:
+    devDependencies:
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
 
   packages/ui:
     dependencies:
@@ -242,6 +255,10 @@ importers:
       react-dom:
         specifier: ^19.0.0
         version: 19.2.4(react@19.2.4)
+    devDependencies:
+      typescript:
+        specifier: ^5.8.3
+        version: 5.9.3
 
 packages:
 

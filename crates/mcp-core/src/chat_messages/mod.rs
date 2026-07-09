@@ -1,4 +1,3 @@
-
 use axum::{
     extract::{Extension, Path as AxumPath, State},
     http::StatusCode,

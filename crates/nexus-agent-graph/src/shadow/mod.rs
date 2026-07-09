@@ -190,7 +190,10 @@ mod tests {
     /// compute_diff: output non-oggetto diversi -> pseudo-radice.
     #[test]
     fn compute_diff_non_oggetto() {
-        assert_eq!(compute_diff(&json!(1), &json!(2)), vec!["<root>".to_string()]);
+        assert_eq!(
+            compute_diff(&json!(1), &json!(2)),
+            vec!["<root>".to_string()]
+        );
         assert!(compute_diff(&json!("x"), &json!("x")).is_empty());
     }
 

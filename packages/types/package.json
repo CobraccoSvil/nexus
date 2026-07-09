@@ -11,6 +11,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --ext .ts",
     "test": "node -e \"console.log('no tests yet')\""
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
   }
 }
-

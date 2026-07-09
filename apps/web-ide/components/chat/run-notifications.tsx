@@ -72,6 +72,30 @@ export function deriveRunNotifications(
           color: tc.error,
         });
       }
+      if (ev.type === "council_of_competencies") {
+        out.push({
+          tone: ev.degraded ? "warn" : "info",
+          title: "Consiglio delle Competenze",
+          detail: ev.degraded
+            ? ev.degradationReason ??
+              "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
+            : "Attivato dall'analisi agentica/deterministica della richiesta.",
+          color: ev.degraded ? "#f59e0b" : "#0ea5e9",
+        });
+      }
+      if (ev.type === "multi_provider_panel") {
+        out.push({
+          tone: ev.degraded ? "warn" : "info",
+          title: ev.productName,
+          detail: ev.degraded
+            ? ev.degradationReason ??
+              "Provider distinti insufficienti: panel multi-provider non convocato."
+            : typeof ev.providerCount === "number" && ev.providerCount > 0
+              ? `${ev.providerCount} provider distinti hanno analizzato la richiesta.`
+              : "Analisi parallela su provider/modelli distinti.",
+          color: ev.degraded ? "#f59e0b" : "#6366f1",
+        });
+      }
     }
   }
 
@@ -149,7 +173,7 @@ export function RunNotifications({
   if (notifications.length === 0) return null;
 
   const count = notifications.length;
-  const badgeColor = blocking ? "#8b5cf6" : tc.error;
+  const badgeColor = blocking ? "#8b5cf6" : notifications[0]?.color ?? tc.error;
 
   return (
     <div style={{ position: "relative", display: "inline-block" }}>

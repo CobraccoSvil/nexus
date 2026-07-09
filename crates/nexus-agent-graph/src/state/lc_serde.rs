@@ -221,8 +221,10 @@ fn value_to_content(value: Option<&Value>) -> Result<MessageContent, LcSerdeErro
         None => Err(LcSerdeError::MissingField("content")),
         Some(Value::String(s)) => Ok(MessageContent::Text(s.clone())),
         Some(Value::Array(_)) => {
-            let blocks: Vec<ContentBlock> = serde_json::from_value(value.cloned().unwrap_or(Value::Null))
-                .map_err(|e| LcSerdeError::Shape(format!("content a blocchi non valido: {e}")))?;
+            let blocks: Vec<ContentBlock> =
+                serde_json::from_value(value.cloned().unwrap_or(Value::Null)).map_err(|e| {
+                    LcSerdeError::Shape(format!("content a blocchi non valido: {e}"))
+                })?;
             Ok(MessageContent::Blocks(blocks))
         }
         Some(_) => Err(LcSerdeError::Shape(
@@ -336,7 +338,10 @@ mod tests {
 
         for msg in [&blocchi, &openai] {
             let back = from_lc(&to_lc(msg)).expect("from_lc deve ricostruire il messaggio");
-            assert_eq!(&back, msg, "la thoughtSignature per-call deve essere identica");
+            assert_eq!(
+                &back, msg,
+                "la thoughtSignature per-call deve essere identica"
+            );
         }
     }
 
@@ -357,7 +362,10 @@ mod tests {
             thinking_signature: Some("sig-thinking".to_string()),
         };
         let back = from_lc(&to_lc(&ai)).expect("from_lc deve ricostruire il messaggio");
-        assert_eq!(&back, &ai, "la thinking_signature deve sopravvivere al round-trip");
+        assert_eq!(
+            &back, &ai,
+            "la thinking_signature deve sopravvivere al round-trip"
+        );
     }
 
     /// Verifica la forma del JSON LangChain prodotto da `to_lc` per un AIMessage
@@ -378,7 +386,10 @@ mod tests {
         let lc = to_lc(&ai);
         assert_eq!(lc["lc"], json!(1));
         assert_eq!(lc["type"], json!("constructor"));
-        assert_eq!(lc["id"].as_array().unwrap().last().unwrap(), &json!("AIMessage"));
+        assert_eq!(
+            lc["id"].as_array().unwrap().last().unwrap(),
+            &json!("AIMessage")
+        );
         let tc = &lc["kwargs"]["tool_calls"][0];
         assert_eq!(tc["name"], json!("edit_file"));
         assert_eq!(tc["args"], json!({"a": 1}));
@@ -417,8 +428,13 @@ mod tests {
     fn round_trip_lc_vs_python() {
         let raw = std::fs::read_to_string("/tmp/lc_messages.json")
             .expect("manca /tmp/lc_messages.json: generarlo con lo script Python nel doc del test");
-        let arr: Vec<Value> = serde_json::from_str(&raw).expect("/tmp/lc_messages.json non e' JSON valido");
-        assert_eq!(arr.len(), 3, "atteso esattamente 3 messaggi (Human, AI, Tool)");
+        let arr: Vec<Value> =
+            serde_json::from_str(&raw).expect("/tmp/lc_messages.json non e' JSON valido");
+        assert_eq!(
+            arr.len(),
+            3,
+            "atteso esattamente 3 messaggi (Human, AI, Tool)"
+        );
 
         // 1) HumanMessage: content testuale.
         let human = from_lc(&arr[0]).expect("from_lc Human");
@@ -447,7 +463,10 @@ mod tests {
         }
         // to_lc deve riprodurre la forma LangChain (args, type=tool_call).
         let ai_lc = to_lc(&ai);
-        assert_eq!(ai_lc["kwargs"]["tool_calls"][0]["args"], json!({"path": "/tmp/x"}));
+        assert_eq!(
+            ai_lc["kwargs"]["tool_calls"][0]["args"],
+            json!({"path": "/tmp/x"})
+        );
         assert_eq!(ai_lc["kwargs"]["tool_calls"][0]["type"], json!("tool_call"));
 
         // 3) ToolMessage: tool_call_id preservato.

@@ -26,10 +26,7 @@ amministratore deve eseguire una volta: bash deploy/install-sudo-manager.sh";
 /// sudo_manager e ritorna `Some(output)`. Altrimenti `None` (esecuzione
 /// normale in shell). Per `sudo <altro>` non instradabile ritorna comunque
 /// `Some(messaggio_guida)` (evita il fallimento muto nella shell).
-pub async fn try_route_privileged_command(
-    ctx: &AgentToolContext,
-    command: &str,
-) -> Option<String> {
+pub async fn try_route_privileged_command(ctx: &AgentToolContext, command: &str) -> Option<String> {
     let (had_sudo, rest) = strip_sudo_prefix(command);
     // Normalizza il comando per il MATCHING (regola H, causa radice della
     // non-convergenza sui fix che richiedono privilegi): gli LLM scrivono
@@ -222,7 +219,8 @@ fn is_playwright_with_deps(rest: &str) -> bool {
         return false;
     }
     let lower = rest.to_lowercase();
-    lower.contains("playwright") && (lower.contains("--with-deps") || lower.contains("install-deps"))
+    lower.contains("playwright")
+        && (lower.contains("--with-deps") || lower.contains("install-deps"))
 }
 
 async fn run_apt_install(ctx: &AgentToolContext, pkgs: &[String]) -> String {
@@ -241,7 +239,10 @@ async fn run_apt_install(ctx: &AgentToolContext, pkgs: &[String]) -> String {
 
 async fn run_apt_update(ctx: &AgentToolContext) -> String {
     match sudo_manager::apt_update(&ctx.db).await {
-        Ok(out) => format!("[sudo-runner] apt-get update\n{}", format_sudo_outcome(&out)),
+        Ok(out) => format!(
+            "[sudo-runner] apt-get update\n{}",
+            format_sudo_outcome(&out)
+        ),
         Err(e) => format!("\u{274C} [sudo] apt-get update fallito: {e}\n{SUDO_SETUP_HINT}"),
     }
 }
@@ -255,9 +256,9 @@ async fn run_playwright_deps(ctx: &AgentToolContext) -> String {
              Esegui quel comando separatamente se non l'hai gia' fatto.",
             format_sudo_outcome(&out)
         ),
-        Err(e) => format!(
-            "\u{274C} [sudo] Installazione deps Playwright fallita: {e}\n{SUDO_SETUP_HINT}"
-        ),
+        Err(e) => {
+            format!("\u{274C} [sudo] Installazione deps Playwright fallita: {e}\n{SUDO_SETUP_HINT}")
+        }
     }
 }
 
@@ -331,7 +332,9 @@ mod tests {
     fn comando_composito_non_instradato() {
         // `apt install x && rm -rf /` non deve passare il parsing apt sicuro.
         assert!(apt_tokens("apt-get install -y libnss3 && rm -rf /").is_none());
-        assert!(!is_playwright_with_deps("playwright install --with-deps; rm -rf /"));
+        assert!(!is_playwright_with_deps(
+            "playwright install --with-deps; rm -rf /"
+        ));
     }
 
     #[test]
@@ -346,7 +349,9 @@ mod tests {
 
     #[test]
     fn playwright_with_deps_riconosciuto() {
-        assert!(is_playwright_with_deps("npx playwright install --with-deps"));
+        assert!(is_playwright_with_deps(
+            "npx playwright install --with-deps"
+        ));
         assert!(is_playwright_with_deps("playwright install-deps chromium"));
         assert!(!is_playwright_with_deps("npx playwright install chromium"));
     }

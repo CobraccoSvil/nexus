@@ -294,7 +294,8 @@ fn is_build_failure(exit_code: i32, combined: &str) -> bool {
     }
     combined.contains("error ts")
         || combined.contains("error[e")
-        || combined.contains("found ") && (combined.contains(" error") || combined.contains(" problem"))
+        || combined.contains("found ")
+            && (combined.contains(" error") || combined.contains(" problem"))
         || combined.contains("compilation failed")
         || combined.contains("compilation error")
         || combined.contains("build failed")

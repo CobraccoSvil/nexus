@@ -68,11 +68,8 @@
 //! 6. HITL (interrupt-resume): il MOTORE gestisce gia' l'interrupt
 //!    `awaiting_confirmation` (`run_until_interrupt` -> `Interrupted`) e il RESUME
 //!    dal checkpoint (`resume_until_interrupt`, cablato in `resume_native` +
-//!    `confirm_native_run`). RESTA da portare il NODO che IMPOSTA
-//!    `awaiting_confirmation` (l'`interrupt_before=["executor"]` di graph.py):
-//!    finche' nessun nodo nativo valorizza il flag, un run `engine='rust'` non
-//!    raggiunge l'HITL e il resume nativo non viene ancora esercitato. Il resume
-//!    dei run PYTHON storici/rollback resta sul brain (`resume_run`).
+//!    `confirm_native_run`). Il `ToolDispatchNode` imposta il flag in modalita'
+//!    Conferma quando ci sono tool mutativi pendenti (`decisions::hitl`).
 //! 5. CLASSIFIER LLM nel `RouterNode` (TODO `router.rs`, FIX A): la
 //!    classificazione intent via LLM (`AgenticIntentClassifier`) NON e' ancora
 //!    portata. Senza `intent_hint` il RouterNode cade nel fallback
@@ -101,12 +98,15 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use nexus_agent_graph::nodes::{
-    ExecutorConfig, ExecutorNode, ScaleConfig, ScaleControlNode, StallRecoveryNode, VerifierConfig,
-    VerifierNode,
-};
 use nexus_agent_graph::decisions::context_reduction::{CtxMgmtConfig, TokenBrakeConfig};
 use nexus_agent_graph::decisions::{LoopThresholds, RepetitionThresholds};
+use nexus_agent_graph::decisions::supervisor::{
+    SupervisorConfig, DEFAULT_ANOMALY_STEP_THRESHOLD, DEFAULT_INTERLEAVED_INTERVAL,
+};
+use nexus_agent_graph::nodes::{
+    ExecutorConfig, ExecutorNode, ScaleConfig, ScaleControlNode, StallRecoveryNode, SupervisorNode,
+    VerifierConfig, VerifierNode,
+};
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
     LlmGateway, MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
@@ -118,7 +118,7 @@ use nexus_agent_graph::{
     ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, LearnerConfig, LearnerNode, Message,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
-    UnderstandingNode,
+    UnderstandingNode, SupervisorMode,
 };
 use nexus_graph::outcome::StepOutcome;
 
@@ -126,15 +126,22 @@ use crate::agent_graph_adapter::{
     agent_step_store::PgAgentStepStore,
     billing_cooldown_port::{CooldownBillingPort, NullBillingCooldownPort},
     clarify_history_store::PgClarifyHistoryStore,
-    context_offload::RagContextOffloadAdapter, criteria_runner::FinalGateCriteriaRunnerAdapter,
+    context_offload::RagContextOffloadAdapter,
+    criteria_runner::FinalGateCriteriaRunnerAdapter,
     embedding_store::PgEmbeddingStore,
-    escalation_port::PgEscalationPort, event_sink::SseEventSinkAdapter,
+    escalation_port::PgEscalationPort,
+    event_sink::SseEventSinkAdapter,
     llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
-    meta_step_store::PgMetaStepStore, model_upscale_port::CatalogModelUpscalePort,
-    next_actions_deriver::NextActionsDeriverAdapter, run_control_store::PgRunControlStore,
-    stall_budget_store::PgStallBudgetStore, stall_reasoner_port::PgMetaReasonerPort,
-    summary_store::PgSummaryStore, todo_store::PgTodoStore,
-    tool_executor::ToolRunnerExecutorAdapter, verifier_run_store::PgVerifierRunStore,
+    meta_step_store::PgMetaStepStore,
+    model_upscale_port::CatalogModelUpscalePort,
+    next_actions_deriver::NextActionsDeriverAdapter,
+    run_control_store::PgRunControlStore,
+    stall_budget_store::PgStallBudgetStore,
+    stall_reasoner_port::PgMetaReasonerPort,
+    summary_store::PgSummaryStore,
+    todo_store::PgTodoStore,
+    tool_executor::ToolRunnerExecutorAdapter,
+    verifier_run_store::PgVerifierRunStore,
 };
 use crate::agent_types::AgentStepEvent;
 use crate::nexus_gateway::NexusGatewayClient;
@@ -145,6 +152,7 @@ use crate::tool_runner_server::ToolRunnerDeps;
 // `RoutingConfig` dell'orchestratore mcp-core (provider/model per behavior_mode):
 // usiamo SOLO quella del grafo qui, col path completo, per non confonderle
 // (regola L: una sola fonte per ciascun concern).
+use nexus_agent_graph::decisions::hitl::HITL_PENDING_ACTIONS_EXTRA_KEY;
 use nexus_agent_graph::routing::RoutingConfig;
 
 /// Dipendenze infrastrutturali del motore nativo, estratte da `AppState` al call
@@ -215,6 +223,8 @@ pub struct NativeRunInput {
     pub action_oriented_min_score: f32,
     /// Modalita' automazione della sessione (study/confirm/automatic/...).
     pub automation_mode: String,
+    /// Modalita' supervisore worker (none/anomaly/interleaved/continuous).
+    pub supervisor_mode: SupervisorMode,
     /// Canale broadcast SSE del run (lo stesso di `run_via_brain`, `agent_channels`).
     pub step_tx: broadcast::Sender<AgentStepEvent>,
     /// Run genitore quando questo run e' un SUB-RUN (sub-agente nativo). `None` per
@@ -234,6 +244,12 @@ pub struct NativeRunInput {
     /// comportamento invariato: il ctx usa la root del progetto. In PR3 TUTTI i
     /// call site lasciano `None`; l'accensione (passare `Some`) e' PR4.
     pub working_root: Option<std::path::PathBuf>,
+    /// Sintesi advisory strutturata prodotta PRIMA del run (panel multi-provider
+    /// o consiglio a monte). Seed in `AgentState.extra` per il coordinatore
+    /// (regola M: segnale macchina, non parsing del blocco testuale).
+    pub pre_run_advisory_synthesis: Option<serde_json::Value>,
+    /// Fonte del segnale pre-run (`multi_provider_synthesis` | `advisory_synthesis`).
+    pub pre_run_advisory_source: Option<&'static str>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -433,6 +449,9 @@ pub struct NativeRunOutcome {
     ///
     /// Letto dal finalizzatore: mai `Completed` con una bocciatura pendente.
     pub final_gate_failed_pending: bool,
+    /// Azioni in attesa di conferma utente (HITL modalita' Conferma), serializzate
+    /// dal grafo in `extra.hitl_pending_actions`. Vuoto se nessuna sospensione HITL.
+    pub pending_actions: Vec<serde_json::Value>,
 }
 
 /// Chiavi del blocco esito STRUTTURATO ([`NativeRunOutcome::structured_verdict`]).
@@ -528,8 +547,7 @@ impl NativeRunOutcome {
             }
         } else if matches!(self.stop_reason, Some(StopReason::Error)) {
             AgentRunStatus::Failed
-        } else if declared_refusal
-            || matches!(declared_kind, Some("blocked") | Some("needs_input"))
+        } else if declared_refusal || matches!(declared_kind, Some("blocked") | Some("needs_input"))
         {
             // Bloccato per causa esterna / serve input umano / rifiuto safety:
             // esito canonico BlockedNeedsInput (parita' WAVE 3.2 del path brain).
@@ -665,7 +683,10 @@ async fn resolve_purpose(db: &PgPool, purpose: &str) -> (String, String) {
 
 /// `value` -> bool con la semantica `_coerce` del brain (`{true,1,yes,on}` truthy).
 fn coerce_bool(raw: &str) -> bool {
-    matches!(raw.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
 }
 
 /// `value` CSV -> `Vec<String>` (strip per elemento + scarto dei vuoti), come
@@ -741,6 +762,30 @@ async fn setting_string(db: &PgPool, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+async fn load_supervisor_config(db: &PgPool) -> SupervisorConfig {
+    SupervisorConfig {
+        interleaved_interval: setting_i64(
+            db,
+            "agent.supervisor.interleaved_interval",
+            DEFAULT_INTERLEAVED_INTERVAL,
+        )
+        .await
+        .max(1),
+        anomaly_step_threshold: setting_i64(
+            db,
+            "agent.supervisor.anomaly_step_threshold",
+            DEFAULT_ANOMALY_STEP_THRESHOLD,
+        )
+        .await
+        .max(1),
+    }
+}
+
+/// Converte il tipo condiviso mcp-core nel tipo del grafo (stesse varianti).
+pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> SupervisorMode {
+    SupervisorMode::from_str(mode.as_str())
+}
+
 /// Costruisce la [`PlannerConfig`] DB-driven (regola G), 1:1 con le chiavi
 /// `orchestrator.*` lette dal brain (`orchestrator_config.py`). I campi che il
 /// brain NON popola da `orchestrator_config` restano al loro `Default`:
@@ -752,22 +797,62 @@ async fn setting_string(db: &PgPool, key: &str, default: &str) -> String {
 async fn load_planner_config(db: &PgPool) -> PlannerConfig {
     let d = PlannerConfig::default();
     PlannerConfig {
-        plan_phase_enabled: setting_bool(db, "orchestrator.plan_phase_enabled", d.plan_phase_enabled).await,
-        plan_behavior_modes: setting_csv(db, "orchestrator.plan_behavior_modes", d.plan_behavior_modes).await,
+        plan_phase_enabled: setting_bool(
+            db,
+            "orchestrator.plan_phase_enabled",
+            d.plan_phase_enabled,
+        )
+        .await,
+        plan_behavior_modes: setting_csv(
+            db,
+            "orchestrator.plan_behavior_modes",
+            d.plan_behavior_modes,
+        )
+        .await,
         plan_intents: setting_csv(db, "orchestrator.plan_intents", d.plan_intents).await,
-        plan_min_token_budget: setting_i64(db, "orchestrator.plan_min_token_budget", d.plan_min_token_budget).await,
+        plan_min_token_budget: setting_i64(
+            db,
+            "orchestrator.plan_min_token_budget",
+            d.plan_min_token_budget,
+        )
+        .await,
         planner_prompt_key: nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
             .await
             .unwrap_or(d.planner_prompt_key),
-        clarifying_questions_enabled: setting_bool(db, "orchestrator.clarifying_questions_enabled", d.clarifying_questions_enabled).await,
-        clarifying_questions_max: setting_i64(db, "orchestrator.clarifying_questions_max", d.clarifying_questions_max).await,
-        plan_rationale_enabled: setting_bool(db, "orchestrator.plan_rationale_enabled", d.plan_rationale_enabled).await,
-        dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
+        clarifying_questions_enabled: setting_bool(
+            db,
+            "orchestrator.clarifying_questions_enabled",
+            d.clarifying_questions_enabled,
+        )
+        .await,
+        clarifying_questions_max: setting_i64(
+            db,
+            "orchestrator.clarifying_questions_max",
+            d.clarifying_questions_max,
+        )
+        .await,
+        plan_rationale_enabled: setting_bool(
+            db,
+            "orchestrator.plan_rationale_enabled",
+            d.plan_rationale_enabled,
+        )
+        .await,
+        dag_topological_enabled: setting_bool(
+            db,
+            "orchestrator.dag_topological_enabled",
+            d.dag_topological_enabled,
+        )
+        .await,
         // Gate orchestrazione LLM-driven della plan-phase (Fase 1). DEFAULT SAFE
         // FALSE (regola G): il setting sara' seminato dalla migrazione del
         // sotto-blocco successivo; finche' assente o false il gate ricade sempre
         // su is_eligible -> comportamento bit-identico a oggi.
-        orchestration_enabled: setting_bool(db, "agent.orchestration.enabled", d.orchestration_enabled).await,
+        orchestration_enabled: setting_bool(
+            db,
+            "agent.orchestration.enabled",
+            d.orchestration_enabled,
+        )
+        .await,
         // Risolti a monte / da altra fonte (vedi doc della funzione): default.
         planner_system_text: d.planner_system_text,
         turn_focus_enabled: d.turn_focus_enabled,
@@ -798,13 +883,36 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
     FinalGateConfig {
         enabled: setting_bool(db, "agent.final_gate.enabled", d.enabled).await,
         max_cycles: setting_i64(db, "agent.final_gate.max_cycles", d.max_cycles).await,
-        runtime_check_enabled: setting_bool(db, "agent.final_gate.runtime_check_enabled", d.runtime_check_enabled).await,
-        build_timeout_s: setting_f64(db, "agent.final_gate.build_timeout_s", d.build_timeout_s).await,
-        build_output_max_chars: setting_i64(db, "agent.final_gate.build_output_max_chars", d.build_output_max_chars).await,
-        runtime_error_patterns: setting_csv(db, "agent.final_gate.runtime_error_patterns", d.runtime_error_patterns).await,
-        no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio).await,
-        import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs).await,
-        criteria_timeout_s: setting_f64(db, "orchestrator.verifier_timeout_s", d.criteria_timeout_s).await,
+        runtime_check_enabled: setting_bool(
+            db,
+            "agent.final_gate.runtime_check_enabled",
+            d.runtime_check_enabled,
+        )
+        .await,
+        build_timeout_s: setting_f64(db, "agent.final_gate.build_timeout_s", d.build_timeout_s)
+            .await,
+        build_output_max_chars: setting_i64(
+            db,
+            "agent.final_gate.build_output_max_chars",
+            d.build_output_max_chars,
+        )
+        .await,
+        runtime_error_patterns: setting_csv(
+            db,
+            "agent.final_gate.runtime_error_patterns",
+            d.runtime_error_patterns,
+        )
+        .await,
+        no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio)
+            .await,
+        import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs)
+            .await,
+        criteria_timeout_s: setting_f64(
+            db,
+            "orchestrator.verifier_timeout_s",
+            d.criteria_timeout_s,
+        )
+        .await,
         // verify_steps/verify_profile_missing innestati in run_engine (profilo
         // per-ambiente, ADR 0036). log_command / endpoint_criterion restano
         // risolti per-progetto a monte (non ancora portati): default
@@ -813,10 +921,25 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
         verify_profile_missing: d.verify_profile_missing,
         log_command: d.log_command,
         endpoint_criterion: d.endpoint_criterion,
-        design_verify_enabled: setting_bool(db, "agent.final_gate.design_verify_enabled", d.design_verify_enabled).await,
-        design_verify_min_score: setting_i64(db, "agent.final_gate.design_verify_min_score", d.design_verify_min_score).await,
+        design_verify_enabled: setting_bool(
+            db,
+            "agent.final_gate.design_verify_enabled",
+            d.design_verify_enabled,
+        )
+        .await,
+        design_verify_min_score: setting_i64(
+            db,
+            "agent.final_gate.design_verify_min_score",
+            d.design_verify_min_score,
+        )
+        .await,
         // ADR 0018 leva 3 (mig 0503): kill-switch dei criteri strutturali.
-        structural_criteria_enabled: setting_bool(db, "agent.final_gate.structural_criteria_enabled", d.structural_criteria_enabled).await,
+        structural_criteria_enabled: setting_bool(
+            db,
+            "agent.final_gate.structural_criteria_enabled",
+            d.structural_criteria_enabled,
+        )
+        .await,
     }
 }
 
@@ -829,9 +952,15 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
     let d = VerifierConfig::default();
     VerifierConfig {
         enabled: setting_bool(db, "orchestrator.verifier_enabled", d.enabled).await,
-        max_verify_cycles: setting_i64(db, "orchestrator.max_verify_cycles", d.max_verify_cycles).await,
+        max_verify_cycles: setting_i64(db, "orchestrator.max_verify_cycles", d.max_verify_cycles)
+            .await,
         fail_closed: setting_bool(db, "agent.verifier.fail_closed", d.fail_closed).await,
-        dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
+        dag_topological_enabled: setting_bool(
+            db,
+            "orchestrator.dag_topological_enabled",
+            d.dag_topological_enabled,
+        )
+        .await,
         exploratory_verify_max_total: d.exploratory_verify_max_total,
     }
 }
@@ -852,10 +981,36 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     RoutingConfig {
         recursion_limit,
         g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
-        todo_isolation_enabled: setting_bool(db, "agent.continuous.todo_isolation_enabled", d.todo_isolation_enabled).await,
-        pending_steps_detection_enabled: setting_bool(db, "agent.closure.pending_steps_detection_enabled", d.pending_steps_detection_enabled).await,
-        pending_steps_min_items: setting_i64(db, "agent.closure.pending_steps_min_items", d.pending_steps_min_items).await,
-        final_gate_software_intents: setting_csv(db, "agent.final_gate.software_intents", d.final_gate_software_intents).await,
+        todo_isolation_enabled: setting_bool(
+            db,
+            "agent.continuous.todo_isolation_enabled",
+            d.todo_isolation_enabled,
+        )
+        .await,
+        pending_steps_detection_enabled: setting_bool(
+            db,
+            "agent.closure.pending_steps_detection_enabled",
+            d.pending_steps_detection_enabled,
+        )
+        .await,
+        pending_steps_min_items: setting_i64(
+            db,
+            "agent.closure.pending_steps_min_items",
+            d.pending_steps_min_items,
+        )
+        .await,
+        final_gate_software_intents: setting_csv(
+            db,
+            "agent.final_gate.software_intents",
+            d.final_gate_software_intents,
+        )
+        .await,
+        fs_mutator_tools: setting_csv(
+            db,
+            "agent.tools.result_cache_mutators",
+            d.fs_mutator_tools,
+        )
+        .await,
         ..RoutingConfig::default()
     }
 }
@@ -892,7 +1047,12 @@ async fn load_executor_config(
         iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
         // Ex costanti hardcoded portate in DB (regola G): offset forced-text,
         // budget escalation unico, soglie loop-by-signature.
-        forced_text_offset: setting_i64(db, "agent.executor.forced_text_offset", d.forced_text_offset).await,
+        forced_text_offset: setting_i64(
+            db,
+            "agent.executor.forced_text_offset",
+            d.forced_text_offset,
+        )
+        .await,
         max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
         // Limiti anti-runaway basati sui TOKEN (mig 0520, regola G): budget token
         // cumulativo per run + fast-fail su turni solo-testo consecutivi. `0` =
@@ -926,68 +1086,219 @@ async fn load_executor_config(
         .await
         .max(0) as u32,
         loop_thresholds: LoopThresholds {
-            signature: setting_i64(db, "agent.loop.signature_threshold", d.loop_thresholds.signature as i64).await.max(1) as usize,
-            cap: setting_i64(db, "agent.loop.recent_signatures_cap", d.loop_thresholds.cap as i64).await.max(1) as usize,
+            signature: setting_i64(
+                db,
+                "agent.loop.signature_threshold",
+                d.loop_thresholds.signature as i64,
+            )
+            .await
+            .max(1) as usize,
+            cap: setting_i64(
+                db,
+                "agent.loop.recent_signatures_cap",
+                d.loop_thresholds.cap as i64,
+            )
+            .await
+            .max(1) as usize,
         },
         // Anti repetition-collapse del testo (mig 0531, regola G): soglie della
         // rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
         // `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
         // lunghezze minime >=1 (0 sarebbe insensato).
         repetition: RepetitionThresholds {
-            min_unit_len: setting_i64(db, "agent.anti_repetition.min_unit_len", d.repetition.min_unit_len as i64).await.max(1) as usize,
-            max_unit_len: setting_i64(db, "agent.anti_repetition.max_unit_len", d.repetition.max_unit_len as i64).await.max(1) as usize,
-            min_repeats: setting_i64(db, "agent.anti_repetition.min_repeats", d.repetition.min_repeats as i64).await.max(0) as usize,
-            min_total_len: setting_i64(db, "agent.anti_repetition.min_total_len", d.repetition.min_total_len as i64).await.max(0) as usize,
-            scan_tail_cap: setting_i64(db, "agent.anti_repetition.scan_tail_cap", d.repetition.scan_tail_cap as i64).await.max(0) as usize,
+            min_unit_len: setting_i64(
+                db,
+                "agent.anti_repetition.min_unit_len",
+                d.repetition.min_unit_len as i64,
+            )
+            .await
+            .max(1) as usize,
+            max_unit_len: setting_i64(
+                db,
+                "agent.anti_repetition.max_unit_len",
+                d.repetition.max_unit_len as i64,
+            )
+            .await
+            .max(1) as usize,
+            min_repeats: setting_i64(
+                db,
+                "agent.anti_repetition.min_repeats",
+                d.repetition.min_repeats as i64,
+            )
+            .await
+            .max(0) as usize,
+            min_total_len: setting_i64(
+                db,
+                "agent.anti_repetition.min_total_len",
+                d.repetition.min_total_len as i64,
+            )
+            .await
+            .max(0) as usize,
+            scan_tail_cap: setting_i64(
+                db,
+                "agent.anti_repetition.scan_tail_cap",
+                d.repetition.scan_tail_cap as i64,
+            )
+            .await
+            .max(0) as usize,
         },
         // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
-        repeated_user_question_threshold: setting_i64(db, "agent.loop.repeated_user_question_threshold", d.repeated_user_question_threshold).await,
+        repeated_user_question_threshold: setting_i64(
+            db,
+            "agent.loop.repeated_user_question_threshold",
+            d.repeated_user_question_threshold,
+        )
+        .await,
         // ── Meta-reasoner di recovery-da-stallo (mig 0510, opt-in DB, regola G) ─
         // Con enabled=false (default) il gate di emissione StallReason nell'executor
         // non scatta mai -> comportamento bit-identico a oggi. Il budget per-sessione
         // e' il cap duro anti meta-loop/costo del gate.
-        stall_recovery_enabled: setting_bool(db, "agent.stall_recovery.enabled", d.stall_recovery_enabled).await,
-        stall_recovery_max_moves_per_session: setting_i64(db, "agent.stall_recovery.max_moves_per_session", d.stall_recovery_max_moves_per_session).await,
+        stall_recovery_enabled: setting_bool(
+            db,
+            "agent.stall_recovery.enabled",
+            d.stall_recovery_enabled,
+        )
+        .await,
+        stall_recovery_max_moves_per_session: setting_i64(
+            db,
+            "agent.stall_recovery.max_moves_per_session",
+            d.stall_recovery_max_moves_per_session,
+        )
+        .await,
         // ── Scale-controller (mig 0516, opt-in DB, regola G) ──────────────────
         // Con enabled=false (default) il detector-emissione dell'executor salta
         // PRIMA di ogni lavoro -> nessun ScaleReason -> nodo ScaleControl mai
         // raggiunto -> BIT-IDENTICO. Tutte le soglie dai settings agent.scale.*.
         scale: ScaleConfig {
             enabled: setting_bool(db, "agent.scale.enabled", d.scale.enabled).await,
-            downscale_enabled: setting_bool(db, "agent.scale.downscale_enabled", d.scale.downscale_enabled).await,
-            eval_every_iters: setting_i64(db, "agent.scale.eval_every_iters", d.scale.eval_every_iters).await,
-            min_tail_iters: setting_i64(db, "agent.scale.min_tail_iters", d.scale.min_tail_iters).await,
-            min_confidence: setting_f64(db, "agent.scale.min_confidence", d.scale.min_confidence).await,
-            change_cooldown_turns: setting_i64(db, "agent.scale.change_cooldown_turns", d.scale.change_cooldown_turns).await,
-            downscale_clean_window: setting_i64(db, "agent.scale.downscale_clean_window", d.scale.downscale_clean_window).await,
-            max_reversals: setting_i64(db, "agent.scale.max_reversals", d.scale.max_reversals).await,
-            max_tier_changes_per_run: setting_i64(db, "agent.scale.max_tier_changes_per_run", d.scale.max_tier_changes_per_run).await,
-            max_evals_per_run: setting_i64(db, "agent.scale.max_evals_per_run", d.scale.max_evals_per_run).await,
-            window_overhead_ratio: setting_f64(db, "agent.scale.window_overhead_ratio", d.scale.window_overhead_ratio).await,
+            downscale_enabled: setting_bool(
+                db,
+                "agent.scale.downscale_enabled",
+                d.scale.downscale_enabled,
+            )
+            .await,
+            eval_every_iters: setting_i64(
+                db,
+                "agent.scale.eval_every_iters",
+                d.scale.eval_every_iters,
+            )
+            .await,
+            min_tail_iters: setting_i64(db, "agent.scale.min_tail_iters", d.scale.min_tail_iters)
+                .await,
+            min_confidence: setting_f64(db, "agent.scale.min_confidence", d.scale.min_confidence)
+                .await,
+            change_cooldown_turns: setting_i64(
+                db,
+                "agent.scale.change_cooldown_turns",
+                d.scale.change_cooldown_turns,
+            )
+            .await,
+            downscale_clean_window: setting_i64(
+                db,
+                "agent.scale.downscale_clean_window",
+                d.scale.downscale_clean_window,
+            )
+            .await,
+            max_reversals: setting_i64(db, "agent.scale.max_reversals", d.scale.max_reversals)
+                .await,
+            max_tier_changes_per_run: setting_i64(
+                db,
+                "agent.scale.max_tier_changes_per_run",
+                d.scale.max_tier_changes_per_run,
+            )
+            .await,
+            max_evals_per_run: setting_i64(
+                db,
+                "agent.scale.max_evals_per_run",
+                d.scale.max_evals_per_run,
+            )
+            .await,
+            window_overhead_ratio: setting_f64(
+                db,
+                "agent.scale.window_overhead_ratio",
+                d.scale.window_overhead_ratio,
+            )
+            .await,
             // ── Sizing agentico (mig 0524, kill-switch nested, opt-in DB, regola G) ─
             // Con sizing_enabled=false (default) il detector non popola i segnali
             // sizing e il gate degrada ogni AdjustSizing a KeepTier -> flusso tier
             // BIT-IDENTICO anche con scale ON.
-            sizing_enabled: setting_bool(db, "agent.scale.sizing_enabled", d.scale.sizing_enabled).await,
-            sizing_cooldown_turns: setting_i64(db, "agent.scale.sizing_cooldown_turns", d.scale.sizing_cooldown_turns).await,
-            sizing_aggressiveness: setting_f64(db, "agent.scale.sizing_aggressiveness", d.scale.sizing_aggressiveness).await,
+            sizing_enabled: setting_bool(db, "agent.scale.sizing_enabled", d.scale.sizing_enabled)
+                .await,
+            sizing_cooldown_turns: setting_i64(
+                db,
+                "agent.scale.sizing_cooldown_turns",
+                d.scale.sizing_cooldown_turns,
+            )
+            .await,
+            sizing_aggressiveness: setting_f64(
+                db,
+                "agent.scale.sizing_aggressiveness",
+                d.scale.sizing_aggressiveness,
+            )
+            .await,
         },
-        progress_controller_enabled: setting_bool(db, "agent.progress_controller_enabled", d.progress_controller_enabled).await,
-        repeated_action_threshold: setting_i64(db, "agent.repeated_action_threshold", d.repeated_action_threshold).await,
-        repeated_action_threshold_read_only: setting_i64(db, "agent.repeated_action_threshold.read_only", d.repeated_action_threshold_read_only).await,
-        repeated_action_force_diagnose_enabled: setting_bool(db, "agent.repeated_action_force_diagnose_enabled", d.repeated_action_force_diagnose_enabled).await,
-        reallocation_threshold: setting_i64(db, "agent.loop.resource_reallocation_threshold", d.reallocation_threshold).await,
+        progress_controller_enabled: setting_bool(
+            db,
+            "agent.progress_controller_enabled",
+            d.progress_controller_enabled,
+        )
+        .await,
+        repeated_action_threshold: setting_i64(
+            db,
+            "agent.repeated_action_threshold",
+            d.repeated_action_threshold,
+        )
+        .await,
+        repeated_action_threshold_read_only: setting_i64(
+            db,
+            "agent.repeated_action_threshold.read_only",
+            d.repeated_action_threshold_read_only,
+        )
+        .await,
+        repeated_action_force_diagnose_enabled: setting_bool(
+            db,
+            "agent.repeated_action_force_diagnose_enabled",
+            d.repeated_action_force_diagnose_enabled,
+        )
+        .await,
+        reallocation_threshold: setting_i64(
+            db,
+            "agent.loop.resource_reallocation_threshold",
+            d.reallocation_threshold,
+        )
+        .await,
         upscale_enabled: setting_bool(db, "agent.upscale.enabled", d.upscale_enabled).await,
-        upscale_overhead_ratio: setting_f64(db, "agent.upscale.target_overhead_ratio", d.upscale_overhead_ratio).await,
-        verification_directive_enabled: setting_bool(db, "agent.verification_directive_enabled", d.verification_directive_enabled).await,
+        upscale_overhead_ratio: setting_f64(
+            db,
+            "agent.upscale.target_overhead_ratio",
+            d.upscale_overhead_ratio,
+        )
+        .await,
+        verification_directive_enabled: setting_bool(
+            db,
+            "agent.verification_directive_enabled",
+            d.verification_directive_enabled,
+        )
+        .await,
         // ── tool_choice forcing (ADR 0018 leva 2, mig 0300) ───────────────────
         // Il porting Rust aveva PERSO questi tre campi: restavano ai Default del
         // nodo (enabled=false, style=None) -> il force-action era INERTE per ogni
         // provider (force_now sempre false). Ora il DB e' di nuovo l'unica fonte
         // (regola G): i flag dai settings (default-DB-down nel `Default`), lo
         // stile dal catalog via punto unico `capability::resolve_tool_choice_style`.
-        tool_choice_forcing_enabled: setting_bool(db, "agent.tool_choice_forcing_enabled", d.tool_choice_forcing_enabled).await,
-        tool_choice_forcing_max_iteration: setting_i64(db, "agent.tool_choice_forcing_max_iteration", d.tool_choice_forcing_max_iteration).await,
+        tool_choice_forcing_enabled: setting_bool(
+            db,
+            "agent.tool_choice_forcing_enabled",
+            d.tool_choice_forcing_enabled,
+        )
+        .await,
+        tool_choice_forcing_max_iteration: setting_i64(
+            db,
+            "agent.tool_choice_forcing_max_iteration",
+            d.tool_choice_forcing_max_iteration,
+        )
+        .await,
         tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
         // ── context management (mig 0199/0429): il bug + l'inerzia ────────────
         // context_window (passato come parametro): senza questo era 0 -> token_brake
@@ -998,45 +1309,158 @@ async fn load_executor_config(
         // max_chars [1200,600,300,100]) erano IGNORATI perche' load_executor_config
         // chiudeva con `..Default::default()` (safe-default permissivi). Ora dal DB.
         ctx_mgmt: CtxMgmtConfig {
-            compress_start_iter: setting_i64(db, "agent.context.compress_start_iter", d.ctx_mgmt.compress_start_iter).await,
-            compress_phase_boundaries: setting_i64_csv(db, "agent.context.compress_phase_boundaries", d.ctx_mgmt.compress_phase_boundaries.clone()).await,
-            compress_phase_keep_recent: setting_i64_csv(db, "agent.context.compress_phase_keep_recent", d.ctx_mgmt.compress_phase_keep_recent.clone()).await,
-            compress_phase_max_chars: setting_i64_csv(db, "agent.context.compress_phase_max_chars", d.ctx_mgmt.compress_phase_max_chars.clone()).await,
+            compress_start_iter: setting_i64(
+                db,
+                "agent.context.compress_start_iter",
+                d.ctx_mgmt.compress_start_iter,
+            )
+            .await,
+            compress_phase_boundaries: setting_i64_csv(
+                db,
+                "agent.context.compress_phase_boundaries",
+                d.ctx_mgmt.compress_phase_boundaries.clone(),
+            )
+            .await,
+            compress_phase_keep_recent: setting_i64_csv(
+                db,
+                "agent.context.compress_phase_keep_recent",
+                d.ctx_mgmt.compress_phase_keep_recent.clone(),
+            )
+            .await,
+            compress_phase_max_chars: setting_i64_csv(
+                db,
+                "agent.context.compress_phase_max_chars",
+                d.ctx_mgmt.compress_phase_max_chars.clone(),
+            )
+            .await,
         },
         // Freno token: la soglia hard (0.55 in DB vs 0.70 default) e i parametri
         // aggressivi, ora dal DB.
         token_brake: TokenBrakeConfig {
-            max_context_ratio: setting_f64(db, "agent.context.max_context_ratio", d.token_brake.max_context_ratio).await,
-            aggressive_keep_recent: setting_i64(db, "agent.context.aggressive_keep_recent", d.token_brake.aggressive_keep_recent as i64).await.max(0) as usize,
-            aggressive_max_chars: setting_i64(db, "agent.context.aggressive_max_chars", d.token_brake.aggressive_max_chars as i64).await.max(0) as usize,
+            max_context_ratio: setting_f64(
+                db,
+                "agent.context.max_context_ratio",
+                d.token_brake.max_context_ratio,
+            )
+            .await,
+            aggressive_keep_recent: setting_i64(
+                db,
+                "agent.context.aggressive_keep_recent",
+                d.token_brake.aggressive_keep_recent as i64,
+            )
+            .await
+            .max(0) as usize,
+            aggressive_max_chars: setting_i64(
+                db,
+                "agent.context.aggressive_max_chars",
+                d.token_brake.aggressive_max_chars as i64,
+            )
+            .await
+            .max(0) as usize,
         },
         // Forced-RAG reminder: ratio + testo dal DB (erano vuoti/0.0 -> reminder mai
         // iniettato anche con offload attivo).
-        forced_rag_ratio: setting_f64(db, "agent.context.forced_rag_threshold_ratio", d.forced_rag_ratio).await,
-        forced_rag_reminder_text: setting_string(db, "agent.context.forced_rag_reminder_text", &d.forced_rag_reminder_text).await,
-        turn_focus_enabled: setting_bool(db, "agent.context.turn_focus_enabled", d.turn_focus_enabled).await,
-        discovery_max_injected: setting_i64(db, "agent.tools.discovery_max_injected", d.discovery_max_injected as i64).await.max(0) as usize,
+        forced_rag_ratio: setting_f64(
+            db,
+            "agent.context.forced_rag_threshold_ratio",
+            d.forced_rag_ratio,
+        )
+        .await,
+        forced_rag_reminder_text: setting_string(
+            db,
+            "agent.context.forced_rag_reminder_text",
+            &d.forced_rag_reminder_text,
+        )
+        .await,
+        turn_focus_enabled: setting_bool(
+            db,
+            "agent.context.turn_focus_enabled",
+            d.turn_focus_enabled,
+        )
+        .await,
+        discovery_max_injected: setting_i64(
+            db,
+            "agent.tools.discovery_max_injected",
+            d.discovery_max_injected as i64,
+        )
+        .await
+        .max(0) as usize,
         // ── rolling-summary (intervento 3): RIASSUME i vecchi via LLM economico ─
         // Flag + keep_recent dal DB (regola G). Il MODELLO economico vive nell'impl
         // della porta PgSummaryStore (agent.context.rolling_summary_model).
-        rolling_summary_enabled: setting_bool(db, "agent.context.rolling_summary_enabled", d.rolling_summary_enabled).await,
-        rolling_keep_recent: setting_i64(db, "agent.context.rolling_keep_recent_turns", d.rolling_keep_recent).await,
+        rolling_summary_enabled: setting_bool(
+            db,
+            "agent.context.rolling_summary_enabled",
+            d.rolling_summary_enabled,
+        )
+        .await,
+        rolling_keep_recent: setting_i64(
+            db,
+            "agent.context.rolling_keep_recent_turns",
+            d.rolling_keep_recent,
+        )
+        .await,
         // Governance costo/beneficio del rolling-summary (opt-in, mig 0523). OFF di
         // default -> il gate non si applica (comportamento storico bit-identico).
-        governance_rolling_summary_adaptive: setting_bool(db, "agent.governance.rolling_summary_adaptive", d.governance_rolling_summary_adaptive).await,
-        governance_rolling_summary_min_prefix: setting_i64(db, "agent.governance.rolling_summary_min_prefix", d.governance_rolling_summary_min_prefix).await,
+        governance_rolling_summary_adaptive: setting_bool(
+            db,
+            "agent.governance.rolling_summary_adaptive",
+            d.governance_rolling_summary_adaptive,
+        )
+        .await,
+        governance_rolling_summary_min_prefix: setting_i64(
+            db,
+            "agent.governance.rolling_summary_min_prefix",
+            d.governance_rolling_summary_min_prefix,
+        )
+        .await,
         // ── continuity-trim SEMANTICO + offload retrievabile (EmbeddingStore) ──
         // Tutti OFF di default (regola G): con questi valori il comportamento e'
         // bit-identico a oggi. La porta embedding/offload e' iniettata dal wiring.
-        continuity_trim_enabled: setting_bool(db, "agent.context.continuity_trim_enabled", d.continuity_trim_enabled).await,
-        continuity_trim_min_score: setting_f64(db, "agent.context.continuity_trim_min_score", d.continuity_trim_min_score as f64).await as f32,
-        continuity_trim_max_drop: setting_i64(db, "agent.context.continuity_trim_max_drop", d.continuity_trim_max_drop).await,
-        compress_offload_enabled: setting_bool(db, "agent.context.compress_offload_enabled", d.compress_offload_enabled).await,
-        rolling_summary_offload_enabled: setting_bool(db, "agent.context.rolling_summary_offload_enabled", d.rolling_summary_offload_enabled).await,
+        continuity_trim_enabled: setting_bool(
+            db,
+            "agent.context.continuity_trim_enabled",
+            d.continuity_trim_enabled,
+        )
+        .await,
+        continuity_trim_min_score: setting_f64(
+            db,
+            "agent.context.continuity_trim_min_score",
+            d.continuity_trim_min_score as f64,
+        )
+        .await as f32,
+        continuity_trim_max_drop: setting_i64(
+            db,
+            "agent.context.continuity_trim_max_drop",
+            d.continuity_trim_max_drop,
+        )
+        .await,
+        compress_offload_enabled: setting_bool(
+            db,
+            "agent.context.compress_offload_enabled",
+            d.compress_offload_enabled,
+        )
+        .await,
+        rolling_summary_offload_enabled: setting_bool(
+            db,
+            "agent.context.rolling_summary_offload_enabled",
+            d.rolling_summary_offload_enabled,
+        )
+        .await,
         // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
         // dell'executor (stesse chiavi della RoutingConfig, regola L).
-        pending_steps_detection_enabled: setting_bool(db, "agent.closure.pending_steps_detection_enabled", d.pending_steps_detection_enabled).await,
-        pending_steps_min_items: setting_i64(db, "agent.closure.pending_steps_min_items", d.pending_steps_min_items).await,
+        pending_steps_detection_enabled: setting_bool(
+            db,
+            "agent.closure.pending_steps_detection_enabled",
+            d.pending_steps_detection_enabled,
+        )
+        .await,
+        pending_steps_min_items: setting_i64(
+            db,
+            "agent.closure.pending_steps_min_items",
+            d.pending_steps_min_items,
+        )
+        .await,
         // ── hard cap post-brake (ADR 0016 fase D2, mig 0286) ──────────────────
         // Ratio dal DB (0.95 in produzione; il Default 0.0 = gate OFF vale SOLO
         // a DB irraggiungibile) + template del messaggio overflow risolto qui
@@ -1067,7 +1491,10 @@ enum TokenizerKind {
 /// Legge `agent.context.tokenizer` (mig 0286). Solo `cl100k_base` attiva la BPE
 /// reale; qualunque altro valore o chiave assente -> char-based (safe-DB-down).
 async fn resolve_tokenizer_kind(db: &PgPool) -> TokenizerKind {
-    match nexus_auth::get_setting(db, "agent.context.tokenizer").await.as_deref() {
+    match nexus_auth::get_setting(db, "agent.context.tokenizer")
+        .await
+        .as_deref()
+    {
         Some("cl100k_base") => TokenizerKind::Cl100k,
         _ => TokenizerKind::Chars,
     }
@@ -1112,9 +1539,24 @@ async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
         todo_isolation_kind: nexus_auth::get_setting(db, "agent.continuous.todo_isolation_kind")
             .await
             .unwrap_or(d.todo_isolation_kind),
-        max_retries: setting_i64(db, "agent.continuous.todo_isolation_max_retries", d.max_retries).await,
-        dag_topological_enabled: setting_bool(db, "orchestrator.dag_topological_enabled", d.dag_topological_enabled).await,
-        dag_parallel_min_ready: setting_i64(db, "orchestrator.dag_parallel_min_ready", d.dag_parallel_min_ready).await,
+        max_retries: setting_i64(
+            db,
+            "agent.continuous.todo_isolation_max_retries",
+            d.max_retries,
+        )
+        .await,
+        dag_topological_enabled: setting_bool(
+            db,
+            "orchestrator.dag_topological_enabled",
+            d.dag_topological_enabled,
+        )
+        .await,
+        dag_parallel_min_ready: setting_i64(
+            db,
+            "orchestrator.dag_parallel_min_ready",
+            d.dag_parallel_min_ready,
+        )
+        .await,
         ..TodoRunnerConfig::default()
     }
 }
@@ -1151,7 +1593,9 @@ enum RunMode {
     New,
     /// Resume HITL: nessun initial_state (riparte dal checkpoint), `resume_delta`
     /// sblocca l'interrupt (azzera `awaiting_confirmation` + inietta l'approvazione).
-    Resume { resume_delta: nexus_graph::StateDelta },
+    Resume {
+        resume_delta: nexus_graph::StateDelta,
+    },
 }
 
 /// Costruisce le 14 impl concrete + gli 11 nodi (porte iniettate) + la
@@ -1202,8 +1646,8 @@ async fn build_native_engine(
     // (comportamento storico). Risolto UNA volta dal session_id via la directory
     // di routing. Le porte che leggono SOLO config/catalogo GLOBALI (settings,
     // ai_price_catalog, nexus_prompt_templates, routing matrix) restano su `db`.
-    let run_db = crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id)
-        .await;
+    let run_db =
+        crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id).await;
 
     // Fase C3 Part B: disponibilita' dell'isolamento fisico (worktree git) per
     // questo run, calcolata UNA volta qui e passata al ctx (i nodi puri non fanno
@@ -1343,8 +1787,10 @@ async fn build_native_engine(
     // unico, regola L) per i criteri run_command/list_files + DB per outputs_exist.
     // Il tipo CONCRETO resta visibile per la misura baseline pre-lavoro
     // (measure_command_exit non fa parte del trait CriteriaRunner).
-    let criteria_adapter =
-        Arc::new(FinalGateCriteriaRunnerAdapter::new(tools.clone(), run_db.clone()));
+    let criteria_adapter = Arc::new(FinalGateCriteriaRunnerAdapter::new(
+        tools.clone(),
+        run_db.clone(),
+    ));
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
     // ── Config dei nodi (DB-driven, regola G piena) ──────────────────────────
@@ -1393,7 +1839,10 @@ async fn build_native_engine(
             // misurabile resta senza baseline -> fail-closed come prima.
             if !role.is_shadow() {
                 let mut measured = false;
-                for s in steps.iter_mut().filter(|s| s.gate && s.baseline_exit_code.is_none()) {
+                for s in steps
+                    .iter_mut()
+                    .filter(|s| s.gate && s.baseline_exit_code.is_none())
+                {
                     if let Some(exit) = criteria_adapter
                         .measure_command_exit(&s.command, s.working_dir.as_deref())
                         .await
@@ -1433,11 +1882,17 @@ async fn build_native_engine(
 
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
+        fs_mutator_tools: routing_cfg.fs_mutator_tools.clone(),
         ..ToolDispatchConfig::default()
     };
 
     let reflection_cfg = ReflectionConfig {
-        enabled: setting_bool(&db, "reflection_enabled", ReflectionConfig::default().enabled).await,
+        enabled: setting_bool(
+            &db,
+            "reflection_enabled",
+            ReflectionConfig::default().enabled,
+        )
+        .await,
         provider: reflection_provider,
         model: reflection_model,
         ..ReflectionConfig::default()
@@ -1548,6 +2003,10 @@ async fn build_native_engine(
         // DB-driven del gate anti-oscillazione arrivano al nodo via extra (trasportate
         // dal detector che possiede `ExecutorConfig.scale`, FIX-B), non via costruttore.
         scale_control: Arc::new(ScaleControlNode::new(reasoner.clone())),
+        supervisor: Arc::new(SupervisorNode::new(
+            reasoner.clone(),
+            load_supervisor_config(&db).await,
+        )),
         verifier: Arc::new(VerifierNode::new(
             verifier_cfg,
             final_gate_cfg.clone(),
@@ -1580,7 +2039,14 @@ async fn build_native_engine(
             Arc::new(nexus_agent_graph::PgCheckpointer::new(run_db.clone()))
         };
 
-    let engine = build_agent_graph(nodes, routing_cfg.clone(), planner_cfg, checkpointer);
+    let supervisor_cfg = load_supervisor_config(&db).await;
+    let engine = build_agent_graph(
+        nodes,
+        routing_cfg.clone(),
+        planner_cfg,
+        supervisor_cfg,
+        checkpointer,
+    );
     Ok((engine, routing_cfg, llm, tools, emit, isolation_available))
 }
 
@@ -1777,7 +2243,9 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
             match intent_hint {
                 Some(intent) => (
                     Some(intent.to_string()),
-                    Some(nexus_agent_graph::decisions::action_oriented_for_intent(intent)),
+                    Some(nexus_agent_graph::decisions::action_oriented_for_intent(
+                        intent,
+                    )),
                 ),
                 None => (None, None),
             }
@@ -1811,6 +2279,40 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         None
     };
 
+    let mut extra = serde_json::Map::new();
+    let mut declared_outcome = None;
+    let mut stop_reason = None;
+    let mut result = None;
+    if let Some(synthesis) = &input.pre_run_advisory_synthesis {
+        extra.insert(
+            nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY.to_string(),
+            synthesis.clone(),
+        );
+        let source = input
+            .pre_run_advisory_source
+            .unwrap_or("advisory_synthesis");
+        if let Some(enforcement) =
+            nexus_agent_graph::nodes::panel_enforcement_from_advisory_synthesis(synthesis, source)
+        {
+            let terminal = enforcement
+                .get("terminal")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            extra.insert(
+                nexus_agent_graph::nodes::PANEL_ENFORCEMENT_KEY.to_string(),
+                enforcement.clone(),
+            );
+            if terminal {
+                declared_outcome = enforcement.get("declared_outcome").cloned();
+                stop_reason = Some(nexus_agent_graph::state::StopReason::EndTurn);
+                result = enforcement
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+    }
+
     AgentState {
         messages,
         thread_id: Some(input.run_id.to_string()),
@@ -1824,6 +2326,11 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         model_override: Some(input.model.clone()),
         tools_json: tools,
         automation_mode: parse_automation_mode(&input.automation_mode),
+        supervisor_mode: Some(input.supervisor_mode),
+        declared_outcome,
+        stop_reason,
+        result,
+        extra,
         // DEBITO 1 chiuso (TODO Fase 5): `behavior_mode` valorizzato con la STESSA
         // fonte del primario Python, il quale lo riceve dal payload
         // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
@@ -1859,7 +2366,10 @@ fn parse_automation_mode(s: &str) -> Option<nexus_agent_graph::AutomationMode> {
 /// `init` distingue nuovo run (Some) da resume (None, riparte dal checkpoint).
 /// Per il path primario `shadow=false` (`ExecMode::Real`): i tool hanno
 /// side-effect reali sul progetto.
-pub async fn run_native(deps: &NativeDeps, input: &NativeRunInput) -> anyhow::Result<NativeRunOutcome> {
+pub async fn run_native(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+) -> anyhow::Result<NativeRunOutcome> {
     let outcome = run_engine(deps, input, RunMode::New, RunRole::Primary).await?;
     Ok(map_outcome(outcome))
 }
@@ -1885,7 +2395,13 @@ pub async fn resume_native(
     resume_message: &str,
 ) -> anyhow::Result<NativeRunOutcome> {
     let resume_delta = build_resume_delta(resume_message);
-    let outcome = run_engine(deps, input, RunMode::Resume { resume_delta }, RunRole::Primary).await?;
+    let outcome = run_engine(
+        deps,
+        input,
+        RunMode::Resume { resume_delta },
+        RunRole::Primary,
+    )
+    .await?;
     Ok(map_outcome(outcome))
 }
 
@@ -1899,6 +2415,8 @@ fn build_resume_delta(resume_message: &str) -> nexus_graph::StateDelta {
         // Azzera il predicato di interrupt: senza, il motore si re-interrompe sul
         // checkpoint ancora-in-attesa (loop di conferma).
         awaiting_confirmation: Some(Some(false)),
+        // Dopo l'approvazione esegui i tool mutativi senza re-interrompere.
+        approved: Some(Some(true)),
         // Accoda l'approvazione come turno utente: l'executor la rilegge nel
         // contesto come ultimo messaggio (parita' col `resume_message` iniettato
         // dal brain nello state al `/agent/approve`).
@@ -1998,7 +2516,13 @@ pub async fn resume_native_fanin(
     subagent_results: Vec<Value>,
 ) -> anyhow::Result<NativeRunOutcome> {
     let resume_delta = build_resume_delta_subagents(subagent_results);
-    let outcome = run_engine(deps, input, RunMode::Resume { resume_delta }, RunRole::Primary).await?;
+    let outcome = run_engine(
+        deps,
+        input,
+        RunMode::Resume { resume_delta },
+        RunRole::Primary,
+    )
+    .await?;
     Ok(map_outcome(outcome))
 }
 
@@ -2098,12 +2622,11 @@ async fn run_engine(
             // migrati al DB progetto), risolto col PUNTO UNICO per-sessione.
             // Fail-open: guasto DB -> conteggio 0 (asse mai attivo, invariato).
             if !role.is_shadow() {
-                let run_db =
-                    crate::project_db_routes::project_data_pool_by_session_from(
-                        &deps.db,
-                        input.session_id,
-                    )
-                    .await;
+                let run_db = crate::project_db_routes::project_data_pool_by_session_from(
+                    &deps.db,
+                    input.session_id,
+                )
+                .await;
                 let clarify_history = PgClarifyHistoryStore::new(run_db);
                 let (sig, repeat_count) = clarify_history
                     .latest_signature_and_repeat_count(input.session_id)
@@ -2160,10 +2683,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         total_tokens: state.total_tokens.unwrap_or(0),
         total_cost: state.total_cost_usd.unwrap_or(0.0),
         user_intent: state.user_intent.clone(),
-        reasoning: state
-            .reasoning_acc
-            .clone()
-            .filter(|s| !s.trim().is_empty()),
+        reasoning: state.reasoning_acc.clone().filter(|s| !s.trim().is_empty()),
         // Conversazione finale serializzata per agent_runs.messages_json (resume +
         // trace panel). `Message` serializza in `{role, content, [tool_calls|
         // tool_call_id]}`, la forma attesa dal resume. Conversazione vuota o
@@ -2190,6 +2710,12 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         // in plan-phase il gate e' one-shot e un ciclo residuo e' legittimo.
         final_gate_failed_pending: state.final_gate_cycle.unwrap_or(0) > 0
             && !state.plan_phase_active.unwrap_or(false),
+        pending_actions: state
+            .extra
+            .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
     }
 }
 
@@ -2237,7 +2763,11 @@ fn canonical_stop_reason(raw: Option<&str>) -> &'static str {
         None => "none",
         Some(s) => match s.as_str() {
             // Vocabolario comune diretto.
-            "end_turn" | "endturn" | "stop" | "completed" | "completed_verified"
+            "end_turn"
+            | "endturn"
+            | "stop"
+            | "completed"
+            | "completed_verified"
             | "completed_unverified" => "end_turn",
             "tool_use" | "tooluse" => "tool_use",
             "error" | "failed" | "failed_diagnosed" => "failed",
@@ -2306,7 +2836,12 @@ fn shadow_canonical(state: &AgentState, completed: bool) -> Value {
     };
 
     for m in &state.messages {
-        if let Message::Ai { content, tool_calls, .. } = m {
+        if let Message::Ai {
+            content,
+            tool_calls,
+            ..
+        } = m
+        {
             // Forma OpenAI-compat: tool_calls fuori dal contenuto.
             for tc in tool_calls {
                 note_tool(&tc.name);
@@ -2343,11 +2878,10 @@ fn shadow_canonical(state: &AgentState, completed: bool) -> Value {
 async fn primary_canonical(db: &PgPool, primary_run_id: Uuid) -> anyhow::Result<Value> {
     // status e' TEXT NOT NULL (mig 0009): fetch_optional -> Option<String> (None
     // solo se il run non esiste, caso anomalo nel flusso shadow).
-    let status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
-            .bind(primary_run_id)
-            .fetch_optional(db)
-            .await?;
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+        .bind(primary_run_id)
+        .fetch_optional(db)
+        .await?;
 
     let tool_names: Vec<String> =
         sqlx::query_scalar("SELECT tool_name FROM agent_steps WHERE run_id = $1")
@@ -2491,12 +3025,15 @@ mod tests {
             classifier_resolved: false,
             action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
             automation_mode: "automatic".to_string(),
+            supervisor_mode: SupervisorMode::None,
             step_tx: tx,
             // Run principale di test: nessun annidamento sub-agente.
             parent_run_id: None,
             subagent_depth: None,
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,
+            pre_run_advisory_synthesis: None,
+            pre_run_advisory_source: None,
         }
     }
 
@@ -2504,8 +3041,6 @@ mod tests {
     fn initial_state_da_prompt_history_e_override() {
         let input = sample_input();
         let state = build_initial_state(&input, RunRole::Primary);
-
-        // History pregressa convertita (lc_serde) + messaggio del turno in coda.
         assert_eq!(state.messages.len(), 2, "history (1) + turno corrente (1)");
         // L'ULTIMO messaggio e' il prompt utente del turno.
         match state.messages.last().expect("almeno un messaggio") {
@@ -2547,6 +3082,32 @@ mod tests {
         assert_eq!(
             state.user_intent, None,
             "primario: user_intent non forzato (decide il RouterNode)"
+        );
+    }
+
+    #[test]
+    fn initial_state_seeda_pre_run_advisory_synthesis() {
+        let mut input = sample_input();
+        input.pre_run_advisory_synthesis = Some(serde_json::json!({
+            "verdict": "proceed_with_changes",
+            "requirements": ["punto unico routing"],
+        }));
+        input.pre_run_advisory_source = Some("multi_provider_synthesis");
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert!(state
+            .extra
+            .contains_key(nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY));
+        let enforcement = state
+            .extra
+            .get(nexus_agent_graph::nodes::PANEL_ENFORCEMENT_KEY)
+            .expect("panel enforcement");
+        assert_eq!(
+            enforcement.get("source").and_then(serde_json::Value::as_str),
+            Some("multi_provider_synthesis")
+        );
+        assert_eq!(
+            enforcement.get("verdict").and_then(serde_json::Value::as_str),
+            Some("proceed_with_changes")
         );
     }
 
@@ -2689,7 +3250,11 @@ mod tests {
         input.action_oriented_min_score = 0.5;
         let primary_run_id = Uuid::new_v4();
         let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.action_oriented, Some(true), "score 0.80 >= 0.5 -> azione");
+        assert_eq!(
+            state.action_oriented,
+            Some(true),
+            "score 0.80 >= 0.5 -> azione"
+        );
     }
 
     // ── Parita' PRIMARIO RUST: deriva action_oriented dal classifier come Python ─
@@ -2917,10 +3482,10 @@ mod tests {
         assert!(supports, "anthropic_any deve supportare il forcing");
 
         let force_now = should_force_tool_choice(
-            true,                        // tools_available
-            turn_action_oriented(None),  // action_oriented (None -> true conservativo)
-            1,                           // iteration <= max
-            false,                       // in_discovery_phase
+            true,                       // tools_available
+            turn_action_oriented(None), // action_oriented (None -> true conservativo)
+            1,                          // iteration <= max
+            false,                      // in_discovery_phase
             supports,
             cfg.tool_choice_forcing_enabled,
             cfg.tool_choice_forcing_max_iteration,
@@ -2958,7 +3523,10 @@ mod tests {
             cfg.tool_choice_forcing_enabled,
             cfg.tool_choice_forcing_max_iteration,
         );
-        assert!(!force_now, "con style None il force-action e' inerte (il bug)");
+        assert!(
+            !force_now,
+            "con style None il force-action e' inerte (il bug)"
+        );
     }
 
     #[test]
@@ -2981,7 +3549,11 @@ mod tests {
             "il delta deve azzerare awaiting_confirmation (sblocca l'interrupt)"
         );
         // Il messaggio di approvazione e' ACCODATO (reducer append su messages).
-        assert_eq!(state.messages.len(), 2, "messaggio di approvazione accodato");
+        assert_eq!(
+            state.messages.len(),
+            2,
+            "messaggio di approvazione accodato"
+        );
         match state.messages.last() {
             Some(Message::Human { content }) => {
                 let txt = serde_json::to_string(content).unwrap_or_default();
@@ -3060,7 +3632,10 @@ mod tests {
         // nessun array JSON spurio.
         let msg = format_fanin_results_message(&[]);
         assert!(msg.contains("terminati"), "nota di completamento: {msg}");
-        assert!(!msg.contains("array JSON"), "niente blocco JSON quando vuoto: {msg}");
+        assert!(
+            !msg.contains("array JSON"),
+            "niente blocco JSON quando vuoto: {msg}"
+        );
     }
 
     #[test]
@@ -3075,7 +3650,11 @@ mod tests {
             "outcome": {"verdict": "completed_verified"},
         })];
         let msg = format_fanin_results_message(&results);
-        assert!(msg.contains("[troncato]"), "summary enorme troncato: {}", &msg[..80.min(msg.len())]);
+        assert!(
+            msg.contains("[troncato]"),
+            "summary enorme troncato: {}",
+            &msg[..80.min(msg.len())]
+        );
         assert!(msg.contains("completed_verified"), "outcome integro");
         // Il testo non deve contenere l'intero summary enorme non troncato.
         assert!(
@@ -3124,8 +3703,14 @@ mod tests {
     fn canonical_stop_reason_mappa_vocabolario_comune() {
         // Python (status agent_runs) -> vocabolario comune.
         assert_eq!(canonical_stop_reason(Some("completed")), "end_turn");
-        assert_eq!(canonical_stop_reason(Some("completed_verified")), "end_turn");
-        assert_eq!(canonical_stop_reason(Some("completed_unverified")), "end_turn");
+        assert_eq!(
+            canonical_stop_reason(Some("completed_verified")),
+            "end_turn"
+        );
+        assert_eq!(
+            canonical_stop_reason(Some("completed_unverified")),
+            "end_turn"
+        );
         assert_eq!(canonical_stop_reason(Some("failed")), "failed");
         assert_eq!(canonical_stop_reason(Some("failed_diagnosed")), "failed");
         assert_eq!(
@@ -3351,7 +3936,10 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["has_produced_work".to_string(), "num_tool_calls".to_string()]
+            vec![
+                "has_produced_work".to_string(),
+                "num_tool_calls".to_string()
+            ]
         );
     }
 
@@ -3384,7 +3972,12 @@ mod tests {
         // di produzione (plan_phase_enabled=true abilita il planner).
         create_settings_table(&pool).await;
         set_setting(&pool, "orchestrator.plan_phase_enabled", "true").await;
-        set_setting(&pool, "orchestrator.plan_behavior_modes", "bilanciata,approfondita").await;
+        set_setting(
+            &pool,
+            "orchestrator.plan_behavior_modes",
+            "bilanciata,approfondita",
+        )
+        .await;
         set_setting(&pool, "orchestrator.plan_intents", "code,fix,debug").await;
         set_setting(&pool, "orchestrator.plan_min_token_budget", "800").await;
         set_setting(&pool, "orchestrator.clarifying_questions_enabled", "false").await;
@@ -3395,14 +3988,21 @@ mod tests {
         assert_eq!(cfg.plan_behavior_modes, vec!["bilanciata", "approfondita"]);
         assert_eq!(cfg.plan_intents, vec!["code", "fix", "debug"]);
         assert_eq!(cfg.plan_min_token_budget, 800);
-        assert!(!cfg.clarifying_questions_enabled, "false dal DB sovrascrive il default true");
+        assert!(
+            !cfg.clarifying_questions_enabled,
+            "false dal DB sovrascrive il default true"
+        );
         assert!(cfg.dag_topological_enabled);
 
         // Con plan_phase_enabled=true e behavior_mode "bilanciata" (fonte primario,
         // DEBITO 1) in plan_behavior_modes + un intent in plan_intents + budget
         // sufficiente, il planner Rust e' eleggibile (accoppiamento debito 1+2).
         assert!(
-            cfg.is_eligible(Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE), Some("code"), 1000),
+            cfg.is_eligible(
+                Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE),
+                Some("code"),
+                1000
+            ),
             "planner eleggibile col behavior_mode del primario + intent + budget"
         );
     }
@@ -3418,10 +4018,20 @@ mod tests {
         // dal DB; + degrado in blocco al default per un CSV malformato (max_chars).
         create_settings_table(&pool).await;
         set_setting(&pool, "agent.context.compress_start_iter", "3").await;
-        set_setting(&pool, "agent.context.compress_phase_boundaries", "3,7,15,30").await;
+        set_setting(
+            &pool,
+            "agent.context.compress_phase_boundaries",
+            "3,7,15,30",
+        )
+        .await;
         set_setting(&pool, "agent.context.compress_phase_keep_recent", "5,3,2,1").await;
         // CSV malformato di proposito: deve degradare IN BLOCCO al default safe.
-        set_setting(&pool, "agent.context.compress_phase_max_chars", "1200,xxx,300,100").await;
+        set_setting(
+            &pool,
+            "agent.context.compress_phase_max_chars",
+            "1200,xxx,300,100",
+        )
+        .await;
         set_setting(&pool, "agent.context.max_context_ratio", "0.55").await;
         set_setting(&pool, "agent.context.forced_rag_threshold_ratio", "0.30").await;
 
@@ -3433,7 +4043,10 @@ mod tests {
         assert_eq!(cfg.ctx_mgmt.compress_phase_boundaries, vec![3, 7, 15, 30]);
         assert_eq!(cfg.ctx_mgmt.compress_phase_keep_recent, vec![5, 3, 2, 1]);
         // CSV malformato -> degrado IN BLOCCO al default del nodo (non lista parziale).
-        assert_eq!(cfg.ctx_mgmt.compress_phase_max_chars, vec![2000, 1000, 500, 150]);
+        assert_eq!(
+            cfg.ctx_mgmt.compress_phase_max_chars,
+            vec![2000, 1000, 500, 150]
+        );
         // token_brake dal DB (0.55 < 0.70 default).
         assert!((cfg.token_brake.max_context_ratio - 0.55).abs() < 1e-9);
         assert!((cfg.forced_rag_ratio - 0.30).abs() < 1e-9);
@@ -3535,12 +4148,24 @@ mod tests {
         create_settings_table(&pool).await;
 
         let planner = load_planner_config(&pool).await;
-        assert!(!planner.plan_phase_enabled, "safe-default: planner OFF se chiave assente");
-        assert_eq!(planner.plan_min_token_budget, PlannerConfig::default().plan_min_token_budget);
+        assert!(
+            !planner.plan_phase_enabled,
+            "safe-default: planner OFF se chiave assente"
+        );
+        assert_eq!(
+            planner.plan_min_token_budget,
+            PlannerConfig::default().plan_min_token_budget
+        );
 
         let verifier = load_verifier_config(&pool).await;
-        assert!(!verifier.enabled, "safe-default: verifier OFF se chiave assente");
-        assert_eq!(verifier.max_verify_cycles, VerifierConfig::default().max_verify_cycles);
+        assert!(
+            !verifier.enabled,
+            "safe-default: verifier OFF se chiave assente"
+        );
+        assert_eq!(
+            verifier.max_verify_cycles,
+            VerifierConfig::default().max_verify_cycles
+        );
 
         let final_gate = load_final_gate_config(&pool).await;
         assert_eq!(final_gate.enabled, FinalGateConfig::default().enabled);
@@ -3558,7 +4183,10 @@ mod tests {
         let cfg = load_verifier_config(&pool).await;
         assert!(cfg.enabled, "verifier_enabled=true dal DB");
         assert_eq!(cfg.max_verify_cycles, 5);
-        assert!(!cfg.fail_closed, "fail_closed=false dal DB sovrascrive il default true");
+        assert!(
+            !cfg.fail_closed,
+            "fail_closed=false dal DB sovrascrive il default true"
+        );
     }
 
     #[sqlx::test]
@@ -3585,7 +4213,10 @@ mod tests {
         assert!((cfg.no_orphan_min_ratio - 0.7).abs() < f64::EPSILON);
         assert_eq!(cfg.import_staging_dirs, vec!["figma_export", "staging"]);
         assert!((cfg.criteria_timeout_s - 45.0).abs() < f64::EPSILON);
-        assert_eq!(cfg.runtime_error_patterns, vec!["ECONNREFUSED", "Traceback"]);
+        assert_eq!(
+            cfg.runtime_error_patterns,
+            vec!["ECONNREFUSED", "Traceback"]
+        );
         // log_command / endpoint_criterion sono risolti per-progetto a monte:
         // restano vuoto/None dal loader. La catena comandi (ADR 0036) NON e'
         // del loader: verify_steps/verify_profile_missing sono innestati da
@@ -3628,6 +4259,7 @@ mod tests {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            pending_actions: Vec::new(),
         }
     }
 
@@ -3768,7 +4400,10 @@ mod tests {
         };
         let vr = reviewer.structured_verdict();
         assert_eq!(vr["review"]["verdict"], serde_json::json!("needs_changes"));
-        assert_eq!(vr["review"]["findings"][0]["file"], serde_json::json!("a.rs"));
+        assert_eq!(
+            vr["review"]["findings"][0]["file"],
+            serde_json::json!("a.rs")
+        );
 
         // Consiglio a monte: il parere della FIGURA attraversa il confine dentro il
         // blocco (campo `advisory`), indipendente dallo status lifecycle.
@@ -3782,7 +4417,10 @@ mod tests {
         };
         let vf = figure.structured_verdict();
         assert_eq!(vf["advisory"]["verdict"], serde_json::json!("block"));
-        assert_eq!(vf["advisory"]["risks"][0]["severity"], serde_json::json!("alta"));
+        assert_eq!(
+            vf["advisory"]["risks"][0]["severity"],
+            serde_json::json!("alta")
+        );
 
         // Gate fallito + dichiarazione "done" ottimista: il verdetto oggettivo
         // prevale (failed_diagnosed) e l'error_class strutturata viaggia col blocco.

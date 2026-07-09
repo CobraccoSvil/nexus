@@ -112,15 +112,18 @@ pub(crate) fn build_remediation_content(
 pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) {
     // Solo regole con auto_remediate=true nel catalogo (le altre restano
     // visibili nel pannello, azionabili a mano col pulsante chat).
-    let enabled_flag = crate::settings::get_setting(
-        &state.db,
-        "agent.resource_violation.auto_remediate",
-    )
-    .await
-    .ok()
-    .flatten()
-    .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "off" | "no"))
-    .unwrap_or(true);
+    let enabled_flag =
+        crate::settings::get_setting(&state.db, "agent.resource_violation.auto_remediate")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| {
+                !matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "false" | "0" | "off" | "no"
+                )
+            })
+            .unwrap_or(true);
 
     let cooldown_s: i64 = crate::settings::get_setting(
         &state.db,
@@ -131,15 +134,13 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     .flatten()
     .and_then(|v| v.trim().parse().ok())
     .unwrap_or(900);
-    let max_per_hour: i64 = crate::settings::get_setting(
-        &state.db,
-        "agent.resource_violation.remediate_max_per_hour",
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|v| v.trim().parse().ok())
-    .unwrap_or(3);
+    let max_per_hour: i64 =
+        crate::settings::get_setting(&state.db, "agent.resource_violation.remediate_max_per_hour")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3);
     let max_attempts: i64 = crate::settings::get_setting(
         &state.db,
         "agent.resource_violation.max_attempts_per_signature",
@@ -152,9 +153,8 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
 
     // Violazioni aperte, escluse quelle in cooldown e quelle di regole non
     // auto-riparabili (join col catalogo: metric = 'kind/rule').
-    let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT d.id, d.file_path, d.detail, d.error_signature_hash \
+    let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT d.id, d.file_path, d.detail, d.error_signature_hash \
                FROM service_diagnoses d \
                JOIN nexus_resource_policies p \
                  ON p.resource_kind = split_part(d.metric, '/', 1) \
@@ -167,11 +167,11 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
                 AND d.file_path IS NOT NULL AND d.file_path <> '-' AND d.file_path <> '' \
               ORDER BY d.ts ASC \
               LIMIT 20",
-        )
-        .bind(project_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
     if rows.is_empty() {
         return;
     }
@@ -281,8 +281,7 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         );
         return;
     }
-    let bucket_start =
-        crate::project_workspace::services::project_bucket_start(&project_id);
+    let bucket_start = crate::project_workspace::services::project_bucket_start(&project_id);
     let bucket_end =
         bucket_start + crate::project_workspace::services::PROJECT_PORT_BUCKET_SIZE - 1;
     let allocations: Vec<(i32, String)> = sqlx::query_as(
@@ -390,7 +389,8 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
                 // Separazione DB: agent_runs e' migrata -> pool del progetto
                 // (project_id in scope; a flag OFF ritorna il meta-DB).
                 let runs_pool =
-                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id).await;
+                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id)
+                        .await;
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let status: Option<String> =
@@ -433,8 +433,7 @@ async fn close_after_remediation(state: &AppState, project_id: Uuid, run_id: Uui
         return;
     };
     let allocated =
-        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id)
-            .await;
+        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id).await;
     let root_path = std::path::PathBuf::from(&root);
     let alloc_clone = allocated.clone();
     let findings = tokio::task::spawn_blocking(move || {
@@ -462,12 +461,10 @@ async fn close_after_remediation(state: &AppState, project_id: Uuid, run_id: Uui
                 && (f.port as f64 - value).abs() < f64::EPSILON
         });
         if still_dirty {
-            let _ = sqlx::query(
-                "UPDATE service_diagnoses SET status = 'open' WHERE id = $1",
-            )
-            .bind(diag_id)
-            .execute(&state.db)
-            .await;
+            let _ = sqlx::query("UPDATE service_diagnoses SET status = 'open' WHERE id = $1")
+                .bind(diag_id)
+                .execute(&state.db)
+                .await;
         } else {
             let _ = sqlx::query(
                 "UPDATE service_diagnoses SET status = 'resolved', resolved_at = NOW() WHERE id = $1",
@@ -480,11 +477,7 @@ async fn close_after_remediation(state: &AppState, project_id: Uuid, run_id: Uui
 }
 
 /// Marca le violazioni come `failed_remediation` (terminale) + notifica + audit.
-async fn mark_failed_remediation(
-    state: &AppState,
-    project_id: Uuid,
-    violations: &[ViolationRow],
-) {
+async fn mark_failed_remediation(state: &AppState, project_id: Uuid, violations: &[ViolationRow]) {
     let ids: Vec<Uuid> = violations.iter().map(|v| v.id).collect();
     let updated = sqlx::query(
         "UPDATE service_diagnoses SET status = 'failed_remediation' \
@@ -536,7 +529,9 @@ mod tests {
     fn solo_violazioni_con_sorgente_sono_riparabili_by_edit() {
         // Violazione con sorgente reale (porta hardcoded in un file): riparabile.
         assert!(violation_is_remediable_by_edit(Some("vite.config.ts")));
-        assert!(violation_is_remediable_by_edit(Some("playwright.config.ts")));
+        assert!(violation_is_remediable_by_edit(Some(
+            "playwright.config.ts"
+        )));
         // Violazioni RUNTIME (kill del port_enforcer): nessun file -> NON riparabili
         // by-edit (causa radice del loop di remediation che bruciava provider).
         assert!(!violation_is_remediable_by_edit(Some("-")));
@@ -581,12 +576,7 @@ mod tests {
 
     #[test]
     fn build_content_senza_allocazioni() {
-        let out = build_remediation_content(
-            "{allocated_ports}",
-            &[],
-            (20000, 20049),
-            &[],
-        );
+        let out = build_remediation_content("{allocated_ports}", &[], (20000, 20049), &[]);
         assert!(out.contains("request_port"));
     }
 }

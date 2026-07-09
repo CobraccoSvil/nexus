@@ -36,5 +36,6 @@ Questo documento mappa il ciclo di contribuzione (study -> confirm -> automatic)
 | Emoji              | Vietate in file, commit, changelog, report                 |
 | `unwrap`/`expect`  | Solo in `#[cfg(test)]` o `tests/`                          |
 | Log sensibili      | Niente `payload`, `prompt`, `response` in chiaro           |
+| TypeScript compiler | Package `typescript` (never npm `tsc`); use `pnpm run typecheck` or `pnpm exec tsc` from repo root |
 | TS `any`           | `@typescript-eslint/no-explicit-any` = error               |
 | Python             | `ruff` + `mypy --strict` in `brain/`                       |

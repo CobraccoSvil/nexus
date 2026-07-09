@@ -145,12 +145,14 @@ pub async fn draft_plugin_integration(
     let cfg = build_mcp_config(&body)?;
 
     let stdio_timeout = mcp_client::resolve_stdio_timeout(&state.db).await;
-    let tools = mcp_client::list_tools(&cfg, stdio_timeout).await.map_err(|e| {
-        api_error(
-            StatusCode::BAD_GATEWAY,
-            format!("Tool discovery fallito: {e}"),
-        )
-    })?;
+    let tools = mcp_client::list_tools(&cfg, stdio_timeout)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Tool discovery fallito: {e}"),
+            )
+        })?;
 
     let discovered_tools = tools
         .iter()

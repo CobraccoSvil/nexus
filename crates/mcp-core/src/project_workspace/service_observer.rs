@@ -98,6 +98,8 @@ struct UnitState {
     /// Istante in cui e' stato osservato l'avvio corrente (per il grace period
     /// readiness, in-memory: niente parsing del timestamp systemd).
     run_seen_at: Option<Instant>,
+    /// Ultimo `active_state` emesso via ServiceStatusChanged (dedup SSE).
+    prev_reported_active: Option<String>,
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -342,13 +344,13 @@ async fn windows_visible_service_rows(
 /// Riga service di `agent_processes` (proiezione usata dal collector Windows).
 #[cfg(windows)]
 type WindowsServiceRow = (
-    String,                          // label
-    String,                          // status
-    chrono::DateTime<chrono::Utc>,   // created_at
-    Option<i32>,                     // pid
-    Option<i32>,                     // exit_code
-    String,                          // output (stdout)
-    String,                          // error_output (stderr)
+    String,                                // label
+    String,                                // status
+    chrono::DateTime<chrono::Utc>,         // created_at
+    Option<i32>,                           // pid
+    Option<i32>,                           // exit_code
+    String,                                // output (stdout)
+    String,                                // error_output (stderr)
     Option<chrono::DateTime<chrono::Utc>>, // started_at
 );
 
@@ -610,16 +612,18 @@ async fn unit_env_ports(unit: &str) -> Vec<u16> {
 /// unico del ciclo di vita dei crash strutturali: quando il servizio e' di nuovo
 /// healthy (porta in ascolto / non failed) il problema sparisce dal pannello,
 /// simmetrico a `resolve_stale_anomalies` per le anomalie.
-async fn resolve_open_crashes(db: &PgPool, project_id: Uuid, unit: &str) {
-    let _ = sqlx::query(
+async fn resolve_open_crashes(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<Uuid> {
+    sqlx::query_scalar(
         "UPDATE service_diagnoses SET status = 'resolved', resolved_at = NOW() \
          WHERE project_id = $1 AND unit = $2 AND signal_kind = 'crash' \
-           AND status IN ('open', 'diagnosing')",
+           AND status IN ('open', 'diagnosing') \
+         RETURNING id",
     )
     .bind(project_id)
     .bind(unit)
-    .execute(db)
-    .await;
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
 }
 
 /// PUNTO UNICO (regola L) del criterio "riga-error" per l'error-rate: conta le
@@ -781,7 +785,12 @@ fn evaluate_anomalies(
     }
     if let Some(cpu) = cpu_pct {
         if cpu > cfg.cpu_pct_threshold {
-            out.push(AnomalySignal::new("cpu", cpu, cfg.cpu_pct_threshold, "warning"));
+            out.push(AnomalySignal::new(
+                "cpu",
+                cpu,
+                cfg.cpu_pct_threshold,
+                "warning",
+            ));
         }
     }
     if cfg.rss_bytes_threshold > 0 && rss_bytes > cfg.rss_bytes_threshold {
@@ -942,21 +951,23 @@ async fn resolve_stale_anomalies(
     project_id: Uuid,
     unit: &str,
     active_metrics: &[String],
-) {
-    let _ = sqlx::query(
+) -> Vec<Uuid> {
+    sqlx::query_scalar(
         r#"UPDATE service_diagnoses
            SET status = 'resolved', resolved_at = NOW()
            WHERE project_id = $1
              AND unit = $2
              AND signal_kind = 'anomaly'
              AND status IN ('open', 'diagnosing')
-             AND metric <> ALL($3)"#,
+             AND metric <> ALL($3)
+           RETURNING id"#,
     )
     .bind(project_id)
     .bind(unit)
     .bind(active_metrics)
-    .execute(db)
-    .await;
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
 }
 
 /// Chiude le anomalie aperte di un progetto le cui `unit` NON sono piu' tra i
@@ -973,19 +984,21 @@ async fn resolve_anomalies_for_absent_units(
     db: &PgPool,
     project_id: Uuid,
     observed_units: &[String],
-) {
-    let _ = sqlx::query(
+) -> Vec<Uuid> {
+    sqlx::query_scalar(
         r#"UPDATE service_diagnoses
            SET status = 'resolved', resolved_at = NOW()
            WHERE project_id = $1
              AND signal_kind = 'anomaly'
              AND status IN ('open', 'diagnosing')
-             AND unit <> ALL($2)"#,
+             AND unit <> ALL($2)
+           RETURNING id"#,
     )
     .bind(project_id)
     .bind(observed_units)
-    .execute(db)
-    .await;
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
 }
 
 /// Chiude le anomalie il cui `updated_at` e' piu' vecchio di `max_age_seconds`:
@@ -996,20 +1009,43 @@ async fn resolve_anomalies_for_absent_units(
 /// tempo. Gira solo mentre l'observer e' attivo, quindi le anomalie REALI hanno
 /// `updated_at` fresco (UPSERT ogni `interval_s`) e non vengono mai toccate.
 /// 0 = disabilitato.
-async fn resolve_stale_anomalies_by_age(db: &PgPool, max_age_seconds: i64) {
+async fn resolve_stale_anomalies_by_age(db: &PgPool, max_age_seconds: i64) -> Vec<(Uuid, Uuid)> {
     if max_age_seconds <= 0 {
-        return;
+        return Vec::new();
     }
-    let _ = sqlx::query(
+    sqlx::query_as::<_, (Uuid, Uuid)>(
         r#"UPDATE service_diagnoses
            SET status = 'resolved', resolved_at = NOW()
            WHERE signal_kind = 'anomaly'
              AND status IN ('open', 'diagnosing')
-             AND updated_at < NOW() - ($1::bigint * interval '1 second')"#,
+             AND updated_at < NOW() - ($1::bigint * interval '1 second')
+           RETURNING project_id, id"#,
     )
     .bind(max_age_seconds)
-    .execute(db)
-    .await;
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
+
+fn notify_problems_panel_refresh(project_id: Uuid, resolved_ids: Vec<Uuid>) {
+    if resolved_ids.is_empty() {
+        return;
+    }
+    crate::project_workspace::logs::emit_problems_panel_refresh(project_id, resolved_ids);
+}
+
+fn notify_problems_panel_refresh_batch(rows: &[(Uuid, Uuid)]) {
+    if rows.is_empty() {
+        return;
+    }
+    use std::collections::HashMap;
+    let mut by_project: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (project_id, id) in rows {
+        by_project.entry(*project_id).or_default().push(*id);
+    }
+    for (project_id, ids) in by_project {
+        notify_problems_panel_refresh(project_id, ids);
+    }
 }
 
 fn sig_hash(s: &str) -> String {
@@ -1202,7 +1238,9 @@ async fn handle_anomalies(
     // sul DB, non sullo stato in-memory). Senza questo le righe restavano 'open' a
     // vita nel pannello Problemi a servizio sano.
     let active_metrics: Vec<String> = st.active_anomalies.iter().cloned().collect();
-    resolve_stale_anomalies(&ctx.state.db, ctx.project_id, unit, &active_metrics).await;
+    let resolved =
+        resolve_stale_anomalies(&ctx.state.db, ctx.project_id, unit, &active_metrics).await;
+    notify_problems_panel_refresh(ctx.project_id, resolved);
 }
 
 /// Ingredienti per la registrazione di un problema strutturale, gia' calcolati.
@@ -1248,9 +1286,9 @@ fn build_structural_problem(
     let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
     let tail: String = tail.chars().take(600).collect();
     let initial_detail = match &cause_hint {
-        Some(hint) => format!(
-            "Servizio non operativo ({reason}). {hint}\n\nUltime righe di log:\n{tail}"
-        ),
+        Some(hint) => {
+            format!("Servizio non operativo ({reason}). {hint}\n\nUltime righe di log:\n{tail}")
+        }
         None => {
             format!("Servizio non operativo ({reason}). Ultime righe di log:\n{tail}")
         }
@@ -1291,11 +1329,7 @@ fn port_not_listening_hint(reason: &str, ports: &[u16]) -> Option<String> {
 /// LLM in background. Register-then-refine: il persist e' sincrono e non dipende
 /// dall'LLM; la diagnosi raffina il detail dopo, senza bloccare il ciclo. Estratto
 /// da `run_cycle` (comportamento invariato).
-async fn register_structural_problem(
-    ctx: &CycleCtx<'_>,
-    unit: &str,
-    problem: StructuralProblem,
-) {
+async fn register_structural_problem(ctx: &CycleCtx<'_>, unit: &str, problem: StructuralProblem) {
     let StructuralProblem {
         reason,
         sig,
@@ -1352,7 +1386,9 @@ async fn apply_run_reset(
         st.prev_active_enter = active_enter;
         st.run_seen_at = Some(Instant::now());
         st.last_crash_sig = None;
-        resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+        let resolved =
+            resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+        notify_problems_panel_refresh(ctx.project_id, resolved);
     }
     st.run_seen_at
         .map(|t| t.elapsed().as_secs() as i64 >= ctx.cfg.readiness_grace_seconds)
@@ -1407,7 +1443,9 @@ async fn detect_structural_failure(
         if grace_ok {
             // Servizio sano dopo il grace: chiude eventuali crash aperti (ciclo di
             // vita: quando viene riparato, il problema sparisce).
-            resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+            let resolved =
+                resolve_open_crashes(&ctx.state.db, ctx.project_id, unit).await;
+            notify_problems_panel_refresh(ctx.project_id, resolved);
             st.last_crash_sig = None;
         }
         return;
@@ -1524,6 +1562,19 @@ async fn process_sample(
     let key = format!("{}:{unit}", ctx.project_id);
     let st = states.entry(key).or_default();
 
+    if st.prev_reported_active.as_deref() != Some(active.as_str()) {
+        st.prev_reported_active = Some(active.clone());
+        nexus_events::dispatcher::emit_global(
+            ctx.project_id,
+            nexus_events::event::ProjectEvent::ServiceStatusChanged {
+                name: unit.clone(),
+                status: active.clone(),
+                port: None,
+                pid: pid.map(|p| p as i32),
+            },
+        );
+    }
+
     // ── Metriche (cap 4) ───────────────────────────────────────────────────
     let (cpu_pct, rss) = sample_process_metrics(ctx, st, &unit, pid);
 
@@ -1532,8 +1583,7 @@ async fn process_sample(
     let (error_per_min, log_text) = sample_error_rate(st, &unit, now_ts, &log_buffer).await;
 
     // ── Anomalie: emetti solo sulla transizione + auto-resolve ─────────────
-    let signals =
-        evaluate_anomalies(&active, cpu_pct, rss, restart_delta, error_per_min, ctx.cfg);
+    let signals = evaluate_anomalies(&active, cpu_pct, rss, restart_delta, error_per_min, ctx.cfg);
     handle_anomalies(ctx, st, &unit, &active, &signals).await;
 
     // ── Detection STRUTTURALE di servizio non funzionante (cap 1) ──────────
@@ -1577,7 +1627,13 @@ async fn run_cycle(
         // Le richiude qui perche' il resolve per-unit non le raggiunge mai.
         // Guard !is_empty(): non azzerare tutto su un errore di systemctl.
         if !observed_units.is_empty() {
-            resolve_anomalies_for_absent_units(&state.db, project_id, &observed_units).await;
+            let resolved = resolve_anomalies_for_absent_units(
+                &state.db,
+                project_id,
+                &observed_units,
+            )
+            .await;
+            notify_problems_panel_refresh(project_id, resolved);
         }
     }
 
@@ -1585,7 +1641,9 @@ async fn run_cycle(
     // e' troppo vecchio (servizio non piu' osservato per molti cicli: bus --user
     // cieco in WSL, unit rimosso, o non piu' anomalo). Non dipende da systemctl,
     // a differenza del sweep per-progetto qui sopra: usa solo il tempo.
-    resolve_stale_anomalies_by_age(&state.db, cfg.anomaly_stale_resolve_seconds).await;
+    let stale_resolved =
+        resolve_stale_anomalies_by_age(&state.db, cfg.anomaly_stale_resolve_seconds).await;
+    notify_problems_panel_refresh_batch(&stale_resolved);
 }
 
 #[cfg(test)]
@@ -1731,7 +1789,12 @@ mod tests {
         .expect("create unique partial index");
     }
 
-    async fn count_open_anomalies(pool: &PgPool, project_id: Uuid, unit: &str, metric: &str) -> i64 {
+    async fn count_open_anomalies(
+        pool: &PgPool,
+        project_id: Uuid,
+        unit: &str,
+        metric: &str,
+    ) -> i64 {
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM service_diagnoses \
              WHERE project_id=$1 AND unit=$2 AND metric=$3 \
@@ -1749,8 +1812,15 @@ mod tests {
     // incapsula la chiamata ripetuta di persist_diagnosis nel test dell'UPSERT.
     async fn open_error_rate(pool: &PgPool, project_id: Uuid, unit: &str, value: f64) -> Uuid {
         persist_diagnosis(
-            pool, project_id, unit, "anomaly", Some("error_rate"),
-            Some(value), Some(10.0), None, Some("active=active"),
+            pool,
+            project_id,
+            unit,
+            "anomaly",
+            Some("error_rate"),
+            Some(value),
+            Some(10.0),
+            None,
+            Some("active=active"),
         )
         .await
         .expect("persist error_rate")
@@ -1776,13 +1846,12 @@ mod tests {
             "una sola anomalia open per (unit, metric)"
         );
 
-        let (value, occ): (f64, i32) = sqlx::query_as(
-            "SELECT value, occurrences FROM service_diagnoses WHERE id=$1",
-        )
-        .bind(id1)
-        .fetch_one(&pool)
-        .await
-        .expect("riga canonica");
+        let (value, occ): (f64, i32) =
+            sqlx::query_as("SELECT value, occurrences FROM service_diagnoses WHERE id=$1")
+                .bind(id1)
+                .fetch_one(&pool)
+                .await
+                .expect("riga canonica");
         assert_eq!(value, 833.0, "value aggiornato all'ultimo tick");
         assert_eq!(occ, 3, "occurrences incrementato a ogni tick");
     }
@@ -1796,8 +1865,15 @@ mod tests {
         // Metrica diversa sulla stessa unit -> riga distinta (chiave diversa).
         open_error_rate(&pool, project_id, unit, 60.0).await;
         persist_diagnosis(
-            &pool, project_id, unit, "anomaly", Some("cpu"),
-            Some(95.0), Some(90.0), None, Some("active=active"),
+            &pool,
+            project_id,
+            unit,
+            "anomaly",
+            Some("cpu"),
+            Some(95.0),
+            Some(90.0),
+            None,
+            Some("active=active"),
         )
         .await
         .expect("anomalia cpu distinta");
@@ -1816,13 +1892,18 @@ mod tests {
 
         // Dopo resolve, un nuovo tick puo' riaprire (l'indice copre solo gli attivi).
         let id1 = open_error_rate(&pool, project_id, unit, 60.0).await;
-        sqlx::query("UPDATE service_diagnoses SET status='resolved', resolved_at=NOW() WHERE id=$1")
-            .bind(id1)
-            .execute(&pool)
-            .await
-            .expect("resolve manuale");
+        sqlx::query(
+            "UPDATE service_diagnoses SET status='resolved', resolved_at=NOW() WHERE id=$1",
+        )
+        .bind(id1)
+        .execute(&pool)
+        .await
+        .expect("resolve manuale");
         let id_riaperta = open_error_rate(&pool, project_id, unit, 500.0).await;
-        assert_ne!(id_riaperta, id1, "nuova riga dopo resolve (storico preservato)");
+        assert_ne!(
+            id_riaperta, id1,
+            "nuova riga dopo resolve (storico preservato)"
+        );
         assert_eq!(
             count_open_anomalies(&pool, project_id, unit, "error_rate").await,
             1,

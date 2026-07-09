@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useProjectStore, selectOperationalRefreshAt } from "../../lib/project-dispatcher";
 
 interface SecurityPanelProps {
   projectId: string;
@@ -56,6 +57,7 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState<string>("all");
   const [total, setTotal] = useState(0);
+  const operationalRefreshAt = useProjectStore(selectOperationalRefreshAt);
 
   const fetchAudit = useCallback(async () => {
     setLoading(true);
@@ -89,14 +91,9 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
   }, [projectId]);
 
   useEffect(() => {
-    fetchAudit();
-    fetchQuota();
-    const interval = setInterval(() => {
-      fetchAudit();
-      fetchQuota();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [fetchAudit, fetchQuota]);
+    void fetchAudit();
+    void fetchQuota();
+  }, [fetchAudit, fetchQuota, operationalRefreshAt]);
 
   const formatTime = (ts: string) => {
     try {

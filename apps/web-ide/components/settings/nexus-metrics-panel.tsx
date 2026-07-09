@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
-const POLL_INTERVAL_MS = 5000;
 
 interface PersistedTotals {
   pairs: number;
@@ -90,9 +90,8 @@ export function NexusMetricsPanel() {
   const [stats, setStats] = useState<NexusStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/nexus/stats`, { credentials: "include" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -104,15 +103,16 @@ export function NexusMetricsPanel() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchStats();
-    intervalRef.current = setInterval(fetchStats, POLL_INTERVAL_MS);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, []);
+    void fetchStats();
+  }, [fetchStats]);
+
+  const onHealthSnapshot = useCallback(() => {
+    void fetchStats();
+  }, [fetchStats]);
+  useHealthSnapshot(onHealthSnapshot);
 
   const r = stats?.router;
   const s = stats?.scheduler;
@@ -163,7 +163,7 @@ export function NexusMetricsPanel() {
         )}
       </div>
       <div style={{ color: tc.textMuted, fontSize: 12, marginBottom: 14 }}>
-        Snapshot in tempo reale del Q-Learning router. Aggiornato ogni {POLL_INTERVAL_MS / 1000}s.
+        Snapshot in tempo reale del Q-Learning router. Aggiornato via health-monitor condiviso (~5s).
       </div>
 
       {error ? (

@@ -848,7 +848,10 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
         let start = read_start_time(pid).unwrap_or(0);
         let ppid = read_ppid(pid).unwrap_or(0);
         let sig = dev_server_signature(&cmdline);
-        groups.entry(cwd_str).or_default().push((pid, start, ppid, sig));
+        groups
+            .entry(cwd_str)
+            .or_default()
+            .push((pid, start, ppid, sig));
     }
 
     let mut killed = 0u64;
@@ -1094,7 +1097,11 @@ mod tests {
     #[test]
     fn tre_radici_stessa_signature_tiene_la_piu_recente() {
         // Tre radici indipendenti stessa signature; tiene 20 (start 9), termina 10 e 30.
-        let procs = vec![p(10, 5, 1, "vite"), p(20, 9, 1, "vite"), p(30, 7, 1, "vite")];
+        let procs = vec![
+            p(10, 5, 1, "vite"),
+            p(20, 9, 1, "vite"),
+            p(30, 7, 1, "vite"),
+        ];
         let mut k = dev_server_roots_to_kill(&procs);
         k.sort_unstable();
         assert_eq!(k, vec![10, 30]);

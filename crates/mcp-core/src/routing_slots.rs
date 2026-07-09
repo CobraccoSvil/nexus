@@ -135,9 +135,8 @@ impl SlotsRoutingMatrix {
         // Preferenza al match piu' specifico (campi esatti sui wildcard)
         // se piu' righe collidono nello stesso probe.
         matches.sort_by_key(|e| {
-            let exact = (e.target_type != "*") as u8
-                + (e.scope != "*") as u8
-                + (e.framework != "*") as u8;
+            let exact =
+                (e.target_type != "*") as u8 + (e.scope != "*") as u8 + (e.framework != "*") as u8;
             std::cmp::Reverse(exact)
         });
         let e = matches[0];

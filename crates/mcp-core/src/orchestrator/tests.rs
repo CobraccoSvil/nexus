@@ -366,7 +366,10 @@ fn assert_no_brain_grpc(outcome: anyhow::Result<serde_json::Value>) {
                 content.starts_with("[Error:"),
                 "atteso Value d'errore dal mapping gateway (gateway HTTP down): {v}"
             );
-            assert!(!v["error"].is_null(), "il Value d'errore deve avere `error`: {v}");
+            assert!(
+                !v["error"].is_null(),
+                "il Value d'errore deve avere `error`: {v}"
+            );
         }
     }
 }

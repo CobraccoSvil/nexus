@@ -30,6 +30,29 @@ use nexus_graph_derive::GraphState as DeriveGraphState;
 pub use delta::{put_extra, StateDelta};
 pub use message::{ContentBlock, Message, MessageContent, ToolUse};
 
+/// Modalita' supervisore worker (UI: off / su anomalia / ogni N step / continuo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorMode {
+    #[default]
+    None,
+    Anomaly,
+    #[serde(rename = "interleaved")]
+    Interleaved,
+    Continuous,
+}
+
+impl SupervisorMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "anomaly" | "c" => Self::Anomaly,
+            "interleaved" | "a" => Self::Interleaved,
+            "continuous" | "b" => Self::Continuous,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Modalita' di automazione del turno chat propagata da mcp-core
 /// (`state.py:274`). Enum dedicato invece di `String`: il `match` esaustivo
 /// nei nodi non puo' dimenticare un caso.
@@ -115,6 +138,11 @@ pub enum StopReason {
     ///
     /// INERTE in PR-A: nessun nodo la produce (il nodo `ScaleControl` e' PR-B).
     ScaleResolved,
+    /// Il nodo `Supervisor` ha completato il check (continue/redirect) e rientra
+    /// nell'executor.
+    SupervisorResolved,
+    /// Il supervisore ha deciso di abbandonare il task: instrada verso chiusura.
+    SupervisorAbandon,
     /// Errore provider durante l'executor (`__init__.py:3104-3107`): l'executor
     /// scrive `result="[Errore provider ...]"` (NON vuoto) e `stop_reason="error"`.
     /// Serializza in `"error"` (snake_case): e' il SOLO valore che fa entrare il
@@ -521,6 +549,8 @@ pub struct AgentState {
     // ── Automazione ─────────────────────────────────────────────────────────────
     /// Modalita' automazione del turno chat propagata da mcp-core.
     pub automation_mode: Option<AutomationMode>,
+    /// Modalita' supervisore worker scelta in UI (none/anomaly/interleaved/continuous).
+    pub supervisor_mode: Option<SupervisorMode>,
 
     // ── HITL (predicato di interrupt-resume) ─────────────────────────────────────
     /// `true` quando lo stato attende una conferma umana (HITL). Non presente
@@ -662,7 +692,10 @@ mod tests {
         // Le chiavi sconosciute sono catturate da `extra` (flatten).
         assert_eq!(state.extra.get("iteration_budget"), Some(&json!(42)));
         assert_eq!(state.extra.get("project_id"), Some(&json!("proj-123")));
-        assert_eq!(state.extra.get("auto_escalations"), Some(&json!(["a", "b"])));
+        assert_eq!(
+            state.extra.get("auto_escalations"),
+            Some(&json!(["a", "b"]))
+        );
 
         // Round-trip: re-serializza e ri-deserializza; deve essere identico.
         let serialized = serde_json::to_value(&state).expect("serialize");

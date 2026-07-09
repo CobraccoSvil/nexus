@@ -14,7 +14,7 @@
 //! Edge fissi:
 //! ```text
 //!   router        -> clarify_or_expand
-//!   tool_dispatch -> executor          (loop agentico)
+//!   tool_dispatch -> executor | learner (loop agentico o veto panel terminale)
 //!   reflection    -> learner
 //!   learner       -> END
 //! ```
@@ -69,13 +69,15 @@ use nexus_graph::edge::Edge;
 use nexus_graph::engine::GraphEngine;
 use nexus_graph::node::{GraphNode, NodeId};
 
+use crate::decisions::supervisor::{detect_anomalies, should_invoke, SupervisorConfig};
+use crate::nodes::supervisor::SUPERVISOR_ABANDON_KEY;
 use crate::nodes::PlannerConfig;
 use crate::routing::{
     self, route_after_executor, route_after_final_gate, route_after_planner,
     route_after_todo_runner, route_after_verifier, NodeTarget, RoutingConfig,
 };
 use crate::runtime::AgentNodeCtx;
-use crate::state::AgentState;
+use crate::state::{AgentState, SupervisorMode};
 
 /// Alias del nodo del grafo agentico (stato `AgentState`, contesto `AgentNodeCtx`).
 pub type AgentGraphNode = dyn GraphNode<AgentState, AgentNodeCtx>;
@@ -112,6 +114,8 @@ pub struct AgentGraphNodes {
     /// `MetaReasonerPort::assess_scale` ritorna `Ok(None)` e nessun detector emette
     /// `ScaleReason`, quindi il nodo non e' mai raggiunto (bit-identico).
     pub scale_control: Arc<AgentGraphNode>,
+    /// Supervisore worker (monitoraggio periodico post tool_dispatch).
+    pub supervisor: Arc<AgentGraphNode>,
     /// Verifica plan-phase (DoD).
     pub verifier: Arc<AgentGraphNode>,
     /// Verifica E2E pre-chiusura.
@@ -154,14 +158,58 @@ pub fn node_target_to_node_id(target: NodeTarget) -> NodeId {
 fn build_edges(
     routing_cfg: RoutingConfig,
     planner_cfg: PlannerConfig,
+    supervisor_cfg: SupervisorConfig,
 ) -> HashMap<NodeId, Edge<AgentState>> {
     let mut edges: HashMap<NodeId, Edge<AgentState>> = HashMap::new();
+    let sup_cfg = supervisor_cfg;
 
     // ── Edge fissi (graph.py:164, 237, 246, 247) ─────────────────────────────
     // router -> clarify_or_expand (sempre).
     edges.insert(NodeId::Router, Edge::Static(NodeId::ClarifyOrExpand));
-    // tool_dispatch -> executor (rientro nel loop agentico).
-    edges.insert(NodeId::ToolDispatch, Edge::Static(NodeId::Executor));
+    // tool_dispatch -> supervisor | executor | learner (veto panel terminale).
+    edges.insert(
+        NodeId::ToolDispatch,
+        Edge::conditional(move |state: &AgentState| {
+            let terminal_panel_veto = state
+                .extra
+                .get(crate::nodes::PANEL_ENFORCEMENT_KEY)
+                .and_then(|v| v.get("terminal"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if terminal_panel_veto {
+                return NodeId::Learner;
+            }
+            let mode = state.supervisor_mode.unwrap_or(SupervisorMode::None);
+            if mode != SupervisorMode::None {
+                let iterations = state.iterations.unwrap_or(0);
+                let anomalies = detect_anomalies(state, sup_cfg);
+                if should_invoke(mode, iterations, sup_cfg, &anomalies) {
+                    return NodeId::Supervisor;
+                }
+            }
+            NodeId::Executor
+        }),
+    );
+    // supervisor -> executor (continue/redirect) | learner (abandon).
+    edges.insert(
+        NodeId::Supervisor,
+        Edge::conditional(|state: &AgentState| {
+            let abandon = state
+                .extra
+                .get(SUPERVISOR_ABANDON_KEY)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || matches!(
+                    state.stop_reason,
+                    Some(crate::state::StopReason::SupervisorAbandon)
+                );
+            if abandon {
+                NodeId::Learner
+            } else {
+                NodeId::Executor
+            }
+        }),
+    );
     // stall_recovery -> executor (rientro nel loop agentico dopo il superstep di
     // recovery). Il nodo emette sempre StopReason::StallResolved e torna
     // nell'executor, che consuma la RecoveryMove eventualmente persistita in extra
@@ -265,9 +313,7 @@ fn build_edges(
 }
 
 /// Costruisce la mappa `NodeId -> nodo concreto`.
-fn build_node_map(
-    nodes: AgentGraphNodes,
-) -> HashMap<NodeId, Arc<AgentGraphNode>> {
+fn build_node_map(nodes: AgentGraphNodes) -> HashMap<NodeId, Arc<AgentGraphNode>> {
     let mut map: HashMap<NodeId, Arc<AgentGraphNode>> = HashMap::new();
     map.insert(NodeId::Router, nodes.router);
     map.insert(NodeId::ClarifyOrExpand, nodes.clarify_or_expand);
@@ -278,6 +324,7 @@ fn build_node_map(
     map.insert(NodeId::ToolDispatch, nodes.tool_dispatch);
     map.insert(NodeId::StallRecovery, nodes.stall_recovery);
     map.insert(NodeId::ScaleControl, nodes.scale_control);
+    map.insert(NodeId::Supervisor, nodes.supervisor);
     map.insert(NodeId::Verifier, nodes.verifier);
     map.insert(NodeId::FinalGate, nodes.final_gate);
     map.insert(NodeId::Reflection, nodes.reflection);
@@ -301,10 +348,11 @@ pub fn build_agent_graph(
     nodes: AgentGraphNodes,
     routing_cfg: RoutingConfig,
     planner_cfg: PlannerConfig,
+    supervisor_cfg: SupervisorConfig,
     checkpointer: Arc<dyn nexus_graph::checkpoint::Checkpointer<AgentState>>,
 ) -> AgentGraphEngine {
     let node_map = build_node_map(nodes);
-    let edges = build_edges(routing_cfg, planner_cfg);
+    let edges = build_edges(routing_cfg, planner_cfg, supervisor_cfg);
     GraphEngine::new(node_map, edges, NodeId::Router, checkpointer)
 }
 
@@ -331,9 +379,9 @@ mod tests {
     use crate::nodes::{
         ClarifyConfig, ClarifyOrExpandNode, ExecutorConfig, ExecutorNode, FinalGateConfig,
         FinalGateNode, LearnerConfig, LearnerNode, PlannerNode, ReflectionConfig, ReflectionNode,
-        RouterNode, ScaleControlNode, StallRecoveryNode, TodoRunnerConfig, TodoRunnerNode,
-        ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig, UnderstandingNode,
-        VerifierConfig, VerifierNode,
+        RouterNode, ScaleControlNode, StallRecoveryNode, SupervisorNode, TodoRunnerConfig,
+        TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
+        UnderstandingNode, VerifierConfig, VerifierNode,
     };
     use crate::runtime::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
@@ -370,8 +418,8 @@ mod tests {
             next: NodeId,
             state: &AgentState,
         ) -> Result<(), CheckpointError> {
-            let json = serde_json::to_value(state)
-                .map_err(|e| CheckpointError::Store(e.to_string()))?;
+            let json =
+                serde_json::to_value(state).map_err(|e| CheckpointError::Store(e.to_string()))?;
             self.store
                 .lock()
                 .expect("lock checkpoint store")
@@ -491,11 +539,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for StubToolForGraph {
-        async fn execute(
-            &self,
-            call: ToolCall,
-            _mode: ExecMode,
-        ) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
             Ok(ToolOutcome {
                 tool_call_id: call.id,
                 content: json!("contenuto del file letto"),
@@ -509,7 +553,9 @@ mod tests {
     /// Criteria runner stub: nessun criterio fallisce (final_gate/verifier passano
     /// se mai raggiunti). Lista vuota -> all_passed (vacuamente vero lato nodo).
     fn stub_criteria() -> Arc<dyn CriteriaRunner> {
-        Arc::new(StubCriteriaRunner::with_results(Vec::<CriterionResult>::new()))
+        Arc::new(StubCriteriaRunner::with_results(
+            Vec::<CriterionResult>::new(),
+        ))
     }
 
     /// PgPool LAZY: `connect_lazy` NON apre connessioni finche' non si interroga
@@ -534,8 +580,7 @@ mod tests {
         let todos: Arc<dyn TodoStore> = Arc::new(StubTodoStore::with_todos(vec![]));
         let verifier_runs: Arc<dyn VerifierRunStore> = Arc::new(StubVerifierRunStore::default());
         let escalation: Arc<dyn EscalationPort> = Arc::new(StubEscalationPort::default());
-        let next_actions: Arc<dyn NextActionsDeriver> =
-            Arc::new(StubNextActionsDeriver::default());
+        let next_actions: Arc<dyn NextActionsDeriver> = Arc::new(StubNextActionsDeriver::default());
         let billing: Arc<dyn BillingCooldownPort> = Arc::new(StubBillingCooldownPort::default());
         let upscale: Arc<dyn ModelUpscalePort> = Arc::new(StubModelUpscalePort::default());
         let summary_store: Arc<dyn SummaryStore> = Arc::new(StubSummaryStore::default());
@@ -598,6 +643,10 @@ mod tests {
             // Ok(None) e nessun detector che emette ScaleReason il nodo non e' mai
             // raggiunto nei test del grafo (bit-identico).
             scale_control: Arc::new(ScaleControlNode::new(reasoner.clone())),
+            supervisor: Arc::new(SupervisorNode::new(
+                reasoner.clone(),
+                SupervisorConfig::default(),
+            )),
             verifier: Arc::new(VerifierNode::new(
                 VerifierConfig::default(),
                 FinalGateConfig::default(),
@@ -675,12 +724,18 @@ mod tests {
             node_target_to_node_id(NodeTarget::ToolDispatch),
             NodeId::ToolDispatch
         );
-        assert_eq!(node_target_to_node_id(NodeTarget::Verifier), NodeId::Verifier);
+        assert_eq!(
+            node_target_to_node_id(NodeTarget::Verifier),
+            NodeId::Verifier
+        );
         assert_eq!(
             node_target_to_node_id(NodeTarget::FinalGate),
             NodeId::FinalGate
         );
-        assert_eq!(node_target_to_node_id(NodeTarget::Executor), NodeId::Executor);
+        assert_eq!(
+            node_target_to_node_id(NodeTarget::Executor),
+            NodeId::Executor
+        );
         assert_eq!(
             node_target_to_node_id(NodeTarget::TodoRunner),
             NodeId::TodoRunner
@@ -699,7 +754,11 @@ mod tests {
 
     #[test]
     fn topologia_copre_ogni_nodo_non_terminale() {
-        let edges = build_edges(RoutingConfig::default(), PlannerConfig::default());
+        let edges = build_edges(
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+        );
         // Ogni nodo non terminale ha un edge uscente dichiarato.
         for id in [
             NodeId::Router,
@@ -711,6 +770,7 @@ mod tests {
             NodeId::ToolDispatch,
             NodeId::StallRecovery,
             NodeId::ScaleControl,
+            NodeId::Supervisor,
             NodeId::Verifier,
             NodeId::FinalGate,
             NodeId::Reflection,
@@ -723,10 +783,19 @@ mod tests {
             edges.get(&NodeId::Router),
             Some(Edge::Static(NodeId::ClarifyOrExpand))
         ));
-        assert!(matches!(
-            edges.get(&NodeId::ToolDispatch),
-            Some(Edge::Static(NodeId::Executor))
-        ));
+        let tool_dispatch_edge = edges
+            .get(&NodeId::ToolDispatch)
+            .expect("edge tool_dispatch presente");
+        assert_eq!(
+            tool_dispatch_edge.resolve(&AgentState::default()),
+            NodeId::Executor
+        );
+        let mut veto_state = AgentState::default();
+        veto_state.extra.insert(
+            crate::nodes::PANEL_ENFORCEMENT_KEY.to_string(),
+            serde_json::json!({"terminal": true}),
+        );
+        assert_eq!(tool_dispatch_edge.resolve(&veto_state), NodeId::Learner);
         // stall_recovery -> executor (self-loop di rientro dopo il superstep).
         assert!(matches!(
             edges.get(&NodeId::StallRecovery),
@@ -761,6 +830,7 @@ mod tests {
             nodes,
             RoutingConfig::default(),
             PlannerConfig::default(),
+            SupervisorConfig::default(),
             checkpointer.clone(),
         );
 
@@ -799,7 +869,11 @@ mod tests {
             state.result
         );
         assert!(
-            state.pending_tool_uses.as_ref().map(|p| p.is_empty()).unwrap_or(true),
+            state
+                .pending_tool_uses
+                .as_ref()
+                .map(|p| p.is_empty())
+                .unwrap_or(true),
             "nessun tool pending residuo a fine run"
         );
 
@@ -898,6 +972,7 @@ mod tests {
             nodes,
             RoutingConfig::default(),
             PlannerConfig::default(),
+            SupervisorConfig::default(),
             checkpointer.clone(),
         );
 

@@ -104,7 +104,9 @@ use crate::runtime::ports::{
     TodoStore,
 };
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, TaskComplexity, ToolUse};
+use crate::state::{
+    AgentState, Message, MessageContent, MetaStep, StateDelta, TaskComplexity, ToolUse,
+};
 
 /// Config DB-driven del nodo planner, PASSATA (regola G: nessuna lettura DB nel
 /// nodo, nessun fallback hardcoded dentro la logica decisionale).
@@ -218,7 +220,12 @@ impl PlannerConfig {
     /// Parita' falsy col Python: `if behavior_mode and ...` -> un behavior_mode
     /// `None`/vuoto NON applica il gate del mode (passa); idem per `intent`. Il
     /// gate budget usa `int(token_budget or 0)` (gia' i64 qui).
-    pub fn is_eligible(&self, behavior_mode: Option<&str>, intent: Option<&str>, token_budget: i64) -> bool {
+    pub fn is_eligible(
+        &self,
+        behavior_mode: Option<&str>,
+        intent: Option<&str>,
+        token_budget: i64,
+    ) -> bool {
         if !self.plan_phase_enabled {
             return false;
         }
@@ -227,7 +234,11 @@ impl PlannerConfig {
         if let Some(bm) = behavior_mode {
             if !bm.is_empty() {
                 let bm_l = bm.to_lowercase();
-                if !self.plan_behavior_modes.iter().any(|m| m.to_lowercase() == bm_l) {
+                if !self
+                    .plan_behavior_modes
+                    .iter()
+                    .any(|m| m.to_lowercase() == bm_l)
+                {
                     return false;
                 }
             }
@@ -726,11 +737,7 @@ impl PlannerNode {
     /// non un magic fallback (regola G), ma l'assenza esplicita del vincolo. La
     /// guard `delegation_forbidden` non gata la plan-phase (Fase 1 e' sequenziale,
     /// niente delega eseguita); e' passata per completezza del contesto LLM.
-    async fn orchestration_gate(
-        &self,
-        state: &AgentState,
-        ctx: &AgentNodeCtx,
-    ) -> PlanGateOutcome {
+    async fn orchestration_gate(&self, state: &AgentState, ctx: &AgentNodeCtx) -> PlanGateOutcome {
         // Regola G: gate OFF di default -> ricadi su is_eligible (bit-identico).
         if !self.cfg.orchestration_enabled {
             return PlanGateOutcome::Heuristic;
@@ -799,14 +806,20 @@ impl PlannerNode {
             // GOVERNA l'esecuzione, non solo la scelta di pianificare. I tasks sono
             // gia' validati (validate_orch_move: mai vuoti, mai delegation_forbidden;
             // la coordination e' gia' degradata a Sequential se l'isolamento manca).
-            Ok(Some(OrchestrationMove::DelegateSubagents { tasks, coordination })) => {
+            Ok(Some(OrchestrationMove::DelegateSubagents {
+                tasks,
+                coordination,
+            })) => {
                 tracing::info!(
                     target: "nexus_agent_graph::planner",
                     tasks = tasks.len(),
                     coordination = ?coordination,
                     "orchestration gate: materializza delega sub-agenti (LLM-driven)"
                 );
-                PlanGateOutcome::MaterializeDelegation { tasks, coordination }
+                PlanGateOutcome::MaterializeDelegation {
+                    tasks,
+                    coordination,
+                }
             }
             // RunInline -> salta la plan-phase.
             Ok(Some(OrchestrationMove::RunInline)) => {
@@ -1042,14 +1055,15 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             PlanGateOutcome::SkipPlanPhase => false,
             // Decisione LLM esplicita: materializza la delega (PR5). Si ENTRA nella
             // plan-phase ma la generazione todo_block e' bypassata (todo dai task).
-            PlanGateOutcome::MaterializeDelegation { tasks, coordination } => {
+            PlanGateOutcome::MaterializeDelegation {
+                tasks,
+                coordination,
+            } => {
                 delegation = Some((tasks, coordination));
                 true
             }
             // Il gate non decide: euristica esistente (planner_node.py:64-74).
-            PlanGateOutcome::Heuristic => {
-                self.cfg.is_eligible(behavior_mode, intent, token_budget)
-            }
+            PlanGateOutcome::Heuristic => self.cfg.is_eligible(behavior_mode, intent, token_budget),
         };
         if !enter_plan_phase {
             tracing::debug!(
@@ -1078,7 +1092,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
                         todos = todos.len(),
                         "planner: piano valido, riuso"
                     );
-                    return Ok(Self::reuse_delta(&run_id, todos_to_values(&todos), active_id));
+                    return Ok(Self::reuse_delta(
+                        &run_id,
+                        todos_to_values(&todos),
+                        active_id,
+                    ));
                 }
                 // Stale/NoPlan: prosegue alla creazione di un nuovo piano.
                 PlanReuse::Stale | PlanReuse::NoPlan => {}
@@ -1203,8 +1221,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             let hinted_system = self.build_hinted_system(state, &run_id);
             let llm_messages = Self::build_llm_messages(&state.messages);
 
-            let req =
-                Self::build_request(&used_provider, &used_model, llm_messages.clone(), &hinted_system);
+            let req = Self::build_request(
+                &used_provider,
+                &used_model,
+                llm_messages.clone(),
+                &hinted_system,
+            );
             todo_block = match ctx.llm.complete(req).await {
                 // NOTA parita': la `LlmResponse` minimale NON espone provider/model
                 // (il gateway concreto puo' aver fatto un cascade interno usando un
@@ -1286,8 +1308,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         let todo_block = todo_block.expect("todo_block presente dopo i fallback");
 
         // ── Esegui nexus_todo_write via ToolExecutor (planner_node.py:494-514) ──
-        let tool_input =
-            build_tool_input(&todo_block, &run_id, &used_provider, &used_model, intent, behavior_mode);
+        let tool_input = build_tool_input(
+            &todo_block,
+            &run_id,
+            &used_provider,
+            &used_model,
+            intent,
+            behavior_mode,
+        );
         let tool_use_id = todo_block
             .get("id")
             .and_then(Value::as_str)
@@ -1662,10 +1690,7 @@ mod tests {
 
     #[async_trait]
     impl crate::runtime::ports::LlmGateway for ScriptedLlm {
-        async fn complete(
-            &self,
-            _req: LlmRequest,
-        ) -> Result<LlmResponse, PortError> {
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
             let mut c = self.calls.lock().unwrap();
             *c += 1;
             if *c == 1 {
@@ -1694,11 +1719,7 @@ mod tests {
     }
     #[async_trait]
     impl crate::runtime::ports::ToolExecutor for ScriptedTools {
-        async fn execute(
-            &self,
-            call: ToolCall,
-            mode: ExecMode,
-        ) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
             let id = call.id.clone();
             self.seen.lock().unwrap().push((call, mode));
             Ok(ToolOutcome {
@@ -1786,6 +1807,14 @@ mod tests {
         ) -> Result<Option<crate::runtime::ports::ScaleMove>, PortError> {
             Ok(None)
         }
+
+        async fn supervise(
+            &self,
+            _ctx: crate::runtime::ports::SupervisorContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
+            Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
+        }
     }
 
     /// Ctx con LLM/tool dati. PgPool lazy (il planner non interroga il DB
@@ -1829,7 +1858,10 @@ mod tests {
     fn is_eligible_gates() {
         let cfg = cfg_active();
         // Eleggibile: tutto a posto.
-        assert!(cfg.is_eligible(Some("Automatico"), Some("CODE"), 8000), "case-insensitive");
+        assert!(
+            cfg.is_eligible(Some("Automatico"), Some("CODE"), 8000),
+            "case-insensitive"
+        );
         // plan_phase OFF -> mai eleggibile.
         let off = PlannerConfig::default();
         assert!(!off.is_eligible(Some("automatico"), Some("code"), 8000));
@@ -1907,7 +1939,9 @@ mod tests {
     async fn orchestration_off_stato_non_eligible_skip() {
         // Flag OFF + plan_phase OFF (default) -> is_eligible=false -> skip, e la
         // porta non e' mai consultata.
-        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase { decompose: true })));
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase {
+            decompose: true,
+        })));
         let store = Arc::new(StubTodoStore::with_todos(vec![]));
         let node = node_with_reasoner(PlannerConfig::default(), store, spy.clone());
         let ctx = gate_ctx(false);
@@ -1990,7 +2024,9 @@ mod tests {
     async fn orchestration_on_planphase_scavalca_is_eligible_false() {
         // Flag ON + Real + PlanPhase: procede alla plan-phase ANCHE se is_eligible
         // sarebbe false (plan_phase OFF). Il gate LLM scavalca l'euristica.
-        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase { decompose: false })));
+        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::PlanPhase {
+            decompose: false,
+        })));
         let store = Arc::new(StubTodoStore::with_todos(vec![]));
         // plan_phase OFF (Default) -> is_eligible false; orchestration ON.
         let cfg = PlannerConfig {
@@ -2060,7 +2096,7 @@ mod tests {
         assert_eq!(todos[0]["content"], json!("[db_architect] schema DB"));
         assert_eq!(todos[1]["content"], json!("[backend_implementer] API REST"));
         assert_eq!(todos[2]["content"], json!("frontend")); // kind vuoto -> no prefisso
-        // write_scope propagato 1:1.
+                                                            // write_scope propagato 1:1.
         assert_eq!(todos[0]["write_scope"], json!(["db/"]));
         assert_eq!(todos[2]["write_scope"], json!(["apps/web/"]));
         // node_key stabili.
@@ -2104,13 +2140,15 @@ mod tests {
     async fn ponte_delega_sequential_materializza_senza_llm() {
         // Flag ON + Real + DelegateSubagents{Sequential}: il gate MATERIALIZZA i
         // todo dai task SENZA consultare l'LLM del planner (decisione gia' presa).
-        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::DelegateSubagents {
-            tasks: vec![
-                subtask("crea schema", "db_architect", &["db/"]),
-                subtask("crea API", "backend", &["crates/api/"]),
-            ],
-            coordination: Coordination::Sequential,
-        })));
+        let spy = Arc::new(SpyReasoner::new(Some(
+            OrchestrationMove::DelegateSubagents {
+                tasks: vec![
+                    subtask("crea schema", "db_architect", &["db/"]),
+                    subtask("crea API", "backend", &["crates/api/"]),
+                ],
+                coordination: Coordination::Sequential,
+            },
+        )));
         let store = Arc::new(StubTodoStore::with_todos(vec![]));
         let cfg = PlannerConfig {
             orchestration_enabled: true,
@@ -2132,7 +2170,11 @@ mod tests {
         assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
         // L'LLM del planner NON e' consultato per la GENERAZIONE del todo_block: la
         // materializzazione bypassa il canale LLM (clarifying OFF -> 0 chiamate).
-        assert_eq!(*llm.calls.lock().unwrap(), 0, "delega bypassa la generazione LLM");
+        assert_eq!(
+            *llm.calls.lock().unwrap(),
+            0,
+            "delega bypassa la generazione LLM"
+        );
         // La plan-phase e' attiva (il todo_write e' andato a buon fine).
         assert_eq!(out.plan_phase_active, Some(true));
         // Il tool nexus_todo_write ha ricevuto i todo materializzati dai task.
@@ -2150,13 +2192,12 @@ mod tests {
     async fn ponte_delega_parallel_dep_keys_vuoti() {
         // DelegateSubagents{ParallelIsolated}: i todo materializzati non hanno
         // dipendenze (parallelismo; disgiunzione gia' garantita a monte).
-        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::DelegateSubagents {
-            tasks: vec![
-                subtask("A", "impl", &["a/"]),
-                subtask("B", "impl", &["b/"]),
-            ],
-            coordination: Coordination::ParallelIsolated,
-        })));
+        let spy = Arc::new(SpyReasoner::new(Some(
+            OrchestrationMove::DelegateSubagents {
+                tasks: vec![subtask("A", "impl", &["a/"]), subtask("B", "impl", &["b/"])],
+                coordination: Coordination::ParallelIsolated,
+            },
+        )));
         let store = Arc::new(StubTodoStore::with_todos(vec![]));
         let cfg = PlannerConfig {
             orchestration_enabled: true,
@@ -2183,10 +2224,12 @@ mod tests {
         // BIT-IDENTICO: con orchestration_enabled=false (default) il gate NON
         // consulta la porta e il ponte NON scatta anche se la mossa dello spy
         // sarebbe DelegateSubagents. Governa is_eligible -> plan-phase LLM normale.
-        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::DelegateSubagents {
-            tasks: vec![subtask("X", "impl", &["x/"])],
-            coordination: Coordination::Sequential,
-        })));
+        let spy = Arc::new(SpyReasoner::new(Some(
+            OrchestrationMove::DelegateSubagents {
+                tasks: vec![subtask("X", "impl", &["x/"])],
+                coordination: Coordination::Sequential,
+            },
+        )));
         // cfg_active: plan_phase ON, orchestration OFF (default). Stato eligible +
         // piano riusabile -> riuso, senza chiamare LLM ne materializzare.
         let node = node_with_reasoner(cfg_active(), store_reusable(), spy.clone());
@@ -2228,7 +2271,10 @@ mod tests {
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(true));
-        assert_eq!(out.current_plan_id.as_deref(), Some("11111111-1111-1111-1111-111111111111"));
+        assert_eq!(
+            out.current_plan_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
         // active_todo = primo pending (t1 e' completed) -> t2.
         assert_eq!(out.active_todo_id.as_deref(), Some("t2"));
         // Riuso: nessuna chiamata LLM.
@@ -2253,7 +2299,11 @@ mod tests {
             json!({"action": "create", "todos": [{"content": "fai X"}]}),
         ));
         let node = node_with(cfg, store);
-        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let ctx = ctx_with(
+            llm.clone(),
+            Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)),
+            false,
+        );
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(true));
@@ -2285,7 +2335,10 @@ mod tests {
         st.behavior_mode = Some("confirm".to_string());
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(false));
-        assert_eq!(out.plan_phase_skip_reason.as_deref(), Some("awaiting_clarifications"));
+        assert_eq!(
+            out.plan_phase_skip_reason.as_deref(),
+            Some("awaiting_clarifications")
+        );
         let pending = out.pending_clarifications.expect("pending");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["id"], json!("q1"));
@@ -2295,7 +2348,11 @@ mod tests {
     async fn clarifying_prosegue_automatico() {
         // behavior_mode automatico + domande emesse -> applica default e PROSEGUE
         // (crea il piano). applied_default_assumptions popolato.
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
+            "t1",
+            TodoStatus::Pending,
+            1,
+        )]));
         // 1a chiamata: detection -> request_clarification; 2a chiamata: planner ->
         // nexus_todo_write.
         let llm = Arc::new(ScriptedLlm::new(
@@ -2305,10 +2362,17 @@ mod tests {
                     {"id": "q1", "question": "Quale DB?", "suggested_default": "postgres"}
                 ]}),
             ),
-            tool_resp("nexus_todo_write", json!({"action": "create", "todos": [{"content": "X"}]})),
+            tool_resp(
+                "nexus_todo_write",
+                json!({"action": "create", "todos": [{"content": "X"}]}),
+            ),
         ));
         let node = node_with(cfg_active(), store);
-        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let ctx = ctx_with(
+            llm.clone(),
+            Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)),
+            false,
+        );
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(true));
@@ -2328,7 +2392,11 @@ mod tests {
         // clarifying OFF per non consumare chiamate LLM nel branching.
         let mut cfg = cfg_active();
         cfg.clarifying_questions_enabled = false;
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
+            "t1",
+            TodoStatus::Pending,
+            1,
+        )]));
         let node = node_with(cfg, store);
         let llm = Arc::new(ScriptedLlm::never_tool());
         let tools = Arc::new(ScriptedTools::ok(r#"{"ok": true}"#));
@@ -2359,7 +2427,10 @@ mod tests {
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(false));
-        assert_eq!(out.plan_phase_skip_reason.as_deref(), Some("no_tool_use_emitted"));
+        assert_eq!(
+            out.plan_phase_skip_reason.as_deref(),
+            Some("no_tool_use_emitted")
+        );
     }
 
     #[tokio::test]
@@ -2404,14 +2475,21 @@ mod tests {
         let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": false}"#)), false);
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
-        assert_eq!(out.plan_phase_skip_reason.as_deref(), Some("tool_returned_error"));
+        assert_eq!(
+            out.plan_phase_skip_reason.as_deref(),
+            Some("tool_returned_error")
+        );
     }
 
     // ── Shadow: tool in Replay ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn shadow_usa_replay() {
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
+            "t1",
+            TodoStatus::Pending,
+            1,
+        )]));
         let mut cfg = cfg_active();
         cfg.clarifying_questions_enabled = false;
         let node = node_with(cfg, store);
@@ -2437,10 +2515,17 @@ mod tests {
     /// Anthropic-compat rifiutano (400) la sequenza al turno successivo.
     fn assert_simmetria_tool_use_result(out: &AgentState) -> String {
         let n = out.messages.len();
-        assert!(n >= 2, "attesi almeno assistant + tool in coda, trovati {n}");
+        assert!(
+            n >= 2,
+            "attesi almeno assistant + tool in coda, trovati {n}"
+        );
         let (tool_use_id, name) = match &out.messages[n - 2] {
             Message::Ai { tool_calls, .. } => {
-                assert_eq!(tool_calls.len(), 1, "il Message::Ai deve portare 1 tool_use");
+                assert_eq!(
+                    tool_calls.len(),
+                    1,
+                    "il Message::Ai deve portare 1 tool_use"
+                );
                 (tool_calls[0].id.clone(), tool_calls[0].name.clone())
             }
             other => panic!("penultimo messaggio non e' Message::Ai: {other:?}"),
@@ -2464,7 +2549,11 @@ mod tests {
         // tool_result lo referenzia -> coppia valida.
         let mut cfg = cfg_active();
         cfg.clarifying_questions_enabled = false;
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
+            "t1",
+            TodoStatus::Pending,
+            1,
+        )]));
         let node = node_with(cfg, store);
         let llm = Arc::new(ScriptedLlm::always_tool(
             "nexus_todo_write",
@@ -2486,7 +2575,11 @@ mod tests {
         // La coppia tool_use/tool_result deve restare simmetrica (stesso uuid).
         let mut cfg = cfg_active();
         cfg.clarifying_questions_enabled = false;
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo("t1", TodoStatus::Pending, 1)]));
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
+            "t1",
+            TodoStatus::Pending,
+            1,
+        )]));
         let node = node_with(cfg, store);
         let llm = Arc::new(ScriptedLlm::never_tool());
         let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
@@ -2507,7 +2600,10 @@ mod tests {
 
     #[test]
     fn plan_reuse_pura() {
-        assert_eq!(plan_reuse_decision(None, Some("code"), Some("auto")), PlanReuse::NoPlan);
+        assert_eq!(
+            plan_reuse_decision(None, Some("code"), Some("auto")),
+            PlanReuse::NoPlan
+        );
         // Legacy (campi None) -> riuso storico.
         assert_eq!(
             plan_reuse_decision(Some(&PlanRow::default()), Some("code"), Some("auto")),
@@ -2516,7 +2612,10 @@ mod tests {
         // Intent divergente tracciato -> stale.
         assert_eq!(
             plan_reuse_decision(
-                Some(&PlanRow { user_intent: Some("docs".into()), behavior_mode: None }),
+                Some(&PlanRow {
+                    user_intent: Some("docs".into()),
+                    behavior_mode: None
+                }),
                 Some("code"),
                 Some("auto"),
             ),
@@ -2541,12 +2640,24 @@ mod tests {
     #[test]
     fn clarifying_branch_pura() {
         // Nessuna domanda -> proceed (a prescindere dal mode).
-        assert_eq!(clarifying_branch(&[], Some("confirm")), ClarifyingBranch::Proceed);
+        assert_eq!(
+            clarifying_branch(&[], Some("confirm")),
+            ClarifyingBranch::Proceed
+        );
         let q = vec![json!({"id": "q1", "question": "x"})];
         // None/confirm/study -> halt.
-        assert!(matches!(clarifying_branch(&q, None), ClarifyingBranch::Halt { .. }));
-        assert!(matches!(clarifying_branch(&q, Some("confirm")), ClarifyingBranch::Halt { .. }));
-        assert!(matches!(clarifying_branch(&q, Some("study")), ClarifyingBranch::Halt { .. }));
+        assert!(matches!(
+            clarifying_branch(&q, None),
+            ClarifyingBranch::Halt { .. }
+        ));
+        assert!(matches!(
+            clarifying_branch(&q, Some("confirm")),
+            ClarifyingBranch::Halt { .. }
+        ));
+        assert!(matches!(
+            clarifying_branch(&q, Some("study")),
+            ClarifyingBranch::Halt { .. }
+        ));
         // automatico/continuo -> apply defaults.
         assert!(matches!(
             clarifying_branch(&q, Some("automatico")),
@@ -2559,7 +2670,10 @@ mod tests {
     #[test]
     fn parse_tool_result_gate() {
         assert_eq!(parse_tool_result(r#"{"ok": true}"#), ToolResultOutcome::Ok);
-        assert_eq!(parse_tool_result(r#"{"ok": false}"#), ToolResultOutcome::Error);
+        assert_eq!(
+            parse_tool_result(r#"{"ok": false}"#),
+            ToolResultOutcome::Error
+        );
         assert_eq!(parse_tool_result(r#"{}"#), ToolResultOutcome::Error);
         assert_eq!(parse_tool_result("non-json"), ToolResultOutcome::Error);
     }
@@ -2567,7 +2681,14 @@ mod tests {
     #[test]
     fn build_tool_input_forza_campi() {
         let block = json!({"input": {"action": "create", "todos": []}});
-        let out = build_tool_input(&block, "RID", "anthropic", "m1", Some("code"), Some("automatico"));
+        let out = build_tool_input(
+            &block,
+            "RID",
+            "anthropic",
+            "m1",
+            Some("code"),
+            Some("automatico"),
+        );
         assert_eq!(out["run_id"], json!("RID"));
         assert_eq!(out["planner_model"], json!("anthropic/m1"));
         assert_eq!(out["user_intent"], json!("code"));
@@ -2619,11 +2740,16 @@ mod golden {
             cfg.plan_phase_enabled = b;
         }
         if let Some(a) = input.get("plan_behavior_modes").and_then(Value::as_array) {
-            cfg.plan_behavior_modes =
-                a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            cfg.plan_behavior_modes = a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
         }
         if let Some(a) = input.get("plan_intents").and_then(Value::as_array) {
-            cfg.plan_intents = a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            cfg.plan_intents = a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
         }
         if let Some(n) = input.get("plan_min_token_budget").and_then(Value::as_i64) {
             cfg.plan_min_token_budget = n;
@@ -2682,7 +2808,9 @@ mod golden {
     fn clarifying_label(b: &ClarifyingBranch) -> Value {
         match b {
             ClarifyingBranch::Proceed => json!({"branch": "proceed"}),
-            ClarifyingBranch::Halt { questions } => json!({"branch": "halt", "questions": questions}),
+            ClarifyingBranch::Halt { questions } => {
+                json!({"branch": "halt", "questions": questions})
+            }
             ClarifyingBranch::ApplyDefaults { assumptions } => {
                 json!({"branch": "apply_defaults", "assumptions": assumptions})
             }
@@ -2698,7 +2826,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 25, "attesi >=25 casi golden, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 25,
+            "attesi >=25 casi golden, trovati {}",
+            cases.len()
+        );
 
         let mut checked = 0usize;
         for c in &cases {
@@ -2707,7 +2839,11 @@ mod golden {
                     let cfg = cfg_from(&c.input);
                     let bm = opt_str(&c.input, "behavior_mode");
                     let it = opt_str(&c.input, "intent");
-                    let tb = c.input.get("token_budget").and_then(Value::as_i64).unwrap_or(0);
+                    let tb = c
+                        .input
+                        .get("token_budget")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     json!(cfg.is_eligible(bm.as_deref(), it.as_deref(), tb))
                 }
                 "plan_reuse" => {
@@ -2717,14 +2853,24 @@ mod golden {
                             None
                         } else {
                             Some(PlanRow {
-                                user_intent: v.get("user_intent").and_then(Value::as_str).map(str::to_string),
-                                behavior_mode: v.get("behavior_mode").and_then(Value::as_str).map(str::to_string),
+                                user_intent: v
+                                    .get("user_intent")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                behavior_mode: v
+                                    .get("behavior_mode")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
                             })
                         }
                     });
                     let it = opt_str(&c.input, "intent");
                     let bm = opt_str(&c.input, "behavior_mode");
-                    json!(plan_reuse_label(plan_reuse_decision(existing.as_ref(), it.as_deref(), bm.as_deref())))
+                    json!(plan_reuse_label(plan_reuse_decision(
+                        existing.as_ref(),
+                        it.as_deref(),
+                        bm.as_deref()
+                    )))
                 }
                 "clarifying_branch" => {
                     let questions = c
@@ -2751,8 +2897,12 @@ mod golden {
                         "m".to_string(),
                         "fp".to_string(),
                         "fm".to_string(),
-                        std::sync::Arc::new(crate::runtime::test_doubles::StubTodoStore::with_todos(vec![])),
-                        std::sync::Arc::new(crate::runtime::test_doubles::StubMetaStepStore::default()),
+                        std::sync::Arc::new(
+                            crate::runtime::test_doubles::StubTodoStore::with_todos(vec![]),
+                        ),
+                        std::sync::Arc::new(
+                            crate::runtime::test_doubles::StubMetaStepStore::default(),
+                        ),
                         std::sync::Arc::new(crate::runtime::StubMetaReasonerPort),
                     );
                     json!(node.build_hinted_system(&st, run_id))
@@ -2760,14 +2910,26 @@ mod golden {
                 "build_tool_input" => {
                     let block = c.input.get("todo_block").cloned().unwrap_or(json!({}));
                     let run_id = c.input.get("run_id").and_then(Value::as_str).unwrap_or("");
-                    let up = c.input.get("used_provider").and_then(Value::as_str).unwrap_or("");
-                    let um = c.input.get("used_model").and_then(Value::as_str).unwrap_or("");
+                    let up = c
+                        .input
+                        .get("used_provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let um = c
+                        .input
+                        .get("used_model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let it = opt_str(&c.input, "intent");
                     let bm = opt_str(&c.input, "behavior_mode");
                     build_tool_input(&block, run_id, up, um, it.as_deref(), bm.as_deref())
                 }
                 "parse_tool_result" => {
-                    let rj = c.input.get("result_json").and_then(Value::as_str).unwrap_or("");
+                    let rj = c
+                        .input
+                        .get("result_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     json!(matches!(parse_tool_result(rj), ToolResultOutcome::Ok))
                 }
                 other => panic!("funzione golden sconosciuta: {other} (caso {})", c.case_id),

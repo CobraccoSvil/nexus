@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
 
 interface SystemMetrics {
   cpu: {
@@ -56,28 +57,27 @@ export function ServerMonitorPanel() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<number>(0);
 
-  useEffect(() => {
-    let active = true;
-
-    const poll = async () => {
-      try {
-        const res = await fetch("/nexus/system-metrics");
-        if (!res.ok) throw new Error(`${res.status}`);
-        const data = await res.json() as SystemMetrics;
-        if (active) {
-          setMetrics(data);
-          setLastUpdate(Date.now());
-          setError(null);
-        }
-      } catch (e) {
-        if (active) setError(String(e));
-      }
-    };
-
-    poll();
-    const id = setInterval(poll, 2000);
-    return () => { active = false; clearInterval(id); };
+  const fetchMetrics = useCallback(async () => {
+    try {
+      const res = await fetch("/nexus/system-metrics");
+      if (!res.ok) throw new Error(`${res.status}`);
+      const data = await res.json() as SystemMetrics;
+      setMetrics(data);
+      setLastUpdate(Date.now());
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
   }, []);
+
+  useEffect(() => {
+    void fetchMetrics();
+  }, [fetchMetrics]);
+
+  const onHealthSnapshot = useCallback(() => {
+    void fetchMetrics();
+  }, [fetchMetrics]);
+  useHealthSnapshot(onHealthSnapshot);
 
   const label: React.CSSProperties = {
     fontSize: 10,

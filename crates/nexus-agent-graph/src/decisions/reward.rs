@@ -164,7 +164,11 @@ mod tests {
         assert_eq!(heuristic_reward("end_turn", true, 10, 10), 0.3);
         // budget 0 -> floor MAX_AGENT_ITERATIONS (60).
         assert_eq!(heuristic_reward("end_turn", true, 60, 0), 0.3);
-        assert_eq!(heuristic_reward("end_turn", true, 59, 0), 1.0, "59 < 60 -> non superato");
+        assert_eq!(
+            heuristic_reward("end_turn", true, 59, 0),
+            1.0,
+            "59 < 60 -> non superato"
+        );
     }
 
     #[test]
@@ -185,7 +189,11 @@ mod tests {
         assert_eq!(prelim_reward("end_turn", false), 0.4);
         // error -> 0.0.
         assert_eq!(prelim_reward("error", false), 0.0);
-        assert_eq!(prelim_reward("error", true), 0.0, "error vince anche con result");
+        assert_eq!(
+            prelim_reward("error", true),
+            0.0,
+            "error vince anche con result"
+        );
         // qualsiasi altro stop_reason -> 0.3 (cap iterazioni o altro).
         assert_eq!(prelim_reward("loop_abort", true), 0.3);
         assert_eq!(prelim_reward("stop", false), 0.3);

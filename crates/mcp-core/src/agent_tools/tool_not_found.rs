@@ -319,7 +319,11 @@ async fn lookup_uninstalled_catalog(db: &PgPool, missing: &str) -> Option<(Strin
 
 /// Prima riga non vuota di una descrizione, troncata per non gonfiare l'output.
 fn first_line(s: &str) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = s
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if line.chars().count() > 120 {
         let truncated: String = line.chars().take(117).collect();
         format!("{truncated}...")
@@ -416,9 +420,13 @@ mod tests {
             ("NOME SIMILE (vicino a delete_file)", "delete"),
         ];
         for (etichetta, missing) in casi {
-            let out = resolve_tool_not_found(&pool, None, user_id, project_id, "user", missing).await;
+            let out =
+                resolve_tool_not_found(&pool, None, user_id, project_id, "user", missing).await;
             eprintln!("\n========== {etichetta}: input='{missing}' ==========\n{out}\n");
-            assert!(out.starts_with(ERR_MARK), "manca il marker is_error per '{missing}'");
+            assert!(
+                out.starts_with(ERR_MARK),
+                "manca il marker is_error per '{missing}'"
+            );
         }
     }
 }

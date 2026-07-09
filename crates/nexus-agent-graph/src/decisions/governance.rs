@@ -73,7 +73,10 @@ impl ModelTelemetry {
     /// Chiave canonica `(provider, model)` per il match nella mappa di telemetria.
     /// Case-insensitive sul provider (convenzione del progetto), model esatto.
     pub fn key(provider: &str, model: &str) -> (String, String) {
-        (provider.trim().to_ascii_lowercase(), model.trim().to_string())
+        (
+            provider.trim().to_ascii_lowercase(),
+            model.trim().to_string(),
+        )
     }
 }
 
@@ -258,13 +261,14 @@ pub fn rank_candidates(
     // Ordina: bucket ASC (sani prima), poi punteggio DESC. `sort_by` e' STABILE:
     // a parita' di (bucket, punteggio) l'ordine d'ingresso (indice) e' preservato.
     enriched.sort_by(|a, b| {
-        a.2.cmp(&b.2).then(
-            b.3.partial_cmp(&a.3)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+        a.2.cmp(&b.2)
+            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    enriched.into_iter().map(|(_, pm, _, _)| pm.clone()).collect()
+    enriched
+        .into_iter()
+        .map(|(_, pm, _, _)| pm.clone())
+        .collect()
 }
 
 /// GOVERNANCE costo/beneficio del ROLLING-SUMMARY (decisione trasversale, regola

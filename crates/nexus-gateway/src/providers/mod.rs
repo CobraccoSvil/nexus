@@ -22,7 +22,6 @@ pub use google::GoogleProvider;
 pub use mistral::MistralProvider;
 pub use openai::OpenAiProvider;
 pub use openai_compat::{
-    classify_provider_error, is_billing_error, OpenAiCompatClient, ProviderErrorKind,
-    ProviderHttpError,
+    classify_provider_error, OpenAiCompatClient, ProviderErrorKind, ProviderHttpError,
 };
 pub use vllm::VllmProvider;

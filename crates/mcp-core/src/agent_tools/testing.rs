@@ -326,15 +326,24 @@ struct PlaywrightRunParams {
 /// clamp dei timeout (punto unico del parsing input, regola L).
 fn parse_playwright_params(input: &Value) -> PlaywrightRunParams {
     PlaywrightRunParams {
-        filter: input.get("filter").and_then(Value::as_str).map(str::to_string),
-        project_arg: input.get("project").and_then(Value::as_str).map(str::to_string),
+        filter: input
+            .get("filter")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        project_arg: input
+            .get("project")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         workers: input.get("workers").and_then(Value::as_u64).unwrap_or(1),
         reporter: input
             .get("reporter")
             .and_then(Value::as_str)
             .unwrap_or("list")
             .to_string(),
-        explicit_base_url: input.get("base_url").and_then(Value::as_str).map(str::to_string),
+        explicit_base_url: input
+            .get("base_url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         timeout: input
             .get("timeout_secs")
             .and_then(Value::as_u64)
@@ -348,8 +357,14 @@ fn parse_playwright_params(input: &Value) -> PlaywrightRunParams {
             .and_then(Value::as_u64)
             .unwrap_or(10_000)
             .min(60_000),
-        auto_start: input.get("auto_start_server").and_then(Value::as_bool).unwrap_or(false),
-        config_path_override: input.get("config_path").and_then(Value::as_str).map(str::to_string),
+        auto_start: input
+            .get("auto_start_server")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        config_path_override: input
+            .get("config_path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         cleanup_stale: input
             .get("cleanup_stale_configs")
             .and_then(Value::as_bool)
@@ -431,7 +446,10 @@ fn cleanup_stale_e2e_dir(stale_dir: &Path, notes: &mut Vec<String>) {
     if let Err(e) = std::fs::remove_dir_all(&e2e_dir) {
         tracing::warn!(path = %e2e_dir.display(), error = %e, "cleanup stale e2e/: errore");
     } else {
-        notes.push(format!("Rimossa directory e2e/ wrapper: {}", e2e_dir.display()));
+        notes.push(format!(
+            "Rimossa directory e2e/ wrapper: {}",
+            e2e_dir.display()
+        ));
     }
 }
 
@@ -749,7 +767,14 @@ async fn stream_playwright_stdout(
                 acc_log.push('\n');
             }
 
-            emit_stdout_line_events(&channels, job_id, &line, &progress, prev_passed, prev_failed);
+            emit_stdout_line_events(
+                &channels,
+                job_id,
+                &line,
+                &progress,
+                prev_passed,
+                prev_failed,
+            );
 
             // Flush DB a intervalli (max 500ms tra UPDATE)
             if last_db_flush.elapsed() >= FLUSH_INTERVAL {
@@ -825,16 +850,17 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     } = params;
 
     // ── 2. Controllo presenza Playwright ─────────────────────────────────────
-    let (playwright_root, stale_configs) =
-        match resolve_playwright_root(ctx, &config_path_override) {
-            Ok(v) => v,
-            Err(msg) => return msg,
-        };
+    let (playwright_root, stale_configs) = match resolve_playwright_root(ctx, &config_path_override)
+    {
+        Ok(v) => v,
+        Err(msg) => return msg,
+    };
     let root = &playwright_root;
     tracing::info!(playwright_root = %root.display(), "run_playwright_tests: directory scelta");
 
     // Cleanup automatico di config "wrapper stale" alla radice (es. residuo di run precedenti)
-    let cleanup_notes: Vec<String> = if cleanup_stale && ctx.can_write && !stale_configs.is_empty() {
+    let cleanup_notes: Vec<String> = if cleanup_stale && ctx.can_write && !stale_configs.is_empty()
+    {
         cleanup_stale_configs(&stale_configs)
     } else {
         Vec::new()
@@ -886,13 +912,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     let server_status = check_server_status(ctx, root, base_url.as_deref(), auto_start).await;
 
     // ── 6. Costruisci il comando Playwright ───────────────────────────────────
-    let command_str = build_playwright_command(
-        test_timeout_ms,
-        workers,
-        &reporter,
-        &project_arg,
-        &filter,
-    );
+    let command_str =
+        build_playwright_command(test_timeout_ms, workers, &reporter, &project_arg, &filter);
     tracing::info!(command = %command_str, root = %root.display(), "run_playwright_tests: avvio comando");
 
     // ── 7. Esegui con env BASE_URL ────────────────────────────────────────────
@@ -910,8 +931,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     // Separazione DB per-progetto: la tabella `jobs` e' migrata. Risolvo una
     // sola volta il pool del progetto (per ctx.project_id in scope) e lo riuso
     // per INSERT, UPDATE live nel task stdout e UPDATE finale.
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
     let job_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
@@ -1039,7 +1059,10 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
 
 /// Costruisce il descrittore JSON dell'esito (label + message) da usare nel
 /// record `jobs` e negli eventi. Ritorna (status, label, message).
-fn playwright_result_summary(exit_code: i32, stats: &PlaywrightStats) -> (&'static str, String, String) {
+fn playwright_result_summary(
+    exit_code: i32,
+    stats: &PlaywrightStats,
+) -> (&'static str, String, String) {
     let status = if exit_code == 0 { "passed" } else { "failed" };
     let label = if exit_code == 0 {
         format!("{} test passati", stats.passed)
@@ -1122,7 +1145,14 @@ async fn finalize_playwright_job(
     .await;
 
     emit_playwright_final_events(
-        ctx, job_id, status, &label, &msg, artifacts, exit_code, final_progress,
+        ctx,
+        job_id,
+        status,
+        &label,
+        &msg,
+        artifacts,
+        exit_code,
+        final_progress,
     );
 }
 
@@ -1416,7 +1446,10 @@ struct PlaywrightStats {
 /// direttamente la stringa d'errore gia' formattata (pronta per il return del
 /// tool) se il path e' fuori dalla root o invalido. Punto unico condiviso dai
 /// tool testing/lint (regola L).
-fn resolve_work_path(ctx: &AgentToolContext, working_dir: &str) -> Result<std::path::PathBuf, String> {
+fn resolve_work_path(
+    ctx: &AgentToolContext,
+    working_dir: &str,
+) -> Result<std::path::PathBuf, String> {
     if working_dir.is_empty() {
         return Ok(ctx.root_path.clone());
     }
@@ -1513,14 +1546,22 @@ fn detect_lint_command(work_path: &Path, check_only: bool) -> Option<String> {
         return Some(cmd.to_string());
     }
     if work_path.join("package.json").is_file() {
-        let cmd = if check_only { "npx eslint . 2>&1" } else { "npx eslint . --fix 2>&1" };
+        let cmd = if check_only {
+            "npx eslint . 2>&1"
+        } else {
+            "npx eslint . --fix 2>&1"
+        };
         return Some(cmd.to_string());
     }
     if work_path.join("pyproject.toml").is_file()
         || work_path.join("setup.py").is_file()
         || work_path.join("ruff.toml").is_file()
     {
-        let cmd = if check_only { "ruff check . 2>&1" } else { "ruff check . --fix 2>&1" };
+        let cmd = if check_only {
+            "ruff check . 2>&1"
+        } else {
+            "ruff check . --fix 2>&1"
+        };
         return Some(cmd.to_string());
     }
     None
@@ -1720,7 +1761,10 @@ async fn spawn_and_capture_output(
         Ok(Err(e)) => return Err(format!("[Errore attesa processo: {}]", e)),
         Err(_) => {
             let _ = child.start_kill();
-            return Err(format!("[Timeout dopo {}s. Comando: {}]", timeout_secs, command));
+            return Err(format!(
+                "[Timeout dopo {}s. Comando: {}]",
+                timeout_secs, command
+            ));
         }
     };
 

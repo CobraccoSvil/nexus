@@ -823,8 +823,7 @@ async fn resolve_subgraph_seed(
         nodes.push(id);
     } else {
         return Err(
-            json!({"error": "serve 'query' (testo) oppure 'note_id' (UUID) come seed"})
-                .to_string(),
+            json!({"error": "serve 'query' (testo) oppure 'note_id' (UUID) come seed"}).to_string(),
         );
     }
     Ok(nodes)
@@ -874,10 +873,7 @@ async fn expand_subgraph_bfs(ctx: &AgentToolContext, p: &SubgraphParams, nodes: 
 
 /// Dettagli dei nodi validi (scope=project + project_id + non-frozen). Ritorna
 /// gli id validi e la loro serializzazione JSON.
-async fn subgraph_nodes(
-    ctx: &AgentToolContext,
-    nodes: &[Uuid],
-) -> (Vec<Uuid>, Vec<Value>) {
+async fn subgraph_nodes(ctx: &AgentToolContext, nodes: &[Uuid]) -> (Vec<Uuid>, Vec<Value>) {
     let rows = sqlx::query(
         r#"
         SELECT id, title, intent, kind, edit_lock FROM wiki_docs
@@ -996,9 +992,7 @@ fn parse_create_link_params(input: &Value) -> Result<CreateLinkParams, String> {
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => {
-            return Err(json!({"error": "from_note_id mancante o non UUID valido"}).to_string())
-        }
+        None => return Err(json!({"error": "from_note_id mancante o non UUID valido"}).to_string()),
     };
     let to = match input
         .get("to_note_id")
@@ -1393,7 +1387,10 @@ async fn run_graph_import(
 /// Fa il parsing del payload JSON node-link e ne valida i nodi (non vuoti,
 /// entro `max_nodes`). Ritorna `(nodes_in, edges_in)`. `Err` = messaggio JSON di
 /// errore serializzato.
-fn parse_graph_payload(content: &str, max_nodes: usize) -> Result<(Vec<Value>, Vec<Value>), String> {
+fn parse_graph_payload(
+    content: &str,
+    max_nodes: usize,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
     let payload: Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => return Err(json!({"error": format!("JSON invalido: {e}")}).to_string()),

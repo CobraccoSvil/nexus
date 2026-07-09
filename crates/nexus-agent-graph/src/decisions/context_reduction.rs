@@ -220,12 +220,15 @@ pub struct CompressParams {
 /// allineate per fase; se piu' corte di `boundaries` il Python farebbe IndexError
 /// — qui clampiamo l'indice alla lunghezza disponibile, fail-safe non osservabile
 /// in pratica perche' le liste sono sempre allineate).
-pub fn should_compress_now(
-    iteration: i64,
-    cfg: &CtxMgmtConfig,
-) -> (bool, CompressParams) {
+pub fn should_compress_now(iteration: i64, cfg: &CtxMgmtConfig) -> (bool, CompressParams) {
     if iteration < cfg.compress_start_iter {
-        return (false, CompressParams { keep_recent: 0, max_content_chars: 0 });
+        return (
+            false,
+            CompressParams {
+                keep_recent: 0,
+                max_content_chars: 0,
+            },
+        );
     }
     let mut idx = 0usize;
     for (i, b) in cfg.compress_phase_boundaries.iter().enumerate() {
@@ -243,7 +246,13 @@ pub fn should_compress_now(
         .compress_phase_max_chars
         .get(idx.min(cfg.compress_phase_max_chars.len().saturating_sub(1)))
         .unwrap_or(&0);
-    (true, CompressParams { keep_recent, max_content_chars })
+    (
+        true,
+        CompressParams {
+            keep_recent,
+            max_content_chars,
+        },
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -278,7 +287,11 @@ fn tool_use_id_name_input(block: &Value) -> Option<(String, String, Value)> {
     if tid.is_empty() {
         return None;
     }
-    let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // block.get("input", {}) or {} : input assente/null/falsy -> {}.
     let input = match obj.get("input") {
         Some(v) if !v.is_null() => v.clone(),
@@ -316,9 +329,13 @@ pub fn dedup_tool_results_history(messages: &[HistoryMessage]) -> Vec<HistoryMes
     // Step 2: ultima posizione (mi, bi) di tool_result per signature.
     let mut last_pos: HashMap<String, (usize, usize)> = HashMap::new();
     for (mi, m) in messages.iter().enumerate() {
-        let Some(blocks) = m.anthropic_blocks() else { continue };
+        let Some(blocks) = m.anthropic_blocks() else {
+            continue;
+        };
         for (bi, block) in blocks.iter().enumerate() {
-            let Some(obj) = block.as_object() else { continue };
+            let Some(obj) = block.as_object() else {
+                continue;
+            };
             if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }
@@ -366,7 +383,7 @@ pub fn dedup_tool_results_history(messages: &[HistoryMessage]) -> Vec<HistoryMes
                         "tool_use_id": tid,
                         "content": format!(
                             "[dedup: stesso tool con stessi args, vedi risultato \
-piu' recente in msg #{}]",
+                    piu' recente in msg #{}]",
                             last.0
                         ),
                     }));
@@ -409,7 +426,12 @@ pub fn dedup_tool_results(messages: &[HistoryMessage]) -> Vec<HistoryMessage> {
                         if o.get("type").and_then(Value::as_str) == Some("text") {
                             // str(b.get("text","")) — un text non-stringa non
                             // accade nel contratto; usiamo as_str.
-                            Some(o.get("text").and_then(Value::as_str).unwrap_or("").to_string())
+                            Some(
+                                o.get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
                         } else {
                             None
                         }
@@ -438,14 +460,21 @@ pub fn dedup_tool_results(messages: &[HistoryMessage]) -> Vec<HistoryMessage> {
     // Passata 1: hash -> ultima (mi, bi). Solo content >= 200 char.
     let mut last_indices: HashMap<String, (usize, usize)> = HashMap::new();
     for (mi, m) in messages.iter().enumerate() {
-        let Some(blocks) = m.anthropic_blocks() else { continue };
+        let Some(blocks) = m.anthropic_blocks() else {
+            continue;
+        };
         for (bi, block) in blocks.iter().enumerate() {
-            if block.as_object().and_then(|o| o.get("type")).and_then(Value::as_str)
+            if block
+                .as_object()
+                .and_then(|o| o.get("type"))
+                .and_then(Value::as_str)
                 != Some("tool_result")
             {
                 continue;
             }
-            let Some(serialized) = serialized_content(block) else { continue };
+            let Some(serialized) = serialized_content(block) else {
+                continue;
+            };
             // Passata 1 Python (helpers.py:2862-2872): serializza il content sia
             // se stringa sia se lista (" ".join dei text block) e registra in
             // last_indices solo se la serializzazione e' >=200 char. Identica alla
@@ -470,7 +499,10 @@ pub fn dedup_tool_results(messages: &[HistoryMessage]) -> Vec<HistoryMessage> {
         let mut changed = false;
         let mut new_blocks: Vec<Value> = Vec::with_capacity(blocks.len());
         for (bi, block) in blocks.iter().enumerate() {
-            if block.as_object().and_then(|o| o.get("type")).and_then(Value::as_str)
+            if block
+                .as_object()
+                .and_then(|o| o.get("type"))
+                .and_then(Value::as_str)
                 != Some("tool_result")
             {
                 new_blocks.push(block.clone());
@@ -578,7 +610,10 @@ pub fn drop_unused_base64_payloads(
                             if o.get("type").and_then(Value::as_str) == Some("text") {
                                 // str(b.get("text",""))
                                 parts.push(
-                                    o.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+                                    o.get("text")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
                                 );
                             }
                         }
@@ -686,7 +721,10 @@ originale.]"
 /// TODO `EmbeddingStore`) e ritorna il marker con `ref`. Qui resta solo la forma
 /// pura/degraded, usata anche dai golden (offload disabilitato).
 pub fn degraded_marker(content: &str) -> String {
-    format!("\n[... compresso: {} char originali ...]", content.chars().count())
+    format!(
+        "\n[... compresso: {} char originali ...]",
+        content.chars().count()
+    )
 }
 
 /// `_compress_old_tool_results`: comprime i tool_result dei messaggi vecchi.
@@ -801,8 +839,7 @@ where
     let mut new_blocks: Vec<Value> = Vec::with_capacity(blocks.len());
     for block in blocks {
         let obj = block.as_object();
-        let is_tr =
-            obj.and_then(|o| o.get("type")).and_then(Value::as_str) == Some("tool_result");
+        let is_tr = obj.and_then(|o| o.get("type")).and_then(Value::as_str) == Some("tool_result");
         if !is_tr {
             new_blocks.push(block.clone());
             continue;
@@ -972,7 +1009,10 @@ fn compress_aggressive_token_based(
 /// `tool_use` se la sua serializzazione JSON e' troppo lunga (mantenendo id/name),
 /// e il `content` stringa diretto. Usa `degraded_marker` (parte pura del
 /// `_compress_marker`) + `AGGRESSIVE_TRUNC_MARKER`. Ritorna `(msg, changed)`.
-fn truncate_message_content(m: &HistoryMessage, max_content_chars: usize) -> (HistoryMessage, bool) {
+fn truncate_message_content(
+    m: &HistoryMessage,
+    max_content_chars: usize,
+) -> (HistoryMessage, bool) {
     if let Some(blocks) = m.anthropic_blocks() {
         let mut changed = false;
         let mut new_blocks: Vec<Value> = Vec::with_capacity(blocks.len());
@@ -991,13 +1031,19 @@ fn truncate_message_content(m: &HistoryMessage, max_content_chars: usize) -> (Hi
                             Some(Value::String(s)) => ("text", s.clone()),
                             _ => (
                                 "content",
-                                obj.get("content").and_then(Value::as_str).unwrap_or("").to_string(),
+                                obj.get("content")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
                             ),
                         }
                     } else {
                         (
                             "content",
-                            obj.get("content").and_then(Value::as_str).unwrap_or("").to_string(),
+                            obj.get("content")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                         )
                     };
                     // Il Python tronca solo se isinstance(content, str): se la
@@ -1013,8 +1059,10 @@ fn truncate_message_content(m: &HistoryMessage, max_content_chars: usize) -> (Hi
                             .saturating_sub(AGGRESSIVE_TRUNC_MARKER.chars().count())
                             .max(50);
                         let head: String = content.chars().take(floor).collect();
-                        let truncated =
-                            format!("{head}{}{AGGRESSIVE_TRUNC_MARKER}", degraded_marker(&content));
+                        let truncated = format!(
+                            "{head}{}{AGGRESSIVE_TRUNC_MARKER}",
+                            degraded_marker(&content)
+                        );
                         let mut nb = block.clone();
                         if let Some(o) = nb.as_object_mut() {
                             o.insert(content_key.to_string(), Value::String(truncated));
@@ -1071,8 +1119,10 @@ fn truncate_message_content(m: &HistoryMessage, max_content_chars: usize) -> (Hi
                 .saturating_sub(AGGRESSIVE_TRUNC_MARKER.chars().count())
                 .max(50);
             let head: String = content.chars().take(floor).collect();
-            let new_content =
-                format!("{head}{}{AGGRESSIVE_TRUNC_MARKER}", degraded_marker(content));
+            let new_content = format!(
+                "{head}{}{AGGRESSIVE_TRUNC_MARKER}",
+                degraded_marker(content)
+            );
             let mut nm = m.clone();
             nm.content = Value::String(new_content);
             return (nm, true);
@@ -1366,10 +1416,7 @@ fn serialize_blocks(blocks: &[Value]) -> Vec<String> {
             }
             Some("tool_use") => {
                 let name = obj.get("name").and_then(Value::as_str).unwrap_or("?");
-                let args = obj
-                    .get("input")
-                    .map(compact_json)
-                    .unwrap_or_default();
+                let args = obj.get("input").map(compact_json).unwrap_or_default();
                 out.push(format!("<tool {name}({args})>"));
             }
             Some("tool_result") => {
@@ -1473,7 +1520,9 @@ fn message_has_tool_use(m: &HistoryMessage) -> bool {
     m.anthropic_blocks()
         .map(|blocks| {
             blocks.iter().any(|b| {
-                b.as_object().and_then(|o| o.get("type")).and_then(Value::as_str)
+                b.as_object()
+                    .and_then(|o| o.get("type"))
+                    .and_then(Value::as_str)
                     == Some("tool_use")
             })
         })
@@ -1562,7 +1611,10 @@ pub fn select_continuity_trim_candidates(
             // Assistant testuale standalone: atomo droppabile singolo.
             let text = serialize_message_body(m);
             if !text.trim().is_empty() {
-                out.push(ContinuityCandidate { indices: vec![i], text });
+                out.push(ContinuityCandidate {
+                    indices: vec![i],
+                    text,
+                });
             }
             i += 1;
         }
@@ -1658,7 +1710,9 @@ pub fn contents_eligible_for_offload(
             continue;
         };
         for block in blocks {
-            let Some(obj) = block.as_object() else { continue };
+            let Some(obj) = block.as_object() else {
+                continue;
+            };
             if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
                 continue;
             }

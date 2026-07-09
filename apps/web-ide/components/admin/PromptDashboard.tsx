@@ -77,9 +77,7 @@ export default function PromptDashboard() {
   }, []);
 
   useEffect(() => {
-    load();
-    const interval = setInterval(load, 60000);
-    return () => clearInterval(interval);
+    void load();
   }, [load]);
 
   const prompts = data?.prompts ?? [];

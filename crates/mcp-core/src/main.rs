@@ -49,11 +49,11 @@ mod internal_routing;
 // Tappa 1b. Vedi crate doc-comment di intent_classifier.rs.
 mod intent_classifier;
 pub(crate) use nexus_types::llm_json;
+mod governance_telemetry;
 mod long_running;
 mod mcp_client;
 mod mcp_connectors;
 mod middleware;
-mod governance_telemetry;
 mod model_catalog_sync;
 mod model_health_probe;
 mod models;
@@ -61,7 +61,6 @@ mod mutations_api;
 mod native_engine;
 mod neural_compat;
 mod nexus_bridge;
-mod playbook_engine;
 mod nexus_builtin;
 mod nexus_database_stats;
 mod nexus_gateway;
@@ -69,6 +68,7 @@ mod nexus_routing;
 mod nexus_tool_catalog;
 mod nexus_tools;
 mod orchestrator;
+mod playbook_engine;
 mod playwright_env;
 pub mod playwright_live;
 mod plugins;
@@ -79,6 +79,8 @@ mod profiles;
 // Estratto in crate workspace (split 7.4): re-export per mantenere
 // validi i path crate::project_db:: dei moduli esistenti.
 pub use nexus_project_db as project_db;
+mod db_retention;
+mod learned_instructions;
 mod project_db_routes;
 mod project_files;
 mod project_git;
@@ -94,8 +96,6 @@ mod routing_config;
 mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
-mod learned_instructions;
-mod db_retention;
 mod run_reaper;
 pub use nexus_tool_kit::sandbox;
 mod security;
@@ -105,8 +105,8 @@ mod session_worklog;
 mod settings;
 mod static_preview;
 mod sudo_manager;
-mod system_services;
 mod sudo_routes;
+mod system_services;
 mod task_watchdog;
 #[cfg(test)]
 mod test_support;
@@ -122,10 +122,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::http::{header as http_header, HeaderValue, Method};
-use axum::{
-    extract::State,
-    Json,
-};
+use axum::{extract::State, Json};
 use chrono::Utc;
 use dashmap::{DashMap, DashSet};
 use serde_json::json;
@@ -263,7 +260,7 @@ async fn reattach_stream_output(
     }
     if !buf.is_empty() {
         let _ = sqlx::query(
-            "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2"
+            "UPDATE agent_processes SET output = LEFT(output || $1, 50000) WHERE id=$2",
         )
         .bind(&buf)
         .bind(id)
@@ -336,7 +333,7 @@ fn spawn_reattach_monitor(id: uuid::Uuid, pid_val: i32, db_clone: sqlx::PgPool) 
                 // si lascia NULL (coerente col path Unix, che scrive -1 solo se
                 // non riesce a leggere VmPeak).
                 let _ = sqlx::query(
-                    "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1"
+                    "UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1",
                 )
                 .bind(id)
                 .execute(&db_clone)
@@ -652,8 +649,7 @@ async fn init_routing_and_port_caches(db: &sqlx::PgPool) -> RoutingAndPortCaches
     // Cache parametri routing (mig 0111) e intent capability (mig 0110).
     // Stesso pattern: retry 5x5s + panic se DB irraggiungibile.
     let thresholds = routing_config::RoutingThresholdsCache::init_thresholds(db.clone()).await;
-    let intent =
-        routing_config::IntentCapabilityCache::init_intent_capability(db.clone()).await;
+    let intent = routing_config::IntentCapabilityCache::init_intent_capability(db.clone()).await;
     // Cache matrice slot-based (mig 0133, Livello 4 NLU). Diversamente dalle
     // altre cache, non panica se assente: il routing classico (intent,mode)
     // resta il fallback predefinito quando la matrice slots non e' popolata.
@@ -854,7 +850,9 @@ fn spawn_wiki_and_learning_workers(state: &AppState) {
     wiki::links_worker::start_links_worker(std::sync::Arc::new(state.wiki_deps()));
     wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.wiki_deps()));
     // Arricchimento LLM dei wiki_docs kind=code (placeholder -> scheda + embedding).
-    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.wiki_deps()));
+    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(
+        state.wiki_deps(),
+    ));
     // Distiller learned instructions (livello 2 continuita', mig 0412).
     learned_instructions::spawn_learned_instructions_distiller(state.clone());
 }
@@ -950,7 +948,9 @@ async fn configure_provider_cooldown(state: &AppState) {
 /// Legge i tempi health/cooldown provider dai settings (mig 0252): default storici,
 /// sovrascrive solo le chiavi presenti (setting mancante = invariato). Estratto da
 /// `configure_provider_cooldown`.
-async fn fetch_provider_health_timings(db: &sqlx::PgPool) -> provider_cooldown::ProviderHealthTimings {
+async fn fetch_provider_health_timings(
+    db: &sqlx::PgPool,
+) -> provider_cooldown::ProviderHealthTimings {
     let mut pht = provider_cooldown::ProviderHealthTimings::default();
     // Ordine allineato all'assegnazione sotto (indici 0..12); u64 tranne
     // circuit_breaker_threshold (7) e outage_threshold (11), letti come usize.
@@ -1201,7 +1201,6 @@ fn parse_bool_or(opt: Option<String>, default: bool) -> bool {
     })
     .unwrap_or(default)
 }
-
 
 /// Applica il single-instance guard (Unix: flock esclusivo per porta; su Windows
 /// e' garantito dal Service Manager, quindi cfg-gated), binda il listener HTTP con
@@ -1540,8 +1539,7 @@ async fn main() -> anyhow::Result<()> {
         build_orchestrator(&db, neural_client, template_cache.clone(), caches).await;
 
     // Sandbox + AppState + init_global_pools + boot-recovery (vedi `build_app_state`).
-    let state =
-        build_app_state(db, redis, orchestrator, template_cache, port_registry_cache).await;
+    let state = build_app_state(db, redis, orchestrator, template_cache, port_registry_cache).await;
 
     // Worker fire-and-forget e loop periodici, nell'ordine esatto (vedi
     // `spawn_background_workers`).

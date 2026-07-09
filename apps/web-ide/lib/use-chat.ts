@@ -380,14 +380,25 @@ export function useChat(
   // tracciate qui: vivono legate al ciclo del run padre.
   const primarySubCleanupRef = useRef<(() => void) | null>(null);
 
+  /** Chiude la subscription SSE primaria e azzera il banner "Connessione persa".
+   *  Punto unico (regola L): ogni chiusura del canale run (watchdog, reattach,
+   *  cancel, cambio run) deve passare da qui, altrimenti il loop di reconnect
+   *  resta attivo con isReconnecting=true anche senza agentRun in UI. */
+  const stopPrimaryAgentStream = useCallback(() => {
+    if (primarySubCleanupRef.current) {
+      primarySubCleanupRef.current();
+      primarySubCleanupRef.current = null;
+    }
+    setIsReconnecting(false);
+  }, []);
+
   // Sottoscrive a un run (primario o figlio) e aggiorna le map di stato
   const subscribeToRun = useCallback(
     (sid: string, runId: string, isPrimary: boolean) => {
       // Chiudi la subscription primaria precedente prima di aprirne una nuova
       // (idempotenza del riaggancio: mai due EventSource primari attivi).
-      if (isPrimary && primarySubCleanupRef.current) {
-        primarySubCleanupRef.current();
-        primarySubCleanupRef.current = null;
+      if (isPrimary) {
+        stopPrimaryAgentStream();
       }
       const cleanup = subscribeAgentStream(
         sid,
@@ -705,6 +716,24 @@ export function useChat(
               return next;
             });
           }
+          if (m.kind === "awaiting_confirmation") {
+            const pendingRaw = payload.pending_actions;
+            const pendingActions = Array.isArray(pendingRaw) ? pendingRaw : [];
+            const patchRun = (run: AgentRunInfo): AgentRunInfo => ({
+              ...run,
+              status: "awaiting_confirmation",
+              pendingActions: pendingActions as AgentRunInfo["pendingActions"],
+            });
+            setAgentRuns((prevMap) => {
+              const cur = prevMap.get(runId);
+              if (!cur) return prevMap;
+              return new Map(prevMap).set(runId, patchRun(cur));
+            });
+            if (isPrimary) {
+              setAgentRun((prev) => (prev && prev.runId === runId ? patchRun(prev) : prev));
+              setIsLoading(false);
+            }
+          }
         },
         isPrimary ? (text: string) => {
           // Modalita append: accumula tutte le righe di ragionamento (router,
@@ -761,7 +790,7 @@ export function useChat(
         primarySubCleanupRef.current = cleanup;
       }
     },
-    [projectId, refreshSessionUsage],
+    [projectId, refreshSessionUsage, stopPrimaryAgentStream],
   );
 
   // Riaggancia un run attivo del backend non ancora noto al client (post-refresh,
@@ -771,6 +800,9 @@ export function useChat(
   // 409 in loop. Ritorna true se ha agganciato un run attivo. Punto unico (regola L).
   const reattachActiveRun = useCallback(
     async (sid: string): Promise<boolean> => {
+      // Ferma subito il reconnect-loop corrente (non aspettare getActiveRun):
+      // evita stream orfani e banner "Connessione persa" infinito.
+      stopPrimaryAgentStream();
       try {
         const { activeRun } = await getActiveRunForSession(sid);
         if (!activeRun || !isAgentRunLiveOrWaiting(activeRun.status)) {
@@ -788,7 +820,7 @@ export function useChat(
         return false;
       }
     },
-    [subscribeToRun],
+    [subscribeToRun, stopPrimaryAgentStream],
   );
 
   const send = useCallback(
@@ -1078,6 +1110,7 @@ export function useChat(
   }, [positiveFeedback]);
 
   const clear = useCallback(() => {
+    stopPrimaryAgentStream();
     setMessages([]);
     setError(null);
     setSessionId(null);
@@ -1089,7 +1122,7 @@ export function useChat(
     setMetaStepsMap(new Map());
     setTokenUsage({ totalTokens: 0, totalCostUsd: 0 });
     setTraces([]);
-  }, []);
+  }, [stopPrimaryAgentStream]);
 
   const confirmAgent = useCallback(
     async (runId: string, approved: boolean) => {
@@ -1097,6 +1130,7 @@ export function useChat(
       try {
         await confirmAgentRun(runId, approved);
         if (!approved) {
+          stopPrimaryAgentStream();
           setAgentRun((prev) => (prev ? { ...prev, status: "cancelled" } : null));
           setIsLoading(false);
           return;
@@ -1107,77 +1141,17 @@ export function useChat(
           if (!run) return prev;
           return new Map(prev).set(runId, { ...run, status: "running" });
         });
-        // Riavvia l'ascolto dello stream
+        // Riavvia l'ascolto dello stream (punto unico subscribeToRun: chiude la
+        // subscription precedente e traccia primarySubCleanupRef).
         if (sessionId) {
-          subscribeAgentStream(
-            sessionId,
-            runId,
-            (event) => {
-              if (!event.step) return; // eventi trace non hanno step
-              // Difesa FIX 4 (punto unico, regola L): stessa logica del path
-              // di subscribe primario, niente collasso di step con indice ripetuto.
-              setAgentSteps((prev) => mergeIncomingStep(prev, event.step!));
-            },
-            async () => {
-              try {
-                const finalRun = await getAgentRun(runId);
-                setAgentRun(finalRun);
-                setAgentSteps(finalRun.steps);
-                if (isStatusTerminal(finalRun.status)) {
-                  const syntheticMsg = createTerminalMessage(finalRun, projectId);
-                  setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
-                }
-              } catch {}
-              setIsLoading(false);
-              setIsReconnecting(false);
-            },
-            undefined,
-            setIsReconnecting,
-            (delta: string) => setStreamingToken((prev) => prev + delta),
-            (meta) => {
-              setMetaStepsMap((prev) => {
-                const current = prev.get(runId) ?? [];
-                const isDup = current.some(
-                  (m) => m.kind === meta.metaStep.kind && m.createdAt === meta.metaStep.createdAt,
-                );
-                if (isDup) return prev;
-                return new Map(prev).set(runId, [...current, meta.metaStep]);
-              });
-            },
-            undefined,
-            (usage) => {
-              // Token live anche per i run ripresi dopo conferma (stesso patch
-              // della sottoscrizione primaria).
-              const applyUsage = (run: AgentRunInfo): AgentRunInfo => ({
-                ...run,
-                usage: {
-                  ...run.usage,
-                  totalPromptTokens:
-                    usage.lastPromptTokens || usage.promptTokens || run.usage?.totalPromptTokens,
-                  // Come nella sottoscrizione primaria: campo dedicato al
-                  // riempimento contesto (per-turno), mai il cumulativo billing.
-                  lastPromptTokens:
-                    usage.lastPromptTokens ?? usage.promptTokens ?? run.usage?.lastPromptTokens,
-                  totalCompletionTokens: usage.completionTokens ?? run.usage?.totalCompletionTokens,
-                  totalTokens: usage.totalTokens ?? run.usage?.totalTokens,
-                },
-                totalCostUsd: usage.totalCostUsd ?? run.totalCostUsd,
-              });
-              setAgentRun((prev) => (prev && prev.runId === runId ? applyUsage(prev) : prev));
-              setAgentRuns((prevMap) => {
-                const cur = prevMap.get(runId);
-                if (!cur) return prevMap;
-                return new Map(prevMap).set(runId, applyUsage(cur));
-              });
-            },
-          );
+          subscribeToRun(sessionId, runId, true);
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : "Conferma fallita.");
         setIsLoading(false);
       }
     },
-    [projectId, sessionId],
+    [projectId, sessionId, subscribeToRun, stopPrimaryAgentStream],
   );
 
   // Dopo bootstrap: riconnetti all'agente in corso (se il browser è stato refreshato mentre girava)
@@ -1232,7 +1206,9 @@ export function useChat(
       try {
         const finalRun = await getAgentRun(runId);
         if (cancelled || !isStatusTerminal(finalRun.status)) return;
-        // Run gia' terminato nel DB ma lo stream non ce l'ha notificato: chiudi.
+        // Run gia' terminato nel DB ma lo stream non ce l'ha notificato: chiudi
+        // anche il loop SSE (altrimenti isReconnecting resta true all'infinito).
+        stopPrimaryAgentStream();
         setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
         setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
         setAgentRun(null);
@@ -1260,7 +1236,7 @@ export function useChat(
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, agentRun?.runId, projectId]);
+  }, [sessionId, agentRun?.runId, projectId, stopPrimaryAgentStream]);
 
   // Risync SSE al ritorno del backend (fix "chat cieca sul run dopo restart di
   // mcp-core"). Il canale agent-stream ha gia' reconnect con backoff, ma dopo un
@@ -1286,12 +1262,9 @@ export function useChat(
   // stream era gia' concluso.
   useEffect(() => {
     return () => {
-      if (primarySubCleanupRef.current) {
-        primarySubCleanupRef.current();
-        primarySubCleanupRef.current = null;
-      }
+      stopPrimaryAgentStream();
     };
-  }, []);
+  }, [stopPrimaryAgentStream]);
 
   /** Chiude la modal di indicizzazione KB senza eseguire alcuna richiesta.
    *  Usato sia dal pulsante "Salta tutto" sia dopo il completamento di una
@@ -1357,6 +1330,7 @@ export function useChat(
     confirmAgent,
     cancelRun: useCallback(async (runId?: string) => {
       // Resetta stato UI SUBITO per sbloccare l'input (prima delle chiamate async)
+      stopPrimaryAgentStream();
       setAgentRun(null);
       setAgentSteps([]);
       setIsLoading(false);
@@ -1386,7 +1360,7 @@ export function useChat(
           setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
         }
       } catch { /* ignore */ }
-    }, [projectId, sessionId]),
+    }, [projectId, sessionId, stopPrimaryAgentStream]),
     clear,
     clearTraces: () => setTraces([]),
     refresh: bootstrap,

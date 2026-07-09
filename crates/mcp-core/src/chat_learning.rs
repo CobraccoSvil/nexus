@@ -229,7 +229,9 @@ fn merge_config(
         auto_apply_max_changes_per_day: body
             .auto_apply_max_changes_per_day
             .unwrap_or(current.auto_apply_max_changes_per_day),
-        feedback_threshold: body.feedback_threshold.unwrap_or(current.feedback_threshold),
+        feedback_threshold: body
+            .feedback_threshold
+            .unwrap_or(current.feedback_threshold),
         feedback_window_days: body
             .feedback_window_days
             .unwrap_or(current.feedback_window_days),
@@ -650,9 +652,13 @@ async fn evaluate_learning_gate(
     config: &ProjectLearningConfig,
     force: bool,
 ) -> Result<LearningGate, ApiError> {
-    let feedback_count =
-        count_feedback_window(feedback_pool, project_id, intent, config.feedback_window_days)
-            .await?;
+    let feedback_count = count_feedback_window(
+        feedback_pool,
+        project_id,
+        intent,
+        config.feedback_window_days,
+    )
+    .await?;
 
     if let Some(halt) =
         precheck_volume_thresholds(db, project_id, config, force, feedback_count).await?
@@ -661,9 +667,13 @@ async fn evaluate_learning_gate(
     }
 
     // separazione DB: ai_response_feedback nel pool del progetto (riuso feedback_pool)
-    let Some((provider, provider_feedback_count)) =
-        top_provider_in_window(feedback_pool, project_id, intent, config.feedback_window_days)
-            .await?
+    let Some((provider, provider_feedback_count)) = top_provider_in_window(
+        feedback_pool,
+        project_id,
+        intent,
+        config.feedback_window_days,
+    )
+    .await?
     else {
         return Ok(LearningGate::Halt(json!({
             "status": "no_provider_signal",
@@ -771,7 +781,12 @@ pub(crate) async fn apply_project_learning(
             provider_feedback_count,
             confidence,
             feedback_count,
-        } => (provider, provider_feedback_count, confidence, feedback_count),
+        } => (
+            provider,
+            provider_feedback_count,
+            confidence,
+            feedback_count,
+        ),
     };
 
     commit_learning_update(db, project_id, triggered_by, &intent, &config, gate).await
@@ -1028,8 +1043,15 @@ async fn run_vector_compaction(
         .await
         .unwrap_or(0);
 
-    insert_compaction_run_start(db, run_id, project_id, trigger_type, before_count, requested_by)
-        .await?;
+    insert_compaction_run_start(
+        db,
+        run_id,
+        project_id,
+        trigger_type,
+        before_count,
+        requested_by,
+    )
+    .await?;
 
     // Separazione DB: prompt_corrections vive nel pool del progetto quando
     // project_id e' noto; vector_compaction_runs (sopra/sotto) NON e' migrata e
@@ -1154,9 +1176,14 @@ pub(crate) async fn dedup_on_write(
     // separazione DB: prompt_corrections vive nel pool del progetto (flag ON);
     // pool riusato per la UPDATE di dedup nello stesso scope
     let corrections_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    let (ids_to_prune, points_to_prune) =
-        load_dedup_siblings(&corrections_pool, project_id, intent, normalized_hint_hash, keep_id)
-            .await?;
+    let (ids_to_prune, points_to_prune) = load_dedup_siblings(
+        &corrections_pool,
+        project_id,
+        intent,
+        normalized_hint_hash,
+        keep_id,
+    )
+    .await?;
 
     if ids_to_prune.is_empty() {
         return Ok(0);
@@ -1237,9 +1264,10 @@ async fn resolve_user_emails(
             .await
         {
             for ur in urows {
-                if let (Ok(uid), Ok(email)) =
-                    (ur.try_get::<Uuid, _>("id"), ur.try_get::<String, _>("email"))
-                {
+                if let (Ok(uid), Ok(email)) = (
+                    ur.try_get::<Uuid, _>("id"),
+                    ur.try_get::<String, _>("email"),
+                ) {
                     email_by_user.insert(uid, email);
                 }
             }
@@ -1688,18 +1716,18 @@ async fn resolve_correction_project_id(
 ) -> Result<Uuid, (StatusCode, Json<Value>)> {
     match body_project_id {
         Some(id) => Ok(id),
-        None => sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM projects ORDER BY created_at ASC LIMIT 1",
-        )
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-        .ok_or_else(|| {
-            json_err(
-                StatusCode::BAD_REQUEST,
-                "nessun progetto trovato — specificare project_id",
-            )
-        }),
+        None => {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects ORDER BY created_at ASC LIMIT 1")
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+                .ok_or_else(|| {
+                    json_err(
+                        StatusCode::BAD_REQUEST,
+                        "nessun progetto trovato — specificare project_id",
+                    )
+                })
+        }
     }
 }
 
@@ -1749,11 +1777,12 @@ async fn embed_and_upsert_correction(
     project_id: Uuid,
     point_id: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    let embedding = state
-        .orchestrator
-        .embed_text(text)
-        .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("embedding fallito: {e}")))?;
+    let embedding = state.orchestrator.embed_text(text).await.map_err(|e| {
+        json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("embedding fallito: {e}"),
+        )
+    })?;
 
     let payload = json!({
         "correction_id": point_id,
@@ -1764,7 +1793,12 @@ async fn embed_and_upsert_correction(
 
     vector_memory::upsert_prompt_correction_point(&state.db, point_id, &embedding, payload)
         .await
-        .map_err(|e| json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("upsert Qdrant fallito: {e}")))
+        .map_err(|e| {
+            json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("upsert Qdrant fallito: {e}"),
+            )
+        })
 }
 
 /// POST /api/admin/prompt-corrections
@@ -1793,9 +1827,15 @@ pub async fn admin_create_prompt_correction(
     // separazione DB: prompt_corrections vive nel pool del progetto (flag ON)
     let corrections_pool =
         crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-    let correction_id =
-        insert_prompt_correction_row(&corrections_pool, project_id, &intent, &text, &hash, &point_id)
-            .await?;
+    let correction_id = insert_prompt_correction_row(
+        &corrections_pool,
+        project_id,
+        &intent,
+        &text,
+        &hash,
+        &point_id,
+    )
+    .await?;
 
     Ok(Json(json!({
         "id": correction_id.to_string(),

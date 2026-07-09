@@ -275,7 +275,7 @@ mod tests {
     use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{ExecMode, PortError};
     use crate::runtime::ports::{OrchestrationContext, OrchestrationMove};
-    use crate::runtime::ports::{ScaleContext, ScaleMove};
+    use crate::runtime::ports::{ScaleContext, ScaleMove, SupervisorContext};
     use crate::runtime::{AgentNodeCtx, NullEventSink, StubMetaReasonerPort};
     use crate::state::AgentState;
     use sqlx::postgres::PgPoolOptions;
@@ -310,6 +310,14 @@ mod tests {
         ) -> Result<Option<ScaleMove>, PortError> {
             Ok(None)
         }
+
+        async fn supervise(
+            &self,
+            _ctx: SupervisorContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
+            Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
+        }
     }
 
     /// Porta reasoner che ritorna sempre errore (ramo degrado). `orchestrate` e
@@ -340,6 +348,14 @@ mod tests {
             _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
             Ok(None)
+        }
+
+        async fn supervise(
+            &self,
+            _ctx: SupervisorContext,
+            _mode: ExecMode,
+        ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
+            Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
     }
 
@@ -495,7 +511,12 @@ mod tests {
                 .clone(),
         )
         .expect("mossa cache deserializzabile");
-        assert_eq!(mv, RecoveryMove::AskUser { question: "email?".to_string() });
+        assert_eq!(
+            mv,
+            RecoveryMove::AskUser {
+                question: "email?".to_string()
+            }
+        );
     }
 
     #[tokio::test]

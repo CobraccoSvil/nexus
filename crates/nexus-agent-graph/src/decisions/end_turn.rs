@@ -94,7 +94,11 @@ pub fn build_unfulfilled_report(result_text: Option<&str>, messages: &[Message])
         };
         for block in blocks {
             if let crate::state::ContentBlock::ToolUse { name, input, .. } = block {
-                let name = if name.is_empty() { "tool".to_string() } else { name.clone() };
+                let name = if name.is_empty() {
+                    "tool".to_string()
+                } else {
+                    name.clone()
+                };
                 bump_count(&mut tool_counts, &name);
                 // path | file_path | filename dal blocco input (py:1654).
                 if let Some(obj) = input.as_object() {
@@ -124,7 +128,10 @@ eseguirlo, quindi il compito NON e' completato. Ecco il resoconto onesto:"
         // DESC, tie-break stabile (sort_by_key e' stabile -> ordine d'inserzione).
         let mut sorted = tool_counts.clone();
         sorted.sort_by_key(|(_, n)| -*n);
-        let azioni: Vec<String> = sorted.iter().map(|(name, n)| format!("{n}x {name}")).collect();
+        let azioni: Vec<String> = sorted
+            .iter()
+            .map(|(name, n)| format!("{n}x {name}"))
+            .collect();
         lines.push(format!("- Cosa ho fatto: {}.", azioni.join(", ")));
     } else {
         lines.push("- Cosa ho fatto: nessuna azione concreta in questo turno.".to_string());
@@ -266,7 +273,9 @@ pub fn billing_fail_fast_message(
     // crediti" (fuorviante). Senza questo check il messaggio incolpava i crediti
     // anche con un provider perfettamente funzionante.
     if current_provider.is_empty()
-        || !exhausted.iter().any(|p| p.eq_ignore_ascii_case(current_provider))
+        || !exhausted
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(current_provider))
     {
         return None;
     }
@@ -381,7 +390,8 @@ mod tests {
 
     #[test]
     fn strip_blocco_suggested() {
-        let text = "Ecco la risposta.\n<suggested_actions>\n[{\"label\":\"x\"}]\n</suggested_actions>";
+        let text =
+            "Ecco la risposta.\n<suggested_actions>\n[{\"label\":\"x\"}]\n</suggested_actions>";
         let cleaned = strip_suggested_actions(text);
         assert_eq!(cleaned, "Ecco la risposta.");
         assert!(!cleaned.contains("suggested_actions"));

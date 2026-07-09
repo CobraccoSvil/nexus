@@ -16,6 +16,7 @@ import { buildTree, type WikiDocSummary } from "../wiki/wiki-scope";
 import { WikiTreeNodeView } from "../wiki/wiki-tree";
 import { useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
+import { useProjectStore, selectKnowledgeChangedAt } from "../../lib/project-dispatcher";
 
 interface Props {
   projectId: string;
@@ -42,24 +43,26 @@ export function KnowledgeNavigator({ projectId }: Props) {
   const [error, setError] = React.useState<string | null>(null);
   const [filter, setFilter] = React.useState("");
 
-  React.useEffect(() => {
-    let cancelled = false;
+  const knowledgeChangedAt = useProjectStore(selectKnowledgeChangedAt);
+
+  const loadDocs = React.useCallback(() => {
     setLoading(true);
     setError(null);
-    listDocs({ scope: "project", project_id: projectId, limit: 1000 })
+    return listDocs({ scope: "project", project_id: projectId, limit: 1000 })
       .then((r) => {
-        if (!cancelled) setDocs(r.items);
+        setDocs(r.items);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        setError(e instanceof Error ? e.message : String(e));
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        setLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
   }, [projectId]);
+
+  React.useEffect(() => {
+    void loadDocs();
+  }, [loadDocs, knowledgeChangedAt]);
 
   const tree = React.useMemo(() => {
     const f = filter.trim().toLowerCase();

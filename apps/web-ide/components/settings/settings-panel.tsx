@@ -122,9 +122,6 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   useEffect(() => {
     if (category !== "providers") return;
     void loadGatewayProviders();
-    // Fallback polling rilassato (120s) — la fonte primaria e' il dispatcher SSE
-    const gwInterval = setInterval(() => void loadGatewayProviders(), 120_000);
-    return () => clearInterval(gwInterval);
   }, [category, loadGatewayProviders]);
 
   // Event-driven: ricarica gateway providers quando il health probe emette ProviderHealthChanged

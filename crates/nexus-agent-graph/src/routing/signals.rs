@@ -353,35 +353,37 @@ fn content_value_has_error(content: &Value) -> bool {
 fn message_tool_result_outcome(m: &Message) -> Option<bool> {
     match m {
         // ToolMessage langchain: il content puo' essere testo o blocchi.
-        Message::Tool { content, .. } => match content {
-            MessageContent::Text(s) => Some(text_has_error_hint(s)),
-            MessageContent::Blocks(blocks) => {
-                // Cerca un blocco con segnale strutturale; poi lessicale.
-                for b in blocks {
-                    if let ContentBlock::ToolResult {
-                        is_error,
-                        exit_code,
-                        content,
-                        ..
-                    } = b
-                    {
-                        if let Some(ec) = exit_code {
-                            return Some(*ec != 0);
-                        }
-                        if *is_error {
-                            return Some(true);
-                        }
-                        if content_value_has_error(content) {
-                            return Some(true);
+        Message::Tool { content, .. } => {
+            match content {
+                MessageContent::Text(s) => Some(text_has_error_hint(s)),
+                MessageContent::Blocks(blocks) => {
+                    // Cerca un blocco con segnale strutturale; poi lessicale.
+                    for b in blocks {
+                        if let ContentBlock::ToolResult {
+                            is_error,
+                            exit_code,
+                            content,
+                            ..
+                        } = b
+                        {
+                            if let Some(ec) = exit_code {
+                                return Some(*ec != 0);
+                            }
+                            if *is_error {
+                                return Some(true);
+                            }
+                            if content_value_has_error(content) {
+                                return Some(true);
+                            }
                         }
                     }
+                    // Nessun blocco tool_result strutturato: fallback su testo piatto.
+                    Some(blocks.iter().any(
+                        |b| matches!(b, ContentBlock::Text { text } if text_has_error_hint(text)),
+                    ))
                 }
-                // Nessun blocco tool_result strutturato: fallback su testo piatto.
-                Some(blocks.iter().any(|b| {
-                    matches!(b, ContentBlock::Text { text } if text_has_error_hint(text))
-                }))
             }
-        },
+        }
         // anthropic_content tool_result in un HumanMessage (tool_dispatch_node
         // emette il tool_result come HumanMessage; gli AIMessage portano i
         // tool_use, mai i tool_result -> non valutati, come in Python).
@@ -504,9 +506,7 @@ pub fn has_completed_subagent_dispatch(messages: &[Message]) -> bool {
 fn message_has_completed_subagent_result(m: &Message) -> bool {
     let block_matches = |b: &ContentBlock| match b {
         ContentBlock::ToolResult { content, .. } => is_completed_subagent_payload(content),
-        ContentBlock::Text { text } => {
-            is_completed_subagent_payload(&Value::String(text.clone()))
-        }
+        ContentBlock::Text { text } => is_completed_subagent_payload(&Value::String(text.clone())),
         ContentBlock::ToolUse { .. } => false,
     };
     match m {
@@ -544,7 +544,9 @@ fn tool_result_text_of(m: &Message) -> Option<String> {
             MessageContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolResult { content, .. } => Some(content_value_to_text(content)),
+                    ContentBlock::ToolResult { content, .. } => {
+                        Some(content_value_to_text(content))
+                    }
                     ContentBlock::Text { text } => Some(text.clone()),
                     _ => None,
                 })
@@ -558,7 +560,9 @@ fn tool_result_text_of(m: &Message) -> Option<String> {
             let parts: Vec<String> = blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolResult { content, .. } => Some(content_value_to_text(content)),
+                    ContentBlock::ToolResult { content, .. } => {
+                        Some(content_value_to_text(content))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -848,7 +852,11 @@ pub fn detect_repeated_failed_command(
         }
     }
     pick_top(&failed, last_signature.as_deref()).map_or((None, 0), |(sig, count)| {
-        let cmd = sig.split_once('|').map(|(c, _)| c).unwrap_or(&sig).to_string();
+        let cmd = sig
+            .split_once('|')
+            .map(|(c, _)| c)
+            .unwrap_or(&sig)
+            .to_string();
         (Some(cmd), count)
     })
 }
@@ -1034,9 +1042,7 @@ pub fn detect_repeated_action_detailed(
             // si ripeteva senza ulteriore progresso" su un run che convergeva).
             if !is_read_only_repeatable_tool(name) && outcome == Some(true) {
                 let cur_out = tool_result_text_after(recent, idx, 3).unwrap_or_default();
-                if let Some((_, prev_out)) =
-                    last_outputs.iter_mut().find(|(s, _)| *s == sig)
-                {
+                if let Some((_, prev_out)) = last_outputs.iter_mut().find(|(s, _)| *s == sig) {
                     if !outputs_similar(prev_out, &cur_out) {
                         if let Some((_, c)) = counts.iter_mut().find(|(s, _)| *s == sig) {
                             *c = 0;
@@ -1273,11 +1279,7 @@ pub fn detect_pending_steps_report(text: Option<&str>, cfg: &RoutingConfig) -> b
 /// una config propria, `ExecutorConfig`) chiama direttamente questa firma con
 /// le STESSE chiavi DB `agent.closure.pending_steps_*` (ADR 0018 fase 3: e' il
 /// sostituto strutturale del vecchio fallback lessicale rimosso).
-pub fn detect_pending_steps_report_with(
-    text: Option<&str>,
-    enabled: bool,
-    min_items: i64,
-) -> bool {
+pub fn detect_pending_steps_report_with(text: Option<&str>, enabled: bool, min_items: i64) -> bool {
     let Some(text) = text else {
         return false;
     };
@@ -1553,7 +1555,9 @@ mod tests {
         // e' una STRINGA JSON con `subagent_run_id` + `status`.
         let ok = r#"{"subagent_run_id":"11111111-1111-1111-1111-111111111111","kind":"rust_implementer","status":"completed","summary":"riscritto AppointmentsTab","iterations":56,"cost_usd":0.1}"#;
         // Forma HumanMessage con blocco tool_result (content = stringa JSON).
-        assert!(has_completed_subagent_dispatch(&[human_tool_result(None, false, ok)]));
+        assert!(has_completed_subagent_dispatch(&[human_tool_result(
+            None, false, ok
+        )]));
         // Forma ToolMessage langchain con content testuale.
         assert!(has_completed_subagent_dispatch(&[tool_msg(ok)]));
         // Solo `status == "completed"` conta: paused/failed/timeout/running NO.
@@ -1579,7 +1583,9 @@ mod tests {
         };
         assert!(has_completed_subagent_dispatch(&[structured]));
         // History senza sub-run -> false.
-        assert!(!has_completed_subagent_dispatch(&[tool_msg("nessun subrun")]));
+        assert!(!has_completed_subagent_dispatch(&[tool_msg(
+            "nessun subrun"
+        )]));
     }
 
     #[test]
@@ -1762,7 +1768,11 @@ mod tests {
         // Nessun tool_result -> (0, 0).
         assert_eq!(tool_error_stats(&[], 40), (0, 0));
         // Tre ok consecutivi in coda -> error_count 0, streak 3.
-        let all_ok = vec![tool_msg("done ok"), tool_msg("done ok"), tool_msg("done ok")];
+        let all_ok = vec![
+            tool_msg("done ok"),
+            tool_msg("done ok"),
+            tool_msg("done ok"),
+        ];
         assert_eq!(tool_error_stats(&all_ok, 40), (0, 3));
         // Un errore in coda -> error_count 1, streak 0 (l'ultimo e' errore).
         let last_err = vec![tool_msg("done ok"), tool_msg("Error: build failed")];
@@ -1783,9 +1793,15 @@ mod tests {
         // valuta SOLO i ToolMessage successivi (1:1 col Python, che guarda
         // isinstance(nm, ToolMessage)), quindi qui usiamo tool_msg.
         let msgs = vec![
-            ai_tool_input("run_command", json!({"command": "npm i", "working_dir": "/p"})),
+            ai_tool_input(
+                "run_command",
+                json!({"command": "npm i", "working_dir": "/p"}),
+            ),
             tool_msg("error: build failed"),
-            ai_tool_input("run_command", json!({"command": "npm i", "working_dir": "/p"})),
+            ai_tool_input(
+                "run_command",
+                json!({"command": "npm i", "working_dir": "/p"}),
+            ),
             tool_msg("error: build failed"),
         ];
         let (cmd, count) = detect_repeated_failed_command(&msgs, 12);
@@ -1912,7 +1928,11 @@ mod tests {
             human_tool_result(Some(0), false, "..."),
         ];
         let hit2 = detect_repeated_action_detailed(&diversi, 24);
-        assert_eq!(hit2.map(|h| h.count), Some(1), "path diversi -> nessuno stallo");
+        assert_eq!(
+            hit2.map(|h| h.count),
+            Some(1),
+            "path diversi -> nessuno stallo"
+        );
     }
 
     #[test]
@@ -1925,7 +1945,10 @@ mod tests {
         let msgs = vec![
             ai_tool_input("read_file", json!({"path": "vite.config.ts"})),
             human_tool_result(Some(0), false, "port: 35198"),
-            ai_tool_input("edit_file", json!({"path": "vite.config.ts", "old_string": "35198"})),
+            ai_tool_input(
+                "edit_file",
+                json!({"path": "vite.config.ts", "old_string": "35198"}),
+            ),
             human_tool_result(Some(0), false, "applied"),
             ai_tool_input("read_file", json!({"path": "vite.config.ts"})),
             human_tool_result(Some(0), false, "port: process.env.PORT"),
@@ -1976,7 +1999,10 @@ mod tests {
         let msgs = vec![
             ai_tool_input("read_file", json!({"path": "backend/index.js"})),
             human_tool_result(Some(0), false, "app.listen(...)"),
-            ai_tool_input("run_command", json!({"command": "curl -s localhost:3000/health"})),
+            ai_tool_input(
+                "run_command",
+                json!({"command": "curl -s localhost:3000/health"}),
+            ),
             human_tool_result(Some(0), false, "500"),
             ai_tool_input("read_file", json!({"path": "backend/index.js"})),
             human_tool_result(Some(0), false, "app.listen(...)"),
@@ -1999,7 +2025,10 @@ mod tests {
         let msgs = vec![
             ai_tool_input("read_file", json!({"path": "backend/index.js"})),
             human_tool_result(Some(0), false, "..."),
-            ai_tool_input("run_command", json!({"command": "curl -s localhost:3000/users"})),
+            ai_tool_input(
+                "run_command",
+                json!({"command": "curl -s localhost:3000/users"}),
+            ),
             human_tool_result(Some(0), false, "500 Internal Server Error"),
             ai_tool_input("run_command", json!({"command": "psql -c 'select 1'"})),
             human_tool_result(Some(0), false, "1 row"),
@@ -2102,18 +2131,46 @@ mod tests {
         // loop su read_file/range ed edit_file/old_string). Esito fallito ovunque
         // per neutralizzare l'esclusione "falso-doppione" dei tool produttivi.
         let cases: &[(&str, Value, Value)] = &[
-            ("read_file", json!({"path": "a.ts"}), json!({"path": "a.ts", "start_line": 50})),
+            (
+                "read_file",
+                json!({"path": "a.ts"}),
+                json!({"path": "a.ts", "start_line": 50}),
+            ),
             (
                 "read_file_lines",
                 json!({"path": "a.ts", "start_line": 1, "end_line": 50}),
                 json!({"path": "a.ts", "start_line": 51, "end_line": 100}),
             ),
-            ("list_files", json!({"dir": "src"}), json!({"dir": "src/app"})),
-            ("grep", json!({"pattern": "TODO", "path": "src"}), json!({"pattern": "TODO", "path": "lib"})),
-            ("search_in_files", json!({"query": "auth", "path": "a"}), json!({"query": "auth", "path": "b"})),
-            ("edit_file", json!({"path": "a.ts", "old_string": "x"}), json!({"path": "a.ts", "old_string": "y"})),
-            ("write_file", json!({"path": "a.ts", "content": "x"}), json!({"path": "a.ts", "content": "y"})),
-            ("run_command", json!({"command": "ls"}), json!({"command": "pwd"})),
+            (
+                "list_files",
+                json!({"dir": "src"}),
+                json!({"dir": "src/app"}),
+            ),
+            (
+                "grep",
+                json!({"pattern": "TODO", "path": "src"}),
+                json!({"pattern": "TODO", "path": "lib"}),
+            ),
+            (
+                "search_in_files",
+                json!({"query": "auth", "path": "a"}),
+                json!({"query": "auth", "path": "b"}),
+            ),
+            (
+                "edit_file",
+                json!({"path": "a.ts", "old_string": "x"}),
+                json!({"path": "a.ts", "old_string": "y"}),
+            ),
+            (
+                "write_file",
+                json!({"path": "a.ts", "content": "x"}),
+                json!({"path": "a.ts", "content": "y"}),
+            ),
+            (
+                "run_command",
+                json!({"command": "ls"}),
+                json!({"command": "pwd"}),
+            ),
         ];
         for (tool, base, variato) in cases {
             // Un argomento diverso -> azioni distinte -> nessuna signature a soglia 2.
@@ -2160,7 +2217,8 @@ mod tests {
     #[test]
     fn pending_steps_report_min_items() {
         let cfg = RoutingConfig::default();
-        let report = "Stato attuale: ok.\nProssimi passi necessari:\n1. Verificare X\n2. Eseguire Y";
+        let report =
+            "Stato attuale: ok.\nProssimi passi necessari:\n1. Verificare X\n2. Eseguire Y";
         assert!(detect_pending_steps_report(Some(report), &cfg));
         // Un solo item < min_items(2).
         let uno = "Prossimi passi:\n1. Solo questo";
@@ -2313,7 +2371,11 @@ mod golden {
                     content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
                         id: "golden".into(),
                         name: name.clone(),
-                        input: if input.is_null() { json!({}) } else { input.clone() },
+                        input: if input.is_null() {
+                            json!({})
+                        } else {
+                            input.clone()
+                        },
                         thought_signature: None,
                     }]),
                     tool_calls: vec![],
@@ -2372,7 +2434,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 20, "attesi >= 20 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 20,
+            "attesi >= 20 casi, trovati {}",
+            cases.len()
+        );
 
         let cfg = RoutingConfig::default();
         let mut checked = 0usize;
@@ -2383,9 +2449,7 @@ mod golden {
                     Value::Bool(has_filesystem_mutation_in_history(&msgs, &cfg))
                 }
                 "has_tool_calls_in_history" => Value::Bool(has_tool_calls_in_history(&msgs)),
-                "tool_result_outcome_after" => {
-                    opt_bool(tool_result_outcome_after(&msgs, 0, 3))
-                }
+                "tool_result_outcome_after" => opt_bool(tool_result_outcome_after(&msgs, 0, 3)),
                 "detect_repeated_failed_command" => {
                     let (cmd, count) = detect_repeated_failed_command(&msgs, 12);
                     json!({ "command": cmd, "count": count })
@@ -2394,9 +2458,7 @@ mod golden {
                     let (label, count) = detect_repeated_action(&msgs, 24);
                     json!({ "label": label, "count": count })
                 }
-                "count_recent_request_port" => {
-                    Value::from(count_recent_request_port(&msgs, 16))
-                }
+                "count_recent_request_port" => Value::from(count_recent_request_port(&msgs, 16)),
                 "has_active_resources_in_history" => {
                     Value::Bool(has_active_resources_in_history(&msgs, 24))
                 }

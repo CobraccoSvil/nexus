@@ -383,8 +383,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
         // PUNTO UNICO anti-duplicato (regola L): come run_service e wizard
         // install, il lancio di una run config servizio ferma prima i processi
         // running dello stesso scopo (label esatta o variante simile).
-        let _ =
-            crate::agent_processes::stop_similar_running_services(db, project_id, &label).await;
+        let _ = crate::agent_processes::stop_similar_running_services(db, project_id, &label).await;
     }
     match crate::agent_processes::spawn_agent_process(
         db,

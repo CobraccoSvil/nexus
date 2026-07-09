@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use super::AgentToolContext;
 use crate::native_engine::{verdict_keys, NativeDeps, NativeRunInput, NativeRunOutcome};
-use nexus_agent_graph::decisions::{AdvisoryPolicy, QuorumPolicy};
+use nexus_agent_graph::decisions::{AdvisoryPolicy, AdvisorySynthesis, QuorumPolicy};
 
 /// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
 /// `tool_result_is_error` deriva `is_error=true`).
@@ -140,9 +140,7 @@ fn apply_subagent_setting(s: &mut SubagentSettings, key: &str, value: &str) {
         }
         "orchestrator.subagent_max_depth" => s.max_depth = v.parse().unwrap_or(2),
         "orchestrator.subagent_cost_cap_per_run_usd" => s.cost_cap_usd = v.parse().unwrap_or(5.0),
-        "orchestrator.subagent_default_timeout_s" => {
-            s.default_timeout_s = v.parse().unwrap_or(300)
-        }
+        "orchestrator.subagent_default_timeout_s" => s.default_timeout_s = v.parse().unwrap_or(300),
         "orchestrator.subagent_narration_enabled" => s.narration_enabled = settings_flag(v),
         "orchestrator.subagent_narration_heartbeat_s" => {
             s.narration_heartbeat_s = v.parse().unwrap_or(20)
@@ -333,8 +331,7 @@ fn read_background_flag(input: &Value) -> bool {
 /// sincrono a runtime (60s, senza redeploy) senza lasciare padri appesi (regola
 /// G/H). Rete di sicurezza per il turn-on del fan-in async.
 async fn background_active(ctx: &AgentToolContext, input: &Value) -> bool {
-    read_background_flag(input)
-        && crate::fanin_worker::background_fanin_enabled(&ctx.core.db).await
+    read_background_flag(input) && crate::fanin_worker::background_fanin_enabled(&ctx.core.db).await
 }
 
 /// Handler del tool `dispatch_subagent` (singolo sub-run nativo).
@@ -362,9 +359,17 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
     // -> sincrono, comportamento invariato. Letto come CAMPO strutturato (regola M).
     let background = background_active(ctx, input).await;
 
-    run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format, None, background)
-        .await
-        .to_string()
+    run_single_subagent(
+        ctx,
+        &kind,
+        &task,
+        &context_blob,
+        &expected_format,
+        None,
+        background,
+    )
+    .await
+    .to_string()
 }
 
 /// Handler del tool `dispatch_subagents` (batch parallelo di sub-run nativi).
@@ -473,7 +478,15 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
         let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
         for wave in parsed.chunks(max_parallel) {
             let futs = wave.iter().map(|p| {
-                run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, false)
+                run_single_subagent(
+                    ctx,
+                    &p.kind,
+                    &p.task,
+                    &p.context_blob,
+                    &p.expected,
+                    None,
+                    false,
+                )
             });
             let wave_res = futures::future::join_all(futs).await;
             results.extend(wave_res);
@@ -570,8 +583,9 @@ static ISOLATION_FLAG_CACHE: std::sync::OnceLock<nexus_cache::TtlCache<(), bool>
     std::sync::OnceLock::new();
 
 fn isolation_flag_cache() -> &'static nexus_cache::TtlCache<(), bool> {
-    ISOLATION_FLAG_CACHE
-        .get_or_init(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(ISOLATION_FLAG_TTL_SECS)))
+    ISOLATION_FLAG_CACHE.get_or_init(|| {
+        nexus_cache::TtlCache::new(std::time::Duration::from_secs(ISOLATION_FLAG_TTL_SECS))
+    })
 }
 
 /// Legge il flag `orchestrator.subagent_isolation_enabled` (default false) con
@@ -646,7 +660,8 @@ async fn run_batch_isolated(
 ) -> String {
     let root = ctx.core.root_path.clone();
     let project_id = ctx.core.project_id;
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await;
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await;
 
     // (0) LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in worktree.rs):
     //     serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
@@ -845,8 +860,17 @@ async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> 
     let mut prepared: Vec<Result<SubagentExecInputs, Value>> = Vec::with_capacity(parsed.len());
     for p in parsed {
         prepared.push(
-            prepare_subagent_run(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, true)
-                .await,
+            prepare_subagent_run(
+                ctx,
+                &p.kind,
+                &p.task,
+                &p.context_blob,
+                &p.expected,
+                None,
+                true,
+                None,
+            )
+            .await,
         );
     }
     // (2) SPAWN-ALL: solo ORA che TUTTE le row sono inserite, spawna le esecuzioni.
@@ -874,7 +898,15 @@ async fn run_batch_sequential(
         let futs = wave.iter().map(|p| {
             // Degrado dell'isolamento a sequenziale: mai background (questo ramo e'
             // raggiunto solo dal fallback dell'isolato, che esclude il background).
-            run_single_subagent(ctx, &p.kind, &p.task, &p.context_blob, &p.expected, None, false)
+            run_single_subagent(
+                ctx,
+                &p.kind,
+                &p.task,
+                &p.context_blob,
+                &p.expected,
+                None,
+                false,
+            )
         });
         let wave_res = futures::future::join_all(futs).await;
         results.extend(wave_res);
@@ -1037,7 +1069,7 @@ async fn read_quorum_policy(ctx: &AgentToolContext) -> QuorumPolicy {
 /// L): letta dai settings `orchestrator.council_advisory_*` (mig 0548) e passata al
 /// punto unico PURO `compose_advisory_synthesis`. Niente hardcode; safe-default
 /// coincidente con `AdvisoryPolicy::default` se le chiavi mancano.
-async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPolicy {
+pub(crate) async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPolicy {
     let rows = sqlx::query(
         "SELECT key, value FROM settings WHERE key IN (
             'orchestrator.council_advisory_min_valid',
@@ -1064,6 +1096,472 @@ async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPolicy {
         }
     }
     policy
+}
+
+// ─── Consiglio a monte: convocazione PROGRAMMATICA delle figure (regola L/M) ──
+//
+// A differenza del panel di review a VALLE (dispatchato dal modello via
+// dispatch_subagents), il consiglio a MONTE viene convocato dal MOTORE — non dal
+// modello — PRIMA che il run primario agisca: i modelli non-frontier non convocano
+// le figure da soli nonostante la direttiva <consiglio_analisi>. `spawn_agent_run`
+// costruisce il ctx, seleziona le figure pertinenti e chiama `convene_council`; la
+// sintesi risultante viene iniettata nel primo messaggio del run. Best-effort:
+// qualunque fallimento -> None e il run primario prosegue invariato.
+
+/// Configurazione DB-driven (regola G) della SELEZIONE figure del consiglio.
+/// Caricata dai settings (mig 0553); passata al selettore PURO
+/// [`select_council_figures`]. Nessun kind hardcoded nel codice: le figure sono un
+/// DATO nel DB (sono `kind`, non nomi-modello).
+pub(crate) struct CouncilConfig {
+    /// Figure sempre convocate (trasversali): CSV `orchestrator.council_figures`.
+    pub base_figures: Vec<String>,
+    /// Figure aggiuntive quando il testo tocca ambiti infrastruttura/deploy: CSV
+    /// `orchestrator.council_infra_figures`.
+    pub infra_figures: Vec<String>,
+    /// Keyword d'ambito infrastruttura/deploy (CSV `orchestrator.council_infra_keywords`).
+    pub infra_keywords: Vec<String>,
+    /// Cap del numero di figure convocate (`orchestrator.council_max_figures`).
+    pub max_figures: usize,
+}
+
+/// Configurazione DB-driven del panel multi-provider. Il kind e il purpose sono
+/// dati nel DB: il codice decide solo il flusso, non quali provider/modelli usare.
+pub(crate) struct MultiProviderConfig {
+    pub enabled: bool,
+    pub kind: String,
+    pub purpose: String,
+    pub max_providers: usize,
+    pub min_providers: usize,
+}
+
+/// Segnale strutturato (regola M) del degrado del panel multi-provider quando
+/// non ci sono abbastanza provider distinti o il purpose non e' risolvibile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MultiProviderDegradeReason {
+    PurposeUnavailable,
+    InsufficientProviderDiversity,
+}
+
+/// Motivo strutturato del degrado del Consiglio delle Competenze (regola M).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CouncilDegradeReason {
+    SubagentsDisabled,
+    BuildCtxFailed,
+    SynthesisUnavailable,
+}
+
+/// Esito del pre-step Consiglio delle Competenze: sintesi attiva o degrado esplicito.
+/// `None` dal call site significa che i gate pre-convocazione non sono passati
+/// (feature off, keyword miss, nessuna figura): nessun segnale UI.
+#[derive(Debug, Clone)]
+pub(crate) enum CouncilConveneOutcome {
+    Active {
+        synthesis: AdvisorySynthesis,
+        figures: Vec<String>,
+    },
+    Degraded {
+        reason: CouncilDegradeReason,
+        figures: Vec<String>,
+    },
+}
+
+impl CouncilConveneOutcome {
+    pub(crate) fn degradation_reason_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Active { .. } => None,
+            Self::Degraded {
+                reason: CouncilDegradeReason::SubagentsDisabled,
+                ..
+            } => Some("subagents_disabled"),
+            Self::Degraded {
+                reason: CouncilDegradeReason::BuildCtxFailed,
+                ..
+            } => Some("build_ctx_failed"),
+            Self::Degraded {
+                reason: CouncilDegradeReason::SynthesisUnavailable,
+                ..
+            } => Some("synthesis_unavailable"),
+        }
+    }
+
+    /// Blocco `<consiglio_sintesi>` da anteporre al primo messaggio; vuoto se degradato.
+    pub(crate) fn render_block(&self) -> String {
+        match self {
+            Self::Active { synthesis, .. } => render_council_synthesis(synthesis),
+            Self::Degraded { .. } => String::new(),
+        }
+    }
+
+    pub(crate) fn figures(&self) -> &[String] {
+        match self {
+            Self::Active { figures, .. } | Self::Degraded { figures, .. } => figures.as_slice(),
+        }
+    }
+}
+
+/// Esito del panel multi-provider: sintesi attiva oppure degrado esplicito.
+#[derive(Debug, Clone)]
+pub(crate) enum MultiProviderPanelOutcome {
+    Active {
+        synthesis: AdvisorySynthesis,
+        provider_count: usize,
+    },
+    Degraded {
+        reason: MultiProviderDegradeReason,
+        got: usize,
+        min: usize,
+    },
+}
+
+impl MultiProviderPanelOutcome {
+    pub(crate) fn degradation_reason_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Active { .. } => None,
+            Self::Degraded {
+                reason: MultiProviderDegradeReason::PurposeUnavailable,
+                ..
+            } => Some("purpose_unavailable"),
+            Self::Degraded {
+                reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
+                ..
+            } => Some("insufficient_provider_diversity"),
+        }
+    }
+
+    /// Blocco `<multi_provider_sintesi>` da anteporre al primo messaggio; vuoto se degradato.
+    pub(crate) fn render_block(&self) -> String {
+        match self {
+            Self::Active { synthesis, .. } => render_multi_provider_synthesis(synthesis),
+            Self::Degraded { .. } => String::new(),
+        }
+    }
+
+    /// Valore strutturato per il seed pre-run nel grafo (regola M).
+    pub(crate) fn advisory_synthesis_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Active { synthesis, .. } => Some(synthesis.to_value()),
+            Self::Degraded { .. } => None,
+        }
+    }
+}
+
+/// Carica la config di selezione figure dai settings (regola G). Safe-default se le
+/// chiavi mancano: nessuna figura base -> il selettore ritorna vuoto -> nessuna
+/// convocazione (fail-closed sulla selezione; la feature va accesa esplicitamente coi
+/// settings di mig 0553 oltre al kill-switch `orchestrator.council_enabled`).
+pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
+    fn csv(v: Option<String>) -> Vec<String> {
+        v.map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+    let base = csv(nexus_auth::get_setting(db, "orchestrator.council_figures").await);
+    let infra = csv(nexus_auth::get_setting(db, "orchestrator.council_infra_figures").await);
+    let infra_keywords =
+        csv(nexus_auth::get_setting(db, "orchestrator.council_infra_keywords").await);
+    let max_figures = nexus_auth::get_setting(db, "orchestrator.council_max_figures")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(6)
+        .max(1);
+    CouncilConfig {
+        base_figures: base,
+        infra_figures: infra,
+        infra_keywords,
+        max_figures,
+    }
+}
+
+/// Selettore PURO (regola L, testabile senza DB) delle figure del consiglio per un
+/// dato testo. Parte dalle figure base; aggiunge le figure infra se il testo tocca
+/// almeno una keyword d'ambito infrastruttura/deploy (riuso del PUNTO UNICO substring
+/// [`crate::prompt_templates::count_sensitive_domain_hits`], regola L). Dedup stabile
+/// + cap `max_figures`.
+pub(crate) fn select_council_figures(user_text: &str, cfg: &CouncilConfig) -> Vec<String> {
+    let mut figures: Vec<String> = Vec::new();
+    let push = |f: &String, figures: &mut Vec<String>| {
+        if !f.is_empty() && !figures.iter().any(|e| e == f) {
+            figures.push(f.clone());
+        }
+    };
+    for f in &cfg.base_figures {
+        push(f, &mut figures);
+    }
+    let touches_infra =
+        crate::prompt_templates::count_sensitive_domain_hits(user_text, &cfg.infra_keywords) > 0;
+    if touches_infra {
+        for f in &cfg.infra_figures {
+            push(f, &mut figures);
+        }
+    }
+    figures.truncate(cfg.max_figures);
+    figures
+}
+
+pub(crate) async fn read_multi_provider_config(db: &sqlx::PgPool) -> Option<MultiProviderConfig> {
+    let enabled = nexus_auth::get_bool_setting(db, "orchestrator.multi_provider_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let kind = nexus_auth::get_setting(db, "orchestrator.multi_provider_kind")
+        .await?
+        .trim()
+        .to_string();
+    let purpose = nexus_auth::get_setting(db, "orchestrator.multi_provider_purpose")
+        .await?
+        .trim()
+        .to_string();
+    if kind.is_empty() || purpose.is_empty() {
+        return None;
+    }
+    let max_providers = nexus_auth::get_setting(db, "orchestrator.multi_provider_max_providers")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1);
+    let min_providers = nexus_auth::get_setting(db, "orchestrator.multi_provider_min_providers")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1)
+        .min(max_providers);
+    Some(MultiProviderConfig {
+        enabled,
+        kind,
+        purpose,
+        max_providers,
+        min_providers,
+    })
+}
+
+/// Convoca le figure `kinds` in PARALLELO (sub-run read-only, sincroni) e compone la
+/// SINTESI del loro parere col punto unico PURO `compose_advisory_synthesis` (regola
+/// L/M: legge i segnali strutturati `outcome.advisory`, mai la prosa di `summary`).
+/// `None` se la lista e' vuota o nessuna figura ha prodotto un parere valido.
+/// Best-effort: i Guard di `prepare_subagent_run` (whitelist/depth/cost) restano
+/// attivi; una figura in errore/timeout semplicemente non vota.
+pub(crate) async fn convene_council(
+    ctx: &AgentToolContext,
+    task: &str,
+    kinds: &[&str],
+    policy: &AdvisoryPolicy,
+) -> Option<AdvisorySynthesis> {
+    if kinds.is_empty() {
+        return None;
+    }
+    // Le figure hanno gia' l'istruzione advisory_verdict nel loro prompt (mig 0548);
+    // qui ribadiamo il formato atteso come promemoria operativo.
+    let expected = "Concludi la tua analisi chiamando il tool advisory_verdict \
+                    (verdict, requirements, risks[severity+description], recommendations).";
+    let futs = kinds
+        .iter()
+        .map(|kind| run_single_subagent(ctx, kind, task, "", expected, None, false));
+    let results: Vec<Value> = futures::future::join_all(futs).await;
+    compose_council_synthesis(&results, policy)
+}
+
+/// Convoca lo stesso analista read-only su provider diversi, scelti dal catalog
+/// tramite purpose tier-aware. Nessuna chiamata diretta ai provider: sono sub-run
+/// nativi con provider/model pin derivati dal DB e passati al grafo.
+pub(crate) async fn convene_multi_provider_panel(
+    ctx: &AgentToolContext,
+    task: &str,
+    cfg: &MultiProviderConfig,
+    policy: &AdvisoryPolicy,
+) -> Option<MultiProviderPanelOutcome> {
+    if !cfg.enabled {
+        return None;
+    }
+    let candidates = match crate::internal_routing::resolve_purpose_provider_candidates_db(
+        &ctx.core.db,
+        &cfg.purpose,
+        cfg.max_providers,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                purpose = %cfg.purpose,
+                resolution = ?e,
+                "multi-provider panel: purpose non risolvibile"
+            );
+            return Some(MultiProviderPanelOutcome::Degraded {
+                reason: MultiProviderDegradeReason::PurposeUnavailable,
+                got: 0,
+                min: cfg.min_providers,
+            });
+        }
+    };
+    if candidates.len() < cfg.min_providers {
+        tracing::warn!(
+            purpose = %cfg.purpose,
+            got = candidates.len(),
+            min = cfg.min_providers,
+            "multi-provider panel: provider distinti insufficienti"
+        );
+        return Some(MultiProviderPanelOutcome::Degraded {
+            reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
+            got: candidates.len(),
+            min: cfg.min_providers,
+        });
+    }
+    let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
+                    e chiudi chiamando advisory_verdict (verdict, requirements, \
+                    risks[severity+description], recommendations).";
+    async fn run_provider_analyst(
+        ctx: &AgentToolContext,
+        kind: &str,
+        task: &str,
+        context: String,
+        expected: &str,
+        provider: String,
+        model: String,
+    ) -> Value {
+        run_single_subagent_with_model_pin(
+            ctx,
+            kind,
+            task,
+            &context,
+            expected,
+            &provider,
+            &model,
+        )
+        .await
+    }
+    let futs = candidates.iter().map(|c| {
+        run_provider_analyst(
+            ctx,
+            &cfg.kind,
+            task,
+            format!(
+                "Provider assegnato a questa analisi: {}. Modello assegnato: {}. \
+                 Confronta la richiesta dalla prospettiva dei trade-off e dei failure-mode \
+                 tipici del provider/modello assegnato, senza assumere che gli altri \
+                 provider arrivino alla stessa conclusione.",
+                c.provider, c.model
+            ),
+            expected,
+            c.provider.clone(),
+            c.model.clone(),
+        )
+    });
+    let results: Vec<Value> = futures::future::join_all(futs).await;
+    let provider_count = candidates.len();
+    compose_multi_provider_synthesis(&results, policy).map(|synthesis| {
+        MultiProviderPanelOutcome::Active {
+            synthesis,
+            provider_count,
+        }
+    })
+}
+
+/// Parte PURA (regola L, testabile senza DB) di [`convene_council`]: estrae i blocchi
+/// `outcome` dai tool_result delle figure (regola M) e delega al punto unico PURO
+/// `compose_advisory_synthesis`. Separata cosi' il mapping result->outcome->synthesis
+/// e' coperto da unit test con result mock.
+fn compose_council_synthesis(
+    results: &[Value],
+    policy: &AdvisoryPolicy,
+) -> Option<AdvisorySynthesis> {
+    let outcomes: Vec<Value> = results
+        .iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
+    nexus_agent_graph::decisions::compose_advisory_synthesis(outcomes.as_slice(), policy)
+}
+
+fn compose_multi_provider_synthesis(
+    results: &[Value],
+    policy: &AdvisoryPolicy,
+) -> Option<AdvisorySynthesis> {
+    compose_council_synthesis(results, policy)
+}
+
+/// Rende la sintesi del consiglio in un blocco testuale `<consiglio_sintesi>` da
+/// anteporre al primo messaggio del run (il modello legge requisiti/rischi/verdetto
+/// come vincoli operativi). Deriva dai campi STRUTTURATI (regola M), non dalla prosa.
+pub(crate) fn render_council_synthesis(s: &AdvisorySynthesis) -> String {
+    let mut out = String::from("<consiglio_sintesi>\n");
+    out.push_str(&format!("Verdetto del consiglio: {}\n", s.verdict.as_str()));
+    if !s.requirements.is_empty() {
+        out.push_str("Requisiti obbligatori:\n");
+        for r in &s.requirements {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+    if !s.risks.is_empty() {
+        out.push_str("Rischi (per severity):\n");
+        for risk in &s.risks {
+            let sev = risk.get("severity").and_then(Value::as_str).unwrap_or("?");
+            let desc = risk
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            out.push_str(&format!("- [{sev}] {desc}\n"));
+        }
+    }
+    if !s.recommendations.is_empty() {
+        out.push_str("Raccomandazioni:\n");
+        for r in &s.recommendations {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+    out.push_str(
+        "(Questo e' il parere convergente del consiglio di figure: rispetta i \
+         requisiti obbligatori e fermati sui rischi bloccanti.)\n",
+    );
+    out.push_str("</consiglio_sintesi>");
+    out
+}
+
+pub(crate) fn render_multi_provider_synthesis(s: &AdvisorySynthesis) -> String {
+    let mut out = String::from("<multi_provider_sintesi>\n");
+    out.push_str(&format!(
+        "Verdetto del panel multi-provider: {}\n",
+        s.verdict.as_str()
+    ));
+    out.push_str(&format!(
+        "Pareri validi: {}/{}; dissenso: {}\n",
+        s.valid, s.total_advisories, s.dissent
+    ));
+    if !s.requirements.is_empty() {
+        out.push_str("Requisiti obbligatori convergenti:\n");
+        for r in &s.requirements {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+    if !s.risks.is_empty() {
+        out.push_str("Rischi multi-provider (per severity):\n");
+        for risk in &s.risks {
+            let sev = risk.get("severity").and_then(Value::as_str).unwrap_or("?");
+            let desc = risk
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            out.push_str(&format!("- [{sev}] {desc}\n"));
+        }
+    }
+    if !s.recommendations.is_empty() {
+        out.push_str("Raccomandazioni:\n");
+        for r in &s.recommendations {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+    out.push_str(
+        "(Questo e' il parere convergente di modelli/provider diversi: incorpora \
+         i requisiti nel piano e tratta i veti come vincoli bloccanti.)\n",
+    );
+    out.push_str("</multi_provider_sintesi>");
+    out
 }
 
 // ─── Narrazione del sub-run sul run PADRE (ADR 0037) ───────────────────────
@@ -1168,8 +1666,13 @@ impl ParentNarrator {
         let target = targets.remove(&idx);
         let (title, payload) =
             tool_progress_meta(sub_kind, sub_run_id, &tool, target.as_deref(), is_error);
-        self.say("subagent_progress", title, self.with_pin(payload), sub_run_id)
-            .await;
+        self.say(
+            "subagent_progress",
+            title,
+            self.with_pin(payload),
+            sub_run_id,
+        )
+        .await;
         true
     }
 
@@ -1221,9 +1724,7 @@ fn put_model_fields(payload: &mut Value, provider: &str, model: &str) {
 /// se CONCLUSO — `Completed` (ok) o `Failed` (errore) dal segnale strutturato
 /// `AgentStepStatus`, mai dal testo. `Running` e' escluso (doppione per tool);
 /// uno step senza nome (ToolResult orfano) non produce narrazione utile.
-fn concluded_tool_step(
-    ev: &crate::agent_types::AgentStepEvent,
-) -> Option<(bool, String, u32)> {
+fn concluded_tool_step(ev: &crate::agent_types::AgentStepEvent) -> Option<(bool, String, u32)> {
     let step = ev.step.as_ref()?;
     let is_error = match step.status {
         crate::agent_types::AgentStepStatus::Completed => false,
@@ -1328,7 +1829,7 @@ fn spawn_narration_bridge(
 /// audit/reconcile. `run_id` E' l'identita' del sub-run (row DB) E del worktree
 /// (dir/branch): un solo id per entrambi, cosi' il GC filesystem (dir name =
 /// run_id) e la row DB restano allineati.
-struct IsolationSlot {
+pub(crate) struct IsolationSlot {
     /// Identita' condivisa row sub-run + worktree.
     run_id: Uuid,
     /// Path del worktree effimero (override root del sub-run).
@@ -1348,7 +1849,7 @@ struct IsolationSlot {
 /// scrive nel worktree `slot.worktree_path` (ctx isolato: autocommit/reindex
 /// soppressi, PR3) e persiste `worktree_path`/`base_commit`. L'apply dei
 /// cambiamenti alla root e' responsabilita' SERIALIZZATA del chiamante batch.
-async fn run_single_subagent(
+pub(crate) async fn run_single_subagent(
     ctx: &AgentToolContext,
     kind: &str,
     task: &str,
@@ -1356,6 +1857,53 @@ async fn run_single_subagent(
     expected_format: &str,
     isolation: Option<&IsolationSlot>,
     is_background: bool,
+) -> Value {
+    run_single_subagent_inner(
+        ctx,
+        kind,
+        task,
+        context_blob,
+        expected_format,
+        isolation,
+        is_background,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_subagent_with_model_pin(
+    ctx: &AgentToolContext,
+    kind: &str,
+    task: &str,
+    context_blob: &str,
+    expected_format: &str,
+    provider: &str,
+    model: &str,
+) -> Value {
+    run_single_subagent_inner(
+        ctx,
+        kind,
+        task,
+        context_blob,
+        expected_format,
+        None,
+        false,
+        Some((provider, model)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_single_subagent_inner(
+    ctx: &AgentToolContext,
+    kind: &str,
+    task: &str,
+    context_blob: &str,
+    expected_format: &str,
+    isolation: Option<&IsolationSlot>,
+    is_background: bool,
+    model_pin: Option<(&str, &str)>,
 ) -> Value {
     // FASE PREPARE (guard + INSERT + ensure_child, tutto SINCRONO fail-fast): il
     // punto unico condiviso dal ramo singolo e dal batch background (regola L).
@@ -1367,6 +1915,7 @@ async fn run_single_subagent(
         expected_format,
         isolation,
         is_background,
+        model_pin,
     )
     .await
     {
@@ -1410,12 +1959,17 @@ async fn prepare_subagent_run(
     expected_format: &str,
     isolation: Option<&IsolationSlot>,
     is_background: bool,
+    model_pin: Option<(&str, &str)>,
 ) -> Result<SubagentExecInputs, Value> {
     let db = &*ctx.core.db;
     let project_id = ctx.core.project_id;
     let session_id = match ctx.core.session_id {
         Some(s) => s,
-        None => return Err(json!({"error": "sub-agent richiede una sessione chat (session_id assente)"})),
+        None => {
+            return Err(
+                json!({"error": "sub-agent richiede una sessione chat (session_id assente)"}),
+            )
+        }
     };
     // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
     // del progetto. Risolvo una volta il pool per_progetto e lo riuso per la catena
@@ -1428,17 +1982,23 @@ async fn prepare_subagent_run(
         Err(e) => return Err(json!({"error": format!("lettura settings fallita: {e}")})),
     };
     if !settings.enabled {
-        return Err(json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"}));
+        return Err(
+            json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"}),
+        );
     }
     if !settings.whitelist.iter().any(|w| w == kind) {
-        return Err(json!({"error": format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist)}));
+        return Err(
+            json!({"error": format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist)}),
+        );
     }
 
     // ── Guard 2: definition del kind ──────────────────────────────────────────
     let definition = match fetch_definition(ctx, kind).await {
         Ok(Some(d)) => d,
         Ok(None) => {
-            return Err(json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")}))
+            return Err(
+                json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")}),
+            )
         }
         Err(e) => return Err(json!({"error": e})),
     };
@@ -1465,12 +2025,17 @@ async fn prepare_subagent_run(
     // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
     let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
     if system_text.trim().is_empty() {
-        return Err(json!({"error": format!("prompt '{}' non trovato o vuoto", definition.prompt_key)}));
+        return Err(
+            json!({"error": format!("prompt '{}' non trovato o vuoto", definition.prompt_key)}),
+        );
     }
     let tools_json = build_tools_json(&definition.tool_whitelist);
 
-    let (provider, model) =
-        resolve_worker_model(db, &proj_pool, kind, &definition, anchor, session_id).await;
+    let (provider, model) = if let Some((provider, model)) = model_pin {
+        (provider.to_string(), model.to_string())
+    } else {
+        resolve_worker_model(db, &proj_pool, kind, &definition, anchor, session_id).await
+    };
 
     let timeout_s = if definition.timeout_s > 0 {
         definition.timeout_s
@@ -1509,7 +2074,11 @@ async fn prepare_subagent_run(
     };
     let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
         Ok(id) => id,
-        Err(e) => return Err(json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")})),
+        Err(e) => {
+            return Err(
+                json!({"error": format!("creazione riga nexus_subagent_runs fallita: {e}")}),
+            )
+        }
     };
 
     // ── Riga agent_runs del SUB-run (osservabilita', regola M) ────────────────
@@ -1586,7 +2155,6 @@ fn spawn_background_subagent(exec: SubagentExecInputs) -> Value {
     })
 }
 
-
 /// Input OWNED (`'static`) della parte "execute" di un sub-run: narrazione avvio ->
 /// grafo nativo -> finalize. Raggruppa i parametri gia' risolti da
 /// [`run_single_subagent`] cosi' l'helper puo' essere `await`ato inline (ramo
@@ -1662,8 +2230,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // meta-step la chat resta muta e il run padre sembra bloccato mentre il figlio
     // lavora. Nel ramo background la narrazione racconta il progresso del figlio
     // sul run padre gia' sospeso (il fan-in arrivera' via poll).
-    let narrator =
-        ParentNarrator::from_ctx(&ctx, &proj_pool, narration_enabled, &provider, &model);
+    let narrator = ParentNarrator::from_ctx(&ctx, &proj_pool, narration_enabled, &provider, &model);
     if let Some(n) = &narrator {
         let task_head: String = task.trim().chars().take(160).collect();
         n.say(
@@ -1725,6 +2292,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // Sub-agente eseguito in autonomia (parita' col brain: behavior_mode
         // "automatico", approved=true).
         automation_mode: "automatic".to_string(),
+        supervisor_mode: nexus_agent_graph::SupervisorMode::None,
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
@@ -1734,6 +2302,8 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // `tool_dispatch_subagents`) -> scrive nel worktree effimero, ctx isolato
         // (autocommit/reindex soppressi, PR3). L'apply serializzato e' del batch.
         working_root,
+        pre_run_advisory_synthesis: None,
+        pre_run_advisory_source: None,
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
@@ -1745,7 +2315,8 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // segua quella di chiusura (race chiusa alla radice, regola H).
     let run_fut = crate::native_engine::run_native(&deps, &native_input);
     let outcome: anyhow::Result<NativeRunOutcome> =
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await
+        {
             Ok(res) => res,
             Err(_) => {
                 stop_bridge(bridge).await;
@@ -1753,8 +2324,23 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
                 // deve passare per l'enqueue fan-in come gli altri rami (senza,
                 // un parent con l'ultimo figlio andato in timeout resterebbe
                 // sospeso per sempre). Non esce con return diretto.
-                let out = finalize_timeout(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, timeout_s).await;
-                maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, fanin_parent_run_id, session_id, is_background).await;
+                let out = finalize_timeout(
+                    &proj_pool,
+                    narrator.as_deref(),
+                    subagent_run_id,
+                    &kind,
+                    timeout_s,
+                )
+                .await;
+                maybe_enqueue_fanin_resume(
+                    &ctx,
+                    &proj_pool,
+                    anchor,
+                    fanin_parent_run_id,
+                    session_id,
+                    is_background,
+                )
+                .await;
                 return out;
             }
         };
@@ -1762,15 +2348,32 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
 
     let out = match outcome {
         Ok(o) => {
-            finalize_success(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, current_depth, &o)
-                .await
+            finalize_success(
+                &proj_pool,
+                narrator.as_deref(),
+                subagent_run_id,
+                &kind,
+                current_depth,
+                &o,
+            )
+            .await
         }
-        Err(e) => finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, &e).await,
+        Err(e) => {
+            finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, &e).await
+        }
     };
     // Fan-in (Fase D): il figlio si e' marcato TERMINALE nel finalize sopra. Se e'
     // il ramo background e nessun altro figlio background del parent e' ancora
     // attivo, accoda il parent nella coda META (il worker fan-in lo riprende).
-    maybe_enqueue_fanin_resume(&ctx, &proj_pool, anchor, fanin_parent_run_id, session_id, is_background).await;
+    maybe_enqueue_fanin_resume(
+        &ctx,
+        &proj_pool,
+        anchor,
+        fanin_parent_run_id,
+        session_id,
+        is_background,
+    )
+    .await;
     out
 }
 
@@ -1902,6 +2505,42 @@ async fn fanin_enqueue_if_last(
 /// `parent_provider` da `agent_runs`); `proj_pool` e' il pool del PROGETTO, dove
 /// vive `chat_sessions` (il pin). Le due letture NON possono condividere lo stesso
 /// pool (incidente separazione DB: `chat_sessions` non e' nel meta).
+/// Setting kill-switch diversita' tier ultracode (mig 0555, regola G).
+const ULTRACODE_TIER_DIVERSITY_SETTING: &str = "orchestrator.ultracode_tier_diversity_enabled";
+
+/// Risolve il purpose model per un sub-agent ultracode leggendo i settings
+/// `orchestrator.ultracode_*_purpose` con fallback a
+/// `nexus_subagent_definitions.model_purpose` (regola G/L).
+async fn resolve_worker_model_purpose(
+    db: &sqlx::PgPool,
+    kind: &str,
+    definition: &SubagentDefinition,
+) -> String {
+    let tier_diversity = nexus_auth::get_bool_setting(db, ULTRACODE_TIER_DIVERSITY_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true);
+    if !tier_diversity {
+        return definition.model_purpose.clone();
+    }
+    let setting_key = match kind {
+        "implement" => Some("orchestrator.ultracode_implement_purpose"),
+        "verify" => Some("orchestrator.ultracode_verify_purpose"),
+        "review" => Some("orchestrator.ultracode_review_purpose"),
+        _ => None,
+    };
+    if let Some(key) = setting_key {
+        if let Some(v) = nexus_auth::get_setting(db, key).await {
+            let trimmed = v.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+    }
+    definition.model_purpose.clone()
+}
+
 async fn resolve_worker_model(
     db: &sqlx::PgPool,
     proj_pool: &sqlx::PgPool,
@@ -1910,10 +2549,11 @@ async fn resolve_worker_model(
     anchor: Uuid,
     session_id: Uuid,
 ) -> (String, String) {
-    if definition.model_purpose.trim().is_empty() {
+    let purpose = resolve_worker_model_purpose(db, kind, definition).await;
+    if purpose.trim().is_empty() {
         return (String::new(), String::new());
     }
-    let purpose = &definition.model_purpose;
+    let purpose = purpose.as_str();
 
     // Ramo REVIEW: pin IGNORATO, vincolo giudice != worker invariato. Provider del
     // padre da escludere (astensione da auto-certificazione).
@@ -2157,7 +2797,11 @@ async fn narrate_completed(
     o: &NativeRunOutcome,
 ) {
     let Some(n) = narrator else { return };
-    let esito = if o.completed { "completato" } else { "in pausa" };
+    let esito = if o.completed {
+        "completato"
+    } else {
+        "in pausa"
+    };
     n.say(
         "subagent_completed",
         format!("Subagente {kind} {esito} ({} iterazioni)", o.iterations),
@@ -2177,8 +2821,12 @@ async fn narrate_completed(
 /// Chiusura del ramo OK del sub-run: mark_run + log + narrazione + tool_result
 /// (il main riceve SOLO questo summary, non l'intera conversazione del figlio).
 async fn finalize_success(
-    pool: &sqlx::PgPool, narrator: Option<&ParentNarrator>,
-    sub_run_id: Uuid, kind: &str, depth: i64, o: &NativeRunOutcome,
+    pool: &sqlx::PgPool,
+    narrator: Option<&ParentNarrator>,
+    sub_run_id: Uuid,
+    kind: &str,
+    depth: i64,
+    o: &NativeRunOutcome,
 ) -> Value {
     let summary = o.final_answer.clone().unwrap_or_default();
     // `status` LIFECYCLE del sub-run (completed = arrivato a End, paused = fermato
@@ -2529,7 +3177,9 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     let run_id = match Uuid::parse_str(&run_id_str) {
         Ok(u) => u,
         Err(_) => {
-            return format!("\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}")
+            return format!(
+                "\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}"
+            )
         }
     };
 
@@ -2600,7 +3250,10 @@ mod tests {
         let tools = build_tools_json(&["read_file".to_string(), "write_file".to_string()]);
         let arr = tools.as_array().expect("array");
         // Solo i tool in whitelist, con schema REALE (campo input_schema presente).
-        assert!(!arr.is_empty(), "lo schema reale deve contenere i tool richiesti");
+        assert!(
+            !arr.is_empty(),
+            "lo schema reale deve contenere i tool richiesti"
+        );
         for t in arr {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
             assert!(
@@ -2647,7 +3300,10 @@ mod tests {
             "flag OFF -> sempre sequenziale"
         );
         // Anche con scope vuoti / sovrapposti resta false (irrilevante a flag OFF).
-        assert!(!should_isolate_batch(false, &[sc(&["src/a"]), sc(&["src/a"])]));
+        assert!(!should_isolate_batch(
+            false,
+            &[sc(&["src/a"]), sc(&["src/a"])]
+        ));
         assert!(!should_isolate_batch(false, &[]));
     }
 
@@ -2749,7 +3405,11 @@ mod tests {
         let running = step_event(S::Running, "read_file", 1, json!({}));
         assert_eq!(concluded_tool_step(&running), None, "Running: doppione");
         let orfano = step_event(S::Completed, "", 2, json!({}));
-        assert_eq!(concluded_tool_step(&orfano), None, "senza nome: nessuna riga utile");
+        assert_eq!(
+            concluded_tool_step(&orfano),
+            None,
+            "senza nome: nessuna riga utile"
+        );
         let senza_step = crate::agent_types::AgentStepEvent {
             run_id: "r".into(),
             step: None,
@@ -2835,7 +3495,10 @@ mod tests {
         .expect("create nexus_subagent_runs");
     }
 
-    async fn fetch_worktree_cols(pool: &sqlx::PgPool, id: Uuid) -> (Option<String>, Option<String>) {
+    async fn fetch_worktree_cols(
+        pool: &sqlx::PgPool,
+        id: Uuid,
+    ) -> (Option<String>, Option<String>) {
         sqlx::query_as("SELECT worktree_path, base_commit FROM nexus_subagent_runs WHERE id = $1")
             .bind(id)
             .fetch_one(pool)
@@ -2864,7 +3527,9 @@ mod tests {
         };
 
         // Ramo sequenziale: id dal DB (non nil), colonne worktree NULL.
-        let seq_id = insert_subagent_run(&pool, &row, None).await.expect("insert seq");
+        let seq_id = insert_subagent_run(&pool, &row, None)
+            .await
+            .expect("insert seq");
         assert!(!seq_id.is_nil(), "id generato dal DB non nullo");
         assert_eq!(fetch_worktree_cols(&pool, seq_id).await, (None, None));
 
@@ -2874,11 +3539,19 @@ mod tests {
             worktree_path: std::path::PathBuf::from("/tmp/wt"),
             base_commit: "abc123".to_string(),
         };
-        let iso_id = insert_subagent_run(&pool, &row, Some(&slot)).await.expect("insert iso");
-        assert_eq!(iso_id, slot.run_id, "ramo isolato: id = run_id del worktree");
+        let iso_id = insert_subagent_run(&pool, &row, Some(&slot))
+            .await
+            .expect("insert iso");
+        assert_eq!(
+            iso_id, slot.run_id,
+            "ramo isolato: id = run_id del worktree"
+        );
         assert_eq!(
             fetch_worktree_cols(&pool, iso_id).await,
-            (Some(slot.worktree_path.to_string_lossy().to_string()), Some(slot.base_commit)),
+            (
+                Some(slot.worktree_path.to_string_lossy().to_string()),
+                Some(slot.base_commit)
+            ),
         );
     }
 
@@ -2893,7 +3566,10 @@ mod tests {
 
         let mut vuoto = json!({"phase": "tool"});
         put_model_fields(&mut vuoto, "", "  ");
-        assert!(vuoto.get(K_PROVIDER).is_none(), "pin non risolto: campo omesso");
+        assert!(
+            vuoto.get(K_PROVIDER).is_none(),
+            "pin non risolto: campo omesso"
+        );
         assert!(vuoto.get(K_MODEL).is_none());
     }
 
@@ -2973,7 +3649,14 @@ mod tests {
         create_child_run_tables(&pool).await;
         let child = Uuid::new_v4();
         let anchor_non_tracciato = Uuid::new_v4(); // sessione: NON in agent_runs
-        ensure_child(&pool, child, anchor_non_tracciato, "mistral", "mistral-medium-3").await;
+        ensure_child(
+            &pool,
+            child,
+            anchor_non_tracciato,
+            "mistral",
+            "mistral-medium-3",
+        )
+        .await;
         let row: (String, Option<String>, Option<Uuid>, Option<String>) = sqlx::query_as(
             "SELECT status, nexus_agent_type, parent_run_id, model FROM agent_runs WHERE id = $1",
         )
@@ -2983,7 +3666,10 @@ mod tests {
         .expect("riga figlio presente");
         assert_eq!(row.0, "running");
         assert_eq!(row.1.as_deref(), Some("subagent"));
-        assert_eq!(row.2, None, "ancora non tracciata -> parent NULL (no FK rotta)");
+        assert_eq!(
+            row.2, None,
+            "ancora non tracciata -> parent NULL (no FK rotta)"
+        );
         assert_eq!(row.3.as_deref(), Some("mistral-medium-3"));
 
         // Idempotente sul retry (ON CONFLICT DO NOTHING).
@@ -3109,7 +3795,10 @@ mod tests {
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
         let (provider, _model) =
             resolve_worker_model(&pool, &pool, "review", &def, parent, Uuid::new_v4()).await;
-        assert_eq!(provider, "beta", "il review deve evitare il provider del worker (alpha)");
+        assert_eq!(
+            provider, "beta",
+            "il review deve evitare il provider del worker (alpha)"
+        );
     }
 
     /// C2 fallback: se il provider del worker e' l'UNICO capable, il review gira
@@ -3119,7 +3808,10 @@ mod tests {
         let (parent, def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
         let (provider, _model) =
             resolve_worker_model(&pool, &pool, "review", &def, parent, Uuid::new_v4()).await;
-        assert_eq!(provider, "alpha", "unico provider capable -> fallback senza esclusione");
+        assert_eq!(
+            provider, "alpha",
+            "unico provider capable -> fallback senza esclusione"
+        );
     }
 
     /// C2 parita': un kind NON review non esclude nulla (il provider del padre e'
@@ -3240,8 +3932,14 @@ mod tests {
         seed_session_pin(&pool, session, Some("deepseek")).await;
         let (provider, model) =
             resolve_worker_model(&pool, &pool, "implement", &def, Uuid::new_v4(), session).await;
-        assert_eq!(provider, "deepseek", "il pin deve vincere il cost-first (mistral piu' economico)");
-        assert_eq!(model, "deepseek-medium", "tier medium rispettato (non il light deepseek-flash)");
+        assert_eq!(
+            provider, "deepseek",
+            "il pin deve vincere il cost-first (mistral piu' economico)"
+        );
+        assert_eq!(
+            model, "deepseek-medium",
+            "tier medium rispettato (non il light deepseek-flash)"
+        );
     }
 
     /// TEST 2 — pin non-capable -> degrado: il provider pinnato non ha un modello
@@ -3262,9 +3960,15 @@ mod tests {
         seed_session_pin(&pool, session, Some("deepseek")).await;
         let (provider, model) =
             resolve_worker_model(&pool, &pool, "implement", &def, Uuid::new_v4(), session).await;
-        assert_eq!(provider, "mistral", "pin non-capable -> fallback senza pin al purpose normale");
+        assert_eq!(
+            provider, "mistral",
+            "pin non-capable -> fallback senza pin al purpose normale"
+        );
         assert_eq!(model, "mistral-medium");
-        assert!(!provider.is_empty() && !model.is_empty(), "mai (\"\",\"\") se il purpose e' risolvibile");
+        assert!(
+            !provider.is_empty() && !model.is_empty(),
+            "mai (\"\",\"\") se il purpose e' risolvibile"
+        );
     }
 
     /// TEST 3 — pin in cooldown -> degrado: il provider pinnato e' capable ma in
@@ -3329,7 +4033,10 @@ mod tests {
         seed_session_pin(&pool, session, Some("alpha")).await;
         let (provider, _model) =
             resolve_worker_model(&pool, &pool, "review", &def, parent, session).await;
-        assert_eq!(provider, "beta", "review: il pin e' ignorato, l'esclusione del padre vince");
+        assert_eq!(
+            provider, "beta",
+            "review: il pin e' ignorato, l'esclusione del padre vince"
+        );
     }
 
     /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
@@ -3423,6 +4130,7 @@ mod tests {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            pending_actions: Vec::new(),
         };
         let keys = |v: &Value| -> BTreeSet<String> {
             v.as_object()
@@ -3498,11 +4206,13 @@ mod tests {
     }
 
     async fn queue_len(pool: &sqlx::PgPool, parent: Uuid) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM subagent_fanin_resume_queue WHERE parent_run_id = $1")
-            .bind(parent)
-            .fetch_one(pool)
-            .await
-            .expect("count queue")
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subagent_fanin_resume_queue WHERE parent_run_id = $1",
+        )
+        .bind(parent)
+        .fetch_one(pool)
+        .await
+        .expect("count queue")
     }
 
     /// Con un figlio background ancora `running`, l'enqueue NON scatta: si aspetta
@@ -3546,7 +4256,11 @@ mod tests {
             .await
             .expect("enqueue query ok");
         assert!(enq3, "ancora tutti terminali -> ritorna true");
-        assert_eq!(queue_len(&pool, parent).await, 1, "nessun duplicato in coda");
+        assert_eq!(
+            queue_len(&pool, parent).await,
+            1,
+            "nessun duplicato in coda"
+        );
     }
 
     /// BUG #1 (ALTA FATALE): l'enqueue deve accodare il RUN CORRENTE
@@ -3737,7 +4451,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count anchor");
-        assert_eq!(via_anchor, 3, "il vecchio filtro per anchor vedeva anche il nipote");
+        assert_eq!(
+            via_anchor, 3,
+            "il vecchio filtro per anchor vedeva anche il nipote"
+        );
         let via_dispatcher: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM nexus_subagent_runs WHERE dispatcher_run_id = $1 AND is_background = true",
         )
@@ -3745,12 +4462,277 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count dispatcher");
-        assert_eq!(via_dispatcher, 2, "il fix per dispatcher vede SOLO i figli diretti di P");
+        assert_eq!(
+            via_dispatcher, 2,
+            "il fix per dispatcher vede SOLO i figli diretti di P"
+        );
 
         // Cp1 NON si accoda ancora: il suo figlio diretto Cs1 e' running.
         let enq_cp1 = fanin_enqueue_if_last(&pool, &pool, cp1_run, project, session)
             .await
             .expect("enqueue Cp1 ok");
         assert!(!enq_cp1, "Cp1 ha Cs1 ancora running -> non si accoda");
+    }
+
+    // ─── Consiglio a monte: selezione figure + composizione sintesi ─────────────
+
+    fn council_cfg() -> CouncilConfig {
+        CouncilConfig {
+            base_figures: vec![
+                "functional_analyst".to_string(),
+                "software_architect".to_string(),
+                "security_engineer".to_string(),
+                "project_manager".to_string(),
+            ],
+            infra_figures: vec!["sysadmin".to_string()],
+            infra_keywords: vec!["deploy".to_string(), "docker".to_string()],
+            max_figures: 6,
+        }
+    }
+
+    #[test]
+    fn select_figures_solo_base_senza_ambito_infra() {
+        let cfg = council_cfg();
+        let got = select_council_figures("aggiungi il login con OTP via email", &cfg);
+        assert_eq!(
+            got,
+            vec![
+                "functional_analyst",
+                "software_architect",
+                "security_engineer",
+                "project_manager"
+            ],
+        );
+        assert!(!got.iter().any(|f| f == "sysadmin"));
+    }
+
+    #[test]
+    fn select_figures_aggiunge_sysadmin_su_ambito_deploy() {
+        let cfg = council_cfg();
+        let got = select_council_figures("prepara il deploy con docker in produzione", &cfg);
+        assert!(
+            got.iter().any(|f| f == "sysadmin"),
+            "atteso sysadmin: {got:?}"
+        );
+        assert_eq!(got.len(), 5);
+    }
+
+    #[test]
+    fn select_figures_dedup_e_cap() {
+        let cfg = CouncilConfig {
+            base_figures: vec![
+                "software_architect".to_string(),
+                "software_architect".to_string(),
+                "security_engineer".to_string(),
+            ],
+            infra_figures: vec!["security_engineer".to_string(), "sysadmin".to_string()],
+            infra_keywords: vec!["deploy".to_string()],
+            max_figures: 2,
+        };
+        let got = select_council_figures("deploy dell'app", &cfg);
+        // Dedup: software_architect una sola volta; cap 2 -> tronca.
+        assert_eq!(got, vec!["software_architect", "security_engineer"]);
+    }
+
+    #[test]
+    fn select_figures_vuoto_se_base_vuota() {
+        let cfg = CouncilConfig {
+            base_figures: vec![],
+            infra_figures: vec![],
+            infra_keywords: vec![],
+            max_figures: 6,
+        };
+        assert!(select_council_figures("qualunque testo", &cfg).is_empty());
+    }
+
+    #[test]
+    fn council_outcome_degraded_codes_strutturati() {
+        let figures = vec!["security_engineer".to_string()];
+        assert_eq!(
+            CouncilConveneOutcome::Degraded {
+                reason: CouncilDegradeReason::SubagentsDisabled,
+                figures: figures.clone(),
+            }
+            .degradation_reason_code(),
+            Some("subagents_disabled")
+        );
+        assert_eq!(
+            CouncilConveneOutcome::Degraded {
+                reason: CouncilDegradeReason::SynthesisUnavailable,
+                figures: figures.clone(),
+            }
+            .degradation_reason_code(),
+            Some("synthesis_unavailable")
+        );
+        assert!(
+            CouncilConveneOutcome::Degraded {
+                reason: CouncilDegradeReason::BuildCtxFailed,
+                figures,
+            }
+            .render_block()
+            .is_empty()
+        );
+    }
+
+    /// Un tool_result mock di una figura col blocco `outcome.advisory` (regola M).
+    fn mock_figure_result(verdict: &str, req: &str, risk_sev: Option<&str>) -> Value {
+        let mut advisory = json!({
+            "verdict": verdict,
+            "requirements": [req],
+            "recommendations": [],
+        });
+        if let Some(sev) = risk_sev {
+            advisory["risks"] = json!([{ "severity": sev, "description": "rischio con evidenza" }]);
+        } else {
+            advisory["risks"] = json!([]);
+        }
+        json!({
+            "status": "completed",
+            "outcome": { "success": true, "advisory": advisory },
+        })
+    }
+
+    #[test]
+    fn compose_council_synthesis_da_result_mock() {
+        let results = vec![
+            mock_figure_result("proceed_with_changes", "validare input", None),
+            mock_figure_result("proceed", "logging strutturato", None),
+        ];
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default())
+            .expect("almeno un advisory -> sintesi presente");
+        assert_eq!(synth.verdict.as_str(), "proceed_with_changes");
+        assert_eq!(synth.valid, 2);
+        assert!(synth.requirements.iter().any(|r| r == "validare input"));
+        assert!(synth
+            .requirements
+            .iter()
+            .any(|r| r == "logging strutturato"));
+    }
+
+    #[test]
+    fn compose_council_synthesis_veto_su_high_severity() {
+        let results = vec![
+            mock_figure_result("proceed", "ok", None),
+            mock_figure_result("block", "non esporre il segreto", Some("alta")),
+        ];
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default())
+            .expect("sintesi presente");
+        // Veto avversario attivo di default: un block con severity alta vince.
+        assert_eq!(synth.verdict.as_str(), "block");
+        assert!(synth.verdict.is_veto());
+    }
+
+    #[test]
+    fn compose_council_synthesis_none_senza_advisory() {
+        // Result senza outcome.advisory (worker ordinario) -> non e' un panel.
+        let results = vec![json!({ "status": "completed", "outcome": { "success": true } })];
+        assert!(compose_council_synthesis(&results, &AdvisoryPolicy::default()).is_none());
+    }
+
+    #[test]
+    fn render_synthesis_contiene_requisiti_rischi_verdetto() {
+        let results = vec![mock_figure_result(
+            "proceed_with_changes",
+            "cifrare i dati a riposo",
+            Some("media"),
+        )];
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default()).unwrap();
+        let block = render_council_synthesis(&synth);
+        assert!(block.starts_with("<consiglio_sintesi>"));
+        assert!(block.ends_with("</consiglio_sintesi>"));
+        assert!(block.contains("proceed_with_changes"));
+        assert!(block.contains("cifrare i dati a riposo"));
+        assert!(block.contains("[media]"));
+    }
+
+    #[test]
+    fn render_multi_provider_synthesis_contiene_quorum_e_verdetto() {
+        let results = vec![
+            mock_figure_result("proceed", "test idempotenti", None),
+            mock_figure_result("proceed_with_changes", "punto unico routing", None),
+        ];
+        let synth = compose_multi_provider_synthesis(&results, &AdvisoryPolicy::default())
+            .expect("sintesi multi-provider");
+        let block = render_multi_provider_synthesis(&synth);
+        assert!(block.starts_with("<multi_provider_sintesi>"));
+        assert!(block.contains("Verdetto del panel multi-provider"));
+        assert!(block.contains("Pareri validi:"));
+    }
+
+    #[test]
+    fn multi_provider_panel_outcome_degraded_non_inietta_blocco() {
+        let outcome = MultiProviderPanelOutcome::Degraded {
+            reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
+            got: 1,
+            min: 2,
+        };
+        assert!(outcome.render_block().is_empty());
+        assert!(outcome.advisory_synthesis_value().is_none());
+        assert_eq!(
+            outcome.degradation_reason_code(),
+            Some("insufficient_provider_diversity")
+        );
+    }
+
+    /// Mig 0555: purpose ultracode da settings con fallback a model_purpose.
+    #[sqlx::test]
+    async fn ultracode_purpose_da_settings_con_fallback(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings");
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("nexus_purpose_model");
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        for (purpose, tier, provider, model) in [
+            ("worker_implement", "medium", "openai", "gpt-a"),
+            ("worker_verify", "light", "anthropic", "claude-v"),
+            ("reviewer", "high", "deepseek", "ds-r"),
+        ] {
+            sqlx::query(
+                "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+                 VALUES ($1, $2, 'code', true)",
+            )
+            .bind(purpose)
+            .bind(tier)
+            .execute(&pool)
+            .await
+            .expect("purpose");
+            seed_catalog_row(&pool, provider, model, tier, 1.0).await;
+        }
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES \
+             ('orchestrator.ultracode_tier_diversity_enabled', 'true'), \
+             ('orchestrator.ultracode_implement_purpose', 'worker_implement'), \
+             ('orchestrator.ultracode_verify_purpose', 'worker_verify'), \
+             ('orchestrator.ultracode_review_purpose', 'reviewer')",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings");
+        let def = SubagentDefinition {
+            prompt_key: "x".to_string(),
+            tool_whitelist: vec![],
+            model_purpose: "worker_implement".to_string(),
+            timeout_s: 0,
+        };
+        let (provider, _model) =
+            resolve_worker_model(&pool, &pool, "verify", &def, Uuid::new_v4(), Uuid::new_v4())
+                .await;
+        assert_eq!(
+            provider, "anthropic",
+            "kind verify deve usare orchestrator.ultracode_verify_purpose"
+        );
     }
 }

@@ -42,10 +42,13 @@ use nexus_cache::TtlCache;
 // via purpose `intent_classifier` (regola G). Specchiano i DEFAULT_* del Python.
 
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60; // 24 ore
-// Parita' col Python: dimensione cache. `TtlCache` non ha cap hard (eviction
-// gestita dal TTL), quindi questa costante e' documentazione del contratto: non
-// e' letta dal codice (l'eviction e' solo TTL-based), ma documenta la parita'.
-#[allow(dead_code, reason = "documenta la dimensione cache del Python; TtlCache evince solo per TTL")]
+                                                     // Parita' col Python: dimensione cache. `TtlCache` non ha cap hard (eviction
+                                                     // gestita dal TTL), quindi questa costante e' documentazione del contratto: non
+                                                     // e' letta dal codice (l'eviction e' solo TTL-based), ma documenta la parita'.
+#[allow(
+    dead_code,
+    reason = "documenta la dimensione cache del Python; TtlCache evince solo per TTL"
+)]
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_LLM_TIMEOUT_SECONDS: f32 = 5.0;
 const DEFAULT_AMBIGUITY_MIN_CONFIDENCE: f32 = 0.70;
@@ -226,10 +229,7 @@ impl AgenticIntent {
             cached: false,
             fallback_used: true,
             authorizes_changes: true,
-            candidates: vec![IntentCandidate {
-                intent,
-                confidence,
-            }],
+            candidates: vec![IntentCandidate { intent, confidence }],
             is_ambiguous: false,
             slots: ActionSlots::default(),
         }
@@ -447,7 +447,9 @@ fn parse_candidates(
         if !ALLOWED_INTENTS.contains(&intent.as_str()) {
             continue;
         }
-        let Some(conf) = item.confidence else { continue };
+        let Some(conf) = item.confidence else {
+            continue;
+        };
         out.push(IntentCandidate {
             intent,
             confidence: clamp01(conf),
@@ -508,11 +510,8 @@ fn validate_parsed(
     let ambiguous = is_ambiguous(&candidates, ambiguity_min_confidence, ambiguity_min_margin);
     let slots = parse_slots(raw.slots);
     // Default true = fail-safe: se l'LLM non popola il campo NON si bloccano i fix.
-    let authorizes_changes = strict_bool(
-        raw.authorizes_changes.as_ref(),
-        "authorizes_changes",
-        true,
-    );
+    let authorizes_changes =
+        strict_bool(raw.authorizes_changes.as_ref(), "authorizes_changes", true);
     Some(AgenticIntent {
         intent,
         agentic_score,
@@ -538,7 +537,9 @@ async fn build_prompt(db: &PgPool, message: &str) -> String {
         if tpl.contains("{message}") {
             return tpl.replace("{message}", message);
         }
-        tracing::warn!("agentic_classifier: template DB privo di {{message}}, uso fallback costante");
+        tracing::warn!(
+            "agentic_classifier: template DB privo di {{message}}, uso fallback costante"
+        );
     }
     CLASSIFIER_PROMPT_FALLBACK.replace("{message}", message)
 }
@@ -559,11 +560,7 @@ async fn build_prompt(db: &PgPool, message: &str) -> String {
 /// 7. cache put del risultato valido.
 ///
 /// Niente panico, niente magic-fallback di modello (regola G).
-pub async fn classify(
-    db: &PgPool,
-    gateway: &NexusGatewayClient,
-    message: &str,
-) -> AgenticIntent {
+pub async fn classify(db: &PgPool, gateway: &NexusGatewayClient, message: &str) -> AgenticIntent {
     if message.trim().is_empty() {
         return AgenticIntent::fallback("empty_message");
     }
@@ -649,11 +646,9 @@ pub async fn classify(
         }
     };
 
-    let Some(mut validated) = validate_parsed(
-        raw,
-        cfg.ambiguity_min_confidence,
-        cfg.ambiguity_min_margin,
-    ) else {
+    let Some(mut validated) =
+        validate_parsed(raw, cfg.ambiguity_min_confidence, cfg.ambiguity_min_margin)
+    else {
         tracing::warn!("classifier: schema invalido -> fallback");
         return AgenticIntent::fallback("json_validation");
     };
@@ -776,7 +771,10 @@ mod tests {
         let r = validate_parsed(raw, 0.70, 0.15).expect("schema valido");
         assert_eq!(r.intent, "chat");
         assert!(r.requires_tools, "requires_tools assente -> default true");
-        assert!(r.authorizes_changes, "authorizes_changes assente -> default true");
+        assert!(
+            r.authorizes_changes,
+            "authorizes_changes assente -> default true"
+        );
         assert_eq!(r.candidates.len(), 1);
         assert_eq!(r.candidates[0].intent, "chat");
         assert!(!r.slots.is_complete(), "slots assenti -> incompleti");
@@ -950,7 +948,12 @@ mod tests {
     #[test]
     fn action_oriented_intent_hint_sempre_true() {
         // Disambiguazione risolta -> azione per costruzione, ignora gli altri.
-        assert!(derive_action_oriented(Some("fix"), Some(false), Some(0.0), 0.5));
+        assert!(derive_action_oriented(
+            Some("fix"),
+            Some(false),
+            Some(0.0),
+            0.5
+        ));
     }
 
     #[test]
@@ -1015,15 +1018,17 @@ mod tests {
     #[ignore = "richiede DB+gateway+brain vivi; validazione manuale cutover"]
     async fn parita_classifier_rust_vs_python() {
         let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        let db = sqlx::PgPool::connect(&db_url).await.expect("connessione DB");
+        let db = sqlx::PgPool::connect(&db_url)
+            .await
+            .expect("connessione DB");
         // Gateway: stesso default del runtime (porta dal DB, token dev).
         let gw_port = nexus_auth::resolve_port(&db, "nexus_gateway_port").await;
         let gw_url = format!("http://127.0.0.1:{gw_port}");
         let token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
             .unwrap_or_else(|_| "dev-internal-token".to_string());
         let gateway = NexusGatewayClient::new(gw_url, token);
-        let brain_url = std::env::var("BRAIN_REST_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        let brain_url =
+            std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         let http = reqwest::Client::new();
 
         let messages = [
@@ -1044,7 +1049,10 @@ mod tests {
         println!("\n{:-<140}", "");
         println!(
             "{:<48} | {:^28} | {:^28} | {:^22}",
-            "MESSAGGIO", "RUST (intent/score/rt/auth/ao)", "PYTHON (intent/score/rt/auth/ao)", "PARITA'"
+            "MESSAGGIO",
+            "RUST (intent/score/rt/auth/ao)",
+            "PYTHON (intent/score/rt/auth/ao)",
+            "PARITA'"
         );
         println!("{:-<140}", "");
 
@@ -1060,7 +1068,10 @@ mod tests {
             );
 
             let py: PyIntent = http
-                .post(format!("{}/classify-intent-agentic", brain_url.trim_end_matches('/')))
+                .post(format!(
+                    "{}/classify-intent-agentic",
+                    brain_url.trim_end_matches('/')
+                ))
                 .json(&serde_json::json!({ "message": m }))
                 .send()
                 .await
@@ -1124,6 +1135,10 @@ mod tests {
         }
     }
     fn bool_c(b: bool) -> &'static str {
-        if b { "T" } else { "F" }
+        if b {
+            "T"
+        } else {
+            "F"
+        }
     }
 }

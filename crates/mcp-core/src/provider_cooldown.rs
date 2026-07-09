@@ -845,8 +845,14 @@ mod tests {
         // Flag OFF (default): qualunque reason -> cooldown lungo pieno (bit-identico).
         let t = ProviderHealthTimings::default();
         assert!(!t.adaptive_billing_cooldown_enabled);
-        assert_eq!(adaptive_billing_cooldown_secs("credit balance too low", &t), t.cooldown_long_s);
-        assert_eq!(adaptive_billing_cooldown_secs("quota_exceeded", &t), t.cooldown_long_s);
+        assert_eq!(
+            adaptive_billing_cooldown_secs("credit balance too low", &t),
+            t.cooldown_long_s
+        );
+        assert_eq!(
+            adaptive_billing_cooldown_secs("quota_exceeded", &t),
+            t.cooldown_long_s
+        );
     }
 
     #[test]
@@ -857,10 +863,19 @@ mod tests {
             ..Default::default()
         };
         // Hard billing (credit/balance/payment): ricarica manuale -> nessuna riduzione.
-        assert_eq!(adaptive_billing_cooldown_secs("credit balance too low", &t), t.cooldown_long_s);
-        assert_eq!(adaptive_billing_cooldown_secs("payment required", &t), t.cooldown_long_s);
+        assert_eq!(
+            adaptive_billing_cooldown_secs("credit balance too low", &t),
+            t.cooldown_long_s
+        );
+        assert_eq!(
+            adaptive_billing_cooldown_secs("payment required", &t),
+            t.cooldown_long_s
+        );
         // Quota/rate: recupero prevedibile -> TTL ridotto (2h).
-        assert_eq!(adaptive_billing_cooldown_secs("quota_exceeded", &t), 2 * 3600);
+        assert_eq!(
+            adaptive_billing_cooldown_secs("quota_exceeded", &t),
+            2 * 3600
+        );
         assert_eq!(adaptive_billing_cooldown_secs("rate_limit", &t), 2 * 3600);
         // Altra causa: conservativo -> cooldown lungo pieno.
         assert_eq!(adaptive_billing_cooldown_secs("boh", &t), t.cooldown_long_s);
@@ -877,13 +892,19 @@ mod tests {
             adaptive_billing_cooldown_min_s: 1,
             ..base
         };
-        assert_eq!(adaptive_billing_cooldown_secs("quota", &t), t.cooldown_min_s);
+        assert_eq!(
+            adaptive_billing_cooldown_secs("quota", &t),
+            t.cooldown_min_s
+        );
         // Min sopra cooldown_long_s -> clampato a cooldown_long_s.
         let t2 = ProviderHealthTimings {
             adaptive_billing_cooldown_min_s: 99 * 3600,
             ..base
         };
-        assert_eq!(adaptive_billing_cooldown_secs("quota", &t2), t2.cooldown_long_s);
+        assert_eq!(
+            adaptive_billing_cooldown_secs("quota", &t2),
+            t2.cooldown_long_s
+        );
     }
 
     #[test]

@@ -431,13 +431,9 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
     // Governance risorse in scrittura (porte ADR 0010 + URL interni), punto
     // unico con audit: su violazione registra in nexus_resource_audit e
     // ritorna il rifiuto. Catalogo policy: nexus_resource_policies (mig 0397).
-    if let Some(msg) = crate::security::resource_governance::enforce_on_write(
-        ctx,
-        "write_file",
-        path_str,
-        content,
-    )
-    .await
+    if let Some(msg) =
+        crate::security::resource_governance::enforce_on_write(ctx, "write_file", path_str, content)
+            .await
     {
         return msg;
     }
@@ -515,7 +511,13 @@ fn spawn_autocommit_snapshot(ctx: &AgentToolContext, op: &str, path_str: &str) {
     let ac_op = op.to_string();
     tokio::spawn(async move {
         crate::session_autocommit::snapshot_after_mutation(
-            &ac_db, &ac_root, ac_is_git, ac_sid, ac_isolated, &ac_op, &ac_path,
+            &ac_db,
+            &ac_root,
+            ac_is_git,
+            ac_sid,
+            ac_isolated,
+            &ac_op,
+            &ac_path,
         )
         .await;
     });
@@ -573,8 +575,15 @@ fn spawn_write_reindex(ctx: &AgentToolContext, target: &Path, path_str: &str, co
 /// warning build-graph + nota B2 sulle config critiche (che richiedono il
 /// riavvio dei servizi per avere effetto, mig 0438). Estratto da
 /// `tool_write_file`.
-fn build_write_success_message(path_str: &str, byte_len: usize, bg_warning: Option<String>) -> String {
-    let mut msg = format!("File '{}' scritto con successo ({} byte)", path_str, byte_len);
+fn build_write_success_message(
+    path_str: &str,
+    byte_len: usize,
+    bg_warning: Option<String>,
+) -> String {
+    let mut msg = format!(
+        "File '{}' scritto con successo ({} byte)",
+        path_str, byte_len
+    );
     if let Some(w) = bg_warning {
         msg = format!("{}\n\n{}", msg, w);
     }
@@ -1266,7 +1275,11 @@ fn build_old_string_ambiguous_message(
 /// 40 righe del file (preview generica, comportamento storico ridotto).
 ///
 /// Funzione pura per essere coperta da test unitari senza dipendenze runtime.
-fn build_old_string_not_found_message(content: &str, old_string_lf: &str, path_str: &str) -> String {
+fn build_old_string_not_found_message(
+    content: &str,
+    old_string_lf: &str,
+    path_str: &str,
+) -> String {
     // Limiti dell'estratto (FIX hardening qualita' agentico):
     //  - WINDOW_BEFORE/AFTER controllano la finestra simmetrica attorno
     //    alla riga "simile"; valori conservativi per restare entro ~2 KB.
@@ -1335,8 +1348,17 @@ fn build_old_string_not_found_message(content: &str, old_string_lf: &str, path_s
 
     let lines_shown_end = last_rendered_idx + 1;
     let header_label = match similar_line_idx {
-        Some(i) => format!("Contenuto attuale attorno alla riga {} (righe {}..{})", i + 1, start + 1, lines_shown_end),
-        None => format!("Contenuto attuale (righe {}..{})", start + 1, lines_shown_end),
+        Some(i) => format!(
+            "Contenuto attuale attorno alla riga {} (righe {}..{})",
+            i + 1,
+            start + 1,
+            lines_shown_end
+        ),
+        None => format!(
+            "Contenuto attuale (righe {}..{})",
+            start + 1,
+            lines_shown_end
+        ),
     };
 
     let more_hint = if lines_shown_end < total_lines {
@@ -1460,9 +1482,7 @@ async fn edit_matched_content(
     let count = content.matches(old_string_lf.as_str()).count();
     match count {
         0 => build_old_string_not_found_message(&content, &old_string_lf, path_str),
-        n if n > 1 => {
-            build_old_string_ambiguous_message(&content, &old_string_lf, path_str, n)
-        }
+        n if n > 1 => build_old_string_ambiguous_message(&content, &old_string_lf, path_str, n),
         _ => {
             apply_edit_and_persist(
                 ctx,
@@ -1503,12 +1523,7 @@ struct EditApply<'a> {
 /// PRIMA della scrittura (`before` e' il contenuto preesistente gia' letto dal
 /// chiamante). Best-effort: warn ma non blocca. Estratto da
 /// `apply_edit_and_persist`.
-async fn record_edit_mutation(
-    ctx: &AgentToolContext,
-    path_str: &str,
-    before: &str,
-    after: &str,
-) {
+async fn record_edit_mutation(ctx: &AgentToolContext, path_str: &str, before: &str, after: &str) {
     if let Err(e) = crate::file_mutations::record_mutation(
         &ctx.db,
         ctx.project_id,
@@ -1844,32 +1859,57 @@ mod tests {
         let msg = build_old_string_not_found_message(&content, old_string, "src/lib.rs");
 
         // 1. Messaggio originale conservato.
-        assert!(msg.starts_with("[Errore: old_string non trovato nel file 'src/lib.rs'."),
-            "header originale non preservato: {}", msg);
-        assert!(msg.contains("NON chiamare read_file"),
-            "warning anti-loop perso: {}", msg);
+        assert!(
+            msg.starts_with("[Errore: old_string non trovato nel file 'src/lib.rs'."),
+            "header originale non preservato: {}",
+            msg
+        );
+        assert!(
+            msg.contains("NON chiamare read_file"),
+            "warning anti-loop perso: {}",
+            msg
+        );
 
         // 2. Riga simile correttamente individuata (riga 42).
-        assert!(msg.contains("Prima riga simile trovata ~riga 42."),
-            "ancora di navigazione non presente: {}", msg);
+        assert!(
+            msg.contains("Prima riga simile trovata ~riga 42."),
+            "ancora di navigazione non presente: {}",
+            msg
+        );
 
         // 3. Header dell'estratto presente con riferimento alla riga 42.
-        assert!(msg.contains("Contenuto attuale attorno alla riga 42"),
-            "header dell'estratto attorno alla riga simile mancante: {}", msg);
+        assert!(
+            msg.contains("Contenuto attuale attorno alla riga 42"),
+            "header dell'estratto attorno alla riga simile mancante: {}",
+            msg
+        );
 
         // 4. Estratto NUMERATO contiene la riga 42 ed alcune righe attorno
         //    (finestra +/- 15: dovrebbe coprire almeno 27 e 57).
-        assert!(msg.contains("  42 | pub fn target_function"),
-            "riga 42 numerata non presente nell'estratto: {}", msg);
-        assert!(msg.contains("  30 | "),
-            "riga 30 (window before) attesa nell'estratto: {}", msg);
-        assert!(msg.contains("  55 | "),
-            "riga 55 (window after) attesa nell'estratto: {}", msg);
+        assert!(
+            msg.contains("  42 | pub fn target_function"),
+            "riga 42 numerata non presente nell'estratto: {}",
+            msg
+        );
+        assert!(
+            msg.contains("  30 | "),
+            "riga 30 (window before) attesa nell'estratto: {}",
+            msg
+        );
+        assert!(
+            msg.contains("  55 | "),
+            "riga 55 (window after) attesa nell'estratto: {}",
+            msg
+        );
 
         // 5. Limite di sicurezza: il messaggio totale deve restare contenuto
         //    (tetto ~2 KB sull'estratto + margine).
-        assert!(msg.len() < 4096,
-            "messaggio sopra il tetto ragionevole ({}B): {}", msg.len(), msg);
+        assert!(
+            msg.len() < 4096,
+            "messaggio sopra il tetto ragionevole ({}B): {}",
+            msg.len(),
+            msg
+        );
     }
 
     #[test]
@@ -1879,11 +1919,17 @@ mod tests {
 
         let msg = build_old_string_not_found_message(&content, old_string, "f.txt");
 
-        assert!(msg.contains("Nessuna riga contiene il primo token di old_string."),
-            "hint di assenza atteso: {}", msg);
+        assert!(
+            msg.contains("Nessuna riga contiene il primo token di old_string."),
+            "hint di assenza atteso: {}",
+            msg
+        );
         // L'estratto di fallback parte dalla riga 1.
-        assert!(msg.contains("   1 | alpha"),
-            "fallback alle prime righe non emesso: {}", msg);
+        assert!(
+            msg.contains("   1 | alpha"),
+            "fallback alle prime righe non emesso: {}",
+            msg
+        );
     }
 
     #[test]
@@ -1909,16 +1955,38 @@ mod tests {
         let msg = build_old_string_ambiguous_message(content, old_string, "src/lib.rs", 3);
 
         // Header informa del conteggio e dell'obbligo di univocita'.
-        assert!(msg.contains("trovato 3 volte in 'src/lib.rs'"),
-            "conteggio mancante: {}", msg);
-        assert!(msg.contains("deve essere UNICO"), "vincolo univocita' mancante: {}", msg);
+        assert!(
+            msg.contains("trovato 3 volte in 'src/lib.rs'"),
+            "conteggio mancante: {}",
+            msg
+        );
+        assert!(
+            msg.contains("deve essere UNICO"),
+            "vincolo univocita' mancante: {}",
+            msg
+        );
         // Anti-loop: niente read_file, il contesto e' gia' qui.
-        assert!(msg.contains("NON chiamare read_file"), "anti-loop mancante: {}", msg);
+        assert!(
+            msg.contains("NON chiamare read_file"),
+            "anti-loop mancante: {}",
+            msg
+        );
         // Estratto numerato presente con la riga reale dell'occorrenza.
-        assert!(msg.contains("| val = compute();"),
-            "riga numerata dell'occorrenza mancante: {}", msg);
+        assert!(
+            msg.contains("| val = compute();"),
+            "riga numerata dell'occorrenza mancante: {}",
+            msg
+        );
         // Etichette di occorrenza multipla.
-        assert!(msg.contains("Occorrenza 1"), "etichetta occorrenza 1 mancante: {}", msg);
-        assert!(msg.contains("Occorrenza 2"), "etichetta occorrenza 2 mancante: {}", msg);
+        assert!(
+            msg.contains("Occorrenza 1"),
+            "etichetta occorrenza 1 mancante: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Occorrenza 2"),
+            "etichetta occorrenza 2 mancante: {}",
+            msg
+        );
     }
 }

@@ -84,7 +84,13 @@ pub fn spawn_fanin_worker(state: AppState) {
             .checked_sub(Duration::from_secs(3600))
             .unwrap_or_else(std::time::Instant::now);
         loop {
-            let poll = load_u64(&state.db, "orchestrator.background_fanin_poll_seconds", 4, 2).await;
+            let poll = load_u64(
+                &state.db,
+                "orchestrator.background_fanin_poll_seconds",
+                4,
+                2,
+            )
+            .await;
             if background_fanin_enabled(&state.db).await {
                 if let Err(e) = run_one_round(&state).await {
                     tracing::warn!("fanin_worker: round fallito: {e}");
@@ -94,9 +100,13 @@ pub fn spawn_fanin_worker(state: AppState) {
                 // timeout DB su mark_run, o restart di mcp-core tra il finalize del
                 // figlio e l'enqueue). Scandisce i progetti, quindi va scandito piu'
                 // di rado del poll rapido della coda.
-                let backstop_every =
-                    load_u64(&state.db, "orchestrator.background_fanin_backstop_seconds", 60, 10)
-                        .await;
+                let backstop_every = load_u64(
+                    &state.db,
+                    "orchestrator.background_fanin_backstop_seconds",
+                    60,
+                    10,
+                )
+                .await;
                 if last_backstop.elapsed() >= Duration::from_secs(backstop_every) {
                     if let Err(e) = run_backstop(&state).await {
                         tracing::warn!("fanin_worker: backstop fallito: {e}");
@@ -107,9 +117,7 @@ pub fn spawn_fanin_worker(state: AppState) {
             sleep(Duration::from_secs(poll)).await;
         }
     });
-    tracing::info!(
-        "fanin_worker: avviato (trigger resume fan-in dei sub-run background, Fase D)"
-    );
+    tracing::info!("fanin_worker: avviato (trigger resume fan-in dei sub-run background, Fase D)");
 }
 
 /// Kill-switch DB-driven (regola G): default ON (mig 0542). `false/0/no/off` OFF.
@@ -271,13 +279,8 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
     for project_id in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let proj_pool =
             crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-        requeued += backstop_project(
-            &state.db,
-            &proj_pool,
-            orphan_timeout_s as i64,
-            no_progress,
-        )
-        .await;
+        requeued +=
+            backstop_project(&state.db, &proj_pool, orphan_timeout_s as i64, no_progress).await;
     }
     if requeued > 0 {
         tracing::warn!(
@@ -413,12 +416,7 @@ async fn backstop_project(
 /// Accoda UN padre nella coda META (idempotente). `project_id` risolto dal PROJECT
 /// pool (agent_runs.project_id) per non dipendere dal valore iterato. Ritorna 1 se
 /// ha inserito una riga nuova, 0 altrimenti (gia' presente o errore).
-async fn backstop_enqueue_one(
-    meta: &PgPool,
-    proj: &PgPool,
-    run_id: Uuid,
-    session_id: Uuid,
-) -> u64 {
+async fn backstop_enqueue_one(meta: &PgPool, proj: &PgPool, run_id: Uuid, session_id: Uuid) -> u64 {
     // project_id dal PROJECT pool (fonte di verita' della riga run).
     let project_id: Option<Uuid> =
         sqlx::query_scalar("SELECT project_id FROM agent_runs WHERE id = $1")
@@ -462,8 +460,7 @@ async fn process_queue_row(state: &AppState, row: QueueRow) {
     } = row;
 
     // Pool del progetto (separazione DB): agent_runs e' migrata per-progetto.
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
 
     // CAS: transizione atomica awaiting_subagents -> running. RETURNING id ->
     // vince UN solo consumer/giro (idempotenza del resume, regola H: e' il CAS a
@@ -647,7 +644,6 @@ mod tests {
         );
     }
 
-
     /// Crea le tabelle minime per i test del backstop: `agent_runs` +
     /// `nexus_subagent_runs` + la coda. Un solo pool fa da project e da meta (in
     /// prod i primi due sono sul PROJECT pool, la coda sul META): il backstop
@@ -821,14 +817,16 @@ mod tests {
         // Timeout BASSO (60s): il figlio (30 min) e' oltre soglia -> marcato
         // `timeout`, la COUNT scende a 0, il padre viene accodato.
         let requeued_old = backstop_project(&pool, &pool, 60, NO_PROGRESS_OFF).await;
-        assert_eq!(requeued_old, 1, "figlio orfano oltre timeout -> padre accodato");
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM nexus_subagent_runs WHERE parent_run_id = $1",
-        )
-        .bind(session)
-        .fetch_one(&pool)
-        .await
-        .expect("status figlio");
+        assert_eq!(
+            requeued_old, 1,
+            "figlio orfano oltre timeout -> padre accodato"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM nexus_subagent_runs WHERE parent_run_id = $1")
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .expect("status figlio");
         assert_eq!(status, "timeout", "la sub-run orfana e' marcata timeout");
     }
 
@@ -893,7 +891,10 @@ mod tests {
         // Guardia DISABILITATA: nessun figlio viene toccato dal check no-progress.
         // orphan_timeout ALTO (1h): neanche l'orphan scatta -> 0 accodati.
         let requeued_off = backstop_project(&pool, &pool, 3600, NO_PROGRESS_OFF).await;
-        assert_eq!(requeued_off, 0, "guardia off + orphan alto -> nessun accodato");
+        assert_eq!(
+            requeued_off, 0,
+            "guardia off + orphan alto -> nessun accodato"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM nexus_subagent_runs WHERE status = 'timeout'"
@@ -1084,7 +1085,10 @@ mod tests {
         assert_eq!(queued, Some(parent), "in coda il run parent (dispatcher)");
 
         // Il worker vince il CAS e cancella la riga (delete-al-CAS).
-        assert!(cas_and_delete_on_win(&pool, parent).await, "CAS vinto sul parent");
+        assert!(
+            cas_and_delete_on_win(&pool, parent).await,
+            "CAS vinto sul parent"
+        );
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subagent_fanin_resume_queue")
             .fetch_one(&pool)
             .await
@@ -1207,7 +1211,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count coda 2");
-        assert_eq!(in_coda2, 1, "riga fresca creata solo al completamento della 2a ondata");
+        assert_eq!(
+            in_coda2, 1,
+            "riga fresca creata solo al completamento della 2a ondata"
+        );
         assert!(
             cas_and_delete_on_win(&pool, parent).await,
             "ora il CAS vince e riprende il padre con la 2a ondata TERMINALE"

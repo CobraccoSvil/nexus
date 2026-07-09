@@ -746,10 +746,10 @@ fn strip_trailing_assistant(messages: &mut Vec<WireMessage>) {
 }
 
 /// True per i provider che esigono come ULTIMO messaggio role `user` o `tool`
-/// (assistant trailing rifiutato dall'API). E' una proprieta' del PROVIDER, non
-/// del modello (regola G: nessun model_id hardcoded).
+/// (assistant trailing rifiutato dall'API). Delega al sanitizer autoritativo
+/// (regola L): un solo punto di controllo cross-provider.
 fn provider_requires_user_or_tool_last(provider: &str) -> bool {
-    provider == "mistral"
+    crate::history_sanitizer::provider_requires_user_or_tool_last(provider)
 }
 
 /// Converte un [`crate::types::LlmMessage`] nel formato wire OpenAI.
@@ -1017,9 +1017,12 @@ fn normalize_finish_reason(raw: Option<&str>) -> String {
     .to_string()
 }
 
-/// Detection di errore di billing/crediti esauriti (per la Fase 3: cooldown
-/// automatico del provider). Pattern case-insensitive ispirati ai messaggi reali
-/// di OpenAI/Mistral/DeepSeek e ai 402 Payment Required.
+/// Detection di errore di billing/crediti esauriti (LEGACY).
+///
+/// DEPRECATO (regola M): preferire [`classify_provider_error`] su status+codice
+/// strutturato. Mantenuto solo per retro-compatibilita' dei test e dei call site
+/// che leggono ancora `Display`/`to_string()` dell'errore HTTP.
+#[deprecated(note = "use classify_provider_error on ProviderHttpError status+code")]
 pub fn is_billing_error(msg: &str) -> bool {
     let m = msg.to_lowercase();
     m.contains("insufficient_quota")
@@ -2225,6 +2228,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn billing_error_pattern() {
         assert!(is_billing_error("Error: insufficient_quota for org"));
         assert!(is_billing_error("You exceeded your current quota"));

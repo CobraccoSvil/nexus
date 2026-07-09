@@ -243,7 +243,11 @@ fn exit_code_from_result(tool_result: Option<&str>) -> Option<i64> {
 /// Costruisce un `ErrorFact` da uno step non riuscito (Failed o
 /// ProviderUnavailable): stessa forma per entrambi i rami, estratta per
 /// evitare duplicazione e tenere `collect_step_facts` compatta.
-fn error_fact(step: &AgentStep, detail: &Option<String>, error_excerpt_max_chars: usize) -> ErrorFact {
+fn error_fact(
+    step: &AgentStep,
+    detail: &Option<String>,
+    error_excerpt_max_chars: usize,
+) -> ErrorFact {
     ErrorFact {
         tool: step.tool_name.clone(),
         detail: detail.clone().unwrap_or_default(),
@@ -293,14 +297,18 @@ fn apply_completed_step(
     };
     if let Some(action) = file_action {
         if let Some(p) = step.tool_input.get("path").and_then(|v| v.as_str()) {
-            facts.files_touched.insert(p.to_string(), action.to_string());
+            facts
+                .files_touched
+                .insert(p.to_string(), action.to_string());
         }
     }
     // Spostamenti: la destinazione E' un file/albero toccato
     // (incidente Beauty-Book, vedi recap ADR 0025).
     if matches!(step.tool_name.as_str(), "rename_file" | "fs_move") {
         if let Some(to) = step.tool_input.get("to").and_then(|v| v.as_str()) {
-            facts.files_touched.insert(to.to_string(), "move".to_string());
+            facts
+                .files_touched
+                .insert(to.to_string(), "move".to_string());
         }
     }
     if let Some(cmd) = command_fact(step, true) {
@@ -343,7 +351,11 @@ fn process_step(
     let detail = step_detail(step);
     facts.last_tool = Some(step.tool_name.clone());
 
-    let signature = format!("{}|{}", step.tool_name, detail.as_deref().unwrap_or_default());
+    let signature = format!(
+        "{}|{}",
+        step.tool_name,
+        detail.as_deref().unwrap_or_default()
+    );
 
     match step.status {
         AgentStepStatus::Completed => {
@@ -355,7 +367,9 @@ fn process_step(
             entry.0 += 1;
             entry.1 = false;
 
-            facts.errors.push(error_fact(step, &detail, error_excerpt_max_chars));
+            facts
+                .errors
+                .push(error_fact(step, &detail, error_excerpt_max_chars));
             if let Some(cmd) = command_fact(step, false) {
                 facts.commands.push(cmd);
             }
@@ -366,7 +380,9 @@ fn process_step(
             // errore informativo per il modello subentrante (continuita'
             // cross-provider), ma NON tocchiamo `outcomes`: "non ripetere" vale
             // per i fallimenti dell'azione, non per quelli del provider.
-            facts.errors.push(error_fact(step, &detail, error_excerpt_max_chars));
+            facts
+                .errors
+                .push(error_fact(step, &detail, error_excerpt_max_chars));
         }
         // Running/AwaitingConfirmation/Skipped: stati transitori o non-esiti,
         // nessun fatto operativo certo da registrare.
@@ -388,7 +404,13 @@ pub fn collect_step_facts(steps: &[AgentStep], error_excerpt_max_chars: usize) -
         if step.tool_name.is_empty() {
             continue;
         }
-        process_step(step, &mut facts, &mut seen_lines, &mut outcomes, error_excerpt_max_chars);
+        process_step(
+            step,
+            &mut facts,
+            &mut seen_lines,
+            &mut outcomes,
+            error_excerpt_max_chars,
+        );
     }
 
     derive_retry_facts(&mut facts, &outcomes);
@@ -417,7 +439,11 @@ fn status_text_for(facts: &StepFacts, run_id: Uuid, status_label: &str) -> Strin
     )
 }
 
-fn facts_to_events(facts: &StepFacts, run_id: Uuid, status_label: &str) -> Vec<(String, Value, String)> {
+fn facts_to_events(
+    facts: &StepFacts,
+    run_id: Uuid,
+    status_label: &str,
+) -> Vec<(String, Value, String)> {
     let mut events: Vec<(String, Value, String)> = Vec::new();
     // Tutti i dedup_key includono run_id: la provenance per-run e' preservata
     // (due run della stessa sessione che toccano lo stesso file generano due
@@ -556,7 +582,16 @@ pub async fn ingest_steps_for_run(
         return Ok(0);
     }
     let facts = collect_step_facts(steps, settings.error_excerpt_max_chars);
-    ingest_facts(meta_db, db, session_id, project_id, run_id, status_label, &facts).await
+    ingest_facts(
+        meta_db,
+        db,
+        session_id,
+        project_id,
+        run_id,
+        status_label,
+        &facts,
+    )
+    .await
 }
 
 /// Traduce l'etichetta status persistita in `AgentStepStatus`. Copertura
@@ -591,7 +626,9 @@ fn db_row_to_step(r: &sqlx::postgres::PgRow, run_id: Uuid) -> AgentStep {
         step_index: r.try_get::<i32, _>("step_index").unwrap_or(0).max(0) as u32,
         tool_name: r.try_get("tool_name").unwrap_or_default(),
         tool_input: r.try_get::<Value, _>("tool_input").unwrap_or(Value::Null),
-        tool_result: r.try_get::<Option<String>, _>("tool_result").unwrap_or(None),
+        tool_result: r
+            .try_get::<Option<String>, _>("tool_result")
+            .unwrap_or(None),
         status: parse_step_status(&status_raw, run_id),
         created_at: String::new(),
     }
@@ -613,13 +650,11 @@ pub async fn ingest_from_db_steps(
     if !settings.enabled {
         return Ok(0);
     }
-    let run_row = sqlx::query(
-        "SELECT session_id, project_id FROM agent_runs WHERE id = $1",
-    )
-    .bind(run_id)
-    .fetch_optional(db)
-    .await
-    .context("SELECT agent_runs per worklog ingest")?;
+    let run_row = sqlx::query("SELECT session_id, project_id FROM agent_runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_optional(db)
+        .await
+        .context("SELECT agent_runs per worklog ingest")?;
     let Some(run_row) = run_row else {
         return Ok(0);
     };
@@ -638,13 +673,19 @@ pub async fn ingest_from_db_steps(
         return Ok(0);
     }
 
-    let steps: Vec<AgentStep> = rows
-        .iter()
-        .map(|r| db_row_to_step(r, run_id))
-        .collect();
+    let steps: Vec<AgentStep> = rows.iter().map(|r| db_row_to_step(r, run_id)).collect();
 
     let facts = collect_step_facts(&steps, settings.error_excerpt_max_chars);
-    ingest_facts(meta_db, db, session_id, project_id, run_id, status_label, &facts).await
+    ingest_facts(
+        meta_db,
+        db,
+        session_id,
+        project_id,
+        run_id,
+        status_label,
+        &facts,
+    )
+    .await
 }
 
 /// Pruning oltre soglia: rimuove gli eventi piu' VECCHI dei kind non critici
@@ -688,7 +729,10 @@ pub struct WorklogEvent {
 }
 
 fn payload_str(p: &Value, key: &str) -> String {
-    p.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+    p.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Righe "Da NON ripetere": failed_attempt e' per-run (dedup_key con run_id);
@@ -789,7 +833,10 @@ fn digest_section(title: &str, lines: &[String], max_items: usize) -> String {
         s.push('\n');
     }
     if lines.len() > shown {
-        s.push_str(&format!("- (... altre {} voci via nexus_get_worklog)\n", lines.len() - shown));
+        s.push_str(&format!(
+            "- (... altre {} voci via nexus_get_worklog)\n",
+            lines.len() - shown
+        ));
     }
     s
 }
@@ -837,11 +884,23 @@ pub fn render_digest(
     // Ordine di priorita' sezioni (invariato): da-non-ripetere > errori >
     // risolti-dopo-retry > decisioni > file > comandi. La costruzione delle
     // righe di ogni sezione vive negli helper `digest_*_lines`.
-    out.push_str(&section("Da NON ripetere (tentativi falliti):", digest_failed_lines(events)));
+    out.push_str(&section(
+        "Da NON ripetere (tentativi falliti):",
+        digest_failed_lines(events),
+    ));
     out.push_str(&section("Errori incontrati:", digest_error_lines(events)));
-    out.push_str(&section("Risolti dopo retry:", digest_simple_lines(events, "retry_ok", "detail", false)));
-    out.push_str(&section("Decisioni:", digest_simple_lines(events, "decision", "text", true)));
-    out.push_str(&section("File gia' creati/modificati:", digest_file_lines(events)));
+    out.push_str(&section(
+        "Risolti dopo retry:",
+        digest_simple_lines(events, "retry_ok", "detail", false),
+    ));
+    out.push_str(&section(
+        "Decisioni:",
+        digest_simple_lines(events, "decision", "text", true),
+    ));
+    out.push_str(&section(
+        "File gia' creati/modificati:",
+        digest_file_lines(events),
+    ));
     out.push_str(&section("Comandi eseguiti:", digest_command_lines(events)));
 
     out.push_str(&format!(
@@ -963,7 +1022,11 @@ pub async fn ingest_decisions(
 /// Hash del testo normalizzato (lowercase, spazi collassati): dedup robusto a
 /// differenze cosmetiche, condiviso da decisioni e (concettualmente) regole.
 fn normalized_hash(text: &str) -> String {
-    let normalized = text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -973,19 +1036,21 @@ fn normalized_hash(text: &str) -> String {
 /// Rust, gemello di `fetch_worklog_block` lato brain). `None` se assente, vuoto
 /// o su errore (fail-open): i chiamanti degradano senza bloccare.
 /// `meta_db` = meta (settings); `db` = pool dati worklog (progetto).
-pub async fn fetch_rendered_block(meta_db: &PgPool, db: &PgPool, session_id: Uuid) -> Option<String> {
+pub async fn fetch_rendered_block(
+    meta_db: &PgPool,
+    db: &PgPool,
+    session_id: Uuid,
+) -> Option<String> {
     let settings = current_settings(meta_db).await;
     if !settings.enabled {
         return None;
     }
-    let row = sqlx::query(
-        "SELECT rendered_block FROM nexus_session_worklog WHERE session_id = $1",
-    )
-    .bind(session_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()?;
+    let row = sqlx::query("SELECT rendered_block FROM nexus_session_worklog WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()?;
     let block: String = row.try_get("rendered_block").ok()?;
     let trimmed = block.trim();
     if trimmed.is_empty() {
@@ -1101,7 +1166,11 @@ pub async fn tool_nexus_get_worklog(
         .and_then(Value::as_i64)
         .unwrap_or(settings.tool_page_size)
         .clamp(1, settings.tool_page_size);
-    let offset = input.get("offset").and_then(Value::as_i64).unwrap_or(0).max(0);
+    let offset = input
+        .get("offset")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
 
     let rows = match fetch_worklog_page(wpool, session_id, kind, run_id, limit, offset).await {
         Ok(r) => r,
@@ -1155,21 +1224,59 @@ mod tests {
     fn facts_replicano_collect_actions_storico() {
         // Righe-azione deduplicate + file toccati (incluso il "to" dei rename).
         let steps = vec![
-            step(1, "write_file", json!({"path": "src/a.ts"}), Some("ok"), AgentStepStatus::Completed),
-            step(2, "write_file", json!({"path": "src/a.ts"}), Some("ok"), AgentStepStatus::Completed),
-            step(3, "rename_file", json!({"from": "x", "to": "src/app"}), Some("ok"), AgentStepStatus::Completed),
+            step(
+                1,
+                "write_file",
+                json!({"path": "src/a.ts"}),
+                Some("ok"),
+                AgentStepStatus::Completed,
+            ),
+            step(
+                2,
+                "write_file",
+                json!({"path": "src/a.ts"}),
+                Some("ok"),
+                AgentStepStatus::Completed,
+            ),
+            step(
+                3,
+                "rename_file",
+                json!({"from": "x", "to": "src/app"}),
+                Some("ok"),
+                AgentStepStatus::Completed,
+            ),
         ];
         let facts = collect_step_facts(&steps, DEFAULT_ERROR_EXCERPT_CHARS);
-        assert_eq!(facts.action_lines.len(), 2, "righe deduplicate: {:?}", facts.action_lines);
+        assert_eq!(
+            facts.action_lines.len(),
+            2,
+            "righe deduplicate: {:?}",
+            facts.action_lines
+        );
         assert!(facts.files_touched.contains_key("src/a.ts"));
-        assert!(facts.files_touched.contains_key("src/app"), "il 'to' del rename e' un file toccato");
+        assert!(
+            facts.files_touched.contains_key("src/app"),
+            "il 'to' del rename e' un file toccato"
+        );
     }
 
     #[test]
     fn failed_attempt_su_doppio_fallimento_senza_successo() {
         let steps = vec![
-            step(1, "edit_file", json!({"path": "src/b.ts"}), Some("old_string non trovato"), AgentStepStatus::Failed),
-            step(2, "edit_file", json!({"path": "src/b.ts"}), Some("old_string non trovato"), AgentStepStatus::Failed),
+            step(
+                1,
+                "edit_file",
+                json!({"path": "src/b.ts"}),
+                Some("old_string non trovato"),
+                AgentStepStatus::Failed,
+            ),
+            step(
+                2,
+                "edit_file",
+                json!({"path": "src/b.ts"}),
+                Some("old_string non trovato"),
+                AgentStepStatus::Failed,
+            ),
         ];
         let facts = collect_step_facts(&steps, DEFAULT_ERROR_EXCERPT_CHARS);
         assert_eq!(facts.failed_attempts.len(), 1);
@@ -1190,7 +1297,11 @@ mod tests {
             AgentStepStatus::Failed,
         )];
         let facts = collect_step_facts(&steps, DEFAULT_ERROR_EXCERPT_CHARS);
-        assert_eq!(facts.failed_attempts.len(), 1, "il singolo fallimento e' segnalato");
+        assert_eq!(
+            facts.failed_attempts.len(),
+            1,
+            "il singolo fallimento e' segnalato"
+        );
         assert_eq!(facts.failed_attempts[0].count, 1);
         assert!(facts.retry_ok.is_empty());
     }
@@ -1217,8 +1328,20 @@ mod tests {
     fn retry_ok_su_fallimento_poi_successo() {
         // Stessa signature: prima fallisce, poi riesce -> errore-e-fix, NON da-non-ripetere.
         let steps = vec![
-            step(1, "run_command", json!({"command": "npm test"}), Some("{\"exit_code\": 1}"), AgentStepStatus::Failed),
-            step(2, "run_command", json!({"command": "npm test"}), Some("{\"exit_code\": 0}"), AgentStepStatus::Completed),
+            step(
+                1,
+                "run_command",
+                json!({"command": "npm test"}),
+                Some("{\"exit_code\": 1}"),
+                AgentStepStatus::Failed,
+            ),
+            step(
+                2,
+                "run_command",
+                json!({"command": "npm test"}),
+                Some("{\"exit_code\": 0}"),
+                AgentStepStatus::Completed,
+            ),
         ];
         let facts = collect_step_facts(&steps, DEFAULT_ERROR_EXCERPT_CHARS);
         assert_eq!(facts.retry_ok.len(), 1);
@@ -1257,24 +1380,46 @@ mod tests {
     #[test]
     fn digest_entro_budget_e_con_priorita() {
         let mut events = vec![
-            ev("status", json!({"text": "run 12345678 completed: 3 azioni, 2 file, 0 errori"})),
-            ev("failed_attempt", json!({"detail": "edit_file: src/b.ts", "count": 3})),
+            ev(
+                "status",
+                json!({"text": "run 12345678 completed: 3 azioni, 2 file, 0 errori"}),
+            ),
+            ev(
+                "failed_attempt",
+                json!({"detail": "edit_file: src/b.ts", "count": 3}),
+            ),
         ];
         for i in 0..200 {
-            events.push(ev("file_touched", json!({"path": format!("src/f{i}.ts"), "action": "write"})));
+            events.push(ev(
+                "file_touched",
+                json!({"path": format!("src/f{i}.ts"), "action": "write"}),
+            ));
         }
         let out = render_digest(&events, events.len(), 8, 1200);
-        assert!(out.chars().count() <= 1200, "budget sforato: {}", out.chars().count());
+        assert!(
+            out.chars().count() <= 1200,
+            "budget sforato: {}",
+            out.chars().count()
+        );
         assert!(out.contains("Stato:"), "lo stato ha priorita' massima");
-        assert!(out.contains("Da NON ripetere"), "i failed_attempt devono sopravvivere al budget");
-        assert!(out.contains("nexus_get_worklog"), "puntatore al drill-down sempre presente");
+        assert!(
+            out.contains("Da NON ripetere"),
+            "i failed_attempt devono sopravvivere al budget"
+        );
+        assert!(
+            out.contains("nexus_get_worklog"),
+            "puntatore al drill-down sempre presente"
+        );
     }
 
     #[test]
     fn digest_max_items_per_sezione() {
         let mut events = vec![];
         for i in 0..20 {
-            events.push(ev("file_touched", json!({"path": format!("src/f{i}.ts"), "action": "write"})));
+            events.push(ev(
+                "file_touched",
+                json!({"path": format!("src/f{i}.ts"), "action": "write"}),
+            ));
         }
         let out = render_digest(&events, 20, 5, 100_000);
         let shown = out.matches("- `src/f").count();
@@ -1287,13 +1432,22 @@ mod tests {
         // Due run distinti (eventi failed_attempt per-run con stesso detail):
         // il render aggrega in UNA riga sommando i count.
         let events = vec![
-            ev("failed_attempt", json!({"detail": "edit_file: src/b.ts", "count": 2})),
-            ev("failed_attempt", json!({"detail": "edit_file: src/b.ts", "count": 1})),
+            ev(
+                "failed_attempt",
+                json!({"detail": "edit_file: src/b.ts", "count": 2}),
+            ),
+            ev(
+                "failed_attempt",
+                json!({"detail": "edit_file: src/b.ts", "count": 1}),
+            ),
         ];
         let out = render_digest(&events, events.len(), 8, 100_000);
         let rows = out.matches("edit_file: src/b.ts").count();
         assert_eq!(rows, 1, "una sola riga aggregata: {out}");
-        assert!(out.contains("fallita 3 volte"), "count sommato cross-run: {out}");
+        assert!(
+            out.contains("fallita 3 volte"),
+            "count sommato cross-run: {out}"
+        );
     }
 
     #[test]
@@ -1302,10 +1456,16 @@ mod tests {
         // dedicata del digest provider-neutro.
         let events = vec![
             ev("status", json!({"text": "run completato"})),
-            ev("decision", json!({"text": "Adottato pattern repository per il data layer"})),
+            ev(
+                "decision",
+                json!({"text": "Adottato pattern repository per il data layer"}),
+            ),
         ];
         let out = render_digest(&events, events.len(), 8, 100_000);
-        assert!(out.contains("Decisioni:"), "sezione decisioni assente: {out}");
+        assert!(
+            out.contains("Decisioni:"),
+            "sezione decisioni assente: {out}"
+        );
         assert!(out.contains("pattern repository"));
     }
 
@@ -1321,11 +1481,18 @@ mod tests {
         // qualunque sia la lunghezza del footer.
         let mut events = vec![ev("status", json!({"text": "run completato"}))];
         for i in 0..50 {
-            events.push(ev("file_touched", json!({"path": format!("src/very/long/path/file{i}.ts"), "action": "write"})));
+            events.push(ev(
+                "file_touched",
+                json!({"path": format!("src/very/long/path/file{i}.ts"), "action": "write"}),
+            ));
         }
         for cap in [80usize, 120, 300, 1200] {
             let out = render_digest(&events, events.len(), 8, cap);
-            assert!(out.chars().count() <= cap, "cap {cap} sforato: {}", out.chars().count());
+            assert!(
+                out.chars().count() <= cap,
+                "cap {cap} sforato: {}",
+                out.chars().count()
+            );
         }
     }
 }

@@ -315,8 +315,12 @@ impl VerifierNode {
         runs: Arc<dyn VerifierRunStore>,
         meta_steps: Arc<dyn crate::runtime::ports::MetaStepStore>,
     ) -> Self {
-        let final_gate =
-            FinalGateNode::new(final_gate_cfg, routing_cfg.clone(), criteria.clone(), meta_steps);
+        let final_gate = FinalGateNode::new(
+            final_gate_cfg,
+            routing_cfg.clone(),
+            criteria.clone(),
+            meta_steps,
+        );
         Self {
             cfg,
             routing_cfg,
@@ -332,11 +336,7 @@ impl VerifierNode {
     /// non c'e' prossimo -> `{active_todo_id:None, stop_reason:end_turn}`;
     /// altrimenti marca il prossimo `in_progress` e ritorna `{active_todo_id,
     /// stop_reason:tool_use, current_todos}`. `mode` propaga il gate shadow.
-    async fn advance_or_end(
-        &self,
-        run_id: &str,
-        mode: ExecMode,
-    ) -> Result<StateDelta, NodeError> {
+    async fn advance_or_end(&self, run_id: &str, mode: ExecMode) -> Result<StateDelta, NodeError> {
         let todos = self.store.list_todos(run_id).await.map_err(port_err)?;
         match dag_scheduler::pick_next_todo(&todos, self.cfg.dag_topological_enabled) {
             None => {
@@ -411,9 +411,8 @@ impl VerifierNode {
         // diagnostic[:800] su CHAR.
         let diagnostic_trunc: String = diagnostic.chars().take(800).collect();
 
-        let remediation = suggest_remediation(
-            &failed.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
-        );
+        let remediation =
+            suggest_remediation(&failed.iter().map(|r| (*r).clone()).collect::<Vec<_>>());
 
         format!(
             "<verification_failed cycle=\"{cycle}/{max_cycles}\" todo=\"{todo_content}\">\n\
@@ -481,11 +480,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
 
         // ── Risoluzione active_todo_id (verifier_node.py:56-67) ───────────────
         // Se assente, prova a calcolarlo via TodoStore::active_todo.
-        let active_todo_id = match state
-            .active_todo_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
+        let active_todo_id = match state.active_todo_id.as_deref().filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
             None => match self.store.active_todo(&run_id).await.map_err(port_err)? {
                 Some(t) => t.id,
@@ -527,14 +522,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
 
         // ── Esegui tutti i criteria (verifier_node.py:135-159) ────────────────
         let started = Instant::now();
-        let mut results = self
-            .criteria
-            .run(criteria_raw, mode)
-            .await
-            .map_err(|e| NodeError::Failed {
-                node: "verifier",
-                message: format!("esecuzione criteri fallita: {e}"),
-            })?;
+        let mut results =
+            self.criteria
+                .run(criteria_raw, mode)
+                .await
+                .map_err(|e| NodeError::Failed {
+                    node: "verifier",
+                    message: format!("esecuzione criteri fallita: {e}"),
+                })?;
         let duration_ms = started.elapsed().as_millis() as i64;
 
         // ── Conteggio evaluable vs inconclusive (verifier_node.py:163-181) ────
@@ -919,7 +914,7 @@ mod tests {
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::nodes::final_gate::FinalGateConfig;
     use crate::runtime::test_doubles::{
-        NullEventSink, StubCriteriaRunner, StubLlmGateway, StubToolExecutor, StubTodoStore,
+        NullEventSink, StubCriteriaRunner, StubLlmGateway, StubTodoStore, StubToolExecutor,
         StubVerifierRunStore,
     };
     use crate::runtime::AgentNodeCtx;
@@ -1034,7 +1029,11 @@ mod tests {
             plan_phase_active: Some(true),
             thread_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
             active_todo_id: Some(active_todo.to_string()),
-            messages: if software { vec![ai_mutation()] } else { vec![] },
+            messages: if software {
+                vec![ai_mutation()]
+            } else {
+                vec![]
+            },
             ..Default::default()
         }
     }
@@ -1047,7 +1046,12 @@ mod tests {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![]));
         let runs = Arc::new(StubVerifierRunStore::default());
         // Default: enabled=false -> pass-through {}.
-        let node = node_with(VerifierConfig::default(), store.clone(), runner.clone(), runs);
+        let node = node_with(
+            VerifierConfig::default(),
+            store.clone(),
+            runner.clone(),
+            runs,
+        );
         let ctx = ctx_with(false);
         let st = plan_state("a", false);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1228,7 +1232,10 @@ mod tests {
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen[0].1, ExecMode::Replay);
         // mark_status no-op in shadow (marks vuoto).
-        assert!(store.marks.lock().unwrap().is_empty(), "zero scritture todo");
+        assert!(
+            store.marks.lock().unwrap().is_empty(),
+            "zero scritture todo"
+        );
         // persist no-op in shadow (records vuoto).
         assert!(runs.records.lock().unwrap().is_empty(), "zero persist");
     }
@@ -1269,31 +1276,35 @@ mod tests {
 
     #[test]
     fn suggest_remediation_per_tipo() {
-        assert_eq!(
-            suggest_remediation(&[]),
-            "verifica i criteri e riprova"
+        assert_eq!(suggest_remediation(&[]), "verifica i criteri e riprova");
+        assert!(suggest_remediation(&[fail_result("http", json!({}))]).contains("non risponde"));
+        assert!(
+            suggest_remediation(&[fail_result("http", json!({"status": 503}))])
+                .contains("HTTP 503")
         );
-        assert!(suggest_remediation(&[fail_result("http", json!({}))])
-            .contains("non risponde"));
-        assert!(suggest_remediation(&[fail_result("http", json!({"status": 503}))])
-            .contains("HTTP 503"));
-        assert!(suggest_remediation(&[fail_result("http", json!({"status": 404}))])
-            .contains("404"));
+        assert!(
+            suggest_remediation(&[fail_result("http", json!({"status": 404}))]).contains("404")
+        );
         assert!(
             suggest_remediation(&[fail_result("run_command", json!({"exit_code": 2}))])
                 .contains("exit_code=2")
         );
-        assert!(suggest_remediation(&[fail_result("file_exists", json!({}))])
-            .contains("write_file"));
+        assert!(
+            suggest_remediation(&[fail_result("file_exists", json!({}))]).contains("write_file")
+        );
         assert!(suggest_remediation(&[fail_result(
             "db_query",
             json!({"notes": ["tabella mancante", "indice assente"]})
         )])
         .contains("tabella mancante; indice assente"));
-        assert!(suggest_remediation(&[fail_result("regex_in_output", json!({}))])
-            .contains("pattern atteso"));
-        assert!(suggest_remediation(&[fail_result("sconosciuto", json!({}))])
-            .contains("correzione mirata"));
+        assert!(
+            suggest_remediation(&[fail_result("regex_in_output", json!({}))])
+                .contains("pattern atteso")
+        );
+        assert!(
+            suggest_remediation(&[fail_result("sconosciuto", json!({}))])
+                .contains("correzione mirata")
+        );
     }
 
     #[test]
@@ -1363,7 +1374,10 @@ mod golden {
     /// deterministici azzerati, l'avanzamento e' coperto dai test del nodo).
     fn decision_delta(input: &Value, max_cycles: i64) -> Value {
         let results = results_from(input.get("results"));
-        let verify_cycle = input.get("verify_cycle").and_then(Value::as_i64).unwrap_or(0);
+        let verify_cycle = input
+            .get("verify_cycle")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let behavior = input
             .get("behavior_mode")
             .and_then(Value::as_str)
@@ -1436,7 +1450,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 25, "attesi >=25 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 25,
+            "attesi >=25 casi, trovati {}",
+            cases.len()
+        );
 
         const MAX_VERIFY_CYCLES: i64 = 3;
         let mut checked = 0usize;
@@ -1453,8 +1471,11 @@ mod golden {
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let cycle = c.input.get("cycle").and_then(Value::as_i64).unwrap_or(1);
-                    let max_cycles =
-                        c.input.get("max_cycles").and_then(Value::as_i64).unwrap_or(3);
+                    let max_cycles = c
+                        .input
+                        .get("max_cycles")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(3);
                     let results = results_from(c.input.get("results"));
                     json!(VerifierNode::render_failed_block(
                         todo_content,

@@ -4,6 +4,7 @@
 // con dati potenzialmente stantii.
 
 import { onBackendRecovered } from "../api/health-monitor";
+import { bumpOperationalRefreshOnConnect, dispatchProjectUiBridges, DISPATCHER_EVENT_KINDS } from "./bridge-events";
 import { useProjectStore } from "./store";
 import type { EnvelopedEvent } from "./types";
 
@@ -61,6 +62,7 @@ function openStream(projectId: string): void {
     try {
       const env: EnvelopedEvent = JSON.parse(raw.data);
       useProjectStore.getState().applyEvent(env);
+      dispatchProjectUiBridges(env);
 
       // Se l'evento e' SnapshotRequired -> ricarica snapshot
       if (env.payload.kind === "SnapshotRequired") {
@@ -78,51 +80,13 @@ function openStream(projectId: string): void {
     }
   };
 
-  const KINDS = [
-    "JobCreated", "JobUpdated", "JobsCleared",
-    "PortAllocated", "PortReleased",
-    "FindingsUpdated",
-    "ServiceStarted", "ServiceStopped", "ServiceRestarted",
-    "FileChanged",
-    "GitStatusChanged",
-    "DbQueryRun",
-    "DbConfigUpdated",
-    "AgentToolUsed",
-    "Notification",
-    "FlagChanged",
-    "MonitorUpdated",
-    "HighlightPanel",
-    "Custom",
-    "SnapshotRequired",
-    // ── Chat session lifecycle (handler nello store, prima non sottoscritti) ──
-    "ChatSessionCompacted",
-    "ChatMessageAdded",
-    "ChatSessionStatusChanged",
-    // ── Catch-all HTTP mutations + meta enrichment ─────────────────────────
-    "MutationRecorded",
-    "EventEnriched",
-    // ── Project lifecycle + DB migrations + run configs + memory ──────────
-    "ProjectCreated",
-    "ProjectDeleted",
-    "MigrationApplied",
-    "MigrationRolledBack",
-    "RunConfigChanged",
-    "MemoryUpdated",
-    "ProviderHealthChanged",
-    "PluginChanged",
-    "SettingChanged",
-    "SubagentRunChanged",
-    "QualityScanProgress",
-    "OutputChannelCreated",
-    // ── Documenti di progetto (refresh pannello DOCUMENTI in realtime) ─────
-    "DocumentGenerated",
-  ];
-  KINDS.forEach((k) => es.addEventListener(k, handleEvent));
+  DISPATCHER_EVENT_KINDS.forEach((k) => es.addEventListener(k, handleEvent));
   es.addEventListener("message", handleEvent);
 
   es.onopen = () => {
     useProjectStore.getState().setConnectionStatus("open");
     useProjectStore.getState().resetReconnect();
+    bumpOperationalRefreshOnConnect();
   };
 
   es.onerror = () => {

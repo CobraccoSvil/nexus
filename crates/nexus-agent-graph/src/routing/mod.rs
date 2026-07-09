@@ -138,7 +138,9 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
     // (3) Abort coordinato / legacy: final_gate se eleggibile, altrimenti learner.
     if matches!(
         stop_reason,
-        Some(StopReason::LoopAbort) | Some(StopReason::LoopDetected) | Some(StopReason::G1CapReached)
+        Some(StopReason::LoopAbort)
+            | Some(StopReason::LoopDetected)
+            | Some(StopReason::G1CapReached)
     ) {
         if signals::final_gate_eligible(state, cfg) {
             return NodeTarget::FinalGate;

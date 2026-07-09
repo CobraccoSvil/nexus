@@ -114,8 +114,11 @@ pub fn action_oriented_for_intent(intent: &str) -> bool {
 /// Stili di `tool_choice` (cap.tool_choice_style) che permettono di OBBLIGARE
 /// una tool call. `_TC_FORCING_SUPPORTED_STYLES` Python (1:1). Gli stili "none"
 /// e "openai_auto" NON permettono il forcing -> non sono in lista.
-const TC_FORCING_SUPPORTED_STYLES: &[&str] =
-    &["anthropic_any", "openai_required", "google_function_calling_any"];
+const TC_FORCING_SUPPORTED_STYLES: &[&str] = &[
+    "anthropic_any",
+    "openai_required",
+    "google_function_calling_any",
+];
 
 /// True se lo style di tool_choice del provider permette di obbligare una tool
 /// call (`anthropic_any` / `openai_required` / `google_function_calling_any`).
@@ -358,8 +361,7 @@ mod tests {
     fn budget_weak_model_cap() {
         let cfg = AdaptiveBudgetConfig::default();
         // Tier "light" dal catalog (non piu' substring sul nome modello).
-        let (budget, _) =
-            compute_iteration_budget("x", Some("light"), Some("high"), None, &cfg);
+        let (budget, _) = compute_iteration_budget("x", Some("light"), Some("high"), None, &cfg);
         // (60 + 280) * 1.5 = 510 -> cap 300.
         assert_eq!(budget, 300);
         // Tier medium/heavy o assente: nessun moltiplicatore.

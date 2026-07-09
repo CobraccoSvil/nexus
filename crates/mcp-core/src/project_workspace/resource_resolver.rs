@@ -104,8 +104,19 @@ enum ServiceClass {
 fn service_class(label: &str) -> Option<ServiceClass> {
     let l = label.to_lowercase();
     const FRONTEND: &[&str] = &[
-        "frontend", "front-end", "vite", "react", "svelte", "nuxt", "astro", "ui", "web", "client",
-        "next", "angular", "vue",
+        "frontend",
+        "front-end",
+        "vite",
+        "react",
+        "svelte",
+        "nuxt",
+        "astro",
+        "ui",
+        "web",
+        "client",
+        "next",
+        "angular",
+        "vue",
     ];
     const BACKEND: &[&str] = &[
         "backend", "back-end", "api", "server", "express", "fastify", "uvicorn", "gunicorn",
@@ -297,7 +308,11 @@ pub async fn resolve_for_label(
 /// servizio). Ritorna stringa vuota se non c'e' alcuna risorsa: niente blocco
 /// rumoroso. Il blocco e' deterministico, non chiama LLM, e va iniettato a valle
 /// di `project_header` (non tocca il template DB ne' l'offload del system).
-pub async fn render_prompt_block(_db: &PgPool, registry: &PortRegistryCache, project_id: Uuid) -> String {
+pub async fn render_prompt_block(
+    _db: &PgPool,
+    registry: &PortRegistryCache,
+    project_id: Uuid,
+) -> String {
     let resources = resolve_project_resources(registry, project_id).await;
     if resources.services.is_empty() {
         return String::new();
@@ -332,10 +347,7 @@ pub async fn render_prompt_block(_db: &PgPool, registry: &PortRegistryCache, pro
         match s.suggested_action {
             SuggestedAction::Reuse => {
                 let prog = s.program.as_deref().unwrap_or("?");
-                let pid_txt = s
-                    .pid
-                    .map(|p| format!(", pid {p}"))
-                    .unwrap_or_default();
+                let pid_txt = s.pid.map(|p| format!(", pid {p}")).unwrap_or_default();
                 lines.push_str(&format!(
                     "- {}: porta {} ATTIVA ({}{}) -> RIUSA, non riallocare{}\n",
                     s.label, port_txt, prog, pid_txt, suffix
@@ -369,7 +381,10 @@ mod tests {
     #[test]
     fn service_class_disgiunta() {
         assert_eq!(service_class("backend"), Some(ServiceClass::Backend));
-        assert_eq!(service_class("Backend - Nodemon"), Some(ServiceClass::Backend));
+        assert_eq!(
+            service_class("Backend - Nodemon"),
+            Some(ServiceClass::Backend)
+        );
         assert_eq!(service_class("frontend"), Some(ServiceClass::Frontend));
         assert_eq!(service_class("Frontend Vite"), Some(ServiceClass::Frontend));
         // Ambiguo: contiene token di entrambe le classi -> nessuna classe.
@@ -426,7 +441,12 @@ mod tests {
 
     // ── Test della riconciliazione delle fonti (funzione pura `reconcile`) ──
 
-    fn alloc(project_id: Uuid, port: u16, label: &str, mode: &str) -> crate::port_registry::PortAllocation {
+    fn alloc(
+        project_id: Uuid,
+        port: u16,
+        label: &str,
+        mode: &str,
+    ) -> crate::port_registry::PortAllocation {
         crate::port_registry::PortAllocation {
             id: Uuid::new_v4(),
             project_id,
@@ -474,12 +494,19 @@ mod tests {
     fn reconcile_orfano_listen_senza_riga_db() {
         // Nessuna allocazione DB, ma un dev-server vite in LISTEN nel bucket.
         let allocations: Vec<crate::port_registry::PortAllocation> = vec![];
-        let listening = vec![(21000u16, 555u32, "node /p/node_modules/.bin/vite".to_string())];
+        let listening = vec![(
+            21000u16,
+            555u32,
+            "node /p/node_modules/.bin/vite".to_string(),
+        )];
         let res = reconcile(&allocations, &listening, 21000, 21099, 9999);
         assert_eq!(res.len(), 1);
         let s = &res[0];
         assert_eq!(s.source, ResourceSource::ListeningOrphan);
-        assert_eq!(s.label, "frontend", "vite sulla porta piu' bassa -> frontend");
+        assert_eq!(
+            s.label, "frontend",
+            "vite sulla porta piu' bassa -> frontend"
+        );
         assert!(s.listening);
         assert_eq!(s.suggested_action, SuggestedAction::Reuse);
     }

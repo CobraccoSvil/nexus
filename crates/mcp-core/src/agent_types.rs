@@ -6,6 +6,7 @@
 //! ponte `brain_agent_client` e dall'SSE del frontend.
 
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -31,6 +32,20 @@ pub enum SupervisorMode {
     Continuous,
 }
 
+
+impl FromStr for SupervisorMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "anomaly" | "c" => Self::Anomaly,
+            "interleaved" | "a" => Self::Interleaved,
+            "continuous" | "b" => Self::Continuous,
+            _ => Self::None,
+        })
+    }
+}
+
 impl SupervisorMode {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -41,15 +56,6 @@ impl SupervisorMode {
         }
     }
 
-    
-    pub fn from_str(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
-            "anomaly" | "c" => Self::Anomaly,
-            "interleaved" | "a" => Self::Interleaved,
-            "continuous" | "b" => Self::Continuous,
-            _ => Self::None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +95,6 @@ pub enum AgentStepStatus {
 }
 
 impl AgentStepStatus {
-    
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -170,8 +175,7 @@ pub const ACTIVE_RUN_STATUSES: [&str; 3] =
 /// Frammento SQL della lista [`ACTIVE_RUN_STATUSES`] per clausole `IN (...)` /
 /// `NOT IN (...)`. Const senza input utente: interpolazione sicura. La coerenza
 /// con l'array e' verificata dal test `active_run_status_sql_coerente_con_array`.
-pub const ACTIVE_RUN_STATUS_SQL: &str =
-    "'running', 'awaiting_confirmation', 'awaiting_subagents'";
+pub const ACTIVE_RUN_STATUS_SQL: &str = "'running', 'awaiting_confirmation', 'awaiting_subagents'";
 
 /// `true` se lo stato (stringa DB) e' un run attivo/sospeso-vivo su una sessione.
 /// Per i match-arm Rust che non usano SQL (es. loop di attesa della remediation).

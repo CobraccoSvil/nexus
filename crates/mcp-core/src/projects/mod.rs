@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-
 use axum::{
     extract::{Extension, Path as AxumPath, Query, State},
     http::StatusCode,
@@ -643,7 +642,11 @@ fn parse_porcelain_branch_header(line: &str) -> String {
 }
 
 /// Classifica il `kind` di un cambiamento in base ai due caratteri di stato.
-fn classify_git_change_kind(staged_status: &str, worktree_status: &str, untracked: bool) -> &'static str {
+fn classify_git_change_kind(
+    staged_status: &str,
+    worktree_status: &str,
+    untracked: bool,
+) -> &'static str {
     if untracked {
         "untracked"
     } else if staged_status == "D" || worktree_status == "D" {

@@ -122,8 +122,7 @@ pub fn build_turn_focus_directive(messages: &[Message], new_topic: bool) -> Opti
 
     let mut lines: Vec<String> = vec![
         "### FOCUS DEL TURNO CORRENTE ###".to_string(),
-        "La richiesta da portare a termine ADESSO e' l'ultimo messaggio dell'utente:"
-            .to_string(),
+        "La richiesta da portare a termine ADESSO e' l'ultimo messaggio dell'utente:".to_string(),
         format!("\"{excerpt}\""),
         String::new(),
         "La cronologia precedente e' CONTESTO DI SUPPORTO, non l'oggetto di questa \
@@ -328,7 +327,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 15, "attesi >=15 casi golden, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 15,
+            "attesi >=15 casi golden, trovati {}",
+            cases.len()
+        );
 
         let mut checked = 0usize;
         for c in &cases {

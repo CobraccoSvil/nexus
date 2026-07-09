@@ -343,6 +343,10 @@ export function subscribeAgentStream(
       finish(receivedFinal);
       return;
     }
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       // Cap dei tentativi consecutivi raggiunto. Consulta il DB: se il run e'
       // gia' terminato chiudi pulito; ma se e' ANCORA running NON arrenderti.
@@ -403,6 +407,10 @@ export function subscribeAgentStream(
   /** Pianifica la riapertura dell'EventSource con backoff esponenziale. */
   function scheduleReconnect(): void {
     if (closed) return;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     const delay = Math.min(BASE_DELAY_MS * 2 ** reconnectAttempts, MAX_DELAY_MS);
     reconnectAttempts += 1;
     reconnectTimer = setTimeout(() => {

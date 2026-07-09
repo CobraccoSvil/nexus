@@ -6,8 +6,8 @@
 //!   2. policy_engine.decide(tier) -> lista ordinata di provider ammessi;
 //!   3. per ogni provider candidato non in cooldown: risolve l'alias modello
 //!      (skip se non risolvibile per quel provider), poi tenta la completion;
-//!   4. su errore marca il cooldown (billing/transient via `is_billing_error`,
-//!      punto unico) e passa al successivo; il primo successo vince;
+//!   4. su errore classifica via [`classify_provider_error`] (status+codice
+//!      strutturato, regola M) e applica cooldown/retry/sanificazione history;
 //!   5. redaction strict-mode opzionale (pre-flight redact + post-flight rehydrate)
 //!      quando il tier elevato richiede invio cloud;
 //!   6. enforce quota PRIMA della completion (guardrail), record ledger DOPO.
@@ -37,6 +37,7 @@ use crate::batch::{
     parse_anthropic_status, BatchStatusResponse, CreateBatchBody, CreateBatchResponse,
 };
 use crate::cooldown::{CooldownManager, RetryPolicy};
+use crate::history_sanitizer::{self, SanitizeMode};
 use crate::model_alias_resolver::ModelAliasResolver;
 use crate::provider::LlmProvider;
 use crate::providers::{classify_provider_error, ProviderErrorKind, ProviderHttpError};
@@ -594,8 +595,9 @@ impl CallFailure {
 /// transitori (Fase B1, strict pin). Classifica l'errore col punto unico
 /// [`classify_provider_error`] (regola L):
 ///   - Billing   -> `mark_billing`, niente retry, errore (ricarica necessaria);
-///   - ClientError -> niente cooldown, niente retry, errore (colpa nostra/config
-///     o singolo modello non abilitato: ritentare non aiuta);
+///   - ClientError history-related -> sanificazione aggressiva + 1 retry;
+///   - ClientError invalid_model -> errore immediato (niente cooldown provider);
+///   - ClientError altro -> errore (colpa config/modello singolo);
 ///   - Transient -> retry con backoff+jitter; dopo l'ultimo tentativo
 ///     `mark_transient` (cooldown breve, liberato dal re-probe appena sano).
 ///
@@ -610,19 +612,40 @@ async fn complete_with_retry(
 ) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
+    let mut history_aggressive_retry = true;
     loop {
         attempt += 1;
-        match provider.complete(req).await {
+        let mut call_req = req.clone();
+        let sanitize_mode = if history_aggressive_retry {
+            SanitizeMode::Standard
+        } else {
+            SanitizeMode::Aggressive
+        };
+        let sanitize_report =
+            history_sanitizer::sanitize_history(&mut call_req.messages, name, sanitize_mode);
+        if sanitize_report != history_sanitizer::SanitizeReport::default() {
+            tracing::debug!(
+                provider = name,
+                mode = ?sanitize_mode,
+                stripped_reasoning = sanitize_report.stripped_reasoning,
+                stripped_trailing = sanitize_report.stripped_trailing_assistant,
+                orphan_tools = sanitize_report.removed_orphan_tool_results,
+                synthetic_tools = sanitize_report.injected_synthetic_tool_results,
+                "gateway: history sanificata per dialetto provider"
+            );
+        }
+
+        match provider.complete(&call_req).await {
             Ok(resp) => return Ok(resp),
             Err(err) => {
                 // Classificazione DETERMINISTICA su status/codice strutturato
                 // (regola H): il testo del messaggio serve solo per log/display.
                 let kind = classify_provider_error(&err);
-                // `Retry-After` autoritativo dal provider (RFC 9457/7231), se c'e'.
-                let retry_after = err
+                let http = err
                     .chain()
-                    .find_map(|c| c.downcast_ref::<ProviderHttpError>())
-                    .and_then(|h| h.retry_after_seconds);
+                    .find_map(|c| c.downcast_ref::<ProviderHttpError>());
+                // `Retry-After` autoritativo dal provider (RFC 9457/7231), se c'e'.
+                let retry_after = http.and_then(|h| h.retry_after_seconds);
                 let failure = CallFailure::from_error(kind, &err);
                 let msg = failure.message.clone();
                 match kind {
@@ -631,16 +654,33 @@ async fn complete_with_retry(
                         return Err(failure);
                     }
                     ProviderErrorKind::ClientError => {
-                        // Colpa nostra/config o modello singolo non abilitato:
-                        // ne' cooldown (il provider e' sano) ne' retry. PRIMA era
-                        // un'uscita muta: il 4xx spariva dai log e il chiamante
-                        // vedeva solo il 500 aggregato scambiandolo per un
-                        // provider instabile (incidente run 48793fde). Log dei
-                        // soli segnali strutturati (regola F: niente body).
+                        let code = failure.code.as_deref();
+                        let status = failure.status.unwrap_or(0);
+                        if history_sanitizer::is_invalid_model_error(code, status) {
+                            tracing::warn!(
+                                provider = name,
+                                status = failure.status,
+                                code = code,
+                                "gateway: modello invalido/deprecato (client_error, niente cooldown provider)"
+                            );
+                            return Err(failure);
+                        }
+                        if history_aggressive_retry
+                            && history_sanitizer::is_history_related_client_error(code)
+                        {
+                            history_aggressive_retry = false;
+                            tracing::warn!(
+                                provider = name,
+                                status = failure.status,
+                                code = code,
+                                "gateway: client_error history -> sanificazione aggressiva e retry"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             provider = name,
                             status = failure.status,
-                            code = failure.code.as_deref(),
+                            code = code,
                             "gateway: il provider ha rifiutato la richiesta \
                              (errore client, niente retry/cooldown)"
                         );
@@ -1901,6 +1941,8 @@ mod tests {
         ErrBilling,
         /// Errore lato client (400 invalid_request): non ritentabile, non da cooldown.
         ErrClient,
+        /// Primo tentativo: 400 history-related; secondo tentativo: OK (sanificazione).
+        ErrHistoryThenOk,
     }
 
     struct FakeProvider {
@@ -2097,6 +2139,36 @@ mod tests {
                     message: "invalid request: bad field".into(),
                 }
                 .into()),
+                Behaviour::ErrHistoryThenOk => {
+                    if idx == 0 {
+                        Err(crate::providers::ProviderHttpError {
+                            provider: self.name.clone(),
+                            status: 400,
+                            code: Some("invalid_request_message_order".into()),
+                            retry_after_seconds: None,
+                            message: "invalid message order".into(),
+                        }
+                        .into())
+                    } else {
+                        Ok(LlmResponse {
+                            content: "ok-after-sanitize".into(),
+                            tool_calls: None,
+                            usage: LlmUsage {
+                                input_tokens: 1,
+                                output_tokens: 1,
+                                cache_read_tokens: None,
+                                cache_creation_tokens: None,
+                            },
+                            model_used: req.model.clone(),
+                            provider_used: self.name.clone(),
+                            latency_ms: 0,
+                            finish_reason: "stop".into(),
+                            privacy_rerouted: None,
+                            reasoning: None,
+                            thinking_signature: None,
+                        })
+                    }
+                }
             }
         }
         async fn stream(&self, _req: &LlmRequest) -> anyhow::Result<crate::provider::ChunkStream> {
@@ -2132,7 +2204,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
+                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                    anyhow::bail!("HTTP 400 invalid_request: bad field")
+                }
             }
         }
         fn supports_audio_in(&self) -> bool {
@@ -2151,7 +2225,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
+                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                    anyhow::bail!("HTTP 400 invalid_request: bad field")
+                }
             }
         }
         fn supports_audio_out(&self) -> bool {
@@ -2168,7 +2244,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
+                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                    anyhow::bail!("HTTP 400 invalid_request: bad field")
+                }
             }
         }
         fn supports_video_gen(&self) -> bool {
@@ -2189,7 +2267,9 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
-                Behaviour::ErrClient => anyhow::bail!("HTTP 400 invalid_request: bad field"),
+                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                    anyhow::bail!("HTTP 400 invalid_request: bad field")
+                }
             }
         }
     }
@@ -2386,8 +2466,24 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.message.contains("tutti i provider hanno fallito"));
-        assert_eq!(p.calls.load(Ordering::SeqCst), 1); // niente retry
+        // history-related client_error: 1 retry con sanificazione aggressiva, poi errore
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
         assert!(!cooldown.is_in_cooldown("google")); // niente cooldown
+    }
+
+    #[tokio::test]
+    async fn history_client_error_sanitize_retry_poi_successo() {
+        let p = FakeProvider::new("mistral", Behaviour::ErrHistoryThenOk);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "mistral-small-latest".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        let resp = run_fallback(&resolved, &cooldown, &req(), true)
+            .await
+            .unwrap();
+        assert_eq!(resp.content, "ok-after-sanitize");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
     }
 
     // ── Body d'errore strutturato (regola M): classe per-provider nei details ──

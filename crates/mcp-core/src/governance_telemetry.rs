@@ -38,7 +38,8 @@ const GOVERNANCE_RECENT_WINDOW_SETTING: &str = "agent.governance.recent_window";
 /// Error-rate recente oltre cui un candidato e' "recently_failed" (retrocesso).
 const GOVERNANCE_EXCLUDE_ERROR_RATE_SETTING: &str = "agent.governance.exclude_error_rate";
 /// Fallimenti consecutivi (o tool) oltre cui un candidato e' "recently_failed".
-const GOVERNANCE_EXCLUDE_CONSECUTIVE_SETTING: &str = "agent.governance.exclude_consecutive_failures";
+const GOVERNANCE_EXCLUDE_CONSECUTIVE_SETTING: &str =
+    "agent.governance.exclude_consecutive_failures";
 /// Check recenti minimi perche' l'error-rate sia affidabile.
 const GOVERNANCE_MIN_RECENT_CHECKS_SETTING: &str = "agent.governance.min_recent_checks";
 /// Latenza (ms) di riferimento per la penalita' di latenza (tie-breaker).
@@ -97,11 +98,10 @@ pub async fn load_governance_policy(db: &PgPool) -> GovernancePolicy {
         .await
         .filter(|v| *v > 0)
         .unwrap_or(def.latency_ref_ms);
-    let failover_downgrade_penalty =
-        setting_f64(db, GOVERNANCE_FAILOVER_DOWNGRADE_PENALTY_SETTING)
-            .await
-            .filter(|v| *v > 0.0 && *v <= 1.0)
-            .unwrap_or(def.failover_downgrade_penalty);
+    let failover_downgrade_penalty = setting_f64(db, GOVERNANCE_FAILOVER_DOWNGRADE_PENALTY_SETTING)
+        .await
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(def.failover_downgrade_penalty);
     GovernancePolicy {
         exclude_error_rate,
         exclude_consecutive_failures,
@@ -304,7 +304,10 @@ mod tests {
         // pc/mc assente (nessuna fonte) -> non compare.
         assert_eq!(tel.len(), 2, "solo i candidati con storico o catalog");
 
-        let pa = tel.iter().find(|t| t.model == "ma").expect("pa/ma presente");
+        let pa = tel
+            .iter()
+            .find(|t| t.model == "ma")
+            .expect("pa/ma presente");
         assert_eq!(pa.recent_checks, 3);
         assert_eq!(pa.recent_failures, 2);
         assert_eq!(pa.avg_latency_ms, 150); // avg(100, 200), NULL escluso
@@ -312,7 +315,10 @@ mod tests {
         assert_eq!(pa.last_error_kind.as_deref(), Some("rate_limit")); // ultimo fallito
         assert!(!pa.provider_in_cooldown);
 
-        let pb = tel.iter().find(|t| t.model == "mb").expect("pb/mb presente");
+        let pb = tel
+            .iter()
+            .find(|t| t.model == "mb")
+            .expect("pb/mb presente");
         assert_eq!(pb.recent_checks, 0); // nessuno storico health
         assert_eq!(pb.consecutive_failures, 5);
         assert_eq!(pb.consecutive_tool_failures, 2);

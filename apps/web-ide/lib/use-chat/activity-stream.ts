@@ -174,6 +174,30 @@ export interface AwaitingSubagentsEvent extends EventProvenance {
   title: string;
 }
 
+/** Il run ha attivato il Consiglio delle Competenze tramite analisi agentica/
+ *  deterministica di complessita' e ambito. Non e' un toggle manuale: la fonte
+ *  e' il meta-step backend `council_of_competencies`. */
+export interface CouncilOfCompetenciesEvent extends EventProvenance {
+  type: "council_of_competencies";
+  title: string;
+  productName: string;
+  activationSource?: string;
+  degraded?: boolean;
+  degradationReason?: string;
+}
+
+/** Panel multi-provider: stesso problema analizzato da provider/modelli distinti
+ *  tramite purpose tier-aware. Meta-step backend `multi_provider_panel`. */
+export interface MultiProviderPanelEvent extends EventProvenance {
+  type: "multi_provider_panel";
+  title: string;
+  productName: string;
+  activationSource?: string;
+  providerCount?: number;
+  degraded?: boolean;
+  degradationReason?: string;
+}
+
 export type ActivityEvent =
   | RoutingEvent
   | PlanEvent
@@ -184,7 +208,9 @@ export type ActivityEvent =
   | ContextOverflowEvent
   | FoldedToolsEvent
   | SubagentEvent
-  | AwaitingSubagentsEvent;
+  | AwaitingSubagentsEvent
+  | CouncilOfCompetenciesEvent
+  | MultiProviderPanelEvent;
 
 /** Segmento del nastro: tutti gli eventi eseguiti da UN provider/model, in
  *  ordine. Un nuovo segmento si apre a ogni cambio provider effettivo. */
@@ -567,6 +593,36 @@ export function composeActivityStream(
             type: "awaiting_subagents",
             count: readAwaitingCount(p),
             title: m.title,
+          });
+          break;
+        }
+        case "council_of_competencies": {
+          // Indicatore prodotto: il Consiglio delle Competenze e' stato attivato
+          // da un gate strutturato a monte, non da un toggle manuale o dal testo
+          // del modello.
+          const seg = ensureSegment(undefined, undefined);
+          seg.events.push({
+            type: "council_of_competencies",
+            title: m.title,
+            productName: asString(p.product_name) ?? "Consiglio delle Competenze",
+            activationSource: asString(p.activation_source),
+            degraded: p.degraded === true,
+            degradationReason:
+              asString(p.degradation_detail) ?? asString(p.degradation_reason),
+          });
+          break;
+        }
+        case "multi_provider_panel": {
+          const seg = ensureSegment(undefined, undefined);
+          seg.events.push({
+            type: "multi_provider_panel",
+            title: m.title,
+            productName: asString(p.product_name) ?? "Multi-provider advisory",
+            activationSource: asString(p.activation_source),
+            providerCount: typeof p.provider_count === "number" ? p.provider_count : undefined,
+            degraded: p.degraded === true,
+            degradationReason:
+              asString(p.degradation_detail) ?? asString(p.degradation_reason),
           });
           break;
         }

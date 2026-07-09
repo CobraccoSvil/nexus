@@ -645,12 +645,18 @@ mod tests {
     fn run_notes_set_e_append() {
         // set sostituisce.
         assert_eq!(
-            apply_run_notes(Some("vecchio"), &json!({"action": "set", "content": " nuovo "})),
+            apply_run_notes(
+                Some("vecchio"),
+                &json!({"action": "set", "content": " nuovo "})
+            ),
             Some("nuovo".to_string())
         );
         // append aggiunge una riga.
         assert_eq!(
-            apply_run_notes(Some("riga1"), &json!({"action": "append", "content": "riga2"})),
+            apply_run_notes(
+                Some("riga1"),
+                &json!({"action": "append", "content": "riga2"})
+            ),
             Some("riga1\nriga2".to_string())
         );
         // append senza note correnti = content.
@@ -662,8 +668,14 @@ mod tests {
 
     #[test]
     fn run_notes_invalido() {
-        assert_eq!(apply_run_notes(None, &json!({"action": "x", "content": "y"})), None);
-        assert_eq!(apply_run_notes(None, &json!({"action": "set", "content": "  "})), None);
+        assert_eq!(
+            apply_run_notes(None, &json!({"action": "x", "content": "y"})),
+            None
+        );
+        assert_eq!(
+            apply_run_notes(None, &json!({"action": "set", "content": "  "})),
+            None
+        );
         assert_eq!(apply_run_notes(None, &json!("non oggetto")), None);
     }
 
@@ -672,7 +684,10 @@ mod tests {
         let big = "a".repeat(RUN_NOTES_MAX_CHARS + 100);
         let out = apply_run_notes(None, &json!({"action": "set", "content": big})).unwrap();
         assert!(out.starts_with("[...]\n"));
-        assert_eq!(out.chars().count(), RUN_NOTES_MAX_CHARS - 6 + "[...]\n".chars().count());
+        assert_eq!(
+            out.chars().count(),
+            RUN_NOTES_MAX_CHARS - 6 + "[...]\n".chars().count()
+        );
     }
 
     #[test]
@@ -690,7 +705,10 @@ mod tests {
 
     #[test]
     fn normalize_outcome_invalido() {
-        assert_eq!(normalize_declared_outcome(&json!({"outcome": "fatto"})), None);
+        assert_eq!(
+            normalize_declared_outcome(&json!({"outcome": "fatto"})),
+            None
+        );
         assert_eq!(normalize_declared_outcome(&json!([1, 2])), None);
     }
 
@@ -769,8 +787,9 @@ mod tests {
         // input non-oggetto -> None.
         assert!(normalize_review_verdict(&json!("fail")).is_none());
         // fail SENZA findings validi -> None (verdetto negativo senza evidenza).
-        assert!(normalize_review_verdict(&json!({"verdict": "fail", "summary": "brutto"}))
-            .is_none());
+        assert!(
+            normalize_review_verdict(&json!({"verdict": "fail", "summary": "brutto"})).is_none()
+        );
         // fail con findings tutti invalidi (file/description vuoti) -> None.
         assert!(normalize_review_verdict(&json!({
             "verdict": "fail",
@@ -833,7 +852,9 @@ mod tests {
         // input non-oggetto -> None.
         assert!(normalize_advisory_verdict(&json!("block")).is_none());
         // block SENZA rischi -> None (veto senza evidenza rifiutato alla fonte).
-        assert!(normalize_advisory_verdict(&json!({"verdict": "block", "summary": "no"})).is_none());
+        assert!(
+            normalize_advisory_verdict(&json!({"verdict": "block", "summary": "no"})).is_none()
+        );
         // block con rischi tutti invalidi (description vuota) -> None.
         assert!(normalize_advisory_verdict(&json!({
             "verdict": "block",
@@ -878,8 +899,14 @@ mod tests {
             (102_400.0 * 1.4) as i64
         );
         // tool noti.
-        assert_eq!(estimate_tool_result_size_bytes("nexus_extract_pdf_text", &json!({})), 100_000);
-        assert_eq!(estimate_tool_result_size_bytes("tool_qualunque", &json!({})), 5_000);
+        assert_eq!(
+            estimate_tool_result_size_bytes("nexus_extract_pdf_text", &json!({})),
+            100_000
+        );
+        assert_eq!(
+            estimate_tool_result_size_bytes("tool_qualunque", &json!({})),
+            5_000
+        );
     }
 
     #[test]
@@ -894,7 +921,10 @@ mod tests {
     #[test]
     fn context_chars_solo_content_str_e_block_content() {
         let msgs = vec![
-            ContextMessage { content: json!("ciao"), anthropic_content: Value::Null },
+            ContextMessage {
+                content: json!("ciao"),
+                anthropic_content: Value::Null,
+            },
             ContextMessage {
                 content: json!(["ignorato perche' lista"]),
                 anthropic_content: json!([{ "type": "text", "content": "AB" }, { "type": "tool_use", "name": "x" }]),
@@ -908,7 +938,7 @@ mod tests {
     #[test]
     fn token_estimate_somma_tutte_le_stringhe() {
         let msgs = vec![ContextMessage {
-            content: json!("abcdefg"), // 7
+            content: json!("abcdefg"),                                     // 7
             anthropic_content: json!([{ "type": "text", "text": "xyz" }]), // "text"3 + "xyz"3 = 6... e "type"="text" 4
         }];
         // system "sys"=3 + content 7 + block: type(4)+text(3) -> tutte le stringhe = 7.
@@ -924,7 +954,10 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         append_reminder_block(&mut blocks, "ricorda");
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[1]["text"], json!("<system-reminder>\nricorda\n</system-reminder>"));
+        assert_eq!(
+            blocks[1]["text"],
+            json!("<system-reminder>\nricorda\n</system-reminder>")
+        );
     }
 }
 
@@ -950,7 +983,10 @@ mod golden {
     fn spec_to_ctx(spec: &Value) -> ContextMessage {
         ContextMessage {
             content: spec.get("content").cloned().unwrap_or(Value::Null),
-            anthropic_content: spec.get("anthropic_content").cloned().unwrap_or(Value::Null),
+            anthropic_content: spec
+                .get("anthropic_content")
+                .cloned()
+                .unwrap_or(Value::Null),
         }
     }
 
@@ -986,7 +1022,10 @@ mod golden {
                     Value::from(estimate_tool_result_size_bytes(tn, &args))
                 }
                 "extract_returned_bytes" => {
-                    let content = inp.get("result_content").and_then(Value::as_str).unwrap_or("");
+                    let content = inp
+                        .get("result_content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     Value::from(extract_returned_bytes(content))
                 }
                 "estimate_context_chars" => {
@@ -1012,7 +1051,10 @@ mod golden {
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    let text = inp.get("reminder_text").and_then(Value::as_str).unwrap_or("");
+                    let text = inp
+                        .get("reminder_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     append_reminder_block(&mut blocks, text);
                     Value::Array(blocks)
                 }
@@ -1027,7 +1069,10 @@ mod golden {
             );
             checked += 1;
         }
-        assert!(checked >= 40, "attesi >= 40 casi dispatch, verificati {checked}");
+        assert!(
+            checked >= 40,
+            "attesi >= 40 casi dispatch, verificati {checked}"
+        );
         println!("golden dispatch_pure (tool_dispatch): {checked} casi verificati, tutti verdi");
     }
 }

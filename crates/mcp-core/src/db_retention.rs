@@ -35,7 +35,12 @@ async fn retention_enabled(db: &PgPool) -> bool {
         .await
         .ok()
         .flatten()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -111,9 +116,8 @@ async fn prune_health_history(db: &PgPool) {
     let days = setting_i64(db, "db.retention.health_history_days", 30, 1).await;
     for table in ["ai_model_health_history", "nexus_provider_health_history"] {
         // `table` e' una costante interna (mai input utente): nessuna injection.
-        let sql = format!(
-            "DELETE FROM {table} WHERE checked_at < NOW() - make_interval(days => $1)"
-        );
+        let sql =
+            format!("DELETE FROM {table} WHERE checked_at < NOW() - make_interval(days => $1)");
         let deleted = sqlx::query(&sql)
             .bind(days as f64)
             .execute(db)

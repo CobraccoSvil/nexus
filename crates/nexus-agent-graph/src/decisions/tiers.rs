@@ -51,7 +51,11 @@ mod tests {
     #[test]
     fn rank_monotono_sulla_scala_a_5() {
         let ranks: Vec<u8> = PERFORMANCE_TIERS.iter().map(|t| tier_rank(t)).collect();
-        assert_eq!(ranks, vec![1, 2, 3, 4, 5], "ordine light<medium<high<heavy<frontier");
+        assert_eq!(
+            ranks,
+            vec![1, 2, 3, 4, 5],
+            "ordine light<medium<high<heavy<frontier"
+        );
         // Strettamente crescente.
         assert!(ranks.windows(2).all(|w| w[0] < w[1]));
     }

@@ -172,7 +172,10 @@ mod tests {
             duration_ms: 0,
         };
         // Best-effort: ritorna Ok senza inserire e senza errore propagato.
-        store.record(rec, ExecMode::Real).await.expect("best-effort Ok");
+        store
+            .record(rec, ExecMode::Real)
+            .await
+            .expect("best-effort Ok");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nexus_agent_verifier_runs")
             .fetch_one(&pool)
             .await

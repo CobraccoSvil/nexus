@@ -340,8 +340,7 @@ pub fn validate_orch_move(
             tasks,
             coordination: Coordination::ParallelIsolated,
         } => {
-            let scopes: Vec<Vec<String>> =
-                tasks.iter().map(|t| t.write_scope.clone()).collect();
+            let scopes: Vec<Vec<String>> = tasks.iter().map(|t| t.write_scope.clone()).collect();
             let coordination = if isolation_available && subtasks_are_disjoint(&scopes) {
                 Coordination::ParallelIsolated
             } else {
@@ -369,20 +368,35 @@ mod tests {
         assert_eq!(context_pressure_from_tokens(100, 0), ContextPressure::Low);
         assert_eq!(context_pressure_from_tokens(0, 1000), ContextPressure::Low);
         // Sotto la soglia media -> Low.
-        assert_eq!(context_pressure_from_tokens(500, 1000), ContextPressure::Low);
+        assert_eq!(
+            context_pressure_from_tokens(500, 1000),
+            ContextPressure::Low
+        );
         // Tra media e alta -> Medium.
-        assert_eq!(context_pressure_from_tokens(700, 1000), ContextPressure::Medium);
+        assert_eq!(
+            context_pressure_from_tokens(700, 1000),
+            ContextPressure::Medium
+        );
         // Oltre la soglia alta -> High.
-        assert_eq!(context_pressure_from_tokens(900, 1000), ContextPressure::High);
+        assert_eq!(
+            context_pressure_from_tokens(900, 1000),
+            ContextPressure::High
+        );
         // Esattamente sulla soglia alta -> High (>=).
-        assert_eq!(context_pressure_from_tokens(850, 1000), ContextPressure::High);
+        assert_eq!(
+            context_pressure_from_tokens(850, 1000),
+            ContextPressure::High
+        );
     }
 
     #[test]
     fn orch_epoch_plan_entry_e_stabile() {
         assert_eq!(orch_epoch(OrchPhase::PlanEntry), 0);
         // Deterministica a chiamate ripetute (idempotenza/replay).
-        assert_eq!(orch_epoch(OrchPhase::PlanEntry), orch_epoch(OrchPhase::PlanEntry));
+        assert_eq!(
+            orch_epoch(OrchPhase::PlanEntry),
+            orch_epoch(OrchPhase::PlanEntry)
+        );
     }
 
     #[test]
@@ -482,7 +496,11 @@ mod tests {
         let m = validate_orch_move(&json!({"move": "run_inline"}), false, false);
         assert_eq!(m, OrchestrationMove::RunInline);
 
-        let m = validate_orch_move(&json!({"move": "plan_phase", "decompose": true}), false, false);
+        let m = validate_orch_move(
+            &json!({"move": "plan_phase", "decompose": true}),
+            false,
+            false,
+        );
         assert_eq!(m, OrchestrationMove::PlanPhase { decompose: true });
 
         let m = validate_orch_move(
@@ -695,7 +713,10 @@ mod tests {
 
     #[test]
     fn subtasks_are_disjoint_scope_disgiunti_true() {
-        assert!(subtasks_are_disjoint(&[sc(&["crates/a"]), sc(&["crates/b"])]));
+        assert!(subtasks_are_disjoint(&[
+            sc(&["crates/a"]),
+            sc(&["crates/b"])
+        ]));
         // Multi-path per task, tutti disgiunti tra task.
         assert!(subtasks_are_disjoint(&[
             sc(&["src/api", "docs/api.md"]),
@@ -754,16 +775,25 @@ mod tests {
             sc(&["node_modules/foo"]),
             sc(&["src/b"]),
         ]));
-        assert!(!subtasks_are_disjoint(&[sc(&["target/debug"]), sc(&["src/b"])]));
+        assert!(!subtasks_are_disjoint(&[
+            sc(&["target/debug"]),
+            sc(&["src/b"])
+        ]));
         // .git non deve mai stare in scope.
-        assert!(!subtasks_are_disjoint(&[sc(&[".git/config"]), sc(&["src/b"])]));
+        assert!(!subtasks_are_disjoint(&[
+            sc(&[".git/config"]),
+            sc(&["src/b"])
+        ]));
     }
 
     #[test]
     fn subtasks_are_disjoint_normalizza_separatori_e_case() {
         // Separatori Windows, ./ iniziale, / finale, case misto: normalizzati.
         // "./Src/A/" e "src\\a" collidono dopo normalizzazione -> non disgiunti.
-        assert!(!subtasks_are_disjoint(&[sc(&["./Src/A/"]), sc(&["src\\a"])]));
+        assert!(!subtasks_are_disjoint(&[
+            sc(&["./Src/A/"]),
+            sc(&["src\\a"])
+        ]));
         // Stessi separatori misti ma path diversi -> disgiunti.
         assert!(subtasks_are_disjoint(&[sc(&["src\\a"]), sc(&["src\\b"])]));
     }

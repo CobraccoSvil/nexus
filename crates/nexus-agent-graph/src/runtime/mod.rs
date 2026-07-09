@@ -11,14 +11,13 @@ pub mod ports;
 pub use ctx::AgentNodeCtx;
 pub use ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, ContextPressure, Coordination,
-    CriteriaRunner, CriterionResult, CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort,
-    EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage, MetaReasonerPort,
-    OffloadKind,
-    MetaStepStore, ModelUpscalePort, NextActionChoice, NextActionsDeriver, OrchPhase,
-    OrchestrationContext, OrchestrationMove, PlanBlock, PlanRow, PortError, RecoveryMove,
-    RunControlStore, ScaleContext, ScaleMove, ScaleTier, SseEvent, StallBudgetPort, StallContext,
-    SubTask, SummaryStore, TodoStore, ToolCall, ToolExecutor, ToolOutcome, UpscalePick,
-    VerifierRunRecord, VerifierRunStore,
+    CriteriaRunner, CriterionResult, CriterionSpec, EmbeddingStore, EscalationInputs,
+    EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage,
+    MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionChoice, NextActionsDeriver,
+    OffloadKind, OrchPhase, OrchestrationContext, OrchestrationMove, PlanBlock, PlanRow, PortError,
+    RecoveryMove, RunControlStore, ScaleContext, ScaleMove, ScaleTier, SseEvent, StallBudgetPort,
+    StallContext, SubTask, SummaryStore, SupervisorContext, TodoStore, ToolCall, ToolExecutor, ToolOutcome,
+    UpscalePick, VerifierRunRecord, VerifierRunStore,
 };
 
 use async_trait::async_trait;
@@ -82,6 +81,14 @@ impl MetaReasonerPort for StubMetaReasonerPort {
     ) -> Result<Option<ScaleMove>, PortError> {
         Ok(None)
     }
+
+    async fn supervise(
+        &self,
+        _ctx: SupervisorContext,
+        _mode: ExecMode,
+    ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
+        Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
+    }
 }
 
 /// Budget stall CROSS-RUN INERTE: [`StallBudgetPort::consultations_in_session`]
@@ -126,8 +133,9 @@ pub mod test_doubles {
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
         CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort, EventSink, ExecMode,
         LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort,
-        NextActionChoice, NextActionsDeriver, OffloadKind, PlanRow, PortError, RunControlStore,
-        SseEvent, SummaryStore, ToolCall, ToolExecutor, ToolOutcome, TodoStore, UpscalePick,
+        NextActionChoice, NextActionsDeriver, OffloadKind, PlanRow, PortError,
+        ProviderFailureCause, ProviderUnavailableInfo, RunControlStore,
+        SseEvent, SummaryStore, TodoStore, ToolCall, ToolExecutor, ToolOutcome, UpscalePick,
         VerifierRunRecord, VerifierRunStore,
     };
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
@@ -146,6 +154,9 @@ pub mod test_doubles {
         /// `Err(PortError::ProviderUnavailable(_))` invece di `PortError::Llm(_)`:
         /// esercita il ramo FALLBACK cross-provider del nodo (provider in cooldown).
         pub error_provider_unavailable: bool,
+        /// Causa tipizzata quando `error_provider_unavailable` e' true. `None` ->
+        /// `Unknown` (retro-compatibile).
+        pub provider_unavailable_cause: Option<ProviderFailureCause>,
         /// Richieste registrate (in ordine d'arrivo).
         pub seen: Mutex<Vec<LlmRequest>>,
     }
@@ -162,6 +173,7 @@ pub mod test_doubles {
                 },
                 error: None,
                 error_provider_unavailable: false,
+                provider_unavailable_cause: None,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -184,6 +196,7 @@ pub mod test_doubles {
                 },
                 error: None,
                 error_provider_unavailable: false,
+                provider_unavailable_cause: None,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -196,6 +209,7 @@ pub mod test_doubles {
                 canned: LlmResponse::default(),
                 error: Some(message.to_string()),
                 error_provider_unavailable: false,
+                provider_unavailable_cause: None,
                 seen: Mutex::new(vec![]),
             }
         }
@@ -209,6 +223,22 @@ pub mod test_doubles {
                 canned: LlmResponse::default(),
                 error: Some(message.to_string()),
                 error_provider_unavailable: true,
+                provider_unavailable_cause: None,
+                seen: Mutex::new(vec![]),
+            }
+        }
+
+        /// Come [`with_provider_unavailable`](Self::with_provider_unavailable) ma con
+        /// causa tipizzata esplicita (es. `ClientError` per test policy failover).
+        pub fn with_provider_unavailable_cause(
+            cause: ProviderFailureCause,
+            message: &str,
+        ) -> Self {
+            Self {
+                canned: LlmResponse::default(),
+                error: Some(message.to_string()),
+                error_provider_unavailable: true,
+                provider_unavailable_cause: Some(cause),
                 seen: Mutex::new(vec![]),
             }
         }
@@ -220,7 +250,12 @@ pub mod test_doubles {
             self.seen.lock().expect("lock seen").push(req);
             if let Some(msg) = &self.error {
                 if self.error_provider_unavailable {
-                    return Err(PortError::ProviderUnavailable(msg.clone().into()));
+                    let cause = self
+                        .provider_unavailable_cause
+                        .unwrap_or(ProviderFailureCause::Unknown);
+                    return Err(PortError::ProviderUnavailable(
+                        ProviderUnavailableInfo::new(cause, msg.clone()),
+                    ));
                 }
                 return Err(PortError::Llm(msg.clone()));
             }
@@ -254,11 +289,7 @@ pub mod test_doubles {
 
     #[async_trait]
     impl ToolExecutor for StubToolExecutor {
-        async fn execute(
-            &self,
-            call: ToolCall,
-            mode: ExecMode,
-        ) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
             self.seen.lock().expect("lock seen").push((call, mode));
             Ok(self.canned.clone())
         }
@@ -405,11 +436,7 @@ pub mod test_doubles {
 
     #[async_trait]
     impl VerifierRunStore for StubVerifierRunStore {
-        async fn record(
-            &self,
-            run: VerifierRunRecord,
-            mode: ExecMode,
-        ) -> Result<(), PortError> {
+        async fn record(&self, run: VerifierRunRecord, mode: ExecMode) -> Result<(), PortError> {
             // Gate shadow: in Replay NON si persiste (no-op), come l'impl concreta.
             if mode != ExecMode::Real {
                 return Ok(());
@@ -577,7 +604,10 @@ pub mod test_doubles {
             }
             let mut g = self.offloaded.lock().expect("lock offloaded");
             g.push(payload);
-            self.offloaded_kinds.lock().expect("lock offloaded_kinds").push(kind);
+            self.offloaded_kinds
+                .lock()
+                .expect("lock offloaded_kinds")
+                .push(kind);
             // Pointer fittizio deterministico (indice progressivo).
             Ok(format!("stub-rag-pointer-{}", g.len() - 1))
         }
@@ -617,7 +647,9 @@ pub mod test_doubles {
                 return Err(PortError::Tool("shadow: embed no-op".to_string()));
             }
             if self.vectors.is_empty() {
-                return Err(PortError::Tool("stub: nessun vettore configurato".to_string()));
+                return Err(PortError::Tool(
+                    "stub: nessun vettore configurato".to_string(),
+                ));
             }
             {
                 let mut seen = self.embed_seen.lock().expect("lock embed_seen");
@@ -670,11 +702,16 @@ pub mod test_doubles {
             if mode != ExecMode::Real {
                 return Err(PortError::Llm("shadow: summarize no-op".to_string()));
             }
-            self.summarize_seen.lock().expect("lock summarize_seen").push(text);
+            self.summarize_seen
+                .lock()
+                .expect("lock summarize_seen")
+                .push(text);
             match &self.summary {
                 Some(s) => Ok(s.clone()),
                 // Nessun riassunto configurato: degrado best-effort (history invariata).
-                None => Err(PortError::Llm("stub: nessun summary configurato".to_string())),
+                None => Err(PortError::Llm(
+                    "stub: nessun summary configurato".to_string(),
+                )),
             }
         }
     }
@@ -817,14 +854,11 @@ pub mod test_doubles {
             if self.fail {
                 return Err(PortError::Llm("stub: failover_provider fail".to_string()));
             }
-            Ok(self
-                .failover
-                .as_ref()
-                .map(|(p, m)| CrossProviderCandidate {
-                    provider: p.clone(),
-                    model: m.clone(),
-                    tier: self.failover_tier.clone(),
-                }))
+            Ok(self.failover.as_ref().map(|(p, m)| CrossProviderCandidate {
+                provider: p.clone(),
+                model: m.clone(),
+                tier: self.failover_tier.clone(),
+            }))
         }
     }
 
@@ -869,11 +903,11 @@ pub mod test_doubles {
 
     #[async_trait]
     impl NextActionsDeriver for StubNextActionsDeriver {
-        async fn derive(
-            &self,
-            cleaned_text: &str,
-        ) -> Result<Vec<NextActionChoice>, PortError> {
-            self.seen.lock().expect("lock seen").push(cleaned_text.to_string());
+        async fn derive(&self, cleaned_text: &str) -> Result<Vec<NextActionChoice>, PortError> {
+            self.seen
+                .lock()
+                .expect("lock seen")
+                .push(cleaned_text.to_string());
             if self.fail {
                 return Err(PortError::Llm("stub: derive fail".to_string()));
             }

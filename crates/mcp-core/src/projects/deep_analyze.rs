@@ -289,7 +289,10 @@ async fn resolve_analyzer_model(db: &sqlx::PgPool) -> Result<(String, String), S
         }
         other => Err(format!(
             "routing purpose 'project_analyzer' non risolvibile: {}",
-            other.into_model("project_analyzer").err().unwrap_or_default()
+            other
+                .into_model("project_analyzer")
+                .err()
+                .unwrap_or_default()
         )),
     }
 }

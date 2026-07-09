@@ -46,11 +46,10 @@ use uuid::Uuid;
 
 use crate::nexus_gateway::{GwMessage, GwMetadata, GwRequest};
 use crate::projects::{
-    api_error, list_directory_nodes, load_project_context,
-    load_user_project_preferences, parse_user_id, refresh_git_snapshot,
-    save_user_project_preferences, sign_terminal_token, terminal_session_secret, terminal_shell,
-    upsert_open_session, TerminalSessionClaims, TerminalSessionResponse,
-    WorkbenchStateUpdateRequest,
+    api_error, list_directory_nodes, load_project_context, load_user_project_preferences,
+    parse_user_id, refresh_git_snapshot, save_user_project_preferences, sign_terminal_token,
+    terminal_session_secret, terminal_shell, upsert_open_session, TerminalSessionClaims,
+    TerminalSessionResponse, WorkbenchStateUpdateRequest,
 };
 use crate::{auth::Claims, AppState};
 

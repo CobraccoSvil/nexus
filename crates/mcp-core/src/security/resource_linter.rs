@@ -140,9 +140,15 @@ pub fn lint_file_content(
 /// (`port_scanner`), qui si raffina solo il consiglio di fix.
 fn snippet_has_env_fallback(snippet: &str) -> bool {
     let lower = snippet.to_lowercase();
-    let has_env_hint = ["process.env", "os.environ", "env::var", "getenv", "import.meta.env"]
-        .iter()
-        .any(|h| lower.contains(h))
+    let has_env_hint = [
+        "process.env",
+        "os.environ",
+        "env::var",
+        "getenv",
+        "import.meta.env",
+    ]
+    .iter()
+    .any(|h| lower.contains(h))
         || lower.contains("${");
     let has_fallback_op = snippet.contains("||")
         || snippet.contains("??")
@@ -280,11 +286,7 @@ pub async fn allocated_ports_for_project(db: &PgPool, project_id: Uuid) -> HashS
 
 /// Esegue il lint di UN progetto, apre le diagnosi e audita i finding nuovi.
 /// Ritorna il numero di violazioni aperte (nuove).
-pub async fn lint_project(
-    state: &crate::AppState,
-    project_id: Uuid,
-    root_path: &str,
-) -> usize {
+pub async fn lint_project(state: &crate::AppState, project_id: Uuid, root_path: &str) -> usize {
     let db = &state.db;
     let allocated = allocated_ports_for_project(db, project_id).await;
     let root = std::path::PathBuf::from(root_path);
@@ -292,8 +294,7 @@ pub async fn lint_project(
         return 0;
     }
     let alloc_clone = allocated.clone();
-    let findings = match tokio::task::spawn_blocking(move || lint_tree(&root, &alloc_clone)).await
-    {
+    let findings = match tokio::task::spawn_blocking(move || lint_tree(&root, &alloc_clone)).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "resource_linter: walk fallito");
@@ -408,15 +409,14 @@ pub async fn revalidate_file_violations(
     abs_path: &Path,
 ) {
     // Flag DB-driven coerente con il linter periodico (regola G): opt-out per progetto.
-    let lint_on = sqlx::query_scalar::<_, bool>(
-        "SELECT port_lint_enabled FROM projects WHERE id = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(true);
+    let lint_on =
+        sqlx::query_scalar::<_, bool>("SELECT port_lint_enabled FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(true);
     if !lint_on {
         return;
     }
@@ -436,7 +436,9 @@ pub async fn revalidate_file_violations(
     let allocated = allocated_ports_for_project(db, project_id).await;
     // Contenuto corrente del file (se illeggibile/cancellato: nessun finding,
     // quindi tutte le diagnosi aperte sul file vengono risolte).
-    let current = tokio::fs::read_to_string(abs_path).await.unwrap_or_default();
+    let current = tokio::fs::read_to_string(abs_path)
+        .await
+        .unwrap_or_default();
     let findings = lint_file_content(&rel_path, &current, &allocated);
 
     // 1) Apre eventuali violazioni nuove (dedup a monte: non riapre le note).
@@ -522,15 +524,18 @@ pub fn spawn_resource_linter(state: crate::AppState) {
         // Primo giro ritardato: lascia partire i worker di base.
         tokio::time::sleep(std::time::Duration::from_secs(90)).await;
         loop {
-            let enabled = crate::settings::get_setting(
-                &state.db,
-                "agent.resource_violation.linter_enabled",
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "off" | "no"))
-            .unwrap_or(true);
+            let enabled =
+                crate::settings::get_setting(&state.db, "agent.resource_violation.linter_enabled")
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| {
+                        !matches!(
+                            v.trim().to_lowercase().as_str(),
+                            "false" | "0" | "off" | "no"
+                        )
+                    })
+                    .unwrap_or(true);
             let interval_s = crate::settings::get_setting(
                 &state.db,
                 "agent.resource_violation.linter_interval_seconds",

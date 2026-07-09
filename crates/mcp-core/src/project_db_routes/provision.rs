@@ -109,11 +109,7 @@ fn derive_project_db_name(slug: Option<&str>, project_id: Uuid, suffix: &str) ->
     if sanitized.is_empty() {
         sanitized = project_id.simple().to_string();
     }
-    if sanitized
-        .chars()
-        .next()
-        .is_none_or(|c| c.is_ascii_digit())
-    {
+    if sanitized.chars().next().is_none_or(|c| c.is_ascii_digit()) {
         sanitized.insert(0, 'p');
     }
     // Tronca lasciando spazio al suffisso, cosi' il nome totale resta valido.
@@ -254,8 +250,15 @@ async fn provision_internal(
     engine_in: Option<&str>,
     db_name_in: Option<&str>,
 ) -> ApiResult {
-    match provision_internal_core(&state.db, project_id, name, engine_in, db_name_in, DbRole::App)
-        .await
+    match provision_internal_core(
+        &state.db,
+        project_id,
+        name,
+        engine_in,
+        db_name_in,
+        DbRole::App,
+    )
+    .await
     {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, e)),
@@ -540,7 +543,9 @@ async fn project_meta_pool_core(
         .map_err(|e| format!("caricamento migrazioni per-progetto fallito: {e}"))?
         .run(arc.as_ref())
         .await
-        .map_err(|e| format!("migrazioni schema per-progetto (progetto {project_id}) fallite: {e}"))?;
+        .map_err(|e| {
+            format!("migrazioni schema per-progetto (progetto {project_id}) fallite: {e}")
+        })?;
     cache.insert(project_id, arc.clone());
     Ok(arc)
 }

@@ -5,7 +5,7 @@
  *
  * Sezione A: Servizi del progetto attivi
  *   - Rilevamento dinamico dei servizi gestiti del progetto
- *   - Stato live con polling 5s + bottoni start / stop / restart
+ *   - Stato live via SSE dispatcher (ServiceStatusChanged + operationalRefresh)
  *   - URL/porta cliccabile per ogni servizio in esecuzione
  *
  * Sezione B: Wizard "Configura servizi del progetto"
@@ -21,8 +21,7 @@ import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
 import {
   useProjectStore,
-  selectServicesMap,
-  selectPorts as selectDispatcherPorts,
+  selectOperationalRefreshAt,
 } from "../../lib/project-dispatcher/store";
 import {
   getProjectServicesStatus,
@@ -181,40 +180,21 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   }, [projectId, lastRestart]);
 
   useEffect(() => {
-    fetchServices();
-    fetchPorts();
-    fetchPortAllocations();
-    fetchChanges();
-    // Polling servizi a 5s: gli eventi dispatcher SSE coprono solo
-    // ServiceStarted/Stopped/Restarted, NON le transizioni di sub-state
-    // (activating->running, crash-loop, stop/disable esterno) -> senza un polling
-    // abbastanza fitto lo stato resta stantio fino al refresh manuale (bug
-    // osservato: fullstack mostrato attivo dopo che l'agente l'aveva disabilitato).
-    // Fix radice separato: evento SSE ServiceStatusChanged con payload completo.
-    const t1 = setInterval(fetchServices, 5000);
-    const t2 = setInterval(fetchPorts, 30000);
-    const t3 = setInterval(fetchChanges, 4000); // file changes mantengono cadenza fitta (no evento dedicato)
-    const t4 = setInterval(fetchPortAllocations, 60000);
-    return () => { clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
-  }, [fetchServices, fetchPorts, fetchPortAllocations, fetchChanges]);
-
-  // ── Refresh event-driven via dispatcher SSE ─────────────────────────────
-  // L'evento dispatcher non contiene tutti i campi del RunPanel (unit, state,
-  // crash_loop): lo usiamo come trigger di refresh, non come sorgente dati.
-  const servicesFromDispatcher = useProjectStore(selectServicesMap);
-  const portsFromDispatcher = useProjectStore(selectDispatcherPorts);
-  useEffect(() => {
-    // skip mount iniziale (gia' coperto da useEffect precedente)
-    if (Object.keys(servicesFromDispatcher).length === 0) return;
     void fetchServices();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servicesFromDispatcher]);
-  useEffect(() => {
-    if (portsFromDispatcher.length === 0) return;
     void fetchPorts();
     void fetchPortAllocations();
+    void fetchChanges();
+  }, [fetchServices, fetchPorts, fetchPortAllocations, fetchChanges]);
+
+  const operationalRefreshAt = useProjectStore(selectOperationalRefreshAt);
+  useEffect(() => {
+    if (operationalRefreshAt === 0) return;
+    void fetchServices();
+    void fetchPorts();
+    void fetchPortAllocations();
+    void fetchChanges();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [portsFromDispatcher]);
+  }, [operationalRefreshAt]);
 
   // Quando l'agente completa un run, ri-verifica immediatamente i servizi
   // e aggiorna il feedback diagnostico (risolto / persiste)
@@ -408,10 +388,9 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         }
       } catch { /* ignora errori in background */ }
     };
-    tick();
-    const t = window.setInterval(tick, 60_000);
-    return () => { cancelled = true; window.clearInterval(t); };
-  }, [projectId]);
+    void tick();
+    return () => { cancelled = true; };
+  }, [projectId, operationalRefreshAt]);
 
   const handleInstall = async (svc: ServiceWizardSuggestion, env: Record<string,string>, description: string) => {
     // Non chiudere la modale prima di sapere l'esito: l'utente deve vedere
@@ -461,11 +440,8 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
     } catch { /* ignora — il backend potrebbe essere down */ }
   }, []);
 
-  // Polling rilassato (30s) — i servizi Nexus cambiano stato raramente.
   useEffect(() => {
-    fetchNexusServices();
-    const t = setInterval(fetchNexusServices, 30_000);
-    return () => clearInterval(t);
+    void fetchNexusServices();
   }, [fetchNexusServices]);
 
   const handleNexusAction = async (svc: NexusServiceInfo, action: "start" | "stop" | "restart") => {

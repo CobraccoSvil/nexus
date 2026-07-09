@@ -221,7 +221,11 @@ async fn check_microservices() -> EnvironmentCheck {
         .join(", ");
 
     if ok_count == total {
-        EnvironmentCheck::ok("microservices", LABEL, format!("{ok_count}/{total} operativi"))
+        EnvironmentCheck::ok(
+            "microservices",
+            LABEL,
+            format!("{ok_count}/{total} operativi"),
+        )
     } else if ok_count > 0 {
         EnvironmentCheck::warn(
             "microservices",
@@ -229,7 +233,11 @@ async fn check_microservices() -> EnvironmentCheck {
             format!("{ok_count}/{total} operativi — {detail}"),
         )
     } else {
-        EnvironmentCheck::error("microservices", LABEL, format!("0/{total} operativi — {detail}"))
+        EnvironmentCheck::error(
+            "microservices",
+            LABEL,
+            format!("0/{total} operativi — {detail}"),
+        )
     }
 }
 
@@ -636,7 +644,11 @@ async fn action_install_sqlx_cli() -> ApiResult {
             .output(),
     )
     .await;
-    command_result_json(result, "Errore avvio cargo: ", "Timeout dopo 300s. Riprova.")
+    command_result_json(
+        result,
+        "Errore avvio cargo: ",
+        "Timeout dopo 300s. Riprova.",
+    )
 }
 
 pub async fn fix_environment(

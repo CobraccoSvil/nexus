@@ -391,7 +391,11 @@ impl ClarifyOrExpandNode {
 
         // Gate 5: tetto tentativi clarify (:704-712, mig 0386, fail-open).
         let clarify_attempts = state.clarify_attempts.unwrap_or(0);
-        let max_clarify = if cfg.max_attempts != 0 { cfg.max_attempts } else { 1 };
+        let max_clarify = if cfg.max_attempts != 0 {
+            cfg.max_attempts
+        } else {
+            1
+        };
         if clarify_attempts >= max_clarify {
             return GateOutcome::Skip;
         }
@@ -577,17 +581,16 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
         let user_msg = user_msg.trim().to_string();
 
         // ── Catena di gate pre-LLM (punto unico) ──────────────────────────────
-        let (force_classify, confidence) =
-            match Self::pre_llm_gate(&self.cfg, state, &user_msg) {
-                GateOutcome::Skip => {
-                    // No-op: il flusso prosegue invariato (delta vuoto).
-                    return Ok(StateDelta::default().into_opaque());
-                }
-                GateOutcome::CallLlm {
-                    force_classify,
-                    confidence,
-                } => (force_classify, confidence),
-            };
+        let (force_classify, confidence) = match Self::pre_llm_gate(&self.cfg, state, &user_msg) {
+            GateOutcome::Skip => {
+                // No-op: il flusso prosegue invariato (delta vuoto).
+                return Ok(StateDelta::default().into_opaque());
+            }
+            GateOutcome::CallLlm {
+                force_classify,
+                confidence,
+            } => (force_classify, confidence),
+        };
 
         // NB i sotto-gate Comp.1 (intake_gate) / Cluster 4 (decision_lookup) NON
         // sono portati (OFF di default, I/O KB+LLM+DB): vedi doc del modulo. Con i
@@ -1075,7 +1078,10 @@ mod tests {
             ""
         );
         // nessun marcatore -> vuoto.
-        assert_eq!(ClarifyOrExpandNode::build_project_context("foo.txt\nbar.csv"), "");
+        assert_eq!(
+            ClarifyOrExpandNode::build_project_context("foo.txt\nbar.csv"),
+            ""
+        );
     }
 
     #[test]
@@ -1164,7 +1170,11 @@ mod tests {
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
 
         assert_eq!(out.pending_clarify, Some(true));
-        assert_eq!(out.clarify_attempts, Some(1), "clarify_attempts incrementato");
+        assert_eq!(
+            out.clarify_attempts,
+            Some(1),
+            "clarify_attempts incrementato"
+        );
         assert_eq!(out.meta_steps.len(), 1);
         assert_eq!(out.meta_steps[0].kind, "clarify");
         assert_eq!(out.meta_steps[0].title, "Serve un chiarimento");
@@ -1194,7 +1204,9 @@ mod tests {
     #[tokio::test]
     async fn nodo_gate_skip_passthrough() {
         let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
-        let llm = Arc::new(ScriptedLlm::with_decision(json!({"mode": "ask", "question": "x"})));
+        let llm = Arc::new(ScriptedLlm::with_decision(
+            json!({"mode": "ask", "question": "x"}),
+        ));
         let ctx = ctx_with(llm.clone(), Arc::new(FailingTools), false);
         let mut st = trigger_state();
         st.intent_confidence = Some(0.95); // sopra soglia -> skip
@@ -1208,7 +1220,11 @@ mod tests {
     #[tokio::test]
     async fn nodo_no_tool_use_noop() {
         let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
-        let ctx = ctx_with(Arc::new(ScriptedLlm::no_tool()), Arc::new(FailingTools), false);
+        let ctx = ctx_with(
+            Arc::new(ScriptedLlm::no_tool()),
+            Arc::new(FailingTools),
+            false,
+        );
         let st = trigger_state();
         let delta = node.run(&st, &ctx).await.expect("run ok");
         assert_eq!(delta.as_map().len(), 0);
@@ -1254,7 +1270,9 @@ mod golden {
     use serde::Deserialize;
     use serde_json::Value;
 
-    use super::{ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision};
+    use super::{
+        ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
+    };
     use crate::state::{AgentState, AutomationMode, Message, MessageContent};
 
     #[derive(Debug, Deserialize)]
@@ -1283,7 +1301,10 @@ mod golden {
         if let Some(f) = v.get("smalltalk_agentic_score_max").and_then(Value::as_f64) {
             c.smalltalk_agentic_score_max = f;
         }
-        if let Some(b) = v.get("confirm_irreversible_in_auto").and_then(Value::as_bool) {
+        if let Some(b) = v
+            .get("confirm_irreversible_in_auto")
+            .and_then(Value::as_bool)
+        {
             c.confirm_irreversible_in_auto = b;
         }
         c
@@ -1365,7 +1386,11 @@ mod golden {
                 "pre_llm_gate" => {
                     let cfg = cfg_from_json(c.input.get("cfg").expect("cfg"));
                     let st = state_from_json(c.input.get("state").expect("state"));
-                    let user_msg = c.input.get("user_msg").and_then(Value::as_str).unwrap_or("");
+                    let user_msg = c
+                        .input
+                        .get("user_msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     gate_to_json(ClarifyOrExpandNode::pre_llm_gate(&cfg, &st, user_msg))
                 }
                 "last_user_message" => {
@@ -1401,14 +1426,20 @@ mod golden {
                     Value::String(ClarifyOrExpandNode::last_user_message(&msgs))
                 }
                 "truncate_question" => {
-                    let q = c.input.get("question").and_then(Value::as_str).unwrap_or("");
-                    let m =
-                        c.input.get("max_chars").and_then(Value::as_i64).unwrap_or(0) as usize;
+                    let q = c
+                        .input
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let m = c
+                        .input
+                        .get("max_chars")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0) as usize;
                     Value::String(ClarifyOrExpandNode::truncate_question(q, m))
                 }
                 "build_project_context" => {
-                    let listing =
-                        c.input.get("listing").and_then(Value::as_str).unwrap_or("");
+                    let listing = c.input.get("listing").and_then(Value::as_str).unwrap_or("");
                     Value::String(ClarifyOrExpandNode::build_project_context(listing))
                 }
                 "llm_decision" => {
@@ -1424,8 +1455,11 @@ mod golden {
                 }
                 "build_expand_delta" => {
                     let d = LlmDecision::from_tool_input(c.input.get("tool_input").expect("input"));
-                    let user_msg =
-                        c.input.get("user_msg").and_then(Value::as_str).unwrap_or("");
+                    let user_msg = c
+                        .input
+                        .get("user_msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     match ClarifyOrExpandNode::build_expand_delta(&d, user_msg) {
                         // None -> {"expanded_query": null} (no-op), Some -> il valore.
                         None => serde_json::json!(null),

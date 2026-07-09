@@ -130,13 +130,12 @@ mod tests {
             )
             .await
             .expect("ok");
-        let row: (String, String) = sqlx::query_as(
-            "SELECT kind, title FROM nexus_agent_meta_steps WHERE run_id = $1",
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .expect("riga");
+        let row: (String, String) =
+            sqlx::query_as("SELECT kind, title FROM nexus_agent_meta_steps WHERE run_id = $1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("riga");
         assert_eq!(row.0, "plan");
         assert_eq!(row.1, "Piano");
     }

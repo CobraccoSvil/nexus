@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
-const POLL_INTERVAL_MS = 10000;
 
 interface WorkerStat {
   runs: number;
@@ -58,9 +58,8 @@ export function NexusWorkersPanel() {
   const [stats, setStats] = useState<NexusStatsSlim | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/nexus/stats`, { credentials: "include" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -72,15 +71,16 @@ export function NexusWorkersPanel() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchStats();
-    intervalRef.current = setInterval(fetchStats, POLL_INTERVAL_MS);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, []);
+    void fetchStats();
+  }, [fetchStats]);
+
+  const onHealthSnapshot = useCallback(() => {
+    void fetchStats();
+  }, [fetchStats]);
+  useHealthSnapshot(onHealthSnapshot);
 
   const perWorker = stats?.scheduler.per_worker ?? {};
 

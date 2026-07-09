@@ -58,9 +58,9 @@ pub fn py_json_len_ascii(v: &Value) -> usize {
 /// senza materializzare la stringa intera (conta i codepoint man mano).
 fn accumulate_len_ascii(v: &Value, acc: &mut usize) {
     match v {
-        Value::Null => *acc += 4,                  // null
-        Value::Bool(true) => *acc += 4,            // true
-        Value::Bool(false) => *acc += 5,           // false
+        Value::Null => *acc += 4,        // null
+        Value::Bool(true) => *acc += 4,  // true
+        Value::Bool(false) => *acc += 5, // false
         Value::Number(_) => {
             // I numeri sono interamente ASCII: la lunghezza coincide con la
             // serializzazione Python-compatibile (interi + float repr CPython).
@@ -78,8 +78,8 @@ fn accumulate_len_ascii(v: &Value, acc: &mut usize) {
         }
         Value::Object(map) => {
             *acc += 2; // { }
-            // SortKeys::No: ordine d'inserimento (preserve_order del workspace),
-            // come il `json.dumps` Python senza sort_keys.
+                       // SortKeys::No: ordine d'inserimento (preserve_order del workspace),
+                       // come il `json.dumps` Python senza sort_keys.
             for (i, (k, val)) in map.iter().enumerate() {
                 if i > 0 {
                     *acc += 2; // separatore ", "
@@ -151,7 +151,11 @@ pub fn build_m16_allowed(
 /// True se la chiamata al tool `name` e' ammessa: in `allowed` OPPURE in `discovered`
 /// (i tool scoperti in questo turno). 1:1 con `name not in _M16_ALLOWED and name not
 /// in _disc_now` (negato).
-pub fn is_tool_allowed(name: &str, allowed: &HashSet<String>, discovered: &HashSet<String>) -> bool {
+pub fn is_tool_allowed(
+    name: &str,
+    allowed: &HashSet<String>,
+    discovered: &HashSet<String>,
+) -> bool {
     allowed.contains(name) || discovered.contains(name)
 }
 
@@ -190,7 +194,11 @@ pub fn parse_discovered_tools(raw_json: &str, schema_max_bytes: usize) -> Vec<Di
             .get("tool_name")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .or_else(|| obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()));
+            .or_else(|| {
+                obj.get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            });
         let Some(name) = name else {
             continue;
         };
@@ -235,7 +243,8 @@ pub fn merge_discovered_run(
     // Replica l'insertion-order di un dict Python: chiave esistente -> valore aggiornato
     // mantenendo la posizione; chiave nuova -> appesa in coda.
     let mut order: Vec<String> = Vec::new();
-    let mut map: std::collections::HashMap<String, DiscoveredTool> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, DiscoveredTool> =
+        std::collections::HashMap::new();
     for t in previous {
         if !map.contains_key(&t.name) {
             order.push(t.name.clone());
@@ -248,10 +257,7 @@ pub fn merge_discovered_run(
         }
         map.insert(t.name.clone(), t.clone());
     }
-    order
-        .into_iter()
-        .filter_map(|k| map.remove(&k))
-        .collect()
+    order.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
 
 #[cfg(test)]
@@ -297,7 +303,10 @@ mod tests {
         assert_eq!(got[0].name, "a");
         assert_eq!(got[1].name, "b");
         // default schema per b.
-        assert_eq!(got[1].input_schema, json!({"type":"object","properties":{}}));
+        assert_eq!(
+            got[1].input_schema,
+            json!({"type":"object","properties":{}})
+        );
     }
 
     #[test]
@@ -321,11 +330,19 @@ mod tests {
     #[test]
     fn parse_schema_oversize_azzerato() {
         // schema enorme -> sostituito col default.
-        let big_props: String = (0..2000).map(|i| format!("\"p{i}\":{{}}")).collect::<Vec<_>>().join(",");
-        let raw = format!(r#"{{"results":[{{"tool_name":"big","input_schema":{{"properties":{{{big_props}}}}}}}]}}"#);
+        let big_props: String = (0..2000)
+            .map(|i| format!("\"p{i}\":{{}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = format!(
+            r#"{{"results":[{{"tool_name":"big","input_schema":{{"properties":{{{big_props}}}}}}}]}}"#
+        );
         let got = parse_discovered_tools(&raw, 100);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].input_schema, json!({"type":"object","properties":{}}));
+        assert_eq!(
+            got[0].input_schema,
+            json!({"type":"object","properties":{}})
+        );
     }
 
     #[test]
@@ -333,9 +350,9 @@ mod tests {
         // Stringhe ASCII: lunghezza = len(json.dumps(s)) Python.
         assert_eq!(json_string_len_ascii("ab"), 4); // "ab"
         assert_eq!(json_string_len_ascii(""), 2); // ""
-        // Escape brevi: \n -> 2 char dentro le virgolette.
+                                                  // Escape brevi: \n -> 2 char dentro le virgolette.
         assert_eq!(json_string_len_ascii("\n"), 4); // "\n"
-        // Non-ASCII BMP: ogni carattere -> \uXXXX (6). "à" -> "à" = 6 + 2 = 8.
+                                                    // Non-ASCII BMP: ogni carattere -> \uXXXX (6). "à" -> "à" = 6 + 2 = 8.
         assert_eq!(json_string_len_ascii("à"), 8);
         // Astrale (emoji, > 0xFFFF): coppia surrogata -> 2x \uXXXX = 12 + 2 = 14.
         assert_eq!(json_string_len_ascii("😀"), 14);
@@ -345,8 +362,14 @@ mod tests {
         let v = json!({"k": "à"});
         assert_eq!(py_json_len_ascii(&v), 15);
         // Numeri/bool/null interamente ASCII: coincidono con la repr.
-        assert_eq!(py_json_len_ascii(&json!({"n": 42})), r#"{"n": 42}"#.chars().count());
-        assert_eq!(py_json_len_ascii(&json!([true, false, null])), "[true, false, null]".chars().count());
+        assert_eq!(
+            py_json_len_ascii(&json!({"n": 42})),
+            r#"{"n": 42}"#.chars().count()
+        );
+        assert_eq!(
+            py_json_len_ascii(&json!([true, false, null])),
+            "[true, false, null]".chars().count()
+        );
     }
 
     #[test]
@@ -380,12 +403,28 @@ mod tests {
     #[test]
     fn merge_ultimo_vince() {
         let prev = vec![
-            DiscoveredTool { name: "a".into(), description: "vecchio a".into(), input_schema: json!({}) },
-            DiscoveredTool { name: "b".into(), description: "b".into(), input_schema: json!({}) },
+            DiscoveredTool {
+                name: "a".into(),
+                description: "vecchio a".into(),
+                input_schema: json!({}),
+            },
+            DiscoveredTool {
+                name: "b".into(),
+                description: "b".into(),
+                input_schema: json!({}),
+            },
         ];
         let next = vec![
-            DiscoveredTool { name: "a".into(), description: "nuovo a".into(), input_schema: json!({}) },
-            DiscoveredTool { name: "c".into(), description: "c".into(), input_schema: json!({}) },
+            DiscoveredTool {
+                name: "a".into(),
+                description: "nuovo a".into(),
+                input_schema: json!({}),
+            },
+            DiscoveredTool {
+                name: "c".into(),
+                description: "c".into(),
+                input_schema: json!({}),
+            },
         ];
         let merged = merge_discovered_run(&prev, &next);
         // a aggiornato (in posizione 0), b resta, c appeso.
@@ -422,7 +461,11 @@ mod golden {
 
     fn str_list(v: &Value) -> Vec<String> {
         v.as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -434,7 +477,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 15, "attesi >= 15 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 15,
+            "attesi >= 15 casi, trovati {}",
+            cases.len()
+        );
         let mut saw_truncated = false;
         for c in &cases {
             let inp = &c.input;
@@ -455,9 +502,13 @@ mod golden {
                 "is_tool_allowed" => {
                     let name = inp.get("name").and_then(Value::as_str).unwrap_or("");
                     let allowed: HashSet<String> =
-                        str_list(inp.get("allowed").unwrap_or(&Value::Null)).into_iter().collect();
+                        str_list(inp.get("allowed").unwrap_or(&Value::Null))
+                            .into_iter()
+                            .collect();
                     let disc: HashSet<String> =
-                        str_list(inp.get("discovered").unwrap_or(&Value::Null)).into_iter().collect();
+                        str_list(inp.get("discovered").unwrap_or(&Value::Null))
+                            .into_iter()
+                            .collect();
                     Value::Bool(is_tool_allowed(name, &allowed, &disc))
                 }
                 "parse_discovered_tools" => {
@@ -465,8 +516,10 @@ mod golden {
                         saw_truncated = true;
                     }
                     let raw_json = inp.get("raw_json").and_then(Value::as_str).unwrap_or("");
-                    let mx = inp.get("schema_max_bytes").and_then(Value::as_u64).unwrap_or(8192)
-                        as usize;
+                    let mx = inp
+                        .get("schema_max_bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(8192) as usize;
                     serde_json::to_value(parse_discovered_tools(raw_json, mx)).unwrap()
                 }
                 "merge_discovered_run" => {
@@ -482,7 +535,13 @@ mod golden {
                 c.group, c.case_id, got, c.output
             );
         }
-        assert!(saw_truncated, "il caso CRUCIALE parse troncato deve essere presente");
-        println!("golden m16: {} casi verificati (incluso troncato), tutti verdi", cases.len());
+        assert!(
+            saw_truncated,
+            "il caso CRUCIALE parse troncato deve essere presente"
+        );
+        println!(
+            "golden m16: {} casi verificati (incluso troncato), tutti verdi",
+            cases.len()
+        );
     }
 }

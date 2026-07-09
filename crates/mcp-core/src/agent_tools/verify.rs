@@ -65,17 +65,19 @@ fn output_excerpt(raw: &str, max_chars: usize) -> (String, bool) {
         let skip = total - max_chars / 2;
         raw.chars().skip(skip).collect()
     };
-    (
-        format!("{head}\n[... output troncato ...]\n{tail}"),
-        true,
-    )
+    (format!("{head}\n[... output troncato ...]\n{tail}"), true)
 }
 
 pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Value) -> String {
     // Kill-switch DB-driven.
     let enabled = nexus_auth::get_setting(&ctx.db, "agent.verify.enabled")
         .await
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     if !enabled {
         return serde_json::json!({
@@ -94,13 +96,9 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
     // Profilo per-ambiente (ADR 0036): inferito da LLM alla prima richiesta,
     // poi cache su tabella con invalidazione deterministica. Il tool puo'
     // triggerare l'inferenza (ha meta-db, neural e root nel contesto).
-    let profile: Vec<VerifyProfileStep> = crate::verify_profile::ensure_profile(
-        &ctx.db,
-        &ctx.neural,
-        ctx.project_id,
-        &ctx.root_path,
-    )
-    .await;
+    let profile: Vec<VerifyProfileStep> =
+        crate::verify_profile::ensure_profile(&ctx.db, &ctx.neural, ctx.project_id, &ctx.root_path)
+            .await;
     if profile.is_empty() {
         // NESSUN comando generico di ripiego (decisione utente): esito
         // strutturato onesto, il chiamante sa che la verifica non e' partita.
@@ -117,8 +115,7 @@ pub(super) async fn tool_nexus_verify_change(ctx: &AgentToolContext, input: &Val
         // Rapido: solo gli step che l'LLM ha marcato per il gate di chiusura.
         "quick" => profile.iter().filter(|s| s.gate).collect(),
         name => {
-            let hit: Vec<&VerifyProfileStep> =
-                profile.iter().filter(|s| s.step == name).collect();
+            let hit: Vec<&VerifyProfileStep> = profile.iter().filter(|s| s.step == name).collect();
             if hit.is_empty() {
                 return serde_json::json!({
                     "error": "invalid_scope",
@@ -254,7 +251,10 @@ mod tests {
         let (excerpt, truncated) = output_excerpt(&raw, 400);
         assert!(truncated);
         assert!(excerpt.starts_with("xxxx"));
-        assert!(excerpt.ends_with("FINE-CODA"), "la coda (totali build) va preservata");
+        assert!(
+            excerpt.ends_with("FINE-CODA"),
+            "la coda (totali build) va preservata"
+        );
         assert!(excerpt.contains("[... output troncato ...]"));
     }
 
@@ -296,11 +296,15 @@ mod tests {
         .expect("seed run_config");
 
         // Override locale presente.
-        let r = resolve_step_override(&pool, pid, "test").await.expect("override");
+        let r = resolve_step_override(&pool, pid, "test")
+            .await
+            .expect("override");
         assert_eq!(r, "cargo nextest run");
 
         // Altro progetto senza run_config -> None (si usa il profilo).
-        assert!(resolve_step_override(&pool, uuid::Uuid::new_v4(), "test").await.is_none());
+        assert!(resolve_step_override(&pool, uuid::Uuid::new_v4(), "test")
+            .await
+            .is_none());
         // Step senza role corrispondente -> None.
         assert!(resolve_step_override(&pool, pid, "lint").await.is_none());
     }

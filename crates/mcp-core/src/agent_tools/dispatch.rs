@@ -300,8 +300,8 @@ mod tests {
     /// brain non connesso. Sufficiente per i path di dispatch che non
     /// toccano rete ne' DB.
     fn ctx_for_dispatch_tests(root: std::path::PathBuf) -> AgentToolContext {
-        let db = sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test")
-            .expect("pool lazy");
+        let db =
+            sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test").expect("pool lazy");
         AgentToolContext {
             core: nexus_agent_tools::ToolContextCore {
                 root_path: root,
@@ -364,7 +364,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
         let out = execute_agent_tool(&ctx, "tool_che_non_esiste", &serde_json::json!({})).await;
-        assert!(out.contains("non esiste"), "fallback atteso, ottenuto: {out}");
+        assert!(
+            out.contains("non esiste"),
+            "fallback atteso, ottenuto: {out}"
+        );
         assert!(
             out.trim_start().starts_with('\u{274C}'),
             "GAP1: l'errore tool-not-found deve iniziare col marker U+274C: {out}"
@@ -383,9 +386,12 @@ mod tests {
     async fn nexus_tool_inesistente_ha_marker_errore() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
-        let out =
-            execute_agent_tool(&ctx, "nexus_tool_inventato_dal_modello", &serde_json::json!({}))
-                .await;
+        let out = execute_agent_tool(
+            &ctx,
+            "nexus_tool_inventato_dal_modello",
+            &serde_json::json!({}),
+        )
+        .await;
         assert!(
             out.trim_start().starts_with('\u{274C}'),
             "GAP1: nexus_* inesistente deve produrre is_error path (marker U+274C): {out}"

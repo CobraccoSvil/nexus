@@ -1412,12 +1412,9 @@ pub async fn launch_run_config(
         // PUNTO UNICO anti-duplicato (regola L): come run_service e wizard
         // install, il lancio di una run config servizio ferma prima i processi
         // running dello stesso scopo (label esatta o variante simile).
-        let _ = crate::agent_processes::stop_similar_running_services(
-            &state.db,
-            project_id,
-            &label,
-        )
-        .await;
+        let _ =
+            crate::agent_processes::stop_similar_running_services(&state.db, project_id, &label)
+                .await;
     }
     let process_id = crate::agent_processes::spawn_agent_process(
         &state.db,

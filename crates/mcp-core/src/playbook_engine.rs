@@ -67,7 +67,11 @@ pub async fn match_playbook(
         if steps.is_empty() {
             continue;
         }
-        return Some(PlaybookMatch { key, steps, guidance });
+        return Some(PlaybookMatch {
+            key,
+            steps,
+            guidance,
+        });
     }
     None
 }
@@ -114,7 +118,8 @@ fn trigger_matches(
     if let Some(ak) = trigger.get("attachment_kind").and_then(Value::as_str) {
         let ak_lc = ak.to_lowercase();
         let cited = prompt_lc.contains(&ak_lc)
-            || (ak_lc == "figma_make" && (prompt_lc.contains(".make") || prompt_lc.contains("figma")));
+            || (ak_lc == "figma_make"
+                && (prompt_lc.contains(".make") || prompt_lc.contains("figma")));
         if !cited {
             return false;
         }
@@ -163,13 +168,23 @@ mod tests {
     #[test]
     fn keyword_match_basta() {
         let t = design_trigger();
-        assert!(trigger_matches(&t, None, "il layout non e' conforme al design", None));
+        assert!(trigger_matches(
+            &t,
+            None,
+            "il layout non e' conforme al design",
+            None
+        ));
     }
 
     #[test]
     fn intent_match_basta() {
         let t = design_trigger();
-        assert!(trigger_matches(&t, Some("frontend"), "testo senza keyword", None));
+        assert!(trigger_matches(
+            &t,
+            Some("frontend"),
+            "testo senza keyword",
+            None
+        ));
     }
 
     #[test]
@@ -186,9 +201,19 @@ mod tests {
             "keywords": ["realizza l'app"],
             "attachment_kind": "figma_make"
         });
-        assert!(!trigger_matches(&t, Some("implement"), "realizza l'app gestionale", None));
+        assert!(!trigger_matches(
+            &t,
+            Some("implement"),
+            "realizza l'app gestionale",
+            None
+        ));
         // Con "figma" nel prompt l'indizio c'e'.
-        assert!(trigger_matches(&t, Some("implement"), "realizza l'app dal figma", None));
+        assert!(trigger_matches(
+            &t,
+            Some("implement"),
+            "realizza l'app dal figma",
+            None
+        ));
     }
 
     #[test]
@@ -205,6 +230,9 @@ mod tests {
     #[test]
     fn steps_da_json_filtra_non_stringhe() {
         let v = json!(["passo 1", 42, "passo 2", null]);
-        assert_eq!(steps_from_json(&v), vec!["passo 1".to_string(), "passo 2".to_string()]);
+        assert_eq!(
+            steps_from_json(&v),
+            vec!["passo 1".to_string(), "passo 2".to_string()]
+        );
     }
 }

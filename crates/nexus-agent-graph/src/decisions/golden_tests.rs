@@ -181,8 +181,7 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 #[test]
 #[ignore = "richiede /tmp/golden_phase2a.json generato da gen_golden_phase2a.py"]
 fn golden_parita_python() {
-    let Some(raw) =
-        crate::golden_util::load_golden("golden_phase2a.json", "gen_golden_phase2a.py")
+    let Some(raw) = crate::golden_util::load_golden("golden_phase2a.json", "gen_golden_phase2a.py")
     else {
         return;
     };
@@ -259,8 +258,7 @@ fn golden_parita_python() {
                 Value::from(out)
             }
             "compute_iteration_budget" => {
-                let i: BudgetInput =
-                    serde_json::from_value(c.input.clone()).expect("BudgetInput");
+                let i: BudgetInput = serde_json::from_value(c.input.clone()).expect("BudgetInput");
                 let (budget, score) = helpers::compute_iteration_budget(
                     &i.prompt,
                     i.performance_tier.as_deref(),

@@ -58,7 +58,9 @@ use serde_json::{json, Value};
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
-use crate::decisions::reward::{final_reward as fuse_final_reward, heuristic_reward, round_half_even};
+use crate::decisions::reward::{
+    final_reward as fuse_final_reward, heuristic_reward, round_half_even,
+};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, StateDelta};
 
@@ -536,7 +538,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReflectionNode {
         };
 
         // ── Reward euristico (PUNTO UNICO decisions::reward, regola L) ────────
-        let heuristic = heuristic_reward(&stop_reason, !result.is_empty(), iterations, iteration_budget);
+        let heuristic = heuristic_reward(
+            &stop_reason,
+            !result.is_empty(),
+            iterations,
+            iteration_budget,
+        );
 
         // ── Fusione final_reward (__init__.py:4367-4381) ─────────────────────
         // reflection_data None -> solo euristico, final_reward = None.
@@ -914,7 +921,10 @@ mod tests {
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.reflection_score, None);
         assert_eq!(out.final_reward, None);
-        assert!(llm.seen.lock().unwrap().is_empty(), "no LLM su sampling escluso");
+        assert!(
+            llm.seen.lock().unwrap().is_empty(),
+            "no LLM su sampling escluso"
+        );
     }
 
     #[tokio::test]
@@ -994,8 +1004,14 @@ mod tests {
 
     #[test]
     fn should_sample_skip_boundary() {
-        assert!(!ReflectionNode::should_sample_skip(0.3, 0.3), "roll == rate -> NON skip");
-        assert!(ReflectionNode::should_sample_skip(0.31, 0.3), "roll > rate -> skip");
+        assert!(
+            !ReflectionNode::should_sample_skip(0.3, 0.3),
+            "roll == rate -> NON skip"
+        );
+        assert!(
+            ReflectionNode::should_sample_skip(0.31, 0.3),
+            "roll > rate -> skip"
+        );
         assert!(!ReflectionNode::should_sample_skip(0.0, 1.0));
         assert!(ReflectionNode::should_sample_skip(0.5, 0.0));
     }
@@ -1094,7 +1110,11 @@ mod tests {
             "suggestions": "xy"
         });
         let rd = ReflectionNode::validate(&v).expect("valido");
-        assert_eq!(rd.weaknesses, vec!["a", "b", "c"], "primi 3 char della stringa");
+        assert_eq!(
+            rd.weaknesses,
+            vec!["a", "b", "c"],
+            "primi 3 char della stringa"
+        );
         assert_eq!(rd.suggestions, vec!["x", "y"], "stringa piu' corta di 3");
     }
 }
@@ -1167,8 +1187,7 @@ mod golden {
                 "build_reflection_prompt" => {
                     let task = c.input.get("task").and_then(Value::as_str).unwrap_or("");
                     let output = c.input.get("output").and_then(Value::as_str).unwrap_or("");
-                    let (sys, user) =
-                        ReflectionNode::build_reflection_prompt(&cfg, task, output);
+                    let (sys, user) = ReflectionNode::build_reflection_prompt(&cfg, task, output);
                     json!({"system": sys, "user": user})
                 }
                 "parse_reflection_response" => {
@@ -1180,22 +1199,54 @@ mod golden {
                     reflection_to_json(ReflectionNode::validate(data))
                 }
                 "heuristic_reward" => {
-                    let sr = c.input.get("stop_reason").and_then(Value::as_str).unwrap_or("");
-                    let res = c.input.get("result_non_empty").and_then(Value::as_bool).unwrap_or(false);
-                    let it = c.input.get("iterations").and_then(Value::as_i64).unwrap_or(0);
-                    let bud = c.input.get("iteration_budget").and_then(Value::as_i64).unwrap_or(0);
+                    let sr = c
+                        .input
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let res = c
+                        .input
+                        .get("result_non_empty")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let it = c
+                        .input
+                        .get("iterations")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let bud = c
+                        .input
+                        .get("iteration_budget")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     json!(heuristic_reward(sr, res, it, bud))
                 }
                 "final_reward" => {
-                    let h = c.input.get("heuristic").and_then(Value::as_f64).unwrap_or(0.0);
-                    let s = c.input.get("reflection_score").and_then(Value::as_f64).unwrap_or(0.0);
-                    let w = c.input.get("reward_weight").and_then(Value::as_f64).unwrap_or(0.0);
+                    let h = c
+                        .input
+                        .get("heuristic")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let s = c
+                        .input
+                        .get("reflection_score")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let w = c
+                        .input
+                        .get("reward_weight")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
                     json!(final_reward(h, s, w))
                 }
                 "aggregate_score" => {
                     // input.dimensions = {nome: valore}; i pesi sono quelli della
                     // rubrica (correctness=0.40, completeness=0.30, efficiency=0.15, safety=0.15).
-                    let dims = c.input.get("dimensions").and_then(Value::as_object).expect("dims");
+                    let dims = c
+                        .input
+                        .get("dimensions")
+                        .and_then(Value::as_object)
+                        .expect("dims");
                     let pesi = [
                         ("correctness", 0.40),
                         ("completeness", 0.30),
@@ -1213,7 +1264,11 @@ mod golden {
                 }
                 "should_sample_skip" => {
                     let roll = c.input.get("roll").and_then(Value::as_f64).unwrap_or(0.0);
-                    let rate = c.input.get("sample_rate").and_then(Value::as_f64).unwrap_or(0.0);
+                    let rate = c
+                        .input
+                        .get("sample_rate")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
                     json!(ReflectionNode::should_sample_skip(roll, rate))
                 }
                 other => panic!("funzione golden sconosciuta: {other} (caso {})", c.case_id),

@@ -218,14 +218,14 @@ fn should_skip_path(path: &str) -> bool {
 /// di terze parti piu' comuni. Falso-negativo accettabile: un progetto che bindasse
 /// davvero una di queste e' raro (Nexus provisiona i DB, i servizi usano il bucket).
 const WELL_KNOWN_SERVICE_PORTS: &[u32] = &[
-    5432, 5433, // PostgreSQL (5433 = ideai-postgres-nexus)
-    3306, // MySQL / MariaDB
+    5432, 5433,  // PostgreSQL (5433 = ideai-postgres-nexus)
+    3306,  // MySQL / MariaDB
     27017, // MongoDB
-    6379, // Redis
-    6333, 6334, // Qdrant (REST / gRPC)
-    1433, // SQL Server
-    5672, // RabbitMQ (amqp)
-    9200, // Elasticsearch
+    6379,  // Redis
+    6333, 6334,  // Qdrant (REST / gRPC)
+    1433,  // SQL Server
+    5672,  // RabbitMQ (amqp)
+    9200,  // Elasticsearch
     11211, // Memcached
 ];
 
@@ -546,15 +546,16 @@ fn audit_port_rejection(
             serde_json::json!({ "line": f.line, "port": f.port, "snippet": snippet })
         })
         .collect();
-    let mut entry = crate::security::AuditEntry::blocked(ctx.project_id, action.to_string(), "port")
-        .with_resource(resource_id)
-        .with_details(serde_json::json!({
-            "tool": tool_name,
-            "path": path,
-            "ports": ports,
-            "findings": detail_findings,
-        }))
-        .with_actor_user(ctx.user_id);
+    let mut entry =
+        crate::security::AuditEntry::blocked(ctx.project_id, action.to_string(), "port")
+            .with_resource(resource_id)
+            .with_details(serde_json::json!({
+                "tool": tool_name,
+                "path": path,
+                "ports": ports,
+                "findings": detail_findings,
+            }))
+            .with_actor_user(ctx.user_id);
     if let Some(s) = ctx.session_id {
         entry = entry.with_actor_session(s);
     }
@@ -613,7 +614,10 @@ mod tests {
     fn allocated_hint_elenca_le_porte() {
         // Fix anti-loop porte: il messaggio di rifiuto elenca le porte gia'
         // allocate con il numero ESATTO da usare.
-        let ports = vec![(21950u32, "frontend".to_string()), (21951u32, "backend".to_string())];
+        let ports = vec![
+            (21950u32, "frontend".to_string()),
+            (21951u32, "backend".to_string()),
+        ];
         let hint = render_allocated_hint(&ports);
         assert!(hint.contains("21950 (label: frontend)"), "{hint}");
         assert!(hint.contains("21951 (label: backend)"), "{hint}");
@@ -726,7 +730,10 @@ mod tests {
         // Lettura pura da env, senza fallback numerico: ammessa.
         let res = scan_content("src/server.js", "app.listen(process.env.PORT)\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
-        let res = scan_content("src/server.js", "app.listen(parseInt(process.env.PORT, 10))\n");
+        let res = scan_content(
+            "src/server.js",
+            "app.listen(parseInt(process.env.PORT, 10))\n",
+        );
         assert!(matches!(res, PortScanOutcome::Allowed));
     }
 
@@ -754,12 +761,18 @@ mod tests {
         ));
         // Rust unwrap_or
         assert!(matches!(
-            scan_content("a.rs", "let p = env::var(\"PORT\").unwrap_or(\"3000\".to_string());\n"),
+            scan_content(
+                "a.rs",
+                "let p = env::var(\"PORT\").unwrap_or(\"3000\".to_string());\n"
+            ),
             PortScanOutcome::Reject(_)
         ));
         // Rust unwrap_or_else con closure
         assert!(matches!(
-            scan_content("a.rs", "let p = env::var(\"PORT\").unwrap_or_else(|_| \"3000\".into());\n"),
+            scan_content(
+                "a.rs",
+                "let p = env::var(\"PORT\").unwrap_or_else(|_| \"3000\".into());\n"
+            ),
             PortScanOutcome::Reject(_)
         ));
     }

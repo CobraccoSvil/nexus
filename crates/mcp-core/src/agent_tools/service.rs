@@ -190,10 +190,7 @@ struct ServiceLaunch {
 /// backend con host 'base' -> getaddrinfo ENOTFOUND). Punto unico della
 /// validazione: security::redaction_guard (regola L). `Err(msg)` = messaggio
 /// gia' pronto da restituire.
-async fn validate_service_command(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> Result<String, String> {
+async fn validate_service_command(ctx: &AgentToolContext, input: &Value) -> Result<String, String> {
     let command = match input.get("command").and_then(Value::as_str) {
         Some(s) => s.to_string(),
         None => return Err("[Errore: parametro 'command' mancante]".to_string()),
@@ -231,12 +228,12 @@ async fn resolve_service_launch(
     // Registrarli con kind='service' li fa comparire per sempre nel pannello
     // Servizi (list_services_windows). Il processo resta gestito identico
     // (stessa tabella, stop/read_output per id): cambia solo la classificazione.
-    let kind = if kind == "service" && is_long_oneshot(&command) && !looks_like_web_service(&command)
-    {
-        "task"
-    } else {
-        kind
-    };
+    let kind =
+        if kind == "service" && is_long_oneshot(&command) && !looks_like_web_service(&command) {
+            "task"
+        } else {
+            kind
+        };
 
     // Risoluzione working directory (punto unico riusato anche dal restart).
     let work_dir = resolve_service_work_dir(ctx, input)?;
@@ -299,8 +296,8 @@ async fn resolve_label_and_check_dup(
 /// ("frontend-dev" ~ "frontend"). Il cleanup preserva la label che stiamo
 /// (ri)avviando: la sua porta spenta verra' adottata, non rilasciata.
 async fn dedup_and_cleanup_ports(ctx: &AgentToolContext, label: &str) {
-    let _ = crate::agent_processes::stop_similar_running_services(&ctx.db, ctx.project_id, label)
-        .await;
+    let _ =
+        crate::agent_processes::stop_similar_running_services(&ctx.db, ctx.project_id, label).await;
     if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing, label).await;
     }
@@ -340,23 +337,23 @@ async fn spawn_service_process(
 
 /// Legge l'output iniziale di un servizio appena avviato, registra la porta
 /// rilevata, emette gli eventi di pannello e compone il messaggio di ritorno.
-async fn report_started_service(
-    ctx: &AgentToolContext,
-    label: &str,
-    process_id: Uuid,
-) -> String {
-    let info =
-        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000)
-            .await
-        {
-            Ok(info) => info,
-            Err(e) => {
-                return format!(
-                    "Servizio '{}' avviato (process_id: {}), ma errore lettura output: {}",
-                    label, process_id, e
-                )
-            }
-        };
+async fn report_started_service(ctx: &AgentToolContext, label: &str, process_id: Uuid) -> String {
+    let info = match crate::agent_processes::read_process_output(
+        &ctx.db,
+        ctx.project_id,
+        process_id,
+        4000,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return format!(
+                "Servizio '{}' avviato (process_id: {}), ma errore lettura output: {}",
+                label, process_id, e
+            )
+        }
+    };
 
     // Auto-detect porta dall'output del servizio e registra
     // in nexus_port_allocations per il pannello Porte.
@@ -379,12 +376,7 @@ async fn report_started_service(
 
 /// Registra in `nexus_port_allocations` la porta auto-rilevata dall'output ed
 /// emette l'evento `PortAllocated` per il pannello Porte.
-async fn register_detected_port(
-    ctx: &AgentToolContext,
-    label: &str,
-    port: i32,
-    pid: Option<i32>,
-) {
+async fn register_detected_port(ctx: &AgentToolContext, label: &str, port: i32, pid: Option<i32>) {
     // Solo porte del range Nexus (20000-39999): l'output di un servizio puo'
     // menzionare una porta a cui si CONNETTE (es. Postgres :5434), non su cui
     // ASCOLTA. Registrarla creerebbe una "porta fantasma" fuori dallo scope del
@@ -433,7 +425,9 @@ fn format_started_message(
         "Servizio '{}' avviato (process_id: {}, pid: {}, status: {})\n",
         label,
         process_id,
-        info.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+        info.pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".into()),
         info.status,
     );
     if !info.stdout.is_empty() {
@@ -575,9 +569,10 @@ async fn check_container_quotas(
     }
     // Quota RAM pre-avvio (governance container/memory_quota): blocca se i
     // servizi gia' attivi del progetto saturano max_memory_mb.
-    let ram_gate = crate::security::resource_governance::policy(&ctx.db, "container", "memory_quota")
-        .await
-        .enabled;
+    let ram_gate =
+        crate::security::resource_governance::policy(&ctx.db, "container", "memory_quota")
+            .await
+            .enabled;
     if !ram_gate {
         return None;
     }
@@ -673,7 +668,12 @@ async fn cleanup_dead_process_ports(
 /// Rilascia una singola allocazione dinamica se la sua porta non e' realmente
 /// in ascolto (bind test). Estratto da `cleanup_dead_process_ports` per tenerla
 /// sotto soglia; comportamento invariato.
-async fn release_stale_port(db: &sqlx::PgPool, project_id: uuid::Uuid, port: i32, alloc_label: &str) {
+async fn release_stale_port(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    port: i32,
+    alloc_label: &str,
+) {
     // Verifica che la porta non sia effettivamente in uso (bind test).
     let port_in_use = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
@@ -710,7 +710,9 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
             return "Nessun servizio avviato per questo progetto.".to_string();
         }
         let last = &rows[0];
-        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, last.id, 4000).await {
+        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, last.id, 4000)
+            .await
+        {
             Ok(info) => format_process_output(&info),
             Err(e) => format!("[Errore lettura output: {}]", e),
         }
@@ -719,7 +721,9 @@ pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Val
             Ok(id) => id,
             Err(_) => return "[Errore: process_id non valido]".to_string(),
         };
-        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000).await {
+        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, 4000)
+            .await
+        {
             Ok(info) => format_process_output(&info),
             Err(e) => format!("[Errore lettura output: {}]", e),
         }
@@ -817,7 +821,11 @@ async fn restart_work_dir(ctx: &AgentToolContext, process_id: Uuid) -> String {
     match row {
         Ok(Some(row)) => {
             let wd: String = row.try_get("working_dir").unwrap_or_default();
-            if wd.is_empty() { fallback() } else { wd }
+            if wd.is_empty() {
+                fallback()
+            } else {
+                wd
+            }
         }
         _ => fallback(),
     }
@@ -871,8 +879,13 @@ pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value
     };
 
     if follow_secs == 0 {
-        return match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, max_chars)
-            .await
+        return match crate::agent_processes::read_process_output(
+            &ctx.db,
+            ctx.project_id,
+            process_id,
+            max_chars,
+        )
+        .await
         {
             Ok(info) => format_process_output(&info),
             Err(e) => format!("[Errore lettura output: {}]", e),
@@ -917,7 +930,14 @@ async fn follow_service_logs(
 
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < follow_secs {
-        match crate::agent_processes::read_process_output(&ctx.db, ctx.project_id, process_id, max_chars).await {
+        match crate::agent_processes::read_process_output(
+            &ctx.db,
+            ctx.project_id,
+            process_id,
+            max_chars,
+        )
+        .await
+        {
             Ok(info) => {
                 if append_new_output(&mut combined_output, &mut seen, &info) {
                     break; // processo terminato: footer gia' aggiunto
@@ -961,7 +981,9 @@ fn append_new_output(
         combined.push_str(&format!(
             "\n--- Processo terminato (status: {}, exit_code: {}) ---",
             info.status,
-            info.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+            info.exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into())
         ));
         return true;
     }
@@ -1012,7 +1034,9 @@ fn format_service_row(proc: &crate::agent_processes::ProcessSummary) -> String {
         status_icon,
         proc.label,
         proc.id,
-        proc.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+        proc.pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".into()),
         proc.status,
     );
     if let Some(code) = proc.exit_code {
@@ -1046,7 +1070,6 @@ mod tests {
         assert!(!looks_like_web_service("cargo build"));
         assert!(!looks_like_web_service("npm install"));
     }
-
 
     /// Regressione deadlock allocazione stantia: un servizio dello stesso scopo
     /// gia' ATTIVO va rifiutato (no duplicato), ma una allocazione SPENTA va

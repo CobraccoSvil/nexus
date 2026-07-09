@@ -168,11 +168,9 @@ impl ToolRunnerService {
         let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
         // Separazione DB: run_db = pool del progetto per i tool che toccano il
         // dominio run (plans/todos/worklog); `db` resta il meta per la config.
-        let run_db = crate::project_db_routes::project_data_pool_by_session_from(
-            &self.deps.db,
-            session_id,
-        )
-        .await;
+        let run_db =
+            crate::project_db_routes::project_data_pool_by_session_from(&self.deps.db, session_id)
+                .await;
         // Root effettiva del ctx + flag isolamento: decisi dal PUNTO UNICO puro
         // `resolve_ctx_root` (testabile senza DB) — override del sub-run isolato
         // quando presente, altrimenti la root del progetto (path invariato).
@@ -556,7 +554,10 @@ mod tests_exit_code {
 
     #[test]
     fn nessun_marker_ritorna_none() {
-        assert_eq!(extract_exit_code("output di read_file senza exit code"), None);
+        assert_eq!(
+            extract_exit_code("output di read_file senza exit code"),
+            None
+        );
         assert_eq!(extract_exit_code(""), None);
     }
 }

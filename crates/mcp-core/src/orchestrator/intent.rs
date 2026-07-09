@@ -564,7 +564,10 @@ mod tests_classifier_engine {
         create_settings_table(&pool).await;
         // Nessuna riga settings -> default difensivo rust (il classifier Python
         // e' stato rimosso, mig 0462/0532: il path HTTP non ha piu' un backend).
-        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Rust);
+        assert_eq!(
+            select_classifier_engine(&pool).await,
+            ClassifierEngine::Rust
+        );
     }
 
     #[sqlx::test]
@@ -577,26 +580,28 @@ mod tests_classifier_engine {
         .execute(&pool)
         .await
         .expect("insert setting rust");
-        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Rust);
+        assert_eq!(
+            select_classifier_engine(&pool).await,
+            ClassifierEngine::Rust
+        );
 
-        sqlx::query(
-            "UPDATE settings SET value = 'python' WHERE key = 'routing.classifier_engine'",
-        )
-        .execute(&pool)
-        .await
-        .expect("update setting python");
+        sqlx::query("UPDATE settings SET value = 'python' WHERE key = 'routing.classifier_engine'")
+            .execute(&pool)
+            .await
+            .expect("update setting python");
         assert_eq!(
             select_classifier_engine(&pool).await,
             ClassifierEngine::Python
         );
 
         // Valore ignoto -> default difensivo rust (loggato).
-        sqlx::query(
-            "UPDATE settings SET value = 'boh' WHERE key = 'routing.classifier_engine'",
-        )
-        .execute(&pool)
-        .await
-        .expect("update setting ignoto");
-        assert_eq!(select_classifier_engine(&pool).await, ClassifierEngine::Rust);
+        sqlx::query("UPDATE settings SET value = 'boh' WHERE key = 'routing.classifier_engine'")
+            .execute(&pool)
+            .await
+            .expect("update setting ignoto");
+        assert_eq!(
+            select_classifier_engine(&pool).await,
+            ClassifierEngine::Rust
+        );
     }
 }

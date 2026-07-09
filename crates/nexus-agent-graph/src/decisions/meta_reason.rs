@@ -183,9 +183,7 @@ pub fn validate_move(raw: &serde_json::Value) -> RecoveryMove {
             RecoveryMove::Fallback
         }
         RecoveryMove::AskUser { question } if question.trim().is_empty() => RecoveryMove::Fallback,
-        RecoveryMove::DeclareBlocked { blocker }
-            if !VALID_BLOCKERS.contains(&blocker.trim()) =>
-        {
+        RecoveryMove::DeclareBlocked { blocker } if !VALID_BLOCKERS.contains(&blocker.trim()) => {
             RecoveryMove::Fallback
         }
         _ => mv,
@@ -264,7 +262,11 @@ mod tests {
     #[test]
     fn work_epoch_avanza_solo_sui_cambi_macroscopici() {
         let base = work_epoch(2, 1, 0);
-        assert_eq!(base, work_epoch(2, 1, 0), "deterministica a input invariati");
+        assert_eq!(
+            base,
+            work_epoch(2, 1, 0),
+            "deterministica a input invariati"
+        );
         assert!(work_epoch(3, 1, 0) > base, "nuovo todo avanza l'epoca");
         assert!(work_epoch(2, 2, 0) > base, "escalation avanza l'epoca");
         assert!(work_epoch(2, 1, 5) > base, "bump floor avanza l'epoca");
@@ -277,19 +279,41 @@ mod tests {
         let m = validate_move(&json!({"move": "escalate_model"}));
         assert_eq!(m, RecoveryMove::EscalateModel);
         let m = validate_move(&json!({"move": "ask_user", "question": "Qual e' l'email reale?"}));
-        assert_eq!(m, RecoveryMove::AskUser { question: "Qual e' l'email reale?".into() });
+        assert_eq!(
+            m,
+            RecoveryMove::AskUser {
+                question: "Qual e' l'email reale?".into()
+            }
+        );
         let m = validate_move(&json!({"move": "declare_blocked", "blocker": "credential"}));
-        assert_eq!(m, RecoveryMove::DeclareBlocked { blocker: "credential".into() });
+        assert_eq!(
+            m,
+            RecoveryMove::DeclareBlocked {
+                blocker: "credential".into()
+            }
+        );
     }
 
     #[test]
     fn validate_move_malformato_degrada_a_fallback() {
         // JSON non deserializzabile in RecoveryMove.
-        assert_eq!(validate_move(&json!({"move": "sconosciuto"})), RecoveryMove::Fallback);
-        assert_eq!(validate_move(&json!({"foo": "bar"})), RecoveryMove::Fallback);
+        assert_eq!(
+            validate_move(&json!({"move": "sconosciuto"})),
+            RecoveryMove::Fallback
+        );
+        assert_eq!(
+            validate_move(&json!({"foo": "bar"})),
+            RecoveryMove::Fallback
+        );
         // Campi vuoti.
-        assert_eq!(validate_move(&json!({"move": "ask_user", "question": "   "})), RecoveryMove::Fallback);
-        assert_eq!(validate_move(&json!({"move": "continue_guided", "nudge": ""})), RecoveryMove::Fallback);
+        assert_eq!(
+            validate_move(&json!({"move": "ask_user", "question": "   "})),
+            RecoveryMove::Fallback
+        );
+        assert_eq!(
+            validate_move(&json!({"move": "continue_guided", "nudge": ""})),
+            RecoveryMove::Fallback
+        );
         // Blocker fuori dal vocabolario ADR 0034.
         assert_eq!(
             validate_move(&json!({"move": "declare_blocked", "blocker": "boh"})),
@@ -304,13 +328,23 @@ mod tests {
             Action::Escalate
         );
         assert_eq!(
-            translate(&RecoveryMove::ShiftStrategy { nudge: "cambia".into() }).unwrap().action,
+            translate(&RecoveryMove::ShiftStrategy {
+                nudge: "cambia".into()
+            })
+            .unwrap()
+            .action,
             Action::ChangeStrategy
         );
-        let ask = translate(&RecoveryMove::AskUser { question: "email?".into() }).unwrap();
+        let ask = translate(&RecoveryMove::AskUser {
+            question: "email?".into(),
+        })
+        .unwrap();
         assert_eq!(ask.action, Action::AskUser);
         assert_eq!(ask.nudge_text.as_deref(), Some("email?"));
-        let blk = translate(&RecoveryMove::DeclareBlocked { blocker: "credential".into() }).unwrap();
+        let blk = translate(&RecoveryMove::DeclareBlocked {
+            blocker: "credential".into(),
+        })
+        .unwrap();
         assert_eq!(blk.action, Action::DeclareBlocked);
         assert_eq!(blk.nudge_text.as_deref(), Some("credential"));
         // Fallback -> None (il chiamante usa pc::decide).

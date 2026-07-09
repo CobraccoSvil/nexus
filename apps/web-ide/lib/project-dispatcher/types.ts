@@ -40,12 +40,14 @@ export type ProjectEvent =
   | { kind: "ServiceStarted"; name: string; port?: number; pid?: number }
   | { kind: "ServiceStopped"; name: string }
   | { kind: "ServiceRestarted"; name: string }
+  | { kind: "ServiceStatusChanged"; name: string; status: string; port?: number; pid?: number }
   | { kind: "FileChanged"; path: string; op: "created" | "modified" | "deleted" }
   | { kind: "GitStatusChanged"; branch: string; ahead: number; behind: number; modified_count: number }
   | { kind: "DbQueryRun"; query_id?: string; duration_ms: number; rows: number; statement_kind: string }
   | { kind: "DbConfigUpdated"; name: string; engine?: string; action: string }
   | { kind: "AgentToolUsed"; run_id: string; tool: string; target_resource?: string }
   | { kind: "TodoUpdated"; run_id: string; todo_id: string; seq?: number; status: string }
+  | { kind: "PlanUpdated"; run_id: string; plan_id?: string; status?: string }
   | { kind: "Notification"; severity: string; message: string; panel?: string; ttl_ms?: number; run_id?: string }
   | { kind: "FlagChanged"; key: string; value: unknown }
   | { kind: "MonitorUpdated"; monitor_id: string; value: unknown; label?: string }

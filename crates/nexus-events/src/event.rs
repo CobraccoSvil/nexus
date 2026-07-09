@@ -100,6 +100,14 @@ pub enum ProjectEvent {
     ServiceRestarted {
         name: String,
     },
+    /// Stato systemd/processo cambiato (active, failed, activating, ...).
+    /// Emesso dal service_observer a ogni transizione — elimina polling Run panel.
+    ServiceStatusChanged {
+        name: String,
+        status: String,
+        port: Option<i32>,
+        pid: Option<i32>,
+    },
 
     // ── Filesystem ─────────────────────────────────────────────────────
     FileChanged {
@@ -431,7 +439,8 @@ impl ProjectEvent {
             Self::FindingsUpdated { .. } => TOPIC_PROBLEMS,
             Self::ServiceStarted { .. }
             | Self::ServiceStopped { .. }
-            | Self::ServiceRestarted { .. } => TOPIC_SERVICES,
+            | Self::ServiceRestarted { .. }
+            | Self::ServiceStatusChanged { .. } => TOPIC_SERVICES,
             Self::FileChanged { .. } => TOPIC_FILES,
             Self::GitStatusChanged { .. } => TOPIC_GIT,
             Self::DbQueryRun { .. } | Self::DbConfigUpdated { .. } => TOPIC_DATABASE,
@@ -482,6 +491,7 @@ impl ProjectEvent {
             Self::ServiceStarted { .. } => "ServiceStarted",
             Self::ServiceStopped { .. } => "ServiceStopped",
             Self::ServiceRestarted { .. } => "ServiceRestarted",
+            Self::ServiceStatusChanged { .. } => "ServiceStatusChanged",
             Self::FileChanged { .. } => "FileChanged",
             Self::GitStatusChanged { .. } => "GitStatusChanged",
             Self::DbQueryRun { .. } => "DbQueryRun",

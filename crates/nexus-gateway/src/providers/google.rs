@@ -1908,16 +1908,58 @@ fn build_generation_config(req: &LlmRequest, thinking: GoogleThinking) -> Option
             thinking_budget: budget,
         }),
     };
+    let response_format = google_response_format(req.response_format.as_ref());
 
-    if req.temperature.is_some() || max_output_tokens.is_some() || thinking_config.is_some() {
+    if req.temperature.is_some()
+        || max_output_tokens.is_some()
+        || thinking_config.is_some()
+        || response_format.is_some()
+    {
         Some(GenerationConfig {
             temperature: req.temperature,
             max_output_tokens,
             thinking_config,
+            response_mime_type: response_format
+                .as_ref()
+                .map(|rf| rf.response_mime_type.clone()),
+            response_schema: response_format.and_then(|rf| rf.response_schema),
         })
     } else {
         None
     }
+}
+
+/// Mappa `response_format` OpenAI-style nel dialetto Gemini/Vertex.
+///
+/// Supporta il vincolo JSON senza inventare schema: `{"type":"json_object"}`
+/// diventa `responseMimeType:"application/json"`. Se il chiamante usa
+/// `json_schema` e passa uno schema strutturato, lo inoltriamo come
+/// `responseSchema`.
+fn google_response_format(format: Option<&serde_json::Value>) -> Option<GoogleResponseFormat> {
+    let format = format?;
+    let kind = format.get("type").and_then(|v| v.as_str())?;
+    match kind {
+        "json_object" => Some(GoogleResponseFormat {
+            response_mime_type: "application/json".to_string(),
+            response_schema: None,
+        }),
+        "json_schema" => {
+            let schema = format
+                .get("json_schema")
+                .and_then(|v| v.get("schema"))
+                .cloned();
+            Some(GoogleResponseFormat {
+                response_mime_type: "application/json".to_string(),
+                response_schema: schema,
+            })
+        }
+        _ => None,
+    }
+}
+
+struct GoogleResponseFormat {
+    response_mime_type: String,
+    response_schema: Option<serde_json::Value>,
 }
 
 /// Costruisce le `functionDeclarations` native Gemini: ogni tool del contratto
@@ -2743,6 +2785,11 @@ struct GenerationConfig {
     /// solo quando il thinking e' attivo per la richiesta.
     #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
     thinking_config: Option<ThinkingConfigWire>,
+    /// JSON mode / schema strutturato nel dialetto Gemini/Vertex.
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
+    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
 }
 
 /// `thinkingConfig` del body Gemini. `includeThoughts=true` espone i thoughts
@@ -3302,6 +3349,63 @@ mod tests {
         assert_eq!(json["contents"][0]["parts"][0]["text"], "domanda");
         assert_eq!(json["generationConfig"]["temperature"], 0.5);
         assert_eq!(json["generationConfig"]["maxOutputTokens"], 500);
+    }
+
+    #[test]
+    fn response_format_json_object_diventa_response_mime_type() {
+        let req = LlmRequest {
+            model: "gemini-x".to_string(),
+            messages: vec![msg("user", "restituisci json")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: Some(serde_json::json!({"type": "json_object"})),
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: metadata(),
+        };
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
+        assert_eq!(
+            json["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(json["generationConfig"].get("responseSchema").is_none());
+    }
+
+    #[test]
+    fn response_format_json_schema_inoltra_response_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        });
+        let req = LlmRequest {
+            model: "gemini-x".to_string(),
+            messages: vec![msg("user", "restituisci json")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"schema": schema}
+            })),
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: metadata(),
+        };
+        let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
+        assert_eq!(
+            json["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            json["generationConfig"]["responseSchema"]["properties"]["answer"]["type"],
+            "string"
+        );
     }
 
     fn search_tool() -> crate::types::LlmToolDefinition {

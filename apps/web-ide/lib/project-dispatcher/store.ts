@@ -69,6 +69,7 @@ export interface ProjectSnapshot {
   playwright?: { runs?: PlaywrightRunSummary[] };
   flags?: Record<string, unknown>;
   monitors?: Record<string, MonitorState>;
+  fetch_topics?: string[];
   [k: string]: unknown;
 }
 
@@ -129,6 +130,16 @@ export interface ProjectStoreState {
     resolvedIds: string[];
     ts: number;
   } | null;
+  /** Timestamp ultimo evento che invalida il pannello Problemi (job, servizi, ...). */
+  problemsRefreshAt: number;
+  /** Refetch completo viste operative (problemi, output, porte, playwright, run-configs). */
+  operationalRefreshAt: number;
+  /** Refetch stato servizi progetto (Run panel). */
+  servicesRefreshAt: number;
+  /** Invalidazione sidebar Modifiche / cache mutations.recent. */
+  mutationsRefreshAt: number;
+  /** Ultime righe log servizio via SSE (Debug panel). */
+  serviceLogs: { recent: Array<{ unit: string; level: string; line: string; ts: number }> };
 
   // UI ephemera
   toasts: ToastItem[];
@@ -149,6 +160,9 @@ export interface ProjectStoreState {
   recordChatCompaction: (sessionId: string, totalTokens: number, totalCostUsd: number) => void;
   bumpReconnect: () => void;
   resetReconnect: () => void;
+  bumpOperationalRefresh: (ts?: number) => void;
+  clearPanelPorts: () => void;
+  clearPanelPlaywright: () => void;
   /**
    * Sottoscrive un listener che riceve OGNI evento applicato (post-dedup).
    * Restituisce una funzione per disiscriversi. Usato da `useProjectEvents`
@@ -195,6 +209,11 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   qualityScan: null,
   outputChannels: { lastChangeAt: 0 },
   findingsUpdate: null,
+  problemsRefreshAt: 0,
+  operationalRefreshAt: 0,
+  servicesRefreshAt: 0,
+  mutationsRefreshAt: 0,
+  serviceLogs: { recent: [] },
 
   toasts: [],
   panelHighlights: {},
@@ -221,6 +240,11 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
     mutations: { recent: [] },
     enrichments: { byEventId: {} },
     findingsUpdate: null,
+    problemsRefreshAt: 0,
+    operationalRefreshAt: 0,
+    servicesRefreshAt: 0,
+    mutationsRefreshAt: 0,
+    serviceLogs: { recent: [] },
     toasts: [],
     panelHighlights: {},
   }),
@@ -241,6 +265,10 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
     if (snapshot.monitors) {
       next.monitors = snapshot.monitors;
     }
+    const fetchTopics = snapshot.fetch_topics;
+    if (Array.isArray(fetchTopics) && fetchTopics.length > 0) {
+      next.operationalRefreshAt = Date.now();
+    }
     return { ...state, ...next };
   }),
 
@@ -253,10 +281,21 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       lastEventTs: env.ts,
     };
 
+    const bumpProblemsRefresh = () => {
+      next.problemsRefreshAt = env.ts;
+      next.operationalRefreshAt = env.ts;
+    };
+
+    const bumpServicesRefresh = () => {
+      next.servicesRefreshAt = env.ts;
+      next.operationalRefreshAt = env.ts;
+    };
+
     // Apply payload
     const p = env.payload;
     switch (p.kind) {
       case "JobCreated": {
+        bumpProblemsRefresh();
         if (p.job_kind === "playwright_test") {
           const newRun: PlaywrightRunSummary = {
             id: p.id,
@@ -272,6 +311,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         break;
       }
       case "JobUpdated": {
+        bumpProblemsRefresh();
         next.playwright = {
           ...next.playwright,
           runs: next.playwright.runs.map((r) =>
@@ -283,6 +323,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         break;
       }
       case "JobsCleared": {
+        bumpProblemsRefresh();
         if (p.job_kind === "playwright_test") {
           next.playwright = { ...next.playwright, runs: [] };
         }
@@ -291,13 +332,16 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       case "PortAllocated": {
         const without = next.ports.entries.filter((e) => e.port !== p.port);
         next.ports = { entries: [...without, { port: p.port, label: p.label, pid: p.pid }] };
+        next.operationalRefreshAt = env.ts;
         break;
       }
       case "PortReleased": {
         next.ports = { entries: next.ports.entries.filter((e) => e.port !== p.port) };
+        next.operationalRefreshAt = env.ts;
         break;
       }
       case "FindingsUpdated": {
+        bumpProblemsRefresh();
         next.problems = { ...next.problems, badge: p.total };
         // Esponi resolved_ids in slot dedicato: optimization-panel ascolta
         // questo per marcare i findings in-place senza scan extra.
@@ -312,6 +356,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         break;
       }
       case "ServiceStarted": {
+        bumpServicesRefresh();
         next.services = {
           byName: {
             ...next.services.byName,
@@ -321,25 +366,77 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         break;
       }
       case "ServiceStopped": {
-        const existing = next.services.byName[p.name];
+        bumpServicesRefresh();
+        const existingStopped = next.services.byName[p.name];
         next.services = {
           byName: {
             ...next.services.byName,
-            [p.name]: existing ? { ...existing, status: "stopped" } : { name: p.name, status: "stopped" },
+            [p.name]: existingStopped ? { ...existingStopped, status: "stopped" } : { name: p.name, status: "stopped" },
           },
         };
         break;
       }
       case "ServiceRestarted": {
-        const existing = next.services.byName[p.name];
+        bumpServicesRefresh();
+        const existingRestart = next.services.byName[p.name];
         next.services = {
           byName: {
             ...next.services.byName,
-            [p.name]: existing ? { ...existing, status: "running" } : { name: p.name, status: "running" },
+            [p.name]: existingRestart ? { ...existingRestart, status: "running" } : { name: p.name, status: "running" },
           },
         };
         break;
       }
+      case "ServiceStatusChanged": {
+        bumpServicesRefresh();
+        const existingStatus = next.services.byName[p.name];
+        const mappedStatus = p.status === "active" || p.status === "running" ? "running" : "stopped";
+        next.services = {
+          byName: {
+            ...next.services.byName,
+            [p.name]: {
+              name: p.name,
+              port: p.port ?? existingStatus?.port,
+              pid: p.pid ?? existingStatus?.pid,
+              status: mappedStatus,
+            },
+          },
+        };
+        break;
+      }
+      case "ServiceLogLine": {
+        bumpServicesRefresh();
+        next.serviceLogs = {
+          recent: [
+            { unit: p.unit, level: p.level, line: p.line, ts: env.ts },
+            ...next.serviceLogs.recent,
+          ].slice(0, 200),
+        };
+        break;
+      }
+      case "ServiceMetrics": {
+        bumpServicesRefresh();
+        const monitorId = `service:${p.unit}`;
+        next.monitors = {
+          ...next.monitors,
+          [monitorId]: {
+            value: {
+              cpu_pct: p.cpu_pct,
+              rss_bytes: p.rss_bytes,
+              io_read_bytes: p.io_read_bytes,
+              io_write_bytes: p.io_write_bytes,
+              latency_ms: p.latency_ms,
+              pid: p.pid,
+            },
+            label: p.unit,
+            updated_at: new Date(env.ts).toISOString(),
+          },
+        };
+        break;
+      }
+      case "TodoUpdated":
+      case "PlanUpdated":
+        break;
       case "FileChanged": {
         next.files = {
           recentChanged: [
@@ -347,6 +444,8 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
             ...next.files.recentChanged.filter((f) => f.path !== p.path),
           ].slice(0, 50),
         };
+        next.mutationsRefreshAt = env.ts;
+        next.operationalRefreshAt = env.ts;
         // Rileva creazione/modifica playwright.config.* per aggiornare pannello Playwright
         if (/playwright\.config\.(ts|js|mjs)$/.test(p.path)) {
           next.playwright = { ...next.playwright, configChangedAt: env.ts };
@@ -425,6 +524,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         break;
       }
       case "MutationRecorded": {
+        next.mutationsRefreshAt = env.ts;
         next.mutations = {
           recent: [
             {
@@ -510,6 +610,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       // ── Run configurations ──────────────────────────────────────────
       case "RunConfigChanged": {
         next.runConfigs = { lastChangeAt: env.ts };
+        next.operationalRefreshAt = env.ts;
         break;
       }
       // ── Memory ──────────────────────────────────────────────────────
@@ -550,6 +651,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       // ── Output channels ───────────────────────────────────────────
       case "OutputChannelCreated": {
         next.outputChannels = { lastChangeAt: env.ts };
+        next.operationalRefreshAt = env.ts;
         break;
       }
       // ── Knowledge ─────────────────────────────────────────────────
@@ -562,6 +664,14 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       // DocumentGenerated: il refresh del pannello DOCUMENTI e' gestito in
       // connection.ts via window event "nexus:documents:refresh" (il pannello
       // ricarica dalla REST); qui nessuna mutazione di stato dispatcher.
+      case "ServiceCrashDetected":
+      case "ServiceBuildErrors":
+      case "ServiceDiagnosisStarted":
+      case "ServiceAnomaly": {
+        bumpProblemsRefresh();
+        bumpServicesRefresh();
+        break;
+      }
       case "DocumentGenerated":
       case "Notification":
       case "HighlightPanel":
@@ -655,6 +765,17 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
 
   bumpReconnect: () => set((state) => ({ reconnectAttempts: state.reconnectAttempts + 1 })),
   resetReconnect: () => set({ reconnectAttempts: 0 }),
+
+  bumpOperationalRefresh: (ts) => set({
+    operationalRefreshAt: ts ?? Date.now(),
+    problemsRefreshAt: ts ?? Date.now(),
+  }),
+
+  clearPanelPorts: () => set({ ports: { entries: [] } }),
+
+  clearPanelPlaywright: () => set({
+    playwright: { runs: [], configChangedAt: Date.now() },
+  }),
 }));
 
 // Selectors esportati per ergonomia
@@ -687,6 +808,11 @@ export const selectMutationsRecent = (s: ProjectStoreState) => s.mutations.recen
 export const selectEnrichmentByEventId = (eventId: string) => (s: ProjectStoreState) =>
   s.enrichments.byEventId[eventId] ?? null;
 export const selectFindingsUpdate = (s: ProjectStoreState) => s.findingsUpdate;
+export const selectProblemsRefreshAt = (s: ProjectStoreState) => s.problemsRefreshAt;
+export const selectOperationalRefreshAt = (s: ProjectStoreState) => s.operationalRefreshAt;
+export const selectServicesRefreshAt = (s: ProjectStoreState) => s.servicesRefreshAt;
+export const selectMutationsRefreshAt = (s: ProjectStoreState) => s.mutationsRefreshAt;
+export const selectServiceLogsRecent = (s: ProjectStoreState) => s.serviceLogs.recent;
 export const selectProjectLifecycleAt = (s: ProjectStoreState) => s.projectLifecycle.lastChangeAt;
 export const selectMigrationsChangedAt = (s: ProjectStoreState) => s.migrations.lastChangeAt;
 export const selectRunConfigsChangedAt = (s: ProjectStoreState) => s.runConfigs.lastChangeAt;

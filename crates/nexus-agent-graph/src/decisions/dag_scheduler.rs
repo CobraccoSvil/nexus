@@ -159,7 +159,9 @@ pub fn compute_ready_layer(todos: &[Todo]) -> Vec<Todo> {
 /// non legge il DB. Ritorna un riferimento al todo scelto (preso dallo slice
 /// d'ingresso), o `None`.
 pub fn pick_next_todo(todos: &[Todo], dag_topological_enabled: bool) -> Option<&Todo> {
-    let first_pending = todos.iter().find(|t| matches!(t.status, TodoStatus::Pending));
+    let first_pending = todos
+        .iter()
+        .find(|t| matches!(t.status, TodoStatus::Pending));
     let first_pending = first_pending?; // nessun pending -> None (passo 1)
 
     let has_deps = todos.iter().any(|t| !t.depends_on.is_empty());
@@ -173,7 +175,7 @@ pub fn pick_next_todo(todos: &[Todo], dag_topological_enabled: bool) -> Option<&
         .filter(|t| matches!(t.status, TodoStatus::Pending))
         .find(|t| t.depends_on.iter().all(|d| done.contains(d.as_str())));
     match executable {
-        Some(t) => Some(t),         // passo 3: primo eseguibile
+        Some(t) => Some(t),          // passo 3: primo eseguibile
         None => Some(first_pending), // passo 4: fallback deadlock
     }
 }
@@ -422,12 +424,15 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 25, "attesi >=25 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 25,
+            "attesi >=25 casi, trovati {}",
+            cases.len()
+        );
 
         let mut checked = 0usize;
         for c in &cases {
-            let input: TodosInput =
-                serde_json::from_value(c.input.clone()).expect("TodosInput");
+            let input: TodosInput = serde_json::from_value(c.input.clone()).expect("TodosInput");
             let got: Value = match c.function.as_str() {
                 "compute_ready_layer" => {
                     let ready = compute_ready_layer(&input.todos);

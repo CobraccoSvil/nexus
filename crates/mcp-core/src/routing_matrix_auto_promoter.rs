@@ -748,11 +748,7 @@ pub(crate) fn tier_rank(tier: &str) -> i32 {
     nexus_agent_graph::decisions::tiers::tier_rank(tier) as i32 - 1
 }
 
-fn cost_score(
-    req: &IntentRequirement,
-    m: &CatalogModel,
-    catalog: &[CatalogModel],
-) -> f32 {
+fn cost_score(req: &IntentRequirement, m: &CatalogModel, catalog: &[CatalogModel]) -> f32 {
     // pricing_state (mig 0477) disambigua il significato di input_cost==0:
     //  - 'free'    = gratuito reale -> costo 0 effettivo: per 'asc' e' l'ottimo
     //                (score 1.0); per 'desc' (costo alto = proxy capability) e' il
@@ -763,7 +759,13 @@ fn cost_score(
     //                trattamento esplicito li rende non-ottimi anche se abilitati).
     //  - 'priced'  = comportamento storico (normalizzazione lineare sul pool).
     match m.pricing_state.as_str() {
-        "free" => return if req.cost_direction == "asc" { 1.0 } else { 0.0 },
+        "free" => {
+            return if req.cost_direction == "asc" {
+                1.0
+            } else {
+                0.0
+            }
+        }
         "priced" => {}
         _ => return 0.5, // 'unknown' e qualsiasi valore non riconosciuto: neutro.
     }

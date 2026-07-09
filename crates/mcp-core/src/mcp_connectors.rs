@@ -79,12 +79,7 @@ pub async fn test_mcp_server(
                     .unwrap_or_else(|| "user".to_string());
             for (tname, tdesc) in &tools_meta {
                 if let Err(e) = crate::nexus_builtin::index_tool(
-                    &db_idx,
-                    server_id,
-                    &sname_idx,
-                    tname,
-                    tdesc,
-                    &scope,
+                    &db_idx, server_id, &sname_idx, tname, tdesc, &scope,
                 )
                 .await
                 {

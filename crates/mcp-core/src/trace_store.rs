@@ -87,8 +87,7 @@ pub async fn get_session_traces(
     .fetch_all(run_pool)
     .await?;
 
-    let mut runs: std::collections::HashMap<String, Vec<Value>> =
-        std::collections::HashMap::new();
+    let mut runs: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
     for row in rows {
         let run_id: Uuid = match row.try_get("run_id") {
             Ok(v) => v,

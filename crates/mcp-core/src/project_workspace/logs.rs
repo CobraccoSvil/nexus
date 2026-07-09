@@ -18,11 +18,14 @@ pub async fn get_project_problems(
     // parita' di chiave di sort): quality -> security -> jobs -> diag -> runtime.
     let mut items = Vec::<Value>::new();
     items.extend(collect_quality_problems(&state.db, project_id).await?);
-    items.extend(collect_security_problems(&state.db, project_id).await?);
+    // security_findings: tabella legacy (0001) senza writer attivo nel codebase;
+    // includeva righe storiche eternamente "aperte". Esclusa dalla vista canonica
+    // finche' non esiste uno scanner con lifecycle (fixed_at / resolved_at).
     items.extend(collect_failed_job_problems(&proj_pool, project_id).await?);
     items.extend(collect_service_diagnosis_problems(&state.db, project_id).await?);
     items.extend(collect_runtime_problems(&state.db, project_id).await?);
 
+    deduplicate_problems(&mut items);
     sort_problems(&mut items);
 
     Ok(Json(json!({ "items": items })))
@@ -61,7 +64,10 @@ fn sort_problems(items: &mut [Value]) {
 /// quality finding, escludendo quelli gia' risolti (fixed_at) o marcati come
 /// falsi positivi (is_false_positive): stesso criterio di get_quality_findings
 /// e dell'evento FindingsUpdated emesso dall'auto-scan per-file.
-async fn collect_quality_problems(db: &sqlx::PgPool, project_id: Uuid) -> Result<Vec<Value>, ApiError> {
+async fn collect_quality_problems(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Result<Vec<Value>, ApiError> {
     let rows = sqlx::query(
         r#"
         SELECT id, file_path, category, severity, title, line_number, scanned_at
@@ -95,40 +101,127 @@ async fn collect_quality_problems(db: &sqlx::PgPool, project_id: Uuid) -> Result
         .collect())
 }
 
-async fn collect_security_problems(db: &sqlx::PgPool, project_id: Uuid) -> Result<Vec<Value>, ApiError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, file_path, severity, finding, created_at
-        FROM security_findings
-        WHERE project_id = $1
-        ORDER BY created_at DESC
-        LIMIT 100
-        "#,
-    )
-    .bind(project_id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+/// Invalida la vista UI del pannello Problemi: il frontend ascolta FindingsUpdated
+/// e ri-fetcha via get_project_problems. Punto unico per refresh non-quality.
+pub(crate) fn emit_problems_panel_refresh(project_id: Uuid, resolved_ids: Vec<Uuid>) {
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::ProjectEvent::FindingsUpdated {
+            scan_id: None,
+            total: 0,
+            critical: 0,
+            warnings: 0,
+            resolved_ids,
+        },
+    );
+}
 
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let finding = row.get::<Value, _>("finding");
-            json!({
-                "id": row.get::<Uuid, _>("id").to_string(),
-                "severity": row.get::<String, _>("severity"),
-                "source": "security",
-                "message": finding.get("message")
-                    .and_then(Value::as_str)
-                    .or_else(|| finding.get("title").and_then(Value::as_str))
-                    .unwrap_or("Security finding"),
-                "filePath": row.get::<String, _>("file_path"),
-                "line": finding.get("line").and_then(Value::as_i64),
-                "column": finding.get("column").and_then(Value::as_i64),
-                "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-            })
-        })
-        .collect())
+fn normalize_path_for_dedup(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase()
+}
+
+fn normalize_message_for_dedup(message: &str) -> String {
+    message
+        .split_whitespace()
+        .take(24)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn source_priority_for_dedup(source: &str) -> i32 {
+    if source.starts_with("quality:") {
+        0
+    } else if source.starts_with("policy:") {
+        1
+    } else if source.starts_with("service_observer:") {
+        2
+    } else if source == "security" {
+        3
+    } else if source.starts_with("runtime:") {
+        4
+    } else {
+        5
+    }
+}
+
+fn problem_dedup_key(item: &Value) -> (String, i32, String) {
+    let file = item
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(normalize_path_for_dedup)
+        .unwrap_or_default();
+    let line = item
+        .get("line")
+        .and_then(Value::as_i64)
+        .map(|l| (l / 10) as i32)
+        .unwrap_or(-1);
+    let message = item
+        .get("message")
+        .and_then(Value::as_str)
+        .map(normalize_message_for_dedup)
+        .unwrap_or_default();
+    (file, line, message)
+}
+
+fn prefer_problem_candidate(left: &Value, right: &Value) -> bool {
+    let left_sev = left
+        .get("severity")
+        .and_then(Value::as_str)
+        .map(severity_rank)
+        .unwrap_or(2);
+    let right_sev = right
+        .get("severity")
+        .and_then(Value::as_str)
+        .map(severity_rank)
+        .unwrap_or(2);
+    if left_sev != right_sev {
+        return left_sev < right_sev;
+    }
+    let left_src = left
+        .get("source")
+        .and_then(Value::as_str)
+        .map(source_priority_for_dedup)
+        .unwrap_or(5);
+    let right_src = right
+        .get("source")
+        .and_then(Value::as_str)
+        .map(source_priority_for_dedup)
+        .unwrap_or(5);
+    left_src < right_src
+}
+
+/// Dedup cross-fonte: stesso file+riga+messaggio (normalizzati) -> una sola riga,
+/// preferendo severita' piu' alta e fonte piu' canonica (quality > policy > ...).
+fn deduplicate_problems(items: &mut Vec<Value>) {
+    use std::collections::HashMap;
+
+    let mut best_idx: HashMap<(String, i32, String), usize> = HashMap::new();
+    let mut deduped: Vec<Value> = Vec::new();
+
+    for item in items.drain(..) {
+        let key = problem_dedup_key(&item);
+        if key.2.is_empty() {
+            deduped.push(item);
+            continue;
+        }
+        if let Some(&idx) = best_idx.get(&key) {
+            if prefer_problem_candidate(&item, &deduped[idx]) {
+                deduped[idx] = item;
+            }
+        } else {
+            let idx = deduped.len();
+            best_idx.insert(key, idx);
+            deduped.push(item);
+        }
+    }
+
+    *items = deduped;
 }
 
 /// Audit 27/05/2026: aggiunto 'passed' alla lista di esclusione.
@@ -239,7 +332,15 @@ fn diagnosis_row_to_problem(row: sqlx::postgres::PgRow) -> Value {
     } else {
         "warning"
     };
-    let (source, message) = diagnosis_source_message(&signal_kind, &unit, &status, &metric, value, threshold, &detail);
+    let (source, message) = diagnosis_source_message(
+        &signal_kind,
+        &unit,
+        &status,
+        &metric,
+        value,
+        threshold,
+        &detail,
+    );
     json!({
         "id": row.get::<Uuid, _>("id").to_string(),
         "severity": severity,
@@ -306,7 +407,10 @@ fn diagnosis_source_message(
 /// solo all'endpoint separato /runtime-issues, e il pannello "Problemi" appariva
 /// vuoto anche quando c'erano errori runtime evidenti (es. db in crash-loop con
 /// `EAI_AGAIN postgres`). Filtra status open/in_progress (i resolved spariscono).
-async fn collect_runtime_problems(db: &sqlx::PgPool, project_id: Uuid) -> Result<Vec<Value>, ApiError> {
+async fn collect_runtime_problems(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Result<Vec<Value>, ApiError> {
     let rows = sqlx::query(
         r#"
         SELECT id, source, severity, message, details, tool_name, command, exit_code, created_at
@@ -420,6 +524,65 @@ pub(super) fn severity_rank(value: &str) -> i32 {
         "error" | "critical" | "high" => 0,
         "warning" | "medium" => 1,
         _ => 2,
+    }
+}
+
+#[cfg(test)]
+mod problems_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn deduplicate_problems_keeps_higher_severity() {
+        let mut items = vec![
+            json!({
+                "id": "1",
+                "severity": "warning",
+                "source": "runtime:run_command",
+                "message": "Command failed npm test",
+                "filePath": "src/app.ts",
+                "line": 12,
+                "createdAt": "2026-01-01T00:00:00Z",
+            }),
+            json!({
+                "id": "2",
+                "severity": "error",
+                "source": "quality:lint",
+                "message": "Command failed npm test",
+                "filePath": "src/app.ts",
+                "line": 14,
+                "createdAt": "2026-01-01T00:00:01Z",
+            }),
+        ];
+        deduplicate_problems(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("id").and_then(Value::as_str), Some("2"));
+    }
+
+    #[test]
+    fn deduplicate_problems_keeps_distinct_messages() {
+        let mut items = vec![
+            json!({
+                "id": "1",
+                "severity": "error",
+                "source": "quality:a",
+                "message": "first issue",
+                "filePath": "src/a.ts",
+                "line": 1,
+                "createdAt": "2026-01-01T00:00:00Z",
+            }),
+            json!({
+                "id": "2",
+                "severity": "error",
+                "source": "quality:b",
+                "message": "second issue",
+                "filePath": "src/a.ts",
+                "line": 1,
+                "createdAt": "2026-01-01T00:00:01Z",
+            }),
+        ];
+        deduplicate_problems(&mut items);
+        assert_eq!(items.len(), 2);
     }
 }
 
@@ -578,7 +741,11 @@ pub(super) async fn read_service_logs(
 
 /// Evento "nessun log dal restart" quando journalctl restituisce output vuoto.
 #[cfg(not(windows))]
-fn service_empty_log_event(service: &str, channel: &str, since: &Option<String>) -> Vec<serde_json::Value> {
+fn service_empty_log_event(
+    service: &str,
+    channel: &str,
+    since: &Option<String>,
+) -> Vec<serde_json::Value> {
     let header = match since {
         Some(ts) => format!(
             "Il servizio e' attivo dal {} ma non ha prodotto output dal restart.",
@@ -609,7 +776,10 @@ fn service_tail_log_event(
     let level = detect_log_level(&text);
     let line_count = text.lines().count();
     let title = match since {
-        Some(ts) => format!("{} — ultimi {} log dal restart ({})", service, line_count, ts),
+        Some(ts) => format!(
+            "{} — ultimi {} log dal restart ({})",
+            service, line_count, ts
+        ),
         None => format!("{} — ultimi {} log", service, line_count),
     };
     vec![serde_json::json!({
@@ -999,7 +1169,9 @@ async fn agent_channel_events(
         if label.is_empty() { &command } else { &label },
         pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
         status,
-        exit_code.map(|c| format!(", exit: {}", c)).unwrap_or_default(),
+        exit_code
+            .map(|c| format!(", exit: {}", c))
+            .unwrap_or_default(),
     );
     let text = if error_output.is_empty() {
         output
@@ -1054,7 +1226,10 @@ async fn system_channel_events(
     }
 
     if lines.is_empty() {
-        lines.push(format!("Nessun servizio trovato per il progetto '{}'.", slug));
+        lines.push(format!(
+            "Nessun servizio trovato per il progetto '{}'.",
+            slug
+        ));
     }
 
     lines.push(String::new());

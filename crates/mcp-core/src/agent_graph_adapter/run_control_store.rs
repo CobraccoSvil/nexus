@@ -151,7 +151,11 @@ mod tests {
         } else {
             "INSERT INTO agent_runs (id) VALUES ($1)"
         };
-        sqlx::query(sql).bind(id).execute(pool).await.expect("insert");
+        sqlx::query(sql)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("insert");
         id
     }
 
@@ -199,7 +203,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("riga");
-        assert!(updated.is_some(), "heartbeat Real deve valorizzare updated_at");
+        assert!(
+            updated.is_some(),
+            "heartbeat Real deve valorizzare updated_at"
+        );
     }
 
     #[sqlx::test]

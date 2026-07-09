@@ -5,7 +5,6 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-
 use crate::{
     billing::{self, UsageNumbers},
     domain::OrchestratorAudit,
@@ -63,9 +62,10 @@ impl Orchestrator {
         // Path RUST in-process quando il flag DB lo dice E il gateway e'
         // disponibile (senza gateway non si puo' chiamare l'LLM: si resta sul
         // path Python, comportamento stabile).
-        if let (ClassifierEngine::Rust, Some(gw)) =
-            (select_classifier_engine(db).await, self.nexus_gateway.as_ref())
-        {
+        if let (ClassifierEngine::Rust, Some(gw)) = (
+            select_classifier_engine(db).await,
+            self.nexus_gateway.as_ref(),
+        ) {
             let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
             return (classified.intent, classified.confidence);
         }
@@ -86,9 +86,10 @@ impl Orchestrator {
         // Punto unico di scelta motore (regola L, flag mig 0458): `rust` ->
         // classificatore in-process; `python` (default) -> endpoint brain. Il
         // path rust richiede il gateway; senza, si resta sul path Python.
-        if let (ClassifierEngine::Rust, Some(gw)) =
-            (select_classifier_engine(db).await, self.nexus_gateway.as_ref())
-        {
+        if let (ClassifierEngine::Rust, Some(gw)) = (
+            select_classifier_engine(db).await,
+            self.nexus_gateway.as_ref(),
+        ) {
             let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
             return classified;
         }
@@ -244,7 +245,11 @@ impl Orchestrator {
     /// NB: il ramo "dinamico" di `resolve_agent_provider` NON usa questo helper:
     /// li' il default e' `medium/reasoning` con WARN dedicato (comportamento
     /// deliberatamente diverso, lasciato invariato).
-    async fn intent_tier_capability(&self, intent: &str, estimated_tokens: u32) -> (String, String) {
+    async fn intent_tier_capability(
+        &self,
+        intent: &str,
+        estimated_tokens: u32,
+    ) -> (String, String) {
         let icap_arc = self.intent_capability.current_async().await.ok();
         match icap_arc.as_deref() {
             Some(map) => match map.get(intent) {
@@ -1342,9 +1347,12 @@ impl Orchestrator {
         });
         if let Some(ref pr) = gw_resp.privacy_rerouted {
             tracing::warn!(
-                    "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
-                    pr.blocked_tier, pr.provider, intent, actual_usage.total_tokens
-                );
+                "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
+                pr.blocked_tier,
+                pr.provider,
+                intent,
+                actual_usage.total_tokens
+            );
         } else {
             tracing::info!(
                 "Nexus Gateway: intent={} provider={} model={} tokens={}",
@@ -1507,7 +1515,9 @@ impl Orchestrator {
                     || error.to_lowercase().contains("too_many_requests")
                 {
                     skip_reasons.push(format!("{provider}:rate_limited:{error}"));
-                    tracing::warn!("Provider {provider} segnala rate limit nella risposta, provo il prossimo");
+                    tracing::warn!(
+                        "Provider {provider} segnala rate limit nella risposta, provo il prossimo"
+                    );
                 } else {
                     skip_reasons.push(format!("{provider}:failed:{error}"));
                 }

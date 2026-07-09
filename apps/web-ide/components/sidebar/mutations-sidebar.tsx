@@ -1,8 +1,9 @@
 "use client";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useThemeColors } from "../../lib/theme";
-import { useGlobalDialog } from "../global-dialog-provider";
-import type { UserProjectDetails } from "../../lib/api-client";
+import {
+  useProjectStore,
+  selectMutationsRefreshAt,
+} from "../../lib/project-dispatcher";
 import {
   type FileMutation,
   type MutationDetail,
@@ -10,6 +11,9 @@ import {
   listMutations,
   revertMutation,
 } from "../../lib/api/mutations";
+import { useThemeColors } from "../../lib/theme";
+import { useGlobalDialog } from "../global-dialog-provider";
+import type { UserProjectDetails } from "../../lib/api-client";
 
 interface Props {
   project: UserProjectDetails | null;
@@ -53,6 +57,8 @@ export function MutationsSidebar({ project, onOpenInEditor }: Props) {
   const [openDetail, setOpenDetail] = useState<MutationDetail | null>(null);
   const [openDetailId, setOpenDetailId] = useState<number | null>(null);
 
+  const mutationsRefreshAt = useProjectStore(selectMutationsRefreshAt);
+
   const refresh = useCallback(async () => {
     if (!project?.id) return;
     setLoading(true);
@@ -67,16 +73,7 @@ export function MutationsSidebar({ project, onOpenInEditor }: Props) {
     }
   }, [project?.id]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
-
-  // L'evento SSE FileChanged (gia' emesso da write_file / edit_file e dal
-  // revert) significa che la lista mutazioni e' cambiata: re-fetch.
-  useEffect(() => {
-    if (!project?.id) return;
-    const handler = () => { void refresh(); };
-    window.addEventListener("nexus:file:changed", handler);
-    return () => window.removeEventListener("nexus:file:changed", handler);
-  }, [project?.id, refresh]);
+  useEffect(() => { void refresh(); }, [refresh, mutationsRefreshAt]);
 
   const doRevert = useCallback(
     async (item: FileMutation, force = false) => {

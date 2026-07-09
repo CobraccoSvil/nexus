@@ -297,7 +297,11 @@ fn clamp_one_step(current: ScaleTier, target: ScaleTier) -> ScaleTier {
 /// Ritorna sempre una [`ScaleMove`] (l'`KeepTier` e' la rete di sicurezza). Un
 /// `UpscaleTo`/`DownscaleTo` che dopo i gate coincide col tier corrente degrada a
 /// `KeepTier` (no-op esplicito).
-pub fn apply_hysteresis(mv: ScaleMove, ctx: &ScaleContext, cfg: &ScaleHysteresisConfig) -> ScaleMove {
+pub fn apply_hysteresis(
+    mv: ScaleMove,
+    ctx: &ScaleContext,
+    cfg: &ScaleHysteresisConfig,
+) -> ScaleMove {
     // Estrai tier target + confidence + direzione; KeepTier passa dritto.
     let (target, confidence, is_down) = match &mv {
         ScaleMove::KeepTier => return ScaleMove::KeepTier,
@@ -425,11 +429,7 @@ pub fn scale_trigger(
     }
     let n = cfg.eval_every_iters.max(1);
     let cadence = ctx.iterations > 0 && ctx.iterations % n == 0;
-    cadence
-        || pressure_changed
-        || todo_closed_now
-        || error_ratchet_advanced
-        || escalation_advanced
+    cadence || pressure_changed || todo_closed_now || error_ratchet_advanced || escalation_advanced
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -526,7 +526,10 @@ pub struct SizingBaseline {
 /// `apply_hysteresis`; qui e' difensivo). L'LLM NON scavalca il gate.
 pub fn apply_sizing_gate(mv: ScaleMove, ctx: &ScaleContext, cfg: &ScaleSizingConfig) -> ScaleMove {
     let (posture, confidence) = match &mv {
-        ScaleMove::AdjustSizing { posture, confidence } => (*posture, *confidence),
+        ScaleMove::AdjustSizing {
+            posture,
+            confidence,
+        } => (*posture, *confidence),
         other => return other.clone(),
     };
     // GATE 0 — kill-switch nested del sizing.
@@ -547,7 +550,10 @@ pub fn apply_sizing_gate(mv: ScaleMove, ctx: &ScaleContext, cfg: &ScaleSizingCon
     if since < cfg.cooldown_turns {
         return ScaleMove::KeepTier;
     }
-    ScaleMove::AdjustSizing { posture, confidence }
+    ScaleMove::AdjustSizing {
+        posture,
+        confidence,
+    }
 }
 
 /// Aggressivita' EFFETTIVA: la manopola DB `aggressiveness` amplificata dalla
@@ -759,7 +765,7 @@ mod tests {
         assert_eq!(clamp_one_step(Light, Frontier), Medium); // +4 -> +1
         assert_eq!(clamp_one_step(Frontier, Light), Heavy); //  -4 -> -1
         assert_eq!(clamp_one_step(Medium, Heavy), High); //    +2 -> +1
-        // tier adiacenti passano invariati
+                                                         // tier adiacenti passano invariati
         assert_eq!(clamp_one_step(High, Heavy), Heavy);
         assert_eq!(clamp_one_step(Heavy, High), High);
     }
@@ -809,7 +815,11 @@ mod tests {
             3,
             0,
         );
-        assert_eq!(ctx.current_tier, ScaleTier::Medium, "None -> Medium deterministico");
+        assert_eq!(
+            ctx.current_tier,
+            ScaleTier::Medium,
+            "None -> Medium deterministico"
+        );
         assert_eq!(ctx.tail_headroom, 15, "tail = cap - iters, mai negativo");
     }
 
@@ -841,7 +851,11 @@ mod tests {
             0,
             0,
         );
-        assert_eq!(ctx.current_tier, ScaleTier::Medium, "tier fuori vocabolario -> Medium");
+        assert_eq!(
+            ctx.current_tier,
+            ScaleTier::Medium,
+            "tier fuori vocabolario -> Medium"
+        );
         assert_eq!(ctx.tail_headroom, 0, "tail non underflowa");
     }
 
@@ -879,13 +893,23 @@ mod tests {
     fn cache_key_stesso_stato_stessa_chiave() {
         let a = base_ctx();
         let b = base_ctx();
-        assert_eq!(scale_cache_key(&a, 4), scale_cache_key(&b, 4), "deterministica");
+        assert_eq!(
+            scale_cache_key(&a, 4),
+            scale_cache_key(&b, 4),
+            "deterministica"
+        );
     }
 
     #[test]
     fn cache_key_error_ratchet_monotono_distingue_livelli() {
-        let low = ScaleContext { error_count: 0, ..base_ctx() };
-        let high = ScaleContext { error_count: 3, ..base_ctx() };
+        let low = ScaleContext {
+            error_count: 0,
+            ..base_ctx()
+        };
+        let high = ScaleContext {
+            error_count: 3,
+            ..base_ctx()
+        };
         assert_ne!(
             scale_cache_key(&low, 4),
             scale_cache_key(&high, 4),
@@ -903,18 +927,29 @@ mod tests {
         );
         assert_eq!(
             validate_scale_move(&json!({"move": "upscale_to", "tier": "heavy", "confidence": 0.8})),
-            ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.8 }
+            ScaleMove::UpscaleTo {
+                tier: ScaleTier::Heavy,
+                confidence: 0.8
+            }
         );
         assert_eq!(
-            validate_scale_move(&json!({"move": "downscale_to", "tier": "light", "confidence": 0.9})),
-            ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 }
+            validate_scale_move(
+                &json!({"move": "downscale_to", "tier": "light", "confidence": 0.9})
+            ),
+            ScaleMove::DownscaleTo {
+                tier: ScaleTier::Light,
+                confidence: 0.9
+            }
         );
     }
 
     #[test]
     fn validate_malformato_degrada_a_keep() {
         // Enum sconosciuto.
-        assert_eq!(validate_scale_move(&json!({"move": "boh"})), ScaleMove::KeepTier);
+        assert_eq!(
+            validate_scale_move(&json!({"move": "boh"})),
+            ScaleMove::KeepTier
+        );
         // Tier fuori vocabolario (non deserializza ScaleTier).
         assert_eq!(
             validate_scale_move(&json!({"move": "upscale_to", "tier": "titan", "confidence": 0.9})),
@@ -927,7 +962,9 @@ mod tests {
         );
         // Confidence negativa.
         assert_eq!(
-            validate_scale_move(&json!({"move": "downscale_to", "tier": "light", "confidence": -0.1})),
+            validate_scale_move(
+                &json!({"move": "downscale_to", "tier": "light", "confidence": -0.1})
+            ),
             ScaleMove::KeepTier
         );
     }
@@ -938,7 +975,10 @@ mod tests {
     fn gate_confidenza_sotto_soglia_keep() {
         let cfg = ScaleHysteresisConfig::conservative_defaults();
         let ctx = base_ctx();
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.5 };
+        let mv = ScaleMove::UpscaleTo {
+            tier: ScaleTier::Heavy,
+            confidence: 0.5,
+        };
         assert_eq!(apply_hysteresis(mv, &ctx, &cfg), ScaleMove::KeepTier);
     }
 
@@ -948,10 +988,16 @@ mod tests {
         let ctx = base_ctx();
         // Target adiacente (Medium->High) per isolare il gate confidenza dal gate
         // clamp (gate 4): un salto Medium->Heavy verrebbe clampato a High.
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 };
+        let mv = ScaleMove::UpscaleTo {
+            tier: ScaleTier::High,
+            confidence: 0.9,
+        };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 }
+            ScaleMove::UpscaleTo {
+                tier: ScaleTier::High,
+                confidence: 0.9
+            }
         );
     }
 
@@ -967,10 +1013,16 @@ mod tests {
             ..base_ctx()
         };
         // Target adiacente (Medium->High) per isolare il gate banda dal gate clamp.
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.75 };
+        let mv = ScaleMove::UpscaleTo {
+            tier: ScaleTier::High,
+            confidence: 0.75,
+        };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.75 }
+            ScaleMove::UpscaleTo {
+                tier: ScaleTier::High,
+                confidence: 0.75
+            }
         );
     }
 
@@ -986,25 +1038,47 @@ mod tests {
             todos_closed: 2,
             ..base_ctx()
         };
-        let mv = ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.95 };
-        assert_eq!(apply_hysteresis(mv, &ctx, &cfg), ScaleMove::KeepTier, "downscale OFF");
+        let mv = ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.95,
+        };
+        assert_eq!(
+            apply_hysteresis(mv, &ctx, &cfg),
+            ScaleMove::KeepTier,
+            "downscale OFF"
+        );
 
         // Con downscale ON e banda pulita: passa (clampato a 1 gradino: medium->light).
-        let cfg_on = ScaleHysteresisConfig { downscale_enabled: true, ..cfg };
+        let cfg_on = ScaleHysteresisConfig {
+            downscale_enabled: true,
+            ..cfg
+        };
         assert_eq!(
             apply_hysteresis(
-                ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.95 },
+                ScaleMove::DownscaleTo {
+                    tier: ScaleTier::Light,
+                    confidence: 0.95
+                },
                 &ctx,
                 &cfg_on
             ),
-            ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.95 }
+            ScaleMove::DownscaleTo {
+                tier: ScaleTier::Light,
+                confidence: 0.95
+            }
         );
 
         // Banda sporca (errore recente) -> KeepTier anche con downscale ON.
-        let ctx_dirty = ScaleContext { error_free_streak: 0, ..ctx };
+        let ctx_dirty = ScaleContext {
+            error_free_streak: 0,
+            ..ctx
+        };
         assert_eq!(
             apply_hysteresis(
-                ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.95 },
+                ScaleMove::DownscaleTo {
+                    tier: ScaleTier::Light,
+                    confidence: 0.95
+                },
                 &ctx_dirty,
                 &cfg_on
             ),
@@ -1015,7 +1089,10 @@ mod tests {
     #[test]
     fn gate_banda_downscale_vietato_da_escalation_lock() {
         // FIX-E: escalation_lock_active -> mai downscale.
-        let cfg = ScaleHysteresisConfig { downscale_enabled: true, ..ScaleHysteresisConfig::conservative_defaults() };
+        let cfg = ScaleHysteresisConfig {
+            downscale_enabled: true,
+            ..ScaleHysteresisConfig::conservative_defaults()
+        };
         let ctx = ScaleContext {
             context_pressure: ContextPressure::Low,
             error_free_streak: 5,
@@ -1025,7 +1102,10 @@ mod tests {
             todos_closed: 2,
             ..base_ctx()
         };
-        let mv = ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.95 };
+        let mv = ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.95,
+        };
         assert_eq!(apply_hysteresis(mv, &ctx, &cfg), ScaleMove::KeepTier);
     }
 
@@ -1034,8 +1114,14 @@ mod tests {
     #[test]
     fn gate_cooldown_blocca_cambio_recente() {
         let cfg = ScaleHysteresisConfig::conservative_defaults();
-        let ctx = ScaleContext { turns_since_change: 1, ..base_ctx() };
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.9 };
+        let ctx = ScaleContext {
+            turns_since_change: 1,
+            ..base_ctx()
+        };
+        let mv = ScaleMove::UpscaleTo {
+            tier: ScaleTier::Heavy,
+            confidence: 0.9,
+        };
         assert_eq!(apply_hysteresis(mv, &ctx, &cfg), ScaleMove::KeepTier);
     }
 
@@ -1045,11 +1131,20 @@ mod tests {
     fn gate_clamp_un_gradino_light_a_heavy() {
         // Da light chiedendo heavy (salto 2 gradini) -> clampa a medium.
         let cfg = ScaleHysteresisConfig::conservative_defaults();
-        let ctx = ScaleContext { current_tier: ScaleTier::Light, ..base_ctx() };
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::Heavy, confidence: 0.9 };
+        let ctx = ScaleContext {
+            current_tier: ScaleTier::Light,
+            ..base_ctx()
+        };
+        let mv = ScaleMove::UpscaleTo {
+            tier: ScaleTier::Heavy,
+            confidence: 0.9,
+        };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::Medium, confidence: 0.9 }
+            ScaleMove::UpscaleTo {
+                tier: ScaleTier::Medium,
+                confidence: 0.9
+            }
         );
     }
 
@@ -1066,10 +1161,16 @@ mod tests {
             reversal_count: 2,
             ..base_ctx()
         };
-        let mv = ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 };
+        let mv = ScaleMove::UpscaleTo {
+            tier: ScaleTier::High,
+            confidence: 0.9,
+        };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
-            ScaleMove::UpscaleTo { tier: ScaleTier::High, confidence: 0.9 },
+            ScaleMove::UpscaleTo {
+                tier: ScaleTier::High,
+                confidence: 0.9
+            },
             "reversal-pin sale al tier piu' alto dei due, safety-biased"
         );
     }
@@ -1086,7 +1187,10 @@ mod tests {
             reversal_count: 2,
             ..base_ctx()
         };
-        let mv = ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 };
+        let mv = ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.9,
+        };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
             ScaleMove::KeepTier,
@@ -1103,7 +1207,10 @@ mod tests {
             reversal_count: 3,
             ..base_ctx()
         };
-        let mv = ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 };
+        let mv = ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.9,
+        };
         assert_eq!(apply_hysteresis(mv, &ctx, &cfg), ScaleMove::KeepTier);
     }
 
@@ -1112,7 +1219,10 @@ mod tests {
     #[test]
     fn floor_tier_downscale_non_scende_sotto_floor() {
         // floor=medium: un downscale medium->light viene bloccato (floor==current).
-        let cfg = ScaleHysteresisConfig { downscale_enabled: true, ..ScaleHysteresisConfig::conservative_defaults() };
+        let cfg = ScaleHysteresisConfig {
+            downscale_enabled: true,
+            ..ScaleHysteresisConfig::conservative_defaults()
+        };
         let ctx = ScaleContext {
             current_tier: ScaleTier::Medium,
             intent_tier_floor: ScaleTier::Medium,
@@ -1123,7 +1233,10 @@ mod tests {
             todos_closed: 2,
             ..base_ctx()
         };
-        let mv = ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.95 };
+        let mv = ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.95,
+        };
         assert_eq!(
             apply_hysteresis(mv, &ctx, &cfg),
             ScaleMove::KeepTier,
@@ -1147,7 +1260,10 @@ mod tests {
 
     #[test]
     fn window_ok_finestra_ignota_fail_safe() {
-        assert!(!context_window_ok(0, 100, 1.3), "finestra ignota -> non autorizzare");
+        assert!(
+            !context_window_ok(0, 100, 1.3),
+            "finestra ignota -> non autorizzare"
+        );
     }
 
     // ── scale_trigger (break-even + precedenza stallo) ──────────────────────────
@@ -1161,34 +1277,70 @@ mod tests {
 
     #[test]
     fn trigger_break_even_tail_corta_no() {
-        let cfg = ScaleTriggerConfig { enabled: true, eval_every_iters: 4, min_tail_iters: 6 };
-        let ctx = ScaleContext { tail_headroom: 3, ..base_ctx() };
-        assert!(!scale_trigger(&ctx, &cfg, false, true, true, true, true), "coda corta -> no trigger");
+        let cfg = ScaleTriggerConfig {
+            enabled: true,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+        };
+        let ctx = ScaleContext {
+            tail_headroom: 3,
+            ..base_ctx()
+        };
+        assert!(
+            !scale_trigger(&ctx, &cfg, false, true, true, true, true),
+            "coda corta -> no trigger"
+        );
     }
 
     #[test]
     fn trigger_stallo_vince() {
         // FIX-E: stallo attivo -> mai trigger, anche con cadenza pronta.
-        let cfg = ScaleTriggerConfig { enabled: true, eval_every_iters: 4, min_tail_iters: 6 };
-        let ctx = ScaleContext { iterations: 8, tail_headroom: 12, ..base_ctx() };
+        let cfg = ScaleTriggerConfig {
+            enabled: true,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+        };
+        let ctx = ScaleContext {
+            iterations: 8,
+            tail_headroom: 12,
+            ..base_ctx()
+        };
         assert!(!scale_trigger(&ctx, &cfg, true, false, false, false, false));
     }
 
     #[test]
     fn trigger_cadenza_scatta() {
-        let cfg = ScaleTriggerConfig { enabled: true, eval_every_iters: 4, min_tail_iters: 6 };
-        let ctx = ScaleContext { iterations: 8, tail_headroom: 12, ..base_ctx() };
+        let cfg = ScaleTriggerConfig {
+            enabled: true,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+        };
+        let ctx = ScaleContext {
+            iterations: 8,
+            tail_headroom: 12,
+            ..base_ctx()
+        };
         assert!(scale_trigger(&ctx, &cfg, false, false, false, false, false));
     }
 
     #[test]
     fn trigger_cambio_banda_scatta_fuori_cadenza() {
-        let cfg = ScaleTriggerConfig { enabled: true, eval_every_iters: 4, min_tail_iters: 6 };
+        let cfg = ScaleTriggerConfig {
+            enabled: true,
+            eval_every_iters: 4,
+            min_tail_iters: 6,
+        };
         // iters=9 (non multiplo di 4) ma pressure_changed=true.
-        let ctx = ScaleContext { iterations: 9, tail_headroom: 11, ..base_ctx() };
+        let ctx = ScaleContext {
+            iterations: 9,
+            tail_headroom: 11,
+            ..base_ctx()
+        };
         assert!(scale_trigger(&ctx, &cfg, false, true, false, false, false));
         // Senza alcun segnale non scatta.
-        assert!(!scale_trigger(&ctx, &cfg, false, false, false, false, false));
+        assert!(!scale_trigger(
+            &ctx, &cfg, false, false, false, false, false
+        ));
     }
 
     // ── SIZING: validate_scale_move su AdjustSizing ─────────────────────────────
@@ -1196,17 +1348,26 @@ mod tests {
     #[test]
     fn validate_adjust_sizing_forme() {
         assert_eq!(
-            validate_scale_move(&json!({"move": "adjust_sizing", "posture": "compact", "confidence": 0.8})),
-            ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.8 }
+            validate_scale_move(
+                &json!({"move": "adjust_sizing", "posture": "compact", "confidence": 0.8})
+            ),
+            ScaleMove::AdjustSizing {
+                posture: SizingPosture::Compact,
+                confidence: 0.8
+            }
         );
         // Confidence fuori [0,1] -> KeepTier.
         assert_eq!(
-            validate_scale_move(&json!({"move": "adjust_sizing", "posture": "relax", "confidence": 1.4})),
+            validate_scale_move(
+                &json!({"move": "adjust_sizing", "posture": "relax", "confidence": 1.4})
+            ),
             ScaleMove::KeepTier
         );
         // Postura fuori vocabolario -> non deserializza -> KeepTier.
         assert_eq!(
-            validate_scale_move(&json!({"move": "adjust_sizing", "posture": "turbo", "confidence": 0.9})),
+            validate_scale_move(
+                &json!({"move": "adjust_sizing", "posture": "turbo", "confidence": 0.9})
+            ),
             ScaleMove::KeepTier
         );
     }
@@ -1214,53 +1375,95 @@ mod tests {
     // ── SIZING: apply_sizing_gate ───────────────────────────────────────────────
 
     fn sizing_cfg_on() -> ScaleSizingConfig {
-        ScaleSizingConfig { enabled: true, ..ScaleSizingConfig::conservative_defaults() }
+        ScaleSizingConfig {
+            enabled: true,
+            ..ScaleSizingConfig::conservative_defaults()
+        }
     }
 
     fn sizing_ctx(turns_since: Option<i64>) -> ScaleContext {
-        ScaleContext { sizing_turns_since_change: turns_since, ..base_ctx() }
+        ScaleContext {
+            sizing_turns_since_change: turns_since,
+            ..base_ctx()
+        }
     }
 
     #[test]
     fn sizing_gate_disabilitato_keep() {
         // sizing_enabled=false (default) -> AdjustSizing degrada a KeepTier.
         let cfg = ScaleSizingConfig::conservative_defaults();
-        let mv = ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.95 };
-        assert_eq!(apply_sizing_gate(mv, &sizing_ctx(Some(10)), &cfg), ScaleMove::KeepTier);
+        let mv = ScaleMove::AdjustSizing {
+            posture: SizingPosture::Compact,
+            confidence: 0.95,
+        };
+        assert_eq!(
+            apply_sizing_gate(mv, &sizing_ctx(Some(10)), &cfg),
+            ScaleMove::KeepTier
+        );
     }
 
     #[test]
     fn sizing_gate_hold_keep() {
         let cfg = sizing_cfg_on();
-        let mv = ScaleMove::AdjustSizing { posture: SizingPosture::Hold, confidence: 0.95 };
-        assert_eq!(apply_sizing_gate(mv, &sizing_ctx(Some(10)), &cfg), ScaleMove::KeepTier);
+        let mv = ScaleMove::AdjustSizing {
+            posture: SizingPosture::Hold,
+            confidence: 0.95,
+        };
+        assert_eq!(
+            apply_sizing_gate(mv, &sizing_ctx(Some(10)), &cfg),
+            ScaleMove::KeepTier
+        );
     }
 
     #[test]
     fn sizing_gate_confidenza_sotto_soglia_keep() {
         let cfg = sizing_cfg_on();
-        let mv = ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.5 };
-        assert_eq!(apply_sizing_gate(mv, &sizing_ctx(Some(10)), &cfg), ScaleMove::KeepTier);
+        let mv = ScaleMove::AdjustSizing {
+            posture: SizingPosture::Compact,
+            confidence: 0.5,
+        };
+        assert_eq!(
+            apply_sizing_gate(mv, &sizing_ctx(Some(10)), &cfg),
+            ScaleMove::KeepTier
+        );
     }
 
     #[test]
     fn sizing_gate_cooldown_blocca() {
         let cfg = sizing_cfg_on(); // cooldown_turns = 3
-        let mv = ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.95 };
-        assert_eq!(apply_sizing_gate(mv, &sizing_ctx(Some(1)), &cfg), ScaleMove::KeepTier);
+        let mv = ScaleMove::AdjustSizing {
+            posture: SizingPosture::Compact,
+            confidence: 0.95,
+        };
+        assert_eq!(
+            apply_sizing_gate(mv, &sizing_ctx(Some(1)), &cfg),
+            ScaleMove::KeepTier
+        );
     }
 
     #[test]
     fn sizing_gate_passa() {
         let cfg = sizing_cfg_on();
-        let mv = ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.95 };
+        let mv = ScaleMove::AdjustSizing {
+            posture: SizingPosture::Compact,
+            confidence: 0.95,
+        };
         // Segnale assente (None) = primo cambio -> non blocca.
         assert_eq!(
             apply_sizing_gate(mv.clone(), &sizing_ctx(None), &cfg),
-            ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.95 }
+            ScaleMove::AdjustSizing {
+                posture: SizingPosture::Compact,
+                confidence: 0.95
+            }
         );
         // Cooldown rispettato (>= 3).
-        assert_eq!(apply_sizing_gate(mv, &sizing_ctx(Some(5)), &cfg), ScaleMove::AdjustSizing { posture: SizingPosture::Compact, confidence: 0.95 });
+        assert_eq!(
+            apply_sizing_gate(mv, &sizing_ctx(Some(5)), &cfg),
+            ScaleMove::AdjustSizing {
+                posture: SizingPosture::Compact,
+                confidence: 0.95
+            }
+        );
     }
 
     // ── SIZING: resolve_sizing_overrides ────────────────────────────────────────
@@ -1283,7 +1486,11 @@ mod tests {
             &baseline(),
             &sizing_cfg_on(),
         );
-        assert_eq!(ov, SizingOverrides::default(), "Hold -> tutti None (bit-identico)");
+        assert_eq!(
+            ov,
+            SizingOverrides::default(),
+            "Hold -> tutti None (bit-identico)"
+        );
     }
 
     #[test]
@@ -1294,12 +1501,16 @@ mod tests {
             recent_productive: Some(true),
             ..base_ctx()
         };
-        let ov = resolve_sizing_overrides(SizingPosture::Compact, &ctx, &baseline(), &sizing_cfg_on());
+        let ov =
+            resolve_sizing_overrides(SizingPosture::Compact, &ctx, &baseline(), &sizing_cfg_on());
         // compress_start_iter abbassato (comprimi prima).
         assert!(ov.compress_start_iter.unwrap() <= 5);
         // keep_recent non aumenta.
         let keep = ov.compress_phase_keep_recent.unwrap();
-        assert!(keep.iter().zip([8_i64, 5, 3, 2]).all(|(&n, o)| n <= o && n >= 1));
+        assert!(keep
+            .iter()
+            .zip([8_i64, 5, 3, 2])
+            .all(|(&n, o)| n <= o && n >= 1));
         // freno piu' aggressivo (< base 0.70) ma sopra il floor.
         let brake = ov.token_brake_max_context_ratio.unwrap();
         assert!((0.50..0.70).contains(&brake));
@@ -1311,8 +1522,12 @@ mod tests {
 
     #[test]
     fn resolve_relax_allarga() {
-        let ctx = ScaleContext { recent_productive: Some(false), ..base_ctx() };
-        let ov = resolve_sizing_overrides(SizingPosture::Relax, &ctx, &baseline(), &sizing_cfg_on());
+        let ctx = ScaleContext {
+            recent_productive: Some(false),
+            ..base_ctx()
+        };
+        let ov =
+            resolve_sizing_overrides(SizingPosture::Relax, &ctx, &baseline(), &sizing_cfg_on());
         // keep_recent non diminuisce.
         let keep = ov.compress_phase_keep_recent.unwrap();
         assert!(keep.iter().zip([8_i64, 5, 3, 2]).all(|(&n, o)| n >= o));
@@ -1337,7 +1552,11 @@ mod tests {
     #[test]
     fn effective_ctx_mgmt_none_invariato() {
         let base = ctx_mgmt_base();
-        assert_eq!(effective_ctx_mgmt(&base, None), base, "None -> base invariata");
+        assert_eq!(
+            effective_ctx_mgmt(&base, None),
+            base,
+            "None -> base invariata"
+        );
     }
 
     #[test]
@@ -1354,15 +1573,30 @@ mod tests {
         // max_chars non overridden -> invariato.
         assert_eq!(eff.compress_phase_max_chars, base.compress_phase_max_chars);
         // boundaries mai toccate.
-        assert_eq!(eff.compress_phase_boundaries, base.compress_phase_boundaries);
+        assert_eq!(
+            eff.compress_phase_boundaries,
+            base.compress_phase_boundaries
+        );
     }
 
     #[test]
     fn effective_token_brake_e_rolling() {
-        let brake_base = TokenBrakeConfig { max_context_ratio: 0.70, aggressive_keep_recent: 3, aggressive_max_chars: 200 };
+        let brake_base = TokenBrakeConfig {
+            max_context_ratio: 0.70,
+            aggressive_keep_recent: 3,
+            aggressive_max_chars: 200,
+        };
         assert_eq!(effective_token_brake(&brake_base, None), brake_base);
-        let ov = SizingOverrides { token_brake_max_context_ratio: Some(0.6), rolling_summary_enabled: Some(true), rolling_keep_recent: Some(4), ..SizingOverrides::default() };
-        assert_eq!(effective_token_brake(&brake_base, Some(&ov)).max_context_ratio, 0.6);
+        let ov = SizingOverrides {
+            token_brake_max_context_ratio: Some(0.6),
+            rolling_summary_enabled: Some(true),
+            rolling_keep_recent: Some(4),
+            ..SizingOverrides::default()
+        };
+        assert_eq!(
+            effective_token_brake(&brake_base, Some(&ov)).max_context_ratio,
+            0.6
+        );
         assert_eq!(effective_rolling(false, 2, None), (false, 2));
         assert_eq!(effective_rolling(false, 2, Some(&ov)), (true, 4));
     }
@@ -1370,10 +1604,16 @@ mod tests {
     #[test]
     fn effective_g1_threshold_mult() {
         assert_eq!(effective_g1_threshold(24, None), 24, "None -> base");
-        let ov = SizingOverrides { g1_loop_threshold_mult: Some(1.5), ..SizingOverrides::default() };
+        let ov = SizingOverrides {
+            g1_loop_threshold_mult: Some(1.5),
+            ..SizingOverrides::default()
+        };
         assert_eq!(effective_g1_threshold(24, Some(&ov)), 36);
         // Moltiplicatore non valido -> base (fail-safe).
-        let bad = SizingOverrides { g1_loop_threshold_mult: Some(f64::NAN), ..SizingOverrides::default() };
+        let bad = SizingOverrides {
+            g1_loop_threshold_mult: Some(f64::NAN),
+            ..SizingOverrides::default()
+        };
         assert_eq!(effective_g1_threshold(24, Some(&bad)), 24);
     }
 }

@@ -561,7 +561,10 @@ mod tests {
 
         // Dev server / watcher -> long-running (NON devono risvegliare l'agente).
         assert!(is_long_running_service("pnpm run dev:backend", &patterns));
-        assert!(is_long_running_service("pnpm exec vite --port 21976", &patterns));
+        assert!(is_long_running_service(
+            "pnpm exec vite --port 21976",
+            &patterns
+        ));
         assert!(is_long_running_service("npm run dev:frontend", &patterns));
         assert!(is_long_running_service("vite --port 21992", &patterns));
 
@@ -572,7 +575,10 @@ mod tests {
         ));
         assert!(!is_long_running_service("pnpm install", &patterns));
         assert!(!is_long_running_service("tsc --noEmit", &patterns));
-        assert!(!is_long_running_service("lsof -t -i:21950 | xargs kill -9", &patterns));
+        assert!(!is_long_running_service(
+            "lsof -t -i:21950 | xargs kill -9",
+            &patterns
+        ));
 
         // Lista vuota / pattern vuoto -> niente match (nessun falso positivo).
         assert!(!is_long_running_service("vite", &[]));

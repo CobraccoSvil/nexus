@@ -277,7 +277,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 12, "attesi >= 12 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 12,
+            "attesi >= 12 casi, trovati {}",
+            cases.len()
+        );
         for c in &cases {
             assert_eq!(c.group, "g1_accounting");
             let signals = G1Signals {
@@ -303,6 +307,9 @@ mod golden {
                 c.case_id, got, c.output
             );
         }
-        println!("golden executor_g1: {} casi verificati, tutti verdi", cases.len());
+        println!(
+            "golden executor_g1: {} casi verificati, tutti verdi",
+            cases.len()
+        );
     }
 }

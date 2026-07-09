@@ -232,8 +232,7 @@ pub(crate) async fn select_models_tierchain(
     // kind della mig 0478) si filtrano via colonna; ogni altra capability (chat,
     // 'code', 'reasoning', ...) resta nel jsonb `capabilities`. Aggiungere un
     // nuovo media kind = una riga qui (e la colonna in mig), niente if sparsi.
-    let capability_column: Option<&'static str> =
-        filter.capability.and_then(capability_to_column);
+    let capability_column: Option<&'static str> = filter.capability.and_then(capability_to_column);
     // jsonb solo per le capability SENZA colonna dedicata.
     let capability_json = filter
         .capability
@@ -253,7 +252,10 @@ pub(crate) async fn select_models_tierchain(
         let mut sql = String::from(
             "SELECT provider, model, performance_tier FROM ai_price_catalog \
              WHERE is_enabled = TRUE \
-               AND LOWER(provider) <> ALL($1)",
+               AND LOWER(provider) <> ALL($1) \
+               AND (auto_disabled_reason IS NULL \
+                    OR (auto_disabled_reason NOT LIKE 'invalid_model%' \
+                        AND auto_disabled_reason NOT LIKE 'model_not_found%'))",
         );
         if filter.require_tool_use {
             sql.push_str(" AND supports_tool_use = TRUE");
@@ -599,7 +601,10 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert!(out_absent.is_empty(), "provider pinnato assente -> pool vuoto");
+        assert!(
+            out_absent.is_empty(),
+            "provider pinnato assente -> pool vuoto"
+        );
     }
 
     #[sqlx::test]
@@ -894,10 +899,19 @@ mod tests {
     #[test]
     fn capability_to_column_mappa_solo_le_capability_con_colonna() {
         assert_eq!(capability_to_column("vision"), Some("supports_vision"));
-        assert_eq!(capability_to_column("image_gen"), Some("supports_image_gen"));
+        assert_eq!(
+            capability_to_column("image_gen"),
+            Some("supports_image_gen")
+        );
         assert_eq!(capability_to_column("audio_in"), Some("supports_audio_in"));
-        assert_eq!(capability_to_column("audio_out"), Some("supports_audio_out"));
-        assert_eq!(capability_to_column("video_gen"), Some("supports_video_gen"));
+        assert_eq!(
+            capability_to_column("audio_out"),
+            Some("supports_audio_out")
+        );
+        assert_eq!(
+            capability_to_column("video_gen"),
+            Some("supports_video_gen")
+        );
         // capability nel jsonb: nessuna colonna dedicata.
         assert_eq!(capability_to_column("code"), None);
         assert_eq!(capability_to_column("reasoning"), None);

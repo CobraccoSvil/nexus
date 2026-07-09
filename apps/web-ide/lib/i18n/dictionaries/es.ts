@@ -93,6 +93,11 @@ export const es: PartialDictionary = {
     "chat.thinking": "Pensando...",
     "chat.you": "Tú",
     "chat.ai": "AI",
+    "chat.systemWakeup.badge": "Despertar automático del sistema",
+    "chat.systemWakeup.explain": "El agente se despertó por su cuenta para reaccionar a un evento del proyecto: no pediste este turno.",
+    "chat.systemWakeup.success": "Un comando en segundo plano terminó con éxito.",
+    "chat.systemWakeup.failure": "Un comando en segundo plano falló.",
+    "chat.systemWakeup.cap": "Límite anti-bucle alcanzado: despertares automáticos en pausa.",
 
     "mon.title": "Monitoreo",
     "mon.subtitle": "Estado de la plataforma",

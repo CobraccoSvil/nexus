@@ -129,7 +129,15 @@ pub(crate) async fn run_one_round(
     let tool_cfg = load_tool_probe_config(db).await;
 
     for pm in models {
-        probe_model_round(orchestrator, db, pm, failure_threshold, &tool_cfg, &mut stats).await;
+        probe_model_round(
+            orchestrator,
+            db,
+            pm,
+            failure_threshold,
+            &tool_cfg,
+            &mut stats,
+        )
+        .await;
     }
 
     run_reprobe_phase(orchestrator, db, &mut stats).await;
@@ -463,11 +471,7 @@ struct ReprobeCandidate {
 /// (billing/quota -> cooldown; missing_from_api -> non esiste piu'; policy ->
 /// decisione amministrativa; lock manuale). Punto unico (regola L) del criterio
 /// di inclusione/esclusione: la query SQL e i test usano questa funzione.
-fn is_reprobe_candidate(
-    is_enabled: bool,
-    capability_source: &str,
-    reason: Option<&str>,
-) -> bool {
+fn is_reprobe_candidate(is_enabled: bool, capability_source: &str, reason: Option<&str>) -> bool {
     if is_enabled {
         return false;
     }
@@ -756,7 +760,15 @@ async fn probe_one_model(
 
     persist_probe_history(db, provider, model, &outcome, latency_ms).await;
 
-    apply_probe_outcome(db, provider, model, outcome, prior_failures, failure_threshold).await
+    apply_probe_outcome(
+        db,
+        provider,
+        model,
+        outcome,
+        prior_failures,
+        failure_threshold,
+    )
+    .await
 }
 
 /// Classifica una response del brain andata a buon fine sul trasporto (chat-probe).
@@ -1017,7 +1029,10 @@ async fn record_model_specific_failure(
     failure_threshold: i32,
 ) -> ProbeOutcome {
     let new_count = prior_failures + 1;
-    let should_disable = new_count >= failure_threshold;
+    // invalid_model / model_not_found: auto-disable IMMEDIATO (regola H, incidente
+    // mistral-small deprecato). Non attendere N consecutive_failures.
+    let immediate_disable = kind == "invalid_model" || kind == "model_not_found";
+    let should_disable = immediate_disable || new_count >= failure_threshold;
     if should_disable {
         let _ = sqlx::query(
             "UPDATE ai_price_catalog
@@ -1035,7 +1050,7 @@ async fn record_model_specific_failure(
         .execute(db)
         .await;
         tracing::warn!(
-            "model_health_probe: AUTO-DISABLE {provider}/{model} (failures={new_count}, reason={kind})"
+            "model_health_probe: AUTO-DISABLE {provider}/{model} (failures={new_count}, reason={kind}, immediate={immediate_disable})"
         );
         ProbeOutcome::AutoDisabled
     } else {
@@ -1523,7 +1538,9 @@ pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
         // Model-specific -> conteggio/auto-disable del modello. Sono le SOLE
         // cause davvero attribuibili al modello: 404 (modello inesistente),
         // contesto troppo lungo, richiesta invalida, capability non supportata.
-        "not_found" => Classification::ModelSpecific("model_not_found".into(), Some(ec.into())),
+        "not_found" | "invalid_model" => {
+            Classification::ModelSpecific("invalid_model".into(), Some(ec.into()))
+        }
         "context_too_long" | "invalid_request" | "unprocessable" | "unsupported" => {
             Classification::ModelSpecific(ec.into(), Some(ec.into()))
         }
@@ -1666,7 +1683,12 @@ mod tests {
             classification_from_error_class("not_found"),
             Classification::ModelSpecific(ref k, _) if k == "model_not_found"
         ));
-        for ec in ["context_too_long", "invalid_request", "unprocessable", "unsupported"] {
+        for ec in [
+            "context_too_long",
+            "invalid_request",
+            "unprocessable",
+            "unsupported",
+        ] {
             assert!(
                 matches!(classification_from_error_class(ec), Classification::ModelSpecific(ref k, _) if k == ec),
                 "{ec} doveva restare ModelSpecific",
@@ -1903,12 +1925,32 @@ mod tests {
     fn run_outcome_blames_model_distingue_modello_da_ambiente() {
         use crate::agent_types::AgentRunStatus as S;
         // Colpa modello: fallito/loop/diagnosed, non hollow, error_class non ambientale.
-        assert!(run_outcome_blames_model(S::FailedDiagnosed, None, false, false));
-        assert!(run_outcome_blames_model(S::Failed, Some("model_not_found"), false, false));
+        assert!(run_outcome_blames_model(
+            S::FailedDiagnosed,
+            None,
+            false,
+            false
+        ));
+        assert!(run_outcome_blames_model(
+            S::Failed,
+            Some("model_not_found"),
+            false,
+            false
+        ));
         assert!(run_outcome_blames_model(S::LoopAborted, None, false, false));
         // Ambiente: blocco reale, provider giu', errore ambientale -> NON colpa modello.
-        assert!(!run_outcome_blames_model(S::BlockedNeedsInput, None, false, false));
-        assert!(!run_outcome_blames_model(S::ProviderUnavailable, None, false, false));
+        assert!(!run_outcome_blames_model(
+            S::BlockedNeedsInput,
+            None,
+            false,
+            false
+        ));
+        assert!(!run_outcome_blames_model(
+            S::ProviderUnavailable,
+            None,
+            false,
+            false
+        ));
         assert!(!run_outcome_blames_model(
             S::FailedDiagnosed,
             Some("context_overflow"),
@@ -1916,9 +1958,19 @@ mod tests {
             false
         ));
         // Hollow: gia' contato dai contatori dedicati, non doppiare.
-        assert!(!run_outcome_blames_model(S::FailedDiagnosed, None, true, false));
+        assert!(!run_outcome_blames_model(
+            S::FailedDiagnosed,
+            None,
+            true,
+            false
+        ));
         assert!(!run_outcome_blames_model(S::Failed, None, false, true));
         // Successo: mai colpa.
-        assert!(!run_outcome_blames_model(S::CompletedVerified, None, false, false));
+        assert!(!run_outcome_blames_model(
+            S::CompletedVerified,
+            None,
+            false,
+            false
+        ));
     }
 }

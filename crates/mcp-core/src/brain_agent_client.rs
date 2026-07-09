@@ -417,7 +417,10 @@ mod dispatch_kinds_enum_tests {
             {"name": "dispatch_subagents", "input_schema": {"properties": {"tasks": {"items": {"properties": {"kind": {"enum": ["plan"]}}}}}}},
             {"name": "read_file", "input_schema": {"properties": {}}}
         ]);
-        apply_dispatch_kinds_enum(&mut tools, &["plan".to_string(), "security_engineer".to_string()]);
+        apply_dispatch_kinds_enum(
+            &mut tools,
+            &["plan".to_string(), "security_engineer".to_string()],
+        );
         assert_eq!(
             tools[0]["input_schema"]["properties"]["kind"]["enum"],
             json!(["plan", "security_engineer"])
@@ -436,7 +439,10 @@ mod dispatch_kinds_enum_tests {
             {"name": "dispatch_subagent", "input_schema": {"properties": {"kind": {"enum": ["plan"]}}}}
         ]);
         apply_dispatch_kinds_enum(&mut tools, &[]);
-        assert_eq!(tools[0]["input_schema"]["properties"]["kind"]["enum"], json!(["plan"]));
+        assert_eq!(
+            tools[0]["input_schema"]["properties"]["kind"]["enum"],
+            json!(["plan"])
+        );
     }
 }
 
@@ -500,8 +506,15 @@ pub async fn build_tools_json_for_agent(
         &mut base_tools,
         &crate::agent_tools::subagent_native::convocable_kinds(db).await,
     );
-    let full_tools =
-        assemble_full_tools(db, user_id, project_id, mcp_tool_count, hard_limit, base_tools).await;
+    let full_tools = assemble_full_tools(
+        db,
+        user_id,
+        project_id,
+        mcp_tool_count,
+        hard_limit,
+        base_tools,
+    )
+    .await;
 
     // Gating finale per automation_mode: in `study` filtriamo a solo
     // read-only. `confirm` e `automatic` passano la lista intera.
@@ -652,9 +665,7 @@ fn classify_by_error_class(
         | Some("billing_required")
         | Some("quota_exceeded")
         | Some("credit_balance_too_low")
-        | Some("insufficient_quota") => {
-            Some(("billing_error", CooldownKind::Long, BILLING_REASON))
-        }
+        | Some("insufficient_quota") => Some(("billing_error", CooldownKind::Long, BILLING_REASON)),
         Some("rate_limit") => {
             // Anche con error_class=rate_limit esplicito, un 429 puo' in realta'
             // essere quota/credito esaurito: il brain (o un altro provider) puo'
@@ -677,60 +688,69 @@ fn classify_by_error_class(
             CooldownKind::Short,
             "Provider sovraccarico o errore temporaneo",
         )),
+        Some("auth_error") | Some("forbidden") => Some((
+            "auth_error",
+            CooldownKind::Long,
+            "Credenziali o accesso provider non validi",
+        )),
+        Some("not_found") | Some("invalid_model") => None,
+        Some("invalid_request")
+        | Some("unprocessable")
+        | Some("context_too_long")
+        | Some("unsupported") => None,
         _ => None,
     }
 }
 
-/// Step 2 della classificazione: pattern matching sul testo (it/en) quando
-/// `error_class` non ha dato un esito. `lower` deve gia' essere lowercased.
-fn classify_by_message(
-    lower: &str,
-    has_billing_marker: bool,
+/// Mappa il classificatore testuale unificato (`provider_error_classifier`) su
+/// cooldown. Usato SOLO quando `error_class` strutturato e' assente (regola M).
+fn map_classifier_to_cooldown(
+    c: &crate::provider_error_classifier::ClassifiedError,
 ) -> Option<(&'static str, CooldownKind, &'static str)> {
-    if has_billing_marker {
-        return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
-    }
-    if lower.contains("rate limit")
-        || lower.contains("limite di richieste")
-        || lower.contains("too many requests")
-        || lower.contains("429")
-    {
-        return Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"));
-    }
-    if lower.contains("overloaded")
-        || lower.contains("service unavailable")
-        || lower.contains("bad gateway")
-        || lower.contains("internal server error")
-        || lower.contains("gateway timeout")
-        || lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("504")
-    {
-        return Some((
+    match c.stop_reason.as_str() {
+        "billing_error" => Some(("billing_error", CooldownKind::Long, BILLING_REASON)),
+        "rate_limit" => Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto")),
+        "overloaded" | "service_unavailable" | "bad_gateway" | "provider_error" => Some((
             "provider_error",
             CooldownKind::Short,
             "Provider sovraccarico o errore temporaneo",
-        ));
+        )),
+        "timeout" | "connection_error" => Some((
+            "timeout",
+            CooldownKind::Short,
+            "Provider sovraccarico o errore temporaneo",
+        )),
+        "auth_error" | "forbidden" => Some((
+            "auth_error",
+            CooldownKind::Long,
+            "Credenziali o accesso provider non validi",
+        )),
+        // Model-specific / client: nessun cooldown provider.
+        "not_found" | "invalid_request" | "context_too_long" | "unprocessable" | "unsupported" => {
+            None
+        }
+        _ => None,
     }
-    None
 }
 
+/// Step 2 legacy rimosso: usare [`map_classifier_to_cooldown`] via
+/// `provider_error_classifier` (regola M).
 /// Classifica un errore del provider e suggerisce il tipo di cooldown.
 /// Ritorna `(error_class_normalizzato, kind, human_reason)`.
-/// La priorita': prima legge `error_class` esplicito (dal brain Python via
-/// `brain/providers/error_handler.py`), poi cade sul pattern matching su msg
-/// (per messaggi italiani/altri provider).
+/// Priorita': `error_class` strutturato (SSE brain/gateway), poi classificatore
+/// unificato `provider_error_classifier` — MAI parsing billing ad-hoc sul testo
+/// (regola M).
 fn classify_provider_error(
     error_class: Option<&str>,
     msg: &str,
 ) -> Option<(&'static str, CooldownKind, &'static str)> {
-    let lower = msg.to_lowercase();
-    let has_billing_marker = msg_has_billing_marker(&lower);
-
-    if let Some(hit) = classify_by_error_class(error_class, has_billing_marker) {
-        return Some(hit);
+    if let Some(ec) = error_class.map(str::trim).filter(|s| !s.is_empty() && *s != "ok") {
+        if let Some(hit) = classify_by_error_class(Some(ec), false) {
+            return Some(hit);
+        }
     }
-    classify_by_message(&lower, has_billing_marker)
+    let classified = crate::provider_error_classifier::classify_text(msg);
+    map_classifier_to_cooldown(&classified)
 }
 
 /// Applica il cooldown al provider in base alla classificazione dell'errore.
@@ -801,7 +821,10 @@ fn handle_usage_event(
     let prompt_t = u32_field("prompt_tokens");
     let completion_t = u32_field("completion_tokens");
     let total_t = u32_field("total_tokens");
-    let cost_t = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let cost_t = evt
+        .get("total_cost")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let last_pt = u32_field("last_prompt_tokens");
     // Mantieni gli accumulatori coerenti col risultato finale anche
     // se end_turn non dovesse arrivare (es. stream troncato).
@@ -849,12 +872,20 @@ fn handle_meta_step_event(
     run_id_str: &str,
     payload: &str,
 ) {
-    let kind = evt.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let kind = evt
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if kind.is_empty() {
         tracing::warn!("meta_step senza kind, scarto: {payload}");
         return;
     }
-    let title = evt.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = evt
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let payload_val = evt.get("payload").cloned().unwrap_or(json!({}));
     let correlation_id = evt
         .get("correlation_id")
@@ -951,13 +982,22 @@ fn apply_end_turn_metadata(evt: &Value, out: &mut EndTurnOutputs<'_>) {
 
 /// Copia token cumulativi, costo e token dell'ultima iterazione dall'evento.
 fn apply_end_turn_tokens(evt: &Value, out: &mut EndTurnOutputs<'_>) {
-    *out.acc_prompt_tokens = evt.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    *out.acc_prompt_tokens = evt
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     *out.acc_completion_tokens = evt
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    *out.acc_total_tokens = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    *out.acc_total_cost = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    *out.acc_total_tokens = evt
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    *out.acc_total_cost = evt
+        .get("total_cost")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     // Token prompt dell'ultima iterazione (per context ratio UI)
     *out.last_prompt_tokens = evt
         .get("last_prompt_tokens")
@@ -1162,7 +1202,10 @@ fn compute_hollow_completion(
     iteration: u32,
     final_answer: &str,
 ) -> (bool, bool, &'static str) {
-    let had_tools = tools_json.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    let had_tools = tools_json
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
     let final_answer_empty = final_answer.trim().is_empty();
     let is_completed = *status == AgentRunStatus::Completed;
     let hollow_no_tools = is_completed && had_tools && steps.is_empty() && iteration <= 1;
@@ -1262,7 +1305,11 @@ struct SseState<'a> {
 /// convertito un errore provider in content `[Error: ...]`, mette il provider in
 /// cooldown (senza questo il LED resterebbe verde con provider fuori uso).
 fn handle_assistant_delta(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
-    let text = evt.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = evt
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if text.is_empty() {
         return;
     }
@@ -1293,7 +1340,11 @@ fn handle_assistant_delta(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_
 fn handle_tool_use(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
     state.last_text_segment.clear();
     *state.iteration = state.iteration.saturating_add(1);
-    let tool_name = evt.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let tool_name = evt
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let input = evt.get("input").cloned().unwrap_or(json!({}));
     let step = AgentStep {
         run_id: ctx.run_id_str.to_string(),
@@ -1319,7 +1370,11 @@ fn handle_tool_use(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
 /// Gestisce l'evento `thinking_delta`: accumula il ragionamento (FIX D4) e lo
 /// ri-emette live.
 fn handle_thinking_delta(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
-    let text = evt.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = evt
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     if text.is_empty() {
         return;
     }
@@ -1339,9 +1394,19 @@ fn handle_thinking_delta(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>
 
 /// Gestisce l'evento `tool_result`: aggiorna l'ultimo step Running con l'esito.
 fn handle_tool_result(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
-    let tool_use_id = evt.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-    let content = evt.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let is_error = evt.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+    let tool_use_id = evt
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content = evt
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_error = evt
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Aggiorna l'ultimo step in Running (match by step_index non disponibile
     // qui — aggiorniamo l'ultimo).
     if let Some(last) = state
@@ -1366,7 +1431,10 @@ fn handle_tool_result(evt: &Value, ctx: &SseCtx<'_>, state: &mut SseState<'_>) {
             meta_step: None,
         });
     } else {
-        tracing::warn!("tool_result senza step Running (tool_use_id={})", tool_use_id);
+        tracing::warn!(
+            "tool_result senza step Running (tool_use_id={})",
+            tool_use_id
+        );
     }
 }
 
@@ -1473,7 +1541,10 @@ async fn dispatch_sse_event(
             // (END node raggiunto). Chiediamo l'uscita immediata dal loop esterno
             // senza attendere il timeout di silenzio SSE — elimina l'attesa di 120s
             // percepita come "Agente in esecuzione" dopo la risposta finale.
-            tracing::info!("brain SSE done ricevuto: chiusura stream {}", ctx.run_id_str);
+            tracing::info!(
+                "brain SSE done ricevuto: chiusura stream {}",
+                ctx.run_id_str
+            );
             return true;
         }
         _ => {
@@ -1787,7 +1858,9 @@ pub async fn run_via_brain(
             if let Some(summary) = declared_summary.clone() {
                 Some(summary)
             } else {
-                last_error.as_ref().map(|e| build_answer_from_error(e.as_str()))
+                last_error
+                    .as_ref()
+                    .map(|e| build_answer_from_error(e.as_str()))
             }
         } else {
             // Se ci sono stati tool_use, salva solo l'ultimo segmento di testo

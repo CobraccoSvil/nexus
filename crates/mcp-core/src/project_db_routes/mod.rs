@@ -44,18 +44,18 @@ pub use connection::{detect_project_db, test_project_db_connection};
 // una connection string / DSN postgres. Riusato dal cleanup di cancellazione
 // progetto (`projects::cleanup::drop_internal_app_databases`) per applicare i
 // guard di sicurezza sul nome del database prima del DROP.
-pub(crate) use shared::pg_physical_target;
 pub use migrations::{
     apply_project_migrations, list_project_migrations, request_ddl_override,
     rollback_project_migration,
 };
 pub use provision::{
-    init_global_pools, list_all_project_ids, project_data_pool, project_data_pool_by_correction_from,
-    project_data_pool_by_feedback_from, project_data_pool_by_message_from,
-    project_data_pool_by_run_from, project_data_pool_by_session, project_data_pool_by_session_from,
-    project_data_pool_from, provision_internal_core, provision_project_db,
-    register_entity_routing, DbRole,
+    init_global_pools, list_all_project_ids, project_data_pool,
+    project_data_pool_by_correction_from, project_data_pool_by_feedback_from,
+    project_data_pool_by_message_from, project_data_pool_by_run_from, project_data_pool_by_session,
+    project_data_pool_by_session_from, project_data_pool_from, provision_internal_core,
+    provision_project_db, register_entity_routing, DbRole,
 };
+pub(crate) use shared::pg_physical_target;
 // Esportati come fondazione; non ancora richiamati da call-site interni.
 #[allow(unused_imports)]
 pub use provision::project_meta_pool;

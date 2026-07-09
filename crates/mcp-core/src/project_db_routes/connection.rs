@@ -482,25 +482,25 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
                         {
                             Some("postgres")
                         } else if lc.contains("port=3306") || lc.contains("mysql://") {
-                                Some("mysql")
-                            } else if lc.contains("initial catalog=") {
-                                // Univocamente SQL Server
-                                Some("sqlserver")
-                            } else if lc.contains("server=")
-                                && (lc.contains(",1433") || lc.contains(",1434"))
-                            {
-                                // Sintassi SQL Server con porta inline
-                                Some("sqlserver")
-                            } else if lc.contains(";port=") || lc.starts_with("port=") {
-                                // `Port=` keyword separato (non SQL Server) ma porta non 5432/3306
-                                // -> probabile Postgres su porta non standard
-                                Some("postgres")
-                            } else if lc.contains("server=") && lc.contains("database=") {
-                                // Fallback legacy: nessun segnale Postgres/MySQL trovato
-                                Some("sqlserver")
-                            } else {
-                                None
-                            };
+                            Some("mysql")
+                        } else if lc.contains("initial catalog=") {
+                            // Univocamente SQL Server
+                            Some("sqlserver")
+                        } else if lc.contains("server=")
+                            && (lc.contains(",1433") || lc.contains(",1434"))
+                        {
+                            // Sintassi SQL Server con porta inline
+                            Some("sqlserver")
+                        } else if lc.contains(";port=") || lc.starts_with("port=") {
+                            // `Port=` keyword separato (non SQL Server) ma porta non 5432/3306
+                            // -> probabile Postgres su porta non standard
+                            Some("postgres")
+                        } else if lc.contains("server=") && lc.contains("database=") {
+                            // Fallback legacy: nessun segnale Postgres/MySQL trovato
+                            Some("sqlserver")
+                        } else {
+                            None
+                        };
 
                         match detected {
                             Some("postgres") => {

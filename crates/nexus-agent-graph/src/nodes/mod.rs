@@ -20,6 +20,7 @@ pub mod reflection;
 pub mod router;
 pub mod scale_control;
 pub mod stall_recovery;
+pub mod supervisor;
 pub mod todo_runner;
 pub mod tool_dispatch;
 pub mod understanding;
@@ -35,15 +36,19 @@ pub use final_gate::{
 };
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use planner::{
-    clarifying_branch, plan_reuse_decision, ClarifyingBranch, PlanReuse, PlannerConfig, PlannerNode,
-    ToolResultOutcome,
+    clarifying_branch, plan_reuse_decision, ClarifyingBranch, PlanReuse, PlannerConfig,
+    PlannerNode, ToolResultOutcome,
 };
 pub use reflection::{ReflectionConfig, ReflectionData, ReflectionNode};
 pub use router::RouterNode;
 pub use scale_control::{ScaleControlNode, SCALE_CONTEXT_KEY, SCALE_MOVE_CACHE_KEY_KEY};
 pub use stall_recovery::{stall_move_key, StallRecoveryNode, STALL_CONTEXT_KEY};
+pub use supervisor::{SupervisorNode, SUPERVISOR_ABANDON_KEY};
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
-pub use tool_dispatch::{tool_target_from_input, ToolDispatchConfig, ToolDispatchNode};
+pub use tool_dispatch::{
+    panel_enforcement_from_advisory_synthesis, tool_target_from_input, ToolDispatchConfig,
+    ToolDispatchNode, PANEL_ENFORCEMENT_KEY, PRE_RUN_ADVISORY_SYNTHESIS_KEY,
+};
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
 
 /// NARRAZIONE LIVE di una FASE semantica del run (punto unico, regola L):

@@ -168,7 +168,9 @@ fn err404(msg: &str) -> (StatusCode, String) {
 }
 
 async fn build_acl(state: &AppState, claims: &Claims) -> Result<WikiAcl, (StatusCode, String)> {
-    WikiAcl::from_claims(&state.wiki_deps(), claims).await.map_err(err500)
+    WikiAcl::from_claims(&state.wiki_deps(), claims)
+        .await
+        .map_err(err500)
 }
 
 /// Verifica che il chiamante sia admin; altrimenti 403 con `msg`.
@@ -332,16 +334,18 @@ pub async fn delete_doc(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    storage::delete_doc(&state.wiki_deps(), &acl, id).await.map_err(|e| {
-        let msg = format!("{e}");
-        if msg.contains("permesso negato") || msg.contains("frozen") {
-            err403(&msg)
-        } else if msg.contains("non trovato") {
-            err404(&msg)
-        } else {
-            err500(msg)
-        }
-    })?;
+    storage::delete_doc(&state.wiki_deps(), &acl, id)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e}");
+            if msg.contains("permesso negato") || msg.contains("frozen") {
+                err403(&msg)
+            } else if msg.contains("non trovato") {
+                err404(&msg)
+            } else {
+                err500(msg)
+            }
+        })?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -524,9 +528,13 @@ pub async fn recompute_links_handler(
     let project_filter = q.project_id;
 
     if wait {
-        let report = links_worker::recompute_links_for_scope(&state.wiki_deps(), scope_filter, project_filter)
-            .await
-            .map_err(err500)?;
+        let report = links_worker::recompute_links_for_scope(
+            &state.wiki_deps(),
+            scope_filter,
+            project_filter,
+        )
+        .await
+        .map_err(err500)?;
         return Ok((
             StatusCode::OK,
             Json(serde_json::to_value(report).unwrap_or_else(|_| json!({}))),
@@ -585,8 +593,12 @@ fn spawn_recompute_links_scope_bg(
             project_id = ?project_filter,
             "wiki.recompute-links: avvio task background"
         );
-        match links_worker::recompute_links_for_scope(&state.wiki_deps(), scope_filter, project_filter)
-            .await
+        match links_worker::recompute_links_for_scope(
+            &state.wiki_deps(),
+            scope_filter,
+            project_filter,
+        )
+        .await
         {
             Ok(rep) => tracing::info!(
                 run_id = %run_id,
@@ -700,7 +712,10 @@ async fn run_recompute_titles_batch(
                 .await?;
         overall_processed += rep.processed_count;
         overall_updated += rep.updated_count;
-        aggregated.insert("meta".to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+        aggregated.insert(
+            "meta".to_string(),
+            serde_json::to_value(rep).unwrap_or(Value::Null),
+        );
     }
     if do_project {
         let project_ids: Vec<Uuid> = if let Some(pid) = project_id {
@@ -720,7 +735,10 @@ async fn run_recompute_titles_batch(
             .await?;
             overall_processed += rep.processed_count;
             overall_updated += rep.updated_count;
-            projects_map.insert(pid.to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+            projects_map.insert(
+                pid.to_string(),
+                serde_json::to_value(rep).unwrap_or(Value::Null),
+            );
         }
         aggregated.insert("projects".to_string(), Value::Object(projects_map));
     }
@@ -792,7 +810,9 @@ pub async fn list_doc_links(
     let acl = build_acl(&state, &claims).await?;
 
     // Verifica che il doc sorgente sia visibile.
-    let source = storage::get_doc(&state.wiki_deps(), &acl, id).await.map_err(err500)?;
+    let source = storage::get_doc(&state.wiki_deps(), &acl, id)
+        .await
+        .map_err(err500)?;
     if source.is_none() {
         return Err(err404("documento non trovato o non accessibile"));
     }
@@ -896,7 +916,11 @@ fn map_link_row(row: sqlx::postgres::PgRow, edge_dir: &str) -> Value {
         "title": target_title,
         "kind": target_kind,
     });
-    let doc_key = if edge_dir == "outbound" { "to_doc" } else { "from_doc" };
+    let doc_key = if edge_dir == "outbound" {
+        "to_doc"
+    } else {
+        "from_doc"
+    };
     let mut obj = serde_json::Map::new();
     obj.insert("from_doc_id".to_string(), json!(from_id));
     obj.insert("to_doc_id".to_string(), json!(to_id));
@@ -1147,7 +1171,9 @@ async fn fetch_graph_edges(
     ];
     let mut edge_next_idx = 3usize;
     if predicates.is_some() {
-        edge_where.push(format!("wiki_links.rel_type = ANY(${edge_next_idx}::text[])"));
+        edge_where.push(format!(
+            "wiki_links.rel_type = ANY(${edge_next_idx}::text[])"
+        ));
         edge_next_idx += 1;
     }
     let edges_sql = format!(
@@ -1159,7 +1185,9 @@ async fn fetch_graph_edges(
         edge_next_idx
     );
 
-    let mut q_edges = sqlx::query(&edges_sql).bind(node_id_vec).bind(confidence_min);
+    let mut q_edges = sqlx::query(&edges_sql)
+        .bind(node_id_vec)
+        .bind(confidence_min);
     if let Some(preds) = predicates {
         q_edges = q_edges.bind(preds.clone());
     }
@@ -1279,7 +1307,10 @@ async fn run_extract_triples_batch(
         .await
         .map_err(err500)?;
         overall_processed += rep.processed_count;
-        aggregated.insert("meta".to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+        aggregated.insert(
+            "meta".to_string(),
+            serde_json::to_value(rep).unwrap_or(Value::Null),
+        );
     }
     if scope_label == "project" || scope_label == "all" {
         // Se project_id specifico, batch solo su quello; altrimenti tutti.
@@ -1293,7 +1324,10 @@ async fn run_extract_triples_batch(
             .await
             .map_err(err500)?;
             overall_processed += rep.processed_count;
-            projects_map.insert(pid.to_string(), serde_json::to_value(rep).unwrap_or(Value::Null));
+            projects_map.insert(
+                pid.to_string(),
+                serde_json::to_value(rep).unwrap_or(Value::Null),
+            );
         }
         aggregated.insert("projects".to_string(), Value::Object(projects_map));
     }
@@ -1366,7 +1400,8 @@ fn spawn_extract_triples_batch_bg(
 // SQL di `list_doc_triples`. Outbound: subj=this, arricchimento del target SOLO
 // se obj_doc_id non nullo (i concetti liberi/external non hanno doc visibile) ->
 // LEFT JOIN. Inbound: obj=this, il subject e' sempre una doc -> JOIN.
-const SQL_DOC_TRIPLES_OUTBOUND: &str = "SELECT t.id, t.predicate, t.obj_doc_id, t.obj_text, t.obj_external, \
+const SQL_DOC_TRIPLES_OUTBOUND: &str =
+    "SELECT t.id, t.predicate, t.obj_doc_id, t.obj_text, t.obj_external, \
             t.source, t.confidence, t.evidence, t.created_at, \
             d.scope AS target_scope, d.slug AS target_slug, \
             d.title AS target_title, d.kind AS target_kind, \
@@ -1376,7 +1411,8 @@ const SQL_DOC_TRIPLES_OUTBOUND: &str = "SELECT t.id, t.predicate, t.obj_doc_id, 
      WHERE t.subj_doc_id = $1 \
      ORDER BY t.confidence DESC, t.predicate ASC";
 
-const SQL_DOC_TRIPLES_INBOUND: &str = "SELECT t.id, t.predicate, t.subj_doc_id, t.source, t.confidence, t.evidence, t.created_at, \
+const SQL_DOC_TRIPLES_INBOUND: &str =
+    "SELECT t.id, t.predicate, t.subj_doc_id, t.source, t.confidence, t.evidence, t.created_at, \
             d.scope AS subj_scope, d.slug AS subj_slug, d.title AS subj_title, \
             d.kind AS subj_kind, d.project_id AS subj_project_id \
      FROM wiki_concept_triples t \
@@ -1393,7 +1429,9 @@ pub async fn list_doc_triples(
     let acl = build_acl(&state, &claims).await?;
 
     // Verifica visibilita' del doc sorgente.
-    let source = storage::get_doc(&state.wiki_deps(), &acl, id).await.map_err(err500)?;
+    let source = storage::get_doc(&state.wiki_deps(), &acl, id)
+        .await
+        .map_err(err500)?;
     if source.is_none() {
         return Err(err404("documento non trovato o non accessibile"));
     }
@@ -1408,10 +1446,16 @@ pub async fn list_doc_triples(
         .bind(id)
         .fetch_all(&state.db)
         .await
-    .map_err(err500)?;
+        .map_err(err500)?;
 
-    let outbound: Vec<Value> = outbound_rows.into_iter().map(map_triple_outbound_row).collect();
-    let inbound: Vec<Value> = inbound_rows.into_iter().map(map_triple_inbound_row).collect();
+    let outbound: Vec<Value> = outbound_rows
+        .into_iter()
+        .map(map_triple_outbound_row)
+        .collect();
+    let inbound: Vec<Value> = inbound_rows
+        .into_iter()
+        .map(map_triple_inbound_row)
+        .collect();
 
     Ok(Json(json!({
         "doc_id": id,
@@ -1726,10 +1770,7 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             get(get_doc).patch(patch_doc).delete(delete_doc),
         )
         .route("/api/wiki/docs/:id/revisions", get(list_revisions))
-        .route(
-            "/api/wiki/docs/:id/revisions/:version",
-            get(get_revision),
-        )
+        .route("/api/wiki/docs/:id/revisions/:version", get(get_revision))
         .route("/api/wiki/docs/:id/diff", get(diff))
         .route("/api/wiki/docs/:id/restore", post(restore))
         .route("/api/wiki/reingest", post(reingest_handler))

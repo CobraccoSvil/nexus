@@ -119,10 +119,7 @@ impl RepetitionHit {
 /// sono escluse: non sono un collasso semantico. Nota: testo STRUTTURATO con
 /// righe DIVERSE (es. tabella markdown con dati distinti) non e' periodico ->
 /// non rilevato; solo righe IDENTICHE ripetute (degeneri) lo sono.
-pub fn detect_repetition_collapse(
-    text: &str,
-    th: RepetitionThresholds,
-) -> Option<RepetitionHit> {
+pub fn detect_repetition_collapse(text: &str, th: RepetitionThresholds) -> Option<RepetitionHit> {
     if th.scan_tail_cap == 0 || th.min_repeats == 0 {
         return None;
     }

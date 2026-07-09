@@ -108,11 +108,7 @@ async fn fetch_tool_choice_style(
 ///
 /// Il valore (anche `None`) e' cache-ato: un provider non-tool-capable non
 /// ripaga la query a ogni iterazione del loop executor.
-pub async fn resolve_tool_choice_style(
-    db: &PgPool,
-    provider: &str,
-    model: &str,
-) -> Option<String> {
+pub async fn resolve_tool_choice_style(db: &PgPool, provider: &str, model: &str) -> Option<String> {
     let key = cache_key(provider, model);
     if let Some(cached) = style_cache().get(&key) {
         return cached;
@@ -155,7 +151,10 @@ mod tests {
 
     #[test]
     fn default_style_anthropic() {
-        assert_eq!(default_style_for_provider("anthropic"), Some("anthropic_any"));
+        assert_eq!(
+            default_style_for_provider("anthropic"),
+            Some("anthropic_any")
+        );
         assert_eq!(
             default_style_for_provider("Anthropic"),
             Some("anthropic_any"),

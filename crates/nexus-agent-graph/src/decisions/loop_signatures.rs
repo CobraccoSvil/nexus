@@ -16,8 +16,8 @@
 //! golden-validabili in isolamento (regola L: punto unico della rilevazione
 //! loop-by-signature, i call site Rust delegheranno qui).
 
-use sha1::{Digest, Sha1};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 
 use crate::py_json::{py_json_dumps, SortKeys};
 
@@ -204,7 +204,9 @@ pub fn detect_signature_loop_progress_aware_with(
     combined.extend_from_slice(new_signatures);
 
     let sig_name = |sig: &str| -> String {
-        sig.split_once('|').map(|(n, _)| n.to_string()).unwrap_or_else(|| sig.to_string())
+        sig.split_once('|')
+            .map(|(n, _)| n.to_string())
+            .unwrap_or_else(|| sig.to_string())
     };
 
     let mut loop_signature: Option<String> = None;
@@ -363,7 +365,10 @@ mod tests {
         let recent = vec![read.clone(), edit, build, read.clone()];
         let out =
             detect_signature_loop_progress_aware(&recent, std::slice::from_ref(&read), read_only);
-        assert_eq!(out.loop_signature, None, "rilettura post-progresso non e' stallo");
+        assert_eq!(
+            out.loop_signature, None,
+            "rilettura post-progresso non e' stallo"
+        );
         // La coda aggiornata resta completa (il filtro e' solo sul conteggio).
         assert_eq!(out.updated_signatures.len(), 5);
     }
@@ -391,7 +396,10 @@ mod tests {
         let recent = vec![build.clone(), poll.clone(), edit, build, poll.clone()];
         let out =
             detect_signature_loop_progress_aware(&recent, std::slice::from_ref(&poll), read_only);
-        assert_eq!(out.loop_signature, None, "polling tra build/edit e' monitoraggio, non stallo");
+        assert_eq!(
+            out.loop_signature, None,
+            "polling tra build/edit e' monitoraggio, non stallo"
+        );
     }
 
     #[test]
@@ -431,7 +439,10 @@ mod tests {
         // Proprieta' Rust (NON parita' Python: il riferimento Python usa la
         // costante fissa 3/12). Con soglia signature=2 il loop scatta a 2
         // occorrenze; con cap=4 la coda e' limitata a 4.
-        let th = LoopThresholds { signature: 2, cap: 4 };
+        let th = LoopThresholds {
+            signature: 2,
+            cap: 4,
+        };
         let sig = build_signature("read_file", &json!({"path": "x"}));
         // Due occorrenze: con default (3) NON e' loop; con signature=2 lo e'.
         let recent = vec![sig.clone()];
@@ -519,7 +530,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 20, "attesi >= 20 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 20,
+            "attesi >= 20 casi, trovati {}",
+            cases.len()
+        );
 
         let mut checked = 0usize;
         for c in &cases {
@@ -530,8 +545,7 @@ mod golden {
                     Value::String(build_signature(&i.name, &i.tool_input))
                 }
                 "detect_signature_loop" => {
-                    let i: LoopInput =
-                        serde_json::from_value(c.input.clone()).expect("LoopInput");
+                    let i: LoopInput = serde_json::from_value(c.input.clone()).expect("LoopInput");
                     let out = detect_signature_loop(&i.recent, &i.new_signatures);
                     json!({
                         "loop_signature": out.loop_signature,

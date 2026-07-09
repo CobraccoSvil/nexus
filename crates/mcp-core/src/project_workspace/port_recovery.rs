@@ -73,7 +73,12 @@ async fn read_cmdline(pid: u32) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string())
+    Some(
+        String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .trim()
+            .to_string(),
+    )
 }
 
 /// Scansiona /proc e ritorna i `(pid, comm)` dei processi il cui process group
@@ -580,7 +585,10 @@ mod is_nexus_process_tests {
     #[test]
     fn comm_match_diretto() {
         assert!(is_nexus_process(Some("mcp-core"), None));
-        assert!(is_nexus_process(Some("nexus-gateway"), Some("/usr/bin/nexus-gateway")));
+        assert!(is_nexus_process(
+            Some("nexus-gateway"),
+            Some("/usr/bin/nexus-gateway")
+        ));
     }
 
     /// Regressione: il brain gira come `python3 -m brain.grpc_server.main`, quindi

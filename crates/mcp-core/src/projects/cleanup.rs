@@ -187,10 +187,9 @@ async fn cleanup_docker_containers(slug: &str) -> DockerResult {
                 }
                 let name = parts[0];
                 let id = parts[1].to_string();
-                if (name == slug || name.starts_with(&prefix))
-                    && !container_ids.contains(&id) {
-                        container_ids.push(id);
-                    }
+                if (name == slug || name.starts_with(&prefix)) && !container_ids.contains(&id) {
+                    container_ids.push(id);
+                }
             }
         }
         Err(e) => out.errors.push(format!("docker ps (name): {}", e)),
@@ -363,12 +362,11 @@ async fn cleanup_windows_services(db: &PgPool, project_id: Uuid) -> SystemdResul
     // De-registrazione definitiva delle righe kind='service' del progetto sul
     // pool del progetto (agent_processes e' tabella migrata).
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    if let Err(e) = sqlx::query(
-        "DELETE FROM agent_processes WHERE project_id = $1 AND kind = 'service'",
-    )
-    .bind(project_id)
-    .execute(&proj_pool)
-    .await
+    if let Err(e) =
+        sqlx::query("DELETE FROM agent_processes WHERE project_id = $1 AND kind = 'service'")
+            .bind(project_id)
+            .execute(&proj_pool)
+            .await
     {
         out.errors
             .push(format!("de-registrazione servizi Windows: {e}"));
@@ -626,7 +624,8 @@ pub async fn drop_internal_app_databases(db: &PgPool, project_id: Uuid) -> DbDro
                 project_id = %project_id,
                 "drop_internal_app_databases: query config fallita: {e}"
             );
-            out.errors.push(format!("query project_database_config: {e}"));
+            out.errors
+                .push(format!("query project_database_config: {e}"));
             return out;
         }
     };
@@ -643,8 +642,9 @@ pub async fn drop_internal_app_databases(db: &PgPool, project_id: Uuid) -> DbDro
                 conn = %name,
                 "drop_internal_app_databases: connection_secret vuoto/non utf8, skip"
             );
-            out.errors
-                .push(format!("connessione '{name}': secret vuoto o non leggibile"));
+            out.errors.push(format!(
+                "connessione '{name}': secret vuoto o non leggibile"
+            ));
             continue;
         };
 
@@ -736,8 +736,7 @@ pub async fn drop_internal_app_databases(db: &PgPool, project_id: Uuid) -> DbDro
                     dbname = %dbname,
                     "drop_internal_app_databases: DROP DATABASE fallito: {e}"
                 );
-                out.errors
-                    .push(format!("DROP DATABASE \"{dbname}\": {e}"));
+                out.errors.push(format!("DROP DATABASE \"{dbname}\": {e}"));
             }
         }
         pool.close().await;

@@ -86,7 +86,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::dag_scheduler::{self, Todo, TodoStatus};
-use crate::runtime::ports::{ExecMode, ToolCall, TodoStore, ToolExecutor};
+use crate::runtime::ports::{ExecMode, TodoStore, ToolCall, ToolExecutor};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, StateDelta, StopReason};
 
@@ -218,10 +218,7 @@ fn head_chars(s: &str, n: usize) -> String {
 /// (default `completed`, trimmed+lower) non in `{completed, completed_verified}`.
 pub fn result_failed(result: &Value) -> bool {
     // `result.get("error") is not None`: chiave presente con valore non-null.
-    let error_present = result
-        .get("error")
-        .map(|e| !e.is_null())
-        .unwrap_or(false);
+    let error_present = result.get("error").map(|e| !e.is_null()).unwrap_or(false);
     if error_present {
         return true;
     }
@@ -275,11 +272,7 @@ impl TodoRunnerNode {
     ///
     /// `prior_results` sono i `subagent_results` (Vec di oggetti JSON). `todo` e'
     /// il todo corrente con i campi opachi (`content`, `acceptance_criteria`, ...).
-    pub fn build_context_blob(
-        state: &AgentState,
-        todo: &Value,
-        prior_results: &[Value],
-    ) -> String {
+    pub fn build_context_blob(state: &AgentState, todo: &Value, prior_results: &[Value]) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         // (a) worklog: TODO (vedi doc di modulo). Niente blocco: equivalente al
@@ -312,16 +305,20 @@ impl TodoRunnerNode {
         }
 
         // (c) <piano>: rationale + constraints.
-        let rationale = state.plan_rationale.as_deref().unwrap_or("").trim().to_string();
-        let constraints: Vec<String> = state
-            .plan_constraints
+        let rationale = state
+            .plan_rationale
             .as_deref()
-            .unwrap_or(&[])
-            .to_vec();
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let constraints: Vec<String> = state.plan_constraints.as_deref().unwrap_or(&[]).to_vec();
         if !rationale.is_empty() || !constraints.is_empty() {
             let mut block: Vec<String> = vec!["<piano>".to_string()];
             if !rationale.is_empty() {
-                block.push(format!("  <rationale>{}</rationale>", head_chars(&rationale, 1200)));
+                block.push(format!(
+                    "  <rationale>{}</rationale>",
+                    head_chars(&rationale, 1200)
+                ));
             }
             if !constraints.is_empty() {
                 let items = constraints
@@ -575,7 +572,10 @@ impl TodoRunnerNode {
             let tv = todo_value_of(todos, &t.id);
             let seq = tv.get("seq").cloned();
             let content = str_or_empty(tv.get("content"));
-            let summary = compact(&str_or_empty(result.get("summary")), self.cfg.summary_max_chars);
+            let summary = compact(
+                &str_or_empty(result.get("summary")),
+                self.cfg.summary_max_chars,
+            );
             let cost = cost_of(result, "cost_usd");
             total_cost += cost;
             let mut record = build_record(seq.as_ref(), &t.id, &content, &summary, cost);
@@ -648,7 +648,12 @@ impl TodoRunnerNode {
     /// [`dag_scheduler::descendants`] (regola L: niente DFS re-implementata qui).
     /// `mode` propaga il gate shadow alla [`TodoStore::mark_status`] (no-op in
     /// Replay).
-    async fn cascade_skip(&self, todo_id: &str, todos: &[Todo], mode: ExecMode) -> Result<(), NodeError> {
+    async fn cascade_skip(
+        &self,
+        todo_id: &str,
+        todos: &[Todo],
+        mode: ExecMode,
+    ) -> Result<(), NodeError> {
         for desc in dag_scheduler::descendants(todos, todo_id) {
             self.store
                 .mark_status(desc, TodoStatus::Skipped, mode)
@@ -668,7 +673,13 @@ fn cost_of(result: &Value, key: &str) -> f64 {
 }
 
 /// `record["content"] = content[:200]` e i campi del record di esito.
-fn build_record(seq: Option<&Value>, todo_id: &str, content: &str, summary: &str, cost: f64) -> serde_json::Map<String, Value> {
+fn build_record(
+    seq: Option<&Value>,
+    todo_id: &str,
+    content: &str,
+    summary: &str,
+    cost: f64,
+) -> serde_json::Map<String, Value> {
     let mut record = serde_json::Map::new();
     record.insert("seq".to_string(), seq.cloned().unwrap_or(Value::Null));
     record.insert("todo_id".to_string(), json!(todo_id));
@@ -732,22 +743,25 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
             };
             if ready.len() >= 2 && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg) {
                 let mode = ctx.exec_mode();
-                return self.dispatch_wave(state, &run_id, &todos, ready, mode).await;
+                return self
+                    .dispatch_wave(state, &run_id, &todos, ready, mode)
+                    .await;
             }
         }
 
         // (3b) pick_next None -> end_turn (PUNTO UNICO pick_next_todo, regola L).
-        let next_todo = match dag_scheduler::pick_next_todo(&todos, self.cfg.dag_topological_enabled) {
-            Some(t) => t.clone(),
-            None => {
-                tracing::info!(
-                    target: "nexus_agent_graph::todo_runner",
-                    total = todos.len(),
-                    "tutti i todo terminali -> end_turn"
-                );
-                return Ok(end_turn_no_active());
-            }
-        };
+        let next_todo =
+            match dag_scheduler::pick_next_todo(&todos, self.cfg.dag_topological_enabled) {
+                Some(t) => t.clone(),
+                None => {
+                    tracing::info!(
+                        target: "nexus_agent_graph::todo_runner",
+                        total = todos.len(),
+                        "tutti i todo terminali -> end_turn"
+                    );
+                    return Ok(end_turn_no_active());
+                }
+            };
         // `next_todo` come Value opaco per i campi non-DAG (content, criteria, seq).
         let next_value = todo_value_of(&todos, &next_todo.id);
         let todo_id = next_todo.id.clone();
@@ -792,7 +806,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
 
         // ── (7-8) Esito del sub-run (py:278-365) ──────────────────────────────
         let mut accumulated = state.subagent_results.clone().unwrap_or_default();
-        let summary = compact(&str_or_empty(result.get("summary")), self.cfg.summary_max_chars);
+        let summary = compact(
+            &str_or_empty(result.get("summary")),
+            self.cfg.summary_max_chars,
+        );
         let cost = cost_of(&result, "cost_usd");
         let mut record = build_record(seq.as_ref(), &todo_id, &content, &summary, cost);
 
@@ -847,7 +864,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                      Affronta la causa del fallimento prima di riprovare.\n\
                      </tentativo_precedente_fallito>"
                 );
-                let retry_result = self.dispatch_one(state, &next_value, mode, &err_ctx).await?;
+                let retry_result = self
+                    .dispatch_one(state, &next_value, mode, &err_ctx)
+                    .await?;
                 if let Some(rr) = retry_result.as_ref() {
                     if !result_failed(rr) {
                         self.store
@@ -983,7 +1002,13 @@ fn python_repr_opt(v: Option<&Value>) -> String {
         None | Some(Value::Null) => "None".to_string(),
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(b)) => if *b { "True".to_string() } else { "False".to_string() },
+        Some(Value::Bool(b)) => {
+            if *b {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
         Some(other) => other.to_string(),
     }
 }
@@ -1105,11 +1130,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for QueueToolExecutor {
-        async fn execute(
-            &self,
-            call: ToolCall,
-            mode: ExecMode,
-        ) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
             self.seen.lock().unwrap().push((call, mode));
             let mut q = self.responses.lock().unwrap();
             if q.len() > 1 {
@@ -1300,7 +1321,9 @@ mod tests {
             todo("a", TodoStatus::Pending, &[], 1),
             todo("b", TodoStatus::Pending, &[], 2),
         ]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("fatto a", 0.5)]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
+            "fatto a", 0.5,
+        )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
         let ctx = ctx_with(false, routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
@@ -1349,7 +1372,11 @@ mod tests {
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         {
             let seen = tools.seen.lock().unwrap();
-            assert_eq!(seen.len(), 1, "una sola chiamata dispatch per l'intera ondata");
+            assert_eq!(
+                seen.len(),
+                1,
+                "una sola chiamata dispatch per l'intera ondata"
+            );
             assert_eq!(
                 seen[0].0.input["tasks"].as_array().unwrap().len(),
                 2,
@@ -1410,7 +1437,9 @@ mod tests {
             &[],
             1,
         )]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("fatto", 0.2)]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
+            "fatto", 0.2,
+        )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
         let ctx = ctx_with(false, routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
@@ -1429,7 +1458,9 @@ mod tests {
             todo("b", TodoStatus::Pending, &["a"], 2),
             todo("c", TodoStatus::Pending, &["b"], 3),
         ]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![failed_payload("rotto")]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![failed_payload(
+            "rotto",
+        )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
         let ctx = ctx_with(false, routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
@@ -1463,7 +1494,9 @@ mod tests {
             todo("b", TodoStatus::Pending, &["a"], 2), // discendente -> skipped
             todo("d", TodoStatus::Pending, &[], 3),    // indipendente -> prossimo
         ]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![failed_payload("rotto")]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![failed_payload(
+            "rotto",
+        )]));
         let cfg = TodoRunnerConfig {
             on_failure: OnFailure::Continue,
             ..TodoRunnerConfig::default()
@@ -1478,7 +1511,9 @@ mod tests {
         let marks = store.marks.lock().unwrap();
         assert_eq!(marks[0], ("a".to_string(), TodoStatus::InProgress));
         assert_eq!(marks[1], ("a".to_string(), TodoStatus::Blocked));
-        assert!(marks.iter().any(|m| *m == ("b".to_string(), TodoStatus::Skipped)));
+        assert!(marks
+            .iter()
+            .any(|m| *m == ("b".to_string(), TodoStatus::Skipped)));
     }
 
     // ── failed + retry riuscito -> completed_after_retry + advance ───────────────
@@ -1547,8 +1582,12 @@ mod tests {
         assert_eq!(out.active_todo_id.as_deref(), Some("a"));
         assert_eq!(tools.seen.lock().unwrap().len(), 2);
         let marks = store.marks.lock().unwrap();
-        assert!(marks.iter().any(|m| *m == ("a".to_string(), TodoStatus::Blocked)));
-        assert!(marks.iter().any(|m| *m == ("b".to_string(), TodoStatus::Skipped)));
+        assert!(marks
+            .iter()
+            .any(|m| *m == ("a".to_string(), TodoStatus::Blocked)));
+        assert!(marks
+            .iter()
+            .any(|m| *m == ("b".to_string(), TodoStatus::Skipped)));
     }
 
     // ── retry budget esaurito (retries_done >= max) -> direttamente stop ─────────
@@ -1561,7 +1600,9 @@ mod tests {
             &[],
             1,
         )]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![failed_payload("rotto")]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![failed_payload(
+            "rotto",
+        )]));
         let cfg = TodoRunnerConfig {
             on_failure: OnFailure::Retry,
             max_retries: 1,
@@ -1618,7 +1659,10 @@ mod tests {
         let ctx = ctx_with(false, routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         // Il run NON deve fallire: si aspetta Ok (pass-through), non Err.
-        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run NON deve fallire"));
+        let out = apply(
+            st.clone(),
+            n.run(&st, &ctx).await.expect("run NON deve fallire"),
+        );
         // Delta pass-through {}: nessun stop_reason (fallback executor).
         assert_eq!(out.stop_reason, None);
         // marks: t1 in_progress poi ripristinato a pending (come is_error).
@@ -1638,7 +1682,9 @@ mod tests {
             &[],
             1,
         )]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("ok", 0.0)]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
+            "ok", 0.0,
+        )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
         let ctx = ctx_with(true, routing_cfg_on()); // shadow
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
@@ -1673,12 +1719,16 @@ mod tests {
         // status assente -> default completed -> non fallito.
         assert!(!result_failed(&json!({})));
         // error non-null -> fallito (anche se status completed).
-        assert!(result_failed(&json!({"status": "completed", "error": "boom"})));
+        assert!(result_failed(
+            &json!({"status": "completed", "error": "boom"})
+        ));
         // status timeout/failed -> fallito.
         assert!(result_failed(&json!({"status": "timeout"})));
         assert!(result_failed(&json!({"status": "FAILED"})));
         // error null -> non conta come errore.
-        assert!(!result_failed(&json!({"status": "completed", "error": null})));
+        assert!(!result_failed(
+            &json!({"status": "completed", "error": null})
+        ));
     }
 
     #[test]
@@ -1744,7 +1794,10 @@ mod golden {
         if let Some(arr) = input.get("subagent_results").and_then(Value::as_array) {
             st.subagent_results = Some(arr.clone());
         }
-        if let Some(c) = input.get("subagent_cost_cumulative_usd").and_then(Value::as_f64) {
+        if let Some(c) = input
+            .get("subagent_cost_cumulative_usd")
+            .and_then(Value::as_f64)
+        {
             st.subagent_cost_cumulative_usd = Some(c);
         }
         if let Some(r) = input.get("todo_isolation_retries").and_then(Value::as_i64) {
@@ -1766,7 +1819,10 @@ mod golden {
             .get("on_failure")
             .and_then(Value::as_str)
             .unwrap_or("stop");
-        let max_retries = input.get("max_retries").and_then(Value::as_i64).unwrap_or(1);
+        let max_retries = input
+            .get("max_retries")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
         let dag = input
             .get("dag_topological_enabled")
             .and_then(Value::as_bool)
@@ -1804,7 +1860,10 @@ mod golden {
                 Some(t) => {
                     delta.insert("active_todo_id".to_string(), json!(t.id));
                     delta.insert("stop_reason".to_string(), json!("tool_use"));
-                    delta.insert("current_todos".to_string(), json!(todos_to_values(&todos_after)));
+                    delta.insert(
+                        "current_todos".to_string(),
+                        json!(todos_to_values(&todos_after)),
+                    );
                 }
             }
             Value::Object(delta)
@@ -1858,17 +1917,27 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 25, "attesi >=25 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 25,
+            "attesi >=25 casi, trovati {}",
+            cases.len()
+        );
 
         let mut checked = 0usize;
         for c in &cases {
             let got: Value = match c.function.as_str() {
                 "compact" => {
                     let text = c.input.get("text").and_then(Value::as_str).unwrap_or("");
-                    let max = c.input.get("max_chars").and_then(Value::as_u64).unwrap_or(600) as usize;
+                    let max = c
+                        .input
+                        .get("max_chars")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(600) as usize;
                     json!(compact(text, max))
                 }
-                "result_failed" => json!(result_failed(c.input.get("result").unwrap_or(&json!({})))),
+                "result_failed" => {
+                    json!(result_failed(c.input.get("result").unwrap_or(&json!({}))))
+                }
                 "todo_kind" => {
                     let kind = c.input.get("kind").and_then(Value::as_str).unwrap_or("");
                     let cfg = TodoRunnerConfig {

@@ -65,9 +65,7 @@ pub fn render_prometheus() -> String {
         return String::new();
     }
     let mut out = String::with_capacity(4096);
-    out.push_str(
-        "# HELP nexus_http_request_duration_ms HTTP request duration by route template\n",
-    );
+    out.push_str("# HELP nexus_http_request_duration_ms HTTP request duration by route template\n");
     out.push_str("# TYPE nexus_http_request_duration_ms histogram\n");
 
     // Ordine stabile per output deterministico (test + diff scrape leggibili).

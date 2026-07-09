@@ -219,13 +219,12 @@ pub fn pick_failover_model(
 ) -> Option<CrossProviderCandidate> {
     let cur_rank = tier_rank(current_tier);
     // Penalty fuori range (0, 1] -> indicazione disattivata (1.0), mai un boost.
-    let penalty = if policy.failover_downgrade_penalty > 0.0
-        && policy.failover_downgrade_penalty <= 1.0
-    {
-        policy.failover_downgrade_penalty
-    } else {
-        1.0
-    };
+    let penalty =
+        if policy.failover_downgrade_penalty > 0.0 && policy.failover_downgrade_penalty <= 1.0 {
+            policy.failover_downgrade_penalty
+        } else {
+            1.0
+        };
 
     let mut ranked: Vec<(&EscalationCandidate, u8, f64, u8)> = candidates
         .iter()
@@ -379,7 +378,7 @@ mod tests {
         // Un candidato senza tier (None) non e' penalizzato ne' premiato: rank medium.
         let p = GovernancePolicy::default();
         let cands = vec![
-            cand("google", "gemini", None),        // -> medium
+            cand("google", "gemini", None),         // -> medium
             cand("deepseek", "pro", Some("heavy")), // heavy vince
         ];
         let r = pick_escalation_model(&cands, Some("x"), Some("y"), &p).expect("pick");

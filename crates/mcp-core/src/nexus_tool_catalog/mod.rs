@@ -441,9 +441,7 @@ impl NexusToolCatalog {
         tokio::task::spawn_blocking(move || handle.block_on(handler.execute(&ctx, &args)))
             .await
             .map_err(|e| {
-                NexusToolError::Io(std::io::Error::other(
-                    format!("tool join error: {e}"),
-                ))
+                NexusToolError::Io(std::io::Error::other(format!("tool join error: {e}")))
             })?
     }
 

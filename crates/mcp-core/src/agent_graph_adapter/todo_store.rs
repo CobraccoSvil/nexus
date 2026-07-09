@@ -201,12 +201,18 @@ impl TodoStore for PgTodoStore {
     /// inline ASCII, niente emoji). SOLA LETTURA: nessun gate `mode`. Le soglie sono
     /// DB-driven (regola G), niente hardcode nella logica di business.
     async fn build_reminder_text(&self, run_id: &str) -> Result<Option<String>, PortError> {
-        let plan_enabled = crate::settings::get_setting(&self.meta, "orchestrator.plan_phase_enabled")
-            .await
-            .ok()
-            .flatten()
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+        let plan_enabled =
+            crate::settings::get_setting(&self.meta, "orchestrator.plan_phase_enabled")
+                .await
+                .ok()
+                .flatten()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false);
         if !plan_enabled {
             return Ok(None);
         }
@@ -214,12 +220,13 @@ impl TodoStore for PgTodoStore {
         if todos.is_empty() {
             return Ok(None);
         }
-        let min_todos: i64 = crate::settings::get_setting(&self.meta, "orchestrator.todo_reminder_min_todos")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(3);
+        let min_todos: i64 =
+            crate::settings::get_setting(&self.meta, "orchestrator.todo_reminder_min_todos")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(3);
         let pending = todos
             .iter()
             .filter(|t| matches!(t.status, TodoStatus::Pending | TodoStatus::InProgress))
@@ -266,7 +273,10 @@ impl TodoStore for PgTodoStore {
             } else {
                 " "
             };
-            let seq = t.seq.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string());
+            let seq = t
+                .seq
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string());
             lines.push(format!("{prefix} {seq}. {box_glyph} {}", content_of(&t.id)));
         }
         let todos_rendered = lines.join("\n");
@@ -520,17 +530,22 @@ mod tests {
         }
         // settings vuoto -> plan_phase_enabled default false.
         let store = PgTodoStore::new(pool.clone(), pool.clone());
-        let r = store.build_reminder_text(&run_id.to_string()).await.expect("ok");
+        let r = store
+            .build_reminder_text(&run_id.to_string())
+            .await
+            .expect("ok");
         assert!(r.is_none(), "feature OFF -> nessun reminder");
     }
 
     #[sqlx::test]
     async fn build_reminder_render_quando_attivo_e_sopra_soglia(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('orchestrator.plan_phase_enabled', 'true')")
-            .execute(&pool)
-            .await
-            .expect("set flag");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('orchestrator.plan_phase_enabled', 'true')",
+        )
+        .execute(&pool)
+        .await
+        .expect("set flag");
         sqlx::query("INSERT INTO settings (key, value) VALUES ('orchestrator.todo_reminder_min_todos', '3')")
             .execute(&pool)
             .await

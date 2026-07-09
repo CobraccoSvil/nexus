@@ -536,7 +536,13 @@ impl ServiceBackend for SystemdUserBackend {
         // (regola M). Interroga il bus con un comando innocuo (`is-system-running`
         // non richiede argomenti unit) e classifica sullo status/stderr strutturato.
         let out = tokio::process::Command::new("systemctl")
-            .args(["--user", "list-units", "--type=service", "--no-legend", "--no-pager"])
+            .args([
+                "--user",
+                "list-units",
+                "--type=service",
+                "--no-legend",
+                "--no-pager",
+            ])
             .output()
             .await;
         match out {
@@ -700,10 +706,7 @@ mod tests {
         // Serializzazione: acted deve comparire come booleano strutturato.
         let json = serde_json::to_value(&acted).expect("serializzazione outcome");
         assert_eq!(json.get("acted").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            json.get("message").and_then(|v| v.as_str()),
-            Some("fatto")
-        );
+        assert_eq!(json.get("message").and_then(|v| v.as_str()), Some("fatto"));
     }
 
     #[test]

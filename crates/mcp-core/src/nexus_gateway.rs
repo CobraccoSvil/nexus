@@ -67,6 +67,13 @@ pub struct GwMetadata {
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
+pub struct GwThinkingConfig {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct GwRequest {
     pub model: String,
     pub messages: Vec<GwMessage>,
@@ -80,6 +87,15 @@ pub struct GwRequest {
     /// converte PRIMA di valorizzare questo campo (vedi adapter LlmGateway).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Value>,
+    /// Vincolo sul formato della risposta nel contratto gateway completo
+    /// (`response_format` OpenAI-style). Il gateway lo inoltra solo ai provider
+    /// che lo supportano o lo traducono nel proprio dialetto.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
+    /// Configurazione thinking esplicita del chiamante. `None` conserva il
+    /// comportamento storico DB-driven/provider-specifico del gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<GwThinkingConfig>,
     /// Vincolo di scelta tool in stile OpenAI (`"auto"` | `"required"` | `"none"`
     /// | `{"type":"function","function":{"name":"X"}}`). DEVE arrivare al gateway
     /// per non neutralizzare il force-action anti-loop (memoria progetto "Gateway

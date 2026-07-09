@@ -52,12 +52,12 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{
-    ExecMode, PortError, ToolCall, ToolExecutor, ToolOutcome,
-};
+use nexus_agent_graph::runtime::ports::{ExecMode, PortError, ToolCall, ToolExecutor, ToolOutcome};
 
 use crate::agent_tools::execute_agent_tool;
-use crate::tool_runner_server::{extract_exit_code, tool_result_is_error, ToolRunnerDeps, ToolRunnerService};
+use crate::tool_runner_server::{
+    extract_exit_code, tool_result_is_error, ToolRunnerDeps, ToolRunnerService,
+};
 
 /// Adapter [`ToolExecutor`] -> dispatch tool IN-PROCESS (Real) + replay
 /// `tool_result` da `agent_steps` (Replay).
@@ -321,10 +321,7 @@ mod tests {
 
     #[test]
     fn esito_errore_applicativo_marker() {
-        let out = map_result_to_outcome(
-            "c",
-            "\u{274C} Tool 'pippo' non esiste".to_string(),
-        );
+        let out = map_result_to_outcome("c", "\u{274C} Tool 'pippo' non esiste".to_string());
         assert!(out.is_error, "marker U+274C -> is_error");
         // tool non-comando: nessun exit_code.
         assert_eq!(out.exit_code, None);
@@ -427,15 +424,21 @@ mod tests {
         // Cursore per-nome: read_file#0 -> step 1000, read_file#1 -> step 2000;
         // list_files#0 -> step 1500 (cursori indipendenti per nome).
         assert_eq!(
-            replay_tool_result(&pool, run, "read_file", 0).await.unwrap(),
+            replay_tool_result(&pool, run, "read_file", 0)
+                .await
+                .unwrap(),
             "primo read"
         );
         assert_eq!(
-            replay_tool_result(&pool, run, "list_files", 0).await.unwrap(),
+            replay_tool_result(&pool, run, "list_files", 0)
+                .await
+                .unwrap(),
             "listing"
         );
         assert_eq!(
-            replay_tool_result(&pool, run, "read_file", 1).await.unwrap(),
+            replay_tool_result(&pool, run, "read_file", 1)
+                .await
+                .unwrap(),
             "secondo read"
         );
     }
@@ -447,7 +450,9 @@ mod tests {
         insert_step(&pool, run, 1000, "read_file", Some("solo uno")).await;
 
         // offset 0 ok, offset 1 manca -> ReplayMissing.
-        replay_tool_result(&pool, run, "read_file", 0).await.expect("ok");
+        replay_tool_result(&pool, run, "read_file", 0)
+            .await
+            .expect("ok");
         let err = replay_tool_result(&pool, run, "read_file", 1)
             .await
             .expect_err("deve mancare");

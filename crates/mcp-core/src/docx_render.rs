@@ -227,7 +227,10 @@ fn render_section(body: &mut String, section: &Value, level: u8) -> i32 {
     if let Some(code) = section.get("code") {
         match code {
             Value::Object(map) => {
-                let code_text = map.get("content").map(|v| as_text(Some(v))).unwrap_or_default();
+                let code_text = map
+                    .get("content")
+                    .map(|v| as_text(Some(v)))
+                    .unwrap_or_default();
                 let lang = map.get("language").and_then(Value::as_str).unwrap_or("");
                 body.push_str(&render_code_block(&code_text, lang));
             }
@@ -255,7 +258,10 @@ fn render_content(body: &mut String, content: &str) {
         if stripped.is_empty() {
             continue;
         }
-        if let Some(rest) = stripped.strip_prefix("- ").or_else(|| stripped.strip_prefix("* ")) {
+        if let Some(rest) = stripped
+            .strip_prefix("- ")
+            .or_else(|| stripped.strip_prefix("* "))
+        {
             body.push_str(&list_paragraph(rest, "ListBullet"));
         } else if is_numbered_list_line(stripped) {
             // Salta il primo carattere (cifra) + il delimitatore.
@@ -653,7 +659,8 @@ mod tests {
 
     #[test]
     fn produce_zip_valido_con_parti_obbligatorie() {
-        let json = r#"{"sections":[{"number":"1","title":"Intro","content":"Testo della sezione."}]}"#;
+        let json =
+            r#"{"sections":[{"number":"1","title":"Intro","content":"Testo della sezione."}]}"#;
         let bytes = render_to_bytes(json);
         // Deve essere uno ZIP (magic PK\x03\x04).
         assert_eq!(&bytes[0..2], b"PK");
@@ -680,13 +687,20 @@ mod tests {
         assert!(doc.contains("Heading1"), "deve usare lo stile Heading1");
         assert!(doc.contains("1. Introduzione"), "heading numerato");
         assert!(doc.contains("Prima riga."), "paragrafo semplice");
-        assert!(doc.contains("ListBullet"), "riga bullet -> stile ListBullet");
-        assert!(doc.contains("ListNumber"), "riga numerata -> stile ListNumber");
+        assert!(
+            doc.contains("ListBullet"),
+            "riga bullet -> stile ListBullet"
+        );
+        assert!(
+            doc.contains("ListNumber"),
+            "riga numerata -> stile ListNumber"
+        );
     }
 
     #[test]
     fn escaping_caratteri_xml_riservati() {
-        let json = r#"{"sections":[{"number":"1","title":"A & B <c>","content":"x < y && z > 0 \"q\""}]}"#;
+        let json =
+            r#"{"sections":[{"number":"1","title":"A & B <c>","content":"x < y && z > 0 \"q\""}]}"#;
         let bytes = render_to_bytes(json);
         let doc = read_zip_part(&bytes, "word/document.xml");
         // I caratteri riservati devono essere escapati (niente < grezzo nei valori).

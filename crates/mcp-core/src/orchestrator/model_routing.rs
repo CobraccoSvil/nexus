@@ -1178,7 +1178,9 @@ pub(crate) fn decide_tool_capability_gate(
 /// `classify_attachment_kind` — il punto unico gia' esistente della
 /// classificazione mime->kind (chat_attachments.rs). Un turno "ha un'immagine"
 /// se almeno un allegato e' di kind "image".
-pub(crate) fn turn_has_image_attachment(attachments: &[crate::orchestrator::ChatAttachment]) -> bool {
+pub(crate) fn turn_has_image_attachment(
+    attachments: &[crate::orchestrator::ChatAttachment],
+) -> bool {
     attachments
         .iter()
         .any(|a| crate::chat_attachments::classify_attachment_kind(&a.mime_type) == "image")
@@ -1469,7 +1471,10 @@ mod agentic_tier_floor_tests {
             agentic_tier_chain("frontier"),
             vec!["frontier", "heavy", "high", "medium", "light"]
         );
-        assert_eq!(agentic_tier_chain("heavy"), vec!["heavy", "high", "medium", "light"]);
+        assert_eq!(
+            agentic_tier_chain("heavy"),
+            vec!["heavy", "high", "medium", "light"]
+        );
         assert_eq!(agentic_tier_chain("high"), vec!["high", "medium", "light"]);
         assert_eq!(agentic_tier_chain("medium"), vec!["medium", "light"]);
         assert_eq!(agentic_tier_chain("light"), vec!["light", "medium"]);

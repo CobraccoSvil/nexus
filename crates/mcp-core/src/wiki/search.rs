@@ -213,10 +213,7 @@ fn parse_search_params(body: &mut SearchBody) -> Result<SearchParams, (StatusCod
 }
 
 /// Embed del testo di query (troncato a 2000 char). 503 se l'embedder e' giu'.
-async fn embed_query(
-    state: &AppState,
-    q: &str,
-) -> Result<Vec<f32>, (StatusCode, String)> {
+async fn embed_query(state: &AppState, q: &str) -> Result<Vec<f32>, (StatusCode, String)> {
     let embed_text = if q.len() > 2000 { &q[..2000] } else { q };
     state
         .orchestrator

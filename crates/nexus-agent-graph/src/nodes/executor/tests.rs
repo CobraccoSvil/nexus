@@ -17,8 +17,9 @@ use crate::routing::config::RoutingConfig;
 use crate::runtime::ports::{LlmResponse, LlmUsage, SseEvent};
 use crate::runtime::test_doubles::{
     NullEventSink, RecordingEventSink, StubAgentStepStore, StubBillingCooldownPort,
-    StubEmbeddingStore, StubEscalationPort, StubLlmGateway, StubMetaStepStore, StubModelUpscalePort,
-    StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubToolExecutor,
+    StubEmbeddingStore, StubEscalationPort, StubLlmGateway, StubMetaStepStore,
+    StubModelUpscalePort, StubNextActionsDeriver, StubRunControlStore, StubSummaryStore,
+    StubToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{ContentBlock, MessageContent, ToolUse};
@@ -292,7 +293,10 @@ async fn nudge_esplorazione_a_soglia_iniettato() {
         m.role == "user"
             && matches!(&m.content, Value::String(s) if s.contains("NON esplorare oltre"))
     });
-    assert!(has_nudge, "il nudge anti-esplorazione deve essere nel prompt");
+    assert!(
+        has_nudge,
+        "il nudge anti-esplorazione deve essere nel prompt"
+    );
 }
 
 #[tokio::test]
@@ -320,7 +324,10 @@ async fn nudge_comando_fallito_a_tre() {
     let has_cmd_nudge = req.messages.iter().any(|m| {
         matches!(&m.content, Value::String(s) if s.contains("[LOOP RILEVATO]") && s.contains("npm run build"))
     });
-    assert!(has_cmd_nudge, "il nudge anti-loop-comando deve essere nel prompt");
+    assert!(
+        has_cmd_nudge,
+        "il nudge anti-loop-comando deve essere nel prompt"
+    );
 }
 
 #[tokio::test]
@@ -439,12 +446,22 @@ async fn repeated_action_edit_fallito_diagnose_prima_di_abort() {
         .unwrap_or_default()
         .contains(&"repeated_action".to_string()));
     // L'LLM e' stato chiamato (la diagnosi prosegue, non chiude).
-    let req = llm.seen.lock().unwrap().last().cloned().expect("llm chiamato");
+    let req = llm
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("llm chiamato");
     // Il prompt contiene il nudge SPECIFICO edit-fallito.
-    let has_specific_nudge = req.messages.iter().any(|m| {
-        matches!(&m.content, Value::String(s) if s.contains("old_string ESATTO"))
-    });
-    assert!(has_specific_nudge, "atteso il nudge specifico edit-fallito nel prompt");
+    let has_specific_nudge = req
+        .messages
+        .iter()
+        .any(|m| matches!(&m.content, Value::String(s) if s.contains("old_string ESATTO")));
+    assert!(
+        has_specific_nudge,
+        "atteso il nudge specifico edit-fallito nel prompt"
+    );
 }
 
 /// Messaggi con lo STESSO edit_file fallito 2 volte (signature identica).
@@ -477,7 +494,10 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
     let rc = Arc::new(StubRunControlStore::default());
     // FIX-A (scale-controller): la catena porta il tier 'heavy' -> il pick lo
     // propaga e il call-site scrive `current_tier` nel delta.
-    let esc = Arc::new(StubEscalationPort::with_chain_tier(&["claude-piu-capace"], "heavy"));
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
     let ctx = ctx_with(llm.clone(), false);
@@ -499,7 +519,10 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
     assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
     // FIX-A: current_tier scritto col performance_tier del modello promosso.
     assert_eq!(out.current_tier.as_deref(), Some("heavy"));
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
     assert_eq!(
         out.extra.get("repeat_scan_floor").and_then(Value::as_i64),
         Some(msg_len)
@@ -590,11 +613,15 @@ async fn abort_con_task_complete_forza_turno_dichiarativo() {
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(
-        out.extra.get("force_outcome_declaration").and_then(Value::as_bool),
+        out.extra
+            .get("force_outcome_declaration")
+            .and_then(Value::as_bool),
         Some(true)
     );
     assert_eq!(
-        out.extra.get("outcome_declaration_forced").and_then(Value::as_bool),
+        out.extra
+            .get("outcome_declaration_forced")
+            .and_then(Value::as_bool),
         Some(true)
     );
     // Nessuna chiusura testuale di sistema e nessuna chiamata LLM qui.
@@ -622,7 +649,11 @@ async fn abort_senza_task_complete_chiusura_storica() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
-    assert!(out.result.as_deref().unwrap().contains("continua a fallire"));
+    assert!(out
+        .result
+        .as_deref()
+        .unwrap()
+        .contains("continua a fallire"));
 }
 
 #[tokio::test]
@@ -636,7 +667,9 @@ async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
     let ctx = ctx_with(llm.clone(), false);
     let mut messages = edit_fallito_x2();
     let floor = messages.len() as i64;
-    messages.push(human("Chiama ORA il tool task_complete dichiarando l'esito."));
+    messages.push(human(
+        "Chiama ORA il tool task_complete dichiarando l'esito.",
+    ));
     let mut extra = serde_json::Map::new();
     extra.insert("force_outcome_declaration".into(), json!(true));
     extra.insert("outcome_declaration_forced".into(), json!(true));
@@ -657,7 +690,13 @@ async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     // La chiamata LLM e' avvenuta col SOLO task_complete nel catalogo.
-    let req = llm.seen.lock().unwrap().last().cloned().expect("LLM chiamato");
+    let req = llm
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("LLM chiamato");
     let tool_names: Vec<&str> = req
         .tools
         .as_deref()
@@ -669,7 +708,9 @@ async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
     // Flag consumato: la finestra dichiarativa e' una sola.
     assert!(out.extra.get("force_outcome_declaration").is_none());
     assert_eq!(
-        out.extra.get("outcome_declaration_forced").and_then(Value::as_bool),
+        out.extra
+            .get("outcome_declaration_forced")
+            .and_then(Value::as_bool),
         Some(true)
     );
 }
@@ -727,7 +768,9 @@ async fn forced_text_risposta_vuota_rientra_turno_dichiarativo() {
     // Risposta vuota -> turno dichiarativo richiesto, NESSUNA chiusura.
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(
-        out.extra.get("force_outcome_declaration").and_then(Value::as_bool),
+        out.extra
+            .get("force_outcome_declaration")
+            .and_then(Value::as_bool),
         Some(true)
     );
     assert!(out.result.is_none());
@@ -774,7 +817,9 @@ async fn turno_dichiarativo_risposta_vuota_forced_close() {
     let llm = Arc::new(StubLlmGateway::with_text(""));
     let ctx = ctx_with(llm.clone(), false);
     let mut messages = history_pre_forced_text();
-    messages.push(human("Chiama ORA il tool task_complete dichiarando l'esito."));
+    messages.push(human(
+        "Chiama ORA il tool task_complete dichiarando l'esito.",
+    ));
     let mut extra = serde_json::Map::new();
     extra.insert("force_outcome_declaration".into(), json!(true));
     extra.insert("outcome_declaration_forced".into(), json!(true));
@@ -876,7 +921,10 @@ async fn chiusura_dichiarativa_una_tantum_non_ricattura_rientro_final_gate() {
     extra.insert("outcome_declaration_closed".into(), json!(true));
     let state = AgentState {
         thread_id: Some("r1".into()),
-        messages: vec![human("sistema il file"), human("<final_gate_failed> build rotta")],
+        messages: vec![
+            human("sistema il file"),
+            human("<final_gate_failed> build rotta"),
+        ],
         declared_outcome: Some(json!({"outcome": "done", "summary": "stantio"})),
         tools_json: Some(vec![json!({"name": "edit_file"})]),
         extra,
@@ -886,7 +934,11 @@ async fn chiusura_dichiarativa_una_tantum_non_ricattura_rientro_final_gate() {
     let out = apply(state, delta);
     // NON la chiusura d'autorita' col summary stantio: il modello ha lavorato.
     assert_ne!(out.result.as_deref(), Some("stantio"));
-    assert_eq!(llm.seen.lock().unwrap().len(), 1, "il turno normale prosegue");
+    assert_eq!(
+        llm.seen.lock().unwrap().len(),
+        1,
+        "il turno normale prosegue"
+    );
 }
 
 #[tokio::test]
@@ -916,7 +968,10 @@ async fn escalation_current_pair_ancora_a_model_used_senza_sticky() {
     let _ = n.run(&state, &ctx).await.expect("run");
     let seen = esc.seen.lock().unwrap();
     assert_eq!(seen.last().unwrap().1.as_deref(), Some("anthropic"));
-    assert_eq!(seen.last().unwrap().2.as_deref(), Some("claude-upscalato-1m"));
+    assert_eq!(
+        seen.last().unwrap().2.as_deref(),
+        Some("claude-upscalato-1m")
+    );
 }
 
 #[tokio::test]
@@ -940,6 +995,7 @@ async fn happy_path_tool_use_produce_pending() {
         canned,
         error: None,
         error_provider_unavailable: false,
+        provider_unavailable_cause: None,
         seen: std::sync::Mutex::new(vec![]),
     });
     let ctx = ctx_with(llm.clone(), false);
@@ -957,7 +1013,10 @@ async fn happy_path_tool_use_produce_pending() {
     assert_eq!(out.iterations, Some(1));
     let pending = out.pending_tool_uses.unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].get("name").and_then(Value::as_str), Some("write_file"));
+    assert_eq!(
+        pending[0].get("name").and_then(Value::as_str),
+        Some("write_file")
+    );
     assert_eq!(out.provider_used.as_deref(), Some("anthropic"));
     // signature registrata per il loop-detection.
     assert_eq!(out.recent_tool_signatures.unwrap().len(), 1);
@@ -1009,6 +1068,7 @@ async fn executor_emette_tool_use_su_pending() {
         canned,
         error: None,
         error_provider_unavailable: false,
+        provider_unavailable_cause: None,
         seen: std::sync::Mutex::new(vec![]),
     });
     let sink = Arc::new(RecordingEventSink::default());
@@ -1110,7 +1170,10 @@ async fn no_provider_sentinella_node_error() {
         tools_json: Some(vec![json!({"name": "write_file"})]),
         ..Default::default()
     };
-    let err = n.run(&state, &ctx).await.expect_err("deve fallire (no provider)");
+    let err = n
+        .run(&state, &ctx)
+        .await
+        .expect_err("deve fallire (no provider)");
     assert!(matches!(err, NodeError::Failed { .. }));
     assert!(llm.seen.lock().unwrap().is_empty());
 }
@@ -1288,7 +1351,8 @@ async fn forcing_early_action_scatta_se_turno_precedente_non_ha_agito() {
     let _ = apply(state, delta);
     let req = llm.seen.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
-        req.force_tool_choice, Some(true),
+        req.force_tool_choice,
+        Some(true),
         "BUG-e preservato: turno precedente che non ha agito -> forcing early ON"
     );
 }
@@ -1345,10 +1409,14 @@ async fn lettura_ripetuta_identica_informativa_guida_a_concludere() {
     let _ = apply(state, delta);
     let req = llm.seen.lock().unwrap().last().cloned().unwrap();
     // Nudge "concludi con testo" iniettato.
-    let has_concludi = req.messages.iter().any(|m| {
-        matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole"))
-    });
-    assert!(has_concludi, "atteso nudge 'concludi con testo' per la lettura ripetuta informativa");
+    let has_concludi = req
+        .messages
+        .iter()
+        .any(|m| matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole")));
+    assert!(
+        has_concludi,
+        "atteso nudge 'concludi con testo' per la lettura ripetuta informativa"
+    );
     // NON forza il tool (force_tool_choice None): il modello puo' chiudere con testo.
     assert_eq!(
         req.force_tool_choice, None,
@@ -1402,7 +1470,10 @@ async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages,
-        tools_json: Some(vec![json!({"name": "read_file"}), json!({"name": "edit_file"})]),
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "edit_file"}),
+        ]),
         // Turno di modifica: il nudge deve orientare all'edit, non alla resa.
         action_oriented: Some(true),
         ..Default::default()
@@ -1411,17 +1482,26 @@ async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
     let _ = apply(state, delta);
     let req = llm.seen.lock().unwrap().last().cloned().unwrap();
     // Nudge orientato all'AZIONE iniettato, NON quello "rispondi a parole".
-    let has_edit_nudge = req.messages.iter().any(|m| {
-        matches!(&m.content, Value::String(s) if s.contains("ESEGUI l'azione"))
-    });
-    assert!(has_edit_nudge, "atteso nudge orientato all'azione per la lettura ripetuta su un fix");
-    let has_concludi = req.messages.iter().any(|m| {
-        matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole"))
-    });
-    assert!(!has_concludi, "su un fix il nudge NON deve guidare a rispondere a parole");
+    let has_edit_nudge = req
+        .messages
+        .iter()
+        .any(|m| matches!(&m.content, Value::String(s) if s.contains("ESEGUI l'azione")));
+    assert!(
+        has_edit_nudge,
+        "atteso nudge orientato all'azione per la lettura ripetuta su un fix"
+    );
+    let has_concludi = req
+        .messages
+        .iter()
+        .any(|m| matches!(&m.content, Value::String(s) if s.contains("Rispondi ORA a parole")));
+    assert!(
+        !has_concludi,
+        "su un fix il nudge NON deve guidare a rispondere a parole"
+    );
     // Forza la tool call: l'agente DEVE applicare l'edit, non rinunciare.
     assert_eq!(
-        req.force_tool_choice, Some(true),
+        req.force_tool_choice,
+        Some(true),
         "lettura ripetuta su un fix -> force-action verso l'edit"
     );
 }
@@ -1547,7 +1627,9 @@ async fn errore_gateway_persiste_contatori() {
     // (nessun nuovo pending nel turno errato).
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
-    let llm = Arc::new(StubLlmGateway::with_error("billing_error: credito esaurito"));
+    let llm = Arc::new(StubLlmGateway::with_error(
+        "billing_error: credito esaurito",
+    ));
     let ctx = ctx_with(llm.clone(), false);
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -1561,7 +1643,10 @@ async fn errore_gateway_persiste_contatori() {
         tools_json: Some(vec![json!({"name": "write_file"})]),
         ..Default::default()
     };
-    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire su errore gateway");
+    let delta = n
+        .run(&state, &ctx)
+        .await
+        .expect("run NON deve abortire su errore gateway");
     let out = apply(state, delta);
     // Esito error coerente col Python (stop_reason=error, result onesto).
     assert_eq!(out.stop_reason, Some(StopReason::Error));
@@ -1580,7 +1665,10 @@ async fn errore_gateway_persiste_contatori() {
         Some(&["read_file|deadbeef".to_string()][..])
     );
     // auto_escalations emesso nel delta (FIX 3): invariato a 0 (escalation TODO).
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(0));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(0)
+    );
     // UNA sola chiamata LLM: nessun retry-senza-forcing sul ramo error gateway.
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
 }
@@ -1626,14 +1714,21 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
     assert_eq!(out.action_nudge_count, Some(0));
     assert!(out.pending_tool_uses.unwrap().is_empty());
     // auto_escalations incrementato (0 -> 1): gate < 3 rispettato.
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
     // failover_tried accumula sia il provider CADUTO sia quello SCELTO, cosi' un
     // eventuale secondo salto li esclude entrambi (cascata).
     let tried: Vec<String> = out
         .extra
         .get("failover_tried")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     assert_eq!(tried, vec!["anthropic".to_string(), "mistral".to_string()]);
     // UNA sola chiamata LLM (quella fallita): la ri-esecuzione avviene nel self-loop
@@ -1683,7 +1778,10 @@ async fn failover_cascata_accumula_provider_gia_provati() {
     // stesso): e' cio' che il vecchio `loop_fallback_default` (candidato fisso) non
     // faceva, costringendo l'utente a ri-lanciare.
     let rc = Arc::new(StubRunControlStore::default());
-    let esc = Arc::new(StubEscalationPort::with_failover("google", "gemini-2.5-pro"));
+    let esc = Arc::new(StubEscalationPort::with_failover(
+        "google",
+        "gemini-2.5-pro",
+    ));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> mistral\",\
@@ -1708,7 +1806,10 @@ async fn failover_cascata_accumula_provider_gia_provati() {
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(out.sticky_provider.as_deref(), Some("google"));
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(2));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(2)
+    );
     // failover_provider interrogato escludendo i gia' provati (deepseek) PIU' il
     // provider corrente caduto (anthropic) — in quest'ordine.
     let seen = esc.failover_seen.lock().unwrap();
@@ -1721,12 +1822,53 @@ async fn failover_cascata_accumula_provider_gia_provati() {
         .extra
         .get("failover_tried")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     assert_eq!(
         tried,
-        vec!["deepseek".to_string(), "anthropic".to_string(), "google".to_string()]
+        vec![
+            "deepseek".to_string(),
+            "anthropic".to_string(),
+            "google".to_string()
+        ]
     );
+}
+
+#[tokio::test]
+async fn client_error_non_scatena_failover_cross_provider() {
+    use crate::runtime::ports::ProviderFailureCause;
+
+    // client_error: il gateway ha gia' provato sanificazione; l'executor NON deve
+    // fare failover cieco (incidente f0ad0337).
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_failover("google", "gemini-2.5-flash"));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_provider_unavailable_cause(
+        ProviderFailureCause::ClientError,
+        "deepseek HTTP 400 invalid_request_error",
+    ));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("leggi file")],
+        provider_used: Some("deepseek".into()),
+        model_used: Some("deepseek-v4-flash".into()),
+        sticky_provider: Some("deepseek".into()),
+        sticky_model: Some("deepseek-v4-flash".into()),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    assert_eq!(out.sticky_provider.as_deref(), Some("deepseek"));
+    assert_eq!(out.sticky_model.as_deref(), Some("deepseek-v4-flash"));
+    assert!(esc.failover_seen.lock().unwrap().is_empty());
+    assert_eq!(llm.seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1773,7 +1915,10 @@ async fn signature_loop_escalation_riesegue() {
     }
     let rc = Arc::new(StubRunControlStore::default());
     // Catena intra-provider: anthropic/claude-x -> claude-piu-capace (tier heavy).
-    let esc = Arc::new(StubEscalationPort::with_chain_tier(&["claude-piu-capace"], "heavy"));
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let same_input = json!({"path": "x"});
     let sig = build_signature("read_file", &same_input);
@@ -1798,7 +1943,10 @@ async fn signature_loop_escalation_riesegue() {
     assert_eq!(out.result.as_deref(), Some("Risolto col modello promosso."));
     assert!(out.pending_tool_uses.unwrap().is_empty());
     // auto_escalations incrementato.
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
     // provider/model promossi nel delta (provider_used = richiesto escalato).
     assert_eq!(out.provider_used.as_deref(), Some("anthropic"));
     assert_eq!(out.model_used.as_deref(), Some("claude-piu-capace"));
@@ -1815,7 +1963,10 @@ async fn signature_loop_escalation_riesegue() {
     // FIX-A: la promozione del signature-loop scrive anche current_tier col tier
     // del modello promosso (catturato dal pick, delta finale del turno).
     assert_eq!(out.current_tier.as_deref(), Some("heavy"));
-    assert_eq!(out.extra.get("repeat_scan_floor").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("repeat_scan_floor").and_then(Value::as_i64),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -1931,7 +2082,10 @@ async fn signature_loop_senza_escalation_chiude_secco() {
     assert_eq!(out.stop_reason, Some(StopReason::LoopDetected));
     assert!(out.result.as_deref().unwrap().contains("[LOOP RILEVATO]"));
     assert!(out.pending_tool_uses.unwrap().is_empty());
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(0));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(0)
+    );
     // Il segnale STRUTTURATO di chiusura anti-loop viaggia nel delta: il
     // finalizzatore mappa FailedDiagnosed anche se il final_gate riscrive
     // stop_reason (run b833a83d chiudeva "completed" col testo di sistema).
@@ -1964,7 +2118,9 @@ async fn signature_loop_secco_con_task_complete_forza_dichiarazione() {
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(
-        out.extra.get("force_outcome_declaration").and_then(Value::as_bool),
+        out.extra
+            .get("force_outcome_declaration")
+            .and_then(Value::as_bool),
         Some(true)
     );
     // Nessuna chiusura testuale di sistema.
@@ -1996,7 +2152,10 @@ async fn signature_loop_cap_escalations_chiude_secco() {
     let out = apply(state, delta);
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
     assert_eq!(out.stop_reason, Some(StopReason::LoopDetected));
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(3));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(3)
+    );
 }
 
 #[tokio::test]
@@ -2029,11 +2188,17 @@ async fn g1_cap_escalation_promuove_sticky() {
     assert_eq!(out.sticky_model.as_deref(), Some("gemini-2.5-pro"));
     assert_eq!(out.g1_reroute_count, Some(0));
     assert_eq!(out.action_nudge_count, Some(0));
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
     // LLM NON chiamato (escalation G1 = sticky + nudge, niente turno).
     assert!(llm.seen.lock().unwrap().is_empty());
     // La porta e' stata interrogata col modello corrente (provider_used).
-    assert_eq!(esc.seen.lock().unwrap().last().unwrap().1.as_deref(), Some("anthropic"));
+    assert_eq!(
+        esc.seen.lock().unwrap().last().unwrap().1.as_deref(),
+        Some("anthropic")
+    );
 }
 
 #[tokio::test]
@@ -2090,7 +2255,10 @@ async fn esplorazione_escalation_promuove_sticky() {
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(out.sticky_provider.as_deref(), Some("google"));
     assert_eq!(out.sticky_model.as_deref(), Some("gemini-2.5-pro"));
-    assert_eq!(out.extra.get("auto_escalations").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
     assert_eq!(out.consecutive_exploration_calls, Some(0));
     // LLM NON chiamato: escalation = sticky + nudge, il self-loop rientra.
     assert!(llm.seen.lock().unwrap().is_empty());
@@ -2150,7 +2318,11 @@ async fn cap_assoluto_iterazioni_chiude() {
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     assert_eq!(out.forced_close_unverified, Some(true));
-    assert!(out.result.as_deref().unwrap().contains("massimo di iterazioni"));
+    assert!(out
+        .result
+        .as_deref()
+        .unwrap()
+        .contains("massimo di iterazioni"));
     assert!(llm.seen.lock().unwrap().is_empty());
 }
 
@@ -2161,7 +2333,10 @@ async fn billing_fail_fast_chiude_loop_abort() {
     // provider-in-uso: cfr. billing_fail_fast_provider_corrente_valido).
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
-    let billing = Arc::new(StubBillingCooldownPort::with_exhausted(&["anthropic", "openai"]));
+    let billing = Arc::new(StubBillingCooldownPort::with_exhausted(&[
+        "anthropic",
+        "openai",
+    ]));
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
@@ -2220,9 +2395,10 @@ async fn next_actions_rimuove_blocco_e_deriva() {
     // visibile (punto unico deterministico) + meta_step next_actions emesso se la
     // derivazione trova scelte (py:3379-3402).
     let rc = Arc::new(StubRunControlStore::default());
-    let next_actions = Arc::new(StubNextActionsDeriver::with_choices(&[
-        ("Aggiungi form", "Aggiungi un form di contatto alla pagina"),
-    ]));
+    let next_actions = Arc::new(StubNextActionsDeriver::with_choices(&[(
+        "Aggiungi form",
+        "Aggiungi un form di contatto alla pagina",
+    )]));
     let billing = Arc::new(StubBillingCooldownPort::default());
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, meta) = node_ports(cfg_resolved(), rc, next_actions.clone(), billing, upscale);
@@ -2245,10 +2421,15 @@ async fn next_actions_rimuove_blocco_e_deriva() {
     assert!(result.contains("Ecco la home page."));
     // meta_step next_actions persistito (la derivazione ha trovato scelte).
     let metas = meta.meta_steps.lock().unwrap();
-    assert!(metas.iter().any(|m| m.get("kind").and_then(Value::as_str) == Some("next_actions")));
+    assert!(metas
+        .iter()
+        .any(|m| m.get("kind").and_then(Value::as_str) == Some("next_actions")));
     // La porta ha ricevuto il testo GIA' ripulito.
     let seen = next_actions.seen.lock().unwrap();
-    assert!(seen.last().map(|s| !s.contains("suggested_actions")).unwrap_or(false));
+    assert!(seen
+        .last()
+        .map(|s| !s.contains("suggested_actions"))
+        .unwrap_or(false));
 }
 
 #[tokio::test]
@@ -2271,14 +2452,19 @@ async fn next_actions_derive_fallita_blocco_comunque_rimosso() {
         tools_json: Some(vec![json!({"name": "read_file"})]),
         ..Default::default()
     };
-    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire su derive fallita");
+    let delta = n
+        .run(&state, &ctx)
+        .await
+        .expect("run NON deve abortire su derive fallita");
     let out = apply(state, delta);
     let result = out.result.as_deref().unwrap();
     assert!(!result.to_lowercase().contains("suggested_actions"));
     assert!(result.contains("Risposta finale."));
     // Nessun meta_step next_actions (derive fallita -> nessuna scelta).
     let metas = meta.meta_steps.lock().unwrap();
-    assert!(!metas.iter().any(|m| m.get("kind").and_then(Value::as_str) == Some("next_actions")));
+    assert!(!metas
+        .iter()
+        .any(|m| m.get("kind").and_then(Value::as_str) == Some("next_actions")));
 }
 
 #[tokio::test]
@@ -2482,7 +2668,11 @@ async fn smart_upscale_promuove_modello() {
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     // Window piccola (200 token) -> con un minimo di history la stima supera 180.
-    let upscale = Arc::new(StubModelUpscalePort::promoting(200, "google", "gemini-2.5-pro"));
+    let upscale = Arc::new(StubModelUpscalePort::promoting(
+        200,
+        "google",
+        "gemini-2.5-pro",
+    ));
     let cfg = ExecutorConfig {
         routing_provider: "anthropic".to_string(),
         routing_model: "claude-x".to_string(),
@@ -2521,7 +2711,11 @@ async fn smart_upscale_sotto_soglia_non_promuove() {
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     // Window enorme -> la stima non la raggiunge mai.
-    let upscale = Arc::new(StubModelUpscalePort::promoting(1_000_000, "google", "gemini-2.5-pro"));
+    let upscale = Arc::new(StubModelUpscalePort::promoting(
+        1_000_000,
+        "google",
+        "gemini-2.5-pro",
+    ));
     let cfg = ExecutorConfig {
         routing_provider: "anthropic".to_string(),
         routing_model: "claude-x".to_string(),
@@ -2566,8 +2760,7 @@ async fn hard_cap_termina_il_run_senza_chiamare_llm() {
         context_window: 100,
         hard_cap_ratio: 0.95,
         overflow_message_template:
-            "Contesto stimato %ESTIMATED_TOKENS% token oltre la finestra %MAX_WINDOW%."
-                .to_string(),
+            "Contesto stimato %ESTIMATED_TOKENS% token oltre la finestra %MAX_WINDOW%.".to_string(),
         ..ExecutorConfig::default()
     };
     let (n, meta) = node_ports(cfg, rc, next_actions, billing, upscale);
@@ -2594,11 +2787,16 @@ async fn hard_cap_termina_il_run_senza_chiamare_llm() {
     assert!(result.contains("oltre la finestra 100"), "result: {result}");
     assert!(!result.contains("%ESTIMATED_TOKENS%"));
     // NESSUNA chiamata LLM: fail-fast prima della richiesta al provider.
-    assert!(llm.seen.lock().unwrap().is_empty(), "LLM non deve essere chiamato");
+    assert!(
+        llm.seen.lock().unwrap().is_empty(),
+        "LLM non deve essere chiamato"
+    );
     // Meta_step strutturato context_overflow persistito.
     let metas = meta.meta_steps.lock().unwrap();
     assert!(
-        metas.iter().any(|m| m.get("kind").and_then(|k| k.as_str()) == Some("context_overflow")),
+        metas
+            .iter()
+            .any(|m| m.get("kind").and_then(|k| k.as_str()) == Some("context_overflow")),
         "meta_step context_overflow atteso"
     );
 }
@@ -2631,7 +2829,11 @@ async fn hard_cap_inerte_con_ratio_default() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     assert_ne!(out.stop_reason, Some(StopReason::Error));
-    assert_eq!(llm.seen.lock().unwrap().len(), 1, "LLM chiamato normalmente");
+    assert_eq!(
+        llm.seen.lock().unwrap().len(),
+        1,
+        "LLM chiamato normalmente"
+    );
 }
 
 #[tokio::test]
@@ -2709,7 +2911,10 @@ async fn token_counter_iniettato_pilota_l_hard_cap() {
     };
     let meta = Arc::new(StubMetaStepStore::default());
     let steps = Arc::new(StubAgentStepStore::default());
-    let counter = Arc::new(FixedTokenCounter { tokens: 1_000_000, calls: std::sync::Mutex::new(0) });
+    let counter = Arc::new(FixedTokenCounter {
+        tokens: 1_000_000,
+        calls: std::sync::Mutex::new(0),
+    });
     let n = ExecutorNode::new(
         cfg,
         rc,
@@ -2739,7 +2944,10 @@ async fn token_counter_iniettato_pilota_l_hard_cap() {
         Some("context_overflow")
     );
     assert!(llm.seen.lock().unwrap().is_empty(), "LLM non chiamato");
-    assert!(*counter.calls.lock().unwrap() > 0, "il contatore iniettato e' stato usato");
+    assert!(
+        *counter.calls.lock().unwrap() > 0,
+        "il contatore iniettato e' stato usato"
+    );
 }
 
 // ── rolling-summary (intervento 3): aggancio al cambio-fase ───────────────────
@@ -2805,7 +3013,13 @@ async fn rolling_summary_collassa_la_history_al_cambio_fase() {
 
     // La richiesta LLM porta la history COLLASSATA: 1 summary + 2 recenti = 3
     // (contro i 6 originali).
-    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    let req = llm
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("una richiesta LLM");
     assert_eq!(
         req.messages.len(),
         3,
@@ -2835,7 +3049,13 @@ async fn rolling_summary_degrado_best_effort_history_invariata() {
     // possono aggiungere un messaggio) e' che la history NON e' ridotta a
     // 1 summary + keep_recent (3, come nel caso col summarizer) e che il primo
     // messaggio NON e' il riassunto.
-    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    let req = llm
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("una richiesta LLM");
     assert!(
         req.messages.len() >= 6,
         "degrado best-effort: history non collassata (len={}, attesi >= 6 originali)",
@@ -2907,18 +3127,33 @@ async fn continuity_trim_scarta_atomo_irrilevante_al_cambio_fase() {
     // L'embedder ha ricevuto il focus (per primo) + i 2 atomi candidati.
     let seen = embedding.embed_seen.lock().unwrap();
     assert_eq!(seen.len(), 3, "embed chiamato con focus + 2 candidati");
-    assert!(seen.iter().any(|t| t.contains("risposta 1")), "candidato r1 embeddato");
-    assert!(seen.iter().any(|t| t.contains("risposta 2")), "candidato r2 embeddato");
+    assert!(
+        seen.iter().any(|t| t.contains("risposta 1")),
+        "candidato r1 embeddato"
+    );
+    assert!(
+        seen.iter().any(|t| t.contains("risposta 2")),
+        "candidato r2 embeddato"
+    );
     drop(seen);
 
     // La richiesta LLM NON porta piu' "risposta 1" (atomo scartato), ma porta "risposta 2".
-    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    let req = llm
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("una richiesta LLM");
     let contiene = |needle: &str| {
         req.messages
             .iter()
             .any(|m| m.content.as_str().unwrap_or_default().contains(needle))
     };
-    assert!(!contiene("risposta 1"), "l'atomo irrilevante deve essere scartato");
+    assert!(
+        !contiene("risposta 1"),
+        "l'atomo irrilevante deve essere scartato"
+    );
     assert!(contiene("risposta 2"), "l'atomo rilevante resta");
 }
 
@@ -2928,7 +3163,10 @@ async fn continuity_trim_scarta_atomo_irrilevante_al_cambio_fase() {
 async fn continuity_trim_flag_off_non_chiama_embedder() {
     let rc = Arc::new(StubRunControlStore::default());
     let embedding = Arc::new(StubEmbeddingStore::with_vectors(vec![vec![1.0, 0.0]]));
-    let cfg = ExecutorConfig { continuity_trim_enabled: false, ..cfg_continuity() };
+    let cfg = ExecutorConfig {
+        continuity_trim_enabled: false,
+        ..cfg_continuity()
+    };
     let n = node_continuity(cfg, rc, embedding.clone());
     let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
     let ctx = ctx_with(llm.clone(), false);
@@ -2939,9 +3177,19 @@ async fn continuity_trim_flag_off_non_chiama_embedder() {
         "flag OFF: l'embedder NON deve essere chiamato"
     );
     // History invariata: "risposta 1" resta nella richiesta.
-    let req = llm.seen.lock().unwrap().last().cloned().expect("una richiesta LLM");
+    let req = llm
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("una richiesta LLM");
     assert!(
-        req.messages.iter().any(|m| m.content.as_str().unwrap_or_default().contains("risposta 1")),
+        req.messages.iter().any(|m| m
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .contains("risposta 1")),
         "flag OFF: nessun trim, la history resta completa"
     );
 }
@@ -3023,7 +3271,10 @@ async fn stall_recovery_on_emette_stall_reason() {
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::StallReason));
     // StallContext strutturato presente (regola M): asse repeated_action.
-    let ctx_val = out.extra.get(STALL_CONTEXT_KEY).expect("StallContext in extra");
+    let ctx_val = out
+        .extra
+        .get(STALL_CONTEXT_KEY)
+        .expect("StallContext in extra");
     let sc: StallContext = serde_json::from_value(ctx_val.clone()).expect("StallContext");
     assert_eq!(sc.axis, "repeated_action");
     // L'LLM NON e' chiamato dall'executor (lo fara' il nodo dedicato, replay-safe).
@@ -3128,14 +3379,20 @@ async fn stall_recovery_consume_ask_user_produce_needs_input() {
     assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     // Esito STRUTTURATO needs_input (regola M): letto dal segnale, non dalla prosa.
     let outcome = out.declared_outcome.as_ref().expect("declared_outcome");
-    assert_eq!(outcome.get("outcome").and_then(Value::as_str), Some("needs_input"));
+    assert_eq!(
+        outcome.get("outcome").and_then(Value::as_str),
+        Some("needs_input")
+    );
     assert!(out
         .result
         .as_deref()
         .unwrap_or_default()
         .contains("email reale"));
     // Budget consumato.
-    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("stall_moves_used").and_then(Value::as_i64),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -3159,9 +3416,18 @@ async fn stall_recovery_consume_declare_blocked_produce_blocked() {
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
     let outcome = out.declared_outcome.as_ref().expect("declared_outcome");
-    assert_eq!(outcome.get("outcome").and_then(Value::as_str), Some("blocked"));
-    assert_eq!(outcome.get("blocker").and_then(Value::as_str), Some("credential"));
-    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        outcome.get("outcome").and_then(Value::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        outcome.get("blocker").and_then(Value::as_str),
+        Some("credential")
+    );
+    assert_eq!(
+        out.extra.get("stall_moves_used").and_then(Value::as_i64),
+        Some(1)
+    );
 }
 
 // ── R1: redaction_rejected da SEGNALE STRUTTURATO nello StallContext ──────────
@@ -3204,10 +3470,17 @@ async fn stall_context_redaction_rejected_da_segnale_strutturato() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::StallReason));
-    let sc: StallContext =
-        serde_json::from_value(out.extra.get(STALL_CONTEXT_KEY).expect("StallContext").clone())
-            .expect("StallContext");
-    assert!(sc.redaction_rejected, "il segnale strutturato deve alzare il flag");
+    let sc: StallContext = serde_json::from_value(
+        out.extra
+            .get(STALL_CONTEXT_KEY)
+            .expect("StallContext")
+            .clone(),
+    )
+    .expect("StallContext");
+    assert!(
+        sc.redaction_rejected,
+        "il segnale strutturato deve alzare il flag"
+    );
 }
 
 #[tokio::test]
@@ -3225,10 +3498,17 @@ async fn stall_context_redaction_rejected_false_senza_segnale() {
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    let sc: StallContext =
-        serde_json::from_value(out.extra.get(STALL_CONTEXT_KEY).expect("StallContext").clone())
-            .expect("StallContext");
-    assert!(!sc.redaction_rejected, "senza segnale strutturato resta false");
+    let sc: StallContext = serde_json::from_value(
+        out.extra
+            .get(STALL_CONTEXT_KEY)
+            .expect("StallContext")
+            .clone(),
+    )
+    .expect("StallContext");
+    assert!(
+        !sc.redaction_rejected,
+        "senza segnale strutturato resta false"
+    );
 }
 
 // ── R2: budget stall CROSS-RUN (StallBudgetPort) ──────────────────────────────
@@ -3246,10 +3526,18 @@ struct StubStallBudget {
 
 impl StubStallBudget {
     fn with_count(count: i64) -> Self {
-        Self { count, fail_read: false, recorded: std::sync::Mutex::new(0) }
+        Self {
+            count,
+            fail_read: false,
+            recorded: std::sync::Mutex::new(0),
+        }
     }
     fn failing_read() -> Self {
-        Self { count: 0, fail_read: true, recorded: std::sync::Mutex::new(0) }
+        Self {
+            count: 0,
+            fail_read: true,
+            recorded: std::sync::Mutex::new(0),
+        }
     }
 }
 
@@ -3369,13 +3657,22 @@ async fn stall_budget_consumo_registra_cross_run() {
     let n = node_budget(cfg, budget.clone());
     let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
     let epoch = stall_work_epoch(0, 0, 0);
-    let mv = RecoveryMove::DeclareBlocked { blocker: "credential".into() };
+    let mv = RecoveryMove::DeclareBlocked {
+        blocker: "credential".into(),
+    };
     let state = state_rientro("repeated_user_question", epoch, Some(mv));
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     // Per-run incrementato E cross-run registrato una volta (Real).
-    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
-    assert_eq!(*budget.recorded.lock().unwrap(), 1, "una consultazione cross-run registrata");
+    assert_eq!(
+        out.extra.get("stall_moves_used").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        *budget.recorded.lock().unwrap(),
+        1,
+        "una consultazione cross-run registrata"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -3420,6 +3717,7 @@ fn llm_tool_use(name: &str, input: Value) -> Arc<StubLlmGateway> {
         },
         error: None,
         error_provider_unavailable: false,
+        provider_unavailable_cause: None,
         seen: std::sync::Mutex::new(vec![]),
     })
 }
@@ -3449,8 +3747,15 @@ async fn scale_off_non_emette_scale_reason() {
     let state = state_scale_turn();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_eq!(out.stop_reason, Some(StopReason::ToolUse), "turno normale, non ScaleReason");
-    assert!(out.extra.get(SCALE_CTX_KEY).is_none(), "nessuno ScaleContext a flag OFF");
+    assert_eq!(
+        out.stop_reason,
+        Some(StopReason::ToolUse),
+        "turno normale, non ScaleReason"
+    );
+    assert!(
+        out.extra.get(SCALE_CTX_KEY).is_none(),
+        "nessuno ScaleContext a flag OFF"
+    );
 }
 
 #[tokio::test]
@@ -3480,7 +3785,10 @@ async fn scale_on_trigger_emette_scale_reason() {
         "la ScaleHysteresisConfig DB-driven deve raggiungere il nodo (FIX-B)"
     );
     // Budget consultazioni incrementato.
-    assert_eq!(out.extra.get("scale_evals_used").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("scale_evals_used").and_then(Value::as_i64),
+        Some(1)
+    );
     // FIX-A/F1/F4/F6: emissione PRE-LLM -> la `complete` del turno NON e' avvenuta.
     assert!(
         llm.seen.lock().unwrap().is_empty(),
@@ -3501,14 +3809,20 @@ async fn scale_precedenza_stallo_no_scale_reason() {
     // Ultimo tool_result = errore -> detect_recent_tool_error true -> stall_active.
     // `Message::Tool` (ToolMessage) con hint errore: e' la forma che
     // `detect_recent_tool_error` scandisce (filtra i soli Message::Tool).
-    state.messages.push(ai_tool("write_file", json!({"path": "a.rs"})));
+    state
+        .messages
+        .push(ai_tool("write_file", json!({"path": "a.rs"})));
     state.messages.push(Message::Tool {
         tool_call_id: "c1".into(),
         content: MessageContent::text("Error: permission denied"),
     });
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_ne!(out.stop_reason, Some(StopReason::ScaleReason), "stallo attivo -> no ScaleReason");
+    assert_ne!(
+        out.stop_reason,
+        Some(StopReason::ScaleReason),
+        "stallo attivo -> no ScaleReason"
+    );
     assert!(out.extra.get(SCALE_CTX_KEY).is_none());
 }
 
@@ -3527,7 +3841,11 @@ async fn scale_break_even_coda_corta_no_trigger() {
     let state = state_scale_turn(); // iterations 4 -> tail 8-4=4 < 6
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_ne!(out.stop_reason, Some(StopReason::ScaleReason), "coda corta -> no trigger");
+    assert_ne!(
+        out.stop_reason,
+        Some(StopReason::ScaleReason),
+        "coda corta -> no trigger"
+    );
     assert!(out.extra.get(SCALE_CTX_KEY).is_none());
 }
 
@@ -3574,21 +3892,35 @@ async fn scale_rientro_downscale_con_modello_applica_sticky() {
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
     // La porta risolve (provider, model) per il tier target.
-    let upscale = Arc::new(StubModelUpscalePort::tier_resolving("mistral", "mistral-small"));
+    let upscale = Arc::new(StubModelUpscalePort::tier_resolving(
+        "mistral",
+        "mistral-small",
+    ));
     let (n, _m) = node_ports(cfg_scale_on(), rc, next_actions, billing, upscale.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
     let ctx = ctx_with(llm.clone(), false);
     let state = state_scale_rientro(
         ScaleTier::Medium,
-        ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 },
+        ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.9,
+        },
         5000,
     );
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated), "self-loop ri-fa il turno");
+    assert_eq!(
+        out.stop_reason,
+        Some(StopReason::G1Escalated),
+        "self-loop ri-fa il turno"
+    );
     assert_eq!(out.sticky_provider.as_deref(), Some("mistral"));
     assert_eq!(out.sticky_model.as_deref(), Some("mistral-small"));
-    assert_eq!(out.current_tier.as_deref(), Some("light"), "current_tier al tier target");
+    assert_eq!(
+        out.current_tier.as_deref(),
+        Some("light"),
+        "current_tier al tier target"
+    );
     // FIX-B: la porta e' stata chiamata col vincolo finestra (est 5000 * 1.3 = 6500).
     let calls = upscale.tier_selected.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -3613,7 +3945,10 @@ async fn scale_rientro_downscale_senza_modello_annulla() {
     let ctx = ctx_with(llm.clone(), false);
     let state = state_scale_rientro(
         ScaleTier::Medium,
-        ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 },
+        ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.9,
+        },
         5000,
     );
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -3621,7 +3956,11 @@ async fn scale_rientro_downscale_senza_modello_annulla() {
     // Cambio annullato: il rientro ritorna None -> il turno prosegue normalmente
     // (nessun sticky/current_tier scritto dal cambio annullato).
     assert_ne!(out.stop_reason, Some(StopReason::G1Escalated));
-    assert_ne!(out.current_tier.as_deref(), Some("light"), "downscale annullato: tier invariato");
+    assert_ne!(
+        out.current_tier.as_deref(),
+        Some("light"),
+        "downscale annullato: tier invariato"
+    );
     // La porta e' stata interrogata (poi ha ritornato None -> annullo).
     assert_eq!(upscale.tier_selected.lock().unwrap().len(), 1);
 }
@@ -3644,7 +3983,11 @@ async fn scale_replay_detector_non_emette_doppia_complete() {
     let state = state_scale_turn();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_eq!(out.stop_reason, Some(StopReason::ScaleReason), "detector emette anche in Replay");
+    assert_eq!(
+        out.stop_reason,
+        Some(StopReason::ScaleReason),
+        "detector emette anche in Replay"
+    );
     // Il superstep di emissione NON ha chiamato complete (replay-safe: nessun
     // gruppo consumato dal cursore).
     assert!(
@@ -3678,7 +4021,10 @@ async fn scale_rientro_keeptier_prosegue_una_sola_complete() {
     };
     let key = crate::decisions::scale_reason::scale_cache_key(&scale_ctx, 4);
     let mut extra = serde_json::Map::new();
-    extra.insert(SCALE_CTX_KEY.to_string(), serde_json::to_value(&scale_ctx).unwrap());
+    extra.insert(
+        SCALE_CTX_KEY.to_string(),
+        serde_json::to_value(&scale_ctx).unwrap(),
+    );
     extra.insert(SCALE_MOVE_CACHE_KEY_KEY.to_string(), json!(key));
     // NB: nessuna chiave `key` -> KeepTier (mossa assente).
     let state = AgentState {
@@ -3693,7 +4039,11 @@ async fn scale_rientro_keeptier_prosegue_una_sola_complete() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     // Il turno prosegue e produce il ToolUse col modello corrente.
-    assert_eq!(out.stop_reason, Some(StopReason::ToolUse), "KeepTier: prosegue il turno");
+    assert_eq!(
+        out.stop_reason,
+        Some(StopReason::ToolUse),
+        "KeepTier: prosegue il turno"
+    );
     // UNA sola chiamata LLM (nessun turno scartato/rifatto).
     assert_eq!(
         llm.seen.lock().unwrap().len(),
@@ -3711,7 +4061,10 @@ async fn scale_tetto_cambi_tier_pinna_heavy() {
     let rc = Arc::new(StubRunControlStore::default());
     let next_actions = Arc::new(StubNextActionsDeriver::default());
     let billing = Arc::new(StubBillingCooldownPort::default());
-    let upscale = Arc::new(StubModelUpscalePort::tier_resolving("anthropic", "claude-heavy"));
+    let upscale = Arc::new(StubModelUpscalePort::tier_resolving(
+        "anthropic",
+        "claude-heavy",
+    ));
     let cfg = ExecutorConfig {
         scale: ScaleConfig {
             enabled: true,
@@ -3730,21 +4083,43 @@ async fn scale_tetto_cambi_tier_pinna_heavy() {
     // Rientro con una DownscaleTo Light (l'LLM proponeva un downscale) e current=Medium.
     let state = state_scale_rientro(
         ScaleTier::Medium,
-        ScaleMove::DownscaleTo { tier: ScaleTier::Light, confidence: 0.9 },
+        ScaleMove::DownscaleTo {
+            tier: ScaleTier::Light,
+            confidence: 0.9,
+        },
         5000,
     );
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated), "cambio applicato (pin heavy)");
+    assert_eq!(
+        out.stop_reason,
+        Some(StopReason::G1Escalated),
+        "cambio applicato (pin heavy)"
+    );
     // Pin-UP a Heavy invece del Light proposto.
-    assert_eq!(out.current_tier.as_deref(), Some("heavy"), "tetto raggiunto -> pin a Heavy");
+    assert_eq!(
+        out.current_tier.as_deref(),
+        Some("heavy"),
+        "tetto raggiunto -> pin a Heavy"
+    );
     // La porta e' stata interrogata sul tier HEAVY, non light.
     let calls = upscale.tier_selected.lock().unwrap();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, "heavy", "risolve il modello del tier pinnato (heavy)");
+    assert_eq!(
+        calls[0].0, "heavy",
+        "risolve il modello del tier pinnato (heavy)"
+    );
     // Contatore cambi + flag pin persistiti.
-    assert_eq!(out.extra.get("scale_tier_changes_used").and_then(Value::as_i64), Some(1));
-    assert_eq!(out.extra.get("scale_pinned_heavy").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        out.extra
+            .get("scale_tier_changes_used")
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        out.extra.get("scale_pinned_heavy").and_then(Value::as_bool),
+        Some(true)
+    );
 }
 
 #[tokio::test]
@@ -3757,11 +4132,20 @@ async fn scale_pinned_heavy_disattiva_detector() {
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
     let ctx = ctx_with(llm.clone(), false);
     let mut state = state_scale_turn();
-    state.extra.insert("scale_pinned_heavy".to_string(), json!(true));
+    state
+        .extra
+        .insert("scale_pinned_heavy".to_string(), json!(true));
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
-    assert_ne!(out.stop_reason, Some(StopReason::ScaleReason), "pinnato heavy -> nessuna emissione");
-    assert!(out.extra.get(SCALE_CTX_KEY).is_none(), "detector disattivato dal pin");
+    assert_ne!(
+        out.stop_reason,
+        Some(StopReason::ScaleReason),
+        "pinnato heavy -> nessuna emissione"
+    );
+    assert!(
+        out.extra.get(SCALE_CTX_KEY).is_none(),
+        "detector disattivato dal pin"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -3785,6 +4169,7 @@ fn llm_text_usage(text: &str, prompt: i64, completion: i64) -> Arc<StubLlmGatewa
         },
         error: None,
         error_provider_unavailable: false,
+        provider_unavailable_cause: None,
         seen: std::sync::Mutex::new(vec![]),
     })
 }
@@ -4082,7 +4467,10 @@ async fn run_token_budget_a_flag_on_emette_stall_reason_runaway() {
         "nessuna chiusura anti_runaway: il giudice decide"
     );
     // StallContext strutturato (regola M): asse token_overflow, count = token usati.
-    let ctx_val = out.extra.get(STALL_CONTEXT_KEY).expect("StallContext in extra");
+    let ctx_val = out
+        .extra
+        .get(STALL_CONTEXT_KEY)
+        .expect("StallContext in extra");
     let sc: StallContext = serde_json::from_value(ctx_val.clone()).expect("StallContext");
     assert_eq!(sc.axis, "token_overflow");
     assert_eq!(sc.count, 400_001);
@@ -4115,7 +4503,10 @@ async fn text_only_a_flag_on_emette_stall_reason_runaway() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::StallReason));
-    let ctx_val = out.extra.get(STALL_CONTEXT_KEY).expect("StallContext in extra");
+    let ctx_val = out
+        .extra
+        .get(STALL_CONTEXT_KEY)
+        .expect("StallContext in extra");
     let sc: StallContext = serde_json::from_value(ctx_val.clone()).expect("StallContext");
     assert_eq!(sc.axis, "text_only");
     assert_eq!(sc.count, 3);
@@ -4295,7 +4686,10 @@ async fn runaway_stall_consuma_escalate_model() {
     // Escalation applicata: modello sticky promosso, budget consumato, ri-da il turno.
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
     assert_eq!(out.sticky_model.as_deref(), Some("claude-y"));
-    assert_eq!(out.extra.get("stall_moves_used").and_then(Value::as_i64), Some(1));
+    assert_eq!(
+        out.extra.get("stall_moves_used").and_then(Value::as_i64),
+        Some(1)
+    );
 }
 
 /// Golden di parita' 1:1 vs Python per la LOGICA DETERMINISTICA del singolo turno
@@ -4348,18 +4742,20 @@ mod golden {
         let already_guided: HashSet<String> = input
             .get("already_guided")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let repeated_action: Option<(String, i64)> = input
-            .get("repeated_action")
-            .and_then(|v| {
-                if v.is_null() {
-                    None
-                } else {
-                    let arr = v.as_array()?;
-                    Some((arr.first()?.as_str()?.to_string(), arr.get(1)?.as_i64()?))
-                }
-            });
+        let repeated_action: Option<(String, i64)> = input.get("repeated_action").and_then(|v| {
+            if v.is_null() {
+                None
+            } else {
+                let arr = v.as_array()?;
+                Some((arr.first()?.as_str()?.to_string(), arr.get(1)?.as_i64()?))
+            }
+        });
 
         // 1) esplorazione 2x soglia (controller ON).
         if progress_on && exploration_count >= 2 * exploration_threshold {
@@ -4420,8 +4816,14 @@ mod golden {
             s("sticky_model"),
             s("provider_override"),
             s("model_override"),
-            input.get("routing_provider").and_then(Value::as_str).unwrap_or(""),
-            input.get("routing_model").and_then(Value::as_str).unwrap_or(""),
+            input
+                .get("routing_provider")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            input
+                .get("routing_model")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
         );
         match res {
             ProviderResolution::Resolved(p, m) => {
@@ -4429,7 +4831,10 @@ mod golden {
             }
             ProviderResolution::NoProvider(p) => {
                 // Il Python espone provider/model risolti anche nel ramo no_provider.
-                let m = input.get("routing_model").and_then(Value::as_str).unwrap_or("");
+                let m = input
+                    .get("routing_model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 json!({"provider": p, "model": m, "no_provider": true})
             }
         }
@@ -4445,17 +4850,29 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 20, "attesi >= 20 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 20,
+            "attesi >= 20 casi, trovati {}",
+            cases.len()
+        );
         let mut checked = 0usize;
         for c in &cases {
             let got: Value = match c.group.as_str() {
                 "head_gate" => {
                     let inp = &c.input;
                     let h = head_gate(
-                        inp.get("superseded").and_then(Value::as_bool).unwrap_or(false),
-                        inp.get("declared_done").and_then(Value::as_bool).unwrap_or(false),
-                        inp.get("declared_done_count").and_then(Value::as_i64).unwrap_or(0),
-                        inp.get("g1_cap_reached").and_then(Value::as_bool).unwrap_or(false),
+                        inp.get("superseded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        inp.get("declared_done")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        inp.get("declared_done_count")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0),
+                        inp.get("g1_cap_reached")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     );
                     Value::String(head_gate_str(h).to_string())
                 }
@@ -4547,7 +4964,11 @@ mod golden_end_turn {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 15, "attesi >= 15 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 15,
+            "attesi >= 15 casi, trovati {}",
+            cases.len()
+        );
         let mut checked = 0usize;
         for c in &cases {
             let got: Value = match c.group.as_str() {
@@ -4561,7 +4982,11 @@ mod golden_end_turn {
                     Value::String(strip_suggested_actions(text))
                 }
                 "billing_fail_fast" => {
-                    let cnt = c.input.get("exploration_count").and_then(Value::as_i64).unwrap_or(0);
+                    let cnt = c
+                        .input
+                        .get("exploration_count")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     let thr = c
                         .input
                         .get("exploration_threshold")
@@ -4571,7 +4996,11 @@ mod golden_end_turn {
                         .input
                         .get("exhausted")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     // Il golden (parita' storica) non porta current_provider: passa
                     // il primo esausto, cosi' la semantica 3-param e' replicata
@@ -4584,14 +5013,34 @@ mod golden_end_turn {
                     }
                 }
                 "should_upscale" => {
-                    let en = c.input.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-                    let est = c.input.get("est_tokens").and_then(Value::as_i64).unwrap_or(0);
-                    let win = c.input.get("current_window").and_then(Value::as_i64).unwrap_or(0);
+                    let en = c
+                        .input
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let est = c
+                        .input
+                        .get("est_tokens")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let win = c
+                        .input
+                        .get("current_window")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     Value::Bool(should_upscale(en, est, win))
                 }
                 "upscale_required" => {
-                    let est = c.input.get("est_tokens").and_then(Value::as_i64).unwrap_or(0);
-                    let ov = c.input.get("overhead").and_then(Value::as_f64).unwrap_or(1.0);
+                    let est = c
+                        .input
+                        .get("est_tokens")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let ov = c
+                        .input
+                        .get("overhead")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0);
                     Value::from(upscale_required_tokens(est, ov))
                 }
                 other => panic!("gruppo golden sconosciuto: {other} (caso {})", c.case_id),
@@ -4654,7 +5103,10 @@ mod multi_turn_wire {
         // [1] assistant con tool_calls NON vuoto contenente id=c1 (NON appiattito
         // nel content): cosi' il server produce un block tool_use, non una stringa.
         assert_eq!(wire[1].role, "assistant");
-        let calls = wire[1].tool_calls.as_ref().expect("assistant deve avere tool_calls");
+        let calls = wire[1]
+            .tool_calls
+            .as_ref()
+            .expect("assistant deve avere tool_calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].name, "read_file");

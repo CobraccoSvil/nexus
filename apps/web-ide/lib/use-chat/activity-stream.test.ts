@@ -138,6 +138,128 @@ test("escalation con causa strutturata la porta nello SwitchEvent", () => {
   assert.equal(sw?.cooldown, undefined);
 });
 
+test("consiglio competenze usa meta-step strutturato dedicato", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        activation_source: "agentic_deterministic_complexity_scope_analysis",
+        signal: "council_synthesis_present",
+        activated: true,
+      },
+      "Consiglio delle Competenze attivo",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+    );
+
+  assert.ok(event, "evento Consiglio delle Competenze atteso");
+  assert.equal(event.productName, "Consiglio delle Competenze");
+  assert.equal(event.activationSource, "agentic_deterministic_complexity_scope_analysis");
+});
+
+test("consiglio competenze degradato espone segnale strutturato", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        activation_source: "agentic_deterministic_complexity_scope_analysis",
+        signal: "council_degraded",
+        activated: false,
+        degraded: true,
+        degradation_reason: "subagents_disabled",
+        degradation_detail:
+          "Sub-agents disabilitati (orchestrator.subagents_enabled=false): impossibile convocare le figure.",
+        figure_count: 5,
+      },
+      "Consiglio delle Competenze degradato (5 figure)",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+    );
+
+  assert.ok(event, "evento Consiglio degradato atteso");
+  assert.equal(event.degraded, true);
+  assert.match(
+    event.degradationReason ?? "",
+    /subagents_enabled=false/,
+  );
+});
+
+test("multi-provider panel usa meta-step strutturato dedicato", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "multi_provider_panel",
+      {
+        product_name: "Multi-provider advisory",
+        activation_source: "agentic_deterministic_multi_provider_panel",
+        signal: "multi_provider_synthesis_present",
+        activated: true,
+        degraded: false,
+        provider_count: 3,
+      },
+      "Panel multi-provider attivo (3)",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "multi_provider_panel" }> =>
+      e.type === "multi_provider_panel",
+    );
+
+  assert.ok(event, "evento multi-provider atteso");
+  assert.equal(event.productName, "Multi-provider advisory");
+  assert.equal(event.providerCount, 3);
+  assert.equal(event.degraded, false);
+});
+
+test("multi-provider panel degradato espone segnale strutturato", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "multi_provider_panel",
+      {
+        product_name: "Multi-provider advisory",
+        signal: "multi_provider_degraded",
+        activated: false,
+        degraded: true,
+        degradation_reason: "insufficient_provider_diversity",
+        provider_count_got: 1,
+        provider_count_min: 2,
+      },
+      "Panel multi-provider degradato (1/2)",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "multi_provider_panel" }> =>
+      e.type === "multi_provider_panel",
+    );
+
+  assert.ok(event);
+  assert.equal(event.degraded, true);
+  assert.equal(event.degradationReason, "insufficient_provider_diversity");
+});
+
 test("fallback senza to_provider strutturato non crea segmento fantasma", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [

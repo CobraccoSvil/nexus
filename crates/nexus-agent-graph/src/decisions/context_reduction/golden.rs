@@ -33,14 +33,26 @@ struct GoldenCase {
 /// `anthropic_content` assente o `null` -> `Value::Null`; flag default false.
 fn spec_to_msg(spec: &Value) -> HistoryMessage {
     HistoryMessage {
-        is_human: spec.get("is_human").and_then(Value::as_bool).unwrap_or(false),
+        is_human: spec
+            .get("is_human")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         content: spec
             .get("content")
             .cloned()
             .unwrap_or_else(|| Value::String(String::new())),
-        anthropic_content: spec.get("anthropic_content").cloned().unwrap_or(Value::Null),
-        nexus_summary: spec.get("nexus_summary").and_then(Value::as_bool).unwrap_or(false),
-        rolling_summary: spec.get("rolling_summary").and_then(Value::as_bool).unwrap_or(false),
+        anthropic_content: spec
+            .get("anthropic_content")
+            .cloned()
+            .unwrap_or(Value::Null),
+        nexus_summary: spec
+            .get("nexus_summary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        rolling_summary: spec
+            .get("rolling_summary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         ..Default::default()
     }
 }
@@ -83,7 +95,11 @@ fn golden_context_reduction() {
         return;
     };
     let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-    assert!(cases.len() >= 35, "attesi >= 35 casi, trovati {}", cases.len());
+    assert!(
+        cases.len() >= 35,
+        "attesi >= 35 casi, trovati {}",
+        cases.len()
+    );
 
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 
@@ -101,8 +117,16 @@ fn golden_context_reduction() {
                     compress_phase_max_chars: i64_vec(&cfg_j["compress_phase_max_chars"]),
                 };
                 let (comp, params) = should_compress_now(iteration, &cfg);
-                assert_eq!(comp, c.output["compress"].as_bool().unwrap(), "{ctx} compress");
-                assert_eq!(params.keep_recent, c.output["keep_recent"].as_i64().unwrap(), "{ctx} keep_recent");
+                assert_eq!(
+                    comp,
+                    c.output["compress"].as_bool().unwrap(),
+                    "{ctx} compress"
+                );
+                assert_eq!(
+                    params.keep_recent,
+                    c.output["keep_recent"].as_i64().unwrap(),
+                    "{ctx} keep_recent"
+                );
                 assert_eq!(
                     params.max_content_chars,
                     c.output["max_content_chars"].as_i64().unwrap(),
@@ -122,7 +146,11 @@ fn golden_context_reduction() {
             "looks_like_base64" => {
                 let s = c.input["s"].as_str().unwrap();
                 let min_len = c.input["min_len"].as_u64().unwrap() as usize;
-                assert_eq!(looks_like_base64(s, min_len), c.output.as_bool().unwrap(), "{ctx}");
+                assert_eq!(
+                    looks_like_base64(s, min_len),
+                    c.output.as_bool().unwrap(),
+                    "{ctx}"
+                );
             }
             "drop_unused_base64_payloads" => {
                 let msgs = specs_to_msgs(&c.input["messages"]);
@@ -136,7 +164,13 @@ fn golden_context_reduction() {
                 let keep_recent = c.input["keep_recent"].as_u64().unwrap() as usize;
                 let max_chars = c.input["max_content_chars"].as_u64().unwrap() as usize;
                 let cutoff = c.input["cutoff_index"].as_u64().map(|v| v as usize);
-                let got = compress_old_tool_results(&msgs, keep_recent, max_chars, cutoff, &degraded_marker);
+                let got = compress_old_tool_results(
+                    &msgs,
+                    keep_recent,
+                    max_chars,
+                    cutoff,
+                    &degraded_marker,
+                );
                 assert_msgs_eq(&got, &c.output, &ctx);
             }
             "apply_token_brake" => {
@@ -145,7 +179,8 @@ fn golden_context_reduction() {
                 let cfg_j = c.input["config"].as_object().unwrap();
                 let cfg = TokenBrakeConfig {
                     max_context_ratio: cfg_j["max_context_ratio"].as_f64().unwrap(),
-                    aggressive_keep_recent: cfg_j["aggressive_keep_recent"].as_u64().unwrap() as usize,
+                    aggressive_keep_recent: cfg_j["aggressive_keep_recent"].as_u64().unwrap()
+                        as usize,
                     aggressive_max_chars: cfg_j["aggressive_max_chars"].as_u64().unwrap() as usize,
                 };
                 let got = apply_token_brake(&msgs, window, &cfg, &det_estimator);
@@ -182,7 +217,11 @@ fn golden_context_reduction() {
                 let (got_msgs, got_sys) =
                     inject_forced_rag_reminder(&msgs, sys, est, window, ratio, text);
                 assert_msgs_eq(&got_msgs, &c.output["messages"], &ctx);
-                assert_eq!(got_sys, c.output["system_text"].as_str().unwrap(), "{ctx} system_text");
+                assert_eq!(
+                    got_sys,
+                    c.output["system_text"].as_str().unwrap(),
+                    "{ctx} system_text"
+                );
             }
             other => panic!("gruppo golden sconosciuto: {other} (caso {})", c.case_id),
         }
@@ -203,9 +242,15 @@ fn golden_context_reduction() {
         "inject_verification_directive",
         "inject_forced_rag_reminder",
     ] {
-        assert!(counts.get(g).copied().unwrap_or(0) > 0, "nessun caso per il gruppo {g}");
+        assert!(
+            counts.get(g).copied().unwrap_or(0) > 0,
+            "nessun caso per il gruppo {g}"
+        );
     }
-    println!("golden context_reduction: {} casi verificati per gruppo {counts:?}", cases.len());
+    println!(
+        "golden context_reduction: {} casi verificati per gruppo {counts:?}",
+        cases.len()
+    );
 }
 
 /// Converte un array JSON di interi in `Vec<i64>`.

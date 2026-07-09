@@ -527,12 +527,8 @@ impl FinalGateNode {
             let mut last_score: Option<i64> = None;
             for m in &state.messages {
                 if let Message::Tool { content, .. } = m {
-                    if let Ok(v) =
-                        serde_json::from_str::<Value>(content.flatten_text().trim())
-                    {
-                        if let Some(sc) =
-                            v.get("similarity_score").and_then(Value::as_i64)
-                        {
+                    if let Ok(v) = serde_json::from_str::<Value>(content.flatten_text().trim()) {
+                        if let Some(sc) = v.get("similarity_score").and_then(Value::as_i64) {
                             last_score = Some(sc);
                         }
                     }
@@ -569,17 +565,17 @@ impl FinalGateNode {
                 expected: json!({ "acted": true }),
                 timeout_s: None,
             });
-            // tool_capability: un task software con ZERO tool esposti e' una
-            // misconfigurazione (catalogo/whitelist), non colpa del task.
-            let tools_count = state
-                .tools_json
-                .as_ref()
-                .map(|t| t.len())
-                .unwrap_or(0);
+            // tool_capability: un task software con ZERO tool esposti e senza
+            // alcuna tool call gia' osservata e' una misconfigurazione
+            // (catalogo/whitelist), non colpa del task. Se la history contiene
+            // tool_use, il catalogo c'era al momento dell'azione: non bocciare
+            // per un `tools_json` non propagato al gate/resume.
+            let tools_count = state.tools_json.as_ref().map(|t| t.len()).unwrap_or(0);
             criteria.push(CriterionSpec {
                 criterion_type: "tool_capability".to_string(),
                 spec: json!({
                     "tools_count": tools_count,
+                    "has_tool_calls": signals::has_tool_calls_in_history(&state.messages),
                     "action_oriented": action_oriented,
                 }),
                 expected: json!({ "capable": true }),
@@ -676,7 +672,10 @@ impl FinalGateNode {
                 // dei pattern di errore su un build riuscito (run 48793fde).
                 if r.criterion_type == "run_command" {
                     if let Value::Object(map) = &mut item {
-                        map.insert("exit_code".to_string(), ev.get("exit_code").cloned().unwrap_or(Value::Null));
+                        map.insert(
+                            "exit_code".to_string(),
+                            ev.get("exit_code").cloned().unwrap_or(Value::Null),
+                        );
                         map.insert(
                             "build_errors".to_string(),
                             ev.get("build_errors").cloned().unwrap_or(Value::Null),
@@ -776,16 +775,13 @@ impl FinalGateNode {
                 .to_string(),
             "- Correggi TUTTI gli errori in un solo giro quando possibile: edita ogni file"
                 .to_string(),
-            "  impattato (anche errori 'banali' tipo unused/type mismatch contano)."
-                .to_string(),
+            "  impattato (anche errori 'banali' tipo unused/type mismatch contano).".to_string(),
             "- Se l'output e' troncato (vedi nota 'output troncato'), rilancia il comando di"
                 .to_string(),
-            "  build con run_command (o rileggi i file impattati) per vedere il resto."
-                .to_string(),
+            "  build con run_command (o rileggi i file impattati) per vedere il resto.".to_string(),
             "- Lavora per CONVERGENZA: niente 'task completato' finche' il build non passa"
                 .to_string(),
-            "  al 100% (exit 0, zero errori). Riverifica sempre dopo le correzioni."
-                .to_string(),
+            "  al 100% (exit 0, zero errori). Riverifica sempre dopo le correzioni.".to_string(),
         ];
         if build_errors_count > 0 {
             directives_lines.insert(
@@ -1065,7 +1061,9 @@ mod tests {
 
     use super::*;
     use crate::runtime::ports::ExecMode;
-    use crate::runtime::test_doubles::{NullEventSink, StubCriteriaRunner, StubLlmGateway, StubMetaStepStore, StubToolExecutor};
+    use crate::runtime::test_doubles::{
+        NullEventSink, StubCriteriaRunner, StubLlmGateway, StubMetaStepStore, StubToolExecutor,
+    };
     use crate::runtime::AgentNodeCtx;
     use crate::state::{ContentBlock, Message, MessageContent};
 
@@ -1118,7 +1116,12 @@ mod tests {
         cfg: FinalGateConfig,
         criteria: Arc<dyn crate::runtime::ports::CriteriaRunner>,
     ) -> FinalGateNode {
-        FinalGateNode::new(cfg, RoutingConfig::default(), criteria, std::sync::Arc::new(StubMetaStepStore::default()))
+        FinalGateNode::new(
+            cfg,
+            RoutingConfig::default(),
+            criteria,
+            std::sync::Arc::new(StubMetaStepStore::default()),
+        )
     }
 
     /// Messaggio AI con un tool_use mutativo: rende il task "software"
@@ -1222,9 +1225,9 @@ mod tests {
             fail_result("completion_confirmed", json!({})),
         ]));
         // nessun fallito -> false (e' gia' PASSED)
-        assert!(!FinalGateNode::only_completion_confirmed_failed(&[ok_result(
-            "run_command"
-        )]));
+        assert!(!FinalGateNode::only_completion_confirmed_failed(&[
+            ok_result("run_command")
+        ]));
     }
 
     #[tokio::test]
@@ -1235,7 +1238,10 @@ mod tests {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![
             ok_result("no_orphan_imported"),
             ok_result("run_command"),
-            fail_result("completion_confirmed", json!({"excerpt": "manca task_complete"})),
+            fail_result(
+                "completion_confirmed",
+                json!({"excerpt": "manca task_complete"}),
+            ),
         ]));
         let node = node_with(FinalGateConfig::default(), runner);
         let ctx = ctx_with(false);
@@ -1515,6 +1521,7 @@ mod tests {
             .find(|c| c.criterion_type == "tool_capability")
             .expect("tool_capability");
         assert_eq!(tc.spec["tools_count"], json!(1));
+        assert_eq!(tc.spec["has_tool_calls"], json!(true));
 
         let cc = crits
             .iter()
@@ -1549,6 +1556,27 @@ mod tests {
         assert!(!types_off.iter().any(|t| t == "action_requested"
             || t == "tool_capability"
             || t == "completion_confirmed"));
+    }
+
+    #[test]
+    fn build_criteria_tool_capability_porta_history_tool_call() {
+        // Regressione: in alcuni resume/fan-in il catalogo nello stato puo' essere
+        // vuoto/assente, ma la history contiene gia' tool_use eseguiti. Il criterio
+        // deve ricevere quel fatto strutturato invece di bocciare solo su
+        // tools_count=0.
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        let mut st = software_state();
+        st.tools_json = None;
+        let crits = node.build_criteria(&st);
+        let tc = crits
+            .iter()
+            .find(|c| c.criterion_type == "tool_capability")
+            .expect("tool_capability");
+        assert_eq!(tc.spec["tools_count"], json!(0));
+        assert_eq!(tc.spec["has_tool_calls"], json!(true));
     }
 
     // ── count_build_errors ────────────────────────────────────────────────────────
@@ -1620,7 +1648,11 @@ mod tests {
         let arr = meta.as_array().expect("array");
         assert_eq!(arr[0]["type"], json!("run_command"));
         assert_eq!(arr[0]["exit_code"], json!(0), "exit_code AS-IS nel payload");
-        assert_eq!(arr[0]["build_errors"], json!(1), "build_errors visibile: exit 0 + 1 = falso positivo");
+        assert_eq!(
+            arr[0]["build_errors"],
+            json!(1),
+            "build_errors visibile: exit 0 + 1 = falso positivo"
+        );
         // I criteri NON-comando non portano exit_code/build_errors (niente rumore).
         assert_eq!(arr[1]["type"], json!("completion_confirmed"));
         assert!(arr[1].get("exit_code").is_none());
@@ -1743,10 +1775,7 @@ mod tests {
 
     #[test]
     fn all_passed_reduce() {
-        assert!(FinalGateNode::all_passed(&[
-            ok_result("a"),
-            ok_result("b")
-        ]));
+        assert!(FinalGateNode::all_passed(&[ok_result("a"), ok_result("b")]));
         assert!(!FinalGateNode::all_passed(&[
             ok_result("a"),
             fail_result("b", json!({}))
@@ -1846,7 +1875,10 @@ mod golden {
         if let Some(tid) = input.get("thread_id").and_then(Value::as_str) {
             st.thread_id = Some(tid.to_string());
         }
-        if let Some(f) = input.get("forced_close_unverified").and_then(Value::as_bool) {
+        if let Some(f) = input
+            .get("forced_close_unverified")
+            .and_then(Value::as_bool)
+        {
             st.forced_close_unverified = Some(f);
         }
         if let Some(c) = input.get("final_gate_cycle").and_then(Value::as_i64) {
@@ -1935,10 +1967,15 @@ mod golden {
                 "render_failed_block" => {
                     let st = state_from(&c.input);
                     let cycle = c.input.get("cycle").and_then(Value::as_i64).unwrap_or(1);
-                    let max_cycles =
-                        c.input.get("max_cycles").and_then(Value::as_i64).unwrap_or(2);
+                    let max_cycles = c
+                        .input
+                        .get("max_cycles")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(2);
                     let results = results_from(&c.input);
-                    json!(FinalGateNode::render_failed_block(&st, cycle, max_cycles, &results))
+                    json!(FinalGateNode::render_failed_block(
+                        &st, cycle, max_cycles, &results
+                    ))
                 }
                 "route_after_final_gate" => {
                     let st = state_from(&c.input);
@@ -1952,8 +1989,11 @@ mod golden {
                 "decision_machine" => {
                     let st = state_from(&c.input);
                     let results = results_from(&c.input);
-                    let max_cycles =
-                        c.input.get("max_cycles").and_then(Value::as_i64).unwrap_or(2);
+                    let max_cycles = c
+                        .input
+                        .get("max_cycles")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(2);
                     decision_delta(&st, &results, max_cycles)
                 }
                 other => panic!("funzione golden sconosciuta: {other} (caso {})", c.case_id),

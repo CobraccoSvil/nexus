@@ -148,12 +148,16 @@ export function EditorArea({
     for (const model of models) {
       // model.uri is something like "file:///src/app.ts" or just the path
       const uriPath = normalizePath(model.uri.path);
-      const matchingProblems = byPath.get(uriPath) ?? [];
+      let matchingProblems = byPath.get(uriPath) ?? [];
       if (matchingProblems.length === 0) {
-        // Try suffix match (filePath might be relative while uri is absolute)
+        // Suffix match: usa il path relativo piu' lungo (evita marker duplicati).
+        let bestLen = 0;
         for (const [probPath, items] of byPath) {
           if (uriPath.endsWith("/" + probPath) || uriPath === probPath) {
-            matchingProblems.push(...items);
+            if (probPath.length > bestLen) {
+              bestLen = probPath.length;
+              matchingProblems = items;
+            }
           }
         }
       }

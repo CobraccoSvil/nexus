@@ -6,7 +6,7 @@
  * Colonna sinistra: tutti i canali disponibili (System, Git, Tasks, …)
  *   + processi agente attivi/terminati (prefisso "agent:").
  * Area destra: contenuto del canale selezionato.
- *   - Canali statici: polling 5s (comportamento precedente).
+ *   - Canali statici: aggiornati dal parent via SSE (OutputChannelCreated).
  *   - Canali agent:  SSE in tempo reale, autoscroll, colori ANSI base.
  *
  * Funzionalità agente: Stop, Invia a Nexus, Apri URL, Chiudi (solo terminati).
@@ -22,13 +22,14 @@ import {
   type OutputChannel,
   type OutputEvent,
 } from "../../lib/api-client";
+import { useProjectStore, selectOutputChannelsChangedAt } from "../../lib/project-dispatcher";
 
 interface OutputPanelProps {
   projectId: string;
   projectName?: string;
   /** Canali statici già caricati dal parent (System, Git, Tasks, …). */
   staticChannels?: OutputChannel[];
-  /** Events per il canale statico selezionato (dal parent via polling). */
+  /** Events per il canale statico selezionato (dal parent via SSE operativo). */
   staticEvents?: OutputEvent[];
   selectedStaticChannel?: string;
   onSelectStaticChannel?: (id: string) => void;
@@ -350,11 +351,16 @@ ${selection.text}
     } catch { /* ignore */ }
   }, [projectId]);
 
+  const outputChannelsChangedAt = useProjectStore(selectOutputChannelsChangedAt);
+
   useEffect(() => {
-    fetchAgentChannels();
-    const iv = setInterval(fetchAgentChannels, 5000);
-    return () => clearInterval(iv);
+    void fetchAgentChannels();
   }, [fetchAgentChannels]);
+
+  useEffect(() => {
+    if (outputChannelsChangedAt === 0) return;
+    void fetchAgentChannels();
+  }, [outputChannelsChangedAt, fetchAgentChannels]);
 
   // --- SSE per canale agente selezionato ---
   const startSse = useCallback((processId: string) => {
@@ -402,7 +408,7 @@ ${selection.text}
     };
   }, [projectId]);
 
-  // Fallback polling se SSE non è disponibile
+  // Snapshot iniziale one-shot prima di SSE live agente.
   const fetchAgentOutputPolling = useCallback(async (channelId: string) => {
     try {
       const res = await getOutputEvents(projectId, channelId, 1);
@@ -418,7 +424,6 @@ ${selection.text}
   useEffect(() => {
     if (!selectedAgent) return;
     const processId = selectedAgent.replace("agent:", "");
-    // Carica snapshot iniziale via polling, poi avvia SSE
     void fetchAgentOutputPolling(selectedAgent);
     startSse(processId);
     return () => {

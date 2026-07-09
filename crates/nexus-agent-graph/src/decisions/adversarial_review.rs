@@ -186,9 +186,9 @@ fn extract_vote(outcome: &Value) -> Option<Vote> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let has_high_severity = findings.iter().any(|f| {
-        f.get("severity").and_then(Value::as_str) == Some("alta")
-    });
+    let has_high_severity = findings
+        .iter()
+        .any(|f| f.get("severity").and_then(Value::as_str) == Some("alta"));
     Some(Vote {
         verdict,
         has_high_severity,
@@ -238,7 +238,12 @@ pub fn compose_panel_verdict(outcomes: &[Value], policy: &QuorumPolicy) -> Optio
     let valid = votes.len();
     let distinct = usize::from(pass > 0) + usize::from(fail > 0) + usize::from(needs_changes > 0);
     let verdict = classify_panel_verdict(
-        &Tally { valid, fail, needs_changes, any_high_severity_fail },
+        &Tally {
+            valid,
+            fail,
+            needs_changes,
+            any_high_severity_fail,
+        },
         policy,
     );
 
@@ -309,7 +314,10 @@ mod tests {
         let media = json!([{"file": "a.rs", "severity": "media", "description": "nit"}]);
         let out = compose_panel_verdict(
             &[reviewer("fail", media)],
-            &QuorumPolicy { min_valid_verdicts: 1, fail_on_high_severity: true },
+            &QuorumPolicy {
+                min_valid_verdicts: 1,
+                fail_on_high_severity: true,
+            },
         )
         .unwrap();
         assert_eq!(out.verdict, PanelVerdict::NeedsChanges);
@@ -320,7 +328,10 @@ mod tests {
         let media = json!([{"file": "a.rs", "severity": "media", "description": "nit"}]);
         let out = compose_panel_verdict(
             &[reviewer("fail", media)],
-            &QuorumPolicy { min_valid_verdicts: 1, fail_on_high_severity: false },
+            &QuorumPolicy {
+                min_valid_verdicts: 1,
+                fail_on_high_severity: false,
+            },
         )
         .unwrap();
         assert_eq!(out.verdict, PanelVerdict::Fail);
@@ -329,7 +340,10 @@ mod tests {
     #[test]
     fn needs_changes_senza_fail() {
         let out = compose_panel_verdict(
-            &[reviewer("pass", json!([])), reviewer("needs_changes", json!([]))],
+            &[
+                reviewer("pass", json!([])),
+                reviewer("needs_changes", json!([])),
+            ],
             &QuorumPolicy::default(),
         )
         .unwrap();
@@ -344,13 +358,19 @@ mod tests {
         let abstain = json!({"verdict": "timed_out", "success": false, "review": Value::Null});
         let out = compose_panel_verdict(
             &[reviewer("pass", json!([])), abstain],
-            &QuorumPolicy { min_valid_verdicts: 2, fail_on_high_severity: true },
+            &QuorumPolicy {
+                min_valid_verdicts: 2,
+                fail_on_high_severity: true,
+            },
         )
         .unwrap();
         assert_eq!(out.verdict, PanelVerdict::Inconclusive);
         assert!(!out.verdict.is_approved());
         assert_eq!(out.valid, 1);
-        assert_eq!(out.total_reviews, 1, "l'astensione senza review non conta come review");
+        assert_eq!(
+            out.total_reviews, 1,
+            "l'astensione senza review non conta come review"
+        );
     }
 
     #[test]

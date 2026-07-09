@@ -525,11 +525,7 @@ fn infer_tier_openai_gpt(m: &str, major: u32) -> &'static str {
 fn infer_tier_mistral(m: &str) -> &'static str {
     // Mistral non ha un tier "heavy"/"frontier" reale: large/medium-3.5 e'
     // il loro massimo (medium). Piccoli (ministral, small, nemo, tiny) light.
-    if m.contains("ministral")
-        || m.contains("small")
-        || m.contains("nemo")
-        || m.contains("tiny")
-    {
+    if m.contains("ministral") || m.contains("small") || m.contains("nemo") || m.contains("tiny") {
         "light"
     } else {
         // large, medium, codestral, devstral, magistral
@@ -621,13 +617,12 @@ pub(crate) fn classify_capabilities(
     //    'disable_for_tools'). Il FALSE storico nel catalog era un degrado
     //    runtime (malformed_tool_calls da run hollow) scritto senza guard
     //    capability_source, non una verita' del provider.
-    let supports_tool_use = if (p == "mistral" && m.contains("magistral"))
-        || (p == "deepseek" && m.contains("v4"))
-    {
-        true
-    } else {
-        meta_tool_use.unwrap_or(true)
-    };
+    let supports_tool_use =
+        if (p == "mistral" && m.contains("magistral")) || (p == "deepseek" && m.contains("v4")) {
+            true
+        } else {
+            meta_tool_use.unwrap_or(true)
+        };
 
     // ── vision: riflette l'instradabilita' REALE da brain/grpc_server/routes/
     //    vision.py. La lista dei provider instradabili NON e' piu' hardcoded ma
@@ -1079,7 +1074,15 @@ async fn sync_one_provider_into_stats(
     orchestrator: Option<&Orchestrator>,
     stats: &mut SyncStats,
 ) {
-    match sync_provider(db, provider, disable_missing, insert_new_disabled, orchestrator).await {
+    match sync_provider(
+        db,
+        provider,
+        disable_missing,
+        insert_new_disabled,
+        orchestrator,
+    )
+    .await
+    {
         Ok((ins, dis, re)) => {
             stats.providers_ok += 1;
             stats.inserted += ins;
@@ -1182,11 +1185,9 @@ async fn process_discovered_media_model(
     catalog_models: &std::collections::HashMap<String, (bool, bool)>,
 ) -> u32 {
     match catalog_models.contains_key(api_model) {
-        false if insert_new_disabled => {
-            insert_media_model(db, provider, api_model, kind)
-                .await
-                .unwrap_or(0)
-        }
+        false if insert_new_disabled => insert_media_model(db, provider, api_model, kind)
+            .await
+            .unwrap_or(0),
         // Media gia' presente: riallinea il flag supports_<media> sulle
         // righe 'auto' (gemello del riallineamento supports_vision dei chat).
         true => {
@@ -1858,7 +1859,9 @@ async fn probe_new_model_on_insert(
         ProbeOnInsertResult::Inconclusive(reason) => {
             tracing::debug!(
                 "catalog_sync[{}]: probe inconclusive su '{}': {} -> resta disabled (default)",
-                provider, api_model, reason
+                provider,
+                api_model,
+                reason
             );
         }
         ProbeOnInsertResult::Transient(kind) => {
@@ -1899,7 +1902,9 @@ async fn apply_probe_model_broken(db: &PgPool, provider: &str, api_model: &str, 
     .await;
     tracing::warn!(
         "catalog_sync[{}]: probe FAIL su nuovo modello '{}' (reason={}) -> resta disabled",
-        provider, api_model, kind
+        provider,
+        api_model,
+        kind
     );
 }
 
@@ -1953,7 +1958,13 @@ async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
     .await;
     tracing::info!(
         "catalog_sync[{}]: probe OK su '{}' -> {} (policy allowlist)",
-        provider, api_model, if allowed {"abilitato"} else {"lasciato disabilitato (fuori allowlist)"}
+        provider,
+        api_model,
+        if allowed {
+            "abilitato"
+        } else {
+            "lasciato disabilitato (fuori allowlist)"
+        }
     );
 }
 
@@ -2251,13 +2262,19 @@ mod tests {
             "light"
         );
         // Anthropic: fable-5 frontier.
-        assert_eq!(infer_tier_from_name("anthropic", "claude-fable-5"), "frontier");
+        assert_eq!(
+            infer_tier_from_name("anthropic", "claude-fable-5"),
+            "frontier"
+        );
         // OpenAI: *-pro / *-codex = heavy.
         assert_eq!(infer_tier_from_name("openai", "gpt-5-pro"), "heavy");
         assert_eq!(infer_tier_from_name("openai", "gpt-5.2-codex"), "heavy");
         // DeepSeek: v4-pro/reasoner high, v4-flash medium, coder light.
         assert_eq!(infer_tier_from_name("deepseek", "deepseek-v4-pro"), "high");
-        assert_eq!(infer_tier_from_name("deepseek", "deepseek-v4-flash"), "medium");
+        assert_eq!(
+            infer_tier_from_name("deepseek", "deepseek-v4-flash"),
+            "medium"
+        );
         assert_eq!(infer_tier_from_name("deepseek", "deepseek-coder"), "light");
     }
 
@@ -2295,14 +2312,23 @@ mod tests {
         // image_gen: dall-e / imagen / gpt-image / *-image / nano-banana.
         assert_eq!(classify_media_kind("dall-e-3"), Some("image_gen"));
         assert_eq!(classify_media_kind("dall-e-2"), Some("image_gen"));
-        assert_eq!(classify_media_kind("imagen-3.0-generate-002"), Some("image_gen"));
+        assert_eq!(
+            classify_media_kind("imagen-3.0-generate-002"),
+            Some("image_gen")
+        );
         assert_eq!(classify_media_kind("gpt-image-1"), Some("image_gen"));
-        assert_eq!(classify_media_kind("gemini-2.5-flash-image"), Some("image_gen"));
+        assert_eq!(
+            classify_media_kind("gemini-2.5-flash-image"),
+            Some("image_gen")
+        );
         assert_eq!(classify_media_kind("gemini-nano-banana"), Some("image_gen"));
         // audio_in: whisper / transcribe / voxtral.
         assert_eq!(classify_media_kind("whisper-1"), Some("audio_in"));
         assert_eq!(classify_media_kind("gpt-4o-transcribe"), Some("audio_in"));
-        assert_eq!(classify_media_kind("voxtral-small-latest"), Some("audio_in"));
+        assert_eq!(
+            classify_media_kind("voxtral-small-latest"),
+            Some("audio_in")
+        );
         // audio_out: tts.
         assert_eq!(classify_media_kind("tts-1"), Some("audio_out"));
         assert_eq!(classify_media_kind("tts-1-hd"), Some("audio_out"));

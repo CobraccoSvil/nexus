@@ -60,7 +60,8 @@ async fn neural_core_url(db: &PgPool) -> String {
     crate::auth::get_setting(db, "neural_core_url")
         .await
         .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
+            std::env::var("NEURAL_CORE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
         })
 }
 
@@ -229,7 +230,9 @@ async fn resolve_docs_generator_model(db: &PgPool) -> Result<(String, String), S
         }
         crate::internal_routing::PurposeResolution::MatrixUnavailable(e) => {
             tracing::error!("nexus_doc_generate: routing non disponibile: {e}");
-            Err(format!("[Errore] routing docs_generator non disponibile: {e}"))
+            Err(format!(
+                "[Errore] routing docs_generator non disponibile: {e}"
+            ))
         }
     }
 }
@@ -355,7 +358,9 @@ async fn call_docs_generator_gateway(
     };
     match gw.complete(gw_req).await {
         Ok(r) => Ok(r.content),
-        Err(e) => Err(format!("[Errore] Generazione automatica contenuto fallita: {e}")),
+        Err(e) => Err(format!(
+            "[Errore] Generazione automatica contenuto fallita: {e}"
+        )),
     }
 }
 
@@ -579,7 +584,9 @@ async fn render_docx_blocking(
     match join_result {
         Ok(Ok(rendered)) => Ok(rendered),
         Ok(Err(e)) => Err(format!("[Errore] Generazione documento fallita: {e}")),
-        Err(e) => Err(format!("[Errore] Task di rendering documento interrotto: {e}")),
+        Err(e) => Err(format!(
+            "[Errore] Task di rendering documento interrotto: {e}"
+        )),
     }
 }
 
@@ -609,13 +616,32 @@ async fn persist_generated_document(
         "nexus_doc_generate: .docx renderizzato in-process (renderer Rust)"
     );
     let doc_id = Uuid::new_v4();
-    if let Err(msg) =
-        insert_document_row(db, doc_id, pid, user_id, doc_type, final_title, version, relative_path, content).await
+    if let Err(msg) = insert_document_row(
+        db,
+        doc_id,
+        pid,
+        user_id,
+        doc_type,
+        final_title,
+        version,
+        relative_path,
+        content,
+    )
+    .await
     {
         return msg;
     }
 
-    spawn_document_side_effects(db, doc_id, pid, doc_type, final_title, version, relative_path, content);
+    spawn_document_side_effects(
+        db,
+        doc_id,
+        pid,
+        doc_type,
+        final_title,
+        version,
+        relative_path,
+        content,
+    );
 
     format_json(&json!({
         "ok": true,
@@ -710,9 +736,10 @@ fn spawn_document_side_effects(
     let doc_type2 = doc_type.to_string();
     let version2 = version.to_string();
     tokio::spawn(async move {
-        if let Err(e) =
-            crate::vector_memory::vectorize_document(&db2, pid, doc_id, &doc_type2, &version2, &content2)
-                .await
+        if let Err(e) = crate::vector_memory::vectorize_document(
+            &db2, pid, doc_id, &doc_type2, &version2, &content2,
+        )
+        .await
         {
             tracing::warn!("Vettorializzazione documento fallita: {e}");
         }
@@ -750,7 +777,8 @@ async fn save_document_version_history(
 /// Applica in-place gli aggiornamenti di `content`/`title` alle sezioni della
 /// `structure` esistente, appaiando per `number`. Estratto da `handle_doc_update`.
 fn merge_document_sections(structure: &mut Value, updates: &[Value]) {
-    let Some(existing_sections) = structure.get_mut("sections").and_then(Value::as_array_mut) else {
+    let Some(existing_sections) = structure.get_mut("sections").and_then(Value::as_array_mut)
+    else {
         return;
     };
     for update in updates {

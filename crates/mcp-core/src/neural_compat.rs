@@ -53,7 +53,10 @@ pub struct ReloadSettingsRequest {
     /// Accettato per parita' col contratto del brain ma non usato: mcp-core non
     /// ha un servizio esterno da ricaricare (cache TTL DB-driven, regola G).
     #[serde(default)]
-    #[allow(dead_code, reason = "campo del contratto brain /reload-settings, mantenuto per parita' API")]
+    #[allow(
+        dead_code,
+        reason = "campo del contratto brain /reload-settings, mantenuto per parita' API"
+    )]
     pub mcp_core_url: Option<String>,
 }
 
@@ -303,8 +306,6 @@ pub async fn billing_cooldown() -> impl IntoResponse {
 /// POST /reload-settings (mount: `/api/neural/reload-settings`).
 /// No-op: mcp-core legge le settings dal DB con cache TTL (regola G), non c'e'
 /// alcun servizio esterno da ricaricare. Forma: `{"ok": true}`.
-pub async fn reload_settings(
-    Json(_body): Json<ReloadSettingsRequest>,
-) -> impl IntoResponse {
+pub async fn reload_settings(Json(_body): Json<ReloadSettingsRequest>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "ok": true })))
 }

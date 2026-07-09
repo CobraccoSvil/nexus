@@ -82,8 +82,8 @@ impl FileReindexer for NeuralFileReindexer {
         let db = self.db.clone();
         let neural = self.neural.clone();
         Box::pin(async move {
-            let _ = crate::projects::reindex_single_file(&db, &neural, project_id, &root, &file)
-                .await;
+            let _ =
+                crate::projects::reindex_single_file(&db, &neural, project_id, &root, &file).await;
         })
     }
 }

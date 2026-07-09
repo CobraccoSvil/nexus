@@ -72,8 +72,7 @@ impl CacheConfig {
         .await;
         let mutators_csv =
             read_text(db, "agent.tools.result_cache_mutators", MUTATORS_DEFAULT).await;
-        let readers_csv =
-            read_text(db, "agent.tools.result_cache_readers", READERS_DEFAULT).await;
+        let readers_csv = read_text(db, "agent.tools.result_cache_readers", READERS_DEFAULT).await;
         Self {
             enabled,
             ttl_seconds,
@@ -88,9 +87,7 @@ impl CacheConfig {
     /// default legacy senza rename_file/nexus_mcp_tool_call): un tool con
     /// side-effect cacheato e' sempre un bug, mai una scelta.
     pub fn should_cache(&self, tool_name: &str) -> bool {
-        self.enabled
-            && !self.skip_for.iter().any(|s| s == tool_name)
-            && !self.is_mutator(tool_name)
+        self.enabled && !self.skip_for.iter().any(|s| s == tool_name) && !self.is_mutator(tool_name)
     }
 
     pub fn is_mutator(&self, tool_name: &str) -> bool {

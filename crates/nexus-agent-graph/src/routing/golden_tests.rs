@@ -54,8 +54,7 @@ fn node_label(n: NodeTarget) -> &'static str {
 #[test]
 #[ignore = "richiede /tmp/golden_phase2b.json generato da gen_golden_phase2b.py"]
 fn golden_parita_python() {
-    let Some(raw) =
-        crate::golden_util::load_golden("golden_phase2b.json", "gen_golden_phase2b.py")
+    let Some(raw) = crate::golden_util::load_golden("golden_phase2b.json", "gen_golden_phase2b.py")
     else {
         return;
     };

@@ -94,6 +94,11 @@ export const it: PartialDictionary = {
     "chat.thinking": "Sto pensando...",
     "chat.you": "Tu",
     "chat.ai": "AI",
+    "chat.systemWakeup.badge": "Risveglio automatico di sistema",
+    "chat.systemWakeup.explain": "L'agente si e' svegliato da solo per reagire a un evento del progetto: non hai chiesto tu questo turno.",
+    "chat.systemWakeup.success": "Un comando in background e' terminato con successo.",
+    "chat.systemWakeup.failure": "Un comando in background e' fallito.",
+    "chat.systemWakeup.cap": "Limite anti-loop raggiunto: risvegli automatici in pausa.",
 
     "mon.title": "Monitoraggio",
     "mon.subtitle": "Stato piattaforma",

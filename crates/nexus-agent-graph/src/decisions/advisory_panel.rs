@@ -286,9 +286,8 @@ pub fn compose_advisory_synthesis(
     risks.sort_by_key(severity_rank);
 
     let valid = advices.len();
-    let distinct = usize::from(proceed > 0)
-        + usize::from(proceed_with_changes > 0)
-        + usize::from(block > 0);
+    let distinct =
+        usize::from(proceed > 0) + usize::from(proceed_with_changes > 0) + usize::from(block > 0);
 
     let class = classify_panel(
         &QuorumTally {
@@ -354,13 +353,19 @@ mod tests {
     #[test]
     fn tutti_proceed_e_clear() {
         let out = compose_advisory_synthesis(
-            &[figure("proceed", json!([]), json!([])), figure("proceed", json!([]), json!([]))],
+            &[
+                figure("proceed", json!([]), json!([])),
+                figure("proceed", json!([]), json!([])),
+            ],
             &AdvisoryPolicy::default(),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Proceed);
         assert!(out.verdict.is_clear());
-        assert_eq!((out.proceed, out.proceed_with_changes, out.block), (2, 0, 0));
+        assert_eq!(
+            (out.proceed, out.proceed_with_changes, out.block),
+            (2, 0, 0)
+        );
         assert!(!out.dissent);
     }
 
@@ -369,7 +374,10 @@ mod tests {
         // Un solo block con rischio alta -> panel Block anche in minoranza.
         let high = json!([{"severity": "alta", "description": "falla"}]);
         let out = compose_advisory_synthesis(
-            &[figure("proceed", json!([]), json!([])), figure("block", high, json!(["usa PKCE"]))],
+            &[
+                figure("proceed", json!([]), json!([])),
+                figure("block", high, json!(["usa PKCE"])),
+            ],
             &AdvisoryPolicy::default(),
         )
         .unwrap();
@@ -385,7 +393,10 @@ mod tests {
         let media = json!([{"severity": "media", "description": "nit"}]);
         let out = compose_advisory_synthesis(
             &[figure("block", media, json!([]))],
-            &AdvisoryPolicy { min_valid_advisories: 1, block_on_high_severity: true },
+            &AdvisoryPolicy {
+                min_valid_advisories: 1,
+                block_on_high_severity: true,
+            },
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::ProceedWithChanges);
@@ -396,7 +407,10 @@ mod tests {
         let media = json!([{"severity": "media", "description": "nit"}]);
         let out = compose_advisory_synthesis(
             &[figure("block", media, json!([]))],
-            &AdvisoryPolicy { min_valid_advisories: 1, block_on_high_severity: false },
+            &AdvisoryPolicy {
+                min_valid_advisories: 1,
+                block_on_high_severity: false,
+            },
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Block);
@@ -424,13 +438,19 @@ mod tests {
         let abstain = json!({"verdict": "timed_out", "success": false, "advisory": Value::Null});
         let out = compose_advisory_synthesis(
             &[figure("proceed", json!([]), json!([])), abstain],
-            &AdvisoryPolicy { min_valid_advisories: 2, block_on_high_severity: true },
+            &AdvisoryPolicy {
+                min_valid_advisories: 2,
+                block_on_high_severity: true,
+            },
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Inconclusive);
         assert!(!out.verdict.is_clear());
         assert_eq!(out.valid, 1);
-        assert_eq!(out.total_advisories, 1, "l'astensione senza advisory non conta");
+        assert_eq!(
+            out.total_advisories, 1,
+            "l'astensione senza advisory non conta"
+        );
     }
 
     #[test]
@@ -444,7 +464,10 @@ mod tests {
         )
         .unwrap();
         // B compare una sola volta, ordine di prima apparizione.
-        assert_eq!(out.requirements, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+        assert_eq!(
+            out.requirements,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
     }
 
     #[test]

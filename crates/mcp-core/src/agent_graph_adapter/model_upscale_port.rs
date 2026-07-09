@@ -215,10 +215,12 @@ mod tests {
     #[sqlx::test]
     async fn select_upscale_sceglie_window_piu_grande_nel_tier(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')")
-            .execute(&pool)
-            .await
-            .expect("set tier");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
+        )
+        .execute(&pool)
+        .await
+        .expect("set tier");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
@@ -247,10 +249,12 @@ mod tests {
     #[sqlx::test]
     async fn select_upscale_none_se_migliore_e_il_corrente(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')")
-            .execute(&pool)
-            .await
-            .expect("set tier");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
+        )
+        .execute(&pool)
+        .await
+        .expect("set tier");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
@@ -261,17 +265,22 @@ mod tests {
         .expect("insert");
         let port = CatalogModelUpscalePort::new(pool.clone());
         // Il migliore coincide col corrente -> nessun upscale.
-        let pick = port.select_upscale_model("grande", 100000).await.expect("ok");
+        let pick = port
+            .select_upscale_model("grande", 100000)
+            .await
+            .expect("ok");
         assert!(pick.is_none());
     }
 
     #[sqlx::test]
     async fn select_upscale_esclude_thinking_exclude(pool: PgPool) {
         create_schema(&pool).await;
-        sqlx::query("INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')")
-            .execute(&pool)
-            .await
-            .expect("set tier");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
+        )
+        .execute(&pool)
+        .await
+        .expect("set tier");
         sqlx::query(
             "INSERT INTO ai_price_catalog \
              (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \

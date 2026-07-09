@@ -34,13 +34,11 @@ use sqlx::PgPool;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{
-    LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError,
-};
+use nexus_agent_graph::runtime::ports::{LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError};
 use nexus_agent_graph::state::ToolUse;
 
 use crate::nexus_gateway::{
-    GwMessage, GwMetadata, GwRequest, GwResponse, GwToolCall, GwToolFunctionCall,
+    GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall, GwToolFunctionCall,
     NexusGatewayClient,
 };
 
@@ -89,7 +87,12 @@ fn purpose_for_empty_model(req: &LlmRequest) -> Result<Option<String>, PortError
     if !req.model.trim().is_empty() {
         return Ok(None);
     }
-    match req.purpose.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    match req
+        .purpose
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(p) => Ok(Some(p.to_string())),
         None => Err(PortError::Llm(
             "richiesta LLM senza modello ne' purpose: il chiamante deve risolvere \
@@ -255,7 +258,8 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
                     function: GwToolFunctionCall {
                         name: tc.name.clone(),
                         // arguments e' una STRINGA JSON (contratto OpenAI).
-                        arguments: serde_json::to_string(&tc.input).unwrap_or_else(|_| "{}".to_string()),
+                        arguments: serde_json::to_string(&tc.input)
+                            .unwrap_or_else(|_| "{}".to_string()),
                     },
                     // ROUND-TRIP firma PER-CALL (Gemini 3): la thoughtSignature
                     // catturata in risposta viaggia allegata alla ToolUse e va
@@ -296,6 +300,11 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
         max_tokens: req.max_tokens.and_then(|m| u32::try_from(m).ok()),
         temperature: None,
         tools: req.tools.as_ref().map(|t| tools_to_openai_schema(t)),
+        response_format: req.response_format.clone(),
+        thinking: req.thinking.as_ref().map(|t| GwThinkingConfig {
+            enabled: t.enabled,
+            budget_tokens: t.budget_tokens,
+        }),
         tool_choice: force_tool_choice_to_value(req.force_tool_choice),
         pin_provider: if req.provider.is_empty() {
             None
@@ -544,12 +553,14 @@ async fn load_replay_steps(
 
     Ok(rows
         .into_iter()
-        .map(|(step_index, tool_name, tool_input, created_at_us)| ReplayStep {
-            step_index,
-            tool_name,
-            tool_input,
-            created_at_us,
-        })
+        .map(
+            |(step_index, tool_name, tool_input, created_at_us)| ReplayStep {
+                step_index,
+                tool_name,
+                tool_input,
+                created_at_us,
+            },
+        )
         .collect())
 }
 
@@ -824,7 +835,7 @@ impl LlmGateway for ReplayLlmGateway {
 mod tests {
     use super::*;
     use crate::nexus_gateway::{GwToolCall, GwToolFunctionCall, GwUsage};
-    use nexus_agent_graph::runtime::ports::LlmMessage;
+    use nexus_agent_graph::runtime::ports::{LlmMessage, ThinkingConfig};
 
     fn base_req() -> LlmRequest {
         LlmRequest {
@@ -980,7 +991,10 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     fn classify_altri_errori_restano_llm_generico() {
         // Un 400 di richiesta (BAD_REQUEST) o un errore HTTP non e' un cooldown:
         // resta Llm generico -> l'executor chiude come prima (StopReason::Error).
-        let bad = gw_err(400, "{\"error\":\"model non valido\",\"code\":\"BAD_REQUEST\"}");
+        let bad = gw_err(
+            400,
+            "{\"error\":\"model non valido\",\"code\":\"BAD_REQUEST\"}",
+        );
         assert!(matches!(classify_gateway_error(&bad), PortError::Llm(_)));
         // Errore di trasporto senza GatewayHttpError nella catena.
         let http = anyhow::anyhow!("Nexus Gateway HTTP error: connection refused");
@@ -994,7 +1008,9 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         // AFTER: force_tool_choice=Some(true) -> tool_choice "required" nel GwRequest.
         let mut req = base_req();
         req.force_tool_choice = Some(true);
-        req.tools = Some(vec![json!({"name": "edit_file", "input_schema": {"type": "object"}})]);
+        req.tools = Some(vec![
+            json!({"name": "edit_file", "input_schema": {"type": "object"}}),
+        ]);
 
         let gw = build_gw_request(&req);
         // Il vincolo DEVE essere presente e valere "required" (non droppato).
@@ -1021,6 +1037,24 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         req.force_tool_choice = Some(false);
         let gw = build_gw_request(&req);
         assert_eq!(gw.tool_choice, Some(json!("none")));
+    }
+
+    #[test]
+    fn response_format_e_thinking_attraversano_adapter() {
+        // AFTER: i parametri avanzati del contratto gateway non vengono piu'
+        // droppati dal client mcp-core prima di arrivare al provider.
+        let mut req = base_req();
+        req.response_format = Some(json!({"type": "json_object"}));
+        req.thinking = Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: Some(512),
+        });
+
+        let gw = build_gw_request(&req);
+        let body = serde_json::to_value(&gw).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert_eq!(body["thinking"]["enabled"], true);
+        assert_eq!(body["thinking"]["budget_tokens"], 512);
     }
 
     // ── provider/model pin + system ───────────────────────────────────────────
@@ -1278,7 +1312,10 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         // Il tool_use NON deve essere appiattito in content (resta il testo).
         let ai = &gw.messages[1];
         assert_eq!(ai.role, "assistant");
-        let calls = ai.tool_calls.as_ref().expect("assistant deve avere tool_calls");
+        let calls = ai
+            .tool_calls
+            .as_ref()
+            .expect("assistant deve avere tool_calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_X");
         assert_eq!(calls[0].kind, "function");
@@ -1365,7 +1402,11 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
             step_at(3003, "read_file", ond2),
         ];
         let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
-        assert_eq!(groups.len(), 2, "due ondate -> due turni, NON un mega-turno");
+        assert_eq!(
+            groups.len(),
+            2,
+            "due ondate -> due turni, NON un mega-turno"
+        );
         assert_eq!(groups[0].len(), 4);
         assert!(groups[0].iter().all(|s| s.tool_name == "read_file"));
         assert_eq!(groups[1].len(), 4);
@@ -1600,7 +1641,10 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
             assert_eq!(resp.stop_reason, None);
         }
         // purpose None -> anch'esso neutro.
-        let resp = gw.complete(LlmRequest::default()).await.expect("none neutro");
+        let resp = gw
+            .complete(LlmRequest::default())
+            .await
+            .expect("none neutro");
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.stop_reason, None);
     }
@@ -1613,7 +1657,10 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         let run = insert_run(&pool, None).await; // final_answer NULL
         let gw = ReplayLlmGateway::new(pool.clone(), run);
 
-        let r = gw.complete(executor_req()).await.expect("end_turn immediato");
+        let r = gw
+            .complete(executor_req())
+            .await
+            .expect("end_turn immediato");
         assert!(r.tool_calls.is_empty());
         assert_eq!(r.content, "", "final_answer NULL -> content vuoto");
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
@@ -1632,9 +1679,18 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         insert_step_at(&pool, run, 3000, "c", "2026-06-27T10:00:02Z").await;
 
         let gw = ReplayLlmGateway::new(pool.clone(), run);
-        assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "a");
-        assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "b");
-        assert_eq!(gw.complete(executor_req()).await.unwrap().tool_calls[0].name, "c");
+        assert_eq!(
+            gw.complete(executor_req()).await.unwrap().tool_calls[0].name,
+            "a"
+        );
+        assert_eq!(
+            gw.complete(executor_req()).await.unwrap().tool_calls[0].name,
+            "b"
+        );
+        assert_eq!(
+            gw.complete(executor_req()).await.unwrap().tool_calls[0].name,
+            "c"
+        );
         // 4a: esausto -> end_turn.
         let last = gw.complete(executor_req()).await.unwrap();
         assert_eq!(last.stop_reason.as_deref(), Some("end_turn"));

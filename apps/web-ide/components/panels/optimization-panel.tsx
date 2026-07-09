@@ -2,8 +2,10 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useThemeColors } from "../../lib/theme";
-import { useProjectStore, selectFilesRecent, useEventOfKind } from "../../lib/project-dispatcher/hooks";
+import { useProjectStore, selectFilesRecent } from "../../lib/project-dispatcher/hooks";
 import { selectQualityScan, selectFindingsUpdate } from "../../lib/project-dispatcher/store";
+import { useHealthSnapshot } from "../../lib/hooks/use-health-snapshot";
+import type { HealthResponse } from "../../lib/api/system";
 import {
   runQualityScan,
   getQualityFindings,
@@ -35,25 +37,11 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
   // sessione browser il banner "non disponibile" rimaneva stale all'infinito
   // perche l'effetto girava solo on-mount.
   const [depsOk, setDepsOk] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    const checkHealth = () => {
-      fetch(`${OPT_API_BASE}/api/health`, { credentials: "include" })
-        .then(r => r.json())
-        .then(d => {
-          if (cancelled) return;
-          const comps = d.components as Record<string, boolean> | undefined;
-          setDepsOk(comps?.qdrant !== false && comps?.embedder !== false);
-        })
-        .catch(() => { /* ignora — assume ok finche' un check riesce */ });
-    };
-    checkHealth();
-    const interval = window.setInterval(checkHealth, 30_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
+  const onHealthSnapshot = useCallback((health: HealthResponse) => {
+    const comps = health.components as Record<string, boolean | undefined>;
+    setDepsOk(comps.qdrant !== false && comps.embedder !== false);
   }, []);
+  useHealthSnapshot(onHealthSnapshot);
 
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<QualityScanResult | null>(() => {
@@ -507,21 +495,6 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
     }
   }, [filesRecentChanged, projectId]);
 
-  // Binding evento dispatcher `FindingsUpdated`: il backend emette dopo ogni
-  // scan di quality (auto o on-demand) con il delta `resolved_ids` (lista
-  // findings risolti rispetto allo stato precedente). Marchiamo in-place
-  // SENZA ri-scansionare lato client, evitando flash banner e duplicate API.
-  //
-  // Sostituisce il vecchio setInterval(15000) che faceva polling locale dei
-  // file con findings HIGH attivi — rumoroso e causa di flash banner periodici.
-  useEventOfKind("FindingsUpdated", (env) => {
-    const ids = env.payload.resolved_ids ?? [];
-    if (ids.length === 0) return;
-    void markBatchFixedRef.current(ids);
-    // Refresh leggero per allineare anche eventuali findings nuovi non risolti
-    setTimeout(() => { fetchFindingsRef.current(); }, 1000);
-  }, [projectId]);
-
   // Auto-reset della coda dopo che tutti i file sono stati inviati (con delay per mostrare il messaggio)
   useEffect(() => {
     if (fixQueue.length === 0 || fixQueueIndex < fixQueue.length || autoFixEnabled) return;
@@ -606,13 +579,15 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
     }
   }, [qualityScan, fetchFindings]);
 
-  // Reazione a FindingsUpdated via dispatcher SSE: emesso dall'auto-scan per-file
-  // (maybe_auto_scan_file) dopo ogni write/edit, inclusi i casi "file corretto"
-  // (0 finding nuovi) che prima lasciavano i problemi risolti nel pannello.
-  // Ricarica i findings cosi' la lista riflette lo stato reale senza scan manuale.
+  // Punto unico FindingsUpdated: store `findingsUpdate` (mark fixed + refetch).
   const findingsUpdate = useProjectStore(selectFindingsUpdate);
   useEffect(() => {
     if (!findingsUpdate) return;
+    if (findingsUpdate.resolvedIds.length > 0) {
+      void markBatchFixedRef.current(findingsUpdate.resolvedIds);
+      const t = window.setTimeout(() => { void fetchFindings(); }, 1000);
+      return () => window.clearTimeout(t);
+    }
     void fetchFindings();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [findingsUpdate]);

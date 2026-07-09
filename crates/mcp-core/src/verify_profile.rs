@@ -204,14 +204,13 @@ pub async fn persist_steps(meta_db: &PgPool, project_id: Uuid, steps: &[VerifyPr
 
 /// Legge gli step del profilo persistito (lettura pura, nessuna inferenza).
 pub async fn profile_steps(meta_db: &PgPool, project_id: Uuid) -> Vec<VerifyProfileStep> {
-    let row: Option<serde_json::Value> = sqlx::query_scalar(
-        "SELECT steps FROM project_verify_profiles WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(meta_db)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT steps FROM project_verify_profiles WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_optional(meta_db)
+            .await
+            .ok()
+            .flatten();
     row.and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default()
 }
@@ -253,8 +252,7 @@ async fn infer_call(
     user_text: String,
     timeout_s: u64,
 ) -> Option<serde_json::Value> {
-    let messages =
-        serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
+    let messages = serde_json::json!([{ "role": "user", "content": user_text }]).to_string();
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_s),
         neural.generate_agent_turn(provider, model, &messages, "[]", 1500, system_text),
@@ -297,23 +295,27 @@ pub async fn ensure_profile(
 ) -> Vec<VerifyProfileStep> {
     let enabled = nexus_auth::get_setting(meta_db, "agent.verify_infer.enabled")
         .await
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     if !enabled {
         return Vec::new();
     }
 
     // Stato persistito: steps + file osservati + hash + ownership.
-    let cached: Option<(serde_json::Value, serde_json::Value, String, String)> =
-        sqlx::query_as(
-            "SELECT steps, environment, manifest_hash, source \
+    let cached: Option<(serde_json::Value, serde_json::Value, String, String)> = sqlx::query_as(
+        "SELECT steps, environment, manifest_hash, source \
              FROM project_verify_profiles WHERE project_id = $1",
-        )
-        .bind(project_id)
-        .fetch_optional(meta_db)
-        .await
-        .ok()
-        .flatten();
+    )
+    .bind(project_id)
+    .fetch_optional(meta_db)
+    .await
+    .ok()
+    .flatten();
     let cached_steps = |c: &Option<(serde_json::Value, serde_json::Value, String, String)>| {
         c.as_ref()
             .and_then(|(s, _, _, _)| serde_json::from_value(s.clone()).ok())
@@ -327,8 +329,7 @@ pub async fn ensure_profile(
     }
 
     let root_owned = root.to_path_buf();
-    let Ok(listing) =
-        tokio::task::spawn_blocking(move || project_listing(&root_owned)).await
+    let Ok(listing) = tokio::task::spawn_blocking(move || project_listing(&root_owned)).await
     else {
         return cached_steps(&cached);
     };
@@ -566,7 +567,11 @@ mod tests {
         std::fs::write(dir.path().join("a.json"), "{}").expect("write");
         let files = read_requested_files(
             dir.path(),
-            &["a.json".to_string(), "../evil".to_string(), "manca.txt".to_string()],
+            &[
+                "a.json".to_string(),
+                "../evil".to_string(),
+                "manca.txt".to_string(),
+            ],
         );
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "a.json");

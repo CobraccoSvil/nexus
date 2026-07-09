@@ -80,9 +80,7 @@ export default function PromptExperiments() {
   }, []);
 
   useEffect(() => {
-    load();
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
+    void load();
   }, [load]);
 
   const handleExpand = async (id: string) => {

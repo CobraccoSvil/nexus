@@ -43,17 +43,62 @@ fn human_text(text: &str) -> HistoryMessage {
 fn should_compress_fasi() {
     let cfg = cfg_default();
     // Sotto start: no.
-    assert_eq!(should_compress_now(4, &cfg), (false, CompressParams { keep_recent: 0, max_content_chars: 0 }));
+    assert_eq!(
+        should_compress_now(4, &cfg),
+        (
+            false,
+            CompressParams {
+                keep_recent: 0,
+                max_content_chars: 0
+            }
+        )
+    );
     // 5-9 -> idx 0 -> (8, 2000).
-    assert_eq!(should_compress_now(5, &cfg).1, CompressParams { keep_recent: 8, max_content_chars: 2000 });
-    assert_eq!(should_compress_now(9, &cfg).1, CompressParams { keep_recent: 8, max_content_chars: 2000 });
+    assert_eq!(
+        should_compress_now(5, &cfg).1,
+        CompressParams {
+            keep_recent: 8,
+            max_content_chars: 2000
+        }
+    );
+    assert_eq!(
+        should_compress_now(9, &cfg).1,
+        CompressParams {
+            keep_recent: 8,
+            max_content_chars: 2000
+        }
+    );
     // 10-19 -> idx 1 -> (5, 1000).
-    assert_eq!(should_compress_now(10, &cfg).1, CompressParams { keep_recent: 5, max_content_chars: 1000 });
+    assert_eq!(
+        should_compress_now(10, &cfg).1,
+        CompressParams {
+            keep_recent: 5,
+            max_content_chars: 1000
+        }
+    );
     // 20-49 -> idx 2 -> (3, 500).
-    assert_eq!(should_compress_now(20, &cfg).1, CompressParams { keep_recent: 3, max_content_chars: 500 });
+    assert_eq!(
+        should_compress_now(20, &cfg).1,
+        CompressParams {
+            keep_recent: 3,
+            max_content_chars: 500
+        }
+    );
     // >=50 -> idx 3 -> (2, 150).
-    assert_eq!(should_compress_now(50, &cfg).1, CompressParams { keep_recent: 2, max_content_chars: 150 });
-    assert_eq!(should_compress_now(999, &cfg).1, CompressParams { keep_recent: 2, max_content_chars: 150 });
+    assert_eq!(
+        should_compress_now(50, &cfg).1,
+        CompressParams {
+            keep_recent: 2,
+            max_content_chars: 150
+        }
+    );
+    assert_eq!(
+        should_compress_now(999, &cfg).1,
+        CompressParams {
+            keep_recent: 2,
+            max_content_chars: 150
+        }
+    );
     // compress sempre true da start in poi.
     assert!(should_compress_now(5, &cfg).0);
 }
@@ -64,7 +109,8 @@ fn should_compress_fasi() {
 fn dedup_per_signature_tiene_ultimo() {
     // Due read_file con stessi args: il primo tool_result diventa placeholder.
     let tu = |id: &str| json!({ "type": "tool_use", "id": id, "name": "read_file", "input": {"path": "a.rs"} });
-    let tr = |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
+    let tr =
+        |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
     let msgs = vec![
         msg_blocks(json!([tu("t1")])),
         msg_blocks(json!([tr("t1", "primo contenuto")])),
@@ -74,7 +120,10 @@ fn dedup_per_signature_tiene_ultimo() {
     let out = dedup_tool_results_history(&msgs);
     // Il tool_result t1 (non ultimo per la signature read_file|a.rs) -> placeholder.
     let b1 = out[1].anthropic_content.as_array().unwrap()[0].clone();
-    assert_eq!(b1["content"].as_str().unwrap(), "[dedup: stesso tool con stessi args, vedi risultato piu' recente in msg #3]");
+    assert_eq!(
+        b1["content"].as_str().unwrap(),
+        "[dedup: stesso tool con stessi args, vedi risultato piu' recente in msg #3]"
+    );
     // t2 (ultimo) resta intatto.
     let b3 = out[3].anthropic_content.as_array().unwrap()[0].clone();
     assert_eq!(b3["content"].as_str().unwrap(), "secondo contenuto");
@@ -99,7 +148,8 @@ fn dedup_no_op_se_signature_diverse() {
 #[test]
 fn dedup_legacy_per_content() {
     let big = "z".repeat(300);
-    let tr = |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
+    let tr =
+        |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
     let msgs = vec![
         msg_blocks(json!([tr("t1", &big)])),
         msg_blocks(json!([tr("t2", &big)])),
@@ -107,7 +157,10 @@ fn dedup_legacy_per_content() {
     let out = dedup_tool_results(&msgs);
     // Stesso content -> il primo (non ultimo) e' placeholder [deduped: ...].
     let b0 = out[0].anthropic_content.as_array().unwrap()[0].clone();
-    assert_eq!(b0["content"].as_str().unwrap(), "[deduped: contenuto identico al tool_result piu' recente in msg #1]");
+    assert_eq!(
+        b0["content"].as_str().unwrap(),
+        "[deduped: contenuto identico al tool_result piu' recente in msg #1]"
+    );
     // content < 200 char: nessun dedup.
     let small = "k".repeat(100);
     let msgs2 = vec![
@@ -137,7 +190,8 @@ fn looks_like_base64_euristica() {
 fn drop_base64_orfano_sostituito_referenziato_intatto() {
     let b64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5".repeat(5);
     let prefix16: String = b64.chars().take(16).collect();
-    let tr = |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
+    let tr =
+        |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
     // Caso orfano: 4 messaggi, max_age=3, keep_recent=2 -> boundary=2; il msg 0
     // ha base64 non citato nei successivi -> sostituito.
     let msgs = vec![
@@ -160,7 +214,12 @@ fn drop_base64_orfano_sostituito_referenziato_intatto() {
         human_text("recente2"),
     ];
     let out2 = drop_unused_base64_payloads(&msgs2, 3, 2);
-    assert_eq!(out2[0].anthropic_content.as_array().unwrap()[0]["content"].as_str().unwrap(), b64);
+    assert_eq!(
+        out2[0].anthropic_content.as_array().unwrap()[0]["content"]
+            .as_str()
+            .unwrap(),
+        b64
+    );
 }
 
 // ── 4) compress_old_tool_results ─────────────────────────────────────────────
@@ -168,23 +227,37 @@ fn drop_base64_orfano_sostituito_referenziato_intatto() {
 #[test]
 fn compress_a_generazioni_sotto_cutoff() {
     let big = "y".repeat(1200);
-    let tr = |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
+    let tr =
+        |id: &str, body: &str| json!({ "type": "tool_result", "tool_use_id": id, "content": body });
     let msgs = vec![
         msg_blocks(json!([tr("t1", &big)])), // i=0, sotto cutoff=1 -> compresso
         msg_blocks(json!([tr("t2", &big)])), // i=1, >= cutoff -> intatto
     ];
     let out = compress_old_tool_results(&msgs, 6, 500, Some(1), &degraded_marker);
-    let c0 = out[0].anthropic_content.as_array().unwrap()[0]["content"].as_str().unwrap().to_string();
+    let c0 = out[0].anthropic_content.as_array().unwrap()[0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // kept = max(500/2, 100) = 250 char + marker degraded.
     assert!(c0.starts_with(&"y".repeat(250)));
-    assert!(c0.ends_with(&format!("[... compresso: {} char originali ...]", big.chars().count())));
+    assert!(c0.ends_with(&format!(
+        "[... compresso: {} char originali ...]",
+        big.chars().count()
+    )));
     // i=1 intatto.
-    assert_eq!(out[1].anthropic_content.as_array().unwrap()[0]["content"].as_str().unwrap(), big);
+    assert_eq!(
+        out[1].anthropic_content.as_array().unwrap()[0]["content"]
+            .as_str()
+            .unwrap(),
+        big
+    );
 }
 
 #[test]
 fn compress_cutoff_zero_no_op() {
-    let msgs = vec![msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t", "content": "x".repeat(2000) }]))];
+    let msgs = vec![msg_blocks(
+        json!([{ "type": "tool_result", "tool_use_id": "t", "content": "x".repeat(2000) }]),
+    )];
     let out = compress_old_tool_results(&msgs, 6, 500, Some(0), &degraded_marker);
     assert_eq!(out, msgs);
 }
@@ -192,7 +265,9 @@ fn compress_cutoff_zero_no_op() {
 #[test]
 fn compress_sotto_soglia_non_tocca() {
     let small = "k".repeat(100);
-    let msgs = vec![msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t", "content": small }]))];
+    let msgs = vec![msg_blocks(
+        json!([{ "type": "tool_result", "tool_use_id": "t", "content": small }]),
+    )];
     let out = compress_old_tool_results(&msgs, 0, 500, Some(1), &degraded_marker);
     assert_eq!(out, msgs);
 }
@@ -210,7 +285,11 @@ fn token_brake_sotto_soglia_no_op() {
             })
             .sum()
     };
-    let cfg = TokenBrakeConfig { max_context_ratio: 0.7, aggressive_keep_recent: 3, aggressive_max_chars: 200 };
+    let cfg = TokenBrakeConfig {
+        max_context_ratio: 0.7,
+        aggressive_keep_recent: 3,
+        aggressive_max_chars: 200,
+    };
     let msgs = vec![human_text("breve")];
     // window 1000 -> soglia 700; est=5 -> no-op.
     assert_eq!(apply_token_brake(&msgs, 1000, &cfg, &est), msgs);
@@ -226,7 +305,11 @@ fn token_brake_comprime_aggressivo() {
             })
             .sum()
     };
-    let cfg = TokenBrakeConfig { max_context_ratio: 0.5, aggressive_keep_recent: 1, aggressive_max_chars: 50 };
+    let cfg = TokenBrakeConfig {
+        max_context_ratio: 0.5,
+        aggressive_keep_recent: 1,
+        aggressive_max_chars: 50,
+    };
     // 4 messaggi: primo human (preservato), 2 vecchi lunghi (troncati), 1 recente.
     let mut msgs = vec![
         human_text(&"a".repeat(100)), // first_human -> preservato
@@ -237,7 +320,7 @@ fn token_brake_comprime_aggressivo() {
     msgs[1].is_human = false;
     msgs[2].is_human = false;
     let out = apply_token_brake(&msgs, 200, &cfg, &est); // soglia 100
-    // Il first_human (i=0) resta intatto.
+                                                         // Il first_human (i=0) resta intatto.
     assert_eq!(out[0].content.as_str().unwrap().chars().count(), 100);
     // I messaggi vecchi sono stati troncati (content piu' corto dell'originale).
     assert!(out[1].content.as_str().unwrap().chars().count() < 400);
@@ -254,7 +337,10 @@ fn lang_reminder_idempotente() {
     // Doppia iniezione: testa + coda.
     assert_eq!(s.matches("rispondi in italiano").count(), 2);
     // Idempotente: ri-applicare non duplica.
-    assert_eq!(inject_language_reminder(&s, true, "rispondi in italiano"), s);
+    assert_eq!(
+        inject_language_reminder(&s, true, "rispondi in italiano"),
+        s
+    );
     // Disabilitato o testo vuoto: no-op.
     assert_eq!(inject_language_reminder("X", false, "t"), "X");
     assert_eq!(inject_language_reminder("X", true, ""), "X");
@@ -265,9 +351,12 @@ fn lang_reminder_idempotente() {
 #[test]
 fn turn_focus_idempotente_col_marker() {
     let msgs = vec![human_text("crea index.html")];
-    let directive = build_turn_focus_directive(&[crate::state::Message::Human {
-        content: crate::state::MessageContent::text("crea index.html"),
-    }], false)
+    let directive = build_turn_focus_directive(
+        &[crate::state::Message::Human {
+            content: crate::state::MessageContent::text("crea index.html"),
+        }],
+        false,
+    )
     .expect("directive");
     let s1 = inject_turn_focus("SYS", &directive);
     assert!(s1.starts_with(TURN_FOCUS_MARKER));
@@ -293,8 +382,14 @@ fn verification_directive_condizioni() {
     // Idempotente.
     assert_eq!(inject_verification_directive(&s, true, true, dir), s);
     // Non rilevato / disabilitato / vuoto: no-op.
-    assert_eq!(inject_verification_directive("SYS", false, true, dir), "SYS");
-    assert_eq!(inject_verification_directive("SYS", true, false, dir), "SYS");
+    assert_eq!(
+        inject_verification_directive("SYS", false, true, dir),
+        "SYS"
+    );
+    assert_eq!(
+        inject_verification_directive("SYS", true, false, dir),
+        "SYS"
+    );
     assert_eq!(inject_verification_directive("SYS", true, true, ""), "SYS");
 }
 
@@ -304,18 +399,44 @@ fn verification_directive_condizioni() {
 fn forced_rag_reminder_condizioni() {
     let msgs = vec![human_text("ciao")];
     // est >= ratio*window -> appende un messaggio in coda.
-    let (out, sys) = inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.5, "usa la ricerca semantica");
+    let (out, sys) =
+        inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.5, "usa la ricerca semantica");
     assert_eq!(sys, "SYS"); // system intatto
     assert_eq!(out.len(), 2);
-    assert!(out[1].content.as_str().unwrap().contains(RAG_REMINDER_MARKER));
+    assert!(out[1]
+        .content
+        .as_str()
+        .unwrap()
+        .contains(RAG_REMINDER_MARKER));
     // Idempotenza: ri-applicare sul risultato (marker negli ultimi 8) non aggiunge.
-    let (out2, _) = inject_forced_rag_reminder(&out, "SYS", 80, 100, 0.5, "usa la ricerca semantica");
+    let (out2, _) =
+        inject_forced_rag_reminder(&out, "SYS", 80, 100, 0.5, "usa la ricerca semantica");
     assert_eq!(out2.len(), 2);
     // Sotto soglia / ratio<=0 / vuoto / window<=0: no-op.
-    assert_eq!(inject_forced_rag_reminder(&msgs, "SYS", 10, 100, 0.5, "x").0.len(), 1);
-    assert_eq!(inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.0, "x").0.len(), 1);
-    assert_eq!(inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.5, "").0.len(), 1);
-    assert_eq!(inject_forced_rag_reminder(&msgs, "SYS", 80, 0, 0.5, "x").0.len(), 1);
+    assert_eq!(
+        inject_forced_rag_reminder(&msgs, "SYS", 10, 100, 0.5, "x")
+            .0
+            .len(),
+        1
+    );
+    assert_eq!(
+        inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.0, "x")
+            .0
+            .len(),
+        1
+    );
+    assert_eq!(
+        inject_forced_rag_reminder(&msgs, "SYS", 80, 100, 0.5, "")
+            .0
+            .len(),
+        1
+    );
+    assert_eq!(
+        inject_forced_rag_reminder(&msgs, "SYS", 80, 0, 0.5, "x")
+            .0
+            .len(),
+        1
+    );
 }
 
 // ── 9) ROLLING SUMMARY (cutoff + serialize + apply) ───────────────────────────
@@ -373,9 +494,15 @@ fn rolling_cutoff_aggiusta_per_non_lasciare_tool_result_orfano() {
         human_text("ok grazie"),
     ];
     let cut = select_rolling_summary_cutoff(&hist, 3).expect("cutoff Some");
-    assert_eq!(cut, 4, "cutoff aggiustato per assorbire i tool_result nel prefisso");
+    assert_eq!(
+        cut, 4,
+        "cutoff aggiustato per assorbire i tool_result nel prefisso"
+    );
     // Il primo messaggio del suffisso NON e' un tool_result.
-    assert!(!hist[cut].is_tool, "suffisso non parte con un tool_result orfano");
+    assert!(
+        !hist[cut].is_tool,
+        "suffisso non parte con un tool_result orfano"
+    );
 }
 
 #[test]
@@ -530,7 +657,7 @@ fn cosine_similarity_casi_base() {
 fn select_continuity_candidates_atomi_e_confine() {
     // [human, assist(tool_use t1), tool_result t1, assist-text, keep_recent(2): assist, human]
     let hist = vec![
-        human_text("task originale"),           // 0 human (ancora, escluso)
+        human_text("task originale"),            // 0 human (ancora, escluso)
         tool_use_msg("t1", "read_file"),         // 1 \ atomo bilanciato droppabile [1,2]
         tool_result_msg("t1", "contenuto file"), // 2 /
         assistant_text("pensiero intermedio"),   // 3 assistant-text standalone [3]
@@ -552,7 +679,7 @@ fn select_continuity_candidates_tool_use_al_confine_non_droppabile() {
         human_text("task"),              // 0
         tool_use_msg("t1", "read_file"), // 1 tool_use, result a 2 (in coda) -> escluso
         tool_result_msg("t1", "body"),   // 2 keep_recent
-        human_text("focus"),            // 3 keep_recent
+        human_text("focus"),             // 3 keep_recent
     ];
     assert!(select_continuity_trim_candidates(&hist, 2).is_empty());
 }
@@ -560,8 +687,14 @@ fn select_continuity_candidates_tool_use_al_confine_non_droppabile() {
 #[test]
 fn decide_continuity_drops_scarta_sotto_soglia() {
     let candidates = vec![
-        ContinuityCandidate { indices: vec![1, 2], text: "a".into() },
-        ContinuityCandidate { indices: vec![3], text: "b".into() },
+        ContinuityCandidate {
+            indices: vec![1, 2],
+            text: "a".into(),
+        },
+        ContinuityCandidate {
+            indices: vec![3],
+            text: "b".into(),
+        },
     ];
     let focus = vec![1.0f32, 0.0];
     // cand0 rilevante (coseno 1.0, >=0.5), cand1 irrilevante (coseno 0.0, <0.5).
@@ -575,8 +708,14 @@ fn decide_continuity_drops_scarta_sotto_soglia() {
 #[test]
 fn decide_continuity_drops_rispetta_il_cap() {
     let candidates = vec![
-        ContinuityCandidate { indices: vec![1, 2], text: "a".into() },
-        ContinuityCandidate { indices: vec![3], text: "b".into() },
+        ContinuityCandidate {
+            indices: vec![1, 2],
+            text: "a".into(),
+        },
+        ContinuityCandidate {
+            indices: vec![3],
+            text: "b".into(),
+        },
     ];
     let focus = vec![1.0f32, 0.0];
     // Entrambi sotto soglia; cand1 (coseno -1.0) piu' irrilevante -> ordinato prima.
@@ -590,7 +729,10 @@ fn decide_continuity_drops_rispetta_il_cap() {
 
 #[test]
 fn decide_continuity_drops_focus_vuoto_o_cap_zero_no_op() {
-    let candidates = vec![ContinuityCandidate { indices: vec![1], text: "a".into() }];
+    let candidates = vec![ContinuityCandidate {
+        indices: vec![1],
+        text: "a".into(),
+    }];
     let cand_vecs = vec![vec![0.0f32, 1.0]];
     assert!(decide_continuity_drops(&[], &cand_vecs, &candidates, 0.5, 8).is_empty());
     assert!(decide_continuity_drops(&[1.0, 0.0], &cand_vecs, &candidates, 0.5, 0).is_empty());
@@ -618,9 +760,13 @@ fn apply_continuity_trim_rimuove_indici() {
 fn contents_eligible_solo_tool_result_lunghi_sotto_cutoff() {
     let long = "x".repeat(50);
     let hist = vec![
-        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t1", "content": long.clone() }])), // 0 lungo, dentro cutoff
-        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t2", "content": "corto" }])),        // 1 corto
-        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t3", "content": "y".repeat(50) }])), // 2 fuori cutoff
+        msg_blocks(
+            json!([{ "type": "tool_result", "tool_use_id": "t1", "content": long.clone() }]),
+        ), // 0 lungo, dentro cutoff
+        msg_blocks(json!([{ "type": "tool_result", "tool_use_id": "t2", "content": "corto" }])), // 1 corto
+        msg_blocks(
+            json!([{ "type": "tool_result", "tool_use_id": "t3", "content": "y".repeat(50) }]),
+        ), // 2 fuori cutoff
     ];
     // cutoff=2 (indici 0,1), threshold=10 -> solo il tool_result 0 (lungo) eleggibile.
     let eligible = contents_eligible_for_offload(&hist, 2, 10);

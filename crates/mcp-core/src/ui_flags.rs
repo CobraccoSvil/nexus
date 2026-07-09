@@ -110,7 +110,9 @@ mod tests {
             .await
             .expect("build ok");
         assert_eq!(
-            flags.get("chat.activity_stream_enabled").map(String::as_str),
+            flags
+                .get("chat.activity_stream_enabled")
+                .map(String::as_str),
             Some("true"),
         );
     }

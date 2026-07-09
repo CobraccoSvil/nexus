@@ -403,7 +403,10 @@ fn direct_spawn_env(
         .into_iter()
         .filter(|(k, _)| !sandbox::is_blocked_env(k))
         .collect();
-    env.insert("NEXUS_PROJECT_DB_URL".to_string(), project_db_url.to_string());
+    env.insert(
+        "NEXUS_PROJECT_DB_URL".to_string(),
+        project_db_url.to_string(),
+    );
     env.insert(
         "NEXUS_PROJECT_DB_NAME".to_string(),
         project_db_name.to_string(),
@@ -426,8 +429,8 @@ fn direct_spawn_env(
 /// Idempotente: applicarla sia al flush sia alla lettura non altera testo gia'
 /// redatto.
 pub(crate) fn redact_secrets_for_persistence(text: &str) -> String {
-    let (redacted, kinds) = nexus_tool_kit::secret_text_scanner::SecretScanner
-        .redact_secrets_preserving_context(text);
+    let (redacted, kinds) =
+        nexus_tool_kit::secret_text_scanner::SecretScanner.redact_secrets_preserving_context(text);
     if kinds > 0 {
         // Regola F: solo il conteggio dei tipi, mai il contenuto.
         tracing::debug!(
@@ -525,7 +528,6 @@ pub async fn read_process_output(
 
 use sqlx::Row;
 
-
 pub struct ProcessOutput {
     pub command: String,
     pub pid: Option<i32>,
@@ -608,10 +610,11 @@ pub async fn stop_process(
     }
 
     // 4. Solo ora lo stato dichiarato coincide con quello reale.
-    let _ = sqlx::query("UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1")
-        .bind(process_id)
-        .execute(&proj_pool)
-        .await;
+    let _ =
+        sqlx::query("UPDATE agent_processes SET status='stopped', stopped_at=NOW() WHERE id=$1")
+            .bind(process_id)
+            .execute(&proj_pool)
+            .await;
 
     Ok("Process stopped".to_string())
 }
@@ -648,7 +651,6 @@ pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<Process
         .collect())
 }
 
-
 pub struct ProcessSummary {
     pub id: Uuid,
     pub label: String,
@@ -675,7 +677,10 @@ mod tests {
                 "DATABASE_URL".to_string(),
                 "postgresql://nexus:nexus@localhost:5433/nexus".to_string(),
             ),
-            ("REDIS_URL".to_string(), "redis://localhost:6379".to_string()),
+            (
+                "REDIS_URL".to_string(),
+                "redis://localhost:6379".to_string(),
+            ),
             ("ANTHROPIC_API_KEY".to_string(), "sk-ant-xyz".to_string()),
             ("JWT_SECRET".to_string(), "supersegreto".to_string()),
             (
@@ -683,12 +688,24 @@ mod tests {
                 r"C:\Windows\system32;C:\Program Files\Git\bin".to_string(),
             ),
             ("SYSTEMROOT".to_string(), r"C:\Windows".to_string()),
-            ("COMSPEC".to_string(), r"C:\Windows\system32\cmd.exe".to_string()),
-            ("TEMP".to_string(), r"C:\Users\x\AppData\Local\Temp".to_string()),
-            ("TMP".to_string(), r"C:\Users\x\AppData\Local\Temp".to_string()),
+            (
+                "COMSPEC".to_string(),
+                r"C:\Windows\system32\cmd.exe".to_string(),
+            ),
+            (
+                "TEMP".to_string(),
+                r"C:\Users\x\AppData\Local\Temp".to_string(),
+            ),
+            (
+                "TMP".to_string(),
+                r"C:\Users\x\AppData\Local\Temp".to_string(),
+            ),
             ("USERPROFILE".to_string(), r"C:\Users\x".to_string()),
             ("HOME".to_string(), r"C:\Users\x".to_string()),
-            ("APPDATA".to_string(), r"C:\Users\x\AppData\Roaming".to_string()),
+            (
+                "APPDATA".to_string(),
+                r"C:\Users\x\AppData\Roaming".to_string(),
+            ),
         ]
     }
 
@@ -788,7 +805,7 @@ mod tests {
         assert!(similar_service_labels("Backend API", "backend"));
         assert!(similar_service_labels("Backend", "backend")); // case-insensitive
         assert!(similar_service_labels("Service", "service")); // eq, pur generica
-        // Scopi diversi NON si fondono.
+                                                               // Scopi diversi NON si fondono.
         assert!(!similar_service_labels("frontend", "backend"));
         assert!(!similar_service_labels("Service", "backend"));
         assert!(!similar_service_labels("worker-emails", "frontend"));

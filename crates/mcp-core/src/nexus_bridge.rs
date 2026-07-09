@@ -54,7 +54,6 @@ static NEXUS_BRIDGE: OnceLock<Arc<NexusBridge>> = OnceLock::new();
 
 /// Bridge Nexus — wrapper thread-safe sui componenti nexus-orchestrator
 pub struct NexusBridge {
-    
     router: Arc<QLearningRouter>,
     scheduler: Arc<LearningScheduler>,
     /// Namespace globale per observability dei dati che attraversano il bridge
@@ -682,7 +681,7 @@ impl NexusBridge {
     }
 
     /// Router Q-Learning sottostante
-    
+
     pub fn router(&self) -> &Arc<QLearningRouter> {
         &self.router
     }
@@ -1228,7 +1227,9 @@ pub async fn nexus_embed(Json(req): Json<EmbedRequest>) -> (StatusCode, Json<ser
 /// Serializza le statistiche per-worker in un oggetto JSON (le struct dei
 /// worker non derivano `Serialize`). Estratta da `nexus_stats` per contenerne
 /// la lunghezza (long-fn); contenuto invariato.
-fn per_worker_stats_json(s: &nexus_orchestrator::SchedulerStats) -> serde_json::Map<String, serde_json::Value> {
+fn per_worker_stats_json(
+    s: &nexus_orchestrator::SchedulerStats,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut per_worker = serde_json::Map::new();
     for (name, ws) in &s.per_worker {
         per_worker.insert(

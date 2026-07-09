@@ -32,9 +32,7 @@ use serde_json::{json, Value};
 // proto/neural_core.proto) non esistono piu': il proto e' stato rimosso col
 // brain. `NeuralCoreClient` non incapsula piu' un canale gRPC, tutti i metodi
 // delegano all'embedder ONNX in-process o al Nexus LLM Gateway.
-use crate::nexus_gateway::{
-    GwMessage, GwMetadata, GwRequest, GwResponse, NexusGatewayClient,
-};
+use crate::nexus_gateway::{GwMessage, GwMetadata, GwRequest, GwResponse, NexusGatewayClient};
 
 /// Client storico del neural-core. Non incapsula piu' un canale gRPC verso il
 /// brain: TUTTI i metodi rimasti delegano all'embedder ONNX in-process
@@ -324,7 +322,6 @@ impl NeuralCoreClient {
     pub async fn classify_error(&self, error_text: &str, _provider: &str) -> String {
         crate::provider_error_classifier::classify_text(error_text).stop_reason
     }
-
 }
 
 // ───────────────────────────────────────────────────────────────────────────

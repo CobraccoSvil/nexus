@@ -36,9 +36,15 @@ export {
   selectEnrichmentByEventId,
   selectFilesRecent,
   selectFindingsUpdate,
+  selectOperationalRefreshAt,
+  selectProblemsRefreshAt,
+  selectServicesRefreshAt,
+  selectMutationsRefreshAt,
+  selectServiceLogsRecent,
   selectFlags,
   selectGitStatus,
   selectHighlight,
+  selectKnowledgeChangedAt,
   selectMemoryChangedAt,
   selectMigrationsChangedAt,
   selectMonitors,
@@ -59,4 +65,5 @@ export {
   subscribeAll,
 } from "./store";
 export { useEventOfKind, useProjectEvents } from "./use-events";
+export { useOperationalRefresh } from "./use-operational-data";
 export type { EventFilter, EventHandler } from "./use-events";

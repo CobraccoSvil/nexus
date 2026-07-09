@@ -77,7 +77,10 @@ impl EmbeddingStore for PgEmbeddingStore {
                 }
             }
         }
-        tracing::debug!(n = out.len(), "embed: vettori calcolati per continuity-trim");
+        tracing::debug!(
+            n = out.len(),
+            "embed: vettori calcolati per continuity-trim"
+        );
         Ok(out)
     }
 }
@@ -91,7 +94,9 @@ mod tests {
     #[tokio::test]
     async fn replay_e_un_noop_che_ritorna_porterror() {
         let store = PgEmbeddingStore::new();
-        let res = store.embed(vec!["ciao".to_string()], ExecMode::Replay).await;
+        let res = store
+            .embed(vec!["ciao".to_string()], ExecMode::Replay)
+            .await;
         assert!(res.is_err(), "in Replay l'embed deve fallire (no-op)");
     }
 

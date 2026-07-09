@@ -375,6 +375,113 @@ function RunStatusBadge({ status, tc }: { status: string; tc: ThemeColors }) {
   );
 }
 
+/** Esito di un risveglio automatico di sistema, ricostruito dal messaggio
+ *  sintetico iniettato dal worker backend process_resume. */
+type SystemWakeup = { outcome: "success" | "failure" | "cap"; label: string };
+
+/**
+ * Riconosce se un messaggio e' un RISVEGLIO AUTOMATICO di sistema (worker
+ * `process_resume`, crates/mcp-core/src/process_resume.rs): l'agente viene
+ * ri-avviato da solo quando un processo/servizio del progetto termina o va in
+ * crash, senza che l'utente lo abbia chiesto.
+ *
+ * NOTA (ripiego dichiarato, regole M/H): il backend marca questi messaggi con
+ * `metadata.source = "process_resume"`, ma `to_message_view`
+ * (crates/mcp-core/src/chat_messages/persistence.rs) NON espone ancora il campo
+ * `source` alla UI. Finche' non viene esposto un marcatore STRUTTURATO,
+ * riconosciamo il risveglio dal TESTO del messaggio sintetico (fragile per
+ * definizione). Appena il backend espone `source`/`syntheticKind`, questa
+ * detection va spostata su quel campo (vedi report/handoff backend).
+ */
+function classifySystemWakeup(message: ChatMessage): SystemWakeup | null {
+  if (!message.synthetic || message.role !== "user") return null;
+  const content = message.content ?? "";
+  let m = /^Il comando in background "([^"]+)" e' terminato con SUCCESSO/.exec(content);
+  if (m) return { outcome: "success", label: m[1] };
+  m = /^Il comando in background "([^"]+)" e' FALLITO/.exec(content);
+  if (m) return { outcome: "failure", label: m[1] };
+  m = /^Cap anti-loop raggiunto: il processo di sfondo "([^"]+)"/.exec(content);
+  if (m) return { outcome: "cap", label: m[1] };
+  return null;
+}
+
+// Banner distintivo per un turno nato da un risveglio automatico di sistema.
+// Rende esplicito all'utente che l'agente si e' svegliato da solo (consuma token
+// e tocca i file del progetto) in reazione a un evento, non su sua richiesta.
+function SystemWakeupBanner({
+  wakeup,
+  tc,
+  t,
+}: {
+  wakeup: SystemWakeup;
+  tc: ThemeColors;
+  t: (key: string) => string;
+}) {
+  const accent = "#f59e0b";
+  const outcomeKey =
+    wakeup.outcome === "success"
+      ? "chat.systemWakeup.success"
+      : wakeup.outcome === "failure"
+        ? "chat.systemWakeup.failure"
+        : "chat.systemWakeup.cap";
+  return (
+    <div
+      style={{
+        alignSelf: "stretch",
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        padding: "8px 10px",
+        borderRadius: 10,
+        border: `1px solid ${accent}55`,
+        background: `${accent}12`,
+        minWidth: 0,
+        overflow: "hidden",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        <span
+          style={{
+            flexShrink: 0,
+            display: "inline-flex",
+            alignItems: "center",
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: 0.2,
+            color: accent,
+            background: `${accent}1f`,
+            border: `1px solid ${accent}66`,
+            borderRadius: 5,
+            padding: "1px 7px",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {t("chat.systemWakeup.badge")}
+        </span>
+        <span
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            fontSize: 11,
+            color: tc.textSecondary,
+          }}
+          title={wakeup.label}
+        >
+          {t(outcomeKey)}
+          {wakeup.label ? " — " : ""}
+          {wakeup.label ? <code style={{ fontSize: 10, color: tc.textMuted }}>{wakeup.label}</code> : null}
+        </span>
+      </div>
+      <span style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.35 }}>
+        {t("chat.systemWakeup.explain")}
+      </span>
+    </div>
+  );
+}
+
 
 /**
  * Pulsanti delle scelte di proseguimento (next_actions) per un singolo messaggio
@@ -1034,8 +1141,13 @@ export function MessageList({
 
   // Filtra messaggi sintetici (auto-continuazione "Continua") prima del raggruppamento.
   // Restano persistiti nel DB per coerenza del run, ma non vanno mostrati come se
-  // fossero stati digitati dall'utente.
-  const visibleMessages = messages.filter((m) => !m.synthetic);
+  // fossero stati digitati dall'utente. ECCEZIONE: i messaggi sintetici di
+  // RISVEGLIO AUTOMATICO di sistema (process_resume) vanno invece resi visibili
+  // come banner distintivo, cosi' l'utente capisce che l'agente si e' svegliato
+  // da solo (vedi classifySystemWakeup / SystemWakeupBanner).
+  const visibleMessages = messages.filter(
+    (m) => !m.synthetic || classifySystemWakeup(m) !== null,
+  );
   const grouped = groupMessages(visibleMessages);
 
   // ADR 0037: id dell'ULTIMO messaggio assistant con runId nella lista visibile.
@@ -1065,6 +1177,16 @@ export function MessageList({
         }
 
         const { message, idx } = item;
+
+        // Risveglio automatico di sistema: rendering dedicato (banner), non la
+        // bolla utente standard. Distingue nettamente il turno auto-avviato.
+        const wakeup = classifySystemWakeup(message);
+        if (wakeup) {
+          return (
+            <SystemWakeupBanner key={message.id} wakeup={wakeup} tc={tc} t={t} />
+          );
+        }
+
         const isUser = message.role === "user";
         const isDeleted = Boolean(message.deletedAt);
         const busyAction = busyByMessage[message.id];

@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 // Tipi DTO: punto unico in nexus_types::settings_dto (regola L / ADR 0026, S8).
 pub use nexus_types::settings_dto::{
-    BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting,
-    UpdateSettingRequest,
+    BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting, UpdateSettingRequest,
 };
 
 // FS browse: punto unico in nexus_types::fs_browse (regola L / ADR 0026).

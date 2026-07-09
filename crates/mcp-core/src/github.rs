@@ -1243,15 +1243,13 @@ async fn fetch_user_repos(
         .append_pair("sort", "updated")
         .append_pair("per_page", "100");
 
-    let primary_error = match github_api_get::<Vec<GitHubUserRepoResponse>>(
-        access_token,
-        primary_url.as_str(),
-    )
-    .await
-    {
-        Ok(value) => return Ok(value),
-        Err(error) => error,
-    };
+    let primary_error =
+        match github_api_get::<Vec<GitHubUserRepoResponse>>(access_token, primary_url.as_str())
+            .await
+        {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
 
     let fallback_url = owner_repos_url("https://api.github.com/user/repos")?;
     let fallback_error =
@@ -1468,12 +1466,8 @@ async fn clone_into_new_project(
         absolute_path: dest.to_string_lossy().to_string(),
         name: Some(remote.repo.clone()),
     };
-    crate::projects::register_project(
-        State(state),
-        Extension(claims),
-        axum::Json(register_body),
-    )
-    .await
+    crate::projects::register_project(State(state), Extension(claims), axum::Json(register_body))
+        .await
 }
 
 /// Ricava il branch corrente del repository appena clonato via `rev-parse`,
@@ -1571,7 +1565,13 @@ async fn clone_in_place(
         run_authenticated_clone(state, user_id, &context, access_token, remote).await?;
 
     let branch = resolve_cloned_branch(&context.repository_root_path).await;
-    persist_cloned_repo(&state.db, project_id, &context.repository_root_path, &branch).await?;
+    persist_cloned_repo(
+        &state.db,
+        project_id,
+        &context.repository_root_path,
+        &branch,
+    )
+    .await?;
 
     let refreshed_context = load_project_context(&state.db, project_id, user_id).await?;
     crate::projects::record_git_operation(
@@ -2107,7 +2107,10 @@ async fn prepare_local_git_repo(
 
     // .gitignore di default se manca
     let gitignore_path = root.join(".gitignore");
-    if !tokio::fs::try_exists(&gitignore_path).await.unwrap_or(false) {
+    if !tokio::fs::try_exists(&gitignore_path)
+        .await
+        .unwrap_or(false)
+    {
         let default_gitignore = "# Dependencies\nnode_modules/\n.pnpm-store/\n\n# Build output\ndist/\nbuild/\n.next/\n.turbo/\nout/\ntarget/\n\n# Environment\n.env\n.env.local\n.env.*.local\n!.env.example\n\n# Logs\n*.log\nnpm-debug.log*\npnpm-debug.log*\n\n# Editor\n.vscode/\n.idea/\n*.swp\n*.swo\n.DS_Store\n\n# Test artifacts\nplaywright-report/\ntest-results/\ncoverage/\n\n# OS\nThumbs.db\n";
         let _ = tokio::fs::write(&gitignore_path, default_gitignore).await;
     }

@@ -332,11 +332,7 @@ enum ServiceCount {
 ///
 /// Ramo Linux: sorgente di verita' i file unit systemd `--user`.
 #[cfg(unix)]
-async fn count_services(
-    _state: &AppState,
-    _project_id: Uuid,
-    slug: &str,
-) -> Option<ServiceCount> {
+async fn count_services(_state: &AppState, _project_id: Uuid, slug: &str) -> Option<ServiceCount> {
     let home = std::env::var("HOME").ok()?;
     let dir = format!("{home}/.config/systemd/user");
     let prefix = format!("{slug}-");
@@ -390,13 +386,8 @@ async fn count_services(
 /// progetto (regola separazione DB per-progetto). Errore DB -> None, che il
 /// chiamante degrada a "—" senza tentare path Linux.
 #[cfg(windows)]
-async fn count_services(
-    state: &AppState,
-    project_id: Uuid,
-    _slug: &str,
-) -> Option<ServiceCount> {
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+async fn count_services(state: &AppState, project_id: Uuid, _slug: &str) -> Option<ServiceCount> {
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
     // COUNT DISTINCT label evita di gonfiare i numeri con lo storico (piu' righe
     // per stessa label, ORDER BY created_at DESC nel resto del modulo).
     let row: Option<(i64, i64)> = sqlx::query_as(

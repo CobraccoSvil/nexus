@@ -808,16 +808,14 @@ fn map_stop_reason(raw: Option<&str>) -> String {
     .to_string()
 }
 
-/// Detection billing specifica di Anthropic (estende [`super::is_billing_error`]
-/// con i pattern propri del messaggio Anthropic: "plans & billing", "upgrade or
-/// purchase credits", "billing required"). Punto unico (regola L): la detection
-/// generica resta in `openai_compat`, qui si aggiunge solo il delta Anthropic.
+/// Detection billing specifica di Anthropic. Quirk isolato nell'adapter: traduce
+/// pattern Anthropic in codice `"billing"` su [`ProviderHttpError`] (regola M).
 pub fn is_anthropic_billing_error(msg: &str) -> bool {
-    if super::is_billing_error(msg) {
-        return true;
-    }
     let m = msg.to_lowercase();
-    m.contains("plans & billing")
+    m.contains("insufficient_quota")
+        || m.contains("credit balance")
+        || m.contains("payment required")
+        || m.contains("plans & billing")
         || m.contains("upgrade or purchase credits")
         || m.contains("billing required")
 }

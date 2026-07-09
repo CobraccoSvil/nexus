@@ -151,7 +151,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for RouterNode {
         // None (build_initial_state Primary) -> si applica il fallback conservativo
         // sotto, comportamento INVARIATO. `None` nel delta = "non toccare lo stato".
         let action_oriented_delta: Option<Option<bool>> = match state.action_oriented {
-            Some(_) => None, // gia' derivato a monte (shadow) -> preserva
+            Some(_) => None,          // gia' derivato a monte (shadow) -> preserva
             None => Some(Some(true)), // fallback NEUTRO conservativo (Python degradato)
         };
 

@@ -169,7 +169,6 @@ use crate::decisions::loop_signatures::{
     LoopThresholds,
 };
 use crate::decisions::meta_reason::{build_stall_context, translate};
-use crate::decisions::text_repetition::{detect_repetition_collapse, RepetitionThresholds};
 use crate::decisions::orchestration_reason::context_pressure_from_tokens;
 use crate::decisions::progress_controller::{self as pc, Action, Axis, ProgressSignals};
 use crate::decisions::scale_reason::{
@@ -177,28 +176,29 @@ use crate::decisions::scale_reason::{
     effective_token_brake, resolve_sizing_overrides, scale_cache_key, scale_trigger,
     ScaleHysteresisConfig, ScaleSizingConfig, ScaleTriggerConfig, SizingBaseline,
 };
+use crate::decisions::text_repetition::{detect_repetition_collapse, RepetitionThresholds};
 use crate::decisions::tool_dispatch::{
-    current_context_token_estimate, estimate_context_chars, flatten_context_text,
-    ContextMessage,
+    current_context_token_estimate, estimate_context_chars, flatten_context_text, ContextMessage,
 };
 use crate::decisions::turn_focus::build_turn_focus_directive;
-use crate::routing::signals::{
-    count_recent_request_port, detect_recent_tool_error, detect_repeated_action_detailed,
-    detect_pending_steps_report_with, detect_repeated_failed_command, has_active_resources_in_history,
-    has_recent_productive_action, has_tool_calls_in_history, modified_files_from_messages,
-    tool_error_stats, EXPLORATION_ONLY_TOOLS,
-};
-use crate::runtime::ports::{
-    AgentStepStore, BillingCooldownPort, ContextOffload, EmbeddingStore, EscalationPort, LlmMessage,
-    LlmRequest, MetaStepStore, ModelUpscalePort, NextActionsDeriver, OffloadKind, RunControlStore,
-    ScaleMove, ScaleTier, SizingOverrides, SseEvent, StallBudgetPort, SummaryStore, TokenCounter,
-};
 use crate::nodes::scale_control::{
     SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY, SCALE_SIZING_CFG_KEY,
     SCALE_SIZING_OVERRIDES_KEY,
 };
 use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
+use crate::routing::signals::{
+    count_recent_request_port, detect_pending_steps_report_with, detect_recent_tool_error,
+    detect_repeated_action_detailed, detect_repeated_failed_command,
+    has_active_resources_in_history, has_recent_productive_action, has_tool_calls_in_history,
+    modified_files_from_messages, tool_error_stats, EXPLORATION_ONLY_TOOLS,
+};
 use crate::runtime::ports::RecoveryMove;
+use crate::runtime::ports::{
+    AgentStepStore, BillingCooldownPort, ContextOffload, EmbeddingStore, EscalationPort,
+    LlmMessage, LlmRequest, MetaStepStore, ModelUpscalePort, NextActionsDeriver, OffloadKind,
+    RunControlStore, ScaleMove, ScaleTier, SizingOverrides, SseEvent, StallBudgetPort,
+    SummaryStore, TokenCounter,
+};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
     put_extra, AgentState, ContentBlock, Message, MessageContent, MetaStep, StateDelta, StopReason,
@@ -784,7 +784,11 @@ impl ExecutorNode {
         let Some(offload) = self.offload.as_ref() else {
             return map;
         };
-        let session = if run_id.is_empty() { None } else { Some(run_id.to_string()) };
+        let session = if run_id.is_empty() {
+            None
+        } else {
+            Some(run_id.to_string())
+        };
         for content in ctxr::contents_eligible_for_offload(hist, cutoff_index, threshold) {
             if map.contains_key(&content) {
                 continue;
@@ -894,8 +898,12 @@ pub(crate) fn resolve_provider_model(
     if let (Some(p), Some(m)) = (prov, modl) {
         return ProviderResolution::Resolved(p.to_string(), m.to_string());
     }
-    let p = prov.map(str::to_string).unwrap_or_else(|| routing_provider.to_string());
-    let m = modl.map(str::to_string).unwrap_or_else(|| routing_model.to_string());
+    let p = prov
+        .map(str::to_string)
+        .unwrap_or_else(|| routing_provider.to_string());
+    let m = modl
+        .map(str::to_string)
+        .unwrap_or_else(|| routing_model.to_string());
     if p.is_empty() || SENTINELS.contains(&p.as_str()) || SENTINELS.contains(&m.as_str()) {
         return ProviderResolution::NoProvider(p);
     }
@@ -1074,7 +1082,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         let _ = &mut system_text; // mutato dai rami plan_rationale / delega (sotto)
 
         // ── plan_rationale injection (py:1766, ramo ON se presente) ───────────
-        if let Some(rat) = state.plan_rationale.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(rat) = state
+            .plan_rationale
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let mut block = vec!["<piano_razionale>".to_string(), rat.to_string()];
             let constraints = state.plan_constraints.clone().unwrap_or_default();
             if !constraints.is_empty() {
@@ -1086,7 +1099,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                 .filter_map(|a| {
                     let o = a.as_object()?;
                     let opt = o.get("option").and_then(Value::as_str).unwrap_or("?");
-                    let rej = o.get("rejected_because").and_then(Value::as_str).unwrap_or("?");
+                    let rej = o
+                        .get("rejected_because")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?");
                     Some(format!("{opt} (scartata: {rej})"))
                 })
                 .collect();
@@ -1140,7 +1156,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                 .collect();
             let meta_set: HashSet<String> = DISCOVERY_META.iter().map(|s| s.to_string()).collect();
             if !names.is_empty() && names.is_subset(&meta_set) && self.cfg.is_first_agent_turn {
-                tools_json.retain(|t| t.get("name").and_then(Value::as_str) == Some("nexus_mcp_tool_search"));
+                tools_json.retain(|t| {
+                    t.get("name").and_then(Value::as_str) == Some("nexus_mcp_tool_search")
+                });
                 tracing::info!(
                     target: "nexus_agent_graph::executor",
                     "M16: turno di scoperta -> espongo solo nexus_mcp_tool_search"
@@ -1416,8 +1434,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
             // nuovo. Contarlo fa scattare il cap G1 + escalation invece di bruciare
             // iterazioni fino a iteration_cap. Soglia derivata dal cap DB-driven
             // g1_max_nudges (niente hardcoded, regola G).
-            error_is_stale: g1_recent_error
-                && iters_in >= self.cfg.g1_max_nudges.saturating_mul(2),
+            error_is_stale: g1_recent_error && iters_in >= self.cfg.g1_max_nudges.saturating_mul(2),
             current_count: g1_reroute_count,
             max_nudges: self.cfg.g1_max_nudges,
         });
@@ -1494,7 +1511,10 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
         let g1_cap_effective = (g1.cap_reached
             || (unfulfilled_for_g1 && iters_in >= g1_loop_threshold && !g1_recent_productive))
             && !declaration_pending;
-        if matches!(head_gate(false, false, 0, g1_cap_effective), HeadGate::G1Cap) {
+        if matches!(
+            head_gate(false, false, 0, g1_cap_effective),
+            HeadGate::G1Cap
+        ) {
             // ESCALATION orchestratore (py:1962-1993): prima di arrenderci, l'
             // orchestratore PROMUOVE il turno a un modello piu' capace (catena DB
             // intra-provider + cross-provider loop_fallback_default), azzerando il
@@ -1507,7 +1527,11 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
             // dopo una promozione sticky il "corrente" e' il promosso, anche se
             // non ha ancora fatto una chiamata (vedi escalation_current_pair).
             let (g1_cur_provider, g1_cur_model) = self.escalation_current_pair(state);
-            let g1_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+            let g1_escal = state
+                .extra
+                .get("auto_escalations")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
             // `_g1_picked = _pick(...) if _g1_escal < 3 else None` (py:1962-1966).
             let g1_picked = if g1_escal < 3 {
                 let inputs = self
@@ -1598,7 +1622,10 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
             // ADR 0034: prima della chiusura di sistema, UN turno dichiarativo
             // forzato — l'esito del run diventa la dichiarazione strutturata
             // del modello invece del testo sintetico qui sotto.
-            if let Some(delta) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
+            if let Some(delta) = self
+                .forced_declaration_delta(state, iters_in, ctx, mode)
+                .await
+            {
                 return Ok(delta);
             }
             let cap_text = format!(
@@ -1647,12 +1674,24 @@ la richiesta in modo piu' specifico.",
         let mut exploration_nudge_sent = state.exploration_nudge_sent.unwrap_or(false);
         let mut exploration_nudge_injected = false;
         let mut force_action_hard = false;
-        let mut progress_guided: HashSet<String> =
-            state.progress_guided_axes.clone().unwrap_or_default().into_iter().collect();
-        let mut progress_diagnosed: HashSet<String> =
-            state.progress_diagnosed_axes.clone().unwrap_or_default().into_iter().collect();
-        let mut progress_strategy: HashSet<String> =
-            state.progress_strategy_axes.clone().unwrap_or_default().into_iter().collect();
+        let mut progress_guided: HashSet<String> = state
+            .progress_guided_axes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut progress_diagnosed: HashSet<String> = state
+            .progress_diagnosed_axes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut progress_strategy: HashSet<String> = state
+            .progress_strategy_axes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let progress_on = self.cfg.progress_controller_enabled;
 
         // ── fail-fast billing-exhausted (py:2072-2092) ────────────────────────
@@ -2043,7 +2082,9 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
             // arrendersi con ABORT (regola H, gemello dell'edit fallito).
             let ra_service_failed = ra_hit
                 .as_ref()
-                .map(|h| h.failed && matches!(h.tool_name.as_str(), "run_service" | "service_restart"))
+                .map(|h| {
+                    h.failed && matches!(h.tool_name.as_str(), "run_service" | "service_restart")
+                })
                 .unwrap_or(false);
             // Fallimento STRUTTURATO generico (exit_code/is_error, regola M): una
             // qualsiasi azione ripetuta che fallisce DAVVERO (es. `run_command:
@@ -2061,7 +2102,10 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
             } else {
                 self.cfg.repeated_action_threshold
             };
-            let matched = ra_label.as_ref().map(|_| ra_count >= ra_threshold).unwrap_or(false);
+            let matched = ra_label
+                .as_ref()
+                .map(|_| ra_count >= ra_threshold)
+                .unwrap_or(false);
             if !matched {
                 progress_guided.remove("repeated_action");
                 progress_diagnosed.remove("repeated_action");
@@ -2070,7 +2114,11 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                 // Candidato escalation (stesso pattern di esplorazione/G1 cap):
                 // prima di abortire su azione ripetuta, promuovi a un modello piu'
                 // capace invece di arrenderti.
-                let ra_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+                let ra_escal = state
+                    .extra
+                    .get("auto_escalations")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 // Coppia corrente = risoluzione del turno (punto unico, regola L).
                 let (ra_cur_provider, ra_cur_model) = self.escalation_current_pair(state);
                 let ra_picked = if ra_escal < 3 {
@@ -2194,7 +2242,10 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         // I sottocasi con lavoro prodotto o read-only instradano
                         // gia' al final_gate (esito oggettivo): restano invariati.
                         if touched.is_empty() && !ra_read_only {
-                            if let Some(delta) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
+                            if let Some(delta) = self
+                                .forced_declaration_delta(state, iters_in, ctx, mode)
+                                .await
+                            {
                                 return Ok(delta);
                             }
                         }
@@ -2323,7 +2374,8 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                         // Grazia post-escalation: senza questo floor il rientro
                         // rivedeva le stesse azioni e ri-decideva in pochi ms,
                         // bruciando il budget senza chiamare il promosso.
-                        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                        extra_out
+                            .insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                         progress_guided.insert("repeated_action".to_string());
                         return Ok(StateDelta {
                             messages: Some(vec![esc_nudge]),
@@ -2370,7 +2422,11 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                 progress_guided.remove("resource_reallocation");
             } else {
                 // Candidato escalation (stesso pattern di repeated_action/esplorazione).
-                let rp_escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+                let rp_escal = state
+                    .extra
+                    .get("auto_escalations")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 // Coppia corrente = risoluzione del turno (punto unico, regola L).
                 let (rp_cur_provider, rp_cur_model) = self.escalation_current_pair(state);
                 let rp_picked = if rp_escal < 3 {
@@ -2447,7 +2503,9 @@ tool/le richieste a quella porta, senza allocarne di nuove."
                             }]),
                             result: Some(Some(rp_text)),
                             pending_tool_uses: Some(Some(vec![])),
-                            stop_reason: Some(Some(stop_reason_from_str(dec.stop_reason.as_deref()))),
+                            stop_reason: Some(Some(stop_reason_from_str(
+                                dec.stop_reason.as_deref(),
+                            ))),
                             iterations: Some(Some(iters_in + 1)),
                             progress_guided_axes: Some(Some(sorted(&progress_guided))),
                             progress_diagnosed_axes: Some(Some(sorted(&progress_diagnosed))),
@@ -2474,7 +2532,8 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                         let mut extra_out = state.extra.clone();
                         extra_out.insert("auto_escalations".to_string(), json!(rp_escal + 1));
                         // Grazia post-escalation (vedi floor nel check 6c).
-                        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                        extra_out
+                            .insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                         progress_guided.insert("resource_reallocation".to_string());
                         return Ok(StateDelta {
                             messages: Some(vec![esc_nudge]),
@@ -2589,9 +2648,7 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                 .clone()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| {
-                    t.get("name").and_then(Value::as_str) == Some(TASK_COMPLETE_TOOL_NAME)
-                })
+                .filter(|t| t.get("name").and_then(Value::as_str) == Some(TASK_COMPLETE_TOOL_NAME))
                 .collect();
             if !decl_only.is_empty() {
                 tools_json = decl_only;
@@ -2745,9 +2802,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             // BEST-EFFORT: su guasto (LLM down, cooldown, Replay no-op) la history
             // resta INVARIATA e si prosegue (compress/token_brake fanno il resto).
             if eff_rolling_enabled {
-                if let Some(cut) =
-                    ctxr::select_rolling_summary_cutoff(&hist, eff_rolling_keep)
-                {
+                if let Some(cut) = ctxr::select_rolling_summary_cutoff(&hist, eff_rolling_keep) {
                     // GOVERNANCE costo/beneficio (opt-in, decisione PURA regola L):
                     // salta il rolling-summary se il prefisso da riassumere e' troppo
                     // piccolo per giustificare il costo della chiamata LLM. Flag OFF
@@ -2767,7 +2822,11 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                         );
                     } else {
                         let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
-                        match self.summary_store.summarize(prefix_text.clone(), mode).await {
+                        match self
+                            .summary_store
+                            .summarize(prefix_text.clone(), mode)
+                            .await
+                        {
                             Ok(summary) if !summary.trim().is_empty() => {
                                 // OFFLOAD retrievable degli ORIGINALI (chat_history) PRIMA di
                                 // sostituirli col riassunto: restano recuperabili per sessione
@@ -2778,7 +2837,11 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                                             .offload_to_rag(
                                                 serde_json::Value::String(prefix_text.clone()),
                                                 OffloadKind::ChatHistory,
-                                                if run_id.is_empty() { None } else { Some(run_id.clone()) },
+                                                if run_id.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(run_id.clone())
+                                                },
                                                 None,
                                                 mode,
                                             )
@@ -2840,8 +2903,10 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             // BEST-EFFORT: su guasto embedder / Replay no-op la history resta invariata.
             if self.cfg.continuity_trim_enabled {
                 if let Some(embedder) = self.embedding_store.as_ref() {
-                    let candidates =
-                        ctxr::select_continuity_trim_candidates(&hist, self.cfg.rolling_keep_recent);
+                    let candidates = ctxr::select_continuity_trim_candidates(
+                        &hist,
+                        self.cfg.rolling_keep_recent,
+                    );
                     let focus_text = ctxr::continuity_focus_text(&hist);
                     if !candidates.is_empty() && !focus_text.trim().is_empty() {
                         // Un solo embed: [focus] ++ testo dei candidati (ordine preservato).
@@ -2945,7 +3010,8 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
         // window del modello EFFETTIVO come dichiarato dall'intento di questa fase.
         let mut effective_window = self.cfg.context_window;
         if should_upscale(self.cfg.upscale_enabled, upscale_est_tokens, upscale_window) {
-            let required = upscale_required_tokens(upscale_est_tokens, self.cfg.upscale_overhead_ratio);
+            let required =
+                upscale_required_tokens(upscale_est_tokens, self.cfg.upscale_overhead_ratio);
             if let Ok(Some(pick)) = self.upscale.select_upscale_model(&model, required).await {
                 tracing::info!(
                     target: "nexus_agent_graph::executor",
@@ -3103,9 +3169,10 @@ della finestra {effective_window} del modello {provider}/{model}"
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
             .collect();
-        let in_discovery = !names_tc.is_empty()
-            && names_tc.iter().all(|n| n == "nexus_mcp_tool_search");
-        let supports_forcing = provider_style_supports_forcing(self.cfg.tool_choice_style.as_deref());
+        let in_discovery =
+            !names_tc.is_empty() && names_tc.iter().all(|n| n == "nexus_mcp_tool_search");
+        let supports_forcing =
+            provider_style_supports_forcing(self.cfg.tool_choice_style.as_deref());
         // Forcing "early action" TRANSITORIO (NON-convergenza, regola H): il
         // forcing `tool_choice=required` non si applica a OGNI iterazione iniziale
         // (cio' costringeva il modello a chiamare un tool anche quando il task era
@@ -3199,11 +3266,21 @@ della finestra {effective_window} del modello {provider}/{model}"
             provider: provider.clone(),
             model: model.clone(),
             messages: llm_messages.clone(),
-            tools: if tools_json.is_empty() { None } else { Some(tools_json.clone()) },
+            tools: if tools_json.is_empty() {
+                None
+            } else {
+                Some(tools_json.clone())
+            },
             force_tool_choice: force_tc,
             system_text: Some(system_text.clone()),
             max_tokens: Some(max_tokens),
-            run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
+            response_format: None,
+            thinking: None,
+            run_id: if run_id.is_empty() {
+                None
+            } else {
+                Some(run_id.clone())
+            },
             iteration: Some(iters_in),
             intent: state.user_intent.clone(),
             // Nodo chiamante = executor: il decorator di replay (shadow) rigioca
@@ -3243,6 +3320,20 @@ della finestra {effective_window} del modello {provider}/{model}"
                 // quando NESSUN provider sano resta cadiamo nella chiusura `Error`
                 // (onesta). Gated `auto_escalations < 3` (no escalation a raffica).
                 if let crate::runtime::ports::PortError::ProviderUnavailable(pu) = &err {
+                    use crate::runtime::ports::ProviderFailureCause as Cause;
+                    // client_error = formato richiesta/history: il gateway ha gia'
+                    // tentato sanificazione+retry. Failover cieco con la stessa
+                    // history rompe Mistral (message_order) e maschera la causa
+                    // (incidente f0ad0337). Failover SOLO per billing/cooldown/
+                    // transient/policy.
+                    if pu.cause == Cause::ClientError {
+                        tracing::warn!(
+                            target: "nexus_agent_graph::executor",
+                            provider = %provider,
+                            model = %model,
+                            "provider client_error: niente failover cross-provider, chiusura onesta"
+                        );
+                    } else {
                     let cd_escal = state
                         .extra
                         .get("auto_escalations")
@@ -3367,10 +3458,8 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                             // lui, il giro dopo lo esclude e ne sceglie un altro sano.
                             tried.push(pick.provider.clone());
                             let mut extra_out = state.extra.clone();
-                            extra_out
-                                .insert("auto_escalations".to_string(), json!(cd_escal + 1));
-                            extra_out
-                                .insert("failover_tried".to_string(), json!(tried));
+                            extra_out.insert("auto_escalations".to_string(), json!(cd_escal + 1));
+                            extra_out.insert("failover_tried".to_string(), json!(tried));
                             // Grazia post-escalation (vedi floor nel check 6c).
                             extra_out.insert(
                                 "repeat_scan_floor".to_string(),
@@ -3410,6 +3499,7 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                         auto_escalations = cd_escal,
                         "provider caduto ma nessun provider sano disponibile: chiusura Error"
                     );
+                    }
                 }
                 // try/except onnicomprensivo Python: result="[Errore provider ...]",
                 // stop_reason="error" (NON NodeError: il run prosegue al routing).
@@ -3453,11 +3543,21 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                 // clone: `llm_messages` serve anche all'eventuale ri-chiamata di
                 // auto-escalation del signature-loop (sotto).
                 messages: llm_messages.clone(),
-                tools: if tools_json.is_empty() { None } else { Some(tools_json.clone()) },
+                tools: if tools_json.is_empty() {
+                    None
+                } else {
+                    Some(tools_json.clone())
+                },
                 force_tool_choice: Some(false),
                 system_text: Some(system_text.clone()),
                 max_tokens: Some(max_tokens),
-                run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
+                response_format: None,
+                thinking: None,
+                run_id: if run_id.is_empty() {
+                    None
+                } else {
+                    Some(run_id.clone())
+                },
                 iteration: Some(iters_in),
                 intent: state.user_intent.clone(),
                 // Retry-senza-forcing dello stesso turno executor: stesso purpose
@@ -3492,7 +3592,11 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                 Some(r) => Some(r),
                 None if !resp.tool_calls.is_empty() => {
                     let c = resp.content.trim();
-                    if c.is_empty() { None } else { Some(c.to_string()) }
+                    if c.is_empty() {
+                        None
+                    } else {
+                        Some(c.to_string())
+                    }
                 }
                 None => None,
             };
@@ -3548,7 +3652,11 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
         );
         // `escalations` (auto_escalations) cresce di 1 quando il loop scala il
         // modello (py:3284); resta invariato altrimenti. Tracciato per il delta.
-        let mut escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+        let mut escalations = state
+            .extra
+            .get("auto_escalations")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         // `true` quando il signature-loop ha promosso e ri-eseguito il turno col
         // modello promosso: rende la promozione STICKY nel delta finale (prima era
         // one-shot: il turno successivo ricadeva sul modello di routing debole, che
@@ -3664,7 +3772,13 @@ riassumi lo stato."
                         force_tool_choice: None,
                         system_text: Some(system_text2),
                         max_tokens: Some(max_tokens),
-                        run_id: if run_id.is_empty() { None } else { Some(run_id.clone()) },
+                        response_format: None,
+                        thinking: None,
+                        run_id: if run_id.is_empty() {
+                            None
+                        } else {
+                            Some(run_id.clone())
+                        },
                         iteration: Some(iters_in),
                         intent: state.user_intent.clone(),
                         // Auto-escalation dello stesso turno executor: stesso purpose.
@@ -3702,7 +3816,10 @@ riassumi lo stato."
                 // del modello (outcome/blocker/summary) invece del testo sintetico.
                 // La risposta corrente (la tool call ripetuta identica) viene
                 // scartata: non va ne' eseguita ne' persistita.
-                if let Some(delta) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
+                if let Some(delta) = self
+                    .forced_declaration_delta(state, iters_in, ctx, mode)
+                    .await
+                {
                     return Ok(delta);
                 }
                 // Chiusura secca loop_detected (py:3269-3281). Messaggio ONESTO:
@@ -3804,7 +3921,10 @@ modello piu' capace.",
         // Provider/model EFFETTIVI (cascade interno del gateway), calcolati DOPO l'
         // eventuale escalation cosi' il confronto e' col NUOVO modello promosso
         // (py:3457+). set_effective_model best-effort (gata Real) -> modello reale UI.
-        let eff_provider = resp.provider_used.clone().unwrap_or_else(|| provider.clone());
+        let eff_provider = resp
+            .provider_used
+            .clone()
+            .unwrap_or_else(|| provider.clone());
         let eff_model = resp.model_used.clone().unwrap_or_else(|| model.clone());
         let cascade_did_fallback = eff_provider != provider || eff_model != model;
         if cascade_did_fallback {
@@ -3920,7 +4040,10 @@ modello piu' capace.",
             && pending_tool_uses.is_empty()
             && final_result.trim().is_empty();
         if empty_forced_reply {
-            if let Some(d) = self.forced_declaration_delta(state, iters_in, ctx, mode).await {
+            if let Some(d) = self
+                .forced_declaration_delta(state, iters_in, ctx, mode)
+                .await
+            {
                 tracing::warn!(
                     target: "nexus_agent_graph::executor",
                     forced_text = forced_text_turn,
@@ -4062,8 +4185,16 @@ modello piu' capace.",
         //    (l'executor puo' essere riattraversato in turni successivi), 1:1 con
         //    `run_via_brain` che mette `is_final=true` solo a fine retry loop.
         for tu in &pending_tool_uses {
-            let id = tu.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            let name = tu.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = tu
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = tu
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if name.is_empty() {
                 continue;
             }
@@ -4415,8 +4546,16 @@ impl ExecutorNode {
         }
         // work_epoch STABILE (chiave idempotenza/replay): avanza solo sui cambi
         // macroscopici. `todo_seq` ~ iterazioni del run; escalation e floor da extra.
-        let escalations = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
-        let floor = state.extra.get("repeat_scan_floor").and_then(Value::as_i64).unwrap_or(0);
+        let escalations = state
+            .extra
+            .get("auto_escalations")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let floor = state
+            .extra
+            .get("repeat_scan_floor")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
         // (3) ANTI-META-LOOP (idempotenza per epoca): mossa gia' decisa+consumata
         // (chiave-cache in extra) o epoca gia' risolta a Fallback (marcatore) per questo
@@ -4472,7 +4611,9 @@ impl ExecutorNode {
             epoch,
             moves_used_session,
             ..
-        } = self.stall_emit_gate(state, axis.as_str(), iters_in, ctx).await?;
+        } = self
+            .stall_emit_gate(state, axis.as_str(), iters_in, ctx)
+            .await?;
         // Solo se la gerarchia fissa farebbe una mossa COSTOSA (non GUIDE/Proceed): il
         // meta-ragionamento subentra DOPO il livello-1 GUIDE cheap. Check STALL-ONLY
         // (gli assi runaway non sono in `ProgressSignals`, il gemello non lo ha) e
@@ -4493,8 +4634,7 @@ impl ExecutorNode {
         // (regola L) lo LEGGE, MAI un `contains("[REDACTED:")` sul placeholder
         // umano. E' il segnale che riconosce il blocco ambientale del loop email
         // (email ri-oscurata che il modello continua a copiare).
-        let redaction_rejected =
-            crate::routing::signals::recent_redaction_rejected(messages, 16);
+        let redaction_rejected = crate::routing::signals::recent_redaction_rejected(messages, 16);
         let stall = build_stall_context(
             axis,
             signals,
@@ -4572,8 +4712,7 @@ impl ExecutorNode {
         let recent_tool_signatures = state.recent_tool_signatures.clone().unwrap_or_default();
         let last_outcome = Self::last_tool_outcome(messages);
         let modified = crate::routing::signals::modified_files_from_messages(messages, 40);
-        let redaction_rejected =
-            crate::routing::signals::recent_redaction_rejected(messages, 16);
+        let redaction_rejected = crate::routing::signals::recent_redaction_rejected(messages, 16);
         let action_oriented = turn_action_oriented(state.action_oriented);
         let stall = crate::decisions::meta_reason::build_runaway_context(
             axis,
@@ -4848,7 +4987,11 @@ azioni concrete e mirate verso il completamento.",
             // (pick_escalation_model + sticky). Se nessun candidato -> rete di
             // sicurezza (gerarchia fissa, che a budget escalation esaurito abortisce).
             Action::Escalate => {
-                let escal = state.extra.get("auto_escalations").and_then(Value::as_i64).unwrap_or(0);
+                let escal = state
+                    .extra
+                    .get("auto_escalations")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 let (cur_provider, cur_model) = self.escalation_current_pair(state);
                 let picked = if escal < self.cfg.max_escalations {
                     let inputs = self
@@ -5148,12 +5291,13 @@ al mio controllo e va risolta prima di continuare."
     /// usano solo segnali strutturati. In dubbio, non-critico (il floor e gli altri
     /// gate del downscale restano comunque attivi).
     fn task_critical(state: &AgentState, escalations_done: i64) -> bool {
-        matches!(state.task_complexity, Some(crate::state::TaskComplexity::High))
-            || matches!(
-                state.automation_mode,
-                Some(crate::state::AutomationMode::Continuous)
-            )
-            || escalations_done > 0
+        matches!(
+            state.task_complexity,
+            Some(crate::state::TaskComplexity::High)
+        ) || matches!(
+            state.automation_mode,
+            Some(crate::state::AutomationMode::Continuous)
+        ) || escalations_done > 0
     }
 
     /// Pavimento di tier per l'intent (FIX-D): il downscale non scende MAI sotto.
@@ -5536,7 +5680,10 @@ al mio controllo e va risolta prima di continuare."
         let reaches_cap = cap > 0 && changes_used + 1 >= cap;
         let (target_tier, is_down) = if reaches_cap {
             // Pin-UP a Heavy: la direzione diventa "up" se Heavy e' sopra il corrente.
-            (ScaleTier::Heavy, ScaleTier::Heavy.rank() < scale_ctx.current_tier.rank())
+            (
+                ScaleTier::Heavy,
+                ScaleTier::Heavy.rank() < scale_ctx.current_tier.rank(),
+            )
         } else {
             (raw_target_tier, raw_is_down)
         };
@@ -5548,7 +5695,10 @@ al mio controllo e va risolta prima di continuare."
         if reaches_cap && target_tier == scale_ctx.current_tier {
             let mut extra_out = state.extra.clone();
             extra_out.insert("scale_pinned_heavy".to_string(), json!(true));
-            extra_out.insert("scale_tier_changes_used".to_string(), json!(cap.max(changes_used)));
+            extra_out.insert(
+                "scale_tier_changes_used".to_string(),
+                json!(cap.max(changes_used)),
+            );
             tracing::info!(
                 target: "nexus_agent_graph::executor",
                 current_tier = scale_ctx.current_tier.as_str(),
@@ -5659,7 +5809,10 @@ al mio controllo e va risolta prima di continuare."
         // (`reaches_cap`): marca `scale_pinned_heavy` cosi' il detector non emette piu'
         // (pin heavy + disattiva, mig 0516).
         let new_changes_used = changes_used + 1;
-        extra_out.insert("scale_tier_changes_used".to_string(), json!(new_changes_used));
+        extra_out.insert(
+            "scale_tier_changes_used".to_string(),
+            json!(new_changes_used),
+        );
         if reaches_cap {
             extra_out.insert("scale_pinned_heavy".to_string(), json!(true));
             tracing::info!(
@@ -6141,7 +6294,10 @@ fn sorted(set: &HashSet<String>) -> Vec<String> {
 /// "anthropic_content"]` Python): i tool_use restano riferibili dai tool_result
 /// del turno successivo. Se assenti: content testuale + i tool_calls in
 /// `tool_calls` (forma OpenAI-compat), come fa il planner col solo tool_use.
-fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_text: &str) -> Message {
+fn build_assistant_message(
+    resp: &crate::runtime::ports::LlmResponse,
+    result_text: &str,
+) -> Message {
     if !resp.assistant_content.is_empty() {
         let blocks: Vec<ContentBlock> = resp
             .assistant_content
@@ -6191,7 +6347,12 @@ fn build_assistant_message(resp: &crate::runtime::ports::LlmResponse, result_tex
 fn message_to_history(m: &Message) -> HistoryMessage {
     match m {
         Message::Human { content } => history_from_content(content, true),
-        Message::Ai { content, tool_calls, reasoning, thinking_signature } => {
+        Message::Ai {
+            content,
+            tool_calls,
+            reasoning,
+            thinking_signature,
+        } => {
             // Se l'AI porta tool_calls (forma OpenAI-compat) ma content testuale,
             // espandiamo i tool_use in anthropic_content per la dedup/compress.
             let mut hm = history_from_content(content, false);
@@ -6224,7 +6385,10 @@ fn message_to_history(m: &Message) -> HistoryMessage {
         // verrebbe degradato ad assistant testuale e Anthropic risponderebbe HTTP
         // 400 (`tool_use ids without tool_result`). La compressione che lo riscrive
         // azzera questi flag (vedi `HistoryMessage::rebuilt_human`).
-        Message::Tool { content, tool_call_id } => {
+        Message::Tool {
+            content,
+            tool_call_id,
+        } => {
             let mut hm = history_from_content(content, false);
             hm.is_tool = true;
             hm.tool_call_id = Some(tool_call_id.clone());
@@ -6331,9 +6495,17 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
                 role: role.to_string(),
                 content: m.anthropic_content.clone(),
                 // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
-                reasoning: if m.is_human { None } else { m.reasoning.clone() },
+                reasoning: if m.is_human {
+                    None
+                } else {
+                    m.reasoning.clone()
+                },
                 // Round-trip firma thinking Anthropic: solo sugli assistant.
-                thinking_signature: if m.is_human { None } else { m.thinking_signature.clone() },
+                thinking_signature: if m.is_human {
+                    None
+                } else {
+                    m.thinking_signature.clone()
+                },
                 ..Default::default()
             }];
         }
@@ -6345,9 +6517,17 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
         role: role.to_string(),
         content: m.content.clone(),
         // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
-        reasoning: if m.is_human { None } else { m.reasoning.clone() },
+        reasoning: if m.is_human {
+            None
+        } else {
+            m.reasoning.clone()
+        },
         // Round-trip firma thinking Anthropic: solo sugli assistant.
-        thinking_signature: if m.is_human { None } else { m.thinking_signature.clone() },
+        thinking_signature: if m.is_human {
+            None
+        } else {
+            m.thinking_signature.clone()
+        },
         ..Default::default()
     }]
 }
@@ -6360,7 +6540,11 @@ fn extract_tool_uses(blocks: &[Value]) -> Vec<ToolUse> {
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
         .filter_map(|b| {
             let id = b.get("id").and_then(Value::as_str)?.to_string();
-            let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let name = b
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
             // Firma PER-CALL (Gemini 3): estratta dal blocco tool_use per essere
             // ri-passata sulla stessa functionCall nel round-trip verso il gateway.

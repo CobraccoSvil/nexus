@@ -60,9 +60,7 @@ export default function NexusDatabasePage() {
   };
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 30000);
-    return () => clearInterval(interval);
+    void fetchData();
   }, []);
 
   const statCardStyle = {

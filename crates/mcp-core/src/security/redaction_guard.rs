@@ -140,12 +140,9 @@ pub async fn enforce_no_redacted_placeholder(
 ) -> Option<String> {
     // Funzione pura prima del lookup policy: zero costo DB quando non serve.
     let placeholder = find_redacted_placeholder(text)?;
-    let policy = super::resource_governance::policy(
-        ctx.db.as_ref(),
-        "secret",
-        "no_redacted_placeholder",
-    )
-    .await;
+    let policy =
+        super::resource_governance::policy(ctx.db.as_ref(), "secret", "no_redacted_placeholder")
+            .await;
     if !policy.enabled {
         return None;
     }

@@ -201,10 +201,7 @@ impl UnderstandingNode {
             .unwrap_or_default();
         let mut lines: Vec<String> = Vec::new();
         for h in hits.into_iter().take(topk) {
-            let sk = h
-                .get("source_kind")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let sk = h.get("source_kind").and_then(Value::as_str).unwrap_or("?");
             let txt_raw = h.get("chunk_text").and_then(Value::as_str).unwrap_or("");
             let txt = Self::truncate_chars(txt_raw.trim(), HIT_TEXT_MAX);
             // `float(... or 0)` Python: numero o 0.0; le stringhe numeriche del
@@ -243,10 +240,7 @@ impl UnderstandingNode {
         let mut lines: Vec<String> = Vec::new();
         for raw in summaries_json {
             let parsed: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-            let summary = parsed
-                .get("summary")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let summary = parsed.get("summary").and_then(Value::as_str).unwrap_or("");
             if !summary.is_empty() {
                 let truncated = Self::truncate_chars(summary, EXPLORE_SUMMARY_MAX);
                 lines.push(format!("  <explore>{truncated}</explore>"));
@@ -507,11 +501,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for ScriptedTools {
-        async fn execute(
-            &self,
-            call: ToolCall,
-            mode: ExecMode,
-        ) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
             self.modes.lock().unwrap().push(mode);
             self.names.lock().unwrap().push(call.name.clone());
             let rj = match call.name.as_str() {
@@ -586,7 +576,9 @@ mod tests {
     /// Stato complesso "tipo" con query lunga e budget sufficiente.
     fn complex_state() -> AgentState {
         AgentState {
-            messages: vec![human("Rifattorizza il modulo di autenticazione del progetto")],
+            messages: vec![human(
+                "Rifattorizza il modulo di autenticazione del progetto",
+            )],
             task_complexity: Some(TaskComplexity::High),
             token_budget: Some(5000),
             session_id: Some("sess-test".to_string()),
@@ -600,7 +592,11 @@ mod tests {
         let node = UnderstandingNode::new(UnderstandingConfig::default()); // enabled=false
         let ctx = ctx_with_tools(Arc::new(FailingTools), false);
         let delta = node.run(&complex_state(), &ctx).await.expect("run ok");
-        assert_eq!(delta.as_map().len(), 0, "flag OFF: delta vuoto, zero chiavi");
+        assert_eq!(
+            delta.as_map().len(),
+            0,
+            "flag OFF: delta vuoto, zero chiavi"
+        );
         // Lo Sink esiste solo per evitare warning di import non usato.
         let _ = Sink;
     }
@@ -644,7 +640,10 @@ mod tests {
         state.is_ambiguous = Some(false);
         state.agentic_score = Some(0.3);
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
-        assert_eq!(out.understanding_skip_reason.as_deref(), Some("not_complex"));
+        assert_eq!(
+            out.understanding_skip_reason.as_deref(),
+            Some("not_complex")
+        );
     }
 
     /// `is_complex` per i tre segnali, incluso agentic_score >= soglia.
@@ -653,7 +652,10 @@ mod tests {
         let mut s = AgentState::default();
         assert!(!UnderstandingNode::is_complex(&s));
         s.agentic_score = Some(0.7);
-        assert!(UnderstandingNode::is_complex(&s), "score >= 0.7 -> complesso");
+        assert!(
+            UnderstandingNode::is_complex(&s),
+            "score >= 0.7 -> complesso"
+        );
         s.agentic_score = Some(0.69);
         assert!(!UnderstandingNode::is_complex(&s));
         s.is_ambiguous = Some(true);
@@ -727,7 +729,10 @@ mod tests {
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
         let brief = out.context_brief.expect("brief");
         assert!(brief.contains("<grounding>"));
-        assert!(!brief.contains("<esplorazioni>"), "fanout OFF -> niente explore");
+        assert!(
+            !brief.contains("<esplorazioni>"),
+            "fanout OFF -> niente explore"
+        );
     }
 
     /// Best-effort: se il grounding fallisce ma l'explore produce contenuto, il
@@ -761,7 +766,10 @@ mod tests {
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
         assert_eq!(out.understanding_active, Some(true));
         let brief = out.context_brief.expect("brief");
-        assert!(!brief.contains("<grounding>"), "grounding fallito -> assente");
+        assert!(
+            !brief.contains("<grounding>"),
+            "grounding fallito -> assente"
+        );
         assert!(brief.contains("<explore>trovato qualcosa</explore>"));
     }
 
@@ -909,13 +917,21 @@ mod golden {
                     Value::String(UnderstandingNode::last_user_message(&msgs))
                 }
                 "render_grounding" => {
-                    let rj = c.input.get("result_json").and_then(Value::as_str).unwrap_or("");
+                    let rj = c
+                        .input
+                        .get("result_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let topk = c.input.get("topk").and_then(Value::as_i64).unwrap_or(0) as usize;
                     Value::String(UnderstandingNode::render_grounding(rj, topk))
                 }
                 "explore_subqueries" => {
                     let q = c.input.get("query").and_then(Value::as_str).unwrap_or("");
-                    let me = c.input.get("max_explore").and_then(Value::as_i64).unwrap_or(0) as usize;
+                    let me = c
+                        .input
+                        .get("max_explore")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0) as usize;
                     serde_json::to_value(UnderstandingNode::explore_subqueries(q, me))
                         .expect("serialize subqueries")
                 }
@@ -924,12 +940,20 @@ mod golden {
                         .input
                         .get("summaries_json")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     Value::String(UnderstandingNode::render_explore(&sums))
                 }
                 "assemble_raw_brief" => {
-                    let g = c.input.get("grounding").and_then(Value::as_str).unwrap_or("");
+                    let g = c
+                        .input
+                        .get("grounding")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let e = c.input.get("explore").and_then(Value::as_str).unwrap_or("");
                     Value::String(UnderstandingNode::assemble_raw_brief(g, e))
                 }

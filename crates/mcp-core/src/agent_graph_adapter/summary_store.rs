@@ -230,7 +230,10 @@ mod tests {
     async fn replay_e_un_noop_che_ritorna_porterror(pool: PgPool) {
         let store = PgSummaryStore::new(pool.clone());
         let res = store
-            .summarize("[human]: ciao\n[assistant]: salve".to_string(), ExecMode::Replay)
+            .summarize(
+                "[human]: ciao\n[assistant]: salve".to_string(),
+                ExecMode::Replay,
+            )
             .await;
         assert!(
             res.is_err(),

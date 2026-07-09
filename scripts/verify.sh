@@ -33,7 +33,9 @@ run_phase() {
 SKIP_RUST="${VERIFY_SKIP_RUST:-0}"
 SKIP_TS="${VERIFY_SKIP_TS:-0}"
 
+
 if [[ "$SKIP_TS" != "1" ]]; then
+    run_phase "check TypeScript toolchain" node scripts/check-no-honeypot-tsc.mjs
     run_phase "turbo typecheck+lint+test" pnpm exec turbo run typecheck lint test --continue
 else
     echo "-- verify: TS saltato (VERIFY_SKIP_TS=1)"

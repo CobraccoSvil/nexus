@@ -343,7 +343,10 @@ pub fn check_dangerous_sql(sql: &str) -> Option<String> {
 
     // DROP/ALTER di interi database o schemi (oltre il singolo oggetto).
     if norm.contains("drop database") || norm.contains("drop schema") {
-        return Some("DROP DATABASE/SCHEMA non consentito (oltre lo scope del singolo oggetto applicativo)".to_string());
+        return Some(
+            "DROP DATABASE/SCHEMA non consentito (oltre lo scope del singolo oggetto applicativo)"
+                .to_string(),
+        );
     }
 
     // DELETE / UPDATE di massa senza WHERE (wipe involontario).

@@ -78,9 +78,9 @@ fn derive_error_class(body: &ProviderErrorPayload) -> Result<(String, Option<u64
     let classified = crate::provider_error_classifier::classify_with_status(raw, body.status);
     // retry-after: esplicito del payload > estratto dal testo raw (l'estrazione
     // che il bridge brain faceva con regex locale ora vive nel classifier Rust).
-    let retry_after = body.retry_after_seconds.or_else(|| {
-        crate::provider_error_classifier::extract_retry_after_seconds(raw)
-    });
+    let retry_after = body
+        .retry_after_seconds
+        .or_else(|| crate::provider_error_classifier::extract_retry_after_seconds(raw));
     Ok((classified.stop_reason, retry_after))
 }
 
@@ -200,6 +200,16 @@ pub enum PurposeResolution {
     NotFound,
     /// La routing matrix non e' disponibile (DB down): nessun fallback hardcoded.
     MatrixUnavailable(String),
+}
+
+/// Candidato provider/model per un purpose multi-provider. Deriva dalla stessa
+/// tier-rule di `nexus_purpose_model` usata da [`resolve_purpose_model_db`], ma
+/// mantiene provider distinti per fan-out analitici indipendenti.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurposeProviderCandidate {
+    pub provider: String,
+    pub model: String,
+    pub tier: Option<String>,
 }
 
 impl PurposeResolution {
@@ -325,6 +335,71 @@ pub async fn resolve_purpose_model_db_pinned(
     resolve_purpose_model_db_inner(db, purpose, &[], only_provider).await
 }
 
+/// Risolve fino a `limit` provider DISTINTI per un purpose tier-based, usando il
+/// catalog e gli stessi filtri/cooldown del routing live. E' il punto unico per
+/// fan-out multi-provider: i chiamanti non interrogano `ai_price_catalog` a mano e
+/// non hardcodano provider/modelli.
+pub async fn resolve_purpose_provider_candidates_db(
+    db: &PgPool,
+    purpose: &str,
+    limit: usize,
+) -> Result<Vec<PurposeProviderCandidate>, PurposeResolution> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let purpose = purpose.trim();
+    let Some(rule) = fetch_purpose_tier_rule_db(db, purpose).await? else {
+        return Err(PurposeResolution::NotFound);
+    };
+
+    let filter = crate::orchestrator::EligibilityFilter {
+        require_tool_use: rule.requires_tool_use,
+        require_thinking_non_exclude: rule.requires_tool_use,
+        capability: rule.capability.as_deref(),
+        min_context_window: 0,
+        exclude_providers: &[],
+        apply_cooldown: true,
+        only_provider: None,
+    };
+    let order_by = if rule.requires_tool_use {
+        crate::orchestrator::AGENTIC_COST_FIRST_ORDER
+    } else {
+        "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
+         input_cost_per_million_tokens ASC, is_featured DESC"
+    };
+    // Recupera un pool piu' ampio del limite per poter deduplicare per provider
+    // senza forzare una query SQL dedicata fuori dal selettore unico.
+    let pool_limit = (limit.saturating_mul(4)).max(limit) as i64;
+    let rows = crate::orchestrator::select_models_tierchain(
+        db,
+        &filter,
+        &[rule.tier.as_str()],
+        order_by,
+        pool_limit,
+    )
+    .await
+    .map_err(PurposeResolution::MatrixUnavailable)?;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for (provider, model, tier) in rows {
+        let key = provider.to_lowercase();
+        if seen.iter().any(|p| p == &key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(PurposeProviderCandidate {
+            provider,
+            model,
+            tier,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// PUNTO UNICO (regola L) della lettura tier-rule da `nexus_purpose_model` + delega
 /// al core decisionale. `_excluding` e `_pinned` sono viste su questa funzione con
 /// combinazioni diverse di `exclude_providers`/`only_provider`: la query DB della
@@ -336,29 +411,35 @@ async fn resolve_purpose_model_db_inner(
     only_provider: Option<&str>,
 ) -> PurposeResolution {
     let purpose = purpose.trim();
-    let row = match sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
+    let tier_rule = match fetch_purpose_tier_rule_db(db, purpose).await {
+        Ok(rule) => rule,
+        Err(e) => return e,
+    };
+
+    resolve_purpose_core(db, purpose, tier_rule, exclude_providers, only_provider).await
+}
+
+async fn fetch_purpose_tier_rule_db(
+    db: &PgPool,
+    purpose: &str,
+) -> Result<Option<crate::routing_matrix::PurposeTierRule>, PurposeResolution> {
+    let row = sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
         "SELECT tier, required_capability, requires_tool_use \
          FROM nexus_purpose_model WHERE purpose = $1 LIMIT 1",
     )
     .bind(purpose)
     .fetch_optional(db)
     .await
-    {
-        Ok(r) => r,
-        Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
-    };
+    .map_err(|e| PurposeResolution::MatrixUnavailable(e.to_string()))?;
 
     let Some((tier, capability, requires_tool_use)) = row else {
-        return PurposeResolution::NotFound;
+        return Ok(None);
     };
-
-    let tier_rule = tier.map(|t| crate::routing_matrix::PurposeTierRule {
+    Ok(tier.map(|t| crate::routing_matrix::PurposeTierRule {
         tier: t,
         capability,
         requires_tool_use,
-    });
-
-    resolve_purpose_core(db, purpose, tier_rule, exclude_providers, only_provider).await
+    }))
 }
 
 /// Handler `GET /api/internal/routing/purpose?purpose=...`
@@ -538,10 +619,7 @@ pub async fn decide_routing(
     // manchi (es. re-route per-turno dopo un tool_result). Il 400
     // indiscriminato faceva morire i run agentici multi-turno con la
     // sentinella __router_unavailable__ (incidente 2026-06-10).
-    let has_intent = body
-        .intent
-        .as_deref()
-        .is_some_and(|v| !v.trim().is_empty());
+    let has_intent = body.intent.as_deref().is_some_and(|v| !v.trim().is_empty());
     if body.message.trim().is_empty() && !has_intent {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -813,5 +891,56 @@ mod tests {
         // Solo status, senza testo: classificabile (HTTP map).
         let (class, _) = derive_error_class(&payload(None, None, Some(500), None)).unwrap();
         assert_eq!(class, "provider_error");
+    }
+
+    /// Fan-out multi-provider: provider distinti dal catalog, dedup per provider.
+    #[sqlx::test]
+    async fn resolve_purpose_provider_candidates_deduplica_provider(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("nexus_purpose_model");
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('multi_provider_advisory', 'medium', 'reasoning', true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        for (provider, model, cost) in [
+            ("openai", "gpt-a", 1.0),
+            ("openai", "gpt-b", 0.5),
+            ("anthropic", "claude-a", 2.0),
+            ("deepseek", "ds-a", 0.3),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                 (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                  performance_tier, capabilities, input_cost_per_million_tokens) \
+                 VALUES ($1, $2, true, true, 'none', 'medium', '[\"reasoning\"]'::jsonb, $3)",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(cost)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+        let candidates =
+            resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3)
+                .await
+                .expect("candidati");
+        assert_eq!(candidates.len(), 3, "max 3 provider distinti");
+        let providers: Vec<_> = candidates.iter().map(|c| c.provider.as_str()).collect();
+        assert_eq!(providers, vec!["deepseek", "openai", "anthropic"]);
+        assert_eq!(candidates[1].model, "gpt-b", "cost-first sullo stesso provider");
     }
 }

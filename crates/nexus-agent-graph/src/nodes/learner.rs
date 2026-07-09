@@ -252,7 +252,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for LearnerNode {
             .thread_id
             .clone()
             .unwrap_or_else(|| ctx.run_id.to_string());
-        let task_type = state.user_intent.clone().unwrap_or_else(|| "chat".to_string());
+        let task_type = state
+            .user_intent
+            .clone()
+            .unwrap_or_else(|| "chat".to_string());
         let behavior_mode = state
             .behavior_mode
             .clone()
@@ -322,8 +325,17 @@ impl GraphNode<AgentState, AgentNodeCtx> for LearnerNode {
         // NON scrive (zero side-effect). Fire-and-forget: errore -> WARN, mai
         // fatale (parita' col Python che logga e non rilancia, __init__.py:4561).
         if !ctx.shadow && !user_input.is_empty() {
-            self.spawn_persist_pg(ctx, &thread_id, &task_type, &behavior_mode, &user_input,
-                &result, provider.as_deref(), model.as_deref(), state);
+            self.spawn_persist_pg(
+                ctx,
+                &thread_id,
+                &task_type,
+                &behavior_mode,
+                &user_input,
+                &result,
+                provider.as_deref(),
+                model.as_deref(),
+                state,
+            );
         }
 
         // ── Reward fuso per il Q-learning (deterministico, golden-abile) ──────
@@ -484,7 +496,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::runtime::ports::{EventSink, LlmGateway, LlmRequest, LlmResponse, PortError, SseEvent};
+    use crate::runtime::ports::{
+        EventSink, LlmGateway, LlmRequest, LlmResponse, PortError, SseEvent,
+    };
     use crate::runtime::test_doubles::StubToolExecutor;
     use crate::runtime::AgentNodeCtx;
     use crate::state::{AgentState, Message, MessageContent, StopReason};
@@ -604,7 +618,10 @@ mod tests {
         assert!(out.completed_at.is_some());
         // Gate Qdrant chiuso indipendentemente dal reward.
         assert!(!LearnerNode::should_save_qdrant(
-            &LearnerConfig { auto_extract: false, ..Default::default() },
+            &LearnerConfig {
+                auto_extract: false,
+                ..Default::default()
+            },
             1.0
         ));
     }
@@ -624,10 +641,7 @@ mod tests {
 
     #[test]
     fn user_input_primo_human() {
-        let msgs = vec![
-            human("primo"),
-            human("secondo"),
-        ];
+        let msgs = vec![human("primo"), human("secondo")];
         assert_eq!(LearnerNode::user_input(&msgs), "primo");
         // Nessun human -> stringa vuota.
         assert_eq!(LearnerNode::user_input(&[]), "");
@@ -635,14 +649,20 @@ mod tests {
 
     #[test]
     fn should_save_qdrant_gate() {
-        let cfg = LearnerConfig { auto_extract: true, min_confidence: 0.6 };
+        let cfg = LearnerConfig {
+            auto_extract: true,
+            min_confidence: 0.6,
+        };
         // prelim >= soglia E auto_extract -> true.
         assert!(LearnerNode::should_save_qdrant(&cfg, 0.6));
         assert!(LearnerNode::should_save_qdrant(&cfg, 1.0));
         // prelim < soglia -> false.
         assert!(!LearnerNode::should_save_qdrant(&cfg, 0.4));
         // auto_extract off -> false anche se sopra soglia.
-        let off = LearnerConfig { auto_extract: false, min_confidence: 0.6 };
+        let off = LearnerConfig {
+            auto_extract: false,
+            min_confidence: 0.6,
+        };
         assert!(!LearnerNode::should_save_qdrant(&off, 1.0));
     }
 
@@ -676,8 +696,13 @@ mod tests {
     #[test]
     fn build_payload_preview_e_provider_null() {
         let p = LearnerNode::build_qdrant_payload(
-            "tid", "code_write", "bilanciata", None, None,
-            &"a".repeat(300), &"b".repeat(300),
+            "tid",
+            "code_write",
+            "bilanciata",
+            None,
+            None,
+            &"a".repeat(300),
+            &"b".repeat(300),
         );
         assert_eq!(p.input_preview.chars().count(), 200);
         assert_eq!(p.output_preview.chars().count(), 200);
@@ -731,7 +756,11 @@ mod golden {
         for c in &cases {
             let got: Value = match c.function.as_str() {
                 "prelim_reward" => {
-                    let sr = c.input.get("stop_reason").and_then(Value::as_str).unwrap_or("");
+                    let sr = c
+                        .input
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let res = c
                         .input
                         .get("result_non_empty")
@@ -740,40 +769,91 @@ mod golden {
                     json!(prelim_reward(sr, res))
                 }
                 "heuristic_reward" => {
-                    let sr = c.input.get("stop_reason").and_then(Value::as_str).unwrap_or("");
+                    let sr = c
+                        .input
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let res = c
                         .input
                         .get("result_non_empty")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    let it = c.input.get("iterations").and_then(Value::as_i64).unwrap_or(0);
-                    let bud = c.input.get("iteration_budget").and_then(Value::as_i64).unwrap_or(0);
+                    let it = c
+                        .input
+                        .get("iterations")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let bud = c
+                        .input
+                        .get("iteration_budget")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     json!(heuristic_reward(sr, res, it, bud))
                 }
                 "fuse_reward" => {
                     // final_reward_state e' null o un float.
                     let frs = c.input.get("final_reward_state").and_then(Value::as_f64);
-                    let h = c.input.get("heuristic").and_then(Value::as_f64).unwrap_or(0.0);
+                    let h = c
+                        .input
+                        .get("heuristic")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
                     json!(LearnerNode::fuse_reward(frs, h))
                 }
                 "should_save_qdrant" => {
-                    let auto = c.input.get("auto_extract").and_then(Value::as_bool).unwrap_or(false);
-                    let minc = c.input.get("min_confidence").and_then(Value::as_f64).unwrap_or(0.0);
-                    let prelim = c.input.get("prelim_reward").and_then(Value::as_f64).unwrap_or(0.0);
-                    let cfg = LearnerConfig { auto_extract: auto, min_confidence: minc };
+                    let auto = c
+                        .input
+                        .get("auto_extract")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let minc = c
+                        .input
+                        .get("min_confidence")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let prelim = c
+                        .input
+                        .get("prelim_reward")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let cfg = LearnerConfig {
+                        auto_extract: auto,
+                        min_confidence: minc,
+                    };
                     json!(LearnerNode::should_save_qdrant(&cfg, prelim))
                 }
                 "interaction_text" => {
-                    let ui = c.input.get("user_input").and_then(Value::as_str).unwrap_or("");
+                    let ui = c
+                        .input
+                        .get("user_input")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let res = c.input.get("result").and_then(Value::as_str).unwrap_or("");
                     json!(LearnerNode::interaction_text(ui, res))
                 }
                 "build_qdrant_payload" => {
-                    let ui = c.input.get("user_input").and_then(Value::as_str).unwrap_or("");
+                    let ui = c
+                        .input
+                        .get("user_input")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let res = c.input.get("result").and_then(Value::as_str).unwrap_or("");
-                    let tid = c.input.get("thread_id").and_then(Value::as_str).unwrap_or("");
-                    let tt = c.input.get("task_type").and_then(Value::as_str).unwrap_or("");
-                    let bm = c.input.get("behavior_mode").and_then(Value::as_str).unwrap_or("");
+                    let tid = c
+                        .input
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let tt = c
+                        .input
+                        .get("task_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let bm = c
+                        .input
+                        .get("behavior_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let prov = c.input.get("provider").and_then(Value::as_str);
                     let model = c.input.get("model").and_then(Value::as_str);
                     let p = LearnerNode::build_qdrant_payload(tid, tt, bm, prov, model, ui, res);
@@ -781,7 +861,11 @@ mod golden {
                 }
                 "user_input" => {
                     // input.messages = lista di {role, content}; ricostruiamo i Message.
-                    let msgs_raw = c.input.get("messages").and_then(Value::as_array).expect("messages");
+                    let msgs_raw = c
+                        .input
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .expect("messages");
                     let msgs: Vec<Message> = msgs_raw
                         .iter()
                         .filter_map(|m| {

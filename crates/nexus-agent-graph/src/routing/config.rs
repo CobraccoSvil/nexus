@@ -74,7 +74,14 @@ impl Default for RoutingConfig {
             final_gate_enabled: true,
             final_gate_max_cycles: 2,
             final_gate_software_intents: [
-                "code", "debug", "scaffold", "implement", "build", "frontend", "fix", "refactor",
+                "code",
+                "debug",
+                "scaffold",
+                "implement",
+                "build",
+                "frontend",
+                "fix",
+                "refactor",
             ]
             .iter()
             .map(|s| s.to_string())

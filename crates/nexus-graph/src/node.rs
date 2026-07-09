@@ -49,6 +49,8 @@ pub enum NodeId {
     /// e rientra nell'executor via self-loop (`StopReason::ScaleResolved`). Inerte
     /// finche' nessun detector emette `ScaleReason` (flag `agent.scale.enabled` OFF).
     ScaleControl,
+    /// Supervisore worker: monitora l'avanzamento e puo' redirectare/abbandonare.
+    Supervisor,
     Verifier,
     FinalGate,
     Reflection,
@@ -71,6 +73,7 @@ impl NodeId {
             NodeId::ToolDispatch => "tool_dispatch",
             NodeId::StallRecovery => "stall_recovery",
             NodeId::ScaleControl => "scale_control",
+            NodeId::Supervisor => "supervisor",
             NodeId::Verifier => "verifier",
             NodeId::FinalGate => "final_gate",
             NodeId::Reflection => "reflection",
@@ -93,6 +96,7 @@ impl NodeId {
             "tool_dispatch" => NodeId::ToolDispatch,
             "stall_recovery" => NodeId::StallRecovery,
             "scale_control" => NodeId::ScaleControl,
+            "supervisor" => NodeId::Supervisor,
             "verifier" => NodeId::Verifier,
             "final_gate" => NodeId::FinalGate,
             "reflection" => NodeId::Reflection,

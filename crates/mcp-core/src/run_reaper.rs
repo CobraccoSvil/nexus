@@ -146,7 +146,12 @@ async fn reap_all_at_boot_enabled(db: &PgPool) -> bool {
     .await
     .ok()
     .flatten()
-    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    .map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
     .unwrap_or(true)
 }
 

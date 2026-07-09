@@ -99,11 +99,7 @@ impl StallBudgetPort for PgStallBudgetStore {
     /// consultazione effettiva). Gata `Real` (no-op in `Replay`: lo shadow non
     /// incrementa il budget del primario). Best-effort: errore DB loggato,
     /// `Ok(())` ritornato (il `PortError` resta per un contratto rotto).
-    async fn record_consultation(
-        &self,
-        session_id: Uuid,
-        mode: ExecMode,
-    ) -> Result<(), PortError> {
+    async fn record_consultation(&self, session_id: Uuid, mode: ExecMode) -> Result<(), PortError> {
         if mode != ExecMode::Real {
             return Ok(());
         }

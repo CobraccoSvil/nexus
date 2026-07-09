@@ -309,7 +309,11 @@ async fn finalize_scan_failed(db: &sqlx::PgPool, scan_id: i64, error: &str, dura
     .bind(scan_id)
     .execute(db)
     .await;
-    tracing::warn!("quality_scan background: scan_id={} FAILED: {}", scan_id, error);
+    tracing::warn!(
+        "quality_scan background: scan_id={} FAILED: {}",
+        scan_id,
+        error
+    );
 }
 
 /// Esegue la scansione qualita' completa. Chiamata dal task background.
@@ -342,7 +346,15 @@ async fn perform_quality_scan(
         collect_regex_batch(db, project_id, root_path).await;
 
     // Fase vettoriale (arricchimento) + duplicati semantici, con guard watchdog.
-    run_semantic_phase(db, orchestrator, project_id, &mut batch, &file_contents, dep_status).await;
+    run_semantic_phase(
+        db,
+        orchestrator,
+        project_id,
+        &mut batch,
+        &file_contents,
+        dep_status,
+    )
+    .await;
 
     // Conta totali (esclusi gli auto-soppressi).
     let mut total_findings = 0u32;
@@ -1259,8 +1271,11 @@ async fn enrich_findings_with_vectors(
         // Genera context_snippet se non gia' presente
         if row.context_snippet.is_none() {
             if let (Some(ln), Some(content)) = (row.line_number, file_contents.get(&row.file)) {
-                row.context_snippet =
-                    Some(mcp_quality::extract_context_snippet(content, ln as usize, 5));
+                row.context_snippet = Some(mcp_quality::extract_context_snippet(
+                    content,
+                    ln as usize,
+                    5,
+                ));
             }
         }
 
@@ -1594,7 +1609,11 @@ fn dup_finding_from_hit(
         return None;
     }
 
-    let hit_file = hit.payload.get("file_path").and_then(|v| v.as_str())?.to_string();
+    let hit_file = hit
+        .payload
+        .get("file_path")
+        .and_then(|v| v.as_str())?
+        .to_string();
 
     // Ignora match nello stesso file
     if hit_file == *rel_path {
@@ -1946,7 +1965,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count before");
-        assert_eq!(before, 1, "il finding stantio deve esistere prima dello scan");
+        assert_eq!(
+            before, 1,
+            "il finding stantio deve esistere prima dello scan"
+        );
 
         maybe_auto_scan_file(&pool, project_id, &file_path).await;
 

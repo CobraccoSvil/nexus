@@ -178,7 +178,10 @@ mod golden {
                     let inp = &c.input;
                     let ratio = inp.get("ratio").and_then(Value::as_f64).unwrap();
                     let window = inp.get("window").and_then(Value::as_i64).unwrap();
-                    let exp = inp.get("expected_size_bytes").and_then(Value::as_i64).unwrap();
+                    let exp = inp
+                        .get("expected_size_bytes")
+                        .and_then(Value::as_i64)
+                        .unwrap();
                     let cur = inp.get("current_tokens").and_then(Value::as_i64).unwrap();
                     match predictive_cap_check(ratio, window, exp, cur) {
                         Some(s) => Value::String(s),
@@ -196,7 +199,10 @@ mod golden {
             );
             checked += 1;
         }
-        assert!(checked >= 5, "attesi >= 5 casi predictive_cap, verificati {checked}");
+        assert!(
+            checked >= 5,
+            "attesi >= 5 casi predictive_cap, verificati {checked}"
+        );
         println!("golden predictive_cap: {checked} casi verificati, tutti verdi");
     }
 }

@@ -48,6 +48,9 @@
 //!     condiviso reflection/learner, regola L).
 //!   - [`turn_focus`]: direttiva "focus del turno corrente" (anti-contaminazione
 //!     history). PUNTO UNICO condiviso da planner ed executor (regola L).
+//!   - [`hitl`]: gate HITL strutturale per modalita' Conferma (sospensione prima
+//!     dei tool mutativi, pending_actions, compatibile con interrupt-resume).
+//!   - [`supervisor`]: scheduling e parsing della risposta del supervisore worker.
 //!   - [`end_turn`]: decisioni DETERMINISTICHE post-end_turn dell'executor
 //!     (unfulfilled-report, rimozione blocco `<suggested_actions>`, messaggio
 //!     billing fail-fast, gate smart-upscale). PUNTO UNICO dei rami che
@@ -69,6 +72,7 @@ pub mod escalation;
 pub mod g1_accounting;
 pub mod governance;
 pub mod helpers;
+pub mod hitl;
 pub mod loop_signatures;
 pub mod m16;
 pub mod meta_reason;
@@ -78,6 +82,7 @@ pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
 pub mod scale_reason;
+pub mod supervisor;
 pub mod text_repetition;
 pub mod tiers;
 pub mod tool_dispatch;
@@ -92,12 +97,11 @@ pub use advisory_panel::{
 };
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{
-    apply_token_brake, compress_old_tool_results, dedup_tool_results,
-    dedup_tool_results_history, degraded_marker, drop_unused_base64_payloads, first_human_index,
-    inject_forced_rag_reminder, inject_language_reminder, inject_turn_focus,
-    inject_verification_directive, looks_like_base64, should_compress_now, CompressParams,
-    CtxMgmtConfig, HistoryMessage, TokenBrakeConfig, AGGRESSIVE_TRUNC_MARKER, LANG_REMINDER_MARKER,
-    RAG_REMINDER_MARKER, VERIFY_DIRECTIVE_MARKER,
+    apply_token_brake, compress_old_tool_results, dedup_tool_results, dedup_tool_results_history,
+    degraded_marker, drop_unused_base64_payloads, first_human_index, inject_forced_rag_reminder,
+    inject_language_reminder, inject_turn_focus, inject_verification_directive, looks_like_base64,
+    should_compress_now, CompressParams, CtxMgmtConfig, HistoryMessage, TokenBrakeConfig,
+    AGGRESSIVE_TRUNC_MARKER, LANG_REMINDER_MARKER, RAG_REMINDER_MARKER, VERIFY_DIRECTIVE_MARKER,
 };
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,
@@ -115,32 +119,6 @@ pub use governance::{
     is_recently_failed, likelihood_score, rank_candidates, rolling_summary_worthwhile,
     GovernancePolicy, ModelTelemetry,
 };
-pub use m16::{
-    build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
-    py_json_len_ascii, DiscoveredTool, M16_META_TOOLS,
-};
-pub use meta_reason::{build_stall_context, translate, validate_move, work_epoch, VALID_BLOCKERS};
-pub use orchestration_reason::{
-    build_orchestration_context, context_pressure_from_tokens, delegation_forbidden, orch_epoch,
-    subtasks_are_disjoint, validate_orch_move,
-};
-pub use panel_quorum::{classify_panel, PanelClass, QuorumTally};
-pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
-pub use tool_dispatch::{
-    append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
-    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_declared_outcome,
-    ContextMessage, MAX_CONTEXT_CHARS, MAX_TOOL_RESULT_CHARS, RUN_NOTES_MAX_CHARS,
-    TOKEN_CHARS_DIVISOR, VALID_OUTCOMES,
-};
-pub use reward::{
-    aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
-    MAX_AGENT_ITERATIONS,
-};
-pub use scale_reason::{
-    apply_hysteresis, build_scale_context, context_window_ok, scale_cache_key, scale_trigger,
-    validate_scale_move, ScaleHysteresisConfig, ScaleTriggerConfig,
-};
-pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
 pub use helpers::{
     action_oriented_for_intent, compute_iteration_budget, estimate_prompt_complexity,
     provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,
@@ -152,8 +130,39 @@ pub use loop_signatures::{
     exploration_counter_update, ExplorationCounterUpdate, LoopDetection, LoopThresholds,
     LOOP_THRESHOLD, RECENT_SIGNATURES_CAP,
 };
+pub use m16::{
+    build_m16_allowed, is_tool_allowed, merge_discovered_run, parse_discovered_tools,
+    py_json_len_ascii, DiscoveredTool, M16_META_TOOLS,
+};
+pub use meta_reason::{build_stall_context, translate, validate_move, work_epoch, VALID_BLOCKERS};
+pub use orchestration_reason::{
+    build_orchestration_context, context_pressure_from_tokens, delegation_forbidden, orch_epoch,
+    subtasks_are_disjoint, validate_orch_move,
+};
+pub use panel_quorum::{classify_panel, PanelClass, QuorumTally};
+pub use predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
 pub use progress_controller::{
     decide, Action, Axis, ProgressDecision, ProgressSignals, ABORT_STOP_REASON,
+};
+pub use reward::{
+    aggregate_score, final_reward, heuristic_reward, prelim_reward, round_half_even,
+    MAX_AGENT_ITERATIONS,
+};
+pub use scale_reason::{
+    apply_hysteresis, build_scale_context, context_window_ok, scale_cache_key, scale_trigger,
+    validate_scale_move, ScaleHysteresisConfig, ScaleTriggerConfig,
+};
+pub use supervisor::{
+    build_anomaly_block, build_steps_summary, detect_anomalies, extract_original_task,
+    should_invoke, supervisor_cache_key, validate_supervisor_response, SupervisorAnomalies,
+    SupervisorConfig, SupervisorDecision,
+};
+pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
+pub use tool_dispatch::{
+    append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
+    estimate_tool_result_size_bytes, extract_returned_bytes, normalize_declared_outcome,
+    ContextMessage, MAX_CONTEXT_CHARS, MAX_TOOL_RESULT_CHARS, RUN_NOTES_MAX_CHARS,
+    TOKEN_CHARS_DIVISOR, VALID_OUTCOMES,
 };
 pub use turn_focus::{build_turn_focus_directive, user_text_only, TURN_FOCUS_MARKER};
 

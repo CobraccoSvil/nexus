@@ -124,7 +124,9 @@ pub async fn execute_with_args(
 
     let started = std::time::Instant::now();
     let mut cmd = Command::new("sudo");
-    cmd.arg("--non-interactive").arg(&cfg.runner_path).arg(purpose);
+    cmd.arg("--non-interactive")
+        .arg(&cfg.runner_path)
+        .arg(purpose);
     for a in extra_args {
         cmd.arg(a);
     }

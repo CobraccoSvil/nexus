@@ -62,6 +62,8 @@ const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
   folded_tools: "…", // ellissi
   subagent: "◈", // rombo con centro (attivita' delegata)
   awaiting_subagents: "⧗", // clessidra (attesa fan-in dei sub-agent)
+  council_of_competencies: "◎", // indicatore del Consiglio delle Competenze
+  multi_provider_panel: "◉", // panel multi-provider
 };
 
 const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
@@ -75,11 +77,15 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
   folded_tools: "Passi",
   subagent: "Subagente",
   awaiting_subagents: "In attesa",
+  council_of_competencies: "Consiglio",
+  multi_provider_panel: "Multi-provider",
 };
 
 /** Accent della narrazione sub-agente (viola: attivita' delegata, distinto dal
  *  verde tool del run corrente). */
 const SUBAGENT_ACCENT = "#8b5cf6";
+const COUNCIL_ACCENT = "#0ea5e9";
+const MULTI_PROVIDER_ACCENT = "#6366f1";
 
 const FINAL_GATE_PHASES: Record<string, string> = {
   start: "avviata",
@@ -646,6 +652,71 @@ function EventBody({
               ? `In attesa di ${event.count} sub-agent in background...`
               : "In attesa dei sub-agent in background..."}
           </span>
+        </div>
+      );
+    case "council_of_competencies":
+      return (
+        <div
+          style={{
+            minWidth: 0,
+            borderRadius: 10,
+            border: `1px solid ${withAlpha(event.degraded ? "#f59e0b" : COUNCIL_ACCENT, 0.35)}`,
+            background: withAlpha(event.degraded ? "#f59e0b" : COUNCIL_ACCENT, 0.08),
+            padding: "7px 9px",
+          }}
+        >
+          <div style={rowStyle}>
+            <span
+              className="nx-as-kind-label"
+              style={kindLabelStyle(event.degraded ? "#f59e0b" : COUNCIL_ACCENT)}
+            >
+              {EVENT_KIND_LABEL.council_of_competencies}
+            </span>
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: tc.text }}>
+              {event.productName}
+            </span>
+            <span style={tagStyle(event.degraded ? "#f59e0b" : COUNCIL_ACCENT)}>
+              {event.degraded ? "degradato" : "attivo"}
+            </span>
+          </div>
+          <div style={{ marginTop: 3, fontSize: 11.5, color: tc.textMuted }}>
+            {event.degraded
+              ? event.degradationReason ??
+                "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
+              : "Attivato dall'analisi agentica/deterministica di complessita' e ambito della richiesta."}
+          </div>
+        </div>
+      );
+    case "multi_provider_panel":
+      return (
+        <div
+          style={{
+            minWidth: 0,
+            borderRadius: 10,
+            border: `1px solid ${withAlpha(MULTI_PROVIDER_ACCENT, 0.35)}`,
+            background: withAlpha(MULTI_PROVIDER_ACCENT, 0.08),
+            padding: "7px 9px",
+          }}
+        >
+          <div style={rowStyle}>
+            <span className="nx-as-kind-label" style={kindLabelStyle(MULTI_PROVIDER_ACCENT)}>
+              {EVENT_KIND_LABEL.multi_provider_panel}
+            </span>
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: tc.text }}>
+              {event.productName}
+            </span>
+            <span style={tagStyle(event.degraded ? tc.warning : MULTI_PROVIDER_ACCENT)}>
+              {event.degraded ? "degradato" : "attivo"}
+            </span>
+          </div>
+          <div style={{ marginTop: 3, fontSize: 11.5, color: tc.textMuted }}>
+            {event.degraded
+              ? event.degradationReason ??
+                "Provider distinti insufficienti: panel multi-provider non convocato."
+              : typeof event.providerCount === "number" && event.providerCount > 0
+                ? `${event.providerCount} provider distinti hanno analizzato la richiesta.`
+                : "Analisi parallela su provider/modelli distinti tramite routing tier-aware."}
+          </div>
         </div>
       );
     default:

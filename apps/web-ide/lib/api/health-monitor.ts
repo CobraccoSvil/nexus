@@ -16,7 +16,7 @@
 // backend "up" solo quando components.neural_core === true, cosi' non emettiamo
 // un recovery prematuro verso endpoint che risponderebbero ancora 503.
 
-import { getHealth } from "./system";
+import { getHealth, type HealthResponse } from "./system";
 
 type BackendState = "unknown" | "up" | "down";
 
@@ -28,19 +28,21 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let started = false;
 let inFlight = false;
 const listeners = new Set<() => void>();
+const snapshotListeners = new Set<(health: HealthResponse) => void>();
 
-async function probe(): Promise<boolean> {
+async function probe(): Promise<{ up: boolean; health?: HealthResponse }> {
   try {
     const health = await getHealth();
     // "up" solo se il Core e' realmente operativo (readiness), non solo se
     // l'endpoint risponde. Se il campo manca (versione backend diversa) si
     // ricade sullo status generale.
     if (typeof health.components?.neural_core === "boolean") {
-      return health.components.neural_core;
+      return { up: health.components.neural_core, health };
     }
-    return health.status === "ok" || health.status === "healthy";
+    const up = health.status === "ok" || health.status === "healthy";
+    return { up, health };
   } catch {
-    return false;
+    return { up: false };
   }
 }
 
@@ -56,14 +58,25 @@ async function tick(): Promise<void> {
   }
   inFlight = true;
   let up = false;
+  let health: HealthResponse | undefined;
   try {
-    up = await probe();
+    ({ up, health } = await probe());
   } finally {
     inFlight = false;
   }
 
   const prev = state;
   state = up ? "up" : "down";
+
+  if (health) {
+    for (const cb of Array.from(snapshotListeners)) {
+      try {
+        cb(health);
+      } catch {
+        // best-effort
+      }
+    }
+  }
 
   // Emette recovery SOLO sulla transizione down->up (non al primo giro
   // unknown->up, che non e' un ritorno ma lo stato iniziale). Le callback sono
@@ -96,6 +109,15 @@ export function onBackendRecovered(cb: () => void): () => void {
   startBackendHealthMonitor();
   return () => {
     listeners.delete(cb);
+  };
+}
+
+/** Snapshot health condiviso (5s up / 2s down): un solo timer per tutta l'app. */
+export function subscribeHealthSnapshot(cb: (health: HealthResponse) => void): () => void {
+  snapshotListeners.add(cb);
+  startBackendHealthMonitor();
+  return () => {
+    snapshotListeners.delete(cb);
   };
 }
 

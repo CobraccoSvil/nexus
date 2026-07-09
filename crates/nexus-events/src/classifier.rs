@@ -398,7 +398,9 @@ impl Classifier {
                 flash_duration_ms: Some(1000),
             }),
             // Eventi ad alta frequenza: nessun toast (consumati dai pannelli).
-            ProjectEvent::ServiceMetrics { .. } | ProjectEvent::ServiceLogLine { .. } => None,
+            ProjectEvent::ServiceStatusChanged { .. }
+            | ProjectEvent::ServiceMetrics { .. }
+            | ProjectEvent::ServiceLogLine { .. } => None,
         }
     }
 }

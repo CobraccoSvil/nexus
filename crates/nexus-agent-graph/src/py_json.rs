@@ -306,7 +306,7 @@ mod tests {
             (1e-100, "1e-100"),  // esponente a 3 cifre resta 3
             // Esponente positivo grande: segno '+' esplicito.
             (6.022e23, "6.022e+23"),
-            (1e16, "1e+16"),  // x = 16: scientifica
+            (1e16, "1e+16"),              // x = 16: scientifica
             (1e15, "1000000000000000.0"), // x = 15: decimale
             (1.5e16, "1.5e+16"),
             (1e100, "1e+100"),

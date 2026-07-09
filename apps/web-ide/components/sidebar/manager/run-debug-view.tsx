@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { TruncatedText } from "../../truncated-text";
 import {
   useProjectStore,
-  selectServicesMap,
+  selectOperationalRefreshAt,
 } from "../../../lib/project-dispatcher/store";
 import {
   createRunConfig,
@@ -66,12 +66,8 @@ export function RunDebugView({
 
   const projectId = project?.id ?? "";
 
-  // ── Event-driven: refresh dei soli "short" name dei servizi installati, usati
-  // per nascondere i run config che li duplicherebbero. Stato e azioni dei servizi
-  // (start/stop/restart) vivono UNICAMENTE nel pannello Run & Debug. ──
-  const servicesFromDispatcher = useProjectStore(selectServicesMap);
+  const operationalRefreshAt = useProjectStore(selectOperationalRefreshAt);
 
-  // Polling rilassato (30s) — fallback; il refresh reale e' event-driven sotto.
   useEffect(() => {
     if (!projectId) { setServiceShorts(new Set()); return; }
     let cancelled = false;
@@ -82,25 +78,9 @@ export function RunDebugView({
         setServiceShorts(new Set((r.services ?? []).map(s => s.short)));
       } catch { /* ignora */ }
     };
-    refresh();
-    const t = window.setInterval(refresh, 30_000);
-    return () => { cancelled = true; window.clearInterval(t); };
-  }, [projectId]);
-
-  // Refresh immediato quando il dispatcher notifica un cambio di stato servizi.
-  useEffect(() => {
-    if (!projectId || Object.keys(servicesFromDispatcher).length === 0) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await getProjectServicesStatus(projectId);
-        if (cancelled) return;
-        setServiceShorts(new Set((r.services ?? []).map(s => s.short)));
-      } catch { /* ignora */ }
-    })();
+    void refresh();
     return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servicesFromDispatcher]);
+  }, [projectId, operationalRefreshAt]);
 
   const toggleCategory = (cat: Category) => {
     setCollapsed(prev => {

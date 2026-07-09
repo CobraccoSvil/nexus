@@ -77,29 +77,41 @@ pub fn count_sensitive_domain_hits(text: &str, keywords: &[String]) -> usize {
 /// consiglio di troppo che perderne uno su un task sensibile). PUNTO UNICO del
 /// gate; i call site che costruiscono il system prompt agentico delegano qui.
 pub async fn gate_council_directive(db: &PgPool, prompt: String, user_text: &str) -> String {
-    let keywords: Vec<String> = match nexus_auth::get_setting(db, "orchestrator.council_trigger_keywords")
-        .await
-    {
-        Some(csv) => csv
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        None => return prompt, // fail-open: nessuna config -> lascia la direttiva.
-    };
+    if council_triggered_for(db, user_text).await {
+        prompt
+    } else {
+        strip_council_directive(&prompt)
+    }
+}
+
+/// PUNTO UNICO (regola L) della decisione "il consiglio deve attivarsi per questo
+/// testo?": legge le keyword d'ambito sensibile (`orchestrator.council_trigger_
+/// keywords`, CSV) e la soglia (`orchestrator.council_min_trigger_hits`) e ritorna
+/// `true` se il testo tocca >= soglia keyword. Delega la conta al puro
+/// [`count_sensitive_domain_hits`]. Sia il gate della direttiva in-prompt
+/// ([`gate_council_directive`]) sia l'ATTIVAZIONE programmatica del pre-step del
+/// consiglio (`spawn_agent_run`) delegano qui: una sola definizione dell'ambito
+/// sensibile. Fail-open: config assente (DB hiccup) -> `true` (meglio un consiglio di
+/// troppo che perderne uno su un task sensibile).
+pub async fn council_triggered_for(db: &PgPool, user_text: &str) -> bool {
+    let keywords: Vec<String> =
+        match nexus_auth::get_setting(db, "orchestrator.council_trigger_keywords").await {
+            Some(csv) => csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => return true, // fail-open: nessuna config -> considera attivo.
+        };
     if keywords.is_empty() {
-        return prompt;
+        return true;
     }
     let min_hits = nexus_auth::get_setting(db, "orchestrator.council_min_trigger_hits")
         .await
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(1)
         .max(1);
-    if count_sensitive_domain_hits(user_text, &keywords) >= min_hits {
-        prompt
-    } else {
-        strip_council_directive(&prompt)
-    }
+    count_sensitive_domain_hits(user_text, &keywords) >= min_hits
 }
 
 #[cfg(test)]
@@ -126,7 +138,10 @@ mod council_gate_tests {
         );
         // Keyword vuote/spazi ignorate.
         assert_eq!(
-            count_sensitive_domain_hits("login", &["".to_string(), "  ".to_string(), "login".to_string()]),
+            count_sensitive_domain_hits(
+                "login",
+                &["".to_string(), "  ".to_string(), "login".to_string()]
+            ),
             1
         );
     }
@@ -558,7 +573,8 @@ async fn finalize_batch_usage(
     estimated_completion_tokens: i32,
 ) {
     // Finalizza il costo con i token reali (se presenti), altrimenti usa stima.
-    let usage_numbers = crate::billing::extract_usage_numbers(v, prompt_tokens, estimated_completion_tokens);
+    let usage_numbers =
+        crate::billing::extract_usage_numbers(v, prompt_tokens, estimated_completion_tokens);
     if let Some(res) = reservation {
         if let Err(e) =
             crate::billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await
@@ -597,7 +613,9 @@ async fn reserve_batch_usage(
     {
         Ok(r) => Some(r),
         Err(e) => {
-            tracing::error!("batch: billing reserve FAILED (provider={provider} model={model}): {e}");
+            tracing::error!(
+                "batch: billing reserve FAILED (provider={provider} model={model}): {e}"
+            );
             None
         }
     }
@@ -632,8 +650,14 @@ async fn try_provider_once(
 
     match neural.generate_completion(provider, &model, prompt).await {
         Ok(v) => {
-            finalize_batch_usage(db, &reservation, &v, prompt_tokens, estimated_completion_tokens)
-                .await;
+            finalize_batch_usage(
+                db,
+                &reservation,
+                &v,
+                prompt_tokens,
+                estimated_completion_tokens,
+            )
+            .await;
             classify_successful_generation(v, provider)
         }
         Err(e) => {
@@ -641,7 +665,11 @@ async fn try_provider_once(
             if let Some(res) = &reservation {
                 crate::billing::release_usage(db, res, "provider_error").await;
             }
-            tracing::warn!("batch: provider {} errore gRPC: {}, marcato broken", provider, e);
+            tracing::warn!(
+                "batch: provider {} errore gRPC: {}, marcato broken",
+                provider,
+                e
+            );
             ProviderAttempt::Broken
         }
     }
@@ -756,15 +784,18 @@ async fn generate_ai_suggestion_text(
     // Meta-prompt dal DB (system.ai_suggest_meta_prompt, mig 0445); fallback al
     // default builtin se DB down. {{content}} per ultimo: il content puo'
     // contenere placeholder e non va corrotto dai replace dei metadati.
-    let meta_prompt =
-        get_template_or_default(&state.db, &state.template_cache, "system.ai_suggest_meta_prompt")
-            .await
-            .replace("{{usage_ctx}}", usage_ctx)
-            .replace("{{key}}", &template.key)
-            .replace("{{category}}", &template.category)
-            .replace("{{title}}", &template.title)
-            .replace("{{instruction}}", req.instruction.trim())
-            .replace("{{content}}", &template.content);
+    let meta_prompt = get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "system.ai_suggest_meta_prompt",
+    )
+    .await
+    .replace("{{usage_ctx}}", usage_ctx)
+    .replace("{{key}}", &template.key)
+    .replace("{{category}}", &template.category)
+    .replace("{{title}}", &template.title)
+    .replace("{{instruction}}", req.instruction.trim())
+    .replace("{{content}}", &template.content);
 
     let result = state
         .orchestrator
@@ -1023,10 +1054,8 @@ fn build_tool_catalog(tool_rows: &[sqlx::postgres::PgRow]) -> ToolCatalog {
     // - by_pair: (server, tool_name) -> true
     // - by_name: tool_name -> set(server) per gestire collisioni e richiedere disambiguazione quando serve.
     let mut by_pair: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    let mut servers_by_name: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
+    let mut servers_by_name: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     for r in tool_rows {
         let name: String = r.get("name");
         let server: String = r.get("server_name");
@@ -1091,13 +1120,21 @@ fn parse_tool_selection_item(item: &serde_json::Value) -> ParsedToolItem {
             .map(|s| s.to_string());
     }
 
-    ParsedToolItem { name, server, usage_ctx }
+    ParsedToolItem {
+        name,
+        server,
+        usage_ctx,
+    }
 }
 
 /// Risolve il server per un tool selezionato: usa quello esplicito, oppure
 /// l'unico server che espone il tool_name. `None` se ambiguo o inesistente.
 /// Estratto da `batch_assign_tools_impl` (comportamento invariato).
-fn resolve_tool_server(catalog: &ToolCatalog, tool_name: &str, server: Option<String>) -> Option<String> {
+fn resolve_tool_server(
+    catalog: &ToolCatalog,
+    tool_name: &str,
+    server: Option<String>,
+) -> Option<String> {
     // Se server non specificato:
     // - accetta solo se il tool_name è univoco tra i server
     // - se ambiguo, richiede "server::tool" o tool_server nel JSON.
@@ -1136,7 +1173,10 @@ fn select_tools_from_array(
             continue;
         };
 
-        if !catalog.by_pair.contains(&(tool_server.clone(), tool_name.clone())) {
+        if !catalog
+            .by_pair
+            .contains(&(tool_server.clone(), tool_name.clone()))
+        {
             continue;
         }
 
@@ -1347,7 +1387,9 @@ async fn assign_tools_for_one_template(
     let matrix_arc = match state.orchestrator.routing_matrix.current_async().await {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!("regenerate_tool_suggestions: routing_matrix non disponibile ({e}), skip");
+            tracing::error!(
+                "regenerate_tool_suggestions: routing_matrix non disponibile ({e}), skip"
+            );
             return None;
         }
     };
@@ -1536,11 +1578,12 @@ async fn resolve_billing_ids_admin_first(
 /// Risolve user_id/project_id come ultimo utente/progetto, nil su fallimento
 /// (nessun log). Usato dal re-run "admin". Comportamento invariato.
 async fn resolve_billing_ids_latest_or_nil(db: &PgPool) -> (uuid::Uuid, uuid::Uuid) {
-    let user_id =
-        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users ORDER BY created_at DESC LIMIT 1")
-            .fetch_one(db)
-            .await
-            .unwrap_or(uuid::Uuid::nil());
+    let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap_or(uuid::Uuid::nil());
     let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
     )
@@ -1611,13 +1654,14 @@ pub async fn batch_assign_tools_handler(
 /// `internal_batch_assign_tools_handler` (comportamento invariato).
 async fn resolve_billing_ids_internal(db: &PgPool) -> (uuid::Uuid, uuid::Uuid) {
     // Trigger interno: usa ultimo user/progetto come “contabilità di sistema”.
-    let user_id =
-        sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users ORDER BY created_at DESC LIMIT 1")
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(uuid::Uuid::new_v4);
+    let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(uuid::Uuid::new_v4);
 
     let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",

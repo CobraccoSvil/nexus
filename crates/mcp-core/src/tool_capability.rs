@@ -105,14 +105,8 @@ pub async fn record_tool_failure(
     };
 
     // Decisione a soglia delegata alla funzione pura testata (agent_types).
-    let action = crate::agent_types::tool_failure_action(
-        true,
-        true,
-        true,
-        false,
-        failures - 1,
-        threshold,
-    );
+    let action =
+        crate::agent_types::tool_failure_action(true, true, true, false, failures - 1, threshold);
     if matches!(
         action,
         crate::agent_types::ToolCapabilityAction::MarkNonToolCapable
@@ -243,7 +237,12 @@ mod tests {
         // degrado automatico, niente ri-test.
         assert!(!was_auto_degraded(false, "auto", None, 0));
         // Reason di un ciclo diverso (is_enabled): non e' un degrado tool.
-        assert!(!was_auto_degraded(false, "auto", Some("missing_from_api"), 2));
+        assert!(!was_auto_degraded(
+            false,
+            "auto",
+            Some("missing_from_api"),
+            2
+        ));
         // Riga ancora tool-capable: il gate principale la testa gia'.
         assert!(!was_auto_degraded(true, "auto", None, 0));
     }

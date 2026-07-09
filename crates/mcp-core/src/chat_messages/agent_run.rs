@@ -378,12 +378,10 @@ fn is_report_hollow(result: &crate::agent_types::AgentRunResult) -> bool {
 /// esplicita non passa piu' da qui: e' dichiarata via task_complete
 /// (refusal/blocked, ADR 0034 — la detection lessicale RESIGNED e' stata
 /// rimossa, ADR 0018 fase 3).
-pub(crate) fn canonical_run_status(
-    result: &crate::agent_types::AgentRunResult,
-) -> AgentRunStatus {
+pub(crate) fn canonical_run_status(result: &crate::agent_types::AgentRunResult) -> AgentRunStatus {
     if is_report_hollow(result) {
-        let no_work = result.steps.is_empty()
-            && result.hollow_completion_kind.contains("EMPTY_ANSWER");
+        let no_work =
+            result.steps.is_empty() && result.hollow_completion_kind.contains("EMPTY_ANSWER");
         if no_work {
             return AgentRunStatus::FailedDiagnosed;
         }
@@ -517,9 +515,7 @@ fn is_only_provider_errors(s: &str) -> bool {
 /// non menziona i file toccati; oppure, per un run hollow, il recap deterministico
 /// delle azioni o un placeholder esplicito. `None` solo se non c'e' nulla da dire
 /// (run non-hollow senza risposta, es. intent chat che chiude legittimamente).
-pub(crate) fn compose_turn_answer(
-    result: &crate::agent_types::AgentRunResult,
-) -> Option<String> {
+pub(crate) fn compose_turn_answer(result: &crate::agent_types::AgentRunResult) -> Option<String> {
     match result.final_answer.as_deref() {
         // Tool call colata nel testo o soli errori provider come "risposta":
         // non e' una risposta. Recap deterministico (o nota cooldown/placeholder).
@@ -568,10 +564,7 @@ pub(crate) fn compose_turn_answer(
 /// assente dopo un resume di conferma). Centralizzandolo qui i due percorsi
 /// producono lo stesso testo. `outcome_summary` e' a sua volta 1:1 con il
 /// `buildSemanticDetail` del frontend (FIX D3), cosi' live e refresh coincidono.
-pub(crate) fn append_outcome_summary(
-    answer: String,
-    steps: &[AgentStep],
-) -> String {
+pub(crate) fn append_outcome_summary(answer: String, steps: &[AgentStep]) -> String {
     match outcome_summary(steps) {
         Some(s) => format!("{answer}{s}"),
         None => answer,
@@ -620,7 +613,12 @@ pub(crate) async fn narrative_or(
     };
     let enabled = nexus_auth::get_setting(&state.db, "agent.chat.narrative_recap_enabled")
         .await
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     if !enabled || !is_report_hollow(result) || result.steps.is_empty() {
         return base;
@@ -628,7 +626,9 @@ pub(crate) async fn narrative_or(
 
     use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
     let (provider, model) = match resolve_purpose_model(state, "turn_recap").await {
-        PurposeResolution::Resolved { provider, model, .. } => (provider, model),
+        PurposeResolution::Resolved {
+            provider, model, ..
+        } => (provider, model),
         _ => return base,
     };
 
@@ -1149,16 +1149,14 @@ pub(crate) async fn supersede_active_runs(
 /// che usa questa funzione per decidere se RISVEGLIARE l'agente (a riposo) o
 /// RIMANDARE il resume (run ancora attivo) invece di superarlo via last-wins.
 pub(crate) async fn session_has_active_run(db: &sqlx::PgPool, session_id: Uuid) -> bool {
-    match sqlx::query_scalar::<_, bool>(
-        &format!(
-            "SELECT EXISTS( \
+    match sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS( \
              SELECT 1 FROM agent_runs \
               WHERE session_id = $1 \
                 AND status IN ({}) \
          )",
-            crate::agent_types::ACTIVE_RUN_STATUS_SQL
-        ),
-    )
+        crate::agent_types::ACTIVE_RUN_STATUS_SQL
+    ))
     .bind(session_id)
     .fetch_one(db)
     .await
@@ -1306,14 +1304,32 @@ async fn native_outcome_to_run_result(
     // coordinatore legge da un sub-run coincide con quello del run padre.
     let status = outcome.classify_status();
 
+    let pending_actions: Vec<crate::agent_types::AgentPendingAction> = outcome
+        .pending_actions
+        .iter()
+        .filter_map(|v| {
+            Some(crate::agent_types::AgentPendingAction {
+                index: v.get("index")?.as_u64()? as usize,
+                tool_name: v.get("toolName")?.as_str()?.to_string(),
+                tool_input: v.get("toolInput").cloned().unwrap_or_else(|| json!({})),
+                description: v
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect();
+
     // stop_reason in forma snake_case (serde dell'enum) per la colonna agent_runs
     // / la telemetria: stesso vocabolario del path Python.
-    let stop_reason: Option<String> = outcome
-        .stop_reason
-        .and_then(|r| match serde_json::to_value(r) {
-            Ok(Value::String(s)) => Some(s),
-            _ => None,
-        });
+    let stop_reason: Option<String> =
+        outcome
+            .stop_reason
+            .and_then(|r| match serde_json::to_value(r) {
+                Ok(Value::String(s)) => Some(s),
+                _ => None,
+            });
 
     let provider = outcome.provider_used.clone().unwrap_or_default();
     let model = outcome.model_used.clone().unwrap_or_default();
@@ -1334,7 +1350,11 @@ async fn native_outcome_to_run_result(
     // "completato" mentre lo status era failed_diagnosed (run e91d4892). Non si
     // applica alle dichiarazioni oneste (blocked/needs_input/partial: il modello
     // stesso ha gia' descritto l'incompletezza nel summary).
-    let final_answer = match (final_answer, outcome.final_gate_passed, outcome.final_gate_unverified) {
+    let final_answer = match (
+        final_answer,
+        outcome.final_gate_passed,
+        outcome.final_gate_unverified,
+    ) {
         (Some(ans), Some(false), _) => Some(format!(
             "{ans}\n\n---\n**Verifica automatica non superata** (limite tentativi \
              raggiunto): i criteri di verifica del progetto non sono passati, quindi \
@@ -1386,7 +1406,7 @@ async fn native_outcome_to_run_result(
         run_id: run_id.to_string(),
         status,
         steps,
-        pending_actions: Vec::new(),
+        pending_actions,
         final_answer,
         provider,
         model,
@@ -1403,8 +1423,7 @@ async fn native_outcome_to_run_result(
         // E' il prompt dell'ultima iterazione (riempimento contesto corrente).
         // Va catturato qui, PRIMA che reconcile_run_cost_from_ledger sovrascriva
         // prompt_tokens col cumulativo di billing del ledger.
-        last_prompt_tokens: (outcome.prompt_tokens > 0)
-            .then_some(outcome.prompt_tokens as u32),
+        last_prompt_tokens: (outcome.prompt_tokens > 0).then_some(outcome.prompt_tokens as u32),
         // Classe d'errore STRUTTURATA dal grafo (extra.error_class, es.
         // context_overflow — ADR 0016 D2): segnale macchina, mai dal testo.
         error_class: outcome.error_class,
@@ -1443,9 +1462,7 @@ pub(crate) fn is_provider_error_answer(answer: &str) -> bool {
 /// = messaggio di errore provider sintetizzato dall'executor. Punto unico (regola
 /// L) della regola "esito certo: errore provider -> Failed", invocato sia dal
 /// finalizzatore dello spawn principale sia da `canonical_run_status` (path resume).
-pub(crate) fn is_provider_error_completion(
-    result: &crate::agent_types::AgentRunResult,
-) -> bool {
+pub(crate) fn is_provider_error_completion(result: &crate::agent_types::AgentRunResult) -> bool {
     matches!(result.status, crate::agent_types::AgentRunStatus::Completed)
         && result.completion_tokens == 0
         && result
@@ -1542,7 +1559,9 @@ pub(crate) fn reconcile_run_cost_from_ledger(
     result.total_tokens = if tt > 0 {
         tt as u32
     } else {
-        result.prompt_tokens.saturating_add(result.completion_tokens)
+        result
+            .prompt_tokens
+            .saturating_add(result.completion_tokens)
     };
     true
 }
@@ -2038,8 +2057,8 @@ pub(crate) async fn spawn_agent_run(
             .load(std::sync::atomic::Ordering::Relaxed);
     let recent_history = if vec_deps_ok {
         build_vectorized_conversation_history(
-            &msgs_pool,  // pool progetto: chat_messages (raw fallback + finestra recente)
-            &state.db,   // meta-DB: setting globali qdrant_url/collection (regola G/L)
+            &msgs_pool, // pool progetto: chat_messages (raw fallback + finestra recente)
+            &state.db,  // meta-DB: setting globali qdrant_url/collection (regola G/L)
             &state.orchestrator.neural,
             params.session_id,
             &params.content,
@@ -2328,6 +2347,53 @@ pub(crate) async fn spawn_agent_run(
         params.session_id,
     )
     .await;
+    let council_outcome =
+        maybe_convene_council(state, params.session_id, &params.content).await;
+    if let Some(ref outcome) = council_outcome {
+        emit_council_of_competencies_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
+    }
+    let council_block = council_outcome
+        .as_ref()
+        .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
+        .filter(|b| !b.is_empty());
+    let multi_provider_block =
+        maybe_convene_multi_provider_panel(state, params.session_id, &params.content).await;
+    if let Some(outcome) = &multi_provider_block {
+        emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
+    }
+    let initial_msg = match (&council_block, &multi_provider_block) {
+        (Some(council_text), Some(outcome)) => {
+            let mp_block = outcome.render_block();
+            if mp_block.is_empty() {
+                format!("{council_text}\n\n{initial_msg}")
+            } else {
+                format!("{council_text}\n\n{mp_block}\n\n{initial_msg}")
+            }
+        }
+        (Some(council_text), None) => format!("{council_text}\n\n{initial_msg}"),
+        (None, Some(outcome)) => {
+            let mp_block = outcome.render_block();
+            if mp_block.is_empty() {
+                initial_msg
+            } else {
+                format!("{mp_block}\n\n{initial_msg}")
+            }
+        }
+        (None, None) => initial_msg,
+    };
+    let pre_run_advisory_synthesis = multi_provider_block
+        .as_ref()
+        .and_then(|o| o.advisory_synthesis_value());
+    let pre_run_advisory_source = if pre_run_advisory_synthesis.is_some() {
+        Some("multi_provider_synthesis")
+    } else {
+        None
+    };
+    let system_text = if council_block.is_some() {
+        crate::prompt_templates::strip_council_directive(&system_text)
+    } else {
+        system_text
+    };
 
     // Se questo run ha SUPERATO run attivi (last-wins), il modello vedra' nella
     // history della sessione il task precedente ancora "aperto" e tende a
@@ -2416,6 +2482,8 @@ pub(crate) async fn spawn_agent_run(
     // Engine::Rust (primario instradato globalmente) ed Engine::Shadow
     // (attivabile solo per-sessione).
     let classifier_input_for_shadow: String = classifier_input.clone();
+    let pre_run_advisory_synthesis_clone = pre_run_advisory_synthesis.clone();
+    let pre_run_advisory_source_clone = pre_run_advisory_source;
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
@@ -2628,6 +2696,9 @@ pub(crate) async fn spawn_agent_run(
                     classifier_resolved: primary_classifier.classifier_resolved,
                     action_oriented_min_score: primary_classifier.action_oriented_min_score,
                     automation_mode: automation_mode_for_brain.clone(),
+                    supervisor_mode: crate::native_engine::graph_supervisor_mode(
+                        params.supervisor_mode,
+                    ),
                     step_tx: tx_for_brain.clone(),
                     // Run PRINCIPALE (non sub-agente): nessun parent/depth. Solo
                     // `dispatch_subagent` (subagent_native) popola questi campi.
@@ -2636,6 +2707,8 @@ pub(crate) async fn spawn_agent_run(
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
                     working_root: None,
+                    pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone.clone(),
+                    pre_run_advisory_source: pre_run_advisory_source_clone,
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
                     Ok(outcome) => {
@@ -2707,187 +2780,188 @@ pub(crate) async fn spawn_agent_run(
             // il path Python INVARIATO (nessuna re-indentazione): il primario nativo
             // esce subito con `break 'compute`, evitando il doppio-run (DEBITO 2).
             let mut result: crate::agent_types::AgentRunResult = 'compute: {
-            if let Some(r) = native_result.take() {
-                break 'compute r;
-            }
-            // ── Loop di retry con fallback automatico tra provider ───────────────
-            // Se il run fallisce per "credit too low" / "quota exceeded", il provider
-            // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
-            // il fallimento e ritentiamo con il prossimo provider della gerarchia
-            // ammin (escludendo quelli in cooldown).
-            //
-            // Limite dinamico: tante iterazioni quanti sono i provider con almeno
-            // un modello idoneo nel catalog (is_enabled + supports_tool_use +
-            // consecutive_failures=0). Il +1 copre il tentativo iniziale. Floor=2
-            // per garantire almeno un fallback se il catalog e' parziale.
-            let max_provider_fallbacks: usize = {
-                let n: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(DISTINCT provider)
+                if let Some(r) = native_result.take() {
+                    break 'compute r;
+                }
+                // ── Loop di retry con fallback automatico tra provider ───────────────
+                // Se il run fallisce per "credit too low" / "quota exceeded", il provider
+                // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
+                // il fallimento e ritentiamo con il prossimo provider della gerarchia
+                // ammin (escludendo quelli in cooldown).
+                //
+                // Limite dinamico: tante iterazioni quanti sono i provider con almeno
+                // un modello idoneo nel catalog (is_enabled + supports_tool_use +
+                // consecutive_failures=0). Il +1 copre il tentativo iniziale. Floor=2
+                // per garantire almeno un fallback se il catalog e' parziale.
+                let max_provider_fallbacks: usize = {
+                    let n: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(DISTINCT provider)
                    FROM ai_price_catalog
                   WHERE is_enabled = true
                     AND supports_tool_use = true
                     AND agentic_thinking_policy <> 'exclude'
                     AND consecutive_failures = 0",
-                )
-                .fetch_one(&db_clone)
-                .await
-                .unwrap_or(4);
-                std::cmp::max(2, (n as usize).saturating_add(1))
-            };
-            let provider_hierarchy: Vec<String> = {
-                let row: Option<String> = sqlx::query_scalar(
-                    "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1",
-                )
-                .fetch_optional(&db_clone)
-                .await
-                .ok()
-                .flatten();
-                row.map(|s| {
-                    s.split(',')
-                        .map(|t| t.trim().to_lowercase())
-                        .filter(|t| !t.is_empty())
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    vec![
-                        "anthropic".into(),
-                        "openai".into(),
-                        "google".into(),
-                        "deepseek".into(),
-                        "mistral".into(),
-                    ]
-                })
-            };
-
-            let mut current_provider = provider_clone.clone();
-            let mut current_model = model_clone.clone();
-            let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut result;
-            let mut fallback_attempt: usize = 0;
-
-            // ── Fix B+C: stima tokens richiesti e scelta context-aware ──────────
-            // Approssimazione (1 token = ~4 caratteri): system prompt + msg utente
-            // + storia conversazione + descrizioni tool. Usata per:
-            //   B) troncare history se eccede 70% ctx del modello selezionato
-            //   C) pre-filtrare il routing escludendo modelli con ctx insufficiente
-            let estimated_input_chars: usize = {
-                let history_chars: usize = recent_history_for_brain
-                    .iter()
-                    .map(|m| {
-                        m.get("content")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.len())
-                            .unwrap_or(0)
+                    )
+                    .fetch_one(&db_clone)
+                    .await
+                    .unwrap_or(4);
+                    std::cmp::max(2, (n as usize).saturating_add(1))
+                };
+                let provider_hierarchy: Vec<String> = {
+                    let row: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1",
+                    )
+                    .fetch_optional(&db_clone)
+                    .await
+                    .ok()
+                    .flatten();
+                    row.map(|s| {
+                        s.split(',')
+                            .map(|t| t.trim().to_lowercase())
+                            .filter(|t| !t.is_empty())
+                            .collect()
                     })
-                    .sum();
-                let tools_chars: usize = serde_json::to_string(&tools_json_for_brain)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                system_text_clone.len() + initial_msg_clone.len() + history_chars + tools_chars
-            };
-            let estimated_input_tokens: i64 = (estimated_input_chars / 4) as i64;
-            tracing::info!(
-                "agent_run {}: input stimato {} tokens (~{} chars)",
-                run_id,
-                estimated_input_tokens,
-                estimated_input_chars
-            );
-            // Se il modello primario non ha context_window sufficiente (con margine
-            // 30% per output), cerca subito un modello idoneo per ctx.
-            let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
-            // Idoneita' del primario: context_window sufficiente E eleggibilita'
-            // agentica (supports_tool_use AND policy<>'exclude'), lette in un'unica
-            // query. Il routing a monte (routing matrix) puo' aver scelto un modello
-            // NON tool-capable (es. mistral-small-latest, supports_tool_use=false):
-            // in un run agentico fallirebbe sistematicamente (422/MALFORMED/hollow).
-            // Va sostituito SUBITO con un modello eleggibile, non solo quando il
-            // context e' insufficiente. Cosi' il gate di capability vale anche per
-            // il PRIMARIO, non solo per i fallback (prima era bypassato).
-            // context_window e' INT4 in Postgres: il cast ::bigint evita il
-            // type-mismatch i64/INT4 che faceva fallire la decodifica sqlx. Prima
-            // l'errore veniva ingoiato da .ok() -> fallback (8192,false) ->
-            // re-route SEMPRE attivo -> degrado a un modello piccolo anche quando
-            // il routing aveva scelto un modello capace (regola G: niente fallback
-            // magico che nasconde errori). Ora l'errore reale viene loggato.
-            let (primary_ctx, primary_tool_ok): (i64, bool) = match sqlx::query_as(
-                "SELECT context_window::bigint,
+                    .unwrap_or_else(|| {
+                        vec![
+                            "anthropic".into(),
+                            "openai".into(),
+                            "google".into(),
+                            "deepseek".into(),
+                            "mistral".into(),
+                        ]
+                    })
+                };
+
+                let mut current_provider = provider_clone.clone();
+                let mut current_model = model_clone.clone();
+                let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut result;
+                let mut fallback_attempt: usize = 0;
+
+                // ── Fix B+C: stima tokens richiesti e scelta context-aware ──────────
+                // Approssimazione (1 token = ~4 caratteri): system prompt + msg utente
+                // + storia conversazione + descrizioni tool. Usata per:
+                //   B) troncare history se eccede 70% ctx del modello selezionato
+                //   C) pre-filtrare il routing escludendo modelli con ctx insufficiente
+                let estimated_input_chars: usize = {
+                    let history_chars: usize = recent_history_for_brain
+                        .iter()
+                        .map(|m| {
+                            m.get("content")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0)
+                        })
+                        .sum();
+                    let tools_chars: usize = serde_json::to_string(&tools_json_for_brain)
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    system_text_clone.len() + initial_msg_clone.len() + history_chars + tools_chars
+                };
+                let estimated_input_tokens: i64 = (estimated_input_chars / 4) as i64;
+                tracing::info!(
+                    "agent_run {}: input stimato {} tokens (~{} chars)",
+                    run_id,
+                    estimated_input_tokens,
+                    estimated_input_chars
+                );
+                // Se il modello primario non ha context_window sufficiente (con margine
+                // 30% per output), cerca subito un modello idoneo per ctx.
+                let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
+                // Idoneita' del primario: context_window sufficiente E eleggibilita'
+                // agentica (supports_tool_use AND policy<>'exclude'), lette in un'unica
+                // query. Il routing a monte (routing matrix) puo' aver scelto un modello
+                // NON tool-capable (es. mistral-small-latest, supports_tool_use=false):
+                // in un run agentico fallirebbe sistematicamente (422/MALFORMED/hollow).
+                // Va sostituito SUBITO con un modello eleggibile, non solo quando il
+                // context e' insufficiente. Cosi' il gate di capability vale anche per
+                // il PRIMARIO, non solo per i fallback (prima era bypassato).
+                // context_window e' INT4 in Postgres: il cast ::bigint evita il
+                // type-mismatch i64/INT4 che faceva fallire la decodifica sqlx. Prima
+                // l'errore veniva ingoiato da .ok() -> fallback (8192,false) ->
+                // re-route SEMPRE attivo -> degrado a un modello piccolo anche quando
+                // il routing aveva scelto un modello capace (regola G: niente fallback
+                // magico che nasconde errori). Ora l'errore reale viene loggato.
+                let (primary_ctx, primary_tool_ok): (i64, bool) = match sqlx::query_as(
+                    "SELECT context_window::bigint,
                         (supports_tool_use AND agentic_thinking_policy <> 'exclude')
                    FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1",
-            )
-            .bind(&current_provider)
-            .bind(&current_model)
-            .fetch_optional(&db_clone)
-            .await
-            {
-                Ok(Some(row)) => row,
-                Ok(None) => {
-                    tracing::warn!(
-                        "agent_run {}: {}/{} assente dal catalog per il check idoneita', \
+                )
+                .bind(&current_provider)
+                .bind(&current_model)
+                .fetch_optional(&db_clone)
+                .await
+                {
+                    Ok(Some(row)) => row,
+                    Ok(None) => {
+                        tracing::warn!(
+                            "agent_run {}: {}/{} assente dal catalog per il check idoneita', \
                          fallback conservativo (8192, non-tool)",
-                        run_id,
-                        current_provider,
-                        current_model
-                    );
-                    (8192, false)
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "agent_run {}: query idoneita' context fallita per {}/{}: {e} \
+                            run_id,
+                            current_provider,
+                            current_model
+                        );
+                        (8192, false)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "agent_run {}: query idoneita' context fallita per {}/{}: {e} \
                          (fallback conservativo)",
-                        run_id,
-                        current_provider,
-                        current_model
-                    );
-                    (8192, false)
-                }
-            };
-            if primary_ctx < ctx_needed || !primary_tool_ok {
-                tracing::warn!(
+                            run_id,
+                            current_provider,
+                            current_model
+                        );
+                        (8192, false)
+                    }
+                };
+                if primary_ctx < ctx_needed || !primary_tool_ok {
+                    tracing::warn!(
                     "agent_run {}: primario {}/{} non idoneo (ctx {} < {} oppure non tool-capable: {}), re-route agentico",
                     run_id, current_provider, current_model, primary_ctx, ctx_needed, !primary_tool_ok
                 );
-                // Re-routing AGENTICO. PUNTO UNICO di selezione (regola L):
-                // l'eleggibilita' agentica (tool_use, policy<>'exclude',
-                // consecutive_failures, cooldown) e' definita una sola volta in
-                // select_agentic_model. Vincolo extra: context_window >= ctx_needed.
-                let alt = crate::orchestrator::select_agentic_model(
-                    &db_clone,
-                    &[],
-                    None,
-                    ctx_needed,
-                    &[],
-                    "input_cost_per_million_tokens ASC NULLS LAST",
-                )
-                .await;
-                if let Some((p, m)) = alt {
-                    tracing::info!(
-                        "agent_run {}: re-route agentico: {} -> {}/{}",
-                        run_id,
-                        current_model,
-                        p,
-                        m
-                    );
-                    current_provider = p;
-                    current_model = m;
+                    // Re-routing AGENTICO. PUNTO UNICO di selezione (regola L):
+                    // l'eleggibilita' agentica (tool_use, policy<>'exclude',
+                    // consecutive_failures, cooldown) e' definita una sola volta in
+                    // select_agentic_model. Vincolo extra: context_window >= ctx_needed.
+                    let alt = crate::orchestrator::select_agentic_model(
+                        &db_clone,
+                        &[],
+                        None,
+                        ctx_needed,
+                        &[],
+                        "input_cost_per_million_tokens ASC NULLS LAST",
+                    )
+                    .await;
+                    if let Some((p, m)) = alt {
+                        tracing::info!(
+                            "agent_run {}: re-route agentico: {} -> {}/{}",
+                            run_id,
+                            current_model,
+                            p,
+                            m
+                        );
+                        current_provider = p;
+                        current_model = m;
+                    }
                 }
-            }
 
-            // ADR 0023 (Fix 3a): se il re-routing context-aware ha cambiato il
-            // modello rispetto a quello registrato a spawn (provider_clone/
-            // model_clone), allinea il record agent_runs al modello EFFETTIVO
-            // con cui il run partira'. Cosi' header e badge dei meta-step (che
-            // leggono agentRun.provider/model) convergono sul modello reale.
-            // Best-effort: un fallimento qui non deve bloccare il run.
-            if current_provider != provider_clone || current_model != model_clone {
-                let _ =
-                    sqlx::query("UPDATE agent_runs SET provider = $1, model = $2 WHERE id = $3")
-                        .bind(&current_provider)
-                        .bind(&current_model)
-                        .bind(run_id)
-                        // Pool del progetto (separazione DB): agent_runs migrata.
-                        .execute(&run_pool)
-                        .await;
-                tracing::info!(
+                // ADR 0023 (Fix 3a): se il re-routing context-aware ha cambiato il
+                // modello rispetto a quello registrato a spawn (provider_clone/
+                // model_clone), allinea il record agent_runs al modello EFFETTIVO
+                // con cui il run partira'. Cosi' header e badge dei meta-step (che
+                // leggono agentRun.provider/model) convergono sul modello reale.
+                // Best-effort: un fallimento qui non deve bloccare il run.
+                if current_provider != provider_clone || current_model != model_clone {
+                    let _ = sqlx::query(
+                        "UPDATE agent_runs SET provider = $1, model = $2 WHERE id = $3",
+                    )
+                    .bind(&current_provider)
+                    .bind(&current_model)
+                    .bind(run_id)
+                    // Pool del progetto (separazione DB): agent_runs migrata.
+                    .execute(&run_pool)
+                    .await;
+                    tracing::info!(
                     "agent_run {}: agent_runs.provider/model aggiornato al modello effettivo {}/{} (era {}/{})",
                     run_id,
                     current_provider,
@@ -2895,141 +2969,141 @@ pub(crate) async fn spawn_agent_run(
                     provider_clone,
                     model_clone
                 );
-            }
+                }
 
-            loop {
-                tried.insert(current_provider.to_lowercase());
-                tracing::info!(
-                    "agent_run {}: tentativo {}/{} con provider={} model={} (ctx_needed={})",
-                    run_id,
-                    fallback_attempt + 1,
-                    max_provider_fallbacks,
-                    current_provider,
-                    current_model,
-                    ctx_needed
-                );
-                result = crate::brain_agent_client::run_via_brain(
-                    run_id,
-                    session_id_cp,
-                    current_provider.clone(),
-                    current_model.clone(),
-                    system_text_clone.clone(),
-                    initial_msg_clone.clone(),
-                    tx_for_brain.clone(),
-                    recent_history_for_brain.clone(),
-                    tools_json_for_brain.clone(),
-                    sse_max_silence_secs,
-                    false, // emit_final_event: emesso manualmente dopo il break del retry loop
-                    automation_mode_for_brain.clone(),
-                    intent_hint_for_brain.clone(),
-                    db_clone.clone(),
-                )
-                .await;
+                loop {
+                    tried.insert(current_provider.to_lowercase());
+                    tracing::info!(
+                        "agent_run {}: tentativo {}/{} con provider={} model={} (ctx_needed={})",
+                        run_id,
+                        fallback_attempt + 1,
+                        max_provider_fallbacks,
+                        current_provider,
+                        current_model,
+                        ctx_needed
+                    );
+                    result = crate::brain_agent_client::run_via_brain(
+                        run_id,
+                        session_id_cp,
+                        current_provider.clone(),
+                        current_model.clone(),
+                        system_text_clone.clone(),
+                        initial_msg_clone.clone(),
+                        tx_for_brain.clone(),
+                        recent_history_for_brain.clone(),
+                        tools_json_for_brain.clone(),
+                        sse_max_silence_secs,
+                        false, // emit_final_event: emesso manualmente dopo il break del retry loop
+                        automation_mode_for_brain.clone(),
+                        intent_hint_for_brain.clone(),
+                        db_clone.clone(),
+                    )
+                    .await;
 
-                // ── Detection errore infrastrutturale ───────────────────────────
-                // Il ToolRunner/sandbox down NON e' colpa del modello: non
-                // incrementare consecutive_failures e terminare senza scalare (gli
-                // altri provider hanno lo stesso ToolRunner).
-                // WAVE 2.2: fonte PRIMARIA = error_class STRUTTURATO "infrastructure"
-                // emesso dal brain (tool_runner_client su gRPC UNAVAILABLE). Il
-                // contains testuale su final_answer resta SOLO come fallback quando
-                // il brain non ha propagato la classe (run vecchio), loggato.
-                let is_infrastructure_error = if result.error_class.as_deref()
-                    == Some("infrastructure")
-                {
-                    true
-                } else {
-                    let hit = result
-                        .final_answer
-                        .as_ref()
-                        .map(|s| {
-                            let lower = s.to_lowercase();
-                            lower.contains("sandbox")
-                                && (lower.contains("gr pc")
-                                    || lower.contains("grpc")
-                                    || lower.contains("connession")
-                                    || lower.contains("non e' raggiungibile")
-                                    || lower.contains("non raggiungibile"))
-                                || lower.contains("50500")
-                                || lower.contains("tool_runner")
-                                || lower.contains("toolrunner")
-                                || lower.contains("tcp handshaker")
-                        })
-                        .unwrap_or(false);
-                    if hit {
-                        tracing::info!(
+                    // ── Detection errore infrastrutturale ───────────────────────────
+                    // Il ToolRunner/sandbox down NON e' colpa del modello: non
+                    // incrementare consecutive_failures e terminare senza scalare (gli
+                    // altri provider hanno lo stesso ToolRunner).
+                    // WAVE 2.2: fonte PRIMARIA = error_class STRUTTURATO "infrastructure"
+                    // emesso dal brain (tool_runner_client su gRPC UNAVAILABLE). Il
+                    // contains testuale su final_answer resta SOLO come fallback quando
+                    // il brain non ha propagato la classe (run vecchio), loggato.
+                    let is_infrastructure_error = if result.error_class.as_deref()
+                        == Some("infrastructure")
+                    {
+                        true
+                    } else {
+                        let hit = result
+                            .final_answer
+                            .as_ref()
+                            .map(|s| {
+                                let lower = s.to_lowercase();
+                                lower.contains("sandbox")
+                                    && (lower.contains("gr pc")
+                                        || lower.contains("grpc")
+                                        || lower.contains("connession")
+                                        || lower.contains("non e' raggiungibile")
+                                        || lower.contains("non raggiungibile"))
+                                    || lower.contains("50500")
+                                    || lower.contains("tool_runner")
+                                    || lower.contains("toolrunner")
+                                    || lower.contains("tcp handshaker")
+                            })
+                            .unwrap_or(false);
+                        if hit {
+                            tracing::info!(
                             "lexical_fallback_used: is_infrastructure_error (contains su final_answer)"
                         );
-                    }
-                    hit
-                };
-                if is_infrastructure_error {
-                    tracing::warn!(
+                        }
+                        hit
+                    };
+                    if is_infrastructure_error {
+                        tracing::warn!(
                     "agent_run {}: errore INFRASTRUTTURALE rilevato (ToolRunner/sandbox down) — \
                      non incremento consecutive_failures per {}/{}, termino senza fallback (altri \
                      provider hanno lo stesso ToolRunner)",
                     run_id, result.provider, result.model
                 );
-                    break;
-                }
+                        break;
+                    }
 
-                // ── Counter hollow per modello (auto-disable) ────────────────────
-                // Se il run e' hollow_completion REALE in produzione, incrementa
-                // il counter consecutive_failures su ai_price_catalog. Questo e'
-                // piu' affidabile del model_health_probe perche' rileva il problema
-                // su workload reali (prompt lunghi, max_tokens reali) — non con
-                // "ping" che a volte passa anche su modelli broken (es. gemini-3.5-flash
-                // risponde a "ping" in 5s ma da hollow su prompt agente).
-                //
-                // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
-                // primo successo (status=Completed e final_answer NON vuoto).
-                let intent_uses_tools = classified_intent_for_loop != "chat";
-                if result.status.is_success() && intent_uses_tools {
-                    let success_now = !result.hollow_completion
-                        && result
-                            .final_answer
-                            .as_ref()
-                            .map(|s| !s.trim().is_empty())
-                            .unwrap_or(false);
+                    // ── Counter hollow per modello (auto-disable) ────────────────────
+                    // Se il run e' hollow_completion REALE in produzione, incrementa
+                    // il counter consecutive_failures su ai_price_catalog. Questo e'
+                    // piu' affidabile del model_health_probe perche' rileva il problema
+                    // su workload reali (prompt lunghi, max_tokens reali) — non con
+                    // "ping" che a volte passa anche su modelli broken (es. gemini-3.5-flash
+                    // risponde a "ping" in 5s ma da hollow su prompt agente).
+                    //
+                    // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
+                    // primo successo (status=Completed e final_answer NON vuoto).
+                    let intent_uses_tools = classified_intent_for_loop != "chat";
+                    if result.status.is_success() && intent_uses_tools {
+                        let success_now = !result.hollow_completion
+                            && result
+                                .final_answer
+                                .as_ref()
+                                .map(|s| !s.trim().is_empty())
+                                .unwrap_or(false);
 
-                    // ── B: tool-failure model-specific (MALFORMED / output-vuoto su tool) ──
-                    // `hollow_no_tools` = il modello aveva tool esposti ma non ne ha
-                    // invocato nessuno al primo turno: e' il segnale runtime di
-                    // finish_reason=MALFORMED_FUNCTION_CALL / output vuoto sul
-                    // tool-forcing (es. gemini-2.5-pro sui task agentici). Questo NON
-                    // significa che il modello sia rotto in assoluto: funziona per i
-                    // task chat. Quindi NON tocchiamo is_enabled (che lo escluderebbe
-                    // ANCHE dai task chat) ma incrementiamo un contatore DEDICATO
-                    // (consecutive_tool_failures) e a soglia marchiamo
-                    // supports_tool_use=false. L'auto-promoter, che per gli intent con
-                    // requires_tool_use filtra su supports_tool_use, lo escludera' dai
-                    // soli intent agentici lasciandolo per chat; il cleanup pass (A)
-                    // disattivera' poi la riga matrix agentica gia' presente.
-                    if result.hollow_no_tools {
-                        let tool_threshold: i32 = crate::settings::get_setting(
-                            &db_clone,
-                            "agent.model_tool_failure_threshold",
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|v| v.trim().parse::<i32>().ok())
-                        .filter(|n| *n > 0)
-                        .unwrap_or(3);
+                        // ── B: tool-failure model-specific (MALFORMED / output-vuoto su tool) ──
+                        // `hollow_no_tools` = il modello aveva tool esposti ma non ne ha
+                        // invocato nessuno al primo turno: e' il segnale runtime di
+                        // finish_reason=MALFORMED_FUNCTION_CALL / output vuoto sul
+                        // tool-forcing (es. gemini-2.5-pro sui task agentici). Questo NON
+                        // significa che il modello sia rotto in assoluto: funziona per i
+                        // task chat. Quindi NON tocchiamo is_enabled (che lo escluderebbe
+                        // ANCHE dai task chat) ma incrementiamo un contatore DEDICATO
+                        // (consecutive_tool_failures) e a soglia marchiamo
+                        // supports_tool_use=false. L'auto-promoter, che per gli intent con
+                        // requires_tool_use filtra su supports_tool_use, lo escludera' dai
+                        // soli intent agentici lasciandolo per chat; il cleanup pass (A)
+                        // disattivera' poi la riga matrix agentica gia' presente.
+                        if result.hollow_no_tools {
+                            let tool_threshold: i32 = crate::settings::get_setting(
+                                &db_clone,
+                                "agent.model_tool_failure_threshold",
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.trim().parse::<i32>().ok())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(3);
 
-                        // PUNTO UNICO (regola L): counter + degrado a soglia con
-                        // guard capability_source='auto' vivono in tool_capability.
-                        // Le righe curate a mano (manual) non vengono mai degradate
-                        // dal runtime (incidente deepseek-v4, 2026-06-10).
-                        let rec = crate::tool_capability::record_tool_failure(
-                            &db_clone,
-                            &result.provider,
-                            &result.model,
-                            tool_threshold,
-                            crate::tool_capability::REASON_MALFORMED_TOOL_CALLS,
-                        )
-                        .await;
-                        if let crate::tool_capability::ToolFailureRecord::Counted { failures }
+                            // PUNTO UNICO (regola L): counter + degrado a soglia con
+                            // guard capability_source='auto' vivono in tool_capability.
+                            // Le righe curate a mano (manual) non vengono mai degradate
+                            // dal runtime (incidente deepseek-v4, 2026-06-10).
+                            let rec = crate::tool_capability::record_tool_failure(
+                                &db_clone,
+                                &result.provider,
+                                &result.model,
+                                tool_threshold,
+                                crate::tool_capability::REASON_MALFORMED_TOOL_CALLS,
+                            )
+                            .await;
+                            if let crate::tool_capability::ToolFailureRecord::Counted { failures }
                         | crate::tool_capability::ToolFailureRecord::MarkedNonToolCapable {
                             failures,
                         } = rec
@@ -3039,208 +3113,208 @@ pub(crate) async fn spawn_agent_run(
                             run_id, result.provider, result.model, failures, tool_threshold
                         );
                         }
-                    } else if result.hollow_completion {
-                        // Hollow generico NON dovuto al tool-forcing (empty answer):
-                        // mantiene la semantica storica sul contatore
-                        // consecutive_failures -> is_enabled=false a soglia 3.
-                        let new_count: Option<i32> = sqlx::query_scalar(
-                            "UPDATE ai_price_catalog
+                        } else if result.hollow_completion {
+                            // Hollow generico NON dovuto al tool-forcing (empty answer):
+                            // mantiene la semantica storica sul contatore
+                            // consecutive_failures -> is_enabled=false a soglia 3.
+                            let new_count: Option<i32> = sqlx::query_scalar(
+                                "UPDATE ai_price_catalog
                             SET consecutive_failures = consecutive_failures + 1,
                                 updated_at = NOW()
                           WHERE provider = $1 AND model = $2
                         RETURNING consecutive_failures",
-                        )
-                        .bind(&result.provider)
-                        .bind(&result.model)
-                        .fetch_optional(&db_clone)
-                        .await
-                        .ok()
-                        .flatten();
-                        if let Some(n) = new_count {
-                            tracing::warn!(
-                                "agent_run {}: hollow run reale su {}/{} — counter={}/3",
-                                run_id,
-                                result.provider,
-                                result.model,
-                                n
-                            );
-                            if n >= 3 {
-                                let _ = sqlx::query(
-                                    "UPDATE ai_price_catalog
+                            )
+                            .bind(&result.provider)
+                            .bind(&result.model)
+                            .fetch_optional(&db_clone)
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(n) = new_count {
+                                tracing::warn!(
+                                    "agent_run {}: hollow run reale su {}/{} — counter={}/3",
+                                    run_id,
+                                    result.provider,
+                                    result.model,
+                                    n
+                                );
+                                if n >= 3 {
+                                    let _ = sqlx::query(
+                                        "UPDATE ai_price_catalog
                                     SET is_enabled = false,
                                         auto_disabled_at = NOW(),
                                         auto_disabled_reason = 'hollow_completion_runtime',
                                         updated_at = NOW()
                                   WHERE provider = $1 AND model = $2
                                     AND is_enabled = true",
-                                )
-                                .bind(&result.provider)
-                                .bind(&result.model)
-                                .execute(&db_clone)
-                                .await;
-                                tracing::warn!(
-                                    "AUTO-DISABLE runtime {}/{} dopo {} hollow consecutivi",
-                                    result.provider,
-                                    result.model,
-                                    n
-                                );
+                                    )
+                                    .bind(&result.provider)
+                                    .bind(&result.model)
+                                    .execute(&db_clone)
+                                    .await;
+                                    tracing::warn!(
+                                        "AUTO-DISABLE runtime {}/{} dopo {} hollow consecutivi",
+                                        result.provider,
+                                        result.model,
+                                        n
+                                    );
+                                }
                             }
+                        } else if success_now {
+                            // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
+                            // contatori (generico e tool-specific) e riabilita la
+                            // tool-capability se il degrado era automatico, da
+                            // QUALUNQUE fonte (runtime O tool-probe) — punto unico.
+                            crate::tool_capability::reset_tool_failures_on_success(
+                                &db_clone,
+                                &result.provider,
+                                &result.model,
+                                true,
+                            )
+                            .await;
                         }
-                    } else if success_now {
-                        // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
-                        // contatori (generico e tool-specific) e riabilita la
-                        // tool-capability se il degrado era automatico, da
-                        // QUALUNQUE fonte (runtime O tool-probe) — punto unico.
-                        crate::tool_capability::reset_tool_failures_on_success(
-                            &db_clone,
-                            &result.provider,
-                            &result.model,
-                            true,
-                        )
-                        .await;
                     }
-                }
 
-                // FIX telemetria esiti-run (audit selezione costi/mascheramento):
-                // gli esiti REALI dei run agentici alimentano la telemetria di
-                // governance, cosi' un modello che non converge mai vede scendere la
-                // sua likelihood e il routing smette di ripescarlo come partenza
-                // economica. Prima solo probe + hollow la alimentavano: un modello che
-                // chiudeva 10 run FailedDiagnosed (fa tool call + testo, mai hollow)
-                // restava likelihood 1.0. Segnale MORBIDO (health-history, MAI
-                // auto-disable); NON penalizza l'ambiente (blocker reale ->
-                // BlockedNeedsInput; error_class ambientale escluso; hollow gia' contato
-                // sopra coi suoi contatori dedicati). Punto unico regola L/M in
-                // model_health_probe.
-                if intent_uses_tools {
-                    if crate::model_health_probe::run_outcome_blames_model(
-                        result.status.clone(),
-                        result.error_class.as_deref(),
-                        result.hollow_completion,
-                        result.hollow_no_tools,
-                    ) {
-                        crate::model_health_probe::record_run_outcome_health(
-                            &db_clone,
-                            &result.provider,
-                            &result.model,
-                            false,
-                            "run_nonconvergence",
-                        )
-                        .await;
-                        tracing::info!(
+                    // FIX telemetria esiti-run (audit selezione costi/mascheramento):
+                    // gli esiti REALI dei run agentici alimentano la telemetria di
+                    // governance, cosi' un modello che non converge mai vede scendere la
+                    // sua likelihood e il routing smette di ripescarlo come partenza
+                    // economica. Prima solo probe + hollow la alimentavano: un modello che
+                    // chiudeva 10 run FailedDiagnosed (fa tool call + testo, mai hollow)
+                    // restava likelihood 1.0. Segnale MORBIDO (health-history, MAI
+                    // auto-disable); NON penalizza l'ambiente (blocker reale ->
+                    // BlockedNeedsInput; error_class ambientale escluso; hollow gia' contato
+                    // sopra coi suoi contatori dedicati). Punto unico regola L/M in
+                    // model_health_probe.
+                    if intent_uses_tools {
+                        if crate::model_health_probe::run_outcome_blames_model(
+                            result.status.clone(),
+                            result.error_class.as_deref(),
+                            result.hollow_completion,
+                            result.hollow_no_tools,
+                        ) {
+                            crate::model_health_probe::record_run_outcome_health(
+                                &db_clone,
+                                &result.provider,
+                                &result.model,
+                                false,
+                                "run_nonconvergence",
+                            )
+                            .await;
+                            tracing::info!(
                             "agent_run {}: esito '{}' attribuito al modello {}/{} -> telemetria governance (likelihood)",
                             run_id,
                             result.status.as_str(),
                             result.provider,
                             result.model
                         );
-                    } else if result.status.is_success() && !result.hollow_completion {
-                        // Successo reale: record POSITIVO per bilanciare la finestra
-                        // scorrevole (l'error-rate riflette gli esiti reali, non solo i
-                        // fallimenti che altrimenti la saturerebbero).
-                        crate::model_health_probe::record_run_outcome_health(
-                            &db_clone,
-                            &result.provider,
-                            &result.model,
-                            true,
-                            "",
-                        )
-                        .await;
+                        } else if result.status.is_success() && !result.hollow_completion {
+                            // Successo reale: record POSITIVO per bilanciare la finestra
+                            // scorrevole (l'error-rate riflette gli esiti reali, non solo i
+                            // fallimenti che altrimenti la saturerebbero).
+                            crate::model_health_probe::record_run_outcome_health(
+                                &db_clone,
+                                &result.provider,
+                                &result.model,
+                                true,
+                                "",
+                            )
+                            .await;
+                        }
                     }
-                }
 
-                // Decide se ritentare: nuova logica basata su error_class strutturato
-                // propagato dal brain via SSE, oltre allo stato cooldown del provider.
-                // Casi che giustificano un retry su altro provider:
-                //   - provider in cooldown (lungo o breve, gia' marcato dal brain_agent_client)
-                //   - error_class in {billing_error, rate_limit, provider_error}
-                //   - il run e' fallito con stop_reason=error (anche senza classify, ritenta una volta)
-                //   - hollow_completion: il modello ha risposto senza usare tool (0 step)
-                let failed_retry = matches!(result.status, AgentRunStatus::Failed) && {
-                    let in_cooldown =
-                        crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
-                    let retriable_class = matches!(
-                        result.error_class.as_deref(),
-                        Some("billing_error") | Some("rate_limit") | Some("provider_error")
-                    );
-                    in_cooldown || retriable_class
-                };
-                // Hollow completion: il modello ha risposto senza usare tool.
-                // Per intent `chat` (chiacchierata, domande conversazionali,
-                // meta-domande) la risposta senza tool e' attesa e corretta —
-                // disabilitiamo il retry. Per altri intent (anche `docs` quando
-                // l'utente chiede di scrivere/leggere documentazione) il retry
-                // serve perche' il modello dovrebbe usare tool.
-                //
-                // Intent AUTORITATIVO: quello del router del brain propagato in
-                // nexus_task_type (segnale del classifier LLM). WAVE 4
-                // (de-lessicalizzazione): se il brain ha fornito l'intent, e' LUI
-                // a decidere se il run d'azione hollow va ritentato (intent !=
-                // "chat") — niente piu' OR con le keyword di detect_action_request
-                // sull'initial_msg, che introducevano falsi positivi (una chat con
-                // la parola "crea" forzava un retry inutile). Il keyword resta SOLO
-                // come fallback quando il brain NON ha propagato l'intent (caso
-                // degradato), loggato come lexical_fallback_used.
-                let action_intent = match result.nexus_task_type.as_deref() {
-                    Some(intent) => intent != "chat",
-                    None => {
-                        let kw = crate::agent_types::detect_action_request(&initial_msg_clone);
-                        if kw {
-                            tracing::info!(
+                    // Decide se ritentare: nuova logica basata su error_class strutturato
+                    // propagato dal brain via SSE, oltre allo stato cooldown del provider.
+                    // Casi che giustificano un retry su altro provider:
+                    //   - provider in cooldown (lungo o breve, gia' marcato dal brain_agent_client)
+                    //   - error_class in {billing_error, rate_limit, provider_error}
+                    //   - il run e' fallito con stop_reason=error (anche senza classify, ritenta una volta)
+                    //   - hollow_completion: il modello ha risposto senza usare tool (0 step)
+                    let failed_retry = matches!(result.status, AgentRunStatus::Failed) && {
+                        let in_cooldown =
+                            crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
+                        let retriable_class = matches!(
+                            result.error_class.as_deref(),
+                            Some("billing_error") | Some("rate_limit") | Some("provider_error")
+                        );
+                        in_cooldown || retriable_class
+                    };
+                    // Hollow completion: il modello ha risposto senza usare tool.
+                    // Per intent `chat` (chiacchierata, domande conversazionali,
+                    // meta-domande) la risposta senza tool e' attesa e corretta —
+                    // disabilitiamo il retry. Per altri intent (anche `docs` quando
+                    // l'utente chiede di scrivere/leggere documentazione) il retry
+                    // serve perche' il modello dovrebbe usare tool.
+                    //
+                    // Intent AUTORITATIVO: quello del router del brain propagato in
+                    // nexus_task_type (segnale del classifier LLM). WAVE 4
+                    // (de-lessicalizzazione): se il brain ha fornito l'intent, e' LUI
+                    // a decidere se il run d'azione hollow va ritentato (intent !=
+                    // "chat") — niente piu' OR con le keyword di detect_action_request
+                    // sull'initial_msg, che introducevano falsi positivi (una chat con
+                    // la parola "crea" forzava un retry inutile). Il keyword resta SOLO
+                    // come fallback quando il brain NON ha propagato l'intent (caso
+                    // degradato), loggato come lexical_fallback_used.
+                    let action_intent = match result.nexus_task_type.as_deref() {
+                        Some(intent) => intent != "chat",
+                        None => {
+                            let kw = crate::agent_types::detect_action_request(&initial_msg_clone);
+                            if kw {
+                                tracing::info!(
                                 "lexical_fallback_used: hollow_retry detect_action_request (brain_intent assente)"
                             );
+                            }
+                            kw || classified_intent_for_loop != "chat"
                         }
-                        kw || classified_intent_for_loop != "chat"
+                    };
+                    // Guardia is_success: il retry hollow esiste per dare una
+                    // risposta a un run "finito bene ma vuoto". Un run gia'
+                    // DIAGNOSTICATO (FailedDiagnosed da forced_close/anti-loop,
+                    // BlockedNeedsInput da dichiarazione) non va ri-eseguito da
+                    // capo su un altro provider: brucerebbe budget ripetendo un
+                    // esito gia' classificato (i Failed retriable passano da
+                    // failed_retry con la loro error_class strutturata).
+                    let hollow_retry =
+                        result.hollow_completion && action_intent && result.status.is_success();
+                    let should_retry = failed_retry || hollow_retry;
+
+                    if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
+                        break;
                     }
-                };
-                // Guardia is_success: il retry hollow esiste per dare una
-                // risposta a un run "finito bene ma vuoto". Un run gia'
-                // DIAGNOSTICATO (FailedDiagnosed da forced_close/anti-loop,
-                // BlockedNeedsInput da dichiarazione) non va ri-eseguito da
-                // capo su un altro provider: brucerebbe budget ripetendo un
-                // esito gia' classificato (i Failed retriable passano da
-                // failed_retry con la loro error_class strutturata).
-                let hollow_retry =
-                    result.hollow_completion && action_intent && result.status.is_success();
-                let should_retry = failed_retry || hollow_retry;
 
-                if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
-                    break;
-                }
-
-                if hollow_retry {
-                    tracing::warn!(
-                        "agent_run {}: hollow completion da {}/{} — il modello ha risposto \
+                    if hollow_retry {
+                        tracing::warn!(
+                            "agent_run {}: hollow completion da {}/{} — il modello ha risposto \
                      senza usare tool, ritento con un modello piu capace",
-                        run_id,
-                        current_provider,
-                        current_model
-                    );
-                }
+                            run_id,
+                            current_provider,
+                            current_model
+                        );
+                    }
 
-                // ── ESCALATION su hollow ricorrente ─────────────────────────────
-                // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
-                // smetti di girare in tondo sui modelli small e scala al primo
-                // modello "di ordine superiore" disponibile nel catalog:
-                // performance_tier='heavy' AND is_enabled, ordinato per qualita'
-                // (costo input desc = proxy di capacita'). Provider-agnostic:
-                // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
-                //
-                // Esempi attesi (sort cost desc):
-                //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
-                //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
-                //
-                // Conta come "hollow precedente" se hollow_retry == true ora E
-                // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
-                let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
-                let next_pair: Option<(String, String)> = if escalate_on_hollow {
-                    let tried_models: Vec<String> = tried.iter().cloned().collect();
-                    // Escalation su hollow ricorrente: PUNTO UNICO di selezione
-                    // (regola L). Eleggibilita' agentica + cooldown definiti una
-                    // sola volta in select_agentic_model. Esclude i provider gia'
-                    // provati; preferisce i piu' "potenti" (tier desc, costo desc) e
-                    // con context_window sufficiente.
-                    crate::orchestrator::select_agentic_model(
+                    // ── ESCALATION su hollow ricorrente ─────────────────────────────
+                    // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
+                    // smetti di girare in tondo sui modelli small e scala al primo
+                    // modello "di ordine superiore" disponibile nel catalog:
+                    // performance_tier='heavy' AND is_enabled, ordinato per qualita'
+                    // (costo input desc = proxy di capacita'). Provider-agnostic:
+                    // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
+                    //
+                    // Esempi attesi (sort cost desc):
+                    //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
+                    //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
+                    //
+                    // Conta come "hollow precedente" se hollow_retry == true ora E
+                    // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
+                    let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
+                    let next_pair: Option<(String, String)> = if escalate_on_hollow {
+                        let tried_models: Vec<String> = tried.iter().cloned().collect();
+                        // Escalation su hollow ricorrente: PUNTO UNICO di selezione
+                        // (regola L). Eleggibilita' agentica + cooldown definiti una
+                        // sola volta in select_agentic_model. Esclude i provider gia'
+                        // provati; preferisce i piu' "potenti" (tier desc, costo desc) e
+                        // con context_window sufficiente.
+                        crate::orchestrator::select_agentic_model(
                         &db_clone,
                         &[],
                         None,
@@ -3258,128 +3332,128 @@ pub(crate) async fn spawn_agent_run(
                         );
                         (p, m)
                     })
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
 
-                let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
-                    pair
-                } else {
-                    // Cerca il prossimo provider nella gerarchia che sia:
-                    //   - non gia' provato in questo run
-                    //   - non in cooldown billing/quota
-                    //   - dotato di un default model in nexus_provider_default_model
-                    //   - con coppia (provider, model) coerente (guard-rail anti-mismatch)
-                    //
-                    // INVARIANTE: provider e model devono SEMPRE appartenere allo
-                    // stesso provider. Un provider senza default model viene SKIPPATO
-                    // nel fallback, mai accoppiato al model del provider precedente.
-                    // Fonte di verita: nexus_provider_default_model (regola G); i
-                    // prefix in model_belongs_to_provider sono detection. Vedi ADR 0016.
-                    //
-                    // Se la routing_matrix non e disponibile non si puo decidere un
-                    // model coerente -> break (manteniamo il result corrente).
-                    let matrix_arc = match routing_matrix_for_loop.current_async().await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!(
+                    let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
+                        pair
+                    } else {
+                        // Cerca il prossimo provider nella gerarchia che sia:
+                        //   - non gia' provato in questo run
+                        //   - non in cooldown billing/quota
+                        //   - dotato di un default model in nexus_provider_default_model
+                        //   - con coppia (provider, model) coerente (guard-rail anti-mismatch)
+                        //
+                        // INVARIANTE: provider e model devono SEMPRE appartenere allo
+                        // stesso provider. Un provider senza default model viene SKIPPATO
+                        // nel fallback, mai accoppiato al model del provider precedente.
+                        // Fonte di verita: nexus_provider_default_model (regola G); i
+                        // prefix in model_belongs_to_provider sono detection. Vedi ADR 0016.
+                        //
+                        // Se la routing_matrix non e disponibile non si puo decidere un
+                        // model coerente -> break (manteniamo il result corrente).
+                        let matrix_arc = match routing_matrix_for_loop.current_async().await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!(
                             "agent_run {}: routing_matrix non disponibile ({}), interrompo fallback e mantengo risultato",
                             run_id, e
                         );
-                            break;
-                        }
-                    };
-                    let mut chosen: Option<(String, String)> = None;
-                    for candidate in provider_hierarchy.iter() {
-                        if tried.contains(candidate)
-                            || crate::provider_cooldown::is_provider_in_cooldown(candidate)
-                        {
-                            continue;
-                        }
-                        let Some(candidate_model) = matrix_arc.default_model(candidate) else {
-                            tracing::warn!(
+                                break;
+                            }
+                        };
+                        let mut chosen: Option<(String, String)> = None;
+                        for candidate in provider_hierarchy.iter() {
+                            if tried.contains(candidate)
+                                || crate::provider_cooldown::is_provider_in_cooldown(candidate)
+                            {
+                                continue;
+                            }
+                            let Some(candidate_model) = matrix_arc.default_model(candidate) else {
+                                tracing::warn!(
                             "agent_run {}: provider '{}' senza default model in nexus_provider_default_model, skip nel fallback",
                             run_id, candidate
                         );
-                            continue;
-                        };
-                        // Guard-rail: la coppia (provider, model) deve essere coerente.
-                        // Previene QUALSIASI mismatch: se il default model non
-                        // appartiene al provider, NON tentiamo la chiamata (404).
-                        if !model_belongs_to_provider(candidate, &candidate_model) {
-                            tracing::error!(
+                                continue;
+                            };
+                            // Guard-rail: la coppia (provider, model) deve essere coerente.
+                            // Previene QUALSIASI mismatch: se il default model non
+                            // appartiene al provider, NON tentiamo la chiamata (404).
+                            if !model_belongs_to_provider(candidate, &candidate_model) {
+                                tracing::error!(
                             "agent_run {}: coppia incoerente provider='{}' model='{}' in nexus_provider_default_model, skip nel fallback",
                             run_id, candidate, candidate_model
                         );
-                            continue;
+                                continue;
+                            }
+                            chosen = Some((candidate.clone(), candidate_model));
+                            break;
                         }
-                        chosen = Some((candidate.clone(), candidate_model));
-                        break;
-                    }
-                    let Some(pair) = chosen else {
-                        tracing::warn!(
+                        let Some(pair) = chosen else {
+                            tracing::warn!(
                         "agent_run {}: nessun provider alternativo con default model coerente disponibile, mantengo risultato",
                         run_id
                     );
-                        break;
+                            break;
+                        };
+                        pair
                     };
-                    pair
-                };
-                // Invariante difensiva finale: anche i candidati da escalation
-                // hollow (next_pair) passano per il guard-rail. Una coppia
-                // incoerente non deve mai diventare current_provider/model.
-                if !model_belongs_to_provider(&chosen_provider, &chosen_model) {
-                    tracing::error!(
+                    // Invariante difensiva finale: anche i candidati da escalation
+                    // hollow (next_pair) passano per il guard-rail. Una coppia
+                    // incoerente non deve mai diventare current_provider/model.
+                    if !model_belongs_to_provider(&chosen_provider, &chosen_model) {
+                        tracing::error!(
                     "agent_run {}: coppia incoerente scelta provider='{}' model='{}', interrompo fallback (guard-rail)",
                     run_id, chosen_provider, chosen_model
                 );
-                    break;
-                }
-                current_provider = chosen_provider;
-                current_model = chosen_model;
-                fallback_attempt += 1;
-                tracing::warn!(
-                    "agent_run {}: fallback automatico a {}/{} (motivo: {})",
-                    run_id,
-                    current_provider,
-                    current_model,
-                    if hollow_retry {
-                        "hollow completion"
-                    } else {
-                        "provider error/cooldown"
+                        break;
                     }
-                );
-                // Meta-step `fallback` pubblicato in chat per trasparenza:
-                // utente vede in tempo reale che il sistema ha cambiato
-                // provider/modello (es. anthropic -> openai per quota_exceeded).
-                let reason = if hollow_retry {
-                    "hollow_completion"
-                } else {
-                    "provider_error_or_cooldown"
-                };
-                let _ = tx_for_brain.send(AgentStepEvent {
-                    run_id: run_id.to_string(),
-                    step: None,
-                    trace: None,
-                    is_final: false,
-                    token_delta: None,
-                    thinking_delta: None,
-                    meta_step: Some(crate::agent_types::AgentMetaStep {
-                        kind: "fallback".to_string(),
-                        title: format!("Fallback su {}/{}", current_provider, current_model),
-                        payload: serde_json::json!({
-                            "to_provider": current_provider,
-                            "to_model": current_model,
-                            "reason": reason,
-                            "attempt": fallback_attempt,
+                    current_provider = chosen_provider;
+                    current_model = chosen_model;
+                    fallback_attempt += 1;
+                    tracing::warn!(
+                        "agent_run {}: fallback automatico a {}/{} (motivo: {})",
+                        run_id,
+                        current_provider,
+                        current_model,
+                        if hollow_retry {
+                            "hollow completion"
+                        } else {
+                            "provider error/cooldown"
+                        }
+                    );
+                    // Meta-step `fallback` pubblicato in chat per trasparenza:
+                    // utente vede in tempo reale che il sistema ha cambiato
+                    // provider/modello (es. anthropic -> openai per quota_exceeded).
+                    let reason = if hollow_retry {
+                        "hollow_completion"
+                    } else {
+                        "provider_error_or_cooldown"
+                    };
+                    let _ = tx_for_brain.send(AgentStepEvent {
+                        run_id: run_id.to_string(),
+                        step: None,
+                        trace: None,
+                        is_final: false,
+                        token_delta: None,
+                        thinking_delta: None,
+                        meta_step: Some(crate::agent_types::AgentMetaStep {
+                            kind: "fallback".to_string(),
+                            title: format!("Fallback su {}/{}", current_provider, current_model),
+                            payload: serde_json::json!({
+                                "to_provider": current_provider,
+                                "to_model": current_model,
+                                "reason": reason,
+                                "attempt": fallback_attempt,
+                            }),
+                            correlation_id: None,
+                            created_at: chrono::Utc::now().to_rfc3339(),
                         }),
-                        correlation_id: None,
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                    }),
-                });
-            }
-            // Espressione finale del blocco 'compute (path Python): `result`.
-            result
+                    });
+                }
+                // Espressione finale del blocco 'compute (path Python): `result`.
+                result
             }; // chiude il blocco 'compute (result = nativo | loop Python)
 
             // ── Riconciliazione costo/token del run dal ledger (regola L) ───────
@@ -3736,11 +3810,17 @@ pub(crate) async fn spawn_agent_run(
             // Python). Persistito solo se valorizzato (COALESCE: non azzera un
             // valore eventualmente scritto a monte), cosi' resume e trace panel
             // la trovano (prima il run nativo lasciava la colonna NULL/vuota).
+            let pending_actions_json = if result.pending_actions.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&result.pending_actions).unwrap_or(json!([])))
+            };
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
              prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
              nexus_override_applied=$9, nexus_agent_type=$10, nexus_task_type=$11, \
              provider=$12, model=$13, messages_json=COALESCE($14, messages_json), \
+             pending_actions_json=COALESCE($15, pending_actions_json), \
              completed_at=NOW() WHERE id=$1",
             )
             .bind(run_id)
@@ -3757,6 +3837,7 @@ pub(crate) async fn spawn_agent_run(
             .bind(&result.provider)
             .bind(&result.model)
             .bind(result.messages_json.as_deref())
+            .bind(pending_actions_json)
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&run_pool)
             .await;
@@ -3795,18 +3876,25 @@ pub(crate) async fn spawn_agent_run(
                 // meta step con il COUNT dei figli non-terminali; canale PRESERVATO
                 // (la narrazione dei figli continua, il worker fan-in riprendera' il
                 // run). Punto unico `emit_awaiting_subagents_meta`.
-                let pending =
-                    emit_awaiting_subagents_meta(&run_pool, &tx_for_brain, run_id).await;
+                let pending = emit_awaiting_subagents_meta(&run_pool, &tx_for_brain, run_id).await;
                 tracing::info!(
                     target: "mcp_core::fanin",
                     run_id = %run_id,
                     pending_background_children = pending,
                     "fan-in: run padre SOSPESO in awaiting_subagents (stream mantenuto, meta step emesso)"
                 );
+            } else if status_canonical == AgentRunStatus::AwaitingConfirmation {
+                let action_count =
+                    emit_awaiting_confirmation_meta(&tx_for_brain, run_id, &result.pending_actions)
+                        .await;
+                tracing::info!(
+                    target: "mcp_core::agent_run",
+                    run_id = %run_id,
+                    pending_actions = action_count,
+                    "HITL: run padre SOSPESO in awaiting_confirmation (stream mantenuto)"
+                );
             } else {
-                // Altro stato non-terminale (es. AwaitingConfirmation quando l'HITL
-                // sara' nativo): canale PRESERVATO, nessun is_final. Coerente col
-                // trattamento HITL storico (stream aperto, "in attesa conferma").
+                // Altro stato non-terminale: canale PRESERVATO, nessun is_final.
                 tracing::info!(
                     target: "mcp_core::agent_run",
                     run_id = %run_id,
@@ -3890,67 +3978,68 @@ pub(crate) async fn spawn_agent_run(
             //   - Altrimenti (ledger vuoto per il run, es. provider che non
             //     scrive ledger): fallback al calcolo da prompt/completion_tokens
             //     × prezzi del catalog.
-            let cost_to_charge: f64 =
-                if result.total_cost > 0.0 {
-                    result.total_cost
-                } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
-                    // Look up prezzi dal catalog. Costo per milione di token.
-                    #[derive(sqlx::FromRow)]
-                    struct PriceRow {
-                        input_cost: f64,
-                        output_cost: f64,
-                    }
-                    let prices: Option<PriceRow> = sqlx::query_as::<_, PriceRow>(
-                        "SELECT input_cost_per_million_tokens::float8 AS input_cost,
+            let cost_to_charge: f64 = if result.total_cost > 0.0 {
+                result.total_cost
+            } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
+                // Look up prezzi dal catalog. Costo per milione di token.
+                #[derive(sqlx::FromRow)]
+                struct PriceRow {
+                    input_cost: f64,
+                    output_cost: f64,
+                }
+                let prices: Option<PriceRow> = sqlx::query_as::<_, PriceRow>(
+                    "SELECT input_cost_per_million_tokens::float8 AS input_cost,
                         output_cost_per_million_tokens::float8 AS output_cost
                    FROM ai_price_catalog
                   WHERE provider = $1 AND model = $2 AND is_enabled = true
                   ORDER BY effective_from DESC LIMIT 1",
-                    )
-                    .bind(&result.provider)
-                    .bind(&result.model)
-                    .fetch_optional(&db_clone)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(p) = prices {
-                        let input_cost = (result.prompt_tokens as f64) * p.input_cost / 1_000_000.0;
-                        let output_cost =
-                            (result.completion_tokens as f64) * p.output_cost / 1_000_000.0;
-                        let total = input_cost + output_cost;
-                        if total > 0.0 {
-                            // Aggiorna anche agent_runs.total_cost E total_tokens
-                            // per coerenza UI (l'UPDATE principale sopra ha scritto
-                            // result.total_tokens, che nel path nativo senza ledger
-                            // puo' essere 0 pur avendo prompt/completion validi:
-                            // ricostruiscilo da prompt+completion). Idempotente:
-                            // tocca solo i run rimasti a 0.
-                            let total_tokens_fallback = (result.total_tokens.max(
-                                result.prompt_tokens.saturating_add(result.completion_tokens),
-                            )) as i32;
-                            let _ = sqlx::query(
-                        "UPDATE agent_runs SET total_cost = $2, total_tokens = $3 \
+                )
+                .bind(&result.provider)
+                .bind(&result.model)
+                .fetch_optional(&db_clone)
+                .await
+                .ok()
+                .flatten();
+                if let Some(p) = prices {
+                    let input_cost = (result.prompt_tokens as f64) * p.input_cost / 1_000_000.0;
+                    let output_cost =
+                        (result.completion_tokens as f64) * p.output_cost / 1_000_000.0;
+                    let total = input_cost + output_cost;
+                    if total > 0.0 {
+                        // Aggiorna anche agent_runs.total_cost E total_tokens
+                        // per coerenza UI (l'UPDATE principale sopra ha scritto
+                        // result.total_tokens, che nel path nativo senza ledger
+                        // puo' essere 0 pur avendo prompt/completion validi:
+                        // ricostruiscilo da prompt+completion). Idempotente:
+                        // tocca solo i run rimasti a 0.
+                        let total_tokens_fallback = (result.total_tokens.max(
+                            result
+                                .prompt_tokens
+                                .saturating_add(result.completion_tokens),
+                        )) as i32;
+                        let _ = sqlx::query(
+                            "UPDATE agent_runs SET total_cost = $2, total_tokens = $3 \
                          WHERE id = $1 AND total_cost = 0",
-                    )
-                    .bind(run_id)
-                    .bind(total)
-                    .bind(total_tokens_fallback)
-                    // Pool del progetto (separazione DB): agent_runs migrata.
-                    .execute(&run_pool)
-                    .await;
-                            tracing::debug!(
+                        )
+                        .bind(run_id)
+                        .bind(total)
+                        .bind(total_tokens_fallback)
+                        // Pool del progetto (separazione DB): agent_runs migrata.
+                        .execute(&run_pool)
+                        .await;
+                        tracing::debug!(
                         "budget: cost calcolato da catalog (ledger vuoto) per {}/{} = ${:.6} (prompt={} comp={})",
                         result.provider, result.model, total,
                         result.prompt_tokens, result.completion_tokens
                     );
-                        }
-                        total
-                    } else {
-                        0.0
                     }
+                    total
                 } else {
                     0.0
-                };
+                }
+            } else {
+                0.0
+            };
             if cost_to_charge > 0.0 {
                 let _ = sqlx::query(
                 "INSERT INTO provider_budget_status (provider, spent_current_period_usd)
@@ -4033,8 +4122,7 @@ pub(crate) async fn spawn_agent_run(
                 // AppState (con db, neural, channels...) per costruire i deps nativi
                 // dentro il task: clone a basso costo (campi Arc/pool condivisi).
                 let shadow_state = state_for_finalize.clone();
-                let (shadow_tx, _shadow_rx) =
-                    tokio::sync::broadcast::channel::<AgentStepEvent>(1);
+                let (shadow_tx, _shadow_rx) = tokio::sync::broadcast::channel::<AgentStepEvent>(1);
 
                 // ── Tappa 1b (B): dati COMPLETI del classifier per lo shadow ─────
                 // Lo shadow deve derivare action_oriented/report_only ESATTAMENTE
@@ -4072,6 +4160,9 @@ pub(crate) async fn spawn_agent_run(
                     classifier_resolved: shadow_classifier.classifier_resolved,
                     action_oriented_min_score: shadow_classifier.action_oriented_min_score,
                     automation_mode: automation_mode_for_brain.clone(),
+                    supervisor_mode: crate::native_engine::graph_supervisor_mode(
+                        params.supervisor_mode,
+                    ),
                     // Canale SSE fittizio: lo shadow usa NullEventSink (non emette
                     // nulla), questo tx esiste solo per soddisfare la firma di
                     // NativeRunInput e viene scartato.
@@ -4081,11 +4172,12 @@ pub(crate) async fn spawn_agent_run(
                     subagent_depth: None,
                     // Shadow Replay-only (nessun side-effect): nessun override root.
                     working_root: None,
+                    pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone,
+                    pre_run_advisory_source: pre_run_advisory_source_clone,
                 };
                 let primary_run_id = run_id;
                 tokio::spawn(async move {
-                    match run_shadow_for_state(&shadow_state, &shadow_input, primary_run_id).await
-                    {
+                    match run_shadow_for_state(&shadow_state, &shadow_input, primary_run_id).await {
                         Ok(()) => {
                             tracing::info!(
                                 primary_run_id = %primary_run_id,
@@ -4395,11 +4487,10 @@ pub(crate) async fn resume_via_native(
 /// H: nessun fallback al brain qui, l'esecuzione nativa che fallisce e' un
 /// fallimento del run, non un motivo per cambiare motore).
 ///
-/// NB (debito noto, documentato): il grafo nativo NON imposta ancora
-/// `awaiting_confirmation` in alcun nodo (il porting dell'`interrupt_before=
-/// ["executor"]` di graph.py non e' completo), quindi un run engine='rust' non
-/// raggiunge oggi questo stato; questa funzione e' l'aggancio corretto per quando
-/// quel nodo sara' portato. Il resume dei run PYTHON legacy resta sul brain.
+/// NB: il grafo nativo imposta `awaiting_confirmation` nel `ToolDispatchNode`
+/// quando `automation_mode=confirm` e ci sono tool mutativi pendenti (gate HITL
+/// in `nexus-agent-graph::decisions::hitl`). Il resume avviene via
+/// [`confirm_native_run`] + checkpoint Postgres.
 pub(crate) async fn confirm_native_run(
     state: &AppState,
     run_id: Uuid,
@@ -4440,11 +4531,14 @@ pub(crate) async fn confirm_native_run(
         classifier_resolved: false,
         action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
         automation_mode,
+        supervisor_mode: nexus_agent_graph::SupervisorMode::None,
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
+        pre_run_advisory_synthesis: None,
+        pre_run_advisory_source: None,
     };
 
     let outcome = resume_via_native(state, &input, resume_message).await;
@@ -4470,11 +4564,18 @@ pub(crate) async fn confirm_native_run(
             // messages_json: conversazione finale del resume nativo (COALESCE: non
             // azzera la history del run originale se il resume non ne produce una
             // nuova). Resume e trace panel la trovano valorizzata.
+            let pending_json = if result.pending_actions.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_value(&result.pending_actions).unwrap_or(json!([])))
+            };
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
                  prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
                  nexus_task_type=$9, provider=$10, model=$11, \
-                 messages_json=COALESCE($12, messages_json), completed_at=NOW() \
+                 messages_json=COALESCE($12, messages_json), \
+                 pending_actions_json=COALESCE($13, pending_actions_json), \
+                 completed_at=NOW() \
                  WHERE id=$1",
             )
             .bind(run_id)
@@ -4489,6 +4590,7 @@ pub(crate) async fn confirm_native_run(
             .bind(&result.provider)
             .bind(&result.model)
             .bind(result.messages_json.as_deref())
+            .bind(pending_json)
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&cn_pool)
             .await;
@@ -4606,6 +4708,44 @@ async fn emit_awaiting_subagents_meta(
     pending
 }
 
+/// Meta step SSE per sospensione HITL (`awaiting_confirmation`).
+///
+/// CONTRATTO SSE (frontend `use-chat.ts`):
+///   kind = "awaiting_confirmation"
+///   payload = { "status": "awaiting_confirmation", "pending_actions": [...], "run_id": "..." }
+async fn emit_awaiting_confirmation_meta(
+    tx: &tokio::sync::broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    pending_actions: &[crate::agent_types::AgentPendingAction],
+) -> usize {
+    let count = pending_actions.len();
+    let actions_json = serde_json::to_value(pending_actions).unwrap_or_else(|_| json!([]));
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "awaiting_confirmation".to_string(),
+            title: if count == 1 {
+                "Attesa conferma (1 azione)".to_string()
+            } else {
+                format!("Attesa conferma ({count} azioni)")
+            },
+            payload: json!({
+                "status": "awaiting_confirmation",
+                "pending_actions": actions_json,
+                "run_id": run_id.to_string(),
+            }),
+            correlation_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    });
+    count
+}
+
 /// Risultati strutturati dei figli BACKGROUND di un parent, nella STESSA forma
 /// del tool_result di `nexus_subagent_poll` (regola L): un `Value` per figlio
 /// con `{subagent_run_id, kind, status, summary, outcome}`. `outcome` e' il
@@ -4702,25 +4842,28 @@ pub(crate) async fn resume_fanin(
     // Pool del progetto (separazione DB): agent_runs / nexus_subagent_runs sono
     // migrate. Risolto UNA volta, riusato per lettura provider/model, risultati
     // dei figli e UPDATE di finalize.
-    let cn_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let cn_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
 
     // provider/model del run originale dal DB (il worker ha solo gli id): servono
     // a popolare ctx + porte I/O del resume (il grafo riparte comunque dal
     // checkpoint). Se il run non esiste piu' (stale), esce senza resume.
-    let row = sqlx::query(
-        "SELECT provider, model FROM agent_runs WHERE id = $1",
-    )
-    .bind(parent_run_id)
-    .fetch_optional(&cn_pool)
-    .await
-    .map_err(|e| format!("lookup run padre fallito: {e}"))?;
+    let row = sqlx::query("SELECT provider, model FROM agent_runs WHERE id = $1")
+        .bind(parent_run_id)
+        .fetch_optional(&cn_pool)
+        .await
+        .map_err(|e| format!("lookup run padre fallito: {e}"))?;
     let (provider, model) = match row {
         Some(r) => {
             use sqlx::Row;
             (
-                r.try_get::<Option<String>, _>("provider").ok().flatten().unwrap_or_default(),
-                r.try_get::<Option<String>, _>("model").ok().flatten().unwrap_or_default(),
+                r.try_get::<Option<String>, _>("provider")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                r.try_get::<Option<String>, _>("model")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             )
         }
         None => return Err(format!("run padre {parent_run_id} non trovato (stale)")),
@@ -4767,19 +4910,21 @@ pub(crate) async fn resume_fanin(
         // Il resume fan-in del run principale eredita l'automazione del run
         // originale via checkpoint; qui basta un valore coerente per il ctx.
         automation_mode: "automatic".to_string(),
+        supervisor_mode: nexus_agent_graph::SupervisorMode::None,
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
+        pre_run_advisory_synthesis: None,
+        pre_run_advisory_source: None,
     };
 
     // Costruisce le NativeDeps da AppState (PUNTO UNICO build_native_deps, regola
     // L: stesso cablaggio infra di run_via_native / confirm_native_run) e delega
     // al motore la meccanica di resume col delta fan-in.
     let deps = build_native_deps(state).await;
-    let outcome =
-        crate::native_engine::resume_native_fanin(&deps, &input, subagent_results).await;
+    let outcome = crate::native_engine::resume_native_fanin(&deps, &input, subagent_results).await;
 
     let status = match outcome {
         Ok(outcome) => {
@@ -4874,10 +5019,12 @@ pub(crate) async fn resume_fanin(
 /// `AppState`. PUNTO UNICO (regola L): sia il run nativo primario
 /// (`run_via_native`) sia lo shadow (`run_shadow_for_state`) lo riusano, niente
 /// duplicazione del cablaggio infra.
-async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps {
-    // Dipendenze del ToolRunner concreto: stesso assemblaggio del server gRPC
-    // (main.rs), ma per l'esecuzione IN-PROCESS (mcp-core E' il ToolRunner).
-    let tool_runner_deps = crate::tool_runner_server::ToolRunnerDeps {
+/// Assemblaggio delle `ToolRunnerDeps` da `AppState` (PUNTO UNICO, regola L): stessa
+/// slice sottile usata dal server gRPC (`main.rs`) per l'esecuzione IN-PROCESS
+/// (mcp-core E' il ToolRunner). Riusato da `build_native_deps` e dal pre-step del
+/// consiglio (`spawn_agent_run`), cosi' la costruzione del ctx tool ha una sola sede.
+fn build_tool_runner_deps(state: &AppState) -> crate::tool_runner_server::ToolRunnerDeps {
+    crate::tool_runner_server::ToolRunnerDeps {
         db: state.db.clone(),
         neural: state.orchestrator.neural.clone(),
         playwright_channels: state.playwright_channels.clone(),
@@ -4885,7 +5032,356 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
         project_channels: state.project_channels.clone(),
         monitor_registry: state.monitor_registry.clone(),
         port_registry: state.port_registry.clone(),
+    }
+}
+
+/// Pre-step del CONSIGLIO a monte (regola L/M): quando acceso e il messaggio tocca
+/// ambiti sensibili, e' il MOTORE (non il modello) a convocare alcune figure
+/// sub-agente read-only PRIMA che il run primario agisca; ritorna il blocco
+/// `<consiglio_sintesi>` da anteporre al primo messaggio del run. `None` quando non
+/// c'e' consiglio: kill-switch OFF, ambito non sensibile, nessuna figura selezionata,
+/// sessione non risolvibile o convocazione senza parere valido. In tutti i casi il
+/// run primario prosegue INVARIATO — best-effort, mai bloccante, nessun errore risale.
+///
+/// Non ricorsivo: le figure girano come sub-run via `run_single_subagent` (grafo
+/// nativo), NON ripassano da `spawn_agent_run`, quindi il pre-step scatta solo per il
+/// run primario della chat.
+async fn maybe_convene_council(
+    state: &AppState,
+    session_id: Uuid,
+    user_text: &str,
+) -> Option<crate::agent_tools::subagent_native::CouncilConveneOutcome> {
+    use crate::agent_tools::subagent_native::{
+        CouncilConveneOutcome, CouncilDegradeReason,
     };
+    // Kill-switch DB-driven (regola G), default OFF: nessun fallback hardcoded, la
+    // feature va accesa esplicitamente in `settings`.
+    let enabled = nexus_auth::get_bool_setting(&state.db, "orchestrator.council_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    // Gate d'ambito sensibile: PUNTO UNICO condiviso col gate della direttiva
+    // in-prompt (regola L) — stessa definizione di "ambito sensibile".
+    if !crate::prompt_templates::council_triggered_for(&state.db, user_text).await {
+        return None;
+    }
+    // Selezione figure (DB-driven + routing per ambito): lista vuota -> niente.
+    let cfg = crate::agent_tools::subagent_native::read_council_config(&state.db).await;
+    let figures = crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg);
+    if figures.is_empty() {
+        return None;
+    }
+    // Kill-switch globale sub-agent (regola G): senza sub-agent il consiglio non
+    // puo' convocare le figure, ma il gate e' passato -> degrado strutturato + UI.
+    let subagents_enabled =
+        nexus_auth::get_bool_setting(&state.db, "orchestrator.subagents_enabled")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+    if !subagents_enabled {
+        tracing::warn!(
+            session_id = %session_id,
+            figure = ?figures,
+            "consiglio a monte: sub-agents disabilitati (orchestrator.subagents_enabled=false)"
+        );
+        return Some(CouncilConveneOutcome::Degraded {
+            reason: CouncilDegradeReason::SubagentsDisabled,
+            figures,
+        });
+    }
+    // Costruzione del ctx tool (PUNTO UNICO ToolRunnerService::build_ctx, regola L).
+    // Sessione non risolvibile -> degrado strutturato (best-effort).
+    let deps = build_tool_runner_deps(state);
+    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
+    let ctx = match svc.build_ctx(session_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("consiglio a monte: build_ctx fallita (session={session_id}): {e}");
+            return Some(CouncilConveneOutcome::Degraded {
+                reason: CouncilDegradeReason::BuildCtxFailed,
+                figures,
+            });
+        }
+    };
+    let policy = crate::agent_tools::subagent_native::read_advisory_policy(&ctx).await;
+    let kinds: Vec<&str> = figures.iter().map(String::as_str).collect();
+    tracing::info!(
+        session_id = %session_id,
+        figure = ?figures,
+        "consiglio a monte: convocazione programmatica delle figure"
+    );
+    let synthesis = match crate::agent_tools::subagent_native::convene_council(
+        &ctx,
+        user_text,
+        &kinds,
+        &policy,
+    )
+    .await
+    {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                figure = ?figures,
+                "consiglio a monte: nessuna sintesi valida dalle figure"
+            );
+            return Some(CouncilConveneOutcome::Degraded {
+                reason: CouncilDegradeReason::SynthesisUnavailable,
+                figures,
+            });
+        }
+    };
+    tracing::info!(
+        session_id = %session_id,
+        verdict = %synthesis.verdict.as_str(),
+        requisiti = synthesis.requirements.len(),
+        rischi = synthesis.risks.len(),
+        "consiglio a monte: sintesi composta, iniezione nel primo messaggio"
+    );
+    Some(CouncilConveneOutcome::Active {
+        synthesis,
+        figures,
+    })
+}
+
+async fn maybe_convene_multi_provider_panel(
+    state: &AppState,
+    session_id: Uuid,
+    user_text: &str,
+) -> Option<crate::agent_tools::subagent_native::MultiProviderPanelOutcome> {
+    if !crate::prompt_templates::council_triggered_for(&state.db, user_text).await {
+        return None;
+    }
+    let cfg = crate::agent_tools::subagent_native::read_multi_provider_config(&state.db).await?;
+    let deps = build_tool_runner_deps(state);
+    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
+    let ctx = match svc.build_ctx(session_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("multi-provider panel: build_ctx fallita (session={session_id}): {e}");
+            return None;
+        }
+    };
+    let policy = crate::agent_tools::subagent_native::read_advisory_policy(&ctx).await;
+    tracing::info!(
+        session_id = %session_id,
+        purpose = %cfg.purpose,
+        max_providers = cfg.max_providers,
+        "multi-provider panel: convocazione programmatica"
+    );
+    let outcome = crate::agent_tools::subagent_native::convene_multi_provider_panel(
+        &ctx,
+        user_text,
+        &cfg,
+        &policy,
+    )
+    .await?;
+    match &outcome {
+        crate::agent_tools::subagent_native::MultiProviderPanelOutcome::Active { synthesis, .. } => {
+            tracing::info!(
+                session_id = %session_id,
+                verdict = %synthesis.verdict.as_str(),
+                valid = synthesis.valid,
+                total = synthesis.total_advisories,
+                "multi-provider panel: sintesi composta, iniezione nel primo messaggio"
+            );
+        }
+        crate::agent_tools::subagent_native::MultiProviderPanelOutcome::Degraded {
+            reason,
+            got,
+            min,
+        } => {
+            tracing::warn!(
+                session_id = %session_id,
+                reason = ?reason,
+                got = got,
+                min = min,
+                "multi-provider panel: degrado strutturato, nessuna sintesi iniettata"
+            );
+        }
+    }
+    Some(outcome)
+}
+
+/// Segnale strutturato per la UI chat: il Consiglio delle Competenze e' stato
+/// attivato dal gate agentico/deterministico. Emesso anche in degrado (es.
+/// sub-agents off o sintesi assente) cosi' l'utente vede il tentativo di
+/// attivazione, non solo l'esito positivo.
+async fn emit_council_of_competencies_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    outcome: &crate::agent_tools::subagent_native::CouncilConveneOutcome,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let figure_count = outcome.figures().len();
+    let (title, payload) = match outcome {
+        crate::agent_tools::subagent_native::CouncilConveneOutcome::Active { synthesis, .. } => (
+            "Consiglio delle Competenze attivo".to_string(),
+            json!({
+                "product_name": "Consiglio delle Competenze",
+                "activation_source": "agentic_deterministic_complexity_scope_analysis",
+                "signal": "council_synthesis_present",
+                "activated": true,
+                "degraded": false,
+                "figure_count": figure_count,
+                "advisory_verdict": synthesis.verdict.as_str(),
+                "requirements_count": synthesis.requirements.len(),
+                "risks_count": synthesis.risks.len(),
+            }),
+        ),
+        crate::agent_tools::subagent_native::CouncilConveneOutcome::Degraded { reason, .. } => (
+            format!("Consiglio delle Competenze degradato ({figure_count} figure)"),
+            json!({
+                "product_name": "Consiglio delle Competenze",
+                "activation_source": "agentic_deterministic_complexity_scope_analysis",
+                "signal": "council_degraded",
+                "activated": false,
+                "degraded": true,
+                "figure_count": figure_count,
+                "degradation_reason": outcome.degradation_reason_code(),
+                "degradation_detail": match reason {
+                    crate::agent_tools::subagent_native::CouncilDegradeReason::SubagentsDisabled =>
+                        "Sub-agents disabilitati (orchestrator.subagents_enabled=false): impossibile convocare le figure.",
+                    crate::agent_tools::subagent_native::CouncilDegradeReason::BuildCtxFailed =>
+                        "Contesto tool non costruibile per la sessione: convocazione annullata.",
+                    crate::agent_tools::subagent_native::CouncilDegradeReason::SynthesisUnavailable =>
+                        "Nessuna figura ha prodotto un parere advisory valido.",
+                },
+            }),
+        ),
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("council_of_competencies")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "consiglio competenze: meta_step persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "council_of_competencies".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
+async fn emit_multi_provider_panel_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    outcome: &crate::agent_tools::subagent_native::MultiProviderPanelOutcome,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let (title, payload) = match outcome {
+        crate::agent_tools::subagent_native::MultiProviderPanelOutcome::Active {
+            provider_count,
+            synthesis,
+        } => (
+            format!("Panel multi-provider attivo ({provider_count})"),
+            json!({
+                "product_name": "Multi-provider advisory",
+                "activation_source": "agentic_deterministic_multi_provider_panel",
+                "signal": "multi_provider_synthesis_present",
+                "activated": true,
+                "degraded": false,
+                "provider_count": provider_count,
+                "advisory_verdict": synthesis.verdict.as_str(),
+                "requirements_count": synthesis.requirements.len(),
+                "risks_count": synthesis.risks.len(),
+                "dissent": synthesis.dissent,
+            }),
+        ),
+        crate::agent_tools::subagent_native::MultiProviderPanelOutcome::Degraded {
+            reason,
+            got,
+            min,
+        } => (
+            format!("Panel multi-provider degradato ({got}/{min})"),
+            json!({
+                "product_name": "Multi-provider advisory",
+                "activation_source": "agentic_deterministic_multi_provider_panel",
+                "signal": "multi_provider_degraded",
+                "activated": false,
+                "degraded": true,
+                "degradation_reason": outcome.degradation_reason_code(),
+                "degradation_detail": match reason {
+                    crate::agent_tools::subagent_native::MultiProviderDegradeReason::PurposeUnavailable =>
+                        "Purpose multi-provider non risolvibile dal catalog.",
+                    crate::agent_tools::subagent_native::MultiProviderDegradeReason::InsufficientProviderDiversity =>
+                        "Provider distinti insufficienti per il quorum configurato.",
+                },
+                "provider_count_got": got,
+                "provider_count_min": min,
+            }),
+        ),
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("multi_provider_panel")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "multi-provider panel: meta_step persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "multi_provider_panel".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
+async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps {
+    // Dipendenze del ToolRunner concreto: stesso assemblaggio del server gRPC
+    // (main.rs), ma per l'esecuzione IN-PROCESS (mcp-core E' il ToolRunner).
+    let tool_runner_deps = build_tool_runner_deps(state);
 
     // Client gateway dalla porta nel DB (regola G/L: punto unico del cablaggio).
     let gateway = crate::nexus_gateway::NexusGatewayClient::from_db(&state.db).await;
@@ -5078,6 +5574,7 @@ mod tests_select_engine {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            pending_actions: Vec::new(),
         }
     }
 
@@ -5085,7 +5582,10 @@ mod tests_select_engine {
     async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
         // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
-        for (si, name, st) in [(1000, "read_file", "completed"), (2000, "write_file", "failed")] {
+        for (si, name, st) in [
+            (1000, "read_file", "completed"),
+            (2000, "write_file", "failed"),
+        ] {
             sqlx::query(
                 "INSERT INTO agent_steps (run_id, step_index, tool_name, status) VALUES ($1,$2,$3,$4)",
             )
@@ -5143,8 +5643,7 @@ mod tests_select_engine {
         // partial -> FailedDiagnosed (dichiarazione onesta di incompletezza,
         // mai "completed" su un lavoro dichiarato parziale).
         let mut o = outcome_base();
-        o.declared_outcome =
-            Some(serde_json::json!({"outcome": "partial", "summary": "meta'"}));
+        o.declared_outcome = Some(serde_json::json!({"outcome": "partial", "summary": "meta'"}));
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
 
@@ -5168,8 +5667,7 @@ mod tests_select_engine {
 
         // done senza refusal: Completed (poi final_gate/hollow a valle).
         let mut o = outcome_base();
-        o.declared_outcome =
-            Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
+        o.declared_outcome = Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::Completed);
     }
@@ -5184,8 +5682,7 @@ mod tests_select_engine {
         // done dichiarato + gate NON passato -> FailedDiagnosed, mai Completed.
         let mut o = outcome_base();
         o.final_answer = Some("Task completato con successo.".to_string());
-        o.declared_outcome =
-            Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
+        o.declared_outcome = Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
         o.final_gate_passed = Some(false);
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
@@ -5339,9 +5836,7 @@ mod tests_select_engine {
     }
 
     #[sqlx::test]
-    async fn native_mapping_hollow_non_scatta_su_risposta_o_step_presenti(
-        pool: sqlx::PgPool,
-    ) {
+    async fn native_mapping_hollow_non_scatta_su_risposta_o_step_presenti(pool: sqlx::PgPool) {
         // Contro-prova del calcolo hollow nativo: risposta presente (o run
         // HITL non concluso) -> hollow false, status invariato.
         let run = setup_mapping_run(&pool).await;
@@ -5467,11 +5962,13 @@ mod tests_session_active {
         // run parallelo (S2 della re-review).
         create_agent_runs_table(&pool).await;
         let sess = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_subagents')")
-            .bind(sess)
-            .execute(&pool)
-            .await
-            .expect("insert awaiting_subagents");
+        sqlx::query(
+            "INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_subagents')",
+        )
+        .bind(sess)
+        .execute(&pool)
+        .await
+        .expect("insert awaiting_subagents");
         assert!(session_has_active_run(&pool, sess).await);
     }
 
@@ -5590,16 +6087,24 @@ mod tests_finalize_turn {
     fn hollow_senza_lavoro_declassato_a_failed_diagnosed() {
         // 0 step + EMPTY_ANSWER -> failed_diagnosed (esito certo, mai completed muto).
         let r = mk_result(
-            AgentRunStatus::Completed, vec![], None, true,
-            "EMPTY_ANSWER", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![],
+            None,
+            true,
+            "EMPTY_ANSWER",
+            Some("fix"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::FailedDiagnosed);
         // La rinuncia esplicita non e' piu' un kind lessicale (RESIGNED rimosso,
         // ADR 0018 fase 3): un completed con risposta e kind vuoto resta tale
         // (la rinuncia dichiarata passa da task_complete refusal/blocked).
         let r2 = mk_result(
-            AgentRunStatus::Completed, vec![], Some("non posso"), true,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![],
+            Some("non posso"),
+            true,
+            "",
+            Some("fix"),
         );
         assert_eq!(canonical_run_status(&r2), AgentRunStatus::Completed);
     }
@@ -5608,15 +6113,21 @@ mod tests_finalize_turn {
     fn hollow_con_lavoro_resta_completed() {
         // Hollow ma con step produttivi -> NON declassato (il lavoro c'e').
         let r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], None, true,
-            "EMPTY_ANSWER", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            None,
+            true,
+            "EMPTY_ANSWER",
+            Some("fix"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
     }
 
     #[test]
     fn is_provider_error_answer_riconosce_marker() {
-        assert!(is_provider_error_answer("[Errore provider deepseek: gateway giu']"));
+        assert!(is_provider_error_answer(
+            "[Errore provider deepseek: gateway giu']"
+        ));
         assert!(is_provider_error_answer("  [Errore provider openai: x]"));
         assert!(!is_provider_error_answer("Ecco il risultato del task."));
         assert!(!is_provider_error_answer("[INFO] qualcosa"));
@@ -5679,8 +6190,12 @@ mod tests_finalize_turn {
     fn chat_hollow_non_e_report_hollow() {
         // intent chat: completamento vuoto atteso, non declassato.
         let r = mk_result(
-            AgentRunStatus::Completed, vec![], None, true,
-            "EMPTY_ANSWER", Some("chat"),
+            AgentRunStatus::Completed,
+            vec![],
+            None,
+            true,
+            "EMPTY_ANSWER",
+            Some("chat"),
         );
         assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
     }
@@ -5689,15 +6204,26 @@ mod tests_finalize_turn {
     fn compose_garantisce_messaggio_su_hollow() {
         // Hollow con step -> recap delle azioni (mai messaggio assente).
         let r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], None, true,
-            "EMPTY_ANSWER", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            None,
+            true,
+            "EMPTY_ANSWER",
+            Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso");
-        assert!(msg.contains("a.ts"), "il recap deve elencare il file toccato");
+        assert!(
+            msg.contains("a.ts"),
+            "il recap deve elencare il file toccato"
+        );
         // Hollow senza step -> placeholder esplicito.
         let r2 = mk_result(
-            AgentRunStatus::Completed, vec![], None, true,
-            "EMPTY_ANSWER", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![],
+            None,
+            true,
+            "EMPTY_ANSWER",
+            Some("fix"),
         );
         let msg2 = compose_turn_answer(&r2).expect("placeholder atteso");
         assert!(msg2.contains("Nessuna risposta utile"));
@@ -5706,8 +6232,12 @@ mod tests_finalize_turn {
     #[test]
     fn compose_usa_risposta_reale_quando_presente() {
         let r = mk_result(
-            AgentRunStatus::Completed, vec![], Some("Ecco il risultato."), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![],
+            Some("Ecco il risultato."),
+            false,
+            "",
+            Some("fix"),
         );
         assert_eq!(compose_turn_answer(&r).unwrap(), "Ecco il risultato.");
     }
@@ -5717,7 +6247,12 @@ mod tests_finalize_turn {
         // Run non-hollow senza final_answer NE step (es. chat che chiude): nessun
         // messaggio. Con 0 step la chat non ha nulla di concreto da riportare.
         let r = mk_result(
-            AgentRunStatus::Completed, vec![], None, false, "", Some("chat"),
+            AgentRunStatus::Completed,
+            vec![],
+            None,
+            false,
+            "",
+            Some("chat"),
         );
         assert!(compose_turn_answer(&r).is_none());
     }
@@ -5731,8 +6266,12 @@ mod tests_finalize_turn {
         // con step eseguiti produce SEMPRE il recap: mai un completed senza nulla
         // a schermo.
         let r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], None, false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            None,
+            false,
+            "",
+            Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso anche se non-hollow");
         assert!(
@@ -5759,12 +6298,22 @@ mod tests_finalize_turn {
         ));
         // compose: con step produttivi -> recap, non la spazzatura.
         let r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some(raw), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some(raw),
+            false,
+            "",
+            Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso");
-        assert!(msg.contains("a.ts"), "deve usare il recap deterministico: {msg}");
-        assert!(!msg.contains("bookingService"), "niente tool call nel testo: {msg}");
+        assert!(
+            msg.contains("a.ts"),
+            "deve usare il recap deterministico: {msg}"
+        );
+        assert!(
+            !msg.contains("bookingService"),
+            "niente tool call nel testo: {msg}"
+        );
     }
 
     #[test]
@@ -5773,13 +6322,19 @@ mod tests_finalize_turn {
         let raw = "[Error: An assistant message with][Error: Unexpected tool call id FbW0bLZsv in tool results][Error: An assistant message with]";
         assert!(super::is_only_provider_errors(raw));
         // Risposte legittime (anche se citano errori) NON matchano.
-        assert!(!super::is_only_provider_errors("Il build fallisce con [Error: x]"));
+        assert!(!super::is_only_provider_errors(
+            "Il build fallisce con [Error: x]"
+        ));
         assert!(!super::is_only_provider_errors("Il DB ha 6 tabelle."));
         assert!(!super::is_only_provider_errors(""));
         // compose: con step -> recap, non la concatenazione di errori.
         let r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some(raw), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some(raw),
+            false,
+            "",
+            Some("fix"),
         );
         let msg = compose_turn_answer(&r).expect("recap atteso");
         assert!(msg.contains("a.ts"), "recap deterministico atteso: {msg}");
@@ -5797,13 +6352,30 @@ mod tests_finalize_turn {
         // Provider buoni in cooldown per credito/quota -> messaggio ONESTO che
         // indica la causa reale e l'azione, non "completamento vuoto".
         let snap = vec![
-            ("anthropic".to_string(), 300u64, Some("credit balance too low".to_string())),
-            ("openai".to_string(), 250u64, Some("you exceeded your current quota".to_string())),
+            (
+                "anthropic".to_string(),
+                300u64,
+                Some("credit balance too low".to_string()),
+            ),
+            (
+                "openai".to_string(),
+                250u64,
+                Some("you exceeded your current quota".to_string()),
+            ),
         ];
         let msg = super::cooldown_note_from_snapshot(&snap).expect("nota attesa");
-        assert!(msg.contains("quota/credito esaurito"), "deve indicare la causa billing: {msg}");
-        assert!(msg.contains("Ricarica"), "deve suggerire la ricarica: {msg}");
-        assert!(msg.contains("anthropic") && msg.contains("openai"), "deve elencare i provider: {msg}");
+        assert!(
+            msg.contains("quota/credito esaurito"),
+            "deve indicare la causa billing: {msg}"
+        );
+        assert!(
+            msg.contains("Ricarica"),
+            "deve suggerire la ricarica: {msg}"
+        );
+        assert!(
+            msg.contains("anthropic") && msg.contains("openai"),
+            "deve elencare i provider: {msg}"
+        );
     }
 
     #[test]
@@ -5811,8 +6383,14 @@ mod tests_finalize_turn {
         // Cooldown transitorio (rate-limit) -> "attendi", NON "ricarica".
         let snap = vec![("mistral".to_string(), 60u64, Some("rate limit".to_string()))];
         let msg = super::cooldown_note_from_snapshot(&snap).expect("nota attesa");
-        assert!(msg.contains("temporaneamente non disponibili"), "non-billing -> attendi: {msg}");
-        assert!(!msg.contains("Ricarica"), "non deve dire ricarica per rate-limit: {msg}");
+        assert!(
+            msg.contains("temporaneamente non disponibili"),
+            "non-billing -> attendi: {msg}"
+        );
+        assert!(
+            !msg.contains("Ricarica"),
+            "non deve dire ricarica per rate-limit: {msg}"
+        );
     }
 
     #[test]
@@ -5822,8 +6400,12 @@ mod tests_finalize_turn {
         // righe reali per il run. La riconciliazione deve adottare i valori del
         // ledger cosi' che messaggio assistant + agent_runs mostrino il costo vero.
         let mut r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some("fatto"), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
         );
         assert_eq!(r.total_cost, 0.0);
         let ledger = super::LedgerTotals {
@@ -5833,7 +6415,10 @@ mod tests_finalize_turn {
             total_tokens: 19_400,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
-        assert!(applied, "deve adottare il ledger quando result e' a 0 e ledger ha costo");
+        assert!(
+            applied,
+            "deve adottare il ledger quando result e' a 0 e ledger ha costo"
+        );
         assert!((r.total_cost - 0.063).abs() < 1e-9, "costo dal ledger");
         assert_eq!(r.prompt_tokens, 18_000);
         assert_eq!(r.completion_tokens, 1_400);
@@ -5845,8 +6430,12 @@ mod tests_finalize_turn {
         // Path Python: result ha gia' un costo valido -> il ledger NON lo tocca
         // (evita doppio conteggio / regressioni dove il brain e' autoritativo).
         let mut r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some("fatto"), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
         );
         r.total_cost = 0.05;
         r.prompt_tokens = 1_000;
@@ -5859,7 +6448,10 @@ mod tests_finalize_turn {
             total_tokens: 199_998,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
-        assert!(!applied, "result con costo > 0 non va sovrascritto dal ledger");
+        assert!(
+            !applied,
+            "result con costo > 0 non va sovrascritto dal ledger"
+        );
         assert!((r.total_cost - 0.05).abs() < 1e-9);
         assert_eq!(r.prompt_tokens, 1_000);
         assert_eq!(r.total_tokens, 1_200);
@@ -5870,16 +6462,31 @@ mod tests_finalize_turn {
         // Ledger assente per il run (provider che non scrive ledger): nessuna
         // riconciliazione -> il chiamante ricade sul fallback calcolo-da-catalog.
         let mut r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some("fatto"), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
         );
         r.prompt_tokens = 500;
         r.completion_tokens = 100;
-        let before = (r.total_cost, r.prompt_tokens, r.completion_tokens, r.total_tokens);
-        let applied = super::reconcile_run_cost_from_ledger(&mut r, &super::LedgerTotals::default());
+        let before = (
+            r.total_cost,
+            r.prompt_tokens,
+            r.completion_tokens,
+            r.total_tokens,
+        );
+        let applied =
+            super::reconcile_run_cost_from_ledger(&mut r, &super::LedgerTotals::default());
         assert!(!applied, "ledger a costo zero non e' autoritativo");
         assert_eq!(
-            (r.total_cost, r.prompt_tokens, r.completion_tokens, r.total_tokens),
+            (
+                r.total_cost,
+                r.prompt_tokens,
+                r.completion_tokens,
+                r.total_tokens
+            ),
             before,
             "result invariato quando il ledger e' vuoto"
         );
@@ -5894,8 +6501,12 @@ mod tests_finalize_turn {
         // campi tornassero a coincidere, il ratio esploderebbe di nuovo sui run
         // multi-iterazione.
         let mut r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some("fatto"), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
         );
         r.last_prompt_tokens = Some(42_000);
         let ledger = super::LedgerTotals {
@@ -5905,8 +6516,14 @@ mod tests_finalize_turn {
             total_tokens: 1_690_000,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
-        assert!(applied, "ledger con costo > 0 e' autoritativo per il billing");
-        assert_eq!(r.prompt_tokens, 1_650_000, "billing dal ledger (cumulativo)");
+        assert!(
+            applied,
+            "ledger con costo > 0 e' autoritativo per il billing"
+        );
+        assert_eq!(
+            r.prompt_tokens, 1_650_000,
+            "billing dal ledger (cumulativo)"
+        );
         assert_eq!(
             r.last_prompt_tokens,
             Some(42_000),
@@ -5919,8 +6536,12 @@ mod tests_finalize_turn {
         // Robustezza: alcune righe ledger possono avere total_tokens=0 pur avendo
         // prompt+completion validi. Non mostrare 0 token a fronte di un costo > 0.
         let mut r = mk_result(
-            AgentRunStatus::Completed, vec![write_step()], Some("fatto"), false,
-            "", Some("fix"),
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
         );
         let ledger = super::LedgerTotals {
             total_cost: 0.01,
@@ -5929,7 +6550,10 @@ mod tests_finalize_turn {
             total_tokens: 0,
         };
         assert!(super::reconcile_run_cost_from_ledger(&mut r, &ledger));
-        assert_eq!(r.total_tokens, 950, "total_tokens ricostruito da prompt+completion");
+        assert_eq!(
+            r.total_tokens, 950,
+            "total_tokens ricostruito da prompt+completion"
+        );
     }
 
     // ── D3: outcome_summary == buildSemanticDetail (recap unico ricco) ─────────
@@ -5984,7 +6608,10 @@ mod tests_finalize_turn {
             ),
         ];
         let out = outcome_summary(&steps).expect("recap atteso");
-        assert!(out.starts_with("\n\n**Riepilogo:**\n"), "header esatto: {out}");
+        assert!(
+            out.starts_with("\n\n**Riepilogo:**\n"),
+            "header esatto: {out}"
+        );
         // Path con >2 segmenti -> nome breve ".../ultimi2"; path <=2 segmenti intero.
         assert!(
             out.contains("- Modificati 2 file: `.../components/Header.tsx`, `a.ts`"),
@@ -5994,12 +6621,18 @@ mod tests_finalize_turn {
             out.contains("- Eseguiti 1 comandi: `pnpm build`"),
             "comando in backtick: {out}"
         );
-        assert!(out.contains("- Analizzati 1 file"), "conteggio analisi: {out}");
+        assert!(
+            out.contains("- Analizzati 1 file"),
+            "conteggio analisi: {out}"
+        );
         assert!(
             out.contains("- Risultato: 4 step completati"),
             "esito completati: {out}"
         );
-        assert!(!out.contains("errori"), "nessun errore -> niente suffisso: {out}");
+        assert!(
+            !out.contains("errori"),
+            "nessun errore -> niente suffisso: {out}"
+        );
     }
 
     #[test]
@@ -6021,10 +6654,16 @@ mod tests_finalize_turn {
             AgentStepStatus::Failed,
         ));
         let out = outcome_summary(&steps).expect("recap atteso");
-        assert!(out.contains("- Modificati 7 file:"), "conteggio totale 7: {out}");
+        assert!(
+            out.contains("- Modificati 7 file:"),
+            "conteggio totale 7: {out}"
+        );
         assert!(out.contains(" e altri 2 file"), "extra file: {out}");
         let expected_short = format!("`{}...`", "x".repeat(77));
-        assert!(out.contains(&expected_short), "comando troncato a 77+...: {out}");
+        assert!(
+            out.contains(&expected_short),
+            "comando troncato a 77+...: {out}"
+        );
         assert!(
             out.contains("- Risultato: 7 step completati, 1 errori"),
             "errori conteggiati: {out}"
@@ -6040,7 +6679,10 @@ mod tests_finalize_turn {
             AgentStepStatus::Completed,
         )];
         let out = outcome_summary(&steps).expect("recap atteso");
-        assert!(out.contains("`.../lib/util.ts`"), "backslash normalizzati: {out}");
+        assert!(
+            out.contains("`.../lib/util.ts`"),
+            "backslash normalizzati: {out}"
+        );
     }
 
     #[test]

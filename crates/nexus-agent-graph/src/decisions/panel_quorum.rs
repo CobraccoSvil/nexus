@@ -86,13 +86,24 @@ mod tests {
     use super::*;
 
     fn tally(valid: usize, veto: usize, conditional: usize, high: bool) -> QuorumTally {
-        QuorumTally { valid, veto, conditional, any_high_severity_veto: high }
+        QuorumTally {
+            valid,
+            veto,
+            conditional,
+            any_high_severity_veto: high,
+        }
     }
 
     #[test]
     fn sotto_soglia_inconclusive() {
-        let p = QuorumPolicy { min_valid: 2, veto_on_high_severity: true };
-        assert_eq!(classify_panel(&tally(1, 0, 0, false), &p), PanelClass::Inconclusive);
+        let p = QuorumPolicy {
+            min_valid: 2,
+            veto_on_high_severity: true,
+        };
+        assert_eq!(
+            classify_panel(&tally(1, 0, 0, false), &p),
+            PanelClass::Inconclusive
+        );
     }
 
     #[test]
@@ -103,25 +114,40 @@ mod tests {
 
     #[test]
     fn veto_senza_high_severity_declassa_a_conditional() {
-        let p = QuorumPolicy { min_valid: 1, veto_on_high_severity: true };
-        assert_eq!(classify_panel(&tally(1, 1, 0, false), &p), PanelClass::Conditional);
+        let p = QuorumPolicy {
+            min_valid: 1,
+            veto_on_high_severity: true,
+        };
+        assert_eq!(
+            classify_panel(&tally(1, 1, 0, false), &p),
+            PanelClass::Conditional
+        );
     }
 
     #[test]
     fn veto_conta_sempre_se_policy_non_richiede_gravita() {
-        let p = QuorumPolicy { min_valid: 1, veto_on_high_severity: false };
+        let p = QuorumPolicy {
+            min_valid: 1,
+            veto_on_high_severity: false,
+        };
         assert_eq!(classify_panel(&tally(1, 1, 0, false), &p), PanelClass::Veto);
     }
 
     #[test]
     fn solo_condizionali_conditional() {
         let p = QuorumPolicy::default();
-        assert_eq!(classify_panel(&tally(2, 0, 1, false), &p), PanelClass::Conditional);
+        assert_eq!(
+            classify_panel(&tally(2, 0, 1, false), &p),
+            PanelClass::Conditional
+        );
     }
 
     #[test]
     fn tutti_ok_approve() {
         let p = QuorumPolicy::default();
-        assert_eq!(classify_panel(&tally(2, 0, 0, false), &p), PanelClass::Approve);
+        assert_eq!(
+            classify_panel(&tally(2, 0, 0, false), &p),
+            PanelClass::Approve
+        );
     }
 }

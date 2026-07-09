@@ -507,36 +507,35 @@ diagnosi e il prossimo passo, non con una ripetizione."
 /// stallo -> proceed.
 pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     // Determina l'asse di stallo prioritario (None = nessuno stallo bloccante).
-    let axis: Option<Axis> = if signals.exploration_count
-        >= 2 * signals.exploration_threshold.max(1)
-    {
-        Some(Axis::Exploration)
-    } else if signals
-        .signature_loop_tool
-        .as_deref()
-        .is_some_and(|t| !t.is_empty())
-    {
-        // Python: `elif signals.signature_loop_tool:` — truthy = non vuoto/non None.
-        Some(Axis::Signature)
-    } else if signals.repeated_user_question_count
-        >= signals.repeated_user_question_threshold.max(1)
-    {
-        // Loop clarification CROSS-RUN (l'incidente email Beaty-Book): la STESSA
-        // domanda-chiarimento e' gia' stata posta all'utente >= soglia volte nella
-        // sessione (segnale strutturato dai meta_step `kind='clarify'`, regola M).
-        // Priorita' TRA signature e repeated_action: un loop di TOOL o esplorazione
-        // ha precedenza (piu' locale), ma la ri-domanda ripetuta precede gli assi
-        // intra-run repeated_action/g1. `.max(1)`: soglia degenere <=0 -> almeno 1.
-        Some(Axis::RepeatedUserQuestion)
-    } else if signals.reallocation_count >= signals.reallocation_threshold.max(1) {
-        Some(Axis::ResourceReallocation)
-    } else if signals.repeated_action.is_some() {
-        Some(Axis::RepeatedAction)
-    } else if signals.g1_over_cap {
-        Some(Axis::G1Descriptive)
-    } else {
-        None
-    };
+    let axis: Option<Axis> =
+        if signals.exploration_count >= 2 * signals.exploration_threshold.max(1) {
+            Some(Axis::Exploration)
+        } else if signals
+            .signature_loop_tool
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
+            // Python: `elif signals.signature_loop_tool:` — truthy = non vuoto/non None.
+            Some(Axis::Signature)
+        } else if signals.repeated_user_question_count
+            >= signals.repeated_user_question_threshold.max(1)
+        {
+            // Loop clarification CROSS-RUN (l'incidente email Beaty-Book): la STESSA
+            // domanda-chiarimento e' gia' stata posta all'utente >= soglia volte nella
+            // sessione (segnale strutturato dai meta_step `kind='clarify'`, regola M).
+            // Priorita' TRA signature e repeated_action: un loop di TOOL o esplorazione
+            // ha precedenza (piu' locale), ma la ri-domanda ripetuta precede gli assi
+            // intra-run repeated_action/g1. `.max(1)`: soglia degenere <=0 -> almeno 1.
+            Some(Axis::RepeatedUserQuestion)
+        } else if signals.reallocation_count >= signals.reallocation_threshold.max(1) {
+            Some(Axis::ResourceReallocation)
+        } else if signals.repeated_action.is_some() {
+            Some(Axis::RepeatedAction)
+        } else if signals.g1_over_cap {
+            Some(Axis::G1Descriptive)
+        } else {
+            None
+        };
 
     let Some(axis) = axis else {
         return ProgressDecision {
@@ -624,17 +623,25 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
             // repeated_action di SOLA LETTURA su turno INFORMATIVO: NON forzare
             // (forzerebbe un altro read-only -> nuovo loop); il nudge guida a
             // concludere con testo. Su turno ACTION-ORIENTED invece forziamo l'edit.
-            Axis::RepeatedAction if signals.repeated_action_read_only && !signals.action_oriented => {
+            Axis::RepeatedAction
+                if signals.repeated_action_read_only && !signals.action_oriented =>
+            {
                 false
             }
             _ => true,
         };
         let reason = match axis {
             Axis::RepeatedAction => {
-                format!("stallo {}: forza-azione correttiva (no ripetizione)", axis.as_str())
+                format!(
+                    "stallo {}: forza-azione correttiva (no ripetizione)",
+                    axis.as_str()
+                )
             }
             Axis::ResourceReallocation => {
-                format!("stallo {}: nudge riusa-porte (no nuova allocazione)", axis.as_str())
+                format!(
+                    "stallo {}: nudge riusa-porte (no nuova allocazione)",
+                    axis.as_str()
+                )
             }
             _ => format!(
                 "stallo {}: forza-azione (rimuovo read-only + tool_choice required)",
@@ -790,7 +797,11 @@ mod tests {
         assert_eq!(d.action, Action::Guide);
         assert_eq!(d.axis, Some(Axis::Exploration));
         assert!(d.force_action);
-        assert!(d.nudge_text.as_deref().unwrap().contains("NON allocarne di nuove"));
+        assert!(d
+            .nudge_text
+            .as_deref()
+            .unwrap()
+            .contains("NON allocarne di nuove"));
     }
 
     #[test]
@@ -805,7 +816,10 @@ mod tests {
         };
         let d = decide(&signals);
         assert_eq!(d.action, Action::Guide);
-        assert!(d.force_action, "repeated_action ora forza l'azione correttiva");
+        assert!(
+            d.force_action,
+            "repeated_action ora forza l'azione correttiva"
+        );
     }
 
     #[test]
@@ -881,7 +895,10 @@ mod tests {
             Action::ForceDiagnose,
             "servizio fallito gia' guidato: diagnosi forzata, non abort/escalate"
         );
-        assert!(!d.force_action, "i log del servizio devono restare leggibili");
+        assert!(
+            !d.force_action,
+            "i log del servizio devono restare leggibili"
+        );
         let nudge = d.nudge_text.as_deref().unwrap();
         assert!(nudge.contains("read_service_output"));
     }
@@ -1014,7 +1031,11 @@ mod tests {
         };
         let d = decide(&signals);
         assert_eq!(d.action, Action::ForceDiagnose);
-        assert!(d.nudge_text.as_deref().unwrap().contains("old_string ESATTO"));
+        assert!(d
+            .nudge_text
+            .as_deref()
+            .unwrap()
+            .contains("old_string ESATTO"));
     }
 
     #[test]

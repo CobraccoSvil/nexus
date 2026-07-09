@@ -34,6 +34,9 @@
 //! 1. `ctx.cancel` / `RunControlStore::is_superseded` -> early return
 //!    `stop_reason=superseded` (uscita cooperativa, mig 0370).
 //! 2. `pending_tool_uses` vuoto -> `{pending_tool_uses:[], stop_reason:end_turn}`.
+//! 2b. HITL Conferma: pending mutativi + `automation_mode=confirm` + `!approved`
+//!     -> `awaiting_confirmation=true` + pending_actions in extra, NESSUN tool
+//!     eseguito (interrupt-resume prima dell'executor, parita' graph.py).
 //! 3. per ogni pending, NELL'ORDINE: predictive_cap_check (priorita') ->
 //!    SYNTHETIC-blocked col SENTINEL (NON eseguito); M16 `is_tool_allowed` ->
 //!    SYNTHETIC error (forza nexus_mcp_tool_search); budget allegati ->
@@ -92,21 +95,23 @@ use serde_json::{json, Map, Value};
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
+use crate::decisions::hitl::{
+    build_pending_actions_json, should_suspend_for_hitl, HITL_PENDING_ACTIONS_EXTRA_KEY,
+};
 use crate::decisions::m16::DiscoveredTool;
-use crate::decisions::predictive_cap::{is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL};
+use crate::decisions::predictive_cap::{
+    is_cap_exempt, predictive_cap_check, PREDICTIVE_CAP_SENTINEL,
+};
 use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
     estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
-    normalize_declared_outcome, normalize_review_verdict,
-    ContextMessage,
+    normalize_declared_outcome, normalize_review_verdict, ContextMessage,
 };
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, ExecMode, MetaStepStore, OffloadKind, RunControlStore, SseEvent,
-    ToolCall,
-    TodoStore,
-    ToolExecutor,
+    AgentStepStore, ContextOffload, ExecMode, MetaStepStore, OffloadKind, RunControlStore,
+    SseEvent, TodoStore, ToolCall, ToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, MessageContent, MetaStep, StateDelta, StopReason};
@@ -136,6 +141,15 @@ const ADVISORY_VERDICT_TOOL_NAME: &str = "advisory_verdict";
 /// il SEGNALE STRUTTURATO `background_dispatched: true` (Fase D fan-in): il padre
 /// NON attende l'esito, si sospende e riprende al fan-in dei sub-run background.
 const DISPATCH_SUBAGENT_TOOLS: &[&str] = &["dispatch_subagent", "dispatch_subagents"];
+
+/// Chiave extra nello stato: enforcement deterministico dei verdetti aggregati
+/// prodotti da `dispatch_subagent(s)` (`panel_verdict` / `advisory_synthesis`).
+pub const PANEL_ENFORCEMENT_KEY: &str = "agentic_panel_enforcement";
+
+/// Chiave extra nello stato: sintesi advisory strutturata prodotta PRIMA del run
+/// (panel multi-provider o consiglio a monte). Il coordinatore legge questo
+/// segnale (regola M), non il blocco testuale in `initial_msg`.
+pub const PRE_RUN_ADVISORY_SYNTHESIS_KEY: &str = "pre_run_advisory_synthesis";
 
 /// Chiave del segnale strutturato (regola M) emesso da `dispatch_subagent(s)` in
 /// modalita' background: `true` -> il padre si sospende in attesa del fan-in.
@@ -200,6 +214,9 @@ pub struct ToolDispatchConfig {
     /// Budget totale del contesto in char (`MAX_CONTEXT_CHARS`): oltre, i
     /// tool_result vengono compressi (offload + troncamento testa+coda).
     pub max_context_chars: usize,
+    /// Tool mutativi (setting `agent.tools.result_cache_mutators`): usati dal
+    /// gate HITL in modalita' Conferma (punto unico `decisions::hitl`).
+    pub fs_mutator_tools: Vec<String>,
 }
 
 impl Default for ToolDispatchConfig {
@@ -220,6 +237,9 @@ impl Default for ToolDispatchConfig {
             discovery_schema_max_bytes: 8192,
             todo_reminder_every_n_steps: 5,
             max_context_chars: crate::decisions::tool_dispatch::MAX_CONTEXT_CHARS,
+            fs_mutator_tools: crate::routing::RoutingConfig::default()
+                .fs_mutator_tools
+                .clone(),
         }
     }
 }
@@ -242,6 +262,37 @@ struct ToolResultBlock {
     /// il parser M16. Rimosso prima di costruire il blocco finale (non arriva al
     /// modello). `None` per ogni altro tool.
     raw_content: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PanelEnforcement {
+    source: &'static str,
+    verdict: String,
+    terminal: bool,
+    declared_outcome: Option<Value>,
+    summary: String,
+    payload: Value,
+}
+
+impl PanelEnforcement {
+    fn to_value(&self) -> Value {
+        json!({
+            "source": self.source,
+            "verdict": self.verdict,
+            "terminal": self.terminal,
+            "summary": self.summary,
+            "payload": self.payload,
+            "declared_outcome": self.declared_outcome,
+        })
+    }
+
+    fn prompt_block(&self) -> String {
+        let payload = py_dumps(&self.payload);
+        format!(
+            "<panel_enforcement>\nsource={}\nverdict={}\nterminal={}\nsummary={}\npayload={}\n</panel_enforcement>",
+            self.source, self.verdict, self.terminal, self.summary, payload
+        )
+    }
 }
 
 /// Nodo tool_dispatch. Le porte I/O (`ToolExecutor`, `AgentStepStore`,
@@ -367,7 +418,11 @@ impl ToolDispatchNode {
                 apply_run_notes(cur.as_deref(), &input)
             };
             let acknowledged = new_notes.is_some();
-            let notes_chars = new_notes.as_deref().map(str::chars).map(Iterator::count).unwrap_or(0);
+            let notes_chars = new_notes
+                .as_deref()
+                .map(str::chars)
+                .map(Iterator::count)
+                .unwrap_or(0);
             if let Some(n) = new_notes {
                 *collector.run_notes.lock().expect("lock run_notes") = Some(n);
             }
@@ -396,7 +451,11 @@ impl ToolDispatchNode {
                 .unwrap_or(Value::Null);
             let acknowledged = decl.is_some();
             if let Some(d) = decl {
-                collector.declared_outcomes.lock().expect("lock outcomes").push(d);
+                collector
+                    .declared_outcomes
+                    .lock()
+                    .expect("lock outcomes")
+                    .push(d);
             }
             return ToolResultBlock {
                 tool_use_id,
@@ -589,9 +648,39 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         // Heartbeat best-effort (anti-recovery prematuro), gata Real.
         let _ = self.run_control.heartbeat(&run_id, mode).await;
 
+        // ── (2b) HITL Conferma: sospensione strutturale prima dei mutators ───
+        if should_suspend_for_hitl(
+            state.automation_mode,
+            state.approved,
+            &pending,
+            &self.cfg.fs_mutator_tools,
+        ) {
+            let actions = build_pending_actions_json(&pending, &self.cfg.fs_mutator_tools);
+            let mut extra = state.extra.clone();
+            extra.insert(
+                HITL_PENDING_ACTIONS_EXTRA_KEY.to_string(),
+                Value::Array(actions),
+            );
+            tracing::info!(
+                target: "nexus_agent_graph::tool_dispatch",
+                pending_mutators = pending.len(),
+                "HITL: run sospeso in attesa di conferma utente (tool mutativi pendenti)"
+            );
+            return Ok(StateDelta {
+                awaiting_confirmation: Some(Some(true)),
+                extra: Some(extra),
+                ..Default::default()
+            }
+            .into_opaque());
+        }
+
         // ── (3) Loop sui pending: cap predittivo / M16 / budget allegati ──────
         let ctx_chars = estimate_context_chars(
-            &state.messages.iter().map(message_to_ctx).collect::<Vec<_>>(),
+            &state
+                .messages
+                .iter()
+                .map(message_to_ctx)
+                .collect::<Vec<_>>(),
         );
         let current_bytes = state.attachment_read_bytes.unwrap_or(0);
         let budget_total = self.cfg.attachment_budget_bytes;
@@ -654,7 +743,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
                          poi richiamalo al turno successivo."
                     )
                 });
-                slots.push(Some(Self::synthetic_error(tool_use_id, Value::String(py_dumps(&err)))));
+                slots.push(Some(Self::synthetic_error(
+                    tool_use_id,
+                    Value::String(py_dumps(&err)),
+                )));
                 continue;
             }
 
@@ -678,7 +770,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
                     "budget_bytes": budget_total,
                     "already_read": current_bytes,
                 });
-                slots.push(Some(Self::synthetic_error(tool_use_id, Value::String(py_dumps(&err)))));
+                slots.push(Some(Self::synthetic_error(
+                    tool_use_id,
+                    Value::String(py_dumps(&err)),
+                )));
                 continue;
             }
 
@@ -692,7 +787,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             run_notes: std::sync::Mutex::new(state.run_notes.clone()),
             ..Default::default()
         };
-        let kept_futs = kept_indices.iter().map(|&i| self.run_one(&pending[i], mode, &collector));
+        let kept_futs = kept_indices
+            .iter()
+            .map(|&i| self.run_one(&pending[i], mode, &collector));
         let kept_results: Vec<ToolResultBlock> = join_all(kept_futs).await;
         // Ricompone nell'ordine originale: ogni slot vuoto prende il prossimo kept.
         let mut kept_iter = kept_results.into_iter();
@@ -730,7 +827,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
 
         // ── (7) Guard blocked-da-cap (py:3924-3953) ───────────────────────────
         let declared_outcomes = collector.declared_outcomes.into_inner().expect("outcomes");
-        let review_verdicts = collector.review_verdicts.into_inner().expect("review verdicts");
+        let review_verdicts = collector
+            .review_verdicts
+            .into_inner()
+            .expect("review verdicts");
         let advisory_verdicts = collector
             .advisory_verdicts
             .into_inner()
@@ -775,6 +875,13 @@ dell'utente.";
             );
         }
 
+        let panel_enforcement = panel_enforcement_from_results(&pending, &results);
+        if let Some(enforcement) = &panel_enforcement {
+            if let Some(declared) = &enforcement.declared_outcome {
+                declared_outcomes.push(declared.clone());
+            }
+        }
+
         // ── (8) Persist step incrementale (gata Real, py:3956-4007) ───────────
         let iteration = state.iterations.unwrap_or(0);
         if !run_id.is_empty() {
@@ -805,7 +912,8 @@ dell'utente.";
             let budget_per_tool =
                 std::cmp::max(1500i64, span / std::cmp::max(results.len() as i64, 1)) as usize;
             for r in results.iter_mut() {
-                self.truncate_content(&mut r.content, budget_per_tool, mode).await;
+                self.truncate_content(&mut r.content, budget_per_tool, mode)
+                    .await;
             }
             tracing::warn!(
                 target: "nexus_agent_graph::tool_dispatch",
@@ -823,7 +931,11 @@ dell'utente.";
         if state.plan_phase_active.unwrap_or(false) {
             let every_n = std::cmp::max(1, self.cfg.todo_reminder_every_n_steps);
             if new_reminder_counter >= every_n && !run_id.is_empty() {
-                reminder_text = self.todos.build_reminder_text(&run_id).await.unwrap_or(None);
+                reminder_text = self
+                    .todos
+                    .build_reminder_text(&run_id)
+                    .await
+                    .unwrap_or(None);
                 if reminder_text.is_some() {
                     // Best-effort: traccia che i todos sono stati "visti".
                     let _ = self.todos.increment_iteration_seen(&run_id, mode).await;
@@ -835,6 +947,9 @@ dell'utente.";
         // ── Costruzione del HumanMessage coi blocchi tool_result ──────────────
         // final_blocks = i tool_result (senza raw_content) + eventuale reminder.
         let mut final_blocks: Vec<Value> = results.iter().map(tool_result_to_block).collect();
+        if let Some(enforcement) = &panel_enforcement {
+            final_blocks.push(json!({"type": "text", "text": enforcement.prompt_block()}));
+        }
         if let Some(txt) = &reminder_text {
             append_reminder_block(&mut final_blocks, txt);
         }
@@ -860,10 +975,8 @@ dell'utente.";
                 .clone()
                 .unwrap_or_else(|| value_as_json_string(&r.content));
             // parse_discovered_tools usa gia' il fix ensure_ascii (PR-G).
-            let parsed = crate::decisions::parse_discovered_tools(
-                &raw,
-                self.cfg.discovery_schema_max_bytes,
-            );
+            let parsed =
+                crate::decisions::parse_discovered_tools(&raw, self.cfg.discovery_schema_max_bytes);
             // Dedup cross-search nel turno: la prima occorrenza vince (come Python
             // `if not any(d.name == ...)`).
             for t in parsed {
@@ -1000,6 +1113,15 @@ dell'utente.";
         if infra_error {
             delta.tool_infra_error = Some(Some(true));
         }
+        if let Some(enforcement) = &panel_enforcement {
+            let mut extra = state.extra.clone();
+            extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), enforcement.to_value());
+            delta.extra = Some(extra);
+            if enforcement.terminal {
+                delta.result = Some(Some(enforcement.summary.clone()));
+                delta.stop_reason = Some(Some(StopReason::EndTurn));
+            }
+        }
         // Fase D fan-in: almeno un `dispatch_subagent(s)` background ha risposto col
         // segnale strutturato -> il padre si sospende. Il motore interrompe su
         // `is_awaiting_interrupt` (Slice 1) e riprende al fan-in (Slice 3). Scritto
@@ -1049,9 +1171,7 @@ impl ToolDispatchNode {
                 "\n\n[...troncato: {total} char totali offloadati in RAG, recupera con \
                  nexus_search_semantic (pointer={ptr})...]\n\n"
             ),
-            None => format!(
-                "\n\n[...troncato: {total} char totali, coda preservata sotto...]\n\n"
-            ),
+            None => format!("\n\n[...troncato: {total} char totali, coda preservata sotto...]\n\n"),
         };
         let head: String = chars.iter().take(head_size).collect();
         let tail: String = chars.iter().skip(total.saturating_sub(tail_size)).collect();
@@ -1067,7 +1187,13 @@ impl ToolDispatchNode {
         // Tool_result grande al dispatch: collection ToolResult, senza filtro
         // session/project (comportamento storico, cache del contesto offloadato).
         self.offload
-            .offload_to_rag(json!({"text": text}), OffloadKind::ToolResult, None, None, mode)
+            .offload_to_rag(
+                json!({"text": text}),
+                OffloadKind::ToolResult,
+                None,
+                None,
+                mode,
+            )
             .await
             .ok()
     }
@@ -1244,6 +1370,131 @@ fn value_as_json_string(v: &Value) -> String {
     }
 }
 
+fn tool_content_as_object(content: &Value) -> Option<Value> {
+    match content {
+        Value::Object(_) => Some(content.clone()),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(Value::is_object),
+        _ => None,
+    }
+}
+
+/// PUNTO UNICO (regola L) dell'enforcement advisory: usato da `dispatch_subagent(s)`
+/// e dal seed pre-run in `build_initial_state` (panel multi-provider / consiglio).
+pub fn panel_enforcement_from_advisory_synthesis(
+    advisory: &Value,
+    source: &'static str,
+) -> Option<Value> {
+    build_advisory_enforcement(advisory, source).map(|e| e.to_value())
+}
+
+fn build_advisory_enforcement(advisory: &Value, source: &'static str) -> Option<PanelEnforcement> {
+    let verdict = advisory.get("verdict").and_then(Value::as_str)?;
+    match verdict {
+        "block" | "inconclusive" => {
+            let summary = match source {
+                "multi_provider_synthesis" => format!(
+                    "Panel multi-provider: verdict={verdict}; il run si ferma prima dell'esecuzione."
+                ),
+                _ => format!(
+                    "Consiglio delle Competenze: verdict={verdict}; il run si ferma prima dell'esecuzione."
+                ),
+            };
+            Some(PanelEnforcement {
+                source,
+                verdict: verdict.to_string(),
+                terminal: true,
+                declared_outcome: Some(json!({
+                    "outcome": "blocked",
+                    "summary": summary,
+                    "blocker": source,
+                    "refusal": false,
+                })),
+                summary,
+                payload: advisory.clone(),
+            })
+        }
+        "proceed_with_changes" => {
+            let summary = match source {
+                "multi_provider_synthesis" => {
+                    "Panel multi-provider: procedere rispettando i requisiti obbligatori convergenti."
+                        .to_string()
+                }
+                _ => {
+                    "Consiglio delle Competenze: procedere rispettando i requisiti obbligatori del panel."
+                        .to_string()
+                }
+            };
+            Some(PanelEnforcement {
+                source,
+                verdict: verdict.to_string(),
+                terminal: false,
+                declared_outcome: None,
+                summary,
+                payload: advisory.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn build_review_panel_enforcement(panel: &Value) -> Option<PanelEnforcement> {
+    let verdict = panel.get("verdict").and_then(Value::as_str)?;
+    if verdict == "pass" {
+        return None;
+    }
+    let summary = format!(
+        "Panel di review: verdict={verdict}; il lavoro non puo' essere trattato come approvato."
+    );
+    Some(PanelEnforcement {
+        source: "panel_verdict",
+        verdict: verdict.to_string(),
+        terminal: false,
+        declared_outcome: Some(json!({
+            "outcome": "partial",
+            "summary": summary,
+            "next_step": "Correggere i findings del panel prima di dichiarare completato.",
+        })),
+        summary,
+        payload: panel.clone(),
+    })
+}
+
+/// Estrae l'enforcement dai verdict aggregati prodotti dai sub-agent. Priorita':
+/// un veto advisory terminale prevale su qualunque review; poi review non-pass;
+/// infine advisory proceed_with_changes come vincolo non bloccante.
+fn panel_enforcement_from_results(
+    pending: &[Value],
+    results: &[ToolResultBlock],
+) -> Option<PanelEnforcement> {
+    let mut deferred_advisory: Option<PanelEnforcement> = None;
+    for (block, result) in pending.iter().zip(results.iter()) {
+        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+        if !DISPATCH_SUBAGENT_TOOLS.contains(&name) || result.is_error {
+            continue;
+        }
+        let Some(content) = tool_content_as_object(&result.content) else {
+            continue;
+        };
+        if let Some(advisory) = content.get("advisory_synthesis") {
+            if let Some(enforcement) = build_advisory_enforcement(advisory, "advisory_synthesis")
+            {
+                if enforcement.terminal {
+                    return Some(enforcement);
+                }
+                deferred_advisory = Some(enforcement);
+            }
+        }
+        if let Some(panel) = content.get("panel_verdict") {
+            if let Some(enforcement) = build_review_panel_enforcement(panel) {
+                return Some(enforcement);
+            }
+        }
+    }
+    deferred_advisory
+}
+
 /// `true` se il content di un tool_result di `dispatch_subagent(s)` porta il
 /// SEGNALE STRUTTURATO `background_dispatched: true` (regola M: campo booleano,
 /// MAI parsing di prosa). Il content di questi tool arriva dal `ToolExecutor` come
@@ -1283,13 +1534,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{PortError, SseEvent, ToolOutcome};
     use crate::runtime::test_doubles::{
         NullEventSink, RecordingEventSink, StubAgentStepStore, StubContextOffload, StubLlmGateway,
         StubMetaStepStore, StubRunControlStore, StubTodoStore,
     };
     use crate::runtime::AgentNodeCtx;
-    use crate::routing::config::RoutingConfig;
     use crate::state::{ContentBlock, Message, MessageContent};
 
     fn apply(base: AgentState, delta: nexus_graph::StateDelta) -> AgentState {
@@ -1324,7 +1575,8 @@ mod tests {
         assert!(content_signals_background(&batch));
 
         // Assenza del campo -> false (dispatch sincrono classico).
-        let sync_result = Value::String(json!({"subagent_run_id": "x", "status": "completed"}).to_string());
+        let sync_result =
+            Value::String(json!({"subagent_run_id": "x", "status": "completed"}).to_string());
         assert!(!content_signals_background(&sync_result));
 
         // Segnale esplicitamente false -> false.
@@ -1337,6 +1589,95 @@ mod tests {
 
         // Forma inattesa (numero) -> false.
         assert!(!content_signals_background(&json!(42)));
+    }
+
+    #[test]
+    fn panel_enforcement_blocca_su_advisory_block() {
+        let pending = vec![json!({"name": "dispatch_subagents"})];
+        let results = vec![ToolResultBlock {
+            tool_use_id: "t1".into(),
+            content: Value::String(
+                json!({
+                    "advisory_synthesis": {
+                        "verdict": "block",
+                        "veto": true,
+                        "risks": [{"severity": "alta", "description": "rischio"}]
+                    }
+                })
+                .to_string(),
+            ),
+            is_error: false,
+            exit_code: None,
+            raw_content: None,
+        }];
+
+        let enforcement = panel_enforcement_from_results(&pending, &results)
+            .expect("advisory block deve produrre enforcement");
+        assert_eq!(enforcement.source, "advisory_synthesis");
+        assert!(enforcement.terminal);
+        assert_eq!(
+            enforcement
+                .declared_outcome
+                .as_ref()
+                .and_then(|v| v.get("outcome"))
+                .and_then(Value::as_str),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn panel_enforcement_review_non_pass_non_terminale() {
+        let pending = vec![json!({"name": "dispatch_subagents"})];
+        let results = vec![ToolResultBlock {
+            tool_use_id: "t1".into(),
+            content: json!({
+                "panel_verdict": {
+                    "verdict": "needs_changes",
+                    "approved": false,
+                    "findings": [{"file": "src/lib.rs", "severity": "media", "description": "bug"}]
+                }
+            }),
+            is_error: false,
+            exit_code: None,
+            raw_content: None,
+        }];
+
+        let enforcement = panel_enforcement_from_results(&pending, &results)
+            .expect("review non-pass deve produrre enforcement");
+        assert_eq!(enforcement.source, "panel_verdict");
+        assert!(!enforcement.terminal);
+        assert_eq!(
+            enforcement
+                .declared_outcome
+                .as_ref()
+                .and_then(|v| v.get("outcome"))
+                .and_then(Value::as_str),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn panel_enforcement_advisory_vincoli_non_blocca() {
+        let pending = vec![json!({"name": "dispatch_subagents"})];
+        let results = vec![ToolResultBlock {
+            tool_use_id: "t1".into(),
+            content: json!({
+                "advisory_synthesis": {
+                    "verdict": "proceed_with_changes",
+                    "clear": false,
+                    "requirements": ["usa il punto unico"]
+                }
+            }),
+            is_error: false,
+            exit_code: None,
+            raw_content: None,
+        }];
+
+        let enforcement = panel_enforcement_from_results(&pending, &results)
+            .expect("proceed_with_changes deve produrre vincolo");
+        assert_eq!(enforcement.source, "advisory_synthesis");
+        assert!(!enforcement.terminal);
+        assert!(enforcement.declared_outcome.is_none());
     }
 
     /// Esecutore di tool a coda per il dispatch: mappa per nome del tool a un
@@ -1384,7 +1725,11 @@ mod tests {
     struct FailingToolExecutor;
     #[async_trait]
     impl ToolExecutor for FailingToolExecutor {
-        async fn execute(&self, _call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(
+            &self,
+            _call: ToolCall,
+            _mode: ExecMode,
+        ) -> Result<ToolOutcome, PortError> {
             Err(PortError::Tool("grpc down".into()))
         }
     }
@@ -1479,7 +1824,10 @@ mod tests {
         match msg {
             Message::Human {
                 content: MessageContent::Blocks(blocks),
-            } => blocks.iter().map(|b| serde_json::to_value(b).unwrap()).collect(),
+            } => blocks
+                .iter()
+                .map(|b| serde_json::to_value(b).unwrap())
+                .collect(),
             _ => vec![],
         }
     }
@@ -1487,8 +1835,63 @@ mod tests {
     // ── (2) pending vuoto -> end_turn ────────────────────────────────────────────
 
     #[tokio::test]
+    async fn hitl_confirm_sospende_prima_dei_mutators() {
+        let (n, steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        st.automation_mode = Some(crate::state::AutomationMode::Confirm);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.awaiting_confirmation, Some(true));
+        assert!(
+            out.extra
+                .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty())
+        );
+        assert!(steps.steps.lock().unwrap().is_empty(), "nessun tool eseguito");
+    }
+
+    #[tokio::test]
+    async fn hitl_automatico_non_sospende() {
+        let (n, steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(
+                MapToolExecutor::new().with(
+                    "write_file",
+                    ToolOutcome {
+                        tool_call_id: "w1".into(),
+                        content: json!("ok"),
+                        is_error: false,
+                        ..Default::default()
+                    },
+                ),
+            ),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        st.automation_mode = Some(crate::state::AutomationMode::Automatic);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_ne!(out.awaiting_confirmation, Some(true));
+        assert!(!steps.steps.lock().unwrap().is_empty(), "tool eseguito");
+    }
+
+    #[tokio::test]
     async fn pending_vuoto_end_turn() {
-        let (n, steps, _rc) = node(ToolDispatchConfig::default(), Arc::new(MapToolExecutor::new()));
+        let (n, steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
         let ctx = ctx_with(false, CancellationToken::new());
         let st = state_with_pending(vec![]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
@@ -1539,7 +1942,11 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, SseEvent::ToolResult { .. }))
             .collect();
-        assert_eq!(results.len(), 2, "un ToolResult per tool, eventi: {events:?}");
+        assert_eq!(
+            results.len(),
+            2,
+            "un ToolResult per tool, eventi: {events:?}"
+        );
         assert!(
             results.iter().any(|e| matches!(
                 e,
@@ -1598,8 +2005,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_token_esce_cooperativo() {
-        let (n, _steps, _rc) =
-            node(ToolDispatchConfig::default(), Arc::new(MapToolExecutor::new()));
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
         let cancel = CancellationToken::new();
         cancel.cancel();
         let ctx = ctx_with(false, cancel);
@@ -1792,7 +2201,11 @@ mod tests {
         // Una chiamata bloccata dal cap + un task_complete outcome=blocked.
         let st = state_with_pending(vec![
             pending_tool("c1", "nexus_read_attachment", json!({"length": 100000})),
-            pending_tool("c2", "task_complete", json!({"outcome": "blocked", "summary": "stop"})),
+            pending_tool(
+                "c2",
+                "task_complete",
+                json!({"outcome": "blocked", "summary": "stop"}),
+            ),
         ]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // La dichiarazione blocked viene rifiutata (declared_outcome NON settato).
@@ -1800,7 +2213,10 @@ mod tests {
         assert_eq!(out.blocked_cap_rejected, Some(true));
         // Il tool_result del task_complete e' marcato is_error con la reason.
         let blocks = blocks_of(out.messages.last().expect("msg"));
-        let tc = blocks.iter().find(|b| b["tool_use_id"] == json!("c2")).unwrap();
+        let tc = blocks
+            .iter()
+            .find(|b| b["tool_use_id"] == json!("c2"))
+            .unwrap();
         assert!(tc["is_error"].as_bool().unwrap());
         assert!(tc["content"].as_str().unwrap().contains("RIFIUTATA"));
     }
@@ -1822,7 +2238,10 @@ mod tests {
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         let blocks = blocks_of(out.messages.last().expect("msg"));
         assert!(blocks[0]["is_error"].as_bool().unwrap());
-        assert!(blocks[0]["content"].as_str().unwrap().contains("nexus_mcp_tool_search"));
+        assert!(blocks[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("nexus_mcp_tool_search"));
         // Tool NON eseguito.
         assert!(tools.seen.lock().unwrap().is_empty());
     }
@@ -1838,12 +2257,16 @@ mod tests {
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(cfg, tools.clone());
         let ctx = ctx_with(false, CancellationToken::new());
-        let mut st = state_with_pending(vec![pending_tool("c1", "nexus_read_attachment", json!({}))]);
+        let mut st =
+            state_with_pending(vec![pending_tool("c1", "nexus_read_attachment", json!({}))]);
         st.attachment_read_bytes = Some(2000); // gia' oltre il budget.
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         let blocks = blocks_of(out.messages.last().expect("msg"));
         assert!(blocks[0]["is_error"].as_bool().unwrap());
-        assert!(blocks[0]["content"].as_str().unwrap().contains("budget letture allegati esaurito"));
+        assert!(blocks[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("budget letture allegati esaurito"));
         assert!(tools.seen.lock().unwrap().is_empty());
     }
 
@@ -1855,8 +2278,16 @@ mod tests {
         let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools.clone());
         let ctx = ctx_with(false, CancellationToken::new());
         let st = state_with_pending(vec![
-            pending_tool("c1", "nexus_run_notes", json!({"action": "set", "content": "appunto"})),
-            pending_tool("c2", "task_complete", json!({"outcome": "done", "summary": "ok"})),
+            pending_tool(
+                "c1",
+                "nexus_run_notes",
+                json!({"action": "set", "content": "appunto"}),
+            ),
+            pending_tool(
+                "c2",
+                "task_complete",
+                json!({"outcome": "done", "summary": "ok"}),
+            ),
         ]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // run_notes persistito; declared_outcome=done; declared_done_count=1.
@@ -1876,7 +2307,10 @@ mod tests {
         // precedente, quella dichiarazione era intermedia -> azzerata. Senza,
         // un "partial"/"blocked" dichiarato a meta' run falsava lo status
         // canonico finale anche a lavoro poi completato.
-        let (n, _steps, _rc) = node(ToolDispatchConfig::default(), Arc::new(MapToolExecutor::new()));
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
         let ctx = ctx_with(false, CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         st.declared_outcome = Some(json!({"outcome": "partial", "summary": "meta'"}));
@@ -1893,7 +2327,10 @@ mod tests {
         let (n, _steps, _rc) = node(ToolDispatchConfig::default(), Arc::new(FailingToolExecutor));
         let ctx = ctx_with(false, CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
-        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run NON deve fallire"));
+        let out = apply(
+            st.clone(),
+            n.run(&st, &ctx).await.expect("run NON deve fallire"),
+        );
         let blocks = blocks_of(out.messages.last().expect("msg"));
         assert!(blocks[0]["is_error"].as_bool().unwrap());
         assert!(blocks[0]["content"].as_str().unwrap().contains("grpc down"));
@@ -1904,7 +2341,10 @@ mod tests {
     #[tokio::test]
     async fn discovered_sempre_scritto_anche_vuoto() {
         // Un read_file qualunque: nessun search -> discovered_next = [] ma SCRITTO.
-        let (n, _steps, _rc) = node(ToolDispatchConfig::default(), Arc::new(MapToolExecutor::new()));
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
         let ctx = ctx_with(false, CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
@@ -1985,7 +2425,10 @@ mod tests {
         struct ReminderStore;
         #[async_trait]
         impl TodoStore for ReminderStore {
-            async fn list_todos(&self, _r: &str) -> Result<Vec<crate::decisions::dag_scheduler::Todo>, PortError> {
+            async fn list_todos(
+                &self,
+                _r: &str,
+            ) -> Result<Vec<crate::decisions::dag_scheduler::Todo>, PortError> {
                 Ok(vec![])
             }
             async fn mark_status(
@@ -2022,10 +2465,13 @@ mod tests {
         assert_eq!(out.since_last_todo_reminder, Some(0));
         // Il blocco reminder e' appeso ai blocchi (ContentBlock::Text col tag).
         let last = out.messages.last().expect("msg");
-        if let Message::Human { content: MessageContent::Blocks(blocks) } = last {
-            let has_reminder = blocks.iter().any(|b| {
-                matches!(b, ContentBlock::Text { text } if text.contains("system-reminder"))
-            });
+        if let Message::Human {
+            content: MessageContent::Blocks(blocks),
+        } = last
+        {
+            let has_reminder = blocks.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text.contains("system-reminder")),
+            );
             assert!(has_reminder, "il reminder deve essere appeso ai blocchi");
         } else {
             panic!("atteso HumanMessage a blocchi");
@@ -2037,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn context_budget_cap_tronca_e_offloada() {
         let cfg = ToolDispatchConfig {
-            max_context_chars: 100, // soglia minuscola -> forza il cap.
+            max_context_chars: 100,           // soglia minuscola -> forza il cap.
             tool_result_max_chars: 1_000_000, // non taglia al passo (5).
             ..Default::default()
         };
@@ -2078,7 +2524,7 @@ mod tests {
     #[tokio::test]
     async fn context_budget_cap_in_shadow_non_offloada() {
         let cfg = ToolDispatchConfig {
-            max_context_chars: 100, // soglia minuscola -> forza il cap (passo 9).
+            max_context_chars: 100,    // soglia minuscola -> forza il cap (passo 9).
             tool_result_max_chars: 50, // taglia anche al passo (5).
             ..Default::default()
         };
@@ -2154,12 +2600,12 @@ mod golden {
     use uuid::Uuid;
 
     use super::*;
+    use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{PortError, ToolOutcome};
     use crate::runtime::test_doubles::{
         NullEventSink, StubAgentStepStore, StubContextOffload, StubLlmGateway, StubRunControlStore,
         StubTodoStore,
     };
-    use crate::routing::config::RoutingConfig;
     use crate::state::{AgentState, Message, MessageContent};
 
     #[derive(Debug, Deserialize)]
@@ -2199,7 +2645,10 @@ mod golden {
         if let Some(n) = v.get("attachment_read_bytes").and_then(Value::as_i64) {
             st.attachment_read_bytes = Some(n);
         }
-        if let Some(d) = v.get("discovered_tools_next_turn").and_then(Value::as_array) {
+        if let Some(d) = v
+            .get("discovered_tools_next_turn")
+            .and_then(Value::as_array)
+        {
             st.discovered_tools_next_turn = Some(d.clone());
         }
         if let Some(b) = v.get("blocked_cap_rejected").and_then(Value::as_bool) {
@@ -2240,12 +2689,20 @@ mod golden {
             discovery_first_whitelist: v
                 .get("discovery_first_whitelist")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or(d.discovery_first_whitelist),
             always_on_tools: v
                 .get("always_on_tools")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or(d.always_on_tools),
             discovery_schema_max_bytes: v
                 .get("discovery_schema_max_bytes")
@@ -2257,6 +2714,7 @@ mod golden {
             tool_result_max_chars: 100_000_000,
             max_context_chars: usize::MAX,
             todo_reminder_every_n_steps: d.todo_reminder_every_n_steps,
+            fs_mutator_tools: d.fs_mutator_tools,
         }
     }
 
@@ -2266,7 +2724,10 @@ mod golden {
         if let Some(obj) = v.as_object() {
             for (id, stub) in obj {
                 let content = stub.get("content").cloned().unwrap_or(json!("{}"));
-                let is_error = stub.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                let is_error = stub
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let exit_code = stub.get("exit_code").and_then(Value::as_i64);
                 map.insert(
                     id.clone(),
@@ -2391,7 +2852,11 @@ mod golden {
             return;
         };
         let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(cases.len() >= 8, "attesi >= 8 casi, trovati {}", cases.len());
+        assert!(
+            cases.len() >= 8,
+            "attesi >= 8 casi, trovati {}",
+            cases.len()
+        );
 
         let mut checked = 0usize;
         for c in &cases {

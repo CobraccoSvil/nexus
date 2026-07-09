@@ -79,9 +79,7 @@ pub async fn list_chat_messages(
         let indexed_at: Option<DateTime<Utc>> = row.try_get("indexed_at").unwrap_or(None);
         let created_at: Option<DateTime<Utc>> = row.try_get("created_at").ok();
 
-        let entry = attachments_by_msg
-            .entry(msg_id.to_string())
-            .or_default();
+        let entry = attachments_by_msg.entry(msg_id.to_string()).or_default();
         entry.push(json!({
             "id": att_id.to_string(),
             "messageId": msg_id.to_string(),
@@ -560,8 +558,12 @@ pub async fn send_chat_message(
             None => read_session_automation_mode(&session_pool, context.session_id).await,
         }
     };
-    let supervisor_mode =
-        SupervisorMode::from_str(body.supervisor_mode.as_deref().unwrap_or("none"));
+    let supervisor_mode = body
+        .supervisor_mode
+        .as_deref()
+        .unwrap_or("none")
+        .parse::<SupervisorMode>()
+        .unwrap();
 
     // Fetch user info to build system context
     let github_username: Option<String> =
@@ -672,7 +674,9 @@ pub async fn send_chat_message(
                     .await
                     .ok();
                     if let Some(err_msg_id) = err_id {
-                        if let Ok(err_row) = load_message_by_id(&state.db, context.project_id, err_msg_id).await {
+                        if let Ok(err_row) =
+                            load_message_by_id(&state.db, context.project_id, err_msg_id).await
+                        {
                             if let Ok(err_msg) = to_message_view(&err_row) {
                                 return Ok(Json(json!({
                                     "sessionId": context.session_id.to_string(),
@@ -900,18 +904,15 @@ async fn try_resume_interrupted_run(
     let prev_supervisor_str: String = prev_run
         .try_get("supervisor_mode")
         .unwrap_or_else(|_| "none".to_string());
-    let prev_supervisor = SupervisorMode::from_str(&prev_supervisor_str);
+    let prev_supervisor = prev_supervisor_str.parse::<SupervisorMode>().unwrap();
 
     // Last-wins atomico (punto unico, regola L): cancella TUTTI i run
     // attivi della sessione (incluso il precedente) PRIMA di inserire
     // il nuovo. Elimina la race "INSERT-poi-UPDATE" che lasciava due
     // run attivi per una finestra, e ferma cooperativamente il vecchio.
-    let _ = crate::chat_messages::agent_run::supersede_active_runs(
-        state,
-        context.session_id,
-        "resume",
-    )
-    .await;
+    let _ =
+        crate::chat_messages::agent_run::supersede_active_runs(state, context.session_id, "resume")
+            .await;
 
     let _ = sqlx::query(
         r#"INSERT INTO agent_runs
@@ -978,13 +979,11 @@ async fn try_resume_interrupted_run(
             "automation.run_resume_instruction",
         )
         .await;
-        let resume_prompt =
-            resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
+        let resume_prompt = resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
 
         // History dal DB del progetto: sul meta chat_messages e' vuota a flag
         // ON e il run ripreso ripartiva senza contesto conversazionale.
-        let resume_history =
-            build_recent_conversation_history(&proj_pool, session_id_r, 8).await;
+        let resume_history = build_recent_conversation_history(&proj_pool, session_id_r, 8).await;
 
         let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
             &db_clone2,
@@ -1070,10 +1069,8 @@ async fn try_resume_interrupted_run(
             // stesso punto unico append_outcome_summary dello spawn,
             // cosi' il content persistito coincide col recap live e
             // non diverge dopo un refresh.
-            let answer = crate::chat_messages::agent_run::append_outcome_summary(
-                answer,
-                &result.steps,
-            );
+            let answer =
+                crate::chat_messages::agent_run::append_outcome_summary(answer, &result.steps);
             let mut meta = serde_json::json!({
                 "provider": &result.provider,
                 "model": &result.model,
@@ -1603,8 +1600,8 @@ pub async fn delete_chat_message(
 
     // Separazione DB: endpoint keyed solo dal message_id. chat_messages/chat_sessions
     // vivono nel DB del progetto -> pool via directory di routing (fallback ricerca).
-    let mpool = crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id)
-        .await;
+    let mpool =
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
 
     let row = sqlx::query(
         r#"
@@ -1663,8 +1660,8 @@ pub async fn feedback_error(
     // progetto dalla directory di routing (fallback ricerca + auto-registrazione);
     // chat_messages/chat_sessions/ai_response_feedback/prompt_corrections vivono
     // li'. A flag OFF -> meta-DB. ensure_project_access resta sul meta (globale).
-    let mpool = crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id)
-        .await;
+    let mpool =
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
 
     let row = sqlx::query(
         r#"
@@ -1828,8 +1825,13 @@ pub async fn feedback_error(
     .execute(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::project_db_routes::register_entity_routing(&state.db, "feedback", feedback_id, project_id)
-        .await;
+    crate::project_db_routes::register_entity_routing(
+        &state.db,
+        "feedback",
+        feedback_id,
+        project_id,
+    )
+    .await;
 
     let correction_id = Uuid::new_v4();
     let point_id = correction_id.to_string();
@@ -1965,8 +1967,8 @@ pub async fn feedback_positive(
 
     // Separazione DB: endpoint keyed solo dal message_id -> pool del progetto via
     // directory di routing (fallback ricerca). A flag OFF -> meta-DB.
-    let mpool = crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id)
-        .await;
+    let mpool =
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
 
     let row = sqlx::query(
         r#"
@@ -2113,8 +2115,13 @@ pub async fn feedback_positive(
     .execute(&mpool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::project_db_routes::register_entity_routing(&state.db, "feedback", feedback_id, project_id)
-        .await;
+    crate::project_db_routes::register_entity_routing(
+        &state.db,
+        "feedback",
+        feedback_id,
+        project_id,
+    )
+    .await;
 
     // Rinforza Q-learning: reward=1.0 (successo confermato dall'utente).
     let mut new_q_value: Option<f32> = None;

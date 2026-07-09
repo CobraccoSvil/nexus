@@ -98,6 +98,11 @@ export const en = {
     "chat.thinking": "Thinking...",
     "chat.you": "You",
     "chat.ai": "AI",
+    "chat.systemWakeup.badge": "Automatic system wakeup",
+    "chat.systemWakeup.explain": "The agent woke up on its own to react to a project event — you didn't ask for this turn.",
+    "chat.systemWakeup.success": "A background command finished successfully.",
+    "chat.systemWakeup.failure": "A background command failed.",
+    "chat.systemWakeup.cap": "Anti-loop limit reached: automatic wakeups paused.",
 
     // Monitoring
     "mon.title": "Monitoring",

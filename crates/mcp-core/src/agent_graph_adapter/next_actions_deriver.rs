@@ -224,13 +224,13 @@ impl NextActionsDeriverAdapter {
     /// Best-effort: ogni errore -> `Vec::new()` (mai propagato).
     async fn extract_via_llm(&self, assistant_text: &str) -> Vec<NextActionChoice> {
         // 1. Risoluzione modello (tier-only, regola G).
-        let (provider, model) =
-            match resolve_purpose_model_db(&self.db, "choices_extractor").await {
-                PurposeResolution::Resolved {
-                    provider, model, ..
-                } => (provider, model),
-                _ => return Vec::new(),
-            };
+        let (provider, model) = match resolve_purpose_model_db(&self.db, "choices_extractor").await
+        {
+            PurposeResolution::Resolved {
+                provider, model, ..
+            } => (provider, model),
+            _ => return Vec::new(),
+        };
         if SENTINELS.contains(&provider.as_str()) || SENTINELS.contains(&model.as_str()) {
             return Vec::new();
         }
@@ -355,10 +355,7 @@ impl NextActionsDeriver for NextActionsDeriverAdapter {
     /// Deriva le scelte da `cleaned_text` (gia' privo del blocco a monte). Ordine
     /// 1:1 con `next_actions.derive`: blocco -> deterministico -> LLM gated.
     /// Best-effort: ogni errore -> `Ok(vec![])`, mai `PortError`.
-    async fn derive(
-        &self,
-        cleaned_text: &str,
-    ) -> Result<Vec<NextActionChoice>, PortError> {
+    async fn derive(&self, cleaned_text: &str) -> Result<Vec<NextActionChoice>, PortError> {
         if cleaned_text.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -417,7 +414,10 @@ mod tests {
     #[test]
     fn block_entry_senza_prompt_scartata() {
         let text = "<suggested_actions>[{\"label\":\"solo label\"}]</suggested_actions>";
-        assert!(extract_block(text).is_empty(), "entry senza prompt scartata");
+        assert!(
+            extract_block(text).is_empty(),
+            "entry senza prompt scartata"
+        );
     }
 
     #[test]

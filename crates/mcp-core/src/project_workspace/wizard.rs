@@ -475,9 +475,8 @@ pub(super) fn short_matches_installed(short: &str, installed: &[String]) -> bool
 }
 
 // safety: pattern literal valido
-static RE_COMPOSE_PORT_VAR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"\$\{(PORT[A-Z0-9_]*)(?::-\d+)?\}").unwrap()
-});
+static RE_COMPOSE_PORT_VAR: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\$\{(PORT[A-Z0-9_]*)(?::-\d+)?\}").unwrap());
 
 /// Porta deterministica per suggerimenti web: evita conflitti già in fase di
 /// analisi. Punto unico su `deterministic_project_port_for_key`.
@@ -600,10 +599,7 @@ async fn detect_dotnet_launch_suggestions(
             .unwrap_or_else(|| root.to_string());
         let csproj = find_csproj_in(&cwd).await;
         let proj_arg = csproj.as_deref().unwrap_or(".");
-        let rel = cwd
-            .strip_prefix(root)
-            .unwrap_or("")
-            .trim_start_matches('/');
+        let rel = cwd.strip_prefix(root).unwrap_or("").trim_start_matches('/');
         let svc_short = if rel.is_empty() {
             "dotnet".to_string()
         } else {
@@ -640,7 +636,8 @@ async fn detect_cargo_bin_suggestions(root: &str, slug: &str) -> Vec<serde_json:
                 .filter_map(|l| {
                     let t = l.trim();
                     if t.starts_with("name") && content.contains("[[bin]]") {
-                        t.split_once('=').map(|x| x.1)
+                        t.split_once('=')
+                            .map(|x| x.1)
                             .map(|v| v.trim().trim_matches('"').to_string())
                     } else {
                         None
@@ -651,10 +648,7 @@ async fn detect_cargo_bin_suggestions(root: &str, slug: &str) -> Vec<serde_json:
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| root.to_string());
-            let rel = cwd
-                .strip_prefix(root)
-                .unwrap_or("")
-                .trim_start_matches('/');
+            let rel = cwd.strip_prefix(root).unwrap_or("").trim_start_matches('/');
             for bin in &bin_names {
                 let svc_short = format!("cargo-{}", bin);
                 suggestions.push(json!({
@@ -1205,7 +1199,10 @@ fn parse_env_body(body: &serde_json::Value) -> std::collections::HashMap<String,
 #[cfg(windows)]
 fn valida_short_command_windows(short: &str, command: &str) -> Result<(), ApiError> {
     if short.contains('/') || short.contains("..") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome servizio non valido",
+        ));
     }
     if command.trim().is_empty() {
         return Err(api_error(
@@ -1223,7 +1220,10 @@ async fn valida_cwd_windows(cwd: &str) -> Result<(), ApiError> {
     if tokio::fs::metadata(cwd).await.is_err() {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            format!("La directory di lavoro '{}' non esiste o non è accessibile", cwd),
+            format!(
+                "La directory di lavoro '{}' non esiste o non è accessibile",
+                cwd
+            ),
         ));
     }
     Ok(())
@@ -1235,7 +1235,11 @@ async fn valida_cwd_windows(cwd: &str) -> Result<(), ApiError> {
 fn costruisci_full_command(command: &str, body: &serde_json::Value) -> String {
     let args: Vec<String> = body["args"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if args.is_empty() {
         command.to_string()
@@ -1640,12 +1644,11 @@ fn costruisci_exec_start_con_porta(cwd: &str, exec_start: &str, p: u16) -> Strin
     // reale dal package.json. Necessario per Vite/Astro/Nuxt che ignorano
     // $PORT env e richiedono --port sulla CLI del tool, non del wrapper.
     let lower_exec = exec_start.to_lowercase();
-    let is_script_runner = (lower_exec.contains("npm")
-        || lower_exec.contains("pnpm")
-        || lower_exec.contains("yarn"))
-        && (lower_exec.contains(" run ")
-            || lower_exec.ends_with(" dev")
-            || lower_exec.ends_with(" start"));
+    let is_script_runner =
+        (lower_exec.contains("npm") || lower_exec.contains("pnpm") || lower_exec.contains("yarn"))
+            && (lower_exec.contains(" run ")
+                || lower_exec.ends_with(" dev")
+                || lower_exec.ends_with(" start"));
     if !is_script_runner {
         return rewrite_port_flags(exec_start, p);
     }
@@ -1923,7 +1926,15 @@ async fn registra_porte_unit(
     if let Some(fp) = final_port {
         aggiorna_service_unit_porta_principale(state, project_id, short, unit_name, fp).await;
     }
-    registra_porte_secondarie(state, project_id, short, unit_name, unit_content, final_port).await;
+    registra_porte_secondarie(
+        state,
+        project_id,
+        short,
+        unit_name,
+        unit_content,
+        final_port,
+    )
+    .await;
 }
 
 /// Installa un servizio come unit file systemd --user e lo abilita.
@@ -2042,9 +2053,16 @@ async fn install_service_systemd(
     let kind = body["kind"].as_str().unwrap_or("");
     let wants_port = matches!(kind, "npm" | "pnpm" | "dotnet" | "static")
         || looks_like_web_server_command(&exec_start);
-    let final_port =
-        alloca_porta_servizio(&state, &project_id, short, kind, wants_port, &reserved, &mut env_map)
-            .await;
+    let final_port = alloca_porta_servizio(
+        &state,
+        &project_id,
+        short,
+        kind,
+        wants_port,
+        &reserved,
+        &mut env_map,
+    )
+    .await;
 
     let exec_start = match final_port {
         Some(p) => costruisci_exec_start_con_porta(cwd, &exec_start, p),
@@ -2319,7 +2337,10 @@ async fn uninstall_project_service_windows(
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
 
     if service.contains('/') || service.contains("..") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome servizio non valido",
+        ));
     }
     // nome corto: rimuovi prefisso "{slug}-" e suffisso ".service" se presenti
     // (stessa normalizzazione di control_project_service_windows / list_services_windows).
@@ -3446,7 +3467,11 @@ fn emit_dotnet_run(
         let run_args: Vec<serde_json::Value> = if dir_label.is_empty() {
             vec![json!("run")]
         } else {
-            vec![json!("run"), json!("--project"), json!(dir_label.to_string())]
+            vec![
+                json!("run"),
+                json!("--project"),
+                json!(dir_label.to_string()),
+            ]
         };
         let cmd = if dir_label.is_empty() {
             format!("dotnet run{}", sdk_notice)
@@ -3582,7 +3607,10 @@ mod tests {
     fn derive_env_label_api_prefix_riconosciuta() {
         // Il backend sibling puo' avere label "api-*" oltre a "backend-*".
         let mut env: HashMap<String, String> = HashMap::new();
-        let siblings = vec![(30001, "frontend".to_string()), (30002, "api-main".to_string())];
+        let siblings = vec![
+            (30001, "frontend".to_string()),
+            (30002, "api-main".to_string()),
+        ];
         derive_frontend_sibling_env(&mut env, &siblings, "vite", "node");
         assert_eq!(
             env.get("VITE_API_URL").map(String::as_str),
