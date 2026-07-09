@@ -403,6 +403,7 @@ mod tests {
         assert!(is_long_oneshot("npx playwright test --project=chromium"));
         assert!(is_long_oneshot("pnpm add -D @playwright/test"));
         assert!(is_long_oneshot("npm run build"));
+        assert!(is_long_oneshot("npx vite build"));
         // I server long-running NON sono one-shot.
         assert!(!is_long_oneshot("node server.js"));
         assert!(!is_long_oneshot("npm run dev"));

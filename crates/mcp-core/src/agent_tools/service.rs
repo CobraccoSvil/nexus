@@ -80,6 +80,10 @@ const WEB_TOKENS: &[&str] = &[
 /// In caso di dubbio (es. `make foo`), NON inietta PORT: l'agente puo' chiamare
 /// `request_port` esplicitamente e includere la porta nel comando.
 pub(crate) fn looks_like_web_service(command: &str) -> bool {
+    // One-shot build/install/test: non sono servizi web (regola L: is_long_oneshot).
+    if is_long_oneshot(command) {
+        return false;
+    }
     let lc = command.to_lowercase();
     WEB_TOKENS.iter().any(|t| lc.contains(t))
 }
@@ -1096,6 +1100,10 @@ mod tests {
         assert!(!looks_like_web_service("ls -la"));
         assert!(!looks_like_web_service("cargo build"));
         assert!(!looks_like_web_service("npm install"));
+        // Regressione final_gate: `npx vite build` non va a run_service (exit_code null).
+        assert!(!looks_like_web_service("npx vite build"));
+        assert!(!looks_like_web_service("pnpm vite build"));
+        assert!(!looks_like_web_service("npm run build"));
     }
 
     /// Regressione deadlock allocazione stantia + ordine dedup/refuse.

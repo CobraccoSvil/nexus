@@ -216,6 +216,11 @@ async fn maybe_route_to_service(
         ));
     }
 
+    // One-shot lunghi (build/install/test): esecuzione sincrona, non run_service.
+    if is_long_oneshot(command) {
+        return None;
+    }
+
     // ── Livello 2: lista hardcoded di comandi noti ──
     if looks_like_long_running_command(command, &ctx.long_running_patterns)
         || service::looks_like_web_service(command)
