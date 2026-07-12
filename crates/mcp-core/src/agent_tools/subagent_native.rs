@@ -313,17 +313,24 @@ fn fanin_target_run_id(ctx: &AgentToolContext, anchor: Uuid) -> Uuid {
     ctx.core.run_id.unwrap_or(anchor)
 }
 
-/// Profondita' corrente DERIVATA dalla catena `nexus_subagent_runs` (anti-ricorsione,
-/// punto unico). Il nuovo sub-run avra' `1 + max(depth)` tra i sub-run con lo stesso
-/// `parent_anchor` ancora `running`. Nessun sub-run attivo -> il nuovo e' depth 1.
-async fn current_chain_depth(pool: &sqlx::PgPool, anchor: Uuid) -> i64 {
+/// Profondita' del nuovo sub-run nella CATENA ANTENATI (anti-ricorsione, punto
+/// unico). E' `1 + depth del DISPATCHER` (il run chiamante immediato), NON il
+/// `MAX(depth)` tra i sub-run `running` sotto l'anchor: quest'ultimo contava i
+/// FRATELLI paralleli (fan-out) come antenati e gonfiava la profondita', facendo
+/// rifiutare le figure del consiglio convocate in parallelo ("depth 3 > max 2"
+/// pur essendo tutte figlie DIRETTE del run principale). La profondita' deve
+/// misurare la LUNGHEZZA della catena padre->figlio, immune al numero di fratelli
+/// concorrenti (stessa distinzione anchor-vs-dispatcher gia' adottata dalla COUNT
+/// del fan-in). Il dispatcher, se e' a sua volta un sub-run, ha una row con
+/// `id = dispatcher_run_id` e la sua depth -> il figlio e' depth+1; se il
+/// dispatcher e' il run PRINCIPALE (nessuna row) -> 0 -> figlio depth 1.
+async fn current_chain_depth(pool: &sqlx::PgPool, dispatcher_run_id: Uuid) -> i64 {
     // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
-    sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MAX(depth)::bigint FROM nexus_subagent_runs \
-         WHERE parent_run_id = $1 AND status = 'running'",
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(depth, 0)::bigint FROM nexus_subagent_runs WHERE id = $1",
     )
-    .bind(anchor)
-    .fetch_one(pool)
+    .bind(dispatcher_run_id)
+    .fetch_optional(pool)
     .await
     .ok()
     .flatten()
@@ -2344,9 +2351,13 @@ async fn prepare_subagent_run(
         Err(e) => return Err(prepare_reject("definition_fetch_failed", e)),
     };
 
-    // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena) ───────────────
+    // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena ANTENATI) ──────
+    // La profondita' del figlio = depth del DISPATCHER (padre immediato) + 1, NON
+    // il MAX tra i fratelli running sotto l'anchor: i fratelli paralleli (es. le 6
+    // figure del consiglio) non devono contarsi a vicenda come annidamento.
     let anchor = parent_anchor(ctx);
-    let current_depth = current_chain_depth(&proj_pool, anchor).await + 1;
+    let dispatcher = fanin_target_run_id(ctx, anchor);
+    let current_depth = current_chain_depth(&proj_pool, dispatcher).await + 1;
     if current_depth > settings.max_depth {
         return Err(prepare_reject(
             "depth_exceeded",
@@ -5058,6 +5069,68 @@ mod tests {
         let report = classify_council_figure_result("security_engineer", &result);
         assert_eq!(report.status, FigureAdvisoryStatus::PrepareFailed);
         assert_eq!(report.detail_code, "depth_exceeded");
+    }
+
+    /// REGRESSIONE consiglio "depth 3 > max 2": la profondita' del sub-run deriva
+    /// dalla CATENA ANTENATI (depth del dispatcher), NON dal MAX tra i fratelli
+    /// paralleli sotto l'anchor. Le 6 figure convocate dal run principale sono
+    /// tutte figlie DIRETTE -> depth 1, non 1/2/3 (che faceva rifiutare le ultime).
+    #[sqlx::test]
+    async fn chain_depth_immune_ai_fratelli_paralleli(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_runs ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 parent_run_id UUID NOT NULL, \
+                 dispatcher_run_id UUID, \
+                 depth INTEGER, \
+                 status TEXT NOT NULL )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create nexus_subagent_runs");
+
+        let main = Uuid::new_v4(); // run principale (dispatcher figure): NON ha row
+        let anchor = Uuid::new_v4(); // anchor condiviso dalle figure
+
+        // 3 figure gia' registrate sotto lo stesso anchor, running, depth 1 (tutte
+        // figlie dirette del main). Col vecchio MAX(depth running under anchor) la
+        // 4a figura avrebbe preso 1 -> depth 2, poi 3 -> rifiuto.
+        for _ in 0..3 {
+            sqlx::query(
+                "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, depth, status) \
+                 VALUES ($1, $2, 1, 'running')",
+            )
+            .bind(anchor)
+            .bind(main)
+            .execute(&pool)
+            .await
+            .expect("insert figura");
+        }
+        // Dispatcher = main (nessuna row) -> base 0 -> figlio depth 1, a prescindere
+        // dai 3 fratelli running. (Vecchio codice: 2.)
+        assert_eq!(
+            current_chain_depth(&pool, main).await,
+            0,
+            "il main non ha row -> depth base 0; i fratelli paralleli NON contano"
+        );
+
+        // Catena reale: un dispatcher che E' un sub-run a depth 1 -> figlio depth 2.
+        let d1 = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, depth, status) \
+             VALUES ($1, $2, $3, 1, 'running')",
+        )
+        .bind(d1)
+        .bind(anchor)
+        .bind(main)
+        .execute(&pool)
+        .await
+        .expect("insert dispatcher depth1");
+        assert_eq!(
+            current_chain_depth(&pool, d1).await,
+            1,
+            "figlio di un dispatcher a depth 1 -> base 1 (+1 = depth 2)"
+        );
     }
 
     #[test]
