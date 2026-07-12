@@ -307,6 +307,55 @@ test("consiglio competenze degradato espone figure_reports strutturati", () => {
   assert.equal(event.figureReports?.[0]?.detail_code, "depth_exceeded");
 });
 
+test("consiglio competenze propaga il parere advisory completo di ogni figura", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_synthesis_present",
+        activated: true,
+        figure_count: 1,
+        figure_reports: [
+          {
+            kind: "security_engineer",
+            status: "advisory_ok",
+            detail_code: "advisory_ok",
+            detail_message: "Parere advisory valido",
+            advisory_verdict: "proceed_with_changes",
+            advisory: {
+              verdict: "proceed_with_changes",
+              requirements: ["Cifrare i token a riposo"],
+              risks: [{ severity: "alta", description: "2FA senza rate limit" }],
+              recommendations: ["Aggiungere audit log"],
+            },
+          },
+        ],
+      },
+      "Consiglio delle Competenze",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+    );
+
+  assert.ok(event, "evento Consiglio atteso");
+  const report = event.figureReports?.[0];
+  assert.ok(report, "report figura atteso");
+  assert.equal(report.advisory_verdict, "proceed_with_changes");
+  assert.ok(report.advisory, "parere advisory strutturato atteso");
+  assert.equal(report.advisory.verdict, "proceed_with_changes");
+  assert.deepEqual(report.advisory.requirements, ["Cifrare i token a riposo"]);
+  assert.equal(report.advisory.risks?.length, 1);
+  assert.equal(report.advisory.risks?.[0]?.severity, "alta");
+  assert.deepEqual(report.advisory.recommendations, ["Aggiungere audit log"]);
+});
+
 test("consiglio competenze degradato espone segnale strutturato", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [
