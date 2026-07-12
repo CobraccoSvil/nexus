@@ -201,6 +201,11 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 Some("cooldown") | Some("transient") => ProviderFailureCause::Cooldown,
                 Some("billing") | Some("cooldown_billing") => ProviderFailureCause::Billing,
                 Some("client_error") => ProviderFailureCause::ClientError,
+                // 200 degenere (content vuoto, zero tool-call, finish non
+                // terminale): il provider e' sano ma il turno e' improduttivo.
+                // Causa dedicata cosi' l'executor RIPIEGA cross-provider (ramo
+                // else != ClientError), invece di chiudere con un hollow turn.
+                Some("empty_completion") => ProviderFailureCause::EmptyCompletion,
                 _ => ProviderFailureCause::Unknown,
             };
             PortError::ProviderUnavailable(ProviderUnavailableInfo::new(cause, err.to_string()))

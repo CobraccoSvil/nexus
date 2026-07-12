@@ -3443,6 +3443,10 @@ della finestra {effective_window} del modello {provider}/{model}"
 passo a {}/{}",
                                     pick.provider, pick.model
                                 ),
+                                Cause::EmptyCompletion => format!(
+                                    "{provider} non ha prodotto output: passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
                                 Cause::Cooldown | Cause::Unknown => format!(
                                     "Provider {provider} non disponibile: passo a {}/{}",
                                     pick.provider, pick.model
@@ -3484,6 +3488,11 @@ prossimo step concreto del compito."
                                 Cause::Billing => {
                                     "Il provider precedente ha il credito esaurito. Riprendi \
 tu, su un provider sano: esegui il prossimo step concreto del compito."
+                                }
+                                Cause::EmptyCompletion => {
+                                    "Il provider precedente ha risposto senza produrre output \
+(nessun testo ne' azione: budget consumato nel ragionamento). Riprendi tu, sul nuovo provider: \
+esegui il prossimo step concreto del compito."
                                 }
                                 Cause::Cooldown | Cause::Unknown => {
                                     "Il provider precedente non e' disponibile (in cooldown). \

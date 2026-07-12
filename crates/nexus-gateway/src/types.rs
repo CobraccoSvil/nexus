@@ -226,6 +226,49 @@ pub struct LlmResponse {
     pub thinking_signature: Option<String>,
 }
 
+impl LlmResponse {
+    /// Risposta DEGENERE: HTTP 200 senza alcun output utile (regola M, solo
+    /// segnali strutturati, mai parsing di prosa). Vero quando il turno non
+    /// produce ne' testo ne' tool-call E il `finish_reason` non e' una chiusura
+    /// legittima. Caso tipico: Gemini consuma l'intero budget nel thinking e
+    /// ritorna `content=""`, `tool_calls=None`, `finish_reason="length"`
+    /// (google.rs `map_finish_reason` MAX_TOKENS -> "length"). Senza questo
+    /// predicato il gateway tratterebbe il 200 come successo e il motore non
+    /// ripiegherebbe mai su un provider alternativo.
+    ///
+    /// Condizioni (tutte necessarie):
+    /// - `content` vuoto o solo whitespace;
+    /// - nessuna tool-call (`None` oppure `Vec` vuoto);
+    /// - `finish_reason` NON e' un blocco di safety deliberato (`"content_filter"`),
+    ///   l'unico esito con output vuoto che NON va aggirato con un failover.
+    ///
+    /// NB (regola M): il segnale PRIMARIO e strutturale e' "nessun output utile"
+    /// (content vuoto + zero tool-call). NON si esclude `"stop"`: Google
+    /// (`map_finish_reason`) collassa a `"stop"` ogni finishReason anomalo non
+    /// mappato — `MALFORMED_FUNCTION_CALL`, `OTHER`, `BLOCKLIST`,
+    /// `FINISH_REASON_UNSPECIFIED` — e `MALFORMED_FUNCTION_CALL` con output vuoto e'
+    /// il caso Gemini PIU' frequente di hollow sul tool-forcing (agent_run.rs:3169).
+    /// Un turno senza output e' inservibile qualunque sia il `finish_reason`, e
+    /// ripiegare su un altro provider e' sempre preferibile a restituire un 200
+    /// vuoto; la sola eccezione e' `content_filter`, dove il vuoto e' una scelta di
+    /// safety intenzionale da non aggirare.
+    ///
+    /// Non e' degenere una risposta con SOLE tool-call (content vuoto ma
+    /// `tool_calls` non vuoto): e' il normale comportamento agentico.
+    pub fn is_degenerate_completion(&self) -> bool {
+        let no_content = self.content.trim().is_empty();
+        let no_tool_calls = self
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty());
+        // Solo il blocco di safety (`content_filter`) e' una chiusura legittima con
+        // output vuoto; `"stop"` NON e' escluso (Google vi collassa anche
+        // MALFORMED_FUNCTION_CALL, output vuoto reale che deve ripiegare).
+        let safety_block = self.finish_reason == "content_filter";
+        no_content && no_tool_calls && !safety_block
+    }
+}
+
 /// Delta di tool-call durante lo streaming.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallDeltaFunction {
@@ -468,4 +511,79 @@ pub struct ModelAliasEntry {
     pub onprem: Option<String>,
     pub min_tier: SensitivityTier,
     pub max_tier: SensitivityTier,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Costruisce una `LlmResponse` minimale variando i soli campi rilevanti per
+    /// il predicato di degenerazione.
+    fn resp(content: &str, tool_calls: Option<Vec<LlmToolCall>>, finish_reason: &str) -> LlmResponse {
+        LlmResponse {
+            content: content.to_string(),
+            tool_calls,
+            usage: LlmUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            },
+            model_used: "m".to_string(),
+            provider_used: "p".to_string(),
+            latency_ms: 0,
+            finish_reason: finish_reason.to_string(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+        }
+    }
+
+    fn a_tool_call() -> LlmToolCall {
+        LlmToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: ToolFunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+            thought_signature: None,
+        }
+    }
+
+    #[test]
+    fn empty_content_length_finish_is_degenerate() {
+        // Caso Gemini: budget consumato dal thinking, content vuoto,
+        // finish_reason="length", nessuna tool-call -> degenere.
+        assert!(resp("", None, "length").is_degenerate_completion());
+        assert!(resp("   \n\t ", None, "length").is_degenerate_completion());
+        assert!(resp("", Some(vec![]), "length").is_degenerate_completion());
+    }
+
+    #[test]
+    fn only_tool_calls_is_not_degenerate() {
+        // Comportamento agentico legittimo: content vuoto ma tool-call presenti.
+        let r = resp("", Some(vec![a_tool_call()]), "tool_calls");
+        assert!(!r.is_degenerate_completion());
+        // Anche con content vuoto e finish_reason non-stop: le tool-call salvano.
+        let r2 = resp("", Some(vec![a_tool_call()]), "length");
+        assert!(!r2.is_degenerate_completion());
+    }
+
+    #[test]
+    fn empty_stop_is_degenerate_but_safety_block_is_not() {
+        // "stop" con output vuoto e' DEGENERE: Google collassa a "stop" anche
+        // MALFORMED_FUNCTION_CALL (il caso Gemini piu' frequente di hollow sul
+        // tool-forcing). Il turno non ha output -> deve ripiegare su un altro provider.
+        assert!(resp("", None, "stop").is_degenerate_completion());
+        // Blocco di safety (content_filter): esito deliberato, NON aggirabile via failover.
+        assert!(!resp("", None, "content_filter").is_degenerate_completion());
+    }
+
+    #[test]
+    fn non_empty_content_is_not_degenerate() {
+        // Qualsiasi testo utile -> non degenere, a prescindere dal finish_reason.
+        assert!(!resp("ok", None, "length").is_degenerate_completion());
+        assert!(!resp("parziale", None, "stop").is_degenerate_completion());
+    }
 }

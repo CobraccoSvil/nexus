@@ -533,7 +533,9 @@ async fn run_fallback(
 /// Fallimento di UN provider della chain, in forma STRUTTURATA (regola M).
 /// `class` e' il vocabolario chiuso condiviso col motore agentico:
 /// `billing` | `client_error` | `transient` (esito della chiamata) oppure
-/// `cooldown` | `cooldown_billing` (provider saltato senza chiamarlo).
+/// `cooldown` | `cooldown_billing` (provider saltato senza chiamarlo) oppure
+/// `empty_completion` (200 senza output utile: content vuoto, zero tool-call,
+/// finish_reason non terminale -> chain prosegue / failover cross-provider).
 /// `status`/`code` arrivano dal [`ProviderHttpError`] quando disponibili.
 struct ProviderFailure {
     provider: String,
@@ -577,6 +579,22 @@ impl CallFailure {
             status: http.map(|h| h.status),
             code: http.and_then(|h| h.code.clone()),
             message: err.to_string(),
+        }
+    }
+
+    /// Fallimento per risposta DEGENERE (HTTP 200 senza output utile, regola M).
+    /// Non e' colpa di salute/credito del provider (nessun cooldown billing o
+    /// transient da marcare): e' un turno improduttivo che deve far proseguire la
+    /// chain al provider successivo. `status`/`code` restano `None` (non c'e' un
+    /// errore HTTP), la classe strutturata `empty_completion` porta l'informazione.
+    fn empty_completion(finish_reason: &str) -> Self {
+        Self {
+            class: "empty_completion",
+            status: None,
+            code: None,
+            message: format!(
+                "risposta degenere: nessun testo ne' tool-call (finish_reason={finish_reason})"
+            ),
         }
     }
 
@@ -636,7 +654,30 @@ async fn complete_with_retry(
         }
 
         match provider.complete(&call_req).await {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => {
+                // PUNTO UNICO di validazione della risposta (regola L+M): un 200
+                // senza output utile (content vuoto E nessuna tool-call E
+                // finish_reason non terminale, es. Gemini "length" col budget
+                // consumato dal thinking) e' un fallimento STRUTTURATO, non un
+                // successo. Convertirlo in `Err(empty_completion)` fa proseguire
+                // la chain al provider successivo (ramo Err in run_fallback =
+                // push failure + continue) e, sull'ultimo elemento, produce un
+                // 500 PROVIDER_ERROR con primary_cause="empty_completion" che il
+                // motore mappa a failover cross-provider. NON marcare cooldown
+                // billing/transient (non e' colpa di salute/credito) e NON
+                // ritentare lo stesso modello: la degenerazione da budget e'
+                // deterministica.
+                if resp.is_degenerate_completion() {
+                    tracing::warn!(
+                        provider = name,
+                        finish_reason = %resp.finish_reason,
+                        "gateway: risposta degenere (content vuoto, zero tool-call, \
+                         finish non terminale) -> failure empty_completion, passo oltre"
+                    );
+                    return Err(CallFailure::empty_completion(&resp.finish_reason));
+                }
+                return Ok(resp);
+            }
             Err(err) => {
                 // Classificazione DETERMINISTICA su status/codice strutturato
                 // (regola H): il testo del messaggio serve solo per log/display.

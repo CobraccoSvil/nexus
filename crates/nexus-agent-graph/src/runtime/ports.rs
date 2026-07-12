@@ -70,6 +70,13 @@ pub enum ProviderFailureCause {
     ClientError,
     /// Provider escluso dalla policy per il sensitivity tier del contenuto.
     PolicyTierExcluded,
+    /// Il provider ha risposto 200 ma DEGENERE: nessun testo ne' tool-call, con
+    /// `finish_reason` non terminale (tipicamente Gemini che consuma il budget
+    /// nel thinking e ritorna `length`). Il provider e' raggiungibile e non ha
+    /// esaurito credito: e' il TURNO a non aver prodotto output. Va trattato
+    /// come indisponibilita' del provider PER QUESTA richiesta -> failover
+    /// cross-provider (a differenza di `ClientError`, che non ripiega).
+    EmptyCompletion,
     /// Non determinabile dai segnali disponibili.
     Unknown,
 }
@@ -82,12 +89,15 @@ impl ProviderFailureCause {
             Self::Billing => "billing",
             Self::ClientError => "client_error",
             Self::PolicyTierExcluded => "policy_tier_excluded",
+            Self::EmptyCompletion => "empty_completion",
             Self::Unknown => "unknown",
         }
     }
 
     /// `true` quando lo switch e' dovuto a indisponibilita' temporale del
     /// provider (cooldown/credito): il frontend colora la banda come cooldown.
+    /// `EmptyCompletion` NON e' cooldown-like: il provider e' sano e non ha
+    /// esaurito credito, e' il turno a non aver prodotto output.
     pub fn is_cooldown_like(self) -> bool {
         matches!(self, Self::Cooldown | Self::Billing)
     }
