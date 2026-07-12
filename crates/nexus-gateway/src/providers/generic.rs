@@ -15,6 +15,8 @@
 //! (nessun `reasoning_effort`/`extra_body.thinking`). Il client mappa comunque un
 //! eventuale `reasoning_content` emesso dal modello.
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use reqwest::Client;
 
@@ -54,6 +56,24 @@ impl GenericOpenAiProvider {
             supports_tools,
         }
     }
+
+    /// Garanzia difensiva (regola H): se il provider dichiara `supports_tools=false`
+    /// (es. Perplexity sonar, che rifiuta le tool definitions con HTTP 400), rimuove
+    /// `tools`/`tool_choice` dalla richiesta PRIMA dell'invio. La garanzia PRIMARIA
+    /// e' il layer di selezione (il selettore agentico esclude i modelli
+    /// `supports_tool_use=false`), ma un pin/override utente potrebbe forzare il
+    /// provider con tool allegati: qui evitiamo il 400 alla fonte. Zero-copy
+    /// (`Cow::Borrowed`) quando non c'e' nulla da strippare.
+    fn prepared<'a>(&self, req: &'a LlmRequest) -> Cow<'a, LlmRequest> {
+        if self.supports_tools || (req.tools.is_none() && req.tool_choice.is_none()) {
+            Cow::Borrowed(req)
+        } else {
+            let mut r = req.clone();
+            r.tools = None;
+            r.tool_choice = None;
+            Cow::Owned(r)
+        }
+    }
 }
 
 #[async_trait]
@@ -79,11 +99,13 @@ impl LlmProvider for GenericOpenAiProvider {
     }
 
     async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
-        self.client.complete(req).await
+        let prepared = self.prepared(req);
+        self.client.complete(prepared.as_ref()).await
     }
 
     async fn stream(&self, req: &LlmRequest) -> anyhow::Result<ChunkStream> {
-        self.client.stream(req).await
+        let prepared = self.prepared(req);
+        self.client.stream(prepared.as_ref()).await
     }
 
     async fn healthcheck(&self) -> bool {
