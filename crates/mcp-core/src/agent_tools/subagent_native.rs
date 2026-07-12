@@ -1704,6 +1704,41 @@ pub(crate) async fn convene_council(
     }
 }
 
+/// Convoca un PANEL di revisori (kind=review) in PARALLELO e compone il verdetto
+/// AVVERSARIO col punto unico `compose_panel_verdict` (Fase C ultracode, regola
+/// L/M: legge `outcome.review`, mai la prosa). Usato dal RINFORZO PROGRAMMATICO
+/// (post-step in agent_run): rende la review deterministica invece che affidata
+/// alla sola direttiva LLM `<revisione_finale>`. `None` se nessun revisore produce
+/// un verdetto valido. Best-effort: i guard di `prepare_subagent_run` restano
+/// attivi; il routing esclude il provider del padre (indipendenza avversaria,
+/// review). `reviewers` e' clampato a >=1.
+pub(crate) async fn convene_review_panel(
+    ctx: &AgentToolContext,
+    task: &str,
+    reviewers: usize,
+    policy: &nexus_agent_graph::decisions::QuorumPolicy,
+) -> Option<nexus_agent_graph::decisions::PanelOutcome> {
+    let n = reviewers.max(1);
+    let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
+                    (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
+                    concreta). Un fail richiede almeno un finding grave con evidenza.";
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut futs = FuturesUnordered::new();
+    for _ in 0..n {
+        let ctx = ctx.clone();
+        let task = task.to_string();
+        let expected = expected.to_string();
+        futs.push(async move {
+            run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await
+        });
+    }
+    let mut outcomes: Vec<Value> = Vec::with_capacity(n);
+    while let Some(r) = futs.next().await {
+        outcomes.push(r.get("outcome").cloned().unwrap_or(Value::Null));
+    }
+    nexus_agent_graph::decisions::compose_panel_verdict(&outcomes, policy)
+}
+
 /// Convoca lo stesso analista read-only su provider diversi, scelti dal catalog
 /// tramite purpose tier-aware. Nessuna chiamata diretta ai provider: sono sub-run
 /// nativi con provider/model pin derivati dal DB e passati al grafo.

@@ -2878,7 +2878,7 @@ pub(crate) async fn spawn_agent_run(
                     pre_run_advisory_source: pre_run_advisory_source_clone,
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
-                    Ok(outcome) => {
+                    Ok(mut outcome) => {
                         // Niente leak: si logga la LUNGHEZZA della risposta, non il
                         // contenuto (regola F). provider/model EFFETTIVI post cascade.
                         tracing::info!(
@@ -2906,6 +2906,20 @@ pub(crate) async fn spawn_agent_run(
                                 session_id_cp,
                             )
                             .await;
+                        // Rinforzo PROGRAMMATICO della review adversariale a valle
+                        // (regola H): la direttiva <revisione_finale> (mig 0571) e'
+                        // LLM-driven e puo' essere saltata. Qui, se il run ha
+                        // MODIFICATO codice e NON ha gia' fatto una review, il panel
+                        // viene convocato dal codice e il verdetto riconciliato nel
+                        // resoconto. No-op se disabilitato o non pertinente.
+                        maybe_convene_review_panel(
+                            &state_for_finalize,
+                            &steps_pool,
+                            session_id_cp,
+                            run_id,
+                            &mut outcome,
+                        )
+                        .await;
                         native_result =
                             Some(native_outcome_to_run_result(&steps_pool, run_id, outcome).await);
                         native_steps_persisted = true;
@@ -5389,6 +5403,193 @@ async fn maybe_convene_council(
     })
 }
 
+/// `true` se il path e' un file di CODICE (una modifica a codice merita review;
+/// config/markdown/asset no). Estensione case-insensitive.
+fn is_code_file(path: &str) -> bool {
+    const CODE_EXT: &[&str] = &[
+        "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java", "rb", "php", "cs", "cpp",
+        "cc", "c", "h", "hpp", "vue", "svelte", "sql", "kt", "swift",
+    ];
+    path.rsplit('.')
+        .next()
+        .map(|e| CODE_EXT.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Segnali strutturati dagli step del run (regola M, MAI dalla prosa): file di
+/// CODICE modificati + se un panel di review e' GIA' stato prodotto. Il tool reale
+/// e' annidato in `agent_steps.tool_input` (`{tool_name, tool_input:{path}}`); la
+/// presenza di un panel si legge dal `panel_verdict` nel tool_result del fan-in.
+async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
+    use sqlx::Row;
+    const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
+    let rows = sqlx::query(
+        "SELECT tool_input->>'tool_name' AS tname, \
+                tool_input->'tool_input'->>'path' AS fpath, \
+                tool_result \
+         FROM agent_steps WHERE run_id = $1 ORDER BY step_index",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut modified: Vec<String> = Vec::new();
+    let mut reviewed = false;
+    for r in rows {
+        let tname: String = r.try_get::<Option<String>, _>("tname").ok().flatten().unwrap_or_default();
+        if WRITE_TOOLS.contains(&tname.as_str()) {
+            if let Some(p) = r.try_get::<Option<String>, _>("fpath").ok().flatten() {
+                if is_code_file(&p) && !modified.iter().any(|m| *m == p) {
+                    modified.push(p);
+                }
+            }
+        }
+        if !reviewed {
+            if let Some(res) = r.try_get::<Option<String>, _>("tool_result").ok().flatten() {
+                if res.contains("panel_verdict") {
+                    reviewed = true;
+                }
+            }
+        }
+    }
+    (modified, reviewed)
+}
+
+/// Nota onesta (regola M) da anteporre/aggiungere al resoconto quando la review
+/// programmatica NON approva. Findings limitati per non gonfiare.
+fn render_review_panel_note(panel: &nexus_agent_graph::decisions::PanelOutcome) -> String {
+    use nexus_agent_graph::decisions::PanelVerdict;
+    let label = match panel.verdict {
+        PanelVerdict::Fail => "NON superata (difetti bloccanti)",
+        PanelVerdict::NeedsChanges => "richiede modifiche",
+        PanelVerdict::Inconclusive => "non conclusiva (quorum non raggiunto)",
+        PanelVerdict::Pass => "superata",
+    };
+    let mut s = format!(
+        "**Review adversariale automatica: {label}** ({}/{} voti validi). Un panel di \
+         revisori indipendenti ha esaminato le modifiche di questo run.",
+        panel.valid, panel.total_reviews
+    );
+    let mut shown = 0;
+    for f in &panel.findings {
+        if shown >= 8 {
+            break;
+        }
+        let desc = f.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        if desc.is_empty() {
+            continue;
+        }
+        let sev = f.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+        let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
+        s.push_str(&format!("\n- [{sev}] {file}: {desc}"));
+        shown += 1;
+    }
+    s.push_str("\n\nControlla e correggi i punti sopra prima di considerare il task concluso.");
+    s
+}
+
+/// RINFORZO PROGRAMMATICO della review adversariale a valle (regola H): la
+/// direttiva `<revisione_finale>` (mig 0571) e' LLM-driven e puo' essere saltata.
+/// Se il run ha DICHIARATO done, ha MODIFICATO codice e NON ha gia' fatto una
+/// review, convoca il panel dal codice (`convene_review_panel`) e riconcilia il
+/// verdetto nel resoconto (nota onesta se non approva; simmetrico alla nota
+/// final_gate). Gate DB-driven `orchestrator.review_panel_autoconvene_enabled`
+/// (mig 0572). No-op fuori dai casi pertinenti: non altera il flusso.
+async fn maybe_convene_review_panel(
+    state: &AppState,
+    steps_pool: &PgPool,
+    session_id: Uuid,
+    run_id: Uuid,
+    outcome: &mut crate::native_engine::NativeRunOutcome,
+) {
+    // Solo su un run CHIUSO come done: rivedere un lavoro dichiarato incompleto
+    // (blocked/partial/needs_input) o non completato e' rumore.
+    if !outcome.completed {
+        return;
+    }
+    let declared = outcome
+        .declared_outcome
+        .as_ref()
+        .and_then(|v| v.get("outcome"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if matches!(declared, "blocked" | "partial" | "needs_input") {
+        return;
+    }
+    if !nexus_auth::get_bool_setting(&state.db, "orchestrator.review_panel_autoconvene_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let (modified, already_reviewed) = review_gate_signals(steps_pool, run_id).await;
+    if modified.is_empty() || already_reviewed {
+        return;
+    }
+    let deps = build_tool_runner_deps(state);
+    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
+    let ctx = match svc.build_ctx(session_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(run_id = %run_id, "review panel: build_ctx fallita: {e}");
+            return;
+        }
+    };
+    let policy = nexus_agent_graph::decisions::QuorumPolicy {
+        min_valid_verdicts: nexus_auth::get_setting(&state.db, "orchestrator.review_quorum_min_valid")
+            .await
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1),
+        fail_on_high_severity: nexus_auth::get_bool_setting(
+            &state.db,
+            "orchestrator.review_fail_on_high_severity",
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(true),
+    };
+    let reviewers = nexus_auth::get_setting(&state.db, "orchestrator.review_panel_size")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1);
+    let files_line = modified
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let task = format!(
+        "Rivedi le modifiche al codice appena applicate dal run corrente. File modificati:\n\
+         {files_line}\n\nLeggi questi file, verifica correttezza, sicurezza, edge case e \
+         regressioni, e dichiara il verdetto con review_verdict."
+    );
+    tracing::info!(
+        run_id = %run_id,
+        reviewers,
+        files = modified.len(),
+        "review panel: convocazione programmatica (rinforzo <revisione_finale>)"
+    );
+    let Some(panel) =
+        crate::agent_tools::subagent_native::convene_review_panel(&ctx, &task, reviewers, &policy)
+            .await
+    else {
+        return; // nessun verdetto valido: best-effort, niente nota
+    };
+    if !panel.verdict.is_approved() {
+        let note = render_review_panel_note(&panel);
+        let base = outcome.final_answer.clone().unwrap_or_default();
+        outcome.final_answer = Some(if base.trim().is_empty() {
+            note
+        } else {
+            format!("{base}\n\n---\n{note}")
+        });
+    }
+}
+
 async fn maybe_convene_multi_provider_panel(
     state: &AppState,
     session_id: Uuid,
@@ -5733,6 +5934,35 @@ pub(crate) async fn run_shadow_for_state(
 ) -> anyhow::Result<()> {
     let deps = build_native_deps(state).await;
     crate::native_engine::run_shadow(&deps, input, primary_run_id).await
+}
+
+#[cfg(test)]
+mod tests_review_gate {
+    use super::is_code_file;
+
+    #[test]
+    fn is_code_file_riconosce_codice_e_scarta_il_resto() {
+        for ok in [
+            "src/utils/utils.ts",
+            "app/Login.tsx",
+            "crates/x/src/lib.rs",
+            "backend/server.js",
+            "db/migrations/0001.sql",
+            "MODULE.PY",
+        ] {
+            assert!(is_code_file(ok), "atteso codice: {ok}");
+        }
+        for no in [
+            "README.md",
+            "package.json",
+            "styles.css",
+            "logo.png",
+            "config.yaml",
+            "senza_estensione",
+        ] {
+            assert!(!is_code_file(no), "atteso NON codice: {no}");
+        }
+    }
 }
 
 #[cfg(test)]
