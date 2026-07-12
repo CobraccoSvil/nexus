@@ -1,12 +1,11 @@
-/* eslint-disable @typescript-eslint/ban-ts-comment */
-// @ts-nocheck
 "use client";
 
 /**
- * SubagentDefinitionsEditor — PR-4 CRUD per nexus_subagent_definitions.
+ * SubagentDefinitionsEditor — CRUD per nexus_subagent_definitions
+ * (endpoint admin-service /api/admin/orchestrator/subagents/*).
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState, type CSSProperties } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
 import {
@@ -19,6 +18,9 @@ import {
 } from "../../lib/api-client";
 
 interface EditState {
+  /** true = creazione: il kind e' editabile. In modifica il kind e' bloccato
+   *  (l'upsert e' ON CONFLICT (kind): rinominare creerebbe una riga duplicata). */
+  isNew: boolean;
   kind: string;
   description: string;
   promptKey: string;
@@ -32,6 +34,7 @@ interface EditState {
 
 function emptyEdit(): EditState {
   return {
+    isNew: true,
     kind: "",
     description: "",
     promptKey: "",
@@ -111,6 +114,7 @@ export function SubagentDefinitionsEditor() {
       return;
     }
     setEditing({
+      isNew: false,
       kind: def.kind,
       description: def.description ?? "",
       promptKey: def.promptKey,
@@ -170,8 +174,8 @@ export function SubagentDefinitionsEditor() {
         </thead>
         <tbody>
           {defs.map((d) => (
-            <>
-              <tr key={d.kind} style={{ borderBottom: `1px solid ${tc.border}33` }}>
+            <Fragment key={d.kind}>
+              <tr style={{ borderBottom: `1px solid ${tc.border}33` }}>
                 <td style={{ padding: 8, fontWeight: 600 }}>
                   <button onClick={() => toggleExpand(d.kind)} style={{ background: "none", border: "none", cursor: "pointer", color: tc.text, fontWeight: 600 }}>
                     {expanded === d.kind ? "▼" : "▶"} {d.kind}
@@ -208,7 +212,7 @@ export function SubagentDefinitionsEditor() {
                   </td>
                 </tr>
               )}
-            </>
+            </Fragment>
           ))}
         </tbody>
       </table>
@@ -216,11 +220,11 @@ export function SubagentDefinitionsEditor() {
       {editing && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", justifyContent: "center", alignItems: "center" }} onClick={() => setEditing(null)}>
           <div onClick={(e) => e.stopPropagation()} style={{ background: tc.bg, color: tc.text, padding: 24, borderRadius: 8, width: 560, maxHeight: "90vh", overflowY: "auto" }}>
-            <h2 style={{ marginTop: 0 }}>{editing.kind ? `Edit '${editing.kind}'` : "Nuovo sub-agent kind"}</h2>
+            <h2 style={{ marginTop: 0 }}>{editing.isNew ? "Nuovo sub-agent kind" : `Edit '${editing.kind}'`}</h2>
             <div style={{ display: "grid", gap: 12 }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                <span>Kind (slug a-z_)</span>
-                <input value={editing.kind} onChange={(e) => setEditing((s) => s && { ...s, kind: e.target.value })} style={fieldStyle(tc)} />
+                <span>Kind (slug a-z_){editing.isNew ? "" : " — non modificabile"}</span>
+                <input value={editing.kind} disabled={!editing.isNew} onChange={(e) => setEditing((s) => s && { ...s, kind: e.target.value })} style={{ ...fieldStyle(tc), opacity: editing.isNew ? 1 : 0.6 }} />
               </label>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
                 <span>Description (usato per auto-delegation by description)</span>
@@ -270,6 +274,6 @@ export function SubagentDefinitionsEditor() {
   );
 }
 
-function fieldStyle(tc: ReturnType<typeof useThemeColors>): React.CSSProperties {
+function fieldStyle(tc: ReturnType<typeof useThemeColors>): CSSProperties {
   return { padding: "4px 8px", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, fontSize: 12 };
 }

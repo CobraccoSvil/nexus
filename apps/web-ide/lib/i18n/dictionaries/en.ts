@@ -4,6 +4,7 @@ export const en = {
     "admin.settings.select": "Select a category from the sidebar to configure settings.",
     "admin.appearance": "Appearance",
     "admin.appearance.desc": "Choose how Nexus looks. Changes are saved automatically.",
+    "admin.council": "Competency Council",
     "admin.users": "Users",
     "admin.users.desc": "Manage system users.",
     "admin.users.placeholder": "Users who have signed in via GitHub will appear here.",

@@ -1,4 +1,4 @@
-import { API_BASE, NEURAL_BASE, fetchJson, fetchJsonNoAuth } from "./_shared";
+import { API_BASE, NEURAL_BASE, adminServiceUrl, fetchJson, fetchJsonNoAuth } from "./_shared";
 import type { MetaStepEntry } from "../use-chat/types";
 
 export interface AgentStep {
@@ -511,13 +511,15 @@ export function subscribeAgentStream(
 }
 
 // ---------------------------------------------------------------------------
-// Stubs Orchestrator (PR-4 admin panel) — endpoint non ancora esposti.
-// Mantenuti come placeholder per consentire il build delle pagine admin
-// (OrchestratorPanel, SubagentDefinitionsEditor) finche' i client reali non
-// vengono cablati. Ritornano risposte vuote / mock.
+// Client Orchestrator admin. I CRUD sub-agent parlano con admin-service
+// (:4010) tramite il rewrite Next `/api/admin/:path*` (next.config.ts).
+// NON creare route handler in app/api/admin/orchestrator/**: userebbero
+// proxyRequest (che punta a mcp-core :4000) e romperebbero il percorso.
 // ---------------------------------------------------------------------------
 
 export async function listOrchestratorPlans(_args?: { limit?: number; projectId?: string }): Promise<{ plans: OrchestratorPlanSummary[] }> {
+  // Stub: la pagina Orchestrator (plans) non e' ancora cablata all'endpoint
+  // admin-service /orchestrator/plans.
   return { plans: [] };
 }
 
@@ -526,26 +528,51 @@ export async function getOrchestratorPlan(_runId: string): Promise<OrchestratorP
 }
 
 export async function listSubagentDefinitions(): Promise<{ definitions: SubagentDefinition[] }> {
-  return { definitions: [] };
+  return fetchJson(adminServiceUrl("/orchestrator/subagents/definitions"));
 }
 
-export async function listSubagentRuns(_args?: { parentRunId?: string; kind?: string; projectId?: string; limit?: number }): Promise<{ runs: OrchestratorSubagentRun[] }> {
-  return { runs: [] };
+export async function listSubagentRuns(args?: {
+  parentRunId?: string;
+  kind?: string;
+  projectId?: string;
+  limit?: number;
+}): Promise<{ runs: OrchestratorSubagentRun[] }> {
+  // Il backend applica UN solo filtro, con precedenza parent_run_id > kind > project_id.
+  const params = new URLSearchParams();
+  if (args?.parentRunId) params.set("parent_run_id", args.parentRunId);
+  if (args?.kind) params.set("kind", args.kind);
+  if (args?.projectId) params.set("project_id", args.projectId);
+  if (args?.limit) params.set("limit", String(args.limit));
+  const qs = params.toString();
+  return fetchJson(adminServiceUrl(`/orchestrator/subagents/runs${qs ? `?${qs}` : ""}`));
 }
 
-export async function upsertSubagentDefinition(_def: unknown): Promise<{ ok: boolean }> {
-  return { ok: true };
+export async function upsertSubagentDefinition(
+  def: SubagentDefinitionUpsert,
+): Promise<{ ok: boolean; kind: string }> {
+  return fetchJson(adminServiceUrl("/orchestrator/subagents/definitions"), {
+    method: "POST",
+    body: JSON.stringify(def),
+  });
 }
 
-export async function deleteSubagentDefinition(_kind: string): Promise<{ ok: boolean }> {
-  return { ok: true };
+/** Soft delete: il backend imposta is_enabled=false, la riga resta. */
+export async function deleteSubagentDefinition(
+  kind: string,
+): Promise<{ ok: boolean; kind: string; soft_deleted: boolean }> {
+  return fetchJson(
+    adminServiceUrl(`/orchestrator/subagents/definitions/${encodeURIComponent(kind)}`),
+    { method: "DELETE" },
+  );
 }
 
 export async function resetProviderCooldown(_providerKey: string): Promise<{ ok: boolean }> {
   return { ok: true };
 }
 
-// Tipi stub Orchestrator (corrispondono ai placeholder API sopra).
+// Tipi Orchestrator. Plan* restano stub-shaped (pagina non cablata); i tipi
+// subagent rispecchiano il payload camelCase di admin-service
+// (crates/admin-service/src/orchestrator_panel.rs).
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type _Any = any;
@@ -564,15 +591,63 @@ export interface OrchestratorPlanDetail {
   [k: string]: _Any;
 }
 export interface OrchestratorSubagentRun {
-  id: string; kind: string; status: string; createdAt: string;
-  costUsd?: number; tokensPrompt?: number; tokensCompletion?: number;
-  iterations?: number; parentRunId?: string;
-  [k: string]: _Any;
+  id: string;
+  kind: string;
+  status: string;
+  task: string;
+  parentRunId: string | null;
+  projectId: string | null;
+  iterations: number;
+  tokensPrompt: number;
+  tokensCompletion: number;
+  costUsd: number;
+  depth: number;
+  source: string;
+  createdAt: string | null;
+  completedAt: string | null;
 }
+/** Riga di nexus_subagent_definitions come emessa da admin-service (camelCase). */
 export interface SubagentDefinition {
-  kind: string; description: string; promptKey: string;
-  toolWhitelist: string[]; modelPurpose: string;
-  maxIterations: number; timeoutS: number;
-  isBackground: boolean; isEnabled: boolean;
-  [k: string]: _Any;
+  kind: string;
+  description: string | null;
+  promptKey: string;
+  toolWhitelist: string[];
+  modelPurpose: string;
+  maxIterations: number;
+  timeoutS: number;
+  isBackground: boolean;
+  isEnabled: boolean;
+  updatedAt: string | null;
+}
+
+/** Body snake_case atteso dall'upsert admin-service (SubagentDefBody). */
+export interface SubagentDefinitionUpsert {
+  kind: string;
+  description?: string | null;
+  prompt_key: string;
+  tool_whitelist: string[];
+  model_purpose: string;
+  max_iterations?: number;
+  timeout_s?: number;
+  is_background?: boolean;
+  is_enabled?: boolean;
+}
+
+/**
+ * Punto unico camelCase -> snake_case per l'upsert. L'endpoint fa un upsert
+ * FULL-BODY (ON CONFLICT aggiorna tutte le colonne): anche il toggle di un
+ * singolo campo deve rispedire l'intera definizione.
+ */
+export function toSubagentUpsertBody(d: SubagentDefinition): SubagentDefinitionUpsert {
+  return {
+    kind: d.kind,
+    description: d.description,
+    prompt_key: d.promptKey,
+    tool_whitelist: d.toolWhitelist,
+    model_purpose: d.modelPurpose,
+    max_iterations: d.maxIterations,
+    timeout_s: d.timeoutS,
+    is_background: d.isBackground,
+    is_enabled: d.isEnabled,
+  };
 }

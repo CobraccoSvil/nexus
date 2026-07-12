@@ -14,6 +14,14 @@ export async function listAdminSettings(): Promise<{ settings: AdminSettingEntry
   return fetchJson(`${API_BASE}/api/admin/settings`);
 }
 
+export async function listAdminSettingsByCategory(
+  category: string,
+): Promise<{ settings: AdminSettingEntry[] }> {
+  return fetchJson(
+    `${API_BASE}/api/admin/settings-by-category/${encodeURIComponent(category)}`,
+  );
+}
+
 export async function updateAdminSetting(
   key: string,
   value: string,

@@ -5,6 +5,7 @@ export const it: PartialDictionary = {
     "admin.settings.select": "Seleziona una categoria dal menu laterale per configurare le impostazioni.",
     "admin.appearance": "Aspetto",
     "admin.appearance.desc": "Scegli l'aspetto di Nexus. Le modifiche vengono salvate automaticamente.",
+    "admin.council": "Consiglio delle Competenze",
     "admin.users": "Utenti",
     "admin.users.desc": "Gestisci gli utenti del sistema.",
     "admin.users.placeholder": "Gli utenti che hanno effettuato l'accesso tramite GitHub appariranno qui.",
