@@ -45,3 +45,56 @@ export interface ModelCatalogItem {
 export async function listModelCatalog(): Promise<{ models: ModelCatalogItem[] }> {
   return fetchJson(`${API_BASE}/api/models`);
 }
+
+// ── Provider registry (fonte unica data-driven per la dashboard admin) ───────
+
+export interface ProviderRegistryEntry {
+  name: string;
+  apiFormat: string;
+  /** Setting della API key (null per provider senza key, es. vllm). */
+  keySetting: string | null;
+  enabledSetting: string | null;
+  baseUrlSetting: string | null;
+  baseUrlDefault: string | null;
+  /** api_key | base_url | api_key_or_vertex */
+  activation: string;
+  supportsTools: boolean;
+  isActive: boolean;
+  sortOrder: number;
+  /** URL console billing/keys (null = self-host). */
+  billingUrl: string | null;
+}
+
+/**
+ * Elenco dei provider del registry (nexus_provider_registry). Fonte unica per
+ * la dashboard admin: da qui la UI deriva quali provider hanno una API key,
+ * il criterio di attivazione e il link billing, senza hardcode.
+ */
+export async function getProviderRegistry(): Promise<{ providers: ProviderRegistryEntry[] }> {
+  return fetchJson(`${API_BASE}/api/admin/provider-registry`);
+}
+
+/**
+ * Modelli del catalog di un provider INCLUSI i disabilitati (a differenza di
+ * `/api/models`): la dashboard admin li mostra per poterli abilitare.
+ */
+export async function getProviderModelsAdmin(
+  provider?: string,
+): Promise<{ models: ModelCatalogEntry[] }> {
+  const url = provider
+    ? `${API_BASE}/api/admin/provider-models?provider=${encodeURIComponent(provider)}`
+    : `${API_BASE}/api/admin/provider-models`;
+  return fetchJson(url);
+}
+
+/** Abilita/disabilita un modello del catalog (ai_price_catalog.is_enabled). */
+export async function setModelEnabled(
+  provider: string,
+  model: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; provider: string; model: string; enabled: boolean }> {
+  return fetchJson(`${API_BASE}/api/admin/provider-models/enabled`, {
+    method: "PUT",
+    body: JSON.stringify({ provider, model, enabled }),
+  });
+}

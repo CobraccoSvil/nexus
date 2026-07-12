@@ -4,6 +4,8 @@ import { useState, useEffect } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
 import { StatusBadge } from "../common/status-badge";
+import { ProviderModelsSection } from "./provider-models-section";
+import { getProviderRegistry } from "../../lib/api/models";
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
@@ -41,8 +43,10 @@ export interface BrowseDirectoriesResponse {
   directories: BrowseDirectoryNode[];
 }
 
-// Provider che supportano il toggle enable/disable
-const PROVIDER_NAMES = ["anthropic", "openai", "google", "deepseek", "mistral"] as const;
+// Fallback dei provider con toggle enable/disable, usato solo finche' il
+// registry (fonte unica, regola G) non e' caricato o se il fetch fallisce.
+// A regime la lista arriva da GET /api/admin/provider-registry.
+const FALLBACK_PROVIDER_NAMES = ["anthropic", "openai", "google", "deepseek", "mistral"];
 
 interface ProviderSettingsProps {
   items: SettingEntry[];
@@ -125,8 +129,34 @@ export function ProviderSettings({
       });
   }, []);
 
-  // Set di chiavi _enabled già incorporate nei card delle API key — non vanno mostrate come card separati
-  const embeddedEnabledKeys = new Set(PROVIDER_NAMES.map((p) => `${p}_enabled`));
+  // Provider con API key e link billing dal registry (fonte unica data-driven,
+  // regola G): i provider onboardati (Groq/OpenRouter/Perplexity) ottengono
+  // toggle/LED/Testa/billing senza hardcode. Fallback ai noti se il fetch
+  // fallisce, cosi' la UI non resta senza controlli.
+  const [providerNames, setProviderNames] = useState<string[]>(FALLBACK_PROVIDER_NAMES);
+  const [billingUrls, setBillingUrls] = useState<Record<string, string>>({});
+  useEffect(() => {
+    getProviderRegistry()
+      .then((d) => {
+        const apiKeyProviders = d.providers.filter((p) => p.keySetting).map((p) => p.name);
+        if (apiKeyProviders.length > 0) setProviderNames(apiKeyProviders);
+        const urls: Record<string, string> = {};
+        for (const p of d.providers) if (p.billingUrl) urls[p.name] = p.billingUrl;
+        setBillingUrls(urls);
+      })
+      .catch(() => {
+        /* fallback: FALLBACK_PROVIDER_NAMES + nessun link billing */
+      });
+  }, []);
+
+  // Chiavi _enabled da incorporare nella card della API key (non mostrarle come
+  // card separate). Derivate dagli items (ogni *_api_key ha il gemello *_enabled)
+  // e non da providerNames: cosi' non lampeggiano prima che il registry carichi.
+  const embeddedEnabledKeys = new Set(
+    items
+      .filter((i) => i.key.endsWith("_api_key"))
+      .map((i) => `${i.key.replace("_api_key", "")}_enabled`),
+  );
 
   return (
     <>
@@ -153,10 +183,11 @@ export function ProviderSettings({
             }}>
               <span style={{
                 width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
-                background: p.healthy ? "#4ade80" : "#f87171",
+                // null = mai misurato (grigio), non "down": distinto da false (rosso).
+                background: p.healthy === true ? "#4ade80" : p.healthy === false ? "#f87171" : "#9ca3af",
               }} />
               <span style={{ fontWeight: 600 }}>{p.name}</span>
-              {!p.healthy && p.error && (
+              {p.healthy === false && p.error && (
                 <span style={{ color: "#f87171", fontSize: 11 }}>{p.error}</span>
               )}
             </div>
@@ -185,7 +216,7 @@ export function ProviderSettings({
           // Cerca il corrispondente setting _enabled (solo per le API key dei provider noti)
           const isProviderApiKey =
             (setting.key.endsWith("_api_key") || isVertexBackendSwitch) &&
-            PROVIDER_NAMES.includes(providerName as (typeof PROVIDER_NAMES)[number]);
+            providerNames.includes(providerName);
 
           const enabledItem = isProviderApiKey
             ? items.find((i) => i.key === `${providerName}_enabled`)
@@ -294,13 +325,7 @@ export function ProviderSettings({
                        L'endpoint /providers/google/health usato dal Testa sceglie
                        internamente Gemini direct o Vertex in base al backend in DB. */}
                   {((setting.is_secret && setting.key.endsWith("_api_key")) || isVertexBackendSwitch) && (() => {
-                    const billingUrls: Record<string, string> = {
-                      anthropic: "https://console.anthropic.com/settings/billing",
-                      openai:    "https://platform.openai.com/account/billing",
-                      google:    "https://console.cloud.google.com/billing",
-                      deepseek:  "https://platform.deepseek.com/api-keys",
-                      mistral:   "https://console.mistral.ai/api-keys",
-                    };
+                    // billingUrls arriva dal registry (state, regola G): niente elenco hardcoded.
 
                     // Se disabilitato: mostra sempre il LED grigio "Disabilitato"
                     if (isProviderApiKey && !isProviderEnabled) {
@@ -754,6 +779,16 @@ export function ProviderSettings({
                     boxSizing: "border-box",
                     cursor: isProviderApiKey && !isProviderEnabled ? "not-allowed" : "text",
                   }}
+                />
+              )}
+
+              {/* ── Gestione modelli del provider (abilita/disabilita catalog) ── */}
+              {isProviderApiKey && (
+                <ProviderModelsSection
+                  provider={providerName}
+                  initialEnabledCount={
+                    modelCatalog.filter((m) => m.provider === providerName).length
+                  }
                 />
               )}
             </div>

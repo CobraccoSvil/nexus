@@ -815,16 +815,27 @@ async fn provider_names_for_status(
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    merge_provider_names(from_catalog, api_key_configured)
+    // Provider del registry (nexus_provider_registry, mig 0565): sempre visibili
+    // se attivi, anche senza key ne' modelli abilitati, cosi' la dashboard admin
+    // li mostra (LED "mai misurato") e permette di configurarli. Chiude T4.
+    let from_registry: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM nexus_provider_registry WHERE is_active = true",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    merge_provider_names(from_catalog, from_registry, api_key_configured)
 }
 
-/// Unione ordinata + deduplicata di provider da catalog e da api_key configurata;
-/// fallback ai noti se entrambe vuote. Puro: testabile senza DB.
+/// Unione ordinata + deduplicata di provider da catalog, registry e api_key
+/// configurata; fallback ai noti se tutte vuote. Puro: testabile senza DB.
 fn merge_provider_names(
     from_catalog: Vec<String>,
+    from_registry: Vec<String>,
     api_key_configured: &std::collections::HashMap<String, bool>,
 ) -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = from_catalog.into_iter().collect();
+    set.extend(from_registry);
     for (name, configured) in api_key_configured {
         if *configured {
             set.insert(name.clone());
@@ -847,15 +858,24 @@ mod provider_names_tests {
         keys.insert("openai".to_string(), true);
         keys.insert("perplexity".to_string(), true); // provider nuovo, solo chiave
         keys.insert("disattivato".to_string(), false); // non configurato -> escluso
-        let out = merge_provider_names(vec!["openai".into(), "mistral".into()], &keys);
+        let out = merge_provider_names(vec!["openai".into(), "mistral".into()], vec![], &keys);
         // Ordinato, dedup (openai una volta), perplexity incluso, disattivato no.
         assert_eq!(out, vec!["mistral", "openai", "perplexity"]);
     }
 
     #[test]
+    fn merge_include_registry_senza_chiave_ne_catalog() {
+        let empty: HashMap<String, bool> = HashMap::new();
+        // Un provider del registry attivo (groq) compare anche senza catalog
+        // abilitato ne' api_key configurata: la dashboard deve poterlo mostrare.
+        let out = merge_provider_names(vec!["openai".into()], vec!["groq".into()], &empty);
+        assert_eq!(out, vec!["groq", "openai"]);
+    }
+
+    #[test]
     fn merge_fallback_ai_noti_se_vuoto() {
         let empty: HashMap<String, bool> = HashMap::new();
-        let out = merge_provider_names(vec![], &empty);
+        let out = merge_provider_names(vec![], vec![], &empty);
         let expected: Vec<String> = KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect();
         assert_eq!(out, expected);
     }

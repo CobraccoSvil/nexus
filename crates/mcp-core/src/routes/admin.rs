@@ -428,6 +428,31 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_admin,
             )),
         )
+        // Admin — provider registry (nexus_provider_registry) data-driven per la
+        // dashboard: elenco provider + criterio attivazione + link billing.
+        .route(
+            "/api/admin/provider-registry",
+            get(admin::providers::list_provider_registry).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
+        // Admin — modelli del catalog INCLUSI i disabilitati (per abilitarli).
+        .route(
+            "/api/admin/provider-models",
+            get(admin::providers::list_provider_models).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
+        // Admin — abilita/disabilita un modello del catalog (ai_price_catalog).
+        .route(
+            "/api/admin/provider-models/enabled",
+            put(admin::providers::set_model_enabled).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
         .route(
             "/api/gateway/providers",
             get(environment::gateway_providers_handler).layer(axum_mw::from_fn_with_state(
