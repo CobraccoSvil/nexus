@@ -83,6 +83,9 @@ const ALLOWED_INTENTS: &[&str] = &[
     "file_ops",
     "system_admin",
     "code_read",
+    // Ricerca web citata (Perplexity Sonar): richieste esplicite di informazioni
+    // aggiornate/fatti recenti dal web con fonti. Flusso NON-agentico.
+    "ricerca_web",
     "agentic_default",
 ];
 

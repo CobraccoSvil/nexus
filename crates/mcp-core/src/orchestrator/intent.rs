@@ -267,6 +267,7 @@ pub(crate) fn intent_str_to_static(intent: &str) -> Option<&'static str> {
         "file_ops" => Some("file_ops"),
         "system_admin" => Some("system_admin"),
         "code_read" => Some("code_read"),
+        "ricerca_web" => Some("ricerca_web"),
         // Intent di sistema: non emesso dal classifier LLM, ma assegnato come
         // fallback neutro quando l'LLM non risponde (vedi
         // classify_intent_async_with_threshold). Mappato qui per coerenza se

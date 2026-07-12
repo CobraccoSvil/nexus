@@ -726,6 +726,10 @@ pub(crate) fn intent_key_for(
         // risponde in astratto. Niente soglia token: la lettura non scala con
         // l'output ma col numero di tool call (gestite dall'iter budget).
         "code_read" => "code_read",
+        // Ricerca web citata (Perplexity): intent_key dedicato -> riga
+        // nexus_routing_matrix ricerca_web (fallback; il primario e' il ramo
+        // non-agentico best_non_agentic_model con capability web_search).
+        "ricerca_web" => "ricerca_web",
         // agentic_default: fallback neutro quando il classifier LLM non risponde.
         // Intent_key dedicato (mig 0337) con modelli tool-robust, cosi' l'agente
         // parte col _LAZY_MINIMAL_TOOLKIT e interpreta da se' invece di finire su
