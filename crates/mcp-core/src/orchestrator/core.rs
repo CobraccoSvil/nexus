@@ -908,6 +908,39 @@ impl Orchestrator {
             // model_routing.rs:772). Attiva il pavimento di tier agentico nel
             // selettore dinamico (regola L: la decisione "agentico?" arriva dal
             // chiamante che conosce l'intent, non re-implementata nel selettore).
+            // Ricerca web citata (intent ricerca_web): instrada verso un modello con
+            // capability web_search (Perplexity sonar) via il ramo NON-agentico
+            // (requires_tool_use=false), perche' i sonar hanno supports_tool_use=false
+            // e sono esclusi dai selettori agentici. Il gateway non allega tool ai
+            // provider supports_tools=false (garanzia difensiva in generic.rs), quindi
+            // il grafo gira in modalita' testo e completa con le citazioni. Gated su
+            // intent: INERTE finche' il classifier non emette ricerca_web (che richiede
+            // l'attivazione admin del prompt). Se nessun sonar e' disponibile (modelli
+            // disabilitati / api_key assente) cade nel routing normale sotto.
+            if intent == "ricerca_web" {
+                if let Some((provider, model)) = best_model_for_tier_pinned(
+                    db,
+                    &base_tier,
+                    Some("web_search"),
+                    false,
+                    &[],
+                    Some("perplexity"),
+                )
+                .await
+                {
+                    if !is_provider_in_cooldown(&provider) {
+                        let model = model_override
+                            .filter(|v| !v.trim().is_empty())
+                            .map(str::to_string)
+                            .unwrap_or(model);
+                        tracing::info!("Agent routing (ricerca_web): -> {}/{}", provider, model);
+                        return (provider, model);
+                    }
+                }
+                tracing::warn!(
+                    "ricerca_web: nessun modello web_search disponibile (sonar disabilitato / provider non configurato), fallback al routing normale"
+                );
+            }
             let is_agentic_turn = intent != "chat";
             if let Some(d) =
                 route_model_from_catalog(db, &base_tier, &capability, "dinamico", is_agentic_turn)
