@@ -276,6 +276,14 @@ export function RunNotifications({
             zIndex: 50,
             width: 280,
             maxWidth: "85vw",
+            // Drop-up (bottom): la lista cresce nello spazio libero SOPRA la
+            // campanella, ancorata in fondo alla chat. Il maxHeight relativo al
+            // viewport + overflowY:auto evita che le voci extra sforino sotto il
+            // bordo: quando eccedono, il pannello scrolla internamente invece di
+            // nascondere le notifiche fuori dal viewport.
+            maxHeight: "min(60vh, 360px)",
+            overflowY: "auto",
+            overflowX: "hidden",
             borderRadius: 10,
             border: `1px solid ${tc.border}`,
             background: tc.bgCard,
