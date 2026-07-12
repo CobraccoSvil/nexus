@@ -163,8 +163,19 @@ onesto, doc/env bonificati. La dir `brain/` e' stata poi eliminata dal repo
 
 Ruolo invariato: provider dedicato alla ricerca web citata, NON nodo agentico.
 
-Stato: **provider FATTO** via registry F2 (mig `0568_perplexity_provider.sql`),
-**citazioni + intent ANCORA DA FARE** (il valore distintivo).
+Stato: **provider FATTO** (mig 0568) + **citazioni end-to-end FATTE** (2026-07-12);
+resta l'**intent `ricerca_web`** non-agentico (Fase 2).
+
+Citazioni (6 hop, additivi/retrocompatibili, regola M campo strutturato):
+`LlmResponse.citations` + wire `ChatCompletion.citations` + `from_chat_completion`
+(gateway, punto unico) -> `GwResponse.citations` -> `metadata.citations` nel path
+chat (`orchestrator/core.rs`) -> `to_message_view`/`ChatMessageView.citations`
+(persistence) -> `ChatMessage.citations` + componente `SourcesPanel` ("Fonti
+consultate", link cliccabili `rel=noopener`) in `message-list.tsx`. build gateway +
+mcp-core verdi, typecheck web-ide verde. Verifica visuale e2e: richiede un run
+Perplexity reale (API key). NB: il path AGENTICO (agent_run.rs) non accumula ancora
+le citazioni nel metadata -- irrilevante per Perplexity (non-agentico), da estendere
+solo se un provider di ricerca venisse usato in un turno con tool.
 - **Mig 0568**: settings `perplexity_api_key`/`_enabled`; registry (`perplexity`,
   `openai_compat`, base_url `https://api.perplexity.ai`, **`supports_tools=false`**);
   3 modelli Sonar `is_enabled=false` (`sonar` 1/1, `sonar-pro` 3/15,

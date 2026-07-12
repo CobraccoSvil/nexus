@@ -903,6 +903,9 @@ fn from_chat_completion(
         cache_creation_tokens: None,
     };
 
+    // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
+    let citations = resp.citations.filter(|c| !c.is_empty());
+
     let finish_reason = normalize_finish_reason(choice.finish_reason.as_deref());
 
     // Reasoning DeepSeek: arriva nel campo separato `reasoning_content`. OpenAI
@@ -925,6 +928,7 @@ fn from_chat_completion(
         reasoning,
         // Dialetto OpenAI-compat: nessuna signature opaca da ri-passare.
         thinking_signature: None,
+        citations,
     })
 }
 
@@ -1383,6 +1387,10 @@ struct ChatCompletion {
     choices: Vec<RespChoice>,
     #[serde(default)]
     usage: Option<WireUsage>,
+    /// Perplexity espone le fonti come array top-level `citations` (non standard
+    /// OpenAI): mappato una sola volta qui, vale per ogni provider OpenAI-compat.
+    #[serde(default)]
+    citations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

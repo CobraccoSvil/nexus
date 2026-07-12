@@ -1338,7 +1338,10 @@ impl Orchestrator {
             billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
         let gw_completion = json!({"content": gw_resp.content, "metadata": {
             "provider": gw_resp.provider_used, "model": gw_resp.model_used,
-            "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason},
+            "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason,
+            // Fonti citate dai provider di ricerca (Perplexity): propagate nel
+            // metadata per il pannello "Fonti consultate". Assente per gli altri.
+            "citations": gw_resp.citations.clone()},
             "privacy_rerouted": gw_resp.privacy_rerouted.as_ref().map(|pr| json!({
                 "provider": pr.provider,
                 "blocked_tier": pr.blocked_tier,

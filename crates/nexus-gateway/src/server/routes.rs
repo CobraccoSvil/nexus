@@ -1070,6 +1070,7 @@ async fn build_sse_stream(
                                     privacy_rerouted: None,
                                     reasoning: None,
                                     thinking_signature: None,
+                                    citations: None,
                                 };
                                 record_usage_to_ledger(&state.db, &body, &resp).await;
                             }
@@ -2162,6 +2163,7 @@ mod tests {
                     privacy_rerouted: None,
                     reasoning: None,
                     thinking_signature: None,
+                    citations: None,
                 }),
                 // Errori strutturati (status + codice), come i provider reali.
                 Behaviour::ErrBilling => Err(crate::providers::ProviderHttpError {
@@ -2207,6 +2209,7 @@ mod tests {
                             privacy_rerouted: None,
                             reasoning: None,
                             thinking_signature: None,
+                            citations: None,
                         })
                     }
                 }

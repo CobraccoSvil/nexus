@@ -57,6 +57,10 @@ pub(crate) struct ChatMessageView {
     /// refresh di ricostruire il blocco "Ragionamento" identico al live, che lo
     /// alimenta dagli eventi SSE effimeri. None per i messaggi senza reasoning.
     pub(crate) reasoning: Option<String>,
+    /// Citazioni (URL fonti) dei provider di ricerca (Perplexity), persistite in
+    /// metadata.citations. Alimentano il pannello "Fonti consultate" al reload.
+    /// None per i messaggi senza fonti citate. Segnale strutturato (regola M).
+    pub(crate) citations: Option<Vec<String>>,
 }
 pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessageView, ApiError> {
     let id: Uuid = row
@@ -150,6 +154,16 @@ pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessage
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned),
+        citations: metadata
+            .get("citations")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<String>>()
+            })
+            .filter(|v| !v.is_empty()),
     })
 }
 /// Rimuove i NULL byte (\0) dal testo. PostgreSQL jsonb li rifiuta con

@@ -113,6 +113,42 @@ function ToolUseBadges({ toolUses, tc }: { toolUses: ToolUseBlock[]; tc: ThemeCo
   );
 }
 
+/** Pannello "Fonti consultate": le citazioni (URL) restituite dai provider di
+ *  ricerca (Perplexity), persistite in metadata.citations. Link cliccabili in
+ *  nuova scheda, rel noopener per sicurezza. */
+function SourcesPanel({ citations }: { citations: string[] }) {
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        marginBottom: 8,
+        borderRadius: 8,
+        border: "1px solid #10b98144",
+        background: "#10b98108",
+        padding: "8px 12px",
+      }}
+    >
+      <div style={{ fontSize: 11, fontWeight: 600, color: "#10b981", marginBottom: 6 }}>
+        Fonti consultate ({citations.length})
+      </div>
+      <ol style={{ margin: 0, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 3 }}>
+        {citations.map((url, i) => (
+          <li key={i} style={{ fontSize: 12, wordBreak: "break-all" }}>
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "#10b981cc", textDecoration: "underline" }}
+            >
+              {url}
+            </a>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function ThinkingPanel({ thinking }: { thinking: string }) {
   const [open, setOpen] = useState(false);
   return (
@@ -1387,6 +1423,9 @@ export function MessageList({
                   <>
                     {reasoning && <ThinkingPanel thinking={reasoning} />}
                     {cleanText.trim() && <MarkdownBlock content={cleanText} projectId={projectId} />}
+                    {message.citations && message.citations.length > 0 && (
+                      <SourcesPanel citations={message.citations} />
+                    )}
                     {toolUses.length > 0 && <ToolUseBadges toolUses={toolUses} tc={tc} />}
                     {!cleanText.trim() && toolUses.length === 0 && (
                       <span style={{ opacity: 0.6, fontStyle: "italic", fontSize: 12 }}>

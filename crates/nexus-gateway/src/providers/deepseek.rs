@@ -351,6 +351,7 @@ mod tests {
             privacy_rerouted: None,
             reasoning: None,
             thinking_signature: None,
+            citations: None,
         }
     }
 

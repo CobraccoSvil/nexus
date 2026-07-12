@@ -56,6 +56,11 @@ export interface ChatMessage {
       NB: richiede che la message view backend (to_message_view) lo esponga da
       metadata->>'reasoning'. */
   reasoning?: string;
+  /** Fonti citate (URL) dai provider di ricerca (Perplexity), persistite dal
+      backend in metadata.citations e propagate da to_message_view. Alimentano il
+      pannello "Fonti consultate" sotto la risposta. Undefined per i messaggi
+      senza fonti. */
+  citations?: string[];
   /** True quando il messaggio e' stato generato automaticamente dal sistema
       (es. auto-continuazione in modalita' "automatic"). La UI lo nasconde
       per non confondere l'utente: il backend lo persiste comunque per

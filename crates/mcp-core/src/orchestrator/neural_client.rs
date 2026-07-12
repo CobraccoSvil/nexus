@@ -555,6 +555,7 @@ mod gateway_mapping_tests {
             privacy_rerouted: None,
             reasoning: None,
             thinking_signature: None,
+            citations: None,
         }
     }
 

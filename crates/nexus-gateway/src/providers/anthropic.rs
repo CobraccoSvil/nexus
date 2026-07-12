@@ -794,6 +794,7 @@ fn from_anthropic_message(
             Some(reasoning)
         },
         thinking_signature,
+        citations: None,
     }
 }
 

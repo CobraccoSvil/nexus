@@ -224,6 +224,12 @@ pub struct LlmResponse {
     /// [`LlmMessage::thinking_signature`]. Retrocompatibile: `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<String>,
+    /// Citazioni (URL fonti) dei provider di ricerca: Perplexity espone un array
+    /// top-level `citations` nella risposta (non standard OpenAI). Retrocompatibile:
+    /// `None` per i provider che non le emettono. Regola M: campo strutturato,
+    /// mai estratto dal testo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<String>>,
 }
 
 impl LlmResponse {
@@ -536,6 +542,7 @@ mod tests {
             privacy_rerouted: None,
             reasoning: None,
             thinking_signature: None,
+            citations: None,
         }
     }
 

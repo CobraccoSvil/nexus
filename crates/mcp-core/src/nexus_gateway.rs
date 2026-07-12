@@ -198,6 +198,12 @@ pub struct GwResponse {
     /// `Message::Ai::thinking_signature`.
     #[serde(default)]
     pub thinking_signature: Option<String>,
+    /// Citazioni (URL fonti) dei provider di ricerca (Perplexity `citations`).
+    /// Parte del contratto wire (default tollerante); propagata nel `metadata` del
+    /// messaggio assistant per il pannello "Fonti consultate". `None` per gli altri
+    /// provider (regola M: campo strutturato, mai estratto dal testo).
+    #[serde(default)]
+    pub citations: Option<Vec<String>>,
 }
 
 /// Errore HTTP del Nexus Gateway coi segnali STRUTTURATI del body JSON estratti

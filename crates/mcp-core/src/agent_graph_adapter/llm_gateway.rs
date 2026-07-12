@@ -1168,6 +1168,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
             privacy_rerouted: None,
             reasoning: None,
             thinking_signature: None,
+            citations: None,
         }
     }
 

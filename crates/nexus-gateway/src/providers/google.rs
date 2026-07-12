@@ -2399,6 +2399,7 @@ fn from_generate_response(
             Some(parts.reasoning)
         },
         thinking_signature: parts.thinking_signature,
+        citations: None,
     }
 }
 

@@ -395,6 +395,7 @@ fn result_line_to_item(line: AnthropicResultLine) -> BatchResultItem {
                 privacy_rerouted: None,
                 reasoning: None,
                 thinking_signature: None,
+                citations: None,
             };
             return BatchResultItem {
                 custom_id: line.custom_id,
