@@ -234,13 +234,22 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
 /// della definition. Migliora la fedelta' rispetto ai descrittori minimali che il
 /// brain costruiva a mano (`_filter_tools_by_whitelist`): il modello vede lo schema
 /// vero. Whitelist vuota -> nessun tool (sub-agente puramente conversazionale).
+/// Canali con cui un sub-run DICHIARA il proprio esito (ADR 0034): impostano
+/// `declared_outcome`, cosi' il gate G1 (`route_after_executor`) onora la
+/// chiusura su `end_turn` invece di re-instradare all'executor. `task_complete`
+/// e' il canale UNIVERSALE (builtin del run principale); le figure del consiglio
+/// usano `advisory_verdict`, il revisore `review_verdict` come loro equivalente
+/// di ruolo (parere strutturato = dichiarazione d'esito).
+const COMPLETION_CHANNEL_TOOLS: [&str; 3] =
+    ["task_complete", "advisory_verdict", "review_verdict"];
+
 fn build_tools_json(whitelist: &[String]) -> Value {
     if whitelist.is_empty() {
         return json!([]);
     }
     let all: Value = serde_json::from_str(nexus_agent_tools::tool_schema::AGENT_TOOLS_JSON)
         .unwrap_or_else(|_| json!([]));
-    let filtered: Vec<Value> = all
+    let mut filtered: Vec<Value> = all
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -254,6 +263,28 @@ fn build_tools_json(whitelist: &[String]) -> Value {
                 .collect()
         })
         .unwrap_or_default();
+    // INVARIANTE ADR 0034 (regola L, punto unico): ogni sub-run con dei tool deve
+    // avere un canale per DICHIARARE l'esito, altrimenti non puo' cortocircuitare
+    // i nudge G1 su `end_turn` e cicla fino al cap (incidente run a6f25c1e: coder
+    // senza `task_complete` -> 39 iterazioni, chiusura confusa). Se la whitelist
+    // NON espone gia' un canale di completamento, iniettiamo `task_complete` (il
+    // builtin universale). Le figure/review, che hanno il loro verdetto
+    // strutturato di ruolo, restano intatte: quello E' il loro canale.
+    let has_completion_channel = filtered.iter().any(|t| {
+        t.get("name")
+            .and_then(Value::as_str)
+            .map(|n| COMPLETION_CHANNEL_TOOLS.contains(&n))
+            .unwrap_or(false)
+    });
+    if !has_completion_channel {
+        if let Some(tc) = all.as_array().and_then(|arr| {
+            arr.iter().find(|t| {
+                t.get("name").and_then(Value::as_str) == Some("task_complete")
+            })
+        }) {
+            filtered.push(tc.clone());
+        }
+    }
     json!(filtered)
 }
 
@@ -3540,7 +3571,8 @@ mod tests {
     fn build_tools_json_filtra_per_whitelist() {
         let tools = build_tools_json(&["read_file".to_string(), "write_file".to_string()]);
         let arr = tools.as_array().expect("array");
-        // Solo i tool in whitelist, con schema REALE (campo input_schema presente).
+        // Solo i tool in whitelist (+ il canale di completamento auto-iniettato),
+        // con schema REALE (campo input_schema presente).
         assert!(
             !arr.is_empty(),
             "lo schema reale deve contenere i tool richiesti"
@@ -3548,8 +3580,8 @@ mod tests {
         for t in arr {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
             assert!(
-                name == "read_file" || name == "write_file",
-                "tool fuori whitelist: {name}"
+                name == "read_file" || name == "write_file" || name == "task_complete",
+                "tool inatteso: {name}"
             );
             assert!(t.get("input_schema").is_some(), "schema reale atteso");
         }
@@ -3565,6 +3597,47 @@ mod tests {
     fn build_tools_json_vuoto_se_whitelist_vuota() {
         let tools = build_tools_json(&[]);
         assert_eq!(tools.as_array().map(|a| a.len()), Some(0));
+    }
+
+    /// INVARIANTE ADR 0034 (regola L): un sub-run coder senza canale di
+    /// completamento nella whitelist riceve `task_complete` auto-iniettato, cosi'
+    /// puo' dichiarare l'esito e chiudere invece di ciclare sui nudge G1
+    /// (incidente run a6f25c1e: 39 iterazioni).
+    #[test]
+    fn build_tools_json_inietta_task_complete_se_mancante() {
+        let tools = build_tools_json(&["read_file".to_string(), "run_command".to_string()]);
+        let names: Vec<&str> = tools
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(
+            names.contains(&"task_complete"),
+            "task_complete deve essere iniettato: {names:?}"
+        );
+    }
+
+    /// Una figura del consiglio (whitelist con `advisory_verdict`) NON riceve
+    /// `task_complete`: il suo verdetto strutturato di ruolo E' gia' il canale di
+    /// completamento (evita che la figura chiuda saltando il parere strutturato).
+    #[test]
+    fn build_tools_json_non_inietta_se_ha_verdetto_di_ruolo() {
+        let tools = build_tools_json(&["read_file".to_string(), "advisory_verdict".to_string()]);
+        let names: Vec<&str> = tools
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(
+            names.contains(&"advisory_verdict"),
+            "advisory_verdict atteso: {names:?}"
+        );
+        assert!(
+            !names.contains(&"task_complete"),
+            "task_complete NON deve essere iniettato se c'e' gia' advisory_verdict: {names:?}"
+        );
     }
 
     #[test]
