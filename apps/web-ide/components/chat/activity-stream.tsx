@@ -35,6 +35,8 @@ import type {
   FoldedToolsEvent,
   SwitchEvent,
   FoldThreshold,
+  FigureAdvisory,
+  FigureAdvisoryReport,
 } from "../../lib/use-chat/activity-stream";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -347,6 +349,12 @@ function EventRow({
             />
           ))}
         </span>
+      ) : event.type === "council_of_competencies" ? (
+        // Il Consiglio e' un'operazione META: ogni figura gira sul PROPRIO provider
+        // (model_purpose tier-aware), non ce n'e' uno solo. Un'icona provider singola
+        // qui mostrava "?" (provider del segmento ignoto) ed era fuorviante -> nessuna
+        // icona. I provider effettivi si vedono nei sub-agenti delle singole figure.
+        null
       ) : (
         event.provider && (
           <span style={{ position: "absolute", right: 8, top: 9, zIndex: 2 }}>
@@ -776,26 +784,25 @@ function EventBody({
               ))}
             </ul>
           ) : null}
-          {event.degraded && event.figureReports && event.figureReports.length > 0 ? (
-            <ul
-              style={{
-                margin: "6px 0 0",
-                paddingLeft: 16,
-                fontSize: 11,
-                color: tc.textMuted,
-                listStyle: "disc",
-              }}
-            >
-              {event.figureReports
-                .filter((r) => r.status !== "advisory_ok")
-                .map((r) => (
-                  <li key={`${r.kind}-${r.detail_code}`}>
-                    <span style={{ fontWeight: 600, color: tc.text }}>{r.kind}</span>
-                    {": "}
-                    {r.detail_message}
-                  </li>
+          {event.figureReports && event.figureReports.length > 0 ? (
+            <div style={{ marginTop: 6 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: tc.textMuted,
+                  textTransform: "uppercase",
+                  letterSpacing: 0.3,
+                }}
+              >
+                Pareri delle figure
+              </div>
+              <ul style={{ margin: "3px 0 0", padding: 0, listStyle: "none" }}>
+                {event.figureReports.map((r) => (
+                  <FigureReportRow key={r.kind} report={r} tc={tc} />
                 ))}
-            </ul>
+              </ul>
+            </div>
           ) : null}
         </div>
       );
@@ -834,6 +841,164 @@ function EventBody({
     default:
       return null;
   }
+}
+
+/** Verdetto strutturato della figura -> colore + etichetta umana (identificatori
+ *  canonici backend, regola N: proceed|proceed_with_changes|block). */
+function verdictMeta(
+  v: string | undefined,
+  tc: ThemeColors,
+): { color: string; label: string } {
+  switch (v) {
+    case "proceed":
+      return { color: "#22c55e", label: "procede" };
+    case "proceed_with_changes":
+      return { color: "#f59e0b", label: "procede con modifiche" };
+    case "block":
+      return { color: tc.error, label: "blocca" };
+    default:
+      return { color: tc.textMuted, label: v ?? "n/d" };
+  }
+}
+
+/** Severita' rischio (backend: alta|media|bassa) -> colore. */
+function severityColor(sev: string, tc: ThemeColors): string {
+  const s = sev.toLowerCase();
+  if (s === "alta" || s === "high") return tc.error;
+  if (s === "media" || s === "medium") return "#f59e0b";
+  return tc.textMuted;
+}
+
+/** Estrae severity/description da un rischio (payload backend non tipizzato). */
+function riskParts(risk: Record<string, unknown>): {
+  severity: string;
+  description: string;
+} {
+  const severity = typeof risk.severity === "string" ? risk.severity : "";
+  const description =
+    typeof risk.description === "string"
+      ? risk.description
+      : typeof risk.detail === "string"
+        ? risk.detail
+        : "";
+  return { severity, description };
+}
+
+/** Sezione a elenco puntato del parere (requisiti / raccomandazioni / ...). */
+function AdvisorySection({
+  title,
+  items,
+  tc,
+}: {
+  title: string;
+  items?: string[];
+  tc: ThemeColors;
+}) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ fontWeight: 600, color: tc.text, fontSize: 10.5 }}>{title}</div>
+      <ul style={{ margin: "2px 0 0", paddingLeft: 14, listStyle: "disc" }}>
+        {items.map((it, i) => (
+          <li key={i}>{it}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Corpo completo del parere di una figura: requisiti, rischi (per severita'),
+ *  raccomandazioni, osservazioni. */
+function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeColors }) {
+  return (
+    <>
+      <AdvisorySection title="Requisiti" items={advisory.requirements} tc={tc} />
+      {advisory.risks && advisory.risks.length > 0 ? (
+        <div style={{ marginTop: 4 }}>
+          <div style={{ fontWeight: 600, color: tc.text, fontSize: 10.5 }}>Rischi</div>
+          <ul style={{ margin: "2px 0 0", paddingLeft: 14, listStyle: "disc" }}>
+            {advisory.risks.map((risk, i) => {
+              const { severity, description } = riskParts(risk);
+              return (
+                <li key={i}>
+                  {severity ? (
+                    <span style={{ ...tagStyle(severityColor(severity, tc)), marginRight: 5 }}>
+                      {severity}
+                    </span>
+                  ) : null}
+                  {description}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+      <AdvisorySection title="Raccomandazioni" items={advisory.recommendations} tc={tc} />
+      <AdvisorySection title="Osservazioni" items={advisory.concerns} tc={tc} />
+    </>
+  );
+}
+
+/** Riga espandibile per il parere di UNA figura del consiglio. Il testo completo
+ *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione. */
+function FigureReportRow({
+  report,
+  tc,
+}: {
+  report: FigureAdvisoryReport;
+  tc: ThemeColors;
+}) {
+  const [open, setOpen] = useState(false);
+  const advisory = report.advisory;
+  const verdict = advisory?.verdict ?? report.advisory_verdict;
+  const vm = verdictMeta(verdict, tc);
+  const failed = report.status !== "advisory_ok";
+  const hasBody =
+    !!advisory &&
+    ((advisory.requirements?.length ?? 0) > 0 ||
+      (advisory.risks?.length ?? 0) > 0 ||
+      (advisory.recommendations?.length ?? 0) > 0 ||
+      (advisory.concerns?.length ?? 0) > 0);
+  const expandable = hasBody || (failed && !!report.detail_message);
+  return (
+    <li style={{ borderTop: `1px solid ${withAlpha(tc.textMuted, 0.15)}` }}>
+      <button
+        type="button"
+        onClick={() => expandable && setOpen((o) => !o)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          width: "100%",
+          background: "none",
+          border: "none",
+          padding: "3px 0",
+          cursor: expandable ? "pointer" : "default",
+          textAlign: "left",
+          color: "inherit",
+          font: "inherit",
+        }}
+      >
+        <span style={{ fontSize: 9, color: tc.textMuted, width: 10, flexShrink: 0 }}>
+          {expandable ? (open ? "▾" : "▸") : ""}
+        </span>
+        <span style={{ fontSize: 11, fontWeight: 600, color: failed ? tc.error : tc.text }}>
+          {report.kind.replace(/_/g, " ")}
+        </span>
+        <span style={{ ...tagStyle(vm.color), marginLeft: "auto" }}>{vm.label}</span>
+      </button>
+      {open ? (
+        <div style={{ padding: "1px 0 5px 16px", fontSize: 11, color: tc.textMuted }}>
+          {failed && report.detail_message ? (
+            <div style={{ color: tc.error, marginBottom: advisory ? 4 : 0 }}>
+              {report.detail_message}
+            </div>
+          ) : null}
+          {advisory ? <AdvisoryBody advisory={advisory} tc={tc} /> : null}
+        </div>
+      ) : null}
+    </li>
+  );
 }
 
 const rowStyle: React.CSSProperties = {

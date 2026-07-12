@@ -174,6 +174,16 @@ export interface AwaitingSubagentsEvent extends EventProvenance {
   title: string;
 }
 
+/** Parere strutturato completo di una figura (dallo structured output del tool
+ *  advisory_verdict). Propagato dal backend per far LEGGERE il testo di ogni parere. */
+export interface FigureAdvisory {
+  verdict?: string;
+  requirements?: string[];
+  risks?: Array<Record<string, unknown>>;
+  recommendations?: string[];
+  concerns?: string[];
+}
+
 /** Report per-figura del consiglio (segnale strutturato backend). */
 export interface FigureAdvisoryReport {
   kind: string;
@@ -187,6 +197,7 @@ export interface FigureAdvisoryReport {
   detail_code: string;
   detail_message: string;
   advisory_verdict?: string;
+  advisory?: FigureAdvisory;
   subagent_run_id?: string;
 }
 
@@ -284,6 +295,36 @@ function asNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+function asStringList(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out = v.filter((x): x is string => typeof x === "string" && x.trim().length > 0);
+  return out.length > 0 ? out : undefined;
+}
+
+/** Parere strutturato completo di una figura dal payload backend (regola M:
+ *  leggiamo i campi strutturati, non prosa). `undefined` se non c'e' contenuto. */
+function readFigureAdvisory(v: unknown): FigureAdvisory | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const a = v as Record<string, unknown>;
+  const risks = Array.isArray(a.risks)
+    ? a.risks.filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+    : undefined;
+  const advisory: FigureAdvisory = {
+    verdict: asString(a.verdict),
+    requirements: asStringList(a.requirements),
+    recommendations: asStringList(a.recommendations),
+    concerns: asStringList(a.concerns),
+    risks: risks && risks.length > 0 ? risks : undefined,
+  };
+  const hasContent =
+    advisory.verdict ||
+    advisory.requirements ||
+    advisory.recommendations ||
+    advisory.concerns ||
+    advisory.risks;
+  return hasContent ? advisory : undefined;
+}
+
 function readFigureReports(payload: Record<string, unknown>): FigureAdvisoryReport[] | undefined {
   const raw = payload.figure_reports;
   if (!Array.isArray(raw) || raw.length === 0) return undefined;
@@ -312,6 +353,7 @@ function readFigureReports(payload: Record<string, unknown>): FigureAdvisoryRepo
       detail_code: detailCode,
       detail_message: detailMessage,
       advisory_verdict: asString(r.advisory_verdict),
+      advisory: readFigureAdvisory(r.advisory),
       subagent_run_id: asString(r.subagent_run_id),
     });
   }

@@ -1218,6 +1218,11 @@ pub(crate) struct FigureAdvisoryReport {
     pub detail_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisory_verdict: Option<String>,
+    /// Parere strutturato COMPLETO della figura (verdict + requirements + risks +
+    /// recommendations + concerns), propagato alla UI per far leggere il testo di
+    /// ogni consiglio. `None` se la figura non ha prodotto un parere valido.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_run_id: Option<String>,
 }
@@ -1461,6 +1466,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_code: code.to_string(),
             detail_message: message,
             advisory_verdict: None,
+            advisory: None,
             subagent_run_id,
         };
     }
@@ -1476,6 +1482,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
                 .unwrap_or("Sub-agent in timeout")
                 .to_string(),
             advisory_verdict: None,
+            advisory: None,
             subagent_run_id,
         };
     }
@@ -1499,6 +1506,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_code: code,
             detail_message: message,
             advisory_verdict: None,
+            advisory: None,
             subagent_run_id,
         };
     }
@@ -1516,6 +1524,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_code: code,
             detail_message: "Sub-run terminato senza esito positivo".to_string(),
             advisory_verdict: None,
+            advisory: None,
             subagent_run_id,
         };
     }
@@ -1528,6 +1537,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
                 detail_code: "no_advisory".to_string(),
                 detail_message: "Sub-run completato senza chiamare advisory_verdict".to_string(),
                 advisory_verdict: None,
+                advisory: None,
                 subagent_run_id,
             };
         }
@@ -1543,6 +1553,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_code: "invalid_advisory".to_string(),
             detail_message: "Parere advisory presente ma verdetto non valido".to_string(),
             advisory_verdict: verdict.map(str::to_owned),
+            advisory: Some(advisory.clone()),
             subagent_run_id,
         };
     }
@@ -1552,6 +1563,7 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
         detail_code: "advisory_ok".to_string(),
         detail_message: "Parere advisory valido".to_string(),
         advisory_verdict: verdict.map(str::to_owned),
+        advisory: Some(advisory.clone()),
         subagent_run_id,
     }
 }
@@ -4844,6 +4856,7 @@ mod tests {
                 detail_code: "advisory_ok".to_string(),
                 detail_message: "ok".to_string(),
                 advisory_verdict: Some("proceed".to_string()),
+                advisory: None,
                 subagent_run_id: None,
             }],
         );
@@ -4858,6 +4871,7 @@ mod tests {
                 detail_code: "run_timeout".to_string(),
                 detail_message: "timeout".to_string(),
                 advisory_verdict: None,
+                advisory: None,
                 subagent_run_id: None,
             }],
         );
