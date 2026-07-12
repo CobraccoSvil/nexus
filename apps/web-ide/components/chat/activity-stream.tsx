@@ -335,6 +335,7 @@ function EventRow({
             top: 9,
             zIndex: 2,
             display: "inline-flex",
+            flexDirection: "column",
             alignItems: "center",
             gap: 4,
             flexShrink: 0,
