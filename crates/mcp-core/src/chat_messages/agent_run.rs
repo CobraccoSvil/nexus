@@ -1465,22 +1465,24 @@ async fn native_outcome_to_run_result(
         outcome.final_gate_unverified,
     ) {
         (Some(ans), Some(false), _) => Some(format!(
-            "{ans}\n\n---\n**Verifica automatica non superata** (limite tentativi \
-             raggiunto): i criteri di verifica del progetto non sono passati, quindi \
-             il task potrebbe non essere completo. Controlla i criteri falliti nella \
-             timeline \"Decisioni del turno\" e riverifica il flusso reale prima di \
-             considerarlo concluso."
+            "**Verifica automatica non superata** (limite tentativi raggiunto): i \
+             criteri di verifica del progetto non sono passati; il task NON e' \
+             confermato completo. Controlla i criteri falliti nella timeline \
+             \"Decisioni del turno\" e riverifica il flusso reale prima di \
+             considerarlo concluso.\n\n---\n_Resoconto dell'agente (auto-valutazione, \
+             non confermata dalla verifica):_\n{ans}"
         )),
         // Bocciatura del gate in sospeso (run morto prima della ri-verifica, es.
         // provider esauriti): l'ultima verifica ESEGUITA era fallita e le
         // correzioni successive non sono mai state ri-verificate (run a5db0985).
         (Some(ans), _, _) if outcome.final_gate_failed_pending => Some(format!(
-            "{ans}\n\n---\n**Verifica automatica fallita e non ripetuta**: l'ultima \
-             verifica dei criteri del progetto era FALLITA e il run si e' chiuso \
-             prima di poter ri-verificare le correzioni. Il task NON risulta \
-             verificato e puo' contenere regressioni: controlla i criteri falliti \
-             nella timeline \"Decisioni del turno\" e riesegui la verifica prima di \
-             considerarlo concluso."
+            "**Verifica automatica fallita e non ripetuta**: l'ultima verifica dei \
+             criteri del progetto era FALLITA e il run si e' chiuso prima di poter \
+             ri-verificare le correzioni. Il task NON risulta verificato e puo' \
+             contenere regressioni: controlla i criteri falliti nella timeline \
+             \"Decisioni del turno\" e riesegui la verifica prima di considerarlo \
+             concluso.\n\n---\n_Resoconto dell'agente (auto-valutazione, non \
+             confermata dalla verifica):_\n{ans}"
         )),
         // Lavoro svolto ma verifica tecnica NON eseguita (profilo di verifica
         // dell'ambiente assente): annotazione onesta (regola M), non un fallimento.
@@ -6008,11 +6010,17 @@ mod tests_select_engine {
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
         let ans = r.final_answer.expect("resoconto presente");
-        assert!(ans.starts_with("Task completato con successo."));
+        // Il verdetto oggettivo GUIDA (regola M): la prosa ottimista del modello e'
+        // retrocessa a resoconto non confermato, sotto l'annotazione del gate.
         assert!(
-            ans.contains("Verifica automatica non superata"),
-            "il resoconto deve essere annotato col verdetto del gate: {ans}"
+            ans.starts_with("**Verifica automatica non superata**"),
+            "il verdetto del gate deve guidare il resoconto: {ans}"
         );
+        assert!(
+            ans.contains("Task completato con successo."),
+            "la prosa del modello resta presente (subordinata): {ans}"
+        );
+        assert!(ans.contains("Resoconto dell'agente"));
 
         // gate PASSATO -> Completed, nessuna annotazione.
         let mut o = outcome_base();
@@ -6054,10 +6062,13 @@ mod tests_select_engine {
         let r = native_outcome_to_run_result(&pool, run, o).await;
         assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
         let ans = r.final_answer.expect("resoconto presente");
-        assert!(ans.starts_with("Correzioni applicate."));
         assert!(
-            ans.contains("Verifica automatica fallita e non ripetuta"),
-            "annotazione onesta attesa sul resoconto: {ans}"
+            ans.starts_with("**Verifica automatica fallita e non ripetuta**"),
+            "il verdetto del gate deve guidare il resoconto: {ans}"
+        );
+        assert!(
+            ans.contains("Correzioni applicate."),
+            "la prosa del modello resta presente (subordinata): {ans}"
         );
 
         // Contro-prova: senza bocciatura pendente il comportamento e' invariato.
