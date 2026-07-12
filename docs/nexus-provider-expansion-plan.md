@@ -159,11 +159,25 @@ onesto, doc/env bonificati. La dir `brain/` e' stata poi eliminata dal repo
 3. NUOVO (0.2): **mig `0564`** — versionare `orchestrator.plan_phase_enabled='true'`
    (landmine gemella del cutover engine).
 
-## 4. Parte A — Perplexity (search/grounding + citazioni UI)
+## 4. Parte A — Perplexity (search/grounding + citazioni UI) — PROVIDER onboarded (2026-07-12)
 
 Ruolo invariato: provider dedicato alla ricerca web citata, NON nodo agentico.
-Non iniziata (zero tracce di sonar/perplexity nel gateway; la voce "Perplexity" in
-`mcp-catalog-data.ts:427` e' un connettore MCP esterno, altra cosa).
+
+Stato: **provider FATTO** via registry F2 (mig `0568_perplexity_provider.sql`),
+**citazioni + intent ANCORA DA FARE** (il valore distintivo).
+- **Mig 0568**: settings `perplexity_api_key`/`_enabled`; registry (`perplexity`,
+  `openai_compat`, base_url `https://api.perplexity.ai`, **`supports_tools=false`**);
+  3 modelli Sonar `is_enabled=false` (`sonar` 1/1, `sonar-pro` 3/15,
+  `sonar-reasoning-pro` 3/15) con **`supports_tool_use=false`** (garanzia A4: il
+  selettore agentico li esclude) e capability `web_search` (per il futuro flusso).
+  `default.yaml`: `perplexity` aggiunto. Additivo/opt-in (verificato).
+- **Prezzi DA VERIFICARE** prima di abilitare: Perplexity ha un request fee per
+  "search context size" NON modellato in `ai_price_catalog`.
+- **PROSSIMO PEZZO (grosso) — citazioni end-to-end + intent** (vedi A2/A3 sotto):
+  tocca `openai_compat.rs` (punto unico critico: campo `citations` nella struct
+  wire) e il **frontend web-ide** (`message-list.tsx`, oggi CONTESO da un'altra
+  sessione attiva -> da fare quando la concorrenza si calma). Il provider da solo
+  non ha ancora il valore search-citato: e' il prerequisito.
 
 ### A1. Provider Rust (invariato)
 - Nuovo `crates/nexus-gateway/src/providers/perplexity.rs` su template
