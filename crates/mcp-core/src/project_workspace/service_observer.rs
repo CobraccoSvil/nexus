@@ -810,9 +810,15 @@ fn evaluate_anomalies(
 /// guardia in-memory `active_anomalies`, che si azzera a ogni restart di mcp-core
 /// lasciando l'anomalia 'open' nel DB e facendola ri-aprire come "nuova".
 ///
-/// Per `crash`/`build_error` resta un INSERT puro: ogni evento e' distinto (firma
-/// errore propria) e il suo ciclo di vita lo governa il Debugger, quindi non
-/// rientra nel vincolo univoco parziale (limitato a signal_kind='anomaly').
+/// Per `signal_kind='crash'` esegue un UPSERT analogo sull'indice univoco parziale
+/// `uniq_service_diagnoses_active_crash` (mig 0562): un solo crash ATTIVO per la
+/// chiave (project_id, unit, signal_kind, COALESCE(error_signature_hash,'')). La
+/// guardia anti-spam `st.last_crash_sig` e' in-memory e si azzera a ogni restart di
+/// mcp-core; senza il vincolo un crash rimasto 'open' nel DB veniva re-inserito come
+/// "nuovo", accumulando righe duplicate nel pannello Problemi.
+///
+/// Per gli altri `signal_kind` non vincolati (es. `build_error`) resta un INSERT
+/// puro: ogni evento e' distinto e il suo ciclo di vita lo governa il Debugger.
 async fn persist_diagnosis(
     db: &PgPool,
     project_id: Uuid,
@@ -834,10 +840,10 @@ async fn persist_diagnosis(
         error_signature_hash,
         detail,
     };
-    if signal_kind == "anomaly" {
-        upsert_anomaly_diagnosis(db, &row).await
-    } else {
-        insert_event_diagnosis(db, &row).await
+    match signal_kind {
+        "anomaly" => upsert_anomaly_diagnosis(db, &row).await,
+        "crash" => upsert_crash_diagnosis(db, &row).await,
+        _ => insert_event_diagnosis(db, &row).await,
     }
 }
 
@@ -886,9 +892,44 @@ async fn upsert_anomaly_diagnosis(db: &PgPool, row: &DiagnosisRow<'_>) -> Option
     .flatten()
 }
 
-/// INSERT puro per `crash`/`build_error`: ogni evento e' distinto (firma errore
-/// propria) e il suo ciclo di vita lo governa il Debugger, quindi non rientra nel
-/// vincolo univoco parziale (limitato a signal_kind='anomaly').
+/// UPSERT per `signal_kind='crash'`: un solo crash attivo per
+/// (project_id, unit, error_signature_hash). Il target ON CONFLICT replica
+/// esattamente colonne+predicato dell'indice parziale
+/// uniq_service_diagnoses_active_crash (mig 0562). La guardia anti-spam
+/// `st.last_crash_sig` e' in-memory e si azzera a ogni restart di mcp-core: senza
+/// questo vincolo un crash rimasto 'open' nel DB veniva re-inserito come "nuovo",
+/// accumulando righe duplicate nel pannello Problemi.
+async fn upsert_crash_diagnosis(db: &PgPool, row: &DiagnosisRow<'_>) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO service_diagnoses
+           (project_id, unit, signal_kind, metric, value, threshold,
+            error_signature_hash, status, detail)
+           VALUES ($1,$2,'crash',$3,$4,$5,$6,'open',$7)
+           ON CONFLICT (project_id, unit, signal_kind, COALESCE(error_signature_hash, ''))
+             WHERE signal_kind = 'crash' AND status IN ('open', 'diagnosing')
+           DO UPDATE SET
+             detail      = EXCLUDED.detail,
+             updated_at  = NOW(),
+             occurrences = service_diagnoses.occurrences + 1
+           RETURNING id"#,
+    )
+    .bind(row.project_id)
+    .bind(row.unit)
+    .bind(row.metric)
+    .bind(row.value)
+    .bind(row.threshold)
+    .bind(row.error_signature_hash)
+    .bind(row.detail)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// INSERT puro per i `signal_kind` non vincolati (es. `build_error`): ogni evento
+/// e' distinto (firma errore propria) e il suo ciclo di vita lo governa il Debugger,
+/// quindi non rientra in un vincolo univoco parziale. `anomaly` e `crash` hanno
+/// invece un proprio UPSERT dedicato (mig 0491 / 0562).
 async fn insert_event_diagnosis(db: &PgPool, row: &DiagnosisRow<'_>) -> Option<Uuid> {
     sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO service_diagnoses
@@ -1748,6 +1789,16 @@ mod tests {
         .execute(pool)
         .await
         .expect("create unique partial index");
+
+        // Indice crash (mig 0562): abilita l'UPSERT del ramo crash.
+        sqlx::query(
+            "CREATE UNIQUE INDEX uniq_service_diagnoses_active_crash \
+                 ON service_diagnoses (project_id, unit, signal_kind, COALESCE(error_signature_hash, '')) \
+                 WHERE signal_kind = 'crash' AND status IN ('open', 'diagnosing')",
+        )
+        .execute(pool)
+        .await
+        .expect("create crash unique partial index");
     }
 
     async fn count_open_anomalies(
@@ -1869,6 +1920,86 @@ mod tests {
             count_open_anomalies(&pool, project_id, unit, "error_rate").await,
             1,
             "sempre una sola anomalia open dopo riapertura"
+        );
+    }
+
+    async fn count_open_crashes(pool: &PgPool, project_id: Uuid, unit: &str, sig: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM service_diagnoses \
+             WHERE project_id=$1 AND unit=$2 AND error_signature_hash=$3 \
+               AND signal_kind='crash' AND status='open'",
+        )
+        .bind(project_id)
+        .bind(unit)
+        .bind(sig)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+    }
+
+    // Apre/aggiorna un crash con la firma data (error_signature_hash): incapsula la
+    // chiamata ripetuta di persist_diagnosis nel test dell'UPSERT crash.
+    async fn open_crash(pool: &PgPool, project_id: Uuid, unit: &str, sig: &str) -> Uuid {
+        persist_diagnosis(
+            pool,
+            project_id,
+            unit,
+            "crash",
+            Some("service_failed"),
+            None,
+            None,
+            Some(sig),
+            Some("Servizio non operativo (service_failed)."),
+        )
+        .await
+        .expect("persist crash")
+    }
+
+    #[sqlx::test]
+    async fn crash_upsert_non_duplica_e_incrementa_occurrences(pool: PgPool) {
+        create_service_diagnoses(&pool).await;
+        let project_id = Uuid::new_v4();
+        let unit = "beauty-book-frontend.service";
+
+        // Primo ciclo: apre il crash. Cicli successivi (simulano un restart di
+        // mcp-core che azzera st.last_crash_sig): AGGIORNANO la stessa riga, non ne
+        // inseriscono. E' la causa radice dei crash duplicati nel pannello Problemi.
+        let id1 = open_crash(&pool, project_id, unit, "sig-abc").await;
+        let id2 = open_crash(&pool, project_id, unit, "sig-abc").await;
+
+        assert_eq!(id1, id2, "stesso id: riga riusata, non duplicata");
+        assert_eq!(
+            count_open_crashes(&pool, project_id, unit, "sig-abc").await,
+            1,
+            "un solo crash open per (unit, firma)"
+        );
+
+        let occ: i32 = sqlx::query_scalar("SELECT occurrences FROM service_diagnoses WHERE id=$1")
+            .bind(id1)
+            .fetch_one(&pool)
+            .await
+            .expect("riga canonica");
+        assert_eq!(occ, 2, "occurrences incrementato al secondo ciclo");
+    }
+
+    #[sqlx::test]
+    async fn crash_firma_diversa_e_riga_separata(pool: PgPool) {
+        create_service_diagnoses(&pool).await;
+        let project_id = Uuid::new_v4();
+        let unit = "beauty-book-frontend.service";
+
+        // Firma errore diversa sulla stessa unit -> riga distinta (chiave diversa).
+        open_crash(&pool, project_id, unit, "sig-uno").await;
+        open_crash(&pool, project_id, unit, "sig-due").await;
+        assert_eq!(
+            count_open_crashes(&pool, project_id, unit, "sig-uno").await,
+            1,
+            "prima firma: una riga"
+        );
+        assert_eq!(
+            count_open_crashes(&pool, project_id, unit, "sig-due").await,
+            1,
+            "firma diversa = crash separato"
         );
     }
 }
