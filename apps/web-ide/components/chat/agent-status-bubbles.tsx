@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { AgentStep } from "../../lib/api-client";
-import { toolLabel } from "./tool-labels";
+import { toolLabel, stepLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 
 /* ------------------------------------------------------------------ */
@@ -245,7 +245,7 @@ export function AgentProgressInline({
               <span style={{ color: statusColor(s.status), fontSize: 11, fontWeight: 700 }}>
                 {statusIcon(s.status)}
               </span>
-              <span>{s.stepIndex + 1}. {toolLabel(s.toolName)}</span>
+              <span>{stepLabel(s)}</span>
             </div>
           ))}
         </div>

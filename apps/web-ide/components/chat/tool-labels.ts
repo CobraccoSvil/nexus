@@ -93,3 +93,14 @@ export function toolLabel(name: string): string {
   if (!name) return "";
   return TOOL_LABELS[name] || name.replace(/_/g, " ");
 }
+
+/** Etichetta leggibile di uno step nella narrazione live dell'agente. Punto unico
+ *  (regola L) usato da agent-status-bubbles / agent-activity-bar. Due accortezze
+ *  che i call site sbagliavano, mostrando righe tipo "2003." senza testo:
+ *  1) `stepIndex` del grafo e' `iteration*1000+idx` (vedi agent_run.rs), NON un
+ *     progressivo -> non va mai mostrato come "numero del passo".
+ *  2) uno step con `toolName` vuoto e' un'iterazione di solo testo/ragionamento del
+ *     modello (nessuna tool call) -> fallback esplicito invece di una riga vuota. */
+export function stepLabel(step: { toolName: string }): string {
+  return toolLabel(step.toolName) || "Elaborazione";
+}

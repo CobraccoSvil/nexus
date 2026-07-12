@@ -1,7 +1,7 @@
 "use client";
 
 import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
-import { toolLabel } from "./tool-labels";
+import { stepLabel } from "./tool-labels";
 
 /**
  * Barra di stato "AI in esecuzione": riassume lo stato del run agente in corso
@@ -82,7 +82,7 @@ export function AgentActivityBar({
         </strong>
         {isAgentRunning && runningAgentStep ? (
           <span style={{ color: tc.textMuted, fontSize: 11 }}>
-            step {runningAgentStep.stepIndex + 1} • {toolLabel(runningAgentStep.toolName)}
+            {stepLabel(runningAgentStep)}
           </span>
         ) : isAgentRunning && lastMetaStep ? (
           // Attivita' corrente live dal flusso meta_step (es. "tool
@@ -183,7 +183,7 @@ export function AgentActivityBar({
                     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                   }}
                 >
-                  {step.stepIndex + 1}. {toolLabel(step.toolName)} —{" "}
+                  {stepLabel(step)} —{" "}
                   {step.status === "completed" ? "ok" : step.status === "running" ? "in corso" : step.status === "failed" ? "errore" : step.status}
                 </div>
               ))}
