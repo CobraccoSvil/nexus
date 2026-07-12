@@ -1356,6 +1356,52 @@ async fn record_tool_probe_failure(
 ///   non vale la pena escludere il provider per ore.
 /// - altri `kind` -> nessun cooldown: lasciamo che il chiamante decida
 ///   (default conservativo per non sopprimere provider per cause ignote).
+/// Esito dell'applicazione di una classificazione probe (per outage detection).
+pub(crate) enum ProbeDispatchOutcome {
+    /// Nessuna azione (ok o inconclusivo).
+    None,
+    /// Cooldown provider applicato (transient/billing).
+    ProviderCooldown,
+    /// Errore model-specific: reconcile default, nessun cooldown provider.
+    ModelSpecific,
+}
+
+/// Punto unico (regola L) per applicare cooldown/reconcile dopo un errore di probe
+/// classificato dal brain (`error_class` canonico). Usato da `provider_health_probe`
+/// e da altri call site che devono allinearsi a `classification_from_error_class`.
+pub(crate) async fn dispatch_probe_error(
+    provider: &str,
+    model: &str,
+    error_class: &str,
+    db: &sqlx::PgPool,
+) -> ProbeDispatchOutcome {
+    match classification_from_error_class(error_class) {
+        Classification::ProviderWide(kind, _) => {
+            apply_provider_wide_cooldown(provider, model, &kind).await;
+            ProbeDispatchOutcome::ProviderCooldown
+        }
+        Classification::ModelSpecific(kind, _) => {
+            tracing::warn!(
+                "probe dispatch: errore model-specific su {provider}/{model} ({kind}) — nessun cooldown provider"
+            );
+            if let Err(e) = crate::reconcile_default_models::reconcile_provider_default_models(db).await
+            {
+                tracing::warn!(
+                    "probe dispatch: reconcile_default_models fallito dopo model-specific: {e}"
+                );
+            }
+            ProbeDispatchOutcome::ModelSpecific
+        }
+        Classification::Transient(kind, _) => {
+            tracing::debug!(
+                "probe dispatch: esito inconclusivo su {provider}/{model} ({kind}) — nessun cooldown"
+            );
+            ProbeDispatchOutcome::None
+        }
+        Classification::Ok => ProbeDispatchOutcome::None,
+    }
+}
+
 async fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
     // Errori persistenti (billing/quota/credito/auth): mettono il provider in
     // cooldown logico in-memory + TTL persistente su nexus_provider_health
@@ -1609,8 +1655,9 @@ mod tests {
 
     #[test]
     fn classification_not_found_da_error_class() {
+        // "not_found" e' unificato a "invalid_model" (stessa semantica model-specific).
         let c = classification_from_error_class("not_found");
-        assert!(matches!(c, Classification::ModelSpecific(ref k, _) if k == "model_not_found"));
+        assert!(matches!(c, Classification::ModelSpecific(ref k, _) if k == "invalid_model"));
     }
 
     #[test]
@@ -1676,12 +1723,21 @@ mod tests {
     }
 
     #[test]
+    fn classification_invalid_model_non_mette_provider_in_cooldown() {
+        let c = classification_from_error_class("invalid_model");
+        assert!(matches!(c, Classification::ModelSpecific(_, _)));
+        let c2 = classification_from_error_class("not_found");
+        assert!(matches!(c2, Classification::ModelSpecific(_, _)));
+    }
+
+    #[test]
     fn classification_model_specific_restano_punitive() {
         // Le SOLE cause davvero model-specific continuano a degradare il modello:
-        // not_found, context_too_long, invalid_request, unprocessable, unsupported.
+        // not_found (unificato a "invalid_model"), context_too_long, invalid_request,
+        // unprocessable, unsupported.
         assert!(matches!(
             classification_from_error_class("not_found"),
-            Classification::ModelSpecific(ref k, _) if k == "model_not_found"
+            Classification::ModelSpecific(ref k, _) if k == "invalid_model"
         ));
         for ec in [
             "context_too_long",
@@ -1723,11 +1779,12 @@ mod tests {
 
     #[test]
     fn tool_probe_model_specific_restano_tool_failed() {
-        // not_found resta ToolFailed (degrada): solo i transient sono inconclusivi.
+        // not_found (unificato a "invalid_model") resta ToolFailed (degrada): solo i
+        // transient sono inconclusivi.
         let v = serde_json::json!({ "error_class": "not_found", "tool_use_blocks": [] });
         assert!(matches!(
             evaluate_tool_probe(&v),
-            ToolProbeVerdict::ToolFailed(ref k) if k == "model_not_found"
+            ToolProbeVerdict::ToolFailed(ref k) if k == "invalid_model"
         ));
     }
 

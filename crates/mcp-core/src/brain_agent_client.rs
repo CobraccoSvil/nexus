@@ -745,12 +745,33 @@ fn classify_provider_error(
     msg: &str,
 ) -> Option<(&'static str, CooldownKind, &'static str)> {
     if let Some(ec) = error_class.map(str::trim).filter(|s| !s.is_empty() && *s != "ok") {
-        if let Some(hit) = classify_by_error_class(Some(ec), false) {
+        // Un error_class esplicito puo' essere una MIS-classificazione del brain: un
+        // 429 mappato a `rate_limit` e' in realta' quota/credito esaurito quando il
+        // MESSAGGIO porta un marker billing. Passiamo il marker (dal punto unico
+        // `classify_text`, regola L) cosi' `classify_by_error_class` promuove a
+        // billing/cooldown-lungo invece di lasciare il provider a-crediti-zero nel
+        // cascade (bug live: l'error_class esplicito short-circuitava la promozione).
+        let has_billing_marker =
+            crate::provider_error_classifier::classify_text(msg).stop_reason == "billing_error";
+        if let Some(hit) = classify_by_error_class(Some(ec), has_billing_marker) {
             return Some(hit);
         }
     }
     let classified = crate::provider_error_classifier::classify_text(msg);
     map_classifier_to_cooldown(&classified)
+}
+
+/// Punto unico per i worker/purpose che invocano LLM fuori dallo stream agente:
+/// classifica l'errore (error_class strutturato o testo) e applica cooldown provider.
+pub(crate) fn handle_provider_llm_failure(
+    provider: &str,
+    error_class: Option<&str>,
+    message: &str,
+) {
+    if let Some((ec, kind, reason)) = classify_provider_error(error_class, message) {
+        let short_secs = crate::provider_cooldown::provider_health_timings().slow_cooldown_s;
+        apply_provider_cooldown(provider, ec, kind, reason, short_secs);
+    }
 }
 
 /// Applica il cooldown al provider in base alla classificazione dell'errore.

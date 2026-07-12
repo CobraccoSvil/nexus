@@ -214,6 +214,12 @@ export interface CouncilOfCompetenciesEvent extends EventProvenance {
   figureReports?: FigureAdvisoryReport[];
 }
 
+/** Coppia provider/model di un analista del panel multi-provider (payload backend). */
+export interface PanelProviderEntry {
+  provider: string;
+  model?: string;
+}
+
 /** Panel multi-provider: stesso problema analizzato da provider/modelli distinti
  *  tramite purpose tier-aware. Meta-step backend `multi_provider_panel`. */
 export interface MultiProviderPanelEvent extends EventProvenance {
@@ -222,6 +228,7 @@ export interface MultiProviderPanelEvent extends EventProvenance {
   productName: string;
   activationSource?: string;
   providerCount?: number;
+  panelProviders?: PanelProviderEntry[];
   degraded?: boolean;
   degradationReason?: string;
 }
@@ -332,6 +339,22 @@ function readCouncilFigureTasks(
       continue;
     }
     out.push({ kind, status });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function readPanelProviders(
+  payload: Record<string, unknown>,
+): PanelProviderEntry[] | undefined {
+  const raw = payload.panel_providers;
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: PanelProviderEntry[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const r = item as Record<string, unknown>;
+    const provider = asString(r.provider);
+    if (!provider) continue;
+    out.push({ provider, model: asString(r.model) });
   }
   return out.length > 0 ? out : undefined;
 }
@@ -734,6 +757,7 @@ export function composeActivityStream(
             productName: asString(p.product_name) ?? "Multi-provider advisory",
             activationSource: asString(p.activation_source),
             providerCount: typeof p.provider_count === "number" ? p.provider_count : undefined,
+            panelProviders: readPanelProviders(p),
             degraded: p.degraded === true,
             degradationReason:
               asString(p.degradation_detail) ?? asString(p.degradation_reason),
@@ -770,6 +794,10 @@ export function composeActivityStream(
     }
   }
 
+  // Provider/model del run PADRE (ultimo segmento con provider noto): usato per
+  // eventi prodotto (Consiglio, multi-provider panel) in segmenti "unknown".
+  const primaryRun = resolvePrimaryRunProvenance(segments);
+
   // Stampa la PROVENIENZA (provider/model) su ogni evento del segmento, cosi'
   // ogni riga del nastro puo' mostrare l'icona provider + tooltip modello senza
   // risalire al segmento. Per i TOOL usa il model EFFETTIVO della trace della
@@ -783,12 +811,26 @@ export function composeActivityStream(
   for (const seg of segments) {
     for (const ev of seg.events) {
       if (ev.type === "switch" || ev.type === "subagent") continue;
-      ev.provider = seg.provider;
+      const productEvent =
+        ev.type === "council_of_competencies" || ev.type === "multi_provider_panel";
+      const prov =
+        seg.provider !== "unknown"
+          ? seg.provider
+          : productEvent && primaryRun?.provider
+            ? primaryRun.provider
+            : seg.provider;
+      const segModel =
+        seg.provider !== "unknown"
+          ? seg.model
+          : productEvent && primaryRun?.provider
+            ? primaryRun.model
+            : seg.model;
+      ev.provider = prov;
       if (ev.type === "tool") {
         const tr = ev.iteration != null ? traceIter.get(ev.iteration) : undefined;
-        ev.model = tr?.model ?? seg.model;
+        ev.model = tr?.model ?? segModel;
       } else {
-        ev.model = seg.model;
+        ev.model = segModel;
       }
     }
   }
@@ -817,6 +859,19 @@ export function composeActivityStream(
  *  effettivo di una trace puo' ancora ri-allineare il provider di segmento. */
 function hasExecutedWork(seg: ActivitySegment): boolean {
   return seg.events.some((e) => e.type === "tool" || e.type === "folded_tools");
+}
+
+/** Ultimo provider/model noto del run padre (esclude "unknown"). */
+function resolvePrimaryRunProvenance(
+  segments: ActivitySegment[],
+): EventProvenance | undefined {
+  let last: EventProvenance | undefined;
+  for (const seg of segments) {
+    if (seg.provider && seg.provider !== "unknown") {
+      last = { provider: seg.provider, model: seg.model };
+    }
+  }
+  return last;
 }
 
 /**

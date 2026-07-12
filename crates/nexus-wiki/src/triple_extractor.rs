@@ -504,37 +504,93 @@ pub async fn extract_triples_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<E
         anyhow::bail!("documento {doc_id} non trovato");
     };
 
-    // Risolvi modello dal PUNTO UNICO tier-only (regola L/G).
-    let (provider, model) = state
-        .ai
-        .resolve_purpose_model("wiki_triple_extract")
-        .await
-        .map_err(|m| anyhow!(m))?;
-
+    // Risolvi modello dal PUNTO UNICO tier-only (regola L/G), con failover se il
+    // provider scelto fallisce (cooldown-aware via `resolve_purpose_model_excluding`).
     let prompt = render_prompt(state, &doc, settings.max_triples_per_doc).await?;
 
-    // NB: non logghiamo il body del documento ne' il prompt; solo metadati.
-    tracing::info!(
-        doc_id = %doc.id,
-        scope = %doc.scope,
-        provider = %provider,
-        model = %model,
-        body_len = doc.body_md.len(),
-        "wiki.triple_extract: invio LLM"
-    );
+    let mut exclude_providers: Vec<String> = Vec::new();
+    let (provider, model, resp) = loop {
+        let (provider, model) = state
+            .ai
+            .resolve_purpose_model_excluding("wiki_triple_extract", &exclude_providers)
+            .await
+            .map_err(|m| anyhow!(m))?;
 
-    let resp = match state
-        .ai
-        .generate_completion(&provider, &model, &prompt)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            report.errors.push(format!("llm error: {e}"));
-            report.elapsed_ms = started.elapsed().as_millis();
-            return Ok(report);
+        tracing::info!(
+            doc_id = %doc.id,
+            scope = %doc.scope,
+            provider = %provider,
+            model = %model,
+            body_len = doc.body_md.len(),
+            "wiki.triple_extract: invio LLM"
+        );
+
+        match state
+            .ai
+            .generate_completion(&provider, &model, &prompt)
+            .await
+        {
+            Ok(v) => {
+                let ec = v
+                    .get("error_class")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| {
+                        v.get("metadata")
+                            .and_then(|m| m.get("error_class"))
+                            .and_then(|x| x.as_str())
+                    });
+                let content = v.get("content").and_then(|x| x.as_str()).unwrap_or("");
+                let swallowed = content.trim().starts_with("[Error:")
+                    || content.trim().starts_with("[error:");
+                if ec.is_some() || swallowed {
+                    let msg = if swallowed {
+                        content.to_string()
+                    } else {
+                        format!("provider error_class={}", ec.unwrap_or("unknown"))
+                    };
+                    state
+                        .ai
+                        .notify_provider_llm_failure(&provider, ec, &msg)
+                        .await;
+                    if exclude_providers.len() < 3 {
+                        exclude_providers.push(provider.to_ascii_lowercase());
+                        tracing::warn!(
+                            doc_id = %doc.id,
+                            provider = %provider,
+                            error_class = ?ec,
+                            "wiki.triple_extract: LLM fallito, ritento con altro provider"
+                        );
+                        continue;
+                    }
+                    report.errors.push(format!("llm provider error: {msg}"));
+                    report.elapsed_ms = started.elapsed().as_millis();
+                    return Ok(report);
+                }
+                break (provider, model, v);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                state
+                    .ai
+                    .notify_provider_llm_failure(&provider, None, &msg)
+                    .await;
+                if exclude_providers.len() < 3 {
+                    exclude_providers.push(provider.to_ascii_lowercase());
+                    tracing::warn!(
+                        doc_id = %doc.id,
+                        provider = %provider,
+                        "wiki.triple_extract: LLM fallito, ritento con altro provider"
+                    );
+                    continue;
+                }
+                report.errors.push(format!("llm error: {msg}"));
+                report.elapsed_ms = started.elapsed().as_millis();
+                return Ok(report);
+            }
         }
     };
+
+    let _ = (provider, model);
 
     // Estrai token usage / cost se presenti nel payload del provider.
     let (tok_in, tok_out) = crate::deps::extract_usage_tokens(&resp);

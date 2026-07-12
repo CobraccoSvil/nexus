@@ -87,6 +87,42 @@ impl WikiAiServices for AppStateWikiAi {
                 .into_model(&purpose)
         })
     }
+
+    fn resolve_purpose_model_excluding(
+        &self,
+        purpose: &str,
+        exclude_providers: &[String],
+    ) -> BoxFuture<'_, Result<(String, String), String>> {
+        let purpose = purpose.to_string();
+        let exclude = exclude_providers.to_vec();
+        Box::pin(async move {
+            crate::internal_routing::resolve_purpose_model_db_excluding(
+                &self.state.db,
+                &purpose,
+                &exclude,
+            )
+            .await
+            .into_model(&purpose)
+        })
+    }
+
+    fn notify_provider_llm_failure(
+        &self,
+        provider: &str,
+        error_class: Option<&str>,
+        message: &str,
+    ) -> BoxFuture<'_, ()> {
+        let provider = provider.to_string();
+        let error_class = error_class.map(str::to_string);
+        let message = message.to_string();
+        Box::pin(async move {
+            crate::brain_agent_client::handle_provider_llm_failure(
+                &provider,
+                error_class.as_deref(),
+                &message,
+            );
+        })
+    }
 }
 
 /// Impl mcp-core del risolutore pool per-progetto per i worker wiki

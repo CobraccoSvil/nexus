@@ -1281,12 +1281,20 @@ impl CouncilConveneOutcome {
     }
 }
 
+/// Coppia provider/model usata da un analista del panel multi-provider.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PanelProviderEntry {
+    pub provider: String,
+    pub model: String,
+}
+
 /// Esito del panel multi-provider: sintesi attiva oppure degrado esplicito.
 #[derive(Debug, Clone)]
 pub(crate) enum MultiProviderPanelOutcome {
     Active {
         synthesis: AdvisorySynthesis,
         provider_count: usize,
+        panel_providers: Vec<PanelProviderEntry>,
     },
     Degraded {
         reason: MultiProviderDegradeReason,
@@ -1702,10 +1710,18 @@ pub(crate) async fn convene_multi_provider_panel(
     });
     let results: Vec<Value> = futures::future::join_all(futs).await;
     let provider_count = candidates.len();
+    let panel_providers: Vec<PanelProviderEntry> = candidates
+        .iter()
+        .map(|c| PanelProviderEntry {
+            provider: c.provider.clone(),
+            model: c.model.clone(),
+        })
+        .collect();
     compose_multi_provider_synthesis(&results, policy).map(|synthesis| {
         MultiProviderPanelOutcome::Active {
             synthesis,
             provider_count,
+            panel_providers,
         }
     })
 }

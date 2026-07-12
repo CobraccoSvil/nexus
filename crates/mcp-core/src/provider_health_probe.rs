@@ -34,10 +34,8 @@ use crate::provider_cooldown::{
     is_provider_in_cooldown, provider_health_timings, put_provider_in_long_cooldown,
     remove_cooldown,
 };
-// `put_provider_in_cooldown` e' `pub(crate)` -> accessibile, ma la signature
-// e' `(provider: &str, retry_after_seconds: Option<u64>)`. Per slow/timeout
-// usiamo l'overload corto.
-use crate::provider_cooldown::put_provider_in_cooldown;
+// `put_provider_in_cooldown` non usato qui: cooldown delegato a
+// `model_health_probe::dispatch_probe_error` (punto unico classificazione).
 
 /// Lista dei provider da probare. Allineata con `KNOWN_PROVIDERS` in
 /// `orchestrator.rs`. Mantenuta hard-coded perche' sono note staticamente
@@ -224,7 +222,6 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     let model = default_model_for_provider(&matrix_arc, provider);
     let timings = provider_health_timings();
     let probe_timeout_s = timings.health_probe_timeout_s;
-    let slow_cooldown_s = timings.slow_cooldown_s;
     let started = Instant::now();
     // generate_completion vive su `NeuralCoreClient`, accessibile via il
     // campo `pub(crate) neural` di `Orchestrator`.
@@ -276,15 +273,12 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 };
                 let kind = kind_from_error_class(&ec);
                 tracing::warn!("provider_health_probe: {provider} errore provider (class={kind})");
-                // billing/auth: persistenti -> long cooldown (servono soldi/key).
-                let billing = matches!(
-                    kind.as_str(),
-                    "quota_exceeded" | "credit_balance_too_low" | "billing_required" | "auth_error"
-                );
-                if billing {
-                    put_provider_in_long_cooldown(provider, &kind);
-                } else {
-                    put_provider_in_cooldown(provider, Some(slow_cooldown_s));
+                if matches!(
+                    crate::model_health_probe::dispatch_probe_error(provider, &model, &ec, db)
+                        .await,
+                    crate::model_health_probe::ProbeDispatchOutcome::ProviderCooldown
+                ) {
+                    round_victims_push(provider);
                 }
                 let detail = if inner.is_empty() {
                     content_text.as_str()
@@ -342,52 +336,41 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             // Classifico per decidere il tipo di cooldown.
             let msg = e.to_string();
             // Classificazione via il punto UNICO (brain gRPC); niente pattern locali.
-            let kind =
-                kind_from_error_class(&orchestrator.neural.classify_error(&msg, provider).await);
+            let ec = orchestrator.neural.classify_error(&msg, provider).await;
+            let kind = kind_from_error_class(&ec);
             tracing::warn!(
                 "provider_health_probe: {provider} ERROR ({kind}) in {latency_ms}ms: {msg}",
                 msg = &msg[..msg.len().min(200)],
             );
-            // Categorie di errore:
-            //   - billing/quota → cooldown lungo (6h): provider DAVVERO down per credito
-            //   - infrastruttura locale (tcp connect / gRPC Unavailable / DNS):
-            //     NON cooldown — il problema e' della rete o del brain bridge,
-            //     non del provider remoto. Senza questa eccezione un hiccup
-            //     di rete locale marcava simultaneamente tutti i provider come
-            //     down (visto in produzione: 5 provider falliti in 8 secondi).
-            //   - altri (rate_limit/timeout/auth/unknown) → cooldown breve 60s
+            // Infrastruttura locale (brain bridge / rete): NON cooldown — il problema
+            // e' locale, non del provider remoto.
             let is_local_infra = matches!(kind.as_str(), "connection_error")
                 || msg.contains("tcp connect error")
                 || msg.contains("Unavailable")
                 || msg.contains("ECONNREFUSED");
-            if matches!(
-                kind.as_str(),
-                "quota_exceeded" | "credit_balance_too_low" | "billing_required"
-            ) {
-                put_provider_in_long_cooldown(provider, &kind);
-            } else if is_local_infra {
+            if is_local_infra {
                 tracing::warn!(
                     "provider_health_probe: {provider} ERROR ma sembra problema di rete \
                      locale / brain bridge — NESSUN cooldown applicato"
                 );
-                // Anche se NON applichiamo cooldown ora, contiamolo per
-                // outage detection: se 3+ provider hanno is_local_infra in
-                // un round, e' OUTAGE certo e NON dobbiamo applicare nulla.
                 round_victims_push(provider);
-            } else {
-                put_provider_in_cooldown(provider, Some(slow_cooldown_s));
+            } else if matches!(
+                crate::model_health_probe::dispatch_probe_error(provider, &model, &ec, db).await,
+                crate::model_health_probe::ProbeDispatchOutcome::ProviderCooldown
+            ) {
                 round_victims_push(provider);
             }
             (false, Some(kind), Some(truncate(&msg, 500)))
         }
         Err(_timeout_elapsed) => {
-            // Timeout: provider troppo lento. Cooldown breve.
             tracing::warn!("provider_health_probe: {provider} TIMEOUT (>{probe_timeout_s}s)");
-            put_provider_in_cooldown(provider, Some(slow_cooldown_s));
-            // Timeout: spesso e' anch'esso un sintomo di outage locale
-            // (brain bridge lento, WSL DNS lento, internet bloccato). Conta
-            // come victim per outage detection.
-            round_victims_push(provider);
+            if matches!(
+                crate::model_health_probe::dispatch_probe_error(provider, &model, "timeout", db)
+                    .await,
+                crate::model_health_probe::ProbeDispatchOutcome::ProviderCooldown
+            ) {
+                round_victims_push(provider);
+            }
             (
                 false,
                 Some("timeout".to_string()),

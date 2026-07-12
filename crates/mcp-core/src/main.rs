@@ -90,6 +90,7 @@ mod prompt_templates;
 mod provider_cooldown;
 mod provider_error_classifier;
 mod provider_health_probe;
+mod reconcile_default_models;
 mod rag;
 mod routes;
 mod routing_config;

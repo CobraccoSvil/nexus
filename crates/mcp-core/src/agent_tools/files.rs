@@ -554,7 +554,7 @@ fn spawn_write_reindex(ctx: &AgentToolContext, target: &Path, path_str: &str, co
             &target_bg,
         )
         .await;
-        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &root_bg, &target_bg).await;
         // Ri-valuta le violazioni di governance risorse sul file appena scritto:
         // se l'edit ha rimosso la porta/URL hardcoded, la diagnosi policy_violation
         // viene chiusa e sparisce dal pannello Problemi (regola H: niente residui).
@@ -1619,7 +1619,7 @@ fn spawn_edit_reindex(ctx: &AgentToolContext, target: &Path) {
             &target_bg,
         )
         .await;
-        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &root_bg, &target_bg).await;
         crate::security::resource_linter::revalidate_file_violations(
             &db_bg,
             project_id_bg,

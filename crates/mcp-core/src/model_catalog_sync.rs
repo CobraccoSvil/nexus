@@ -950,6 +950,11 @@ pub async fn catalog_sync_loop(db: PgPool, orchestrator: Option<Arc<Orchestrator
             tracing::warn!("catalog_sync: reconcile_catalog_with_policy fallito: {e}");
         }
 
+        if let Err(e) = crate::reconcile_default_models::reconcile_provider_default_models(&db).await
+        {
+            tracing::warn!("catalog_sync: reconcile_provider_default_models fallito: {e}");
+        }
+
         // Sleep fino al prossimo tick (interval dinamico dalle settings).
         let interval = load_interval_hours(&db).await;
         tokio::time::sleep(Duration::from_secs(interval * 3600)).await;

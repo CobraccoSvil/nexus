@@ -35,6 +35,22 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
         &self,
         purpose: &str,
     ) -> BoxFuture<'_, Result<(String, String), String>>;
+
+    /// Variante che esclude provider gia' falliti (failover intra-purpose).
+    fn resolve_purpose_model_excluding(
+        &self,
+        purpose: &str,
+        exclude_providers: &[String],
+    ) -> BoxFuture<'_, Result<(String, String), String>>;
+
+    /// Notifica un fallimento LLM strutturato per applicare cooldown provider
+    /// (punto unico `brain_agent_client::handle_provider_llm_failure`).
+    fn notify_provider_llm_failure(
+        &self,
+        provider: &str,
+        error_class: Option<&str>,
+        message: &str,
+    ) -> BoxFuture<'_, ()>;
 }
 
 /// Risolutore del pool DB per-progetto (separazione DB per-progetto). Iniettato

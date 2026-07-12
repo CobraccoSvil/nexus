@@ -38,6 +38,32 @@ pub fn path_within(base: &Path, candidate: &Path) -> bool {
     candidate.starts_with(base)
 }
 
+/// Rimuove il prefisso "verbatim" Windows da un path testuale, se presente:
+/// `\\?\D:\x` -> `D:\x` e `\\?\UNC\server\share` -> `\\server\share`.
+///
+/// PUNTO UNICO (regola L): `std::fs::canonicalize` su Windows produce path
+/// verbatim; persistiti in DB (root progetto, file_path dei finding) diventano
+/// illeggibili in UI e irrisolvibili dai resolver testuali (il `\\` iniziale
+/// viene divorato dalla normalizzazione dei separatori e resta un componente
+/// `?` fantasma). Ogni scrittura di path su DB e ogni normalizzazione testuale
+/// devono passare da qui. No-op su path senza prefisso (incl. tutti i path Unix).
+pub fn strip_windows_verbatim(raw: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    match raw.strip_prefix(r"\\?\") {
+        Some(rest) => std::borrow::Cow::Borrowed(rest),
+        None => std::borrow::Cow::Borrowed(raw),
+    }
+}
+
+/// Come [`strip_windows_verbatim`] ma su `Path`, per i punti che PERSISTONO un
+/// path canonicalizzato (registrazione progetto, target dei tool): ritorna la
+/// stringa da salvare/mostrare, mai la forma verbatim.
+pub fn path_for_storage(path: &Path) -> String {
+    strip_windows_verbatim(&path.to_string_lossy()).into_owned()
+}
+
 /// Normalizza `raw` in un percorso RELATIVO pulito confinato a `root`, SENZA IO.
 /// PUNTO UNICO (regola L / ADR 0026) condiviso da lettura (`resolve_relative_path`)
 /// e scrittura (`resolve_write_target`) in mcp-core.
@@ -61,6 +87,11 @@ pub fn path_within(base: &Path, candidate: &Path) -> bool {
 /// Ritorna `Ok("")` se `raw` rappresenta la root stessa (vuoto o == root): il
 /// chiamante decide se e' lecito (lettura/list ammettono la root; scrittura no).
 pub fn normalize_into_root(root: &Path, raw: &str) -> Result<String, WorkspaceTargetError> {
+    // Prefisso verbatim Windows (`\\?\`) strippato da ENTRAMBI gli input prima
+    // di ogni altra normalizzazione: la sostituzione `\`->`/` piu' sotto lo
+    // trasformerebbe in un componente `?` fantasma che non matcha mai la root
+    // (path storici in DB scritti da canonicalize, o root registrate verbatim).
+    let raw = strip_windows_verbatim(raw);
     let trimmed = raw.trim();
     if trimmed.contains('\0') {
         return Err(WorkspaceTargetError::InvalidChars);
@@ -74,17 +105,23 @@ pub fn normalize_into_root(root: &Path, raw: &str) -> Result<String, WorkspaceTa
         return Ok(String::new());
     }
 
-    let root_str = root.to_string_lossy().replace('\\', "/");
+    let root_lossy = root.to_string_lossy();
+    let root_str = strip_windows_verbatim(&root_lossy).replace('\\', "/");
     let root_str = root_str.trim_end_matches('/');
     // Forma "candidata assoluta" per riconoscere root assoluta o duplicata.
     let candidate_abs = format!("/{normalized}");
 
-    let relative = if candidate_abs == root_str {
+    let relative = if candidate_abs == root_str || normalized == root_str {
         // Il path E' esattamente la root.
         String::new()
     } else if let Some(rest) = candidate_abs.strip_prefix(&format!("{root_str}/")) {
         // (caso 2) assoluto dentro la root oppure (caso 3) relativo che duplica
         // la root: in entrambi usa solo il resto dopo la root.
+        rest.to_string()
+    } else if let Some(rest) = normalized.strip_prefix(&format!("{root_str}/")) {
+        // (caso 2b) assoluto WINDOWS dentro la root (`D:/...`): il leading slash
+        // artificiale di candidate_abs (`/D:/...`) impedisce il match del ramo
+        // precedente quando la root ha il drive (`D:/...`). Confronto diretto.
         rest.to_string()
     } else if is_unix_absolute {
         // (caso 6) assoluto Unix vero ma fuori dalla root.
@@ -194,6 +231,63 @@ mod tests {
             resolve_workspace_target(root, "..\\..\\fuori.txt"),
             Err(WorkspaceTargetError::OutsideRoot)
         );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_forme() {
+        assert_eq!(
+            strip_windows_verbatim(r"\\?\D:\IDEAI-projects\Beaty-Book"),
+            r"D:\IDEAI-projects\Beaty-Book"
+        );
+        assert_eq!(
+            strip_windows_verbatim(r"\\?\UNC\server\share\x.ts"),
+            r"\\server\share\x.ts"
+        );
+        // No-op su path normali (Unix e Windows senza prefisso).
+        assert_eq!(strip_windows_verbatim("/srv/progetto"), "/srv/progetto");
+        assert_eq!(strip_windows_verbatim(r"D:\x\y.ts"), r"D:\x\y.ts");
+        assert_eq!(strip_windows_verbatim("src/app.ts"), "src/app.ts");
+    }
+
+    #[test]
+    fn verbatim_windows_dentro_root_verbatim_viene_strippato() {
+        // Regressione pannello Problemi: i quality finding scritti dall'auto-scan
+        // avevano file_path verbatim (\\?\D:\...) e la root in DB era anch'essa
+        // verbatim: il resolver produceva un componente "?" fantasma -> 404 e il
+        // click sul problema non apriva il file nell'editor.
+        let root = Path::new(r"\\?\D:\IDEAI-projects\Beaty-Book");
+        let clean = normalize_into_root(
+            root,
+            r"\\?\D:\IDEAI-projects\Beaty-Book\src\app\hooks\useBarberLogin.ts",
+        )
+        .expect("verbatim dentro root verbatim deve normalizzare");
+        assert_eq!(clean, "src/app/hooks/useBarberLogin.ts");
+    }
+
+    #[test]
+    fn assoluto_windows_con_drive_dentro_root_viene_strippato() {
+        // Il leading slash artificiale di candidate_abs ("/D:/...") non matcha
+        // mai una root con drive ("D:/..."): serve il confronto diretto su
+        // normalized (caso 2b), altrimenti il path "relativo" conterrebbe il
+        // drive e la risoluzione fallirebbe su Unix (join non rimpiazza).
+        let root = Path::new(r"D:\IDEAI-projects\Beaty-Book");
+        let clean = normalize_into_root(root, r"D:\IDEAI-projects\Beaty-Book\src\x.ts")
+            .expect("assoluto windows dentro root deve essere strippato");
+        assert_eq!(clean, "src/x.ts");
+
+        // Anche mix: raw verbatim su root non-verbatim.
+        let clean = normalize_into_root(root, r"\\?\D:\IDEAI-projects\Beaty-Book\src\y.ts")
+            .expect("verbatim su root pulita deve normalizzare");
+        assert_eq!(clean, "src/y.ts");
+    }
+
+    #[test]
+    fn path_for_storage_mai_verbatim() {
+        assert_eq!(
+            path_for_storage(Path::new(r"\\?\D:\IDEAI-projects\Beaty-Book")),
+            r"D:\IDEAI-projects\Beaty-Book"
+        );
+        assert_eq!(path_for_storage(Path::new("/srv/progetto")), "/srv/progetto");
     }
 
     #[test]

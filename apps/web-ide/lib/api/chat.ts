@@ -61,6 +61,20 @@ export interface ChatMessage {
       per non confondere l'utente: il backend lo persiste comunque per
       coerenza del run. Vedere chat_messages.rs::synthetic. */
   synthetic?: boolean;
+  /** Origine STRUTTURATA del messaggio sintetico (metadata.source). Vale
+      "process_resume" per i risvegli automatici dell'agente (worker
+      crates/mcp-core/src/process_resume.rs). Segnale su cui la UI classifica il
+      banner di risveglio senza pattern-matching sul content (regola M).
+      Undefined per i messaggi ordinari. */
+  source?: string;
+  /** Sottotipo del messaggio sintetico (metadata.kind). Per i risvegli
+      process_resume: "process_success" | "process_failed" | "cap_reached",
+      da cui la UI deriva l'esito del banner. Undefined se assente. */
+  syntheticKind?: string;
+  /** Etichetta del processo/comando di background associato al risveglio
+      (metadata.process_label). Mostrata nel banner di risveglio al posto della
+      cattura via regex dal testo. Undefined per i messaggi ordinari. */
+  processLabel?: string;
   /** Allegati persistiti su filesystem + chat_message_attachments associati
       al messaggio. Popolato dal backend tanto in send_chat_message (subito
       dopo l'INSERT del messaggio user) quanto in list_chat_messages (su

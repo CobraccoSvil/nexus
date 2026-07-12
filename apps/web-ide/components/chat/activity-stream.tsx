@@ -321,11 +321,38 @@ function EventRow({
         {EVENT_GLYPH[event.type]}
       </span>
       {/* Icona provider/model che ha ESEGUITO la riga (tooltip = modello). In
-          alto a destra, compatta: scorrendo il nastro si vede chi ha fatto cosa. */}
-      {event.provider && (
-        <span style={{ position: "absolute", right: 8, top: 9, zIndex: 2 }}>
-          <ProviderIcon provider={event.provider} model={event.model} />
+          alto a destra, compatta: scorrendo il nastro si vede chi ha fatto cosa.
+          Panel multi-provider: una icona per ogni provider del panel. */}
+      {event.type === "multi_provider_panel" &&
+      event.panelProviders &&
+      event.panelProviders.length > 0 ? (
+        <span
+          style={{
+            position: "absolute",
+            right: 8,
+            top: 9,
+            zIndex: 2,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            flexShrink: 0,
+          }}
+        >
+          {event.panelProviders.map((p) => (
+            <ProviderIcon
+              key={`${p.provider}:${p.model ?? ""}`}
+              provider={p.provider}
+              model={p.model}
+              size={18}
+            />
+          ))}
         </span>
+      ) : (
+        event.provider && (
+          <span style={{ position: "absolute", right: 8, top: 9, zIndex: 2 }}>
+            <ProviderIcon provider={event.provider} model={event.model} />
+          </span>
+        )
       )}
       <EventBody event={event} segColor={segColor} tc={tc} />
     </div>

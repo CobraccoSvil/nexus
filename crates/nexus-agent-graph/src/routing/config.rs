@@ -50,14 +50,81 @@ pub struct RoutingConfig {
     /// Tool che MUTANO il filesystem/progetto (per `has_filesystem_mutation_in_history`).
     /// Punto unico dei DATI: setting `agent.tools.result_cache_mutators` (mig 0394).
     pub fs_mutator_tools: Vec<String>,
-    /// Cap di superstep del motore di grafo (`GraphEngine`): anti-loop infinito
-    /// del grafo (NON delle iterazioni agentiche, che hanno il loro `iter_cap`).
-    /// DB-driven (`agent.graph.recursion_limit`): un grafo che non converge si
-    /// ferma qui invece di girare per sempre. Il default replica il
-    /// `recursion_limit` di LangGraph (`MAX_AGENT_ITERATIONS` Python con margine
-    /// per i nodi non-executor: router/clarify/understanding/planner/verifier/
-    /// final_gate/reflection/learner attraversati in un run convergente).
+    /// Cap effettivo di superstep del motore di grafo (`GraphEngine`): anti-loop
+    /// infinito del grafo (NON delle iterazioni agentiche, che hanno il loro
+    /// `iter_cap`). Valorizzato a runtime da
+    /// [`effective_recursion_limit`] (punto unico): `max(pavimento DB
+    /// `agent.graph.recursion_limit`, stima topologica da `iteration_cap` +
+    /// nodi stall/G1/final_gate + margine contorno). Un grafo che non converge
+    /// si ferma qui invece di girare per sempre.
     pub recursion_limit: u32,
+}
+
+/// Input per il calcolo del cap effettivo di superstep (tutti i valori dal
+/// wiring/DB, regola G: nessuna lettura DB in questa funzione).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphTopologyLimits {
+    /// Pavimento DB (`agent.graph.recursion_limit`): il cap non scende mai sotto.
+    pub db_floor: u32,
+    /// Cap iterazioni executor (`agent.executor.iteration_cap`).
+    pub iteration_cap: i64,
+    /// Meta-reasoner stall recovery attivo (`agent.stall_recovery.enabled`).
+    pub stall_recovery_enabled: bool,
+    /// Max mosse stall per sessione (`agent.stall_recovery.max_moves_per_session`).
+    pub stall_max_moves: i64,
+    /// Max re-routing G1 (`agent.g1_max_nudges`).
+    pub g1_max_nudges: i64,
+    /// Max cicli final gate (`agent.final_gate.max_cycles`).
+    pub final_gate_max_cycles: i64,
+}
+
+/// Pavimento topologico: quanti superstep un run puo' consumare al massimo prima
+/// che `iteration_cap` o i nodi di chiusura lo fermino in modo ordinato.
+///
+/// Formula (punto unico, regola L):
+/// - `iteration_cap × 3` — executor↔tool_dispatch + deviazioni occasionali
+///   (verifier, scale, G1 inline) per iterazione;
+/// - `stall_max_moves × 2` — stall_recovery→executor (solo se enabled);
+/// - `g1_max_nudges × 2` — g1_continue→executor;
+/// - `final_gate_max_cycles × 4` — final_gate↔executor;
+/// - `CONTOUR_MARGIN` — router/clarify/understanding/planner/reflection/learner.
+///
+/// Ritorna `max(db_floor, topology_floor)`.
+pub fn effective_recursion_limit(limits: &GraphTopologyLimits) -> u32 {
+    const SUPERSTEPS_PER_ITERATION: i64 = 3;
+    const SUPERSTEPS_PER_STALL_RECOVERY: i64 = 2;
+    const SUPERSTEPS_PER_G1_NUDGE: i64 = 2;
+    const SUPERSTEPS_PER_FINAL_GATE_CYCLE: i64 = 4;
+    const CONTOUR_MARGIN: i64 = 25;
+
+    let mut topology = limits
+        .iteration_cap
+        .max(0)
+        .saturating_mul(SUPERSTEPS_PER_ITERATION)
+        .saturating_add(CONTOUR_MARGIN)
+        .saturating_add(
+            limits
+                .g1_max_nudges
+                .max(0)
+                .saturating_mul(SUPERSTEPS_PER_G1_NUDGE),
+        )
+        .saturating_add(
+            limits
+                .final_gate_max_cycles
+                .max(0)
+                .saturating_mul(SUPERSTEPS_PER_FINAL_GATE_CYCLE),
+        );
+
+    if limits.stall_recovery_enabled {
+        topology = topology.saturating_add(
+            limits
+                .stall_max_moves
+                .max(0)
+                .saturating_mul(SUPERSTEPS_PER_STALL_RECOVERY),
+        );
+    }
+
+    limits.db_floor.max(topology.max(0) as u32)
 }
 
 impl Default for RoutingConfig {
@@ -94,10 +161,8 @@ impl Default for RoutingConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            // Cap conservativo: 150 superstep coprono ampiamente un run con
-            // MAX_AGENT_ITERATIONS (60) iterazioni executor<->tool_dispatch (2
-            // superstep ciascuna) + i nodi di contorno. Identico in spirito al
-            // `recursion_limit` di LangGraph (mai raggiunto in un run sano).
+            // Pavimento safe-DB-down: a runtime `effective_recursion_limit` lo
+            // scala sulla topologia (iteration_cap + stall/G1/final_gate).
             recursion_limit: 150,
         }
     }
@@ -108,3 +173,51 @@ impl Default for RoutingConfig {
 /// dei DATI e' il setting DB condiviso; questo default serve solo se la chiave
 /// manca o il DB e' irraggiungibile.
 const _FS_MUTATORS_DEFAULT: &str = "write_file,edit_file,delete_file,rename_file,file_write,fs_copy,fs_mkdir,fs_move,format_file,run_lint_fix,run_command,command,run_in_terminal,git_command,git_pull,git_commit,git_stage,git_push,nexus_extract_figma_code,nexus_install_shadcn_components,nexus_mcp_tool_call,cargo_install,run_service,service_restart,stop_service";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prod_defaults() -> GraphTopologyLimits {
+        GraphTopologyLimits {
+            db_floor: 150,
+            iteration_cap: 60,
+            stall_recovery_enabled: true,
+            stall_max_moves: 6,
+            g1_max_nudges: 3,
+            final_gate_max_cycles: 2,
+        }
+    }
+
+    #[test]
+    fn topology_prod_default_supera_db_floor() {
+        let eff = effective_recursion_limit(&prod_defaults());
+        assert!(
+            eff > 150,
+            "con iteration_cap=60 e stall_recovery ON il cap deve superare il floor 150, got {eff}"
+        );
+        assert_eq!(eff, 231);
+    }
+
+    #[test]
+    fn db_floor_alto_vince_su_topology() {
+        let mut limits = prod_defaults();
+        limits.db_floor = 500;
+        assert_eq!(effective_recursion_limit(&limits), 500);
+    }
+
+    #[test]
+    fn iteration_cap_alto_scala_linearemente() {
+        let mut limits = prod_defaults();
+        limits.iteration_cap = 300;
+        let eff = effective_recursion_limit(&limits);
+        assert!(eff >= 950, "eff={eff}");
+    }
+
+    #[test]
+    fn stall_recovery_off_riduce_margine() {
+        let mut limits = prod_defaults();
+        limits.stall_recovery_enabled = false;
+        assert_eq!(effective_recursion_limit(&limits), 219);
+    }
+}

@@ -476,9 +476,9 @@ mod tests {
                  consecutive_failures, consecutive_tool_failures, supports_tool_use, \
                  supports_vision, agentic_thinking_policy, capabilities, context_window, \
                  (input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) AS blended_cost, \
-                 ((CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'heavy' THEN 2 ELSE 1 END) * 1000000 \
+                 ((CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) * 1000000 \
                   + round((input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) * 1000))::bigint AS escalation_rank, \
-                 (CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'heavy' THEN 2 ELSE 1 END) AS performance_tier_ord \
+                 (CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) AS performance_tier_ord \
              FROM ai_price_catalog WHERE is_enabled = TRUE",
         )
         .execute(pool)

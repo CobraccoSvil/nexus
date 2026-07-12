@@ -60,6 +60,10 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
     let channels = &state.project_channels;
     let bindings = detect_all_port_bindings(db).await?;
 
+    // Violazioni osservate in QUESTO scan: alimentano lo sweep di chiusura in
+    // coda (le diagnosi runtime aperte NON piu' presenti qui vengono risolte).
+    let mut current_violations: Vec<(Uuid, f64)> = Vec::new();
+
     for b in &bindings {
         let project_id = match b.project_id {
             Some(pid) => pid,
@@ -79,6 +83,8 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
         if owned {
             continue; // allocazione esplicita: ok
         }
+
+        current_violations.push((project_id, b.port as f64));
 
         // VIOLAZIONE: il processo ha bindato una porta non autorizzata
         tracing::error!(
@@ -124,6 +130,36 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
         tokio::spawn(async move {
             chain_violation_to_remediation(&state_chain, project_id, killed_port, &program).await;
         });
+    }
+
+    // Ciclo di vita delle violazioni porta RUNTIME (regola H: niente fantasmi
+    // eterni nel pannello Problemi): le diagnosi aperte senza sorgente
+    // localizzato la cui porta non risulta piu' in violazione vengono risolte.
+    // Copre sia le violazioni rientrate davvero (processo terminato/riallocato)
+    // sia i falsi positivi storici da PID riciclato che nessun linter per-file
+    // avrebbe mai richiuso.
+    //
+    // Guardia FAIL-CLOSED (coerente col GC porte, memoria servizi-porte): eseguo
+    // lo sweep SOLO se il rilevamento ha visto almeno una porta in ascolto. Un
+    // `bindings` vuoto su un sistema reale (che ha sempre DB/servizi in ascolto)
+    // segnala un rilevamento cieco (Get-NetTCPConnection/ss transitoriamente a
+    // vuoto), non "zero porte": chiudere le violazioni in quel caso sarebbe un
+    // fail-open che le farebbe sparire e riapparire (flicker) ogni volta che il
+    // probe fallisce. Con almeno un binding il rilevamento e' affidabile e
+    // l'assenza di una violazione significa che e' davvero rientrata.
+    if !bindings.is_empty() {
+        let resolved = crate::security::resource_governance::resolve_stale_runtime_port_violations(
+            db,
+            &current_violations,
+        )
+        .await;
+        if !resolved.is_empty() {
+            tracing::info!(
+                resolved = resolved.len(),
+                "port_enforcer: violazioni porta runtime non piu' osservate risolte"
+            );
+            crate::project_workspace::logs::emit_problems_panel_refresh_batch(&resolved);
+        }
     }
 
     Ok(())

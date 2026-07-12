@@ -814,7 +814,9 @@ async fn persist_detected_git_repo(
         "#,
     )
     .bind(project_id)
-    .bind(repository_root_path.to_string_lossy().to_string())
+    .bind(nexus_types::workspace_paths::path_for_storage(
+        repository_root_path,
+    ))
     .bind(current_branch.clone())
     .bind(remote_url.clone())
     .execute(db)
@@ -831,7 +833,9 @@ async fn persist_detected_git_repo(
         .bind(Uuid::new_v4())
         .bind(project_id)
         .bind(remote_url)
-        .bind(repository_root_path.to_string_lossy().to_string())
+        .bind(nexus_types::workspace_paths::path_for_storage(
+            repository_root_path,
+        ))
         .bind(current_branch.clone())
         .execute(db)
         .await

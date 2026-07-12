@@ -36,9 +36,16 @@ pub(crate) struct ChatMessageView {
     /// dall'utente, senza pattern-matching sul testo. None per i messaggi ordinari.
     pub(crate) source: Option<String>,
     /// Sottotipo del messaggio sintetico (metadata.kind), es. l'esito del risveglio
-    /// process_resume (success/failed/cap). Con `source` copre il badge senza il
-    /// testo. None se assente.
+    /// process_resume: `process_success` / `process_failed` (calcolati alla fonte
+    /// dalla variabile `ok`, che include la verita' docker) e `cap_reached`. Con
+    /// `source` copre il badge del banner senza il parsing del testo (regola M).
+    /// None se assente.
     pub(crate) synthetic_kind: Option<String>,
+    /// Etichetta del processo/comando di background per i messaggi di risveglio
+    /// automatico (metadata.process_label). Segnale STRUTTURATO che permette al
+    /// banner di risveglio di mostrare il nome del comando senza estrarlo dal
+    /// testo del content. None per i messaggi ordinari.
+    pub(crate) process_label: Option<String>,
     /// Stato CANONICO del run che ha prodotto questo messaggio assistant
     /// (agent_runs.status via LEFT JOIN su run_message_id). None per i messaggi
     /// utente o quando il messaggio non e' collegato a un run. Permette alla UI
@@ -127,6 +134,10 @@ pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessage
             .map(ToOwned::to_owned),
         synthetic_kind: metadata
             .get("kind")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        process_label: metadata
+            .get("process_label")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         // Colonna opzionale presente solo nelle query che fanno il LEFT JOIN su

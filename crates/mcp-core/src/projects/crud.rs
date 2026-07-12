@@ -168,6 +168,10 @@ pub async fn register_project(
             "La directory selezionata non esiste",
         )
     })?;
+    // Forma di STORAGE della root: mai il verbatim Windows (`\\?\D:\...`) che
+    // canonicalize produce — persistito, inquinava ogni path derivato (finding
+    // quality, display UI, resolver testuali). Punto unico nexus_types (regola L).
+    let canonical_storage = nexus_types::workspace_paths::path_for_storage(&canonical);
 
     if !canonical.is_dir() {
         return Err(api_error(
@@ -189,7 +193,7 @@ pub async fn register_project(
         "#,
     )
     .bind(user_id)
-    .bind(canonical.to_string_lossy().to_string())
+    .bind(&canonical_storage)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -255,7 +259,7 @@ pub async fn register_project(
     .bind(&project_name)
     .bind(&slug)
     .bind(&default_branch)
-    .bind(canonical.to_string_lossy().to_string())
+    .bind(&canonical_storage)
     .execute(&mut *tx)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -275,7 +279,7 @@ pub async fn register_project(
     )
     .bind(workspace_id)
     .bind(project_id)
-    .bind(canonical.to_string_lossy().to_string())
+    .bind(&canonical_storage)
     .execute(&mut *tx)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -309,7 +313,9 @@ pub async fn register_project(
     .bind(repository_id)
     .bind(project_id)
     .bind(remote_url)
-    .bind(repo_root_path.to_string_lossy().to_string())
+    .bind(nexus_types::workspace_paths::path_for_storage(
+        &repo_root_path,
+    ))
     .bind(git.is_git_repo)
     .bind(git.current_branch.clone())
     .execute(&mut *tx)

@@ -5300,7 +5300,7 @@ async fn maybe_convene_council(
     let ctx_bg = ctx.clone();
     let user_text_bg = user_text.to_string();
     let figures_bg = figures.clone();
-    let policy_bg = policy.clone();
+    let policy_bg = policy;
     let convene_handle = tokio::spawn(async move {
         let kinds_bg: Vec<&str> = figures_bg.iter().map(String::as_str).collect();
         crate::agent_tools::subagent_native::convene_council(

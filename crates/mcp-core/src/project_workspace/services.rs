@@ -361,20 +361,29 @@ pub(super) fn visible_windows_services(
 }
 
 /// Riconciliazione stato servizi (pura, testabile). Regola M: "running" implica un
-/// processo VIVO; la stringa `status` in DB puo' restare stale (un processo muore
-/// senza aggiornare la riga: crash, kill esterno, riavvio host). Una riga
-/// running/starting il cui pid non e' piu' vivo viene corretta a "stopped".
-/// Ritorna le righe corrette (per `visible_windows_services`) e i pid morti da
-/// persistere come stopped. Punto unico della regola (regola L).
+/// processo VIVO E DI IDENTITA' CONFERMATA; la stringa `status` in DB puo' restare
+/// stale (un processo muore senza aggiornare la riga: crash, kill esterno, riavvio
+/// host) e su Windows il PID puo' essere stato RICICLATO dal SO su un processo
+/// estraneo. Una riga running/starting il cui pid non e' piu' vivo o e' stato
+/// riciclato viene corretta a "stopped". Ritorna le righe corrette (per
+/// `visible_windows_services`) e i pid morti da persistere come stopped. Punto
+/// unico della regola (regola L).
 ///
-/// Limite noto (riciclo PID): `is_alive` puo' dare falso positivo se il pid e'
-/// stato riusato da un processo estraneo -> la riga resta 'running'. E' l'edge che
-/// l'observer risolve con la validazione dello started_at; qui la liveness copre il
-/// caso comune (pid morto e non riusato) ed e' comunque un miglioramento netto.
+/// Il predicato `alive_confirmed(pid, started_at)` incapsula liveness + identita':
+/// il caller Windows inietta `process_alive && pid_identity_confirmed` (lo STESSO
+/// criterio di `windows_pid_state` nell'observer), cosi' il pannello Servizi e il
+/// pannello Problemi non divergono piu' sotto riciclo PID (prima il pannello
+/// Servizi mostrava 'running' un PID riciclato che l'observer marcava 'failed').
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn reconcile_dead_service_rows(
-    rows: Vec<(String, String, Option<i32>, chrono::DateTime<chrono::Utc>)>,
-    is_alive: impl Fn(i32) -> bool,
+    rows: Vec<(
+        String,
+        String,
+        Option<i32>,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+    alive_confirmed: impl Fn(i32, Option<chrono::DateTime<chrono::Utc>>) -> bool,
 ) -> (
     Vec<(String, String, chrono::DateTime<chrono::Utc>)>,
     Vec<i32>,
@@ -382,9 +391,11 @@ pub(super) fn reconcile_dead_service_rows(
     let mut dead_pids = Vec::new();
     let reconciled = rows
         .into_iter()
-        .map(|(label, status, pid, created)| {
+        .map(|(label, status, pid, created, started_at)| {
             let running = matches!(status.as_str(), "running" | "starting");
-            let alive = pid.map(|p| p > 0 && is_alive(p)).unwrap_or(false);
+            let alive = pid
+                .map(|p| p > 0 && alive_confirmed(p, started_at))
+                .unwrap_or(false);
             if running && !alive {
                 if let Some(p) = pid {
                     if p > 0 {
@@ -414,8 +425,14 @@ pub(super) async fn list_services_windows(
     // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
     // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
     let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    let rows: Vec<(String, String, Option<i32>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT label, status, pid, created_at FROM agent_processes \
+    let rows: Vec<(
+        String,
+        String,
+        Option<i32>,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT label, status, pid, created_at, started_at FROM agent_processes \
              WHERE project_id = $1 AND kind = 'service' \
              ORDER BY label, created_at DESC",
     )
@@ -424,11 +441,20 @@ pub(super) async fn list_services_windows(
     .await
     .unwrap_or_default();
 
-    // Self-heal: una riga running/starting con pid morto diventa 'stopped' sia nel
-    // display sia in DB, cosi' il pannello non mostra 'running' un processo defunto
-    // (stato stale) e gli altri consumer leggono uno stato veritiero.
-    let (reconciled, dead_pids) =
-        reconcile_dead_service_rows(rows, |p| crate::process_util::process_alive(p as u32));
+    // Self-heal: una riga running/starting con pid morto O RICICLATO diventa
+    // 'stopped' sia nel display sia in DB, cosi' il pannello Servizi non mostra
+    // 'running' un processo defunto/estraneo (stato stale) e resta COERENTE col
+    // pannello Problemi (l'observer usa lo stesso criterio in windows_pid_state).
+    // Il predicato combina liveness (process_alive: intercetta il processo uscito
+    // con handle ancora aperto) e identita' (pid_identity_confirmed: intercetta il
+    // PID riciclato dal SO su un processo estraneo).
+    let (reconciled, dead_pids) = reconcile_dead_service_rows(rows, |p, started| {
+        crate::process_util::process_alive(p as u32)
+            && crate::process_util::pid_identity_confirmed(
+                p as u32,
+                started.map(|t: chrono::DateTime<chrono::Utc>| t.timestamp()),
+            )
+    });
     if !dead_pids.is_empty() {
         let _ = sqlx::query(
             "UPDATE agent_processes SET status = 'stopped', stopped_at = now() \
@@ -3043,22 +3069,38 @@ async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortB
     // pid -> project_id da agent_processes (la tabella e' migrata: aggreghiamo i
     // DB progetto, come fa il ramo Unix). Un DB progetto irraggiungibile degrada
     // senza azzerare gli altri.
+    //
+    // VALIDAZIONE IDENTITA' del PID (anti-riciclo, punto unico regola L
+    // `process_util::pid_identity_confirmed`, lo stesso dell'observer): Windows
+    // ricicla i PID in modo aggressivo e le righe 'running' possono essere
+    // stantie (crash non ancora sanato, restart di Nexus). Senza il confronto
+    // creation-time vs started_at, un PID riciclato su un processo ESTRANEO
+    // veniva attribuito al progetto e — tramite la risalita dell'albero processi
+    // qui sotto — le sue porte (49664-49671 dei servizi di sistema, 5434 del
+    // cluster DB dell'infrastruttura) finivano flaggate e killate come
+    // "violazioni porta" del progetto: falsi positivi eterni nel pannello
+    // Problemi con detail "processo 'lsass'/'svchost'/'postgres' terminato".
     let mut pid_to_project: HashMap<u32, uuid::Uuid> = HashMap::new();
     for proj in crate::project_db_routes::list_all_project_ids(db).await {
         let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
-        let rows: Vec<(Option<i32>, uuid::Uuid)> = sqlx::query_as(
-            "SELECT pid, project_id FROM agent_processes \
-             WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
-        for (pid_opt, proj_id) in rows {
-            if let Some(pid) = pid_opt {
-                if pid > 0 {
-                    pid_to_project.insert(pid as u32, proj_id);
-                }
+        let rows: Vec<(Option<i32>, uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as(
+                "SELECT pid, project_id, started_at FROM agent_processes \
+                 WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+        for (pid_opt, proj_id, started_at) in rows {
+            let Some(pid) = pid_opt.filter(|p| *p > 0) else {
+                continue;
+            };
+            let pid = pid as u32;
+            if !crate::process_util::pid_identity_confirmed(pid, started_at.map(|t| t.timestamp()))
+            {
+                continue;
             }
+            pid_to_project.insert(pid, proj_id);
         }
     }
 
@@ -3540,21 +3582,35 @@ mod tests {
                 "running".to_string(),
                 Some(200),
                 base,
+                Some(base),
             ),
-            // running con pid VIVO -> invariato
+            // running con pid VIVO e proprio -> invariato
             (
                 "frontend".to_string(),
                 "running".to_string(),
                 Some(100),
                 base,
+                Some(base),
             ),
             // gia' stopped (pid morto) -> invariato, NON raccolto (non era running)
-            ("worker".to_string(), "stopped".to_string(), Some(200), base),
+            (
+                "worker".to_string(),
+                "stopped".to_string(),
+                Some(200),
+                base,
+                Some(base),
+            ),
             // starting senza pid -> non vivo -> stopped, ma nessun pid da persistere
-            ("api".to_string(), "starting".to_string(), None, base),
+            ("api".to_string(), "starting".to_string(), None, base, None),
         ];
-        let alive = |p: i32| p == 100 || p == 300;
-        let (reconciled, dead) = super::reconcile_dead_service_rows(rows, alive);
+        // Predicato mock: vivo E identita' confermata solo se pid in {100,300} e
+        // started_at combacia con `base` (identita' del run). Un pid vivo ma con
+        // started_at diverso simula il RICICLO (processo estraneo).
+        let alive_confirmed =
+            |p: i32, started: Option<chrono::DateTime<chrono::Utc>>| {
+                (p == 100 || p == 300) && started == Some(base)
+            };
+        let (reconciled, dead) = super::reconcile_dead_service_rows(rows, alive_confirmed);
         assert_eq!(
             reconciled[0],
             ("backend".to_string(), "stopped".to_string(), base)
@@ -3573,5 +3629,32 @@ mod tests {
         );
         // Solo il pid 200 della riga RUNNING va persistito come stopped.
         assert_eq!(dead, vec![200]);
+    }
+
+    #[test]
+    fn reconcile_dead_service_rows_marca_stopped_il_pid_riciclato() {
+        // Regressione coerenza pannello Servizi vs Problemi: un PID ancora VIVO ma
+        // RICICLATO dal SO su un processo estraneo (started_at reale != atteso) non
+        // deve restare 'running'. Prima il predicato era la sola liveness -> il
+        // pannello Servizi mostrava 'running' cio' che l'observer marcava 'failed'.
+        let base = chrono::DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rows = vec![(
+            "backend".to_string(),
+            "running".to_string(),
+            Some(500),
+            base,
+            Some(base),
+        )];
+        // pid 500 e' VIVO (liveness true) ma la sua identita' NON e' confermata
+        // (started_at reale diverso): il predicato del caller ritorna false.
+        let alive_confirmed = |_p: i32, _started: Option<chrono::DateTime<chrono::Utc>>| false;
+        let (reconciled, dead) = super::reconcile_dead_service_rows(rows, alive_confirmed);
+        assert_eq!(
+            reconciled[0],
+            ("backend".to_string(), "stopped".to_string(), base)
+        );
+        assert_eq!(dead, vec![500]);
     }
 }

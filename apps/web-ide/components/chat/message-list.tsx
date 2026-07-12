@@ -385,24 +385,28 @@ type SystemWakeup = { outcome: "success" | "failure" | "cap"; label: string };
  * ri-avviato da solo quando un processo/servizio del progetto termina o va in
  * crash, senza che l'utente lo abbia chiesto.
  *
- * NOTA (ripiego dichiarato, regole M/H): il backend marca questi messaggi con
- * `metadata.source = "process_resume"`, ma `to_message_view`
- * (crates/mcp-core/src/chat_messages/persistence.rs) NON espone ancora il campo
- * `source` alla UI. Finche' non viene esposto un marcatore STRUTTURATO,
- * riconosciamo il risveglio dal TESTO del messaggio sintetico (fragile per
- * definizione). Appena il backend espone `source`/`syntheticKind`, questa
- * detection va spostata su quel campo (vedi report/handoff backend).
+ * Classificazione STRUTTURATA (regola M): il backend espone i campi
+ * `source`/`syntheticKind`/`processLabel` (to_message_view in
+ * crates/mcp-core/src/chat_messages/persistence.rs). Il gate e' `source ===
+ * "process_resume"` e l'esito viene dal `syntheticKind` distinto emesso alla
+ * fonte (`process_success` / `process_failed` calcolati da `ok`, che include la
+ * verita' docker; `cap_reached` per il safety net). Nessun parsing del content:
+ * il testo del messaggio serve solo all'agente, non alla UI.
  */
 function classifySystemWakeup(message: ChatMessage): SystemWakeup | null {
   if (!message.synthetic || message.role !== "user") return null;
-  const content = message.content ?? "";
-  let m = /^Il comando in background "([^"]+)" e' terminato con SUCCESSO/.exec(content);
-  if (m) return { outcome: "success", label: m[1] };
-  m = /^Il comando in background "([^"]+)" e' FALLITO/.exec(content);
-  if (m) return { outcome: "failure", label: m[1] };
-  m = /^Cap anti-loop raggiunto: il processo di sfondo "([^"]+)"/.exec(content);
-  if (m) return { outcome: "cap", label: m[1] };
-  return null;
+  if (message.source !== "process_resume") return null;
+  const label = message.processLabel ?? "";
+  switch (message.syntheticKind) {
+    case "process_success":
+      return { outcome: "success", label };
+    case "process_failed":
+      return { outcome: "failure", label };
+    case "cap_reached":
+      return { outcome: "cap", label };
+    default:
+      return null;
+  }
 }
 
 // Banner distintivo per un turno nato da un risveglio automatico di sistema.

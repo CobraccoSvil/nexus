@@ -239,6 +239,64 @@ pub(crate) fn process_start_unix(pid: u32) -> Option<i64> {
     }
 }
 
+/// (Solo Windows) Tolleranza (secondi) nel confronto tra il creation-time reale
+/// del processo e lo `started_at` registrato in `agent_processes`, per validare
+/// l'identita' del PID (anti-riciclo). `started_at` e' impostato a NOW() subito
+/// dopo lo spawn della shell, il creation-time del figlio arriva pochi istanti
+/// dopo: lo scarto legittimo e' di frazioni di secondo. Un PID riciclato ha
+/// creation-time arbitrario (tipicamente molto distante). Margine ampio per non
+/// invalidare mai un processo vero, stretto abbastanza da scartare un estraneo.
+#[cfg(windows)]
+pub(crate) const PID_IDENTITY_TOLERANCE_S: i64 = 10;
+
+/// (Solo Windows) Predicato puro (regola L, testabile) dell'identita' di un PID:
+/// il creation-time reale del processo (`real_start`, epoch unix) combacia con
+/// lo `started_at` atteso (`expected_start`) entro `tolerance` secondi? Se non
+/// combacia, il PID e' stato riciclato dal SO su un processo estraneo -> il
+/// servizio va trattato come morto. Entrambi gli input sono Option: un dato
+/// mancante = identita' non confermabile = false (fail-safe: meglio un possibile
+/// crash segnalato che mascherato con metriche altrui).
+#[cfg(windows)]
+pub(crate) fn pid_identity_ok(
+    real_start: Option<i64>,
+    expected_start: Option<i64>,
+    tolerance: i64,
+) -> bool {
+    match (real_start, expected_start) {
+        (Some(real), Some(expected)) => (real - expected).abs() <= tolerance,
+        _ => false,
+    }
+}
+
+/// (Solo Windows) PUNTO UNICO (regola L) della verifica di identita' di un PID
+/// persistito: il processo con quel `pid` e' ANCORA il processo registrato con
+/// `started_at` atteso? Combina lettura del creation-time reale e predicato di
+/// tolleranza. Usato dall'observer (stato servizi), dal port_enforcer
+/// (attribuzione PID->progetto) e dalla riconciliazione del pannello Servizi:
+/// senza questa verifica un PID riciclato dal SO su un processo estraneo (lsass,
+/// svchost, postgres dell'infrastruttura) veniva attribuito al progetto e le sue
+/// porte flaggate/killate come violazioni, o un servizio mostrato 'running'.
+///
+/// VINCOLO TIMEBASE: `expected_start_unix` deriva da `agent_processes.started_at`
+/// (`NOW()` del server Postgres) mentre `real_start` viene dalle FILETIME Win32
+/// (clock dell'host). Nell'ambiente canonico Nexus i Postgres sono NATIVI Windows
+/// (`pg_ctl` su C:\Program Files\PostgreSQL, non container) -> stesso clock host,
+/// scarto misurato < 1s, ben dentro la tolleranza. Se in futuro il DB girasse in
+/// una VM/container con orologio derivante rispetto all'host, la tolleranza fissa
+/// di 10s non basterebbe e servirebbe ancorare l'anti-riciclo a un dato host-side
+/// (es. registrare il creation-time reale allo spawn, non `NOW()` del DB).
+#[cfg(windows)]
+pub(crate) fn pid_identity_confirmed(
+    pid: u32,
+    expected_start_unix: Option<i64>,
+) -> bool {
+    pid_identity_ok(
+        process_start_unix(pid),
+        expected_start_unix,
+        PID_IDENTITY_TOLERANCE_S,
+    )
+}
+
 /// `true` se esiste un processo vivo con questo `pid`.
 ///
 /// - Unix: presenza di `/proc/{pid}` (coerente con l'implementazione storica).
@@ -380,6 +438,37 @@ mod tests {
     #[test]
     fn start_unix_pid_inesistente_none() {
         assert!(process_start_unix(u32::MAX).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pid_identity_riconosce_riciclo() {
+        // Creation-time entro tolleranza dello started_at atteso = identita' OK
+        // (e' il nostro servizio). started_at 1000, real 1002, tolleranza 10.
+        assert!(pid_identity_ok(Some(1002), Some(1000), 10));
+        assert!(pid_identity_ok(Some(1000), Some(1000), 10));
+        // Creation-time molto distante = PID riciclato su un processo estraneo
+        // (avviato in un altro momento) -> identita' FALLITA -> servizio morto.
+        assert!(!pid_identity_ok(Some(1050), Some(1000), 10));
+        assert!(!pid_identity_ok(Some(500), Some(1000), 10));
+        // Dato mancante (started_at NULL o creation-time non leggibile) = identita'
+        // non confermabile -> false (fail-safe).
+        assert!(!pid_identity_ok(None, Some(1000), 10));
+        assert!(!pid_identity_ok(Some(1000), None, 10));
+        assert!(!pid_identity_ok(None, None, 10));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pid_identity_confirmed_processo_corrente() {
+        // Il processo corrente con il PROPRIO start-time reale come atteso deve
+        // confermare l'identita'; con uno started_at lontano deve rifiutarla
+        // (simula il riciclo: riga DB stantia con PID riassegnato).
+        let me = std::process::id();
+        let real = process_start_unix(me).expect("start-time leggibile");
+        assert!(pid_identity_confirmed(me, Some(real)));
+        assert!(!pid_identity_confirmed(me, Some(real - 3600)));
+        assert!(!pid_identity_confirmed(me, None));
     }
 
     #[cfg(windows)]

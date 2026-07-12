@@ -146,6 +146,21 @@ impl ToolRunnerService {
         self.build_ctx_with_root(session_id, None).await
     }
 
+    /// Costruisce il ctx tool per un pre-step legato a un run primario gia' persistito
+    /// (es. Consiglio delle Competenze a monte di `spawn_agent_run`). Ancora depth/cost
+    /// e catena sub-run al `run_id` del padre, NON alla sessione: ogni run primario
+    /// parte con budget e profondita' isolati.
+    pub(crate) async fn build_ctx_for_primary_run(
+        &self,
+        session_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<AgentToolContext, Status> {
+        let mut ctx = self.build_ctx(session_id).await?;
+        ctx.core.run_id = Some(run_id);
+        ctx.core.parent_run_id = Some(run_id);
+        Ok(ctx)
+    }
+
     /// PUNTO UNICO (regola L) della costruzione dell'`AgentToolContext`: risolve la
     /// sessione in project/root/permessi/canali. Se `override_root` e' `Some`,
     /// SOVRASCRIVE la sola `root_path` con quel valore (FASE 2 orchestrazione: un

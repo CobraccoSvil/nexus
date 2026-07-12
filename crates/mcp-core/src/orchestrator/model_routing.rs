@@ -232,6 +232,11 @@ fn floor_tier_for_agentic<'a>(
 pub(crate) const AGENTIC_COST_FIRST_ORDER: &str =
     "input_cost_per_million_tokens ASC, is_featured DESC";
 
+/// Ordinamento failover cross-provider: preferisce modelli NON-thinking per evitare
+/// vincoli di round-trip `reasoning_content` (DeepSeek) su switch mid-run.
+pub(crate) const AGENTIC_FAILOVER_ORDER: &str =
+    "(uses_thinking_mode) ASC, input_cost_per_million_tokens ASC, is_featured DESC";
+
 pub(crate) async fn route_model_from_catalog(
     db: &PgPool,
     base_tier: &str,
@@ -358,7 +363,7 @@ pub(crate) async fn agentic_failover_candidates(
         db,
         &filter,
         &[],
-        AGENTIC_COST_FIRST_ORDER,
+        AGENTIC_FAILOVER_ORDER,
         FAILOVER_CANDIDATE_POOL,
     )
     .await
@@ -1526,7 +1531,12 @@ mod agentic_tier_floor_tests {
                  capabilities JSONB NOT NULL DEFAULT '[]', \
                  context_window INTEGER NOT NULL DEFAULT 8192, \
                  input_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 is_featured BOOLEAN NOT NULL DEFAULT false \
+                 output_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
+                 is_featured BOOLEAN NOT NULL DEFAULT false, \
+                 speed_tier TEXT NOT NULL DEFAULT 'medium', \
+                 consecutive_failures INT NOT NULL DEFAULT 0, \
+                 consecutive_tool_failures INT NOT NULL DEFAULT 0, \
+                 auto_disabled_reason TEXT \
              )",
         )
         .execute(pool)

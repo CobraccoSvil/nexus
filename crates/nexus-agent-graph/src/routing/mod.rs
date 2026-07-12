@@ -18,7 +18,7 @@ pub mod signals;
 #[cfg(test)]
 mod golden_tests;
 
-pub use config::RoutingConfig;
+pub use config::{effective_recursion_limit, GraphTopologyLimits, RoutingConfig};
 
 use crate::decisions::{structural_unfulfilled_signal, turn_action_oriented};
 use crate::state::{AgentState, AutomationMode, StopReason};

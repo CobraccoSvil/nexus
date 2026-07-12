@@ -297,6 +297,45 @@ pub async fn open_resource_violation(
     }
 }
 
+/// Chiude (resolved) le violazioni porta RUNTIME (senza sorgente localizzato:
+/// `file_path IS NULL`, unit fittizia `runtime:port`) la cui porta NON risulta
+/// piu' in violazione nella scansione corrente del port_enforcer.
+///
+/// PUNTO UNICO del ciclo di vita di queste diagnosi (regola L): le violazioni
+/// STATICHE (con file sorgente) vengono richiuse dal resource_linter quando il
+/// file smette di contenerle; quelle runtime non avevano NESSUN meccanismo di
+/// chiusura e restavano 'open' a vita nel pannello Problemi anche quando il
+/// processo era sparito da giorni (o era un falso positivo da PID riciclato).
+/// `current`: coppie (project_id, porta) ancora in violazione in QUESTO scan —
+/// tutte le altre diagnosi runtime aperte vengono risolte. Ritorna le righe
+/// (project_id, id) risolte per il refresh realtime del pannello.
+pub async fn resolve_stale_runtime_port_violations(
+    db: &PgPool,
+    current: &[(Uuid, f64)],
+) -> Vec<(Uuid, Uuid)> {
+    let (proj_ids, ports): (Vec<Uuid>, Vec<f64>) = current.iter().copied().unzip();
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        r#"UPDATE service_diagnoses d
+           SET status = 'resolved', resolved_at = NOW()
+           WHERE d.signal_kind = 'policy_violation'
+             AND d.metric LIKE 'port/%'
+             AND d.file_path IS NULL
+             AND d.status IN ('open', 'diagnosing', 'failed_remediation')
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM UNNEST($1::uuid[], $2::float8[]) AS cur(project_id, port)
+                WHERE cur.project_id = d.project_id
+                  AND cur.port = d.value
+             )
+           RETURNING d.project_id, d.id"#,
+    )
+    .bind(&proj_ids)
+    .bind(&ports)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+}
+
 /// Guard SQL per-query (statement-level) per i tool DB del progetto. Distinto
 /// dal detector di SQL-injection sui sorgenti (ADR 0021, tool
 /// `sec_sql_injection_check`): qui si bloccano le query DISTRUTTIVE DI MASSA

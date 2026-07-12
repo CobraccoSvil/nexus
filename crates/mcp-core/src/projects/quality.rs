@@ -529,10 +529,16 @@ async fn run_semantic_dup_phase(
 
 /// Normalizza il path assoluto di un file nel path relativo alla root progetto,
 /// con separatori POSIX. Usato come chiave della cache contenuti e dei finding.
+/// Robusto al prefisso verbatim Windows (`\\?\`) su ENTRAMBI gli input: root
+/// canonicalizzate e target dei tool possono arrivare in quella forma e lo
+/// strip_prefix per componenti non matcherebbe mai una coppia mista.
 fn relative_path_str(file_path: &str, root_path: &str) -> String {
-    let rel_path = std::path::Path::new(file_path)
-        .strip_prefix(root_path)
-        .unwrap_or(std::path::Path::new(file_path));
+    use nexus_types::workspace_paths::strip_windows_verbatim;
+    let file_clean = strip_windows_verbatim(file_path);
+    let root_clean = strip_windows_verbatim(root_path);
+    let rel_path = std::path::Path::new(file_clean.as_ref())
+        .strip_prefix(root_clean.as_ref())
+        .unwrap_or(std::path::Path::new(file_clean.as_ref()));
     rel_path
         .to_string_lossy()
         .trim_start_matches('/')
@@ -1703,6 +1709,7 @@ async fn read_setting(db: &sqlx::PgPool, key: &str) -> Option<String> {
 pub async fn maybe_auto_scan_file(
     db: &sqlx::PgPool,
     project_id: Uuid,
+    project_root: &std::path::Path,
     file_path: &std::path::Path,
 ) {
     // Controlla il setting quality_auto_scan
@@ -1738,8 +1745,14 @@ pub async fn maybe_auto_scan_file(
         return;
     }
 
+    // Persistenza col path RELATIVO alla root (stesso formato del full-scan,
+    // punto unico relative_path_str): il path assoluto canonicalizzato dei tool
+    // (verbatim `\\?\D:\...` su Windows) rendeva i finding illeggibili in UI e
+    // il click dal pannello Problemi non risolveva mai il file (404).
+    let rel_str = relative_path_str(path_str, &project_root.to_string_lossy());
+
     // Esegue i checker sul file singolo via mcp_quality::analyze_source (crate esterna)
-    let report = mcp_quality::analyze_source(path_str, &content);
+    let report = mcp_quality::analyze_source(&rel_str, &content);
 
     // Severità minima: low=0, medium=1, high=2
     let min_level: u8 = match threshold.as_str() {
@@ -1748,7 +1761,7 @@ pub async fn maybe_auto_scan_file(
         _ => 0, // "low" o qualsiasi altro valore
     };
 
-    rescan_and_persist_file(db, project_id, path_str, &report, min_level, &threshold).await;
+    rescan_and_persist_file(db, project_id, &rel_str, &report, min_level, &threshold).await;
 }
 
 /// Sostituisce (DELETE + INSERT filtrato) i finding del singolo file e, se
@@ -1943,7 +1956,8 @@ mod tests {
         )
         .await
         .expect("write file");
-        let path_str = file_path.to_string_lossy().to_string();
+        // I finding sono persistiti col path RELATIVO alla root (qui `dir`).
+        let rel_str = "clean.rs";
 
         // Finding stantio gia' presente per quel file (simula problema poi corretto).
         sqlx::query(
@@ -1952,7 +1966,7 @@ mod tests {
              VALUES ($1, $2, 'maintainability', 'medium', 'vecchio', 'da rimuovere')",
         )
         .bind(project_id)
-        .bind(&path_str)
+        .bind(rel_str)
         .execute(&pool)
         .await
         .expect("seed finding");
@@ -1961,7 +1975,7 @@ mod tests {
             "SELECT COUNT(*) FROM project_quality_findings WHERE project_id = $1 AND file_path = $2",
         )
         .bind(project_id)
-        .bind(&path_str)
+        .bind(rel_str)
         .fetch_one(&pool)
         .await
         .expect("count before");
@@ -1970,13 +1984,13 @@ mod tests {
             "il finding stantio deve esistere prima dello scan"
         );
 
-        maybe_auto_scan_file(&pool, project_id, &file_path).await;
+        maybe_auto_scan_file(&pool, project_id, &dir, &file_path).await;
 
         let after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM project_quality_findings WHERE project_id = $1 AND file_path = $2",
         )
         .bind(project_id)
-        .bind(&path_str)
+        .bind(rel_str)
         .fetch_one(&pool)
         .await
         .expect("count after");

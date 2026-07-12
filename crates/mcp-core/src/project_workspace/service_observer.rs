@@ -238,30 +238,9 @@ async fn collect_units(
     out
 }
 
-/// Tolleranza (secondi) nel confronto tra il creation-time reale del processo e
-/// lo `started_at` registrato in agent_processes, per validare l'identita' del
-/// PID (anti-riciclo). started_at e' impostato a NOW() subito dopo lo spawn della
-/// shell, il creation-time del figlio arriva pochi istanti dopo: lo scarto
-/// legittimo e' di frazioni di secondo. Un PID riciclato ha creation-time
-/// arbitrario (tipicamente molto distante). Margine ampio per non invalidare mai
-/// un processo vero, stretto abbastanza da scartare un estraneo.
-#[cfg(windows)]
-const PID_IDENTITY_TOLERANCE_S: i64 = 10;
-
-/// Predicato puro (regola L, testabile) dell'identita' di un PID: il creation-time
-/// reale del processo (`real_start`, epoch unix) combacia con lo `started_at`
-/// atteso (`expected_start`) entro `tolerance` secondi? Se non combacia, il PID e'
-/// stato riciclato dal SO su un processo estraneo -> il servizio va trattato come
-/// morto. Entrambi gli input sono Option: un dato mancante = identita' non
-/// confermabile = false (fail-safe: meglio un possibile crash segnalato che
-/// mascherato con metriche altrui).
-#[cfg(windows)]
-fn pid_identity_ok(real_start: Option<i64>, expected_start: Option<i64>, tolerance: i64) -> bool {
-    match (real_start, expected_start) {
-        (Some(real), Some(expected)) => (real - expected).abs() <= tolerance,
-        _ => false,
-    }
-}
+// La verifica di identita' del PID (anti-riciclo: creation-time vs started_at)
+// e' il PUNTO UNICO `process_util::pid_identity_confirmed` (regola L), condiviso
+// con il port_enforcer (attribuzione PID->progetto in detect_all_port_bindings).
 
 /// Windows: enumera i servizi del progetto da `agent_processes` (kind='service')
 /// e ne aggrega i dati sorgente. Regola L: la visibilita'/dedup delle label
@@ -368,11 +347,9 @@ fn windows_pid_state(
 ) -> (String, Option<u32>) {
     let pid_u = pid.and_then(|p| u32::try_from(p).ok()).filter(|&p| p > 0);
     let alive = match pid_u {
-        Some(p) if crate::process_util::process_alive(p) => pid_identity_ok(
-            crate::process_util::process_start_unix(p),
-            started_at.map(|t| t.timestamp()),
-            PID_IDENTITY_TOLERANCE_S,
-        ),
+        Some(p) if crate::process_util::process_alive(p) => {
+            crate::process_util::pid_identity_confirmed(p, started_at.map(|t| t.timestamp()))
+        }
         _ => false,
     };
     // Vivo E identita' confermata => 'active'; altrimenti morto: exit_code!=0 o
@@ -970,17 +947,27 @@ async fn resolve_stale_anomalies(
     .unwrap_or_default()
 }
 
-/// Chiude le anomalie aperte di un progetto le cui `unit` NON sono piu' tra i
-/// servizi osservati (rinominate/rimosse: lo unit file non esiste piu', quindi
-/// `list_user_services` non le elenca nemmeno con `--all`). Queste righe non
-/// verrebbero MAI richiuse dal resolve per-unit, perche' `run_cycle` non visita
-/// piu' quegli unit: restano 'open' a vita nel pannello Problemi (i veri
-/// "fantasma"). signal_kind='anomaly' soltanto; i crash li governa il Debugger.
+/// Chiude le diagnosi CONTINUE (anomaly) e STRUTTURALI (crash) di un progetto
+/// le cui `unit` NON sono piu' tra i servizi osservati (rinominate/rimosse: lo
+/// unit file non esiste piu', quindi `list_user_services` non le elenca nemmeno
+/// con `--all`). Queste righe non verrebbero MAI richiuse dal resolve per-unit,
+/// perche' `run_cycle` non visita piu' quegli unit: restano 'open' a vita nel
+/// pannello Problemi (i veri "fantasma").
+///
+/// I crash sono inclusi dal fix "unit orfane": `resolve_open_crashes` matcha per
+/// unit ESATTA, quindi un crash su un'unit rinominata (es. il vecchio schema
+/// label `{slug}-{slug}-frontend-dev.service` -> `frontend`) non puo' essere
+/// richiuso da nessuno — nemmeno dal Debugger, che lavora sulla stessa unit.
+/// Un crash la cui unit non esiste piu' non e' actionable: e' solo rumore.
+/// Le policy_violation NON sono toccate: la loro `unit` e' fittizia
+/// (`runtime:port` o un file path) e mai presente tra i servizi osservati;
+/// il loro ciclo di vita e' del resource_linter (statiche) e del port_enforcer
+/// (runtime).
 ///
 /// Il chiamante DEVE garantire `observed_units` non vuoto: con lista vuota
-/// `unit <> ALL('{}')` matcherebbe tutto e azzererebbe ogni anomalia del
+/// `unit <> ALL('{}')` matcherebbe tutto e azzererebbe ogni diagnosi del
 /// progetto su un errore transitorio di systemctl.
-async fn resolve_anomalies_for_absent_units(
+async fn resolve_diagnoses_for_absent_units(
     db: &PgPool,
     project_id: Uuid,
     observed_units: &[String],
@@ -989,7 +976,7 @@ async fn resolve_anomalies_for_absent_units(
         r#"UPDATE service_diagnoses
            SET status = 'resolved', resolved_at = NOW()
            WHERE project_id = $1
-             AND signal_kind = 'anomaly'
+             AND signal_kind IN ('anomaly', 'crash')
              AND status IN ('open', 'diagnosing')
              AND unit <> ALL($2)
            RETURNING id"#,
@@ -1004,7 +991,7 @@ async fn resolve_anomalies_for_absent_units(
 /// Chiude le anomalie il cui `updated_at` e' piu' vecchio di `max_age_seconds`:
 /// l'observer non le ha piu' confermate (UPSERT a ogni tick) per molti cicli,
 /// quindi il servizio non e' piu' osservato (sparito dal bus --user, rinominato,
-/// fermo) o non e' piu' anomalo. Diversamente da `resolve_anomalies_for_absent_units`
+/// fermo) o non e' piu' anomalo. Diversamente da `resolve_diagnoses_for_absent_units`
 /// NON dipende da `list_user_services` (bus --user cieco in WSL): usa solo il
 /// tempo. Gira solo mentre l'observer e' attivo, quindi le anomalie REALI hanno
 /// `updated_at` fresco (UPSERT ogni `interval_s`) e non vengono mai toccate.
@@ -1035,17 +1022,8 @@ fn notify_problems_panel_refresh(project_id: Uuid, resolved_ids: Vec<Uuid>) {
 }
 
 fn notify_problems_panel_refresh_batch(rows: &[(Uuid, Uuid)]) {
-    if rows.is_empty() {
-        return;
-    }
-    use std::collections::HashMap;
-    let mut by_project: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    for (project_id, id) in rows {
-        by_project.entry(*project_id).or_default().push(*id);
-    }
-    for (project_id, ids) in by_project {
-        notify_problems_panel_refresh(project_id, ids);
-    }
+    // Delega al punto unico condiviso col port_enforcer (regola L).
+    crate::project_workspace::logs::emit_problems_panel_refresh_batch(rows);
 }
 
 fn sig_hash(s: &str) -> String {
@@ -1623,11 +1601,12 @@ async fn run_cycle(
             process_sample(&ctx, states, now_ts, sample).await;
         }
 
-        // ── Sweep: anomalie di unit non piu' osservati (rinominati/rimossi) ─
-        // Le richiude qui perche' il resolve per-unit non le raggiunge mai.
-        // Guard !is_empty(): non azzerare tutto su un errore di systemctl.
+        // ── Sweep: anomalie e crash di unit non piu' osservati (rinominati/
+        // rimossi). Le richiude qui perche' il resolve per-unit non le
+        // raggiunge mai. Guard !is_empty(): non azzerare tutto su un errore
+        // di systemctl.
         if !observed_units.is_empty() {
-            let resolved = resolve_anomalies_for_absent_units(
+            let resolved = resolve_diagnoses_for_absent_units(
                 &state.db,
                 project_id,
                 &observed_units,
@@ -1717,24 +1696,6 @@ mod tests {
             "rosso normale"
         );
         assert_eq!(strip_ansi("nessun codice"), "nessun codice");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn pid_identity_riconosce_riciclo() {
-        // Creation-time entro tolleranza dello started_at atteso = identita' OK
-        // (e' il nostro servizio). started_at 1000, real 1002, tolleranza 10.
-        assert!(pid_identity_ok(Some(1002), Some(1000), 10));
-        assert!(pid_identity_ok(Some(1000), Some(1000), 10));
-        // Creation-time molto distante = PID riciclato su un processo estraneo
-        // (avviato in un altro momento) -> identita' FALLITA -> servizio morto.
-        assert!(!pid_identity_ok(Some(1050), Some(1000), 10));
-        assert!(!pid_identity_ok(Some(500), Some(1000), 10));
-        // Dato mancante (started_at NULL o creation-time non leggibile) = identita'
-        // non confermabile -> false (fail-safe).
-        assert!(!pid_identity_ok(None, Some(1000), 10));
-        assert!(!pid_identity_ok(Some(1000), None, 10));
-        assert!(!pid_identity_ok(None, None, 10));
     }
 
     #[test]

@@ -116,6 +116,23 @@ pub(crate) fn emit_problems_panel_refresh(project_id: Uuid, resolved_ids: Vec<Uu
     );
 }
 
+/// Variante batch di [`emit_problems_panel_refresh`] per gli sweep multi-progetto
+/// (observer, port_enforcer): raggruppa le righe `(project_id, diagnosi_id)`
+/// risolte e emette UN refresh per progetto. Punto unico (regola L).
+pub(crate) fn emit_problems_panel_refresh_batch(rows: &[(Uuid, Uuid)]) {
+    if rows.is_empty() {
+        return;
+    }
+    use std::collections::HashMap;
+    let mut by_project: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (project_id, id) in rows {
+        by_project.entry(*project_id).or_default().push(*id);
+    }
+    for (project_id, ids) in by_project {
+        emit_problems_panel_refresh(project_id, ids);
+    }
+}
+
 /// Audit 27/05/2026: aggiunto 'passed' alla lista di esclusione.
 /// I job Playwright vengono salvati con status='passed' quando i test
 /// hanno successo, ma la query li includeva nel pannello Problemi

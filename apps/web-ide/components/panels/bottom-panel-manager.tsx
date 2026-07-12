@@ -89,14 +89,50 @@ function tileStyle(tc: ReturnType<typeof useThemeColors>) {
   } as const;
 }
 
-function severityColor(
-  severity: string,
-  tc: ReturnType<typeof useThemeColors>,
-) {
+/// Classificazione a fasce della gravita' di un problema (punto unico frontend,
+/// stesso ordinamento del backend severity_rank): le fonti emettono vocabolari
+/// diversi (error/critical dal runtime, high/medium/low dallo scanner quality,
+/// warning dalle diagnosi servizio) che collassano in tre fasce colorate.
+function severityInfo(severity: string): {
+  rank: 0 | 1 | 2;
+  label: string;
+  plural: string;
+  color: string;
+  bg: string;
+} {
   const n = severity.toLowerCase();
-  if (n === "error" || n === "critical" || n === "high") return tc.error;
-  if (n === "warning" || n === "medium") return tc.warning;
-  return tc.textMuted;
+  if (n === "error" || n === "critical" || n === "high") {
+    return { rank: 0, label: "grave", plural: "gravi", color: "#ef4444", bg: "rgba(239,68,68,0.14)" };
+  }
+  if (n === "warning" || n === "warn" || n === "medium") {
+    return { rank: 1, label: "medio", plural: "medi", color: "#f59e0b", bg: "rgba(245,158,11,0.14)" };
+  }
+  return { rank: 2, label: "basso", plural: "bassi", color: "#94a3b8", bg: "rgba(148,163,184,0.14)" };
+}
+
+/// Badge pill colorato della fascia di gravita'. Il tooltip conserva la
+/// severity originale della fonte (es. "high · quality:maintainability").
+function SeverityBadge({ severity, source }: { severity: string; source: string }) {
+  const info = severityInfo(severity);
+  return (
+    <span
+      title={`${severity} · ${source}`}
+      style={{
+        color: info.color,
+        background: info.bg,
+        border: `1px solid ${info.color}55`,
+        borderRadius: 8,
+        padding: "1px 8px",
+        fontSize: 10,
+        fontWeight: 600,
+        textTransform: "uppercase",
+        letterSpacing: 0.4,
+        flexShrink: 0,
+      }}
+    >
+      {info.label}
+    </span>
+  );
 }
 
 export function BottomPanelManager({
@@ -215,9 +251,34 @@ export function BottomPanelManager({
 
     if (activePanelTab === "monitor") return <MonitorPanel onSendToChat={onSendToChat} />;
 
-    if (activePanelTab === "problems") return (
+    if (activePanelTab === "problems") {
+      // Contatori per fascia di gravita' (ordine: gravi, medi, bassi).
+      const severityCounts = [0, 0, 0];
+      for (const item of problemItems) {
+        severityCounts[severityInfo(item.severity).rank] += 1;
+      }
+      const countBadges = ([0, 1, 2] as const)
+        .filter((rank) => severityCounts[rank] > 0)
+        .map((rank) => {
+          const sample = rank === 0 ? "error" : rank === 1 ? "warning" : "info";
+          const info = severityInfo(sample);
+          const n = severityCounts[rank];
+          return (
+            <span key={rank} style={{ display: "inline-flex", alignItems: "center", gap: 5, color: tc.textMuted, fontSize: 11 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: info.color, display: "inline-block" }} />
+              {n} {n === 1 ? info.label : info.plural}
+            </span>
+          );
+        });
+
+      return (
       <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
         {clearBar("problems", problemItems.length > 0)}
+        {problemItems.length > 0 ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "6px 12px", borderBottom: `1px solid ${tc.border}`, flexShrink: 0 }}>
+            {countBadges}
+          </div>
+        ) : null}
         <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 10, minHeight: 0, overflow: "auto", flex: 1 }}>
           {problemItems.length === 0 ? (
             <div style={{ color: tc.textMuted }}>Nessun problema aperto.</div>
@@ -233,7 +294,12 @@ export function BottomPanelManager({
               >
                 <button
                   onClick={() => item.filePath && onOpenFile(item.filePath, item.line ?? 1)}
-                  style={{ ...listRowButton(tc), flex: 1, minWidth: 0 }}
+                  style={{
+                    ...listRowButton(tc),
+                    flex: 1,
+                    minWidth: 0,
+                    borderLeft: `3px solid ${severityInfo(item.severity).color}`,
+                  }}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", columnGap: 10 }}>
                     <span style={{ color: tc.text, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -254,9 +320,7 @@ export function BottomPanelManager({
                           x{item.occurrenceCount}
                         </span>
                       ) : null}
-                      <span style={{ color: severityColor(item.severity, tc), fontSize: 11 }}>
-                        {item.severity}
-                      </span>
+                      <SeverityBadge severity={item.severity} source={item.source} />
                     </span>
                   </div>
                   <div style={{ color: tc.textMuted, fontSize: 11, marginTop: 4 }}>
@@ -319,7 +383,8 @@ export function BottomPanelManager({
           )}
         </div>
       </div>
-    );
+      );
+    }
 
     // "services" (e alias legacy "output") usa OutputPanel
     if (activePanelTab === "services" || activePanelTab === "output") return (

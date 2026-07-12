@@ -756,10 +756,10 @@ pub async fn confirm_agent_run(
             )
             .await;
         });
-        return Ok(Json(json!({
+        Ok(Json(json!({
             "runId": run_id.to_string(),
             "status": "running",
-        })));
+        })))
     } else {
         // Resume LEGACY sul brain Python (engine='python' o NULL). Il brain
         // mantiene lo state del thread ed e' l'unica sorgente del loop per quei run.

@@ -144,7 +144,9 @@ async fn announce_cap_reached_in_chat(
         "kind": "cap_reached",
         "synthetic": true,
         "session_id": session_id.to_string(),
-        "label": label,
+        // Chiave allineata a process_completion (process_label): unico campo
+        // strutturato che la UI legge per l'etichetta del banner di risveglio.
+        "process_label": label,
         "cap": cap,
         "source": "process_resume",
     });
@@ -453,7 +455,12 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             )
         };
         let meta = serde_json::json!({
-            "kind": "process_completion",
+            // Kind STRUTTURATO distinto per esito (regola M): la UI deriva
+            // outcome success/failure da questo campo, NON dal parsing del
+            // content. `ok` incorpora anche la verita' docker (container non-up
+            // => process_failed anche con exit_code=0), quindi il segnale resta
+            // fedele nei casi che il testo maschererebbe.
+            "kind": if ok { "process_success" } else { "process_failed" },
             "synthetic": true,
             "process_id": id.to_string(),
             "process_label": label,

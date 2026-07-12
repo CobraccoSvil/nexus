@@ -165,6 +165,42 @@ test("consiglio competenze usa meta-step strutturato dedicato", () => {
   assert.equal(event.activationSource, "agentic_deterministic_complexity_scope_analysis");
 });
 
+test("consiglio in segmento unknown eredita provider dal run principale", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_convening",
+        phase: "convening",
+        figure_count: 3,
+        completed_count: 0,
+      },
+      "Consiglio in corso (0/3)",
+    ),
+    meta(
+      "fallback",
+      {
+        from_provider: "openai",
+        to_provider: "deepseek",
+        to_model: "deepseek-v4-flash",
+        reason: "cooldown",
+        cause: "cooldown",
+      },
+      "Fallback su deepseek/deepseek-v4-flash",
+    ),
+  ];
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const council = stream.segments[0]?.events.find(
+    (e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+  );
+  assert.ok(council, "evento consiglio atteso");
+  assert.equal(council.provider, "deepseek");
+  assert.equal(council.model, "deepseek-v4-flash");
+});
+
 test("consiglio in corso espone figure_tasks e aggiorna lo stesso evento", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [
@@ -318,6 +354,11 @@ test("multi-provider panel usa meta-step strutturato dedicato", () => {
         activated: true,
         degraded: false,
         provider_count: 3,
+        panel_providers: [
+          { provider: "deepseek", model: "deepseek-v4-flash" },
+          { provider: "google", model: "gemini-2.5-flash" },
+          { provider: "mistral", model: "mistral-small-latest" },
+        ],
       },
       "Panel multi-provider attivo (3)",
     ),
@@ -333,6 +374,8 @@ test("multi-provider panel usa meta-step strutturato dedicato", () => {
   assert.ok(event, "evento multi-provider atteso");
   assert.equal(event.productName, "Multi-provider advisory");
   assert.equal(event.providerCount, 3);
+  assert.equal(event.panelProviders?.length, 3);
+  assert.equal(event.panelProviders?.[0]?.provider, "deepseek");
   assert.equal(event.degraded, false);
 });
 

@@ -36,6 +36,7 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
              supports_audio_out BOOLEAN NOT NULL DEFAULT false, \
              supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
              agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
+             uses_thinking_mode BOOLEAN NOT NULL DEFAULT false, \
              performance_tier TEXT NOT NULL DEFAULT 'medium', \
              capabilities JSONB NOT NULL DEFAULT '[]', \
              context_window INTEGER NOT NULL DEFAULT 8192, \
@@ -44,7 +45,8 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
              is_featured BOOLEAN NOT NULL DEFAULT false, \
              speed_tier TEXT NOT NULL DEFAULT 'medium', \
              consecutive_failures INT NOT NULL DEFAULT 0, \
-             consecutive_tool_failures INT NOT NULL DEFAULT 0 \
+             consecutive_tool_failures INT NOT NULL DEFAULT 0, \
+             auto_disabled_reason TEXT \
          )",
     )
     .execute(pool)
