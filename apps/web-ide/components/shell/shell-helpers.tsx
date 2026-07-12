@@ -75,7 +75,9 @@ export function defaultWorkbenchState(): WorkbenchState {
     activeSidebarView: "explorer",
     activePanelTab: "terminal",
     leftWidth: 300,
-    rightWidth: 430,
+    // Default piu' generoso: i workbench gia' persistiti mantengono il loro
+    // valore salvato (retro-compatibile); solo i nuovi progetti partono a 500.
+    rightWidth: 500,
     bottomHeight: 250,
     editorGroups: EMPTY_GROUPS,
     ai: {

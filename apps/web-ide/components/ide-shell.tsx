@@ -85,6 +85,7 @@ import { FirstAnalysisOverlay } from "./shell/first-analysis-overlay";
 import { ShellOverlays } from "./shell/shell-overlays";
 import { BottomPanelHeader } from "./shell/bottom-panel-header";
 import { RightViewTabs } from "./shell/panel-tabs";
+import { rightSidebarBounds } from "./shell/panel-sizing-logic";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -262,7 +263,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     return () => window.removeEventListener("nexus:sql:open", handler);
   }, []);
   const [leftWidth, setLeftWidth] = useState(300);
-  const [rightWidth, setRightWidth] = useState(430);
+  // Placeholder pre-idratazione: allineato al default di defaultWorkbenchState
+  // (500) per non far "saltare" la larghezza al caricamento dello stato.
+  const [rightWidth, setRightWidth] = useState(500);
   const [bottomHeight, setBottomHeight] = useState(250);
   const [viewportWidth, setViewportWidth] = useState(1600);
   const [viewportHeight, setViewportHeight] = useState(900);
@@ -318,11 +321,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     leftSidebarMinWidth,
     Math.min(520, Math.floor(viewportWidth * 0.46)),
   );
-  const rightSidebarMinWidth = isMobileViewport ? 240 : 280;
-  const rightSidebarMaxWidth = Math.max(
-    rightSidebarMinWidth,
-    Math.min(620, Math.floor(viewportWidth * 0.6)),
-  );
+  // Vincoli pannello destro: punto unico in panel-sizing-logic (regola L). Il
+  // tetto e' piu' generoso sotto la soglia narrow/mobile.
+  const { min: rightSidebarMinWidth, max: rightSidebarMaxWidth } = rightSidebarBounds(viewportWidth);
   const effectiveLeftWidth = Math.max(leftSidebarMinWidth, Math.min(leftSidebarMaxWidth, leftWidth));
   const effectiveRightWidth = Math.max(rightSidebarMinWidth, Math.min(rightSidebarMaxWidth, rightWidth));
 
@@ -348,13 +349,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       setBottomHeight((current) => Math.max(bottomPanelMinHeight, Math.min(bottomPanelMaxHeight, current - delta)));
     }, [bottomPanelMinHeight, bottomPanelMaxHeight]),
   });
+  // Un solo handler per tutte le maniglie che regolano la larghezza del pannello
+  // destro (regola L): il divisore centrale (bordo destro dell'AI workspace) e
+  // quello della secondary sidebar avevano corpo identico. Una singola istanza
+  // di useResize e' condivisibile su piu' maniglie perche' un solo drag e'
+  // attivo alla volta (stato dragging interno per-istanza).
   const resizeRight = useResize({
-    direction: "horizontal",
-    onDelta: useCallback((delta: number) => {
-      setRightWidth((current) => Math.max(rightSidebarMinWidth, Math.min(rightSidebarMaxWidth, current - delta)));
-    }, [rightSidebarMaxWidth, rightSidebarMinWidth]),
-  });
-  const resizeCenter = useResize({
     direction: "horizontal",
     onDelta: useCallback((delta: number) => {
       setRightWidth((current) => Math.max(rightSidebarMinWidth, Math.min(rightSidebarMaxWidth, current - delta)));
@@ -1626,7 +1626,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           <div style={{ minWidth: 0, minHeight: 0, height: "100%", display: "flex", overflow: "hidden", borderRight: `1px solid ${tc.border}`, position: "relative" }}>
             {renderAiWorkspace()}
             <div
-              {...resizeCenter}
+              {...resizeRight}
               style={{
                 position: "absolute",
                 top: 0,
@@ -1689,7 +1689,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           {renderAiWorkspace()}
           {/* Resize handle sovrapposto al bordo destro del pannello AI */}
           <div
-            {...resizeCenter}
+            {...resizeRight}
             style={{
               position: "absolute",
               top: 0,

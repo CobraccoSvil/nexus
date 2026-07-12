@@ -201,12 +201,28 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
           padding: "0 8px",
           borderBottom: `1px solid ${tc.border}`,
           fontSize: 12,
+          // Robustezza overflow: nei 32px fissi della riga i figli non devono
+          // andare a capo. Il contenitore puo' restringersi (minWidth:0) e
+          // nasconde l'eccedenza; il nome progetto tronca con ellissi.
+          minWidth: 0,
+          overflow: "hidden",
         }}
       >
-        <span style={{ fontWeight: 600 }}>SQL · {project?.name ?? "(nessun progetto)"}</span>
+        <span
+          style={{
+            fontWeight: 600,
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+          title={`SQL · ${project?.name ?? "(nessun progetto)"}`}
+        >
+          SQL · {project?.name ?? "(nessun progetto)"}
+        </span>
         {connections.length > 0 && (
           <>
-            <span style={{ color: tc.textMuted, marginLeft: 4 }}>DB:</span>
+            <span style={{ color: tc.textMuted, marginLeft: 4, flexShrink: 0 }}>DB:</span>
             <select
               value={selectedConnection}
               onChange={(e) => setSelectedConnection(e.target.value)}
@@ -224,6 +240,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
                 fontSize: 11,
                 padding: "1px 6px",
                 cursor: connections.length > 1 ? "pointer" : "default",
+                flexShrink: 0,
               }}
             >
               {connections.map((c) => (
@@ -249,6 +266,8 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
             borderRadius: 4,
             cursor: loading || !projectId ? "not-allowed" : "pointer",
             fontSize: 12,
+            flexShrink: 0,
+            whiteSpace: "nowrap",
           }}
           title="Esegui (Ctrl+Enter)"
         >
@@ -262,6 +281,12 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
               color: "#fff8d6",
               borderRadius: 3,
               fontSize: 11,
+              // Badge compatto: non deve mandare a capo ne' comprimere gli altri
+              // controlli; su viewport stretti si tronca con ellissi.
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
             }}
             title="Le query DDL (CREATE/ALTER/DROP) verranno archiviate automaticamente in Knowledge Base e come file migration nel progetto."
           >
