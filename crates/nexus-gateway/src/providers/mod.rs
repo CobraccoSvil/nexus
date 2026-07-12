@@ -11,6 +11,7 @@ pub mod tool_choice;
 pub mod anthropic;
 pub mod deepseek;
 pub mod gcp_auth;
+pub mod generic;
 pub mod google;
 pub mod mistral;
 pub mod openai;
@@ -18,6 +19,7 @@ pub mod vllm;
 
 pub use anthropic::AnthropicProvider;
 pub use deepseek::DeepSeekProvider;
+pub use generic::GenericOpenAiProvider;
 pub use google::GoogleProvider;
 pub use mistral::MistralProvider;
 pub use openai::OpenAiProvider;

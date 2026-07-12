@@ -48,6 +48,12 @@ providers:
   google:
     enabled: true
     timeout_ms: 30000
+  groq:
+    enabled: true
+    timeout_ms: 30000
+  openrouter:
+    enabled: true
+    timeout_ms: 30000
 
 redaction:
   enabled: true
