@@ -163,8 +163,28 @@ onesto, doc/env bonificati. La dir `brain/` e' stata poi eliminata dal repo
 
 Ruolo invariato: provider dedicato alla ricerca web citata, NON nodo agentico.
 
-Stato: **provider FATTO** (mig 0568) + **citazioni end-to-end FATTE** (2026-07-12);
-resta l'**intent `ricerca_web`** non-agentico (Fase 2).
+Stato: **provider + citazioni + intent `ricerca_web` FATTI lato backend** (2026-07-12);
+resta solo l'**attivazione admin** (key + abilitare sonar + prompt classifier).
+
+Flusso `ricerca_web` (backend completo, gated/opt-in — INERTE finche' il classifier
+non emette ricerca_web):
+- mig 0569: intent in `nexus_intent_capability` (base_capability `web_search`) +
+  `nexus_routing_matrix` (fallback) + CHECK esteso.
+- classifier: `ricerca_web` in `ALLOWED_INTENTS` + `intent_str_to_static` + `intent_key_for`.
+- **selezione (core.rs)**: `resolve_agent_provider`, per intent=ricerca_web, usa
+  `best_model_for_tier_pinned(web_search, requires_tool_use=false, pin=perplexity)`
+  -> sonar (ramo NON-agentico, perche' sonar ha supports_tool_use=false). Nel path
+  di produzione (spawn_agent_run -> ..._detailed -> resolve_agent_provider).
+- **garanzia tool (generic.rs)**: `GenericOpenAiProvider` strippa tools/tool_choice
+  per supports_tools=false -> sonar non prende 400; il grafo gira in modalita' testo
+  e completa con le citazioni (gia' propagate al pannello "Fonti consultate").
+
+**Attivazione admin (3 step, richiede API key)**: (1) `perplexity_api_key`;
+(2) abilitare i sonar (`is_enabled=true`); (3) aggiornare il prompt DB
+`system.intent_classifier_prompt` perche' il classifier emetta `ricerca_web` per le
+query di ricerca. Lasciato all'admin di proposito: modificare il prompt di
+produzione cambia la classificazione di OGNI richiesta e va fatto con verifica
+(rischio misclassificazione). Verifica e2e con la key.
 
 Citazioni (6 hop, additivi/retrocompatibili, regola M campo strutturato):
 `LlmResponse.citations` + wire `ChatCompletion.citations` + `from_chat_completion`
