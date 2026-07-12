@@ -1,20 +1,19 @@
 //! Classificatore d'errore provider (parte pura, testo-in -> stop_reason-out).
 //!
-//! Punto unico Rust paritetico a ``brain/providers/error_handler.py::classify_error``
-//! (regola L / ADR 0026, Wave 8b). La parte SDK-specifica (estrazione di
-//! `retry-after` da `exc.response.headers`) resta lato Python perche'
-//! richiede l'oggetto eccezione vero dell'SDK; qui sta solo la classificazione
-//! testuale che fino ad ora era duplicata fra:
-//!   - brain (regex e HTTP map autoritative)
-//!   - chiamata via RPC `ClassifyError` da mcp-core
+//! Classificatore TESTUALE Rust (regex + HTTP map). E' un fallback: la fonte
+//! primaria e' il segnale STRUTTURATO alla sorgente (status + codice d'errore
+//! del provider) via `classify_provider_error` / `ProviderHttpError` nel gateway
+//! (regola M, ADR 0033). Questo modulo interviene solo quando resta disponibile
+//! il solo messaggio testuale gia' appiattito.
 //!
-//! La parita' fra le due implementazioni e' verificata da un golden test
-//! cross-language (vedi ``tests/fixtures/error_classifier_golden.json``).
+//! Regressione fissata dal golden `tests/fixtures/error_classifier_golden.json`.
+//! Nota storica: il file golden nasceva per la parita' col brain Python
+//! (`brain/providers/error_handler.py`), ora rimosso; resta come golden Rust.
 
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Esito della classificazione (subset stabile, paritetico col Python).
+/// Esito della classificazione (subset stabile).
 /// Il messaggio leggibile per l'utente NON e' qui per design: questo modulo
 /// fa solo la diagnosi.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,8 +23,7 @@ pub struct ClassifiedError {
     pub http_status: Option<u16>,
 }
 
-/// HTTP status -> (stop_reason, retriable). Paritetico a `HTTP_ERROR_MAP`
-/// nel brain Python.
+/// HTTP status -> (stop_reason, retriable).
 fn http_status_to_reason(status: u16) -> Option<(&'static str, bool)> {
     match status {
         400 => Some(("invalid_request", false)),
@@ -86,8 +84,7 @@ fn http_status_re() -> &'static Regex {
 
 /// Rate-limit testuale SENZA status HTTP affidabile (es. errori inline o
 /// eccezioni che non espongono `status_code`). Valutato DOPO la HTTP map:
-/// uno status esplicito noto vince sempre sul testo. Paritetico a
-/// `RATE_LIMIT_PATTERNS` in `brain/providers/error_handler.py`.
+/// uno status esplicito noto vince sempre sul testo.
 fn rate_limit_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
@@ -104,9 +101,9 @@ fn retry_after_re() -> &'static Regex {
 }
 
 /// Estrae i secondi di retry suggeriti dal testo raw dell'errore
-/// (es. "Please retry after 30 seconds"). Sostituisce l'estrazione che il
-/// bridge brain (`agentic_classifier`) faceva in proprio con regex locale:
-/// il payload raw arriva a mcp-core e l'estrazione vive qui (punto unico).
+/// (es. "Please retry after 30 seconds"). Fallback testuale: la fonte primaria
+/// e' l'header `Retry-After` letto in modo strutturato dall'adapter provider.
+/// Punto unico dell'estrazione dal testo (regola L).
 pub fn extract_retry_after_seconds(raw: &str) -> Option<u64> {
     retry_after_re()
         .captures(raw)
@@ -116,7 +113,7 @@ pub fn extract_retry_after_seconds(raw: &str) -> Option<u64> {
 
 /// Classifica un errore provider rappresentato come testo libero.
 ///
-/// Stesso ordine di valutazione del brain Python:
+/// Ordine di valutazione:
 ///   1. estrazione HTTP status code
 ///   2. pattern billing/quota -> `billing_error`
 ///   3. pattern context too long -> `context_too_long`
@@ -130,11 +127,10 @@ pub fn classify_text(raw: &str) -> ClassifiedError {
 }
 
 /// Variante di [`classify_text`] con HTTP status gia' noto al chiamante
-/// (es. estratto in modo strutturato dall'eccezione SDK lato brain e
-/// inoltrato via bridge `/api/internal/provider-error`). Lo status esplicito
-/// vince sull'estrazione regex dal testo; l'ordine di valutazione resta
-/// identico (parita' col Python, dove lo status strutturato dell'SDK entra
-/// allo stesso passo della HTTP map).
+/// (es. estratto in modo strutturato dalla risposta HTTP del provider). Lo
+/// status esplicito vince sull'estrazione regex dal testo; entra allo stesso
+/// passo della HTTP map (coerente con la regola M: il segnale strutturato
+/// prevale sul testo).
 pub fn classify_with_status(raw: &str, known_status: Option<u16>) -> ClassifiedError {
     let raw_lower = raw.to_lowercase();
 
@@ -271,12 +267,12 @@ mod tests {
         assert_eq!(extract_retry_after_seconds("nessun suggerimento"), None);
     }
 
-    /// Parita' cross-language con ``brain/providers/error_handler.py::classify_error``.
+    /// Golden test del classificatore testuale (regressione su stop_reason).
     // jscpd:ignore-start
     // Boilerplate caricamento fixture: duplicazione GIUSTIFICATA col gemello
     // rag::chunker::tests, il loro scopo e' essere simili (golden test).
     #[test]
-    fn parita_cross_language_da_fixture_golden() {
+    fn classify_text_da_fixture_golden() {
         const FIXTURE: &str = include_str!("../../../tests/fixtures/error_classifier_golden.json");
         let parsed: serde_json::Value =
             serde_json::from_str(FIXTURE).expect("fixture golden non e' JSON valido");
@@ -292,7 +288,7 @@ mod tests {
             let actual = classify_text(input);
             assert_eq!(
                 actual.stop_reason, expected,
-                "caso '{name}' divergente fra Rust e Python: input={input:?}",
+                "caso '{name}' divergente dal golden: input={input:?}",
             );
         }
     }

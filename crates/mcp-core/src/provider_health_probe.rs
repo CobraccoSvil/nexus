@@ -37,10 +37,38 @@ use crate::provider_cooldown::{
 // `put_provider_in_cooldown` non usato qui: cooldown delegato a
 // `model_health_probe::dispatch_probe_error` (punto unico classificazione).
 
-/// Lista dei provider da probare. Allineata con `KNOWN_PROVIDERS` in
-/// `orchestrator.rs`. Mantenuta hard-coded perche' sono note staticamente
-/// (un nuovo provider richiede comunque modifiche al codice di routing).
-const PROBED_PROVIDERS: &[&str] = &["anthropic", "openai", "google", "deepseek", "mistral"];
+/// Fallback dei provider da probare, usato SOLO se il catalog e' irraggiungibile
+/// o vuoto (fail-safe: non smettere di sondare i provider core per una query
+/// fallita). La lista PRIMARIA e' data-driven dal catalog (vedi
+/// [`probed_providers`]): un provider con almeno un modello `is_enabled` viene
+/// sondato automaticamente, senza toccare questa costante (regola G).
+const FALLBACK_PROBED_PROVIDERS: &[&str] = &["anthropic", "openai", "google", "deepseek", "mistral"];
+
+/// Provider da sondare in un round, derivati dal catalog (regola G/L): i
+/// provider con almeno un modello abilitato. Un provider nuovo (es. onboardato
+/// con la sua migrazione catalog) entra nel probe senza modifiche al codice.
+async fn probed_providers(db: &PgPool) -> Vec<String> {
+    let from_db: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT provider FROM ai_price_catalog WHERE is_enabled = true ORDER BY provider",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    resolve_probed_providers(from_db)
+}
+
+/// Applica il fallback ai provider noti se la lista dal catalog e' vuota (query
+/// fallita o catalog senza modelli abilitati). Puro: testabile senza DB.
+fn resolve_probed_providers(from_db: Vec<String>) -> Vec<String> {
+    if from_db.is_empty() {
+        FALLBACK_PROBED_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        from_db
+    }
+}
 
 /// Prompt minimale: 1 parola, ci aspettiamo una risposta breve.
 /// Il provider tipicamente risponde con "Hi!" o "Hello!" (1-2 token).
@@ -80,9 +108,9 @@ pub fn spawn_health_probe(
         .unwrap_or(interval_s)
         .max(60);
     tracing::info!(
-        "provider_health_probe: avvio worker (interval={}s, providers={:?})",
+        "provider_health_probe: avvio worker (interval={}s, providers=data-driven dal catalog, fallback={:?})",
         interval_s,
-        PROBED_PROVIDERS,
+        FALLBACK_PROBED_PROVIDERS,
     );
     tokio::spawn(async move {
         // Aspetta 30s al primo avvio per dare tempo agli altri servizi
@@ -135,7 +163,9 @@ fn round_victims_drain() -> Vec<String> {
 /// ri-testa i billing.
 async fn run_one_round(orchestrator: &Orchestrator, db: &PgPool) {
     let _ = round_victims_drain(); // reset accumulator
-    for provider in PROBED_PROVIDERS {
+    let providers = probed_providers(db).await;
+    for provider in &providers {
+        let provider = provider.as_str();
         if crate::provider_cooldown::is_provider_in_billing_cooldown(provider) {
             tracing::debug!(
                 "provider_health_probe: skip {provider} (billing cooldown — \
@@ -554,6 +584,27 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_probed_providers_usa_il_catalog_quando_presente() {
+        let from_db = vec!["openai".to_string(), "perplexity".to_string()];
+        // La lista dal catalog vince: un provider nuovo (perplexity) e' incluso
+        // senza toccare la costante di fallback.
+        assert_eq!(
+            resolve_probed_providers(from_db),
+            vec!["openai".to_string(), "perplexity".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_probed_providers_fallback_se_catalog_vuoto() {
+        // Query fallita / catalog senza modelli abilitati -> fail-safe sui noti.
+        let expected: Vec<String> = FALLBACK_PROBED_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(resolve_probed_providers(vec![]), expected);
+    }
 
     #[test]
     fn kind_from_error_class_mappa_billing() {

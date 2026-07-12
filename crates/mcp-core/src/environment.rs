@@ -800,6 +800,67 @@ async fn fetch_api_key_configured(db: &sqlx::PgPool) -> std::collections::HashMa
         .collect()
 }
 
+/// Nomi dei provider da mostrare nello status/dashboard (regola G/L): unione dei
+/// provider con almeno un modello abilitato nel catalog e di quelli con `*_api_key`
+/// configurata in `settings`. Un provider onboardato (catalog o chiave) compare
+/// senza toccare il codice (chiude T4). Fallback ai noti (`KNOWN_PROVIDERS`) se
+/// entrambe le fonti sono vuote (DB down / bootstrap incompleto).
+async fn provider_names_for_status(
+    db: &sqlx::PgPool,
+    api_key_configured: &std::collections::HashMap<String, bool>,
+) -> Vec<String> {
+    let from_catalog: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT provider FROM ai_price_catalog WHERE is_enabled = true",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    merge_provider_names(from_catalog, api_key_configured)
+}
+
+/// Unione ordinata + deduplicata di provider da catalog e da api_key configurata;
+/// fallback ai noti se entrambe vuote. Puro: testabile senza DB.
+fn merge_provider_names(
+    from_catalog: Vec<String>,
+    api_key_configured: &std::collections::HashMap<String, bool>,
+) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = from_catalog.into_iter().collect();
+    for (name, configured) in api_key_configured {
+        if *configured {
+            set.insert(name.clone());
+        }
+    }
+    if set.is_empty() {
+        return KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect();
+    }
+    set.into_iter().collect()
+}
+
+#[cfg(test)]
+mod provider_names_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn merge_unisce_catalog_e_chiavi_e_deduplica() {
+        let mut keys = HashMap::new();
+        keys.insert("openai".to_string(), true);
+        keys.insert("perplexity".to_string(), true); // provider nuovo, solo chiave
+        keys.insert("disattivato".to_string(), false); // non configurato -> escluso
+        let out = merge_provider_names(vec!["openai".into(), "mistral".into()], &keys);
+        // Ordinato, dedup (openai una volta), perplexity incluso, disattivato no.
+        assert_eq!(out, vec!["mistral", "openai", "perplexity"]);
+    }
+
+    #[test]
+    fn merge_fallback_ai_noti_se_vuoto() {
+        let empty: HashMap<String, bool> = HashMap::new();
+        let out = merge_provider_names(vec![], &empty);
+        let expected: Vec<String> = KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(out, expected);
+    }
+}
+
 /// Snapshot dei provider in cooldown come mappa `provider -> (secondi, motivo)`.
 fn fetch_cooldown_map() -> std::collections::HashMap<String, (u64, Option<String>)> {
     crate::provider_cooldown::cooldown_snapshot()
@@ -812,13 +873,15 @@ fn fetch_cooldown_map() -> std::collections::HashMap<String, (u64, Option<String
 /// Usata quando il gateway TypeScript (4060) non e' raggiungibile, cosi' i LED
 /// mostrano l'ultimo stato noto invece di essere tutti grigi.
 fn build_providers_fallback(
+    names: &[String],
     health_map: &std::collections::HashMap<String, ProviderHealthRow>,
     api_key_configured: &std::collections::HashMap<String, bool>,
     cooldown_map: &std::collections::HashMap<String, (u64, Option<String>)>,
 ) -> Vec<serde_json::Value> {
-    KNOWN_PROVIDERS
+    names
         .iter()
-        .map(|&name| {
+        .map(|name| {
+            let name = name.as_str();
             let configured = api_key_configured.get(name).copied().unwrap_or(false);
             let mut p = json!({
                 "name": name,
@@ -997,8 +1060,13 @@ pub async fn gateway_providers_handler(
     let cooldown_map = fetch_cooldown_map();
     let health_map = fetch_provider_health_map(&state.db).await;
     let api_key_configured = fetch_api_key_configured(&state.db).await;
-    let providers_fallback =
-        build_providers_fallback(&health_map, &api_key_configured, &cooldown_map);
+    let provider_names = provider_names_for_status(&state.db, &api_key_configured).await;
+    let providers_fallback = build_providers_fallback(
+        &provider_names,
+        &health_map,
+        &api_key_configured,
+        &cooldown_map,
+    );
 
     match client
         .get(format!("{}/providers", gw_url.trim_end_matches('/')))
@@ -1283,10 +1351,12 @@ pub async fn providers_status_internal(
     let health_map = fetch_provider_health_map(&state.db).await;
     let api_key_configured = fetch_api_key_configured(&state.db).await;
     let cooldown_map = fetch_cooldown_map();
+    let provider_names = provider_names_for_status(&state.db, &api_key_configured).await;
 
-    let providers: Vec<Value> = KNOWN_PROVIDERS
+    let providers: Vec<Value> = provider_names
         .iter()
-        .map(|&name| {
+        .map(|name| {
+            let name = name.as_str();
             let mut p = json!({
                 "name": name,
                 "configured": api_key_configured.get(name).copied().unwrap_or(false),
