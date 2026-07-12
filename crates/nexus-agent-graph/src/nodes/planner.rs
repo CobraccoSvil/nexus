@@ -1863,9 +1863,11 @@ mod tests {
     #[test]
     fn is_eligible_gates() {
         let cfg = cfg_active();
-        // Eleggibile: tutto a posto.
+        // Eleggibile: tutto a posto. `Bilanciata`/`CODE` in mixed-case verificano
+        // il match case-insensitive contro il default plan_behavior_modes
+        // (`bilanciata`/`approfondita`) e plan_intents (`code`/...).
         assert!(
-            cfg.is_eligible(Some("Automatico"), Some("CODE"), 8000),
+            cfg.is_eligible(Some("Bilanciata"), Some("CODE"), 8000),
             "case-insensitive"
         );
         // plan_phase OFF -> mai eleggibile.
@@ -2339,6 +2341,11 @@ mod tests {
         let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
         let mut st = eligible_state();
         st.behavior_mode = Some("confirm".to_string());
+        // Il branching clarifying (clarifying_branch) decide HALT vs ApplyDefaults
+        // dall'AUTOMATION_MODE (None/Confirm -> HITL), NON dal behavior_mode:
+        // eligible_state() lo mette Automatic (-> ApplyDefaults), qui va forzato a
+        // Confirm per esercitare il Halt.
+        st.automation_mode = Some(crate::state::AutomationMode::Confirm);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(false));
         assert_eq!(
