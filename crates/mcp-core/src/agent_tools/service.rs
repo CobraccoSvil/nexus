@@ -90,7 +90,10 @@ pub(crate) fn looks_like_web_service(command: &str) -> bool {
 
 /// Cerca nella combinazione stdout+stderr un pattern di porta TCP in ascolto.
 /// Riconosce output di Next.js, Vite, Express, Flask, Django, ecc.
-/// Ritorna la prima porta trovata (4-5 cifre, range 1024-65535).
+/// Ritorna la prima porta REGISTRABILE per il progetto (bucket 20000-39999, non
+/// riservata Nexus): scarta le porte d'infrastruttura che i log menzionano come
+/// destinazione di CONNESSIONE (es. Postgres :5434), non come listener. Criterio
+/// via punto unico `nexus_tool_kit::ports::is_project_registrable_port` (regola L).
 fn detect_port_from_output(stdout: &str, stderr: &str) -> Option<i32> {
     let combined = format!("{}\n{}", stdout, stderr);
     // Pattern frequenti: "localhost:3002", "0.0.0.0:3000", "port 5173",
@@ -99,10 +102,16 @@ fn detect_port_from_output(stdout: &str, stderr: &str) -> Option<i32> {
         r"(?i)(?:localhost|127\.0\.0\.1|0\.0\.0\.0|::)[:\s]+(\d{4,5})|(?:port|porta)\s+(\d{4,5})|Local:\s+https?://[^:]+:(\d{4,5})"
     ).ok()?;
     for cap in re.captures_iter(&combined) {
-        let port_str = cap.get(1).or(cap.get(2)).or(cap.get(3))?;
-        if let Ok(p) = port_str.as_str().parse::<i32>() {
-            if (1024..=65535).contains(&p) {
-                return Some(p);
+        let Some(port_str) = cap.get(1).or(cap.get(2)).or(cap.get(3)) else {
+            continue;
+        };
+        if let Ok(p) = port_str.as_str().parse::<u16>() {
+            // Punto unico (regola L): ritorna solo porte ESPOSTE dal progetto.
+            // Scarta le riservate Nexus/infrastruttura (es. Postgres :5434, che
+            // nei log e' una destinazione di CONNESSIONE, non un listener) e
+            // quanto e' fuori dal bucket dei progetti.
+            if crate::project_workspace::services::is_project_registrable_port(p) {
+                return Some(p as i32);
             }
         }
     }
@@ -412,20 +421,19 @@ async fn report_started_service(ctx: &AgentToolContext, label: &str, process_id:
 /// Registra in `nexus_port_allocations` la porta auto-rilevata dall'output ed
 /// emette l'evento `PortAllocated` per il pannello Porte.
 async fn register_detected_port(ctx: &AgentToolContext, label: &str, port: i32, pid: Option<i32>) {
-    // Solo porte del range Nexus (20000-39999): l'output di un servizio puo'
-    // menzionare una porta a cui si CONNETTE (es. Postgres :5434), non su cui
-    // ASCOLTA. Registrarla creerebbe una "porta fantasma" fuori dallo scope del
-    // progetto (regola H: chiusura alla fonte, coerente con port_allocated_to_project
-    // che onora fuori-bucket solo le `manual`).
-    let (lo, hi) = (
-        crate::project_workspace::services::PROJECT_PORT_RANGE_START as i32,
-        crate::project_workspace::services::PROJECT_PORT_RANGE_END as i32,
-    );
-    if !(lo..=hi).contains(&port) {
+    // Difesa in profondita' (regola L): registra solo porte ESPOSTE dal progetto.
+    // detect_port_from_output gia' filtra, ma delegando allo stesso predicato
+    // unico (is_project_registrable_port) evitiamo di duplicare qui la lista
+    // riservata / il range. Una porta d'infrastruttura (es. Postgres :5434) nei
+    // log e' una destinazione di CONNESSIONE, non un listener: registrarla
+    // creerebbe una "porta fantasma" fuori dallo scope del progetto (regola H).
+    let registrable = u16::try_from(port)
+        .is_ok_and(crate::project_workspace::services::is_project_registrable_port);
+    if !registrable {
         tracing::debug!(
             port,
             service = %label,
-            "porta rilevata dall'output fuori dal range Nexus: non registrata (probabile connessione, non listener)"
+            "porta rilevata dall'output non registrabile per il progetto (riservata o fuori bucket): non registrata (probabile connessione, non listener)"
         );
         return;
     }
@@ -1080,7 +1088,60 @@ fn format_service_row(proc: &crate::agent_processes::ProcessSummary) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{existing_service_action, looks_like_web_service, ExistingServiceAction};
+    use super::{
+        detect_port_from_output, existing_service_action, looks_like_web_service,
+        ExistingServiceAction,
+    };
+
+    /// Regressione FIX P5 (Pannello "Porte"): la regex `localhost:(\d{4,5})`
+    /// cattura anche la stringa di CONNESSIONE al DB nei log del servizio (es.
+    /// Postgres :5434). Quella e' una porta d'infrastruttura riservata
+    /// (NEXUS_RESERVED_PORTS), non un listener del servizio: non deve mai essere
+    /// ritornata/registrata come porta del progetto.
+    #[test]
+    fn detect_port_scarta_infrastruttura_riservata_accetta_bucket() {
+        // La porta del cluster app Postgres (:5434) compariva come "backend-api".
+        assert_eq!(
+            detect_port_from_output("connecting to postgres at localhost:5434", ""),
+            None
+        );
+        // Anche le altre porte d'infrastruttura riservate vanno scartate,
+        // qualunque sia l'ordine in cui compaiono nell'output.
+        assert_eq!(
+            detect_port_from_output("", "db pool -> 127.0.0.1:5433 / qdrant 0.0.0.0:6333"),
+            None
+        );
+        assert_eq!(detect_port_from_output("redis at localhost:6379", ""), None);
+        // Una porta del bucket progetti (20000-39999) e' un listener legittimo.
+        assert_eq!(
+            detect_port_from_output("Local: http://localhost:25123/", ""),
+            Some(25123)
+        );
+        assert_eq!(
+            detect_port_from_output("", "listening on 0.0.0.0:39999"),
+            Some(39999)
+        );
+    }
+
+    /// Il predicato unico (regola L) esclude tutte le porte riservate Nexus e
+    /// quanto e' fuori dal bucket dei progetti; ammette il bucket 20000-39999.
+    #[test]
+    fn predicato_registrabile_esclude_riservate() {
+        use crate::project_workspace::services::is_project_registrable_port;
+        for p in [80u16, 443, 3000, 4000, 4060, 5432, 5433, 5434, 6333, 6334, 6379, 8080] {
+            assert!(
+                !is_project_registrable_port(p),
+                "porta riservata {p} non deve essere registrabile per un progetto"
+            );
+        }
+        assert!(is_project_registrable_port(20000));
+        assert!(is_project_registrable_port(30000));
+        assert!(is_project_registrable_port(39999));
+        // Fuori bucket (non riservate ma non nel range progetti).
+        assert!(!is_project_registrable_port(3002));
+        assert!(!is_project_registrable_port(19999));
+        assert!(!is_project_registrable_port(40000));
+    }
 
     #[test]
     fn web_service_riconosce_dev_server_diretti_e_indiretti() {

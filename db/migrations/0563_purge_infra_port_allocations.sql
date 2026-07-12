@@ -1,0 +1,25 @@
+-- 0563_purge_infra_port_allocations.sql
+-- FIX P5 (Pannello "Porte"): bonifica delle righe stale in nexus_port_allocations
+-- dove e' finita una porta d'INFRASTRUTTURA condivisa, non un listener del
+-- progetto.
+--
+-- Causa radice: detect_port_from_output() (agent_tools/service.rs) applicava una
+-- regex "localhost:(\d{4,5})" ai LOG del servizio e catturava la stringa di
+-- CONNESSIONE al DB (es. "localhost:5434", il cluster app Postgres). La porta
+-- veniva poi registrata come porta ESPOSTA (label = nome servizio, es.
+-- "backend-api", allocation_mode = 'auto'), producendo nel pannello Porte voci
+-- "Nessun URL disponibile" e doppioni per label.
+--
+-- Fix nel codice (regola L): detect_port_from_output + register_detected_port
+-- delegano ora al predicato unico nexus_tool_kit::ports::is_project_registrable_port,
+-- che scarta le porte in NEXUS_RESERVED_PORTS e quanto e' fuori dal bucket dei
+-- progetti (20000-39999). Questa migrazione rimuove i residui gia' persistiti.
+--
+-- L'elenco corrisponde alle porte d'infrastruttura in NEXUS_RESERVED_PORTS
+-- (crates/nexus-tool-kit/src/ports.rs, sezione "Database e infrastruttura"):
+-- PostgreSQL 5432/5433/5434, Qdrant 6333/6334, Redis 6379. Nessun servizio di
+-- progetto puo' esporre legittimamente queste porte, quindi il DELETE e' sicuro.
+--
+-- Idempotente: DELETE su condizione, ri-eseguibile senza effetti.
+DELETE FROM nexus_port_allocations
+WHERE port IN (5432, 5433, 5434, 6333, 6334, 6379);

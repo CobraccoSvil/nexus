@@ -39,7 +39,7 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     50500, // tool-runner gRPC (reale, vedi mig 0239)
     50501, // agent-router gRPC (reale, vedi mig 0190/0239)
     // ── Database e infrastruttura ─────────────────────────────────────────
-    5432, 5433, // PostgreSQL
+    5432, 5433, 5434, // PostgreSQL (5432 host, 5433 cluster meta, 5434 cluster app)
     6333, 6334, // Qdrant REST + gRPC
     6379, // Redis
     8080, // nginx interno
@@ -70,5 +70,21 @@ pub fn project_bucket_start(project_id: &Uuid) -> u16 {
         / (PROJECT_PORT_BUCKET_SIZE as u64);
     let idx = if buckets == 0 { 0 } else { v % buckets };
     PROJECT_PORT_RANGE_START + (idx as u16) * PROJECT_PORT_BUCKET_SIZE
+}
+
+/// True se `port` puo' essere REGISTRATA come porta esposta da un servizio di
+/// progetto: deve stare nel bucket globale dei progetti
+/// [`PROJECT_PORT_RANGE_START`, `PROJECT_PORT_RANGE_END`] e NON essere una porta
+/// riservata Nexus/infrastruttura (`NEXUS_RESERVED_PORTS`).
+///
+/// Punto unico (regola L): il rilevamento porta-da-output dei servizi e la
+/// registrazione in `nexus_port_allocations` delegano a questo predicato invece
+/// di replicare la lista riservata o i confronti di range. Le porte
+/// d'infrastruttura condivise (es. Postgres :5434) compaiono nei log come
+/// destinazione di CONNESSIONE, non come listener del servizio: non vanno mai
+/// registrate come porta del progetto.
+pub fn is_project_registrable_port(port: u16) -> bool {
+    !NEXUS_RESERVED_PORTS.contains(&port)
+        && (PROJECT_PORT_RANGE_START..=PROJECT_PORT_RANGE_END).contains(&port)
 }
 

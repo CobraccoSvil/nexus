@@ -2224,8 +2224,8 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
 // (split 7.4 fase B: sandbox.rs, ora nel crate, ne ha bisogno). Il
 // re-export mantiene validi i path project_workspace::services::* storici.
 pub use nexus_tool_kit::ports::{
-    project_bucket_start, NEXUS_RESERVED_PORTS, PROJECT_PORT_BUCKET_SIZE, PROJECT_PORT_RANGE_END,
-    PROJECT_PORT_RANGE_START,
+    is_project_registrable_port, project_bucket_start, NEXUS_RESERVED_PORTS,
+    PROJECT_PORT_BUCKET_SIZE, PROJECT_PORT_RANGE_END, PROJECT_PORT_RANGE_START,
 };
 
 fn stable_hash_u16(input: &str) -> u16 {
