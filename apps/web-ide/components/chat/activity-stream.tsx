@@ -959,7 +959,7 @@ function FigureReportRow({
       (advisory.risks?.length ?? 0) > 0 ||
       (advisory.recommendations?.length ?? 0) > 0 ||
       (advisory.concerns?.length ?? 0) > 0);
-  const expandable = hasBody || (failed && !!report.detail_message);
+  const expandable = hasBody || (failed && !!report.detail_message) || !!report.provider;
   return (
     <li style={{ borderTop: `1px solid ${withAlpha(tc.textMuted, 0.15)}` }}>
       <button
@@ -985,10 +985,32 @@ function FigureReportRow({
         <span style={{ fontSize: 11, fontWeight: 600, color: failed ? tc.error : tc.text }}>
           {report.kind.replace(/_/g, " ")}
         </span>
+        {report.provider ? (
+          <span
+            style={{
+              fontSize: 9.5,
+              fontFamily: "var(--font-mono)",
+              color: providerBaseColor(report.provider),
+              opacity: 0.9,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {report.provider}
+          </span>
+        ) : null}
         <span style={{ ...tagStyle(vm.color), marginLeft: "auto" }}>{vm.label}</span>
       </button>
       {open ? (
         <div style={{ padding: "1px 0 5px 16px", fontSize: 11, color: tc.textMuted }}>
+          {report.provider ? (
+            <div style={{ marginBottom: 4, fontSize: 10.5, fontFamily: "var(--font-mono)" }}>
+              <span style={{ color: tc.textMuted }}>Provider: </span>
+              <span style={{ color: providerBaseColor(report.provider) }}>
+                {report.provider}
+                {report.model ? ` / ${report.model}` : ""}
+              </span>
+            </div>
+          ) : null}
           {failed && report.detail_message ? (
             <div style={{ color: tc.error, marginBottom: advisory ? 4 : 0 }}>
               {report.detail_message}

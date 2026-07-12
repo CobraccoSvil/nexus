@@ -1254,6 +1254,14 @@ pub(crate) struct FigureAdvisoryReport {
     /// ogni consiglio. `None` se la figura non ha prodotto un parere valido.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advisory: Option<serde_json::Value>,
+    /// Provider/model EFFETTIVI su cui la figura ha girato (segnale strutturato,
+    /// non prosa). `None` per le figure respinte a monte (es. guard depth) che non
+    /// hanno mai risolto un modello. Propagato alla UI per mostrare la provenienza
+    /// di ogni parere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_run_id: Option<String>,
 }
@@ -1485,6 +1493,11 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
         .get(K_SUB_RUN_ID)
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // Provenienza EFFETTIVA della figura (stampata dai finalize_* nel result):
+    // assente per le figure respinte a monte (guard depth/whitelist) che non hanno
+    // mai risolto un modello.
+    let provider = result.get(K_PROVIDER).and_then(Value::as_str).map(str::to_owned);
+    let model = result.get(K_MODEL).and_then(Value::as_str).map(str::to_owned);
     if let Some(code) = result.get("error_code").and_then(Value::as_str) {
         let message = result
             .get("error")
@@ -1498,6 +1511,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_message: message,
             advisory_verdict: None,
             advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
             subagent_run_id,
         };
     }
@@ -1514,6 +1529,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
                 .to_string(),
             advisory_verdict: None,
             advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
             subagent_run_id,
         };
     }
@@ -1538,6 +1555,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_message: message,
             advisory_verdict: None,
             advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
             subagent_run_id,
         };
     }
@@ -1556,6 +1575,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_message: "Sub-run terminato senza esito positivo".to_string(),
             advisory_verdict: None,
             advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
             subagent_run_id,
         };
     }
@@ -1569,6 +1590,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
                 detail_message: "Sub-run completato senza chiamare advisory_verdict".to_string(),
                 advisory_verdict: None,
                 advisory: None,
+                provider: provider.clone(),
+                model: model.clone(),
                 subagent_run_id,
             };
         }
@@ -1585,6 +1608,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
             detail_message: "Parere advisory presente ma verdetto non valido".to_string(),
             advisory_verdict: verdict.map(str::to_owned),
             advisory: Some(advisory.clone()),
+            provider: provider.clone(),
+            model: model.clone(),
             subagent_run_id,
         };
     }
@@ -1595,6 +1620,8 @@ fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryR
         detail_message: "Parere advisory valido".to_string(),
         advisory_verdict: verdict.map(str::to_owned),
         advisory: Some(advisory.clone()),
+        provider: provider.clone(),
+        model: model.clone(),
         subagent_run_id,
     }
 }
@@ -2592,6 +2619,11 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         )
     });
 
+    // provider/model risolti: clonati per i rami finalize timeout/failure, che
+    // girano DOPO che `native_input` prende possesso degli originali. Il ramo
+    // success usa invece la provenienza EFFETTIVA da `o` (post-failover).
+    let provider_resolved = provider.clone();
+    let model_resolved = model.clone();
     let native_input = NativeRunInput {
         run_id: subagent_run_id,
         session_id,
@@ -2652,6 +2684,8 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
                     subagent_run_id,
                     &kind,
                     timeout_s,
+                    &provider_resolved,
+                    &model_resolved,
                 )
                 .await;
                 maybe_enqueue_fanin_resume(
@@ -2681,7 +2715,16 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
             .await
         }
         Err(e) => {
-            finalize_failure(&proj_pool, narrator.as_deref(), subagent_run_id, &kind, &e).await
+            finalize_failure(
+                &proj_pool,
+                narrator.as_deref(),
+                subagent_run_id,
+                &kind,
+                &e,
+                &provider_resolved,
+                &model_resolved,
+            )
+            .await
         }
     };
     // Fan-in (Fase D): il figlio si e' marcato TERMINALE nel finalize sopra. Se e'
@@ -3074,6 +3117,8 @@ async fn finalize_timeout(
     sub_run_id: Uuid,
     kind: &str,
     timeout_s: i64,
+    provider: &str,
+    model: &str,
 ) -> Value {
     let verdict = terminal_verdict("timed_out", "timeout");
     let _ = mark_run(
@@ -3096,7 +3141,7 @@ async fn finalize_timeout(
         )
         .await;
     }
-    json!({
+    let mut out = json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
         "status": "timeout",
@@ -3104,7 +3149,9 @@ async fn finalize_timeout(
         // Verdetto ESITO strutturato (regola M): il coordinatore legge
         // success/verdict qui, mai dalla prosa di `error`.
         "outcome": verdict,
-    })
+    });
+    put_model_fields(&mut out, provider, model);
+    out
 }
 
 /// Narrazione (meta-step live sul run PADRE) della chiusura OK del sub-run.
@@ -3182,7 +3229,7 @@ async fn finalize_success(
         "subagent_native: sub-run eseguito sul grafo nativo"
     );
     narrate_completed(narrator, sub_run_id, kind, status, &summary, o).await;
-    json!({
+    let mut out = json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
         "status": status,
@@ -3193,7 +3240,16 @@ async fn finalize_success(
         // Verdetto ESITO strutturato (regola M): il coordinatore legge
         // success/verdict qui invece di dedurre l'esito dalla prosa di `summary`.
         "outcome": verdict,
-    })
+    });
+    // Provenienza EFFETTIVA (regola M): provider/model realmente usati dal grafo
+    // (post-eventuale failover), non solo il risolto a monte. Letta dal report di
+    // figura (classify_council_figure_result) per mostrarla in UI.
+    put_model_fields(
+        &mut out,
+        o.provider_used.as_deref().unwrap_or_default(),
+        o.model_used.as_deref().unwrap_or_default(),
+    );
+    out
 }
 
 /// Chiusura del ramo ERRORE del sub-run (fallback onesto: errore al chiamante).
@@ -3203,6 +3259,8 @@ async fn finalize_failure(
     sub_run_id: Uuid,
     kind: &str,
     e: &anyhow::Error,
+    provider: &str,
+    model: &str,
 ) -> Value {
     let msg = format!("[errore grafo nativo: {e}]");
     let verdict = terminal_verdict("failed", "engine_error");
@@ -3232,14 +3290,16 @@ async fn finalize_failure(
         )
         .await;
     }
-    json!({
+    let mut out = json!({
         "error": msg,
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
         // Verdetto ESITO strutturato (regola M): mai dedurre il fallimento
         // dalla prosa di `error`.
         "outcome": verdict,
-    })
+    });
+    put_model_fields(&mut out, provider, model);
+    out
 }
 
 /// Crea la riga `agent_runs` del SUB-run (run TRACCIATO: senza, il guard
@@ -4930,6 +4990,8 @@ mod tests {
                 detail_message: "ok".to_string(),
                 advisory_verdict: Some("proceed".to_string()),
                 advisory: None,
+                provider: None,
+                model: None,
                 subagent_run_id: None,
             }],
         );
@@ -4945,6 +5007,8 @@ mod tests {
                 detail_message: "timeout".to_string(),
                 advisory_verdict: None,
                 advisory: None,
+                provider: None,
+                model: None,
                 subagent_run_id: None,
             }],
         );

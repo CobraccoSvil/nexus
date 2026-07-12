@@ -198,6 +198,10 @@ export interface FigureAdvisoryReport {
   detail_message: string;
   advisory_verdict?: string;
   advisory?: FigureAdvisory;
+  /** Provider/model EFFETTIVI su cui la figura ha girato (provenienza del parere).
+   *  Assenti per le figure respinte a monte (guard depth) senza modello risolto. */
+  provider?: string;
+  model?: string;
   subagent_run_id?: string;
 }
 
@@ -354,6 +358,8 @@ function readFigureReports(payload: Record<string, unknown>): FigureAdvisoryRepo
       detail_message: detailMessage,
       advisory_verdict: asString(r.advisory_verdict),
       advisory: readFigureAdvisory(r.advisory),
+      provider: asString(r.provider),
+      model: asString(r.model),
       subagent_run_id: asString(r.subagent_run_id),
     });
   }
