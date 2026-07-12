@@ -5,24 +5,27 @@
 //  - Loghi MONOCROMATICI (OpenAI, Anthropic, DeepSeek, Mistral): resi nel colore
 //    BRAND del provider via currentColor (cosi' sono visibili su tema chiaro/scuro).
 //  - Logo MULTICOLORE (Google Gemini "sparkle"): reso coi suoi colori ufficiali.
-// La TONALITA' del badge dipende dal costo del modello. Il TOOLTIP mostra
-// "Provider / model (· costo)".
+// La TINTA del badge dipende dal MODELLO (shift di hue stabile sul brand del
+// provider); il COSTO modula solo l'intensita' del fondo (dimensione
+// ortogonale). Il TOOLTIP mostra "Provider / model (· costo)".
 //
-// Regole L/G: colori/prezzi/alpha vengono dal punto unico provider-badge.tsx
-// (providerBaseColor / providerLabel / usePricingCatalog / alphaFromCost / rgba);
-// qui nessun colore/prezzo hardcoded oltre ai colori PROPRI dei loghi ufficiali.
+// Regole L/G: normalizzazione provider, colori di brand, tinta per-modello e
+// rgba vengono dal punto unico provider-icon-logic.ts (providerModelTint /
+// providerBaseColor / providerLabel / rgba); prezzi/alpha da provider-badge.tsx
+// (usePricingCatalog / alphaFromCost). Qui nessun colore/prezzo hardcoded oltre
+// ai colori PROPRI dei loghi ufficiali.
 // I loghi sono marchi dei rispettivi provider, usati come indicatori funzionali.
 //
 // Le bande "Cambio provider" NON usano questa icona (hanno i ProviderBadge).
 
+import { usePricingCatalog, alphaFromCost } from "./provider-badge";
 import {
-  providerBaseColor,
+  providerMarkKey,
+  providerModelTint,
   providerLabel,
-  usePricingCatalog,
-  alphaFromCost,
   rgba,
-} from "./provider-badge";
-import { providerMarkKey, type ProviderMarkKey } from "./provider-icon-logic";
+  type ProviderMarkKey,
+} from "./provider-icon-logic";
 
 // Loghi ufficiali (SVG inline, markup interno). `colorful`=true: il markup porta
 // i propri colori (nessuna tinta brand applicata). Altrimenti fill="currentColor"
@@ -107,18 +110,22 @@ export function ProviderIcon({
   if (!provider) return null;
 
   const mark = providerMarkKey(provider);
-  const brand = providerBaseColor(provider);
+  // TINTA per-MODELLO (regola L, punto unico provider-icon-logic): parte dal
+  // brand del provider e applica uno shift di hue stabile derivato dal model id,
+  // cosi' modelli diversi dello stesso provider hanno icone distinguibili senza
+  // perdere il brand. Non collassa a costo 0 (la tinta non dipende dal prezzo).
+  const tint = providerModelTint(provider, model);
   const label = providerLabel(provider);
   const entry =
     model != null
       ? catalog.find((e) => e.provider === provider && e.model === model) ?? null
       : null;
-  // Tonalita' del badge in base al costo del modello (segnale secondario). Il
-  // LOGO monocromatico e' sempre nel colore brand pieno (leggibile ovunque);
-  // il logo multicolore (Gemini) mantiene i suoi colori.
+  // Il COSTO resta una dimensione ORTOGONALE: modula solo l'intensita' del
+  // fondo (segnale secondario). Il logo monocromatico e' reso nella tinta piena
+  // (leggibile ovunque); il logo multicolore (Gemini) mantiene i suoi colori.
   const alpha = alphaFromCost(entry);
-  const bg = rgba(brand, 0.12 + Math.min(0.16, alpha * 0.16));
-  const border = rgba(brand, 0.5);
+  const bg = rgba(tint, 0.12 + Math.min(0.16, alpha * 0.16));
+  const border = rgba(tint, 0.5);
 
   const tipParts: string[] = [`${label}${model ? ` / ${model}` : ""}`];
   if (entry?.input_cost_per_million_tokens != null) {
@@ -144,7 +151,7 @@ export function ProviderIcon({
         background: bg,
         border: `1px solid ${border}`,
         padding: Math.round(size * 0.15),
-        color: brand,
+        color: tint,
         flexShrink: 0,
         lineHeight: 0,
       }}

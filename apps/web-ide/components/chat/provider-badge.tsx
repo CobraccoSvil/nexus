@@ -17,36 +17,17 @@
 
 import { useEffect, useState } from "react";
 
-// ── Brand colors per provider ──────────────────────────────────────────────
-// Coerenti con la barra status providers in alto a destra dell'IDE (OpenAI,
-// Anthropic, Google, DeepSeek, Mistral). Hex base + scala per tonalita'.
-const PROVIDER_COLORS: Record<string, { base: string; label: string }> = {
-  anthropic: { base: "#cc785c", label: "Anthropic" },
-  openai: { base: "#10a37f", label: "OpenAI" },
-  google: { base: "#4285f4", label: "Google" },
-  deepseek: { base: "#7c3aed", label: "DeepSeek" },
-  mistral: { base: "#ff7000", label: "Mistral" },
-  vllm: { base: "#737373", label: "vLLM" },
-  ollama: { base: "#737373", label: "Ollama" },
-  local: { base: "#737373", label: "Local" },
-  unknown: { base: "#94a3b8", label: "?" },
-};
+// Normalizzazione provider, colori di brand, etichetta e conversione rgba vivono
+// nel punto unico provider-icon-logic.ts (regola L). Qui li importiamo per l'uso
+// interno e li ri-esportiamo per i call site storici che li prendono da
+// "./provider-badge".
+import {
+  providerBaseColor,
+  providerLabel,
+  rgba,
+} from "./provider-icon-logic";
 
-/** Colore brand base (#RRGGBB) per provider. Riusato dalle card meta-step per
- *  l'accento della riga (colore differente in base al provider). */
-export function providerBaseColor(provider: string | null | undefined): string {
-  const key = (provider ?? "unknown").toLowerCase();
-  return (PROVIDER_COLORS[key] ?? PROVIDER_COLORS.unknown).base;
-}
-
-/** Etichetta leggibile del provider (brand). Punto unico riusato da ProviderIcon
- *  per il tooltip. Per provider ignoti ritorna la sigla iniziale maiuscola. */
-export function providerLabel(provider: string | null | undefined): string {
-  const key = (provider ?? "unknown").toLowerCase();
-  const entry = PROVIDER_COLORS[key];
-  if (entry) return entry.label;
-  return provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : "?";
-}
+export { providerBaseColor, providerLabel, rgba };
 
 export interface ModelPricingEntry {
   provider: string;
@@ -127,11 +108,11 @@ export function useModelPricing(
 }
 
 /**
- * Calcola la tonalita' (alpha 0.25 → 0.95) di un colore in base al costo
- * del modello. Scala logaritmica: modelli economici (≤$1/M) sono molto
- * trasparenti, modelli costosi (≥$50/M) molto opachi. Esportata come punto
- * unico (regola L): riusata da ProviderIcon per distinguere modelli diversi
- * dello stesso provider con una tonalita' del brand.
+ * Calcola l'intensita' (alpha 0.25 → 0.95) del fondo in base al costo del
+ * modello. Scala logaritmica: modelli economici (≤$1/M) sono molto trasparenti,
+ * modelli costosi (≥$50/M) molto opachi. Esportata come punto unico (regola L):
+ * ProviderIcon la usa come dimensione ORTOGONALE alla tinta per-modello (il
+ * costo modula solo l'opacita', la tinta distingue il modello).
  */
 export function alphaFromCost(entry: ModelPricingEntry | null): number {
   if (!entry) return 0.55;
@@ -144,18 +125,6 @@ export function alphaFromCost(entry: ModelPricingEntry | null): number {
   const log = Math.log10(Math.max(weighted, 0.1));
   const norm = Math.min(1, Math.max(0, (log + 0.3) / 3.0));
   return 0.30 + 0.65 * norm;
-}
-
-/** Converte hex (#RRGGBB) + alpha in `rgba(r,g,b,a)`. Esportata (regola L):
- *  riusata da ProviderIcon per tingere il mark col brand + tonalita' costo. */
-export function rgba(hex: string, alpha: number): string {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
-  if (!m) return hex;
-  const v = m[1];
-  const r = parseInt(v.slice(0, 2), 16);
-  const g = parseInt(v.slice(2, 4), 16);
-  const b = parseInt(v.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha.toFixed(2)})`;
 }
 
 /**
@@ -172,12 +141,12 @@ export function ProviderBadge({
   const entry = useModelPricing(provider, model);
 
   if (!provider && !model) return null;
-  const providerKey = (provider ?? "unknown").toLowerCase();
-  const palette = PROVIDER_COLORS[providerKey] ?? PROVIDER_COLORS.unknown;
+  const base = providerBaseColor(provider);
+  const label = providerLabel(provider);
   const alpha = alphaFromCost(entry);
-  const bg = rgba(palette.base, alpha);
+  const bg = rgba(base, alpha);
   // Bordi piu' opachi per leggibilita'.
-  const border = rgba(palette.base, Math.min(0.95, alpha + 0.2));
+  const border = rgba(base, Math.min(0.95, alpha + 0.2));
 
   const tooltipParts: string[] = [];
   if (entry?.display_name) tooltipParts.push(entry.display_name);
@@ -199,7 +168,7 @@ export function ProviderBadge({
   }
   const tooltip = tooltipParts.length
     ? tooltipParts.join(" · ")
-    : `${palette.label} / ${model ?? "?"}`;
+    : `${label} / ${model ?? "?"}`;
 
   return (
     <span
@@ -221,7 +190,7 @@ export function ProviderBadge({
         textOverflow: "ellipsis",
       }}
     >
-      <span style={{ fontWeight: 700, opacity: 0.9 }}>{palette.label}</span>
+      <span style={{ fontWeight: 700, opacity: 0.9 }}>{label}</span>
       <span style={{ opacity: 0.55 }}>/</span>
       <span>{model ?? "?"}</span>
     </span>
