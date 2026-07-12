@@ -246,6 +246,9 @@ export interface MultiProviderPanelEvent extends EventProvenance {
   panelProviders?: PanelProviderEntry[];
   degraded?: boolean;
   degradationReason?: string;
+  /** Parere individuale di ciascun provider (stessa shape dei report di figura):
+   *  espandibile in UI per mostrare la differenza tra i provider. */
+  providerReports?: FigureAdvisoryReport[];
 }
 
 export type ActivityEvent =
@@ -329,8 +332,11 @@ function readFigureAdvisory(v: unknown): FigureAdvisory | undefined {
   return hasContent ? advisory : undefined;
 }
 
-function readFigureReports(payload: Record<string, unknown>): FigureAdvisoryReport[] | undefined {
-  const raw = payload.figure_reports;
+function readFigureReports(
+  payload: Record<string, unknown>,
+  key: "figure_reports" | "provider_reports" = "figure_reports",
+): FigureAdvisoryReport[] | undefined {
+  const raw = payload[key];
   if (!Array.isArray(raw) || raw.length === 0) return undefined;
   const out: FigureAdvisoryReport[] = [];
   for (const item of raw) {
@@ -806,6 +812,7 @@ export function composeActivityStream(
             activationSource: asString(p.activation_source),
             providerCount: typeof p.provider_count === "number" ? p.provider_count : undefined,
             panelProviders: readPanelProviders(p),
+            providerReports: readFigureReports(p, "provider_reports"),
             degraded: p.degraded === true,
             degradationReason:
               asString(p.degradation_detail) ?? asString(p.degradation_reason),

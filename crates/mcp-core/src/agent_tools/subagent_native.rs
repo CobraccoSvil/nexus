@@ -1346,6 +1346,11 @@ pub(crate) enum MultiProviderPanelOutcome {
         synthesis: AdvisorySynthesis,
         provider_count: usize,
         panel_providers: Vec<PanelProviderEntry>,
+        /// Parere INDIVIDUALE di ogni provider (prima della sintesi): provenienza
+        /// + advisory completo per figura, cosi' la UI mostra la DIFFERENZA tra i
+        /// provider, non solo l'aggregato. Riusa `FigureAdvisoryReport` e la
+        /// classificazione delle figure del consiglio (regola L).
+        provider_reports: Vec<FigureAdvisoryReport>,
     },
     Degraded {
         reason: MultiProviderDegradeReason,
@@ -1794,11 +1799,18 @@ pub(crate) async fn convene_multi_provider_panel(
             model: c.model.clone(),
         })
         .collect();
+    // Parere individuale di ogni provider (provenienza + advisory), riusando la
+    // classificazione delle figure (regola L): la UI puo' mostrare la differenza.
+    let provider_reports: Vec<FigureAdvisoryReport> = results
+        .iter()
+        .map(|r| classify_council_figure_result(&cfg.kind, r))
+        .collect();
     compose_multi_provider_synthesis(&results, policy).map(|synthesis| {
         MultiProviderPanelOutcome::Active {
             synthesis,
             provider_count,
             panel_providers,
+            provider_reports,
         }
     })
 }

@@ -837,6 +837,31 @@ function EventBody({
                 ? `${event.providerCount} provider distinti hanno analizzato la richiesta.`
                 : "Analisi parallela su provider/modelli distinti tramite routing tier-aware."}
           </div>
+          {event.providerReports && event.providerReports.length > 0 ? (
+            <div style={{ marginTop: 6 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: tc.textMuted,
+                  textTransform: "uppercase",
+                  letterSpacing: 0.3,
+                }}
+              >
+                Analisi per provider
+              </div>
+              <ul style={{ margin: "3px 0 0", padding: 0, listStyle: "none" }}>
+                {event.providerReports.map((r, i) => (
+                  <FigureReportRow
+                    key={r.provider ? `${r.provider}:${r.model ?? ""}` : `${r.kind}-${i}`}
+                    report={r}
+                    tc={tc}
+                    titleByProvider
+                  />
+                ))}
+              </ul>
+            </div>
+          ) : null}
         </div>
       );
     default:
@@ -945,9 +970,13 @@ function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeCol
 function FigureReportRow({
   report,
   tc,
+  titleByProvider = false,
 }: {
   report: FigureAdvisoryReport;
   tc: ThemeColors;
+  /** Panel multi-provider: usa il PROVIDER come titolo (le righe differiscono per
+   *  provider, non per kind) e non ripete il chip provider. */
+  titleByProvider?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const advisory = report.advisory;
@@ -983,10 +1012,23 @@ function FigureReportRow({
         <span style={{ fontSize: 9, color: tc.textMuted, width: 10, flexShrink: 0 }}>
           {expandable ? (open ? "▾" : "▸") : ""}
         </span>
-        <span style={{ fontSize: 11, fontWeight: 600, color: failed ? tc.error : tc.text }}>
-          {report.kind.replace(/_/g, " ")}
+        <span
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            color:
+              titleByProvider && report.provider
+                ? providerBaseColor(report.provider)
+                : failed
+                  ? tc.error
+                  : tc.text,
+          }}
+        >
+          {titleByProvider && report.provider
+            ? report.provider
+            : report.kind.replace(/_/g, " ")}
         </span>
-        {report.provider ? (
+        {!titleByProvider && report.provider ? (
           <span
             style={{
               fontSize: 9.5,

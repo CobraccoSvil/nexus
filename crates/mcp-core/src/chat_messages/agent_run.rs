@@ -5626,6 +5626,7 @@ async fn emit_multi_provider_panel_meta_step(
             provider_count,
             synthesis,
             panel_providers,
+            provider_reports,
         } => (
             format!("Panel multi-provider attivo ({provider_count})"),
             json!({
@@ -5636,6 +5637,9 @@ async fn emit_multi_provider_panel_meta_step(
                 "degraded": false,
                 "provider_count": provider_count,
                 "panel_providers": panel_providers,
+                // Pareri INDIVIDUALI per provider (stessa shape di figure_reports):
+                // la UI li rende espandibili per mostrare la differenza tra provider.
+                "provider_reports": provider_reports,
                 "advisory_verdict": synthesis.verdict.as_str(),
                 "requirements_count": synthesis.requirements.len(),
                 "risks_count": synthesis.risks.len(),
