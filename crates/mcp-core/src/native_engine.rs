@@ -19,7 +19,8 @@
 //!
 //! Tutto cio' che e' configurabile viene risolto dal DB a monte della
 //! costruzione dei nodi:
-//! - `recursion_limit` da `agent.graph.recursion_limit`;
+//! - `recursion_limit` da `agent.graph.recursion_limit` (pavimento) scalato a
+//!   runtime da `effective_recursion_limit` su `iteration_cap` + topologia grafo;
 //! - `context_window` del modello del turno da `ai_price_catalog` (predictive cap
 //!   del tool_dispatch);
 //! - provider/model del planner / planner_fallback / reflection da
@@ -968,19 +969,61 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
 /// Costruisce la [`RoutingConfig`] DB-driven (regola G): legge dal DB i campi che
 /// il brain risolve da `orchestrator_config` / `_load_g1_max_nudges` /
 /// `_load_pending_steps_config`, col PUNTO UNICO `nexus_auth::get_setting` (helper
-/// `setting_*`). Il `recursion_limit` (u32) e' letto come faceva il blocco inline.
+/// `setting_*`). Il `recursion_limit` effettivo e' calcolato da
+/// [`nexus_agent_graph::routing::effective_recursion_limit`] (punto unico, regola L):
+/// `max(pavimento DB, topologia da iteration_cap + stall/G1/final_gate)`.
 /// Tutti gli ALTRI campi restano al `Default` (safe-default identico ai
 /// `_SAFE_DEFAULTS` del brain: valgono SOLO se la chiave manca o il DB e'
 /// irraggiungibile, mai come magic fallback nella logica).
 async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     let d = RoutingConfig::default();
-    let recursion_limit: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
+    let db_floor: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
         .await
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(d.recursion_limit);
+    let iteration_cap = setting_i64(
+        db,
+        "agent.executor.iteration_cap",
+        ExecutorConfig::default().iteration_cap,
+    )
+    .await;
+    let stall_recovery_enabled =
+        setting_bool(db, "agent.stall_recovery.enabled", false).await;
+    let stall_max_moves = setting_i64(
+        db,
+        "agent.stall_recovery.max_moves_per_session",
+        6,
+    )
+    .await;
+    let g1_max_nudges = setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await;
+    let final_gate_max_cycles =
+        setting_i64(db, "agent.final_gate.max_cycles", d.final_gate_max_cycles).await;
+    let recursion_limit = nexus_agent_graph::routing::effective_recursion_limit(
+        &nexus_agent_graph::routing::GraphTopologyLimits {
+            db_floor,
+            iteration_cap,
+            stall_recovery_enabled,
+            stall_max_moves,
+            g1_max_nudges,
+            final_gate_max_cycles,
+        },
+    );
+    if recursion_limit > db_floor {
+        tracing::debug!(
+            db_floor,
+            effective = recursion_limit,
+            iteration_cap,
+            stall_recovery_enabled,
+            stall_max_moves,
+            g1_max_nudges,
+            final_gate_max_cycles,
+            "recursion_limit scalato sulla topologia del grafo agentico"
+        );
+    }
     RoutingConfig {
         recursion_limit,
-        g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
+        g1_max_nudges,
+        final_gate_max_cycles,
         todo_isolation_enabled: setting_bool(
             db,
             "agent.continuous.todo_isolation_enabled",
@@ -1254,6 +1297,12 @@ async fn load_executor_config(
             db,
             "agent.repeated_action_threshold.read_only",
             d.repeated_action_threshold_read_only,
+        )
+        .await,
+        recoverable_client_error_codes: setting_csv(
+            db,
+            "routing.client_error_failover_codes",
+            d.recoverable_client_error_codes.clone(),
         )
         .await,
         repeated_action_force_diagnose_enabled: setting_bool(

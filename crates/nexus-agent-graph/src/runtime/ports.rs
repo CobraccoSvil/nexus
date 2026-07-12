@@ -103,12 +103,21 @@ impl ProviderFailureCause {
     }
 }
 
-/// Payload di [`PortError::ProviderUnavailable`]: causa tipizzata + messaggio
-/// umano (solo display/log). `From<String>` per i costruttori che non hanno
-/// segnali di causa (stub di test, porte legacy): causa `Unknown`.
+/// Payload di [`PortError::ProviderUnavailable`]: causa tipizzata + CODICE
+/// strutturato del provider (regola M) + messaggio umano (solo display/log).
+/// `From<String>` per i costruttori che non hanno segnali di causa (stub di test,
+/// porte legacy): causa `Unknown`, `code` `None`.
 #[derive(Debug, Clone)]
 pub struct ProviderUnavailableInfo {
     pub cause: ProviderFailureCause,
+    /// Codice d'errore STRUTTURATO del provider (`error.code`/`error.type`/
+    /// `error.status` normalizzato lowercase dal gateway, es. `invalid_argument`
+    /// per Google, `invalid_request_message_order` per Mistral). E' il DISCRIMINANTE
+    /// (regola M: mai la prosa del messaggio) fra un 400 PROVIDER-SPECIFICO
+    /// recuperabile su un altro provider e un 400 di formato/history CONDIVISA che
+    /// fallirebbe ovunque. `None` quando il gateway non ha un codice strutturato
+    /// (retro-compatibile) o quando la causa non e' un `ClientError` (irrilevante).
+    pub code: Option<String>,
     pub message: String,
 }
 
@@ -116,9 +125,57 @@ impl ProviderUnavailableInfo {
     pub fn new(cause: ProviderFailureCause, message: impl Into<String>) -> Self {
         Self {
             cause,
+            code: None,
             message: message.into(),
         }
     }
+
+    /// Builder additivo: allega il codice strutturato del provider (regola M). Il
+    /// costruttore [`Self::new`] resta invariato per i call site senza segnale.
+    pub fn with_code(mut self, code: Option<String>) -> Self {
+        self.code = code;
+        self
+    }
+
+    /// PUNTO UNICO (regola L) della decisione "questo provider caduto consente il
+    /// FAILOVER cross-provider?", dato il vocabolario DB-driven dei codici di
+    /// `client_error` recuperabili (regola G, mai hardcoded sparso).
+    ///
+    /// - causa != `ClientError` (billing/cooldown/policy/empty_completion): il
+    ///   provider e' il problema, un altro provider aiuta -> failover SEMPRE
+    ///   consentito (comportamento storico invariato).
+    /// - causa == `ClientError`: il provider ha RIFIUTATO la richiesta (4xx). Il
+    ///   failover e' consentito SOLO se il [`Self::code`] STRUTTURATO (regola M:
+    ///   status+code, mai la prosa) e' nel vocabolario `recoverable_codes` — cioe'
+    ///   un 400 PROVIDER-SPECIFICO (es. Google `invalid_argument`/`thought_signature`/
+    ///   schema) che un altro provider (deepseek) accetterebbe. Un 400 di formato/
+    ///   history CONDIVISA (Mistral `invalid_request_message_order`) NON e' in
+    ///   whitelist: fallirebbe su qualunque provider (incidente f0ad0337), quindi
+    ///   niente failover cieco -> chiusura onesta.
+    pub fn allows_cross_provider_failover(&self, recoverable_codes: &[String]) -> bool {
+        if self.cause != ProviderFailureCause::ClientError {
+            return true;
+        }
+        client_error_code_is_recoverable(self.code.as_deref(), recoverable_codes)
+    }
+}
+
+/// PUNTO UNICO (regola L) del match "codice `client_error` recuperabile cross-
+/// provider": normalizza il codice a lowercase/trim e lo confronta col vocabolario
+/// DB-driven (regola G). `None` o codice vuoto -> NON recuperabile (conservativo:
+/// senza un segnale strutturato non si fa failover cieco, regola M). Usato dalla
+/// decisione [`ProviderUnavailableInfo::allows_cross_provider_failover`] e
+/// testabile in isolamento.
+pub fn client_error_code_is_recoverable(code: Option<&str>, recoverable_codes: &[String]) -> bool {
+    let Some(c) = code
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    recoverable_codes
+        .iter()
+        .any(|w| w.trim().eq_ignore_ascii_case(&c))
 }
 
 impl std::fmt::Display for ProviderUnavailableInfo {
@@ -131,6 +188,7 @@ impl From<String> for ProviderUnavailableInfo {
     fn from(message: String) -> Self {
         Self {
             cause: ProviderFailureCause::Unknown,
+            code: None,
             message,
         }
     }
@@ -1888,4 +1946,49 @@ pub struct SupervisorContext {
     pub task: String,
     pub steps_summary: String,
     pub anomaly_block: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_error_code_recuperabile_solo_in_whitelist() {
+        let codes = vec![
+            "invalid_argument".to_string(),
+            "thought_signature".to_string(),
+        ];
+        // Code in whitelist (case-insensitive, trim) -> recuperabile.
+        assert!(client_error_code_is_recoverable(Some("invalid_argument"), &codes));
+        assert!(client_error_code_is_recoverable(Some("  INVALID_ARGUMENT "), &codes));
+        // Code di history CONDIVISA (fuori whitelist) -> NON recuperabile (f0ad0337).
+        assert!(!client_error_code_is_recoverable(
+            Some("invalid_request_message_order"),
+            &codes
+        ));
+        // Code assente/vuoto -> conservativo, NON recuperabile (nessun failover cieco).
+        assert!(!client_error_code_is_recoverable(None, &codes));
+        assert!(!client_error_code_is_recoverable(Some(""), &codes));
+    }
+
+    #[test]
+    fn allows_failover_client_error_solo_se_code_recuperabile() {
+        let codes = vec!["invalid_argument".to_string()];
+        // Non-ClientError -> failover sempre consentito (comportamento storico).
+        assert!(ProviderUnavailableInfo::new(ProviderFailureCause::EmptyCompletion, "vuoto")
+            .allows_cross_provider_failover(&codes));
+        assert!(ProviderUnavailableInfo::new(ProviderFailureCause::Billing, "credito")
+            .allows_cross_provider_failover(&codes));
+        // ClientError con code recuperabile (google) -> failover consentito.
+        assert!(ProviderUnavailableInfo::new(ProviderFailureCause::ClientError, "400")
+            .with_code(Some("invalid_argument".to_string()))
+            .allows_cross_provider_failover(&codes));
+        // ClientError con code di history condivisa (mistral) -> niente failover.
+        assert!(!ProviderUnavailableInfo::new(ProviderFailureCause::ClientError, "400")
+            .with_code(Some("invalid_request_message_order".to_string()))
+            .allows_cross_provider_failover(&codes));
+        // ClientError senza code -> niente failover (conservativo).
+        assert!(!ProviderUnavailableInfo::new(ProviderFailureCause::ClientError, "400")
+            .allows_cross_provider_failover(&codes));
+    }
 }

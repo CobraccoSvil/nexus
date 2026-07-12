@@ -245,6 +245,14 @@ pub struct ExecutorConfig {
     /// scattare la macchina GUIDE->ABORT su un modello capace alla prima
     /// ripetizione accidentale (regola H, causa radice del falso-stallo lettura).
     pub repeated_action_threshold_read_only: i64,
+    /// Vocabolario DB-driven (regola G) dei `code` di `client_error` (4xx)
+    /// PROVIDER-SPECIFICI recuperabili su un ALTRO provider: un 400 con uno di
+    /// questi code (es. Google `invalid_argument`/`thought_signature`) fa failover
+    /// cross-provider invece di chiudere il run; ogni altro 4xx di formato/history
+    /// CONDIVISA (es. Mistral `invalid_request_message_order`) resta chiusura onesta
+    /// (bug 2, incidente f0ad0337). Vuoto = nessun ClientError recuperabile
+    /// (conservativo: senza segnale non si fa failover cieco).
+    pub recoverable_client_error_codes: Vec<String>,
     /// `true` abilita lo stadio force_diagnose per repeated_action
     /// (`agent.repeated_action.force_diagnose_enabled`).
     pub repeated_action_force_diagnose_enabled: bool,
@@ -541,6 +549,13 @@ impl Default for ExecutorConfig {
             progress_controller_enabled: false,
             repeated_action_threshold: 2,
             repeated_action_threshold_read_only: 4,
+            // Safe-default (vale solo se il DB e' irraggiungibile): i code
+            // provider-specifici notoriamente recuperabili con un altro provider.
+            recoverable_client_error_codes: vec![
+                "invalid_argument".to_string(),
+                "thought_signature".to_string(),
+                "failed_precondition".to_string(),
+            ],
             repeated_action_force_diagnose_enabled: false,
             reallocation_threshold: 3,
             tool_choice_forcing_enabled: false,
@@ -3356,18 +3371,18 @@ della finestra {effective_window} del modello {provider}/{model}"
                 // quando NESSUN provider sano resta cadiamo nella chiusura `Error`
                 // (onesta). Gated `auto_escalations < 3` (no escalation a raffica).
                 if let crate::runtime::ports::PortError::ProviderUnavailable(pu) = &err {
-                    use crate::runtime::ports::ProviderFailureCause as Cause;
-                    // client_error = formato richiesta/history: il gateway ha gia'
-                    // tentato sanificazione+retry. Failover cieco con la stessa
-                    // history rompe Mistral (message_order) e maschera la causa
-                    // (incidente f0ad0337). Failover SOLO per billing/cooldown/
-                    // transient/policy.
-                    if pu.cause == Cause::ClientError {
+                    // Bug 2: un ClientError PROVIDER-SPECIFICO recuperabile (code
+                    // strutturato in whitelist DB-driven, es. Google invalid_argument/
+                    // thought_signature) PUO' fare failover cross-provider; ogni altro
+                    // ClientError (code assente o history condivisa Mistral) resta
+                    // chiusura onesta (f0ad0337). Punto unico: allows_cross_provider_failover.
+                    if !pu.allows_cross_provider_failover(&self.cfg.recoverable_client_error_codes) {
                         tracing::warn!(
                             target: "nexus_agent_graph::executor",
                             provider = %provider,
                             model = %model,
-                            "provider client_error: niente failover cross-provider, chiusura onesta"
+                            code = pu.code.as_deref().unwrap_or("none"),
+                            "provider client_error non recuperabile: niente failover cross-provider, chiusura onesta"
                         );
                     } else {
                     let cd_escal = state

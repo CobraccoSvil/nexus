@@ -406,8 +406,76 @@ pub(crate) fn canonical_run_status(result: &crate::agent_types::AgentRunResult) 
 /// (regola L, stessa usata dal frontend e dal pre-check) e si dice all'utente cosa
 /// fare (ricaricare i crediti). `None` se nessun provider e' in cooldown: vale il
 /// placeholder generico.
-fn cooldown_exhaustion_note() -> Option<String> {
-    cooldown_note_from_snapshot(&crate::provider_cooldown::cooldown_snapshot())
+///
+/// GATE (regola M, BUG 3 failover): la nota viene prodotta SOLO quando la causa
+/// STRUTTURATA del turno corrente e' attribuibile all'indisponibilita' dei provider
+/// COINVOLTI nel turno, non da uno snapshot di cooldown globale ortogonale. Senza
+/// questo gate, un turno fallito per una causa diversa (es. `empty_completion` di
+/// google, che ha risposto 200 vuoto e NON e' in cooldown) veniva attribuito a
+/// openai/anthropic solo perche' quei due erano in cooldown billing per motivi
+/// propri, mostrando "ricarica i crediti" e nominando i provider sbagliati.
+fn cooldown_exhaustion_note(result: &crate::agent_types::AgentRunResult) -> Option<String> {
+    cooldown_note_for_turn(&crate::provider_cooldown::cooldown_snapshot(), result)
+}
+
+/// True se la classe errore STRUTTURATA del turno indica che il provider coinvolto
+/// e' finito in cooldown (billing o throttle transiente), non un completamento
+/// vuoto o altra causa ortogonale. Segnale macchina (regola M): nessun parsing di
+/// prosa. Le classi sono quelle emesse dal brain
+/// (`brain_agent_client::classify_provider_error`).
+fn error_class_indicates_cooldown(error_class: Option<&str>) -> bool {
+    matches!(
+        error_class,
+        Some(
+            "billing_error"
+                | "insufficient_quota"
+                | "rate_limit"
+                | "overloaded"
+                | "service_unavailable"
+                | "bad_gateway"
+                | "provider_error"
+        )
+    )
+}
+
+/// Logica pura (testabile, regola F) del gate BUG 3: dato lo snapshot dei cooldown
+/// e il `result` del turno, decide se la nota cooldown/ricarica e' pertinente e su
+/// quali provider. Discriminazione sui SEGNALI STRUTTURATI del turno (regola M),
+/// mai dallo stato globale ortogonale:
+///   - `status == ProviderUnavailable`: il routing non ha trovato ALCUN provider
+///     disponibile (tutti in cooldown). Il turno e' fallito PROPRIO per questo:
+///     l'intero snapshot e' la causa legittima -> nota su tutti i provider.
+///   - `error_class` cooldown-related: il provider DEL TURNO ha colpito un errore
+///     billing/throttle. Lo snapshot va filtrato al provider coinvolto
+///     (`result.provider`): la nota nomina solo lui, non provider ortogonali.
+///   - altrimenti (es. `empty_completion` di google mentre openai/anthropic sono
+///     in cooldown per motivi propri): `None`, vale il placeholder a valle che
+///     nomina il `result.provider` reale.
+fn cooldown_note_for_turn(
+    snap: &[(String, u64, Option<String>)],
+    result: &crate::agent_types::AgentRunResult,
+) -> Option<String> {
+    // Caso 1: il turno e' fallito perche' NESSUN provider era disponibile.
+    // Segnale strutturato dal routing (no_capable_provider). L'intero snapshot
+    // e' la causa legittima del turno.
+    if result.status == crate::agent_types::AgentRunStatus::ProviderUnavailable {
+        return cooldown_note_from_snapshot(snap);
+    }
+    // Caso 2: il provider DEL TURNO ha fallito per una causa cooldown/billing
+    // strutturata. Solo allora lo snapshot e' pertinente, e va filtrato ai
+    // provider effettivamente coinvolti nel turno (result.provider). Se il turno
+    // e' fallito per altra causa (empty_completion, output malformato, ...) lo
+    // snapshot globale e' ortogonale: `None`.
+    if !error_class_indicates_cooldown(result.error_class.as_deref()) {
+        return None;
+    }
+    let involved = result.provider.to_lowercase();
+    let filtered: Vec<(String, u64, Option<String>)> = snap
+        .iter()
+        .filter(|(name, _, _)| name.to_lowercase() == involved)
+        .cloned()
+        .collect();
+    cooldown_note_from_snapshot(&filtered)
 }
 
 /// Logica pura (testabile, regola F): compone la nota dato lo snapshot dei
@@ -522,7 +590,7 @@ pub(crate) fn compose_turn_answer(result: &crate::agent_types::AgentRunResult) -
         // non e' una risposta. Recap deterministico (o nota cooldown/placeholder).
         Some(s) if looks_like_textual_tool_call(s) || is_only_provider_errors(s) => {
             build_action_recap(&result.steps)
-                .or_else(cooldown_exhaustion_note)
+                .or_else(|| cooldown_exhaustion_note(result))
                 .or_else(|| {
                     Some(format!(
                         "_(Il modello {} / {} non ha prodotto una risposta valida \
@@ -544,7 +612,7 @@ pub(crate) fn compose_turn_answer(result: &crate::agent_types::AgentRunResult) -
         // ha chiuso senza body -> mai lasciare la chat muta. Vedi finalize dello spawn.
         _ if is_report_hollow(result) || !result.steps.is_empty() => {
             build_action_recap(&result.steps)
-                .or_else(cooldown_exhaustion_note)
+                .or_else(|| cooldown_exhaustion_note(result))
                 .or_else(|| {
                     Some(format!(
                         "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
@@ -3743,7 +3811,7 @@ pub(crate) async fn spawn_agent_run(
                 // chiusura a max_cycles lasciano final_answer vuoto pur avendo gia'
                 // modificato file. Produci SEMPRE il recap deterministico.
                 _ if report_hollow || !result.steps.is_empty() => build_action_recap(&result.steps)
-                    .or_else(cooldown_exhaustion_note)
+                    .or_else(|| cooldown_exhaustion_note(&result))
                     .or_else(|| {
                         Some(format!(
                             "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
@@ -5555,6 +5623,7 @@ async fn emit_multi_provider_panel_meta_step(
         crate::agent_tools::subagent_native::MultiProviderPanelOutcome::Active {
             provider_count,
             synthesis,
+            panel_providers,
         } => (
             format!("Panel multi-provider attivo ({provider_count})"),
             json!({
@@ -5564,6 +5633,7 @@ async fn emit_multi_provider_panel_meta_step(
                 "activated": true,
                 "degraded": false,
                 "provider_count": provider_count,
+                "panel_providers": panel_providers,
                 "advisory_verdict": synthesis.verdict.as_str(),
                 "requirements_count": synthesis.requirements.len(),
                 "risks_count": synthesis.risks.len(),
@@ -6641,6 +6711,105 @@ mod tests_finalize_turn {
         assert!(
             !msg.contains("Ricarica"),
             "non deve dire ricarica per rate-limit: {msg}"
+        );
+    }
+
+    #[test]
+    fn cooldown_note_gate_non_incolpa_provider_ortogonali() {
+        // BUG 3 failover (regola M): il turno e' fallito per un completamento
+        // VUOTO di google (200 vuoto, thought_signature) — google NON e' in
+        // cooldown. openai/anthropic sono in cooldown billing per motivi PROPRI,
+        // ortogonali a questo turno. La nota NON deve attribuire il fallimento a
+        // openai/anthropic ne' suggerire "ricarica crediti": deve tacere e lasciar
+        // parlare il placeholder a valle, che nomina google (result.provider).
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![],
+            None,
+            true,
+            "EMPTY_ANSWER",
+            Some("fix"),
+        );
+        r.provider = "google".into();
+        r.model = "gemini-2.5-flash".into();
+        r.error_class = None; // 200 vuoto: nessuna classe errore strutturata
+        let snap = vec![
+            (
+                "openai".to_string(),
+                250u64,
+                Some("you exceeded your current quota".to_string()),
+            ),
+            (
+                "anthropic".to_string(),
+                300u64,
+                Some("credit balance too low".to_string()),
+            ),
+        ];
+        assert!(
+            super::cooldown_note_for_turn(&snap, &r).is_none(),
+            "il turno fallito per empty_completion di google NON deve produrre la \
+             nota cooldown che incolpa openai/anthropic"
+        );
+    }
+
+    #[test]
+    fn cooldown_note_gate_provider_unavailable_usa_snapshot() {
+        // Il routing non ha trovato ALCUN provider disponibile (tutti in cooldown):
+        // segnale strutturato ProviderUnavailable. In questo caso lo snapshot
+        // globale E' la causa legittima del turno -> nota su tutti i provider.
+        let r = mk_result(
+            AgentRunStatus::ProviderUnavailable,
+            vec![],
+            None,
+            false,
+            "",
+            None,
+        );
+        let snap = vec![
+            (
+                "openai".to_string(),
+                250u64,
+                Some("you exceeded your current quota".to_string()),
+            ),
+            (
+                "anthropic".to_string(),
+                300u64,
+                Some("credit balance too low".to_string()),
+            ),
+        ];
+        let msg = super::cooldown_note_for_turn(&snap, &r).expect("nota attesa su ProviderUnavailable");
+        assert!(msg.contains("Ricarica"), "billing -> ricarica: {msg}");
+        assert!(
+            msg.contains("openai") && msg.contains("anthropic"),
+            "deve elencare tutti i provider indisponibili: {msg}"
+        );
+    }
+
+    #[test]
+    fn cooldown_note_gate_billing_del_turno_filtra_al_provider() {
+        // Il provider DEL TURNO (openai) ha colpito un billing_error strutturato:
+        // la nota e' pertinente ma va FILTRATA a openai, non deve trascinare
+        // anthropic (in cooldown per motivi propri, ortogonali).
+        let mut r = mk_result(AgentRunStatus::Failed, vec![], None, false, "", None);
+        r.provider = "openai".into();
+        r.error_class = Some("billing_error".into());
+        let snap = vec![
+            (
+                "openai".to_string(),
+                250u64,
+                Some("you exceeded your current quota".to_string()),
+            ),
+            (
+                "anthropic".to_string(),
+                300u64,
+                Some("credit balance too low".to_string()),
+            ),
+        ];
+        let msg = super::cooldown_note_for_turn(&snap, &r).expect("nota attesa per billing del turno");
+        assert!(msg.contains("openai"), "deve nominare il provider del turno: {msg}");
+        assert!(
+            !msg.contains("anthropic"),
+            "NON deve nominare provider ortogonali al turno: {msg}"
         );
     }
 
