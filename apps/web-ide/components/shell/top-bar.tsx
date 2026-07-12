@@ -140,9 +140,6 @@ export function TopBar({
           columnGap: isNarrowViewport ? 8 : 10,
           marginLeft: 8,
           flexShrink: 0,
-          maxWidth: isNarrowViewport ? 320 : undefined,
-          overflowX: isNarrowViewport ? "auto" : "visible",
-          paddingBottom: isNarrowViewport ? 2 : 0,
           order: isMobileViewport ? 11 : 0,
           flexWrap: isMobileViewport ? "wrap" : "nowrap",
           rowGap: isMobileViewport ? 6 : 0,
@@ -150,7 +147,7 @@ export function TopBar({
         }}
         aria-label="Stato provider AI"
       >
-        <ConnectionStatusBadge />
+        <ConnectionStatusBadge compact={isNarrowViewport} />
         <span
           title={providerTitle("OpenAI", providerStatus.openai)}
           style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}

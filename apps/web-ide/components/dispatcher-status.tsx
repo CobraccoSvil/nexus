@@ -13,7 +13,7 @@ import {
  * Da posizionare nell'header dell'IDE. Quando rosso (`disconnected`)
  * l'utente sa che i dati nei pannelli sono potenzialmente stantii.
  */
-export function ConnectionStatusBadge() {
+export function ConnectionStatusBadge({ compact = false }: { compact?: boolean } = {}) {
   const tc = useThemeColors();
   const status = useProjectStore(selectConnection);
 
@@ -38,24 +38,33 @@ export function ConnectionStatusBadge() {
   })();
 
   const canRetry = status === "disconnected";
+  // In header stretto (compact) mostriamo solo il pallino: lo stato resta nel
+  // title (hover) e il colore comunica gia' disconnesso/live. Coerente con i
+  // pallini provider che a loro volta perdono l'etichetta a viewport narrow.
+  const title = canRetry
+    ? `Dispatcher: ${label} - clicca per riconnettere`
+    : `Dispatcher: ${label}`;
 
   return (
     <button
       type="button"
       onClick={canRetry ? () => refreshDispatcher() : undefined}
       disabled={!canRetry}
-      title={canRetry ? "Clicca per riprovare la connessione" : `Dispatcher: ${label}`}
+      title={title}
+      aria-label={title}
       style={{
         display: "inline-flex",
         alignItems: "center",
-        gap: 6,
+        gap: compact ? 0 : 6,
         background: "transparent",
         border: `1px solid ${tc.border}`,
         borderRadius: 12,
-        padding: "2px 8px",
+        padding: compact ? 3 : "2px 8px",
         fontSize: 10,
+        lineHeight: 1,
         color: tc.textMuted,
         cursor: canRetry ? "pointer" : "default",
+        flexShrink: 0,
       }}
     >
       <span
@@ -67,7 +76,7 @@ export function ConnectionStatusBadge() {
           boxShadow: status === "open" ? `0 0 6px ${color}` : "none",
         }}
       />
-      {label}
+      {!compact && label}
     </button>
   );
 }
