@@ -35,13 +35,15 @@ stupefied-*/
 # con il loro proprio remote git: NON vanno tracciati nel repo Nexus.
 /projects/
 
-# Backup DB locali (pg_dump pesanti). Versionati solo su filesystem
-# locale + D:\Backups\Nexus\ tramite deploy/backup-db-to-d.sh, mai in git.
+# Backup DB locali (pg_dump pesanti). Prodotti da deploy/db-backup.ps1 in
+# D:\Backups\Nexus\ (fuori dal repo), mai versionati in git. Le regole sotto
+# coprono le posizioni legacy e un eventuale -BackupDir dentro il repo.
 backups/*.dump
 backups/*.sql.gz
 backups/postgres/*.dump
 backups/postgres/*.sql.gz
 db/backups/
+**/*.dump
 
 # Artefatti runtime locali (non versionati: prodotti dai build / dai test).
 apps/web-ide/tsconfig.tsbuildinfo
