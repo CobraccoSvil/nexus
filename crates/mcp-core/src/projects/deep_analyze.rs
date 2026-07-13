@@ -273,30 +273,6 @@ async fn load_analyzer_template(db: &sqlx::PgPool) -> Result<String, String> {
     template.ok_or_else(|| "prompt agent.project.analyzer non trovato/attivo in DB".to_string())
 }
 
-/// Risolve `(provider, model)` per il purpose `project_analyzer` via routing per
-/// tier (mig 0461): `best_model_for_tier` sceglie il miglior modello del catalog
-/// escludendo i provider in cooldown, sostituendo il loop chain manuale del brain
-/// (regola L). Niente nome modello hardcoded (regola G). `Err` se non risolvibile.
-async fn resolve_analyzer_model(db: &sqlx::PgPool) -> Result<(String, String), String> {
-    match crate::internal_routing::resolve_purpose_model_db(db, "project_analyzer").await {
-        crate::internal_routing::PurposeResolution::Resolved {
-            provider,
-            model,
-            rationale,
-        } => {
-            tracing::info!("project_analyze: modello risolto {provider}/{model} ({rationale})");
-            Ok((provider, model))
-        }
-        other => Err(format!(
-            "routing purpose 'project_analyzer' non risolvibile: {}",
-            other
-                .into_model("project_analyzer")
-                .err()
-                .unwrap_or_default()
-        )),
-    }
-}
-
 /// Mappa la risposta del gateway nella forma storica del brain
 /// (`status`/`insights`/`model_used`/`duration_ms`/`error`). Estratto da
 /// [`run_analyzer_completion`] (comportamento identico).
@@ -372,35 +348,58 @@ async fn run_analyzer_completion(
         registered_services,
     );
 
-    let (provider, model) = resolve_analyzer_model(db).await?;
-
-    // Completion via Nexus Gateway, pinnando il provider deciso a monte (no
-    // secondo routing divergente; il cooldown e' gia' stato applicato dalla
-    // selezione per tier). Errore della singola chiamata -> status failed (non
-    // panic): il run resta tracciato.
+    // Completion via Nexus Gateway con FAILOVER tier-aware (punto unico
+    // complete_for_purpose_with_failover, regola L/G): risolve N candidati del
+    // tier e prova in ordine, pinnando ciascuno; su fallimento (map_analyzer_
+    // response status="failed" = errore/risposta vuota, regola M) passa al
+    // prossimo. Prima degradava a `status=failed` al PRIMO provider fallito.
     let gw = crate::nexus_gateway::NexusGatewayClient::from_db(db).await;
-    let gw_req = crate::nexus_gateway::GwRequest {
-        model: format!("{provider}/{model}"),
-        messages: vec![crate::nexus_gateway::GwMessage {
-            role: "user".to_string(),
-            content: json!(rendered),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning: None,
-            thinking_signature: None,
-        }],
-        max_tokens: Some(8000),
-        pin_provider: Some(provider.clone()),
-        metadata: crate::nexus_gateway::GwMetadata {
-            feature: "project_analyzer".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
+    use crate::internal_routing::{
+        complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
     };
-
-    let model_used = format!("{provider}/{model}");
-    let resp = gw.complete(gw_req).await;
-    Ok(map_analyzer_response(resp, &model_used, started))
+    let gw_ref = &gw;
+    let rendered_ref = &rendered;
+    let outcome = complete_for_purpose_with_failover(db, "project_analyzer", |provider, model| async move {
+        let model_used = format!("{provider}/{model}");
+        let gw_req = crate::nexus_gateway::GwRequest {
+            model: model_used.clone(),
+            messages: vec![crate::nexus_gateway::GwMessage {
+                role: "user".to_string(),
+                content: json!(rendered_ref),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                thinking_signature: None,
+            }],
+            max_tokens: Some(8000),
+            pin_provider: Some(provider),
+            metadata: crate::nexus_gateway::GwMetadata {
+                feature: "project_analyzer".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mapped = map_analyzer_response(gw_ref.complete(gw_req).await, &model_used, started);
+        if mapped.get("status").and_then(|v| v.as_str()) == Some("failed") {
+            AttemptOutcome::Failover
+        } else {
+            AttemptOutcome::Done(mapped)
+        }
+    })
+    .await;
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(PurposeFailoverError::AllCandidatesFailed) => Ok(json!({
+            "status": "failed",
+            "error": "nessun provider del tier ha prodotto un'analisi valida",
+            "insights": null,
+            "duration_ms": started.elapsed().as_millis() as i64,
+        })),
+        Err(PurposeFailoverError::NoCandidate(res)) => Err(format!(
+            "routing purpose 'project_analyzer' non risolvibile: {}",
+            res.into_model("project_analyzer").err().unwrap_or_default()
+        )),
+    }
 }
 
 // ── Handler HTTP ──────────────────────────────────────────────────────────────

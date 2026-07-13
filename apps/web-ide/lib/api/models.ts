@@ -98,3 +98,42 @@ export async function setModelEnabled(
     body: JSON.stringify({ provider, model, enabled }),
   });
 }
+
+// ── Preview routing REALE (dalla matrice DB corrente) ────────────────────────
+
+export interface RoutingPreviewEntry {
+  intent: string;
+  provider: string;
+  model: string;
+  inputCost: number;
+  speed: string;
+}
+
+export interface RoutingPreviewResponse {
+  mode: string;
+  estimatedAvgCostInputPerMillion: number;
+  routing: RoutingPreviewEntry[];
+  error?: string;
+}
+
+/**
+ * Anteprima del routing per una modalita' (veloce|economica|bilanciata|approfondita):
+ * legge la matrice REALE nexus_routing_matrix (cache 60s), non un mirror hardcoded.
+ */
+export async function getRoutingPreview(mode: string): Promise<RoutingPreviewResponse> {
+  return fetchJson(`${API_BASE}/api/models/routing-preview?mode=${encodeURIComponent(mode)}`);
+}
+
+/**
+ * Forza un tick dell'auto-promoter: ricalcola le celle best-fit della matrice
+ * statica dal catalog corrente (le celle con manual_override sono saltate).
+ */
+export async function autoPromoteRoutingMatrixNow(): Promise<{
+  ok?: boolean;
+  updated?: number;
+  skipped_manual?: number;
+  no_candidates?: number;
+  error?: string;
+}> {
+  return fetchJson(`${API_BASE}/api/admin/routing-matrix/auto-promote-now`, { method: "POST" });
+}

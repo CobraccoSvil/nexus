@@ -5,7 +5,7 @@ import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
 import { StatusBadge } from "../common/status-badge";
 import { ProviderModelsSection } from "./provider-models-section";
-import { getProviderRegistry } from "../../lib/api/models";
+import { getProviderRegistry, type ProviderRegistryEntry } from "../../lib/api/models";
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
@@ -48,7 +48,7 @@ export interface BrowseDirectoriesResponse {
 // A regime la lista arriva da GET /api/admin/provider-registry.
 const FALLBACK_PROVIDER_NAMES = ["anthropic", "openai", "google", "deepseek", "mistral"];
 
-interface ProviderSettingsProps {
+export interface ProviderSettingsProps {
   items: SettingEntry[];
   editValues: Record<string, string>;
   saving: Record<string, boolean>;
@@ -73,6 +73,55 @@ interface ProviderSettingsProps {
   onSelectDirectory: (path: string) => void;
   /** Provider LLM dal gateway: fonte primaria dello stato. */
   gatewayProviders?: GatewayProvider[];
+  /** Nasconde il banner gateway in cima (usato quando il banner e' mostrato una
+   *  sola volta a livello superiore, es. providers-overview). */
+  hideGatewayBanner?: boolean;
+  /** Catalogo modelli gia' caricato dal parent: evita un fetch duplicato di
+   *  /api/models quando questo componente e' istanziato piu' volte (per-provider). */
+  catalogOverride?: Array<{ provider: string; model: string }>;
+  /** Registry provider gia' caricato dal parent: evita un fetch duplicato di
+   *  /api/admin/provider-registry. */
+  registryOverride?: ProviderRegistryEntry[];
+}
+
+/** Banner orizzontale con lo stato health dei provider dal gateway.
+ *  Estratto per essere mostrato una sola volta a livello superiore
+ *  (providers-overview) quando ProviderSettings e' istanziato piu' volte. */
+export function GatewayStatusBanner({ providers }: { providers?: GatewayProvider[] }) {
+  if (!providers || providers.length === 0) return null;
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      padding: "10px 16px", borderRadius: 8,
+      border: "1px solid var(--color-border)",
+      background: "var(--color-bgCard)",
+      marginBottom: 8, flexWrap: "wrap",
+    }}>
+      <span style={{
+        fontSize: 11, color: "var(--color-textMuted)", fontWeight: 600,
+        letterSpacing: "0.07em", textTransform: "uppercase", marginRight: 4,
+      }}>
+        Gateway
+      </span>
+      {providers.map((p) => (
+        <div key={p.name} style={{
+          display: "flex", alignItems: "center", gap: 6,
+          padding: "4px 10px", background: "var(--color-bgInput)",
+          borderRadius: 6, border: "1px solid var(--color-border)", fontSize: 12,
+        }}>
+          <span style={{
+            width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
+            // null = mai misurato (grigio), non "down": distinto da false (rosso).
+            background: p.healthy === true ? "#4ade80" : p.healthy === false ? "#f87171" : "#9ca3af",
+          }} />
+          <span style={{ fontWeight: 600 }}>{p.name}</span>
+          {p.healthy === false && p.error && (
+            <span style={{ color: "#f87171", fontSize: 11 }}>{p.error}</span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export function ProviderSettings({
@@ -98,6 +147,9 @@ export function ProviderSettings({
   onSetNewDirectoryName,
   onSelectDirectory,
   gatewayProviders,
+  hideGatewayBanner,
+  catalogOverride,
+  registryOverride,
 }: ProviderSettingsProps) {
   const tc = useThemeColors();
   const { resolved } = useTheme();
@@ -113,6 +165,12 @@ export function ProviderSettings({
   const [modelCatalog, setModelCatalog] = useState<Array<{ provider: string; model: string }>>([]);
   const [modelCatalogStatus, setModelCatalogStatus] = useState<"loading" | "ok" | "error">("loading");
   useEffect(() => {
+    // Se il parent ha gia' il catalogo (istanze multiple per-provider), riusalo.
+    if (catalogOverride) {
+      setModelCatalog(catalogOverride);
+      setModelCatalogStatus(catalogOverride.length > 0 ? "ok" : "error");
+      return;
+    }
     fetch("/api/models", { credentials: "include" })
       .then(async (r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -127,7 +185,7 @@ export function ProviderSettings({
         setModelCatalog([]);
         setModelCatalogStatus("error");
       });
-  }, []);
+  }, [catalogOverride]);
 
   // Provider con API key e link billing dal registry (fonte unica data-driven,
   // regola G): i provider onboardati (Groq/OpenRouter/Perplexity) ottengono
@@ -136,18 +194,24 @@ export function ProviderSettings({
   const [providerNames, setProviderNames] = useState<string[]>(FALLBACK_PROVIDER_NAMES);
   const [billingUrls, setBillingUrls] = useState<Record<string, string>>({});
   useEffect(() => {
+    const apply = (providers: ProviderRegistryEntry[]) => {
+      const apiKeyProviders = providers.filter((p) => p.keySetting).map((p) => p.name);
+      if (apiKeyProviders.length > 0) setProviderNames(apiKeyProviders);
+      const urls: Record<string, string> = {};
+      for (const p of providers) if (p.billingUrl) urls[p.name] = p.billingUrl;
+      setBillingUrls(urls);
+    };
+    // Se il parent ha gia' il registry, riusalo (niente fetch duplicato).
+    if (registryOverride) {
+      apply(registryOverride);
+      return;
+    }
     getProviderRegistry()
-      .then((d) => {
-        const apiKeyProviders = d.providers.filter((p) => p.keySetting).map((p) => p.name);
-        if (apiKeyProviders.length > 0) setProviderNames(apiKeyProviders);
-        const urls: Record<string, string> = {};
-        for (const p of d.providers) if (p.billingUrl) urls[p.name] = p.billingUrl;
-        setBillingUrls(urls);
-      })
+      .then((d) => apply(d.providers))
       .catch(() => {
         /* fallback: FALLBACK_PROVIDER_NAMES + nessun link billing */
       });
-  }, []);
+  }, [registryOverride]);
 
   // Chiavi _enabled da incorporare nella card della API key (non mostrarle come
   // card separate). Derivate dagli items (ogni *_api_key ha il gemello *_enabled)
@@ -161,39 +225,7 @@ export function ProviderSettings({
   return (
     <>
       {/* ── Banner stato gateway LLM ── */}
-      {gatewayProviders && gatewayProviders.length > 0 && (
-        <div style={{
-          display: "flex", alignItems: "center", gap: 8,
-          padding: "10px 16px", borderRadius: 8,
-          border: "1px solid var(--color-border)",
-          background: "var(--color-bgCard)",
-          marginBottom: 8, flexWrap: "wrap",
-        }}>
-          <span style={{
-            fontSize: 11, color: "var(--color-textMuted)", fontWeight: 600,
-            letterSpacing: "0.07em", textTransform: "uppercase", marginRight: 4,
-          }}>
-            Gateway
-          </span>
-          {gatewayProviders.map((p) => (
-            <div key={p.name} style={{
-              display: "flex", alignItems: "center", gap: 6,
-              padding: "4px 10px", background: "var(--color-bgInput)",
-              borderRadius: 6, border: "1px solid var(--color-border)", fontSize: 12,
-            }}>
-              <span style={{
-                width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
-                // null = mai misurato (grigio), non "down": distinto da false (rosso).
-                background: p.healthy === true ? "#4ade80" : p.healthy === false ? "#f87171" : "#9ca3af",
-              }} />
-              <span style={{ fontWeight: 600 }}>{p.name}</span>
-              {p.healthy === false && p.error && (
-                <span style={{ color: "#f87171", fontSize: 11 }}>{p.error}</span>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      {!hideGatewayBanner && <GatewayStatusBanner providers={gatewayProviders} />}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {items.map((setting) => {

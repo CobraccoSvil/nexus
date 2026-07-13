@@ -199,44 +199,6 @@ async fn build_project_context(
     project_context
 }
 
-/// Risolve provider+modello per il purpose `docs_generator` tramite il ROUTING
-/// CANONICO per tier (punto unico regola L): resolve_purpose_model_db applica
-/// tier-rule (mig 0203) -> miglior modello del catalog fuori cooldown ->
-/// fallback statico -> enforcement cooldown. NIENTE piu' query statica che
-/// ignorava il tier e il routing. handle_doc_generate non ha AppState, quindi
-/// usa l'adapter `_db` (stessa logica, fonte DB invece della matrix cache).
-/// `Err` = messaggio d'errore azionabile da propagare al chiamante.
-async fn resolve_docs_generator_model(db: &PgPool) -> Result<(String, String), String> {
-    match crate::internal_routing::resolve_purpose_model_db(db, "docs_generator").await {
-        crate::internal_routing::PurposeResolution::Resolved {
-            provider,
-            model,
-            rationale,
-        } => {
-            tracing::info!("nexus_doc_generate: modello risolto {provider}/{model} ({rationale})");
-            Ok((provider, model))
-        }
-        crate::internal_routing::PurposeResolution::NoCapableModel { tier } => {
-            tracing::warn!("nexus_doc_generate: nessun modello del tier '{tier}' disponibile");
-            Err(format!(
-                "[Errore] Generazione documento non disponibile: nessun modello del \
-                 tier '{tier}' (purpose docs_generator) e' disponibile (capability \
-                 mancante o provider in cooldown). Riprova piu' tardi."
-            ))
-        }
-        crate::internal_routing::PurposeResolution::NotFound => {
-            tracing::error!("purpose 'docs_generator' non configurato o privo di tier.");
-            Err("[Errore] purpose 'docs_generator' non configurato (o privo di tier) in nexus_purpose_model".to_string())
-        }
-        crate::internal_routing::PurposeResolution::MatrixUnavailable(e) => {
-            tracing::error!("nexus_doc_generate: routing non disponibile: {e}");
-            Err(format!(
-                "[Errore] routing docs_generator non disponibile: {e}"
-            ))
-        }
-    }
-}
-
 /// Etichetta leggibile per il tipo di documento, usata nel prompt di generazione.
 fn doc_type_label(doc_type: &str) -> &str {
     match doc_type {
@@ -309,9 +271,44 @@ async fn autogenerate_content_json(
         doc_type_label(doc_type),
         project_context
     );
-    let (gen_provider, gen_model) = resolve_docs_generator_model(db).await?;
-    let resp_text = call_docs_generator_gateway(db, &gen_provider, &gen_model, gen_prompt).await?;
-    let content_val = parse_docs_generator_json(&resp_text, doc_type)?;
+    // FAILOVER tier-aware (punto unico complete_for_purpose_with_failover, regola
+    // L/G): prova N candidati del tier e passa al prossimo su fallimento della
+    // chiamata O JSON invalido O documento a sole intestazioni (regola M:
+    // doc_content_is_empty). Prima abortiva al PRIMO provider fallito. La GwRequest
+    // resta in call_docs_generator_gateway (un solo posto).
+    use crate::internal_routing::{
+        complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
+    };
+    let outcome = complete_for_purpose_with_failover(db, "docs_generator", |provider, model| {
+        let prompt = gen_prompt.clone();
+        let doc_type = doc_type.to_string();
+        async move {
+            match call_docs_generator_gateway(db, &provider, &model, prompt).await {
+                Ok(content) if !content.trim().is_empty() => {
+                    match parse_docs_generator_json(&content, &doc_type) {
+                        Ok(cv) if !doc_content_is_empty(&cv) => AttemptOutcome::Done(cv),
+                        _ => AttemptOutcome::Failover,
+                    }
+                }
+                _ => AttemptOutcome::Failover,
+            }
+        }
+    })
+    .await;
+    let content_val = match outcome {
+        Ok(cv) => cv,
+        Err(PurposeFailoverError::AllCandidatesFailed) => {
+            return Err("[Errore] Generazione automatica contenuto fallita: nessun provider \
+                        del tier ha prodotto un documento valido. Riprova piu' tardi."
+                .to_string())
+        }
+        Err(PurposeFailoverError::NoCandidate(res)) => {
+            return Err(format!(
+                "[Errore] routing docs_generator non risolvibile: {}",
+                res.into_model("docs_generator").err().unwrap_or_default()
+            ))
+        }
+    };
     let sec_count = content_val
         .get("sections")
         .and_then(|s| s.as_array())

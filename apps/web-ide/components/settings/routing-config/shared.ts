@@ -12,7 +12,9 @@ export interface SettingEntry {
   updated_at: string;
 }
 
-export type ProviderName = "anthropic" | "openai" | "google" | "deepseek" | "mistral";
+// Nome provider dinamico (dal registry). Alias `string` mantenuto per leggibilita'
+// delle firme; la lista reale arriva dal registry a runtime, non piu' hardcoded.
+export type ProviderName = string;
 
 export type BehaviorMode = "veloce" | "economica" | "bilanciata" | "approfondita" | "dinamico" | "manuale";
 
@@ -45,75 +47,23 @@ export const PURPOSE_TIER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "frontier", label: "Frontier" },
 ];
 
-export const PROVIDERS: ProviderName[] = ["anthropic", "openai", "google", "deepseek", "mistral"];
+// Fallback usato solo finche' il registry non e' caricato o se il fetch fallisce.
+// A regime la lista provider arriva da GET /api/admin/provider-registry.
+export const FALLBACK_PROVIDERS: string[] = ["anthropic", "openai", "google", "deepseek", "mistral"];
 
 export const BEHAVIOR_MODES: { value: BehaviorMode; label: string; desc: string }[] = [
-  { value: "veloce",       label: "⚡ Veloce",       desc: "Massima velocità — modello più rapido per tier richiesto" },
-  { value: "economica",    label: "💰 Economica",    desc: "Minimo costo — modello più economico capace di gestire il task" },
-  { value: "bilanciata",   label: "⚖️ Bilanciata",   desc: "Qualità/costo ottimale (default)" },
-  { value: "approfondita", label: "🔬 Approfondita", desc: "Massima qualità — scala automaticamente il tier" },
-  { value: "dinamico",     label: "🤖 Dinamico",     desc: "Consulta il catalogo modelli in tempo reale: sceglie il modello ottimale per capability, tier e costo corrente" },
-  { value: "manuale",      label: "🔧 Manuale",      desc: "Configura manualmente provider, modelli e catene per intent" },
+  { value: "veloce",       label: "Veloce",       desc: "Massima velocità — modello più rapido per tier richiesto" },
+  { value: "economica",    label: "Economica",    desc: "Minimo costo — modello più economico capace di gestire il task" },
+  { value: "bilanciata",   label: "Bilanciata",   desc: "Qualità/costo ottimale (default)" },
+  { value: "approfondita", label: "Approfondita", desc: "Massima qualità — scala automaticamente il tier" },
+  { value: "dinamico",     label: "Dinamico",     desc: "Consulta il catalogo modelli in tempo reale: sceglie il modello ottimale per capability, tier e costo corrente" },
+  { value: "manuale",      label: "Manuale",      desc: "Configura manualmente provider, modelli e catene per intent" },
 ];
 
-// Routing matrix frontend — specchio di orchestrator.rs, con dimensione token-complessità
-export interface MatrixEntry { provider: ProviderName; model: string; tokens?: string }
-
-export const NEXUS_ROUTING_MATRIX: Record<string, Array<{ label: string } & MatrixEntry>> = {
-  veloce: [
-    { label: "Chat breve",      provider: "google",    model: "gemini-2.5-flash-lite",    tokens: "≤400 tk" },
-    { label: "Chat media",      provider: "openai",    model: "gpt-4.1-mini",             tokens: "≤1500 tk" },
-    { label: "Chat lunga",      provider: "mistral",   model: "mistral-small-4",          tokens: ">1500 tk" },
-    { label: "Fix semplice",    provider: "openai",    model: "gpt-4.1-mini",             tokens: "≤3000 tk" },
-    { label: "Fix complesso",   provider: "deepseek",  model: "deepseek-chat",            tokens: ">3000 tk" },
-    { label: "Refactor",        provider: "deepseek",  model: "deepseek-chat" },
-    { label: "Test",            provider: "openai",    model: "gpt-4.1-mini" },
-    { label: "Docs",            provider: "mistral",   model: "mistral-small-4" },
-    { label: "Architecture",    provider: "deepseek",  model: "deepseek-reasoner" },
-  ],
-  economica: [
-    { label: "Chat breve",      provider: "openai",    model: "gpt-4.1-nano",             tokens: "≤400 tk" },
-    { label: "Chat media",      provider: "mistral",   model: "open-mistral-nemo",             tokens: "≤1500 tk" },
-    { label: "Chat lunga",      provider: "deepseek",  model: "deepseek-chat",            tokens: ">1500 tk" },
-    { label: "Fix semplice",    provider: "openai",    model: "gpt-4.1-nano",             tokens: "≤3000 tk" },
-    { label: "Fix complesso",   provider: "deepseek",  model: "deepseek-chat",            tokens: ">3000 tk" },
-    { label: "Refactor",        provider: "deepseek",  model: "deepseek-chat" },
-    { label: "Test",            provider: "mistral",   model: "open-mistral-nemo" },
-    { label: "Docs",            provider: "mistral",   model: "open-mistral-nemo" },
-    { label: "Architecture",    provider: "deepseek",  model: "deepseek-chat" },
-  ],
-  bilanciata: [
-    { label: "Chat breve",      provider: "google",    model: "gemini-2.5-flash",         tokens: "≤400 tk" },
-    { label: "Chat media",      provider: "openai",    model: "gpt-4.1-mini",             tokens: "≤1500 tk" },
-    { label: "Chat lunga",      provider: "anthropic", model: "claude-haiku-4-5-20251001",tokens: ">1500 tk" },
-    { label: "Fix semplice",    provider: "openai",    model: "gpt-4.1-mini",             tokens: "≤3000 tk" },
-    { label: "Fix complesso",   provider: "anthropic", model: "claude-haiku-4-5-20251001",tokens: ">3000 tk" },
-    { label: "Refactor",        provider: "anthropic", model: "claude-haiku-4-5-20251001" },
-    { label: "Test",            provider: "openai",    model: "gpt-4.1-mini" },
-    { label: "Docs",            provider: "openai",    model: "gpt-4.1" },
-    { label: "Architecture",    provider: "anthropic", model: "claude-sonnet-4-6" },
-  ],
-  approfondita: [
-    { label: "Chat breve",      provider: "mistral",   model: "mistral-small-4",          tokens: "≤400 tk" },
-    { label: "Chat media",      provider: "deepseek",  model: "deepseek-chat",            tokens: "≤1500 tk" },
-    { label: "Chat lunga",      provider: "anthropic", model: "claude-sonnet-4-6",        tokens: ">1500 tk" },
-    { label: "Fix semplice",    provider: "anthropic", model: "claude-haiku-4-5-20251001",tokens: "≤3000 tk" },
-    { label: "Fix complesso",   provider: "anthropic", model: "claude-sonnet-4-6",        tokens: ">3000 tk" },
-    { label: "Refactor",        provider: "anthropic", model: "claude-sonnet-4-6" },
-    { label: "Test",            provider: "mistral",   model: "codestral-latest" },
-    { label: "Docs",            provider: "anthropic", model: "claude-sonnet-4-6" },
-    { label: "Architecture",    provider: "anthropic", model: "claude-opus-4-6" },
-  ],
-};
-
-
-export const PROVIDER_MODELS: Record<ProviderName, string[]> = {
-  anthropic: ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001", "claude-3-haiku-20240307"],
-  openai:    ["gpt-4.1-mini", "gpt-4.1", "gpt-4.1-nano", "o4-mini", "o3", "gpt-4o-mini"],
-  google:    ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"],
-  deepseek:  ["deepseek-chat", "deepseek-reasoner", "deepseek-coder"],
-  mistral:   ["mistral-small-4", "mistral-large-2411", "codestral-latest", "open-mistral-nemo"],
-};
+// La preview del routing e' ora REALE (dalla matrice DB corrente) via
+// GET /api/models/routing-preview -> RoutingPreviewEntry in lib/api/models.ts.
+// La vecchia NEXUS_ROUTING_MATRIX statica (mirror hardcoded, con modelli stale) e
+// PROVIDER_MODELS sono state rimosse: i modelli per provider arrivano dal catalog.
 
 export const ROUTING_INTENTS = [
   { key: "chat", label: "Chat" },
@@ -139,34 +89,37 @@ export const MANAGED_ROUTING_KEYS = new Set([
   "routing_architecture_providers",
 ]);
 
-function normalizeProviderChain(values: string[]): ProviderName[] {
+// Normalizza una catena provider contro la lista dinamica `providers` (dal registry):
+// tiene solo i provider noti nell'ordine dato, poi accoda quelli mancanti (tutti i
+// provider disponibili restano sempre presenti nella catena).
+function normalizeProviderChain(values: string[], providers: string[]): ProviderName[] {
+  const known = new Set(providers);
   const cleaned = values
     .map((value) => value.trim().toLowerCase())
-    .filter((value): value is ProviderName => PROVIDERS.includes(value as ProviderName));
+    .filter((value) => known.has(value));
   const unique = cleaned.filter((value, index) => cleaned.indexOf(value) === index);
-  // Aggiunge sempre i provider mancanti in coda (tutti e 5 sempre presenti)
-  const result = unique.length > 0 ? unique : [];
-  for (const p of PROVIDERS) {
+  const result = [...unique];
+  for (const p of providers) {
     if (!result.includes(p)) result.push(p);
   }
   return result;
 }
 
-function parseProviderChain(value?: string): ProviderName[] {
-  if (!value) return [...PROVIDERS];
-  return normalizeProviderChain(value.split(","));
+function parseProviderChain(value: string | undefined, providers: string[]): ProviderName[] {
+  if (!value) return [...providers];
+  return normalizeProviderChain(value.split(","), providers);
 }
 
-export function buildRoutingState(settings: SettingEntry[]): RoutingConfigState {
+export function buildRoutingState(settings: SettingEntry[], providers: string[]): RoutingConfigState {
   const get = (key: string) => settings.find((setting) => setting.key === key)?.value ?? "";
-  const providerHierarchy = parseProviderChain(get("provider_hierarchy") || get("default_provider"));
+  const providerHierarchy = parseProviderChain(get("provider_hierarchy") || get("default_provider"), providers);
 
   return {
     providerHierarchy,
     intentChains: Object.fromEntries(
       ROUTING_INTENTS.map((intent) => [
         intent.key,
-        parseProviderChain(get(`routing_${intent.key}_providers`) || providerHierarchy.join(",")),
+        parseProviderChain(get(`routing_${intent.key}_providers`) || providerHierarchy.join(","), providers),
       ]),
     ) as Record<string, ProviderName[]>,
     tokenBudget: get("token_budget") || "4096",
@@ -185,15 +138,20 @@ export function moveProvider(chain: ProviderName[], provider: ProviderName, dire
   return next;
 }
 
-export function labelProvider(provider: ProviderName): string {
-  const labels: Record<ProviderName, string> = {
-    anthropic: "Anthropic",
-    openai:    "OpenAI",
-    google:    "Google",
-    deepseek:  "DeepSeek",
-    mistral:   "Mistral",
+export function labelProvider(provider: string): string {
+  const labels: Record<string, string> = {
+    anthropic:  "Anthropic",
+    openai:     "OpenAI",
+    google:     "Google",
+    deepseek:   "DeepSeek",
+    mistral:    "Mistral",
+    groq:       "Groq",
+    openrouter: "OpenRouter",
+    perplexity: "Perplexity",
+    vllm:       "vLLM",
+    ollama:     "Ollama",
   };
-  return labels[provider] ?? provider;
+  return labels[provider] ?? (provider.charAt(0).toUpperCase() + provider.slice(1));
 }
 
 export function buttonStyle(tc: ReturnType<typeof useThemeColors>, disabled: boolean) {

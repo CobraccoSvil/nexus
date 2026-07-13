@@ -2,8 +2,6 @@
 
 import { useTheme, useThemeColors } from "../../../lib/theme";
 import {
-  PROVIDER_MODELS,
-  PROVIDERS,
   PURPOSE_KEYS,
   PURPOSE_TIER_OPTIONS,
   inputStyle,
@@ -15,6 +13,8 @@ import {
 interface PurposeModelsSectionProps {
   config: RoutingConfigState;
   setConfig: React.Dispatch<React.SetStateAction<RoutingConfigState>>;
+  providers: string[];
+  modelsByProvider: Record<string, string[]>;
   purposeLoading: boolean;
   purposeSaved: boolean;
   purposeError: string | null;
@@ -28,6 +28,8 @@ interface PurposeModelsSectionProps {
 export function PurposeModelsSection({
   config,
   setConfig,
+  providers,
+  modelsByProvider,
   purposeLoading,
   purposeSaved,
   purposeError,
@@ -67,7 +69,22 @@ export function PurposeModelsSection({
       )}
       <div style={{ display: "grid", gap: 10 }}>
         {PURPOSE_KEYS.map((p) => {
-          const pm = config.purposeModels[p.key] ?? { provider: "anthropic" as ProviderName, model_id: PROVIDER_MODELS.anthropic[0], notes: null, tier: null };
+          const defaultProvider = providers[0] ?? "anthropic";
+          const pm = config.purposeModels[p.key] ?? {
+            provider: defaultProvider as ProviderName,
+            model_id: modelsByProvider[defaultProvider]?.[0] ?? "",
+            notes: null,
+            tier: null,
+          };
+          // Provider e modelli mostrati includono sempre il valore corrente, anche
+          // se non piu' nella lista (provider disabilitato / modello legacy).
+          const providerOptions = providers.includes(pm.provider)
+            ? providers
+            : [pm.provider, ...providers];
+          const modelList = modelsByProvider[pm.provider] ?? [];
+          const modelOptions = pm.model_id && !modelList.includes(pm.model_id)
+            ? [pm.model_id, ...modelList]
+            : modelList;
           const currentTier = pm.tier ?? "";
           const tierActive = currentTier !== "";
           const savingThis = !!purposeSaving[p.key];
@@ -129,7 +146,7 @@ export function PurposeModelsSection({
                 value={pm.provider}
                 onChange={(e) => {
                   const provider = e.target.value as ProviderName;
-                  const firstModel = PROVIDER_MODELS[provider]?.[0] ?? "";
+                  const firstModel = modelsByProvider[provider]?.[0] ?? "";
                   setConfig((c) => ({
                     ...c,
                     purposeModels: {
@@ -140,7 +157,7 @@ export function PurposeModelsSection({
                 }}
                 style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
               >
-                {PROVIDERS.map((prov) => (
+                {providerOptions.map((prov) => (
                   <option key={prov} value={prov}>{labelProvider(prov)}</option>
                 ))}
               </select>
@@ -156,8 +173,13 @@ export function PurposeModelsSection({
                 }}
                 style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
               >
-                {(PROVIDER_MODELS[pm.provider] ?? []).map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                {modelOptions.length === 0 && pm.model_id && (
+                  <option value={pm.model_id}>{pm.model_id}</option>
+                )}
+                {modelOptions.map((m) => (
+                  <option key={m} value={m}>
+                    {m}{modelList.includes(m) ? "" : " (corrente — non nel catalogo)"}
+                  </option>
                 ))}
               </select>
 

@@ -777,8 +777,11 @@ async fn fetch_provider_health_map(
 }
 
 /// Mappa `provider -> API key configurata` (chiave `*_api_key` non vuota in
-/// `settings`, categoria providers).
-async fn fetch_api_key_configured(db: &sqlx::PgPool) -> std::collections::HashMap<String, bool> {
+/// `settings`, categoria providers). `pub(crate)`: riusata dall'orchestrator per
+/// derivare l'elenco provider dell'alert cooldown (punto unico, regola L).
+pub(crate) async fn fetch_api_key_configured(
+    db: &sqlx::PgPool,
+) -> std::collections::HashMap<String, bool> {
     #[derive(sqlx::FromRow)]
     struct SettingsRow {
         key: String,
@@ -805,7 +808,7 @@ async fn fetch_api_key_configured(db: &sqlx::PgPool) -> std::collections::HashMa
 /// configurata in `settings`. Un provider onboardato (catalog o chiave) compare
 /// senza toccare il codice (chiude T4). Fallback ai noti (`KNOWN_PROVIDERS`) se
 /// entrambe le fonti sono vuote (DB down / bootstrap incompleto).
-async fn provider_names_for_status(
+pub(crate) async fn provider_names_for_status(
     db: &sqlx::PgPool,
     api_key_configured: &std::collections::HashMap<String, bool>,
 ) -> Vec<String> {
@@ -878,6 +881,56 @@ mod provider_names_tests {
         let out = merge_provider_names(vec![], vec![], &empty);
         let expected: Vec<String> = KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect();
         assert_eq!(out, expected);
+    }
+
+    fn budget_row(provider: &str, budget: &str) -> BudgetRow {
+        BudgetRow {
+            provider: provider.to_string(),
+            monthly_budget_usd: budget.to_string(),
+            spent_current_period_usd: "3.5".to_string(),
+            remaining_usd: "16.5".to_string(),
+            min_threshold_usd: "1.0".to_string(),
+            is_exhausted: false,
+            period_start: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn budget_provider_nuovo_senza_riga_appare_non_configurato() {
+        let names = vec!["anthropic".to_string(), "groq".to_string()];
+        let rows = vec![budget_row("anthropic", "20.0")];
+        let out = merge_budget_entries(&names, rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["provider"], "anthropic");
+        assert_eq!(out[0]["configured"], true);
+        assert_eq!(out[0]["monthly_budget_usd"], "20.0");
+        // groq: entry sintetica a budget 0, non configurata, non esausta.
+        assert_eq!(out[1]["provider"], "groq");
+        assert_eq!(out[1]["configured"], false);
+        assert_eq!(out[1]["monthly_budget_usd"], "0");
+        assert_eq!(out[1]["is_exhausted"], false);
+    }
+
+    #[test]
+    fn budget_riga_orfana_preservata_in_coda() {
+        // Provider con budget ma rimosso dalle fonti (nessun nome corrispondente):
+        // resta visibile per non nascondere spesa gia' tracciata.
+        let names = vec!["openai".to_string()];
+        let rows = vec![budget_row("legacy-provider", "10.0")];
+        let out = merge_budget_entries(&names, rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["provider"], "openai");
+        assert_eq!(out[0]["configured"], false);
+        assert_eq!(out[1]["provider"], "legacy-provider");
+        assert_eq!(out[1]["configured"], true);
+    }
+
+    #[test]
+    fn budget_ordinamento_deterministico_segue_names() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let out = merge_budget_entries(&names, vec![budget_row("b", "5.0")]);
+        let ordine: Vec<&str> = out.iter().map(|v| v["provider"].as_str().unwrap()).collect();
+        assert_eq!(ordine, vec!["a", "b", "c"]);
     }
 }
 
@@ -1422,24 +1475,80 @@ pub async fn admin_routing_matrix_auto_promote_now(
     }
 }
 
+/// Riga della vista budget (a livello modulo per `merge_budget_entries` e i test).
+/// Casto NUMERIC -> TEXT in SQL per evitare la dipendenza rust_decimal:
+/// sqlx mappa NUMERIC::text -> String senza problemi.
+#[derive(sqlx::FromRow)]
+struct BudgetRow {
+    provider: String,
+    monthly_budget_usd: String,
+    spent_current_period_usd: String,
+    remaining_usd: String,
+    min_threshold_usd: String,
+    is_exhausted: bool,
+    period_start: chrono::DateTime<chrono::Utc>,
+}
+
+/// Unione registry-aware delle righe budget (punto unico, regola L; pura: testabile
+/// senza DB). Ogni provider attivo (`names`, da `provider_names_for_status`) appare:
+/// con la sua riga reale (`configured: true`) oppure con una entry sintetica a budget
+/// zero (`configured: false`) se la tabella non ha ancora la riga — cosi' i provider
+/// onboardati via registry (mig 0565+) sono gestibili dal pannello senza seed SQL
+/// (set-budget fa UPSERT e crea la riga al primo "Imposta budget"). Le righe orfane
+/// (provider con budget ma rimosso dalle fonti) restano visibili in coda.
+fn merge_budget_entries(names: &[String], rows: Vec<BudgetRow>) -> Vec<Value> {
+    let now = chrono::Utc::now();
+    let mut by_provider: std::collections::BTreeMap<String, BudgetRow> =
+        rows.into_iter().map(|r| (r.provider.clone(), r)).collect();
+    let mut items: Vec<Value> = Vec::with_capacity(names.len());
+    for name in names {
+        match by_provider.remove(name) {
+            Some(r) => items.push(json!({
+                "provider": r.provider,
+                "monthly_budget_usd": r.monthly_budget_usd,
+                "spent_usd": r.spent_current_period_usd,
+                "remaining_usd": r.remaining_usd,
+                "min_threshold_usd": r.min_threshold_usd,
+                "is_exhausted": r.is_exhausted,
+                "period_start": r.period_start.to_rfc3339(),
+                "configured": true,
+            })),
+            None => items.push(json!({
+                "provider": name,
+                "monthly_budget_usd": "0",
+                "spent_usd": "0",
+                "remaining_usd": "0",
+                // Default allineato a admin_set_provider_budget (threshold 1.0).
+                "min_threshold_usd": "1.0",
+                "is_exhausted": false,
+                "period_start": now.to_rfc3339(),
+                "configured": false,
+            })),
+        }
+    }
+    // Righe orfane: budget impostato per un provider non piu' nelle fonti.
+    for (_, r) in by_provider {
+        items.push(json!({
+            "provider": r.provider,
+            "monthly_budget_usd": r.monthly_budget_usd,
+            "spent_usd": r.spent_current_period_usd,
+            "remaining_usd": r.remaining_usd,
+            "min_threshold_usd": r.min_threshold_usd,
+            "is_exhausted": r.is_exhausted,
+            "period_start": r.period_start.to_rfc3339(),
+            "configured": true,
+        }));
+    }
+    items
+}
+
 /// GET /api/admin/providers/budget
-/// Ritorna il budget residuo per ogni provider (vista comoda della UI admin).
+/// Ritorna il budget residuo per ogni provider attivo (registry-aware): i provider
+/// senza riga budget compaiono come "non impostato" invece di sparire dal pannello.
 pub async fn admin_providers_budget_list(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Json<Value> {
-    // Casto NUMERIC -> TEXT in SQL per evitare la dipendenza rust_decimal.
-    // sqlx mappa NUMERIC::text -> String senza problemi.
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        provider: String,
-        monthly_budget_usd: String,
-        spent_current_period_usd: String,
-        remaining_usd: String,
-        min_threshold_usd: String,
-        is_exhausted: bool,
-        period_start: chrono::DateTime<chrono::Utc>,
-    }
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
+    let rows: Vec<BudgetRow> = sqlx::query_as::<_, BudgetRow>(
         "SELECT provider,
                 monthly_budget_usd::text AS monthly_budget_usd,
                 spent_current_period_usd::text AS spent_current_period_usd,
@@ -1453,21 +1562,10 @@ pub async fn admin_providers_budget_list(
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-    let items: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
-            json!({
-                "provider": r.provider,
-                "monthly_budget_usd": r.monthly_budget_usd,
-                "spent_usd": r.spent_current_period_usd,
-                "remaining_usd": r.remaining_usd,
-                "min_threshold_usd": r.min_threshold_usd,
-                "is_exhausted": r.is_exhausted,
-                "period_start": r.period_start.to_rfc3339(),
-            })
-        })
-        .collect();
-    Json(json!({ "providers": items }))
+    // Lista provider dal punto unico registry-aware (catalog + registry + api_key).
+    let api_key_configured = fetch_api_key_configured(&state.db).await;
+    let names = provider_names_for_status(&state.db, &api_key_configured).await;
+    Json(json!({ "providers": merge_budget_entries(&names, rows) }))
 }
 
 #[derive(serde::Deserialize)]

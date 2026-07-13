@@ -4,11 +4,11 @@ import { useEffect, useState } from "react";
 import { useTheme, useThemeColors } from "../../../lib/theme";
 import { NexusMetricsPanel } from "../nexus-metrics-panel";
 import { NexusWorkersPanel } from "../nexus-workers-panel";
-import { listAdminPurposeModels, resolveInternalPurposeModel, updateAdminPurposeModel, type PurposeModelEntry } from "../../../lib/api-client";
+import { listAdminPurposeModels, resolveInternalPurposeModel, updateAdminPurposeModel, getProviderRegistry, getModels, type PurposeModelEntry } from "../../../lib/api-client";
 import {
   API_BASE,
+  FALLBACK_PROVIDERS,
   MANAGED_ROUTING_KEYS,
-  PROVIDERS,
   ROUTING_INTENTS,
   buildRoutingState,
   type BehaviorMode,
@@ -32,7 +32,11 @@ interface RoutingConfigProps {
 export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) {
   const tc = useThemeColors();
   const { resolved } = useTheme();
-  const [config, setConfig] = useState<RoutingConfigState>(() => buildRoutingState(settings));
+  // Provider e modelli dal registry/catalog (fonte unica, regola G): niente piu'
+  // lista hardcoded a 5. Fallback ai noti finche' il fetch non completa.
+  const [providers, setProviders] = useState<string[]>(FALLBACK_PROVIDERS);
+  const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
+  const [config, setConfig] = useState<RoutingConfigState>(() => buildRoutingState(settings, FALLBACK_PROVIDERS));
   const [purposeLoading, setPurposeLoading] = useState(false);
   const [purposeError, setPurposeError] = useState<string | null>(null);
   const [purposeSaved, setPurposeSaved] = useState(false);
@@ -55,11 +59,31 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   const [nexusPctError, setNexusPctError] = useState<string | null>(null);
 
   useEffect(() => {
-    setConfig(buildRoutingState(settings));
+    setConfig(buildRoutingState(settings, providers));
     const parsedNexusPct =
       parseInt(settings.find((s) => s.key === "nexus_active_routing_pct")?.value ?? "0", 10) || 0;
     setNexusRoutingPct(Math.max(0, Math.min(100, parsedNexusPct)));
-  }, [settings]);
+  }, [settings, providers]);
+
+  // Carica la lista provider (registry, is_active per sortOrder, incluso vllm che
+  // partecipa legittimamente alle catene) e i modelli abilitati per provider.
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      getProviderRegistry().catch(() => ({ providers: [] })),
+      getModels().catch(() => ({ models: [] })),
+    ]).then(([reg, cat]) => {
+      if (!active) return;
+      const names = (reg.providers ?? []).filter((p) => p.isActive).map((p) => p.name);
+      if (names.length > 0) setProviders(names);
+      const byProvider: Record<string, string[]> = {};
+      for (const m of cat.models ?? []) {
+        (byProvider[m.provider] ??= []).push(m.model);
+      }
+      setModelsByProvider(byProvider);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -71,7 +95,8 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         const pm: RoutingConfigState["purposeModels"] = {};
         for (const it of (res.items ?? []) as PurposeModelEntry[]) {
           const prov = it.provider as ProviderName;
-          if (!PROVIDERS.includes(prov)) continue;
+          // Nessun filtro sui provider: il dato DB e' autoritativo, accettiamo
+          // qualunque provider (inclusi quelli onboardati via registry).
           pm[it.purpose] = {
             provider: prov,
             model_id: it.model_id,
@@ -259,6 +284,8 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
           <PurposeModelsSection
             config={config}
             setConfig={setConfig}
+            providers={providers}
+            modelsByProvider={modelsByProvider}
             purposeLoading={purposeLoading}
             purposeSaved={purposeSaved}
             purposeError={purposeError}

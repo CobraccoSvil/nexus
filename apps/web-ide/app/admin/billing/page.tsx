@@ -11,6 +11,7 @@ import {
   createBillingPrice,
   createBillingQuota,
   getAdminBillingUsage,
+  getProviderRegistry,
   listAdminProjects,
   listAdminUsers,
   listBillingPrices,
@@ -32,8 +33,6 @@ function toIsoDateEnd(value: string): string | undefined {
 
 type Tc = ReturnType<typeof useThemeColors>;
 
-const KNOWN_PROVIDERS = ["anthropic", "openai", "google", "deepseek", "mistral"];
-
 export default function AdminBillingPage() {
   const tc = useThemeColors();
   const [loading, setLoading] = useState(true);
@@ -43,6 +42,9 @@ export default function AdminBillingPage() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [projects, setProjects] = useState<AdminProjectSummary[]>([]);
   const [catalog, setCatalog] = useState<ModelCatalogItem[]>([]);
+  // Provider dal registry (fonte unica, regola G): include i provider onboardati
+  // anche senza modelli abilitati o consumo registrato.
+  const [registryProviders, setRegistryProviders] = useState<string[]>([]);
 
   // Billing data
   const [prices, setPrices] = useState<BillingPrice[]>([]);
@@ -79,12 +81,12 @@ export default function AdminBillingPage() {
   });
 
   const providers = useMemo(() => {
-    const set = new Set<string>(KNOWN_PROVIDERS);
+    const set = new Set<string>(registryProviders);
     catalog.forEach((m) => set.add(m.provider));
     // Aggiungi anche i provider presenti nell'usage report corrente
     usage?.breakdown.forEach((b) => set.add(b.provider));
     return Array.from(set).sort();
-  }, [catalog, usage]);
+  }, [registryProviders, catalog, usage]);
 
   // Ref ai filtri correnti per l'auto-refresh (evita stale closure nel listener)
   const dateFromRef = useRef(dateFrom);
@@ -102,14 +104,16 @@ export default function AdminBillingPage() {
 
   const loadReference = async () => {
     try {
-      const [usersRes, projectsRes, catalogRes] = await Promise.all([
+      const [usersRes, projectsRes, catalogRes, registryRes] = await Promise.all([
         listAdminUsers(1, 200).catch(() => ({ users: [] as AdminUser[] })),
         listAdminProjects().catch(() => ({ projects: [] as AdminProjectSummary[] })),
         listModelCatalog().catch(() => ({ models: [] as ModelCatalogItem[] })),
+        getProviderRegistry().catch(() => ({ providers: [] })),
       ]);
       setUsers(usersRes.users || []);
       setProjects(projectsRes.projects || []);
       setCatalog(catalogRes.models || []);
+      setRegistryProviders((registryRes.providers || []).map((p) => p.name));
     } catch (refError) {
       setError(refError instanceof Error ? refError.message : "Reference load failed");
     }

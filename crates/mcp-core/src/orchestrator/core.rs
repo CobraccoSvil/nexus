@@ -442,12 +442,15 @@ impl Orchestrator {
         // Calcola lista provider in cooldown: ci serve sia per il flag
         // `no_capable_provider` sia per mostrare al frontend un alert
         // "questi provider non sono disponibili" piuttosto che far girare
-        // a vuoto le richieste.
-        let known_providers = ["anthropic", "openai", "deepseek", "google", "mistral"];
+        // a vuoto le richieste. Lista dal punto unico registry-aware (regola L):
+        // i provider onboardati via registry (mig 0565+) entrano nell'alert senza
+        // hardcode; fallback ai 5 noti gia' garantito da merge_provider_names.
+        let api_keys = crate::environment::fetch_api_key_configured(db).await;
+        let known_providers = crate::environment::provider_names_for_status(db, &api_keys).await;
         let providers_in_cooldown: Vec<String> = known_providers
             .iter()
             .filter(|p| is_provider_in_cooldown(p))
-            .map(|p| p.to_string())
+            .cloned()
             .collect();
         // Forzatura esplicita utente (ADR 0020): se l'utente ha scelto
         // provider/modello dal dropdown (non Auto), il cooldown e' deliberatamente

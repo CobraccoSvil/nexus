@@ -1,27 +1,31 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
- * Pannello "Budget mensile per provider".
+ * Budget mensile per provider.
  *
  * I provider AI consumer (anthropic, openai, google, mistral) NON espongono
  * un endpoint pubblico per il balance via API key (verificato 2026-05-20).
  * DeepSeek e' l'unica eccezione (`GET /user/balance`) e viene sincronizzato
  * automaticamente da `deepseek_balance_sync.rs` ogni 15 min.
  *
- * Per gli altri 4, lo `spent_current_period_usd` viene incrementato in
- * `chat_messages.rs` quando un run completa (`total_cost` × tokens). L'admin
- * imposta `monthly_budget_usd` quando ricarica l'account presso il provider,
- * e clicca "Ricarica" quando ha ricaricato per davvero (reset spent + period_start).
+ * Per gli altri, lo `spent_current_period_usd` viene incrementato in
+ * `chat_messages.rs` quando un run completa. L'admin imposta `monthly_budget_usd`
+ * quando ricarica l'account, e clicca "Ricarica" quando ha ricaricato davvero.
  *
  * Il `provider_health_probe` (Rust) marca un provider come unhealthy con
  * `error_kind=budget_exhausted` quando `(budget - spent) < min_threshold`.
+ *
+ * Questo modulo espone un hook (`useProviderBudgets`) e una riga presentazionale
+ * (`ProviderBudgetRow`) riusati sia dal pannello standalone che dalle card
+ * per-provider (providers-overview), cosi' il fetch e la logica sono un punto
+ * unico (regola L).
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
-type BudgetEntry = {
+export type BudgetEntry = {
   provider: string;
   monthly_budget_usd: string;
   spent_usd: string;
@@ -29,15 +33,33 @@ type BudgetEntry = {
   min_threshold_usd: string;
   is_exhausted: boolean;
   period_start: string;
+  /** false = provider attivo (registry/catalog/key) ma senza riga budget in DB:
+   *  "Imposta budget" la crea (UPSERT); "Ricarica" (UPDATE-only) resta disabilitato. */
+  configured?: boolean;
 };
 
-export function ProviderBudget() {
+type BudgetDraft = { budget: string; threshold: string };
+
+export interface UseProviderBudgets {
+  items: BudgetEntry[];
+  byProvider: Record<string, BudgetEntry>;
+  editing: Record<string, BudgetDraft>;
+  setEditing: React.Dispatch<React.SetStateAction<Record<string, BudgetDraft>>>;
+  busy: Record<string, boolean>;
+  error: string | null;
+  setBudget: (provider: string) => Promise<void>;
+  recharge: (provider: string) => Promise<void>;
+  reload: () => Promise<void>;
+}
+
+/** Hook: carica e gestisce i budget provider (fetch unico, azioni UPSERT/UPDATE). */
+export function useProviderBudgets(): UseProviderBudgets {
   const [items, setItems] = useState<BudgetEntry[]>([]);
-  const [editing, setEditing] = useState<Record<string, { budget: string; threshold: string }>>({});
+  const [editing, setEditing] = useState<Record<string, BudgetDraft>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  const reload = useCallback(async () => {
     try {
       const r = await fetch(`${API_BASE}/api/admin/providers/budget`, { credentials: "include" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -50,11 +72,11 @@ export function ProviderBudget() {
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void reload();
+  }, [reload]);
 
-  const setBudget = async (provider: string) => {
-    const draft = editing[provider];
+  const setBudget = useCallback(async (provider: string) => {
+    const draft = editingRef.current[provider];
     if (!draft) return;
     setBusy((b) => ({ ...b, [provider]: true }));
     try {
@@ -69,19 +91,18 @@ export function ProviderBudget() {
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setEditing((e) => {
-        const { [provider]: _, ...rest } = e;
+        const { [provider]: _removed, ...rest } = e;
         return rest;
       });
-      await load();
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : "set-budget fallito");
     } finally {
       setBusy((b) => ({ ...b, [provider]: false }));
     }
-  };
+  }, [reload]);
 
-  const recharge = async (provider: string) => {
-    if (!window.confirm) return; // safeguard, ma in pratica usiamo confirmDialog del parent se serve
+  const recharge = useCallback(async (provider: string) => {
     setBusy((b) => ({ ...b, [provider]: true }));
     try {
       const r = await fetch(`${API_BASE}/api/admin/providers/${provider}/recharge-budget`, {
@@ -89,13 +110,119 @@ export function ProviderBudget() {
         credentials: "include",
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      await load();
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : "recharge fallito");
     } finally {
       setBusy((b) => ({ ...b, [provider]: false }));
     }
-  };
+  }, [reload]);
+
+  // Ref agli editing correnti per evitare stale closure in setBudget.
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
+
+  const byProvider: Record<string, BudgetEntry> = {};
+  for (const it of items) byProvider[it.provider] = it;
+
+  return { items, byProvider, editing, setEditing, busy, error, setBudget, recharge, reload };
+}
+
+interface ProviderBudgetRowProps {
+  entry: BudgetEntry;
+  editing?: BudgetDraft;
+  busy: boolean;
+  setEditing: React.Dispatch<React.SetStateAction<Record<string, BudgetDraft>>>;
+  onSetBudget: (provider: string) => void;
+  onRecharge: (provider: string) => void;
+  /** compact = riga snella per la card provider (nasconde il nome, gia' nell'header). */
+  compact?: boolean;
+}
+
+/** Riga budget di un singolo provider (barra + Imposta/Ricarica). Presentazionale. */
+export function ProviderBudgetRow({
+  entry: it,
+  editing: draft,
+  busy,
+  setEditing,
+  onSetBudget,
+  onRecharge,
+  compact,
+}: ProviderBudgetRowProps) {
+  const budget = parseFloat(it.monthly_budget_usd);
+  const spent = parseFloat(it.spent_usd);
+  const remaining = parseFloat(it.remaining_usd);
+  // Un budget impostato (>0) e' il presupposto di "esaurito": senza budget
+  // (provider nuovo o non configurato) non c'e' esaurimento (allineato al
+  // provider_health_probe, che considera esausti solo i provider con budget>0).
+  const hasBudget = budget > 0;
+  const configured = it.configured !== false && hasBudget;
+  const pct = hasBudget ? Math.min(100, (spent / budget) * 100) : 0;
+  const exhausted = configured && it.is_exhausted;
+
+  return (
+    <div style={{ padding: compact ? "8px 0 0" : 12, border: compact ? "none" : "1px solid var(--color-border)", borderRadius: 6, background: compact ? "transparent" : "var(--color-bgInput)", opacity: hasBudget ? 1 : 0.85 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8, flexWrap: "wrap" }}>
+        <div style={{ fontWeight: 600, fontSize: compact ? 12 : 14 }}>
+          {compact ? "Budget mensile" : it.provider}
+          {exhausted ? (
+            <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "rgba(239,68,68,0.15)", color: "#c00" }}>
+              ESAURITO
+            </span>
+          ) : !hasBudget ? (
+            <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "var(--color-border)", color: "var(--color-textMuted)" }}>
+              NON IMPOSTATO
+            </span>
+          ) : null}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--color-textMuted)", fontFamily: "var(--font-mono)" }}>
+          {hasBudget
+            ? `$${remaining.toFixed(4)} / $${budget.toFixed(2)} (${(100 - pct).toFixed(1)}%)`
+            : "budget non impostato"}
+        </div>
+      </div>
+      <div style={{ height: 6, borderRadius: 3, background: "var(--color-border)", overflow: "hidden", marginBottom: 8 }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: pct > 90 ? "#c00" : pct > 70 ? "#f80" : "#0a0" }} />
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
+        {draft ? (
+          <>
+            <label>
+              Budget $: <input type="number" min="0" step="0.01" value={draft.budget} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, budget: e.target.value } }))} style={{ width: 80 }} />
+            </label>
+            <label>
+              Soglia $: <input type="number" min="0" step="0.01" value={draft.threshold} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, threshold: e.target.value } }))} style={{ width: 60 }} />
+            </label>
+            <button onClick={() => onSetBudget(it.provider)} disabled={busy} style={btnStyle("primary")}>
+              Salva
+            </button>
+            <button onClick={() => setEditing((s) => { const { [it.provider]: _removed, ...r } = s; return r; })} style={btnStyle("ghost")}>
+              Annulla
+            </button>
+          </>
+        ) : (
+          <>
+            <button onClick={() => setEditing((s) => ({ ...s, [it.provider]: { budget: hasBudget ? it.monthly_budget_usd : "", threshold: it.min_threshold_usd } }))} style={btnStyle("ghost")}>
+              Imposta budget
+            </button>
+            <button onClick={() => onRecharge(it.provider)} disabled={busy || !configured} style={btnStyle("ghost")} title={configured ? "Reset spent + period_start dopo ricarica reale" : "Imposta prima un budget"}>
+              Ricarica
+            </button>
+            <span style={{ color: "var(--color-textMuted)" }}>
+              {configured
+                ? `periodo dal ${new Date(it.period_start).toLocaleDateString("it")} · soglia $${parseFloat(it.min_threshold_usd).toFixed(2)}`
+                : "nessun budget impostato per questo provider"}
+            </span>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Pannello standalone "Budget mensile provider" (usato fuori dalle card). */
+export function ProviderBudget() {
+  const { items, editing, setEditing, busy, error, setBudget, recharge } = useProviderBudgets();
 
   return (
     <div style={{ marginTop: 40, borderTop: "1px solid var(--color-border)", paddingTop: 24 }}>
@@ -114,61 +241,17 @@ export function ProviderBudget() {
       )}
 
       <div style={{ display: "grid", gap: 12 }}>
-        {items.map((it) => {
-          const budget = parseFloat(it.monthly_budget_usd);
-          const spent = parseFloat(it.spent_usd);
-          const remaining = parseFloat(it.remaining_usd);
-          const pct = budget > 0 ? Math.min(100, (spent / budget) * 100) : 100;
-          const draft = editing[it.provider];
-          return (
-            <div key={it.provider} style={{ padding: 12, border: "1px solid var(--color-border)", borderRadius: 6, background: "var(--color-bgInput)" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <div style={{ fontWeight: 600, fontSize: 14 }}>
-                  {it.provider}
-                  {it.is_exhausted && (
-                    <span style={{ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "rgba(239,68,68,0.15)", color: "#c00" }}>
-                      ESAURITO
-                    </span>
-                  )}
-                </div>
-                <div style={{ fontSize: 12, color: "var(--color-textMuted)", fontFamily: "var(--font-mono)" }}>
-                  ${remaining.toFixed(4)} / ${budget.toFixed(2)} ({(100 - pct).toFixed(1)}%)
-                </div>
-              </div>
-              <div style={{ height: 6, borderRadius: 3, background: "var(--color-border)", overflow: "hidden", marginBottom: 8 }}>
-                <div style={{ height: "100%", width: `${pct}%`, background: pct > 90 ? "#c00" : pct > 70 ? "#f80" : "#0a0" }} />
-              </div>
-              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 12 }}>
-                {draft ? (
-                  <>
-                    <label>
-                      Budget $: <input type="number" min="0" step="0.01" value={draft.budget} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, budget: e.target.value } }))} style={{ width: 80 }} />
-                    </label>
-                    <label>
-                      Soglia $: <input type="number" min="0" step="0.01" value={draft.threshold} onChange={(e) => setEditing((s) => ({ ...s, [it.provider]: { ...draft, threshold: e.target.value } }))} style={{ width: 60 }} />
-                    </label>
-                    <button onClick={() => setBudget(it.provider)} disabled={busy[it.provider]} style={btnStyle("primary")}>
-                      Salva
-                    </button>
-                    <button onClick={() => setEditing((s) => { const { [it.provider]: _, ...r } = s; return r; })} style={btnStyle("ghost")}>
-                      Annulla
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button onClick={() => setEditing((s) => ({ ...s, [it.provider]: { budget: it.monthly_budget_usd, threshold: it.min_threshold_usd } }))} style={btnStyle("ghost")}>
-                      Imposta budget
-                    </button>
-                    <button onClick={() => recharge(it.provider)} disabled={busy[it.provider]} style={btnStyle("ghost")} title="Reset spent + period_start dopo ricarica reale">
-                      Ricarica
-                    </button>
-                    <span style={{ color: "var(--color-textMuted)" }}>periodo dal {new Date(it.period_start).toLocaleDateString("it")} · soglia ${parseFloat(it.min_threshold_usd).toFixed(2)}</span>
-                  </>
-                )}
-              </div>
-            </div>
-          );
-        })}
+        {items.map((it) => (
+          <ProviderBudgetRow
+            key={it.provider}
+            entry={it}
+            editing={editing[it.provider]}
+            busy={!!busy[it.provider]}
+            setEditing={setEditing}
+            onSetBudget={setBudget}
+            onRecharge={recharge}
+          />
+        ))}
       </div>
     </div>
   );
