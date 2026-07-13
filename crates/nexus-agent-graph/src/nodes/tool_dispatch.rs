@@ -1599,7 +1599,11 @@ mod tests {
     }
 
     #[test]
-    fn panel_enforcement_blocca_su_advisory_block() {
+    fn panel_enforcement_advisory_block_e_non_terminale() {
+        // Il verdetto "block" del consiglio e' ADVISORY (fix 7a311454): produce un
+        // enforcement (vincolo/nudge iniettato nel turno) ma NON ferma il run
+        // (terminal=false, declared_outcome=None). Prima era terminal=true e il veto di
+        // UNA figura chiudeva il task dopo la sola pianificazione ("Iniziero'...").
         let pending = vec![json!({"name": "dispatch_subagents"})];
         let results = vec![ToolResultBlock {
             tool_use_id: "t1".into(),
@@ -1619,16 +1623,15 @@ mod tests {
         }];
 
         let enforcement = panel_enforcement_from_results(&pending, &results)
-            .expect("advisory block deve produrre enforcement");
+            .expect("advisory block deve produrre un enforcement (vincolo advisory)");
         assert_eq!(enforcement.source, "advisory_synthesis");
-        assert!(enforcement.terminal);
-        assert_eq!(
-            enforcement
-                .declared_outcome
-                .as_ref()
-                .and_then(|v| v.get("outcome"))
-                .and_then(Value::as_str),
-            Some("blocked")
+        assert!(
+            !enforcement.terminal,
+            "il block del consiglio e' advisory: NON ferma il run"
+        );
+        assert!(
+            enforcement.declared_outcome.is_none(),
+            "nessuna pre-dichiarazione 'blocked' (instraderebbe subito a FinalGate)"
         );
     }
 
