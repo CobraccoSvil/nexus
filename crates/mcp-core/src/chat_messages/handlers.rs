@@ -305,6 +305,17 @@ pub async fn send_chat_message(
         }
     }
 
+    // RC-4 (regola N): il metadata `automationMode` del messaggio riflette il mode
+    // PERSISTITO sulla sessione (pool progetto), non un 'confirm' hardcoded. Se il body
+    // portava un mode esplicito e' gia' stato validato+persistito sopra (sez.
+    // automation_mode -> UPDATE chat_sessions); se era assente, resta il mode scelto
+    // dall'utente. Cosi' un RESEND che rilegge questo metadata eredita il mode reale
+    // (prima: body None -> "confirm" hardcoded -> il resend ereditava 'confirm' anche
+    // con la sessione su 'automatic').
+    let message_automation_mode = read_session_automation_mode(&session_pool, context.session_id)
+        .await
+        .as_str()
+        .to_string();
     let user_message_id = match insert_message_with_client_id(
         &state.db,
         context.session_id,
@@ -314,7 +325,7 @@ pub async fn send_chat_message(
         json!({
             "providerOverride": body.provider_override.clone(),
             "modelOverride": body.model_override.clone(),
-            "automationMode": body.automation_mode.clone().unwrap_or_else(|| "confirm".to_string()),
+            "automationMode": message_automation_mode,
             "attachments": body.attachments.clone(),
             // Marca i messaggi auto-generati dal sistema (es. auto-continuazione).
             // Il frontend filtra questi messaggi dalla UI per non confondere l'utente
@@ -1346,11 +1357,19 @@ pub async fn resend_chat_message(
     let automation_mode = if body.automation_mode.is_some() {
         parse_automation_mode(body.automation_mode.as_deref())
     } else {
-        parse_automation_mode(
-            source_metadata
-                .get("automationMode")
-                .and_then(Value::as_str),
-        )
+        // RC-4 (regola N): prima il mode del messaggio originale (replay del mode di
+        // allora); se assente/vuoto (messaggi vecchi col metadata 'confirm' spurio),
+        // FALLBACK al mode PERSISTITO sulla sessione (pool progetto), mai un default
+        // hardcoded. Cosi' un resend non degrada silenziosamente a Confirm.
+        match source_metadata
+            .get("automationMode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(v) => parse_automation_mode(Some(v)),
+            None => read_session_automation_mode(&msg_pool, session_id).await,
+        }
     };
     let attachments_raw = if body.attachments.is_empty() {
         serde_json::from_value::<Vec<ChatAttachmentRequest>>(
