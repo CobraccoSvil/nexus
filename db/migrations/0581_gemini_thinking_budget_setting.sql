@@ -1,4 +1,6 @@
--- 0579_gemini_thinking_budget_setting.sql
+-- 0581_gemini_thinking_budget_setting.sql
+-- (rinumerata da 0579 -> 0581 per collisione con 0579_observer_boot_grace di una
+--  sessione concorrente, gia' applicata come version 579)
 --
 -- Tuning latenza (segue 0578): il budget di thinking per i modelli a thinking
 -- OBBLIGATORIO (gemini-3, policy 'native') era ricavato da default_max_output_tokens

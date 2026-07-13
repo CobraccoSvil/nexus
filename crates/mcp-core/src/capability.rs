@@ -154,7 +154,7 @@ const MANDATORY_THINKING_BUDGET_FLOOR: u32 = 2048;
 const MANDATORY_THINKING_BUDGET_CEIL: u32 = 24576;
 
 /// Setting DB (regola G) del budget di thinking per i modelli 'native' (gemini-3),
-/// tunabile senza redeploy (cache 60s). Mig 0579 (default 4096). Un valore piu' basso
+/// tunabile senza redeploy (cache 60s). Mig 0581 (default 4096). Un valore piu' basso
 /// = gemini-3 ragiona abbastanza da non andare vuoto ma piu' VELOCE (meno timeout).
 const GEMINI_THINKING_BUDGET_KEY: &str = "orchestrator.gemini_thinking_budget";
 
