@@ -187,6 +187,7 @@ use crate::nodes::scale_control::{
     SCALE_CONTEXT_KEY, SCALE_HYSTERESIS_CFG_KEY, SCALE_MOVE_CACHE_KEY_KEY, SCALE_SIZING_CFG_KEY,
     SCALE_SIZING_OVERRIDES_KEY,
 };
+use crate::nodes::final_gate::FINAL_GATE_ESCALATION_KEY;
 use crate::nodes::stall_recovery::{stall_move_key, STALL_CONTEXT_KEY};
 use crate::routing::signals::{
     count_recent_request_port, detect_pending_steps_report_with, detect_recent_tool_error,
@@ -1048,6 +1049,64 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             }
         }
 
+        // ── CONSUMO trigger di ESCALATION da NON-CONVERGENZA del final_gate ───
+        // Rientro DEDICATO dal final_gate (`ToolUse` + flag [`FINAL_GATE_ESCALATION_KEY`]
+        // in extra, posato quando il gate esaurisce `max_cycles` con criteri OGGETTIVI
+        // ancora falliti): PRIMA di ridare il turno allo STESSO modello scadente,
+        // PROMUOVI a uno piu' capace via il PUNTO UNICO [`Self::maybe_escalate_nonconvergence`]
+        // (regola L: il gate non ha la porta di escalation, l'executor si'). Precede i
+        // cap generici (iteration_cap/budget) perche' e' un segnale gia' diagnosticato
+        // dal gate, non un runaway grezzo.
+        //   - Some -> delta di promozione (sticky + reset contatori + budget del turno
+        //     azzerato + flag CONSUMATO dentro maybe_escalate_nonconvergence); il
+        //     modello promosso riparte con cicli di gate freschi.
+        //   - None -> catena esaurita / tutti in cooldown (raro: il gate ha gia'
+        //     verificato auto_escalations < max, ma un cooldown puo' sopraggiungere):
+        //     chiusura FailedDiagnosed via il PUNTO UNICO [`Self::close_runaway`]
+        //     (backstop identico a budget_token). Il flag residuo e' innocuo (il run
+        //     chiude verso learner/gate-forced, non rientra in questo nodo).
+        if state
+            .extra
+            .get(FINAL_GATE_ESCALATION_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if let Some(delta) = self
+                .maybe_escalate_nonconvergence(
+                    state,
+                    iters_in,
+                    "final_gate_nonconvergence",
+                    ctx,
+                    mode,
+                    false,
+                )
+                .await
+            {
+                return Ok(delta);
+            }
+            let auto_escalations = state
+                .extra
+                .get("auto_escalations")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let close_text = "La verifica finale non e' stata superata entro i tentativi \
+previsti e non e' disponibile un modello piu' capace a cui passare (catena di \
+escalation esaurita). Interrompo: riformula la richiesta in modo piu' specifico \
+oppure riprova piu' tardi."
+                .to_string();
+            tracing::warn!(
+                target: "nexus_agent_graph::executor",
+                auto_escalations,
+                "non-convergenza final_gate: nessun modello di escalation disponibile -> chiusura (backstop)"
+            );
+            return Ok(self.close_runaway(
+                iters_in,
+                close_text,
+                "final_gate_nonconvergence_no_escalation",
+                json!({ "auto_escalations": auto_escalations }),
+            ));
+        }
+
         // ── Chiusura del turno DICHIARATIVO forzato (ADR 0034) ────────────────
         // Se un ramo di chiusura coordinata ha FORZATO la dichiarazione
         // (`outcome_declaration_forced`) e il modello HA dichiarato via
@@ -1246,6 +1305,20 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
             {
                 return Ok(delta);
             }
+            // Non-convergenza (regola H, simmetria col ramo budget_token): esaurito il
+            // giudice meta-reasoner, PRIMA del backstop di chiusura prova l'ESCALATION
+            // AGENTICA a un modello piu' capace (punto unico maybe_escalate_nonconvergence).
+            // `reset_iterations=true`: il cap E' sulle iterazioni, quindi il promosso
+            // riparte con un ciclo pieno (altrimenti rientrerebbe subito qui senza mai
+            // lavorare). None (catena esaurita / max escalation / cooldown) -> backstop
+            // sotto (bit-identico al pre-fix). Bound: auto_escalations + hard-cap
+            // token/costo.
+            if let Some(delta) = self
+                .maybe_escalate_nonconvergence(state, iters_in, "iteration_cap", ctx, mode, true)
+                .await
+            {
+                return Ok(delta);
+            }
             let cap_text = format!(
                 "Raggiunto il numero massimo di iterazioni ({}) senza completare il \
 compito. Interrompo per evitare un ciclo infinito: riformula la richiesta in modo \
@@ -1373,7 +1446,7 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
             // -> backstop sotto. Chiude il cerchio: la non-convergenza fa SALIRE il
             // modello invece di chiudere secco.
             if let Some(delta) = self
-                .maybe_escalate_nonconvergence(state, iters_in, "budget_token", ctx, mode)
+                .maybe_escalate_nonconvergence(state, iters_in, "budget_token", ctx, mode, false)
                 .await
             {
                 return Ok(delta);
@@ -4810,16 +4883,24 @@ impl ExecutorNode {
     }
 
     /// NON-CONVERGENZA -> ESCALATION AGENTICA (regola H, "niente di fisso"): quando
-    /// un limite di non-convergenza (budget token esaurito senza progresso) sta per
-    /// chiudere secco il run, prova PRIMA a promuovere a un modello piu' capace via
-    /// il punto unico [`pick_escalation_model`] (selezione tier+telemetria). Se ne
-    /// esiste uno sano, lo rende sticky, AZZERA il budget token cumulativo (il
-    /// promosso riparte con la sua quota, altrimenti ri-colpirebbe subito il tetto),
-    /// propaga il `current_tier` (aggiorna lo scale-controller) e RI-DA il turno
-    /// (`G1Escalated`). Bound da `auto_escalations < max_escalations` (anti-loop). Se
-    /// non c'e' un candidato (catena esaurita / gia' max escalation / tutti in
-    /// cooldown) -> `None`, il chiamante chiude col backstop. STESSO paradigma del
-    /// cap G1 (regola L), applicato al trigger di non-convergenza.
+    /// un limite di non-convergenza (budget token esaurito, cap iterazioni, o il
+    /// final_gate che non converge) sta per chiudere secco il run, prova PRIMA a
+    /// promuovere a un modello piu' capace via il punto unico [`pick_escalation_model`]
+    /// (selezione tier+telemetria). Se ne esiste uno sano, lo rende sticky, AZZERA il
+    /// budget token cumulativo (il promosso riparte con la sua quota, altrimenti
+    /// ri-colpirebbe subito il tetto), propaga il `current_tier` (aggiorna lo
+    /// scale-controller) e RI-DA il turno (`G1Escalated`). Bound da `auto_escalations
+    /// < max_escalations` (anti-loop). Se non c'e' un candidato (catena esaurita / gia'
+    /// max escalation / tutti in cooldown) -> `None`, il chiamante chiude col backstop.
+    /// STESSO paradigma del cap G1 (regola L), applicato ai trigger di non-convergenza
+    /// (PUNTO UNICO di escalation-da-non-convergenza: 3 call site delegano qui).
+    ///
+    /// `reset_iterations`: quando il limite che scatta E' il conteggio iterazioni
+    /// (ramo `iteration_cap`), azzera anche `iterations` cosi' il modello promosso
+    /// riparte con un ciclo pieno (simmetrico all'azzeramento del budget token);
+    /// altrimenti (`budget_token`/`final_gate_nonconvergence`, dove iterations NON e'
+    /// il limite) il conteggio prosegue (`iters_in + 1`). Il runaway resta bounded da
+    /// `auto_escalations` + hard-cap token/costo (mai resettati).
     async fn maybe_escalate_nonconvergence(
         &self,
         state: &AgentState,
@@ -4827,6 +4908,7 @@ impl ExecutorNode {
         reason: &'static str,
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
+        reset_iterations: bool,
     ) -> Option<OpaqueDelta> {
         let escal = state
             .extra
@@ -4891,6 +4973,11 @@ azioni concrete e mirate verso il completamento.",
         extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
         // Grazia post-escalation: finestra pulita sugli assi anti-loop per il promosso.
         extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        // Consumo del trigger di non-convergenza del final_gate (se presente): il
+        // modello promosso NON deve ri-scattare quel ramo al prossimo turno (sarebbe
+        // un'escalation a raffica senza che abbia lavorato). No-op per gli altri
+        // trigger (budget_token/iteration_cap non posano il flag).
+        extra_out.remove(FINAL_GATE_ESCALATION_KEY);
         Some(
             StateDelta {
                 messages: Some(vec![esc_nudge]),
@@ -4907,7 +4994,12 @@ azioni concrete e mirate verso il completamento.",
                 consecutive_text_only_turns: Some(Some(0)),
                 pending_tool_uses: Some(Some(vec![])),
                 stop_reason: Some(Some(StopReason::G1Escalated)),
-                iterations: Some(Some(iters_in + 1)),
+                // `reset_iterations` (trigger iteration_cap): azzera il conteggio cosi'
+                // il promosso riparte con un ciclo di iterazioni pieno — altrimenti
+                // rientrerebbe subito nel ramo cap senza mai lavorare (escalation a
+                // raffica). Simmetrico all'azzeramento del budget token sopra. Negli
+                // altri trigger iterations NON e' il limite -> prosegue (+1).
+                iterations: Some(Some(if reset_iterations { 0 } else { iters_in + 1 })),
                 extra: Some(extra_out),
                 ..Default::default()
             }

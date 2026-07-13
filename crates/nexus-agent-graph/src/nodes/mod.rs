@@ -32,7 +32,7 @@ pub use clarify_or_expand::{
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
 pub use final_gate::{
     build_error_files, count_build_errors, error_file_matches_touched, FinalGateConfig,
-    FinalGateNode,
+    FinalGateNode, FINAL_GATE_ESCALATION_KEY,
 };
 pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
 pub use planner::{

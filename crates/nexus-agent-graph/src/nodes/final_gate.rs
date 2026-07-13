@@ -117,6 +117,15 @@ static BUILD_ERROR_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 /// Config DB-driven del nodo final_gate, PASSATA (regola G: nessuna lettura DB
 /// nel nodo, nessun fallback hardcoded dentro la logica decisionale).
 ///
+/// Marcatore in `extra` posato dal final_gate quando la NON-CONVERGENZA del gate
+/// (criteri OGGETTIVI ancora falliti a `cycle >= max_cycles`) va promossa a un
+/// tentativo di ESCALATION di modello invece di chiudere secco. Consumato
+/// dall'executor al rientro (`ToolUse`), che delega al PUNTO UNICO di escalation
+/// [`crate::nodes::executor`]`::maybe_escalate_nonconvergence` (regola L): il
+/// gate NON ha la porta di escalation, l'executor si'. Segnale STRUTTURATO
+/// (regola M), non testo. Vedi `route_after_final_gate` (ToolUse -> executor).
+pub const FINAL_GATE_ESCALATION_KEY: &str = "final_gate_escalation_pending";
+
 /// Mappa i settings risolti dal brain (`orchestrator_config.get()` +
 /// `_resolve_build_command`/`_resolve_log_command`/`_build_timeout_s`/
 /// `_build_output_max_chars`, `final_gate.py:78-271`). I comandi build/log sono
@@ -190,6 +199,22 @@ pub struct FinalGateConfig {
     /// e LLM irraggiungibile): il gate lo DICHIARA nella narrazione live
     /// invece di verificare con comandi generici (esito onesto, regola M).
     pub verify_profile_missing: bool,
+    /// ESCALATION su non-convergenza del gate (`agent.final_gate.
+    /// escalate_on_nonconvergence`, default true). Quando il gate esaurisce
+    /// `max_cycles` con criteri OGGETTIVI ancora falliti — un modello scadente
+    /// che non ripara il codice entro i suoi tentativi — invece di chiudere
+    /// secco `FailedDiagnosed` cede il turno all'executor per PROMUOVERE a un
+    /// modello piu' capace (punto unico `maybe_escalate_nonconvergence`, regola
+    /// L). Bound da `auto_escalations < max_escalations` (anti-loop): esaurite le
+    /// promozioni il gate chiude come prima (backstop invariato). OFF ->
+    /// comportamento storico bit-identico (chiusura secca al cap).
+    pub escalate_on_nonconvergence: bool,
+    /// Tetto di escalation cumulative del run (`agent.executor.max_escalations`,
+    /// riusa la stessa chiave dell'executor: e' lo STESSO budget `auto_escalations`
+    /// condiviso, regola L/G). Il gate lo usa solo per decidere se cedere il turno:
+    /// oltre il tetto chiude secco (l'executor rifiuterebbe comunque via
+    /// `maybe_escalate_nonconvergence`, ma evitiamo il giro a vuoto).
+    pub max_escalations: i64,
 }
 
 /// Comando di UNO step della catena di verifica per-ambiente (ADR 0036),
@@ -236,6 +261,11 @@ impl Default for FinalGateConfig {
             structural_criteria_enabled: true,
             verify_steps: Vec::new(),
             verify_profile_missing: false,
+            // Trigger di escalation su non-convergenza del gate ON di default
+            // (il gap che chiudeva secco un modello scadente). max_escalations
+            // = safe-default dell'executor (3): stesso budget condiviso.
+            escalate_on_nonconvergence: true,
+            max_escalations: 3,
         }
     }
 }
@@ -969,6 +999,69 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 }
                 .into_opaque());
             }
+            // ── NON-CONVERGENZA -> ESCALATION di modello (regola H, "niente di
+            // fisso") ─────────────────────────────────────────────────────────
+            // Il gate ha esaurito `max_cycles` con criteri OGGETTIVI ancora
+            // falliti: il modello corrente non ripara il codice entro i suoi
+            // tentativi. Invece di chiudere secco `FailedDiagnosed` (che lascia
+            // il run su un modello scadente — il gap del run cc01d06d,
+            // mistral-medium-3 x52 iter, 0 escalation), CEDE il turno
+            // all'executor perche' PROMUOVA a un modello piu' capace tramite il
+            // PUNTO UNICO `maybe_escalate_nonconvergence` (il gate non ha la porta
+            // di escalation, l'executor si': regola L). Condizioni:
+            //   - flag ON;
+            //   - NON `forced_close` (abort anti-loop: chiudi, non ciclare);
+            //   - NON solo-`completion_confirmed` (oggettivi ok = lavoro DI FATTO
+            //     completo -> chiudi, non sprecare un'escalation; quel caso ha
+            //     gia' il turno di grazia sopra);
+            //   - `auto_escalations < max_escalations` (anti-loop: budget
+            //     condiviso con l'executor; esaurito -> chiudi secco sotto).
+            // `final_gate_cycle=0`: il modello promosso riparte con cicli freschi
+            // sul gate. Il flag `FINAL_GATE_ESCALATION_KEY` e' il segnale
+            // STRUTTURATO (regola M) che l'executor consuma al rientro (ToolUse).
+            let auto_escalations = state
+                .extra
+                .get("auto_escalations")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if self.cfg.escalate_on_nonconvergence
+                && !forced_close
+                && !Self::only_completion_confirmed_failed(&results)
+                && auto_escalations < self.cfg.max_escalations
+            {
+                tracing::warn!(
+                    target: "nexus_agent_graph::final_gate",
+                    cycle,
+                    max_cycles,
+                    auto_escalations,
+                    "final_gate: non-convergenza al cap -> cedo il turno all'executor per ESCALATION di modello"
+                );
+                crate::nodes::emit_phase_meta(
+                    ctx.emit.as_ref(),
+                    self.meta_steps.as_ref(),
+                    ctx.exec_mode(),
+                    "final_gate",
+                    "Verifica non superata al limite tentativi: promuovo a un modello piu' capace".to_string(),
+                    serde_json::json!({"cycle": cycle, "phase": "nonconvergence_escalation", "failed_criteria": Self::failed_criteria_meta(&results)}),
+                )
+                .await;
+                let block = Self::render_failed_block(state, cycle, max_cycles, &results);
+                let mut extra_out = state.extra.clone();
+                extra_out.insert(FINAL_GATE_ESCALATION_KEY.to_string(), serde_json::json!(true));
+                return Ok(StateDelta {
+                    messages: Some(vec![Message::Human {
+                        content: MessageContent::text(block),
+                    }]),
+                    // Cicli freschi per il modello promosso (il gate non ricade
+                    // subito al cap ereditando il conteggio del predecessore).
+                    final_gate_cycle: Some(Some(0)),
+                    stop_reason: Some(Some(StopReason::ToolUse)),
+                    pending_tool_uses: Some(Some(vec![])),
+                    extra: Some(extra_out),
+                    ..Default::default()
+                }
+                .into_opaque());
+            }
             tracing::warn!(
                 target: "nexus_agent_graph::final_gate",
                 forced_close,
@@ -1305,7 +1398,16 @@ mod tests {
             json!({"verdict": "fail"}),
         )]));
         // max_cycles=2, final_gate_cycle gia' a 1 -> cycle diventa 2 >= 2 -> cap.
-        let node = node_with(FinalGateConfig::default(), runner.clone());
+        // Escalation su non-convergenza OFF: backstop di chiusura secca (comportamento
+        // storico bit-identico). Con il flag ON il gate cederebbe all'executor (test
+        // cap_nonconvergenza_delega_escalation).
+        let node = node_with(
+            FinalGateConfig {
+                escalate_on_nonconvergence: false,
+                ..FinalGateConfig::default()
+            },
+            runner.clone(),
+        );
         let ctx = ctx_with(false);
         let mut st = software_state();
         st.final_gate_cycle = Some(1);
@@ -1313,6 +1415,88 @@ mod tests {
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(out.final_gate_passed, Some(false));
         assert_eq!(out.final_gate_cycle, Some(0));
+    }
+
+    // ── Ramo NON-CONVERGENZA -> escalation (mig 0577) ───────────────────────────
+
+    #[tokio::test]
+    async fn cap_nonconvergenza_delega_escalation() {
+        // Cap con criterio OGGETTIVO fallito + flag ON + escalation disponibile
+        // (auto_escalations=0 < max): il gate NON chiude secco, cede il turno
+        // all'executor posando FINAL_GATE_ESCALATION_KEY (segnale strutturato) e
+        // azzerando final_gate_cycle (cicli freschi per il modello promosso).
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![fail_result(
+            "no_orphan_imported",
+            json!({"verdict": "fail"}),
+        )]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with(false);
+        let mut st = software_state();
+        st.final_gate_cycle = Some(1); // cycle -> 2 == max_cycles
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(
+            out.final_gate_passed, None,
+            "la delega NON registra un verdetto negativo"
+        );
+        assert_eq!(
+            out.final_gate_cycle,
+            Some(0),
+            "il promosso riparte con cicli di gate freschi"
+        );
+        assert_eq!(
+            out.extra
+                .get(FINAL_GATE_ESCALATION_KEY)
+                .and_then(Value::as_bool),
+            Some(true),
+            "il flag di escalation e' posato per l'executor"
+        );
+        // Il verdetto fallito e' iniettato come contesto per il modello promosso.
+        assert_eq!(out.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cap_nonconvergenza_escalation_esaurita_chiude_secco() {
+        // Stesso scenario ma auto_escalations gia' al tetto (== max_escalations):
+        // budget di promozioni esaurito -> il gate chiude secco (backstop), niente
+        // flag, niente loop.
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![fail_result(
+            "no_orphan_imported",
+            json!({"verdict": "fail"}),
+        )]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with(false);
+        let mut st = software_state();
+        st.final_gate_cycle = Some(1);
+        st.extra
+            .insert("auto_escalations".to_string(), json!(3)); // == max_escalations default
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(out.final_gate_passed, Some(false));
+        assert_eq!(out.final_gate_cycle, Some(0));
+        assert!(
+            out.extra.get(FINAL_GATE_ESCALATION_KEY).is_none(),
+            "escalation esaurita: nessun flag posato"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_solo_completion_confirmed_non_delega() {
+        // Cap con SOLO completion_confirmed fallito (oggettivi ok) e grazia gia'
+        // spesa (cycle > max_cycles): il lavoro e' di fatto completo -> chiude, NON
+        // spreca un'escalation (esclusione !only_completion_confirmed_failed).
+        let runner = Arc::new(StubCriteriaRunner::with_results(vec![
+            ok_result("run_command"),
+            fail_result("completion_confirmed", json!({})),
+        ]));
+        let node = node_with(FinalGateConfig::default(), runner);
+        let ctx = ctx_with(false);
+        let mut st = software_state();
+        st.final_gate_cycle = Some(2); // cycle -> 3 > max_cycles: no grazia, no delega
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(out.final_gate_passed, Some(false));
+        assert!(out.extra.get(FINAL_GATE_ESCALATION_KEY).is_none());
     }
 
     // ── Ramo FAIL (re-executor) ─────────────────────────────────────────────────
