@@ -187,6 +187,21 @@ fn build_edges(
                     return NodeId::Supervisor;
                 }
             }
+            // ADR 0034: task_complete e' azione TERMINALE. Se il batch appena
+            // dispatchato ha dichiarato un esito onesto terminale (done/blocked/
+            // needs_input), il grafo va alla VERIFICA finale e NON rientra
+            // nell'executor: rientrare permetterebbe al modello di emettere altri
+            // tool e AUTO-INVALIDARE la dichiarazione (tool_dispatch.rs stale-
+            // invalidation), come nel run cc01d06d (task_complete(done) valido
+            // ignorato dal routing -> loop -> failed_diagnosed). `partial` resta
+            // sull'executor (dichiarazione onesta di lavoro incompleto: prosegue).
+            // Punto unico (regola L): declared_outcome_kind, nessuna nuova logica.
+            if matches!(
+                crate::routing::declared_outcome_kind(state).as_deref(),
+                Some("done") | Some("blocked") | Some("needs_input")
+            ) {
+                return NodeId::FinalGate;
+            }
             NodeId::Executor
         }),
     );
@@ -787,6 +802,40 @@ mod tests {
     }
 
     // ── Topologia: copertura edge ─────────────────────────────────────────────
+
+    #[test]
+    fn task_complete_terminale_va_a_final_gate_non_executor() {
+        // REGRESSIONE run cc01d06d: un task_complete(done) VALIDO deve portare al
+        // FINAL_GATE (verifica oggettiva), NON rientrare nell'executor -- dove il
+        // modello continuerebbe e auto-invaliderebbe la dichiarazione, ciclando fino
+        // a failed_diagnosed. Deterministico, nessun LLM.
+        let edges = build_edges(
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+        );
+        let edge = edges
+            .get(&NodeId::ToolDispatch)
+            .expect("edge tool_dispatch presente");
+
+        for outcome in ["done", "blocked", "needs_input"] {
+            let mut s = AgentState::default();
+            s.declared_outcome = Some(serde_json::json!({ "outcome": outcome, "summary": "x" }));
+            assert_eq!(
+                edge.resolve(&s),
+                NodeId::FinalGate,
+                "esito terminale '{outcome}' deve andare al final_gate, non all'executor"
+            );
+        }
+
+        // `partial` = lavoro incompleto onesto -> prosegue sull'executor.
+        let mut partial = AgentState::default();
+        partial.declared_outcome = Some(serde_json::json!({ "outcome": "partial" }));
+        assert_eq!(edge.resolve(&partial), NodeId::Executor);
+
+        // Nessuna dichiarazione -> executor come oggi (nessuna regressione).
+        assert_eq!(edge.resolve(&AgentState::default()), NodeId::Executor);
+    }
 
     #[test]
     fn topologia_copre_ogni_nodo_non_terminale() {

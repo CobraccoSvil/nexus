@@ -235,7 +235,9 @@ fn pending_is_task_complete(state: &AgentState) -> bool {
 
 /// Estrae `declared_outcome["outcome"]` (string) se lo stato lo dichiara.
 /// In Python: `state.get("declared_outcome")` e' un dict con chiave `outcome`.
-fn declared_outcome_kind(state: &AgentState) -> Option<String> {
+/// PUNTO UNICO (regola L) dell'esito dichiarato: usato da route_after_executor e
+/// dall'edge post-ToolDispatch (graph.rs) per trattare task_complete come terminale.
+pub(crate) fn declared_outcome_kind(state: &AgentState) -> Option<String> {
     state
         .declared_outcome
         .as_ref()
