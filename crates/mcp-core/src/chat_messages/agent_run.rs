@@ -5491,7 +5491,7 @@ async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool)
         let tname: String = r.try_get::<Option<String>, _>("tname").ok().flatten().unwrap_or_default();
         if WRITE_TOOLS.contains(&tname.as_str()) {
             if let Some(p) = r.try_get::<Option<String>, _>("fpath").ok().flatten() {
-                if is_code_file(&p) && !modified.iter().any(|m| *m == p) {
+                if is_code_file(&p) && !modified.contains(&p) {
                     modified.push(p);
                 }
             }

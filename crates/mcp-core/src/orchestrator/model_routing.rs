@@ -345,15 +345,24 @@ const FAILOVER_CANDIDATE_POOL: i64 = 512;
 /// tie-break d'ingresso della selezione pura. `Vec::new()` SOLO quando nessun
 /// candidato sano resta (rete davvero esaurita) o su errore di lettura
 /// (fail-open: il chiamante chiude `Error` onestamente).
+///
+/// FINESTRA-AWARE (regola L, coerenza con `chain_for`/`cross_provider`): `min_context_window`
+/// filtra i candidati con finestra strettamente minore (`context_window >= N`). Serve al
+/// failover per NON scegliere un sostituto meno capiente del modello caduto: un contesto gia'
+/// grande andrebbe in overflow (HTTP 413 Request too large) sul sostituto piccolo, come
+/// nell'incidente reale google/1M -> groq/128k -> 413 -> figura n/d. `0` = nessun filtro
+/// (comportamento storico). Il chiamante ([`failover_provider`]) fa fail-open ritentando con
+/// `0` se il vincolo svuota il pool (failover degradato > nessun failover).
 pub(crate) async fn agentic_failover_candidates(
     db: &PgPool,
     exclude: &[String],
+    min_context_window: i64,
 ) -> Vec<(String, String, Option<String>)> {
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: true,
         require_thinking_non_exclude: true,
         capability: None,
-        min_context_window: 0,
+        min_context_window,
         exclude_providers: exclude,
         apply_cooldown: true,
         only_provider: None,

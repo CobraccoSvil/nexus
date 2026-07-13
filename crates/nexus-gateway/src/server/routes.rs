@@ -574,6 +574,7 @@ impl CallFailure {
             class: match kind {
                 ProviderErrorKind::Billing => "billing",
                 ProviderErrorKind::ClientError => "client_error",
+                ProviderErrorKind::ContextTooLong => "context_too_long",
                 ProviderErrorKind::Transient => "transient",
             },
             status: http.map(|h| h.status),
@@ -724,6 +725,21 @@ async fn complete_with_retry(
                             code = code,
                             "gateway: il provider ha rifiutato la richiesta \
                              (errore client, niente retry/cooldown)"
+                        );
+                        return Err(failure);
+                    }
+                    ProviderErrorKind::ContextTooLong => {
+                        // 413 request_too_large: ritentare lo STESSO provider e' inutile
+                        // e NON va messo in cooldown (il provider e' sano, e' la
+                        // richiesta a superare la sua finestra/limite). Torniamo l'errore
+                        // con class "context_too_long": il motore (allows_cross_provider_failover,
+                        // causa != ClientError) ripieghera' su un provider a finestra piu'
+                        // grande invece di chiudere n/d.
+                        tracing::warn!(
+                            provider = name,
+                            status = failure.status,
+                            "gateway: richiesta troppo grande per il provider (413) -> niente \
+                             retry/cooldown, il motore fara' failover cross-provider"
                         );
                         return Err(failure);
                     }
@@ -1097,6 +1113,8 @@ async fn build_sse_stream(
                     ProviderErrorKind::Billing => state.cooldown.mark_billing(name, Some(msg.clone())),
                     // Colpa nostra/config o modello non abilitato: niente cooldown.
                     ProviderErrorKind::ClientError => {}
+                    // 413 troppo grande per il provider: sano, niente cooldown.
+                    ProviderErrorKind::ContextTooLong => {}
                     ProviderErrorKind::Transient => {
                         state.cooldown.mark_transient(name, Some(msg.clone()))
                     }

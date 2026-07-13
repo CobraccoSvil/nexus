@@ -997,6 +997,7 @@ export const SWITCH_CAUSE_LABELS: Record<string, string> = {
   cooldown: "provider in cooldown (indisponibilita' temporanea)",
   billing: "credito esaurito sul provider",
   client_error: "il provider ha rifiutato la richiesta (errore lato provider)",
+  context_too_long: "richiesta troppo grande per il provider (passaggio a finestra piu' ampia)",
   policy_tier_excluded: "contenuto riservato: provider escluso dalla policy (sensitivity tier)",
 };
 

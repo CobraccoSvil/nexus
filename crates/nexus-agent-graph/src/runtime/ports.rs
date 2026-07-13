@@ -77,6 +77,13 @@ pub enum ProviderFailureCause {
     /// come indisponibilita' del provider PER QUESTA richiesta -> failover
     /// cross-provider (a differenza di `ClientError`, che non ripiega).
     EmptyCompletion,
+    /// La richiesta e' troppo grande PER QUESTO provider (HTTP 413 request_too_large
+    /// / context/request-size limit): ritentare lo STESSO provider e' inutile (come
+    /// `ClientError`), ma un provider a finestra/limite piu' grande la accetterebbe.
+    /// Quindi e' cross-provider-recuperabile -> failover (a differenza di
+    /// `ClientError`). Incidente reale: groq/128k dopo google/1M -> 413 -> niente
+    /// secondo failover -> figura consiglio n/d.
+    ContextTooLong,
     /// Non determinabile dai segnali disponibili.
     Unknown,
 }
@@ -90,6 +97,7 @@ impl ProviderFailureCause {
             Self::ClientError => "client_error",
             Self::PolicyTierExcluded => "policy_tier_excluded",
             Self::EmptyCompletion => "empty_completion",
+            Self::ContextTooLong => "context_too_long",
             Self::Unknown => "unknown",
         }
     }
@@ -1978,6 +1986,11 @@ mod tests {
         assert!(ProviderUnavailableInfo::new(ProviderFailureCause::EmptyCompletion, "vuoto")
             .allows_cross_provider_failover(&codes));
         assert!(ProviderUnavailableInfo::new(ProviderFailureCause::Billing, "credito")
+            .allows_cross_provider_failover(&codes));
+        // ContextTooLong (413 request_too_large): cross-provider recuperabile (un
+        // provider a finestra/limite piu' grande accetta) -> failover consentito,
+        // NON serve un code in whitelist (non e' ClientError).
+        assert!(ProviderUnavailableInfo::new(ProviderFailureCause::ContextTooLong, "413")
             .allows_cross_provider_failover(&codes));
         // ClientError con code recuperabile (google) -> failover consentito.
         assert!(ProviderUnavailableInfo::new(ProviderFailureCause::ClientError, "400")

@@ -3535,6 +3535,10 @@ passo a {}/{}",
                                     "{provider} non ha prodotto output: passo a {}/{}",
                                     pick.provider, pick.model
                                 ),
+                                Cause::ContextTooLong => format!(
+                                    "Richiesta troppo grande per {provider}: passo a {}/{}",
+                                    pick.provider, pick.model
+                                ),
                                 Cause::Cooldown | Cause::Unknown => format!(
                                     "Provider {provider} non disponibile: passo a {}/{}",
                                     pick.provider, pick.model
@@ -3581,6 +3585,11 @@ tu, su un provider sano: esegui il prossimo step concreto del compito."
                                     "Il provider precedente ha risposto senza produrre output \
 (nessun testo ne' azione: budget consumato nel ragionamento). Riprendi tu, sul nuovo provider: \
 esegui il prossimo step concreto del compito."
+                                }
+                                Cause::ContextTooLong => {
+                                    "Il provider precedente ha rifiutato la richiesta perche' \
+troppo grande per la sua finestra/limite (non un cooldown). Riprendi tu, sul nuovo provider a \
+finestra piu' ampia: esegui il prossimo step concreto del compito."
                                 }
                                 Cause::Cooldown | Cause::Unknown => {
                                     "Il provider precedente non e' disponibile (in cooldown). \

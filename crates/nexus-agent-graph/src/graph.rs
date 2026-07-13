@@ -819,8 +819,10 @@ mod tests {
             .expect("edge tool_dispatch presente");
 
         for outcome in ["done", "blocked", "needs_input"] {
-            let mut s = AgentState::default();
-            s.declared_outcome = Some(serde_json::json!({ "outcome": outcome, "summary": "x" }));
+            let s = AgentState {
+                declared_outcome: Some(serde_json::json!({ "outcome": outcome, "summary": "x" })),
+                ..Default::default()
+            };
             assert_eq!(
                 edge.resolve(&s),
                 NodeId::FinalGate,
@@ -829,8 +831,10 @@ mod tests {
         }
 
         // `partial` = lavoro incompleto onesto -> prosegue sull'executor.
-        let mut partial = AgentState::default();
-        partial.declared_outcome = Some(serde_json::json!({ "outcome": "partial" }));
+        let partial = AgentState {
+            declared_outcome: Some(serde_json::json!({ "outcome": "partial" })),
+            ..Default::default()
+        };
         assert_eq!(edge.resolve(&partial), NodeId::Executor);
 
         // Nessuna dichiarazione -> executor come oggi (nessuna regressione).

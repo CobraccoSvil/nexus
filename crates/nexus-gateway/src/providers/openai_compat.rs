@@ -1049,6 +1049,13 @@ pub enum ProviderErrorKind {
     /// NON aiuta e mettere in cooldown il PROVIDER e' sbagliato (il problema e' la
     /// singola richiesta o il singolo modello). NIENTE retry, NIENTE cooldown.
     ClientError,
+    /// Richiesta troppo grande per QUESTO provider (413 request_too_large: la
+    /// richiesta supera la finestra/limite del provider). Come `ClientError`,
+    /// ritentare lo STESSO provider e' inutile e NON va messo in cooldown (il
+    /// provider e' sano). MA un provider a finestra/limite piu' grande accetterebbe
+    /// la stessa richiesta -> a livello motore e' cross-provider-recuperabile
+    /// (failover), a differenza di un `ClientError` generico che rifallirebbe ovunque.
+    ContextTooLong,
     /// Transitorio (429 rate-limit, 5xx, timeout, connessione) o ignoto:
     /// ritentabile con backoff. Solo dopo l'esaurimento dei retry si applica un
     /// cooldown breve (transient).
@@ -1200,14 +1207,17 @@ fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind
     }
     // Mappatura verificata sulle tabelle ufficiali (Anthropic/OpenAI, 2026):
     //   402 billing_error (Anthropic) -> Billing;
-    //   400/401/403/404/413/422 (+ altri 4xx non ritentabili) -> ClientError:
-    //     ritentare NON aiuta (413 request_too_large: la richiesta e' troppo
-    //     grande, un retro identico rifallisce);
+    //   400/401/403/404/422 (+ altri 4xx non ritentabili) -> ClientError:
+    //     ritentare NON aiuta (fallirebbe su qualunque provider);
+    //   413 request_too_large -> ContextTooLong: retry STESSO provider inutile (come
+    //     ClientError), ma cross-provider-recuperabile (un provider a finestra piu'
+    //     grande accetta) -> il motore fa failover invece di chiudere;
     //   408/425/429 (timeout/too-early/rate-limit), 5xx e 529 overloaded (Anthropic)
     //     -> Transient (ritentabili).
     match status {
         402 => ProviderErrorKind::Billing,
-        400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 413 | 415 | 422 => {
+        413 => ProviderErrorKind::ContextTooLong,
+        400 | 401 | 403 | 404 | 405 | 406 | 409 | 410 | 415 | 422 => {
             ProviderErrorKind::ClientError
         }
         _ => ProviderErrorKind::Transient,
@@ -2355,10 +2365,11 @@ mod tests {
             classify_provider_error(&http(404, None)),
             ProviderErrorKind::ClientError
         );
-        // 413 request_too_large (OpenAI/Anthropic): non ritentabile -> ClientError.
+        // 413 request_too_large: retry stesso provider inutile ma cross-provider
+        // recuperabile -> ContextTooLong (il motore fa failover, non chiude n/d).
         assert_eq!(
             classify_provider_error(&http(413, None)),
-            ProviderErrorKind::ClientError
+            ProviderErrorKind::ContextTooLong
         );
         // 429 rate-limit puro (senza codice credito) -> Transient (ritentabile).
         assert_eq!(

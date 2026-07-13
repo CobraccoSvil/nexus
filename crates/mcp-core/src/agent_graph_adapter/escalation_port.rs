@@ -379,9 +379,41 @@ impl EscalationPort for PgEscalationPort {
         current_tier: Option<&str>,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError> {
-        let pool =
-            crate::orchestrator::model_routing::agentic_failover_candidates(&self.db, exclude)
-                .await;
+        // FINESTRA-AWARE (regola L/H, coerenza con `chain_for`/`cross_provider`): il
+        // sostituto NON deve avere una finestra piu' piccola del modello caduto,
+        // altrimenti un contesto gia' grande andrebbe in overflow sul sostituto
+        // (incidente reale: cade google/gemini-3.1-pro-preview 1M, il vecchio failover
+        // window-blind sceglieva groq/llama-3.3-70b 128k -> HTTP 413 Request too large
+        // -> sub-run figura chiuso "senza esito positivo" -> n/d). La finestra corrente
+        // e' letta dal catalog (punto unico `model_window`); `0` se il modello caduto non
+        // e' in catalog -> filtro inattivo (fail-open storico).
+        let current_window = match (current_provider, current_model) {
+            (Some(p), Some(m)) => self.model_window(p, m).await,
+            _ => 0,
+        };
+        let mut pool = crate::orchestrator::model_routing::agentic_failover_candidates(
+            &self.db,
+            exclude,
+            current_window,
+        )
+        .await;
+        // FAIL-OPEN finestra: se il modello caduto era gia' il piu' capiente e nessun
+        // candidato regge la sua finestra, il vincolo svuoterebbe il pool -> ritenta
+        // senza vincolo. Un failover degradato (finestra piu' piccola) e' meglio di
+        // nessun failover (chiusura Error): il caso overflow e' un rischio, la chiusura
+        // secca e' una certezza.
+        if pool.is_empty() && current_window > 0 {
+            tracing::info!(
+                target: "nexus_mcp_core::escalation_port",
+                current_window,
+                "failover_provider: nessun candidato regge la finestra corrente, \
+                 ritento senza vincolo finestra (failover degradato > nessun failover)"
+            );
+            pool = crate::orchestrator::model_routing::agentic_failover_candidates(
+                &self.db, exclude, 0,
+            )
+            .await;
+        }
         if pool.is_empty() {
             return Ok(None);
         }
@@ -942,5 +974,104 @@ mod tests {
             .await
             .expect("fail-open");
         assert!(pick.is_none());
+    }
+
+    /// FINESTRA-AWARE (incidente reale groq 413): il sostituto con finestra
+    /// STRETTAMENTE minore del modello caduto e' escluso, cosi' un contesto gia'
+    /// grande non va in overflow (HTTP 413) sul sostituto. Cade google/1M; groq/128k
+    /// e' troppo piccolo (escluso), deepseek/1M regge (scelto).
+    #[sqlx::test]
+    async fn failover_esclude_sostituto_con_finestra_piu_piccola(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog_window(
+            &pool,
+            &[
+                (
+                    "google",
+                    "gemini-3.1-pro-preview",
+                    "heavy",
+                    2.0,
+                    true,
+                    true,
+                    1_000_000,
+                ),
+                // finestra piccola: reggerebbe la selezione salute/tier ma manderebbe
+                // in overflow un contesto grande -> deve essere escluso dal failover.
+                (
+                    "groq",
+                    "llama-3.3-70b-versatile",
+                    "medium",
+                    0.5,
+                    true,
+                    true,
+                    128_000,
+                ),
+                (
+                    "deepseek",
+                    "deepseek-v4-pro",
+                    "high",
+                    1.0,
+                    true,
+                    true,
+                    1_000_000,
+                ),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-3.1-pro-preview"),
+                Some("heavy"),
+                &["google".to_string()],
+            )
+            .await
+            .expect("fail-open")
+            .expect("un sostituto abbastanza capiente esiste");
+        assert_eq!(
+            pick.provider, "deepseek",
+            "groq (128k < 1M corrente) escluso dal failover finestra-aware"
+        );
+    }
+
+    /// FAIL-OPEN finestra: se il modello caduto era gia' il piu' capiente e nessun
+    /// candidato regge la sua finestra, il vincolo svuoterebbe il pool -> si ritenta
+    /// senza vincolo (un failover degradato > nessun failover / chiusura Error).
+    #[sqlx::test]
+    async fn failover_finestra_fail_open_se_nessuno_regge(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog_window(
+            &pool,
+            &[
+                ("google", "gemini-big", "heavy", 2.0, true, true, 1_000_000),
+                // unico sostituto disponibile: finestra piu' piccola della corrente.
+                (
+                    "deepseek",
+                    "deepseek-small",
+                    "high",
+                    1.0,
+                    true,
+                    true,
+                    128_000,
+                ),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-big"),
+                Some("heavy"),
+                &["google".to_string()],
+            )
+            .await
+            .expect("fail-open")
+            .expect("fail-open finestra: si ripiega sull'unico sostituto disponibile");
+        assert_eq!(
+            pick.provider, "deepseek",
+            "nessun candidato regge la finestra -> ritento senza vincolo"
+        );
     }
 }

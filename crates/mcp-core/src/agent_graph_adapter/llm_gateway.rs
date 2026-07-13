@@ -201,6 +201,11 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 Some("cooldown") | Some("transient") => ProviderFailureCause::Cooldown,
                 Some("billing") | Some("cooldown_billing") => ProviderFailureCause::Billing,
                 Some("client_error") => ProviderFailureCause::ClientError,
+                // 413 request_too_large: ritentare lo stesso provider e' inutile, ma
+                // un provider a finestra/limite piu' grande accetta -> failover
+                // cross-provider (ramo else != ClientError in allows_cross_provider_failover),
+                // invece di chiudere n/d. Simmetrico a `empty_completion`.
+                Some("context_too_long") => ProviderFailureCause::ContextTooLong,
                 // 200 degenere (content vuoto, zero tool-call, finish non
                 // terminale): il provider e' sano ma il turno e' improduttivo.
                 // Causa dedicata cosi' l'executor RIPIEGA cross-provider (ramo
