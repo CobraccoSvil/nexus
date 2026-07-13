@@ -1165,11 +1165,20 @@ pub trait EscalationPort: Send + Sync {
     /// chiusura `Error` onesta). FAIL-OPEN: un guasto di lettura -> `Ok(None)`
     /// (nessun failover, il chiamante chiude come oggi), MAI un `PortError` nel
     /// flusso normale. SOLA LETTURA: nessun gate `mode`.
+    ///
+    /// `cause` = causa TIPIZZATA del fallimento del provider corrente (regola M).
+    /// L'impl la usa per il filtro finestra CAUSA-AWARE: solo per
+    /// [`ProviderFailureCause::ContextTooLong`] il sostituto deve avere una finestra
+    /// >= a quella del caduto (413 = richiesta troppo grande per QUESTA finestra); per
+    /// ogni altra causa (EmptyCompletion/Cooldown/Billing/ClientError) la finestra e'
+    /// IRRILEVANTE e non va filtrata (altrimenti un empty su un modello a finestra
+    /// enorme escluderebbe i sostituti a finestra minore, pur validi).
     async fn failover_provider(
         &self,
         current_provider: Option<&str>,
         current_model: Option<&str>,
         current_tier: Option<&str>,
+        cause: ProviderFailureCause,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError>;
 }

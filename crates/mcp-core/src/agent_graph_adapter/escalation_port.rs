@@ -35,7 +35,9 @@ use nexus_agent_graph::decisions::escalation::{
     pick_failover_model, ChainEntry, CrossProviderCandidate, EscalationCandidate,
 };
 use nexus_agent_graph::decisions::governance::ModelTelemetry;
-use nexus_agent_graph::runtime::ports::{EscalationInputs, EscalationPort, ExecMode, PortError};
+use nexus_agent_graph::runtime::ports::{
+    EscalationInputs, EscalationPort, ExecMode, PortError, ProviderFailureCause,
+};
 
 use crate::governance_telemetry::{load_governance_policy, load_model_telemetry};
 use crate::internal_routing::{resolve_purpose_model_db, PurposeResolution};
@@ -377,19 +379,26 @@ impl EscalationPort for PgEscalationPort {
         current_provider: Option<&str>,
         current_model: Option<&str>,
         current_tier: Option<&str>,
+        cause: ProviderFailureCause,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError> {
-        // FINESTRA-AWARE (regola L/H, coerenza con `chain_for`/`cross_provider`): il
-        // sostituto NON deve avere una finestra piu' piccola del modello caduto,
-        // altrimenti un contesto gia' grande andrebbe in overflow sul sostituto
-        // (incidente reale: cade google/gemini-3.1-pro-preview 1M, il vecchio failover
-        // window-blind sceglieva groq/llama-3.3-70b 128k -> HTTP 413 Request too large
-        // -> sub-run figura chiuso "senza esito positivo" -> n/d). La finestra corrente
-        // e' letta dal catalog (punto unico `model_window`); `0` se il modello caduto non
-        // e' in catalog -> filtro inattivo (fail-open storico).
-        let current_window = match (current_provider, current_model) {
-            (Some(p), Some(m)) => self.model_window(p, m).await,
-            _ => 0,
+        // FINESTRA-AWARE CAUSA-AWARE (regola L/H/M): il filtro finestra ha senso SOLO per
+        // ContextTooLong (413 = la richiesta e' troppo grande per la finestra del caduto;
+        // il sostituto deve averne una >= altrimenti ri-fallisce). Per OGNI altra causa
+        // (EmptyCompletion, Cooldown, Billing, ClientError) la finestra e' irrilevante e
+        // filtrarla e' un BUG: un empty-completion su gemini-3.1-pro-preview (finestra 1M)
+        // escluderebbe deepseek/anthropic (1M esatto o meno) come sostituti pur validi ->
+        // failover mancato, il run cicla sul provider vuoto. Solo per ContextTooLong si
+        // legge la finestra del caduto (punto unico `model_window`; `0` se non in catalog
+        // -> filtro inattivo, fail-open). Incidente 413: cade google/1M, il vecchio failover
+        // window-blind sceglieva groq/128k -> 413 di nuovo; il filtro (solo qui) lo evita.
+        let current_window = if matches!(cause, ProviderFailureCause::ContextTooLong) {
+            match (current_provider, current_model) {
+                (Some(p), Some(m)) => self.model_window(p, m).await,
+                _ => 0,
+            }
+        } else {
+            0
         };
         let mut pool = crate::orchestrator::model_routing::agentic_failover_candidates(
             &self.db,
@@ -863,6 +872,7 @@ mod tests {
                 Some("google"),
                 Some("gemini-3.5-flash"),
                 Some("heavy"),
+                ProviderFailureCause::EmptyCompletion,
                 &["google".to_string(), "mistral".to_string()],
             )
             .await
@@ -901,6 +911,7 @@ mod tests {
                 Some("google"),
                 Some("g"),
                 Some("heavy"),
+                ProviderFailureCause::EmptyCompletion,
                 &["google".to_string()],
             )
             .await
@@ -927,6 +938,7 @@ mod tests {
                 Some("google"),
                 Some("gemini-heavy"),
                 Some("heavy"),
+                ProviderFailureCause::EmptyCompletion,
                 &["google".to_string()],
             )
             .await
@@ -956,6 +968,7 @@ mod tests {
                 Some("google"),
                 Some("gemini-heavy"),
                 None,
+                ProviderFailureCause::EmptyCompletion,
                 &["google".to_string()],
             )
             .await
@@ -970,7 +983,13 @@ mod tests {
         create_schema(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
         let pick = port
-            .failover_provider(Some("google"), Some("g"), Some("heavy"), &[])
+            .failover_provider(
+                Some("google"),
+                Some("g"),
+                Some("heavy"),
+                ProviderFailureCause::EmptyCompletion,
+                &[],
+            )
             .await
             .expect("fail-open");
         assert!(pick.is_none());
@@ -1024,6 +1043,7 @@ mod tests {
                 Some("google"),
                 Some("gemini-3.1-pro-preview"),
                 Some("heavy"),
+                ProviderFailureCause::ContextTooLong,
                 &["google".to_string()],
             )
             .await
@@ -1064,6 +1084,7 @@ mod tests {
                 Some("google"),
                 Some("gemini-big"),
                 Some("heavy"),
+                ProviderFailureCause::ContextTooLong,
                 &["google".to_string()],
             )
             .await
@@ -1072,6 +1093,59 @@ mod tests {
         assert_eq!(
             pick.provider, "deepseek",
             "nessun candidato regge la finestra -> ritento senza vincolo"
+        );
+    }
+
+    /// CAUSA-AWARE (regressione empty-completion, run 9e292d5b): un EmptyCompletion su
+    /// un modello a finestra ENORME (gemini-3.1-pro 1M) NON deve escludere i sostituti a
+    /// finestra minore. Prima (Fix A window-blind su ogni causa) il filtro 1M avrebbe
+    /// potuto escludere un deepseek 128k -> failover mancato -> il run cicla sul provider
+    /// vuoto (9 turni, 0 escalation). Con la causa-awareness, per EmptyCompletion il filtro
+    /// finestra e' OFF e deepseek-small viene scelto.
+    #[sqlx::test]
+    async fn failover_empty_completion_non_filtra_la_finestra(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog_window(
+            &pool,
+            &[
+                (
+                    "google",
+                    "gemini-3.1-pro-preview",
+                    "heavy",
+                    2.0,
+                    true,
+                    true,
+                    1_000_000,
+                ),
+                // finestra molto piu' piccola: con ContextTooLong sarebbe escluso, con
+                // EmptyCompletion NO (la finestra e' irrilevante per un turno vuoto).
+                (
+                    "deepseek",
+                    "deepseek-small",
+                    "high",
+                    1.0,
+                    true,
+                    true,
+                    128_000,
+                ),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-3.1-pro-preview"),
+                Some("heavy"),
+                ProviderFailureCause::EmptyCompletion,
+                &["google".to_string()],
+            )
+            .await
+            .expect("fail-open")
+            .expect("EmptyCompletion: deepseek-small e' un sostituto valido");
+        assert_eq!(
+            pick.provider, "deepseek",
+            "EmptyCompletion NON filtra la finestra: il sostituto piu' piccolo e' eleggibile"
         );
     }
 }

@@ -845,6 +845,7 @@ pub mod test_doubles {
             _current_provider: Option<&str>,
             _current_model: Option<&str>,
             _current_tier: Option<&str>,
+            _cause: ProviderFailureCause,
             exclude: &[String],
         ) -> Result<Option<CrossProviderCandidate>, PortError> {
             self.failover_seen

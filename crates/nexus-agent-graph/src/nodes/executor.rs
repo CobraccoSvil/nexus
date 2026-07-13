@@ -3496,6 +3496,10 @@ della finestra {effective_window} del modello {provider}/{model}"
                                 Some(&provider),
                                 Some(&model),
                                 state.current_tier.as_deref(),
+                                // Causa tipizzata (regola M): l'impl filtra la finestra
+                                // SOLO per ContextTooLong; per EmptyCompletion & co. non
+                                // deve escludere sostituti a finestra minore.
+                                pu.cause,
                                 &tried,
                             )
                             .await
