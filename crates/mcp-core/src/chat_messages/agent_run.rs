@@ -2644,14 +2644,18 @@ pub(crate) async fn spawn_agent_run(
         }
         (None, None) => initial_msg,
     };
-    let pre_run_advisory_synthesis = multi_provider_block
-        .as_ref()
-        .and_then(|o| o.advisory_synthesis_value());
-    let pre_run_advisory_source = if pre_run_advisory_synthesis.is_some() {
-        Some("multi_provider_synthesis")
-    } else {
-        None
-    };
+    // Enforcement strutturato a valle (regola M): seedano `pre_run_advisory_synthesis`
+    // ENTRAMBI i panel — consiglio e multi-provider — col verdetto PIU' RESTRITTIVO
+    // che vince (asimmetria chiusa: prima solo il multi-provider era hard-enforced,
+    // un `block` del consiglio restava sola guida testuale).
+    let (pre_run_advisory_synthesis, pre_run_advisory_source) = select_pre_run_advisory(
+        council_outcome
+            .as_ref()
+            .and_then(|o| o.advisory_synthesis_value()),
+        multi_provider_block
+            .as_ref()
+            .and_then(|o| o.advisory_synthesis_value()),
+    );
     let system_text = if council_block.is_some() {
         crate::prompt_templates::strip_council_directive(&system_text)
     } else {
@@ -5243,6 +5247,38 @@ fn build_tool_runner_deps(state: &AppState) -> crate::tool_runner_server::ToolRu
 /// Non ricorsivo: le figure girano come sub-run via `run_single_subagent` (grafo
 /// nativo), NON ripassano da `spawn_agent_run`, quindi il pre-step scatta solo per il
 /// run primario della chat.
+/// Sceglie quale sintesi (consiglio vs multi-provider) seedare come
+/// `pre_run_advisory_synthesis` per l'enforcement al tool_dispatch: vince il
+/// verdetto PIU' RESTRITTIVO (block/inconclusive > proceed_with_changes >
+/// proceed/none). Cosi' un `block` di UNO QUALSIASI dei due panel ferma
+/// l'esecuzione (asimmetria chiusa). Su parita' di rango preferisce il consiglio
+/// (panel di dominio, requisiti piu' ricchi). Il `source` seleziona il messaggio
+/// di enforcement (regola M: solo "multi_provider_synthesis" e' speciale).
+fn select_pre_run_advisory(
+    council: Option<serde_json::Value>,
+    multi_provider: Option<serde_json::Value>,
+) -> (Option<serde_json::Value>, Option<&'static str>) {
+    fn rank(v: &serde_json::Value) -> u8 {
+        match v.get("verdict").and_then(serde_json::Value::as_str) {
+            Some("block") | Some("inconclusive") => 3,
+            Some("proceed_with_changes") => 1,
+            _ => 0,
+        }
+    }
+    match (council, multi_provider) {
+        (Some(c), Some(m)) => {
+            if rank(&m) > rank(&c) {
+                (Some(m), Some("multi_provider_synthesis"))
+            } else {
+                (Some(c), Some("council_synthesis"))
+            }
+        }
+        (Some(c), None) => (Some(c), Some("council_synthesis")),
+        (None, Some(m)) => (Some(m), Some("multi_provider_synthesis")),
+        (None, None) => (None, None),
+    }
+}
+
 async fn maybe_convene_council(
     state: &AppState,
     run_pool: &PgPool,
@@ -5958,7 +5994,40 @@ pub(crate) async fn run_shadow_for_state(
 
 #[cfg(test)]
 mod tests_review_gate {
-    use super::is_code_file;
+    use super::{is_code_file, select_pre_run_advisory};
+    use serde_json::json;
+
+    fn synth(verdict: &str) -> serde_json::Value {
+        json!({ "verdict": verdict })
+    }
+
+    #[test]
+    fn select_pre_run_advisory_vince_il_piu_restrittivo() {
+        // block del CONSIGLIO vince su proceed del multi-provider (asimmetria chiusa).
+        let (v, src) =
+            select_pre_run_advisory(Some(synth("block")), Some(synth("proceed")));
+        assert_eq!(v.unwrap()["verdict"], "block");
+        assert_eq!(src, Some("council_synthesis"));
+
+        // block del MULTI-PROVIDER vince su proceed_with_changes del consiglio.
+        let (v, src) = select_pre_run_advisory(
+            Some(synth("proceed_with_changes")),
+            Some(synth("block")),
+        );
+        assert_eq!(v.unwrap()["verdict"], "block");
+        assert_eq!(src, Some("multi_provider_synthesis"));
+
+        // parita' -> preferisce il consiglio.
+        let (_, src) = select_pre_run_advisory(Some(synth("proceed")), Some(synth("proceed")));
+        assert_eq!(src, Some("council_synthesis"));
+
+        // solo uno presente / nessuno.
+        assert_eq!(
+            select_pre_run_advisory(None, Some(synth("block"))).1,
+            Some("multi_provider_synthesis")
+        );
+        assert_eq!(select_pre_run_advisory(None, None), (None, None));
+    }
 
     #[test]
     fn is_code_file_riconosce_codice_e_scarta_il_resto() {

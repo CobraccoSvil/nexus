@@ -1317,6 +1317,18 @@ impl CouncilConveneOutcome {
         }
     }
 
+    /// Valore STRUTTURATO della sintesi (regola M) per il seed pre-run
+    /// (`pre_run_advisory_synthesis`) e l'enforcement al tool_dispatch: cosi' un
+    /// verdetto `block` del consiglio FERMA l'esecuzione in modo deterministico,
+    /// non solo come guida testuale. Simmetrico a
+    /// [`MultiProviderPanelOutcome::advisory_synthesis_value`]. `None` se degradato.
+    pub(crate) fn advisory_synthesis_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Active { synthesis, .. } => Some(synthesis.to_value()),
+            Self::Degraded { .. } => None,
+        }
+    }
+
     pub(crate) fn figures(&self) -> &[String] {
         match self {
             Self::Active { figures, .. } | Self::Degraded { figures, .. } => figures.as_slice(),
