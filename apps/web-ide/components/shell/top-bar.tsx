@@ -9,11 +9,12 @@ import {
   StatusDot,
   iconButton,
   providerTitle,
+  providerDisplayLabel,
+  sortProviderNames,
   type ProviderHealthState,
-  type ProviderKey,
 } from "./shell-helpers";
 
-type ProviderStatusMap = Record<ProviderKey, ProviderHealthState>;
+type ProviderStatusMap = Record<string, ProviderHealthState>;
 
 export function TopBar({
   tc,
@@ -148,41 +149,20 @@ export function TopBar({
         aria-label="Stato provider AI"
       >
         <ConnectionStatusBadge compact={isNarrowViewport} />
-        <span
-          title={providerTitle("OpenAI", providerStatus.openai)}
-          style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-        >
-          <StatusDot ok={providerStatus.openai.ok} billing={providerStatus.openai.billing} />
-          {!isNarrowViewport && "OpenAI"}
-        </span>
-        <span
-          title={providerTitle("Anthropic", providerStatus.anthropic)}
-          style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-        >
-          <StatusDot ok={providerStatus.anthropic.ok} billing={providerStatus.anthropic.billing} />
-          {!isNarrowViewport && "Anthropic"}
-        </span>
-        <span
-          title={providerTitle("Google", providerStatus.google)}
-          style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-        >
-          <StatusDot ok={providerStatus.google.ok} billing={providerStatus.google.billing} />
-          {!isNarrowViewport && "Google"}
-        </span>
-        <span
-          title={providerTitle("DeepSeek", providerStatus.deepseek)}
-          style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-        >
-          <StatusDot ok={providerStatus.deepseek.ok} billing={providerStatus.deepseek.billing} />
-          {!isNarrowViewport && "DeepSeek"}
-        </span>
-        <span
-          title={providerTitle("Mistral", providerStatus.mistral)}
-          style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-        >
-          <StatusDot ok={providerStatus.mistral.ok} billing={providerStatus.mistral.billing} />
-          {!isNarrowViewport && "Mistral"}
-        </span>
+        {sortProviderNames(Object.keys(providerStatus)).map((name) => {
+          const label = providerDisplayLabel(name);
+          const state = providerStatus[name];
+          return (
+            <span
+              key={name}
+              title={providerTitle(label, state)}
+              style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
+            >
+              <StatusDot ok={state.ok} billing={state.billing} />
+              {!isNarrowViewport && label}
+            </span>
+          );
+        })}
       </div>
     </header>
   );

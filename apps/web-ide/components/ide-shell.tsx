@@ -287,13 +287,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [playwrightRuns, setPlaywrightRuns] = useState<PlaywrightRunSummary[]>([]);
   const [playwrightConfigured, setPlaywrightConfigured] = useState(false);
   const [runConfigs, setRunConfigs] = useState<RunConfigItem[]>([]);
-  const [providerStatus, setProviderStatus] = useState<Record<ProviderKey, ProviderHealthState>>({
-    openai: { ok: null },
-    anthropic: { ok: null },
-    google: { ok: null },
-    deepseek: { ok: null },
-    mistral: { ok: null },
-  });
+  // Mappa dinamica: popolata al primo refresh coi provider configurati dal gateway
+  // (registry-aware), non piu' fissa ai 5 storici.
+  const [providerStatus, setProviderStatus] = useState<Record<string, ProviderHealthState>>({});
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [workbenchReady, setWorkbenchReady] = useState(false);
   // Gate prima analisi: impedisce l'uso dell'IDE finche' il progetto non e' analizzato
@@ -868,31 +864,37 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       };
       // Short-circuit: evita re-render se lo stato non e' cambiato (il polling
       // ogni 15s non deve causare cascate di render inutili).
-      const next = {
-        openai: resolve("openai"),
-        anthropic: resolve("anthropic"),
-        google: resolve("google"),
-        deepseek: resolve("deepseek"),
-        mistral: resolve("mistral"),
-      };
+      // Mostra tutti i provider CONFIGURATI (chiave presente): registry-aware,
+      // niente piu' lista fissa a 5. Il pattern null=grigio del resolve evita
+      // falsi alert sui provider mai sondati (es. nuovi provider coi modelli
+      // appena abilitati, healthy=null finche' l'health probe non gira).
+      const next: Record<string, ProviderHealthState> = {};
+      for (const gw of gwList) {
+        if (gw.configured) next[gw.name] = resolve(gw.name);
+      }
       setProviderStatus((prev) => {
-        const keys: ProviderKey[] = ["openai", "anthropic", "google", "deepseek", "mistral"];
-        const changed = keys.some((k) =>
-          prev[k].ok !== next[k].ok ||
-          prev[k].billing !== next[k].billing ||
-          prev[k].reason !== next[k].reason,
-        );
+        const prevKeys = Object.keys(prev);
+        const nextKeys = Object.keys(next);
+        const changed =
+          prevKeys.length !== nextKeys.length ||
+          nextKeys.some((k) =>
+            prev[k]?.ok !== next[k].ok ||
+            prev[k]?.billing !== next[k].billing ||
+            prev[k]?.reason !== next[k].reason,
+          );
         return changed ? next : prev;
       });
     } catch {
-      // Gateway non raggiungibile: mantieni stato sconosciuto (solo se diverso)
+      // Gateway non raggiungibile: porta i provider noti a "sconosciuto" (grigio)
+      // senza svuotare la lista, cosi' i LED non spariscono su errore transitorio.
       setProviderStatus((prev) => {
-        const keys: ProviderKey[] = ["openai", "anthropic", "google", "deepseek", "mistral"];
+        const keys = Object.keys(prev);
+        if (keys.length === 0) return prev;
         const allNull = keys.every((k) => prev[k].ok === null && !prev[k].billing && !prev[k].reason);
-        return allNull ? prev : {
-          openai: { ok: null }, anthropic: { ok: null }, google: { ok: null },
-          deepseek: { ok: null }, mistral: { ok: null },
-        };
+        if (allNull) return prev;
+        const reset: Record<string, ProviderHealthState> = {};
+        for (const k of keys) reset[k] = { ok: null };
+        return reset;
       });
     }
   }, []);

@@ -10,13 +10,40 @@ import type { SidebarView } from "../sidebar/sidebar-manager";
 import type { PanelTab } from "../panels/bottom-panel-manager";
 
 export type SecondarySidebarView = "ai-tools";
-export type ProviderKey = "openai" | "anthropic" | "google" | "deepseek" | "mistral";
+// Nome provider dinamico (dal gateway/registry): era una union a 5 provider
+// storici, ora i LED della top bar mostrano qualunque provider configurato.
+export type ProviderKey = string;
 export type ProviderHealthState = {
   ok: boolean | null;
   reason?: string;
   status?: string;
   billing?: boolean; // true = crediti/quota esauriti → pallino giallo
 };
+
+// Etichetta leggibile di un provider (nomi noti + fallback capitalizzato).
+const PROVIDER_LABELS: Record<string, string> = {
+  openai: "OpenAI", anthropic: "Anthropic", google: "Google", deepseek: "DeepSeek",
+  mistral: "Mistral", groq: "Groq", openrouter: "OpenRouter", perplexity: "Perplexity",
+  vllm: "vLLM", ollama: "Ollama",
+};
+// Ordine di visualizzazione preferito (storici prima, poi il resto in coda).
+const PROVIDER_ORDER = ["openai", "anthropic", "google", "deepseek", "mistral", "groq", "openrouter", "perplexity", "vllm", "ollama"];
+
+export function providerDisplayLabel(name: string): string {
+  return PROVIDER_LABELS[name] ?? (name.charAt(0).toUpperCase() + name.slice(1));
+}
+
+/** Ordina i nomi provider: quelli noti nell'ordine preferito, gli altri in coda alfabetica. */
+export function sortProviderNames(names: string[]): string[] {
+  return [...names].sort((a, b) => {
+    const ia = PROVIDER_ORDER.indexOf(a);
+    const ib = PROVIDER_ORDER.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
+}
 
 export const sidebarItems: Array<{ key: SidebarView; label: string; icon: string }> = [
   { key: "project-db", label: "Database", icon: "🗄" },
