@@ -576,107 +576,129 @@ pub async fn classify(db: &PgPool, gateway: &NexusGatewayClient, message: &str) 
         return hit;
     }
 
-    // Risoluzione modello: purpose tier-aware (regola G/L). Niente nome modello
-    // hardcoded ne' magic fallback: se il purpose non e' risolvibile -> neutro.
-    let (provider, model) =
-        match crate::internal_routing::resolve_purpose_model_db(db, CLASSIFIER_PURPOSE)
-            .await
-            .into_model(CLASSIFIER_PURPOSE)
-        {
-            Ok(pm) => pm,
-            Err(e) => {
-                tracing::warn!("classifier: modello non risolvibile ({e}) -> fallback");
-                return AgenticIntent::fallback("config_unavailable");
-            }
-        };
-
     // Il prompt Python tronca a 2000 char prima del format.
     let truncated: String = message.chars().take(2000).collect();
     let prompt = build_prompt(db, &truncated).await;
 
+    // Candidati tier-aware CON FAILOVER (regola G/L): il classifier e'
+    // latency-critical e NON deve morire se il PRIMO provider del tier e'
+    // lento/instabile (es. Vertex cold-start ~8s che manda in timeout la singola
+    // chiamata). `resolve_purpose_provider_candidates_db` ritorna N provider
+    // DISTINTI del tier (health/cooldown-aware, niente provider hardcoded, stesso
+    // routing del resto del sistema); si prova in ordine e si fa FAILOVER al
+    // successivo su timeout/errore/CONTENT VUOTO (caso Gemini)/JSON invalido,
+    // arrendendosi al neutro SOLO se TUTTI falliscono.
+    let limit = nexus_auth::get_setting(db, "routing.classifier_failover_candidates")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+        .max(1);
+    let candidates = match crate::internal_routing::resolve_purpose_provider_candidates_db(
+        db,
+        CLASSIFIER_PURPOSE,
+        limit,
+    )
+    .await
+    {
+        Ok(c) if !c.is_empty() => c,
+        _ => {
+            tracing::warn!("classifier: nessun candidato tier risolvibile -> fallback");
+            return AgenticIntent::fallback("config_unavailable");
+        }
+    };
+
+    let timeout = Duration::from_millis((cfg.llm_timeout_seconds * 1000.0) as u64);
+    for cand in &candidates {
+        let Some(mut validated) =
+            try_classify_once(gateway, &cand.provider, &cand.model, &prompt, timeout, &cfg).await
+        else {
+            tracing::warn!(
+                provider = %cand.provider, model = %cand.model,
+                "classifier: candidato fallito, failover al prossimo del tier"
+            );
+            continue;
+        };
+        if validated.model_used.is_empty() {
+            validated.model_used = format!("{}/{}", cand.provider, cand.model);
+        }
+        // Osservabilita' (mig 0460): engine='rust' + provenienza, mai il prompt (regola F).
+        tracing::info!(
+            engine = "rust",
+            intent = %validated.intent,
+            agentic_score = validated.agentic_score,
+            confidence = validated.confidence,
+            requires_tools = validated.requires_tools,
+            authorizes_changes = validated.authorizes_changes,
+            model_used = %validated.model_used,
+            "classifier intent (rust in-process, tier-failover)"
+        );
+        cache.insert(key, validated.clone());
+        return validated;
+    }
+    tracing::warn!(
+        candidates = candidates.len(),
+        "classifier: TUTTI i candidati del tier falliti -> fallback neutro"
+    );
+    AgenticIntent::fallback("all_candidates_failed")
+}
+
+/// UN tentativo di classificazione su un provider/model specifico. `None` su
+/// QUALSIASI fallimento (timeout, errore gateway, provider-error inline, CONTENT
+/// VUOTO, JSON non estraibile/invalido, schema invalido) cosi' il chiamante fa
+/// FAILOVER al prossimo candidato del tier (regola M: fallimento dal segnale, non
+/// dalla prosa). Isola la logica di una singola chiamata dal loop di failover.
+async fn try_classify_once(
+    gateway: &NexusGatewayClient,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    cfg: &ClassifierConfig,
+) -> Option<AgenticIntent> {
     let req = GwRequest {
-        // Il gateway accetta "provider/model" come pin esplicito; valorizziamo
-        // anche `pin_provider` per evitare un secondo routing divergente.
         model: format!("{provider}/{model}"),
         messages: vec![GwMessage {
             role: "user".to_string(),
-            content: serde_json::Value::String(prompt),
+            content: serde_json::Value::String(prompt.to_string()),
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
             thinking_signature: None,
         }],
-        pin_provider: Some(provider.clone()),
+        pin_provider: Some(provider.to_string()),
         metadata: GwMetadata {
             feature: CLASSIFIER_PURPOSE.to_string(),
             ..Default::default()
         },
         ..Default::default()
     };
-
-    let timeout = Duration::from_millis((cfg.llm_timeout_seconds * 1000.0) as u64);
     let resp = match tokio::time::timeout(timeout, gateway.complete(req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            tracing::warn!("classifier: gateway error -> fallback ({e})");
-            return AgenticIntent::fallback("llm_error");
+            tracing::warn!(provider, "classifier: gateway error ({e})");
+            return None;
         }
         Err(_) => {
-            tracing::warn!(
-                "classifier: timeout {}s -> fallback",
-                cfg.llm_timeout_seconds
-            );
-            return AgenticIntent::fallback("timeout");
+            tracing::warn!(provider, timeout_s = timeout.as_secs(), "classifier: timeout");
+            return None;
         }
     };
-
-    // Detection esplicito di provider-error inline (es. Gemini "[Error: ...]").
+    // CONTENT VUOTO o provider-error inline -> fallimento ritentabile (failover):
+    // il caso Gemini/Vertex con content vuoto (finish_reason=length/token budget)
+    // NON deve arrendersi al neutro, ma provare il prossimo provider.
     let stripped = resp.content.trim();
-    if stripped.starts_with("[Error:") || stripped.starts_with("[error:") {
-        tracing::warn!("classifier: provider error inline -> fallback");
-        return AgenticIntent::fallback("provider_inline_error");
+    if stripped.is_empty() || stripped.starts_with("[Error:") || stripped.starts_with("[error:") {
+        tracing::warn!(provider, "classifier: content vuoto o provider-error inline");
+        return None;
     }
-
-    let Some(value) = nexus_types::llm_json::extract_json_block(&resp.content) else {
-        tracing::warn!("classifier: JSON non estraibile -> fallback");
-        return AgenticIntent::fallback("json_parse");
-    };
-    let raw: RawIntent = match serde_json::from_value(value) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("classifier: JSON non deserializzabile ({e}) -> fallback");
-            return AgenticIntent::fallback("json_parse");
-        }
-    };
-
-    let Some(mut validated) =
-        validate_parsed(raw, cfg.ambiguity_min_confidence, cfg.ambiguity_min_margin)
-    else {
-        tracing::warn!("classifier: schema invalido -> fallback");
-        return AgenticIntent::fallback("json_validation");
-    };
-
-    validated.model_used = if resp.model_used.is_empty() {
-        model
-    } else {
-        resp.model_used
-    };
-    // Osservabilita' del path RUST in-process (simmetrico al log del path Python
-    // `classifier LLM: ...`): permette di provare in produzione che il classifier
-    // attivo e' Rust (engine='rust', mig 0460). Niente contenuto sensibile: solo
-    // intent/score/confidence/model, mai il prompt (regola F).
-    tracing::info!(
-        engine = "rust",
-        intent = %validated.intent,
-        agentic_score = validated.agentic_score,
-        confidence = validated.confidence,
-        requires_tools = validated.requires_tools,
-        authorizes_changes = validated.authorizes_changes,
-        model_used = %validated.model_used,
-        "classifier intent (rust in-process)"
-    );
-    cache.insert(key, validated.clone());
-    validated
+    let value = nexus_types::llm_json::extract_json_block(&resp.content)?;
+    let raw: RawIntent = serde_json::from_value(value).ok()?;
+    let mut validated =
+        validate_parsed(raw, cfg.ambiguity_min_confidence, cfg.ambiguity_min_margin)?;
+    if !resp.model_used.is_empty() {
+        validated.model_used = resp.model_used;
+    }
+    Some(validated)
 }
 
 // ── Punto unico derivazione action_oriented / report_only (regola L) ─────────
