@@ -628,33 +628,6 @@ impl PgMetaReasonerPort {
         &self,
         ctx: &SupervisorContext,
     ) -> Result<Option<SupervisorDecision>, PortError> {
-        let (provider, model) = match resolve_purpose_model_db(&self.db, SUPERVISOR_PURPOSE).await {
-            PurposeResolution::Resolved {
-                provider, model, ..
-            } => (provider, model),
-            PurposeResolution::NotFound => {
-                tracing::error!(
-                    target: "nexus_supervisor",
-                    purpose = SUPERVISOR_PURPOSE,
-                    "supervisor: purpose assente in nexus_purpose_model; degrado a continue"
-                );
-                return Ok(Some(SupervisorDecision::Continue));
-            }
-            PurposeResolution::NoCapableModel { tier } => {
-                return Err(PortError::ProviderUnavailable(
-                    format!(
-                        "supervisor: nessun modello del tier '{tier}' per purpose '{SUPERVISOR_PURPOSE}'"
-                    )
-                    .into(),
-                ));
-            }
-            PurposeResolution::MatrixUnavailable(e) => {
-                return Err(PortError::ProviderUnavailable(
-                    format!("supervisor: routing non disponibile: {e}").into(),
-                ));
-            }
-        };
-
         let tpl_cache = crate::prompt_templates::TemplateCache::new();
         let template = crate::prompt_templates::get_template_or_default(
             &self.db,
@@ -680,34 +653,48 @@ impl PgMetaReasonerPort {
             .setting_timeout_s(SUPERVISOR_TIMEOUT_SETTING, SUPERVISOR_TIMEOUT_DEFAULT)
             .await;
 
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_s),
-            self.neural.generate_agent_turn(
-                &provider,
-                &model,
-                &messages,
-                "[]",
-                SUPERVISOR_MAX_TOKENS,
-                "",
-            ),
+        // FAILOVER tier-aware (punto unico, regola L/G): la feature di SICUREZZA
+        // (runaway detection) non deve spegnersi se il primo provider del tier e'
+        // lento/instabile. Prova N candidati (timeout per tentativo); su fallimento
+        // (regola M: neural_value_is_failure) passa al prossimo. Degrada
+        // CONSERVATIVAMENTE a Continue se nessun candidato produce una decisione.
+        use crate::internal_routing::{
+            complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
+        };
+        let neural = &self.neural;
+        let messages_ref = &messages;
+        let value = match complete_for_purpose_with_failover(
+            &self.db,
+            SUPERVISOR_PURPOSE,
+            |prov, mdl| async move {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_s),
+                    neural.generate_agent_turn(
+                        &prov,
+                        &mdl,
+                        messages_ref,
+                        "[]",
+                        SUPERVISOR_MAX_TOKENS,
+                        "",
+                    ),
+                )
+                .await;
+                match r {
+                    Ok(Ok(v)) if !crate::orchestrator::neural_value_is_failure(&v) => {
+                        AttemptOutcome::Done(v)
+                    }
+                    _ => AttemptOutcome::Failover,
+                }
+            },
         )
-        .await;
-
-        let value = match resp {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
+        .await
+        {
+            Ok(v) => v,
+            Err(PurposeFailoverError::AllCandidatesFailed)
+            | Err(PurposeFailoverError::NoCandidate(_)) => {
                 tracing::warn!(
                     target: "nexus_supervisor",
-                    error = %e,
-                    "supervisor: chiamata LLM fallita, degrado a continue"
-                );
-                return Ok(Some(SupervisorDecision::Continue));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: "nexus_supervisor",
-                    timeout_s,
-                    "supervisor: timeout LLM, degrado a continue"
+                    "supervisor: nessun provider valido del tier, degrado a continue"
                 );
                 return Ok(Some(SupervisorDecision::Continue));
             }
