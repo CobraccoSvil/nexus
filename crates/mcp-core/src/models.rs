@@ -189,31 +189,63 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .as_object()
         .ok_or_else(|| "JSON non oggetto".to_string())?;
 
-    let provider_map: &[(&str, &str)] = &[
-        ("claude-", "anthropic"),
-        ("gpt-", "openai"),
-        ("o1", "openai"),
-        ("o3", "openai"),
-        ("o4", "openai"),
-        ("gemini/", "google"),
-        ("deepseek/", "deepseek"),
-        ("mistral/", "mistral"),
-        ("codestral/", "mistral"),
-    ];
+    // Prefissi di matching + politica insert dal registry (data-driven, T5):
+    // era una mappa hardcoded a 5 provider (models.rs).
+    #[derive(sqlx::FromRow)]
+    struct SyncPrefixRow {
+        name: String,
+        litellm_prefixes: Vec<String>,
+        litellm_sync_inserts: bool,
+    }
+    let sync_rows: Vec<SyncPrefixRow> = sqlx::query_as(
+        "SELECT name, litellm_prefixes, litellm_sync_inserts
+           FROM nexus_provider_registry
+          WHERE litellm_prefixes IS NOT NULL AND array_length(litellm_prefixes, 1) > 0",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("registry litellm_prefixes: {e}"))?;
+    // Lista piatta (prefix, provider, allow_insert).
+    let prefix_map: Vec<(String, String, bool)> = sync_rows
+        .iter()
+        .flat_map(|r| {
+            let name = r.name.clone();
+            let allow = r.litellm_sync_inserts;
+            r.litellm_prefixes
+                .iter()
+                .map(move |p| (p.clone(), name.clone(), allow))
+        })
+        .collect();
+    if prefix_map.is_empty() {
+        return Err(
+            "nexus_provider_registry senza litellm_prefixes: applica la migrazione 0575".to_string(),
+        );
+    }
+
+    // Modelli gia' presenti nel catalog: usati per la protezione no-insert dei
+    // provider a listino curato (litellm_sync_inserts=false).
+    let existing: std::collections::HashSet<(String, String)> =
+        sqlx::query_as::<_, (String, String)>("SELECT provider, model FROM ai_price_catalog")
+            .fetch_all(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
     let mut updated = 0i32;
     let mut added = 0i32;
     let mut skipped = 0i32;
 
     for (key, entry) in obj {
-        let Some(provider) = provider_map
+        let Some((provider_owned, allow_insert)) = prefix_map
             .iter()
-            .find(|(prefix, _)| key.starts_with(prefix))
-            .map(|(_, p)| *p)
+            .find(|(prefix, _, _)| key.starts_with(prefix.as_str()))
+            .map(|(_, p, allow)| (p.clone(), *allow))
         else {
             skipped += 1;
             continue;
         };
+        let provider: &str = &provider_owned;
 
         let input_cost = entry
             .get("input_cost_per_token")
@@ -236,6 +268,14 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         } else {
             key.as_str()
         };
+
+        // Protezione anti-inquinamento (T5): per i provider a listino curato
+        // (litellm_sync_inserts=false) aggiorna solo i modelli GIA' presenti, mai
+        // auto-inserisci modelli nuovi (LiteLLM espone centinaia di openrouter/*).
+        if !allow_insert && !existing.contains(&(provider.to_string(), model_id.to_string())) {
+            skipped += 1;
+            continue;
+        }
 
         let context_window = entry
             .get("max_input_tokens")
