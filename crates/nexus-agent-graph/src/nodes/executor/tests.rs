@@ -4497,6 +4497,96 @@ async fn max_consecutive_text_only_turns_oltre_soglia_forza_chiusura() {
 }
 
 #[tokio::test]
+async fn figura_al_cap_text_only_riceve_turno_di_grazia_invece_di_nd() {
+    // Una figura del consiglio (advisory_verdict fra i tool) senza parere, al cap
+    // solo-testo, NON chiude n/d: riceve UN turno di grazia per emettere il parere.
+    // Copre il caso reale fe4dc12c (functional_analyst deepseek, it=60): il
+    // meta-reasoner non interviene (budget stall esaurito) e prima si andava dritti
+    // a close_runaway.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        max_consecutive_text_only_turns: 3,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        consecutive_text_only_turns: Some(3),
+        iterations: Some(5),
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "advisory_verdict"}),
+        ]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // NON chiude: turno di grazia (G1Escalated), niente meta_step anti_runaway.
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_ne!(out.forced_close_unverified, Some(true));
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "la figura non chiude n/d: riceve la grazia"
+    );
+    // Flag una-tantum settato + streak solo-testo azzerato (il turno raggiunge l'LLM).
+    assert_eq!(
+        out.extra.get("advisory_grace_used").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(out.consecutive_text_only_turns, Some(0));
+    // Direttiva di grazia iniettata come messaggio Human.
+    let injected = out
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::Human { content } => Some(content.flatten_text()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        injected.contains("advisory_verdict"),
+        "direttiva di grazia iniettata: {injected}"
+    );
+    // L'LLM NON e' chiamato: delta PRE-LLM che ri-da il turno.
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn figura_grazia_una_tantum_poi_chiude() {
+    // Se la grazia e' GIA' stata concessa (flag in extra), al cap solo-testo la
+    // figura chiude col backstop: la grazia non si ripete (niente loop).
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        max_consecutive_text_only_turns: 3,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert("advisory_grace_used".into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        consecutive_text_only_turns: Some(3),
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "advisory_verdict"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // Grazia gia' usata -> chiusura backstop normale (nessun loop).
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert!(out.meta_steps.iter().any(|m| m.kind == "anti_runaway"));
+}
+
+#[tokio::test]
 async fn consecutive_text_only_turns_incrementa_su_testo_e_azzera_su_tool() {
     // Il contatore si INCREMENTA su un turno solo-testo (nessun tool_use) e si
     // AZZERA appena il modello emette un tool_use (segnale strutturato).

@@ -1522,6 +1522,15 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             {
                 return Ok(delta);
             }
+            // Turno di grazia figura (una-tantum): una figura del consiglio senza parere
+            // non deve chiudere n/d al backstop text-only. Un turno mirato la spinge a
+            // emettere advisory_verdict (parere reale). Copre il percorso in cui il
+            // meta-reasoner NON e' intervenuto (budget stall esaurito) e si andrebbe
+            // dritti a close_runaway: e' il caso reale fe4dc12c (functional_analyst
+            // deepseek, it=60). `None` (non-figura / grazia gia' concessa) -> close sotto.
+            if let Some(delta) = self.maybe_advisory_grace_delta(state, iters_in, ctx, mode).await {
+                return Ok(delta);
+            }
             let stall_text = format!(
                 "Il modello ha prodotto {} risposte consecutive di solo testo senza \
 eseguire alcuna azione (tetto {}). Interrompo: il compito non sta avanzando. \
@@ -6505,6 +6514,73 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         }
         .into_opaque()
     }
+
+    /// Turno di grazia figura al BACKSTOP runaway. Stesso concetto di
+    /// [`recovery_nudge_msg`] (regola L: canale di grazia figura), ma applicato dove
+    /// il meta-reasoner NON interviene e si andrebbe dritti a [`Self::close_runaway`]
+    /// con esito n/d: e' il percorso reale in cui una figura del consiglio (es.
+    /// `functional_analyst` deepseek, run fe4dc12c) muore al cap solo-testo dopo aver
+    /// esaurito il budget stall. Se il run e' una figura senza parere
+    /// ([`is_advisory_figure_without_verdict`]) e la grazia non e' ancora stata
+    /// concessa, invece di chiudere concede UN turno mirato per emettere
+    /// `advisory_verdict` (parere reale al posto di n/d). Una-tantum
+    /// ([`ADVISORY_GRACE_USED_KEY`]) per non ciclare. `None` -> il chiamante procede
+    /// col `close_runaway` (bit-identico per non-figure / grazia gia' concessa).
+    async fn maybe_advisory_grace_delta(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
+        if !is_advisory_figure_without_verdict(state) {
+            return None;
+        }
+        if state
+            .extra
+            .get(ADVISORY_GRACE_USED_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let mut extra_out = state.extra.clone();
+        extra_out.insert(ADVISORY_GRACE_USED_KEY.to_string(), json!(true));
+        // Finestra pulita sui detector di ripetizione (come i rami nudge fissi).
+        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        self.emit_phase(
+            ctx,
+            mode,
+            "advisory_grace",
+            "Turno di grazia: la figura chiude col parere (advisory_verdict)".to_string(),
+            json!({ "iters": iters_in }),
+        )
+        .await;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            iters = iters_in,
+            "figura senza parere al backstop runaway -> turno di grazia advisory_verdict"
+        );
+        Some(
+            StateDelta {
+                messages: Some(vec![human_msg(ADVISORY_GRACE_DIRECTIVE.trim())]),
+                // Azzera lo streak solo-testo: al re-entry il blocco text-only NON
+                // ri-scatta prima di chiamare l'LLM, cosi' il turno di grazia raggiunge
+                // davvero il modello (che puo' emettere advisory_verdict). Senza
+                // l'azzeramento il re-entry richiuderebbe subito senza dare il turno.
+                consecutive_text_only_turns: Some(Some(0)),
+                recent_tool_signatures: Some(Some(vec![])),
+                g1_reroute_count: Some(Some(0)),
+                action_nudge_count: Some(Some(0)),
+                pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -6608,6 +6684,11 @@ CHIUDI ORA la tua analisi chiamando il tool advisory_verdict con la tua migliore
 valutazione corrente (verdict + summary + eventuali requirements). NON continuare a \
 esplorare e NON diagnosticare un fallimento tecnico: emetti il tuo parere consultivo \
 adesso, anche se parziale, basandoti su cio' che hai gia' osservato.";
+
+/// Chiave `extra` che marca la grazia figura come GIA' concessa (una-tantum): il
+/// backstop runaway ([`ExecutorNode::maybe_advisory_grace_delta`]) la concede una
+/// sola volta per run, per non ciclare (grazia -> di nuovo cap -> grazia).
+const ADVISORY_GRACE_USED_KEY: &str = "advisory_grace_used";
 
 /// True se il run e' una FIGURA del consiglio di analisi (canale di chiusura
 /// `advisory_verdict` disponibile fra i tool) che NON ha ancora dichiarato il
