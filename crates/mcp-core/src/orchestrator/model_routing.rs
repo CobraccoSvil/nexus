@@ -1098,6 +1098,26 @@ pub(crate) fn completion_has_error(completion: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// `true` se un value neural (completion/agent-turn) e' un FALLIMENTO ritentabile
+/// via failover cross-provider per i purpose interni a GENERAZIONE DI TESTO
+/// (regola M: segnale strutturato, mai prosa). Estende [`completion_has_error`]
+/// col caso CONTENT VUOTO/ASSENTE (Gemini/Vertex `finish_reason=length` -> content
+/// "": nessun `error`, ma turno improduttivo). PUNTO UNICO (regola L) del "questo
+/// turno va ritentato su un altro provider" per
+/// [`crate::internal_routing::complete_for_purpose_with_failover`] e i suoi call
+/// site. NB: pensato per i purpose text-only (summary/docs/analyzer/...): un turno
+/// legittimo a soli tool_call (content vuoto) verrebbe marcato fallimento, quindi
+/// NON usarlo per purpose che si aspettano tool_call.
+pub(crate) fn neural_value_is_failure(v: &Value) -> bool {
+    if completion_has_error(v) {
+        return true;
+    }
+    v.get("content")
+        .and_then(Value::as_str)
+        .map(|c| c.trim().is_empty())
+        .unwrap_or(true)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Gate di capability sul routing agentico (ADR 0018, leva 0).
 // ────────────────────────────────────────────────────────────────────────────
@@ -1240,6 +1260,31 @@ pub(crate) fn decide_vision_capability_gate(
     match model_supports_vision {
         Some(true) => VisionCapabilityGate::KeepOriginal,
         Some(false) | None => VisionCapabilityGate::NeedsVisionModel,
+    }
+}
+
+#[cfg(test)]
+mod neural_failure_tests {
+    use super::neural_value_is_failure;
+    use serde_json::json;
+
+    #[test]
+    fn neural_value_is_failure_golden() {
+        // Successo: content non vuoto, nessun error.
+        assert!(!neural_value_is_failure(&json!({ "content": "ciao" })));
+        // Error strutturato (metadata.error) -> fallimento.
+        assert!(neural_value_is_failure(
+            &json!({ "content": "x", "metadata": { "error": "boom" } })
+        ));
+        // error_class a root non-null -> fallimento (via completion_has_error/error).
+        assert!(neural_value_is_failure(&json!({ "error": "llm_error", "content": "" })));
+        // Prosa [Error: ...] -> fallimento.
+        assert!(neural_value_is_failure(&json!({ "content": "[Error: quota]" })));
+        // CONTENT VUOTO senza error (caso Gemini finish_reason=length) -> fallimento.
+        assert!(neural_value_is_failure(&json!({ "content": "   " })));
+        assert!(neural_value_is_failure(&json!({ "content": "" })));
+        // content assente -> fallimento (nessun output utile per un purpose text).
+        assert!(neural_value_is_failure(&json!({ "metadata": {} })));
     }
 }
 

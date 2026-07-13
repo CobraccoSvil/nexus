@@ -336,30 +336,23 @@ pub(super) async fn auto_create_profiles_from_analysis(
     }
 }
 
+/// Estrae il testo generato ripulito da un value neural (fn, non closure: non
+/// viene "mossa" nel loop di failover).
+fn clean_generated_text(v: &Value) -> String {
+    v["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .to_string()
+}
+
 /// POST /api/ai/generate-prompt — genera un system prompt per un profilo AI
 pub async fn generate_system_prompt(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
     Json(body): Json<GeneratePromptRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Default purpose-specific risolto dal PUNTO UNICO tier-only (regola L/G).
-    // Errore esplicito 503 se il routing non risolve (niente fallback statico).
-    let (default_prov, default_model) =
-        crate::internal_routing::resolve_purpose_model(&state, "custom_instructions")
-            .await
-            .into_model("custom_instructions")
-            .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
-    let provider = body
-        .provider
-        .as_deref()
-        .unwrap_or(&default_prov)
-        .to_string();
-    let model = body
-        .model
-        .as_deref()
-        .map(String::from)
-        .unwrap_or(default_model);
-
     let desc_line = body
         .description
         .as_deref()
@@ -376,15 +369,55 @@ pub async fn generate_system_prompt(
         .replace("{{name}}", &body.profile_name)
         .replace("{{desc}}", &desc_line);
 
-    let result = state
-        .orchestrator
-        .neural
-        .generate_completion(provider.as_str(), model.as_str(), &prompt)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let text = result["content"].as_str().unwrap_or("").trim().to_string();
-    let text = text.trim_matches('"').to_string();
+    // Un value neural di FALLIMENTO (regola M: neural_value_is_failure — include il
+    // CONTENT VUOTO di Gemini e i "[Error:...]") non deve MAI diventare il system
+    // prompt: era il leak "[Error:...]" salvato come prompt. Se l'utente ha PINNATO
+    // provider+model, si rispetta la sua scelta (una chiamata); altrimenti FAILOVER
+    // tier-aware (punto unico complete_for_purpose_with_failover, regola L).
+    let neural = &state.orchestrator.neural;
+    let text = if let (Some(p), Some(m)) = (body.provider.as_deref(), body.model.as_deref()) {
+        let result = neural
+            .generate_completion(p, m, &prompt)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if crate::orchestrator::neural_value_is_failure(&result) {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Il provider selezionato non ha prodotto un prompt valido".to_string(),
+            ));
+        }
+        clean_generated_text(&result)
+    } else {
+        use crate::internal_routing::{
+            complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
+        };
+        let attempt = |prov: String, mdl: String| {
+            let prompt = &prompt;
+            async move {
+                match neural.generate_completion(&prov, &mdl, prompt).await {
+                    Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => {
+                        AttemptOutcome::Done(clean_generated_text(&v))
+                    }
+                    _ => AttemptOutcome::Failover,
+                }
+            }
+        };
+        match complete_for_purpose_with_failover(&state.db, "custom_instructions", attempt).await {
+            Ok(t) => t,
+            Err(PurposeFailoverError::AllCandidatesFailed) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Nessun provider del tier ha prodotto un prompt valido".to_string(),
+                ))
+            }
+            Err(PurposeFailoverError::NoCandidate(_)) => {
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Nessun modello risolvibile per 'custom_instructions'".to_string(),
+                ))
+            }
+        }
+    };
 
     Ok(Json(serde_json::json!({ "text": text })))
 }

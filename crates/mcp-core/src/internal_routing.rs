@@ -400,6 +400,81 @@ pub async fn resolve_purpose_provider_candidates_db(
     Ok(out)
 }
 
+/// Esito di UN tentativo dentro [`complete_for_purpose_with_failover`].
+pub enum AttemptOutcome<T> {
+    /// Successo: `T` prodotto, il loop si ferma.
+    Done(T),
+    /// Fallimento RITENTABILE: prova il prossimo candidato del tier.
+    Failover,
+}
+
+/// Errore del failover per-purpose (regola M: esiti tipizzati, non stringhe).
+#[derive(Debug)]
+pub enum PurposeFailoverError {
+    /// Nessun candidato risolvibile per il tier (config assente / tutti in cooldown).
+    NoCandidate(PurposeResolution),
+    /// Tutti i candidati provati hanno restituito `Failover`.
+    AllCandidatesFailed,
+}
+
+/// Numero di candidati del tier da provare con failover: override per-purpose
+/// `routing.<purpose>_failover_candidates` -> generico
+/// `routing.purpose_failover_candidates` -> default 3 (regola G: niente numero
+/// hardcoded; `.max(1)` di guardia).
+async fn purpose_failover_candidate_limit(db: &PgPool, purpose: &str) -> usize {
+    let per_purpose = format!("routing.{purpose}_failover_candidates");
+    for key in [per_purpose.as_str(), "routing.purpose_failover_candidates"] {
+        if let Some(n) = nexus_auth::get_setting(db, key)
+            .await
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            return n.max(1);
+        }
+    }
+    3
+}
+
+/// PUNTO UNICO (regola L) del FAILOVER tier-aware per i purpose interni che fanno
+/// resolve+complete inline: risolve N candidati DISTINTI del tier
+/// ([`resolve_purpose_provider_candidates_db`]: health/cooldown-aware, NIENTE
+/// provider hardcoded, stesso routing del resto del sistema) e prova
+/// `attempt(provider, model)` in ORDINE, facendo failover al prossimo su
+/// [`AttemptOutcome::Failover`]. Si arrende con [`PurposeFailoverError::
+/// AllCandidatesFailed`] solo se TUTTI falliscono; il chiamante applica il suo
+/// degrado (503/skip/euristica). Generalizza il loop del classificatore
+/// (`intent_classifier::classify`). Il chiamante decide COSA e' un fallimento nel
+/// closure (tipicamente `orchestrator::neural_value_is_failure` sul value neural).
+pub async fn complete_for_purpose_with_failover<T, F, Fut>(
+    db: &PgPool,
+    purpose: &str,
+    mut attempt: F,
+) -> Result<T, PurposeFailoverError>
+where
+    F: FnMut(String, String) -> Fut,
+    Fut: std::future::Future<Output = AttemptOutcome<T>>,
+{
+    let limit = purpose_failover_candidate_limit(db, purpose).await;
+    let candidates = match resolve_purpose_provider_candidates_db(db, purpose, limit).await {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => return Err(PurposeFailoverError::NoCandidate(PurposeResolution::NotFound)),
+        Err(res) => return Err(PurposeFailoverError::NoCandidate(res)),
+    };
+    for cand in candidates {
+        match attempt(cand.provider.clone(), cand.model.clone()).await {
+            AttemptOutcome::Done(v) => return Ok(v),
+            AttemptOutcome::Failover => {
+                tracing::warn!(
+                    purpose,
+                    provider = %cand.provider,
+                    model = %cand.model,
+                    "purpose failover: candidato fallito, failover al prossimo del tier"
+                );
+            }
+        }
+    }
+    Err(PurposeFailoverError::AllCandidatesFailed)
+}
+
 /// PUNTO UNICO (regola L) della lettura tier-rule da `nexus_purpose_model` + delega
 /// al core decisionale. `_excluding` e `_pinned` sono viste su questa funzione con
 /// combinazioni diverse di `exclude_providers`/`only_provider`: la query DB della
