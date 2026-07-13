@@ -33,6 +33,21 @@ pub(crate) async fn maybe_trigger_debugger(
         return;
     }
 
+    // Boot-grace (regola H, causa radice "la chat riparte da sola" dopo un deploy):
+    // subito dopo un restart di mcp-core i servizi del progetto sono nel transitorio
+    // di riavvio (porte ancora occupate, servizio non ancora in ascolto). L'observer
+    // li vedrebbe "giu'" e li scambierebbe per crash, auto-triggerando un run di
+    // auto-debug che nessuno ha chiesto (incidente Chat 11 Beaty-Book). Entro la
+    // finestra dall'avvio del processo NON si auto-diagnostica: si lascia stabilizzare.
+    if within_boot_grace(state).await {
+        tracing::info!(
+            "service_observer: boot-grace attivo, skip auto-debug per {} ({}) — mcp-core appena riavviato",
+            unit,
+            kind
+        );
+        return;
+    }
+
     // Cooldown: stessa firma gia' diagnosticata entro la finestra.
     let recent: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM service_diagnoses \
@@ -263,4 +278,21 @@ pub(crate) async fn maybe_trigger_debugger(
             // Progetto non caricabile o altro fallback: nessun run (come prima).
         }
     }
+}
+
+/// `true` se mcp-core e' stato avviato da meno di `agent.observer.boot_grace_seconds`
+/// (regola G, default 90s): finestra in cui gli auto-trigger di remediation restano
+/// inerti perche' i servizi osservati sono nel transitorio di riavvio da deploy e i
+/// loro segnali (porte occupate, non-listening) non distinguono un crash reale dalla
+/// stabilizzazione. Punto unico (regola L): ogni auto-remediation che nasce
+/// dall'osservazione dei servizi delega a questa guardia. `boot_at` e' timbrato in
+/// `build_app_state`.
+pub(crate) async fn within_boot_grace(state: &AppState) -> bool {
+    let grace = crate::settings::get_setting(&state.db, "agent.observer.boot_grace_seconds")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(90);
+    state.boot_at.elapsed().as_secs() < grace
 }

@@ -96,8 +96,28 @@ pub fn detect_anomalies(state: &AgentState, cfg: SupervisorConfig) -> Supervisor
     }
 }
 
-/// Estrae il task originale (primo messaggio umano del run).
+/// Chiave in `extra` dove `native_engine::build_initial_state` fissa il task del
+/// TURNO CORRENTE all'avvio del run. Punto unico (regola L): il supervisore legge
+/// il task da qui, non lo ri-deriva dalla cronologia.
+pub const ORIGINAL_TASK_KEY: &str = "original_task";
+
+/// Estrae il task del turno corrente. Priorita' alla chiave `ORIGINAL_TASK_KEY`
+/// fissata all'init del run: in una sessione multi-turno `state.messages` contiene i
+/// task dei turni PRECEDENTI (es. un auto-debug di crash come primo Human), quindi il
+/// vecchio fallback "primo Human del run" faceva inseguire al supervisore il task
+/// sbagliato (incidente Chat 11: 60 iterazioni sul crash frontend invece del task di
+/// sicurezza auth). Fallback all'euristica (primo Human) solo se la chiave manca —
+/// run resumati/legacy o stati costruiti fuori da `build_initial_state`.
 pub fn extract_original_task(state: &AgentState) -> String {
+    if let Some(task) = state
+        .extra
+        .get(ORIGINAL_TASK_KEY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return task.to_string();
+    }
     state
         .messages
         .iter()
@@ -348,5 +368,51 @@ mod tests {
         };
         let s = build_steps_summary(&state, 5);
         assert!(s.contains("edit_file"));
+    }
+
+    #[test]
+    fn original_task_dalla_chiave_extra_vince_sul_primo_human() {
+        // Regressione Chat 11: la cronologia multi-turno ha come PRIMO Human il task
+        // del turno precedente (auto-debug crash); il task corrente e' fissato in
+        // extra[ORIGINAL_TASK_KEY]. Il supervisore deve seguire quello, non il primo.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            ORIGINAL_TASK_KEY.to_string(),
+            Value::String("Analizza la sicurezza dell'autenticazione".into()),
+        );
+        let state = AgentState {
+            messages: vec![
+                Message::Human {
+                    content: MessageContent::text("Crash rilevato nel servizio frontend"),
+                },
+                Message::Human {
+                    content: MessageContent::text("Analizza la sicurezza dell'autenticazione"),
+                },
+            ],
+            extra,
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_original_task(&state),
+            "Analizza la sicurezza dell'autenticazione"
+        );
+    }
+
+    #[test]
+    fn original_task_fallback_primo_human_senza_chiave() {
+        // Senza la chiave (run resumati/legacy) il comportamento resta l'euristica
+        // storica: primo Message::Human del run.
+        let state = AgentState {
+            messages: vec![
+                Message::Human {
+                    content: MessageContent::text("primo task"),
+                },
+                Message::Human {
+                    content: MessageContent::text("secondo messaggio"),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(extract_original_task(&state), "primo task");
     }
 }

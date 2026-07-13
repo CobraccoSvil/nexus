@@ -2340,6 +2340,17 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
     };
 
     let mut extra = serde_json::Map::new();
+    // Task del turno CORRENTE fissato all'origine (punto unico, regola L): il
+    // supervisore lo legge da qui (`extract_original_task`) invece di ri-derivarlo
+    // dalla cronologia, che in una sessione multi-turno contiene i task dei turni
+    // PRECEDENTI. Senza questo, il supervisore inseguiva il primo Human del run —
+    // spesso un auto-debug di crash iniettato dall'observer — invece del task reale
+    // (incidente Chat 11 Beaty-Book: 60 iterazioni sul crash frontend al posto del
+    // task di sicurezza auth).
+    extra.insert(
+        nexus_agent_graph::decisions::ORIGINAL_TASK_KEY.to_string(),
+        serde_json::Value::String(input.initial_msg.clone()),
+    );
     let mut declared_outcome = None;
     let mut stop_reason = None;
     let mut result = None;

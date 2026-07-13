@@ -155,7 +155,7 @@ pub use scale_reason::{
 pub use supervisor::{
     build_anomaly_block, build_steps_summary, detect_anomalies, extract_original_task,
     should_invoke, supervisor_cache_key, validate_supervisor_response, SupervisorAnomalies,
-    SupervisorConfig, SupervisorDecision,
+    SupervisorConfig, SupervisorDecision, ORIGINAL_TASK_KEY,
 };
 pub use text_repetition::{detect_repetition_collapse, RepetitionHit, RepetitionThresholds};
 pub use tool_dispatch::{

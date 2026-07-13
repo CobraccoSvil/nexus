@@ -191,6 +191,11 @@ struct AppState {
     /// il punto unico che risolve/provisiona `<slug>_nexus` e instrada i dati
     /// per-progetto. Invalidazione su re-provisioning / scadenza TTL.
     pub(crate) project_meta_pools: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
+    /// Istante di avvio del processo mcp-core. Usato dal boot-grace dell'observer
+    /// (`service_observer_remediation::within_boot_grace`): dopo un restart da
+    /// deploy i servizi del progetto sono nel transitorio di riavvio e non vanno
+    /// scambiati per crash. Timbrato una volta in `build_app_state`.
+    pub(crate) boot_at: std::time::Instant,
 }
 
 // Fallback quando `tail` non parte (Unix): non potendo seguire l'output, resta in
@@ -1389,6 +1394,7 @@ async fn build_app_state(
         project_channels: nexus_events::dispatcher::new_registry(),
         monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         project_meta_pools: nexus_cache::TtlCache::new(std::time::Duration::from_secs(600)),
+        boot_at: std::time::Instant::now(),
     };
     // Singleton globale per emit da contesti senza &ProjectChannels (NexusToolHandler).
     nexus_events::dispatcher::init_global(state.project_channels.clone());
