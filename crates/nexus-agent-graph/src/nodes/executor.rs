@@ -360,6 +360,15 @@ pub struct ExecutorConfig {
     /// regola M — mai dal parsing del testo). `0` = disabilitato -> bit-identico.
     /// Regola G: DB-driven, mai hardcoded.
     pub max_consecutive_text_only_turns: u32,
+    /// 3.4 (difesa strutturale provider-no-progress): quando il cap solo-testo scatta
+    /// (provider che non produce output utile per N turni), invece di chiudere il run
+    /// col backstop, PROVA prima a CAMBIARE PROVIDER via failover (`failover_provider`,
+    /// escludendo i gia' provati). Cosi' un provider bloccato non affossa il run se un
+    /// altro puo' procedere. `false` = disabilitato -> comportamento bit-identico
+    /// (chiusura backstop come oggi). Gata da `agent.provider_no_progress.enabled`
+    /// (regola G). Riusa il cap solo-testo come trigger e `auto_escalations < 3` per
+    /// non ciclare fra provider.
+    pub provider_no_progress_switch_enabled: bool,
     /// Soglie DB-driven della rilevazione loop-by-signature
     /// (`agent.loop.signature_threshold` / `agent.loop.recent_signatures_cap`).
     /// Regola G: ex costanti `LOOP_THRESHOLD` / `RECENT_SIGNATURES_CAP`.
@@ -602,6 +611,8 @@ impl Default for ExecutorConfig {
             // dal setting DB agent.run_cost_budget_usd (mig 0533).
             run_cost_budget_usd: 0.0,
             max_consecutive_text_only_turns: 3,
+            // 3.4 default OFF -> comportamento bit-identico (chiusura backstop).
+            provider_no_progress_switch_enabled: false,
             loop_thresholds: LoopThresholds::default(),
             repetition: RepetitionThresholds::default(),
             // Default safe-DB-down = seed mig 0510 (2). Con nessuna storia di
@@ -1498,6 +1509,15 @@ piu' specifico, oppure riprova con un modello piu' capace.",
                     &messages,
                     ctx,
                 )
+                .await
+            {
+                return Ok(delta);
+            }
+            // 3.4 (difesa strutturale, dietro flag): prima del backstop close, prova a
+            // CAMBIARE PROVIDER (un provider fermo non deve affossare il run se un altro
+            // puo' procedere). `None` -> chiusura backstop sotto (bit-identico, flag OFF).
+            if let Some(delta) = self
+                .maybe_switch_provider_on_no_progress(state, iters_in, ctx, mode, text_only_streak)
                 .await
             {
                 return Ok(delta);
@@ -4833,6 +4853,130 @@ impl ExecutorNode {
     ///   3. nessuna mossa gia' decisa / epoca gia' risolta a Fallback per questo
     ///      (axis, epoch) (anti-meta-loop, punto unico `stall_move_key`).
     /// `axis` e' [`AXIS_TOKEN_OVERFLOW`] o [`AXIS_TEXT_ONLY`]; `count` e' il valore
+    /// 3.4 (difesa strutturale, dietro flag `provider_no_progress_switch_enabled`): sul
+    /// cap solo-testo (un provider che DESCRIVE senza AGIRE per N turni), prova a
+    /// CAMBIARE PROVIDER via failover invece di chiudere il run col backstop. `None`
+    /// (-> il chiamante chiude, bit-identico) se: flag OFF, provider corrente assente,
+    /// cap escalation esaurito (`auto_escalations >= 3`) o nessun sostituto sano resta.
+    /// Riusa il punto unico `EscalationPort::failover_provider` (causa `EmptyCompletion`
+    /// = "non produce output utile" -> finestra NON filtrata) e la cascata
+    /// `failover_tried` del ramo errore-provider (regola L).
+    async fn maybe_switch_provider_on_no_progress(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+        text_only_streak: u32,
+    ) -> Option<OpaqueDelta> {
+        if !self.cfg.provider_no_progress_switch_enabled {
+            return None;
+        }
+        let provider = state
+            .provider_used
+            .clone()
+            .or_else(|| state.provider_override.clone())
+            .unwrap_or_default();
+        let model = state
+            .model_used
+            .clone()
+            .or_else(|| state.model_override.clone())
+            .unwrap_or_default();
+        if provider.trim().is_empty() {
+            return None;
+        }
+        // Cap anti-raffica (stesso del ramo errore-provider): non ciclare fra provider.
+        let cd_escal = state
+            .extra
+            .get("auto_escalations")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if cd_escal >= 3 {
+            return None;
+        }
+        let mut tried: Vec<String> = state
+            .extra
+            .get("failover_tried")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !tried.iter().any(|p| p == &provider) {
+            tried.push(provider.clone());
+        }
+        // "Non produce output utile": causa EmptyCompletion (il failover causa-aware NON
+        // filtra la finestra -> ripiega su qualunque provider sano).
+        let pick = self
+            .escalation
+            .failover_provider(
+                Some(&provider),
+                Some(&model),
+                state.current_tier.as_deref(),
+                crate::runtime::ports::ProviderFailureCause::EmptyCompletion,
+                &tried,
+            )
+            .await
+            .ok()
+            .flatten()?;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            from_provider = %provider,
+            to_provider = %pick.provider,
+            to_model = %pick.model,
+            text_only_streak,
+            "3.4: provider fermo (solo-testo oltre soglia) -> switch cross-provider invece di chiudere"
+        );
+        self.emit_phase(
+            ctx,
+            mode,
+            "escalation",
+            format!(
+                "{provider} non avanza (solo testo): passo a {}/{}",
+                pick.provider, pick.model
+            ),
+            json!({
+                "from_provider": provider,
+                "to_provider": pick.provider,
+                "to_model": pick.model,
+                "reason": "provider_no_progress",
+                "cooldown": false,
+                "cause": "no_progress",
+            }),
+        )
+        .await;
+        let esc_nudge = human_msg(
+            "Il provider precedente ha descritto senza agire per piu' turni consecutivi. \
+Riprendi tu, sul nuovo provider: esegui SUBITO il prossimo step CONCRETO del compito con \
+una tool call, non descrivere.",
+        );
+        tried.push(pick.provider.clone());
+        let mut extra_out = state.extra.clone();
+        extra_out.insert("auto_escalations".to_string(), json!(cd_escal + 1));
+        extra_out.insert("failover_tried".to_string(), json!(tried));
+        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        Some(
+            StateDelta {
+                messages: Some(vec![esc_nudge]),
+                sticky_provider: Some(Some(pick.provider)),
+                sticky_model: Some(Some(pick.model)),
+                current_tier: Some(pick.tier),
+                recent_tool_signatures: Some(Some(vec![])),
+                g1_reroute_count: Some(Some(0)),
+                action_nudge_count: Some(Some(0)),
+                consecutive_text_only_turns: Some(Some(0)),
+                pending_tool_uses: Some(Some(vec![])),
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
     /// del limite (token cumulativi / streak). NON chiama l'LLM (lo fa il nodo).
     async fn maybe_runaway_stall_delta(
         &self,

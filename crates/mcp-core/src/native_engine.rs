@@ -1139,6 +1139,13 @@ async fn load_executor_config(
         )
         .await
         .max(0) as u32,
+        // 3.4 (provider-no-progress switch): DB-driven, default OFF (bit-identico).
+        provider_no_progress_switch_enabled: setting_bool(
+            db,
+            "agent.provider_no_progress.enabled",
+            d.provider_no_progress_switch_enabled,
+        )
+        .await,
         loop_thresholds: LoopThresholds {
             signature: setting_i64(
                 db,
