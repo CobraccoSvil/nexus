@@ -23,22 +23,64 @@ export interface SettingsCategory {
   count?: number;
 }
 
-/** Ordine e label delle categorie note (non e' un filtro di visibilita'). */
-const KNOWN_CATEGORY_META: ReadonlyArray<{ key: string; label?: string }> = [
-  { key: "providers", label: "Provider AI" },
-  { key: "routing", label: "Routing" },
-  { key: "connectors", label: "Plugin MCP" },
-  { key: "security", label: "Sicurezza & DLP" },
-  { key: "infrastructure", label: "Infrastruttura" },
-  { key: "embeddings", label: "Embeddings" },
-  { key: "quality", label: "Qualita" },
-  { key: "learning", label: "Learning" },
-  { key: "agent", label: "Agenti AI" },
-  { key: "orchestrator", label: "Orchestrator" },
-  { key: "optimizer", label: "Ottimizzatore" },
-  { key: "reflection", label: "Self-Reflection" },
-  { key: "auth", label: "Autenticazione" },
+/**
+ * Livello UI di una categoria: "daily" = uso quotidiano (in alto nel menu),
+ * "advanced" = configurazione profonda (gruppo collassato). Default advanced.
+ * Fase 1 del redesign: la classificazione e' qui (frontend) per categoria; la
+ * fase 2 la sposta nel DB per-chiave (settings.ui_level, ADR 0039).
+ */
+export type CategoryLevel = "daily" | "advanced";
+
+/** Ordine, label e livello delle categorie note (non e' un filtro di visibilita').
+ *  Elenco completo delle categorie live: elimina i titoli grezzi "cat.X". */
+const KNOWN_CATEGORY_META: ReadonlyArray<{ key: string; label: string; level?: CategoryLevel }> = [
+  // Uso quotidiano
+  { key: "providers", label: "Provider AI", level: "daily" },
+  { key: "routing", label: "Routing", level: "daily" },
+  { key: "connectors", label: "Plugin MCP", level: "daily" },
+  { key: "security", label: "Sicurezza & DLP", level: "daily" },
+  { key: "quality", label: "Qualita", level: "daily" },
+  { key: "learning", label: "Learning", level: "daily" },
+  { key: "auth", label: "Autenticazione", level: "daily" },
+  // Configurazione avanzata
+  { key: "agent", label: "Agenti AI", level: "advanced" },
+  { key: "agent_tools", label: "Strumenti agente", level: "advanced" },
+  { key: "orchestrator", label: "Orchestrator", level: "advanced" },
+  { key: "optimizer", label: "Ottimizzatore", level: "advanced" },
+  { key: "reflection", label: "Self-Reflection", level: "advanced" },
+  { key: "embeddings", label: "Embeddings", level: "advanced" },
+  { key: "infrastructure", label: "Infrastruttura", level: "advanced" },
+  { key: "gateway", label: "Gateway LLM", level: "advanced" },
+  { key: "general", label: "Generale", level: "advanced" },
+  { key: "wiki", label: "Wiki", level: "advanced" },
+  { key: "knowledge", label: "Conoscenza", level: "advanced" },
+  { key: "kb", label: "Knowledge Base", level: "advanced" },
+  { key: "database", label: "Database", level: "advanced" },
+  { key: "nexus_tools", label: "Strumenti Nexus", level: "advanced" },
+  { key: "claude_agents", label: "Agenti Claude", level: "advanced" },
+  { key: "prompt_templates", label: "Template prompt", level: "advanced" },
+  { key: "project", label: "Progetto", level: "advanced" },
+  { key: "system", label: "Sistema", level: "advanced" },
+  { key: "chat", label: "Chat", level: "advanced" },
+  { key: "media", label: "Media", level: "advanced" },
 ];
+
+const META_BY_KEY = new Map(KNOWN_CATEGORY_META.map((m) => [m.key, m]));
+
+/** Etichetta leggibile di una categoria (punto unico, regola L): label nota o
+ *  fallback capitalizzato. Usato da sidebar E titolo pagina per non mostrare mai
+ *  la chiave grezza (fix dei titoli "cat.X" non tradotti). */
+export function labelForCategory(category: string): string {
+  const meta = META_BY_KEY.get(category);
+  if (meta) return meta.label;
+  return category.charAt(0).toUpperCase() + category.slice(1).replace(/_/g, " ");
+}
+
+/** Livello UI di una categoria (default advanced: una categoria nuova non
+ *  classificata finisce nel gruppo protetto, mai in cima). */
+export function levelForCategory(category: string): CategoryLevel {
+  return META_BY_KEY.get(category)?.level ?? "advanced";
+}
 
 function buildList(dbCategories: { category: string; count: number }[]): SettingsCategory[] {
   const byKey = new Map(dbCategories.map((c) => [c.category, c.count]));

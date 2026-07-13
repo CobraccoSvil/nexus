@@ -17,6 +17,7 @@ import { GatewayConfig } from "./gateway-config";
 import { CatalogMaintenance } from "./catalog-maintenance";
 import { ProvidersOverview } from "./providers-overview";
 import { getGatewayProviders } from "../../lib/api-client";
+import { labelForCategory } from "../../lib/settings-categories";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -303,9 +304,15 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     : items;
 
   const catKey = category ? (`cat.${category}` as Parameters<typeof t>[0]) : null;
-  const title = catKey ? t(catKey) : t("admin.settings");
+  // Se la chiave i18n non esiste, t() ritorna la chiave grezza ("cat.agent"):
+  // in quel caso usa la label nota (labelForCategory) invece di mostrarla cruda.
+  const translated = catKey ? t(catKey) : "";
+  const catLabel = category
+    ? (translated && translated !== catKey ? translated : labelForCategory(category))
+    : "";
+  const title = category ? catLabel : t("admin.settings");
   const subtitle = category
-    ? t("settings.configure", { category: catKey ? t(catKey).toLowerCase() : category })
+    ? t("settings.configure", { category: catLabel.toLowerCase() })
     : t("settings.stored");
 
   if (loading) {

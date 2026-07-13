@@ -6,7 +6,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
-import { useSettingsCategories } from "../lib/settings-categories";
+import { useSettingsCategories, levelForCategory, type SettingsCategory } from "../lib/settings-categories";
 
 export function AdminSidebar({
   compact = false,
@@ -21,6 +21,42 @@ export function AdminSidebar({
   // Voci settings derivate dai DATI (SELECT DISTINCT category) — regola L:
   // una categoria nuova nel DB diventa navigabile senza toccare il frontend.
   const settingsCategories = useSettingsCategories();
+  // Split per livello: quotidiane sempre visibili, avanzate in un gruppo
+  // collassato (redesign fase 1, ADR 0039).
+  const dailyCategories = settingsCategories.filter((c) => levelForCategory(c.key) === "daily");
+  const advancedCategories = settingsCategories.filter((c) => levelForCategory(c.key) === "advanced");
+  const [advancedCatsOpen, setAdvancedCatsOpen] = useState<boolean>(() =>
+    advancedCategories.some((c) => pathname === `/admin/settings/${c.key}`),
+  );
+
+  const renderCategory = (item: SettingsCategory) => {
+    const href = `/admin/settings/${item.key}` as Route;
+    const active = pathname === href;
+    const catKey = `cat.${item.key}`;
+    const translated = t(catKey as Parameters<typeof t>[0]);
+    const displayLabel = translated !== catKey ? translated : item.label;
+    return (
+      <Link
+        key={item.key}
+        href={href}
+        className="text-sm transition-all"
+        onClick={onNavigate}
+        style={{
+          display: "block",
+          padding: compact ? "6px 12px" : "6px 16px",
+          margin: compact ? "0 6px" : "0 8px",
+          borderRadius: 6,
+          textDecoration: "none",
+          color: active ? tc.accent : tc.textMuted,
+          fontWeight: active ? 600 : 400,
+          background: active ? tc.bgActive : "transparent",
+          borderLeft: "2px solid transparent",
+        }}
+      >
+        {displayLabel}
+      </Link>
+    );
+  };
 
   const menuGroups = [
     {
@@ -48,7 +84,6 @@ export function AdminSidebar({
         { label: "Database Nexus", href: "/admin/nexus-database" as Route, icon: "DN" },
         { label: "Manutenzione Vettori", href: "/admin/vector-maintenance" as Route, icon: "MV" },
         { label: "Knowledge Base", href: "/admin/kb" as Route, icon: "KB" },
-        { label: "Doc Nexus (legacy)", href: "/admin/nexus-docs" as Route, icon: "DX" },
         { label: "Porting Progetto", href: "/admin/project-porting" as Route, icon: "PP" },
       ],
     },
@@ -149,35 +184,43 @@ export function AdminSidebar({
       </Link>
 
       <div className="flex-col" style={{ marginLeft: compact ? 20 : 32, gap: 1 }}>
-        {settingsCategories.map((item) => {
-          const href = `/admin/settings/${item.key}` as Route;
-          const active = pathname === href;
-          const catKey = `cat.${item.key}`;
-          const translated = t(catKey as Parameters<typeof t>[0]);
-          const displayLabel = translated !== catKey ? translated : item.label;
-          return (
-            <Link
-              key={item.key}
-              href={href}
-              className="text-sm transition-all"
-              onClick={onNavigate}
-              style={{
-                display: "block",
-                padding: compact ? "6px 12px" : "6px 16px",
-                margin: compact ? "0 6px" : "0 8px",
-                borderRadius: 6,
-                textDecoration: "none",
-                color: active ? tc.accent : tc.textMuted,
-                fontWeight: active ? 600 : 400,
-                background: active ? tc.bgActive : "transparent",
-                borderLeft: "2px solid transparent",
-              }}
-            >
-              {displayLabel}
-            </Link>
-          );
-        })}
+        {dailyCategories.map((item) => renderCategory(item))}
       </div>
+
+      {/* ── Categorie di configurazione avanzata (collassate di default) ── */}
+      {advancedCategories.length > 0 && (
+        <div style={{ marginLeft: compact ? 20 : 32 }}>
+          <button
+            type="button"
+            onClick={() => setAdvancedCatsOpen((v) => !v)}
+            className="text-sm transition-all"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              width: "100%",
+              padding: compact ? "6px 12px" : "6px 16px",
+              margin: compact ? "0 6px" : "0 8px",
+              borderRadius: 6,
+              border: "none",
+              background: "transparent",
+              color: tc.textMuted,
+              cursor: "pointer",
+              fontFamily: "inherit",
+              textAlign: "left",
+            }}
+          >
+            <span style={{ fontSize: 10 }}>{advancedCatsOpen ? "▾" : "▸"}</span>
+            <span style={{ flex: 1 }}>Configurazione avanzata</span>
+            <span style={{ fontSize: 10, marginRight: 6 }}>{advancedCategories.length}</span>
+          </button>
+          {advancedCatsOpen && (
+            <div className="flex-col" style={{ gap: 1 }}>
+              {advancedCategories.map((item) => renderCategory(item))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ height: 8 }} />
 
