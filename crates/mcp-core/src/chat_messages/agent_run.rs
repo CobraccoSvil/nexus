@@ -2590,6 +2590,17 @@ pub(crate) async fn spawn_agent_run(
         params.session_id,
     )
     .await;
+    // Decisione AGENTICA su consiglio + multi-provider (regola M): a decidere se
+    // il task merita la deliberazione a monte e' il GIUDIZIO del classificatore
+    // LLM (`complexity`), non un keyword-match sul testo (fragile, monolingua,
+    // falsi positivi tipo "migra il testo del bottone"). Solo se il classificatore
+    // NON e' disponibile (fallback: LLM down/timeout/JSON invalido) si degrada al
+    // gate keyword `council_triggered_for` (comportamento storico, fail-safe).
+    let deliberate = if !classified.classifier_resolved {
+        crate::prompt_templates::council_triggered_for(&state.db, &params.content).await
+    } else {
+        classified.complexity != "low"
+    };
     let council_outcome = maybe_convene_council(
         &state,
         &run_pool,
@@ -2597,6 +2608,7 @@ pub(crate) async fn spawn_agent_run(
         params.session_id,
         run_id,
         &params.content,
+        deliberate,
     )
     .await;
     if let Some(ref outcome) = council_outcome {
@@ -2607,7 +2619,8 @@ pub(crate) async fn spawn_agent_run(
         .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
         .filter(|b| !b.is_empty());
     let multi_provider_block =
-        maybe_convene_multi_provider_panel(&state, params.session_id, &params.content).await;
+        maybe_convene_multi_provider_panel(&state, params.session_id, &params.content, deliberate)
+            .await;
     if let Some(outcome) = &multi_provider_block {
         emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }
@@ -5237,6 +5250,7 @@ async fn maybe_convene_council(
     session_id: Uuid,
     run_id: Uuid,
     user_text: &str,
+    deliberate: bool,
 ) -> Option<crate::agent_tools::subagent_native::CouncilConveneOutcome> {
     use crate::agent_tools::subagent_native::{
         CouncilConveneOutcome, CouncilDegradeReason,
@@ -5251,9 +5265,11 @@ async fn maybe_convene_council(
     if !enabled {
         return None;
     }
-    // Gate d'ambito sensibile: PUNTO UNICO condiviso col gate della direttiva
-    // in-prompt (regola L) — stessa definizione di "ambito sensibile".
-    if !crate::prompt_templates::council_triggered_for(&state.db, user_text).await {
+    // Decisione AGENTICA (regola M): `deliberate` viene dal giudizio del
+    // classificatore LLM (o dal fallback keyword se il classificatore e' down),
+    // deciso a monte dal chiamante. Qui si RISPETTA quella decisione: un task che
+    // non la merita non convoca il consiglio.
+    if !deliberate {
         return None;
     }
     // Selezione figure (DB-driven + routing per ambito): lista vuota -> niente.
@@ -5594,8 +5610,12 @@ async fn maybe_convene_multi_provider_panel(
     state: &AppState,
     session_id: Uuid,
     user_text: &str,
+    deliberate: bool,
 ) -> Option<crate::agent_tools::subagent_native::MultiProviderPanelOutcome> {
-    if !crate::prompt_templates::council_triggered_for(&state.db, user_text).await {
+    // Decisione AGENTICA (regola M): stesso segnale del consiglio (giudizio del
+    // classificatore, fallback keyword se down). Il multi-provider e' un panel di
+    // deliberazione a monte come il consiglio: condivide la soglia di attivazione.
+    if !deliberate {
         return None;
     }
     let cfg = crate::agent_tools::subagent_native::read_multi_provider_config(&state.db).await?;

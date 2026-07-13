@@ -76,6 +76,8 @@ fn classified_from_rust(ai: crate::intent_classifier::AgenticIntent) -> Classifi
         // Il fallback neutro del classifier rust NON e' incertezza (scelta di
         // sistema): non forziamo disambiguazione su un fallback.
         is_ambiguous: ai.is_ambiguous && !ai.fallback_used,
+        classifier_resolved: !ai.fallback_used,
+        complexity: ai.complexity,
         slots: ai.slots,
     }
 }
@@ -115,10 +117,6 @@ pub(crate) struct AgenticIntentResponse {
         reason = "campo obbligatorio del contratto JSON di POST /classify-intent-agentic: senza serde(default) la deserializzazione valida la risposta del brain"
     )]
     requires_tools: bool,
-    #[expect(
-        dead_code,
-        reason = "campo obbligatorio del contratto JSON di POST /classify-intent-agentic: senza serde(default) la deserializzazione valida la risposta del brain"
-    )]
     complexity: String,
     confidence: f32,
     #[expect(
@@ -168,6 +166,15 @@ pub struct ClassifiedIntent {
     /// router prova prima la `nexus_routing_slots_matrix` (mig 0133), e
     /// cade sul routing classico (intent, behavior_mode) se non c'e' match.
     pub slots: crate::routing_slots::ActionSlots,
+    /// Complessita' del task giudicata dal classifier LLM (`low`/`medium`/`high`).
+    /// Consumata dalla DECISIONE AGENTICA di convocare consiglio/multi-provider
+    /// (regola M: segnale strutturato del classificatore, non keyword-match sul
+    /// testo). `medium` sul fallback neutro.
+    pub complexity: String,
+    /// `true` se l'interpretazione viene DAVVERO dal classifier LLM; `false` sul
+    /// fallback neutro (LLM down/timeout/JSON invalido). I gate a valle usano il
+    /// giudizio LLM solo se `true`, altrimenti degradano al percorso keyword.
+    pub classifier_resolved: bool,
 }
 
 /// Soglia di confidence default sotto la quale ignoriamo la classificazione LLM
@@ -423,6 +430,8 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
                 confidence: 0.5,
             }],
             is_ambiguous: false,
+            classifier_resolved: false,
+            complexity: "medium".to_string(),
             slots: crate::routing_slots::ActionSlots::default(),
         }
     };
@@ -483,6 +492,8 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
             confidence: parsed.confidence,
             candidates,
             is_ambiguous: true,
+            classifier_resolved: true,
+            complexity: parsed.complexity,
             slots: parsed.slots,
         };
     }
@@ -492,6 +503,8 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
         confidence: parsed.confidence,
         candidates: parsed.candidates,
         is_ambiguous: parsed.is_ambiguous,
+        classifier_resolved: true,
+        complexity: parsed.complexity,
         slots: parsed.slots,
     }
 }

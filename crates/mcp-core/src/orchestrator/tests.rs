@@ -182,6 +182,8 @@ fn classified(
             })
             .collect(),
         is_ambiguous: ambig,
+        classifier_resolved: true,
+        complexity: "medium".to_string(),
         slots: crate::routing_slots::ActionSlots::default(),
     }
 }
