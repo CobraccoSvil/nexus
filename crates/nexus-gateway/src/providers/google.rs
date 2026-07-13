@@ -1618,6 +1618,29 @@ fn resolve_thinking(req: &LlmRequest, configured_budget: u32) -> GoogleThinking 
         .as_ref()
         .and_then(super::tool_choice::ToolChoice::from_openai)
         .is_some();
+    // THINKING OBBLIGATORIO (regola M/G, fix gemini-3 empty-completion): un modello a
+    // thinking mandatory (segnalato dall'adapter mcp-core via `thinking.mandatory`,
+    // policy DB `agentic_thinking_policy='native'`) RIFIUTA `thinkingBudget=0` (HTTP
+    // 400) e, senza `thinkingConfig`, spende un thinking DEFAULT illimitato che divora
+    // il tetto di output -> risposta vuota (finish=length). Per questi modelli NON
+    // disabilitiamo il thinking sui turni con tool: emettiamo un budget bounded
+    // ESPLICITO (>0), e `build_generation_config` alza `maxOutputTokens` del budget
+    // cosi' i `max_tokens` restano interi per la risposta. Precede il gate tool.
+    let mandatory = req.thinking.as_ref().is_some_and(|t| t.mandatory);
+    if mandatory {
+        // Budget dal segnale dell'adapter (dal catalog) o dal configurato; mai 0
+        // (400), mai sopra il tetto di output richiesto (che resta per la risposta).
+        let max_tokens = req.max_tokens.unwrap_or(THINKING_MIN_MAX_TOKENS);
+        let base = req
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens)
+            .unwrap_or(configured_budget);
+        let budget = base
+            .max(THINKING_BUDGET_FLOOR)
+            .min(max_tokens.max(THINKING_BUDGET_FLOOR));
+        return GoogleThinking::Enabled(budget);
+    }
     if has_tools || has_tool_choice_constraint {
         return GoogleThinking::DisabledForTools;
     }
@@ -3578,6 +3601,7 @@ mod tests {
             thinking: Some(crate::types::ThinkingConfig {
                 enabled,
                 budget_tokens: budget,
+                mandatory: false,
             }),
             tool_choice: None,
             pin_provider: None,
@@ -3657,6 +3681,7 @@ mod tests {
         req.thinking = Some(crate::types::ThinkingConfig {
             enabled: true,
             budget_tokens: Some(4096),
+            mandatory: false,
         });
         req.max_tokens = Some(8000);
         let thinking = resolve_thinking(&req, 8192);

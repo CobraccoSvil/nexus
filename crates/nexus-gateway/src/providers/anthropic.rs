@@ -1594,6 +1594,7 @@ mod tests {
             thinking: Some(crate::types::ThinkingConfig {
                 enabled,
                 budget_tokens: budget,
+                mandatory: false,
             }),
             tool_choice: None,
             pin_provider: None,

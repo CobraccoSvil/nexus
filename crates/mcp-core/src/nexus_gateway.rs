@@ -71,6 +71,13 @@ pub struct GwThinkingConfig {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
+    /// Thinking OBBLIGATORIO per il modello (gemini-3, policy DB
+    /// `agentic_thinking_policy='native'`): quando true il gateway emette un thinking
+    /// budget bounded (Enabled) invece di DisabledForTools (che gemini-3 rifiuta ->
+    /// thinking illimitato -> risposta vuota). Popolato in `complete()` dal catalog
+    /// (self.db, regola G). Serializzato verso il gateway (default false).
+    #[serde(default)]
+    pub mandatory: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]

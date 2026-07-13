@@ -178,6 +178,18 @@ pub struct ThinkingConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
+    /// Thinking OBBLIGATORIO per il modello (es. gemini-3): il modello RIFIUTA
+    /// `thinkingBudget=0` (HTTP 400) e, senza `thinkingConfig`, applica il suo
+    /// thinking DEFAULT ILLIMITATO che divora il tetto di output -> risposta vuota
+    /// (`finish_reason=length`). Quando `true`, `resolve_thinking` emette un budget
+    /// bounded ESPLICITO anche sui turni con tool (invece di `DisabledForTools`),
+    /// e `build_generation_config` alza `maxOutputTokens` del budget cosi' la
+    /// risposta ha spazio. Popolato dall'adapter mcp-core dalla policy del catalog
+    /// (`agentic_thinking_policy='native'`, regola G): default `false` -> nessuna
+    /// regressione per i modelli non-obbligatori. Solo trasporto, non serializzato
+    /// verso i provider (usato in `resolve_thinking`).
+    #[serde(default)]
+    pub mandatory: bool,
 }
 
 /// Conteggio token consumati.
@@ -271,9 +283,32 @@ impl LlmResponse {
         // output vuoto; `"stop"` NON e' escluso (Google vi collassa anche
         // MALFORMED_FUNCTION_CALL, output vuoto reale che deve ripiegare).
         let safety_block = self.finish_reason == "content_filter";
-        no_content && no_tool_calls && !safety_block
+        if safety_block {
+            return false;
+        }
+        // (1) Storico: nessun output utile (content vuoto E nessuna tool-call).
+        if no_content && no_tool_calls {
+            return true;
+        }
+        // (2) CONTRATTO STRUTTURATO (regola M, fix gemini hollow-ma-non-vuoto): il
+        // modello e' stato TRONCATO dal limite di token (finish=length: il budget e'
+        // stato speso nel thinking) senza una tool-call e con output VISIBILE
+        // trascurabile. Il segnale e' l'`usage.output_tokens` STRUTTURATO (per Gemini
+        // = candidatesTokenCount, che ESCLUDE i thinking token, google.rs
+        // usage_from_metadata): ~0 significa "nessun output reale" = fallito, anche se
+        // resta un frammento di content. Cattura il caso che (1) mancava (RC-2: una
+        // functionCall vuota/malformata o un frammento non-degenere sfuggiva al gate).
+        // Gating STRETTO (finish=length + no tool-call + output <= floor) per non
+        // flaggare un troncamento legittimo con output reale.
+        let cut_off_by_length = matches!(self.finish_reason.as_str(), "length" | "max_tokens");
+        cut_off_by_length && no_tool_calls && self.usage.output_tokens <= HOLLOW_OUTPUT_TOKENS_FLOOR
     }
 }
+
+/// Soglia (token di output VISIBILE) sotto la quale un turno troncato da `length`
+/// senza tool-call e' considerato hollow (contratto strutturato, regola M). Piccola:
+/// distingue un frammento trascurabile da una risposta parziale reale.
+const HOLLOW_OUTPUT_TOKENS_FLOOR: u32 = 32;
 
 /// Delta di tool-call durante lo streaming.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -588,9 +623,36 @@ mod tests {
     }
 
     #[test]
-    fn non_empty_content_is_not_degenerate() {
-        // Qualsiasi testo utile -> non degenere, a prescindere dal finish_reason.
-        assert!(!resp("ok", None, "length").is_degenerate_completion());
+    fn risposta_reale_troncata_non_e_degenere() {
+        // Una risposta REALE troncata da length (output_tokens sostanziosi, > floor)
+        // NON e' degenere: e' un output valido tagliato, non un hollow da thinking.
+        let mut r = resp("una risposta lunga e utile del modello", None, "length");
+        r.usage.output_tokens = 500;
+        assert!(!r.is_degenerate_completion());
+        // finish "stop" con content: risposta completa, mai degenere (a prescindere
+        // dagli output_tokens).
         assert!(!resp("parziale", None, "stop").is_degenerate_completion());
+        let mut r3 = resp("breve ma completa", None, "stop");
+        r3.usage.output_tokens = 3;
+        assert!(!r3.is_degenerate_completion());
+    }
+
+    #[test]
+    fn frammento_hollow_troncato_da_length_e_degenere() {
+        // CONTRATTO STRUTTURATO (regola M, RC-2): un frammento trascurabile con
+        // finish=length e output_tokens ~0 (budget speso nel thinking) e' hollow, anche
+        // se il content non e' strettamente vuoto. Il segnale e' l'usage STRUTTURATO
+        // (candidatesTokenCount, esclude i thinking token), non il parsing del testo.
+        let mut r = resp("x", None, "length");
+        r.usage.output_tokens = 1;
+        assert!(r.is_degenerate_completion());
+        // Con una tool-call NON e' degenere (progresso agentico), a prescindere.
+        let mut r2 = resp("x", Some(vec![a_tool_call()]), "length");
+        r2.usage.output_tokens = 1;
+        assert!(!r2.is_degenerate_completion());
+        // "max_tokens" (alcuni provider) e' trattato come "length".
+        let mut r4 = resp("", None, "max_tokens");
+        r4.usage.output_tokens = 0;
+        assert!(r4.is_degenerate_completion());
     }
 }

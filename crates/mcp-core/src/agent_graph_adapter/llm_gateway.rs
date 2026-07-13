@@ -133,6 +133,34 @@ impl LlmGateway for GatewayLlmAdapter {
         // costo risultava sempre 0. request_id = run_id e' gia' valorizzato.
         gw_req.metadata.tenant_id = self.project_id.clone();
         gw_req.metadata.user_id = self.user_id.clone();
+        // RC-1 (fix gemini-3 empty-completion): thinking OBBLIGATORIO dal catalog
+        // (punto con accesso a self.db, regola G: niente nomi modello hardcoded). Per i
+        // modelli google con `agentic_thinking_policy='native'` iniettiamo un budget
+        // bounded + il flag `mandatory` cosi' il gateway emette `Enabled(budget)` invece
+        // di `DisabledForTools` (che gemini-3 rifiuta -> thinking illimitato -> risposta
+        // vuota finish=length). GATE alla FAMIGLIA google (il fix e' google-API-specifico:
+        // solo google.rs::resolve_thinking legge `mandatory`): 'native' e' usato anche da
+        // OpenAI o1/o3/o4, che gestiscono il reasoning nativamente e NON vanno toccati.
+        let is_google = matches!(
+            req.provider.trim().to_lowercase().as_str(),
+            "google" | "vertex" | "vertex_ai" | "gemini"
+        );
+        if is_google {
+            if let Some(budget) = crate::capability::resolve_mandatory_thinking_budget(
+                &self.db,
+                &req.provider,
+                &req.model,
+            )
+            .await
+            {
+                let explicit = gw_req.thinking.as_ref().and_then(|t| t.budget_tokens);
+                gw_req.thinking = Some(GwThinkingConfig {
+                    enabled: true,
+                    budget_tokens: Some(explicit.unwrap_or(budget)),
+                    mandatory: true,
+                });
+            }
+        }
         let resp = self
             .gateway
             .complete(gw_req)
@@ -314,6 +342,9 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
         thinking: req.thinking.as_ref().map(|t| GwThinkingConfig {
             enabled: t.enabled,
             budget_tokens: t.budget_tokens,
+            // `mandatory` non arriva dall'executor: lo inietta `complete()` dalla
+            // policy del catalog (RC-1, self.db). Qui default false (fn pura).
+            mandatory: false,
         }),
         tool_choice: force_tool_choice_to_value(req.force_tool_choice),
         pin_provider: if req.provider.is_empty() {

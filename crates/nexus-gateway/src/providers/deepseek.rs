@@ -405,6 +405,7 @@ mod tests {
         let r = resolve_reasoning(&req_with_thinking(Some(ThinkingConfig {
             enabled: true,
             budget_tokens: None,
+            mandatory: false,
         })));
         assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
         assert!(r.enabled);
@@ -415,6 +416,7 @@ mod tests {
         let r = resolve_reasoning(&req_with_thinking(Some(ThinkingConfig {
             enabled: false,
             budget_tokens: None,
+            mandatory: false,
         })));
         assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
         assert!(!r.enabled);
@@ -461,6 +463,7 @@ mod tests {
         let mut req = req_with_thinking(Some(ThinkingConfig {
             enabled: true,
             budget_tokens: None,
+            mandatory: false,
         }));
         req.tool_choice = Some(serde_json::json!("required"));
         let r = resolve_reasoning(&req);
@@ -474,6 +477,7 @@ mod tests {
         let r_on = resolve_reasoning(&req_with_thinking(Some(ThinkingConfig {
             enabled: true,
             budget_tokens: None,
+            mandatory: false,
         })));
         assert!(r_on.enabled);
         let r_none = resolve_reasoning(&req_with_thinking(None));
