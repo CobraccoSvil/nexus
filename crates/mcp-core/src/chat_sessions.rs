@@ -563,55 +563,50 @@ pub(crate) async fn compact_session_core(
     let messages_json =
         serde_json::to_string(&msgs).map_err(|e| CompactError::internal(e.to_string()))?;
 
-    // Risolvi provider/modello dal PUNTO UNICO resolve_purpose_model (regola G +
-    // regola L): niente modello hardcoded, niente fallback a un provider morto.
-    // Rispetta tier-rule, cooldown, disponibilita'. Se nessun provider e'
-    // disponibile, propaga errore chiaro all'utente.
-    let (summary_provider, summary_model) = {
-        use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
-        match resolve_purpose_model(state, "conversation_summary").await {
-            PurposeResolution::Resolved {
-                provider, model, ..
-            } => (provider, model),
-            PurposeResolution::NoCapableModel { tier } => {
+    // FAILOVER tier-aware (punto unico complete_for_purpose_with_failover, regola
+    // L/G): niente modello hardcoded; risolve N candidati del tier e prova in
+    // ordine, facendo failover al prossimo su fallimento (regola M:
+    // neural_value_is_failure — include timeout/errore/content vuoto). Prima
+    // degradava al PRIMO provider fallito; ora si arrende solo se TUTTI falliscono.
+    let summary_resp = {
+        use crate::internal_routing::{
+            complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
+        };
+        let neural = &state.orchestrator.neural;
+        let attempt = |prov: String, mdl: String| {
+            let messages_json = &messages_json;
+            async move {
+                match neural
+                    .generate_agent_turn(&prov, &mdl, messages_json, "[]", 1500, "")
+                    .await
+                {
+                    Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => {
+                        AttemptOutcome::Done(v)
+                    }
+                    _ => AttemptOutcome::Failover,
+                }
+            }
+        };
+        match complete_for_purpose_with_failover(&state.db, "conversation_summary", attempt).await {
+            Ok(v) => v,
+            Err(PurposeFailoverError::AllCandidatesFailed) => {
                 return Err(CompactError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "Compattazione non disponibile: nessun modello del tier '{tier}' e' \
-                         disponibile (capability mancante o provider in cooldown). \
-                         Riprova piu' tardi o ricarica il credito del provider."
-                    ),
+                    "Compattazione non disponibile: nessun provider del tier ha prodotto un \
+                     riassunto valido. Riprova piu' tardi o ricarica il credito del provider."
+                        .to_string(),
                 ));
             }
-            PurposeResolution::NotFound => {
+            Err(PurposeFailoverError::NoCandidate(_)) => {
                 return Err(CompactError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "Compattazione non disponibile: purpose 'conversation_summary' \
-                     non configurato (o privo di tier) in nexus_purpose_model. Aggiungi la \
-                     configurazione dall'admin panel.",
+                    "Compattazione non disponibile: purpose 'conversation_summary' non \
+                     configurato (o privo di tier) in nexus_purpose_model."
+                        .to_string(),
                 ));
-            }
-            PurposeResolution::MatrixUnavailable(e) => {
-                return Err(CompactError::internal(format!(
-                    "Compattazione non disponibile: routing matrix irraggiungibile ({e})"
-                )));
             }
         }
     };
-
-    let summary_resp = state
-        .orchestrator
-        .neural
-        .generate_agent_turn(
-            &summary_provider,
-            &summary_model,
-            &messages_json,
-            "[]",
-            1500,
-            "",
-        )
-        .await
-        .map_err(|e| CompactError::internal(format!("Neural Core error: {e}")))?;
 
     // Extract text from response (try multiple possible keys)
     let summary_text = summary_resp
