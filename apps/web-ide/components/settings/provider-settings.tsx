@@ -371,12 +371,20 @@ export function ProviderSettings({
                     const result = testResults[providerName];
                     const isTesting = result === "testing...";
 
-                    const useGwState = gwProvider != null;
-                    const isReady = useGwState ? gwProvider.healthy : result?.startsWith("ready");
+                    // Usa lo stato del gateway solo se il probe ha un esito reale
+                    // (healthy true/false). Con healthy=null (provider mai sondato,
+                    // es. nuovi provider coi modelli disabilitati) NON e' un errore:
+                    // ricade sul test manuale (o resta neutro), evitando il falso
+                    // "Errore" su un provider che si autentica correttamente.
+                    const useGwState = gwProvider != null && gwProvider.healthy !== null;
+                    // L'endpoint /providers/:name/health ritorna status "ok"; il test
+                    // brain storico usava "ready". Accettiamo entrambi come successo.
+                    const okResult = !!result && (result.startsWith("ready") || result.startsWith("ok"));
+                    const isReady = useGwState ? gwProvider.healthy : okResult;
                     const isDisabledResult = !useGwState && result === "disabled";
                     const isError = useGwState
                       ? !gwProvider.healthy
-                      : (result && !isTesting && !result.startsWith("ready") && result !== "disabled");
+                      : (result && !isTesting && !okResult && result !== "disabled");
                     const badgeLabel = useGwState
                       ? (gwProvider.healthy ? "OK" : (gwProvider.error?.split(":")[0] ?? "Errore"))
                       : (isReady ? "OK" : isDisabledResult ? "Disabilitato" : result?.split(":")[0] ?? "");
