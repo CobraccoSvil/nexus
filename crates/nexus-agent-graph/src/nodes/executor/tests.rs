@@ -2363,6 +2363,117 @@ async fn cap_assoluto_iterazioni_chiude() {
 }
 
 #[tokio::test]
+async fn iteration_cap_prova_escalation_prima_del_backstop() {
+    // Simmetria col ramo budget_token (mig 0577): al cap iterazioni, PRIMA del
+    // backstop di chiusura, prova un'ultima ESCALATION. Con un candidato ->
+    // promuove (sticky + G1Escalated) e reset_iterations=true azzera `iterations`
+    // cosi' il promosso riparte con un ciclo pieno invece di ri-scattare subito il
+    // cap. (Il caso senza candidato -> chiusura secca e' cap_assoluto_iterazioni_chiude.)
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
+    let mut cfg = cfg_resolved();
+    cfg.iteration_cap = 10;
+    let (n, _m, _s) = node_esc(cfg, rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("task complesso")],
+        iterations: Some(10), // == iteration_cap
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    // reset_iterations: ciclo pieno per il promosso (non ri-scatta subito il cap).
+    assert_eq!(out.iterations, Some(0));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn final_gate_nonconvergence_promuove_e_consuma_flag() {
+    // Rientro dal final_gate con FINAL_GATE_ESCALATION_KEY in extra (cap del gate
+    // non convergente): l'executor delega al PUNTO UNICO maybe_escalate_nonconvergence.
+    // Con un candidato -> promuove (sticky + G1Escalated), incrementa auto_escalations
+    // e CONSUMA il flag (niente escalation a raffica al rientro del promosso).
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        crate::nodes::FINAL_GATE_ESCALATION_KEY.into(),
+        json!(true),
+    );
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
+    assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
+    assert_eq!(
+        out.extra.get("auto_escalations").and_then(Value::as_i64),
+        Some(1)
+    );
+    // Flag CONSUMATO: il modello promosso non ri-scatta il ramo al rientro.
+    assert!(out
+        .extra
+        .get(crate::nodes::FINAL_GATE_ESCALATION_KEY)
+        .is_none());
+    // Nessuna chiamata LLM: il self-loop rientra col promosso.
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn final_gate_nonconvergence_senza_candidato_chiude() {
+    // Flag presente ma catena escalation VUOTA (porta default): maybe_escalate
+    // ritorna None -> chiusura FailedDiagnosed via il PUNTO UNICO close_runaway
+    // (EndTurn + forced_close_unverified), non un re-loop sullo stesso modello.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        crate::nodes::FINAL_GATE_ESCALATION_KEY.into(),
+        json!(true),
+    );
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        extra,
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn billing_fail_fast_chiude_loop_abort() {
     // Soglia esplorazione raggiunta + il PROVIDER IN USO in cooldown billing ->
     // chiusura onesta loop_abort PRIMA della chiamata LLM (py:2072-2092 + fix

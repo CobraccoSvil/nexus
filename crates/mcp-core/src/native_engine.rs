@@ -941,6 +941,17 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
             d.structural_criteria_enabled,
         )
         .await,
+        // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
+        // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
+        // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
+        // chiave dell'executor (stesso budget `auto_escalations` condiviso, regola L/G).
+        escalate_on_nonconvergence: setting_bool(
+            db,
+            "agent.final_gate.escalate_on_nonconvergence",
+            d.escalate_on_nonconvergence,
+        )
+        .await,
+        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
     }
 }
 
