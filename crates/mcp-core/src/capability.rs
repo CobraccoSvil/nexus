@@ -147,10 +147,16 @@ pub async fn resolve_tool_choice_style(db: &PgPool, provider: &str, model: &str)
 
 /// Floor/ceiling del budget di thinking bounded per i modelli a thinking OBBLIGATORIO.
 /// Il floor garantisce reasoning non-degenere (>0, mai il budget 0 che gemini-3
-/// rifiuta); il ceiling evita di gonfiare `maxOutputTokens` oltre il ragionevole
-/// (il gateway alza `maxOutputTokens = max_tokens + budget`).
+/// rifiuta) ed e' il fail-safe se il setting manca; il ceiling evita di gonfiare
+/// `maxOutputTokens` oltre il ragionevole (il gateway alza `maxOutputTokens =
+/// max_tokens + budget`).
 const MANDATORY_THINKING_BUDGET_FLOOR: u32 = 2048;
 const MANDATORY_THINKING_BUDGET_CEIL: u32 = 24576;
+
+/// Setting DB (regola G) del budget di thinking per i modelli 'native' (gemini-3),
+/// tunabile senza redeploy (cache 60s). Mig 0579 (default 4096). Un valore piu' basso
+/// = gemini-3 ragiona abbastanza da non andare vuoto ma piu' VELOCE (meno timeout).
+const GEMINI_THINKING_BUDGET_KEY: &str = "orchestrator.gemini_thinking_budget";
 
 static THINKING_DIRECTIVE_CACHE: OnceLock<TtlCache<String, Option<u32>>> = OnceLock::new();
 
@@ -158,43 +164,42 @@ fn thinking_directive_cache() -> &'static TtlCache<String, Option<u32>> {
     THINKING_DIRECTIVE_CACHE.get_or_init(|| TtlCache::new(Duration::from_secs(TOOL_CHOICE_STYLE_TTL_SECS)))
 }
 
-/// Legge `(agentic_thinking_policy, default_max_output_tokens)` dalla vista capability
-/// e ritorna `Some(budget)` SOLO se la policy e' `'native'` (thinking OBBLIGATORIO: il
-/// modello, es. gemini-3, RIFIUTA `thinkingBudget=0` e senza config spende un thinking
-/// DEFAULT illimitato). Il budget deriva da `default_max_output_tokens` del catalog
-/// (regola G), clampato a `[FLOOR, CEIL]`. NESSUNA cache (testabilita' isolata).
-async fn fetch_mandatory_thinking_budget(
+/// Legge `agentic_thinking_policy` dalla vista capability per `(provider, model)`.
+/// NESSUNA cache (il wrapper con cache e' `resolve_mandatory_thinking_budget`).
+async fn fetch_thinking_policy(
     db: &PgPool,
     provider: &str,
     model: &str,
-) -> Result<Option<u32>, sqlx::Error> {
+) -> Result<Option<String>, sqlx::Error> {
     let sql = format!(
-        "SELECT agentic_thinking_policy, default_max_output_tokens FROM {V_MODEL_CAPABILITIES} \
+        "SELECT agentic_thinking_policy FROM {V_MODEL_CAPABILITIES} \
           WHERE provider = $1 AND model = $2"
     );
-    let row: Option<(String, i32)> = sqlx::query_as(&sql)
+    sqlx::query_scalar::<_, String>(&sql)
         .bind(provider)
         .bind(model)
         .fetch_optional(db)
-        .await?;
-    Ok(mandatory_budget_from_row(row))
+        .await
 }
 
-/// Parte PURA (regola L, testabile senza DB): mappa la riga capability nel budget di
-/// thinking obbligatorio. `'native'` -> `Some(default_max clampato)`; ogni altra policy
-/// (o riga assente) -> `None` (nessun override, comportamento storico).
-fn mandatory_budget_from_row(row: Option<(String, i32)>) -> Option<u32> {
-    match row {
-        Some((policy, default_max)) if policy.trim().eq_ignore_ascii_case("native") => {
-            let base = u32::try_from(default_max).unwrap_or(MANDATORY_THINKING_BUDGET_FLOOR);
-            Some(base.clamp(MANDATORY_THINKING_BUDGET_FLOOR, MANDATORY_THINKING_BUDGET_CEIL))
-        }
-        _ => None,
-    }
+/// Parte PURA (regola L, testabile): `true` se la policy indica thinking OBBLIGATORIO
+/// ('native': il modello, es. gemini-3, RIFIUTA thinkingBudget=0). Ogni altra policy
+/// (o assente) -> `false` (nessun override, comportamento storico).
+fn is_native_thinking(policy: Option<&str>) -> bool {
+    matches!(policy, Some(p) if p.trim().eq_ignore_ascii_case("native"))
+}
+
+/// Parte PURA: il budget dal setting (stringa) clampato a `[FLOOR, CEIL]`; se assente
+/// o non parsabile ricade sul FLOOR (fail-safe: budget piccolo ma >0, mai vuoto).
+fn clamp_setting_thinking_budget(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(MANDATORY_THINKING_BUDGET_FLOOR)
+        .clamp(MANDATORY_THINKING_BUDGET_FLOOR, MANDATORY_THINKING_BUDGET_CEIL)
 }
 
 /// Budget di thinking per un modello a thinking OBBLIGATORIO, con cache 60s (punto
-/// unico, ADR 0024/regola L). `Some(budget)` se `agentic_thinking_policy='native'`,
+/// unico, ADR 0024/regola L). `Some(budget)` se `agentic_thinking_policy='native'`
+/// (budget dal setting DB `orchestrator.gemini_thinking_budget`, regola G, clampato),
 /// `None` altrimenti. L'adapter mcp-core lo inietta in `GwThinkingConfig.mandatory`+
 /// `budget_tokens` cosi' il gateway emette `Enabled(budget)` invece di
 /// `DisabledForTools` (che gemini-3 rifiuta). Su DB down -> `None` (nessun override,
@@ -208,8 +213,8 @@ pub async fn resolve_mandatory_thinking_budget(
     if let Some(cached) = thinking_directive_cache().get(&key) {
         return cached;
     }
-    let resolved = match fetch_mandatory_thinking_budget(db, provider, model).await {
-        Ok(v) => v,
+    let policy = match fetch_thinking_policy(db, provider, model).await {
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!(
                 provider,
@@ -219,6 +224,15 @@ pub async fn resolve_mandatory_thinking_budget(
             );
             return None;
         }
+    };
+    let resolved = if is_native_thinking(policy.as_deref()) {
+        let raw = crate::settings::get_setting(db, GEMINI_THINKING_BUDGET_KEY)
+            .await
+            .ok()
+            .flatten();
+        Some(clamp_setting_thinking_budget(raw.as_deref()))
+    } else {
+        None
     };
     thinking_directive_cache().insert(key, resolved);
     resolved
@@ -272,29 +286,39 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_budget_solo_per_native_e_clampato() {
-        // policy 'native' (thinking obbligatorio) -> Some(budget) clampato.
+    fn is_native_thinking_solo_per_native() {
+        assert!(is_native_thinking(Some("native")));
+        assert!(is_native_thinking(Some("NATIVE")), "case-insensitive");
+        assert!(is_native_thinking(Some("  native  ")), "trim");
+        // Ogni altra policy / assente -> false (nessun override, storico invariato).
+        assert!(!is_native_thinking(Some("disable_for_tools")));
+        assert!(!is_native_thinking(Some("none")));
+        assert!(!is_native_thinking(None));
+    }
+
+    #[test]
+    fn clamp_setting_thinking_budget_parsa_e_clampa() {
+        assert_eq!(clamp_setting_thinking_budget(Some("4096")), 4096);
+        assert_eq!(clamp_setting_thinking_budget(Some("  8192  ")), 8192, "trim");
         assert_eq!(
-            mandatory_budget_from_row(Some(("native".into(), 8192))),
-            Some(8192)
+            clamp_setting_thinking_budget(Some("100")),
+            MANDATORY_THINKING_BUDGET_FLOOR,
+            "sotto il floor -> floor"
         );
         assert_eq!(
-            mandatory_budget_from_row(Some(("NATIVE".into(), 100))),
-            Some(MANDATORY_THINKING_BUDGET_FLOOR),
-            "case-insensitive; sotto il floor -> floor"
-        );
-        assert_eq!(
-            mandatory_budget_from_row(Some(("native".into(), 999_999))),
-            Some(MANDATORY_THINKING_BUDGET_CEIL),
+            clamp_setting_thinking_budget(Some("999999")),
+            MANDATORY_THINKING_BUDGET_CEIL,
             "sopra il ceil -> ceil"
         );
-        // Ogni altra policy / riga assente -> None (nessun override, storico invariato).
+        // Fail-safe: assente o non parsabile -> floor (budget piccolo ma >0, mai vuoto).
         assert_eq!(
-            mandatory_budget_from_row(Some(("disable_for_tools".into(), 8192))),
-            None
+            clamp_setting_thinking_budget(Some("xyz")),
+            MANDATORY_THINKING_BUDGET_FLOOR
         );
-        assert_eq!(mandatory_budget_from_row(Some(("none".into(), 8192))), None);
-        assert_eq!(mandatory_budget_from_row(None), None);
+        assert_eq!(
+            clamp_setting_thinking_budget(None),
+            MANDATORY_THINKING_BUDGET_FLOOR
+        );
     }
 
     #[test]
