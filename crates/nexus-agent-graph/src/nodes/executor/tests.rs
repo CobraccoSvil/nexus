@@ -4845,6 +4845,104 @@ async fn runaway_stall_consuma_escalate_model() {
 /// punti unici del nodo (`head_gate`, `pc::decide`, `resolve_provider_model`):
 /// la stessa logica del `run`, esercitata in isolamento.
 #[cfg(test)]
+// ── Turno di grazia figura (elicit advisory_verdict su recovery) ──────────────
+
+#[test]
+fn advisory_figure_senza_verdict_e_riconosciuta() {
+    // Figura del consiglio: advisory_verdict fra i tool, nessun parere ancora.
+    let figura = AgentState {
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "advisory_verdict"}),
+        ]),
+        advisory_verdict: None,
+        ..Default::default()
+    };
+    assert!(
+        is_advisory_figure_without_verdict(&figura),
+        "figura con canale advisory e senza parere -> grazia attiva"
+    );
+}
+
+#[test]
+fn advisory_figure_con_verdict_gia_dichiarato_non_e_in_grazia() {
+    let conclusa = AgentState {
+        tools_json: Some(vec![json!({"name": "advisory_verdict"})]),
+        advisory_verdict: Some(json!({"verdict": "block", "summary": "x"})),
+        ..Default::default()
+    };
+    assert!(
+        !is_advisory_figure_without_verdict(&conclusa),
+        "parere gia' dichiarato -> niente grazia (bit-identico)"
+    );
+}
+
+#[test]
+fn run_principale_e_revisore_non_sono_figure() {
+    // Run principale: task_complete, niente advisory_verdict.
+    let principale = AgentState {
+        tools_json: Some(vec![
+            json!({"name": "task_complete"}),
+            json!({"name": "edit_file"}),
+        ]),
+        advisory_verdict: None,
+        ..Default::default()
+    };
+    assert!(!is_advisory_figure_without_verdict(&principale));
+    // Revisore: review_verdict, non advisory_verdict.
+    let revisore = AgentState {
+        tools_json: Some(vec![json!({"name": "review_verdict"})]),
+        advisory_verdict: None,
+        ..Default::default()
+    };
+    assert!(!is_advisory_figure_without_verdict(&revisore));
+    // Nessun tool -> non figura.
+    let vuoto = AgentState {
+        tools_json: None,
+        advisory_verdict: None,
+        ..Default::default()
+    };
+    assert!(!is_advisory_figure_without_verdict(&vuoto));
+}
+
+#[test]
+fn recovery_nudge_appende_la_grazia_solo_alle_figure() {
+    let figura = AgentState {
+        tools_json: Some(vec![json!({"name": "advisory_verdict"})]),
+        advisory_verdict: None,
+        ..Default::default()
+    };
+    let msg = recovery_nudge_msg(&figura, "diagnostica la causa radice");
+    let Message::Human { content } = msg else {
+        panic!("atteso Message::Human")
+    };
+    let text = content.flatten_text();
+    assert!(
+        text.contains("diagnostica la causa radice"),
+        "conserva il nudge del reasoner: {text}"
+    );
+    assert!(
+        text.contains("advisory_verdict"),
+        "appende la direttiva di grazia: {text}"
+    );
+
+    // Run non-figura: bit-identico al nudge nudo.
+    let principale = AgentState {
+        tools_json: Some(vec![json!({"name": "task_complete"})]),
+        advisory_verdict: None,
+        ..Default::default()
+    };
+    let msg2 = recovery_nudge_msg(&principale, "diagnostica la causa radice");
+    let Message::Human { content } = msg2 else {
+        panic!("atteso Message::Human")
+    };
+    assert_eq!(
+        content.flatten_text(),
+        "diagnostica la causa radice",
+        "non-figura: nudge invariato"
+    );
+}
+
 mod golden {
     use super::*;
     use crate::decisions::progress_controller::{self as pc, ProgressSignals};

@@ -5257,7 +5257,17 @@ azioni concrete e mirate verso il completamento.",
             Action::Guide | Action::ChangeStrategy | Action::ForceDiagnose => {
                 let mut messages_out: Vec<Message> = vec![];
                 if let Some(t) = &dec.nudge_text {
-                    messages_out.push(human_msg(t));
+                    // Turno di grazia figura: se il run e' una figura del consiglio
+                    // senza parere dichiarato, il nudge di recovery (tipicamente
+                    // "diagnostica il fallimento") viene dirottato a ELICERE
+                    // advisory_verdict -> parere reale invece di failed_diagnosed
+                    // (n/d). Per i run non-figura e' bit-identico.
+                    messages_out.push(recovery_nudge_msg(state, t));
+                } else if is_advisory_figure_without_verdict(state) {
+                    // Reasoner senza nudge ma figura senza parere: inietta comunque
+                    // la direttiva di grazia, altrimenti il turno riparte muto e la
+                    // figura continua a esplorare fino a timeout/cap -> n/d.
+                    messages_out.push(human_msg(ADVISORY_GRACE_DIRECTIVE.trim()));
                 }
                 // Il nudge del reasoner riparte con finestra pulita sui detector di
                 // ripetizione (stessa grazia dei rami Escalate: il modello promosso/
@@ -6585,6 +6595,51 @@ fn is_forcing_failure(resp: &crate::runtime::ports::LlmResponse) -> bool {
 fn human_msg(text: &str) -> Message {
     Message::Human {
         content: MessageContent::text(text),
+    }
+}
+
+/// Direttiva deterministica di GRAZIA per una figura del consiglio di analisi
+/// impantanata SENZA parere dichiarato: la spinge a CHIUDERE col proprio canale
+/// (`advisory_verdict`) invece di continuare a esplorare o di "diagnosticare un
+/// fallimento" (che sfocia in `failed_diagnosed` -> n/d al posto del parere).
+/// Viene appesa al nudge di recovery (vedi [`recovery_nudge_msg`]).
+const ADVISORY_GRACE_DIRECTIVE: &str = "\n\nHai gia' raccolto contesto sufficiente. \
+CHIUDI ORA la tua analisi chiamando il tool advisory_verdict con la tua migliore \
+valutazione corrente (verdict + summary + eventuali requirements). NON continuare a \
+esplorare e NON diagnosticare un fallimento tecnico: emetti il tuo parere consultivo \
+adesso, anche se parziale, basandoti su cio' che hai gia' osservato.";
+
+/// True se il run e' una FIGURA del consiglio di analisi (canale di chiusura
+/// `advisory_verdict` disponibile fra i tool) che NON ha ancora dichiarato il
+/// proprio parere. Segnale STRUTTURALE (regola M): presenza del tool nel
+/// `tools_json` + assenza di `advisory_verdict` in stato — nessun parsing di prosa.
+/// Per una figura in questo stato una mossa di recovery generica ("diagnostica il
+/// fallimento") produrrebbe `failed_diagnosed` invece di un parere: il turno di
+/// grazia la dirotta a EMETTERE il verdetto con la sua miglior stima corrente
+/// (parere reale al posto di n/d). Il run principale (niente `advisory_verdict` nel
+/// suo whitelist) e i revisori (`review_verdict`) NON matchano.
+fn is_advisory_figure_without_verdict(state: &AgentState) -> bool {
+    if state.advisory_verdict.is_some() {
+        return false;
+    }
+    state.tools_json.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some("advisory_verdict"))
+    })
+}
+
+/// Costruisce il messaggio-nudge di recovery applicando il turno di grazia figura:
+/// se il run e' una figura del consiglio senza parere (vedi
+/// [`is_advisory_figure_without_verdict`]), appende [`ADVISORY_GRACE_DIRECTIVE`] al
+/// testo del reasoner cosi' la figura chiude con `advisory_verdict` invece di
+/// diagnosticare un fallimento. Altrimenti bit-identico a `human_msg(nudge)`. Punto
+/// unico (regola L) del turno di grazia figura sui nudge di recovery.
+fn recovery_nudge_msg(state: &AgentState, nudge: &str) -> Message {
+    if is_advisory_figure_without_verdict(state) {
+        human_msg(&format!("{nudge}{ADVISORY_GRACE_DIRECTIVE}"))
+    } else {
+        human_msg(nudge)
     }
 }
 
