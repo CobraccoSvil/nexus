@@ -1393,24 +1393,31 @@ fn build_advisory_enforcement(advisory: &Value, source: &'static str) -> Option<
     let verdict = advisory.get("verdict").and_then(Value::as_str)?;
     match verdict {
         "block" | "inconclusive" => {
+            // ADVISORY, NON BLOCCANTE (decisione prodotto 2026-07-13): un verdetto
+            // "block"/"inconclusive" del consiglio/panel a monte e' un PARERE, non un
+            // cancello. Il coordinatore LEGGE il segnale e PROCEDE incorporando i vincoli
+            // (il consiglio e' advisory). PRIMA era `terminal: true` -> il veto di UNA
+            // sola figura (es. sysadmin, 5/6 volevano procedere) fermava l'intero task
+            // dopo la sola pianificazione, e il modello chiudeva con "Iniziero'..."
+            // venendo troncato senza implementare nulla. Ora e' un vincolo FORTE ma non
+            // bloccante: affronta PRIMA i blocker/rischi critici, poi implementa.
+            // `declared_outcome: None` (niente pre-dichiarazione "blocked" che, col fix
+            // graph 9e26d2a7, instraderebbe subito a FinalGate chiudendo il run).
             let summary = match source {
                 "multi_provider_synthesis" => format!(
-                    "Panel multi-provider: verdict={verdict}; il run si ferma prima dell'esecuzione."
+                    "Panel multi-provider: verdict={verdict}; affronta PRIMA i rischi critici/blocker \
+                     segnalati (requisiti obbligatori), poi procedi con l'implementazione."
                 ),
                 _ => format!(
-                    "Consiglio delle Competenze: verdict={verdict}; il run si ferma prima dell'esecuzione."
+                    "Consiglio delle Competenze: verdict={verdict}; affronta PRIMA i blocker/rischi \
+                     critici segnalati (requisiti obbligatori), poi procedi con l'implementazione."
                 ),
             };
             Some(PanelEnforcement {
                 source,
                 verdict: verdict.to_string(),
-                terminal: true,
-                declared_outcome: Some(json!({
-                    "outcome": "blocked",
-                    "summary": summary,
-                    "blocker": source,
-                    "refusal": false,
-                })),
+                terminal: false,
+                declared_outcome: None,
                 summary,
                 payload: advisory.clone(),
             })

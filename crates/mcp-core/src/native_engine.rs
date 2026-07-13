@@ -3192,6 +3192,47 @@ mod tests {
         );
     }
 
+    /// ADVISORY NON BLOCCANTE (decisione prodotto 2026-07-13): un verdetto "block" del
+    /// consiglio pre-run NON deve rendere il run terminale (niente stop_reason ne'
+    /// declared_outcome "blocked" pre-seedati). Il coordinatore legge il segnale e
+    /// procede coi vincoli. Regressione del bug "l'agente pianifica e si ferma dopo il
+    /// consiglio" (il modello chiudeva con 'Iniziero'...' senza implementare).
+    #[test]
+    fn initial_state_block_consiglio_non_e_terminale() {
+        let mut input = sample_input();
+        input.pre_run_advisory_synthesis = Some(serde_json::json!({
+            "verdict": "block",
+            "risks": [{"severity": "high", "description": "x"}],
+        }));
+        input.pre_run_advisory_source = Some("council");
+        let state = build_initial_state(&input, RunRole::Primary);
+        // Il segnale advisory c'e' (il coordinatore lo LEGGE)...
+        assert!(state
+            .extra
+            .contains_key(nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY));
+        // ...ma l'enforcement del block NON e' terminale.
+        let enforcement = state
+            .extra
+            .get(nexus_agent_graph::nodes::PANEL_ENFORCEMENT_KEY)
+            .expect("panel enforcement seedato");
+        assert_eq!(
+            enforcement
+                .get("terminal")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "un block del consiglio NON deve fermare il run (advisory)"
+        );
+        // Il run NON parte gia' terminato: niente EndTurn ne' 'blocked' pre-dichiarato.
+        assert!(
+            state.stop_reason.is_none(),
+            "niente stop_reason pre-seedato dal block"
+        );
+        assert!(
+            state.declared_outcome.is_none(),
+            "niente declared_outcome 'blocked' pre-seedato"
+        );
+    }
+
     #[test]
     fn initial_state_tools_null_diventa_none() {
         let mut input = sample_input();
