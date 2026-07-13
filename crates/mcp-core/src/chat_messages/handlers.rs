@@ -2486,38 +2486,48 @@ pub async fn feedback_assist_handler(
     ]))
     .unwrap_or_default();
 
-    // Modello purpose-specific risolto dal PUNTO UNICO tier-only (regola L/G).
-    let (provider_pt, model_pt) =
-        crate::internal_routing::resolve_purpose_model(&state, "chat_title_generator")
-            .await
-            .into_model("chat_title_generator")
-            .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
-    let raw = match state
-        .orchestrator
-        .neural
-        .generate_agent_turn(
-            &provider_pt,
-            &model_pt,
-            &messages_json,
-            "[]",
-            400,
-            &system_prompt,
-        )
-        .await
-    {
-        Ok(val) => val
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-        Err(e) => {
-            tracing::warn!("feedback_assist LLM error: {}", e);
-            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    // Failover tier-aware (punto unico, regola L): il modello e' risolto dal
+    // resolver a candidati; su fallimento (regola M: neural_value_is_failure —
+    // include content vuoto e "[Error:...]") si prova il prossimo provider. Un
+    // value di fallimento NON diventa MAI il suggerimento (era il leak
+    // "[Error:...]" restituito come suggestion): AllCandidatesFailed -> "".
+    let neural = &state.orchestrator.neural;
+    let suggestion = {
+        use crate::internal_routing::{
+            complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
+        };
+        let attempt = |prov: String, mdl: String| {
+            let messages_json = &messages_json;
+            let system_prompt = &system_prompt;
+            async move {
+                match neural
+                    .generate_agent_turn(&prov, &mdl, messages_json, "[]", 400, system_prompt)
+                    .await
+                {
+                    Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => {
+                        AttemptOutcome::Done(
+                            v.get("content")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .trim()
+                                .trim_matches('"')
+                                .to_string(),
+                        )
+                    }
+                    Ok(_) => AttemptOutcome::Failover,
+                    Err(e) => {
+                        tracing::warn!("feedback_assist LLM error: {e}");
+                        AttemptOutcome::Failover
+                    }
+                }
+            }
+        };
+        match complete_for_purpose_with_failover(&state.db, "chat_title_generator", attempt).await {
+            Ok(s) => s,
+            Err(PurposeFailoverError::AllCandidatesFailed)
+            | Err(PurposeFailoverError::NoCandidate(_)) => String::new(),
         }
     };
-
-    let suggestion = raw.trim().trim_matches('"').to_string();
 
     Ok(Json(json!({ "suggestion": suggestion })))
 }
