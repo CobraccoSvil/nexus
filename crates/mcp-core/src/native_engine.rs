@@ -510,20 +510,41 @@ impl NativeRunOutcome {
     pub fn classify_status(&self) -> crate::agent_types::AgentRunStatus {
         use crate::agent_types::AgentRunStatus;
 
-        // `forced_close_unverified` e' il segnale AUTORITATIVO (mig 0386):
-        // sopravvive alla riscrittura di `stop_reason` operata dal final_gate
-        // sul ramo forced_close (senza, un abort anti-loop ripulito dal
-        // final_gate finiva "completed" col testo di sistema come risposta —
-        // run b833a83d).
-        let forced_close = self.forced_close_unverified
-            || self
-                .stop_reason
-                .is_some_and(|s| FORCED_CLOSE_STOPS.contains(&s));
-        // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
-        // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
-        // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
-        // (es. blocked su credenziale mancante) e' piu' specifica del segnale
-        // generico di chiusura coordinata.
+        if !self.completed && self.resume_at.is_some() {
+            // Ramo INTERROTTO (run SOSPESO, resumibile): due motivi di
+            // interrupt-resume oggi. Il fan-in dei sub-run background (Fase D)
+            // porta il segnale strutturato `awaiting_subagents` (regola M); il
+            // resto e' l'attesa di conferma umana (HITL). Discriminati qui cosi'
+            // il worker fan-in seleziona SOLO i propri run (CAS su questo status).
+            return if self.awaiting_subagents {
+                AgentRunStatus::AwaitingSubagents
+            } else {
+                AgentRunStatus::AwaitingConfirmation
+            };
+        }
+        if matches!(self.stop_reason, Some(StopReason::Error)) {
+            return AgentRunStatus::Failed;
+        }
+        // La dichiarazione del modello ha precedenza sul forced_close: una
+        // dichiarazione onesta (es. blocked su credenziale mancante) e' piu'
+        // specifica del segnale generico di chiusura coordinata.
+        if let Some(status) = self.declared_status() {
+            return status;
+        }
+        if self.is_forced_close() {
+            return AgentRunStatus::FailedDiagnosed;
+        }
+        // Verdetto OGGETTIVO del gate; in sua assenza il run e' completo.
+        self.final_gate_status().unwrap_or(AgentRunStatus::Completed)
+    }
+
+    /// Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
+    /// MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
+    /// (regola M). `None` = il modello non ha dichiarato nulla di discriminante
+    /// -> decidono i segnali successivi in [`Self::classify_status`].
+    fn declared_status(&self) -> Option<crate::agent_types::AgentRunStatus> {
+        use crate::agent_types::AgentRunStatus;
+
         let declared_kind = self
             .declared_outcome
             .as_ref()
@@ -535,52 +556,60 @@ impl NativeRunOutcome {
             .and_then(|v| v.get("refusal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !self.completed && self.resume_at.is_some() {
-            // Ramo INTERROTTO (run SOSPESO, resumibile): due motivi di
-            // interrupt-resume oggi. Il fan-in dei sub-run background (Fase D)
-            // porta il segnale strutturato `awaiting_subagents` (regola M); il
-            // resto e' l'attesa di conferma umana (HITL). Discriminati qui cosi'
-            // il worker fan-in seleziona SOLO i propri run (CAS su questo status).
-            if self.awaiting_subagents {
-                AgentRunStatus::AwaitingSubagents
-            } else {
-                AgentRunStatus::AwaitingConfirmation
-            }
-        } else if matches!(self.stop_reason, Some(StopReason::Error)) {
-            AgentRunStatus::Failed
-        } else if declared_refusal || matches!(declared_kind, Some("blocked") | Some("needs_input"))
-        {
+
+        if declared_refusal || matches!(declared_kind, Some("blocked") | Some("needs_input")) {
             // Bloccato per causa esterna / serve input umano / rifiuto safety:
             // esito canonico BlockedNeedsInput (parita' WAVE 3.2 del path brain).
-            AgentRunStatus::BlockedNeedsInput
+            Some(AgentRunStatus::BlockedNeedsInput)
         } else if matches!(declared_kind, Some("partial")) {
             // Lavoro dichiarato PARZIALE: onesto, non un successo (mai
             // "completed" su una dichiarazione esplicita di incompletezza).
-            AgentRunStatus::FailedDiagnosed
-        } else if forced_close {
-            AgentRunStatus::FailedDiagnosed
-        } else if self.final_gate_passed == Some(false) {
+            Some(AgentRunStatus::FailedDiagnosed)
+        } else {
+            None
+        }
+    }
+
+    /// `forced_close_unverified` e' il segnale AUTORITATIVO (mig 0386):
+    /// sopravvive alla riscrittura di `stop_reason` operata dal final_gate sul
+    /// ramo forced_close (senza, un abort anti-loop ripulito dal final_gate
+    /// finiva "completed" col testo di sistema come risposta — run b833a83d).
+    fn is_forced_close(&self) -> bool {
+        self.forced_close_unverified
+            || self
+                .stop_reason
+                .is_some_and(|s| FORCED_CLOSE_STOPS.contains(&s))
+    }
+
+    /// Verdetto OGGETTIVO del final_gate (regola M). `None` = il gate non ha
+    /// nulla da obiettare -> il run e' `Completed`. L'ordine dei rami e'
+    /// significativo (bocciatura esplicita > bocciatura pendente > non
+    /// verificato).
+    fn final_gate_status(&self) -> Option<crate::agent_types::AgentRunStatus> {
+        use crate::agent_types::AgentRunStatus;
+
+        if self.final_gate_passed == Some(false) {
             // Verifica oggettiva pre-chiusura NON superata (final_gate al
             // cap/forced): il verdetto STRUTTURATO del gate (regola M) prevale
             // su una dichiarazione "done" ottimista del modello -> mai
             // "completed" su un task la cui verifica e' fallita. Difesa in
             // profondita' rispetto a `forced_close`: il cap del final_gate NON
             // imposta forced_close_unverified.
-            AgentRunStatus::FailedDiagnosed
+            Some(AgentRunStatus::FailedDiagnosed)
         } else if self.final_gate_failed_pending {
             // L'ULTIMO verdetto del final_gate e' una BOCCIATURA di ciclo
             // intermedio (correzione rimandata all'executor) e il run e' morto
             // PRIMA della ri-verifica (run a5db0985): il lavoro post-bocciatura
             // non e' mai stato verificato e l'ultimo esito oggettivo noto e' un
             // fallimento — mai `Completed` (regola M).
-            AgentRunStatus::FailedDiagnosed
+            Some(AgentRunStatus::FailedDiagnosed)
         } else if self.final_gate_unverified == Some(true) {
             // Lavoro SVOLTO ma verifica tecnica NON eseguita (gate entrato
             // senza profilo di verifica dell'ambiente): esito ONESTO distinto
             // da un "completato" pieno (is_success=true ma etichettato).
-            AgentRunStatus::CompletedUnverified
+            Some(AgentRunStatus::CompletedUnverified)
         } else {
-            AgentRunStatus::Completed
+            None
         }
     }
 
@@ -796,68 +825,78 @@ pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> Superv
 /// - `turn_focus_enabled`: viene dalla CONTINUITY config (`agent.context.turn_focus_enabled`),
 ///   non da `orchestrator_config` — TODO wiring continuity (default true).
 async fn load_planner_config(db: &PgPool) -> PlannerConfig {
-    let d = PlannerConfig::default();
-    PlannerConfig {
-        plan_phase_enabled: setting_bool(
-            db,
-            "orchestrator.plan_phase_enabled",
-            d.plan_phase_enabled,
-        )
-        .await,
-        plan_behavior_modes: setting_csv(
-            db,
-            "orchestrator.plan_behavior_modes",
-            d.plan_behavior_modes,
-        )
-        .await,
-        plan_intents: setting_csv(db, "orchestrator.plan_intents", d.plan_intents).await,
-        plan_min_token_budget: setting_i64(
-            db,
-            "orchestrator.plan_min_token_budget",
-            d.plan_min_token_budget,
-        )
-        .await,
-        planner_prompt_key: nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
-            .await
-            .unwrap_or(d.planner_prompt_key),
-        clarifying_questions_enabled: setting_bool(
-            db,
-            "orchestrator.clarifying_questions_enabled",
-            d.clarifying_questions_enabled,
-        )
-        .await,
-        clarifying_questions_max: setting_i64(
-            db,
-            "orchestrator.clarifying_questions_max",
-            d.clarifying_questions_max,
-        )
-        .await,
-        plan_rationale_enabled: setting_bool(
-            db,
-            "orchestrator.plan_rationale_enabled",
-            d.plan_rationale_enabled,
-        )
-        .await,
-        dag_topological_enabled: setting_bool(
-            db,
-            "orchestrator.dag_topological_enabled",
-            d.dag_topological_enabled,
-        )
-        .await,
-        // Gate orchestrazione LLM-driven della plan-phase (Fase 1). DEFAULT SAFE
-        // FALSE (regola G): il setting sara' seminato dalla migrazione del
-        // sotto-blocco successivo; finche' assente o false il gate ricade sempre
-        // su is_eligible -> comportamento bit-identico a oggi.
-        orchestration_enabled: setting_bool(
-            db,
-            "agent.orchestration.enabled",
-            d.orchestration_enabled,
-        )
-        .await,
-        // Risolti a monte / da altra fonte (vedi doc della funzione): default.
-        planner_system_text: d.planner_system_text,
-        turn_focus_enabled: d.turn_focus_enabled,
-    }
+    // Parte dai `Default` e i due gruppi DB-driven sovrascrivono i campi di loro
+    // competenza leggendo il default dal campo stesso (stessa invariante di
+    // `load_executor_config`): `planner_system_text`/`turn_focus_enabled`, che il
+    // brain NON popola da `orchestrator_config`, restano cosi' al `Default`.
+    let mut c = PlannerConfig::default();
+    load_planner_plan_phase(db, &mut c).await;
+    load_planner_interaction(db, &mut c).await;
+    c
+}
+
+/// Eleggibilita' e ampiezza della plan-phase (regola G), 1:1 con le chiavi
+/// `orchestrator.*` lette dal brain.
+async fn load_planner_plan_phase(db: &PgPool, c: &mut PlannerConfig) {
+    c.plan_phase_enabled = setting_bool(
+        db,
+        "orchestrator.plan_phase_enabled",
+        c.plan_phase_enabled,
+    )
+    .await;
+    let modes = std::mem::take(&mut c.plan_behavior_modes);
+    c.plan_behavior_modes = setting_csv(db, "orchestrator.plan_behavior_modes", modes).await;
+    let intents = std::mem::take(&mut c.plan_intents);
+    c.plan_intents = setting_csv(db, "orchestrator.plan_intents", intents).await;
+    c.plan_min_token_budget = setting_i64(
+        db,
+        "orchestrator.plan_min_token_budget",
+        c.plan_min_token_budget,
+    )
+    .await;
+    let prompt_key = std::mem::take(&mut c.planner_prompt_key);
+    c.planner_prompt_key = nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
+        .await
+        .unwrap_or(prompt_key);
+    c.dag_topological_enabled = setting_bool(
+        db,
+        "orchestrator.dag_topological_enabled",
+        c.dag_topological_enabled,
+    )
+    .await;
+    // Gate orchestrazione LLM-driven della plan-phase (Fase 1). DEFAULT SAFE
+    // FALSE (regola G): il setting sara' seminato dalla migrazione del
+    // sotto-blocco successivo; finche' assente o false il gate ricade sempre
+    // su is_eligible -> comportamento bit-identico a oggi.
+    c.orchestration_enabled = setting_bool(
+        db,
+        "agent.orchestration.enabled",
+        c.orchestration_enabled,
+    )
+    .await;
+}
+
+/// Interazione col richiedente durante la plan-phase (regola G): domande di
+/// chiarimento e razionale del piano.
+async fn load_planner_interaction(db: &PgPool, c: &mut PlannerConfig) {
+    c.clarifying_questions_enabled = setting_bool(
+        db,
+        "orchestrator.clarifying_questions_enabled",
+        c.clarifying_questions_enabled,
+    )
+    .await;
+    c.clarifying_questions_max = setting_i64(
+        db,
+        "orchestrator.clarifying_questions_max",
+        c.clarifying_questions_max,
+    )
+    .await;
+    c.plan_rationale_enabled = setting_bool(
+        db,
+        "orchestrator.plan_rationale_enabled",
+        c.plan_rationale_enabled,
+    )
+    .await;
 }
 
 /// Costruisce la [`FinalGateConfig`] DB-driven (regola G), 1:1 con le chiavi che
@@ -873,7 +912,6 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
 /// toppa). `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
 async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
-    let d = FinalGateConfig::default();
     // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
     // inferito da LLM (`verify_profile::ensure_profile`), risolta in
     // `run_engine` e innestata in `verify_steps` DOPO questo loader (serve
@@ -881,78 +919,88 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
     // `agent.final_gate.build_command` generico e' stato RIMOSSO (mig 0508,
     // decisione utente: nessuna conoscenza d'ambiente fissa — era proprio il
     // "npm run build" cieco che per Vite non type-checka).
-    FinalGateConfig {
-        enabled: setting_bool(db, "agent.final_gate.enabled", d.enabled).await,
-        max_cycles: setting_i64(db, "agent.final_gate.max_cycles", d.max_cycles).await,
-        runtime_check_enabled: setting_bool(
-            db,
-            "agent.final_gate.runtime_check_enabled",
-            d.runtime_check_enabled,
-        )
-        .await,
-        build_timeout_s: setting_f64(db, "agent.final_gate.build_timeout_s", d.build_timeout_s)
-            .await,
-        build_output_max_chars: setting_i64(
-            db,
-            "agent.final_gate.build_output_max_chars",
-            d.build_output_max_chars,
-        )
-        .await,
-        runtime_error_patterns: setting_csv(
-            db,
-            "agent.final_gate.runtime_error_patterns",
-            d.runtime_error_patterns,
-        )
-        .await,
-        no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio)
-            .await,
-        import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs)
-            .await,
-        criteria_timeout_s: setting_f64(
-            db,
-            "orchestrator.verifier_timeout_s",
-            d.criteria_timeout_s,
-        )
-        .await,
-        // verify_steps/verify_profile_missing innestati in run_engine (profilo
-        // per-ambiente, ADR 0036). log_command / endpoint_criterion restano
-        // risolti per-progetto a monte (non ancora portati): default
-        // vuoto/None (niente criterio, non blocca).
-        verify_steps: d.verify_steps,
-        verify_profile_missing: d.verify_profile_missing,
-        log_command: d.log_command,
-        endpoint_criterion: d.endpoint_criterion,
-        design_verify_enabled: setting_bool(
-            db,
-            "agent.final_gate.design_verify_enabled",
-            d.design_verify_enabled,
-        )
-        .await,
-        design_verify_min_score: setting_i64(
-            db,
-            "agent.final_gate.design_verify_min_score",
-            d.design_verify_min_score,
-        )
-        .await,
-        // ADR 0018 leva 3 (mig 0503): kill-switch dei criteri strutturali.
-        structural_criteria_enabled: setting_bool(
-            db,
-            "agent.final_gate.structural_criteria_enabled",
-            d.structural_criteria_enabled,
-        )
-        .await,
-        // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
-        // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
-        // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
-        // chiave dell'executor (stesso budget `auto_escalations` condiviso, regola L/G).
-        escalate_on_nonconvergence: setting_bool(
-            db,
-            "agent.final_gate.escalate_on_nonconvergence",
-            d.escalate_on_nonconvergence,
-        )
-        .await,
-        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
-    }
+    //
+    // Parte dai `Default` e i gruppi DB-driven sovrascrivono i campi di loro
+    // competenza leggendo il default dal campo stesso (stessa invariante di
+    // `load_executor_config`). Restano cosi' al `Default` i campi risolti
+    // ALTROVE: `verify_steps`/`verify_profile_missing` (innestati in
+    // `run_engine`) e `log_command`/`endpoint_criterion` (per-progetto a monte,
+    // non ancora portati: vuoto/None -> niente criterio, non blocca).
+    let mut c = FinalGateConfig::default();
+    load_final_gate_build_criteria(db, &mut c).await;
+    load_final_gate_structural_criteria(db, &mut c).await;
+    load_final_gate_escalation(db, &mut c).await;
+    c
+}
+
+/// Kill-switch, cap di cicli e criteri BUILD/runtime del final_gate (regola G),
+/// 1:1 con le chiavi che il brain legge da `orchestrator_config`.
+async fn load_final_gate_build_criteria(db: &PgPool, c: &mut FinalGateConfig) {
+    c.enabled = setting_bool(db, "agent.final_gate.enabled", c.enabled).await;
+    c.max_cycles = setting_i64(db, "agent.final_gate.max_cycles", c.max_cycles).await;
+    c.runtime_check_enabled = setting_bool(
+        db,
+        "agent.final_gate.runtime_check_enabled",
+        c.runtime_check_enabled,
+    )
+    .await;
+    // `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
+    // quando `build_command` e' risolto: si leggono comunque per fedelta'.
+    c.build_timeout_s =
+        setting_f64(db, "agent.final_gate.build_timeout_s", c.build_timeout_s).await;
+    c.build_output_max_chars = setting_i64(
+        db,
+        "agent.final_gate.build_output_max_chars",
+        c.build_output_max_chars,
+    )
+    .await;
+    let patterns = std::mem::take(&mut c.runtime_error_patterns);
+    c.runtime_error_patterns =
+        setting_csv(db, "agent.final_gate.runtime_error_patterns", patterns).await;
+    c.criteria_timeout_s =
+        setting_f64(db, "orchestrator.verifier_timeout_s", c.criteria_timeout_s).await;
+}
+
+/// Criteri STRUTTURALI (no-orphan / import staging) + verifica design del
+/// final_gate (regola G). ADR 0018 leva 3 (mig 0503): kill-switch dei criteri
+/// strutturali.
+async fn load_final_gate_structural_criteria(db: &PgPool, c: &mut FinalGateConfig) {
+    c.no_orphan_min_ratio =
+        setting_f64(db, "agent.no_orphan.min_ratio", c.no_orphan_min_ratio).await;
+    let staging = std::mem::take(&mut c.import_staging_dirs);
+    c.import_staging_dirs = setting_csv(db, "agent.import_staging_dirs", staging).await;
+    c.design_verify_enabled = setting_bool(
+        db,
+        "agent.final_gate.design_verify_enabled",
+        c.design_verify_enabled,
+    )
+    .await;
+    c.design_verify_min_score = setting_i64(
+        db,
+        "agent.final_gate.design_verify_min_score",
+        c.design_verify_min_score,
+    )
+    .await;
+    c.structural_criteria_enabled = setting_bool(
+        db,
+        "agent.final_gate.structural_criteria_enabled",
+        c.structural_criteria_enabled,
+    )
+    .await;
+}
+
+/// Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
+/// criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
+/// un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
+/// chiave dell'executor (stesso budget `auto_escalations` condiviso, regola L/G).
+async fn load_final_gate_escalation(db: &PgPool, c: &mut FinalGateConfig) {
+    c.escalate_on_nonconvergence = setting_bool(
+        db,
+        "agent.final_gate.escalate_on_nonconvergence",
+        c.escalate_on_nonconvergence,
+    )
+    .await;
+    c.max_escalations = setting_i64(db, "agent.executor.max_escalations", c.max_escalations).await;
 }
 
 /// Costruisce la [`VerifierConfig`] DB-driven (regola G), 1:1 con le chiavi che il
@@ -988,49 +1036,16 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
 /// irraggiungibile, mai come magic fallback nella logica).
 async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     let d = RoutingConfig::default();
-    let db_floor: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
-        .await
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(d.recursion_limit);
-    let iteration_cap = setting_i64(
-        db,
-        "agent.executor.iteration_cap",
-        ExecutorConfig::default().iteration_cap,
-    )
-    .await;
-    let stall_recovery_enabled =
-        setting_bool(db, "agent.stall_recovery.enabled", false).await;
-    let stall_max_moves = setting_i64(
-        db,
-        "agent.stall_recovery.max_moves_per_session",
-        6,
-    )
-    .await;
     let g1_max_nudges = setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await;
     let final_gate_max_cycles =
         setting_i64(db, "agent.final_gate.max_cycles", d.final_gate_max_cycles).await;
-    let recursion_limit = nexus_agent_graph::routing::effective_recursion_limit(
-        &nexus_agent_graph::routing::GraphTopologyLimits {
-            db_floor,
-            iteration_cap,
-            stall_recovery_enabled,
-            stall_max_moves,
-            g1_max_nudges,
-            final_gate_max_cycles,
-        },
-    );
-    if recursion_limit > db_floor {
-        tracing::debug!(
-            db_floor,
-            effective = recursion_limit,
-            iteration_cap,
-            stall_recovery_enabled,
-            stall_max_moves,
-            g1_max_nudges,
-            final_gate_max_cycles,
-            "recursion_limit scalato sulla topologia del grafo agentico"
-        );
-    }
+    let recursion_limit = resolve_recursion_limit(
+        db,
+        d.recursion_limit,
+        g1_max_nudges,
+        final_gate_max_cycles,
+    )
+    .await;
     RoutingConfig {
         recursion_limit,
         g1_max_nudges,
@@ -1069,6 +1084,54 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     }
 }
 
+/// `recursion_limit` EFFETTIVO del grafo: `max(pavimento DB, topologia)` via il
+/// punto unico [`nexus_agent_graph::routing::effective_recursion_limit`] (regola
+/// L). Il pavimento e' `agent.graph.recursion_limit`; la topologia si ricava da
+/// `iteration_cap` + i giri aggiuntivi di stall-recovery / G1 / final_gate.
+/// `db_floor_default` e' il safe-default (chiave assente / DB irraggiungibile).
+async fn resolve_recursion_limit(
+    db: &PgPool,
+    db_floor_default: u32,
+    g1_max_nudges: i64,
+    final_gate_max_cycles: i64,
+) -> u32 {
+    let db_floor: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(db_floor_default);
+    let iteration_cap = setting_i64(
+        db,
+        "agent.executor.iteration_cap",
+        ExecutorConfig::default().iteration_cap,
+    )
+    .await;
+    let stall_recovery_enabled = setting_bool(db, "agent.stall_recovery.enabled", false).await;
+    let stall_max_moves = setting_i64(db, "agent.stall_recovery.max_moves_per_session", 6).await;
+    let recursion_limit = nexus_agent_graph::routing::effective_recursion_limit(
+        &nexus_agent_graph::routing::GraphTopologyLimits {
+            db_floor,
+            iteration_cap,
+            stall_recovery_enabled,
+            stall_max_moves,
+            g1_max_nudges,
+            final_gate_max_cycles,
+        },
+    );
+    if recursion_limit > db_floor {
+        tracing::debug!(
+            db_floor,
+            effective = recursion_limit,
+            iteration_cap,
+            stall_recovery_enabled,
+            stall_max_moves,
+            g1_max_nudges,
+            final_gate_max_cycles,
+            "recursion_limit scalato sulla topologia del grafo agentico"
+        );
+    }
+    recursion_limit
+}
+
 /// Costruisce la [`ExecutorConfig`] DB-driven (regola G): provider/model sono
 /// RISOLTI A MONTE (passati come parametri, mai letti dal nodo); i flag/soglie
 /// anti-loop + smart-upscale + direttiva di verifica vengono letti dal DB col
@@ -1089,461 +1152,515 @@ async fn load_executor_config(
     model: &str,
     context_window: i64,
 ) -> ExecutorConfig {
-    let d = ExecutorConfig::default();
-    ExecutorConfig {
+    // La config nasce dai `Default` (safe-default valido SOLO a chiave assente o
+    // DB irraggiungibile, regola G) e i gruppi DB-driven qui sotto sovrascrivono
+    // i campi di loro competenza. INVARIANTE che rende la lettura per gruppi
+    // equivalente al vecchio struct-literal: ogni gruppo legge il default dal
+    // CAMPO STESSO (`c.<campo>` prima della sua assegnazione E' il default, dato
+    // che `c` parte da `ExecutorConfig::default()`) e nessun campo e' assegnato
+    // due volte, quindi chiave letta, default applicato e clamp restano 1:1.
+    let mut c = ExecutorConfig {
         routing_provider: provider.to_string(),
         routing_model: model.to_string(),
-        g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
-        // Safety net finale del run: il doc di ExecutorConfig la dichiarava
-        // DB-driven ma il loader NON la leggeva (restava la costante 60).
-        // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
-        // censimento anti-loop / ADR 0035).
-        iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
-        // Ex costanti hardcoded portate in DB (regola G): offset forced-text,
-        // budget escalation unico, soglie loop-by-signature.
-        forced_text_offset: setting_i64(
-            db,
-            "agent.executor.forced_text_offset",
-            d.forced_text_offset,
-        )
-        .await,
-        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
-        // Limiti anti-runaway basati sui TOKEN (mig 0520, regola G): budget token
-        // cumulativo per run + fast-fail su turni solo-testo consecutivi. `0` =
-        // disabilitato -> bit-identico. Complementari a iteration_cap (che conta
-        // ITERAZIONI): chiudono il buco del modello che ignora force_tool_choice e
-        // brucia token in turni solo-testo (osservato 1.8M token / $2.42 senza
-        // convergere). Lettura via setting_i64 (punto unico) + clamp non-negativo.
-        // Budget token PER-TURNO: TRIGGER del giudice/escalation (si resetta
-        // all'escalation). Il freno di SPESA del run e' separato e in dollari
-        // (run_cost_budget_usd sotto): il costo cumulativo reale, esatto anche dopo
-        // un'escalation cross-tier, senza convertire $ in token sul modello iniziale.
-        run_token_budget: setting_i64(db, "agent.run_token_budget", d.run_token_budget as i64)
-            .await
-            .max(0) as u64,
-        // BACKSTOP di catastrofe (mig 0521, regola G): col meta-reasoner acceso il
-        // run_token_budget diventa il TRIGGER del giudice, questo hard-cap e' la rete
-        // di sicurezza non-negoziabile che chiude d'autorita' senza consultarlo.
-        run_token_hard_cap: setting_i64(db, "agent.run_token_hard_cap", d.run_token_hard_cap as i64)
-            .await
-            .max(0) as u64,
-        // Freno di SPESA in dollari dell'intero run (mig 0533, regola G): 0 =
-        // disabilitato. Confrontato col costo cumulativo reale accumulato per-turno.
-        run_cost_budget_usd: setting_f64(db, "agent.run_cost_budget_usd", d.run_cost_budget_usd)
-            .await
-            .max(0.0),
-        max_consecutive_text_only_turns: setting_i64(
-            db,
-            "agent.max_consecutive_text_only_turns",
-            d.max_consecutive_text_only_turns as i64,
-        )
-        .await
-        .max(0) as u32,
-        // 3.4 (provider-no-progress switch): DB-driven, default OFF (bit-identico).
-        provider_no_progress_switch_enabled: setting_bool(
-            db,
-            "agent.provider_no_progress.enabled",
-            d.provider_no_progress_switch_enabled,
-        )
-        .await,
-        loop_thresholds: LoopThresholds {
-            signature: setting_i64(
-                db,
-                "agent.loop.signature_threshold",
-                d.loop_thresholds.signature as i64,
-            )
-            .await
-            .max(1) as usize,
-            cap: setting_i64(
-                db,
-                "agent.loop.recent_signatures_cap",
-                d.loop_thresholds.cap as i64,
-            )
-            .await
-            .max(1) as usize,
-        },
-        // Anti repetition-collapse del testo (mig 0531, regola G): soglie della
-        // rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
-        // `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
-        // lunghezze minime >=1 (0 sarebbe insensato).
-        repetition: RepetitionThresholds {
-            min_unit_len: setting_i64(
-                db,
-                "agent.anti_repetition.min_unit_len",
-                d.repetition.min_unit_len as i64,
-            )
-            .await
-            .max(1) as usize,
-            max_unit_len: setting_i64(
-                db,
-                "agent.anti_repetition.max_unit_len",
-                d.repetition.max_unit_len as i64,
-            )
-            .await
-            .max(1) as usize,
-            min_repeats: setting_i64(
-                db,
-                "agent.anti_repetition.min_repeats",
-                d.repetition.min_repeats as i64,
-            )
-            .await
-            .max(0) as usize,
-            min_total_len: setting_i64(
-                db,
-                "agent.anti_repetition.min_total_len",
-                d.repetition.min_total_len as i64,
-            )
-            .await
-            .max(0) as usize,
-            scan_tail_cap: setting_i64(
-                db,
-                "agent.anti_repetition.scan_tail_cap",
-                d.repetition.scan_tail_cap as i64,
-            )
-            .await
-            .max(0) as usize,
-        },
-        // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
-        repeated_user_question_threshold: setting_i64(
-            db,
-            "agent.loop.repeated_user_question_threshold",
-            d.repeated_user_question_threshold,
-        )
-        .await,
-        // ── Meta-reasoner di recovery-da-stallo (mig 0510, opt-in DB, regola G) ─
-        // Con enabled=false (default) il gate di emissione StallReason nell'executor
-        // non scatta mai -> comportamento bit-identico a oggi. Il budget per-sessione
-        // e' il cap duro anti meta-loop/costo del gate.
-        stall_recovery_enabled: setting_bool(
-            db,
-            "agent.stall_recovery.enabled",
-            d.stall_recovery_enabled,
-        )
-        .await,
-        stall_recovery_max_moves_per_session: setting_i64(
-            db,
-            "agent.stall_recovery.max_moves_per_session",
-            d.stall_recovery_max_moves_per_session,
-        )
-        .await,
-        // ── Scale-controller (mig 0516, opt-in DB, regola G) ──────────────────
-        // Con enabled=false (default) il detector-emissione dell'executor salta
-        // PRIMA di ogni lavoro -> nessun ScaleReason -> nodo ScaleControl mai
-        // raggiunto -> BIT-IDENTICO. Tutte le soglie dai settings agent.scale.*.
-        scale: ScaleConfig {
-            enabled: setting_bool(db, "agent.scale.enabled", d.scale.enabled).await,
-            downscale_enabled: setting_bool(
-                db,
-                "agent.scale.downscale_enabled",
-                d.scale.downscale_enabled,
-            )
-            .await,
-            eval_every_iters: setting_i64(
-                db,
-                "agent.scale.eval_every_iters",
-                d.scale.eval_every_iters,
-            )
-            .await,
-            min_tail_iters: setting_i64(db, "agent.scale.min_tail_iters", d.scale.min_tail_iters)
-                .await,
-            min_confidence: setting_f64(db, "agent.scale.min_confidence", d.scale.min_confidence)
-                .await,
-            change_cooldown_turns: setting_i64(
-                db,
-                "agent.scale.change_cooldown_turns",
-                d.scale.change_cooldown_turns,
-            )
-            .await,
-            downscale_clean_window: setting_i64(
-                db,
-                "agent.scale.downscale_clean_window",
-                d.scale.downscale_clean_window,
-            )
-            .await,
-            max_reversals: setting_i64(db, "agent.scale.max_reversals", d.scale.max_reversals)
-                .await,
-            max_tier_changes_per_run: setting_i64(
-                db,
-                "agent.scale.max_tier_changes_per_run",
-                d.scale.max_tier_changes_per_run,
-            )
-            .await,
-            max_evals_per_run: setting_i64(
-                db,
-                "agent.scale.max_evals_per_run",
-                d.scale.max_evals_per_run,
-            )
-            .await,
-            window_overhead_ratio: setting_f64(
-                db,
-                "agent.scale.window_overhead_ratio",
-                d.scale.window_overhead_ratio,
-            )
-            .await,
-            // ── Sizing agentico (mig 0524, kill-switch nested, opt-in DB, regola G) ─
-            // Con sizing_enabled=false (default) il detector non popola i segnali
-            // sizing e il gate degrada ogni AdjustSizing a KeepTier -> flusso tier
-            // BIT-IDENTICO anche con scale ON.
-            sizing_enabled: setting_bool(db, "agent.scale.sizing_enabled", d.scale.sizing_enabled)
-                .await,
-            sizing_cooldown_turns: setting_i64(
-                db,
-                "agent.scale.sizing_cooldown_turns",
-                d.scale.sizing_cooldown_turns,
-            )
-            .await,
-            sizing_aggressiveness: setting_f64(
-                db,
-                "agent.scale.sizing_aggressiveness",
-                d.scale.sizing_aggressiveness,
-            )
-            .await,
-        },
-        progress_controller_enabled: setting_bool(
-            db,
-            "agent.progress_controller_enabled",
-            d.progress_controller_enabled,
-        )
-        .await,
-        repeated_action_threshold: setting_i64(
-            db,
-            "agent.repeated_action_threshold",
-            d.repeated_action_threshold,
-        )
-        .await,
-        repeated_action_threshold_read_only: setting_i64(
-            db,
-            "agent.repeated_action_threshold.read_only",
-            d.repeated_action_threshold_read_only,
-        )
-        .await,
-        recoverable_client_error_codes: setting_csv(
-            db,
-            "routing.client_error_failover_codes",
-            d.recoverable_client_error_codes.clone(),
-        )
-        .await,
-        repeated_action_force_diagnose_enabled: setting_bool(
-            db,
-            "agent.repeated_action_force_diagnose_enabled",
-            d.repeated_action_force_diagnose_enabled,
-        )
-        .await,
-        reallocation_threshold: setting_i64(
-            db,
-            "agent.loop.resource_reallocation_threshold",
-            d.reallocation_threshold,
-        )
-        .await,
-        upscale_enabled: setting_bool(db, "agent.upscale.enabled", d.upscale_enabled).await,
-        upscale_overhead_ratio: setting_f64(
-            db,
-            "agent.upscale.target_overhead_ratio",
-            d.upscale_overhead_ratio,
-        )
-        .await,
-        verification_directive_enabled: setting_bool(
-            db,
-            "agent.verification_directive_enabled",
-            d.verification_directive_enabled,
-        )
-        .await,
-        // ── tool_choice forcing (ADR 0018 leva 2, mig 0300) ───────────────────
-        // Il porting Rust aveva PERSO questi tre campi: restavano ai Default del
-        // nodo (enabled=false, style=None) -> il force-action era INERTE per ogni
-        // provider (force_now sempre false). Ora il DB e' di nuovo l'unica fonte
-        // (regola G): i flag dai settings (default-DB-down nel `Default`), lo
-        // stile dal catalog via punto unico `capability::resolve_tool_choice_style`.
-        tool_choice_forcing_enabled: setting_bool(
-            db,
-            "agent.tool_choice_forcing_enabled",
-            d.tool_choice_forcing_enabled,
-        )
-        .await,
-        tool_choice_forcing_max_iteration: setting_i64(
-            db,
-            "agent.tool_choice_forcing_max_iteration",
-            d.tool_choice_forcing_max_iteration,
-        )
-        .await,
-        tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
         // ── context management (mig 0199/0429): il bug + l'inerzia ────────────
         // context_window (passato come parametro): senza questo era 0 -> token_brake
         // / forced_rag / smart-upscale tutti no-op (gate `if context_window > 0`).
         context_window,
-        // Fasi di compressione DB-driven: i valori AGGRESSIVI (mig 0429,
-        // compress_start_iter=3, boundaries [3,7,15,30], keep_recent [5,3,2,1],
-        // max_chars [1200,600,300,100]) erano IGNORATI perche' load_executor_config
-        // chiudeva con `..Default::default()` (safe-default permissivi). Ora dal DB.
-        ctx_mgmt: CtxMgmtConfig {
-            compress_start_iter: setting_i64(
-                db,
-                "agent.context.compress_start_iter",
-                d.ctx_mgmt.compress_start_iter,
-            )
-            .await,
-            compress_phase_boundaries: setting_i64_csv(
-                db,
-                "agent.context.compress_phase_boundaries",
-                d.ctx_mgmt.compress_phase_boundaries.clone(),
-            )
-            .await,
-            compress_phase_keep_recent: setting_i64_csv(
-                db,
-                "agent.context.compress_phase_keep_recent",
-                d.ctx_mgmt.compress_phase_keep_recent.clone(),
-            )
-            .await,
-            compress_phase_max_chars: setting_i64_csv(
-                db,
-                "agent.context.compress_phase_max_chars",
-                d.ctx_mgmt.compress_phase_max_chars.clone(),
-            )
-            .await,
-        },
-        // Freno token: la soglia hard (0.55 in DB vs 0.70 default) e i parametri
-        // aggressivi, ora dal DB.
-        token_brake: TokenBrakeConfig {
-            max_context_ratio: setting_f64(
-                db,
-                "agent.context.max_context_ratio",
-                d.token_brake.max_context_ratio,
-            )
-            .await,
-            aggressive_keep_recent: setting_i64(
-                db,
-                "agent.context.aggressive_keep_recent",
-                d.token_brake.aggressive_keep_recent as i64,
-            )
-            .await
-            .max(0) as usize,
-            aggressive_max_chars: setting_i64(
-                db,
-                "agent.context.aggressive_max_chars",
-                d.token_brake.aggressive_max_chars as i64,
-            )
-            .await
-            .max(0) as usize,
-        },
-        // Forced-RAG reminder: ratio + testo dal DB (erano vuoti/0.0 -> reminder mai
-        // iniettato anche con offload attivo).
-        forced_rag_ratio: setting_f64(
-            db,
-            "agent.context.forced_rag_threshold_ratio",
-            d.forced_rag_ratio,
-        )
-        .await,
-        forced_rag_reminder_text: setting_string(
-            db,
-            "agent.context.forced_rag_reminder_text",
-            &d.forced_rag_reminder_text,
-        )
-        .await,
-        turn_focus_enabled: setting_bool(
-            db,
-            "agent.context.turn_focus_enabled",
-            d.turn_focus_enabled,
-        )
-        .await,
-        discovery_max_injected: setting_i64(
-            db,
-            "agent.tools.discovery_max_injected",
-            d.discovery_max_injected as i64,
-        )
-        .await
-        .max(0) as usize,
-        // ── rolling-summary (intervento 3): RIASSUME i vecchi via LLM economico ─
-        // Flag + keep_recent dal DB (regola G). Il MODELLO economico vive nell'impl
-        // della porta PgSummaryStore (agent.context.rolling_summary_model).
-        rolling_summary_enabled: setting_bool(
-            db,
-            "agent.context.rolling_summary_enabled",
-            d.rolling_summary_enabled,
-        )
-        .await,
-        rolling_keep_recent: setting_i64(
-            db,
-            "agent.context.rolling_keep_recent_turns",
-            d.rolling_keep_recent,
-        )
-        .await,
-        // Governance costo/beneficio del rolling-summary (opt-in, mig 0523). OFF di
-        // default -> il gate non si applica (comportamento storico bit-identico).
-        governance_rolling_summary_adaptive: setting_bool(
-            db,
-            "agent.governance.rolling_summary_adaptive",
-            d.governance_rolling_summary_adaptive,
-        )
-        .await,
-        governance_rolling_summary_min_prefix: setting_i64(
-            db,
-            "agent.governance.rolling_summary_min_prefix",
-            d.governance_rolling_summary_min_prefix,
-        )
-        .await,
-        // ── continuity-trim SEMANTICO + offload retrievabile (EmbeddingStore) ──
-        // Tutti OFF di default (regola G): con questi valori il comportamento e'
-        // bit-identico a oggi. La porta embedding/offload e' iniettata dal wiring.
-        continuity_trim_enabled: setting_bool(
-            db,
-            "agent.context.continuity_trim_enabled",
-            d.continuity_trim_enabled,
-        )
-        .await,
-        continuity_trim_min_score: setting_f64(
-            db,
-            "agent.context.continuity_trim_min_score",
-            d.continuity_trim_min_score as f64,
-        )
-        .await as f32,
-        continuity_trim_max_drop: setting_i64(
-            db,
-            "agent.context.continuity_trim_max_drop",
-            d.continuity_trim_max_drop,
-        )
-        .await,
-        compress_offload_enabled: setting_bool(
-            db,
-            "agent.context.compress_offload_enabled",
-            d.compress_offload_enabled,
-        )
-        .await,
-        rolling_summary_offload_enabled: setting_bool(
-            db,
-            "agent.context.rolling_summary_offload_enabled",
-            d.rolling_summary_offload_enabled,
-        )
-        .await,
-        // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
-        // dell'executor (stesse chiavi della RoutingConfig, regola L).
-        pending_steps_detection_enabled: setting_bool(
-            db,
-            "agent.closure.pending_steps_detection_enabled",
-            d.pending_steps_detection_enabled,
-        )
-        .await,
-        pending_steps_min_items: setting_i64(
-            db,
-            "agent.closure.pending_steps_min_items",
-            d.pending_steps_min_items,
-        )
-        .await,
-        // ── hard cap post-brake (ADR 0016 fase D2, mig 0286) ──────────────────
-        // Ratio dal DB (0.95 in produzione; il Default 0.0 = gate OFF vale SOLO
-        // a DB irraggiungibile) + template del messaggio overflow risolto qui
-        // (regola G: il testo redazionale vive SOLO in nexus_prompt_templates).
-        hard_cap_ratio: setting_f64(db, "agent.context.hard_cap_ratio", d.hard_cap_ratio).await,
-        overflow_message_template: {
-            let key = setting_string(
-                db,
-                "agent.context.overflow_message_key",
-                "system.context_overflow",
-            )
-            .await;
-            resolve_prompt_template(db, &key).await.unwrap_or_default()
-        },
+        // ── tool_choice forcing (ADR 0018 leva 2, mig 0300) ───────────────────
+        // Il porting Rust aveva PERSO questo campo: restava al Default del nodo
+        // (style=None) -> il force-action era INERTE per ogni provider (force_now
+        // sempre false). Lo stile viene dal catalog via punto unico
+        // `capability::resolve_tool_choice_style` (i due flag gemelli sono
+        // DB-driven in `load_executor_progress`).
+        tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
         ..ExecutorConfig::default()
-    }
+    };
+    load_executor_run_limits(db, &mut c).await;
+    load_executor_token_budgets(db, &mut c).await;
+    load_executor_loop_guards(db, &mut c).await;
+    load_executor_scale(db, &mut c).await;
+    load_executor_progress(db, &mut c).await;
+    load_executor_context(db, &mut c).await;
+    load_executor_rolling_summary(db, &mut c).await;
+    load_executor_closure(db, &mut c).await;
+    c
+}
+
+/// Limiti di ITERAZIONE del run (regola G): nudge G1, cap iterazioni, offset
+/// forced-text, budget escalation. Complementari ai budget a TOKEN
+/// ([`load_executor_token_budgets`]).
+async fn load_executor_run_limits(db: &PgPool, c: &mut ExecutorConfig) {
+    c.g1_max_nudges = setting_i64(db, "agent.g1_max_nudges", c.g1_max_nudges).await;
+    // Safety net finale del run: il doc di ExecutorConfig la dichiarava
+    // DB-driven ma il loader NON la leggeva (restava la costante 60).
+    // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
+    // censimento anti-loop / ADR 0035).
+    c.iteration_cap = setting_i64(db, "agent.executor.iteration_cap", c.iteration_cap).await;
+    // Ex costanti hardcoded portate in DB (regola G): offset forced-text +
+    // budget escalation unico.
+    c.forced_text_offset = setting_i64(
+        db,
+        "agent.executor.forced_text_offset",
+        c.forced_text_offset,
+    )
+    .await;
+    c.max_escalations = setting_i64(db, "agent.executor.max_escalations", c.max_escalations).await;
+}
+
+/// Limiti anti-runaway basati sui TOKEN (mig 0520, regola G): budget token
+/// cumulativo per run + fast-fail su turni solo-testo consecutivi. `0` =
+/// disabilitato -> bit-identico. Complementari a `iteration_cap` (che conta
+/// ITERAZIONI): chiudono il buco del modello che ignora force_tool_choice e
+/// brucia token in turni solo-testo (osservato 1.8M token / $2.42 senza
+/// convergere). Lettura via setting_i64 (punto unico) + clamp non-negativo.
+async fn load_executor_token_budgets(db: &PgPool, c: &mut ExecutorConfig) {
+    // Budget token PER-TURNO: TRIGGER del giudice/escalation (si resetta
+    // all'escalation). Il freno di SPESA del run e' separato e in dollari
+    // (run_cost_budget_usd sotto): il costo cumulativo reale, esatto anche dopo
+    // un'escalation cross-tier, senza convertire $ in token sul modello iniziale.
+    c.run_token_budget = setting_i64(db, "agent.run_token_budget", c.run_token_budget as i64)
+        .await
+        .max(0) as u64;
+    // BACKSTOP di catastrofe (mig 0521, regola G): col meta-reasoner acceso il
+    // run_token_budget diventa il TRIGGER del giudice, questo hard-cap e' la rete
+    // di sicurezza non-negoziabile che chiude d'autorita' senza consultarlo.
+    c.run_token_hard_cap = setting_i64(db, "agent.run_token_hard_cap", c.run_token_hard_cap as i64)
+        .await
+        .max(0) as u64;
+    // Freno di SPESA in dollari dell'intero run (mig 0533, regola G): 0 =
+    // disabilitato. Confrontato col costo cumulativo reale accumulato per-turno.
+    c.run_cost_budget_usd = setting_f64(db, "agent.run_cost_budget_usd", c.run_cost_budget_usd)
+        .await
+        .max(0.0);
+    c.max_consecutive_text_only_turns = setting_i64(
+        db,
+        "agent.max_consecutive_text_only_turns",
+        c.max_consecutive_text_only_turns as i64,
+    )
+    .await
+    .max(0) as u32;
+}
+
+/// Rilevatori di LOOP dell'executor (regola G): switch provider su no-progress,
+/// soglie loop-by-signature, anti repetition-collapse del testo, asse
+/// RepeatedUserQuestion e meta-reasoner di recovery-da-stallo.
+async fn load_executor_loop_guards(db: &PgPool, c: &mut ExecutorConfig) {
+    // 3.4 (provider-no-progress switch): DB-driven, default OFF (bit-identico).
+    c.provider_no_progress_switch_enabled = setting_bool(
+        db,
+        "agent.provider_no_progress.enabled",
+        c.provider_no_progress_switch_enabled,
+    )
+    .await;
+    load_loop_thresholds(db, &mut c.loop_thresholds).await;
+    load_repetition_thresholds(db, &mut c.repetition).await;
+    // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
+    c.repeated_user_question_threshold = setting_i64(
+        db,
+        "agent.loop.repeated_user_question_threshold",
+        c.repeated_user_question_threshold,
+    )
+    .await;
+    // ── Meta-reasoner di recovery-da-stallo (mig 0510, opt-in DB, regola G) ─
+    // Con enabled=false (default) il gate di emissione StallReason nell'executor
+    // non scatta mai -> comportamento bit-identico a oggi. Il budget per-sessione
+    // e' il cap duro anti meta-loop/costo del gate.
+    c.stall_recovery_enabled = setting_bool(
+        db,
+        "agent.stall_recovery.enabled",
+        c.stall_recovery_enabled,
+    )
+    .await;
+    c.stall_recovery_max_moves_per_session = setting_i64(
+        db,
+        "agent.stall_recovery.max_moves_per_session",
+        c.stall_recovery_max_moves_per_session,
+    )
+    .await;
+}
+
+/// Soglie loop-by-signature (mig 0520, regola G). Clamp >=1: una soglia 0
+/// scatterebbe su ogni turno.
+async fn load_loop_thresholds(db: &PgPool, t: &mut LoopThresholds) {
+    t.signature = setting_i64(db, "agent.loop.signature_threshold", t.signature as i64)
+        .await
+        .max(1) as usize;
+    t.cap = setting_i64(db, "agent.loop.recent_signatures_cap", t.cap as i64)
+        .await
+        .max(1) as usize;
+}
+
+/// Anti repetition-collapse del testo (mig 0531, regola G): soglie della
+/// rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
+/// `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
+/// lunghezze minime >=1 (0 sarebbe insensato).
+async fn load_repetition_thresholds(db: &PgPool, t: &mut RepetitionThresholds) {
+    t.min_unit_len = setting_i64(
+        db,
+        "agent.anti_repetition.min_unit_len",
+        t.min_unit_len as i64,
+    )
+    .await
+    .max(1) as usize;
+    t.max_unit_len = setting_i64(
+        db,
+        "agent.anti_repetition.max_unit_len",
+        t.max_unit_len as i64,
+    )
+    .await
+    .max(1) as usize;
+    t.min_repeats = setting_i64(db, "agent.anti_repetition.min_repeats", t.min_repeats as i64)
+        .await
+        .max(0) as usize;
+    t.min_total_len = setting_i64(
+        db,
+        "agent.anti_repetition.min_total_len",
+        t.min_total_len as i64,
+    )
+    .await
+    .max(0) as usize;
+    t.scan_tail_cap = setting_i64(
+        db,
+        "agent.anti_repetition.scan_tail_cap",
+        t.scan_tail_cap as i64,
+    )
+    .await
+    .max(0) as usize;
+}
+
+/// Scale-controller (mig 0516, opt-in DB, regola G): kill-switch + cadenza di
+/// valutazione. Con `enabled=false` (default) il detector-emissione dell'executor
+/// salta PRIMA di ogni lavoro -> nessun ScaleReason -> nodo ScaleControl mai
+/// raggiunto -> BIT-IDENTICO. Tutte le soglie dai settings `agent.scale.*`.
+async fn load_executor_scale(db: &PgPool, c: &mut ExecutorConfig) {
+    let s = &mut c.scale;
+    s.enabled = setting_bool(db, "agent.scale.enabled", s.enabled).await;
+    s.downscale_enabled =
+        setting_bool(db, "agent.scale.downscale_enabled", s.downscale_enabled).await;
+    s.eval_every_iters =
+        setting_i64(db, "agent.scale.eval_every_iters", s.eval_every_iters).await;
+    s.min_tail_iters = setting_i64(db, "agent.scale.min_tail_iters", s.min_tail_iters).await;
+    s.min_confidence = setting_f64(db, "agent.scale.min_confidence", s.min_confidence).await;
+    s.change_cooldown_turns = setting_i64(
+        db,
+        "agent.scale.change_cooldown_turns",
+        s.change_cooldown_turns,
+    )
+    .await;
+    s.downscale_clean_window = setting_i64(
+        db,
+        "agent.scale.downscale_clean_window",
+        s.downscale_clean_window,
+    )
+    .await;
+    load_executor_scale_caps(db, s).await;
+    load_executor_scale_sizing(db, s).await;
+}
+
+/// Cap anti-oscillazione per-run dello scale-controller (mig 0516, regola G).
+async fn load_executor_scale_caps(db: &PgPool, s: &mut ScaleConfig) {
+    s.max_reversals = setting_i64(db, "agent.scale.max_reversals", s.max_reversals).await;
+    s.max_tier_changes_per_run = setting_i64(
+        db,
+        "agent.scale.max_tier_changes_per_run",
+        s.max_tier_changes_per_run,
+    )
+    .await;
+    s.max_evals_per_run =
+        setting_i64(db, "agent.scale.max_evals_per_run", s.max_evals_per_run).await;
+    s.window_overhead_ratio = setting_f64(
+        db,
+        "agent.scale.window_overhead_ratio",
+        s.window_overhead_ratio,
+    )
+    .await;
+}
+
+/// Sizing agentico (mig 0524, kill-switch nested, opt-in DB, regola G). Con
+/// `sizing_enabled=false` (default) il detector non popola i segnali sizing e il
+/// gate degrada ogni AdjustSizing a KeepTier -> flusso tier BIT-IDENTICO anche
+/// con scale ON.
+async fn load_executor_scale_sizing(db: &PgPool, s: &mut ScaleConfig) {
+    s.sizing_enabled = setting_bool(db, "agent.scale.sizing_enabled", s.sizing_enabled).await;
+    s.sizing_cooldown_turns = setting_i64(
+        db,
+        "agent.scale.sizing_cooldown_turns",
+        s.sizing_cooldown_turns,
+    )
+    .await;
+    s.sizing_aggressiveness = setting_f64(
+        db,
+        "agent.scale.sizing_aggressiveness",
+        s.sizing_aggressiveness,
+    )
+    .await;
+}
+
+/// Progress-controller e reazione alle AZIONI RIPETUTE (regola G): soglie
+/// distinte per azioni mutative e read-only, codici d'errore client ritentabili,
+/// force-diagnose e riallocazione risorse. La chiave
+/// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
+/// usa l'underscore: e' la chiave reale del setting nel DB.
+async fn load_executor_progress(db: &PgPool, c: &mut ExecutorConfig) {
+    c.progress_controller_enabled = setting_bool(
+        db,
+        "agent.progress_controller_enabled",
+        c.progress_controller_enabled,
+    )
+    .await;
+    c.repeated_action_threshold = setting_i64(
+        db,
+        "agent.repeated_action_threshold",
+        c.repeated_action_threshold,
+    )
+    .await;
+    c.repeated_action_threshold_read_only = setting_i64(
+        db,
+        "agent.repeated_action_threshold.read_only",
+        c.repeated_action_threshold_read_only,
+    )
+    .await;
+    let codes = std::mem::take(&mut c.recoverable_client_error_codes);
+    c.recoverable_client_error_codes =
+        setting_csv(db, "routing.client_error_failover_codes", codes).await;
+    c.repeated_action_force_diagnose_enabled = setting_bool(
+        db,
+        "agent.repeated_action_force_diagnose_enabled",
+        c.repeated_action_force_diagnose_enabled,
+    )
+    .await;
+    c.reallocation_threshold = setting_i64(
+        db,
+        "agent.loop.resource_reallocation_threshold",
+        c.reallocation_threshold,
+    )
+    .await;
+    load_executor_upscale(db, c).await;
+}
+
+/// Smart-upscale, direttiva di verifica e forcing del tool_choice (regola G). I
+/// due flag `tool_choice_forcing_*` erano persi dal porting Rust (restavano al
+/// Default `enabled=false` -> force-action INERTE per ogni provider): ora il DB
+/// e' di nuovo l'unica fonte, lo stile arriva dal catalog in
+/// [`load_executor_config`] (ADR 0018 leva 2, mig 0300).
+async fn load_executor_upscale(db: &PgPool, c: &mut ExecutorConfig) {
+    c.upscale_enabled = setting_bool(db, "agent.upscale.enabled", c.upscale_enabled).await;
+    c.upscale_overhead_ratio = setting_f64(
+        db,
+        "agent.upscale.target_overhead_ratio",
+        c.upscale_overhead_ratio,
+    )
+    .await;
+    c.verification_directive_enabled = setting_bool(
+        db,
+        "agent.verification_directive_enabled",
+        c.verification_directive_enabled,
+    )
+    .await;
+    c.tool_choice_forcing_enabled = setting_bool(
+        db,
+        "agent.tool_choice_forcing_enabled",
+        c.tool_choice_forcing_enabled,
+    )
+    .await;
+    c.tool_choice_forcing_max_iteration = setting_i64(
+        db,
+        "agent.tool_choice_forcing_max_iteration",
+        c.tool_choice_forcing_max_iteration,
+    )
+    .await;
+}
+
+/// Context management (mig 0199/0429, regola G): fasi di compressione, freno
+/// token, forced-RAG, continuity-trim/offload e hard cap post-brake. I valori
+/// AGGRESSIVI del DB erano IGNORATI perche' il loader chiudeva con
+/// `..Default::default()` (safe-default permissivi).
+async fn load_executor_context(db: &PgPool, c: &mut ExecutorConfig) {
+    load_ctx_mgmt_config(db, &mut c.ctx_mgmt).await;
+    load_token_brake_config(db, &mut c.token_brake).await;
+    // Forced-RAG reminder: ratio + testo dal DB (erano vuoti/0.0 -> reminder mai
+    // iniettato anche con offload attivo).
+    c.forced_rag_ratio = setting_f64(
+        db,
+        "agent.context.forced_rag_threshold_ratio",
+        c.forced_rag_ratio,
+    )
+    .await;
+    let reminder = std::mem::take(&mut c.forced_rag_reminder_text);
+    c.forced_rag_reminder_text = setting_string(
+        db,
+        "agent.context.forced_rag_reminder_text",
+        &reminder,
+    )
+    .await;
+    c.turn_focus_enabled = setting_bool(
+        db,
+        "agent.context.turn_focus_enabled",
+        c.turn_focus_enabled,
+    )
+    .await;
+    c.discovery_max_injected = setting_i64(
+        db,
+        "agent.tools.discovery_max_injected",
+        c.discovery_max_injected as i64,
+    )
+    .await
+    .max(0) as usize;
+    load_executor_continuity_trim(db, c).await;
+    load_executor_hard_cap(db, c).await;
+}
+
+/// Fasi di compressione DB-driven (mig 0429: compress_start_iter=3, boundaries
+/// [3,7,15,30], keep_recent [5,3,2,1], max_chars [1200,600,300,100]).
+async fn load_ctx_mgmt_config(db: &PgPool, m: &mut CtxMgmtConfig) {
+    m.compress_start_iter = setting_i64(
+        db,
+        "agent.context.compress_start_iter",
+        m.compress_start_iter,
+    )
+    .await;
+    let boundaries = std::mem::take(&mut m.compress_phase_boundaries);
+    m.compress_phase_boundaries = setting_i64_csv(
+        db,
+        "agent.context.compress_phase_boundaries",
+        boundaries,
+    )
+    .await;
+    let keep_recent = std::mem::take(&mut m.compress_phase_keep_recent);
+    m.compress_phase_keep_recent = setting_i64_csv(
+        db,
+        "agent.context.compress_phase_keep_recent",
+        keep_recent,
+    )
+    .await;
+    let max_chars = std::mem::take(&mut m.compress_phase_max_chars);
+    m.compress_phase_max_chars =
+        setting_i64_csv(db, "agent.context.compress_phase_max_chars", max_chars).await;
+}
+
+/// Freno token: la soglia hard (0.55 in DB vs 0.70 default) e i parametri
+/// aggressivi, ora dal DB.
+async fn load_token_brake_config(db: &PgPool, b: &mut TokenBrakeConfig) {
+    b.max_context_ratio = setting_f64(
+        db,
+        "agent.context.max_context_ratio",
+        b.max_context_ratio,
+    )
+    .await;
+    b.aggressive_keep_recent = setting_i64(
+        db,
+        "agent.context.aggressive_keep_recent",
+        b.aggressive_keep_recent as i64,
+    )
+    .await
+    .max(0) as usize;
+    b.aggressive_max_chars = setting_i64(
+        db,
+        "agent.context.aggressive_max_chars",
+        b.aggressive_max_chars as i64,
+    )
+    .await
+    .max(0) as usize;
+}
+
+/// Continuity-trim SEMANTICO + offload retrievabile (EmbeddingStore). Tutti OFF
+/// di default (regola G): con questi valori il comportamento e' bit-identico a
+/// oggi. La porta embedding/offload e' iniettata dal wiring.
+async fn load_executor_continuity_trim(db: &PgPool, c: &mut ExecutorConfig) {
+    c.continuity_trim_enabled = setting_bool(
+        db,
+        "agent.context.continuity_trim_enabled",
+        c.continuity_trim_enabled,
+    )
+    .await;
+    c.continuity_trim_min_score = setting_f64(
+        db,
+        "agent.context.continuity_trim_min_score",
+        c.continuity_trim_min_score as f64,
+    )
+    .await as f32;
+    c.continuity_trim_max_drop = setting_i64(
+        db,
+        "agent.context.continuity_trim_max_drop",
+        c.continuity_trim_max_drop,
+    )
+    .await;
+    c.compress_offload_enabled = setting_bool(
+        db,
+        "agent.context.compress_offload_enabled",
+        c.compress_offload_enabled,
+    )
+    .await;
+    c.rolling_summary_offload_enabled = setting_bool(
+        db,
+        "agent.context.rolling_summary_offload_enabled",
+        c.rolling_summary_offload_enabled,
+    )
+    .await;
+}
+
+/// Hard cap post-brake (ADR 0016 fase D2, mig 0286): ratio dal DB (0.95 in
+/// produzione; il Default 0.0 = gate OFF vale SOLO a DB irraggiungibile) +
+/// template del messaggio overflow risolto qui (regola G: il testo redazionale
+/// vive SOLO in nexus_prompt_templates).
+async fn load_executor_hard_cap(db: &PgPool, c: &mut ExecutorConfig) {
+    c.hard_cap_ratio = setting_f64(db, "agent.context.hard_cap_ratio", c.hard_cap_ratio).await;
+    let key = setting_string(
+        db,
+        "agent.context.overflow_message_key",
+        "system.context_overflow",
+    )
+    .await;
+    c.overflow_message_template = resolve_prompt_template(db, &key).await.unwrap_or_default();
+}
+
+/// Rolling-summary (intervento 3): RIASSUME i vecchi via LLM economico. Flag +
+/// keep_recent dal DB (regola G); il MODELLO economico vive nell'impl della porta
+/// PgSummaryStore (`agent.context.rolling_summary_model`). La governance
+/// costo/beneficio (opt-in, mig 0523) e' OFF di default -> il gate non si applica
+/// (comportamento storico bit-identico).
+async fn load_executor_rolling_summary(db: &PgPool, c: &mut ExecutorConfig) {
+    c.rolling_summary_enabled = setting_bool(
+        db,
+        "agent.context.rolling_summary_enabled",
+        c.rolling_summary_enabled,
+    )
+    .await;
+    c.rolling_keep_recent = setting_i64(
+        db,
+        "agent.context.rolling_keep_recent_turns",
+        c.rolling_keep_recent,
+    )
+    .await;
+    c.governance_rolling_summary_adaptive = setting_bool(
+        db,
+        "agent.governance.rolling_summary_adaptive",
+        c.governance_rolling_summary_adaptive,
+    )
+    .await;
+    c.governance_rolling_summary_min_prefix = setting_i64(
+        db,
+        "agent.governance.rolling_summary_min_prefix",
+        c.governance_rolling_summary_min_prefix,
+    )
+    .await;
+}
+
+/// ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
+/// dell'executor (stesse chiavi della RoutingConfig, regola L).
+async fn load_executor_closure(db: &PgPool, c: &mut ExecutorConfig) {
+    c.pending_steps_detection_enabled = setting_bool(
+        db,
+        "agent.closure.pending_steps_detection_enabled",
+        c.pending_steps_detection_enabled,
+    )
+    .await;
+    c.pending_steps_min_items = setting_i64(
+        db,
+        "agent.closure.pending_steps_min_items",
+        c.pending_steps_min_items,
+    )
+    .await;
 }
 
 /// Tokenizer selezionato per le stime contesto (ADR 0016 D1).
@@ -2235,50 +2352,101 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
 /// decide come oggi), comportamento INVARIATO. Il primario PYTHON
 /// (`run_via_brain`) NON passa di qui: ri-classifica internamente nel router_node.
 fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
+    let (initial_intent, initial_action_oriented, initial_report_only) =
+        derive_classifier_signals(input, role);
+    let (extra, declared_outcome, stop_reason, result) = build_initial_extra(input);
+    let graph_automation_mode = parse_automation_mode(&input.automation_mode);
+
+    AgentState {
+        messages: build_initial_messages(input),
+        thread_id: Some(input.run_id.to_string()),
+        session_id: Some(input.session_id.to_string()),
+        system_text: Some(input.system_text.clone()),
+        intent_hint: input.intent_hint.clone(),
+        user_intent: initial_intent,
+        action_oriented: initial_action_oriented,
+        report_only: initial_report_only,
+        provider_override: Some(input.provider.clone()),
+        model_override: Some(input.model.clone()),
+        // Tools al modello: l'array (se presente). Qualunque forma non-array
+        // (incluso null) -> None: lo stato tratta None come "nessun tool dichiarato".
+        tools_json: input.tools_json.as_array().cloned(),
+        automation_mode: graph_automation_mode,
+        approved: automation_mode_skips_hitl(graph_automation_mode).then_some(true),
+        supervisor_mode: Some(input.supervisor_mode),
+        declared_outcome,
+        stop_reason,
+        result,
+        extra,
+        // DEBITO 1 chiuso (TODO Fase 5): `behavior_mode` valorizzato con la STESSA
+        // fonte del primario Python, il quale lo riceve dal payload
+        // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
+        // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
+        // costante `PRIMARY_BEHAVIOR_MODE` (`brain_agent_client.rs`): la riusiamo
+        // qui (punto unico, regola L) cosi' lo shadow confronta un grafo col mode
+        // IDENTICO. Conta sul serio dal momento in cui il planner e' eleggibile
+        // (`plan_phase_enabled=true`, mig 0426/0439): `PlannerConfig::is_eligible`
+        // gata su questo mode; senza valorizzarlo, lo shadow divergerebbe (None vs
+        // "bilanciata"). Il valore-vero-dal-turno (derivarlo dall'automation_mode/
+        // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
+        // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
+        behavior_mode: Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE.to_string()),
+        // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
+        // stato cosi' il grafo applica i guard di annidamento (UnderstandingNode skip
+        // del fan-out explore se depth>=1). `None` per il run principale -> stato
+        // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
+        parent_run_id: input.parent_run_id.map(|u| u.to_string()),
+        subagent_depth: input.subagent_depth,
+        ..Default::default()
+    }
+}
+
+/// Conversazione iniziale del run: la history pregressa nel formato compatto
+/// `{"role","content"}` prodotto da `build_recent_conversation_history` (lo
+/// STESSO che riceve il brain endpoint /agent/run/stream, regola L), col
+/// messaggio utente del turno corrente in coda. Le entry malformate sono saltate
+/// (best-effort, non bloccano il run).
+fn build_initial_messages(input: &NativeRunInput) -> Vec<Message> {
     use nexus_agent_graph::state::MessageContent;
 
-    // History pregressa nel formato compatto `{"role","content"}` prodotto da
-    // `build_recent_conversation_history` (lo STESSO che riceve il brain endpoint
-    // /agent/run/stream, regola L). Le entry malformate sono saltate (best-effort,
-    // non bloccano il run).
     let mut messages: Vec<Message> = input
         .conversation_history
         .iter()
         .filter_map(history_entry_to_message)
         .collect();
-
-    // Messaggio utente del turno corrente in coda.
     messages.push(Message::Human {
         content: MessageContent::text(input.initial_msg.clone()),
     });
+    messages
+}
 
-    // Tools al modello: l'array (se presente). Qualunque forma non-array
-    // (incluso null) -> None: lo stato tratta None come "nessun tool dichiarato".
-    let tools = input.tools_json.as_array().cloned();
-
-    // ── Tappa 1b (B) + parita' PRIMARIO RUST: action_oriented/report_only FEDELI ─
-    // RADICE della divergenza stop_reason (g1 sui run 0-tool, loop sui run con
-    // tool): il `RouterNode` del grafo Rust NON riclassifica (classifier LLM
-    // delegato a un PR successivo), quindi senza dati cade nel fallback
-    // `agentic_default` con `action_oriented=true` SEMPRE. Il primario Python
-    // invece deriva `action_oriented` dal classifier del turno: per i turni
-    // conversazionali read-only e' `false` -> niente G1.
-    //
-    // Per far CONVERGERE sia lo SHADOW sia il PRIMARIO RUST col primario Python
-    // deriviamo `action_oriented`/`report_only` dagli STESSI dati del classifier
-    // del turno (`requires_tools`/`agentic_score`/`authorizes_changes`) col PUNTO
-    // UNICO `intent_classifier::derive_*` (regola L: porting 1:1 di
-    // `brain/agents/nodes/__init__.py:686-739`). Il call site popola questi campi
-    // in `NativeRunInput` via [`resolve_classifier_fields`] (helper condiviso,
-    // regola L) in ENTRAMBI i rami Shadow e PRIMARY-Rust; il fix precedente
-    // grossolano (`action_oriented_for_intent(intent_hint)`) resta SOLO come
-    // fallback (ramo shadow) quando i dati del classifier non sono disponibili.
-    // Quando NESSUN dato del classifier e' presente il primario resta None ->
-    // il RouterNode decide (comportamento INVARIATO). Il primario PYTHON NON
-    // passa di qui.
-    //
-    // `derive_from_classifier`: i dati del classifier sono presenti (popolati dal
-    // call site). Sia per Shadow sia per Primary la derivazione FEDELE e' identica.
+/// Tappa 1b (B) + parita' PRIMARIO RUST: deriva `(user_intent, action_oriented,
+/// report_only)` dai dati del classifier del turno.
+///
+/// RADICE della divergenza stop_reason (g1 sui run 0-tool, loop sui run con
+/// tool): il `RouterNode` del grafo Rust NON riclassifica (classifier LLM
+/// delegato a un PR successivo), quindi senza dati cade nel fallback
+/// `agentic_default` con `action_oriented=true` SEMPRE. Il primario Python invece
+/// deriva `action_oriented` dal classifier del turno: per i turni conversazionali
+/// read-only e' `false` -> niente G1.
+///
+/// Per far CONVERGERE sia lo SHADOW sia il PRIMARIO RUST col primario Python si
+/// derivano `action_oriented`/`report_only` dagli STESSI dati del classifier del
+/// turno (`requires_tools`/`agentic_score`/`authorizes_changes`) col PUNTO UNICO
+/// `intent_classifier::derive_*` (regola L: porting 1:1 di
+/// `brain/agents/nodes/__init__.py:686-739`). Il call site popola questi campi in
+/// `NativeRunInput` via [`resolve_classifier_fields`] (helper condiviso, regola
+/// L) in ENTRAMBI i rami Shadow e PRIMARY-Rust; il fix precedente grossolano
+/// (`action_oriented_for_intent(intent_hint)`) resta SOLO come fallback (ramo
+/// shadow) quando i dati del classifier non sono disponibili. Quando NESSUN dato
+/// del classifier e' presente il primario resta None -> il RouterNode decide
+/// (comportamento INVARIATO). Il primario PYTHON NON passa di qui.
+fn derive_classifier_signals(
+    input: &NativeRunInput,
+    role: RunRole,
+) -> (Option<String>, Option<bool>, Option<bool>) {
+    // I dati del classifier sono presenti (popolati dal call site). Sia per
+    // Shadow sia per Primary la derivazione FEDELE e' identica.
     let derive_from_classifier = input.classifier_resolved
         || input.requires_tools.is_some()
         || input.agentic_score.is_some();
@@ -2288,72 +2456,114 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (initial_intent, initial_action_oriented): (Option<String>, Option<bool>) =
-        if derive_from_classifier {
-            // Derivazione FEDELE (Shadow o Primary-Rust), identica al primario Python.
-            let action_oriented = crate::intent_classifier::derive_action_oriented(
-                intent_hint,
-                input.requires_tools,
-                input.agentic_score,
-                input.action_oriented_min_score,
-            );
-            // user_intent: l'intent del primario se noto (intent_hint), altrimenti
-            // None (l'intent vive nel routing, non e' richiesto dal grafo per
-            // action_oriented).
-            (intent_hint.map(str::to_string), Some(action_oriented))
-        } else if role.is_shadow() {
-            // Fallback grossolano SOLO shadow (classifier non disponibile): deriva
-            // dall'intent_hint con la mappa deterministica. Quando manca anche
-            // l'hint, None -> il RouterNode shadow applica il fallback del Python
-            // degradato. Il PRIMARIO RUST senza dati resta None (decide il
-            // RouterNode), comportamento INVARIATO.
-            match intent_hint {
-                Some(intent) => (
-                    Some(intent.to_string()),
-                    Some(nexus_agent_graph::decisions::action_oriented_for_intent(
-                        intent,
-                    )),
-                ),
-                None => (None, None),
-            }
-        } else {
-            // Primario Rust senza dati classifier: INTATTO (None -> RouterNode).
-            (None, None)
-        };
+    let (initial_intent, initial_action_oriented) =
+        derive_intent_and_action(input, role, intent_hint, derive_from_classifier);
+    let initial_report_only = derive_report_only_signal(
+        input,
+        role,
+        intent_hint,
+        derive_from_classifier,
+        initial_action_oriented,
+    );
+    (initial_intent, initial_action_oriented, initial_report_only)
+}
 
-    // report_only FEDELE (porting `__init__.py:736-739`), CABLATO nello stato del
-    // grafo: l'executor lo consuma per NON strippare i tool read-only sui turni
-    // di sola lettura (incidente 2026-07-02: "elenca i file" ha requires_tools=true
-    // -> action_oriented=true, ma authorizes_changes=false -> report_only=true; lo
-    // strip lasciava solo tool di scrittura e il run degenerava in edit-loop).
-    // Vale per ENTRAMBI Shadow e Primary-Rust quando i dati del classifier sono
-    // presenti; senza dati resta None (guard inerti solo su Some(true)).
-    let initial_report_only: Option<bool> = if derive_from_classifier {
-        let report_only = crate::intent_classifier::derive_report_only(
-            input.classifier_resolved,
+/// `(user_intent, action_oriented)` del turno. Vedi [`derive_classifier_signals`]
+/// per il razionale della derivazione fedele.
+fn derive_intent_and_action(
+    input: &NativeRunInput,
+    role: RunRole,
+    intent_hint: Option<&str>,
+    derive_from_classifier: bool,
+) -> (Option<String>, Option<bool>) {
+    if derive_from_classifier {
+        // Derivazione FEDELE (Shadow o Primary-Rust), identica al primario Python.
+        let action_oriented = crate::intent_classifier::derive_action_oriented(
             intent_hint,
-            input.authorizes_changes.unwrap_or(true),
+            input.requires_tools,
+            input.agentic_score,
+            input.action_oriented_min_score,
         );
-        tracing::debug!(
-            run_id = %input.run_id,
-            role_shadow = role.is_shadow(),
-            report_only,
-            action_oriented = ?initial_action_oriented,
-            "native: derivazione fedele action_oriented/report_only dal classifier"
-        );
-        Some(report_only)
+        // user_intent: l'intent del primario se noto (intent_hint), altrimenti
+        // None (l'intent vive nel routing, non e' richiesto dal grafo per
+        // action_oriented).
+        (intent_hint.map(str::to_string), Some(action_oriented))
+    } else if role.is_shadow() {
+        // Fallback grossolano SOLO shadow (classifier non disponibile): deriva
+        // dall'intent_hint con la mappa deterministica. Quando manca anche
+        // l'hint, None -> il RouterNode shadow applica il fallback del Python
+        // degradato. Il PRIMARIO RUST senza dati resta None (decide il
+        // RouterNode), comportamento INVARIATO.
+        match intent_hint {
+            Some(intent) => (
+                Some(intent.to_string()),
+                Some(nexus_agent_graph::decisions::action_oriented_for_intent(
+                    intent,
+                )),
+            ),
+            None => (None, None),
+        }
     } else {
-        None
-    };
+        // Primario Rust senza dati classifier: INTATTO (None -> RouterNode).
+        (None, None)
+    }
+}
 
+/// `report_only` FEDELE (porting `__init__.py:736-739`), CABLATO nello stato del
+/// grafo: l'executor lo consuma per NON strippare i tool read-only sui turni di
+/// sola lettura (incidente 2026-07-02: "elenca i file" ha requires_tools=true ->
+/// action_oriented=true, ma authorizes_changes=false -> report_only=true; lo
+/// strip lasciava solo tool di scrittura e il run degenerava in edit-loop).
+/// Vale per ENTRAMBI Shadow e Primary-Rust quando i dati del classifier sono
+/// presenti; senza dati resta None (guard inerti solo su Some(true)).
+fn derive_report_only_signal(
+    input: &NativeRunInput,
+    role: RunRole,
+    intent_hint: Option<&str>,
+    derive_from_classifier: bool,
+    action_oriented: Option<bool>,
+) -> Option<bool> {
+    if !derive_from_classifier {
+        return None;
+    }
+    let report_only = crate::intent_classifier::derive_report_only(
+        input.classifier_resolved,
+        intent_hint,
+        input.authorizes_changes.unwrap_or(true),
+    );
+    tracing::debug!(
+        run_id = %input.run_id,
+        role_shadow = role.is_shadow(),
+        report_only,
+        action_oriented = ?action_oriented,
+        "native: derivazione fedele action_oriented/report_only dal classifier"
+    );
+    Some(report_only)
+}
+
+/// Costruisce il blocco `extra` dello stato iniziale + l'eventuale esito GIA'
+/// terminale imposto dal consiglio a monte.
+///
+/// `ORIGINAL_TASK_KEY`: task del turno CORRENTE fissato all'origine (punto unico,
+/// regola L). Il supervisore lo legge da qui (`extract_original_task`) invece di
+/// ri-derivarlo dalla cronologia, che in una sessione multi-turno contiene i task
+/// dei turni PRECEDENTI. Senza questo, il supervisore inseguiva il primo Human del
+/// run — spesso un auto-debug di crash iniettato dall'observer — invece del task
+/// reale (incidente Chat 11 Beaty-Book: 60 iterazioni sul crash frontend al posto
+/// del task di sicurezza auth).
+///
+/// Quando la sintesi del consiglio porta un enforcement TERMINALE, il run nasce
+/// gia' chiuso: `(declared_outcome, stop_reason=EndTurn, result)` valorizzati.
+/// Altrimenti restano `None` e il grafo parte normalmente.
+fn build_initial_extra(
+    input: &NativeRunInput,
+) -> (
+    serde_json::Map<String, Value>,
+    Option<Value>,
+    Option<nexus_agent_graph::state::StopReason>,
+    Option<String>,
+) {
     let mut extra = serde_json::Map::new();
-    // Task del turno CORRENTE fissato all'origine (punto unico, regola L): il
-    // supervisore lo legge da qui (`extract_original_task`) invece di ri-derivarlo
-    // dalla cronologia, che in una sessione multi-turno contiene i task dei turni
-    // PRECEDENTI. Senza questo, il supervisore inseguiva il primo Human del run —
-    // spesso un auto-debug di crash iniettato dall'observer — invece del task reale
-    // (incidente Chat 11 Beaty-Book: 60 iterazioni sul crash frontend al posto del
-    // task di sicurezza auth).
     extra.insert(
         nexus_agent_graph::decisions::ORIGINAL_TASK_KEY.to_string(),
         serde_json::Value::String(input.initial_msg.clone()),
@@ -2390,50 +2600,7 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
             }
         }
     }
-
-    let graph_automation_mode = parse_automation_mode(&input.automation_mode);
-    let skip_hitl = automation_mode_skips_hitl(graph_automation_mode);
-
-    AgentState {
-        messages,
-        thread_id: Some(input.run_id.to_string()),
-        session_id: Some(input.session_id.to_string()),
-        system_text: Some(input.system_text.clone()),
-        intent_hint: input.intent_hint.clone(),
-        user_intent: initial_intent,
-        action_oriented: initial_action_oriented,
-        report_only: initial_report_only,
-        provider_override: Some(input.provider.clone()),
-        model_override: Some(input.model.clone()),
-        tools_json: tools,
-        automation_mode: graph_automation_mode,
-        approved: skip_hitl.then_some(true),
-        supervisor_mode: Some(input.supervisor_mode),
-        declared_outcome,
-        stop_reason,
-        result,
-        extra,
-        // DEBITO 1 chiuso (TODO Fase 5): `behavior_mode` valorizzato con la STESSA
-        // fonte del primario Python, il quale lo riceve dal payload
-        // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
-        // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
-        // costante `PRIMARY_BEHAVIOR_MODE` (`brain_agent_client.rs`): la riusiamo
-        // qui (punto unico, regola L) cosi' lo shadow confronta un grafo col mode
-        // IDENTICO. Conta sul serio dal momento in cui il planner e' eleggibile
-        // (`plan_phase_enabled=true`, mig 0426/0439): `PlannerConfig::is_eligible`
-        // gata su questo mode; senza valorizzarlo, lo shadow divergerebbe (None vs
-        // "bilanciata"). Il valore-vero-dal-turno (derivarlo dall'automation_mode/
-        // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
-        // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
-        behavior_mode: Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE.to_string()),
-        // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
-        // stato cosi' il grafo applica i guard di annidamento (UnderstandingNode skip
-        // del fan-out explore se depth>=1). `None` per il run principale -> stato
-        // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
-        parent_run_id: input.parent_run_id.map(|u| u.to_string()),
-        subagent_depth: input.subagent_depth,
-        ..Default::default()
-    }
+    (extra, declared_outcome, stop_reason, result)
 }
 
 /// Parsing della modalita' automazione nel enum del grafo. Delega al punto unico
@@ -2666,83 +2833,7 @@ async fn run_engine(
     // Resume HITL: nessun init (carica il checkpoint), applica il resume_delta.
     match mode {
         RunMode::New => {
-            let mut init_state = build_initial_state(input, role);
-            // ── ROUTING INIZIALE tier (FIX-A scale-controller) ───────────────────
-            // Il primo modello del run e' `(input.provider, input.model)` risolto dal
-            // routing a monte (il primo turno dell'executor lo usa via
-            // provider_override/model_override, sticky ancora assente). La
-            // RoutingMatrix::lookup non porta il tier; lo risolviamo qui dal catalog
-            // (punto unico `resolve_initial_tier`, percorso Real all'avvio) e lo
-            // scriviamo nel checkpoint iniziale. Cosi' `current_tier` e' popolato dal
-            // primo turno, non solo dopo un'escalation/upscale. INERTE (PR-A): nessun
-            // decisore lo legge ancora -> bit-identico. Determinismo: la query e'
-            // FUORI dal loop del grafo (non nel path di Replay); il tier vive poi
-            // nello stato checkpointato, condiviso da Primary e Shadow (convergono).
-            init_state.current_tier =
-                Some(resolve_initial_tier(&deps.db, &input.provider, &input.model).await);
-            // Playbook matcher (punto unico, regola L): popola i passi del playbook
-            // che matcha il task, cosi' il planner genera i todo deterministici
-            // (es. nexus_visual_compare per la verifica figma) e il final_gate puo'
-            // applicare design_verify. Senza, `playbook_steps` resta vuoto: era
-            // l'anello mancante del porting (il matcher viveva nel brain Python).
-            // project_root None: i trigger con `project_markers` non sono valutati
-            // qui (root non risolta nel punto di costruzione dello state); i
-            // playbook senza markers — es. verify.design_align — matchano comunque.
-            if let Some(pm) = crate::playbook_engine::match_playbook(
-                &deps.db,
-                input.intent_hint.as_deref(),
-                &input.initial_msg,
-                None,
-            )
-            .await
-            {
-                tracing::info!(
-                    target: "mcp_core::native_engine",
-                    playbook = %pm.key,
-                    steps = pm.steps.len(),
-                    "playbook matchato -> playbook_steps popolati"
-                );
-                init_state.playbook_steps = Some(pm.steps);
-                init_state.playbook_key = Some(pm.key);
-            }
-
-            // ── Detector clarification CROSS-RUN (loop email, blocco #5) ─────────
-            // Calcolato UNA volta all'avvio del run PRIMARIO, FUORI dal grafo
-            // (replay-safe): il valore e' checkpointato in `AgentState`, cosi' il
-            // grafo e il replay lo rileggono dallo stato senza re-interrogare il DB
-            // (il principio guida del piano: la decisione e' presa fuori dal
-            // percorso caldo, il percorso caldo la rilegge). Solo PRIMARIO: nello
-            // shadow (Replay) NON leggiamo stato live che evolve (come
-            // `NullBillingCooldownPort`) — lo shadow rigioca lo stato del primario,
-            // che porta gia' `repeated_clarify_count` checkpointato.
-            //
-            // FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della
-            // sessione. Il pool e' quello del DOMINIO RUN (agent_runs/meta_steps
-            // migrati al DB progetto), risolto col PUNTO UNICO per-sessione.
-            // Fail-open: guasto DB -> conteggio 0 (asse mai attivo, invariato).
-            if !role.is_shadow() {
-                let run_db = crate::project_db_routes::project_data_pool_by_session_from(
-                    &deps.db,
-                    input.session_id,
-                )
-                .await;
-                let clarify_history = PgClarifyHistoryStore::new(run_db);
-                let (sig, repeat_count) = clarify_history
-                    .latest_signature_and_repeat_count(input.session_id)
-                    .await;
-                if repeat_count > 0 {
-                    tracing::info!(
-                        target: "mcp_core::native_engine",
-                        session_id = %input.session_id,
-                        repeated_clarify_count = repeat_count,
-                        signature = sig.as_deref().unwrap_or(""),
-                        "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
-                    );
-                }
-                init_state.repeated_clarify_count = Some(repeat_count);
-            }
-
-            let init = Some(init_state);
+            let init = Some(prepare_new_run_state(deps, input, role).await);
             engine
                 .run_until_interrupt(input.run_id, init, &ctx)
                 .await
@@ -2755,6 +2846,98 @@ async fn run_engine(
     }
 }
 
+/// Stato iniziale di un avvio nuovo: lo stato puro da prompt/history
+/// ([`build_initial_state`]) arricchito coi segnali risolti UNA volta all'avvio,
+/// FUORI dal loop del grafo (replay-safe: finiscono nel checkpoint, il percorso
+/// caldo li rilegge senza re-interrogare il DB).
+async fn prepare_new_run_state(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    role: RunRole,
+) -> AgentState {
+    let mut init_state = build_initial_state(input, role);
+    // ── ROUTING INIZIALE tier (FIX-A scale-controller) ───────────────────
+    // Il primo modello del run e' `(input.provider, input.model)` risolto dal
+    // routing a monte (il primo turno dell'executor lo usa via
+    // provider_override/model_override, sticky ancora assente). La
+    // RoutingMatrix::lookup non porta il tier; lo risolviamo qui dal catalog
+    // (punto unico `resolve_initial_tier`, percorso Real all'avvio) e lo
+    // scriviamo nel checkpoint iniziale. Cosi' `current_tier` e' popolato dal
+    // primo turno, non solo dopo un'escalation/upscale. INERTE (PR-A): nessun
+    // decisore lo legge ancora -> bit-identico. Determinismo: la query e'
+    // FUORI dal loop del grafo (non nel path di Replay); il tier vive poi
+    // nello stato checkpointato, condiviso da Primary e Shadow (convergono).
+    init_state.current_tier =
+        Some(resolve_initial_tier(&deps.db, &input.provider, &input.model).await);
+    apply_playbook_steps(deps, input, &mut init_state).await;
+    if !role.is_shadow() {
+        apply_repeated_clarify_count(deps, input, &mut init_state).await;
+    }
+    init_state
+}
+
+/// Playbook matcher (punto unico, regola L): popola i passi del playbook che
+/// matcha il task, cosi' il planner genera i todo deterministici (es.
+/// nexus_visual_compare per la verifica figma) e il final_gate puo' applicare
+/// design_verify. Senza, `playbook_steps` resta vuoto: era l'anello mancante del
+/// porting (il matcher viveva nel brain Python).
+///
+/// `project_root` None: i trigger con `project_markers` non sono valutati qui
+/// (root non risolta nel punto di costruzione dello state); i playbook senza
+/// markers — es. verify.design_align — matchano comunque.
+async fn apply_playbook_steps(deps: &NativeDeps, input: &NativeRunInput, state: &mut AgentState) {
+    if let Some(pm) = crate::playbook_engine::match_playbook(
+        &deps.db,
+        input.intent_hint.as_deref(),
+        &input.initial_msg,
+        None,
+    )
+    .await
+    {
+        tracing::info!(
+            target: "mcp_core::native_engine",
+            playbook = %pm.key,
+            steps = pm.steps.len(),
+            "playbook matchato -> playbook_steps popolati"
+        );
+        state.playbook_steps = Some(pm.steps);
+        state.playbook_key = Some(pm.key);
+    }
+}
+
+/// Detector clarification CROSS-RUN (loop email, blocco #5). Solo PRIMARIO: nello
+/// shadow (Replay) NON leggiamo stato live che evolve (come
+/// `NullBillingCooldownPort`) — lo shadow rigioca lo stato del primario, che
+/// porta gia' `repeated_clarify_count` checkpointato.
+///
+/// FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della sessione. Il
+/// pool e' quello del DOMINIO RUN (agent_runs/meta_steps migrati al DB progetto),
+/// risolto col PUNTO UNICO per-sessione. Fail-open: guasto DB -> conteggio 0
+/// (asse mai attivo, invariato).
+async fn apply_repeated_clarify_count(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    state: &mut AgentState,
+) {
+    let run_db =
+        crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
+            .await;
+    let clarify_history = PgClarifyHistoryStore::new(run_db);
+    let (sig, repeat_count) = clarify_history
+        .latest_signature_and_repeat_count(input.session_id)
+        .await;
+    if repeat_count > 0 {
+        tracing::info!(
+            target: "mcp_core::native_engine",
+            session_id = %input.session_id,
+            repeated_clarify_count = repeat_count,
+            signature = sig.as_deref().unwrap_or(""),
+            "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
+        );
+    }
+    state.repeated_clarify_count = Some(repeat_count);
+}
+
 /// Mappa lo [`StepOutcome`] del motore nel [`NativeRunOutcome`] del chiamante.
 /// Estrae anche usage/iterazioni/intent dallo stato finale (servono al
 /// finalizzatore condiviso, regola L).
@@ -2765,6 +2948,7 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             (state, false, Some(resume_at.as_label().to_string()))
         }
     };
+    let (error_class, pending_actions) = extra_signals(&state);
     NativeRunOutcome {
         completed,
         // Fan-in (Fase D): l'interrupt e' l'attesa dei sub-run background se lo
@@ -2783,24 +2967,11 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         total_cost: state.total_cost_usd.unwrap_or(0.0),
         user_intent: state.user_intent.clone(),
         reasoning: state.reasoning_acc.clone().filter(|s| !s.trim().is_empty()),
-        // Conversazione finale serializzata per agent_runs.messages_json (resume +
-        // trace panel). `Message` serializza in `{role, content, [tool_calls|
-        // tool_call_id]}`, la forma attesa dal resume. Conversazione vuota o
-        // serializzazione fallita -> None (la colonna resta NULL, nessun valore
-        // spurio).
-        messages_json: if state.messages.is_empty() {
-            None
-        } else {
-            serde_json::to_string(&state.messages).ok()
-        },
+        messages_json: serialize_messages_json(&state.messages),
         declared_outcome: state.declared_outcome.clone(),
         review_verdict: state.review_verdict.clone(),
         advisory_verdict: state.advisory_verdict.clone(),
-        error_class: state
-            .extra
-            .get("error_class")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        error_class,
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
@@ -2809,13 +2980,39 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         // in plan-phase il gate e' one-shot e un ciclo residuo e' legittimo.
         final_gate_failed_pending: state.final_gate_cycle.unwrap_or(0) > 0
             && !state.plan_phase_active.unwrap_or(false),
-        pending_actions: state
-            .extra
-            .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default(),
+        pending_actions,
     }
+}
+
+/// Conversazione finale serializzata per `agent_runs.messages_json` (resume +
+/// trace panel). `Message` serializza in `{role, content, [tool_calls|
+/// tool_call_id]}`, la forma attesa dal resume. Conversazione vuota o
+/// serializzazione fallita -> `None` (la colonna resta NULL, nessun valore
+/// spurio).
+fn serialize_messages_json(messages: &[Message]) -> Option<String> {
+    if messages.is_empty() {
+        None
+    } else {
+        serde_json::to_string(messages).ok()
+    }
+}
+
+/// Segnali che il grafo deposita in `AgentState::extra` invece che in un campo
+/// tipizzato: classe d'errore del gateway e azioni HITL rimaste pendenti.
+/// Entrambi assenti -> `(None, vec![])`, come i rispettivi default dell'outcome.
+fn extra_signals(state: &AgentState) -> (Option<String>, Vec<Value>) {
+    let error_class = state
+        .extra
+        .get("error_class")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let pending_actions = state
+        .extra
+        .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    (error_class, pending_actions)
 }
 
 // ===========================================================================
@@ -3053,16 +3250,25 @@ pub async fn run_shadow(
     let primary = primary_canonical(&primary_pool, primary_run_id).await?;
     let shadow = shadow_canonical(shadow_state, completed);
 
-    // Persiste UN record "__final_state__" col diff (punto unico shadow, regola L:
-    // NESSUN uso di DiffCollector::record per-nodo). persist_node_diff ricalcola
-    // internamente i divergent_keys via compute_diff.
-    let divergent = nexus_agent_graph::compute_diff(&primary, &shadow);
+    persist_shadow_diff(&deps.db, primary_run_id, &primary, &shadow).await
+}
+
+/// Persiste UN record "__final_state__" col diff (punto unico shadow, regola L:
+/// NESSUN uso di `DiffCollector::record` per-nodo). `persist_node_diff` ricalcola
+/// internamente i divergent_keys via `compute_diff`.
+async fn persist_shadow_diff(
+    db: &PgPool,
+    primary_run_id: Uuid,
+    primary: &Value,
+    shadow: &Value,
+) -> anyhow::Result<()> {
+    let divergent = nexus_agent_graph::compute_diff(primary, shadow);
     nexus_agent_graph::persist_node_diff(
-        &deps.db,
+        db,
         primary_run_id,
         SHADOW_FINAL_STATE_NODE,
-        &primary,
-        &shadow,
+        primary,
+        shadow,
     )
     .await
     .map_err(|e| anyhow::anyhow!("persistenza telemetria shadow: {e}"))?;
