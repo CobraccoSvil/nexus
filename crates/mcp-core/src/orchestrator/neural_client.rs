@@ -260,7 +260,22 @@ impl NeuralCoreClient {
 
         match gw.complete(req).await {
             Ok(resp) => Ok(agent_turn_value_from_gw(provider, model, &resp)),
-            Err(e) => Ok(error_agent_turn_value(provider, model, &e.to_string())),
+            Err(e) => {
+                // Regola M: il gateway ha GIA' classificato il fallimento alla fonte
+                // (`CallFailure` -> `details.primary_cause`) e l'errore arriva qui
+                // TIPIZZATO (`GatewayHttpError`, vedi nexus_gateway.rs: "i decisori
+                // fanno downcast_ref, mai match sul testo"). Prima questo ramo faceva
+                // `e.to_string()` e la classe veniva ri-dedotta con una regex sul
+                // Display: il segnale moriva qui. Ora si legge il codice strutturato e
+                // il testo resta solo per display/log.
+                let structured = structured_error_class(&e);
+                Ok(error_agent_turn_value_with_class(
+                    provider,
+                    model,
+                    &e.to_string(),
+                    structured,
+                ))
+            }
         }
     }
 
@@ -483,8 +498,52 @@ fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
 /// Forma `Value` d'errore di `generate_agent_turn`, paritetica al ramo `except`
 /// del brain: `stop_reason="error"` + `error`/`error_class`. `evaluate_tool_probe`
 /// (model_health_probe) legge `error_class` e `stop_reason="error"`.
+/// Estrae la classe d'errore dal segnale STRUTTURATO del gateway, se presente
+/// (regola M). Percorre la catena di `anyhow` cercando un [`GatewayHttpError`] e ne
+/// legge `details.primary_cause`, la classificazione fatta dal gateway ALLA FONTE.
+/// `None` -> il chiamante ricade sul classificatore testuale (comportamento storico).
+///
+/// PUNTO UNICO del ponte segnale-strutturato -> `error_class` per il path neural: la
+/// mappa cause->classe vive in `provider_error_classifier` (regola L), qui c'e' solo
+/// l'estrazione.
+fn structured_error_class(err: &anyhow::Error) -> Option<&'static str> {
+    let gw_err = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())?;
+    let cause = gw_err
+        .details
+        .as_ref()?
+        .get("primary_cause")?
+        .as_str()?;
+    crate::provider_error_classifier::error_class_from_primary_cause(cause)
+}
+
+/// Come [`error_agent_turn_value`] ma con la classe gia' derivata da un segnale
+/// strutturato: se `structured` e' `Some`, vince sul classificatore testuale (che
+/// sul Display del gateway non puo' ricostruire la causa reale).
+fn error_agent_turn_value_with_class(
+    provider: &str,
+    model: &str,
+    raw_error: &str,
+    structured: Option<&'static str>,
+) -> Value {
+    match structured {
+        Some(class) => error_agent_turn_value_inner(provider, model, raw_error, class.to_string()),
+        None => error_agent_turn_value(provider, model, raw_error),
+    }
+}
+
 fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
     let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
+    error_agent_turn_value_inner(provider, model, raw_error, class)
+}
+
+fn error_agent_turn_value_inner(
+    provider: &str,
+    model: &str,
+    raw_error: &str,
+    class: String,
+) -> Value {
     json!({
         "provider": provider,
         "model": model,

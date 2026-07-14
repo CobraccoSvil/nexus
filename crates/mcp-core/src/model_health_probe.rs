@@ -1590,6 +1590,16 @@ pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
         "context_too_long" | "invalid_request" | "unprocessable" | "unsupported" => {
             Classification::ModelSpecific(ec.into(), Some(ec.into()))
         }
+        // Risposta DEGENERE: il provider ha risposto 200 ma senza output utile
+        // (`is_degenerate_completion` nel gateway: content vuoto E zero tool-call).
+        // E' colpa del MODELLO, non del trasporto: la richiesta e' arrivata, il
+        // provider ha risposto, semplicemente quel modello non produce nulla di
+        // usabile in questo profilo. Prima questa causa arrivava qui appiattita in
+        // "error" -> Transient -> "stato invariato, ritento": nessun contatore
+        // avanzava e un modello inservibile restava eleggibile per sempre
+        // (incidente z-ai/glm-4.7-flash). Ora conta come ModelSpecific e alimenta
+        // `consecutive_failures` / auto-disable a soglia.
+        "empty_completion" => Classification::ModelSpecific(ec.into(), Some(ec.into())),
         "" | "ok" => Classification::Ok,
         // INCONCLUSIVO (regola H, causa-non-sintomo): `provider_error` (500
         // generico), `error`/`unknown` (fallback del classificatore) e QUALUNQUE

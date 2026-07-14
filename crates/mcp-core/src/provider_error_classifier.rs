@@ -41,6 +41,34 @@ fn http_status_to_reason(status: u16) -> Option<(&'static str, bool)> {
     }
 }
 
+/// Mappa il `primary_cause` STRUTTURATO del gateway (`details.primary_cause` di
+/// `GatewayHttpError`) sullo `stop_reason` canonico di questo modulo.
+///
+/// Regola M: il gateway CLASSIFICA gia' il fallimento alla fonte (`CallFailure`);
+/// appiattirlo con `to_string()` e poi ri-dedurlo con una regex sul Display e' una
+/// perdita di informazione, non una classificazione. Questa funzione e' il ponte che
+/// preserva il segnale.
+///
+/// Ritorna `Some` SOLO per le cause che AGGIUNGONO informazione rispetto al
+/// classificatore testuale; per tutto il resto ritorna `None` e il chiamante ricade
+/// su [`classify_text`] (comportamento invariato, zero regressione sui call site).
+///
+/// `empty_completion` e' il caso che il testo NON puo' ricostruire: il gateway ha
+/// ricevuto un `200` con zero output utile (`is_degenerate_completion`) e lo riporta
+/// come HTTP 500 `PROVIDER_ERROR`; sul Display resta solo "Nexus Gateway 500 Internal
+/// Server Error: {body}", che la regex HTTP non intercetta -> l'errore degradava a
+/// `error` -> `Transient` -> nessun contatore, nessun degrado, mai (incidente
+/// z-ai/glm-4.7-flash: 3 figure del consiglio in timeout, zero apprendimento).
+pub fn error_class_from_primary_cause(cause: &str) -> Option<&'static str> {
+    match cause.trim() {
+        "empty_completion" => Some("empty_completion"),
+        // Le altre cause del gateway sono gia' ricostruibili dal testo/status
+        // (billing, context_too_long, rate_limit, auth...): lasciarle al fallback
+        // evita di cambiare comportamento ai consumatori esistenti.
+        _ => None,
+    }
+}
+
 fn billing_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
@@ -208,6 +236,33 @@ pub fn classify_with_status(raw: &str, known_status: Option<u16>) -> ClassifiedE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_cause_empty_completion_sopravvive_come_segnale() {
+        // Il caso che il TESTO non puo' ricostruire: il gateway riporta la risposta
+        // degenere come HTTP 500 e sul Display resta solo "Nexus Gateway 500 Internal
+        // Server Error: {body}". Prima degradava a `error` -> Transient -> nessun
+        // contatore (incidente z-ai/glm-4.7-flash). Il primary_cause strutturato lo
+        // preserva.
+        assert_eq!(
+            error_class_from_primary_cause("empty_completion"),
+            Some("empty_completion")
+        );
+        // Prova che il testo NON basta: la regex HTTP non intercetta il Display del
+        // gateway, quindi il fallback testuale non produce "empty_completion".
+        let dal_testo = classify_text("Nexus Gateway 500 Internal Server Error: {\"error\":\"...\"}");
+        assert_ne!(dal_testo.stop_reason, "empty_completion");
+    }
+
+    #[test]
+    fn primary_cause_ignoto_ricade_sul_classificatore_testuale() {
+        // Solo cio' che AGGIUNGE informazione viene mappato: per tutto il resto
+        // `None` -> il chiamante usa classify_text (comportamento invariato, zero
+        // regressione sui call site esistenti).
+        assert_eq!(error_class_from_primary_cause("transient"), None);
+        assert_eq!(error_class_from_primary_cause("billing"), None);
+        assert_eq!(error_class_from_primary_cause(""), None);
+    }
 
     #[test]
     fn billing_pattern() {
