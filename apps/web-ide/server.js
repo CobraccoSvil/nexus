@@ -187,7 +187,15 @@ app.prepare().then(async () => {
   server.addListener = onlyOurUpgrade(server.addListener.bind(server));
   server.prependListener = onlyOurUpgrade(server.prependListener.bind(server));
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`> Ready on http://0.0.0.0:${PORT} (neural → ${BACKEND_URL}/api/neural)`);
+  // Bind DUAL-STACK (regola H, causa radice). Prima era vincolato a "0.0.0.0" = solo
+  // IPv4: ma su Windows `localhost` risolve PRIMA a ::1 (IPv6), quindi ogni richiesta
+  // del browser tentava ::1:PORT, non trovava listener e pagava ~2s di timeout prima
+  // di ripiegare su IPv4. Misurato: localhost 2.40s vs 127.0.0.1 0.36s -> con decine di
+  // fetch per pagina la UI diventava inusabile (richieste accodate/abortite, LED
+  // provider grigi, "Impossibile caricare le viste operative"). Omettendo l'host, Node
+  // binda su :: quando IPv6 e' disponibile accettando ANCHE IPv4 (IPv4-mapped), con
+  // fallback automatico a 0.0.0.0 dove IPv6 non c'e'.
+  server.listen(PORT, () => {
+    console.log(`> Ready on port ${PORT} (dual-stack, neural → ${BACKEND_URL}/api/neural)`);
   });
 });
