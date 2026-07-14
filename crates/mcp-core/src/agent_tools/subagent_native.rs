@@ -411,6 +411,17 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
 }
 
 /// Handler del tool `dispatch_subagents` (batch parallelo di sub-run nativi).
+///
+/// DETERMINISMO/REPLAY: questo intero handler gira SOLO in `ExecMode::Real`. In
+/// Replay/Shadow il `ToolExecutorAdapter` rilegge il tool_result di
+/// `dispatch_subagents` da `agent_steps` (`execute_replay`) senza mai chiamare
+/// `execute_real`: il ramo isolato (worktree/apply, side-effect Real-only) non
+/// viene mai ricreato in shadow -> nessuna divergenza. L'apply e' l'unica fonte
+/// del commit e avviene solo qui, in Real.
+///
+/// Ramo sequenziale/condiviso: i guard per-sub (enabled/whitelist/depth/cost) sono
+/// valutati per ogni sub-run; nel batch il cost cap e' best-effort (race tollerata
+/// dato il cap conservativo).
 pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> String {
     let tasks = match input.get("tasks").and_then(|v| v.as_array()) {
         Some(a) if !a.is_empty() => a.clone(),
@@ -420,159 +431,169 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     if tasks.len() as u64 > batch_max_tasks {
         return err(&format!("troppi task in un batch (max {batch_max_tasks})"));
     }
-    let configured_max = read_max_parallel_subagents(ctx).await;
-    let max_parallel = input
-        .get("max_parallel")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(configured_max)
-        .clamp(1, configured_max) as usize;
-    // Fase D fan-in: dispatch asincrono dell'intero batch, opt-in dal param
-    // `background` (ora nello schema) gattato dal kill-switch DB (regola G/H). Il
-    // ramo ISOLATO non supporta il background (l'apply serializzato dei worktree
-    // esige che i sub-run siano TERMINATI prima di promuovere): quando
-    // `background=true` il batch salta l'isolamento e va sempre sul ramo
-    // sequenziale con `is_background=true` (scelta piu' semplice e sicura). Letto
-    // come CAMPO strutturato (regola M).
+    let max_parallel = resolve_max_parallel(ctx, input).await;
     let background = background_active(ctx, input).await;
 
-    let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
-    for (i, t) in tasks.iter().enumerate() {
-        let kind = t
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let task = t
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if kind.is_empty() || task.trim().is_empty() {
-            return err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori"));
-        }
-        let context_blob = t
-            .get("context")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let expected = t
-            .get("expected_output_format")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
-        // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false ->
-        // ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in `dispatch_wave`.
-        let write_scope = write_scope_of(t);
-        parsed.push(ParsedTask {
-            kind,
-            task,
-            context_blob,
-            expected,
-            write_scope,
-        });
-    }
+    let parsed = match parse_batch_tasks(&tasks) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
 
-    // ── Gating isolamento (regola G + L): il ramo ISOLATO scatta SOLO se
-    //    (1) il flag DB `orchestrator.subagent_isolation_enabled` e' ON (cache 60s)
-    //        E la root del progetto e' isolabile (probe git fail-closed), E
-    //    (2) i `write_scope` dei task sono banalmente disgiunti (funzione pura di
-    //        PR1, punto unico). Altrimenti DEGRADA al ramo sequenziale/condiviso
-    //        (identico a oggi). Con flag OFF (default) -> sempre sequenziale ->
-    //        comportamento BIT-IDENTICO. ─────────────────────────────────────────
-    //
-    // DETERMINISMO/REPLAY: questo intero handler gira SOLO in `ExecMode::Real`. In
-    // Replay/Shadow il `ToolExecutorAdapter` rilegge il tool_result di
-    // `dispatch_subagents` da `agent_steps` (`execute_replay`) senza mai chiamare
-    // `execute_real`: il ramo isolato (worktree/apply, side-effect Real-only) non
-    // viene mai ricreato in shadow -> nessuna divergenza. L'apply e' l'unica fonte
-    // del commit e avviene solo qui, in Real.
-    let scopes: Vec<Vec<String>> = parsed.iter().map(|p| p.write_scope.clone()).collect();
-    // I/O (flag DB + probe git) separato dalla decisione pura: il probe scatta solo
-    // se il flag e' ON (compute_isolation_available corto-circuita), poi la
-    // disgiunzione e' pura e testabile (should_isolate_batch).
-    // Il background salta l'isolamento (vedi doc sopra): il ramo isolato esige
-    // sub-run terminati per l'apply serializzato, incompatibile con il fire-and-forget.
-    let isolation_available = !background && compute_isolation_available(ctx).await;
-    if should_isolate_batch(isolation_available, &scopes) {
+    if batch_wants_isolation(ctx, &parsed, background).await {
         return run_batch_isolated(ctx, &parsed, max_parallel).await;
     }
 
-    // ── Ramo sequenziale/condiviso (invariato con background=false) ────────────
-    // Esecuzione a ondate concorrenti (cap conservativo). I guard per-sub
-    // (enabled/whitelist/depth/cost) sono valutati per ogni sub-run; nel batch
-    // il cost cap e' best-effort (race tollerata dato il cap conservativo).
     let results: Vec<Value> = if background {
-        // BACKGROUND: PREPARE-ALL poi SPAWN-ALL (bug fan-in prematuro). Se
-        // preparassimo+spawnassimo una alla volta, il 1o figlio potrebbe terminare
-        // (task detached) mentre gli altri non sono ancora in nexus_subagent_runs
-        // -> la COUNT del fan-in vedrebbe 0 rimasti -> enqueue PREMATURO del parent.
-        // Inserendo TUTTE le row (running, is_background=true) PRIMA di spawnare
-        // qualunque esecuzione, la COUNT e' corretta gia' quando il 1o figlio
-        // chiude. I guard falliti producono un Value di errore (nessuna row
-        // inserita, nessuno spawn per quel task).
         run_batch_background(ctx, &parsed).await
     } else {
-        let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
-        for wave in parsed.chunks(max_parallel) {
-            let futs = wave.iter().map(|p| {
-                run_single_subagent(
-                    ctx,
-                    &p.kind,
-                    &p.task,
-                    &p.context_blob,
-                    &p.expected,
-                    None,
-                    false,
-                )
-            });
-            let wave_res = futures::future::join_all(futs).await;
-            results.extend(wave_res);
-        }
-        results
+        run_waves(ctx, &parsed, max_parallel).await
     };
 
-    // Fan-in (regola M): raccogli i figli che hanno risposto col SEGNALE
-    // STRUTTURATO `background_dispatched` (mai parsing di prosa) + i loro run_id,
-    // cosi' il padre si sospende e riprende quando i sub-run background terminano.
+    compose_batch_output(ctx, results).await
+}
+
+/// Ondate concorrenti del batch: il valore chiesto dal chiamante, clampato al cap
+/// configurato in DB (regola G); assente -> il cap stesso.
+async fn resolve_max_parallel(ctx: &AgentToolContext, input: &Value) -> usize {
+    let configured_max = read_max_parallel_subagents(ctx).await;
+    input
+        .get("max_parallel")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(configured_max)
+        .clamp(1, configured_max) as usize
+}
+
+/// Gating dell'isolamento fisico (regola G + L): il ramo ISOLATO scatta SOLO se
+///  (1) il flag DB `orchestrator.subagent_isolation_enabled` e' ON (cache 60s) E la
+///      root del progetto e' isolabile (probe git fail-closed), E
+///  (2) i `write_scope` dei task sono banalmente disgiunti (funzione pura di PR1,
+///      punto unico).
+/// Altrimenti DEGRADA al ramo sequenziale/condiviso (identico a oggi). Con flag OFF
+/// (default) -> sempre sequenziale -> comportamento BIT-IDENTICO.
+///
+/// L'I/O (flag DB + probe git) resta separato dalla decisione PURA: il probe scatta
+/// solo se il flag e' ON (`compute_isolation_available` corto-circuita), poi la
+/// disgiunzione e' pura e testabile (`should_isolate_batch`).
+///
+/// Il `background` salta l'isolamento senza alcun probe: il ramo isolato esige
+/// sub-run TERMINATI per l'apply serializzato dei worktree, incompatibile col
+/// fire-and-forget. Il batch background va sempre sul ramo sequenziale con
+/// `is_background=true` (scelta piu' semplice e sicura).
+async fn batch_wants_isolation(
+    ctx: &AgentToolContext,
+    parsed: &[ParsedTask],
+    background: bool,
+) -> bool {
+    let isolation_available = !background && compute_isolation_available(ctx).await;
+    let scopes: Vec<Vec<String>> = parsed.iter().map(|p| p.write_scope.clone()).collect();
+    should_isolate_batch(isolation_available, &scopes)
+}
+
+/// PUNTO UNICO (regola L) del ramo sequenziale/condiviso: esegue i sub-run a
+/// ONDATE concorrenti di al piu' `max_parallel` (cap conservativo), in ordine di
+/// task. Condiviso dal batch principale e dal degrado dall'isolamento
+/// ([`run_batch_sequential`]) — prima le due ondate erano copie divergibili.
+/// Mai background: il fire-and-forget ha il suo ramo ([`run_batch_background`]),
+/// e il degrado dall'isolamento lo esclude per costruzione.
+async fn run_waves(
+    ctx: &AgentToolContext,
+    parsed: &[ParsedTask],
+    max_parallel: usize,
+) -> Vec<Value> {
+    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+    for wave in parsed.chunks(max_parallel) {
+        let futs = wave.iter().map(|p| {
+            run_single_subagent(
+                ctx,
+                &p.kind,
+                &p.task,
+                &p.context_blob,
+                &p.expected,
+                None,
+                false,
+            )
+        });
+        results.extend(futures::future::join_all(futs).await);
+    }
+    results
+}
+
+/// PUNTO UNICO (regola L) del parse dei task del batch: valida i campi
+/// obbligatori e normalizza i facoltativi. `Err(String)` e' gia' il tool_result
+/// d'errore da restituire al chiamante (fail-fast sul primo task invalido, come
+/// prima: nessun task del batch parte se uno solo e' malformato).
+fn parse_batch_tasks(tasks: &[Value]) -> Result<Vec<ParsedTask>, String> {
+    let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
+    for (i, t) in tasks.iter().enumerate() {
+        let kind = str_field(t, "kind");
+        let task = str_field(t, "task");
+        if kind.is_empty() || task.trim().is_empty() {
+            return Err(err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori")));
+        }
+        parsed.push(ParsedTask {
+            kind,
+            task,
+            context_blob: str_field(t, "context"),
+            expected: str_field(t, "expected_output_format"),
+            // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
+            // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false
+            // -> ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in
+            // `dispatch_wave`.
+            write_scope: write_scope_of(t),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Campo stringa di un task del batch; assente o di tipo diverso -> stringa vuota
+/// (i campi obbligatori sono validati a parte da [`parse_batch_tasks`]).
+fn str_field(t: &Value, key: &str) -> String {
+    t.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// tool_result del batch: conteggi + fan-in + verdetti compositi. Tutto deriva dai
+/// SEGNALI STRUTTURATI dei risultati (regola M), mai dalla prosa dei `summary`.
+///
+/// - `background_dispatched`/`child_run_ids`: i figli dispatchati in background,
+///   cosi' il padre si sospende e riprende quando terminano.
+/// - `panel_verdict` (Fase C, coordinatore avversario): se almeno un sub-run ha
+///   dichiarato un `outcome.review`, il punto unico `compose_panel_verdict` compone
+///   il verdetto aggregato. I sub-run non-review non hanno `review` e il panel non
+///   viene aggiunto. Le review sono read-only (write_scope vuoto) -> restano nel
+///   ramo sequenziale.
+/// - `advisory_synthesis` (consiglio a monte): simmetrico al panel di review su
+///   `outcome.advisory`. Il coordinatore (run padre) la legge per costruire il
+///   piano rispettando i requisiti e fermandosi sui veti (verdict=block).
+async fn compose_batch_output(ctx: &AgentToolContext, results: Vec<Value>) -> String {
     let child_run_ids: Vec<Value> = results
         .iter()
         .filter(|r| r.get("background_dispatched").and_then(Value::as_bool) == Some(true))
         .filter_map(|r| r.get(K_SUB_RUN_ID).cloned())
         .collect();
-    let any_background = !child_run_ids.is_empty();
-
     let ok = results.iter().filter(|r| r.get("error").is_none()).count();
+    let outcomes: Vec<Value> = results
+        .iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
     let mut out = json!({
         "count": results.len(),
         "ok": ok,
         "failed": results.len() - ok,
         "results": results,
     });
-    if any_background {
+    if !child_run_ids.is_empty() {
         out["background_dispatched"] = json!(true);
         out["child_run_ids"] = json!(child_run_ids);
     }
-    // Fase C (coordinatore avversario, regola L/M): se il batch e' un PANEL di
-    // review (almeno un sub-run ha dichiarato un `review`), compone il verdetto
-    // aggregato dai segnali strutturati `outcome.review` — mai dalla prosa. I
-    // sub-run non-review non hanno `review` e il panel non viene aggiunto. Le
-    // review sono read-only (write_scope vuoto) -> restano nel ramo sequenziale.
-    let outcomes: Vec<Value> = results
-        .iter()
-        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
-        .collect();
     if let Some(panel) = nexus_agent_graph::decisions::compose_panel_verdict(
         &outcomes,
         &read_quorum_policy(ctx).await,
     ) {
         out["panel_verdict"] = panel.to_value();
     }
-    // Consiglio a monte (regola L/M): se il batch e' un PANEL advisory (almeno una
-    // figura ha dichiarato un `advisory`), compone la SINTESI aggregata dai segnali
-    // strutturati `outcome.advisory` — mai dalla prosa. Simmetrico al panel di
-    // review; il coordinatore (run padre) legge `advisory_synthesis` per costruire
-    // il piano rispettando i requisiti e fermandosi sui veti (verdict=block).
     if let Some(synthesis) = nexus_agent_graph::decisions::compose_advisory_synthesis(
         &outcomes,
         &read_advisory_policy(ctx).await,
@@ -691,6 +712,17 @@ fn should_isolate_batch(isolation_available: bool, scopes: &[Vec<String>]) -> bo
 ///  7. CLEANUP GARANTITO: `remove_worktree` per OGNI handle in OGNI esito (il
 ///     cleanup e' esplicito e async — mai Drop sincrono su runtime tokio, finding
 ///     del design; teardown idempotente e tollerante ai lock Windows).
+///
+/// LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in `worktree.rs`): il passo
+/// (0) serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
+/// progetto (GC -> creazione worktree -> ondate -> apply -> cleanup). Due batch
+/// isolati concorrenti sullo STESSO progetto (session distinte, stessa
+/// project_root: la guardia 409 e' per-session, non per-progetto) vengono
+/// serializzati qui. Chiude insieme D1 (merge/commit concorrenti sulla stessa
+/// `.git` -> index corrotto) e D2 (il GC di un batch che cancella i worktree in
+/// volo di un altro: quando il secondo batch ottiene il lock, il primo ha gia'
+/// applicato e ripulito i suoi worktree). Il guard e' `OwnedMutexGuard<()>` (Send,
+/// `'static`): tenerlo attraverso i `.await` delle ondate join_all e' corretto.
 async fn run_batch_isolated(
     ctx: &AgentToolContext,
     parsed: &[ParsedTask],
@@ -701,25 +733,54 @@ async fn run_batch_isolated(
     let proj_pool =
         crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await;
 
-    // (0) LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in worktree.rs):
-    //     serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
-    //     progetto (GC -> creazione worktree -> ondate -> apply -> cleanup). Due batch
-    //     isolati concorrenti sullo STESSO progetto (session distinte, stessa
-    //     project_root: la guardia 409 e' per-session, non per-progetto) vengono
-    //     serializzati qui. Chiude insieme D1 (merge/commit concorrenti sulla stessa
-    //     .git -> index corrotto) e D2 (il GC di un batch che cancella i worktree in
-    //     volo di un altro: quando il secondo batch ottiene il lock, il primo ha gia'
-    //     applicato e ripulito i suoi worktree). Il guard e' `OwnedMutexGuard<()>`
-    //     (Send, `'static`): tenerlo attraverso i `.await` delle ondate join_all e'
-    //     corretto. Rilascio naturale a fine funzione (Drop).
+    // (0) LOCK PER-ROOT CROSS-BATCH (vedi doc): serializza l'INTERA sezione che
+    //     tocca l'area `.git`/worktree condivisa del progetto. Rilascio naturale a
+    //     fine funzione (Drop).
     let _root_guard = nexus_tool_kit::worktree::lock_project_root(&root).await;
 
-    // (1) GC orfani: bonifica i worktree residui di batch PRECEDENTI (crash / remove
-    //     fallito). Preserva i worktree dei sub-run ancora `running` (batch
-    //     concorrente sullo stesso progetto): passiamo come "attivi" i loro run_id
-    //     dal DB, cosi' il GC non tocca risorse legittime (regola E). Best-effort.
-    let active_run_ids = running_subagent_ids(&proj_pool, project_id).await;
-    let removed = nexus_tool_kit::worktree::gc_orphan_worktrees(&root, &active_run_ids).await;
+    // (1) GC orfani dei batch PRECEDENTI (best-effort).
+    gc_orphan_worktrees_for_batch(&proj_pool, &root, project_id).await;
+
+    // (2) base commit del batch (una volta, riusato da ogni worktree e in replay).
+    let Some(base_commit) = batch_base_commit(&root).await else {
+        return run_batch_sequential(ctx, parsed, max_parallel).await;
+    };
+
+    // (3) Crea un worktree per ogni task, PRIMA dell'esecuzione. Se la creazione di
+    //     uno fallisce, degrada l'intero batch a sequenziale (cleanup di quelli gia'
+    //     creati garantito) — mai un batch a isolamento parziale.
+    let Some(handles) = create_batch_worktrees(&root, parsed.len(), &base_commit).await else {
+        return run_batch_sequential(ctx, parsed, max_parallel).await;
+    };
+
+    // (4) Esecuzione PARALLELA a ondate, ogni sub-run sul proprio worktree.
+    let mut results = run_isolated_waves(ctx, parsed, &handles, max_parallel).await;
+
+    // (5) APPLY SERIALIZZATO + raccolta dei file promossi per il reindex-once.
+    let promoted = apply_isolated_results(&root, &mut results, &handles).await;
+
+    // (6) CLEANUP GARANTITO di OGNI worktree, in OGNI esito.
+    remove_batch_worktrees(&handles).await;
+
+    // (7) Reindex UNA volta sui soli file promossi alla root (dedup dei path: piu'
+    //     sub-run potrebbero aver toccato lo stesso file solo se non-disgiunti, che
+    //     qui non accade, ma il dedup e' innocuo e barato).
+    reindex_promoted_once(ctx, &promoted).await;
+
+    batch_counts_output(results, Some(promoted.len()))
+}
+
+/// Bonifica i worktree residui di batch PRECEDENTI (crash / remove fallito).
+/// Preserva i worktree dei sub-run ancora `running` (batch concorrente sullo stesso
+/// progetto): passa come "attivi" i loro run_id dal DB, cosi' il GC non tocca
+/// risorse legittime (regola E). Best-effort.
+async fn gc_orphan_worktrees_for_batch(
+    proj_pool: &sqlx::PgPool,
+    root: &std::path::Path,
+    project_id: Uuid,
+) {
+    let active_run_ids = running_subagent_ids(proj_pool, project_id).await;
+    let removed = nexus_tool_kit::worktree::gc_orphan_worktrees(root, &active_run_ids).await;
     if removed > 0 {
         tracing::info!(
             target: "mcp_core::subagent_native",
@@ -727,31 +788,38 @@ async fn run_batch_isolated(
             "isolamento: GC ha bonificato worktree orfani prima del batch"
         );
     }
+}
 
-    // (2) base commit del batch (una volta, riusato da ogni worktree e in replay).
-    let base_commit = match nexus_tool_kit::worktree::head_commit(&root).await {
-        Ok(b) => b,
+/// Commit di base del batch, risolto UNA volta e riusato da ogni worktree (e in
+/// replay). `None` = HEAD non risolvibile: il chiamante degrada al ramo sequenziale
+/// (mai fallire l'intero batch per un problema di setup dell'isolamento).
+async fn batch_base_commit(root: &std::path::Path) -> Option<String> {
+    match nexus_tool_kit::worktree::head_commit(root).await {
+        Ok(b) => Some(b),
         Err(e) => {
-            // Impossibile risolvere HEAD: degrada al ramo sequenziale (mai fallire
-            // l'intero batch per un problema di setup isolamento).
             tracing::warn!(
                 target: "mcp_core::subagent_native",
                 error = %e,
                 "isolamento: head_commit fallito, degrado a sequenziale"
             );
-            return run_batch_sequential(ctx, parsed, max_parallel).await;
+            None
         }
-    };
+    }
+}
 
-    // (3) Crea un worktree per ogni task, PRIMA dell'esecuzione. Se la creazione di
-    //     uno fallisce, degrada l'intero batch a sequenziale (cleanup di quelli gia'
-    //     creati garantito) — mai un batch a isolamento parziale.
-    let mut handles: Vec<nexus_tool_kit::worktree::WorktreeHandle> =
-        Vec::with_capacity(parsed.len());
-    for _ in parsed {
+/// Un worktree effimero per ogni task, TUTTI creati prima di eseguire qualunque
+/// sub-run. `None` = creazione fallita: i worktree gia' creati sono rimossi e il
+/// chiamante degrada l'intero batch a sequenziale — mai un batch a isolamento
+/// parziale.
+async fn create_batch_worktrees(
+    root: &std::path::Path,
+    count: usize,
+    base_commit: &str,
+) -> Option<Vec<nexus_tool_kit::worktree::WorktreeHandle>> {
+    let mut handles: Vec<nexus_tool_kit::worktree::WorktreeHandle> = Vec::with_capacity(count);
+    for _ in 0..count {
         let run_id = Uuid::new_v4();
-        match nexus_tool_kit::worktree::create_ephemeral_worktree(&root, run_id, &base_commit).await
-        {
+        match nexus_tool_kit::worktree::create_ephemeral_worktree(root, run_id, base_commit).await {
             Ok(h) => handles.push(h),
             Err(e) => {
                 tracing::warn!(
@@ -759,16 +827,23 @@ async fn run_batch_isolated(
                     error = %e,
                     "isolamento: create_ephemeral_worktree fallito, degrado a sequenziale"
                 );
-                // Cleanup dei worktree gia' creati prima di degradare.
-                for h in &handles {
-                    let _ = nexus_tool_kit::worktree::remove_worktree(h).await;
-                }
-                return run_batch_sequential(ctx, parsed, max_parallel).await;
+                remove_batch_worktrees(&handles).await;
+                return None;
             }
         }
     }
+    Some(handles)
+}
 
-    // (4) Esecuzione PARALLELA a ondate, ogni sub-run sul proprio worktree.
+/// Ondate concorrenti del ramo ISOLATO: come [`run_waves`] ma ogni sub-run gira sul
+/// PROPRIO worktree (`IsolationSlot`) invece che sulla root condivisa. Mai
+/// background: l'apply serializzato esige sub-run terminati.
+async fn run_isolated_waves(
+    ctx: &AgentToolContext,
+    parsed: &[ParsedTask],
+    handles: &[nexus_tool_kit::worktree::WorktreeHandle],
+    max_parallel: usize,
+) -> Vec<Value> {
     let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
     for wave in parsed
         .iter()
@@ -790,34 +865,40 @@ async fn run_batch_isolated(
                     &p.context_blob,
                     &p.expected,
                     Some(&slot),
-                    // Ramo ISOLATO: mai background (l'apply serializzato esige
-                    // sub-run terminati).
                     false,
                 )
                 .await
             }
         });
-        let wave_res = futures::future::join_all(futs).await;
-        results.extend(wave_res);
+        results.extend(futures::future::join_all(futs).await);
     }
+    results
+}
 
-    // (5) APPLY SERIALIZZATO (un worktree alla volta, mai concorrente) + raccolta
-    //     dei file promossi per il reindex-once. Solo i sub-run RIUSCITI (nessun
-    //     campo "error" nel result) vengono applicati; un sub-run fallito lascia il
-    //     suo worktree scartato = rollback naturale.
+/// APPLY SERIALIZZATO dei worktree (un worktree alla volta, mai concorrente:
+/// index/refs `.git` condivisi) e raccolta dei file promossi per il reindex-once.
+/// Solo i sub-run RIUSCITI (nessun campo "error" nel result) vengono applicati; un
+/// sub-run fallito lascia il suo worktree scartato = rollback naturale.
+///
+/// L'esito e' letto dall'enum `ApplyOutcome` (regola M, mai dalla prosa): un
+/// conflitto marca FALLITO quel solo sub-run (root intatta via merge --abort) e gli
+/// altri proseguono.
+async fn apply_isolated_results(
+    root: &std::path::Path,
+    results: &mut [Value],
+    handles: &[nexus_tool_kit::worktree::WorktreeHandle],
+) -> Vec<String> {
     let mut promoted: Vec<String> = Vec::new();
     for (idx, (result, handle)) in results.iter_mut().zip(handles.iter()).enumerate() {
         if result.get("error").is_some() {
             continue; // sub-run fallito: niente apply (worktree scartato).
         }
-        match nexus_tool_kit::worktree::apply_worktree_atomic(&root, handle).await {
+        match nexus_tool_kit::worktree::apply_worktree_atomic(root, handle).await {
             Ok(nexus_tool_kit::worktree::ApplyOutcome::Applied) => {
                 promoted.extend(nexus_tool_kit::worktree::promoted_files(handle).await);
             }
             Ok(nexus_tool_kit::worktree::ApplyOutcome::NoChanges) => {}
             Ok(nexus_tool_kit::worktree::ApplyOutcome::Conflict { files }) => {
-                // Esito strutturato (regola M): il sub-run e' fallito per conflitto,
-                // la root e' intatta (merge --abort), gli altri proseguono.
                 tracing::warn!(
                     target: "mcp_core::subagent_native",
                     task_index = idx,
@@ -847,11 +928,15 @@ async fn run_batch_isolated(
             }
         }
     }
+    promoted
+}
 
-    // (6) CLEANUP GARANTITO di OGNI worktree, in OGNI esito (successo, conflitto,
-    //     errore). Esplicito e async (mai Drop sincrono). Idempotente e tollerante
-    //     ai lock Windows (remove --force nel modulo).
-    for handle in &handles {
+/// Rimozione di OGNI worktree del batch, in OGNI esito (successo, conflitto,
+/// errore). Esplicita e async (mai Drop sincrono su runtime tokio), idempotente e
+/// tollerante ai lock Windows (`remove --force` nel modulo). Un fallimento e'
+/// loggato e ignorato: lo riprende il GC orfani del batch successivo.
+async fn remove_batch_worktrees(handles: &[nexus_tool_kit::worktree::WorktreeHandle]) {
+    for handle in handles {
         if let Err(e) = nexus_tool_kit::worktree::remove_worktree(handle).await {
             tracing::warn!(
                 target: "mcp_core::subagent_native",
@@ -861,22 +946,6 @@ async fn run_batch_isolated(
             );
         }
     }
-
-    // (7) Reindex UNA volta sui soli file promossi alla root (dedup dei path: piu'
-    //     sub-run potrebbero aver toccato lo stesso file solo se non-disgiunti, che
-    //     qui non accade, ma il dedup e' innocuo e barato).
-    reindex_promoted_once(ctx, &promoted).await;
-
-    let ok = results.iter().filter(|r| r.get("error").is_none()).count();
-    json!({
-        "count": results.len(),
-        "ok": ok,
-        "failed": results.len() - ok,
-        "isolated": true,
-        "promoted_files": promoted.len(),
-        "results": results,
-    })
-    .to_string()
 }
 
 /// Ramo BATCH BACKGROUND (Fase D fan-in): PREPARE-ALL poi SPAWN-ALL. Insersce
@@ -897,19 +966,16 @@ async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> 
     //     errore da restituire in ordine. Nessuno spawn ancora.
     let mut prepared: Vec<Result<SubagentExecInputs, Value>> = Vec::with_capacity(parsed.len());
     for p in parsed {
-        prepared.push(
-            prepare_subagent_run(
-                ctx,
-                &p.kind,
-                &p.task,
-                &p.context_blob,
-                &p.expected,
-                None,
-                true,
-                None,
-            )
-            .await,
-        );
+        let req = SubagentRequest {
+            kind: &p.kind,
+            task: &p.task,
+            context_blob: &p.context_blob,
+            expected_format: &p.expected,
+            isolation: None,
+            is_background: true,
+            model_pin: None,
+        };
+        prepared.push(prepare_subagent_run(ctx, &req).await);
     }
     // (2) SPAWN-ALL: solo ORA che TUTTE le row sono inserite, spawna le esecuzioni.
     //     Il 1o figlio che chiude vede in nexus_subagent_runs anche gli altri
@@ -923,40 +989,40 @@ async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> 
         .collect()
 }
 
-/// Ramo sequenziale/condiviso estratto per il degrado dall'isolamento (stessa
-/// logica del ramo principale di `tool_dispatch_subagents`, punto unico). `None`
-/// come `working_root` -> comportamento invariato.
+/// Degrado dall'isolamento al ramo sequenziale/condiviso: stesse ondate del ramo
+/// principale ([`run_waves`], punto unico), `working_root=None` -> comportamento
+/// invariato. Mai background: questo ramo e' raggiunto solo dal fallback
+/// dell'isolato, che il background esclude a monte.
 async fn run_batch_sequential(
     ctx: &AgentToolContext,
     parsed: &[ParsedTask],
     max_parallel: usize,
 ) -> String {
-    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
-    for wave in parsed.chunks(max_parallel) {
-        let futs = wave.iter().map(|p| {
-            // Degrado dell'isolamento a sequenziale: mai background (questo ramo e'
-            // raggiunto solo dal fallback dell'isolato, che esclude il background).
-            run_single_subagent(
-                ctx,
-                &p.kind,
-                &p.task,
-                &p.context_blob,
-                &p.expected,
-                None,
-                false,
-            )
-        });
-        let wave_res = futures::future::join_all(futs).await;
-        results.extend(wave_res);
-    }
+    batch_counts_output(run_waves(ctx, parsed, max_parallel).await, None)
+}
+
+/// tool_result minimale del batch (conteggi + risultati), con i campi
+/// dell'isolamento quando `promoted` e' valorizzato. PUNTO UNICO (regola L) della
+/// forma condivisa dal ramo isolato e dal suo degrado a sequenziale; il ramo
+/// principale ci aggiunge fan-in e verdetti compositi via [`compose_batch_output`].
+///
+/// `results` e' inserito PER ULTIMO di proposito: `serde_json` gira con
+/// `preserve_order` (IndexMap), quindi l'ordine di inserimento e' l'ordine delle
+/// chiavi nel JSON emesso — questo riproduce esattamente quello storico dei due
+/// rami (`count, ok, failed[, isolated, promoted_files], results`).
+fn batch_counts_output(results: Vec<Value>, promoted: Option<usize>) -> String {
     let ok = results.iter().filter(|r| r.get("error").is_none()).count();
-    json!({
+    let mut out = json!({
         "count": results.len(),
         "ok": ok,
         "failed": results.len() - ok,
-        "results": results,
-    })
-    .to_string()
+    });
+    if let Some(promoted_files) = promoted {
+        out["isolated"] = json!(true);
+        out["promoted_files"] = json!(promoted_files);
+    }
+    out["results"] = json!(results);
+    out.to_string()
 }
 
 /// Reindex UNA volta i file effettivamente promossi alla root dopo l'apply
@@ -1511,143 +1577,162 @@ fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value
     })
 }
 
+/// Identita' e provenienza di UNA figura del consiglio: i campi che ogni
+/// [`FigureAdvisoryReport`] porta identici qualunque sia l'esito. Estratti una
+/// volta sola dal tool_result e riusati dai costruttori qui sotto (regola L: prima
+/// erano sei struct literal copiati, che divergevano al primo campo nuovo).
+struct FigureIdentity {
+    kind: String,
+    /// Provenienza EFFETTIVA della figura (stampata dai `finalize_*` nel result):
+    /// assente per le figure respinte a monte (guard depth/whitelist) che non hanno
+    /// mai risolto un modello.
+    provider: Option<String>,
+    model: Option<String>,
+    subagent_run_id: Option<String>,
+}
+
+impl FigureIdentity {
+    fn from_result(kind: &str, result: &Value) -> Self {
+        let field = |k: &str| result.get(k).and_then(Value::as_str).map(str::to_owned);
+        Self {
+            kind: kind.to_string(),
+            provider: field(K_PROVIDER),
+            model: field(K_MODEL),
+            subagent_run_id: field(K_SUB_RUN_ID),
+        }
+    }
+
+    /// Report di una figura che NON ha prodotto un parere (respinta, in timeout,
+    /// fallita, o completata senza chiamare `advisory_verdict`).
+    fn no_advisory(
+        &self,
+        status: FigureAdvisoryStatus,
+        detail_code: impl Into<String>,
+        detail_message: impl Into<String>,
+    ) -> FigureAdvisoryReport {
+        FigureAdvisoryReport {
+            kind: self.kind.clone(),
+            status,
+            detail_code: detail_code.into(),
+            detail_message: detail_message.into(),
+            advisory_verdict: None,
+            advisory: None,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            subagent_run_id: self.subagent_run_id.clone(),
+        }
+    }
+
+    /// Report di una figura che ha prodotto un blocco `advisory` (verdetto valido
+    /// o meno: lo discrimina `status`).
+    fn with_advisory(
+        &self,
+        status: FigureAdvisoryStatus,
+        detail_code: &str,
+        detail_message: &str,
+        verdict: Option<&str>,
+        advisory: &Value,
+    ) -> FigureAdvisoryReport {
+        FigureAdvisoryReport {
+            kind: self.kind.clone(),
+            status,
+            detail_code: detail_code.to_string(),
+            detail_message: detail_message.to_string(),
+            advisory_verdict: verdict.map(str::to_owned),
+            advisory: Some(advisory.clone()),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            subagent_run_id: self.subagent_run_id.clone(),
+        }
+    }
+}
+
+/// Codice d'errore di una figura dal blocco `outcome` (regola M: `error_class`,
+/// poi `verdict`, mai la prosa). Nessuno dei due -> `run_failed`.
+fn outcome_error_code(outcome: &Value) -> String {
+    outcome
+        .get("error_class")
+        .or_else(|| outcome.get("verdict"))
+        .and_then(Value::as_str)
+        .unwrap_or("run_failed")
+        .to_string()
+}
+
 /// Classifica l'esito di UNA figura del consiglio dal tool_result strutturato.
 fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryReport {
-    let subagent_run_id = result
-        .get(K_SUB_RUN_ID)
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    // Provenienza EFFETTIVA della figura (stampata dai finalize_* nel result):
-    // assente per le figure respinte a monte (guard depth/whitelist) che non hanno
-    // mai risolto un modello.
-    let provider = result.get(K_PROVIDER).and_then(Value::as_str).map(str::to_owned);
-    let model = result.get(K_MODEL).and_then(Value::as_str).map(str::to_owned);
-    if let Some(code) = result.get("error_code").and_then(Value::as_str) {
-        let message = result
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or(code)
-            .to_string();
-        return FigureAdvisoryReport {
-            kind: kind.to_string(),
-            status: FigureAdvisoryStatus::PrepareFailed,
-            detail_code: code.to_string(),
-            detail_message: message,
-            advisory_verdict: None,
-            advisory: None,
-            provider: provider.clone(),
-            model: model.clone(),
-            subagent_run_id,
-        };
-    }
-    let lifecycle = result.get("status").and_then(Value::as_str).unwrap_or("");
-    if lifecycle == "timeout" {
-        return FigureAdvisoryReport {
-            kind: kind.to_string(),
-            status: FigureAdvisoryStatus::RunTimeout,
-            detail_code: "run_timeout".to_string(),
-            detail_message: result
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("Sub-agent in timeout")
-                .to_string(),
-            advisory_verdict: None,
-            advisory: None,
-            provider: provider.clone(),
-            model: model.clone(),
-            subagent_run_id,
-        };
-    }
-    if lifecycle == "failed" || lifecycle == "prepare_failed" {
-        let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
-        let code = outcome
-            .get("error_class")
-            .or_else(|| outcome.get("verdict"))
-            .and_then(Value::as_str)
-            .unwrap_or("run_failed")
-            .to_string();
-        let message = result
-            .get("error")
-            .or_else(|| result.get(K_SUMMARY))
-            .and_then(Value::as_str)
-            .unwrap_or("Sub-run fallito")
-            .to_string();
-        return FigureAdvisoryReport {
-            kind: kind.to_string(),
-            status: FigureAdvisoryStatus::RunFailed,
-            detail_code: code,
-            detail_message: message,
-            advisory_verdict: None,
-            advisory: None,
-            provider: provider.clone(),
-            model: model.clone(),
-            subagent_run_id,
-        };
+    let id = FigureIdentity::from_result(kind, result);
+    if let Some(report) = classify_figure_failure(&id, result) {
+        return report;
     }
     let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
     if outcome.get("success").and_then(Value::as_bool) != Some(true) {
-        let code = outcome
-            .get("error_class")
-            .or_else(|| outcome.get("verdict"))
-            .and_then(Value::as_str)
-            .unwrap_or("run_failed")
-            .to_string();
-        return FigureAdvisoryReport {
-            kind: kind.to_string(),
-            status: FigureAdvisoryStatus::RunFailed,
-            detail_code: code,
-            detail_message: "Sub-run terminato senza esito positivo".to_string(),
-            advisory_verdict: None,
-            advisory: None,
-            provider: provider.clone(),
-            model: model.clone(),
-            subagent_run_id,
-        };
+        return id.no_advisory(
+            FigureAdvisoryStatus::RunFailed,
+            outcome_error_code(&outcome),
+            "Sub-run terminato senza esito positivo",
+        );
     }
     let advisory = match outcome.get("advisory") {
         Some(a) if !a.is_null() => a,
         _ => {
-            return FigureAdvisoryReport {
-                kind: kind.to_string(),
-                status: FigureAdvisoryStatus::CompletedNoAdvisory,
-                detail_code: "no_advisory".to_string(),
-                detail_message: "Sub-run completato senza chiamare advisory_verdict".to_string(),
-                advisory_verdict: None,
-                advisory: None,
-                provider: provider.clone(),
-                model: model.clone(),
-                subagent_run_id,
-            };
+            return id.no_advisory(
+                FigureAdvisoryStatus::CompletedNoAdvisory,
+                "no_advisory",
+                "Sub-run completato senza chiamare advisory_verdict",
+            )
         }
     };
     let verdict = advisory.get("verdict").and_then(Value::as_str);
-    let valid_verdict = verdict.is_some_and(|v| {
-        matches!(v, "proceed" | "proceed_with_changes" | "block")
-    });
+    let valid_verdict =
+        verdict.is_some_and(|v| matches!(v, "proceed" | "proceed_with_changes" | "block"));
     if !valid_verdict {
-        return FigureAdvisoryReport {
-            kind: kind.to_string(),
-            status: FigureAdvisoryStatus::InvalidAdvisory,
-            detail_code: "invalid_advisory".to_string(),
-            detail_message: "Parere advisory presente ma verdetto non valido".to_string(),
-            advisory_verdict: verdict.map(str::to_owned),
-            advisory: Some(advisory.clone()),
-            provider: provider.clone(),
-            model: model.clone(),
-            subagent_run_id,
-        };
+        return id.with_advisory(
+            FigureAdvisoryStatus::InvalidAdvisory,
+            "invalid_advisory",
+            "Parere advisory presente ma verdetto non valido",
+            verdict,
+            advisory,
+        );
     }
-    FigureAdvisoryReport {
-        kind: kind.to_string(),
-        status: FigureAdvisoryStatus::AdvisoryOk,
-        detail_code: "advisory_ok".to_string(),
-        detail_message: "Parere advisory valido".to_string(),
-        advisory_verdict: verdict.map(str::to_owned),
-        advisory: Some(advisory.clone()),
-        provider: provider.clone(),
-        model: model.clone(),
-        subagent_run_id,
+    id.with_advisory(
+        FigureAdvisoryStatus::AdvisoryOk,
+        "advisory_ok",
+        "Parere advisory valido",
+        verdict,
+        advisory,
+    )
+}
+
+/// Esiti in cui la figura non e' MAI arrivata a un parere: respinta in PREPARE
+/// (`error_code`, regola M), in timeout o fallita nel lifecycle. `None` = il
+/// sub-run e' arrivato a termine, l'esito va letto dal blocco `outcome`.
+fn classify_figure_failure(id: &FigureIdentity, result: &Value) -> Option<FigureAdvisoryReport> {
+    if let Some(code) = result.get("error_code").and_then(Value::as_str) {
+        let message = result.get("error").and_then(Value::as_str).unwrap_or(code);
+        return Some(id.no_advisory(FigureAdvisoryStatus::PrepareFailed, code, message));
     }
+    let lifecycle = result.get("status").and_then(Value::as_str).unwrap_or("");
+    if lifecycle == "timeout" {
+        let message = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Sub-agent in timeout");
+        return Some(id.no_advisory(FigureAdvisoryStatus::RunTimeout, "run_timeout", message));
+    }
+    if lifecycle == "failed" || lifecycle == "prepare_failed" {
+        let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
+        let message = result
+            .get("error")
+            .or_else(|| result.get(K_SUMMARY))
+            .and_then(Value::as_str)
+            .unwrap_or("Sub-run fallito");
+        return Some(id.no_advisory(
+            FigureAdvisoryStatus::RunFailed,
+            outcome_error_code(&outcome),
+            message,
+        ));
+    }
+    None
 }
 
 /// Esito della convocazione parallela: report per-figura + sintesi opzionale.
@@ -1680,6 +1765,30 @@ pub(crate) async fn convene_council(
     // qui ribadiamo il formato atteso come promemoria operativo.
     let expected = "Concludi la tua analisi chiamando il tool advisory_verdict \
                     (verdict, requirements, risks[severity+description], recommendations).";
+    let pairs = run_council_figures(ctx, task, kinds, expected, progress_tx).await;
+    let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
+    let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+    let synthesis = compose_council_synthesis(&raw_results, policy);
+    CouncilConvokeResult {
+        figure_reports,
+        synthesis,
+    }
+}
+
+/// Esegue le figure `kinds` in PARALLELO e ne raccoglie le coppie (report
+/// classificato, tool_result grezzo). Ogni figura che chiude e' notificata SUBITO
+/// su `progress_tx` (la UI mostra il consiglio che si popola invece di attendere
+/// l'ultima); best-effort, un canale chiuso non ferma il consiglio.
+///
+/// Le coppie tornano nell'ORDINE DI `kinds`, non in quello d'arrivo: il consiglio
+/// non deve dipendere da chi finisce prima.
+async fn run_council_figures(
+    ctx: &AgentToolContext,
+    task: &str,
+    kinds: &[&str],
+    expected: &str,
+    progress_tx: Option<tokio::sync::mpsc::Sender<FigureAdvisoryReport>>,
+) -> Vec<(FigureAdvisoryReport, Value)> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let mut futs = FuturesUnordered::new();
     for kind in kinds {
@@ -1688,8 +1797,7 @@ pub(crate) async fn convene_council(
         let expected = expected.to_string();
         let kind = kind.to_string();
         futs.push(async move {
-            let result =
-                run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await;
+            let result = run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await;
             let report = classify_council_figure_result(&kind, &result);
             (report, result)
         });
@@ -1707,13 +1815,7 @@ pub(crate) async fn convene_council(
             .position(|k| *k == report.kind)
             .unwrap_or(usize::MAX)
     });
-    let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
-    let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
-    let synthesis = compose_council_synthesis(&raw_results, policy);
-    CouncilConvokeResult {
-        figure_reports,
-        synthesis,
-    }
+    pairs
 }
 
 /// Convoca un PANEL di revisori (kind=review) in PARALLELO e compone il verdetto
@@ -1763,81 +1865,11 @@ pub(crate) async fn convene_multi_provider_panel(
     if !cfg.enabled {
         return None;
     }
-    let candidates = match crate::internal_routing::resolve_purpose_provider_candidates_db(
-        &ctx.core.db,
-        &cfg.purpose,
-        cfg.max_providers,
-    )
-    .await
-    {
+    let candidates = match resolve_panel_candidates(ctx, cfg).await {
         Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                purpose = %cfg.purpose,
-                resolution = ?e,
-                "multi-provider panel: purpose non risolvibile"
-            );
-            return Some(MultiProviderPanelOutcome::Degraded {
-                reason: MultiProviderDegradeReason::PurposeUnavailable,
-                got: 0,
-                min: cfg.min_providers,
-            });
-        }
+        Err(degraded) => return Some(degraded),
     };
-    if candidates.len() < cfg.min_providers {
-        tracing::warn!(
-            purpose = %cfg.purpose,
-            got = candidates.len(),
-            min = cfg.min_providers,
-            "multi-provider panel: provider distinti insufficienti"
-        );
-        return Some(MultiProviderPanelOutcome::Degraded {
-            reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
-            got: candidates.len(),
-            min: cfg.min_providers,
-        });
-    }
-    let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
-                    e chiudi chiamando advisory_verdict (verdict, requirements, \
-                    risks[severity+description], recommendations).";
-    async fn run_provider_analyst(
-        ctx: &AgentToolContext,
-        kind: &str,
-        task: &str,
-        context: String,
-        expected: &str,
-        provider: String,
-        model: String,
-    ) -> Value {
-        run_single_subagent_with_model_pin(
-            ctx,
-            kind,
-            task,
-            &context,
-            expected,
-            &provider,
-            &model,
-        )
-        .await
-    }
-    let futs = candidates.iter().map(|c| {
-        run_provider_analyst(
-            ctx,
-            &cfg.kind,
-            task,
-            format!(
-                "Provider assegnato a questa analisi: {}. Modello assegnato: {}. \
-                 Confronta la richiesta dalla prospettiva dei trade-off e dei failure-mode \
-                 tipici del provider/modello assegnato, senza assumere che gli altri \
-                 provider arrivino alla stessa conclusione.",
-                c.provider, c.model
-            ),
-            expected,
-            c.provider.clone(),
-            c.model.clone(),
-        )
-    });
-    let results: Vec<Value> = futures::future::join_all(futs).await;
+    let results = run_provider_analysts(ctx, task, cfg, &candidates).await;
     let provider_count = candidates.len();
     let panel_providers: Vec<PanelProviderEntry> = candidates
         .iter()
@@ -1860,6 +1892,94 @@ pub(crate) async fn convene_multi_provider_panel(
             provider_reports,
         }
     })
+}
+
+/// Provider DISTINTI del panel, dal catalog via purpose tier-aware (punto unico
+/// `resolve_purpose_provider_candidates_db`: nessun provider/modello hardcoded,
+/// stessi filtri/cooldown del routing live).
+///
+/// `Err` = il panel non e' eseguibile e DEGRADA, con la ragione in forma
+/// STRUTTURATA (regola M): purpose non risolvibile, oppure meno provider distinti
+/// del minimo richiesto. Il degrado e' un esito dichiarato, non un fallimento
+/// silenzioso.
+async fn resolve_panel_candidates(
+    ctx: &AgentToolContext,
+    cfg: &MultiProviderConfig,
+) -> Result<
+    Vec<crate::internal_routing::PurposeProviderCandidate>,
+    MultiProviderPanelOutcome,
+> {
+    let candidates = crate::internal_routing::resolve_purpose_provider_candidates_db(
+        &ctx.core.db,
+        &cfg.purpose,
+        cfg.max_providers,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            purpose = %cfg.purpose,
+            resolution = ?e,
+            "multi-provider panel: purpose non risolvibile"
+        );
+        MultiProviderPanelOutcome::Degraded {
+            reason: MultiProviderDegradeReason::PurposeUnavailable,
+            got: 0,
+            min: cfg.min_providers,
+        }
+    })?;
+    if candidates.len() < cfg.min_providers {
+        tracing::warn!(
+            purpose = %cfg.purpose,
+            got = candidates.len(),
+            min = cfg.min_providers,
+            "multi-provider panel: provider distinti insufficienti"
+        );
+        return Err(MultiProviderPanelOutcome::Degraded {
+            reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
+            got: candidates.len(),
+            min: cfg.min_providers,
+        });
+    }
+    Ok(candidates)
+}
+
+/// Esegue lo STESSO analista read-only su ogni provider candidato, in PARALLELO,
+/// con provider/model PINNATI dal catalog (nessuna chiamata diretta ai provider:
+/// sono sub-run nativi). A ciascuno il contesto dichiara il proprio provider/modello
+/// e gli chiede di ragionare sui trade-off e failure-mode TIPICI di quello, senza
+/// assumere che gli altri arrivino alla stessa conclusione: e' la diversita' il
+/// punto del panel. Ordine dei risultati = ordine dei candidati.
+async fn run_provider_analysts(
+    ctx: &AgentToolContext,
+    task: &str,
+    cfg: &MultiProviderConfig,
+    candidates: &[crate::internal_routing::PurposeProviderCandidate],
+) -> Vec<Value> {
+    let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
+                    e chiudi chiamando advisory_verdict (verdict, requirements, \
+                    risks[severity+description], recommendations).";
+    let futs = candidates.iter().map(|c| {
+        let context = format!(
+            "Provider assegnato a questa analisi: {}. Modello assegnato: {}. \
+             Confronta la richiesta dalla prospettiva dei trade-off e dei failure-mode \
+             tipici del provider/modello assegnato, senza assumere che gli altri \
+             provider arrivino alla stessa conclusione.",
+            c.provider, c.model
+        );
+        async move {
+            run_single_subagent_with_model_pin(
+                ctx,
+                &cfg.kind,
+                task,
+                &context,
+                expected,
+                &c.provider,
+                &c.model,
+            )
+            .await
+        }
+    });
+    futures::future::join_all(futs).await
 }
 
 /// Parte PURA (regola L, testabile senza DB) di [`convene_council`]: estrae i blocchi
@@ -2305,8 +2425,7 @@ async fn run_single_subagent_inner(
 ) -> Value {
     // FASE PREPARE (guard + INSERT + ensure_child, tutto SINCRONO fail-fast): il
     // punto unico condiviso dal ramo singolo e dal batch background (regola L).
-    let exec = match prepare_subagent_run(
-        ctx,
+    let req = SubagentRequest {
         kind,
         task,
         context_blob,
@@ -2314,9 +2433,8 @@ async fn run_single_subagent_inner(
         isolation,
         is_background,
         model_pin,
-    )
-    .await
-    {
+    };
+    let exec = match prepare_subagent_run(ctx, &req).await {
         Ok(exec) => exec,
         Err(err) => return err,
     };
@@ -2348,43 +2466,126 @@ async fn run_single_subagent_inner(
 /// del fan-in vedrebbe 0 rimasti -> enqueue PREMATURO del parent (riesumato senza
 /// i risultati degli altri figli). Inserendo tutte le row prima, la COUNT e'
 /// corretta appena il 1o figlio chiude.
-#[allow(clippy::too_many_arguments)]
 async fn prepare_subagent_run(
     ctx: &AgentToolContext,
-    kind: &str,
-    task: &str,
-    context_blob: &str,
-    expected_format: &str,
-    isolation: Option<&IsolationSlot>,
-    is_background: bool,
-    model_pin: Option<(&str, &str)>,
+    req: &SubagentRequest<'_>,
 ) -> Result<SubagentExecInputs, Value> {
-    let db = &*ctx.core.db;
-    let project_id = ctx.core.project_id;
-    let session_id = match ctx.core.session_id {
-        Some(s) => s,
-        None => {
-            return Err(prepare_reject(
-                "session_missing",
-                "sub-agent richiede una sessione chat (session_id assente)",
-            ))
-        }
+    let Some(session_id) = ctx.core.session_id else {
+        return Err(prepare_reject(
+            "session_missing",
+            "sub-agent richiede una sessione chat (session_id assente)",
+        ));
     };
     // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
     // del progetto. Risolvo una volta il pool per_progetto e lo riuso per la catena
     // depth/costo, l'INSERT e le mark_run (a flag OFF ritorna il meta-DB).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
 
-    // ── Guard 1: settings (enabled / whitelist / depth / cost) ────────────────
-    let settings = match read_subagent_settings(ctx).await {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(prepare_reject(
-                "settings_read_failed",
-                format!("lettura settings fallita: {e}"),
-            ))
+    let plan = build_subagent_plan(ctx, &proj_pool, req, session_id).await?;
+    register_subagent_run(ctx, &proj_pool, req, &plan, session_id).await
+}
+
+/// COSA eseguire in un sub-run, come lo descrive il chiamante (singolo o batch).
+/// Raggruppa in una struct di contesto i parametri che attraversano l'intera fase
+/// PREPARE, distinti dal PIANO che il DB risolve ([`SubagentPlan`]).
+struct SubagentRequest<'a> {
+    kind: &'a str,
+    task: &'a str,
+    context_blob: &'a str,
+    expected_format: &'a str,
+    /// `Some` = ramo ISOLATO (worktree effimero gia' creato dal batch). Il ramo
+    /// background non lo supporta ed e' sempre `None`.
+    isolation: Option<&'a IsolationSlot>,
+    is_background: bool,
+    /// Provider/model imposti dal chiamante (panel multi-provider): scavalcano la
+    /// risoluzione del `model_purpose` della definition.
+    model_pin: Option<(&'a str, &'a str)>,
+}
+
+/// Sub-run con TUTTI i guard superati e tutto il DB-driven risolto (definition,
+/// prompt, tools, provider/model, depth, timeout), prima di qualunque scrittura.
+struct SubagentPlan {
+    anchor: Uuid,
+    /// Run CORRENTE che dispatcha ([`fanin_target_run_id`]): isola i figli DIRETTI
+    /// per COUNT/fetch del fan-in (mig project 0010) ed e' il run da RIPRENDERE
+    /// (quello marcato `awaiting_subagents`, che il CAS del worker cerca in
+    /// `agent_runs`). Distinto dall'`anchor` (depth-chain di famiglia, che degenera
+    /// in session_id): la COUNT sui figli con questo dispatcher e la coda che punta
+    /// a questo run coincidono per costruzione.
+    dispatcher: Uuid,
+    current_depth: i64,
+    provider: String,
+    model: String,
+    system_text: String,
+    tools_json: Value,
+    timeout_s: i64,
+    narration_enabled: bool,
+    narration_heartbeat_s: i64,
+}
+
+/// Guard + risoluzione DB-driven del sub-run, senza alcuna scrittura: se un guard
+/// non passa si esce con `Err(Value)` PRIMA che esista qualunque row (regola M: il
+/// coordinatore legge `error_code`, non il testo).
+///
+/// Guard, nell'ordine: settings (enabled/whitelist), definition del kind,
+/// anti-ricorsione + cost cap, prompt non vuoto.
+async fn build_subagent_plan(
+    ctx: &AgentToolContext,
+    proj_pool: &sqlx::PgPool,
+    req: &SubagentRequest<'_>,
+    session_id: Uuid,
+) -> Result<SubagentPlan, Value> {
+    let kind = req.kind;
+    let settings = check_subagent_settings(ctx, kind).await?;
+    let definition = fetch_definition_checked(ctx, kind).await?;
+    let anchor = parent_anchor(ctx);
+    let dispatcher = fanin_target_run_id(ctx, anchor);
+    let current_depth = check_depth_and_cost(proj_pool, &settings, anchor, dispatcher).await?;
+
+    let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
+    if system_text.trim().is_empty() {
+        return Err(prepare_reject(
+            "prompt_missing",
+            format!("prompt '{}' non trovato o vuoto", definition.prompt_key),
+        ));
+    }
+    let (provider, model) = match req.model_pin {
+        Some((provider, model)) => (provider.to_string(), model.to_string()),
+        None => {
+            resolve_worker_model(&ctx.core.db, proj_pool, kind, &definition, anchor, session_id)
+                .await
         }
     };
+    Ok(SubagentPlan {
+        anchor,
+        dispatcher,
+        current_depth,
+        provider,
+        model,
+        system_text,
+        tools_json: build_tools_json(&definition.tool_whitelist),
+        timeout_s: if definition.timeout_s > 0 {
+            definition.timeout_s
+        } else {
+            settings.default_timeout_s
+        },
+        narration_enabled: settings.narration_enabled,
+        narration_heartbeat_s: settings.narration_heartbeat_s,
+    })
+}
+
+/// Guard 1: soglie sub-agent dal DB (regola G) + kind abilitato e in whitelist.
+async fn check_subagent_settings(
+    ctx: &AgentToolContext,
+    kind: &str,
+) -> Result<SubagentSettings, Value> {
+    let settings = read_subagent_settings(ctx).await.map_err(|e| {
+        prepare_reject(
+            "settings_read_failed",
+            format!("lettura settings fallita: {e}"),
+        )
+    })?;
     if !settings.enabled {
         return Err(prepare_reject(
             "subagents_disabled",
@@ -2397,26 +2598,38 @@ async fn prepare_subagent_run(
             format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist),
         ));
     }
+    Ok(settings)
+}
 
-    // ── Guard 2: definition del kind ──────────────────────────────────────────
-    let definition = match fetch_definition(ctx, kind).await {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return Err(prepare_reject(
-                "kind_not_found",
-                format!("kind '{kind}' non trovato in nexus_subagent_definitions"),
-            ))
-        }
-        Err(e) => return Err(prepare_reject("definition_fetch_failed", e)),
-    };
+/// Guard 2: definition del kind in `nexus_subagent_definitions`.
+async fn fetch_definition_checked(
+    ctx: &AgentToolContext,
+    kind: &str,
+) -> Result<SubagentDefinition, Value> {
+    match fetch_definition(ctx, kind).await {
+        Ok(Some(d)) => Ok(d),
+        Ok(None) => Err(prepare_reject(
+            "kind_not_found",
+            format!("kind '{kind}' non trovato in nexus_subagent_definitions"),
+        )),
+        Err(e) => Err(prepare_reject("definition_fetch_failed", e)),
+    }
+}
 
-    // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena ANTENATI) ──────
-    // La profondita' del figlio = depth del DISPATCHER (padre immediato) + 1, NON
-    // il MAX tra i fratelli running sotto l'anchor: i fratelli paralleli (es. le 6
-    // figure del consiglio) non devono contarsi a vicenda come annidamento.
-    let anchor = parent_anchor(ctx);
-    let dispatcher = fanin_target_run_id(ctx, anchor);
-    let current_depth = current_chain_depth(&proj_pool, dispatcher).await + 1;
+/// Guard 3+4: anti-ricorsione (depth DB-driven dalla catena ANTENATI) e cost cap
+/// cumulativo per parent. Ritorna la profondita' del nuovo figlio.
+///
+/// La profondita' del figlio = depth del DISPATCHER (padre immediato) + 1, NON il
+/// MAX tra i fratelli running sotto l'anchor: i fratelli paralleli (es. le 6 figure
+/// del consiglio) non devono contarsi a vicenda come annidamento. Il cost cap
+/// resta invece per FAMIGLIA (anchor).
+async fn check_depth_and_cost(
+    proj_pool: &sqlx::PgPool,
+    settings: &SubagentSettings,
+    anchor: Uuid,
+    dispatcher: Uuid,
+) -> Result<i64, Value> {
+    let current_depth = current_chain_depth(proj_pool, dispatcher).await + 1;
     if current_depth > settings.max_depth {
         return Err(prepare_reject(
             "depth_exceeded",
@@ -2426,9 +2639,7 @@ async fn prepare_subagent_run(
             ),
         ));
     }
-
-    // ── Guard 4: cost cap cumulativo per parent ───────────────────────────────
-    let spent = cumulative_cost(&proj_pool, anchor).await;
+    let spent = cumulative_cost(proj_pool, anchor).await;
     if spent >= settings.cost_cap_usd {
         return Err(prepare_reject(
             "cost_cap_reached",
@@ -2438,122 +2649,124 @@ async fn prepare_subagent_run(
             ),
         ));
     }
+    Ok(current_depth)
+}
 
-    // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
-    let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
-    if system_text.trim().is_empty() {
-        return Err(prepare_reject(
-            "prompt_missing",
-            format!("prompt '{}' non trovato o vuoto", definition.prompt_key),
-        ));
-    }
-    let tools_json = build_tools_json(&definition.tool_whitelist);
-
-    let (provider, model) = if let Some((provider, model)) = model_pin {
-        (provider.to_string(), model.to_string())
-    } else {
-        resolve_worker_model(db, &proj_pool, kind, &definition, anchor, session_id).await
-    };
-
-    let timeout_s = if definition.timeout_s > 0 {
-        definition.timeout_s
-    } else {
-        settings.default_timeout_s
-    };
-
-    // Embedding del context/expected nel task (parita' col brain `run_subagent`).
-    let mut initial_msg = task.trim().to_string();
-    if !context_blob.trim().is_empty() {
-        initial_msg.push_str("\n\n## Contesto aggiuntivo\n");
-        initial_msg.push_str(context_blob.trim());
-    }
-    if !expected_format.trim().is_empty() {
-        initial_msg.push_str("\n\n## Formato output atteso\n");
-        initial_msg.push_str(expected_format.trim());
-    }
-
-    // ── Crea row in nexus_subagent_runs (status='running' subito: la catena depth
-    //    si basa sui 'running'; il sub-run e' bloccante, non c'e' fase 'pending'
-    //    osservabile). ────────────────────────────────────────────────────────────
+/// Prenota il sub-run nel DB e ne fa un run TRACCIATO, poi ne costruisce gli input
+/// d'esecuzione.
+///
+/// La row `nexus_subagent_runs` nasce gia' `status='running'`: la catena depth si
+/// basa sui 'running' e il sub-run e' bloccante, non c'e' fase 'pending'
+/// osservabile.
+///
+/// La riga `agent_runs` del SUB-run e' l'osservabilita' (regola M): senza, il guard
+/// "untracked_run" di `PgAgentStepStore` scartava in SILENZIO ogni tool_result del
+/// figlio (agent_steps vuoto -> errori dei tool illeggibili, incidente 2026-07-06).
+/// Con la riga, gli step (input+result+esito) sono persistiti e ispezionabili;
+/// `nexus_agent_type='subagent'` discrimina i sub-run nelle query UI top-level
+/// (active-run, timeline, guard 409) e `parent_run_id` e' valorizzato solo se
+/// l'ancora e' a sua volta un run tracciato (FK su agent_runs).
+async fn register_subagent_run(
+    ctx: &AgentToolContext,
+    proj_pool: &sqlx::PgPool,
+    req: &SubagentRequest<'_>,
+    plan: &SubagentPlan,
+    session_id: Uuid,
+) -> Result<SubagentExecInputs, Value> {
+    let project_id = ctx.core.project_id;
     let insert = NewSubagentRun {
-        anchor,
-        // Run CORRENTE che dispatcha: isola i figli DIRETTI per COUNT/fetch del
-        // fan-in (mig project 0010). E' lo STESSO id che finisce in
-        // `fanin_parent_run_id` (il target del resume): la COUNT sui figli con
-        // dispatcher = questo run e la coda che punta a questo run coincidono.
-        dispatcher_run_id: fanin_target_run_id(ctx, anchor),
+        anchor: plan.anchor,
+        dispatcher_run_id: plan.dispatcher,
         project_id,
-        kind,
-        task,
-        context_blob,
-        expected_format,
-        depth: current_depth as i32,
-        is_background,
+        kind: req.kind,
+        task: req.task,
+        context_blob: req.context_blob,
+        expected_format: req.expected_format,
+        depth: plan.current_depth as i32,
+        is_background: req.is_background,
     };
-    let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
-        Ok(id) => id,
-        Err(e) => {
-            return Err(prepare_reject(
+    let subagent_run_id = insert_subagent_run(proj_pool, &insert, req.isolation)
+        .await
+        .map_err(|e| {
+            prepare_reject(
                 "insert_failed",
                 format!("creazione riga nexus_subagent_runs fallita: {e}"),
-            ))
-        }
-    };
-
-    // ── Riga agent_runs del SUB-run (osservabilita', regola M) ────────────────
-    // Il sub-run gira sul grafo nativo con run_id=subagent_run_id ma non aveva
-    // alcuna riga in agent_runs: il guard "untracked_run" di PgAgentStepStore
-    // scartava in SILENZIO ogni tool_result del figlio (agent_steps vuoto ->
-    // errori dei tool illeggibili, incidente 2026-07-06). La riga rende il
-    // figlio un run TRACCIATO: step (input+result+esito) persistiti e
-    // ispezionabili. `nexus_agent_type='subagent'` e' il discriminatore per le
-    // query UI top-level (active-run, timeline, guard 409); `parent_run_id` e'
-    // valorizzato solo se l'ancora e' un run tracciato (FK su agent_runs).
+            )
+        })?;
     ensure_child_agent_run(
-        &proj_pool,
+        proj_pool,
         subagent_run_id,
         session_id,
         project_id,
         ctx.core.user_id,
-        anchor,
-        &provider,
-        &model,
+        plan.anchor,
+        &plan.provider,
+        &plan.model,
     )
     .await;
-
-    // ── Input OWNED della parte "execute" (regola L: punto unico condiviso dai
-    //    due rami sync/background). Tutto e' `'static` (String/Uuid/Value/PgPool
-    //    clonabile): l'helper puo' essere `await`ato inline oppure spostato in un
-    //    task detached senza catturare riferimenti allo stack del chiamante. ─────
-    Ok(SubagentExecInputs {
-        ctx: ctx.clone(),
+    Ok(build_exec_inputs(
+        ctx,
         proj_pool,
+        req,
+        plan,
+        session_id,
+        subagent_run_id,
+    ))
+}
+
+/// Input OWNED della parte "execute" (regola L: punto unico condiviso dai due rami
+/// sync/background). Tutto e' `'static` (String/Uuid/Value/PgPool clonabile):
+/// `execute_subagent_run` puo' essere `await`ato inline oppure spostato in un task
+/// detached senza catturare riferimenti allo stack del chiamante.
+fn build_exec_inputs(
+    ctx: &AgentToolContext,
+    proj_pool: &sqlx::PgPool,
+    req: &SubagentRequest<'_>,
+    plan: &SubagentPlan,
+    session_id: Uuid,
+    subagent_run_id: Uuid,
+) -> SubagentExecInputs {
+    SubagentExecInputs {
+        ctx: ctx.clone(),
+        proj_pool: proj_pool.clone(),
         subagent_run_id,
         session_id,
-        anchor,
-        kind: kind.to_string(),
-        task: task.to_string(),
-        provider,
-        model,
-        system_text,
-        initial_msg,
-        tools_json,
-        current_depth,
-        timeout_s,
-        narration_enabled: settings.narration_enabled,
-        narration_heartbeat_s: settings.narration_heartbeat_s,
+        anchor: plan.anchor,
+        kind: req.kind.to_string(),
+        task: req.task.to_string(),
+        provider: plan.provider.clone(),
+        model: plan.model.clone(),
+        system_text: plan.system_text.clone(),
+        initial_msg: compose_initial_message(req),
+        tools_json: plan.tools_json.clone(),
+        current_depth: plan.current_depth,
+        timeout_s: plan.timeout_s,
+        narration_enabled: plan.narration_enabled,
+        narration_heartbeat_s: plan.narration_heartbeat_s,
         // Il ramo background NON supporta isolamento (vedi doc su tool_dispatch_*):
         // qui `working_root` porta il worktree solo per il ramo sequenziale isolato.
-        working_root: isolation.map(|s| s.worktree_path.clone()),
-        isolated: isolation.is_some(),
+        working_root: req.isolation.map(|s| s.worktree_path.clone()),
+        isolated: req.isolation.is_some(),
         // Fase D fan-in: il ramo background enqueue il parent al termine se e'
         // l'ultimo figlio background terminale (vedi execute_subagent_run).
-        is_background,
-        // Run da riprendere nel fan-in: il run CORRENTE (sospeso su
-        // awaiting_subagents), NON l'anchor depth-chain (bug: il CAS del worker
-        // cerca agent_runs.id = questo id).
-        fanin_parent_run_id: fanin_target_run_id(ctx, anchor),
-    })
+        is_background: req.is_background,
+        fanin_parent_run_id: plan.dispatcher,
+    }
+}
+
+/// Messaggio iniziale del sub-run: il task con context/expected embeddati (parita'
+/// col brain `run_subagent`). Le sezioni assenti/vuote non compaiono.
+fn compose_initial_message(req: &SubagentRequest<'_>) -> String {
+    let mut initial_msg = req.task.trim().to_string();
+    if !req.context_blob.trim().is_empty() {
+        initial_msg.push_str("\n\n## Contesto aggiuntivo\n");
+        initial_msg.push_str(req.context_blob.trim());
+    }
+    if !req.expected_format.trim().is_empty() {
+        initial_msg.push_str("\n\n## Formato output atteso\n");
+        initial_msg.push_str(req.expected_format.trim());
+    }
+    initial_msg
 }
 
 /// Spawna l'esecuzione DETACHED di un sub-run gia' preparato (row inserita) e
@@ -2620,196 +2833,178 @@ struct SubagentExecInputs {
 /// allo stack del chiamante. Ritorna il `Value` tool_result del sub-run (summary /
 /// timeout / failure); nel ramo background il valore e' scartato (il fan-in legge
 /// la row DB), ma tutti gli effetti (mark_run, narrazione) avvengono comunque.
+///
+/// ORDINE DEL PONTE (race chiusa alla radice, regola H): in OGNI esito il ponte di
+/// narrazione e' fermato e ATTESO (`stop_bridge`) PRIMA del meta-step di chiusura.
+/// Senza l'await, `abort()` e' cooperativo (cancella al prossimo poll) e un
+/// progress/heartbeat gia' dentro `persist_meta_step` potrebbe ottenere un NOW() >
+/// del completed -> ordine invertito nella timeline storica (ordinata per
+/// `created_at`). L'await del handle garantisce che nessuna INSERT del ponte segua
+/// quella di chiusura.
 async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
-    let SubagentExecInputs {
-        ctx,
-        proj_pool,
-        subagent_run_id,
-        session_id,
-        anchor,
-        kind,
-        task,
-        provider,
-        model,
-        system_text,
-        initial_msg,
-        tools_json,
-        current_depth,
-        timeout_s,
-        narration_enabled,
-        narration_heartbeat_s,
-        working_root,
-        isolated,
-        is_background,
-        fanin_parent_run_id,
-    } = exec;
+    let narrator = ParentNarrator::from_ctx(
+        &exec.ctx,
+        &exec.proj_pool,
+        exec.narration_enabled,
+        &exec.provider,
+        &exec.model,
+    );
+    narrate_subagent_started(narrator.as_deref(), &exec).await;
 
-    // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
-    // Il dispatch (sincrono) e' bloccante e puo' durare minuti: senza questi
-    // meta-step la chat resta muta e il run padre sembra bloccato mentre il figlio
-    // lavora. Nel ramo background la narrazione racconta il progresso del figlio
-    // sul run padre gia' sospeso (il fan-in arrivera' via poll).
-    let narrator = ParentNarrator::from_ctx(&ctx, &proj_pool, narration_enabled, &provider, &model);
-    if let Some(n) = &narrator {
-        let task_head: String = task.trim().chars().take(160).collect();
-        n.say(
-            "subagent_started",
-            format!("Subagente {kind} avviato — {task_head}"),
-            n.with_pin(json!({
-                K_SUB_RUN_ID: subagent_run_id.to_string(),
-                K_SUB_KIND: kind,
-                "task": task_head,
-                "depth": current_depth,
-                K_TIMEOUT_S: timeout_s,
-                "isolated": isolated,
-            })),
-            subagent_run_id,
-        )
-        .await;
-    }
-
-    // ── Esecuzione sul GRAFO NATIVO (in-process, niente brain) ────────────────
-    // Il sub-run e' un run a se': run_id = subagent_run_id (= thread del grafo),
-    // STESSA session_id del parent (eredita root/permessi/canali). Lo stato porta
-    // parent_run_id + subagent_depth -> il grafo applica i guard di annidamento
-    // (UnderstandingNode salta il fan-out explore se depth>=1).
-    let deps = build_native_deps_for_tool(&ctx).await;
-    // Canale SSE proprio del sub-run: NON instrada al frontend (l'output utente
-    // resta quello del main, che riceve solo il summary). Il receiver alimenta
-    // il PONTE narrazione verso il padre (prima era scartato: feature muta);
-    // senza narratore il receiver e' droppato e il comportamento e' lo storico.
+    let deps = build_native_deps_for_tool(&exec.ctx).await;
     let (sub_tx, sub_rx) = tokio::sync::broadcast::channel(256);
     let bridge = narrator.as_ref().map(|n| {
         spawn_narration_bridge(
             n.clone(),
             sub_rx,
-            subagent_run_id,
-            kind.clone(),
-            narration_heartbeat_s,
+            exec.subagent_run_id,
+            exec.kind.clone(),
+            exec.narration_heartbeat_s,
         )
     });
+    let native_input = build_subagent_native_input(&exec, sub_tx);
 
-    // provider/model risolti: clonati per i rami finalize timeout/failure, che
-    // girano DOPO che `native_input` prende possesso degli originali. Il ramo
-    // success usa invece la provenienza EFFETTIVA da `o` (post-failover).
-    let provider_resolved = provider.clone();
-    let model_resolved = model.clone();
-    let native_input = NativeRunInput {
-        run_id: subagent_run_id,
-        session_id,
-        provider,
-        model,
-        system_text,
-        initial_msg,
-        // Sub-run isolato: NIENTE history del main (parita' col brain `run_subagent`,
-        // che parte da messages=[Human(task)]).
+    let run_fut = crate::native_engine::run_native(&deps, &native_input);
+    let budget = std::time::Duration::from_secs(exec.timeout_s as u64);
+    let outcome = tokio::time::timeout(budget, run_fut).await;
+    stop_bridge(bridge).await;
+
+    let out = finalize_subagent_outcome(&exec, narrator.as_deref(), outcome).await;
+    maybe_enqueue_fanin_resume(
+        &exec.ctx,
+        &exec.proj_pool,
+        exec.anchor,
+        exec.fanin_parent_run_id,
+        exec.session_id,
+        exec.is_background,
+    )
+    .await;
+    out
+}
+
+/// Meta-step di AVVIO del sub-run sul run PADRE (ADR 0037). Il dispatch sincrono
+/// e' bloccante e puo' durare minuti: senza questo meta-step la chat resta muta e
+/// il run padre sembra bloccato mentre il figlio lavora. Nel ramo background
+/// racconta il progresso del figlio sul padre gia' sospeso (il fan-in arriva via
+/// poll). Senza narratore (kill-switch OFF) e' un no-op: chat muta, storico.
+async fn narrate_subagent_started(narrator: Option<&ParentNarrator>, exec: &SubagentExecInputs) {
+    let Some(n) = narrator else { return };
+    let kind = &exec.kind;
+    let task_head: String = exec.task.trim().chars().take(160).collect();
+    n.say(
+        "subagent_started",
+        format!("Subagente {kind} avviato — {task_head}"),
+        n.with_pin(json!({
+            K_SUB_RUN_ID: exec.subagent_run_id.to_string(),
+            K_SUB_KIND: kind,
+            "task": task_head,
+            "depth": exec.current_depth,
+            K_TIMEOUT_S: exec.timeout_s,
+            "isolated": exec.isolated,
+        })),
+        exec.subagent_run_id,
+    )
+    .await;
+}
+
+/// Input del GRAFO NATIVO per un sub-run (in-process, niente brain). Il sub-run e'
+/// un run a se': `run_id = subagent_run_id` (= thread del grafo), STESSA
+/// `session_id` del parent (eredita root/permessi/canali). Lo stato porta
+/// `parent_run_id` + `subagent_depth` -> il grafo applica i guard di annidamento
+/// (UnderstandingNode salta il fan-out explore se depth>=1).
+///
+/// Nessuna scelta qui: i campi variabili arrivano da `exec`, gli altri sono
+/// COSTANTI del sub-run — niente history del main (parita' col brain
+/// `run_subagent`, che parte da `messages=[Human(task)]`), nessun intent_hint ne'
+/// giudizio del classifier (il task e' gia' descritto: decide il RouterNode),
+/// autonomia piena (parita' col brain: behavior_mode "automatico", approved=true).
+fn build_subagent_native_input(
+    exec: &SubagentExecInputs,
+    step_tx: tokio::sync::broadcast::Sender<crate::agent_types::AgentStepEvent>,
+) -> NativeRunInput {
+    NativeRunInput {
+        run_id: exec.subagent_run_id,
+        session_id: exec.session_id,
+        provider: exec.provider.clone(),
+        model: exec.model.clone(),
+        system_text: exec.system_text.clone(),
+        initial_msg: exec.initial_msg.clone(),
         conversation_history: Vec::new(),
-        tools_json,
-        // Sub-agente auto-approvato e DIRETTO: nessun intent_hint, nessun giudizio
-        // del classifier (il task e' gia' descritto). Il RouterNode decide.
+        tools_json: exec.tools_json.clone(),
         intent_hint: None,
         requires_tools: None,
         agentic_score: None,
         authorizes_changes: None,
         classifier_resolved: false,
         action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
-        // Sub-agente eseguito in autonomia (parita' col brain: behavior_mode
-        // "automatico", approved=true).
         automation_mode: "automatic".to_string(),
         supervisor_mode: nexus_agent_graph::SupervisorMode::None,
-        step_tx: sub_tx,
-        parent_run_id: Some(anchor),
-        subagent_depth: Some(current_depth),
+        step_tx,
+        parent_run_id: Some(exec.anchor),
+        subagent_depth: Some(exec.current_depth),
         // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso o
         // background) -> scrive sulla root del progetto, comportamento invariato.
         // `Some(worktree)` (ramo ISOLATO, valorizzato dal batch parallelo di
         // `tool_dispatch_subagents`) -> scrive nel worktree effimero, ctx isolato
         // (autocommit/reindex soppressi, PR3). L'apply serializzato e' del batch.
-        working_root,
+        working_root: exec.working_root.clone(),
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
-    };
+    }
+}
 
-    // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
-    // In OGNI ramo il ponte e' fermato e ATTESO (`stop_bridge`) prima del meta-step
-    // di chiusura: senza l'await, abort() e' cooperativo (cancella al prossimo poll)
-    // e un progress/heartbeat gia' dentro persist_meta_step potrebbe ottenere un
-    // NOW() > del completed -> ordine invertito nella timeline storica (ordinata
-    // per created_at). L'await del handle garantisce che nessuna INSERT del ponte
-    // segua quella di chiusura (race chiusa alla radice, regola H).
-    let run_fut = crate::native_engine::run_native(&deps, &native_input);
-    let outcome: anyhow::Result<NativeRunOutcome> =
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await
-        {
-            Ok(res) => res,
-            Err(_) => {
-                stop_bridge(bridge).await;
-                // Il timeout marca comunque la riga TERMINALE (status='timeout'):
-                // deve passare per l'enqueue fan-in come gli altri rami (senza,
-                // un parent con l'ultimo figlio andato in timeout resterebbe
-                // sospeso per sempre). Non esce con return diretto.
-                let out = finalize_timeout(
-                    &proj_pool,
-                    narrator.as_deref(),
-                    subagent_run_id,
-                    &kind,
-                    timeout_s,
-                    &provider_resolved,
-                    &model_resolved,
-                )
-                .await;
-                maybe_enqueue_fanin_resume(
-                    &ctx,
-                    &proj_pool,
-                    anchor,
-                    fanin_parent_run_id,
-                    session_id,
-                    is_background,
-                )
-                .await;
-                return out;
-            }
-        };
-    stop_bridge(bridge).await;
-
-    let out = match outcome {
-        Ok(o) => {
+/// Chiusura del sub-run dal risultato del grafo, letta come SEGNALE STRUTTURATO
+/// (regola M): `Err(Elapsed)` = timeout duro scaduto (parita' col brain
+/// `asyncio.wait_for`), `Ok(Ok)` = esito nativo, `Ok(Err)` = errore d'esecuzione.
+/// Il ramo timeout marca comunque la riga TERMINALE (`status='timeout'`) e torna
+/// al chiamante, che lo fa passare per l'enqueue fan-in come gli altri rami: senza,
+/// un parent con l'ultimo figlio in timeout resterebbe sospeso per sempre.
+///
+/// `provider`/`model` di `exec` sono quelli RISOLTI a monte, usati dai rami
+/// timeout/failure; il ramo success usa invece la provenienza EFFETTIVA da `o`
+/// (post-failover).
+async fn finalize_subagent_outcome(
+    exec: &SubagentExecInputs,
+    narrator: Option<&ParentNarrator>,
+    outcome: Result<anyhow::Result<NativeRunOutcome>, tokio::time::error::Elapsed>,
+) -> Value {
+    match outcome {
+        Err(_) => {
+            finalize_timeout(
+                &exec.proj_pool,
+                narrator,
+                exec.subagent_run_id,
+                &exec.kind,
+                exec.timeout_s,
+                &exec.provider,
+                &exec.model,
+            )
+            .await
+        }
+        Ok(Ok(o)) => {
             finalize_success(
-                &proj_pool,
-                narrator.as_deref(),
-                subagent_run_id,
-                &kind,
-                current_depth,
+                &exec.proj_pool,
+                narrator,
+                exec.subagent_run_id,
+                &exec.kind,
+                exec.current_depth,
                 &o,
             )
             .await
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             finalize_failure(
-                &proj_pool,
-                narrator.as_deref(),
-                subagent_run_id,
-                &kind,
+                &exec.proj_pool,
+                narrator,
+                exec.subagent_run_id,
+                &exec.kind,
                 &e,
-                &provider_resolved,
-                &model_resolved,
+                &exec.provider,
+                &exec.model,
             )
             .await
         }
-    };
-    // Fan-in (Fase D): il figlio si e' marcato TERMINALE nel finalize sopra. Se e'
-    // il ramo background e nessun altro figlio background del parent e' ancora
-    // attivo, accoda il parent nella coda META (il worker fan-in lo riprende).
-    maybe_enqueue_fanin_resume(
-        &ctx,
-        &proj_pool,
-        anchor,
-        fanin_parent_run_id,
-        session_id,
-        is_background,
-    )
-    .await;
-    out
+    }
 }
 
 /// Enqueue idempotente del parent nella coda fan-in META
@@ -3000,32 +3195,53 @@ async fn resolve_worker_model(
     // Ramo WORKER: se l'utente ha pinnato un provider sulla chat, prova a risolvere
     // il purpose RISTRETTO a quel provider (preferenza-forte tier-aware).
     if let Some(pinned) = session_pinned_provider(proj_pool, session_id).await {
-        match crate::internal_routing::resolve_purpose_model_db_pinned(db, purpose, Some(&pinned))
-            .await
-        {
-            crate::internal_routing::PurposeResolution::Resolved {
-                provider, model, ..
-            } => return (provider, model),
-            // NoCapableModel/NotFound col pin: il provider pinnato non offre un
-            // modello capable del tier (o e' in cooldown). FALLBACK senza pin
-            // (regola H fail-loud: il figlio non resta bloccato). WARN strutturato
-            // (regola M: la decisione e' sull'enum PurposeResolution, il testo e'
-            // solo display).
-            other => {
-                tracing::warn!(
-                    kind = %kind,
-                    purpose = %purpose,
-                    pinned = %pinned,
-                    resolution = ?other,
-                    "subagent_native: pin provider non risolvibile per il tier del purpose, \
-                     fallback senza pin"
-                );
-            }
+        if let Some(resolved) = resolve_pinned_worker_model(db, purpose, kind, &pinned).await {
+            return resolved;
         }
     }
 
     // Nessun pin (o pin degradato): risoluzione worker standard (parita' col
     // comportamento pre-pin).
+    resolve_default_worker_model(db, purpose, kind).await
+}
+
+/// Risoluzione del purpose RISTRETTA al provider pinnato dall'utente sulla chat.
+/// `None` = pin non risolvibile (il provider pinnato non offre un modello capable
+/// del tier, o e' in cooldown): il chiamante RIPIEGA sulla risoluzione senza pin
+/// (regola H fail-loud: il figlio non resta bloccato, il pin e' una preferenza
+/// forte non un hard filter). Il WARN e' strutturato (regola M: la decisione e'
+/// sull'enum `PurposeResolution`, il testo e' solo display).
+async fn resolve_pinned_worker_model(
+    db: &sqlx::PgPool,
+    purpose: &str,
+    kind: &str,
+    pinned: &str,
+) -> Option<(String, String)> {
+    match crate::internal_routing::resolve_purpose_model_db_pinned(db, purpose, Some(pinned)).await {
+        crate::internal_routing::PurposeResolution::Resolved {
+            provider, model, ..
+        } => Some((provider, model)),
+        other => {
+            tracing::warn!(
+                kind = %kind,
+                purpose = %purpose,
+                pinned = %pinned,
+                resolution = ?other,
+                "subagent_native: pin provider non risolvibile per il tier del purpose, \
+                 fallback senza pin"
+            );
+            None
+        }
+    }
+}
+
+/// Risoluzione worker standard del purpose (nessun vincolo di provider). Non
+/// risolto -> `("", "")`: nessun override, l'executor usa il routing di default.
+async fn resolve_default_worker_model(
+    db: &sqlx::PgPool,
+    purpose: &str,
+    kind: &str,
+) -> (String, String) {
     match crate::internal_routing::resolve_purpose_model_db(db, purpose).await {
         crate::internal_routing::PurposeResolution::Resolved {
             provider, model, ..
@@ -3299,21 +3515,35 @@ async fn finalize_success(
         "subagent_native: sub-run eseguito sul grafo nativo"
     );
     narrate_completed(narrator, sub_run_id, kind, status, &summary, o).await;
+    subagent_success_result(sub_run_id, kind, status, &summary, o, verdict)
+}
+
+/// tool_result del ramo OK: il main riceve SOLO questo summary compattato, non
+/// l'intera conversazione del figlio.
+///
+/// `outcome` porta il verdetto ESITO strutturato (regola M): il coordinatore legge
+/// success/verdict da li' invece di dedurre l'esito dalla prosa di `summary`.
+/// `provider`/`model` sono la provenienza EFFETTIVA dal grafo (post-eventuale
+/// failover), non il risolto a monte: il report di figura
+/// (`classify_council_figure_result`) la rilegge per mostrarla in UI.
+fn subagent_success_result(
+    sub_run_id: Uuid,
+    kind: &str,
+    status: &str,
+    summary: &str,
+    o: &NativeRunOutcome,
+    verdict: Value,
+) -> Value {
     let mut out = json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
         "status": status,
-        K_SUMMARY: compact_summary(&summary),
+        K_SUMMARY: compact_summary(summary),
         "iterations": o.iterations,
         "cost_usd": o.total_cost,
         "tokens": { "prompt": o.prompt_tokens, "completion": o.completion_tokens },
-        // Verdetto ESITO strutturato (regola M): il coordinatore legge
-        // success/verdict qui invece di dedurre l'esito dalla prosa di `summary`.
         "outcome": verdict,
     });
-    // Provenienza EFFETTIVA (regola M): provider/model realmente usati dal grafo
-    // (post-eventuale failover), non solo il risolto a monte. Letta dal report di
-    // figura (classify_council_figure_result) per mostrarla in UI.
     put_model_fields(
         &mut out,
         o.provider_used.as_deref().unwrap_or_default(),
@@ -3619,20 +3849,9 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
 /// su `nexus_graph_checkpoints`, ma la ripresa nativa qui ri-esegue il sub-run dal
 /// suo `run_id`: la stessa thread del grafo riprende dal checkpoint persistente).
 pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
-    let run_id_str = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            return "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
-                .to_string()
-        }
-    };
-    let run_id = match Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return format!(
-                "\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}"
-            )
-        }
+    let (run_id, run_id_str) = match parse_resume_run_id(input) {
+        Ok(v) => v,
+        Err(e) => return e,
     };
 
     // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run da riprendere
@@ -3660,16 +3879,8 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     }
     let kind: String = row.get("kind");
     let task: String = row.get("task_description");
-    let context_blob: String = row
-        .try_get::<Option<String>, _>("context_blob")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let expected: String = row
-        .try_get::<Option<String>, _>("expected_format")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let context_blob = optional_text(&row, "context_blob");
+    let expected = optional_text(&row, "expected_format");
 
     // Ripresa = ri-esecuzione del sub-run sul kind dato. Riusa lo stesso percorso
     // del dispatch (guard + grafo nativo): semantica onesta, niente notifica brain.
@@ -3679,6 +3890,36 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     // l'esito, non e' un dispatch background.
     let res = run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None, false).await;
     res.to_string()
+}
+
+/// `subagent_run_id` dell'input del resume, in forma tipizzata e testuale (il
+/// tool_result `noop` riporta la stringa originale). `Err` e' gia' il tool_result
+/// d'errore da restituire al chiamante.
+fn parse_resume_run_id(input: &Value) -> Result<(Uuid, String), String> {
+    let run_id_str = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Err(
+                "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
+                    .to_string(),
+            )
+        }
+    };
+    match Uuid::parse_str(&run_id_str) {
+        Ok(u) => Ok((u, run_id_str)),
+        Err(_) => Err(format!(
+            "\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}"
+        )),
+    }
+}
+
+/// Colonna testuale NULLABLE di una row: NULL, tipo inatteso o colonna assente ->
+/// stringa vuota.
+fn optional_text(row: &sqlx::postgres::PgRow, column: &str) -> String {
+    row.try_get::<Option<String>, _>(column)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
