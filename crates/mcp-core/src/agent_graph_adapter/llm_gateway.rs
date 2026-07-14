@@ -73,6 +73,32 @@ impl GatewayLlmAdapter {
             user_id,
         }
     }
+
+    /// Osservazione dei turni REALI (model_observation, ANELLO 5): un turno
+    /// degenere di una figura/sub-run deve contare nel catalog anche se il run
+    /// poi muore in timeout.
+    ///
+    /// Solo con provider pinnato: su una cascata multi-provider l'errore
+    /// aggregato non e' attribuibile al singolo modello, e attribuirlo lo stesso
+    /// sporcherebbe il catalog del modello sbagliato.
+    fn observe_pinned_turn_failure(&self, req: &LlmRequest, e: &anyhow::Error) {
+        if req.provider.trim().is_empty() {
+            return;
+        }
+        let cause = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())
+            .and_then(|h| h.details.as_ref())
+            .and_then(|d| d.get("primary_cause"))
+            .and_then(|c| c.as_str())
+            .map(str::to_owned);
+        crate::model_observation::observe_turn_failure(
+            self.db.clone(),
+            req.provider.clone(),
+            req.model.clone(),
+            cause,
+        );
+    }
 }
 
 /// Se la richiesta arriva con `model` vuoto, ritorna il purpose da risolvere via
@@ -164,28 +190,7 @@ impl LlmGateway for GatewayLlmAdapter {
         let resp = match self.gateway.complete(gw_req).await {
             Ok(r) => r,
             Err(e) => {
-                // Osservazione dei turni REALI (model_observation, ANELLO 5):
-                // un turno degenere di una figura/sub-run deve contare nel
-                // catalog anche se il run poi muore in timeout. Solo con
-                // provider pinnato: su una cascata multi-provider l'errore
-                // aggregato non e' attribuibile al singolo modello.
-                if !req.provider.trim().is_empty() {
-                    let cause = e
-                        .chain()
-                        .find_map(|c| {
-                            c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>()
-                        })
-                        .and_then(|h| h.details.as_ref())
-                        .and_then(|d| d.get("primary_cause"))
-                        .and_then(|c| c.as_str())
-                        .map(str::to_owned);
-                    crate::model_observation::observe_turn_failure(
-                        self.db.clone(),
-                        req.provider.clone(),
-                        req.model.clone(),
-                        cause,
-                    );
-                }
+                self.observe_pinned_turn_failure(&req, &e);
                 return Err(classify_gateway_error(&e));
             }
         };
