@@ -117,6 +117,7 @@ mod trace_store;
 mod ui_flags;
 mod vector_memory;
 mod verify_profile;
+mod verify_probe;
 mod wiki;
 
 use std::net::SocketAddr;

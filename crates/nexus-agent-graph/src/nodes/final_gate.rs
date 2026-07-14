@@ -78,7 +78,7 @@ use crate::routing::config::RoutingConfig;
 use crate::routing::signals;
 use crate::runtime::ports::{CriterionResult, CriterionSpec};
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, Message, MessageContent, StateDelta, StopReason};
+use crate::state::{AgentState, FinalGateVerdict, Message, MessageContent, StateDelta, StopReason};
 
 /// Pattern di errore di compilazione comuni (TypeScript, Rust, generici).
 /// Replica 1:1 `_BUILD_ERROR_PATTERNS` (`final_gate.py:276-282`). Il conteggio
@@ -934,6 +934,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 final_gate_cycle: Some(Some(0)),
                 stop_reason: Some(Some(StopReason::EndTurn)),
                 final_gate_passed: Some(Some(true)),
+                final_gate_verdict: Some(Some(FinalGateVerdict::Passed)),
                 // Esito ONESTO (regola M): i criteri soft (no_orphan/outputs_exist)
                 // sono passati, ma se il profilo di verifica dell'ambiente manca
                 // NESSUN comando di verifica reale e' stato eseguito. Lo segnaliamo
@@ -995,6 +996,13 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     final_gate_cycle: Some(Some(cycle)),
                     stop_reason: Some(Some(StopReason::ToolUse)),
                     pending_tool_uses: Some(Some(vec![])),
+                    // Il lavoro E' verificato: manca solo la firma. Senza questo
+                    // verdetto esplicito il `cycle = max_cycles` qui sopra veniva
+                    // letto a valle come "verifica fallita" e un run RIUSCITO
+                    // chiudeva FailedDiagnosed.
+                    final_gate_verdict: Some(Some(
+                        FinalGateVerdict::ObjectivePassedSignatureMissing,
+                    )),
                     ..Default::default()
                 }
                 .into_opaque());
@@ -1057,6 +1065,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     final_gate_cycle: Some(Some(0)),
                     stop_reason: Some(Some(StopReason::ToolUse)),
                     pending_tool_uses: Some(Some(vec![])),
+                    final_gate_verdict: Some(Some(FinalGateVerdict::EscalationHandoff)),
                     extra: Some(extra_out),
                     ..Default::default()
                 }
@@ -1082,6 +1091,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 final_gate_cycle: Some(Some(0)),
                 stop_reason: Some(Some(StopReason::EndTurn)),
                 final_gate_passed: Some(Some(false)),
+                final_gate_verdict: Some(Some(FinalGateVerdict::FailedFinal)),
                 ..Default::default()
             }
             .into_opaque());
@@ -1115,6 +1125,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             // pending_tool_uses azzerato a lista vuota (durata 1 turno):
             // Some(Some(vec![])) e' AZZERA, distinto da None (no-op).
             pending_tool_uses: Some(Some(vec![])),
+            // L'UNICO ramo in cui una ri-verifica e' davvero attesa: se il run
+            // muore prima di rientrare, "verifica fallita e non ripetuta" e' vero.
+            final_gate_verdict: Some(Some(FinalGateVerdict::FailedPendingCorrection)),
             ..Default::default()
         }
         .into_opaque())

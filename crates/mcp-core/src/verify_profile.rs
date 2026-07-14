@@ -65,6 +65,16 @@ pub struct VerifyProfileStep {
     /// step senza baseline -> ri-misura automatica al run successivo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_exit_code: Option<i64>,
+    /// Esito della PROVA DI EFFICACIA dello step (`verify_probe`): il comando
+    /// sa fallire? Misurato una tantum accanto alla baseline, MAI generato
+    /// dall'LLM. `None` = non ancora provato (ri-misura al run successivo).
+    ///
+    /// Serve perche' il flag `gate` qui sopra e' una DICHIARAZIONE del modello e
+    /// nessuno verificava che il comando fosse capace di bocciare qualcosa: uno
+    /// step `Blind` non e' una verifica e non deve contare come tale (l'esito
+    /// onesto e' `CompletedUnverified`, non un "completato" muto).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<crate::verify_probe::ProbeOutcome>,
 }
 
 /// Limiti di sicurezza dell'osservazione (bounded, non "intelligenza"):

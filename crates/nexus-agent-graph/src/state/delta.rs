@@ -676,6 +676,13 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub final_gate_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::final_gate_verdict`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub final_gate_verdict: Option<Option<crate::state::FinalGateVerdict>>,
     /// Vedi `AgentState::final_gate_passed`.
     #[serde(
         default,

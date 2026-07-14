@@ -116,7 +116,8 @@ use nexus_agent_graph::runtime::ports::{
 use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
-    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, LearnerConfig, LearnerNode, Message,
+    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict, LearnerConfig,
+    LearnerNode, Message,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
     UnderstandingNode, SupervisorMode,
@@ -435,18 +436,25 @@ pub struct NativeRunOutcome {
     /// successivo (es. provider esauriti che bruciano i turni fino al cap
     /// iterazioni, run a5db0985).
     ///
-    /// Derivazione (regola M, due segnali strutturati dello stato):
-    /// `final_gate_cycle > 0` AND `!plan_phase_active`.
-    /// - `final_gate_cycle > 0`: il gate azzera il ciclo a 0 su OGNI chiusura
-    ///   (ramo passed E ramo forced/cap), quindi solo il ramo di bocciatura
-    ///   intermedia lascia un ciclo > 0; un residuo a fine run implica che il
-    ///   giro di gate successivo non c'e' mai stato.
-    /// - `!plan_phase_active`: SOLO fuori dalla plan-phase un ciclo > 0 residuo
-    ///   equivale a "morto prima della ri-verifica". In plan-phase il gate e'
-    ///   raggiunto UNA volta da `route_after_todo_runner` e dopo la bocciatura
-    ///   il loop executor non vi rientra mai (`final_gate_eligible` esclude
-    ///   `plan_phase`), quindi un ciclo > 0 e' il normale esito di una
-    ///   chiusura LEGITTIMA e NON va declassato (falso positivo, review).
+    /// Derivazione (regola M): dal SEGNALE `AgentState::final_gate_verdict`
+    /// (`FailedPendingCorrection` = l'unico ramo con ri-verifica attesa), non
+    /// dal CONTATORE `final_gate_cycle`.
+    ///
+    /// Storia, perche' non si ripeta: qui c'era
+    /// `final_gate_cycle > 0 && !plan_phase_active`, giustificato con
+    /// "il gate azzera il ciclo a 0 su OGNI chiusura, quindi solo il ramo di
+    /// bocciatura intermedia lascia un ciclo > 0". L'enumerazione era FALSA: il
+    /// turno di GRAZIA lascia `cycle = max_cycles` proprio quando i criteri
+    /// oggettivi sono TUTTI passati -> un lavoro riuscito chiudeva
+    /// `FailedDiagnosed` con "Verifica automatica fallita e non ripetuta". Il
+    /// consumatore non puo' tenere aggiornata a mano la lista dei rami del
+    /// produttore: l'esito deve avere un campo proprio, e il `match` esaustivo
+    /// e' cio' che rende l'accoppiamento verificabile dal compilatore.
+    ///
+    /// `plan_phase_active` resta come discriminante SOLO dentro il ramo
+    /// `FailedPendingCorrection`: in plan-phase il gate e' one-shot
+    /// (`final_gate_eligible` la esclude), quindi nessuna ri-verifica era
+    /// prevista e la bocciatura non e' "pendente".
     ///
     /// Letto dal finalizzatore: mai `Completed` con una bocciatura pendente.
     pub final_gate_failed_pending: bool,
@@ -1923,14 +1931,52 @@ async fn build_native_engine(
                         );
                     }
                 }
+                // ── PROVA DI EFFICACIA degli step gate (regola H) ─────────────
+                // La baseline misura lo STATO dell'albero; questa misura il
+                // POTERE DISCRIMINANTE del comando: introduce una rottura NOTA
+                // in cio' che il comando dichiara di coprire e guarda se
+                // arrossisce. Senza, un gate che passa SEMPRE (es.
+                // `node --check a.js b.js`, che ignora gli argomenti oltre il
+                // primo) e' indistinguibile da un gate che passa perche' il
+                // codice e' sano — ed e' cosi' che il backend di Beaty-Book non
+                // e' mai stato verificato da nessun run. Qui e' l'unico posto
+                // che esegue i comandi gate PRIMA del lavoro (albero pulito,
+                // stesso runner della baseline: regola L). Una tantum: l'esito
+                // si persiste come la baseline.
+                let root_path = std::path::PathBuf::from(&root);
+                for s in steps
+                    .iter_mut()
+                    .filter(|s| s.gate && s.probe.is_none() && s.baseline_exit_code.is_some())
+                {
+                    let (cmd, wd, baseline) =
+                        (s.command.clone(), s.working_dir.clone(), s.baseline_exit_code);
+                    let outcome = crate::verify_probe::probe_step(&root_path, &cmd, baseline, || {
+                        criteria_adapter.measure_command_exit(&cmd, wd.as_deref())
+                    })
+                    .await;
+                    if outcome != crate::verify_probe::ProbeOutcome::NotProbed {
+                        s.probe = Some(outcome);
+                        measured = true;
+                    }
+                    tracing::info!(
+                        step = %s.step,
+                        probe = ?outcome,
+                        "verify_profile: prova di efficacia dello step gate"
+                    );
+                }
                 if measured {
                     crate::verify_profile::persist_steps(&db, pid, &steps).await;
                 }
             }
-            final_gate_cfg.verify_profile_missing = steps.is_empty();
             final_gate_cfg.verify_steps = steps
                 .into_iter()
-                .filter(|s| s.gate)
+                // Uno step PROVATO CIECO non e' una verifica, qualunque cosa
+                // dica il suo nome: escluderlo e' cio' che rende l'esito onesto.
+                // Se dopo l'esclusione non resta nessun comando, il gate lo
+                // dichiara (`verify_profile_missing` qui sotto) e il run chiude
+                // CompletedUnverified invece di spacciare per verificato un
+                // lavoro che nessuno ha controllato.
+                .filter(|s| s.gate && s.probe != Some(crate::verify_probe::ProbeOutcome::Blind))
                 .map(|s| nexus_agent_graph::nodes::final_gate::VerifyStepCmd {
                     step: s.step,
                     command: s.command,
@@ -1938,6 +1984,15 @@ async fn build_native_engine(
                     baseline_exit_code: s.baseline_exit_code,
                 })
                 .collect();
+            // Il segnale onesto e' "NESSUN comando di verifica verra' eseguito",
+            // quindi si misura sugli step GATE effettivi, dopo il filtro.
+            // Prima era `steps.is_empty()`, cioe' la PRESENZA del profilo, letta
+            // come ESITO ("verifica eseguita"): un profilo con tutti gli step
+            // `gate:false` -> `verify_profile_missing=false` con `verify_steps`
+            // VUOTO -> il gate dichiarava l'esito VERIFICATO senza aver eseguito
+            // un solo comando. Stessa classe di `final_gate_verdict`: un proxy di
+            // presenza/conteggio non e' un segnale di esito (regola M).
+            final_gate_cfg.verify_profile_missing = final_gate_cfg.verify_steps.is_empty();
         } else {
             // Sessione senza progetto/root (es. run di servizio): niente
             // catena, dichiarazione onesta come per il profilo mancante.
@@ -2804,11 +2859,29 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
-        // Bocciatura del gate rimasta pendente a fine run (dettaglio in
-        // NativeRunOutcome::final_gate_failed_pending). Gated su !plan_phase:
-        // in plan-phase il gate e' one-shot e un ciclo residuo e' legittimo.
-        final_gate_failed_pending: state.final_gate_cycle.unwrap_or(0) > 0
-            && !state.plan_phase_active.unwrap_or(false),
+        // Bocciatura del gate rimasta pendente a fine run: letta dal SEGNALE del
+        // gate (regola M), non piu' dedotta dal CONTATORE `final_gate_cycle`.
+        // Il `match` e' esaustivo di proposito: un ramo nuovo del gate non
+        // compila finche' non dichiara cosa significa qui.
+        final_gate_failed_pending: match state.final_gate_verdict {
+            // L'unico caso vero: bocciato con ri-verifica ATTESA e mai avvenuta.
+            // In plan-phase il gate e' one-shot (`final_gate_eligible` la esclude):
+            // nessuna ri-verifica era prevista, quindi non e' "pendente".
+            Some(FinalGateVerdict::FailedPendingCorrection) => {
+                !state.plan_phase_active.unwrap_or(false)
+            }
+            // Grazia: criteri oggettivi TUTTI passati, manca solo la firma. Era
+            // questo il falso positivo: lascia `cycle = max_cycles` e veniva
+            // letto come "verifica fallita e non ripetuta".
+            Some(FinalGateVerdict::ObjectivePassedSignatureMissing) => false,
+            // Verdetti espliciti: l'esito lo portano `final_gate_passed` /
+            // `final_gate_unverified`, non questo flag.
+            Some(FinalGateVerdict::Passed | FinalGateVerdict::FailedFinal) => false,
+            // Il run e' proseguito su un modello promosso: non e' un esito.
+            Some(FinalGateVerdict::EscalationHandoff) => false,
+            // Il gate non e' mai entrato: niente da dichiarare fallito.
+            None => false,
+        },
         pending_actions: state
             .extra
             .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
@@ -3526,6 +3599,83 @@ mod tests {
         assert!(out.resume_at.is_none());
     }
 
+    // ── L'esito non si deduce da un contatore (regola M) ─────────────────────
+    //
+    // Il turno di GRAZIA lascia `final_gate_cycle = max_cycles` PROPRIO perche'
+    // i criteri oggettivi sono tutti passati e manca solo la firma. Finche'
+    // l'esito era dedotto da `final_gate_cycle > 0 && !plan_phase_active`, quel
+    // residuo dichiarava "Verifica automatica fallita e non ripetuta" su un
+    // lavoro RIUSCITO (visibile nella Chat 17: completion_grace -> task complete
+    // ok -> failed_diagnosed).
+
+    /// IL test del difetto: grazia riuscita -> NON declassare.
+    /// Mutazione che lo rende rosso: ripristinare la derivazione dal contatore
+    /// (`final_gate_cycle.unwrap_or(0) > 0 && !plan_phase_active`) -> con
+    /// cycle=2 e plan_phase assente darebbe failed_pending=true.
+    #[test]
+    fn grazia_riuscita_non_e_una_verifica_fallita() {
+        let state = AgentState {
+            result: Some("Fatto".to_string()),
+            stop_reason: Some(StopReason::EndTurn),
+            // Cio' che scrive davvero il ramo di grazia: cycle == max_cycles.
+            final_gate_cycle: Some(2),
+            final_gate_verdict: Some(FinalGateVerdict::ObjectivePassedSignatureMissing),
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert!(
+            !out.final_gate_failed_pending,
+            "la grazia ha i criteri OGGETTIVI tutti passati: non e' una bocciatura"
+        );
+    }
+
+    /// Il vero positivo deve restare tale: bocciatura con ri-verifica attesa e
+    /// mai avvenuta -> l'esito "fallita e non ripetuta" e' onesto.
+    #[test]
+    fn bocciatura_con_correzione_mai_riverificata_resta_fallita() {
+        let state = AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            final_gate_cycle: Some(1),
+            final_gate_verdict: Some(FinalGateVerdict::FailedPendingCorrection),
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert!(
+            out.final_gate_failed_pending,
+            "questo e' il caso per cui il flag esiste: non va perso"
+        );
+    }
+
+    /// In plan-phase il gate e' one-shot: nessuna ri-verifica era prevista,
+    /// quindi la bocciatura non e' "pendente" (nessuna regressione sul caso
+    /// gia' coperto prima dall'eccezione ad-hoc).
+    #[test]
+    fn bocciatura_in_plan_phase_non_e_pendente() {
+        let state = AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            final_gate_cycle: Some(1),
+            final_gate_verdict: Some(FinalGateVerdict::FailedPendingCorrection),
+            plan_phase_active: Some(true),
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert!(!out.final_gate_failed_pending);
+    }
+
+    /// Un ciclo residuo SENZA verdetto (gate mai entrato) non inventa un
+    /// fallimento: e' il contatore a non avere piu' voce in capitolo.
+    #[test]
+    fn contatore_residuo_senza_verdetto_non_declassa() {
+        let state = AgentState {
+            stop_reason: Some(StopReason::EndTurn),
+            final_gate_cycle: Some(2),
+            final_gate_verdict: None,
+            ..Default::default()
+        };
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert!(!out.final_gate_failed_pending);
+    }
+
     #[test]
     fn map_outcome_interrupted_porta_resume_at() {
         let state = AgentState::default();
@@ -3545,9 +3695,12 @@ mod tests {
     /// non morire nello stato del grafo.
     #[test]
     fn map_outcome_final_gate_bocciato_in_sospeso() {
-        // Fuori dalla plan-phase (a5db0985): ciclo residuo > 0 -> pendente.
+        // Fuori dalla plan-phase (a5db0985): bocciatura con ri-verifica attesa e
+        // mai avvenuta -> pendente. Il caso e' lo stesso di prima; cambia il
+        // segnale che lo porta: il VERDETTO del ramo, non il ciclo residuo.
         let state = AgentState {
             final_gate_cycle: Some(1),
+            final_gate_verdict: Some(FinalGateVerdict::FailedPendingCorrection),
             ..Default::default()
         };
         assert!(map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending);
@@ -3558,6 +3711,7 @@ mod tests {
         let state = AgentState {
             final_gate_cycle: Some(0),
             final_gate_passed: Some(true),
+            final_gate_verdict: Some(FinalGateVerdict::Passed),
             ..Default::default()
         };
         assert!(!map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending);
@@ -3573,16 +3727,18 @@ mod tests {
     fn map_outcome_final_gate_ciclo_residuo_in_plan_phase_non_pendente() {
         let state = AgentState {
             final_gate_cycle: Some(1),
+            final_gate_verdict: Some(FinalGateVerdict::FailedPendingCorrection),
             plan_phase_active: Some(true),
             ..Default::default()
         };
         assert!(
             !map_outcome(StepOutcome::Completed(state)).final_gate_failed_pending,
-            "in plan-phase un ciclo residuo e' legittimo, non una bocciatura pendente"
+            "in plan-phase il gate e' one-shot: nessuna ri-verifica era prevista"
         );
-        // Contro-prova: stesso ciclo residuo, ma plan_phase disattiva -> pendente.
+        // Contro-prova: stessa bocciatura, ma plan_phase disattiva -> pendente.
         let state = AgentState {
             final_gate_cycle: Some(1),
+            final_gate_verdict: Some(FinalGateVerdict::FailedPendingCorrection),
             plan_phase_active: Some(false),
             ..Default::default()
         };
