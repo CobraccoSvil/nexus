@@ -1677,6 +1677,101 @@ enum RunMode {
 /// `RoutingConfig` e la `PlannerConfig` DB-driven, e assembla il
 /// [`AgentGraphEngine`].
 ///
+/// Baseline PRE-LAVORO degli step gate (delta-aware sui criteri): per gli step
+/// gate senza baseline misura l'exit code sull'albero corrente (= stato
+/// pre-lavoro di questo run). Il final_gate non bocciera' un criterio che
+/// fallisce IDENTICO alla baseline (fallimento pre-esistente dell'ambiente, es.
+/// `npx eslint` exit 2 per config assente — incidente run 695794af col build
+/// verde). Un comando non misurabile resta senza baseline -> fail-closed come
+/// prima. Ritorna true se ha misurato qualcosa (=> profilo da persistere).
+async fn measure_gate_baselines(
+    steps: &mut [crate::verify_profile::VerifyProfileStep],
+    criteria_adapter: &FinalGateCriteriaRunnerAdapter,
+) -> bool {
+    let mut measured = false;
+    for s in steps
+        .iter_mut()
+        .filter(|s| s.gate && s.baseline_exit_code.is_none())
+    {
+        if let Some(exit) = criteria_adapter
+            .measure_command_exit(&s.command, s.working_dir.as_deref())
+            .await
+        {
+            s.baseline_exit_code = Some(exit);
+            measured = true;
+            tracing::info!(
+                step = %s.step,
+                baseline_exit = exit,
+                "verify_profile: baseline pre-lavoro misurata per lo step gate"
+            );
+        }
+    }
+    measured
+}
+
+/// Prova di efficacia degli step gate (regola H): la baseline misura lo STATO
+/// dell'albero, questa misura il POTERE DISCRIMINANTE del comando — introduce
+/// una rottura NOTA in cio' che il comando dichiara di coprire e guarda se
+/// arrossisce. Senza, un gate che passa SEMPRE (es. `node --check a.js b.js`,
+/// che ignora gli argomenti oltre il primo) e' indistinguibile da un gate che
+/// passa perche' il codice e' sano — ed e' cosi' che il backend di Beaty-Book
+/// non e' mai stato verificato da nessun run. Ritorna true se ha misurato
+/// qualcosa (=> profilo da persistere).
+async fn probe_gate_steps(
+    root: &str,
+    steps: &mut [crate::verify_profile::VerifyProfileStep],
+    criteria_adapter: &FinalGateCriteriaRunnerAdapter,
+) -> bool {
+    let root_path = std::path::PathBuf::from(root);
+    let mut measured = false;
+    for s in steps
+        .iter_mut()
+        .filter(|s| s.gate && s.probe.is_none() && s.baseline_exit_code.is_some())
+    {
+        let (cmd, wd, baseline) = (
+            s.command.clone(),
+            s.working_dir.clone(),
+            s.baseline_exit_code,
+        );
+        let outcome = crate::verify_probe::probe_step(&root_path, &cmd, baseline, || {
+            criteria_adapter.measure_command_exit(&cmd, wd.as_deref())
+        })
+        .await;
+        if outcome != crate::verify_probe::ProbeOutcome::NotProbed {
+            s.probe = Some(outcome);
+            measured = true;
+        }
+        tracing::info!(
+            step = %s.step,
+            probe = ?outcome,
+            "verify_profile: prova di efficacia dello step gate"
+        );
+    }
+    measured
+}
+
+/// Misura gli step gate del profilo di verifica PRIMA che l'executor tocchi i
+/// file, e persiste il profilo solo se qualcosa e' cambiato. Da chiamare solo
+/// nel primario (in shadow niente inferenza: zero side-effect e zero costo).
+/// Entrambe le misure passano dal PUNTO UNICO del runner criteri (regola L/M:
+/// exit code strutturato), e questo e' l'unico posto che esegue i comandi gate
+/// ad albero pulito.
+async fn measure_gate_steps(
+    meta_db: &PgPool,
+    project_id: Uuid,
+    root: &str,
+    steps: &mut [crate::verify_profile::VerifyProfileStep],
+    criteria_adapter: &FinalGateCriteriaRunnerAdapter,
+) {
+    // `|` e non `||`: la seconda misura va eseguita comunque, non e' un
+    // cortocircuito.
+    let measured = measure_gate_baselines(steps, criteria_adapter).await
+        | probe_gate_steps(root, steps, criteria_adapter).await;
+    if measured {
+        crate::verify_profile::persist_steps(meta_db, project_id, steps).await;
+    }
+}
+
 /// Il `role` decide le sole tre porte che cambiano fra primario e shadow (regola
 /// L: un solo punto): `tools` (Real vs Replay), `emit` (SSE vs no-op),
 /// `checkpointer` (Postgres vs in-memory). Tutto il resto (nodi, config DB-driven,
@@ -1901,72 +1996,8 @@ async fn build_native_engine(
                 )
                 .await
             };
-            // ── Baseline PRE-LAVORO degli step gate (delta-aware sui criteri) ──
-            // SOLO nel primario e SOLO qui, PRIMA che l'executor tocchi file:
-            // per gli step gate senza baseline si misura l'exit code sull'albero
-            // corrente (= stato pre-lavoro di questo run) e lo si persiste nel
-            // profilo (backfill lazy, una tantum finche' il profilo non viene
-            // re-inferito). Il final_gate non bocciera' un criterio che fallisce
-            // IDENTICO alla baseline (fallimento pre-esistente dell'ambiente,
-            // es. `npx eslint` exit 2 per config assente — incidente run
-            // 695794af col build verde). Misura via il PUNTO UNICO del runner
-            // criteri (regola L/M: exit code strutturato). Un comando non
-            // misurabile resta senza baseline -> fail-closed come prima.
             if !role.is_shadow() {
-                let mut measured = false;
-                for s in steps
-                    .iter_mut()
-                    .filter(|s| s.gate && s.baseline_exit_code.is_none())
-                {
-                    if let Some(exit) = criteria_adapter
-                        .measure_command_exit(&s.command, s.working_dir.as_deref())
-                        .await
-                    {
-                        s.baseline_exit_code = Some(exit);
-                        measured = true;
-                        tracing::info!(
-                            step = %s.step,
-                            baseline_exit = exit,
-                            "verify_profile: baseline pre-lavoro misurata per lo step gate"
-                        );
-                    }
-                }
-                // ── PROVA DI EFFICACIA degli step gate (regola H) ─────────────
-                // La baseline misura lo STATO dell'albero; questa misura il
-                // POTERE DISCRIMINANTE del comando: introduce una rottura NOTA
-                // in cio' che il comando dichiara di coprire e guarda se
-                // arrossisce. Senza, un gate che passa SEMPRE (es.
-                // `node --check a.js b.js`, che ignora gli argomenti oltre il
-                // primo) e' indistinguibile da un gate che passa perche' il
-                // codice e' sano — ed e' cosi' che il backend di Beaty-Book non
-                // e' mai stato verificato da nessun run. Qui e' l'unico posto
-                // che esegue i comandi gate PRIMA del lavoro (albero pulito,
-                // stesso runner della baseline: regola L). Una tantum: l'esito
-                // si persiste come la baseline.
-                let root_path = std::path::PathBuf::from(&root);
-                for s in steps
-                    .iter_mut()
-                    .filter(|s| s.gate && s.probe.is_none() && s.baseline_exit_code.is_some())
-                {
-                    let (cmd, wd, baseline) =
-                        (s.command.clone(), s.working_dir.clone(), s.baseline_exit_code);
-                    let outcome = crate::verify_probe::probe_step(&root_path, &cmd, baseline, || {
-                        criteria_adapter.measure_command_exit(&cmd, wd.as_deref())
-                    })
-                    .await;
-                    if outcome != crate::verify_probe::ProbeOutcome::NotProbed {
-                        s.probe = Some(outcome);
-                        measured = true;
-                    }
-                    tracing::info!(
-                        step = %s.step,
-                        probe = ?outcome,
-                        "verify_profile: prova di efficacia dello step gate"
-                    );
-                }
-                if measured {
-                    crate::verify_profile::persist_steps(&db, pid, &steps).await;
-                }
+                measure_gate_steps(&db, pid, &root, &mut steps, &criteria_adapter).await;
             }
             final_gate_cfg.verify_steps = steps
                 .into_iter()
