@@ -5,7 +5,8 @@
 //!
 //! Legge configurazione da variabili d'ambiente NEXUS_*:
 //! - `NEXUS_HTTP_TIMEOUT_SECS` (default 30)
-//! - `NEXUS_HTTP_POOL_MAX` (default 20 idle per host)
+//! - `NEXUS_HTTP_POOL_MAX` (default 0 = nessun socket idle riusato; robusto alle
+//!   connessioni morte post-sleep. Impostare > 0 per riattivare il keep-alive)
 //! - `NEXUS_HTTP_POOL_IDLE_SECS` (default 90)
 //! - `NEXUS_PROXY` — proxy applicativo (es. http://localhost:8002), non modifica il sistema
 
@@ -14,7 +15,16 @@ use reqwest::{Client, ClientBuilder, Proxy};
 use tracing::{debug, warn};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_POOL_MAX: usize = 20;
+// Default 0 = nessun socket idle trattenuto nel pool (resilienza connessioni morte,
+// regola H). Con un pool idle > 0 i socket keep-alive che muoiono quando la macchina
+// va in sleep (o per timeout NAT / blip di rete) vengono RIUSATI al risveglio ->
+// "error sending request" finche' il pool non si rinnova. Con 0 ogni chiamata usa una
+// connessione fresca: l'overhead di handshake (~100-300ms) e' trascurabile per i
+// client backend Nexus (github, rag, sync, deep_review) e la robustezza vale piu' del
+// micro keep-alive. Chi vuole il keep-alive in produzione lo riattiva via
+// NEXUS_HTTP_POOL_MAX o init_global_config (regola G). Gemello dei client provider
+// (nexus-gateway bootstrap, mcp-core nexus_gateway).
+const DEFAULT_POOL_MAX: usize = 0;
 const DEFAULT_POOL_IDLE_SECS: u64 = 90;
 const USER_AGENT: &str = concat!("nexus-backend/", env!("CARGO_PKG_VERSION"));
 

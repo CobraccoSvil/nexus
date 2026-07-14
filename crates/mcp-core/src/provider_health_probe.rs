@@ -438,6 +438,27 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     if let Err(e) = row_result {
         tracing::warn!("provider_health_probe: persistenza fallita per {provider}: {e}");
     }
+
+    // Su probe SANO azzera lo snapshot dell'ultimo errore in nexus_provider_health.
+    // Senza questo `last_error` resta congelato all'ultimo fallimento (anche solo
+    // transitorio, es. connessione morta post-sleep) e il banner mostra il provider
+    // "down" pur essendo tornato sano: la scrittura di last_error (gateway cooldown.rs)
+    // avviene solo su ERRORE, mai un azzeramento su successo. `billing_cooldown_until`
+    // NON viene toccato (gestito dal recovery billing). `AND last_error IS NOT NULL`
+    // evita UPDATE inutili quando non c'e' nulla da azzerare.
+    if healthy {
+        let cleared = sqlx::query(
+            r#"UPDATE nexus_provider_health
+               SET last_error = NULL, last_error_at = NULL, last_error_source = NULL, updated_at = now()
+               WHERE provider = $1 AND last_error IS NOT NULL"#,
+        )
+        .bind(provider)
+        .execute(db)
+        .await;
+        if let Err(e) = cleared {
+            tracing::warn!("provider_health_probe: azzeramento last_error fallito per {provider}: {e}");
+        }
+    }
 }
 
 /// Esito sintetico di un probe attivo, usato dalla logica probe-then-reenable
