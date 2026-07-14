@@ -37,6 +37,22 @@ const GATEWAY_HTTP_TIMEOUT_SECS: u64 = 60;
 /// proprio timeout HTTP >= del poll-loop (regola H: il client non stacca prima).
 const VIDEO_POLL_TIMEOUT_SETTING: &str = "media.video.poll_timeout_s";
 
+/// Client HTTP verso il gateway locale: PUNTO UNICO di trasporto del crate
+/// (regola L). Delega la configurazione a `nexus-http` (keepalive, niente
+/// socket idle riusati, connect_timeout): prima ogni call site costruiva un
+/// `reqwest::Client` NUDO — senza keepalive ne' connect_timeout — cioe' un
+/// client di trasporto fuori dalla config di resilienza condivisa
+/// (incidente 2026-07-14: chiamate al gateway morte con "error sending
+/// request" opaco). Il timeout e' l'unico parametro per-uso.
+fn gateway_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    let config = nexus_http::NexusHttpConfig {
+        timeout_secs,
+        ..nexus_http::NexusHttpConfig::from_env()
+    };
+    nexus_http::try_build_client_with_config(&config)
+        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))
+}
+
 /// Timeout del poll-loop video usato SOLO se il setting e' illeggibile dal DB
 /// (fallback graceful documentato, regola G/H). Allineato al default '300' della
 /// mig 0482.
@@ -136,10 +152,7 @@ pub async fn gateway_vision_complete(
         },
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+    let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
 
     let resp = client
         .post(format!("{base_url}/v1/complete"))
@@ -278,10 +291,7 @@ pub async fn gateway_image_generate(
         },
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+    let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
 
     let resp = client
         .post(format!("{base_url}/v1/images/generations"))
@@ -423,10 +433,7 @@ pub async fn gateway_generate_video(
     // prima che il video sia pronto.
     let http_timeout =
         Duration::from_secs(poll_timeout.saturating_add(VIDEO_HTTP_TIMEOUT_MARGIN_SECS));
-    let client = reqwest::Client::builder()
-        .timeout(http_timeout)
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+    let client = gateway_http_client(http_timeout.as_secs())?;
 
     let resp = client
         .post(format!("{base_url}/v1/videos"))
@@ -570,10 +577,7 @@ pub async fn gateway_transcribe_audio(
         },
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+    let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
 
     let resp = client
         .post(format!("{base_url}/v1/audio/transcriptions"))
@@ -700,10 +704,7 @@ pub async fn gateway_text_to_speech(
         },
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))?;
+    let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
 
     let resp = client
         .post(format!("{base_url}/v1/audio/speech"))
@@ -791,10 +792,7 @@ impl GwBatchStatus {
 /// Costruisce il client HTTP del gateway con il timeout batch (riuso del punto
 /// unico di trasporto del crate, regola L).
 fn batch_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(GATEWAY_HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP gateway: {e}"))
+    gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)
 }
 
 /// Sottomette un batch al gateway (`POST /v1/batch`) pinnando provider+modello
