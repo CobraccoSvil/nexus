@@ -66,6 +66,22 @@ pub struct QuorumTally {
     pub any_high_severity_veto: bool,
 }
 
+/// Soglia EFFETTIVA di voti validi per un panel di cui si conosce il roster
+/// (regola L: unica sede del calcolo del quorum relativo). `convened = Some(n)`
+/// quando il chiamante SA quante figure sono state convocate al voto: la soglia
+/// diventa `max(min_valid, ceil(n * quorum_pct / 100))`, cosi' le assenze
+/// (timeout/errore) pesano nel denominatore invece di sparire dal conteggio.
+/// `convened = None` quando il roster non e' noto (batch generico dove le figure
+/// si riconoscono solo dal voto dichiarato): resta la sola soglia assoluta.
+/// `quorum_pct` oltre 100 viene clampato (percentuale, non moltiplicatore).
+pub fn required_valid(min_valid: usize, convened: Option<usize>, quorum_pct: u8) -> usize {
+    let pct = usize::from(quorum_pct.min(100));
+    let from_roster = convened
+        .map(|n| n.saturating_mul(pct).div_ceil(100))
+        .unwrap_or(0);
+    min_valid.max(from_roster)
+}
+
 /// Classifica l'esito GENERICO del panel dal conteggio e dalla policy (regola L:
 /// unica sede della precedenza; l'ordine dei rami e' significativo — soglia ->
 /// veto -> condizionale -> approve).
@@ -149,5 +165,31 @@ mod tests {
             classify_panel(&tally(2, 0, 0, false), &p),
             PanelClass::Approve
         );
+    }
+
+    #[test]
+    fn required_valid_quorum_relativo_ceil() {
+        // 5 convocate al 50% -> ceil(2.5) = 3, non 2 (floor mascherava l'assenza).
+        assert_eq!(required_valid(1, Some(5), 50), 3);
+        assert_eq!(required_valid(1, Some(6), 50), 3);
+        assert_eq!(required_valid(1, Some(1), 50), 1);
+    }
+
+    #[test]
+    fn required_valid_min_assoluto_domina() {
+        // La soglia assoluta resta un pavimento: quorum relativo piu' basso non
+        // la abbassa.
+        assert_eq!(required_valid(4, Some(5), 50), 4);
+    }
+
+    #[test]
+    fn required_valid_senza_roster_resta_assoluto() {
+        // Roster ignoto (batch generico): semantica storica, sola soglia assoluta.
+        assert_eq!(required_valid(2, None, 50), 2);
+    }
+
+    #[test]
+    fn required_valid_clampa_pct_oltre_100() {
+        assert_eq!(required_valid(1, Some(4), 250), 4);
     }
 }

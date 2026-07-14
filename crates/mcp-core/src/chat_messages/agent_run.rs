@@ -5444,6 +5444,9 @@ async fn maybe_convene_council(
     tracing::info!(
         session_id = %session_id,
         verdict = %synthesis.verdict.as_str(),
+        pareri_validi = synthesis.valid,
+        figure_convocate = synthesis.convened,
+        quorum_minimo = synthesis.required_valid,
         requisiti = synthesis.requirements.len(),
         rischi = synthesis.risks.len(),
         "consiglio a monte: sintesi composta, iniezione nel primo messaggio"
@@ -5809,6 +5812,9 @@ async fn emit_council_of_competencies_meta_step(
                 "figure_count": figure_count,
                 "figure_reports": figure_reports_json,
                 "advisory_verdict": synthesis.verdict.as_str(),
+                "advisory_valid": synthesis.valid,
+                "advisory_convened": synthesis.convened,
+                "advisory_required_valid": synthesis.required_valid,
                 "requirements_count": synthesis.requirements.len(),
                 "risks_count": synthesis.risks.len(),
             }),

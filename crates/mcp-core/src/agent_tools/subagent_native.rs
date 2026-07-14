@@ -52,7 +52,9 @@ use uuid::Uuid;
 
 use super::AgentToolContext;
 use crate::native_engine::{verdict_keys, NativeDeps, NativeRunInput, NativeRunOutcome};
-use nexus_agent_graph::decisions::{AdvisoryPolicy, AdvisorySynthesis, QuorumPolicy};
+use nexus_agent_graph::decisions::{
+    AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster, AdvisorySynthesis, QuorumPolicy,
+};
 
 /// Marker d'errore (stesso contratto di `subagent.rs`: prefisso U+274C ->
 /// `tool_result_is_error` deriva `is_error=true`).
@@ -573,9 +575,13 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // strutturati `outcome.advisory` — mai dalla prosa. Simmetrico al panel di
     // review; il coordinatore (run padre) legge `advisory_synthesis` per costruire
     // il piano rispettando i requisiti e fermandosi sui veti (verdict=block).
+    // Roster SelfDeclared: in un batch misto le figure advisory si riconoscono
+    // solo dal voto dichiarato, il numero di convocate non e' noto (a differenza
+    // del consiglio a monte e del panel multi-provider, che dichiarano il roster).
     if let Some(synthesis) = nexus_agent_graph::decisions::compose_advisory_synthesis(
         &outcomes,
         &read_advisory_policy(ctx).await,
+        AdvisoryRoster::SelfDeclared,
     ) {
         out["advisory_synthesis"] = synthesis.to_value();
     }
@@ -1111,6 +1117,7 @@ pub(crate) async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPoli
     let rows = sqlx::query(
         "SELECT key, value FROM settings WHERE key IN (
             'orchestrator.council_advisory_min_valid',
+            'orchestrator.council_advisory_quorum_pct',
             'orchestrator.council_advisory_block_on_high_severity'
         )",
     )
@@ -1125,6 +1132,11 @@ pub(crate) async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPoli
             "orchestrator.council_advisory_min_valid" => {
                 if let Ok(n) = v.trim().parse::<usize>() {
                     policy.min_valid_advisories = n.max(1);
+                }
+            }
+            "orchestrator.council_advisory_quorum_pct" => {
+                if let Ok(n) = v.trim().parse::<u8>() {
+                    policy.quorum_pct = n.min(100);
                 }
             }
             "orchestrator.council_advisory_block_on_high_severity" => {
@@ -1709,7 +1721,9 @@ pub(crate) async fn convene_council(
     });
     let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
     let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
-    let synthesis = compose_council_synthesis(&raw_results, policy);
+    // Roster esplicito = figure CONVOCATE (regola M): una figura in timeout/errore
+    // e' un'astensione che pesa nel quorum, non una riga che sparisce dal conteggio.
+    let synthesis = compose_council_synthesis(&raw_results, policy, kinds.len());
     CouncilConvokeResult {
         figure_reports,
         synthesis,
@@ -1852,7 +1866,7 @@ pub(crate) async fn convene_multi_provider_panel(
         .iter()
         .map(|r| classify_council_figure_result(&cfg.kind, r))
         .collect();
-    compose_multi_provider_synthesis(&results, policy).map(|synthesis| {
+    compose_multi_provider_synthesis(&results, policy, provider_count).map(|synthesis| {
         MultiProviderPanelOutcome::Active {
             synthesis,
             provider_count,
@@ -1864,32 +1878,69 @@ pub(crate) async fn convene_multi_provider_panel(
 
 /// Parte PURA (regola L, testabile senza DB) di [`convene_council`]: estrae i blocchi
 /// `outcome` dai tool_result delle figure (regola M) e delega al punto unico PURO
-/// `compose_advisory_synthesis`. Separata cosi' il mapping result->outcome->synthesis
-/// e' coperto da unit test con result mock.
+/// `compose_advisory_synthesis`. `convened` = figure CONVOCATE (denominatore del
+/// quorum). Separata cosi' il mapping result->outcome->synthesis e' coperto da unit
+/// test con result mock.
 fn compose_council_synthesis(
     results: &[Value],
     policy: &AdvisoryPolicy,
+    convened: usize,
 ) -> Option<AdvisorySynthesis> {
     let outcomes: Vec<Value> = results
         .iter()
         .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
         .collect();
-    nexus_agent_graph::decisions::compose_advisory_synthesis(outcomes.as_slice(), policy)
+    nexus_agent_graph::decisions::compose_advisory_synthesis(
+        outcomes.as_slice(),
+        policy,
+        AdvisoryRoster::Convened(convened),
+    )
 }
 
 fn compose_multi_provider_synthesis(
     results: &[Value],
     policy: &AdvisoryPolicy,
+    convened: usize,
 ) -> Option<AdvisorySynthesis> {
-    compose_council_synthesis(results, policy)
+    compose_council_synthesis(results, policy, convened)
+}
+
+/// Coda del blocco sintesi, decisa dal VERDETTO con match ESAUSTIVO (regola M):
+/// la frase "parere convergente" e' lecita solo quando il panel ha davvero
+/// deliberato; sotto quorum il testo DICHIARA la parzialita'. Un verdetto nuovo
+/// non compila finche' qualcuno non ne dichiara la semantica testuale (stesso
+/// pattern di `FinalGateVerdict`).
+fn synthesis_closing_note(s: &AdvisorySynthesis, panel_label: &str) -> String {
+    match s.verdict {
+        AdvisoryPanelVerdict::Proceed
+        | AdvisoryPanelVerdict::ProceedWithChanges
+        | AdvisoryPanelVerdict::Block => format!(
+            "(Questo e' il parere convergente {panel_label}: rispetta i requisiti \
+             obbligatori e fermati sui rischi bloccanti.)\n"
+        ),
+        AdvisoryPanelVerdict::Inconclusive => format!(
+            "(ATTENZIONE: quorum NON raggiunto — {} pareri validi su {} convocate, \
+             minimo richiesto {}. Il panel NON ha deliberato: i punti sopra sono \
+             pareri PARZIALI delle sole figure che hanno risposto, non un consenso. \
+             Non trattarli come approvazione.)\n",
+            s.valid, s.convened, s.required_valid
+        ),
+    }
 }
 
 /// Rende la sintesi del consiglio in un blocco testuale `<consiglio_sintesi>` da
 /// anteporre al primo messaggio del run (il modello legge requisiti/rischi/verdetto
 /// come vincoli operativi). Deriva dai campi STRUTTURATI (regola M), non dalla prosa.
+/// Dichiara SEMPRE la base dei voti (validi/convocate/quorum): un verdetto senza
+/// base dichiarata e' il proxy che ha prodotto l'incidente "proceed con 1 parere
+/// su 5".
 pub(crate) fn render_council_synthesis(s: &AdvisorySynthesis) -> String {
     let mut out = String::from("<consiglio_sintesi>\n");
     out.push_str(&format!("Verdetto del consiglio: {}\n", s.verdict.as_str()));
+    out.push_str(&format!(
+        "Pareri validi: {} su {} figure convocate (quorum minimo: {})\n",
+        s.valid, s.convened, s.required_valid
+    ));
     if !s.requirements.is_empty() {
         out.push_str("Requisiti obbligatori:\n");
         for r in &s.requirements {
@@ -1913,10 +1964,7 @@ pub(crate) fn render_council_synthesis(s: &AdvisorySynthesis) -> String {
             out.push_str(&format!("- {r}\n"));
         }
     }
-    out.push_str(
-        "(Questo e' il parere convergente del consiglio di figure: rispetta i \
-         requisiti obbligatori e fermati sui rischi bloccanti.)\n",
-    );
+    out.push_str(&synthesis_closing_note(s, "del consiglio di figure"));
     out.push_str("</consiglio_sintesi>");
     out
 }
@@ -1928,8 +1976,8 @@ pub(crate) fn render_multi_provider_synthesis(s: &AdvisorySynthesis) -> String {
         s.verdict.as_str()
     ));
     out.push_str(&format!(
-        "Pareri validi: {}/{}; dissenso: {}\n",
-        s.valid, s.total_advisories, s.dissent
+        "Pareri validi: {} su {} provider convocati (quorum minimo: {}); dissenso: {}\n",
+        s.valid, s.convened, s.required_valid, s.dissent
     ));
     if !s.requirements.is_empty() {
         out.push_str("Requisiti obbligatori convergenti:\n");
@@ -1954,10 +2002,7 @@ pub(crate) fn render_multi_provider_synthesis(s: &AdvisorySynthesis) -> String {
             out.push_str(&format!("- {r}\n"));
         }
     }
-    out.push_str(
-        "(Questo e' il parere convergente di modelli/provider diversi: incorpora \
-         i requisiti nel piano e tratta i veti come vincoli bloccanti.)\n",
-    );
+    out.push_str(&synthesis_closing_note(s, "di modelli/provider diversi"));
     out.push_str("</multi_provider_sintesi>");
     out
 }
@@ -5228,16 +5273,26 @@ mod tests {
         })
     }
 
+    /// Result mock di una figura CONVOCATA ma senza esito valido (timeout/errore
+    /// provider): astensione che deve pesare nel denominatore del quorum.
+    fn mock_failed_figure_result() -> Value {
+        json!({
+            "status": "completed",
+            "outcome": { "success": false, "advisory": Value::Null },
+        })
+    }
+
     #[test]
     fn compose_council_synthesis_da_result_mock() {
         let results = vec![
             mock_figure_result("proceed_with_changes", "validare input", None),
             mock_figure_result("proceed", "logging strutturato", None),
         ];
-        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default())
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default(), 2)
             .expect("almeno un advisory -> sintesi presente");
         assert_eq!(synth.verdict.as_str(), "proceed_with_changes");
         assert_eq!(synth.valid, 2);
+        assert_eq!((synth.convened, synth.required_valid), (2, 1));
         assert!(synth.requirements.iter().any(|r| r == "validare input"));
         assert!(synth
             .requirements
@@ -5251,7 +5306,7 @@ mod tests {
             mock_figure_result("proceed", "ok", None),
             mock_figure_result("block", "non esporre il segreto", Some("alta")),
         ];
-        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default())
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default(), 2)
             .expect("sintesi presente");
         // Veto avversario attivo di default: un block con severity alta vince.
         assert_eq!(synth.verdict.as_str(), "block");
@@ -5262,7 +5317,27 @@ mod tests {
     fn compose_council_synthesis_none_senza_advisory() {
         // Result senza outcome.advisory (worker ordinario) -> non e' un panel.
         let results = vec![json!({ "status": "completed", "outcome": { "success": true } })];
-        assert!(compose_council_synthesis(&results, &AdvisoryPolicy::default()).is_none());
+        assert!(compose_council_synthesis(&results, &AdvisoryPolicy::default(), 1).is_none());
+    }
+
+    #[test]
+    fn compose_council_synthesis_sotto_quorum_inconclusive() {
+        // Il caso di campo (incidente 2026-07-14): 5 convocate, 4 senza esito,
+        // 1 proceed. Quorum 50% di 5 = 3 -> Inconclusive, mai proceed.
+        let results = vec![
+            mock_figure_result("proceed", "ok", None),
+            mock_failed_figure_result(),
+            mock_failed_figure_result(),
+            mock_failed_figure_result(),
+            mock_failed_figure_result(),
+        ];
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default(), 5)
+            .expect("un advisory presente -> sintesi presente");
+        assert_eq!(synth.verdict.as_str(), "inconclusive");
+        assert_eq!(
+            (synth.valid, synth.convened, synth.required_valid),
+            (1, 5, 3)
+        );
     }
 
     #[test]
@@ -5272,7 +5347,7 @@ mod tests {
             "cifrare i dati a riposo",
             Some("media"),
         )];
-        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default()).unwrap();
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default(), 1).unwrap();
         let block = render_council_synthesis(&synth);
         assert!(block.starts_with("<consiglio_sintesi>"));
         assert!(block.ends_with("</consiglio_sintesi>"));
@@ -5282,17 +5357,54 @@ mod tests {
     }
 
     #[test]
+    fn render_council_synthesis_dichiara_base_voti() {
+        // La base dei voti (validi/convocate/quorum) e' SEMPRE dichiarata: il
+        // lettore non deve mai dedurre il consenso dalla sola presenza del blocco.
+        let results = vec![
+            mock_figure_result("proceed", "ok", None),
+            mock_figure_result("proceed", "ok2", None),
+        ];
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default(), 2).unwrap();
+        let block = render_council_synthesis(&synth);
+        assert!(block.contains("Pareri validi: 2 su 2 figure convocate (quorum minimo: 1)"));
+        assert!(block.contains("parere convergente"));
+    }
+
+    #[test]
+    fn render_council_synthesis_sotto_quorum_dichiara_parzialita() {
+        // Opzione (b): sotto quorum la sintesi viene comunque iniettata ma NON
+        // puo' affermare un consenso che non c'e'.
+        let results = vec![
+            mock_figure_result("proceed", "ok", None),
+            mock_failed_figure_result(),
+            mock_failed_figure_result(),
+            mock_failed_figure_result(),
+            mock_failed_figure_result(),
+        ];
+        let synth = compose_council_synthesis(&results, &AdvisoryPolicy::default(), 5).unwrap();
+        let block = render_council_synthesis(&synth);
+        assert!(block.contains("Verdetto del consiglio: inconclusive"));
+        assert!(block.contains("Pareri validi: 1 su 5 figure convocate (quorum minimo: 3)"));
+        assert!(block.contains("quorum NON raggiunto"));
+        assert!(block.contains("pareri PARZIALI"));
+        assert!(
+            !block.contains("parere convergente"),
+            "sotto quorum la frase 'parere convergente' e' una menzogna"
+        );
+    }
+
+    #[test]
     fn render_multi_provider_synthesis_contiene_quorum_e_verdetto() {
         let results = vec![
             mock_figure_result("proceed", "test idempotenti", None),
             mock_figure_result("proceed_with_changes", "punto unico routing", None),
         ];
-        let synth = compose_multi_provider_synthesis(&results, &AdvisoryPolicy::default())
+        let synth = compose_multi_provider_synthesis(&results, &AdvisoryPolicy::default(), 2)
             .expect("sintesi multi-provider");
         let block = render_multi_provider_synthesis(&synth);
         assert!(block.starts_with("<multi_provider_sintesi>"));
         assert!(block.contains("Verdetto del panel multi-provider"));
-        assert!(block.contains("Pareri validi:"));
+        assert!(block.contains("Pareri validi: 2 su 2 provider convocati (quorum minimo: 1)"));
     }
 
     #[test]
