@@ -261,6 +261,60 @@ impl std::fmt::Display for GatewayHttpError {
 
 impl std::error::Error for GatewayHttpError {}
 
+/// Descrive un errore di TRASPORTO di reqwest con i suoi segnali strutturati e
+/// la catena delle cause (punto unico, regola L+M).
+///
+/// Perche' esiste: `map_err(|e| anyhow!("... {e}"))` stampa solo il `Display` di
+/// `reqwest::Error`, che per un fallimento di invio e' sempre e solo
+/// "error sending request for url (...)" — una frase che non dice NULLA su cosa
+/// sia andato storto. La causa vera vive in `source()` (es. "connection closed
+/// before message completed", `os error 10054` = reset del peer, `10055` =
+/// buffer di sistema esauriti) e nei predicati tipizzati di reqwest. Senza,
+/// resta solo da indovinare: e' esattamente il caso dei 3 `agent_turn` che
+/// falliscono nello stesso millisecondo verso 127.0.0.1:4060 mentre `/health`
+/// risponde in 0.33s.
+fn transport_error_detail(e: &reqwest::Error) -> String {
+    let mut kinds: Vec<&str> = Vec::new();
+    if e.is_connect() {
+        kinds.push("connect");
+    }
+    if e.is_timeout() {
+        kinds.push("timeout");
+    }
+    if e.is_request() {
+        kinds.push("request");
+    }
+    if e.is_body() {
+        kinds.push("body");
+    }
+    if e.is_decode() {
+        kinds.push("decode");
+    }
+    if kinds.is_empty() {
+        kinds.push("altro");
+    }
+    // Catena delle cause: e' qui che vive l'informazione utile.
+    let mut chain: Vec<String> = Vec::new();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        // Codice OS grezzo quando la causa e' un errore di I/O: e' il segnale
+        // piu' specifico che esista (10054 reset, 10055 no buffer, 10048 porte).
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            chain.push(match io.raw_os_error() {
+                Some(code) => format!("io({:?}, os_error={code}): {io}", io.kind()),
+                None => format!("io({:?}): {io}", io.kind()),
+            });
+        } else {
+            chain.push(s.to_string());
+        }
+        src = std::error::Error::source(s);
+    }
+    if chain.is_empty() {
+        chain.push("(nessuna causa sottostante)".to_string());
+    }
+    format!("{e} [kind={}] <- {}", kinds.join("+"), chain.join(" <- "))
+}
+
 /// Budget HTTP mcp-core -> gateway per `/v1/complete`, dal punto unico
 /// (`nexus_auth::llm_timeouts`, regola L).
 ///
@@ -326,7 +380,9 @@ impl NexusGatewayClient {
             .json(&req)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e))
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -369,7 +425,7 @@ impl NexusGatewayClient {
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -509,6 +565,39 @@ mod tests {
         assert!(
             t.client_budget < t.run_timeout,
             "il budget di UNA chiamata non puo' superare il run intero"
+        );
+    }
+
+    /// Prova che il fix AGGIUNGE informazione: il `Display` di reqwest da solo
+    /// non dice cosa sia andato storto ("error sending request for url (...)"),
+    /// la catena si'. Usa una porta chiusa: errore di trasporto vero, nessuna
+    /// dipendenza da servizi esterni.
+    #[tokio::test]
+    async fn transport_error_detail_mostra_la_causa_non_solo_il_display() {
+        let c = reqwest::Client::new();
+        let e = c
+            .post("http://127.0.0.1:59999/v1/complete")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("porta chiusa: deve fallire");
+
+        let display_solo = e.to_string();
+        let dettaglio = transport_error_detail(&e);
+
+        assert!(
+            dettaglio.contains("kind="),
+            "manca il segnale strutturato: {dettaglio}"
+        );
+        assert!(
+            dettaglio.contains("<-"),
+            "manca la catena delle cause: {dettaglio}"
+        );
+        // Il punto: il dettaglio dice di piu' del Display, che e' cio' che
+        // loggavamo prima e che non bastava a diagnosticare nulla.
+        assert!(
+            dettaglio.len() > display_solo.len(),
+            "il dettaglio non aggiunge nulla al Display: {dettaglio}"
         );
     }
 }
