@@ -1307,6 +1307,87 @@ async fn kill_unprotected_listeners(
     (killed, skipped)
 }
 
+/// Porte target del reset: quelle elencate nel body, oppure l'insieme vuoto
+/// (= "tutte quelle rilevate", filtro disattivato) se il body manca o non ha un
+/// array `ports` valido. Estratta da `cleanup_project_ports`; comportamento
+/// invariato, inclusa la troncatura `as u16` dei valori fuori range.
+fn parse_target_ports(body: Option<axum::Json<serde_json::Value>>) -> std::collections::HashSet<u16> {
+    match body {
+        Some(axum::Json(b)) => b
+            .get("ports")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|n| n as u16)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => std::collections::HashSet::new(),
+    }
+}
+
+/// PUNTO UNICO (regola L) dell'espansione di un insieme di PID a tutti i loro
+/// discendenti: BFS sull'albero `children` (parent -> figli). Un pid gia'
+/// presente non viene riaccodato, quindi la BFS termina anche con cicli o pid
+/// riciclati. Usata da entrambi i rami di `cleanup_project_ports` (Windows e
+/// systemd), che prima ne tenevano due copie identiche: cambia solo il modo di
+/// costruire `children`, non l'espansione.
+fn expand_pids_with_descendants(
+    pids: &mut std::collections::HashSet<u32>,
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+) {
+    let mut queue: std::collections::VecDeque<u32> = pids.iter().copied().collect();
+    while let Some(pid) = queue.pop_front() {
+        if let Some(kids) = children.get(&pid) {
+            for &c in kids {
+                if pids.insert(c) {
+                    queue.push_back(c);
+                }
+            }
+        }
+    }
+}
+
+/// Windows: pid vivi dei servizi del progetto (`agent_processes`, kind='service')
+/// piu' tutti i discendenti risalendo l'albero processi Win32
+/// (`windows_process_parents`). Estratta da `cleanup_project_ports`;
+/// comportamento invariato (solo pid > 0 e vivi secondo il punto unico
+/// `process_alive`, poi espansione ai discendenti).
+#[cfg(windows)]
+async fn collect_windows_protected_pids(
+    state: &AppState,
+    project_id: Uuid,
+) -> std::collections::HashSet<u32> {
+    let mut protected_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let svc_pids: Vec<(Option<i32>,)> = sqlx::query_as(
+        "SELECT pid FROM agent_processes \
+         WHERE project_id = $1 AND kind = 'service' \
+           AND status IN ('running', 'starting') AND pid IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(&proj_pool)
+    .await
+    .unwrap_or_default();
+    for (pid,) in svc_pids {
+        if let Some(p) = pid {
+            if p > 0 && crate::process_util::process_alive(p as u32) {
+                protected_pids.insert(p as u32);
+            }
+        }
+    }
+    // Espansione ai discendenti: mappa parent->children (Win32 invertita).
+    let child_to_parent = windows_process_parents().await;
+    let mut parent_to_children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    for (child, parent) in &child_to_parent {
+        parent_to_children.entry(*parent).or_default().push(*child);
+    }
+    expand_pids_with_descendants(&mut protected_pids, &parent_to_children);
+    protected_pids
+}
+
 pub async fn cleanup_project_ports(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -1320,19 +1401,7 @@ pub async fn cleanup_project_ports(
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
 
     // Porte target: dal body o, se assente, tutte quelle rilevate nel progetto
-    let target_ports: std::collections::HashSet<u16> = match body {
-        Some(axum::Json(b)) => b
-            .get("ports")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64())
-                    .map(|n| n as u16)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        None => std::collections::HashSet::new(),
-    };
+    let target_ports: std::collections::HashSet<u16> = parse_target_ports(body);
 
     // PID protetti: i servizi del progetto (e i loro discendenti) non vanno mai
     // uccisi dal reset porte. La sorgente e' platform-specific (punto unico a
@@ -1342,43 +1411,7 @@ pub async fn cleanup_project_ports(
 
     #[cfg(windows)]
     {
-        // Windows: pid vivi dei servizi del progetto (agent_processes) + tutti i
-        // discendenti risalendo l'albero processi Win32 (windows_process_parents).
-        let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-        let svc_pids: Vec<(Option<i32>,)> = sqlx::query_as(
-            "SELECT pid FROM agent_processes \
-             WHERE project_id = $1 AND kind = 'service' \
-               AND status IN ('running', 'starting') AND pid IS NOT NULL",
-        )
-        .bind(project_id)
-        .fetch_all(&proj_pool)
-        .await
-        .unwrap_or_default();
-        for (pid,) in svc_pids {
-            if let Some(p) = pid {
-                if p > 0 && crate::process_util::process_alive(p as u32) {
-                    protected_pids.insert(p as u32);
-                }
-            }
-        }
-        // Espansione ai discendenti: mappa parent->children (Win32 invertita).
-        let child_to_parent = windows_process_parents().await;
-        let mut parent_to_children: std::collections::HashMap<u32, Vec<u32>> =
-            std::collections::HashMap::new();
-        for (child, parent) in &child_to_parent {
-            parent_to_children.entry(*parent).or_default().push(*child);
-        }
-        let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
-        while let Some(pid) = queue.pop_front() {
-            if let Some(kids) = parent_to_children.get(&pid) {
-                for &c in kids {
-                    if protected_pids.insert(c) {
-                        queue.push_back(c);
-                    }
-                }
-            }
-        }
+        protected_pids.extend(collect_windows_protected_pids(&state, project_id).await);
     }
 
     #[cfg(not(windows))]
@@ -1460,16 +1493,7 @@ pub async fn cleanup_project_ports(
             })
             .await
             .unwrap_or_default();
-        let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
-        while let Some(pid) = queue.pop_front() {
-            if let Some(kids) = children.get(&pid) {
-                for &c in kids {
-                    if protected_pids.insert(c) {
-                        queue.push_back(c);
-                    }
-                }
-            }
-        }
+        expand_pids_with_descendants(&mut protected_pids, &children);
     }
 
     // Trova tutti i processi che ascoltano sulle porte e killa quelli non protetti.
@@ -1598,33 +1622,43 @@ async fn systemd_main_pids_by_service(
     (pids, pid_to_service)
 }
 
-/// Propaga l'associazione pid->service ai discendenti: BFS che parte SOLO dai
-/// pid gia' mappati (i MainPID systemd, unici con service noto a priori) e scende
-/// l'albero `children`, ignorando l'appartenenza ad altri set — cosi' l'ordine
-/// delle passate non perde i match anche se un figlio era gia' stato raccolto via
-/// cwd. Estratto da `detect_project_ports` (comportamento invariato).
-fn propagate_service_to_descendants(
-    pid_to_service: &mut std::collections::HashMap<u32, String>,
+/// PUNTO UNICO (regola L) della propagazione di un'attribuzione pid->T lungo
+/// l'albero dei processi: BFS che parte dai pid gia' mappati (gli unici con
+/// attribuzione nota a priori) e scende `children`. Un figlio gia' mappato non
+/// viene ne' sovrascritto ne' riaccodato, quindi l'ordine delle passate non
+/// perde i match anche se il figlio era gia' stato raccolto altrove.
+///
+/// Generico sul valore perche' i due chiamanti propagano attribuzioni diverse
+/// con lo stesso identico algoritmo: pid->service (`propagate_service_to_descendants`,
+/// da `detect_project_ports`) e pid->project_id (`detect_all_port_bindings`).
+fn propagate_to_descendants<T: Clone>(
+    map: &mut std::collections::HashMap<u32, T>,
     children: &std::collections::HashMap<u32, Vec<u32>>,
 ) {
-    let initial_svc_pids: Vec<u32> = pid_to_service.keys().copied().collect();
-    let mut svc_queue: std::collections::VecDeque<u32> = initial_svc_pids.into_iter().collect();
-    while let Some(pid) = svc_queue.pop_front() {
-        let Some(parent_svc) = pid_to_service.get(&pid).cloned() else {
+    let mut queue: std::collections::VecDeque<u32> = map.keys().copied().collect();
+    while let Some(pid) = queue.pop_front() {
+        let Some(value) = map.get(&pid).cloned() else {
             continue;
         };
         if let Some(kids) = children.get(&pid) {
             for &child in kids {
-                let was_new = !pid_to_service.contains_key(&child);
-                pid_to_service
-                    .entry(child)
-                    .or_insert_with(|| parent_svc.clone());
-                if was_new {
-                    svc_queue.push_back(child);
+                if let std::collections::hash_map::Entry::Vacant(e) = map.entry(child) {
+                    e.insert(value.clone());
+                    queue.push_back(child);
                 }
             }
         }
     }
+}
+
+/// Propaga l'associazione pid->service ai discendenti dei MainPID systemd (gli
+/// unici con service noto a priori). Delega al punto unico
+/// [`propagate_to_descendants`]: comportamento invariato.
+fn propagate_service_to_descendants(
+    pid_to_service: &mut std::collections::HashMap<u32, String>,
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+) {
+    propagate_to_descendants(pid_to_service, children);
 }
 
 /// Assegna il campo `service` alle porte LIVE prive di risoluzione dall'albero
@@ -1800,6 +1834,52 @@ pub(super) async fn detect_project_ports(
     ports
 }
 
+/// Mappa una singola pubblicazione Docker `host->container` (es.
+/// `0.0.0.0:5215->8080/tcp`) nella voce porta JSON del pannello. `None` se
+/// l'entry non pubblica una porta host valida (nessun `->`, o porta host non
+/// parsabile: casi gia' saltati dal codice inline che sostituisce). Lo
+/// `svc_guess` deriva dal nome container togliendo il prefisso slug e i suffissi
+/// di ambiente. Comportamento invariato.
+fn docker_published_port_entry(
+    entry: &str,
+    cname: &str,
+    prefix_dash: &str,
+    prefix_underscore: &str,
+) -> Option<serde_json::Value> {
+    let entry = entry.trim();
+    // Estrae la porta host: cerca pattern host_port->container_port
+    let arrow_pos = entry.find("->")?;
+    let host_part = &entry[..arrow_pos];
+    let host_port: u16 = host_part
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    if host_port == 0 {
+        return None;
+    }
+    // Tenta di derivare lo "short" del servizio dal nome container:
+    // redemptor-backend-dev → "backend"; redemptor-sqlserver-dev → "sqlserver"
+    let svc_guess = cname
+        .strip_prefix(prefix_dash)
+        .or_else(|| cname.strip_prefix(prefix_underscore))
+        .map(|rest| {
+            rest.trim_end_matches("-dev")
+                .trim_end_matches("-prod")
+                .trim_end_matches("_dev")
+                .trim_end_matches("_prod")
+                .to_string()
+        });
+    Some(json!({
+        "port":    host_port,
+        "label":   format!("docker:{}", cname),
+        "pid":     0,
+        "state":   "LISTEN",
+        "url":     format!("http://localhost:{}", host_port),
+        "service": svc_guess,
+    }))
+}
+
 /// Porte pubblicate dai container Docker del progetto (nome con prefisso
 /// `{slug}-`/`{slug}_` o contenente lo slug). Interroga `docker ps` e mappa ogni
 /// pubblicazione `host->container` a una voce porta con `svc_guess` derivato dal
@@ -1832,40 +1912,11 @@ async fn docker_container_ports_for_slug(slug: &str) -> Vec<serde_json::Value> {
         }
         // Esempio porte: "0.0.0.0:5215->8080/tcp, [::]:5215->8080/tcp"
         for entry in parts[1].split(',') {
-            let entry = entry.trim();
-            // Estrae la porta host: cerca pattern host_port->container_port
-            let Some(arrow_pos) = entry.find("->") else {
-                continue;
-            };
-            let host_part = &entry[..arrow_pos];
-            let host_port: u16 = host_part
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(0);
-            if host_port == 0 {
-                continue;
+            if let Some(voce) =
+                docker_published_port_entry(entry, cname, &docker_prefix1, &docker_prefix2)
+            {
+                out.push(voce);
             }
-            // Tenta di derivare lo "short" del servizio dal nome container:
-            // redemptor-backend-dev → "backend"; redemptor-sqlserver-dev → "sqlserver"
-            let svc_guess = cname
-                .strip_prefix(&docker_prefix1)
-                .or_else(|| cname.strip_prefix(&docker_prefix2))
-                .map(|rest| {
-                    rest.trim_end_matches("-dev")
-                        .trim_end_matches("-prod")
-                        .trim_end_matches("_dev")
-                        .trim_end_matches("_prod")
-                        .to_string()
-                });
-            out.push(json!({
-                "port":    host_port,
-                "label":   format!("docker:{}", cname),
-                "pid":     0,
-                "state":   "LISTEN",
-                "url":     format!("http://localhost:{}", host_port),
-                "service": svc_guess,
-            }));
         }
     }
     out
@@ -2162,30 +2213,78 @@ pub async fn read_listening_ports_ss() -> anyhow::Result<Vec<(u16, u32, String)>
 }
 
 /// Fallback: legge /proc/net/tcp e /proc/net/tcp6 → Vec<(port, pid, program)>
-pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
-    let mut inode_to_port: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
+/// Mappa inode socket -> porta per le sole socket in LISTEN, leggendo una riga di
+/// `/proc/net/tcp{,6}`. `None` se la riga e' malformata, non in LISTEN, o senza
+/// porta/inode validi. Estratta da `read_listening_ports_proc`; il formato e'
+/// quello del kernel: `parts[1]` = local_address `HEXADDR:HEXPORT`, `parts[3]` =
+/// stato (`0A` = LISTEN), `parts[9]` = inode.
+fn proc_net_tcp_listen_entry(line: &str) -> Option<(u64, u16)> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 10 {
+        return None;
+    }
+    // stato 0A = LISTEN
+    if parts[3] != "0A" {
+        return None;
+    }
+    // local_address es. 00000000:0BB8
+    let port = u16::from_str_radix(parts[1].split(':').nth(1).unwrap_or("0"), 16).unwrap_or(0);
+    let inode: u64 = parts[9].parse().unwrap_or(0);
+    if port == 0 || inode == 0 {
+        return None;
+    }
+    Some((inode, port))
+}
 
+/// Inode socket -> porta di tutte le socket TCP/TCP6 in LISTEN.
+/// Estratta da `read_listening_ports_proc` (fase 1); un file illeggibile viene
+/// saltato, come nel codice inline che sostituisce.
+fn proc_net_tcp_listen_inodes() -> std::collections::HashMap<u64, u16> {
+    let mut inode_to_port: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            for line in content.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 10 {
-                    continue;
-                }
-                // stato 0A = LISTEN
-                if parts[3] != "0A" {
-                    continue;
-                }
-                // local_address es. 00000000:0BB8
-                let port =
-                    u16::from_str_radix(parts[1].split(':').nth(1).unwrap_or("0"), 16).unwrap_or(0);
-                let inode: u64 = parts[9].parse().unwrap_or(0);
-                if port > 0 && inode > 0 {
-                    inode_to_port.insert(inode, port);
-                }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            if let Some((inode, port)) = proc_net_tcp_listen_entry(line) {
+                inode_to_port.insert(inode, port);
             }
         }
     }
+    inode_to_port
+}
+
+/// Porte in ascolto del processo `pid`, risolvendo i suoi fd socket
+/// (`/proc/{pid}/fd/* -> "socket:[inode]"`) contro `inode_to_port`. Estratta da
+/// `read_listening_ports_proc` (fase 2); il `program` resta vuoto come prima.
+fn proc_listening_ports_of_pid(
+    pid: u32,
+    inode_to_port: &std::collections::HashMap<u64, u16>,
+    out: &mut Vec<(u16, u32, String)>,
+) {
+    let fd_dir = format!("/proc/{}/fd", pid);
+    let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+        return;
+    };
+    for fd in fds.flatten() {
+        let Ok(target) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        let t = target.to_string_lossy();
+        // "socket:[12345]"
+        let Some(inode_str) = t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) else {
+            continue;
+        };
+        if let Ok(inode) = inode_str.parse::<u64>() {
+            if let Some(&port) = inode_to_port.get(&inode) {
+                out.push((port, pid, String::new()));
+            }
+        }
+    }
+}
+
+pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
+    let inode_to_port = proc_net_tcp_listen_inodes();
 
     // Mappa inode → pid via /proc/{pid}/fd/*
     let mut result = Vec::new();
@@ -2196,25 +2295,7 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
             let Ok(pid) = name_str.parse::<u32>() else {
                 continue;
             };
-            let fd_dir = format!("/proc/{}/fd", pid);
-            let Ok(fds) = std::fs::read_dir(&fd_dir) else {
-                continue;
-            };
-            for fd in fds.flatten() {
-                if let Ok(target) = std::fs::read_link(fd.path()) {
-                    let t = target.to_string_lossy();
-                    // "socket:[12345]"
-                    if let Some(inode_str) =
-                        t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']'))
-                    {
-                        if let Ok(inode) = inode_str.parse::<u64>() {
-                            if let Some(&port) = inode_to_port.get(&inode) {
-                                result.push((port, pid, String::new()));
-                            }
-                        }
-                    }
-                }
-            }
+            proc_listening_ports_of_pid(pid, &inode_to_port, &mut result);
         }
     }
     result
@@ -2735,18 +2816,22 @@ pub async fn get_port_allocations(
     Ok(Json(json!({ "allocations": items })))
 }
 
-/// POST /api/projects/:id/port-allocations
-/// Alloca una porta al progetto. Body JSON: { port, label?, mode? "manual"|"auto", run_config_id?, service_unit? }
-pub async fn create_port_allocation(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(id): AxumPath<String>,
-    Json(body): Json<Value>,
-) -> ApiResult {
-    let _user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+/// Campi del body di `create_port_allocation` dopo la validazione. Presta i
+/// `&str` dal `Value` di origine: nessuna copia rispetto al codice inline che
+/// sostituisce.
+struct NewPortAllocation<'a> {
+    port: u16,
+    label: &'a str,
+    mode: &'a str,
+    run_config_id: Option<Uuid>,
+    service_unit: Option<&'a str>,
+}
 
+/// Valida il body di `create_port_allocation`, separando i controlli sull'input
+/// dall'effetto sul registry. Ordine dei controlli invariato (presenza `port` ->
+/// porte privilegiate -> porte riservate Nexus -> `mode`), stessi status code e
+/// stessi messaggi: il primo controllo che fallisce decide la risposta.
+fn parse_new_port_allocation(body: &Value) -> Result<NewPortAllocation<'_>, ApiError> {
     let port = body["port"].as_u64().ok_or_else(|| {
         api_error(
             StatusCode::BAD_REQUEST,
@@ -2785,9 +2870,39 @@ pub async fn create_port_allocation(
         .and_then(|s| Uuid::parse_str(s).ok());
     let service_unit = body["service_unit"].as_str();
 
+    Ok(NewPortAllocation {
+        port,
+        label,
+        mode,
+        run_config_id,
+        service_unit,
+    })
+}
+
+/// POST /api/projects/:id/port-allocations
+/// Alloca una porta al progetto. Body JSON: { port, label?, mode? "manual"|"auto", run_config_id?, service_unit? }
+pub async fn create_port_allocation(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+
+    let req = parse_new_port_allocation(&body)?;
+
     match state
         .port_registry
-        .allocate(project_id, port, label, mode, run_config_id, service_unit)
+        .allocate(
+            project_id,
+            req.port,
+            req.label,
+            req.mode,
+            req.run_config_id,
+            req.service_unit,
+        )
         .await
     {
         Ok(alloc) => Ok(Json(json!({
@@ -2801,6 +2916,69 @@ pub async fn create_port_allocation(
         }))),
         Err(e) => Err(api_error(StatusCode::CONFLICT, e)),
     }
+}
+
+/// Verifica che `port` risulti allocata proprio a `project_id` nel registry.
+/// Estratta da `delete_port_allocation` con gli stessi esiti: 403 se la porta e'
+/// di un altro progetto, 404 se non e' allocata. Il guard del registry viene
+/// rilasciato all'uscita, come il `drop` esplicito che sostituisce.
+async fn ensure_port_owned_by_project(
+    state: &AppState,
+    port: u16,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let registry = state.port_registry.current().await;
+    match registry.by_port.get(&port) {
+        Some(alloc) if alloc.project_id != project_id => Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Porta allocata a un altro progetto",
+        )),
+        Some(_) => Ok(()),
+        None => Err(api_error(StatusCode::NOT_FOUND, "Porta non allocata")),
+    }
+}
+
+/// Termina (best-effort) il processo che binda `port` e marca la sua riga
+/// `agent_processes` come stopped. Ritorna `(killed_pid, marked_stopped)`.
+/// Estratta da `delete_port_allocation`; invariante di sicurezza invariata: si
+/// killa SOLO se il binding e' attribuito a questo progetto, e ogni passo e'
+/// best-effort (binding non rilevabile o porta non trovata -> nessun kill).
+async fn kill_project_port_binding(
+    state: &AppState,
+    port: u16,
+    project_id: Uuid,
+) -> (Option<u32>, bool) {
+    let Ok(bindings) = detect_all_port_bindings(&state.db).await else {
+        return (None, false);
+    };
+    let Some(binding) = bindings.iter().find(|b| b.port == port) else {
+        return (None, false);
+    };
+    // Killa solo se il binding e' associato a questo progetto (sicurezza)
+    if binding.project_id != Some(project_id) {
+        return (None, false);
+    }
+    let pid = binding.pid;
+    // Terminazione via punto unico cross-platform (regola L): su Unix
+    // TERM grazioso + KILL se ancora vivo dopo l'attesa incapsulata;
+    // su Windows taskkill /T /F. Il precedente `kill` inline era no-op
+    // su Windows -> la "x" del pannello non liberava la porta.
+    crate::process_util::kill_pid(pid).await;
+    // Marca agent_processes come stopped (riconciliazione).
+    // Separazione DB per-progetto: agent_processes e' migrata, instrada
+    // sul pool del progetto (flag OFF -> meta-pool, behavior-preserving).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let upd = sqlx::query(
+        "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
+         WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
+    )
+    .bind(pid as i32)
+    .bind(project_id)
+    .execute(&proj_pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    (Some(pid), upd > 0)
 }
 
 /// DELETE /api/projects/:id/port-allocations/:port
@@ -2829,58 +3007,12 @@ pub async fn delete_port_allocation(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Porta non valida"))?;
 
     // Verifica che la porta appartenga effettivamente al progetto
-    let registry = state.port_registry.current().await;
-    if let Some(alloc) = registry.by_port.get(&port) {
-        if alloc.project_id != _project_id {
-            return Err(api_error(
-                StatusCode::FORBIDDEN,
-                "Porta allocata a un altro progetto",
-            ));
-        }
-    } else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Porta non allocata"));
-    }
-    drop(registry);
+    ensure_port_owned_by_project(&state, port, _project_id).await?;
 
     // ── Termina il processo che binda la porta (best-effort) ────────────────
     // Senza questo, il processo continuerebbe a girare e il prossimo detect
     // ricreerebbe l'allocazione: l'utente vede "la × non pulisce".
-    let mut killed_pid: Option<u32> = None;
-    let mut marked_stopped = false;
-    if let Ok(bindings) = detect_all_port_bindings(&state.db).await {
-        if let Some(binding) = bindings.iter().find(|b| b.port == port) {
-            // Killa solo se il binding e' associato a questo progetto (sicurezza)
-            let pid_owned_by_project = match binding.project_id {
-                Some(pid) => pid == _project_id,
-                None => false,
-            };
-            if pid_owned_by_project {
-                let pid = binding.pid;
-                // Terminazione via punto unico cross-platform (regola L): su Unix
-                // TERM grazioso + KILL se ancora vivo dopo l'attesa incapsulata;
-                // su Windows taskkill /T /F. Il precedente `kill` inline era no-op
-                // su Windows -> la "x" del pannello non liberava la porta.
-                crate::process_util::kill_pid(pid).await;
-                killed_pid = Some(pid);
-                // Marca agent_processes come stopped (riconciliazione).
-                // Separazione DB per-progetto: agent_processes e' migrata, instrada
-                // sul pool del progetto (flag OFF -> meta-pool, behavior-preserving).
-                let proj_pool =
-                    crate::project_db_routes::project_data_pool_from(&state.db, _project_id).await;
-                let upd = sqlx::query(
-                    "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
-                     WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
-                )
-                .bind(pid as i32)
-                .bind(_project_id)
-                .execute(&proj_pool)
-                .await
-                .map(|r| r.rows_affected())
-                .unwrap_or(0);
-                marked_stopped = upd > 0;
-            }
-        }
-    }
+    let (killed_pid, marked_stopped) = kill_project_port_binding(&state, port, _project_id).await;
 
     state
         .port_registry
@@ -2905,6 +3037,98 @@ pub struct PortBinding {
     pub pid: u32,
     pub program: String,
     pub project_id: Option<uuid::Uuid>,
+}
+
+/// Mappa pid -> project_id dei processi `running`/`starting` in `agent_processes`.
+///
+/// Separazione DB: agent_processes e' migrata per-progetto -> la vista
+/// globale si ottiene aggregando i DB progetto (stesso pattern delle
+/// viste admin globali, regola L). `db` resta il META: serve per
+/// l'elenco progetti e la risoluzione dei pool. Sul meta la tabella e'
+/// vuota a flag ON: la mappa usciva vuota e l'enforcement porte e il
+/// kill dal pannello Porte non scattavano MAI. Un DB progetto
+/// irraggiungibile degrada con WARN senza azzerare gli altri.
+///
+/// Estratta da `detect_all_port_bindings` (blocco 2); comportamento invariato.
+async fn pid_to_project_from_agent_processes(
+    db: &sqlx::PgPool,
+) -> std::collections::HashMap<u32, uuid::Uuid> {
+    let mut pid_rows: Vec<(Option<i32>, uuid::Uuid)> = Vec::new();
+    for proj in crate::project_db_routes::list_all_project_ids(db).await {
+        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        match sqlx::query_as::<_, (Option<i32>, uuid::Uuid)>(
+            "SELECT pid, project_id FROM agent_processes \
+             WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
+        )
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(mut rows) => pid_rows.append(&mut rows),
+            Err(e) => tracing::warn!(
+                project_id = %proj,
+                error = %e,
+                "detect_all_port_bindings: query agent_processes fallita per il progetto"
+            ),
+        }
+    }
+
+    let mut pid_to_project: std::collections::HashMap<u32, uuid::Uuid> =
+        std::collections::HashMap::new();
+    for (pid_opt, proj_id) in &pid_rows {
+        if let Some(pid) = pid_opt {
+            if *pid > 0 {
+                pid_to_project.insert(*pid as u32, *proj_id);
+            }
+        }
+    }
+    pid_to_project
+}
+
+/// Fallback CWD: per i PID in ascolto senza project_id da `agent_processes`,
+/// tenta l'associazione via `/proc/<pid>/cwd` confrontato con
+/// `repository_root_path` dei progetti. Cattura processi avviati fuori dal tool
+/// system Nexus. Non sovrascrive attribuzioni gia' risolte (`or_insert`).
+///
+/// Estratta da `detect_all_port_bindings` (blocco 4); comportamento invariato,
+/// inclusi gli early-return quando non c'e' nulla da risolvere.
+async fn match_unmatched_pids_by_cwd(
+    db: &sqlx::PgPool,
+    listening: &[(u16, u32, String)],
+    pid_to_project: &mut std::collections::HashMap<u32, uuid::Uuid>,
+) {
+    let unmatched_pids: Vec<u32> = listening
+        .iter()
+        .filter(|(_, pid, _)| !pid_to_project.contains_key(pid))
+        .map(|(_, pid, _)| *pid)
+        .collect();
+    if unmatched_pids.is_empty() {
+        return;
+    }
+
+    // Carica mappa root_path -> project_id
+    let project_roots: Vec<(uuid::Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, repository_root_path FROM projects \
+         WHERE repository_root_path IS NOT NULL AND repository_root_path != ''",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if project_roots.is_empty() {
+        return;
+    }
+
+    let roots_clone: Vec<(uuid::Uuid, String)> = project_roots
+        .into_iter()
+        .filter_map(|(id, r)| r.map(|p| (id, p)))
+        .collect();
+    let cwd_matches =
+        tokio::task::spawn_blocking(move || resolve_pids_by_cwd(&unmatched_pids, &roots_clone))
+            .await
+            .unwrap_or_default();
+
+    for (pid, proj_id) in cwd_matches {
+        pid_to_project.entry(pid).or_insert(proj_id);
+    }
 }
 
 /// Scansiona tutte le porte TCP in ascolto (`ss -tlnp` o fallback `/proc/net/tcp`)
@@ -2937,42 +3161,9 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         return Ok(Vec::new());
     }
 
-    // 2. Costruisci mappa pid -> project_id da agent_processes.
-    //    Separazione DB: agent_processes e' migrata per-progetto -> la vista
-    //    globale si ottiene aggregando i DB progetto (stesso pattern delle
-    //    viste admin globali, regola L). `db` resta il META: serve per
-    //    l'elenco progetti e la risoluzione dei pool. Sul meta la tabella e'
-    //    vuota a flag ON: la mappa usciva vuota e l'enforcement porte e il
-    //    kill dal pannello Porte non scattavano MAI. Un DB progetto
-    //    irraggiungibile degrada con WARN senza azzerare gli altri.
-    let mut pid_rows: Vec<(Option<i32>, uuid::Uuid)> = Vec::new();
-    for proj in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
-        match sqlx::query_as::<_, (Option<i32>, uuid::Uuid)>(
-            "SELECT pid, project_id FROM agent_processes \
-             WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
-        )
-        .fetch_all(&pool)
-        .await
-        {
-            Ok(mut rows) => pid_rows.append(&mut rows),
-            Err(e) => tracing::warn!(
-                project_id = %proj,
-                error = %e,
-                "detect_all_port_bindings: query agent_processes fallita per il progetto"
-            ),
-        }
-    }
-
-    let mut pid_to_project: std::collections::HashMap<u32, uuid::Uuid> =
-        std::collections::HashMap::new();
-    for (pid_opt, proj_id) in &pid_rows {
-        if let Some(pid) = pid_opt {
-            if *pid > 0 {
-                pid_to_project.insert(*pid as u32, *proj_id);
-            }
-        }
-    }
+    // 2. Costruisci mappa pid -> project_id da agent_processes (aggregando i DB
+    //    progetto: vedi pid_to_project_from_agent_processes).
+    let mut pid_to_project = pid_to_project_from_agent_processes(db).await;
 
     // 3. Espandi con discendenti: scan /proc sincrono, spostato su spawn_blocking
     //    per non bloccare il runtime tokio (fix: freeze mcp-core su molti processi).
@@ -2981,61 +3172,11 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         .await
         .unwrap_or_default();
 
-    // BFS: propaga project_id dai PID noti ai discendenti
-    let root_pids: Vec<u32> = pid_to_project.keys().copied().collect();
-    let mut queue: std::collections::VecDeque<u32> = root_pids.into_iter().collect();
-    while let Some(pid) = queue.pop_front() {
-        let proj = match pid_to_project.get(&pid).copied() {
-            Some(p) => p,
-            None => continue,
-        };
-        if let Some(kids) = children.get(&pid) {
-            for &child in kids {
-                if let std::collections::hash_map::Entry::Vacant(e) = pid_to_project.entry(child) {
-                    e.insert(proj);
-                    queue.push_back(child);
-                }
-            }
-        }
-    }
+    // BFS: propaga project_id dai PID noti ai discendenti (punto unico, regola L).
+    propagate_to_descendants(&mut pid_to_project, &children);
 
-    // 4. Fallback CWD: per i PID in ascolto senza project_id da agent_processes,
-    //    tenta associazione via /proc/<pid>/cwd confrontato con repository_root_path
-    //    dei progetti. Cattura processi avviati fuori dal tool system Nexus.
-    let unmatched_pids: Vec<u32> = listening
-        .iter()
-        .filter(|(_, pid, _)| !pid_to_project.contains_key(pid))
-        .map(|(_, pid, _)| *pid)
-        .collect();
-
-    if !unmatched_pids.is_empty() {
-        // Carica mappa root_path -> project_id
-        let project_roots: Vec<(uuid::Uuid, Option<String>)> = sqlx::query_as(
-            "SELECT id, repository_root_path FROM projects \
-             WHERE repository_root_path IS NOT NULL AND repository_root_path != ''",
-        )
-        .fetch_all(db)
-        .await
-        .unwrap_or_default();
-
-        if !project_roots.is_empty() {
-            let pids_for_cwd = unmatched_pids;
-            let roots_clone: Vec<(uuid::Uuid, String)> = project_roots
-                .into_iter()
-                .filter_map(|(id, r)| r.map(|p| (id, p)))
-                .collect();
-
-            let cwd_matches = tokio::task::spawn_blocking(move || {
-                resolve_pids_by_cwd(&pids_for_cwd, &roots_clone)
-            })
-            .await
-            .unwrap_or_default();
-
-            for (pid, proj_id) in cwd_matches {
-                pid_to_project.entry(pid).or_insert(proj_id);
-            }
-        }
-    }
+    // 4. Fallback CWD per i PID in ascolto ancora senza project_id.
+    match_unmatched_pids_by_cwd(db, &listening, &mut pid_to_project).await;
 
     // 5. Costruisci i PortBinding
     let bindings: Vec<PortBinding> = listening
