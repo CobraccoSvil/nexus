@@ -1,0 +1,102 @@
+# .lefthookrc -- incluso con '.' da ogni hook git generato da lefthook (chiave 'rc:' in
+# lefthook.yml). Non e' uno script a se': gira nel processo dell'hook, quindi un 'exit'
+# qui termina l'hook e fa RIFIUTARE l'operazione git.
+#
+# Perche' esiste (fail-closed, regola M):
+#   Il template dell'hook generato da lefthook, quando non riesce a risolvere il proprio
+#   binario, stampa "Can't find lefthook in PATH" e prosegue con codice 0. Il commit passa
+#   e TUTTI i gate (cargo_check_quick, single_source_guard, turbo_quick, ...) risultano
+#   superati senza essere mai stati eseguiti: assenza dello strumento di verifica trattata
+#   come verifica superata, cioe' un falso verde.
+#   Nei worktree accadeva a ogni commit: il template cerca node_modules sotto
+#   'git rev-parse --show-toplevel', che dentro un worktree e' la root del worktree, dove
+#   node_modules non esiste (l'install pnpm vive solo nel repo principale).
+#
+# Cosa fa:
+#   1. risolve il binario lefthook anche dai worktree, guardando anche il repo principale
+#      via git common dir (condivisa da tutti i worktree);
+#   2. se non lo trova, esce con 1 -> git rifiuta il commit invece di lasciarlo passare.
+#
+# Perche' qui e non nell'hook: .git/hooks/pre-commit e' rigenerato da 'lefthook install'
+# (che gira nel 'prepare' di pnpm install), quindi ogni patch a mano andrebbe persa. Il
+# source di questo file fa invece parte del template generato: questo file e lefthook.yml
+# sono entrambi versionati, quindi presenti in ogni worktree e in ogni clone.
+#
+# Bypass di emergenza: LEFTHOOK=0, valutato dall'hook prima di questo file. Resta esplicito
+# e volontario, quindi non e' un falso verde.
+
+if [ -z "$LEFTHOOK_BIN" ]; then
+  # uname in Git Bash restituisce 'mingw64_nt-10.0-26200', non 'windows': senza questa
+  # normalizzazione il nome del pacchetto per-piattaforma non matcha mai su Windows.
+  _lh_os="$(uname | tr '[:upper:]' '[:lower:]')"
+  case "$_lh_os" in
+    mingw*|msys*|cygwin*|windows*) _lh_os="windows" ;;
+    darwin*) _lh_os="darwin" ;;
+    linux*) _lh_os="linux" ;;
+  esac
+  _lh_arch="$(uname -m | sed 's/aarch64/arm64/;s/x86_64/x64/')"
+  _lh_exe=""
+  if [ "$_lh_os" = "windows" ]; then
+    _lh_exe=".exe"
+  fi
+
+  _lh_worktree_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+  # In un worktree la common dir e' il .git del repo principale (dove sta node_modules);
+  # nel repo principale e' '.git' relativo alla cwd, che git fissa alla root del worktree.
+  _lh_common_root=""
+  _lh_common_dir="$(git rev-parse --git-common-dir 2>/dev/null)"
+  if [ -n "$_lh_common_dir" ]; then
+    _lh_common_root="$(cd "$(dirname "$_lh_common_dir")" 2>/dev/null && pwd)"
+  fi
+
+  for _lh_name in lefthook lefthook.exe lefthook.bat; do
+    if [ -z "$LEFTHOOK_BIN" ]; then
+      _lh_found="$(command -v "$_lh_name" 2>/dev/null)"
+      if [ -n "$_lh_found" ] && "$_lh_found" -h >/dev/null 2>&1; then
+        LEFTHOOK_BIN="$_lh_found"
+      fi
+    fi
+  done
+
+  for _lh_root in "$_lh_worktree_root" "$_lh_common_root"; do
+    if [ -z "$LEFTHOOK_BIN" ] && [ -n "$_lh_root" ]; then
+      for _lh_rel in \
+        "node_modules/lefthook-${_lh_os}-${_lh_arch}/bin/lefthook${_lh_exe}" \
+        "node_modules/.bin/lefthook" \
+        "node_modules/lefthook/bin/index.js"
+      do
+        if [ -z "$LEFTHOOK_BIN" ] && [ -f "$_lh_root/$_lh_rel" ] &&
+          "$_lh_root/$_lh_rel" -h >/dev/null 2>&1
+        then
+          LEFTHOOK_BIN="$_lh_root/$_lh_rel"
+        fi
+      done
+    fi
+  done
+
+  if [ -z "$LEFTHOOK_BIN" ]; then
+    echo "lefthook non risolvibile: i gate git non possono essere eseguiti." >&2
+    echo "Operazione git RIFIUTATA: un gate non eseguito non e' un gate superato." >&2
+    echo "" >&2
+    echo "Cercato in:" >&2
+    echo "  - PATH (lefthook, lefthook.exe, lefthook.bat)" >&2
+    if [ -n "$_lh_worktree_root" ]; then
+      echo "  - $_lh_worktree_root/node_modules" >&2
+    fi
+    if [ -n "$_lh_common_root" ] && [ "$_lh_common_root" != "$_lh_worktree_root" ]; then
+      echo "  - $_lh_common_root/node_modules" >&2
+    fi
+    echo "" >&2
+    if [ -n "$_lh_common_root" ]; then
+      echo "Rimedio: 'pnpm install' nel repo principale ($_lh_common_root)." >&2
+    else
+      echo "Rimedio: 'pnpm install' nel repo principale." >&2
+    fi
+    echo "Bypass volontario, solo emergenza: LEFTHOOK=0 git commit ..." >&2
+    exit 1
+  fi
+
+  export LEFTHOOK_BIN
+  unset _lh_os _lh_arch _lh_exe _lh_name _lh_found _lh_rel _lh_root
+  unset _lh_worktree_root _lh_common_dir _lh_common_root
+fi

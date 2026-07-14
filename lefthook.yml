@@ -9,6 +9,19 @@
 
 # Emergenza: LEFTHOOK=0
 
+# Fail-closed della risoluzione di lefthook. L'hook generato, se non trova il proprio
+# binario, stampa "Can't find lefthook in PATH" e ritorna 0: il commit passa con tutti i
+# gate saltati (falso verde). Nei worktree succedeva sempre, perche' il template cerca
+# node_modules sotto la root del worktree, dove non esiste. Questa chiave fa includere
+# .lefthookrc dentro l'hook rigenerato: li' lefthook viene risolto anche dai worktree e,
+# se manca, il commit viene RIFIUTATO. Va qui e non in .git/hooks perche' gli hook sono
+# rigenerati da 'lefthook install'; lefthook.yml e .lefthookrc sono invece versionati.
+# NB il prefisso './' e' obbligatorio: il valore finisce testuale nell'hook come
+# '. <valore>', e il comando '.' di POSIX sh cerca nel PATH (non nella cwd) quando
+# l'argomento non contiene una slash. Con 'rc: .lefthookrc' il source fallisce sempre
+# con "file not found" anche se il file c'e'.
+rc: ./.lefthookrc
+
 # NB Windows: lefthook word-splitta il campo 'run' ignorando le virgolette, quindi
 # 'bash -lc "comando con spazi"' veniva eseguito come 'bash -lc comando con spazi'
 # (bash riceveva come command string solo il primo token -> falso-verde). Per i

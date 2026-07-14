@@ -13,7 +13,7 @@
     "smoke": "node scripts/smoke.mjs",
     "e2e:debug-chat": "node scripts/debug-console-agent-e2e.mjs",
     "xtask": "cargo run -p xtask --",
-    "prepare": "lefthook install || true",
+    "prepare": "node scripts/install-hooks.mjs",
     "test:contract": "cargo test -p mcp-core --tests",
     "test:ui-e2e": "playwright test --config=apps/web-ide/playwright.config.ts"
   },
