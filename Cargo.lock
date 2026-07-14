@@ -2235,6 +2235,7 @@ dependencies = [
  "mcp-quality",
  "nexus-auth",
  "nexus-events",
+ "nexus-http",
  "nexus-types",
  "once_cell",
  "parking_lot",
