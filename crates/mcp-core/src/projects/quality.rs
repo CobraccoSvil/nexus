@@ -738,34 +738,8 @@ async fn upsert_db_profile(db: &sqlx::PgPool, project_id: Uuid, root_path: &str)
         .map(|t| t.as_str().to_string());
     let mig_path = db_profile.migration_path.clone();
     let metadata = serde_json::to_value(&db_profile).unwrap_or(serde_json::json!({}));
-    // Il conflict target e' l'indice PARZIALE
-    // `uq_project_database_config_project_primary` (project_id) WHERE is_primary:
-    // va qualificato con la stessa WHERE, perche' l'UNIQUE sul solo project_id
-    // NON esiste piu' (mig 0083: tabella multi-connessione per progetto). Senza
-    // la qualifica la query falliva SEMPRE con "no unique or exclusion constraint
-    // matching the ON CONFLICT specification", e il `.ok()` la rendeva invisibile:
-    // il profilo DB non e' mai stato scritto. La seconda WHERE (in coda) resta la
-    // condizione di UPDATE: non sovrascrive un profilo gia' popolato dall'utente.
-    let saved = sqlx::query(
-        r#"INSERT INTO project_database_config
-           (project_id, engine, hosting_mode, migration_tool, migration_path, detection_metadata)
-           VALUES ($1, $2, 'external', $3, $4, $5)
-           ON CONFLICT (project_id) WHERE is_primary DO UPDATE
-           SET engine = EXCLUDED.engine,
-               migration_tool = COALESCE(project_database_config.migration_tool, EXCLUDED.migration_tool),
-               migration_path = COALESCE(project_database_config.migration_path, EXCLUDED.migration_path),
-               detection_metadata = EXCLUDED.detection_metadata,
-               updated_at = NOW()
-           WHERE project_database_config.migration_tool IS NULL OR
-                 project_database_config.detection_metadata = '{}'::jsonb"#,
-    )
-    .bind(project_id)
-    .bind(&engine_str)
-    .bind(&tool_str)
-    .bind(&mig_path)
-    .bind(&metadata)
-    .execute(db)
-    .await;
+
+    let saved = persist_db_profile(db, project_id, &engine_str, &tool_str, &mig_path, &metadata).await;
 
     // Best-effort (il quality scan non deve fallire per il profilo DB), ma
     // l'errore si LOGGA: era il `.ok()` muto a nascondere la query rotta, mentre
@@ -785,6 +759,48 @@ async fn upsert_db_profile(db: &sqlx::PgPool, project_id: Uuid, root_path: &str)
             "DB detector: profilo rilevato ma salvataggio in project_database_config fallito"
         ),
     }
+}
+
+/// Upsert conservativo del profilo rilevato sulla riga PRIMARIA del progetto.
+///
+/// Il conflict target e' l'indice PARZIALE
+/// `uq_project_database_config_project_primary` (project_id) WHERE is_primary: va
+/// qualificato con la stessa WHERE, perche' l'UNIQUE sul solo project_id NON
+/// esiste piu' (mig 0083: tabella multi-connessione per progetto). Senza la
+/// qualifica la query falliva SEMPRE con "no unique or exclusion constraint
+/// matching the ON CONFLICT specification", e il `.ok()` del chiamante la rendeva
+/// invisibile: il profilo DB non e' mai stato scritto.
+///
+/// La seconda WHERE (in coda) e' la condizione di UPDATE: non sovrascrive un
+/// profilo gia' popolato dall'utente.
+async fn persist_db_profile(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    engine: &str,
+    migration_tool: &Option<String>,
+    migration_path: &Option<String>,
+    metadata: &serde_json::Value,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO project_database_config
+           (project_id, engine, hosting_mode, migration_tool, migration_path, detection_metadata)
+           VALUES ($1, $2, 'external', $3, $4, $5)
+           ON CONFLICT (project_id) WHERE is_primary DO UPDATE
+           SET engine = EXCLUDED.engine,
+               migration_tool = COALESCE(project_database_config.migration_tool, EXCLUDED.migration_tool),
+               migration_path = COALESCE(project_database_config.migration_path, EXCLUDED.migration_path),
+               detection_metadata = EXCLUDED.detection_metadata,
+               updated_at = NOW()
+           WHERE project_database_config.migration_tool IS NULL OR
+                 project_database_config.detection_metadata = '{}'::jsonb"#,
+    )
+    .bind(project_id)
+    .bind(engine)
+    .bind(migration_tool)
+    .bind(migration_path)
+    .bind(metadata)
+    .execute(db)
+    .await
 }
 
 /// GET /api/projects/:id/quality-scan/:scan_id - polling stato scan

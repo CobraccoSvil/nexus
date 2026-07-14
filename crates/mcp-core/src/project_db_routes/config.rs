@@ -480,6 +480,41 @@ pub async fn set_primary_project_db_connection(
 
 // ── DELETE /api/projects/:id/db/connections/:conn_id ─────────────────────────
 
+/// Rifiuta la cancellazione della connessione PRIMARIA se ne restano altre:
+/// l'utente deve prima promuoverne un'altra, altrimenti il progetto resterebbe
+/// senza primaria.
+///
+/// Il COUNT vede ESATTAMENTE cio' che vede l'utente: la riga del DB metadati
+/// Nexus (`connection_role='nexus_metadata'`) e' esclusa da
+/// `list_project_db_connections` e non e' promuovibile a primaria. Contandola, il
+/// guard chiedeva di "impostare un'altra connessione come primaria" indicando una
+/// riga invisibile: con una sola connessione reale il progetto restava con la sua
+/// unica connessione INDELEBILE.
+async fn ensure_primary_is_deletable(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    conn_id: Uuid,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let others: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_database_config \
+         WHERE project_id = $1 AND id <> $2 AND connection_role <> $3",
+    )
+    .bind(project_id)
+    .bind(conn_id)
+    .bind(super::DbRole::NexusMetadata.as_db_value())
+    .fetch_one(db)
+    .await
+    .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if others > 0 {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "Imposta un'altra connessione come primaria prima di eliminare questa",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn delete_project_db_connection(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -503,29 +538,7 @@ pub async fn delete_project_db_connection(
     };
 
     if is_primary {
-        // Il COUNT deve vedere ESATTAMENTE cio' che vede l'utente: la riga del DB
-        // metadati Nexus (`connection_role='nexus_metadata'`) e' esclusa da
-        // `list_project_db_connections` e non e' selezionabile come primaria.
-        // Contandola, il guard chiedeva di "impostare un'altra connessione come
-        // primaria" indicando una riga invisibile: con una sola connessione reale
-        // il progetto restava con la sua unica connessione INDELEBILE.
-        let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_database_config \
-             WHERE project_id = $1 AND id <> $2 AND connection_role <> $3",
-        )
-        .bind(project_id)
-        .bind(conn_id)
-        .bind(super::DbRole::NexusMetadata.as_db_value())
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        if others > 0 {
-            return Err(api_err(
-                StatusCode::BAD_REQUEST,
-                "Imposta un'altra connessione come primaria prima di eliminare questa",
-            ));
-        }
+        ensure_primary_is_deletable(&state.db, project_id, conn_id).await?;
     }
 
     sqlx::query("DELETE FROM project_database_config WHERE id = $1 AND project_id = $2")

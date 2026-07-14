@@ -261,7 +261,7 @@ impl std::fmt::Display for GatewayHttpError {
 
 impl std::error::Error for GatewayHttpError {}
 
-/// Default mig 0421 (allineato a `nexus_gateway::http_timeouts`).
+/// Default mig 0586 (allineato a `nexus_gateway::http_timeouts`).
 const DEFAULT_COMPLETE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_RETRY_MAX_ATTEMPTS: u64 = 3;
 const DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S: i64 = 45;

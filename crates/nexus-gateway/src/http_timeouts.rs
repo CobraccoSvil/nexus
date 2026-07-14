@@ -1,17 +1,25 @@
 //! Timeout HTTP del gateway verso i provider (regola G).
 //!
 //! Le chiavi `gateway.complete_timeout_seconds` e `gateway.stream_timeout_seconds`
-//! sono seedate in mig 0421. Il client HTTP condiviso tra tutti i provider usa il
-//! massimo dei due: le completion non-streaming rispettano il primo, lo streaming
-//! il secondo (tipicamente piu' lungo).
+//! sono seedate in mig **0586**. La 0421 le aveva introdotte per il brain Python,
+//! ma la 0463 le ha eliminate con esso ("nessun consumatore"): quando questo
+//! modulo ha ricominciato a leggerle sono diventate FANTASMA (lette dal codice,
+//! assenti dal DB) e il gate `audit-settings` e' rimasto rosso finche' la 0586 non
+//! le ha riseedate. Se si aggiunge una chiave qui, serve SEMPRE la migrazione che
+//! la seeda: senza riga in DB il valore non e' configurabile e si cade muti sui
+//! default sotto.
+//!
+//! Il client HTTP condiviso tra tutti i provider usa il massimo dei due: le
+//! completion non-streaming rispettano il primo, lo streaming il secondo
+//! (tipicamente piu' lungo).
 
 use std::time::Duration;
 
 use sqlx::PgPool;
 
-/// Default mig 0421: timeout completion non-streaming verso il provider.
+/// Default allineato alla mig 0586: timeout completion non-streaming verso il provider.
 pub const DEFAULT_COMPLETE_TIMEOUT_SECS: u64 = 120;
-/// Default mig 0421: timeout streaming SSE verso il provider.
+/// Default allineato alla mig 0586: timeout streaming SSE verso il provider.
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
 fn parse_positive_u64(raw: Option<String>, default: u64) -> u64 {
