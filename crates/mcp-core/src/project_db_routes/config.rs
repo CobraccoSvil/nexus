@@ -51,12 +51,13 @@ pub async fn get_project_db_config(
             engine, hosting_mode, migration_tool, migration_path,
             allow_ddl_override, detection_metadata
         FROM project_database_config
-        WHERE project_id = $1 AND connection_role <> 'nexus_metadata'
+        WHERE project_id = $1 AND connection_role <> $2
         ORDER BY is_primary DESC, LOWER(name)
         LIMIT 1
         "#,
     )
     .bind(project_id)
+    .bind(super::DbRole::NexusMetadata.as_db_value())
     .fetch_optional(&state.db)
     .await
     .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -407,11 +408,12 @@ pub async fn list_project_db_connections(
         SELECT id, name, engine, hosting_mode, migration_tool, migration_path,
                allow_ddl_override, is_primary, created_at, updated_at
         FROM project_database_config
-        WHERE project_id = $1 AND connection_role <> 'nexus_metadata'
+        WHERE project_id = $1 AND connection_role <> $2
         ORDER BY is_primary DESC, LOWER(name)
         "#,
     )
     .bind(project_id)
+    .bind(super::DbRole::NexusMetadata.as_db_value())
     .fetch_all(&state.db)
     .await
     .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -501,11 +503,19 @@ pub async fn delete_project_db_connection(
     };
 
     if is_primary {
+        // Il COUNT deve vedere ESATTAMENTE cio' che vede l'utente: la riga del DB
+        // metadati Nexus (`connection_role='nexus_metadata'`) e' esclusa da
+        // `list_project_db_connections` e non e' selezionabile come primaria.
+        // Contandola, il guard chiedeva di "impostare un'altra connessione come
+        // primaria" indicando una riga invisibile: con una sola connessione reale
+        // il progetto restava con la sua unica connessione INDELEBILE.
         let others: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_database_config WHERE project_id = $1 AND id <> $2",
+            "SELECT COUNT(*) FROM project_database_config \
+             WHERE project_id = $1 AND id <> $2 AND connection_role <> $3",
         )
         .bind(project_id)
         .bind(conn_id)
+        .bind(super::DbRole::NexusMetadata.as_db_value())
         .fetch_one(&state.db)
         .await
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

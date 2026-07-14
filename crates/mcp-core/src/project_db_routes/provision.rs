@@ -40,8 +40,11 @@ impl DbRole {
             DbRole::NexusMetadata => "_nexus",
         }
     }
-    /// Valore della colonna `connection_role`.
-    fn as_db_value(self) -> &'static str {
+    /// Valore della colonna `connection_role`. Punto unico (regola L): i call
+    /// site che filtrano le righe per ruolo lo bindano invece di ripetere il
+    /// letterale (vedi `config.rs`, dove la riga `nexus_metadata` va nascosta
+    /// all'utente e, soprattutto, NON contata dai guard).
+    pub(crate) fn as_db_value(self) -> &'static str {
         match self {
             DbRole::App => "app",
             DbRole::NexusMetadata => "nexus_metadata",
@@ -644,28 +647,6 @@ pub async fn register_entity_routing(
     nexus_project_pools::register_entity_routing(meta, entity_kind, entity_id, project_id).await
 }
 
-/// Come [`project_data_pool`] ma a partire dall'id di un'entita' (handler senza
-/// `project_id`): risolve il progetto dalla directory di routing e delega.
-/// Entita' non mappata -> meta-DB (resilienza sicura). Punto unico (regola L).
-async fn project_data_pool_by_entity_core(
-    meta: &sqlx::PgPool,
-    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
-    entity_kind: &str,
-    entity_id: Uuid,
-) -> sqlx::PgPool {
-    match resolve_project_for_entity(meta, entity_kind, entity_id).await {
-        Some(project_id) => project_data_pool_core(meta, cache, project_id).await,
-        None => {
-            tracing::warn!(
-                entity_kind,
-                entity_id = %entity_id,
-                "routing directory: entita' non mappata, fallback al meta-DB"
-            );
-            meta.clone()
-        }
-    }
-}
-
 pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
     // Self-healing (regola L, stesso punto unico del by-id): directory O(1); se
     // la sessione NON e' mappata (creata prima della registrazione, o INSERT in
@@ -699,19 +680,6 @@ pub fn init_global_pools(cache: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx:
 pub async fn project_data_pool_from(meta: &sqlx::PgPool, project_id: Uuid) -> sqlx::PgPool {
     match GLOBAL_PROJECT_POOL_CACHE.get() {
         Some(cache) => project_data_pool_core(meta, cache, project_id).await,
-        None => meta.clone(),
-    }
-}
-
-/// Come [`project_data_pool_from`] ma a partire dall'id di un'entita' (risolto via
-/// la directory di routing). Base dei wrapper per session/message/run.
-async fn project_data_pool_by_entity_from(
-    meta: &sqlx::PgPool,
-    entity_kind: &str,
-    entity_id: Uuid,
-) -> sqlx::PgPool {
-    match GLOBAL_PROJECT_POOL_CACHE.get() {
-        Some(cache) => project_data_pool_by_entity_core(meta, cache, entity_kind, entity_id).await,
         None => meta.clone(),
     }
 }

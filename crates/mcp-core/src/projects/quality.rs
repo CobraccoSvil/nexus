@@ -738,11 +738,19 @@ async fn upsert_db_profile(db: &sqlx::PgPool, project_id: Uuid, root_path: &str)
         .map(|t| t.as_str().to_string());
     let mig_path = db_profile.migration_path.clone();
     let metadata = serde_json::to_value(&db_profile).unwrap_or(serde_json::json!({}));
-    let _ = sqlx::query(
+    // Il conflict target e' l'indice PARZIALE
+    // `uq_project_database_config_project_primary` (project_id) WHERE is_primary:
+    // va qualificato con la stessa WHERE, perche' l'UNIQUE sul solo project_id
+    // NON esiste piu' (mig 0083: tabella multi-connessione per progetto). Senza
+    // la qualifica la query falliva SEMPRE con "no unique or exclusion constraint
+    // matching the ON CONFLICT specification", e il `.ok()` la rendeva invisibile:
+    // il profilo DB non e' mai stato scritto. La seconda WHERE (in coda) resta la
+    // condizione di UPDATE: non sovrascrive un profilo gia' popolato dall'utente.
+    let saved = sqlx::query(
         r#"INSERT INTO project_database_config
            (project_id, engine, hosting_mode, migration_tool, migration_path, detection_metadata)
            VALUES ($1, $2, 'external', $3, $4, $5)
-           ON CONFLICT (project_id) DO UPDATE
+           ON CONFLICT (project_id) WHERE is_primary DO UPDATE
            SET engine = EXCLUDED.engine,
                migration_tool = COALESCE(project_database_config.migration_tool, EXCLUDED.migration_tool),
                migration_path = COALESCE(project_database_config.migration_path, EXCLUDED.migration_path),
@@ -757,15 +765,26 @@ async fn upsert_db_profile(db: &sqlx::PgPool, project_id: Uuid, root_path: &str)
     .bind(&mig_path)
     .bind(&metadata)
     .execute(db)
-    .await
-    .ok();
-    tracing::info!(
-        project_id = %project_id,
-        engine = %engine_str,
-        tool = ?tool_str,
-        confidence = db_profile.confidence,
-        "DB detector: profilo rilevato per progetto"
-    );
+    .await;
+
+    // Best-effort (il quality scan non deve fallire per il profilo DB), ma
+    // l'errore si LOGGA: era il `.ok()` muto a nascondere la query rotta, mentre
+    // l'info sotto dichiarava comunque "profilo rilevato".
+    match saved {
+        Ok(_) => tracing::info!(
+            project_id = %project_id,
+            engine = %engine_str,
+            tool = ?tool_str,
+            confidence = db_profile.confidence,
+            "DB detector: profilo rilevato e salvato per progetto"
+        ),
+        Err(e) => tracing::warn!(
+            project_id = %project_id,
+            engine = %engine_str,
+            error = %e,
+            "DB detector: profilo rilevato ma salvataggio in project_database_config fallito"
+        ),
+    }
 }
 
 /// GET /api/projects/:id/quality-scan/:scan_id - polling stato scan

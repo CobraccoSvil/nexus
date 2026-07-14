@@ -657,21 +657,68 @@ pub async fn detect_project_db(
         .await
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Salva metadata (merge in detection_metadata, senza sovrascrivere config esistente)
+    // Salva la detection sulla riga PRIMARIA: e' quella che il pannello mostra
+    // (`get_project_db_config`) e da cui si legge il fallback
+    // `detection_metadata->>'connection_string'` piu' sotto.
+    //
+    // `ON CONFLICT (project_id) WHERE is_primary` aggancia l'indice PARZIALE
+    // `uq_project_database_config_project_primary`. Il conflict target va
+    // qualificato perche' l'UNIQUE sul solo `project_id` NON esiste piu' (mig
+    // 0083: la tabella e' multi-connessione per progetto): la query precedente
+    // diceva `ON CONFLICT (project_id)` e falliva SEMPRE con
+    // "no unique or exclusion constraint matching the ON CONFLICT
+    // specification", per giunta ingoiata da un `let _`, quindi la
+    // detection_metadata non veniva mai salvata e nessuno se ne accorgeva.
     let meta = serde_json::to_value(&result).unwrap_or(json!({}));
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO project_database_config (project_id, detection_metadata)
-        VALUES ($1, $2)
-        ON CONFLICT (project_id) DO UPDATE SET
-            detection_metadata = EXCLUDED.detection_metadata,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(project_id)
-    .bind(&meta)
-    .execute(&state.db)
-    .await;
+    let saved = match (result.engine.as_deref(), result.hosting_mode.as_deref()) {
+        // Detection completa: se la config manca la creiamo, se c'e' gia'
+        // aggiorniamo SOLO la metadata (engine/hosting_mode scelti dall'utente
+        // non si toccano - "senza sovrascrivere config esistente").
+        (Some(engine), Some(hosting_mode)) => {
+            sqlx::query(
+                r#"
+                INSERT INTO project_database_config
+                    (project_id, engine, hosting_mode, detection_metadata)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (project_id) WHERE is_primary DO UPDATE SET
+                    detection_metadata = EXCLUDED.detection_metadata,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(project_id)
+            .bind(engine)
+            .bind(hosting_mode)
+            .bind(&meta)
+            .execute(&state.db)
+            .await
+        }
+        // Engine o hosting_mode non rilevati: NON inventiamo una config (le due
+        // colonne sono NOT NULL senza default, regola G: niente magic fallback).
+        // Aggiorniamo la metadata solo se la riga esiste gia'.
+        _ => {
+            sqlx::query(
+                r#"
+                UPDATE project_database_config
+                SET detection_metadata = $2, updated_at = NOW()
+                WHERE project_id = $1 AND is_primary
+                "#,
+            )
+            .bind(project_id)
+            .bind(&meta)
+            .execute(&state.db)
+            .await
+        }
+    };
+    // Best-effort dichiarato: la detection e' comunque ritornata al chiamante.
+    // Ma l'errore si LOGGA (regola H): era proprio il `let _` a rendere
+    // invisibile una query rotta in modo incondizionato.
+    if let Err(e) = saved {
+        tracing::warn!(
+            project_id = %project_id,
+            error = %e,
+            "detect_project_db: salvataggio di detection_metadata fallito"
+        );
+    }
 
     Ok(Json(json!({
         "ok": true,
