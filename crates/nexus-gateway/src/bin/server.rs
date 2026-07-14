@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -62,6 +63,12 @@ async fn main() -> anyhow::Result<()> {
         // runtime tokio.
     }
 
+    let max_body_bytes = nexus_gateway::resolve_max_body_bytes(&db).await;
+    tracing::info!(
+        max_body_mb = max_body_bytes / (1024 * 1024),
+        "gateway: limite body DB-driven (era il default axum di 2 MB, silenzioso)"
+    );
+
     let app = Router::new()
         .route("/health", get(routes::health))
         .route("/providers", get(routes::providers))
@@ -81,6 +88,18 @@ async fn main() -> anyhow::Result<()> {
             state.clone(),
             auth::require_auth,
         ))
+        // Limite ESPLICITO sul body (regola G: nel DB, non un default nascosto
+        // della libreria). Senza questo layer axum applica il proprio default di
+        // 2 MB, mentre mcp-core — che e' il chiamante — ne accetta 50: un prompt
+        // agentico cresciuto oltre i 2 MB veniva RIFIUTATO dal gateway, e il
+        // rifiuto era INVISIBILE (tower_http::trace classifica come failure solo
+        // i 5xx: un 413 non lascia una riga di log). Lato mcp-core arrivava un
+        // "error sending request", cioe' un errore di TRASPORTO: il segnale
+        // "richiesta troppo grande" era perso per strada (regola M) e il motore
+        // non poteva reagire compattando il contesto.
+        // Verificato sul campo: body 1.90 MB passa, 2.10 MB -> 413
+        // "Failed to buffer the request body: length limit exceeded".
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
