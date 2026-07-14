@@ -87,11 +87,19 @@ assert_single "redaction_guard" 'fn (find_redacted_placeholder|enforce_no_redact
 assert_single "font web-ide" "ui-monospace|['\"]JetBrains Mono|fontFamily:[[:space:]]*['\"]monospace" 'apps/web-ide/app/layout.tsx' apps/web-ide
 
 # Convergenza pool DB per-progetto (2026-07-03): i mattoni comuni della
-# risoluzione (flag separazione, registry project_database_config role
-# nexus_metadata, directory nexus_data_routing) vivono SOLO in
-# crates/nexus-project-pools; mcp-core::project_db_routes e i servizi delegano.
+# risoluzione (registry project_database_config role nexus_metadata, directory
+# nexus_data_routing) vivono SOLO in crates/nexus-project-pools;
+# mcp-core::project_db_routes e i servizi delegano.
 # I glob ammettono anche i test del crate stesso.
-assert_single "flag separazione DB" 'get_setting\(.*"db\.project_separation\.enabled"' 'crates/nexus-project-pools/*' crates
+#
+# La separazione DB e' SEMPRE attiva: il flag e' stato eliminato (mig 0527) e i
+# rami OFF rimossi. Il rischio da presidiare non e' piu' "il flag e' letto fuori
+# dal crate" ma "il flag viene REINTRODOTTO", riaprendo un rollback al meta che
+# leggerebbe tabelle droppate (mig 0525). Il pattern non richiede piu' il
+# prefisso get_setting( — che dopo la rimozione non matchava piu' nulla, e
+# rendeva il check verde per assenza di bersaglio: l'unica occorrenza legittima
+# e' il doc-comment storico in lib.rs, gia' coperto dal glob del crate.
+assert_single "flag separazione DB rimosso (mig 0527)" 'db\.project_separation\.enabled' 'crates/nexus-project-pools/*' crates
 assert_single "registry DB metadati progetto" "connection_role = 'nexus_metadata'" 'crates/nexus-project-pools/*' crates
 assert_single "directory nexus_data_routing" '(FROM|INTO) nexus_data_routing' 'crates/nexus-project-pools/*' crates
 

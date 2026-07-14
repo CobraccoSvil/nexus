@@ -158,9 +158,9 @@ pub fn start_run_summary_worker(state: Arc<WikiDeps>) {
 }
 
 async fn scan_and_ingest(state: &WikiDeps, settings: &RunSummarySettings) -> Result<usize> {
-    // Separazione DB per-progetto: i run vivono nel DB del progetto (a flag OFF
-    // ancora nel meta). Iteriamo i progetti e instradiamo la scansione + il
-    // mark_processed sul pool di ciascuno; `wiki_docs`/Qdrant restano sul meta
+    // Separazione DB per-progetto: i run vivono nel DB del progetto (sempre:
+    // il flag e' stato rimosso, mig 0527). Iteriamo i progetti e instradiamo la
+    // scansione + il mark_processed sul pool di ciascuno; `wiki_docs`/Qdrant restano sul meta
     // (dominio KB non ancora migrato). `max_per_minute` resta un cap GLOBALE per
     // batch tramite il budget `remaining` decrementato a ogni run trattato.
     let mut ingested = 0usize;

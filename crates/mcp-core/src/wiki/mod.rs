@@ -125,11 +125,15 @@ impl WikiAiServices for AppStateWikiAi {
     }
 }
 
-/// Impl mcp-core del risolutore pool per-progetto per i worker wiki
-/// (separazione DB). Delega al registry globale `project_data_pool_from` (punto
-/// unico, regola L): a flag OFF ritorna il meta-DB, a flag ON il pool di
-/// `<slug>_nexus`. Tiene solo il meta pool (i worker girano in background, senza
-/// AppState vivo).
+/// Impl mcp-core del risolutore pool per-progetto per i worker wiki. Delega al
+/// registry globale `project_data_pool_from` (punto unico, regola L), che
+/// instrada sul pool di `<slug>_nexus` e vi aggiunge il layer che il crate
+/// read-only `nexus-project-pools` non puo' offrire: provisioning al primo
+/// accesso, migrazioni `db/migrations/project` sotto lock per-progetto e cache
+/// pool condivisa con AppState. Ritorna il meta solo per resilienza (registry
+/// non inizializzato o provisioning fallito), mai per configurazione: il flag
+/// separazione e' stato rimosso (mig 0527). Tiene solo il meta pool (i worker
+/// girano in background, senza AppState vivo).
 #[derive(Clone)]
 pub(crate) struct AppStateProjectPool {
     meta: sqlx::PgPool,

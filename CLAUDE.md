@@ -275,7 +275,7 @@ condividere codice (fragile base class).
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
-| Pool DB metadati per-progetto (flag, registry, elenco progetti, directory routing) | crate `nexus-project-pools`; `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
+| Pool DB metadati per-progetto (registry, elenco progetti, directory routing, cache pool) | crate `nexus-project-pools` (separazione sempre attiva, flag rimosso mig 0527); `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
 | Aggregazione problemi ripetitivi (pannello Problemi) | `mcp-core/src/project_workspace/problem_aggregation.rs` (`problem_group_key`, `aggregate_problems`); `get_project_problems` delega |
 

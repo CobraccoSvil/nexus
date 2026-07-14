@@ -53,16 +53,24 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
     ) -> BoxFuture<'_, ()>;
 }
 
-/// Risolutore del pool DB per-progetto (separazione DB per-progetto). Iniettato
-/// da mcp-core, che possiede il registry globale (`project_data_pool_from`):
-/// nexus-wiki non vede quel registry (la dipendenza e' invertita, mcp-core ->
-/// nexus-wiki), quindi riceve solo questo contratto. I worker cross-progetto lo
-/// usano per instradare le letture del dominio run/chat sul DB del singolo
-/// progetto. A flag separazione OFF l'impl delega comunque a
-/// `project_data_pool_from`, che ritorna il meta-DB -> comportamento invariato.
+/// Risolutore del pool DB per-progetto. Iniettato da mcp-core, che possiede il
+/// registry globale (`project_data_pool_from`): nexus-wiki non vede quel
+/// registry (la dipendenza e' invertita, mcp-core -> nexus-wiki), quindi riceve
+/// solo questo contratto. I worker cross-progetto lo usano per instradare le
+/// letture del dominio run/chat sul DB del singolo progetto.
+///
+/// Il contratto NON e' rimpiazzabile da `nexus_project_pools::project_data_pool`
+/// (che pure e' il punto unico dei mattoni comuni, regola L): l'impl di mcp-core
+/// PROVISIONA il DB al primo accesso, ne applica le migrazioni
+/// `db/migrations/project` sotto lock per-progetto e condivide la cache pool con
+/// AppState. Il crate read-only non puo' farlo (il migrator sqlx non e'
+/// concurrency-safe cross-processo) e i worker wiki girano dentro il processo
+/// mcp-core: appoggiarli al crate aprirebbe un secondo pool per progetto.
 pub trait ProjectPoolResolver: std::fmt::Debug + Send + Sync {
-    /// Pool del DB del dominio run/chat per `project_id`. A flag OFF ritorna il
-    /// meta-DB; a flag ON il pool di `<slug>_nexus`.
+    /// Pool del DB del dominio run/chat per `project_id`: il DB `<slug>_nexus`
+    /// del progetto. La separazione e' sempre attiva (flag rimosso, mig 0527):
+    /// l'unica via che ritorna il meta e' la resilienza dell'impl (registry non
+    /// inizializzato o provisioning fallito), mai un ramo di configurazione.
     fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, PgPool>;
 }
 
@@ -72,15 +80,19 @@ pub struct WikiDeps {
     pub db: PgPool,
     pub template_cache: TemplateCache,
     pub ai: Arc<dyn WikiAiServices>,
-    /// Risolutore pool per-progetto (separazione DB). `None` -> i worker
-    /// cross-progetto ricadono sul meta-DB (`db`), comportamento storico.
+    /// Risolutore pool per-progetto. In produzione e' sempre `Some`: l'unico
+    /// costruttore (`AppState::wiki_deps`) lo valorizza. Il ramo `None` di
+    /// [`Self::run_pool`] ricade sul meta-DB, dove le tabelle del dominio
+    /// chat/run sono decommissionate (mig 0507/0525): resta solo come default
+    /// per i test che non iniettano il risolutore.
     pub project_pool: Option<Arc<dyn ProjectPoolResolver>>,
 }
 
 impl WikiDeps {
-    /// Pool del dominio run/chat per `project_id`: via il risolutore iniettato
-    /// (separazione DB) oppure, se assente, il meta-DB. Punto unico (regola L)
-    /// di routing per i worker cross-progetto.
+    /// Pool del dominio run/chat per `project_id`: via il risolutore iniettato,
+    /// che instrada sul DB `<slug>_nexus` del progetto. Punto unico (regola L)
+    /// di routing per i worker cross-progetto. Senza risolutore (solo test)
+    /// ritorna il meta-DB: vedi la nota sul campo [`Self::project_pool`].
     pub async fn run_pool(&self, project_id: uuid::Uuid) -> PgPool {
         match &self.project_pool {
             Some(r) => r.project_pool(project_id).await,

@@ -871,8 +871,8 @@ pub async fn get_session_usage(
 
     // Separazione DB per-progetto: chat_sessions/chat_messages vivono nel DB
     // del progetto (nel meta sono decommissionate, mig 0507). Il pool giusto si
-    // risolve dalla sessione via nexus-project-pools (punto unico, regola L);
-    // a flag OFF ritorna il meta (storico).
+    // risolve dalla sessione via nexus-project-pools (punto unico, regola L).
+    // La separazione e' sempre attiva: il flag e' stato rimosso (mig 0527).
     let session_pool = match nexus_project_pools::project_data_pool_by_session(
         &state.db, session_id,
     )

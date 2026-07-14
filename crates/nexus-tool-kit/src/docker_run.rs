@@ -52,8 +52,7 @@ impl NexusToolHandler for DockerRunTool {
             // Separazione DB: agent_processes vive nel DB del progetto; il pool
             // si risolve via nexus-project-pools (punto unico, regola L). Non
             // risolvibile -> WARN + skip check, stesso degrado del pool meta.
-            // Il run_pool NON va chiuso: a flag ON e' condiviso dalla cache del
-            // crate, a flag OFF e' un clone di nexus_pool (chiuso sotto).
+            // Il run_pool NON va chiuso: e' condiviso dalla cache del crate.
             let run_pool =
                 match nexus_project_pools::project_data_pool(&nexus_pool, ctx.project_id).await {
                     Ok(p) => Some(p),

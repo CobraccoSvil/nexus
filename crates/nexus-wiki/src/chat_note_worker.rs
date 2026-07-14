@@ -193,9 +193,9 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &ChatNoteSettings) -> Resul
         }
     };
 
-    // Separazione DB per-progetto: i messaggi chat vivono nel DB del progetto (a
-    // flag OFF ancora nel meta). Iteriamo i progetti e instradiamo scansione +
-    // mark_processed sul pool di ciascuno; `wiki_docs`/Qdrant restano sul meta
+    // Separazione DB per-progetto: i messaggi chat vivono nel DB del progetto
+    // (sempre: il flag e' stato rimosso, mig 0527). Iteriamo i progetti e
+    // instradiamo scansione + mark_processed sul pool di ciascuno; `wiki_docs`/Qdrant restano sul meta
     // (dominio KB non ancora migrato). `max_per_minute` resta un cap GLOBALE per
     // batch tramite il budget `remaining` decrementato a ogni messaggio trattato.
     let mut ingested = 0usize;
@@ -206,7 +206,7 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &ChatNoteSettings) -> Resul
         }
         let run_pool = state.run_pool(project_id).await;
         // Messaggi user pending per QUESTO progetto (no JOIN projects: il
-        // project_id viene dall'iterazione, e a flag ON il pool ha solo i suoi).
+        // project_id viene dall'iterazione, e il pool ha solo i suoi).
         let rows = sqlx::query(
             r#"
             SELECT cm.id, cm.session_id, cm.content, cm.created_at
