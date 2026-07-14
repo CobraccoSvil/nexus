@@ -77,20 +77,15 @@ pub fn spawn_model_health_probe(
     interval_s: u64,
     failure_threshold: i32,
 ) {
-    let enabled = match std::env::var("NEXUS_MODEL_HEALTH_PROBE_ENABLED").as_deref() {
-        Ok("false") | Ok("0") => false,
-        Ok("true") | Ok("1") => true,
-        _ => enabled,
-    };
+    // Niente override da env (regola G): enable/intervallo arrivano SOLO dai
+    // settings DB (model_health_probe_enabled / _interval_s, letti in main).
+    // Un env var che spegne senza traccia l'unica verifica automatica dei
+    // modelli e' esattamente il fallback nascosto che la regola G vieta.
     if !enabled {
         tracing::info!("model_health_probe: DISABILITATO (model_health_probe_enabled=false)");
         return;
     }
-    let interval_s = std::env::var("NEXUS_MODEL_HEALTH_PROBE_INTERVAL_S")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(interval_s)
-        .max(MIN_INTERVAL_S);
+    let interval_s = interval_s.max(MIN_INTERVAL_S);
     tracing::info!(
         "model_health_probe: avvio worker (interval={interval_s}s, threshold={failure_threshold})",
     );
@@ -232,14 +227,14 @@ async fn probe_model_round(
 /// Il tool-probe gira sui candidati agentici (supports_tool_use=true) E
 /// sui modelli AUTO-DEGRADATI da un writer automatico (supports_tool_use=
 /// false con reason 'tool_probe_failed:%' dal probe O 'malformed_tool_calls'
-/// dal runtime, solo capability_source='auto'). Senza questo secondo caso
+/// dal runtime, solo righe senza lock). Senza questo secondo caso
 /// il re-enable promesso era IRRAGGIUNGIBILE: un modello marcato
 /// non-tool-capable non veniva mai piu' ri-testato (catch-22) e restava
 /// degradato anche dopo che il provider tornava sano (es. i magistral; e
 /// il degrado runtime era riabilitabile SOLO se la routing matrix
 /// continuava a scegliere il modello — caso deepseek-v4-pro). I modelli
-/// pure-chat (mai tool-capable) e le curature manual
-/// (capability_source='manual') NON vengono toccati. Provider in cooldown
+/// pure-chat (mai tool-capable) e le righe con lock esplicito
+/// (capability_locked, mig 0590) NON vengono toccati. Provider in cooldown
 /// gia' saltato dal chiamante.
 /// PUNTO UNICO (regola L): il criterio di riaggancio vive in
 /// tool_capability::was_auto_degraded e copre ANCHE le righe ORFANE
@@ -257,7 +252,7 @@ async fn maybe_tool_probe_round(
     let (tool_probe_enabled, tool_failure_threshold) = *tool_cfg;
     let tool_probe_was_auto_degraded = crate::tool_capability::was_auto_degraded(
         pm.supports_tool_use,
-        &pm.capability_source,
+        pm.capability_locked,
         pm.auto_disabled_reason.as_deref(),
         pm.consecutive_tool_failures,
     );
@@ -371,7 +366,7 @@ impl ProbeRoundStats {
     }
 }
 
-enum ProbeOutcome {
+pub(crate) enum ProbeOutcome {
     Ok,
     ProviderWide,
     ModelSpecificCounted,
@@ -398,7 +393,7 @@ enum ToolProbeOutcome {
     Transient,
 }
 
-/// Riga del catalog per il probe. `capability_source` e `auto_disabled_reason`
+/// Riga del catalog per il probe. `capability_locked` e `auto_disabled_reason`
 /// servono al tool-probe per decidere se RI-testare un modello gia' marcato
 /// non-tool-capable (chiude il catch-22 del re-enable, vedi loop principale).
 struct ProbeModel {
@@ -406,7 +401,9 @@ struct ProbeModel {
     model: String,
     consecutive_failures: i32,
     supports_tool_use: bool,
-    capability_source: String,
+    /// Lock esplicito della curatela (mig 0590): esclude la riga dal ciclo
+    /// tool-capability automatico (degrado E ri-test).
+    capability_locked: bool,
     auto_disabled_reason: Option<String>,
     /// Counter del ciclo tool-capability: serve al gate di ri-test per
     /// riconoscere le righe orfane (false + reason NULL + counter > 0).
@@ -418,7 +415,7 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
     let rows = sqlx::query(
         "SELECT provider, model, consecutive_failures, \
                 COALESCE(supports_tool_use, false) AS supports_tool_use, \
-                COALESCE(capability_source, 'auto') AS capability_source, \
+                COALESCE(capability_locked, false) AS capability_locked, \
                 auto_disabled_reason, \
                 COALESCE(consecutive_tool_failures, 0) AS consecutive_tool_failures
            FROM ai_price_catalog
@@ -435,9 +432,7 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
             model: r.try_get("model").unwrap_or_default(),
             consecutive_failures: r.try_get("consecutive_failures").unwrap_or(0),
             supports_tool_use: r.try_get("supports_tool_use").unwrap_or(false),
-            capability_source: r
-                .try_get("capability_source")
-                .unwrap_or_else(|_| "auto".to_string()),
+            capability_locked: r.try_get("capability_locked").unwrap_or(false),
             auto_disabled_reason: r.try_get("auto_disabled_reason").ok().flatten(),
             consecutive_tool_failures: r.try_get("consecutive_tool_failures").unwrap_or(0),
         })
@@ -1019,8 +1014,9 @@ fn handle_probe_ok(provider: &str, model: &str, prior_failures: i32) -> ProbeOut
 
 /// Registra un fallimento model-specific: incrementa `consecutive_failures` e,
 /// a soglia, auto-disabilita il modello (is_enabled=false + reason). Estratta
-/// dal ramo ModelSpecific di `apply_probe_outcome`.
-async fn record_model_specific_failure(
+/// dal ramo ModelSpecific di `apply_probe_outcome`. `pub(crate)`: e' il punto
+/// unico (regola L) riusato da `model_observation` per i turni REALI.
+pub(crate) async fn record_model_specific_failure(
     db: &PgPool,
     provider: &str,
     model: &str,

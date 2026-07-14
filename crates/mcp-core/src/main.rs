@@ -56,6 +56,7 @@ mod mcp_connectors;
 mod middleware;
 mod model_catalog_sync;
 mod model_health_probe;
+mod model_observation;
 mod models;
 mod mutations_api;
 mod native_engine;
