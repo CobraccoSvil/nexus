@@ -1746,7 +1746,7 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
                 extra_out.insert("auto_escalations".to_string(), json!(g1_escal + 1));
                 // Grazia post-escalation: il promosso riparte con finestra pulita
                 // sull'asse repeated_action (vedi floor nel check 6c).
-                extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                Self::mark_repeat_scan_floor(&mut extra_out, state);
                 return Ok(StateDelta {
                     messages: Some(vec![esc_nudge]),
                     sticky_provider: Some(Some(pick.provider)),
@@ -2050,7 +2050,7 @@ esecuzione/verifica), oppure rispondi a parole se era una domanda.",
                     let mut extra_out = state.extra.clone();
                     extra_out.insert("auto_escalations".to_string(), json!(expl_escal + 1));
                     // Grazia post-escalation (vedi floor nel check 6c).
-                    extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                    Self::mark_repeat_scan_floor(&mut extra_out, state);
                     progress_guided.insert("exploration".to_string());
                     return Ok(StateDelta {
                         messages: Some(vec![esc_nudge]),
@@ -2524,8 +2524,7 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                         // Grazia post-escalation: senza questo floor il rientro
                         // rivedeva le stesse azioni e ri-decideva in pochi ms,
                         // bruciando il budget senza chiamare il promosso.
-                        extra_out
-                            .insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                        Self::mark_repeat_scan_floor(&mut extra_out, state);
                         progress_guided.insert("repeated_action".to_string());
                         return Ok(StateDelta {
                             messages: Some(vec![esc_nudge]),
@@ -2682,8 +2681,7 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
                         let mut extra_out = state.extra.clone();
                         extra_out.insert("auto_escalations".to_string(), json!(rp_escal + 1));
                         // Grazia post-escalation (vedi floor nel check 6c).
-                        extra_out
-                            .insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+                        Self::mark_repeat_scan_floor(&mut extra_out, state);
                         progress_guided.insert("resource_reallocation".to_string());
                         return Ok(StateDelta {
                             messages: Some(vec![esc_nudge]),
@@ -3500,19 +3498,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                         // `loop_fallback_default`: un solo provider statico, senza
                         // filtro cooldown -> o coincideva col corrente -> None, o
                         // puntava a un provider a crediti zero -> loop fino a Error).
-                        let mut tried: Vec<String> = state
-                            .extra
-                            .get("failover_tried")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if !tried.iter().any(|p| p == &provider) {
-                            tried.push(provider.clone());
-                        }
+                        let mut tried = Self::failover_tried_with_current(state, &provider);
                         // Punto unico (regola L): selezione AGENTICA del SOSTITUTO
                         // (tutti i tier, telemetria strutturata, esclusi i gia' provati
                         // e i cooldown). Il tier del modello caduto viaggia come
@@ -4509,7 +4495,7 @@ modello piu' capace.",
             // corrente, cosi' l'assistant del promosso (appeso da questo delta)
             // e le sue azioni successive contano da zero nel detector
             // repeated_action, mentre lo storico pre-promozione non conta piu'.
-            extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+            Self::mark_repeat_scan_floor(&mut extra_out, state);
         }
         if declaring_turn {
             // Finestra dichiarativa consumata (ADR 0034): una sola, che il
@@ -4564,6 +4550,145 @@ struct StallEmitGate {
     /// Budget consultazioni CROSS-RUN gia' usate nella sessione (per il log di
     /// emissione, campo strutturato).
     moves_used_session: i64,
+}
+
+/// Segnali cross-cutting che alimentano lo `StallContext`, tutti STRUTTURATI
+/// (regola M: mai parsing della prosa). Raccolti una volta sola dal punto unico
+/// [`StallCrossSignals::collect`] (regola L): i due detector-emissione gemelli
+/// ([`ExecutorNode::maybe_stall_reason_delta`] e
+/// [`ExecutorNode::maybe_runaway_stall_delta`]) ne avevano due copie identiche.
+struct StallCrossSignals {
+    /// Firme dei tool recenti (dal detector di ripetizione).
+    recent_tool_signatures: Vec<String>,
+    /// Esito STRUTTURATO dell'ultimo tool (`tool_result_outcome_after`).
+    last_outcome: Option<&'static str>,
+    /// File modificati nel run (progresso reale).
+    modified: Vec<String>,
+    /// Un tool ha rifiutato l'input per placeholder di redazione.
+    redaction_rejected: bool,
+}
+
+impl StallCrossSignals {
+    /// Raccoglie i segnali dallo stato e dalla coda dei messaggi. Puro
+    /// (side-effect-free): i lookback 40/16 sono quelli storici dei due gemelli.
+    fn collect(state: &AgentState, messages: &[Message]) -> Self {
+        Self {
+            recent_tool_signatures: state.recent_tool_signatures.clone().unwrap_or_default(),
+            last_outcome: ExecutorNode::last_tool_outcome(messages),
+            modified: crate::routing::signals::modified_files_from_messages(messages, 40),
+            // redaction_rejected dal SEGNALE STRUTTURATO (regola M): la fonte
+            // (`mcp-core::security::redaction_guard`) antepone al tool_result il codice
+            // macchina [REDACTION_REJECTED] quando rifiuta un input contenente un
+            // placeholder di redazione; il punto unico `recent_redaction_rejected`
+            // (regola L) lo LEGGE, MAI un `contains("[REDACTED:")` sul placeholder
+            // umano. E' il segnale che riconosce il blocco ambientale del loop email
+            // (email ri-oscurata che il modello continua a copiare).
+            redaction_rejected: crate::routing::signals::recent_redaction_rejected(messages, 16),
+        }
+    }
+}
+
+/// Segnali STRUTTURATI (regola M) che alimentano lo `ScaleContext` del
+/// scale-controller. Raccolti dal punto unico [`ScaleSignals::collect`]; i DEFAULT
+/// documentati qui sotto sono tutti SAFETY-BIASED (proteggono dal downscale piu'
+/// del necessario, mai meno).
+struct ScaleSignals {
+    /// Pressione contesto dal `context_window` del modello del turno (config,
+    /// regola G). Window 0 = ignoto -> pressione Low + headroom pieno.
+    context_pressure: crate::runtime::ports::ContextPressure,
+    /// Rapporto token stimati / finestra, in `[0,1]`. 0 se la finestra e' ignota.
+    token_headroom_ratio: f64,
+    /// Errori tool dal segnale strutturato (exit_code/is_error), finestra 40
+    /// messaggi (coerente col lookback di `modified_files`).
+    error_count: i64,
+    /// Turni consecutivi senza errori tool (stessa finestra di `error_count`).
+    error_free_streak: i64,
+    /// L'ultimo tool_result e' un errore (segnale strutturato, finestra 4).
+    repeated_action_failed: bool,
+    /// DEFAULT documentato: conteggio TOTALE dei file modificati nella finestra,
+    /// non il delta per-checkpoint (che richiederebbe un segnale di checkpoint
+    /// precedente non tracciato). Conservativo: il downscale richiede `> 0`,
+    /// quindi un run senza modifiche NON downscala per questo campo.
+    files_modified_delta: i64,
+    /// Stima di complessita' del task.
+    task_complexity_est: i64,
+    /// Il task e' critico (floor di tier piu' alto).
+    task_critical: bool,
+    /// Pavimento di tier imposto dall'intent.
+    intent_tier_floor: ScaleTier,
+    /// Escalation gia' fatte nel run (eco al `build_scale_context`).
+    escalations_done: i64,
+    /// DEFAULT safety-biased: deriva da "c'e' stata un'escalation nel run"
+    /// (`escalations_done > 0`). Finche' il run ha dovuto salire di potenza il
+    /// downscale resta VIETATO (FIX-E). Non c'e' un escalation-lock esplicito
+    /// tracciato nel path; questo proxy e' conservativo.
+    escalation_lock_active: bool,
+    /// Costo cumulativo speso dai subagenti.
+    cost_spent_usd: f64,
+    /// Turni dall'ultimo cambio-tier (cooldown anti-thrash).
+    turns_since_change: i64,
+    /// Inversioni di tier gia' fatte (gate anti-oscillazione).
+    reversal_count: i64,
+}
+
+impl ScaleSignals {
+    /// Raccoglie i segnali da stato/messaggi/config. Puro (side-effect-free).
+    ///
+    /// Non copre 3 input di `build_scale_context`, i cui DEFAULT sono cablati in
+    /// [`ExecutorNode::build_scale_ctx`] perche' NON derivano da alcun segnale:
+    /// `todos_closed=0` (nessun TodoStore nel path del turno), `cost_cap_usd=0.0`
+    /// (nessun cap propagato -> guard di costo disattivate) e
+    /// `required_capability=None` (il selettore a valle forza gia' l'eleggibilita'
+    /// agentica; una capability del turno non e' un segnale disponibile, quindi non
+    /// la si afferma — regola M).
+    fn collect(
+        node: &ExecutorNode,
+        state: &AgentState,
+        iters_in: i64,
+        messages: &[Message],
+        escalations_done: i64,
+        est_tokens: i64,
+    ) -> Self {
+        let context_window = node.cfg.context_window;
+        let token_headroom_ratio = if context_window > 0 {
+            (est_tokens.max(0) as f64 / context_window as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (error_count, error_free_streak) = tool_error_stats(messages, 40);
+        let task_critical = ExecutorNode::task_critical(state, escalations_done);
+        Self {
+            context_pressure: context_pressure_from_tokens(est_tokens, context_window),
+            token_headroom_ratio,
+            error_count,
+            error_free_streak,
+            repeated_action_failed: detect_recent_tool_error(messages, 4),
+            files_modified_delta: modified_files_from_messages(messages, 40).len() as i64,
+            task_complexity_est: ExecutorNode::task_complexity_est(state),
+            task_critical,
+            intent_tier_floor: ExecutorNode::intent_tier_floor(task_critical),
+            escalations_done,
+            escalation_lock_active: escalations_done > 0,
+            cost_spent_usd: state.subagent_cost_cumulative_usd.unwrap_or(0.0),
+            turns_since_change: node.scale_turns_since_change(state, iters_in),
+            reversal_count: ExecutorNode::scale_reversal_count(state),
+        }
+    }
+}
+
+/// Contesto condiviso dai rami di APPLICAZIONE della `RecoveryMove` al rientro
+/// dal nodo `StallRecovery` (vedi [`ExecutorNode::consume_recovery_move`]).
+/// Raggruppa in una struct (composizione, non parametri sciolti ripetuti su 4
+/// firme) lo stato del turno e la mossa gia' tradotta dal punto unico `translate`.
+struct RecoveryApply<'a> {
+    state: &'a AgentState,
+    ctx: &'a AgentNodeCtx,
+    mode: crate::runtime::ports::ExecMode,
+    iters_in: i64,
+    /// Contesto di stallo che ha prodotto la mossa (porta `axis` e `work_epoch`).
+    stall: &'a crate::runtime::ports::StallContext,
+    /// Mossa del reasoner gia' tradotta in decisione della gerarchia fissa.
+    dec: &'a pc::ProgressDecision,
 }
 
 impl ExecutorNode {
@@ -4732,18 +4857,8 @@ impl ExecutorNode {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         let epoch = crate::decisions::meta_reason::work_epoch(iters_in, escalations, floor);
-        // (3) ANTI-META-LOOP (idempotenza per epoca): mossa gia' decisa+consumata
-        // (chiave-cache in extra) o epoca gia' risolta a Fallback (marcatore) per questo
-        // (axis, epoch) -> non ri-emettere. La chiave-cache e' il punto unico
-        // `stall_move_key` (regola L).
-        if state.extra.contains_key(&stall_move_key(axis, epoch))
-            || state
-                .extra
-                .get("stall_fallback_epochs")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
-                .unwrap_or(false)
-        {
+        // (3) ANTI-META-LOOP (idempotenza per epoca) -> non ri-emettere.
+        if Self::stall_epoch_already_handled(state, axis, epoch) {
             return None;
         }
         Some(StallEmitGate {
@@ -4751,6 +4866,67 @@ impl ExecutorNode {
             escalations,
             moves_used_session,
         })
+    }
+
+    /// Costruisce lo `StallContext` dell'asse dai segnali gia' risolti, delegando
+    /// al modulo puro `build_stall_context` (regola L: la DECISIONE vive li',
+    /// qui c'e' solo la raccolta). Estratto per tenere il gate leggibile.
+    fn stall_context_for_axis(
+        state: &AgentState,
+        axis: Axis,
+        signals: &ProgressSignals,
+        sig: &StallCrossSignals,
+        epoch: i64,
+    ) -> crate::runtime::ports::StallContext {
+        build_stall_context(
+            axis,
+            signals,
+            &sig.recent_tool_signatures,
+            sig.last_outcome,
+            sig.redaction_rejected,
+            state.repeated_clarify_count.unwrap_or(0),
+            state.user_intent.as_deref(),
+            &sig.modified,
+            Self::already_asked_user(state, axis),
+            epoch,
+        )
+    }
+
+    /// Guardia ANTI-META-LOOP del gate: `true` se per questo `(axis, epoch)` una
+    /// mossa e' gia' stata decisa+consumata (chiave-cache in `extra`, dal punto
+    /// unico `stall_move_key` — regola L) oppure l'epoca e' gia' stata risolta a
+    /// Fallback (marcatore `stall_fallback_epochs`).
+    fn stall_epoch_already_handled(state: &AgentState, axis: &str, epoch: i64) -> bool {
+        state.extra.contains_key(&stall_move_key(axis, epoch))
+            || state
+                .extra
+                .get("stall_fallback_epochs")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().any(|v| v.as_i64() == Some(epoch)))
+                .unwrap_or(false)
+    }
+
+    /// Delta di EMISSIONE dello `StallReason` condiviso dai due detector gemelli
+    /// (regola L): serializza lo `StallContext` in `extra[STALL_CONTEXT_KEY]` col
+    /// clone-whole-map (`put_extra`: `extra` e' OVERWRITE totale) e instrada al
+    /// nodo `StallRecovery` ri-dando il turno. `None` se il contesto non e'
+    /// serializzabile -> il chiamante prosegue col proprio backstop.
+    fn stall_reason_delta(
+        state: &AgentState,
+        stall: &crate::runtime::ports::StallContext,
+        iters_in: i64,
+    ) -> Option<OpaqueDelta> {
+        let value = serde_json::to_value(stall).ok()?;
+        let extra = put_extra(state, STALL_CONTEXT_KEY, value);
+        Some(
+            StateDelta {
+                extra: Some(extra),
+                stop_reason: Some(Some(StopReason::StallReason)),
+                iterations: Some(Some(iters_in + 1)),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
     }
 
     /// Gate di EMISSIONE dello `StallReason` (blocco #6, punto 2). Chiamato dai 3
@@ -4797,33 +4973,11 @@ impl ExecutorNode {
         if matches!(fixed.action, Action::Guide | Action::Proceed) {
             return None;
         }
-        // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati).
-        let recent_tool_signatures = state.recent_tool_signatures.clone().unwrap_or_default();
-        let last_outcome = Self::last_tool_outcome(messages);
-        let modified = crate::routing::signals::modified_files_from_messages(messages, 40);
-        let already_asked = Self::already_asked_user(state, axis);
-        // redaction_rejected dal SEGNALE STRUTTURATO (regola M): la fonte
-        // (`mcp-core::security::redaction_guard`) antepone al tool_result il codice
-        // macchina [REDACTION_REJECTED] quando rifiuta un input contenente un
-        // placeholder di redazione; il punto unico `recent_redaction_rejected`
-        // (regola L) lo LEGGE, MAI un `contains("[REDACTED:")` sul placeholder
-        // umano. E' il segnale che riconosce il blocco ambientale del loop email
-        // (email ri-oscurata che il modello continua a copiare).
-        let redaction_rejected = crate::routing::signals::recent_redaction_rejected(messages, 16);
-        let stall = build_stall_context(
-            axis,
-            signals,
-            &recent_tool_signatures,
-            last_outcome,
-            redaction_rejected,
-            state.repeated_clarify_count.unwrap_or(0),
-            state.user_intent.as_deref(),
-            &modified,
-            already_asked,
-            epoch,
-        );
-        let value = serde_json::to_value(&stall).ok()?;
-        let extra = put_extra(state, STALL_CONTEXT_KEY, value);
+        // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati),
+        // dal punto unico condiviso col gemello runaway (regola L).
+        let sig = StallCrossSignals::collect(state, messages);
+        let stall = Self::stall_context_for_axis(state, axis, signals, &sig, epoch);
+        let delta = Self::stall_reason_delta(state, &stall, iters_in)?;
         tracing::info!(
             target: "nexus_agent_graph::executor",
             axis = axis.as_str(),
@@ -4832,15 +4986,7 @@ impl ExecutorNode {
             moves_used_session,
             "meta-reasoner: emetto StallReason -> nodo StallRecovery"
         );
-        Some(
-            StateDelta {
-                extra: Some(extra),
-                stop_reason: Some(Some(StopReason::StallReason)),
-                iterations: Some(Some(iters_in + 1)),
-                ..Default::default()
-            }
-            .into_opaque(),
-        )
+        Some(delta)
     }
 
     /// Gate di EMISSIONE dello `StallReason` per un asse RUNAWAY pre-LLM
@@ -4878,44 +5024,8 @@ impl ExecutorNode {
         mode: crate::runtime::ports::ExecMode,
         text_only_streak: u32,
     ) -> Option<OpaqueDelta> {
-        if !self.cfg.provider_no_progress_switch_enabled {
-            return None;
-        }
-        let provider = state
-            .provider_used
-            .clone()
-            .or_else(|| state.provider_override.clone())
-            .unwrap_or_default();
-        let model = state
-            .model_used
-            .clone()
-            .or_else(|| state.model_override.clone())
-            .unwrap_or_default();
-        if provider.trim().is_empty() {
-            return None;
-        }
-        // Cap anti-raffica (stesso del ramo errore-provider): non ciclare fra provider.
-        let cd_escal = state
-            .extra
-            .get("auto_escalations")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-        if cd_escal >= 3 {
-            return None;
-        }
-        let mut tried: Vec<String> = state
-            .extra
-            .get("failover_tried")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !tried.iter().any(|p| p == &provider) {
-            tried.push(provider.clone());
-        }
+        let (provider, model, cd_escal) = self.no_progress_switch_gate(state)?;
+        let mut tried = Self::failover_tried_with_current(state, &provider);
         // "Non produce output utile": causa EmptyCompletion (il failover causa-aware NON
         // filtra la finestra -> ripiega su qualunque provider sano).
         let pick = self
@@ -4930,32 +5040,8 @@ impl ExecutorNode {
             .await
             .ok()
             .flatten()?;
-        tracing::warn!(
-            target: "nexus_agent_graph::executor",
-            from_provider = %provider,
-            to_provider = %pick.provider,
-            to_model = %pick.model,
-            text_only_streak,
-            "3.4: provider fermo (solo-testo oltre soglia) -> switch cross-provider invece di chiudere"
-        );
-        self.emit_phase(
-            ctx,
-            mode,
-            "escalation",
-            format!(
-                "{provider} non avanza (solo testo): passo a {}/{}",
-                pick.provider, pick.model
-            ),
-            json!({
-                "from_provider": provider,
-                "to_provider": pick.provider,
-                "to_model": pick.model,
-                "reason": "provider_no_progress",
-                "cooldown": false,
-                "cause": "no_progress",
-            }),
-        )
-        .await;
+        self.announce_no_progress_switch(ctx, mode, &provider, &pick, text_only_streak)
+            .await;
         let esc_nudge = human_msg(
             "Il provider precedente ha descritto senza agire per piu' turni consecutivi. \
 Riprendi tu, sul nuovo provider: esegui SUBITO il prossimo step CONCRETO del compito con \
@@ -4965,22 +5051,14 @@ una tool call, non descrivere.",
         let mut extra_out = state.extra.clone();
         extra_out.insert("auto_escalations".to_string(), json!(cd_escal + 1));
         extra_out.insert("failover_tried".to_string(), json!(tried));
-        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        Self::mark_repeat_scan_floor(&mut extra_out, state);
         Some(
             StateDelta {
-                messages: Some(vec![esc_nudge]),
                 sticky_provider: Some(Some(pick.provider)),
                 sticky_model: Some(Some(pick.model)),
                 current_tier: Some(pick.tier),
-                recent_tool_signatures: Some(Some(vec![])),
-                g1_reroute_count: Some(Some(0)),
-                action_nudge_count: Some(Some(0)),
                 consecutive_text_only_turns: Some(Some(0)),
-                pending_tool_uses: Some(Some(vec![])),
-                stop_reason: Some(Some(StopReason::G1Escalated)),
-                iterations: Some(Some(iters_in + 1)),
-                extra: Some(extra_out),
-                ..Default::default()
+                ..Self::retry_turn_delta(vec![esc_nudge], iters_in, extra_out)
             }
             .into_opaque(),
         )
@@ -5005,29 +5083,23 @@ una tool call, non descrivere.",
             escalations,
             moves_used_session,
         } = self.stall_emit_gate(state, axis, iters_in, ctx).await?;
-        // Segnali cross-cutting per lo StallContext (regola M: tutti strutturati),
-        // identici al gemello: esito ultimo tool, firme recenti, redazione, file
-        // modificati, intent. `count` e' il limite runaway; escalations dal budget.
-        let recent_tool_signatures = state.recent_tool_signatures.clone().unwrap_or_default();
-        let last_outcome = Self::last_tool_outcome(messages);
-        let modified = crate::routing::signals::modified_files_from_messages(messages, 40);
-        let redaction_rejected = crate::routing::signals::recent_redaction_rejected(messages, 16);
-        let action_oriented = turn_action_oriented(state.action_oriented);
+        // Segnali cross-cutting identici al gemello (punto unico condiviso, regola
+        // L). `count` e' il limite runaway; escalations dal budget.
+        let sig = StallCrossSignals::collect(state, messages);
         let stall = crate::decisions::meta_reason::build_runaway_context(
             axis,
             count,
-            action_oriented,
+            turn_action_oriented(state.action_oriented),
             escalations,
             self.cfg.max_escalations,
-            &recent_tool_signatures,
-            last_outcome,
-            redaction_rejected,
+            &sig.recent_tool_signatures,
+            sig.last_outcome,
+            sig.redaction_rejected,
             state.user_intent.as_deref(),
-            &modified,
+            &sig.modified,
             epoch,
         );
-        let value = serde_json::to_value(&stall).ok()?;
-        let extra = put_extra(state, STALL_CONTEXT_KEY, value);
+        let delta = Self::stall_reason_delta(state, &stall, iters_in)?;
         tracing::info!(
             target: "nexus_agent_graph::executor",
             axis,
@@ -5037,15 +5109,7 @@ una tool call, non descrivere.",
             moves_used_session,
             "meta-reasoner: runaway pre-LLM -> emetto StallReason (giudice agentico)"
         );
-        Some(
-            StateDelta {
-                extra: Some(extra),
-                stop_reason: Some(Some(StopReason::StallReason)),
-                iterations: Some(Some(iters_in + 1)),
-                ..Default::default()
-            }
-            .into_opaque(),
-        )
+        Some(delta)
     }
 
     /// NON-CONVERGENZA -> ESCALATION AGENTICA (regola H, "niente di fisso"): quando
@@ -5081,6 +5145,30 @@ una tool call, non descrivere.",
             .get("auto_escalations")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        let (pick, cur_provider) = self.nonconvergence_pick(state, mode, escal).await?;
+        self.announce_nonconvergence_escalation(ctx, mode, cur_provider.as_deref(), &pick, reason)
+            .await;
+        Some(Self::nonconvergence_delta(
+            state,
+            pick,
+            escal,
+            iters_in,
+            reset_iterations,
+        ))
+    }
+
+    /// Sceglie il modello promosso per l'escalation-da-non-convergenza: UN gradino
+    /// sopra il tier corrente (non il tier MASSIMO disponibile, audit selezione
+    /// costi), riusando i punti unici `cap_candidates_one_step` +
+    /// `pick_escalation_model`. Ritorna anche il provider corrente (eco per il log).
+    /// `None` se il budget escalation e' esaurito o la catena non offre candidati
+    /// -> il chiamante chiude col backstop.
+    async fn nonconvergence_pick(
+        &self,
+        state: &AgentState,
+        mode: crate::runtime::ports::ExecMode,
+        escal: i64,
+    ) -> Option<(crate::decisions::escalation::EscalationPick, Option<String>)> {
         if escal >= self.cfg.max_escalations {
             return None;
         }
@@ -5107,9 +5195,22 @@ una tool call, non descrivere.",
             cur_model.as_deref(),
             &inputs.policy,
         )?;
+        Some((pick, cur_provider))
+    }
+
+    /// Log + meta_step dell'escalation-da-non-convergenza (vedi
+    /// [`Self::maybe_escalate_nonconvergence`]).
+    async fn announce_nonconvergence_escalation(
+        &self,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+        from_provider: Option<&str>,
+        pick: &crate::decisions::escalation::EscalationPick,
+        reason: &'static str,
+    ) {
         tracing::warn!(
             target: "nexus_agent_graph::executor",
-            from_provider = cur_provider.as_deref().unwrap_or(""),
+            from_provider = from_provider.unwrap_or(""),
             to_provider = %pick.provider,
             to_model = %pick.model,
             reason,
@@ -5130,6 +5231,19 @@ una tool call, non descrivere.",
             }),
         )
         .await;
+    }
+
+    /// Delta di promozione dell'escalation-da-non-convergenza: rende sticky il
+    /// modello promosso e AZZERA i contatori che hanno fatto scattare il limite
+    /// (vedi [`Self::maybe_escalate_nonconvergence`] per il razionale di
+    /// `reset_iterations`).
+    fn nonconvergence_delta(
+        state: &AgentState,
+        pick: crate::decisions::escalation::EscalationPick,
+        escal: i64,
+        iters_in: i64,
+        reset_iterations: bool,
+    ) -> OpaqueDelta {
         let esc_nudge = human_msg(
             "Il modello precedente non ha completato il compito entro il budget del turno. \
 Prosegui tu da dove e' arrivato: NON ricominciare da capo ne' descrivere, procedi con \
@@ -5138,39 +5252,30 @@ azioni concrete e mirate verso il completamento.",
         let mut extra_out = state.extra.clone();
         extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
         // Grazia post-escalation: finestra pulita sugli assi anti-loop per il promosso.
-        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        Self::mark_repeat_scan_floor(&mut extra_out, state);
         // Consumo del trigger di non-convergenza del final_gate (se presente): il
         // modello promosso NON deve ri-scattare quel ramo al prossimo turno (sarebbe
         // un'escalation a raffica senza che abbia lavorato). No-op per gli altri
         // trigger (budget_token/iteration_cap non posano il flag).
         extra_out.remove(FINAL_GATE_ESCALATION_KEY);
-        Some(
-            StateDelta {
-                messages: Some(vec![esc_nudge]),
-                sticky_provider: Some(Some(pick.provider)),
-                sticky_model: Some(Some(pick.model)),
-                current_tier: Some(pick.tier),
-                recent_tool_signatures: Some(Some(vec![])),
-                g1_reroute_count: Some(Some(0)),
-                action_nudge_count: Some(Some(0)),
-                // Reset dei contatori di non-convergenza: il promosso riparte con la
-                // sua quota piena (budget) e streak azzerato (altrimenti erediterebbe
-                // il cumulativo e ri-colpirebbe subito il limite).
-                tokens_used_total: Some(Some(0)),
-                consecutive_text_only_turns: Some(Some(0)),
-                pending_tool_uses: Some(Some(vec![])),
-                stop_reason: Some(Some(StopReason::G1Escalated)),
-                // `reset_iterations` (trigger iteration_cap): azzera il conteggio cosi'
-                // il promosso riparte con un ciclo di iterazioni pieno — altrimenti
-                // rientrerebbe subito nel ramo cap senza mai lavorare (escalation a
-                // raffica). Simmetrico all'azzeramento del budget token sopra. Negli
-                // altri trigger iterations NON e' il limite -> prosegue (+1).
-                iterations: Some(Some(if reset_iterations { 0 } else { iters_in + 1 })),
-                extra: Some(extra_out),
-                ..Default::default()
-            }
-            .into_opaque(),
-        )
+        StateDelta {
+            sticky_provider: Some(Some(pick.provider)),
+            sticky_model: Some(Some(pick.model)),
+            current_tier: Some(pick.tier),
+            // Reset dei contatori di non-convergenza: il promosso riparte con la
+            // sua quota piena (budget) e streak azzerato (altrimenti erediterebbe
+            // il cumulativo e ri-colpirebbe subito il limite).
+            tokens_used_total: Some(Some(0)),
+            consecutive_text_only_turns: Some(Some(0)),
+            // `reset_iterations` (trigger iteration_cap): azzera il conteggio cosi'
+            // il promosso riparte con un ciclo di iterazioni pieno — altrimenti
+            // rientrerebbe subito nel ramo cap senza mai lavorare (escalation a
+            // raffica). Simmetrico all'azzeramento del budget token sopra. Negli
+            // altri trigger iterations NON e' il limite -> prosegue (+1).
+            iterations: Some(Some(if reset_iterations { 0 } else { iters_in + 1 })),
+            ..Self::retry_turn_delta(vec![esc_nudge], iters_in, extra_out)
+        }
+        .into_opaque()
     }
 
     /// CONSUMO della `RecoveryMove` al rientro dal nodo `StallRecovery`
@@ -5201,52 +5306,73 @@ azioni concrete e mirate verso il completamento.",
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        // Lo StallContext dice quale (axis, work_epoch) leggere: la chiave-cache e'
-        // il punto unico `stall_move_key` (stessa formula del nodo produttore).
-        // Assente -> guasto a monte: prosegui la gerarchia fissa senza marcatura.
+        // Lo StallContext dice quale (axis, work_epoch) leggere. Assente -> guasto a
+        // monte: prosegui la gerarchia fissa senza marcatura.
         let stall: crate::runtime::ports::StallContext = state
             .extra
             .get(STALL_CONTEXT_KEY)
             .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+        // Mossa assente (nodo degradato a resolved-only) o Fallback: NON incrementa
+        // il budget (nessuna mossa applicata), marca l'epoca e ri-da' il turno.
+        let Some(dec) = Self::translated_recovery_move(state, &stall) else {
+            return Some(Self::recovery_fallback_delta(state, &stall, iters_in));
+        };
+        // Budget consumato su consultazione EFFETTIVA (mossa applicata).
+        let extra_out = self.consume_stall_budget(state, ctx, mode).await;
+        let rc = RecoveryApply {
+            state,
+            ctx,
+            mode,
+            iters_in,
+            stall: &stall,
+            dec: &dec,
+        };
+        // Ogni ramo e' documentato sull'helper omonimo (vedi la doc di questa fn).
+        match dec.action {
+            Action::Guide | Action::ChangeStrategy | Action::ForceDiagnose => {
+                self.recovery_nudge_delta(&rc, extra_out).await
+            }
+            Action::Escalate => self.recovery_escalate_delta(&rc, extra_out).await,
+            Action::AskUser => self.recovery_ask_user_delta(&rc, extra_out).await,
+            Action::DeclareBlocked => self.recovery_blocked_delta(&rc, extra_out).await,
+            // `translate` non produce mai Proceed/Abort (Fallback -> None gia' sopra):
+            // arm esplicito per esaustivita' (regola L, niente `_`).
+            Action::Proceed | Action::Abort => None,
+        }
+    }
+
+    /// Legge la `RecoveryMove` persistita per il `(axis, work_epoch)` dello
+    /// `StallContext` e la traduce col punto unico `translate`. La chiave-cache e'
+    /// il punto unico `stall_move_key` (stessa formula del nodo produttore).
+    /// `None` = mossa assente (reasoner `Ok(None)`/errore) o `Fallback` (mossa non
+    /// traducibile) -> il chiamante marca l'epoca e prosegue con la gerarchia fissa.
+    fn translated_recovery_move(
+        state: &AgentState,
+        stall: &crate::runtime::ports::StallContext,
+    ) -> Option<pc::ProgressDecision> {
         let key = stall_move_key(&stall.axis, stall.work_epoch);
-        // Mossa assente (nodo degradato a resolved-only: reasoner Ok(None)/errore) o
-        // Fallback (mossa non traducibile): marca l'epoca come risolta a fallback per
-        // rompere il meta-loop, poi RI-DA il turno pulito -> al re-entry il gate non
-        // ri-emette e la gerarchia fissa decide (rete di sicurezza). NON incrementa
-        // il budget (nessuna mossa applicata).
-        let translated = state
+        state
             .extra
             .get(&key)
             .and_then(|v| serde_json::from_value::<RecoveryMove>(v.clone()).ok())
-            .and_then(|mv| translate(&mv));
-        let Some(dec) = translated else {
-            let mut extra_out = state.extra.clone();
-            Self::mark_fallback_epoch(&mut extra_out, stall.work_epoch);
-            tracing::debug!(
-                target: "nexus_agent_graph::executor",
-                axis = %stall.axis,
-                work_epoch = stall.work_epoch,
-                "meta-reasoner: nessuna mossa valida (fallback), prosegue gerarchia fissa"
-            );
-            return Some(
-                StateDelta {
-                    recent_tool_signatures: Some(Some(vec![])),
-                    pending_tool_uses: Some(Some(vec![])),
-                    stop_reason: Some(Some(StopReason::G1Escalated)),
-                    iterations: Some(Some(iters_in + 1)),
-                    extra: Some(extra_out),
-                    ..Default::default()
-                }
-                .into_opaque(),
-            );
-        };
+            .and_then(|mv| translate(&mv))
+    }
 
-        // Budget consumato su consultazione EFFETTIVA (mossa applicata). Due gambe:
-        //  - PER-RUN: `extra["stall_moves_used"]` (checkpointato, si azzera tra run);
-        //  - CROSS-RUN: la porta [`StallBudgetPort`] persiste la consultazione per
-        //    SESSIONE (append, gata Real via `mode`), cosi' il cap e' effettivo
-        //    per-sessione anche sul loop email cross-run. Best-effort (fail-open):
-        //    un guasto di persistenza non deve rompere il turno.
+    /// Consuma il budget di consultazione del meta-reasoner su una mossa APPLICATA,
+    /// su due gambe:
+    ///  - PER-RUN: `extra["stall_moves_used"]` (checkpointato, si azzera tra run);
+    ///  - CROSS-RUN: la porta [`StallBudgetPort`] persiste la consultazione per
+    ///    SESSIONE (append, gata Real via `mode`), cosi' il cap e' effettivo
+    ///    per-sessione anche sul loop email cross-run. Best-effort (fail-open):
+    ///    un guasto di persistenza non deve rompere il turno.
+    ///
+    /// Ritorna l'`extra` aggiornato (clone-whole-map: `extra` e' OVERWRITE totale).
+    async fn consume_stall_budget(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> serde_json::Map<String, Value> {
         let moves_used = Self::stall_moves_used(state) + 1;
         let mut extra_out = state.extra.clone();
         extra_out.insert("stall_moves_used".to_string(), json!(moves_used));
@@ -5259,236 +5385,417 @@ azioni concrete e mirate verso il completamento.",
                 );
             }
         }
+        extra_out
+    }
 
-        match dec.action {
-            // Nudge-based: inietta il nudge del reasoner + eventuale force-action e
-            // RI-DA il turno (self-loop G1Escalated, come i rami nudge fissi).
-            Action::Guide | Action::ChangeStrategy | Action::ForceDiagnose => {
-                let mut messages_out: Vec<Message> = vec![];
-                if let Some(t) = &dec.nudge_text {
-                    // Turno di grazia figura: se il run e' una figura del consiglio
-                    // senza parere dichiarato, il nudge di recovery (tipicamente
-                    // "diagnostica il fallimento") viene dirottato a ELICERE
-                    // advisory_verdict -> parere reale invece di failed_diagnosed
-                    // (n/d). Per i run non-figura e' bit-identico.
-                    messages_out.push(recovery_nudge_msg(state, t));
-                } else if is_advisory_figure_without_verdict(state) {
-                    // Reasoner senza nudge ma figura senza parere: inietta comunque
-                    // la direttiva di grazia, altrimenti il turno riparte muto e la
-                    // figura continua a esplorare fino a timeout/cap -> n/d.
-                    messages_out.push(human_msg(ADVISORY_GRACE_DIRECTIVE.trim()));
-                }
-                // Il nudge del reasoner riparte con finestra pulita sui detector di
-                // ripetizione (stessa grazia dei rami Escalate: il modello promosso/
-                // ri-orientato non deve ereditare le firme che hanno causato lo stallo).
-                extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
-                self.emit_phase(
-                    ctx,
-                    mode,
-                    "stall_recovery",
-                    format!("Recovery: {}", dec.reason),
-                    json!({"axis": stall.axis, "action": action_str(dec.action)}),
-                )
-                .await;
-                tracing::warn!(
-                    target: "nexus_agent_graph::executor",
-                    axis = %stall.axis,
-                    action = action_str(dec.action),
-                    "meta-reasoner: applico mossa nudge -> ri-do il turno"
-                );
-                Some(
-                    StateDelta {
-                        messages: Some(messages_out),
-                        recent_tool_signatures: Some(Some(vec![])),
-                        g1_reroute_count: Some(Some(0)),
-                        action_nudge_count: Some(Some(0)),
-                        pending_tool_uses: Some(Some(vec![])),
-                        stop_reason: Some(Some(StopReason::G1Escalated)),
-                        iterations: Some(Some(iters_in + 1)),
-                        extra: Some(extra_out),
-                        ..Default::default()
-                    }
-                    .into_opaque(),
-                )
-            }
-            // Escalate: promuovi il modello riusando il ramo escalation esistente
-            // (pick_escalation_model + sticky). Se nessun candidato -> rete di
-            // sicurezza (gerarchia fissa, che a budget escalation esaurito abortisce).
-            Action::Escalate => {
-                let escal = state
-                    .extra
-                    .get("auto_escalations")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let (cur_provider, cur_model) = self.escalation_current_pair(state);
-                let picked = if escal < self.cfg.max_escalations {
-                    let inputs = self
-                        .escalation
-                        .escalation_inputs(
-                            state.user_intent.as_deref(),
-                            cur_provider.as_deref(),
-                            cur_model.as_deref(),
-                            ctx.exec_mode(),
-                        )
-                        .await
-                        .unwrap_or_default();
-                    pick_escalation_model(
-                        &inputs.candidates,
-                        cur_provider.as_deref(),
-                        cur_model.as_deref(),
-                        &inputs.policy,
-                    )
-                } else {
-                    None
-                };
-                let pick = picked?;
-                self.emit_phase(
-                    ctx,
-                    mode,
-                    "escalation",
-                    format!("Passo a {}/{} (meta-reasoner)", pick.provider, pick.model),
-                    json!({
-                        "to_provider": pick.provider,
-                        "to_model": pick.model,
-                        "reason": "stall_recovery",
-                    }),
-                )
-                .await;
-                let esc_nudge = human_msg(
-                    "Il modello precedente si e' bloccato senza progresso. Ora rispondi tu, \
+    /// GRAZIA post-mossa: posa il floor della scansione anti-ripetizione all'attuale
+    /// coda dei messaggi, cosi' il modello promosso/ri-orientato non eredita le firme
+    /// che hanno causato lo stallo e fa ALMENO una chiamata prima di qualunque nuova
+    /// decisione (incidente run c4fa064b). Punto unico di SCRITTURA (regola L) del
+    /// marcatore letto da [`repeat_scan_floor`]: la chiave viveva sparsa come
+    /// stringa nuda in ogni ramo che promuove un modello.
+    fn mark_repeat_scan_floor(extra_out: &mut serde_json::Map<String, Value>, state: &AgentState) {
+        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+    }
+
+    /// Il turno di grazia advisory e' gia' stato concesso in questo run?
+    /// (marcatore `extra[ADVISORY_GRACE_USED_KEY]`: la grazia vale una volta sola).
+    fn advisory_grace_used(state: &AgentState) -> bool {
+        state
+            .extra
+            .get(ADVISORY_GRACE_USED_KEY)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Sceglie il modello promosso per il ramo `Escalate` del meta-reasoner (vedi
+    /// [`Self::recovery_escalate_delta`]), riusando il punto unico
+    /// `pick_escalation_model`. `None` se il budget escalation e' esaurito o non
+    /// resta un candidato sano -> rete di sicurezza (gerarchia fissa).
+    async fn recovery_escalation_pick(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+        escal: i64,
+    ) -> Option<crate::decisions::escalation::EscalationPick> {
+        if escal >= self.cfg.max_escalations {
+            return None;
+        }
+        let (cur_provider, cur_model) = self.escalation_current_pair(state);
+        let inputs = self
+            .escalation
+            .escalation_inputs(
+                state.user_intent.as_deref(),
+                cur_provider.as_deref(),
+                cur_model.as_deref(),
+                ctx.exec_mode(),
+            )
+            .await
+            .unwrap_or_default();
+        pick_escalation_model(
+            &inputs.candidates,
+            cur_provider.as_deref(),
+            cur_model.as_deref(),
+            &inputs.policy,
+        )
+    }
+
+    /// Pre-condizioni del switch-provider 3.4 (vedi
+    /// [`Self::maybe_switch_provider_on_no_progress`]): flag ON, provider corrente
+    /// noto e cap anti-raffica non esaurito. Ritorna `(provider, model, escalation
+    /// gia' fatte)`; `None` -> il chiamante chiude col backstop (bit-identico).
+    ///
+    /// Il provider/model sono quelli EFFETTIVAMENTE usati dal turno appena chiuso
+    /// (`*_used`, fallback sugli override), risolti campo per campo: NON e' la
+    /// `escalation_current_pair`, che risolve la COPPIA atomicamente con priorita'
+    /// sticky e fallback sul routing. Semantiche diverse, due punti distinti.
+    fn no_progress_switch_gate(&self, state: &AgentState) -> Option<(String, String, i64)> {
+        if !self.cfg.provider_no_progress_switch_enabled {
+            return None;
+        }
+        let provider = state
+            .provider_used
+            .clone()
+            .or_else(|| state.provider_override.clone())
+            .unwrap_or_default();
+        let model = state
+            .model_used
+            .clone()
+            .or_else(|| state.model_override.clone())
+            .unwrap_or_default();
+        if provider.trim().is_empty() {
+            return None;
+        }
+        // Cap anti-raffica (stesso del ramo errore-provider): non ciclare fra provider.
+        let cd_escal = state
+            .extra
+            .get("auto_escalations")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if cd_escal >= 3 {
+            return None;
+        }
+        Some((provider, model, cd_escal))
+    }
+
+    /// Log + meta_step dello switch cross-provider 3.4 (vedi
+    /// [`Self::maybe_switch_provider_on_no_progress`]).
+    async fn announce_no_progress_switch(
+        &self,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+        provider: &str,
+        pick: &crate::decisions::escalation::CrossProviderCandidate,
+        text_only_streak: u32,
+    ) {
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            from_provider = %provider,
+            to_provider = %pick.provider,
+            to_model = %pick.model,
+            text_only_streak,
+            "3.4: provider fermo (solo-testo oltre soglia) -> switch cross-provider invece di chiudere"
+        );
+        self.emit_phase(
+            ctx,
+            mode,
+            "escalation",
+            format!(
+                "{provider} non avanza (solo testo): passo a {}/{}",
+                pick.provider, pick.model
+            ),
+            json!({
+                "from_provider": provider,
+                "to_provider": pick.provider,
+                "to_model": pick.model,
+                "reason": "provider_no_progress",
+                "cooldown": false,
+                "cause": "no_progress",
+            }),
+        )
+        .await;
+    }
+
+    /// CASCATA cross-provider: i provider gia' provati nel run
+    /// (`extra["failover_tried"]`) piu' quello corrente, cosi' ogni salto sceglie
+    /// un provider SANO DIVERSO invece di insistere su un candidato fisso. Punto
+    /// unico (regola L) del ramo errore-provider di [`Self::run`] e del gemello
+    /// [`Self::maybe_switch_provider_on_no_progress`], che ne avevano due copie
+    /// identiche.
+    fn failover_tried_with_current(state: &AgentState, provider: &str) -> Vec<String> {
+        let mut tried: Vec<String> = state
+            .extra
+            .get("failover_tried")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !tried.iter().any(|p| p == provider) {
+            tried.push(provider.to_string());
+        }
+        tried
+    }
+
+    /// Delta che RI-DA il turno all'agente con finestra PULITA sui detector
+    /// anti-loop (self-loop `G1Escalated`): azzera firme recenti, contatori
+    /// nudge/reroute e tool pendenti, e avanza l'iterazione. Punto unico (regola L)
+    /// dei rami nudge/escalation, che ne ripetevano il corpo identico cambiando
+    /// solo i messaggi. Ritorna lo `StateDelta` NON opaco: i chiamanti che devono
+    /// aggiungere campi (sticky provider/model, tier, reset contatori) lo usano
+    /// come base con la struct-update syntax.
+    fn retry_turn_delta(
+        messages: Vec<Message>,
+        iters_in: i64,
+        extra_out: serde_json::Map<String, Value>,
+    ) -> StateDelta {
+        StateDelta {
+            messages: Some(messages),
+            recent_tool_signatures: Some(Some(vec![])),
+            g1_reroute_count: Some(Some(0)),
+            action_nudge_count: Some(Some(0)),
+            pending_tool_uses: Some(Some(vec![])),
+            stop_reason: Some(Some(StopReason::G1Escalated)),
+            iterations: Some(Some(iters_in + 1)),
+            extra: Some(extra_out),
+            ..Default::default()
+        }
+    }
+
+    /// Delta di CHIUSURA STRUTTURATA (ADR 0034) condiviso dai rami `AskUser` e
+    /// `DeclareBlocked` di [`Self::consume_recovery_move`] (regola L: avevano lo
+    /// stesso identico corpo, cambiavano solo il testo e l'esito). `text` diventa
+    /// sia il messaggio AI finale sia il `result` del run.
+    fn structured_close_delta(
+        text: String,
+        outcome: Value,
+        iters_in: i64,
+        extra_out: serde_json::Map<String, Value>,
+    ) -> OpaqueDelta {
+        StateDelta {
+            messages: Some(vec![Message::Ai {
+                content: MessageContent::text(text.clone()),
+                tool_calls: vec![],
+                reasoning: None,
+                thinking_signature: None,
+            }]),
+            result: Some(Some(text)),
+            declared_outcome: Some(Some(outcome)),
+            pending_tool_uses: Some(Some(vec![])),
+            stop_reason: Some(Some(StopReason::EndTurn)),
+            iterations: Some(Some(iters_in + 1)),
+            extra: Some(extra_out),
+            ..Default::default()
+        }
+        .into_opaque()
+    }
+
+    /// Ramo "nessuna mossa valida" di [`Self::consume_recovery_move`] (reasoner
+    /// degradato o `Fallback`): marca l'epoca come risolta a fallback per rompere
+    /// il meta-loop, poi RI-DA il turno pulito -> al re-entry il gate non ri-emette
+    /// e la gerarchia fissa decide (rete di sicurezza). NON incrementa il budget
+    /// (nessuna mossa applicata).
+    fn recovery_fallback_delta(
+        state: &AgentState,
+        stall: &crate::runtime::ports::StallContext,
+        iters_in: i64,
+    ) -> OpaqueDelta {
+        let mut extra_out = state.extra.clone();
+        Self::mark_fallback_epoch(&mut extra_out, stall.work_epoch);
+        tracing::debug!(
+            target: "nexus_agent_graph::executor",
+            axis = %stall.axis,
+            work_epoch = stall.work_epoch,
+            "meta-reasoner: nessuna mossa valida (fallback), prosegue gerarchia fissa"
+        );
+        StateDelta {
+            recent_tool_signatures: Some(Some(vec![])),
+            pending_tool_uses: Some(Some(vec![])),
+            stop_reason: Some(Some(StopReason::G1Escalated)),
+            iterations: Some(Some(iters_in + 1)),
+            extra: Some(extra_out),
+            ..Default::default()
+        }
+        .into_opaque()
+    }
+
+    /// Rami nudge-based (`Guide`/`ChangeStrategy`/`ForceDiagnose`) di
+    /// [`Self::consume_recovery_move`]: nudge del reasoner + eventuale force-action,
+    /// poi RI-DA il turno.
+    async fn recovery_nudge_delta(
+        &self,
+        rc: &RecoveryApply<'_>,
+        mut extra_out: serde_json::Map<String, Value>,
+    ) -> Option<OpaqueDelta> {
+        let mut messages_out: Vec<Message> = vec![];
+        if let Some(t) = &rc.dec.nudge_text {
+            // Turno di grazia figura: se il run e' una figura del consiglio
+            // senza parere dichiarato, il nudge di recovery (tipicamente
+            // "diagnostica il fallimento") viene dirottato a ELICERE
+            // advisory_verdict -> parere reale invece di failed_diagnosed
+            // (n/d). Per i run non-figura e' bit-identico.
+            messages_out.push(recovery_nudge_msg(rc.state, t));
+        } else if is_advisory_figure_without_verdict(rc.state) {
+            // Reasoner senza nudge ma figura senza parere: inietta comunque
+            // la direttiva di grazia, altrimenti il turno riparte muto e la
+            // figura continua a esplorare fino a timeout/cap -> n/d.
+            messages_out.push(human_msg(ADVISORY_GRACE_DIRECTIVE.trim()));
+        }
+        // Il nudge del reasoner riparte con finestra pulita sui detector di
+        // ripetizione (stessa grazia dei rami Escalate: il modello promosso/
+        // ri-orientato non deve ereditare le firme che hanno causato lo stallo).
+        Self::mark_repeat_scan_floor(&mut extra_out, rc.state);
+        self.emit_phase(
+            rc.ctx,
+            rc.mode,
+            "stall_recovery",
+            format!("Recovery: {}", rc.dec.reason),
+            json!({"axis": rc.stall.axis, "action": action_str(rc.dec.action)}),
+        )
+        .await;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            axis = %rc.stall.axis,
+            action = action_str(rc.dec.action),
+            "meta-reasoner: applico mossa nudge -> ri-do il turno"
+        );
+        Some(Self::retry_turn_delta(messages_out, rc.iters_in, extra_out).into_opaque())
+    }
+
+    /// Ramo `Escalate` di [`Self::consume_recovery_move`]: promuove il modello col
+    /// punto unico `pick_escalation_model` + sticky.
+    async fn recovery_escalate_delta(
+        &self,
+        rc: &RecoveryApply<'_>,
+        mut extra_out: serde_json::Map<String, Value>,
+    ) -> Option<OpaqueDelta> {
+        let escal = rc
+            .state
+            .extra
+            .get("auto_escalations")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let pick = self.recovery_escalation_pick(rc.state, rc.ctx, escal).await?;
+        self.emit_phase(
+            rc.ctx,
+            rc.mode,
+            "escalation",
+            format!("Passo a {}/{} (meta-reasoner)", pick.provider, pick.model),
+            json!({
+                "to_provider": pick.provider,
+                "to_model": pick.model,
+                "reason": "stall_recovery",
+            }),
+        )
+        .await;
+        let esc_nudge = human_msg(
+            "Il modello precedente si e' bloccato senza progresso. Ora rispondi tu, \
 che sei un modello piu' capace: cambia approccio ed ESEGUI il prossimo step concreto \
 con un tool call.",
-                );
-                extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
-                extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
-                tracing::warn!(
-                    target: "nexus_agent_graph::executor",
-                    to_provider = %pick.provider,
-                    to_model = %pick.model,
-                    "meta-reasoner: ESCALATE -> promuovo modello"
-                );
-                Some(
-                    StateDelta {
-                        messages: Some(vec![esc_nudge]),
-                        sticky_provider: Some(Some(pick.provider)),
-                        sticky_model: Some(Some(pick.model)),
-                        // FIX-A (scale-controller): tier del modello promosso dal pick.
-                        current_tier: Some(pick.tier),
-                        recent_tool_signatures: Some(Some(vec![])),
-                        g1_reroute_count: Some(Some(0)),
-                        action_nudge_count: Some(Some(0)),
-                        pending_tool_uses: Some(Some(vec![])),
-                        stop_reason: Some(Some(StopReason::G1Escalated)),
-                        iterations: Some(Some(iters_in + 1)),
-                        extra: Some(extra_out),
-                        ..Default::default()
-                    }
-                    .into_opaque(),
-                )
+        );
+        extra_out.insert("auto_escalations".to_string(), json!(escal + 1));
+        Self::mark_repeat_scan_floor(&mut extra_out, rc.state);
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            to_provider = %pick.provider,
+            to_model = %pick.model,
+            "meta-reasoner: ESCALATE -> promuovo modello"
+        );
+        Some(
+            StateDelta {
+                sticky_provider: Some(Some(pick.provider)),
+                sticky_model: Some(Some(pick.model)),
+                // FIX-A (scale-controller): tier del modello promosso dal pick.
+                current_tier: Some(pick.tier),
+                ..Self::retry_turn_delta(vec![esc_nudge], rc.iters_in, extra_out)
             }
-            // AskUser / DeclareBlocked: consumo REALE delle 2 nuove azioni. Chiudono
-            // il run con esito STRUTTURATO (ADR 0034), NON con un turno LLM libero:
-            // e' cio' che spezza il loop email (l'agente non ri-chiede all'infinito,
-            // dichiara needs_input/blocked una volta). L'outcome e' costruito col
-            // punto unico `normalize_declared_outcome` (regola L) e letto a valle da
-            // `route_after_executor` (gate 7: needs_input/blocked -> chiusura).
-            Action::AskUser => {
-                let question = dec.nudge_text.clone().unwrap_or_default();
-                // Marca l'asse come "gia' chiesto" (cap anti ri-domanda per-run).
-                Self::mark_asked_user(&mut extra_out, &stall.axis);
-                let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
-                    "outcome": "needs_input",
-                    "summary": question,
-                    "next_step": question,
-                }))
-                .unwrap_or_else(|| json!({"outcome": "needs_input", "summary": question}));
-                self.emit_phase(
-                    ctx,
-                    mode,
-                    "outcome_declared",
-                    "Esito dichiarato: needs_input (meta-reasoner)".to_string(),
-                    json!({"outcome": "needs_input", "axis": stall.axis}),
-                )
-                .await;
-                tracing::warn!(
-                    target: "nexus_agent_graph::executor",
-                    axis = %stall.axis,
-                    "meta-reasoner: AskUser -> chiusura strutturata needs_input"
-                );
-                Some(
-                    StateDelta {
-                        messages: Some(vec![Message::Ai {
-                            content: MessageContent::text(question.clone()),
-                            tool_calls: vec![],
-                            reasoning: None,
-                            thinking_signature: None,
-                        }]),
-                        result: Some(Some(question)),
-                        declared_outcome: Some(Some(outcome)),
-                        pending_tool_uses: Some(Some(vec![])),
-                        stop_reason: Some(Some(StopReason::EndTurn)),
-                        iterations: Some(Some(iters_in + 1)),
-                        extra: Some(extra_out),
-                        ..Default::default()
-                    }
-                    .into_opaque(),
-                )
-            }
-            Action::DeclareBlocked => {
-                // `nudge_text` porta il `blocker` (dal `translate`): validato ADR 0034.
-                let blocker = dec.nudge_text.clone().unwrap_or_default();
-                let summary = format!(
-                    "Non posso proseguire: blocco dichiarato ({blocker}). La causa e' esterna \
+            .into_opaque(),
+        )
+    }
+
+    /// Ramo `AskUser` di [`Self::consume_recovery_move`]: chiusura STRUTTURATA
+    /// `needs_input` (ADR 0034), non un turno LLM libero.
+    async fn recovery_ask_user_delta(
+        &self,
+        rc: &RecoveryApply<'_>,
+        mut extra_out: serde_json::Map<String, Value>,
+    ) -> Option<OpaqueDelta> {
+        let question = rc.dec.nudge_text.clone().unwrap_or_default();
+        // Marca l'asse come "gia' chiesto" (cap anti ri-domanda per-run).
+        Self::mark_asked_user(&mut extra_out, &rc.stall.axis);
+        let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
+            "outcome": "needs_input",
+            "summary": question,
+            "next_step": question,
+        }))
+        .unwrap_or_else(|| json!({"outcome": "needs_input", "summary": question}));
+        self.emit_phase(
+            rc.ctx,
+            rc.mode,
+            "outcome_declared",
+            "Esito dichiarato: needs_input (meta-reasoner)".to_string(),
+            json!({"outcome": "needs_input", "axis": rc.stall.axis}),
+        )
+        .await;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            axis = %rc.stall.axis,
+            "meta-reasoner: AskUser -> chiusura strutturata needs_input"
+        );
+        Some(Self::structured_close_delta(
+            question,
+            outcome,
+            rc.iters_in,
+            extra_out,
+        ))
+    }
+
+    /// Ramo `DeclareBlocked` di [`Self::consume_recovery_move`]: chiusura
+    /// STRUTTURATA `blocked` (ADR 0034).
+    async fn recovery_blocked_delta(
+        &self,
+        rc: &RecoveryApply<'_>,
+        extra_out: serde_json::Map<String, Value>,
+    ) -> Option<OpaqueDelta> {
+        // `nudge_text` porta il `blocker` (dal `translate`): validato ADR 0034.
+        let blocker = rc.dec.nudge_text.clone().unwrap_or_default();
+        let summary = format!(
+            "Non posso proseguire: blocco dichiarato ({blocker}). La causa e' esterna \
 al mio controllo e va risolta prima di continuare."
-                );
-                let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
-                    "outcome": "blocked",
-                    "summary": summary,
-                    "blocker": blocker,
-                }))
-                .unwrap_or_else(|| json!({"outcome": "blocked", "summary": summary}));
-                self.emit_phase(
-                    ctx,
-                    mode,
-                    "outcome_declared",
-                    format!("Esito dichiarato: blocked ({blocker})"),
-                    json!({"outcome": "blocked", "blocker": blocker, "axis": stall.axis}),
-                )
-                .await;
-                tracing::warn!(
-                    target: "nexus_agent_graph::executor",
-                    axis = %stall.axis,
-                    blocker = %blocker,
-                    "meta-reasoner: DeclareBlocked -> chiusura strutturata blocked"
-                );
-                let close_summary = outcome
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Blocco dichiarato.")
-                    .to_string();
-                Some(
-                    StateDelta {
-                        messages: Some(vec![Message::Ai {
-                            content: MessageContent::text(close_summary.clone()),
-                            tool_calls: vec![],
-                            reasoning: None,
-                            thinking_signature: None,
-                        }]),
-                        result: Some(Some(close_summary)),
-                        declared_outcome: Some(Some(outcome)),
-                        pending_tool_uses: Some(Some(vec![])),
-                        stop_reason: Some(Some(StopReason::EndTurn)),
-                        iterations: Some(Some(iters_in + 1)),
-                        extra: Some(extra_out),
-                        ..Default::default()
-                    }
-                    .into_opaque(),
-                )
-            }
-            // `translate` non produce mai Proceed/Abort (Fallback -> None gia' sopra):
-            // arm esplicito per esaustivita' (regola L, niente `_`).
-            Action::Proceed | Action::Abort => None,
-        }
+        );
+        let outcome = crate::decisions::tool_dispatch::normalize_declared_outcome(&json!({
+            "outcome": "blocked",
+            "summary": summary,
+            "blocker": blocker,
+        }))
+        .unwrap_or_else(|| json!({"outcome": "blocked", "summary": summary}));
+        self.emit_phase(
+            rc.ctx,
+            rc.mode,
+            "outcome_declared",
+            format!("Esito dichiarato: blocked ({blocker})"),
+            json!({"outcome": "blocked", "blocker": blocker, "axis": rc.stall.axis}),
+        )
+        .await;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            axis = %rc.stall.axis,
+            blocker = %blocker,
+            "meta-reasoner: DeclareBlocked -> chiusura strutturata blocked"
+        );
+        let close_summary = outcome
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("Blocco dichiarato.")
+            .to_string();
+        Some(Self::structured_close_delta(
+            close_summary,
+            outcome,
+            rc.iters_in,
+            extra_out,
+        ))
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -5678,6 +5985,43 @@ al mio controllo e va risolta prima di continuare."
         effective_window: i64,
         stall_active: bool,
     ) -> Option<OpaqueDelta> {
+        let evals_used = self.scale_emit_guards(state)?;
+        let signals =
+            ScaleSignals::collect(self, state, iters_in, messages, escalations_done, est_tokens);
+        let mut scale_ctx = self.build_scale_ctx(state, iters_in, est_tokens, &signals);
+        // ── Segnali di SIZING (mig 0524): popolati SOLO se il sizing e' abilitato ──
+        // A sizing OFF restano None -> OMESSI dal JSON serializzato all'LLM
+        // (skip_serializing_if) -> il flusso TIER resta BIT-IDENTICO.
+        if self.cfg.scale.sizing_enabled {
+            self.attach_sizing_signals(&mut scale_ctx, state, iters_in, messages, effective_window);
+        }
+        if !self.scale_triggered(&scale_ctx, stall_active) {
+            return None;
+        }
+        let key = self.scale_idempotent_key(state, &scale_ctx)?;
+        let extra_out = self.scale_transport_extra(state, &scale_ctx, &key, evals_used)?;
+        tracing::info!(
+            target: "nexus_agent_graph::executor",
+            current_tier = scale_ctx.current_tier.as_str(),
+            iterations = iters_in,
+            tail_headroom = scale_ctx.tail_headroom,
+            evals_used = evals_used + 1,
+            "scale-controller: emetto ScaleReason -> nodo ScaleControl"
+        );
+        Some(
+            StateDelta {
+                extra: Some(extra_out),
+                stop_reason: Some(Some(StopReason::ScaleReason)),
+                iterations: Some(Some(iters_in + 1)),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// Guard di EMISSIONE dello `ScaleReason`. Ritorna le consultazioni gia' usate
+    /// nel run se l'emissione e' permessa; `None` -> nessun overhead.
+    fn scale_emit_guards(&self, state: &AgentState) -> Option<i64> {
         // GUARD PRIMARIO: flag OFF -> zero overhead (nessun ScaleContext, nessun
         // trigger). Bit-identico a oggi (vincolo primario PR-B3).
         if !self.cfg.scale.enabled {
@@ -5693,163 +6037,148 @@ al mio controllo e va risolta prima di continuare."
         if evals_used >= self.cfg.scale.max_evals_per_run {
             return None;
         }
+        Some(evals_used)
+    }
 
-        // ── Raccolta segnali STRUTTURATI (regola M). READY vs DEFAULT documentati ──
-        // context_window del modello del turno (config, regola G). 0 = ignoto ->
-        // pressione Low + headroom pieno (conservativo).
-        let context_window = self.cfg.context_window;
-        let context_pressure = context_pressure_from_tokens(est_tokens, context_window);
-        let token_headroom_ratio = if context_window > 0 {
-            (est_tokens.max(0) as f64 / context_window as f64).clamp(0.0, 1.0)
+    /// Turni dall'ultimo cambio-TIER (cooldown anti-thrash del tier).
+    fn scale_turns_since_change(&self, state: &AgentState, iters_in: i64) -> i64 {
+        let last = Self::scale_last_change_iter(state);
+        if last < 0 {
+            // Mai cambiato: coda ampia -> il cooldown non blocca l'avvio.
+            iters_in.max(self.cfg.scale.change_cooldown_turns)
         } else {
-            0.0
-        };
-        // error_count / error_free_streak dal segnale strutturato (exit_code/is_error),
-        // finestra 40 messaggi (coerente con modified_files lookback).
-        let (error_count, error_free_streak) = tool_error_stats(messages, 40);
-        // repeated_action_failed: l'ultimo tool_result e' errore (segnale strutturato).
-        let repeated_action_failed = detect_recent_tool_error(messages, 4);
-        // files_modified_delta: DEFAULT documentato = conteggio TOTALE dei file
-        // modificati nella finestra (non il delta per-checkpoint, che richiederebbe un
-        // segnale di checkpoint precedente non tracciato). Conservativo: il downscale
-        // richiede `> 0`, quindi un run senza modifiche NON downscala per questo campo.
-        let files_modified_delta = modified_files_from_messages(messages, 40).len() as i64;
-        let task_complexity_est = Self::task_complexity_est(state);
-        let task_critical = Self::task_critical(state, escalations_done);
-        let intent_tier_floor = Self::intent_tier_floor(task_critical);
-        // escalation_lock_active: DEFAULT safety-biased. Deriva da "c'e' stata
-        // un'escalation nel run" (escalations_done > 0): finche' il run ha dovuto
-        // salire di potenza, il downscale resta VIETATO (FIX-E). Non c'e' un
-        // escalation-lock esplicito tracciato nel path; questo proxy e' conservativo
-        // (protegge dal downscale piu' del necessario, mai meno).
-        let escalation_lock_active = escalations_done > 0;
-        let cost_spent_usd = state.subagent_cost_cumulative_usd.unwrap_or(0.0);
-        // cost_cap_usd: DEFAULT 0 = nessun cap propagato nel path del turno (il cap
-        // costo del run non e' un segnale disponibile qui). 0 disattiva le guard di
-        // costo dello scale-controller (conservativo: nessuna decisione forzata dal
-        // costo).
-        let cost_cap_usd = 0.0;
-        let turns_since_change = {
-            let last = Self::scale_last_change_iter(state);
-            if last < 0 {
-                // Mai cambiato: coda ampia -> il cooldown non blocca l'avvio.
-                iters_in.max(self.cfg.scale.change_cooldown_turns)
-            } else {
-                (iters_in - last).max(0)
-            }
-        };
-        let reversal_count = Self::scale_reversal_count(state);
-        // required_capability: DEFAULT `None`. Il selettore a valle
-        // (select_model_for_tier) forza gia' l'eleggibilita' agentica (tool-use); una
-        // capability specifica del turno (es. vision) non e' un segnale strutturato
-        // disponibile qui, quindi non la si afferma (regola M). `requires_tool_use`
-        // resta true (run agentico).
-        let required_capability: Option<&str> = None;
+            (iters_in - last).max(0)
+        }
+    }
 
-        let mut scale_ctx = build_scale_context(
+    /// Costruisce lo `ScaleContext` dai segnali gia' raccolti, delegando al modulo
+    /// puro `build_scale_context` (regola L: la DECISIONE vive li'; qui c'e' solo il
+    /// cablaggio). I default `todos_closed=0`, `cost_cap_usd=0` e
+    /// `required_capability=None` sono documentati su [`ScaleSignals`].
+    fn build_scale_ctx(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        est_tokens: i64,
+        signals: &ScaleSignals,
+    ) -> crate::runtime::ports::ScaleContext {
+        build_scale_context(
             state.current_tier.as_deref(),
-            intent_tier_floor,
+            signals.intent_tier_floor,
             state.user_intent.as_deref(),
             Self::behavior_mode_str(state),
             iters_in,
             self.cfg.iteration_cap,
-            task_complexity_est,
-            task_critical,
-            context_pressure,
+            signals.task_complexity_est,
+            signals.task_critical,
+            signals.context_pressure,
             est_tokens,
-            token_headroom_ratio,
-            files_modified_delta,
-            // todos_closed: DEFAULT 0 (nessun segnale TodoStore nel path del turno;
-            // TODO: propagare i todo chiusi dal TodoStore). Conservativo: il downscale
-            // richiede `> 0`, quindi con 0 NON downscala per questo campo (safety).
+            signals.token_headroom_ratio,
+            signals.files_modified_delta,
             0,
-            error_count,
-            error_free_streak,
-            repeated_action_failed,
-            escalations_done,
-            escalation_lock_active,
-            cost_spent_usd,
-            cost_cap_usd,
-            required_capability,
+            signals.error_count,
+            signals.error_free_streak,
+            signals.repeated_action_failed,
+            signals.escalations_done,
+            signals.escalation_lock_active,
+            signals.cost_spent_usd,
+            0.0,
+            None,
             true,
-            turns_since_change,
-            reversal_count,
+            signals.turns_since_change,
+            signals.reversal_count,
+        )
+    }
+
+    /// Popola gli OCCHI del sizing (regola M: crescita history, rumore tool_result,
+    /// progresso) sullo `ScaleContext`. Chiamato SOLO a `sizing_enabled` (vedi
+    /// [`Self::maybe_scale_reason_delta`]): a sizing OFF i campi restano `None` e il
+    /// flusso TIER e' bit-identico.
+    fn attach_sizing_signals(
+        &self,
+        scale_ctx: &mut crate::runtime::ports::ScaleContext,
+        state: &AgentState,
+        iters_in: i64,
+        messages: &[Message],
+        effective_window: i64,
+    ) {
+        let history_size = messages.len() as i64;
+        scale_ctx.history_size = Some(history_size);
+        // Crescita = messaggi per iterazione (proxy strutturato dell'espansione
+        // del contesto; nessuno stato extra richiesto -> replay-safe).
+        scale_ctx.history_growth_rate = Some(history_size as f64 / (iters_in.max(0) + 1) as f64);
+        // Rumore storia = caratteri del piu' grande messaggio recente (proxy della
+        // tool_result_size_distribution: un singolo output enorme che inquina il
+        // contesto). Riusa il punto unico di stima char (regola L).
+        let noise_window = 10usize;
+        let start = messages.len().saturating_sub(noise_window);
+        scale_ctx.tool_result_noise = Some(
+            messages[start..]
+                .iter()
+                .map(|m| estimate_history_chars(&[message_to_history(m)]))
+                .max()
+                .unwrap_or(0),
         );
+        scale_ctx.effective_window = if effective_window > 0 {
+            Some(effective_window)
+        } else {
+            None
+        };
+        scale_ctx.recent_productive = Some(has_recent_productive_action(messages, 16));
+        // Cooldown anti-thrash del SIZING (distinto dal cooldown TIER).
+        let sizing_last = Self::scale_sizing_last_iter(state);
+        scale_ctx.sizing_turns_since_change = Some(if sizing_last < 0 {
+            // Mai cambiata la postura: coda ampia -> non blocca il primo cambio.
+            iters_in.max(self.cfg.scale.sizing_cooldown_turns)
+        } else {
+            (iters_in - sizing_last).max(0)
+        });
+    }
 
-        // ── Segnali di SIZING (mig 0524): popolati SOLO se il sizing e' abilitato ──
-        // A sizing OFF restano None -> OMESSI dal JSON serializzato all'LLM
-        // (skip_serializing_if) -> il flusso TIER resta BIT-IDENTICO. Sono gli OCCHI
-        // del sizing (regola M): crescita history, rumore tool_result, progresso.
-        if self.cfg.scale.sizing_enabled {
-            let history_size = messages.len() as i64;
-            scale_ctx.history_size = Some(history_size);
-            // Crescita = messaggi per iterazione (proxy strutturato dell'espansione
-            // del contesto; nessuno stato extra richiesto -> replay-safe).
-            scale_ctx.history_growth_rate =
-                Some(history_size as f64 / (iters_in.max(0) + 1) as f64);
-            // Rumore storia = caratteri del piu' grande messaggio recente (proxy della
-            // tool_result_size_distribution: un singolo output enorme che inquina il
-            // contesto). Riusa il punto unico di stima char (regola L).
-            let noise_window = 10usize;
-            let start = messages.len().saturating_sub(noise_window);
-            scale_ctx.tool_result_noise = Some(
-                messages[start..]
-                    .iter()
-                    .map(|m| estimate_history_chars(&[message_to_history(m)]))
-                    .max()
-                    .unwrap_or(0),
-            );
-            scale_ctx.effective_window = if effective_window > 0 {
-                Some(effective_window)
-            } else {
-                None
-            };
-            scale_ctx.recent_productive = Some(has_recent_productive_action(messages, 16));
-            // Cooldown anti-thrash del SIZING (distinto dal cooldown TIER).
-            let sizing_last = Self::scale_sizing_last_iter(state);
-            scale_ctx.sizing_turns_since_change = Some(if sizing_last < 0 {
-                // Mai cambiata la postura: coda ampia -> non blocca il primo cambio.
-                iters_in.max(self.cfg.scale.sizing_cooldown_turns)
-            } else {
-                (iters_in - sizing_last).max(0)
-            });
-        }
-
-        // ── Trigger: gate break-even + cadenza + precedenza stallo (FIX-E) ─────
-        // I sotto-segnali di trigger (pressure_changed / todo_closed_now /
-        // error_ratchet_advanced / escalation_advanced) non sono tracciati per-turno
-        // nel path (richiederebbero uno snapshot precedente checkpointato): passiamo
-        // `false` e ci affidiamo alla CADENZA (`iterations % eval_every == 0`), che e'
-        // il trigger primario. DEFAULT conservativo documentato: senza gli snapshot
-        // il controller valuta a cadenza fissa, mai piu' spesso (mai un costo extra).
+    /// Trigger di valutazione: gate break-even + cadenza + precedenza stallo (FIX-E).
+    ///
+    /// I sotto-segnali (pressure_changed / todo_closed_now / error_ratchet_advanced /
+    /// escalation_advanced) non sono tracciati per-turno nel path (richiederebbero uno
+    /// snapshot precedente checkpointato): passiamo `false` e ci affidiamo alla CADENZA
+    /// (`iterations % eval_every == 0`), che e' il trigger primario. DEFAULT conservativo
+    /// documentato: senza gli snapshot il controller valuta a cadenza fissa, mai piu'
+    /// spesso (mai un costo extra).
+    fn scale_triggered(
+        &self,
+        scale_ctx: &crate::runtime::ports::ScaleContext,
+        stall_active: bool,
+    ) -> bool {
         let trig_cfg = ScaleTriggerConfig {
             enabled: self.cfg.scale.enabled,
             eval_every_iters: self.cfg.scale.eval_every_iters,
             min_tail_iters: self.cfg.scale.min_tail_iters,
         };
-        let triggered = scale_trigger(
-            &scale_ctx,
+        scale_trigger(
+            scale_ctx,
             &trig_cfg,
             stall_active,
             false,
             false,
             false,
             false,
-        );
-        if !triggered {
-            return None;
-        }
+        )
+    }
 
-        // Chiave-cache (punto unico, con l'eval_every_iters reale). Idempotenza
-        // (anti meta-loop, FIX-A/F4/F6): NON ri-emettere per una chiave gia' valutata.
-        // Due sotto-casi:
-        //   - una MOSSA e' gia' in cache a questa chiave (`contains_key(&key)`): il
-        //     nodo farebbe cache-hit, la mossa e' gia' decisa;
-        //   - la chiave e' gia' stata TRASPORTATA a questo giro
-        //     (`SCALE_MOVE_CACHE_KEY_KEY == key`): copre il KeepTier, che il nodo NON
-        //     persiste. Senza questo, al rientro KeepTier (pre-LLM) il detector
-        //     ri-emetterebbe la stessa chiave -> meta-loop fino a max_evals_per_run.
-        let key = scale_cache_key(&scale_ctx, self.cfg.scale.eval_every_iters);
+    /// Chiave-cache (punto unico `scale_cache_key`, con l'eval_every_iters reale) se
+    /// l'emissione e' idempotente (anti meta-loop, FIX-A/F4/F6). `None` -> NON
+    /// ri-emettere, per due sotto-casi:
+    ///   - una MOSSA e' gia' in cache a questa chiave (`contains_key(&key)`): il nodo
+    ///     farebbe cache-hit, la mossa e' gia' decisa;
+    ///   - la chiave e' gia' stata TRASPORTATA a questo giro
+    ///     (`SCALE_MOVE_CACHE_KEY_KEY == key`): copre il KeepTier, che il nodo NON
+    ///     persiste. Senza questo, al rientro KeepTier (pre-LLM) il detector
+    ///     ri-emetterebbe la stessa chiave -> meta-loop fino a max_evals_per_run.
+    fn scale_idempotent_key(
+        &self,
+        state: &AgentState,
+        scale_ctx: &crate::runtime::ports::ScaleContext,
+    ) -> Option<String> {
+        let key = scale_cache_key(scale_ctx, self.cfg.scale.eval_every_iters);
         if state.extra.contains_key(&key) {
             return None;
         }
@@ -5861,17 +6190,28 @@ al mio controllo e va risolta prima di continuare."
         if already_evaluated {
             return None;
         }
+        Some(key)
+    }
 
-        // Serializza ScaleContext + chiave-cache in extra (clone-whole-map: NON azzera
-        // gli altri canali) e incrementa il budget consultazioni.
-        let ctx_value = serde_json::to_value(&scale_ctx).ok()?;
+    /// Serializza `ScaleContext` + chiave-cache in `extra` (clone-whole-map: NON
+    /// azzera gli altri canali), trasporta le config DB-driven al nodo e incrementa
+    /// il budget consultazioni. `None` se lo `ScaleContext` non e' serializzabile.
+    ///
+    /// FIX-B (F2/F3): le 5 soglie del gate anti-oscillazione viaggiano nell'extra
+    /// perche' il nodo non legge i settings (zero I/O). Costruite da `self.cfg.scale`
+    /// (letto dal DB in mcp-core), cosi' `agent.scale.downscale_enabled` & co.
+    /// raggiungono `apply_hysteresis` al posto dei default hardcoded (chiude la
+    /// config muta, regola G/L).
+    fn scale_transport_extra(
+        &self,
+        state: &AgentState,
+        scale_ctx: &crate::runtime::ports::ScaleContext,
+        key: &str,
+        evals_used: i64,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let ctx_value = serde_json::to_value(scale_ctx).ok()?;
         let mut extra_out = put_extra(state, SCALE_CONTEXT_KEY, ctx_value);
         extra_out.insert(SCALE_MOVE_CACHE_KEY_KEY.to_string(), json!(key));
-        // FIX-B (F2/F3): trasporta le 5 soglie DB-driven del gate anti-oscillazione
-        // al nodo (che non legge i settings, zero I/O). Costruite da
-        // `self.cfg.scale` (letto dal DB in mcp-core), cosi'
-        // `agent.scale.downscale_enabled` & co. raggiungono `apply_hysteresis` al
-        // posto dei default hardcoded (chiude la config muta, regola G/L).
         let hyst_cfg = ScaleHysteresisConfig {
             downscale_enabled: self.cfg.scale.downscale_enabled,
             min_confidence: self.cfg.scale.min_confidence,
@@ -5901,23 +6241,7 @@ al mio controllo e va risolta prima di continuare."
             }
         }
         extra_out.insert("scale_evals_used".to_string(), json!(evals_used + 1));
-        tracing::info!(
-            target: "nexus_agent_graph::executor",
-            current_tier = scale_ctx.current_tier.as_str(),
-            iterations = iters_in,
-            tail_headroom = scale_ctx.tail_headroom,
-            evals_used = evals_used + 1,
-            "scale-controller: emetto ScaleReason -> nodo ScaleControl"
-        );
-        Some(
-            StateDelta {
-                extra: Some(extra_out),
-                stop_reason: Some(Some(StopReason::ScaleReason)),
-                iterations: Some(Some(iters_in + 1)),
-                ..Default::default()
-            }
-            .into_opaque(),
-        )
+        Some(extra_out)
     }
 
     /// CONSUMO della `ScaleMove` al rientro dal nodo `ScaleControl`
@@ -6131,7 +6455,7 @@ al mio controllo e va risolta prima di continuare."
         extra_out.insert("scale_last_direction".to_string(), json!(cur_dir));
         // Grazia sui detector di ripetizione (come l'escalation): il modello del nuovo
         // tier riparte con finestra pulita.
-        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        Self::mark_repeat_scan_floor(&mut extra_out, state);
         // FIX-C (F5): conta il cambio-tier APPLICATO. Al raggiungimento del tetto
         // `max_tier_changes_per_run` il target e' gia' stato forzato a Heavy sopra
         // (`reaches_cap`): marca `scale_pinned_heavy` cosi' il detector non emette piu'
@@ -6214,8 +6538,42 @@ al mio controllo e va risolta prima di continuare."
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        // Baseline = soglie FISSE correnti (regola L: il calcolo puro non tocca il DB;
-        // il produttore risolve i valori da ExecutorConfig e li passa al risolutore).
+        let overrides = self.resolve_sizing_for_posture(posture, scale_ctx);
+        // Hold / nessun override effettivo -> non ri-fare il turno (prosegue normale).
+        if overrides == SizingOverrides::default() {
+            return None;
+        }
+        let value = serde_json::to_value(&overrides).ok()?;
+
+        // Clone-whole-map: persiste gli override STICKY + il cooldown del sizing senza
+        // azzerare gli altri canali extra (auto_escalations, scale_*, ...).
+        let mut extra_out = state.extra.clone();
+        extra_out.insert(SCALE_SIZING_OVERRIDES_KEY.to_string(), value);
+        extra_out.insert("scale_sizing_last_iter".to_string(), json!(iters_in));
+
+        self.announce_sizing_applied(ctx, mode, posture, &overrides, iters_in)
+            .await;
+
+        Some(
+            StateDelta {
+                stop_reason: Some(Some(StopReason::G1Escalated)),
+                iterations: Some(Some(iters_in + 1)),
+                extra: Some(extra_out),
+                ..Default::default()
+            }
+            .into_opaque(),
+        )
+    }
+
+    /// Risolve gli override di dimensionamento per la postura scelta. Regola L: il
+    /// calcolo puro vive in `resolve_sizing_overrides` e non tocca il DB; qui c'e'
+    /// solo la RACCOLTA della baseline (soglie FISSE correnti) e della config
+    /// sizing da `ExecutorConfig`.
+    fn resolve_sizing_for_posture(
+        &self,
+        posture: crate::runtime::ports::SizingPosture,
+        scale_ctx: &crate::runtime::ports::ScaleContext,
+    ) -> SizingOverrides {
         let baseline = SizingBaseline {
             compress_start_iter: self.cfg.ctx_mgmt.compress_start_iter,
             compress_phase_keep_recent: self.cfg.ctx_mgmt.compress_phase_keep_recent.clone(),
@@ -6229,25 +6587,30 @@ al mio controllo e va risolta prima di continuare."
             cooldown_turns: self.cfg.scale.sizing_cooldown_turns,
             aggressiveness: self.cfg.scale.sizing_aggressiveness,
         };
-        let overrides = resolve_sizing_overrides(posture, scale_ctx, &baseline, &sizing_cfg);
-        // Hold / nessun override effettivo -> non ri-fare il turno (prosegue normale).
-        if overrides == SizingOverrides::default() {
-            return None;
-        }
-        let value = serde_json::to_value(&overrides).ok()?;
+        resolve_sizing_overrides(posture, scale_ctx, &baseline, &sizing_cfg)
+    }
 
-        // Clone-whole-map: persiste gli override STICKY + il cooldown del sizing senza
-        // azzerare gli altri canali extra (auto_escalations, scale_*, ...).
-        let mut extra_out = state.extra.clone();
-        extra_out.insert(SCALE_SIZING_OVERRIDES_KEY.to_string(), value);
-        extra_out.insert("scale_sizing_last_iter".to_string(), json!(iters_in));
-
-        let posture_label = match posture {
+    /// Etichetta canonica della postura di dimensionamento (identificatore
+    /// inglese, regola N: e' il valore che finisce nel meta_step e nei log).
+    fn sizing_posture_label(posture: crate::runtime::ports::SizingPosture) -> &'static str {
+        match posture {
             crate::runtime::ports::SizingPosture::Compact => "compact",
             crate::runtime::ports::SizingPosture::Relax => "relax",
             crate::runtime::ports::SizingPosture::Hold => "hold",
-        };
-        // Narrazione live: la chat spiega che il motore ha adattato il dimensionamento.
+        }
+    }
+
+    /// Narrazione live + log del dimensionamento applicato: la chat spiega che il
+    /// motore ha adattato il dimensionamento (vedi [`Self::consume_sizing_move`]).
+    async fn announce_sizing_applied(
+        &self,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+        posture: crate::runtime::ports::SizingPosture,
+        overrides: &SizingOverrides,
+        iters_in: i64,
+    ) {
+        let posture_label = Self::sizing_posture_label(posture);
         self.emit_phase(
             ctx,
             mode,
@@ -6268,16 +6631,6 @@ al mio controllo e va risolta prima di continuare."
             iterations = iters_in,
             "scale-controller: SIZING applicato -> override sticky + ri-do il turno"
         );
-
-        Some(
-            StateDelta {
-                stop_reason: Some(Some(StopReason::G1Escalated)),
-                iterations: Some(Some(iters_in + 1)),
-                extra: Some(extra_out),
-                ..Default::default()
-            }
-            .into_opaque(),
-        )
     }
 
     /// Registra `axis` fra gli assi per cui una `AskUser` e' gia' stata emessa
@@ -6329,21 +6682,7 @@ al mio controllo e va risolta prima di continuare."
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        let already = state
-            .extra
-            .get("outcome_declaration_forced")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if already {
-            return None;
-        }
-        let has_tool = state
-            .tools_json
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|t| t.get("name").and_then(Value::as_str) == Some(TASK_COMPLETE_TOOL_NAME));
-        if !has_tool {
+        if !Self::forced_declaration_applicable(state) {
             return None;
         }
         // Narrazione live: la chat spiega perche' il prossimo turno e' "strano"
@@ -6356,6 +6695,41 @@ al mio controllo e va risolta prima di continuare."
             json!({}),
         )
         .await;
+        tracing::warn!(
+            target: "nexus_agent_graph::executor",
+            "chiusura di sistema -> turno dichiarativo forzato (ADR 0034): il modello dichiara l'esito"
+        );
+        Some(Self::forced_declaration_state_delta(state, iters_in))
+    }
+
+    /// Il turno dichiarativo forzato e' applicabile? No se e' gia' stato forzato in
+    /// questo run (finestra dichiarativa: una sola, ADR 0034) o se il catalogo non
+    /// espone `task_complete` (senza il tool la richiesta sarebbe inevadibile).
+    fn forced_declaration_applicable(state: &AgentState) -> bool {
+        let already = state
+            .extra
+            .get("outcome_declaration_forced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if already {
+            return false;
+        }
+        state
+            .tools_json
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some(TASK_COMPLETE_TOOL_NAME))
+    }
+
+    /// Delta del turno dichiarativo forzato (vedi [`Self::forced_declaration_delta`]).
+    ///
+    /// NB: `g1_reroute_count`/`action_nudge_count` NON vengono azzerati — a
+    /// differenza dei rami Escalate ([`Self::retry_turn_delta`]), per cui questo
+    /// delta NON puo' delegare a quel punto unico: il turno dichiarativo non e' un
+    /// nuovo budget di lavoro. Se il modello non dichiara, il gate 7 del routing
+    /// trova i contatori al cap e si chiude secco senza un nuovo ciclo di nudge G1.
+    fn forced_declaration_state_delta(state: &AgentState, iters_in: i64) -> OpaqueDelta {
         let nudge = human_msg(
             "Il turno sta per chiudere senza un esito dichiarato. Chiama ORA il tool \
 task_complete dichiarando l'esito REALE del lavoro: outcome=done SOLO se il lavoro e' \
@@ -6370,28 +6744,17 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         // corto-circuitato dalle azioni pre-chiusura (stesso floor del fix
         // escalation, punto unico repeat_scan_floor). I gate di chiusura pre-LLM
         // hanno inoltre il guard `!declaration_pending` (testa del run).
-        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
-        tracing::warn!(
-            target: "nexus_agent_graph::executor",
-            "chiusura di sistema -> turno dichiarativo forzato (ADR 0034): il modello dichiara l'esito"
-        );
-        // NB: g1_reroute_count/action_nudge_count NON vengono azzerati (a
-        // differenza dei rami Escalate): il turno dichiarativo non e' un nuovo
-        // budget di lavoro — se il modello non dichiara, il gate 7 del routing
-        // trova i contatori al cap e si chiude secco senza un nuovo ciclo di
-        // nudge G1.
-        Some(
-            StateDelta {
-                messages: Some(vec![nudge]),
-                recent_tool_signatures: Some(Some(vec![])),
-                pending_tool_uses: Some(Some(vec![])),
-                stop_reason: Some(Some(StopReason::G1Escalated)),
-                iterations: Some(Some(iters_in + 1)),
-                extra: Some(extra_out),
-                ..Default::default()
-            }
-            .into_opaque(),
-        )
+        Self::mark_repeat_scan_floor(&mut extra_out, state);
+        StateDelta {
+            messages: Some(vec![nudge]),
+            recent_tool_signatures: Some(Some(vec![])),
+            pending_tool_uses: Some(Some(vec![])),
+            stop_reason: Some(Some(StopReason::G1Escalated)),
+            iterations: Some(Some(iters_in + 1)),
+            extra: Some(extra_out),
+            ..Default::default()
+        }
+        .into_opaque()
     }
 
     /// Coppia (provider, model) CORRENTE ai fini dell'escalation (punto unico,
@@ -6533,21 +6896,15 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        if !is_advisory_figure_without_verdict(state) {
-            return None;
-        }
-        if state
-            .extra
-            .get(ADVISORY_GRACE_USED_KEY)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        // Non e' una figura senza parere, o la grazia e' gia' stata concessa in
+        // questo run (una sola volta): niente turno di grazia.
+        if !is_advisory_figure_without_verdict(state) || Self::advisory_grace_used(state) {
             return None;
         }
         let mut extra_out = state.extra.clone();
         extra_out.insert(ADVISORY_GRACE_USED_KEY.to_string(), json!(true));
         // Finestra pulita sui detector di ripetizione (come i rami nudge fissi).
-        extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
+        Self::mark_repeat_scan_floor(&mut extra_out, state);
         self.emit_phase(
             ctx,
             mode,
@@ -6563,20 +6920,16 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         );
         Some(
             StateDelta {
-                messages: Some(vec![human_msg(ADVISORY_GRACE_DIRECTIVE.trim())]),
                 // Azzera lo streak solo-testo: al re-entry il blocco text-only NON
                 // ri-scatta prima di chiamare l'LLM, cosi' il turno di grazia raggiunge
                 // davvero il modello (che puo' emettere advisory_verdict). Senza
                 // l'azzeramento il re-entry richiuderebbe subito senza dare il turno.
                 consecutive_text_only_turns: Some(Some(0)),
-                recent_tool_signatures: Some(Some(vec![])),
-                g1_reroute_count: Some(Some(0)),
-                action_nudge_count: Some(Some(0)),
-                pending_tool_uses: Some(Some(vec![])),
-                stop_reason: Some(Some(StopReason::G1Escalated)),
-                iterations: Some(Some(iters_in + 1)),
-                extra: Some(extra_out),
-                ..Default::default()
+                ..Self::retry_turn_delta(
+                    vec![human_msg(ADVISORY_GRACE_DIRECTIVE.trim())],
+                    iters_in,
+                    extra_out,
+                )
             }
             .into_opaque(),
         )
@@ -6797,33 +7150,7 @@ fn message_to_history(m: &Message) -> HistoryMessage {
             tool_calls,
             reasoning,
             thinking_signature,
-        } => {
-            // Se l'AI porta tool_calls (forma OpenAI-compat) ma content testuale,
-            // espandiamo i tool_use in anthropic_content per la dedup/compress.
-            let mut hm = history_from_content(content, false);
-            if hm.anthropic_content.is_null() && !tool_calls.is_empty() {
-                hm.anthropic_content = Value::Array(
-                    tool_calls
-                        .iter()
-                        .map(|t| {
-                            let mut b = json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input});
-                            // Firma PER-CALL (Gemini 3): preservata nell'espansione
-                            // tool_calls -> anthropic_content per il round-trip.
-                            if let Some(sig) = &t.thought_signature {
-                                b["thought_signature"] = json!(sig);
-                            }
-                            b
-                        })
-                        .collect(),
-                );
-            }
-            // Reasoning DeepSeek del turno: preservato per il round-trip al gateway.
-            hm.reasoning = reasoning.clone();
-            // Firma thinking Anthropic (per-messaggio): preservata attraverso la
-            // riduzione di contesto per il round-trip nei turni con tool.
-            hm.thinking_signature = thinking_signature.clone();
-            hm
-        }
+        } => ai_message_to_history(content, tool_calls, reasoning, thinking_signature),
         // Il `ToolMessage` (risultato) preserva ruolo e id: `history_to_llm_messages`
         // ne ricostruisce il `role="tool"` + `tool_call_id` per il wire (continuita'
         // tool_use/tool_result, bug 2026-06-26). Senza questi campi il messaggio
@@ -6840,6 +7167,42 @@ fn message_to_history(m: &Message) -> HistoryMessage {
             hm
         }
     }
+}
+
+/// Ramo `Message::Ai` di [`message_to_history`]: espande i `tool_calls`
+/// (forma OpenAI-compat) in `anthropic_content` quando il content e' testuale e
+/// preserva reasoning + firma thinking per il round-trip verso il gateway.
+fn ai_message_to_history(
+    content: &MessageContent,
+    tool_calls: &[ToolUse],
+    reasoning: &Option<String>,
+    thinking_signature: &Option<String>,
+) -> HistoryMessage {
+    // Se l'AI porta tool_calls (forma OpenAI-compat) ma content testuale,
+    // espandiamo i tool_use in anthropic_content per la dedup/compress.
+    let mut hm = history_from_content(content, false);
+    if hm.anthropic_content.is_null() && !tool_calls.is_empty() {
+        hm.anthropic_content = Value::Array(
+            tool_calls
+                .iter()
+                .map(|t| {
+                    let mut b = json!({"type": "tool_use", "id": t.id, "name": t.name, "input": t.input});
+                    // Firma PER-CALL (Gemini 3): preservata nell'espansione
+                    // tool_calls -> anthropic_content per il round-trip.
+                    if let Some(sig) = &t.thought_signature {
+                        b["thought_signature"] = json!(sig);
+                    }
+                    b
+                })
+                .collect(),
+        );
+    }
+    // Reasoning DeepSeek del turno: preservato per il round-trip al gateway.
+    hm.reasoning = reasoning.clone();
+    // Firma thinking Anthropic (per-messaggio): preservata attraverso la
+    // riduzione di contesto per il round-trip nei turni con tool.
+    hm.thinking_signature = thinking_signature.clone();
+    hm
 }
 
 fn history_from_content(c: &MessageContent, is_human: bool) -> HistoryMessage {
@@ -6888,17 +7251,7 @@ fn history_to_llm_messages(hist: &[HistoryMessage]) -> Vec<LlmMessage> {
 fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
     // 1) `Message::Tool` esplicito: un solo messaggio `role="tool"` + id.
     if m.is_tool {
-        let content = if m.content.is_null() {
-            tool_result_content(&m.anthropic_content)
-        } else {
-            m.content.clone()
-        };
-        return vec![LlmMessage {
-            role: "tool".to_string(),
-            content,
-            tool_call_id: m.tool_call_id.clone(),
-            ..Default::default()
-        }];
+        return vec![tool_history_to_wire(m)];
     }
 
     // 2) Messaggio a blocchi: separa tool_result (-> messaggi tool), tool_use
@@ -6906,73 +7259,92 @@ fn history_msg_to_wire(m: &HistoryMessage) -> Vec<LlmMessage> {
     //    sia l'human che trasporta i tool_result del tool_dispatch.
     if let Some(blocks) = m.anthropic_content.as_array() {
         if !blocks.is_empty() {
-            let tool_results = extract_tool_results(blocks);
-            let tool_uses = extract_tool_uses(blocks);
-            if !tool_results.is_empty() || !tool_uses.is_empty() {
-                let mut out: Vec<LlmMessage> = Vec::new();
-                // I tool_result diventano messaggi `role="tool"` (round-trip id).
-                for (tool_use_id, content) in tool_results {
-                    out.push(LlmMessage {
-                        role: "tool".to_string(),
-                        content,
-                        tool_call_id: Some(tool_use_id),
-                        ..Default::default()
-                    });
-                }
-                // I tool_use diventano `tool_calls` di un assistant (+ testo).
-                if !tool_uses.is_empty() {
-                    out.push(LlmMessage {
-                        role: "assistant".to_string(),
-                        content: flatten_history_blocks_text(&m.anthropic_content),
-                        tool_calls: Some(tool_uses),
-                        // Round-trip reasoning DeepSeek del turno assistant.
-                        reasoning: m.reasoning.clone(),
-                        // Round-trip firma thinking Anthropic (per-messaggio).
-                        thinking_signature: m.thinking_signature.clone(),
-                        ..Default::default()
-                    });
-                }
-                return out;
-            }
-            // Blocchi senza tool (es. solo testo / immagini): preserva i blocchi.
-            let role = if m.is_human { "user" } else { "assistant" };
-            return vec![LlmMessage {
-                role: role.to_string(),
-                content: m.anthropic_content.clone(),
-                // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
-                reasoning: if m.is_human {
-                    None
-                } else {
-                    m.reasoning.clone()
-                },
-                // Round-trip firma thinking Anthropic: solo sugli assistant.
-                thinking_signature: if m.is_human {
-                    None
-                } else {
-                    m.thinking_signature.clone()
-                },
-                ..Default::default()
-            }];
+            return blocks_history_to_wire(m, blocks);
         }
     }
 
     // 3) Forma minimale role/content (turno puramente testuale).
-    let role = if m.is_human { "user" } else { "assistant" };
+    let (reasoning, thinking_signature) = assistant_round_trip_fields(m);
     vec![LlmMessage {
-        role: role.to_string(),
+        role: history_role(m).to_string(),
         content: m.content.clone(),
-        // Round-trip reasoning DeepSeek: solo sugli assistant (mai sugli user).
-        reasoning: if m.is_human {
-            None
-        } else {
-            m.reasoning.clone()
-        },
-        // Round-trip firma thinking Anthropic: solo sugli assistant.
-        thinking_signature: if m.is_human {
-            None
-        } else {
-            m.thinking_signature.clone()
-        },
+        reasoning,
+        thinking_signature,
+        ..Default::default()
+    }]
+}
+
+/// Ruolo wire di un [`HistoryMessage`] non-tool.
+fn history_role(m: &HistoryMessage) -> &'static str {
+    if m.is_human { "user" } else { "assistant" }
+}
+
+/// Round-trip di `reasoning` (DeepSeek) e `thinking_signature` (Anthropic): vanno
+/// ri-passati SOLO sugli assistant, mai sugli user. Punto unico dei due rami
+/// senza tool_use di [`history_msg_to_wire`] (regola L). Il ramo assistant-con-
+/// tool_calls NON passa di qui: li' i due campi sono sempre propagati.
+fn assistant_round_trip_fields(m: &HistoryMessage) -> (Option<String>, Option<String>) {
+    if m.is_human {
+        (None, None)
+    } else {
+        (m.reasoning.clone(), m.thinking_signature.clone())
+    }
+}
+
+/// Ramo `is_tool` di [`history_msg_to_wire`]: un solo `role="tool"` + id.
+fn tool_history_to_wire(m: &HistoryMessage) -> LlmMessage {
+    let content = if m.content.is_null() {
+        tool_result_content(&m.anthropic_content)
+    } else {
+        m.content.clone()
+    };
+    LlmMessage {
+        role: "tool".to_string(),
+        content,
+        tool_call_id: m.tool_call_id.clone(),
+        ..Default::default()
+    }
+}
+
+/// Ramo a blocchi di [`history_msg_to_wire`]: i `tool_result` diventano messaggi
+/// `role="tool"` e i `tool_use` i `tool_calls` di un assistant; senza blocchi
+/// tool i blocchi sono preservati sul ruolo del messaggio.
+fn blocks_history_to_wire(m: &HistoryMessage, blocks: &[Value]) -> Vec<LlmMessage> {
+    let tool_results = extract_tool_results(blocks);
+    let tool_uses = extract_tool_uses(blocks);
+    if !tool_results.is_empty() || !tool_uses.is_empty() {
+        let mut out: Vec<LlmMessage> = Vec::new();
+        // I tool_result diventano messaggi `role="tool"` (round-trip id).
+        for (tool_use_id, content) in tool_results {
+            out.push(LlmMessage {
+                role: "tool".to_string(),
+                content,
+                tool_call_id: Some(tool_use_id),
+                ..Default::default()
+            });
+        }
+        // I tool_use diventano `tool_calls` di un assistant (+ testo).
+        if !tool_uses.is_empty() {
+            out.push(LlmMessage {
+                role: "assistant".to_string(),
+                content: flatten_history_blocks_text(&m.anthropic_content),
+                tool_calls: Some(tool_uses),
+                // Round-trip reasoning DeepSeek del turno assistant.
+                reasoning: m.reasoning.clone(),
+                // Round-trip firma thinking Anthropic (per-messaggio).
+                thinking_signature: m.thinking_signature.clone(),
+                ..Default::default()
+            });
+        }
+        return out;
+    }
+    // Blocchi senza tool (es. solo testo / immagini): preserva i blocchi.
+    let (reasoning, thinking_signature) = assistant_round_trip_fields(m);
+    vec![LlmMessage {
+        role: history_role(m).to_string(),
+        content: m.anthropic_content.clone(),
+        reasoning,
+        thinking_signature,
         ..Default::default()
     }]
 }
