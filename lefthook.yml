@@ -41,6 +41,18 @@ pre-commit:
       run: bash scripts/precommit-cargo-check.sh
       fail_text: "pre-commit cargo fallito: correggi cargo check."
 
+    # Gate ratchet qualita (scripts/quality-baseline.json): ~2-8s a target caldo.
+    # Sta qui e non solo in `pnpm verify`/CI perche' e' un gate GLOBALE: chi lo
+    # esegue paga il debito di tutti. Confinato alla verifica completa, il drift
+    # si accumulava invisibile per decine di commit e ricadeva sul primo che
+    # eseguiva `pnpm verify` (misurato: 92 commit, +812 finding). Ora lo vede chi
+    # lo introduce, quando correggerlo costa poco.
+    quality_scan:
+      glob:
+        - "*.rs"
+      run: bash scripts/precommit-quality-scan.sh
+      fail_text: "pre-commit: regressione qualita (gate ratchet). Riduci le violazioni introdotte; aggiorna la baseline SOLO se il peggioramento e' giustificato, e dichiaralo nel commit."
+
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
     # definizioni di un punto unico fuori dal suo modulo. Il gate jscpd "ratchet"
     # completo gira in CI (verify.yml), non a ogni commit per non rallentarlo.
