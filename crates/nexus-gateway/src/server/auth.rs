@@ -116,6 +116,7 @@ routing:
                 aliases_file: "x".to_string(),
                 policy_file: "y".to_string(),
             }),
+            timeouts: nexus_auth::llm_timeouts::LlmTimeouts::defaults(),
         };
         Some(AppState {
             db: pool,

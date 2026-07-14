@@ -49,7 +49,8 @@ use crate::types::{
 };
 
 use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
-use super::bootstrap::{build_runtime, GatewayConfig};
+use super::bootstrap::{build_http_client, build_runtime, GatewayConfig};
+use nexus_auth::llm_timeouts::LlmTimeouts;
 use super::AppState;
 
 /// Errore della pipeline tradotto in HTTP. Mantiene lo status coerente col
@@ -306,7 +307,14 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
     // risolto, nessuno swap possibile) si RITENTA lo stesso modello sui
     // transitori e si attende un cooldown breve invece di fallire subito.
     let strict = req.pin_provider.is_some();
-    let mut response = run_fallback(&resolved, &state.cooldown, &redacted_req, strict).await?;
+    let mut response = run_fallback(
+        &resolved,
+        &state.cooldown,
+        &redacted_req,
+        strict,
+        runtime.timeouts.per_attempt,
+    )
+    .await?;
 
     // Reidratazione post-flight: ripristina gli originali nei placeholder.
     response = pipeline.rehydrate(&response, &mut map);
@@ -447,6 +455,7 @@ async fn run_fallback(
     cooldown: &CooldownManager,
     base_req: &LlmRequest,
     strict: bool,
+    per_attempt: std::time::Duration,
 ) -> Result<LlmResponse, PipelineError> {
     let mut failures: Vec<ProviderFailure> = Vec::new();
     let policy = cooldown.retry_policy();
@@ -498,7 +507,16 @@ async fn run_fallback(
         let mut req = base_req.clone();
         req.model = rp.model.clone();
 
-        match complete_with_retry(rp.provider.as_ref(), &req, name, cooldown, &policy, strict).await
+        match complete_with_retry(
+            rp.provider.as_ref(),
+            &req,
+            name,
+            cooldown,
+            &policy,
+            strict,
+            per_attempt,
+        )
+        .await
         {
             Ok(resp) => {
                 // Successo reale: se il provider era in cooldown transitorio,
@@ -599,6 +617,24 @@ impl CallFailure {
         }
     }
 
+    /// Fallimento per CAP PER-TENTATIVO scaduto: il provider non ha risposto
+    /// entro la quota che gli spetta dentro il budget della richiesta. E'
+    /// `transient` (il provider e' lento ORA, non rotto), quindi la chain passa
+    /// oltre e il cooldown breve lo libera al primo re-probe sano. La classe e'
+    /// un segnale STRUTTURATO (regola M): nessuno dovra' dedurre "timeout" dal
+    /// testo del messaggio.
+    fn attempt_timeout(per_attempt: std::time::Duration) -> Self {
+        Self {
+            class: "transient",
+            status: None,
+            code: Some("attempt_timeout".to_string()),
+            message: format!(
+                "nessuna risposta entro il cap per-tentativo ({}s)",
+                per_attempt.as_secs()
+            ),
+        }
+    }
+
     fn into_provider_failure(self, provider: &str) -> ProviderFailure {
         ProviderFailure {
             provider: provider.to_string(),
@@ -621,6 +657,10 @@ impl CallFailure {
 ///     `mark_transient` (cooldown breve, liberato dal re-probe appena sano).
 ///
 /// `strict = false` prova una volta sola (la chain passa al provider successivo).
+///
+/// `per_attempt` limita OGNI singolo `provider.complete()`: senza, un provider
+/// appeso consumava tutto il budget della richiesta e la chain non arrivava mai
+/// al provider successivo.
 async fn complete_with_retry(
     provider: &dyn LlmProvider,
     req: &LlmRequest,
@@ -628,6 +668,7 @@ async fn complete_with_retry(
     cooldown: &CooldownManager,
     policy: &RetryPolicy,
     strict: bool,
+    per_attempt: std::time::Duration,
 ) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
@@ -654,7 +695,25 @@ async fn complete_with_retry(
             );
         }
 
-        match provider.complete(&call_req).await {
+        let call = match tokio::time::timeout(per_attempt, provider.complete(&call_req)).await {
+            Ok(r) => r,
+            Err(_) => {
+                // Il cap e' scaduto: nessuna risposta da classificare. Il
+                // provider e' lento ORA -> cooldown breve (come gli altri
+                // transient) e la chain prova il prossimo dentro il budget.
+                tracing::warn!(
+                    provider = name,
+                    per_attempt_s = per_attempt.as_secs(),
+                    attempt,
+                    "gateway: cap per-tentativo scaduto -> transient, passo oltre"
+                );
+                let failure = CallFailure::attempt_timeout(per_attempt);
+                cooldown.mark_transient(name, Some(failure.message.clone()));
+                return Err(failure);
+            }
+        };
+
+        match call {
             Ok(resp) => {
                 // PUNTO UNICO di validazione della risposta (regola L+M): un 200
                 // senza output utile (content vuoto E nessuna tool-call E
@@ -927,9 +986,36 @@ pub async fn complete(
         )
             .into_response();
     }
-    match run_complete(&state, &body).await {
-        Ok(resp) => Json(resp).into_response(),
-        Err(e) => e.into_response(),
+    // DEADLINE END-TO-END (retry e chain inclusi). Senza di essa una singola
+    // completion poteva correre quanto il TRASPORTO concedeva (300s) — cioe'
+    // quanto l'INTERO run multi-turno che l'aveva chiesta: una chiamata lenta
+    // consumava il 100% della vita del run, che moriva con `it=0`, e la colpa
+    // finiva ogni volta sul modello di turno. Il budget garantisce invece
+    // `min_guaranteed_turns` turni per run (punto unico: nexus_auth::llm_timeouts).
+    let budget = state.runtime_snapshot().await.timeouts.request_budget;
+    match tokio::time::timeout(budget, run_complete(&state, &body)).await {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(e)) => e.into_response(),
+        Err(_) => {
+            tracing::warn!(
+                budget_s = budget.as_secs(),
+                model = %body.model,
+                feature = %body.metadata.feature,
+                "gateway: budget della richiesta esaurito -> 504, il motore fara' failover"
+            );
+            // 504 con codice STRUTTURATO (regola M): il chiamante decide sul
+            // codice, non sul testo.
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({
+                    "error": "request budget exceeded",
+                    "code": "request_budget_exceeded",
+                    "primary_cause": "request_budget_exceeded",
+                    "budget_seconds": budget.as_secs(),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1968,8 +2054,22 @@ async fn get_batch_anthropic(state: &AppState, batch_id: &str) -> Response {
 pub async fn admin_reload(State(state): State<AppState>) -> Response {
     // Ricostruisce la config dai settings correnti (profilo puo' essere cambiato).
     let config = GatewayConfig::load(&state.db).await;
-    let http = reqwest::Client::new();
-    match build_runtime(&state.db, &http, config).await {
+    // Client e timeout dal punto unico, come all'avvio: qui viveva un
+    // `reqwest::Client::new()` che dopo ogni reload lasciava i provider SENZA
+    // timeout, keepalive e pool_max_idle(0) — una chiamata poteva appendersi
+    // senza limite. I timeout si rileggono dal DB, cosi' il reload li applica.
+    let timeouts = LlmTimeouts::resolve(&state.db).await;
+    let http = match build_http_client(&timeouts) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("reload failed: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    match build_runtime(&state.db, &http, config, timeouts).await {
         Ok(new_runtime) => {
             let provider_names: Vec<String> =
                 new_runtime.providers.iter().map(|p| p.name().to_string()).collect();
@@ -1995,6 +2095,11 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Cap per-tentativo nei test della chain: generoso di proposito, cosi' i
+    /// provider finti (che rispondono all'istante) non lo toccano mai e i test
+    /// restano su cio' che vogliono verificare. Il cap ha i suoi test dedicati.
+    const TEST_PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(30);
+
     // ── Provider finto (no rete) ────────────────────────────────────────────
     enum Behaviour {
         Ok,
@@ -2003,6 +2108,9 @@ mod tests {
         ErrClient,
         /// Primo tentativo: 400 history-related; secondo tentativo: OK (sanificazione).
         ErrHistoryThenOk,
+        /// Non risponde mai: simula la chiamata APPESA che ha originato il fix
+        /// (misurata sul campo: 197s senza alcun log, con le figure ferme).
+        Hang,
     }
 
     struct FakeProvider {
@@ -2164,6 +2272,11 @@ mod tests {
                 }
                 .into());
             }
+            if matches!(self.behaviour, Behaviour::Hang) {
+                // Piu' lungo di qualunque cap usato nei test: e' il chiamante a
+                // dover mollare, non il provider a farla finita.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
             match self.behaviour {
                 Behaviour::Ok => Ok(LlmResponse {
                     content: "ok".into(),
@@ -2200,6 +2313,7 @@ mod tests {
                     message: "invalid request: bad field".into(),
                 }
                 .into()),
+                Behaviour::Hang => unreachable!("Behaviour::Hang: il sleep precede il match"),
                 Behaviour::ErrHistoryThenOk => {
                     if idx == 0 {
                         Err(crate::providers::ProviderHttpError {
@@ -2266,6 +2380,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
                 Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -2287,6 +2402,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
                 Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -2306,6 +2422,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
                 Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -2329,6 +2446,7 @@ mod tests {
                     latency_ms: 0,
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
+                Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
                 Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
@@ -2399,7 +2517,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
     }
@@ -2448,7 +2566,7 @@ mod tests {
             },
         ];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
     }
@@ -2464,7 +2582,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -2483,7 +2601,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .err()
             .unwrap();
@@ -2503,7 +2621,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .err()
             .unwrap();
@@ -2523,7 +2641,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .err()
             .unwrap();
@@ -2541,7 +2659,7 @@ mod tests {
             model: "mistral-small-latest".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .unwrap();
         assert_eq!(resp.content, "ok-after-sanitize");
@@ -2563,7 +2681,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .err()
             .unwrap();
@@ -2589,7 +2707,7 @@ mod tests {
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
         cooldown.mark_billing("openai", Some("insufficient_quota".into()));
-        let err = run_fallback(&resolved, &cooldown, &req(), false)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
             .await
             .err()
             .unwrap();
@@ -2677,7 +2795,7 @@ aliases:
             chrono::Utc::now(),
             2,
         );
-        let resp = run_fallback(&resolved, &cooldown, &req(), true)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -2720,7 +2838,7 @@ aliases:
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false).await.err().unwrap();
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
     }
@@ -2782,7 +2900,7 @@ aliases:
         let cooldown = CooldownManager::new();
         cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
 
-        let err = run_fallback(&resolved, &cooldown, &req(), false)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
             .await
             .expect_err("provider pinnato in cooldown deve fallire");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -2803,7 +2921,7 @@ aliases:
         let resolved = vec![rp];
 
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
             .await
             .expect_err("provider pinnato fallito deve dare errore, non fallback");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3157,5 +3275,73 @@ aliases:
         assert_eq!(out.model_used, "veo-3.1-generate-001");
         assert_eq!(out.mime, "video/mp4");
         assert!(out.video_base64.is_some());
+    }
+
+    // ── Cap per-tentativo: la regressione che ha originato il fix ────────────
+    //
+    // Prima non esisteva NESSUN timeout logico nel gateway (`tokio::time::timeout`
+    // non compariva nel crate): una chiamata appesa correva quanto il trasporto
+    // concedeva (300s), cioe' quanto l'INTERO run che l'aveva chiesta, e il run
+    // moriva con zero iterazioni completate.
+
+    /// Un provider che non risponde MAI viene mollato al cap, con un segnale
+    /// strutturato (regola M): classe + codice, mai testo da interpretare.
+    #[tokio::test]
+    async fn il_cap_per_tentativo_molla_un_provider_appeso() {
+        let p = FakeProvider::new("slow", Behaviour::Hang);
+        let cooldown = CooldownManager::new();
+        let policy = cooldown.retry_policy();
+        let cap = std::time::Duration::from_millis(50);
+
+        // La rete di sicurezza del test e' ESTERNA alla funzione sotto esame: se
+        // il cap sparisce, questo test FALLISCE in 5s invece di restare appeso
+        // (un test che si blocca inchioda la CI e non dice cosa e' rotto).
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            complete_with_retry(p.as_ref(), &req(), "slow", &cooldown, &policy, true, cap),
+        )
+        .await
+        .expect("cap per-tentativo NON applicato: la chiamata e' rimasta appesa");
+
+        let Err(err) = res else {
+            panic!("un provider appeso non puo' produrre un successo");
+        };
+        assert_eq!(err.class, "transient", "lento ORA, non rotto");
+        assert_eq!(err.code.as_deref(), Some("attempt_timeout"));
+    }
+
+    /// Il provider appeso non deve bloccare la chain: il successivo, sano,
+    /// risponde. Prima il primo elemento consumava tutto e non si arrivava mai
+    /// al secondo.
+    #[tokio::test]
+    async fn un_provider_appeso_non_blocca_il_resto_della_chain() {
+        let hang: Arc<dyn LlmProvider> = FakeProvider::new("slow", Behaviour::Hang);
+        let ok: Arc<dyn LlmProvider> = FakeProvider::new("sano", Behaviour::Ok);
+        let resolved = vec![
+            ResolvedProvider {
+                provider: hang,
+                model: "m".into(),
+            },
+            ResolvedProvider {
+                provider: ok,
+                model: "m".into(),
+            },
+        ];
+        let cooldown = CooldownManager::new();
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_fallback(
+                &resolved,
+                &cooldown,
+                &req(),
+                false,
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("il provider appeso ha bloccato la chain: cap non applicato")
+        .expect("la chain deve raggiungere il provider sano");
+        assert_eq!(resp.provider_used, "sano");
     }
 }

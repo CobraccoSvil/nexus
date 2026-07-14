@@ -261,53 +261,27 @@ impl std::fmt::Display for GatewayHttpError {
 
 impl std::error::Error for GatewayHttpError {}
 
-/// Default mig 0586 (allineato a `nexus_gateway::http_timeouts`).
-const DEFAULT_COMPLETE_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_RETRY_MAX_ATTEMPTS: u64 = 3;
-const DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S: i64 = 45;
-/// Margine sopra il budget gateway (retry + cooldown) per non chiudere la
-/// connessione mcp-core->gateway prima che il gateway risponda.
-const CLIENT_TIMEOUT_MARGIN_SECS: u64 = 30;
-
-fn parse_positive_u64(raw: Option<String>, default: u64) -> u64 {
-    raw.and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default)
-}
-
-fn parse_positive_i64(raw: Option<String>, default: i64) -> i64 {
-    raw.and_then(|s| s.trim().parse::<i64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default)
-}
-
-/// Budget HTTP mcp-core -> gateway per `/v1/complete`: copre timeout provider
-/// (complete) x retry + attesa cooldown breve + margine (regola G).
+/// Budget HTTP mcp-core -> gateway per `/v1/complete`, dal punto unico
+/// (`nexus_auth::llm_timeouts`, regola L).
+///
+/// Qui viveva un calcolo GEMELLO — `complete x max_attempts + cooldown_cap +
+/// margine` = **435s** — costruito sull'assunzione che il gateway concedesse
+/// 120s per tentativo. L'assunzione era falsa (il gateway ne concedeva 300, e il
+/// 120 non era applicato da nessuno): il risultato era che mcp-core attendeva
+/// una singola chiamata piu' a lungo (435s) di quanto vivesse l'intero run che
+/// l'aveva chiesta (300s). Ora il budget e' DERIVATO dal run, non moltiplicato.
 async fn resolve_client_timeout_secs(db: &sqlx::PgPool) -> u64 {
-    let complete = parse_positive_u64(
-        nexus_auth::get_setting(db, "gateway.complete_timeout_seconds").await,
-        DEFAULT_COMPLETE_TIMEOUT_SECS,
-    );
-    let max_attempts = parse_positive_u64(
-        nexus_auth::get_setting(db, "gateway.retry.max_attempts").await,
-        DEFAULT_RETRY_MAX_ATTEMPTS,
-    );
-    let cooldown_cap = parse_positive_i64(
-        nexus_auth::get_setting(db, "gateway.retry.wait_short_cooldown_cap_s").await,
-        DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S,
-    ) as u64;
-    complete
-        .saturating_mul(max_attempts)
-        .saturating_add(cooldown_cap)
-        .saturating_add(CLIENT_TIMEOUT_MARGIN_SECS)
+    nexus_auth::llm_timeouts::LlmTimeouts::resolve(db)
+        .await
+        .client_budget
+        .as_secs()
 }
 
 impl NexusGatewayClient {
     pub fn new(base_url: String, service_token: String) -> Self {
-        let timeout_secs = DEFAULT_COMPLETE_TIMEOUT_SECS
-            .saturating_mul(DEFAULT_RETRY_MAX_ATTEMPTS)
-            .saturating_add(DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S as u64)
-            .saturating_add(CLIENT_TIMEOUT_MARGIN_SECS);
+        let timeout_secs = nexus_auth::llm_timeouts::LlmTimeouts::defaults()
+            .client_budget
+            .as_secs();
         Self::with_timeout(base_url, service_token, timeout_secs)
     }
 
@@ -525,19 +499,16 @@ mod tests {
         assert!(parsed.models.contains(&"gemini-2.5-pro".to_string()));
     }
 
+    /// La regressione, in numeri: il client attendeva una singola chiamata
+    /// (435s) piu' a lungo del run che la conteneva (300s). Ora il budget e'
+    /// derivato dal run e gli resta sotto, sempre.
     #[test]
-    fn client_timeout_budget_default() {
-        assert_eq!(
-            DEFAULT_COMPLETE_TIMEOUT_SECS
-                .saturating_mul(DEFAULT_RETRY_MAX_ATTEMPTS)
-                .saturating_add(DEFAULT_WAIT_SHORT_COOLDOWN_CAP_S as u64)
-                .saturating_add(CLIENT_TIMEOUT_MARGIN_SECS),
-            435
+    fn il_client_non_attende_piu_del_run_che_lo_contiene() {
+        let t = nexus_auth::llm_timeouts::LlmTimeouts::defaults();
+        assert_eq!(t.client_budget.as_secs(), 90, "era 435 (120*3+45+30)");
+        assert!(
+            t.client_budget < t.run_timeout,
+            "il budget di UNA chiamata non puo' superare il run intero"
         );
-    }
-
-    #[test]
-    fn parse_positive_u64_reject_zero() {
-        assert_eq!(parse_positive_u64(Some("0".into()), 120), 120);
     }
 }

@@ -13,7 +13,6 @@
 
 pub mod batch;
 pub mod cooldown;
-pub mod http_timeouts;
 pub mod history_sanitizer;
 pub mod model_alias_resolver;
 pub mod policy_engine;
