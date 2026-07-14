@@ -42,6 +42,195 @@ fn is_test_file(path: &str) -> bool {
     path.contains("/tests/") || path.ends_with("/tests.rs") || path.ends_with("_tests.rs")
 }
 
+/// Sostituisce con righe vuote gli item annotati `#[cfg(test)]` (tipicamente
+/// `mod tests { ... }` inline), preservando la numerazione delle righe.
+///
+/// Completa [`is_test_file`]: insieme esprimono l'unica policy di scoping del
+/// gate, "i test non entrano nei conteggi" (regola L). Il solo controllo sul
+/// path non basta, perche' in Rust la convenzione dominante per gli unit test
+/// e' il modulo `#[cfg(test)]` inline nel file di produzione: senza questo
+/// strip il gate dichiara "test esclusi" ma li conta, e finisce per penalizzare
+/// chi aggiunge test — inclusi i test di regressione che CLAUDE.md (regola H)
+/// pretende per ogni fix, e gli `unwrap()` che la regola F ammette proprio
+/// nei soli `#[cfg(test)]`.
+fn strip_cfg_test_items(src: &str) -> String {
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    let mut blanked = vec![false; starts.len()];
+    let mut line = 0usize;
+    while line < starts.len() {
+        let begin = starts[line];
+        let text = src[begin..].lines().next().unwrap_or("");
+        if text.trim_start().starts_with("#[cfg(test)]") {
+            let end = item_end_offset(src, begin);
+            // Azzera tutte le righe coperte dall'item, attributo incluso.
+            let mut l = line;
+            while l < starts.len() && starts[l] < end {
+                blanked[l] = true;
+                l += 1;
+            }
+            line = l.max(line + 1);
+        } else {
+            line += 1;
+        }
+    }
+
+    let mut out = src
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if blanked[i] { "" } else { l })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Senza il newline finale l'ultima riga azzerata sparirebbe da `lines()`,
+    // disallineando i numeri di riga dei finding.
+    if src.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Offset (esclusivo) di fine dell'item che inizia a `start`: la graffa di
+/// chiusura bilanciata, oppure il `;` per un item senza body (`mod tests;`).
+/// Graffe dentro commenti, stringhe e char literal non contano.
+fn item_end_offset(src: &str, start: usize) -> usize {
+    let b = src.as_bytes();
+    let mut i = start;
+    let mut depth = 0usize;
+    let mut seen_brace = false;
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => i = skip_block_comment(b, i),
+            b'r' | b'b' if raw_string_hashes(b, i).is_some() => i = skip_raw_string(b, i),
+            b'"' => i = skip_string(b, i),
+            b'\'' => i = skip_char_or_lifetime(src, i),
+            b'{' => {
+                depth += 1;
+                seen_brace = true;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                if depth == 0 && seen_brace {
+                    return i;
+                }
+            }
+            b';' if depth == 0 && !seen_brace => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Salta un commento a blocco, che in Rust puo' essere annidato.
+fn skip_block_comment(b: &[u8], start: usize) -> usize {
+    let mut i = start + 2;
+    let mut nest = 1usize;
+    while i < b.len() && nest > 0 {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            nest += 1;
+            i += 2;
+        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+            nest -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Numero di `#` di una raw string che inizia a `start` (`r"`, `r#"`, `br##"`),
+/// oppure `None` se li' non inizia una raw string.
+fn raw_string_hashes(b: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    if b[i] == b'b' {
+        i += 1;
+        if b.get(i) != Some(&b'r') {
+            return None;
+        }
+    }
+    if b.get(i) != Some(&b'r') {
+        return None;
+    }
+    // Un identificatore che finisce per `r`/`b` non apre una raw string.
+    if start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+        return None;
+    }
+    i += 1;
+    let hashes = b[i..].iter().take_while(|c| **c == b'#').count();
+    if b.get(i + hashes) == Some(&b'"') {
+        Some(hashes)
+    } else {
+        None
+    }
+}
+
+/// Salta una raw string: termina al primo `"` seguito da tanti `#` quanti
+/// l'apertura. Nessun escape con `\` al suo interno.
+fn skip_raw_string(b: &[u8], start: usize) -> usize {
+    let Some(hashes) = raw_string_hashes(b, start) else {
+        return start + 1;
+    };
+    let mut i = start;
+    while i < b.len() && b[i] != b'"' {
+        i += 1;
+    }
+    i += 1;
+    while i < b.len() {
+        if b[i] == b'"' && b[i + 1..].iter().take(hashes).filter(|c| **c == b'#').count() == hashes {
+            return i + 1 + hashes;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Salta una stringa normale, rispettando gli escape `\"`.
+fn skip_string(b: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// Distingue un char literal (`'x'`, `'\n'`) da un lifetime (`'a`), che non ha
+/// apice di chiusura e non va saltato.
+fn skip_char_or_lifetime(src: &str, start: usize) -> usize {
+    let rest = &src[start + 1..];
+    if rest.starts_with('\\') {
+        // Escape: la chiusura e' il primo apice non preceduto da backslash.
+        let b = rest.as_bytes();
+        let mut i = 1usize;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'\'' => return start + 1 + i + 1,
+                _ => i += 1,
+            }
+        }
+        return src.len();
+    }
+    match rest.chars().next() {
+        Some(c) if rest.as_bytes().get(c.len_utf8()) == Some(&b'\'') => {
+            start + 1 + c.len_utf8() + 1
+        }
+        _ => start + 1,
+    }
+}
+
 /// Singolo finding in forma compatta per la work-list di refactor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingLite {
@@ -65,6 +254,17 @@ pub struct FileTarget {
     pub findings: Vec<FindingLite>,
 }
 
+/// Sorgente nello scope del gate: con `include_tests` falso i moduli
+/// `#[cfg(test)]` inline sono azzerati. Punto unico applicato da entrambe le
+/// scansioni, cosi' gate e work-list non possono divergere (regola L).
+fn scoped_source(src: &str, include_tests: bool) -> std::borrow::Cow<'_, str> {
+    if include_tests {
+        std::borrow::Cow::Borrowed(src)
+    } else {
+        std::borrow::Cow::Owned(strip_cfg_test_items(src))
+    }
+}
+
 /// Vero se il finding rientra nei tre tipi-target del batch di refactor.
 fn is_target(f: &crate::QualityFinding) -> bool {
     f.category == "security"
@@ -85,6 +285,7 @@ pub fn scan_targets(roots: &[PathBuf], include_tests: bool) -> Vec<FileTarget> {
         let Ok(src) = fs::read_to_string(&file) else {
             continue;
         };
+        let src = scoped_source(&src, include_tests);
         let report = crate::analyze_source(&path_str, &src);
 
         let mut findings = Vec::new();
@@ -151,6 +352,7 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+
 /// Esegue l'analisi su tutti i `.rs` sotto i `roots` e aggrega le metriche.
 /// Se `include_tests` e' falso i file di test sono ignorati.
 pub fn scan_counts(roots: &[PathBuf], include_tests: bool) -> QualityCounts {
@@ -165,6 +367,7 @@ pub fn scan_counts(roots: &[PathBuf], include_tests: bool) -> QualityCounts {
         };
         counts.files_scanned += 1;
 
+        let src = scoped_source(&src, include_tests);
         let report = crate::analyze_source(&path_str, &src);
         for f in &report.findings {
             counts.total += 1;
@@ -180,4 +383,81 @@ pub fn scan_counts(roots: &[PathBuf], include_tests: bool) -> QualityCounts {
         }
     }
     counts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_azzera_il_modulo_test_inline_e_preserva_la_produzione() {
+        let src = "fn prod() {\n    let x = 1;\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        assert!(true);\n    }\n}\n";
+        let out = strip_cfg_test_items(src);
+        assert!(out.contains("fn prod()"), "il codice di produzione resta");
+        assert!(!out.contains("assert!"), "il corpo del modulo test sparisce");
+        assert!(!out.contains("#[cfg(test)]"), "l'attributo sparisce con l'item");
+        assert_eq!(
+            src.lines().count(),
+            out.lines().count(),
+            "la numerazione delle righe e' preservata"
+        );
+    }
+
+    #[test]
+    fn strip_non_e_ingannato_da_graffe_in_stringhe_commenti_e_char() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn t() {\n        let s = \"}\";\n        let r = r#\"}}}\"#;\n        let c = '}';\n        // }\n        /* } */\n    }\n}\nfn prod_dopo() {}\n";
+        let out = strip_cfg_test_items(src);
+        assert!(
+            out.contains("fn prod_dopo()"),
+            "le graffe dentro stringhe/commenti/char non chiudono il modulo in anticipo: {out}"
+        );
+        assert!(!out.contains("let s ="), "il corpo del test e' comunque azzerato");
+    }
+
+    #[test]
+    fn strip_distingue_lifetime_da_char_literal() {
+        let src =
+            "#[cfg(test)]\nmod tests {\n    fn t<'a>(x: &'a str) -> &'a str {\n        x\n    }\n}\nfn prod_dopo() {}\n";
+        let out = strip_cfg_test_items(src);
+        assert!(
+            out.contains("fn prod_dopo()"),
+            "un lifetime non apre un char literal: {out}"
+        );
+        assert!(!out.contains("fn t<"), "il modulo test e' azzerato");
+    }
+
+    #[test]
+    fn strip_gestisce_item_senza_body() {
+        let src = "#[cfg(test)]\nmod tests;\nfn prod() {}\n";
+        let out = strip_cfg_test_items(src);
+        assert!(out.contains("fn prod()"), "la produzione resta: {out}");
+        assert!(!out.contains("mod tests;"), "la dichiarazione sparisce: {out}");
+    }
+
+    #[test]
+    fn scoped_source_rispetta_include_tests() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        assert!(
+            scoped_source(src, true).contains("fn t()"),
+            "con include_tests i test restano nello scope"
+        );
+        assert!(
+            !scoped_source(src, false).contains("fn t()"),
+            "senza include_tests i test escono dallo scope"
+        );
+    }
+
+    #[test]
+    fn unwrap_nei_test_inline_non_conta_come_finding() {
+        // Regola F di CLAUDE.md: `unwrap()` e' ammesso proprio nei `#[cfg(test)]`.
+        // Il gate non deve contarlo come debito.
+        let src = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        let v: Option<u8> = None;\n        let _ = v.unwrap();\n    }\n}\n";
+        let scoped = scoped_source(src, false);
+        let report = crate::analyze_source("esempio.rs", &scoped);
+        assert!(
+            !report.findings.iter().any(|f| f.title.contains("unwrap")),
+            "nessun finding unwrap dal modulo test: {:?}",
+            report.findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+    }
 }
