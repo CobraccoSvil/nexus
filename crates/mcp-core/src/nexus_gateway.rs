@@ -313,8 +313,15 @@ impl NexusGatewayClient {
 
     fn with_timeout(base_url: String, service_token: String, timeout_secs: u64) -> Self {
         Self {
+            // Resilienza connessioni morte post-sleep (regola H): niente riuso di
+            // socket idle dal pool + keepalive. Il default keep-alive faceva fallire
+            // le chiamate mcp-core -> gateway con "error sending request" dopo che la
+            // macchina si risvegliava dallo sleep (connessioni TCP morte riusate).
+            // Vedi il gemello in nexus-gateway bootstrap (client gateway -> provider).
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout_secs))
+                .tcp_keepalive(std::time::Duration::from_secs(30))
+                .pool_max_idle_per_host(0)
                 .build()
                 .expect("reqwest client"),
             base_url,

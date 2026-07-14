@@ -420,8 +420,20 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
         timeout_secs = http_timeout.as_secs(),
         "gateway: client HTTP provider con timeout DB-driven"
     );
+    // Resilienza alle connessioni TCP morte (regola H, causa radice). Il pool
+    // keep-alive di default (idle illimitato, nessun keepalive) fa RIUSARE
+    // connessioni che muoiono quando la macchina va in sleep: al risveglio la prima
+    // richiesta su una connessione morta fallisce con "error sending request" e il
+    // provider appare down pur essendo raggiungibile (verificato: reqwest da fresco
+    // -> 200). tcp_keepalive rileva le connessioni morte in condizioni normali;
+    // pool_max_idle_per_host(0) NON trattiene connessioni idle nel pool, cosi' ogni
+    // chiamata usa una connessione fresca: nessun riuso di socket morti dopo lo
+    // sleep. L'overhead di handshake (~100-300ms) e' trascurabile sulle chiamate LLM
+    // (secondi di inference); il pool illimitato costava un run KO per ogni risveglio.
     let http = Client::builder()
         .timeout(http_timeout)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(0)
         .build()
         .context("costruzione client HTTP gateway")?;
 
