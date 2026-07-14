@@ -186,10 +186,13 @@ struct AppState {
             std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
         >,
     >,
-    /// Pool-cache dei DB metadati Nexus per-progetto (Fase 0 separazione DB,
-    /// regola L). Popolata/letta SOLO da `project_db_routes::project_meta_pool`,
-    /// il punto unico che risolve/provisiona `<slug>_nexus` e instrada i dati
-    /// per-progetto. Invalidazione su re-provisioning / scadenza TTL.
+    /// Pool-cache dei DB metadati Nexus per-progetto (separazione DB, regola L).
+    /// Popolata/letta SOLO da `project_db_routes` (`project_meta_pool_core`, che
+    /// risolve/provisiona `<slug>_nexus` sotto lock per-progetto, e i suoi
+    /// chiamanti `project_data_pool*`). Lo stesso store e' condiviso con il
+    /// registry globale via `init_global_pools`, cosi' gli helper che non hanno
+    /// `&AppState` non aprono un secondo pool per progetto. Invalidazione su
+    /// re-provisioning / scadenza TTL.
     pub(crate) project_meta_pools: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     /// Istante di avvio del processo mcp-core. Usato dal boot-grace dell'observer
     /// (`service_observer_remediation::within_boot_grace`): dopo un restart da

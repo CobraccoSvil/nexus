@@ -60,9 +60,6 @@ pub use provision::{
     provision_project_db, register_entity_routing, DbRole,
 };
 pub(crate) use shared::pg_physical_target;
-// Esportati come fondazione; non ancora richiamati da call-site interni.
-#[allow(unused_imports)]
-pub use provision::project_meta_pool;
 pub use query::{
     discover_schema_candidates, execute_project_db_query, import_project_db_schema,
     read_schema_file,

@@ -572,14 +572,6 @@ async fn project_meta_pool_core(
     Ok(arc)
 }
 
-/// Wrapper con `&AppState` (Fase 0). Delega a [`project_meta_pool_core`].
-pub async fn project_meta_pool(
-    state: &AppState,
-    project_id: Uuid,
-) -> Result<std::sync::Arc<sqlx::PgPool>, String> {
-    project_meta_pool_core(&state.db, &state.project_meta_pools, project_id).await
-}
-
 /// Risolve la URL del DB metadati Nexus del progetto dal registry
 /// `project_database_config` (connection_role='nexus_metadata'). `None` se non
 /// ancora provisionato. Delega al punto unico
