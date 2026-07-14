@@ -40,6 +40,36 @@ pub(super) fn chunk_text(input: &str, max_chars: usize, max_chunks: usize) -> Ve
 /// Documento di indicizzazione: (chiave sorgente, titolo, corpo testuale).
 type BootstrapDoc = (String, String, String);
 
+/// Riassume le prime 6 lingue rilevate nella forma "linguaggio (n file)".
+/// Estratto da `build_project_summary`.
+fn summarize_languages(languages: &[Value]) -> String {
+    languages
+        .iter()
+        .take(6)
+        .filter_map(|entry| {
+            let language = entry.get("language").and_then(Value::as_str)?;
+            let count = entry.get("fileCount").and_then(Value::as_u64).unwrap_or(0);
+            Some(format!("{language} ({count})"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Riassume i primi 8 framework/build tool rilevati. Estratto da
+/// `build_project_summary`.
+fn summarize_frameworks(frameworks: &[String]) -> String {
+    if frameworks.is_empty() {
+        "nessuno rilevato".to_string()
+    } else {
+        frameworks
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Costruisce il testo del documento "Project Summary" dai metadati del
 /// progetto. Estratto da `index_project_bootstrap_vectors` per contenerne la
 /// lunghezza.
@@ -51,26 +81,8 @@ fn build_project_summary(
     dependencies: &Value,
     git_info: &Value,
 ) -> String {
-    let langs_summary = languages
-        .iter()
-        .take(6)
-        .filter_map(|entry| {
-            let language = entry.get("language").and_then(Value::as_str)?;
-            let count = entry.get("fileCount").and_then(Value::as_u64).unwrap_or(0);
-            Some(format!("{language} ({count})"))
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let frameworks_summary = if frameworks.is_empty() {
-        "nessuno rilevato".to_string()
-    } else {
-        frameworks
-            .iter()
-            .take(8)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let langs_summary = summarize_languages(languages);
+    let frameworks_summary = summarize_frameworks(frameworks);
     let node_deps = dependencies
         .get("node")
         .and_then(|n| n.get("dependencies"))
@@ -264,6 +276,40 @@ async fn append_git_history_docs(root: &Path, git_info: &Value, documents: &mut 
     }
 }
 
+/// Calcola l'ID deterministico di un punto del vector store: UUID dai primi 16
+/// byte di SHA256(project_id || marker || parts unite da ':'). Punto unico
+/// dell'hash point-id (regola L), condiviso da indice bootstrap e code index.
+/// Lo stream di byte e' identico a quello delle due implementazioni precedenti,
+/// quindi gli ID dei punti gia' presenti nel vector store restano invariati.
+fn deterministic_point_id(project_id: Uuid, marker: &[u8], parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_id.as_bytes());
+    hasher.update(marker);
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            hasher.update(b":");
+        }
+        hasher.update(part.as_bytes());
+    }
+    let hash_bytes = hasher.finalize();
+    let uuid_bytes: [u8; 16] = hash_bytes[..16].try_into().expect("sha256>=16");
+    uuid::Uuid::from_bytes(uuid_bytes).to_string()
+}
+
+/// Costruisce il payload JSON di un punto dell'indice bootstrap. Gemello di
+/// `code_point_payload`. Estratto da `embed_and_upsert_bootstrap_docs`.
+fn bootstrap_point_payload(project_id: Uuid, key: &str, title: &str, text: &str) -> Value {
+    json!({
+        "project_id": project_id.to_string(),
+        "type": "project_bootstrap",
+        "source": key,
+        "title": title,
+        "text": text,
+        "active": true,
+        "indexed_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 /// Esito dell'embedding+upsert dei documenti bootstrap.
 struct BootstrapUpsertOutcome {
     indexed_points: usize,
@@ -294,22 +340,8 @@ async fn embed_and_upsert_bootstrap_docs(
             }
         };
 
-        let mut point_hasher = Sha256::new();
-        point_hasher.update(project_id.as_bytes());
-        point_hasher.update(b":project_bootstrap:");
-        point_hasher.update(key.as_bytes());
-        let ph_bytes = point_hasher.finalize();
-        let ph_uuid: [u8; 16] = ph_bytes[..16].try_into().expect("sha256>=16");
-        let point_id = uuid::Uuid::from_bytes(ph_uuid).to_string();
-        let payload = json!({
-            "project_id": project_id.to_string(),
-            "type": "project_bootstrap",
-            "source": key,
-            "title": title,
-            "text": text,
-            "active": true,
-            "indexed_at": chrono::Utc::now().to_rfc3339(),
-        });
+        let point_id = deterministic_point_id(project_id, b":project_bootstrap:", &[key.as_str()]);
+        let payload = bootstrap_point_payload(project_id, key, title, text);
 
         match vector_memory::upsert_project_context_point(&state.db, &point_id, &embedding, payload)
             .await
@@ -374,6 +406,18 @@ pub async fn index_project_bootstrap_vectors(
         });
     }
 
+    upsert_bootstrap_documents_and_report(state, project_id, &documents).await
+}
+
+/// Cancella l'indice bootstrap precedente, embedda e upserta i documenti e
+/// costruisce il JSON di esito. L'errore di cleanup e' passato come primo errore
+/// gia' noto, cosi' resta visibile in risposta anche se l'upsert va a buon fine.
+/// Estratto da `index_project_bootstrap_vectors` per contenerne la lunghezza.
+async fn upsert_bootstrap_documents_and_report(
+    state: &AppState,
+    project_id: Uuid,
+    documents: &[BootstrapDoc],
+) -> Value {
     let collection = vector_memory::project_context_collection_name(&state.db)
         .await
         .unwrap_or_else(|_| "project_context".to_string());
@@ -385,7 +429,7 @@ pub async fn index_project_bootstrap_vectors(
         };
 
     let outcome =
-        embed_and_upsert_bootstrap_docs(state, project_id, &documents, cleanup_error).await;
+        embed_and_upsert_bootstrap_docs(state, project_id, documents, cleanup_error).await;
 
     json!({
         "status": index_status(outcome.indexed_points, outcome.failed_points),
@@ -480,18 +524,65 @@ fn build_code_chunks(relative_path: &str, header: &str, content: &str) -> Vec<St
 }
 
 /// Calcola l'ID deterministico (UUID da SHA256) di un punto del code index a
-/// partire da progetto, path relativo e indice del chunk. Punto unico dell'hash
-/// point-id (regola L), condiviso da indicizzazione e reindex.
+/// partire da progetto, path relativo e indice del chunk. Delega a
+/// `deterministic_point_id` (punto unico dell'hash point-id, regola L).
 fn code_point_id(project_id: Uuid, relative_path: &str, chunk_index: usize) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(project_id.as_bytes());
-    hasher.update(b":code:");
-    hasher.update(relative_path.as_bytes());
-    hasher.update(b":");
-    hasher.update(chunk_index.to_string().as_bytes());
-    let hash_bytes = hasher.finalize();
-    let uuid_bytes: [u8; 16] = hash_bytes[..16].try_into().expect("sha256>=16");
-    uuid::Uuid::from_bytes(uuid_bytes).to_string()
+    deterministic_point_id(
+        project_id,
+        b":code:",
+        &[relative_path, &chunk_index.to_string()],
+    )
+}
+
+/// Deriva il path del file relativo alla root del progetto, normalizzato con
+/// separatori POSIX; se il file e' fuori dalla root usa il path completo
+/// normalizzato. Punto unico (regola L): la stessa derivazione era duplicata in
+/// `process_code_file_for_index` e `prepare_reindex`.
+fn relative_code_path(root: &Path, file_path: &Path) -> String {
+    file_path
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| file_path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Estrae le label UI del file e ne costruisce i chunk, anteponendo al primo
+/// l'header con i metadati. Ritorna `(label UI, chunk)`. Punto unico (regola L):
+/// la stessa sequenza label -> header -> chunk era duplicata in
+/// `index_single_code_file` e `prepare_reindex`.
+fn build_labeled_code_chunks(
+    relative_path: &str,
+    ext: &str,
+    content: &str,
+) -> (Vec<String>, Vec<String>) {
+    let ui_labels = extract_ui_labels(ext, content);
+    let labels_str = ui_labels.join(", ");
+    let header = format!("File: {relative_path}\nTipo: {ext}\nLabels UI: {labels_str}\n\n");
+    let chunks = build_code_chunks(relative_path, &header, content);
+    (ui_labels, chunks)
+}
+
+/// Vero se il file rientra nello scope dell'indice vettoriale: estensione di
+/// codice ed entro la soglia di dimensione. Con `skip_generated` esclude anche i
+/// file generati (`*.min.*`, `*.d.*`). Punto unico del gate estensione+dimensione
+/// (regola L): `collect_code_files_for_index` salta i generati, `prepare_reindex`
+/// no — differenza storica preservata dal parametro, non appiattita.
+async fn is_code_file_in_scope(path: &Path, skip_generated: bool) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !CODE_EXTENSIONS.contains(&ext) {
+        return false;
+    }
+    if skip_generated {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.ends_with(".min") || stem.ends_with(".d") {
+            return false;
+        }
+    }
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        if meta.len() > CODE_MAX_FILE_BYTES {
+            return false;
+        }
+    }
+    true
 }
 
 /// Costruisce il payload JSON di un punto del code index. Punto unico del
@@ -545,31 +636,17 @@ async fn collect_code_files_for_index(root: &Path) -> Vec<std::path::PathBuf> {
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
             let path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
 
             if path.is_dir() {
-                if !SKIP_DIRS.contains(&name_str.as_ref()) {
+                let name = entry.file_name();
+                if !SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
                     pending_dirs.push(path);
                 }
                 continue;
             }
 
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !CODE_EXTENSIONS.contains(&ext) {
+            if !is_code_file_in_scope(&path, true).await {
                 continue;
-            }
-
-            // Salta file generati
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if stem.ends_with(".min") || stem.ends_with(".d") {
-                continue;
-            }
-
-            if let Ok(meta) = tokio::fs::metadata(&path).await {
-                if meta.len() > CODE_MAX_FILE_BYTES {
-                    continue;
-                }
             }
 
             file_list.push(path);
@@ -586,10 +663,21 @@ async fn collect_code_files_for_index(root: &Path) -> Vec<std::path::PathBuf> {
 
 /// Esito dell'indicizzazione di un singolo file di codice: chunk indicizzati e
 /// chunk falliti (con il primo errore incontrato).
+#[derive(Default)]
 struct CodeFileIndexOutcome {
     chunks_indexed: usize,
     failed: usize,
     first_error: Option<String>,
+}
+
+impl CodeFileIndexOutcome {
+    /// Contabilizza un chunk fallito, trattenendo solo il primo errore.
+    fn record_failure(&mut self, message: String) {
+        self.failed += 1;
+        if self.first_error.is_none() {
+            self.first_error = Some(message);
+        }
+    }
 }
 
 /// Indicizza i chunk di un singolo file: estrae le label UI, costruisce i chunk,
@@ -602,16 +690,8 @@ async fn index_single_code_file(
     ext: &str,
     content: &str,
 ) -> CodeFileIndexOutcome {
-    let mut outcome = CodeFileIndexOutcome {
-        chunks_indexed: 0,
-        failed: 0,
-        first_error: None,
-    };
-
-    let ui_labels = extract_ui_labels(ext, content);
-    let labels_str = ui_labels.join(", ");
-    let header = format!("File: {relative_path}\nTipo: {ext}\nLabels UI: {labels_str}\n\n");
-    let chunks = build_code_chunks(relative_path, &header, content);
+    let mut outcome = CodeFileIndexOutcome::default();
+    let (ui_labels, chunks) = build_labeled_code_chunks(relative_path, ext, content);
 
     for (chunk_index, chunk_text) in chunks.iter().enumerate() {
         let embedding = match state.orchestrator.embed_text(chunk_text).await {
@@ -620,10 +700,7 @@ async fn index_single_code_file(
                 tracing::warn!(
                     "code index: embed failed for {relative_path} chunk {chunk_index}: {e}"
                 );
-                outcome.failed += 1;
-                if outcome.first_error.is_none() {
-                    outcome.first_error = Some(format!("embed fallito per '{relative_path}': {e}"));
-                }
+                outcome.record_failure(format!("embed fallito per '{relative_path}': {e}"));
                 continue;
             }
         };
@@ -646,11 +723,7 @@ async fn index_single_code_file(
                 tracing::warn!(
                     "code index: upsert failed for {relative_path} chunk {chunk_index}: {e}"
                 );
-                outcome.failed += 1;
-                if outcome.first_error.is_none() {
-                    outcome.first_error =
-                        Some(format!("upsert fallito per '{relative_path}': {e}"));
-                }
+                outcome.record_failure(format!("upsert fallito per '{relative_path}': {e}"));
             }
         }
     }
@@ -688,10 +761,7 @@ async fn process_code_file_for_index(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_string();
-    let relative_path = file_path
-        .strip_prefix(root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| file_path.to_string_lossy().replace('\\', "/"));
+    let relative_path = relative_code_path(root, file_path);
 
     let content = match tokio::fs::read_to_string(file_path).await {
         Ok(c) => c,
@@ -782,6 +852,29 @@ struct ReindexPrep {
     chunks: Vec<String>,
 }
 
+/// Vero se il contenuto del file e' identico a quello gia' indicizzato (hash
+/// memorizzato in `file_index_hashes`), quindi il reindex e' superfluo. Un
+/// errore di lettura equivale a "hash assente" e quindi a contenuto cambiato:
+/// comportamento invariato rispetto all'`unwrap_or(None)` originale. Estratto da
+/// `prepare_reindex`.
+async fn is_content_hash_unchanged(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    relative_path: &str,
+    content_hash: &str,
+) -> bool {
+    let stored_hash: Option<String> = sqlx::query_scalar(
+        "SELECT content_hash FROM file_index_hashes WHERE project_id = $1 AND file_path = $2",
+    )
+    .bind(project_id)
+    .bind(relative_path)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    stored_hash.as_deref() == Some(content_hash)
+}
+
 /// Prepara il materiale per il reindex di un file: valida estensione e
 /// dimensione, legge il contenuto, applica il gate dell'hash (skip se invariato
 /// e `force=false`), cancella i chunk precedenti e costruisce i chunk nuovi.
@@ -794,21 +887,11 @@ async fn prepare_reindex(
     file_path: &Path,
     force: bool,
 ) -> anyhow::Result<Option<ReindexPrep>> {
-    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !CODE_EXTENSIONS.contains(&ext) {
+    if !is_code_file_in_scope(file_path, false).await {
         return Ok(None);
     }
-
-    if let Ok(meta) = tokio::fs::metadata(file_path).await {
-        if meta.len() > CODE_MAX_FILE_BYTES {
-            return Ok(None);
-        }
-    }
-
-    let relative_path = file_path
-        .strip_prefix(root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| file_path.to_string_lossy().replace('\\', "/"));
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let relative_path = relative_code_path(root, file_path);
 
     let content = match tokio::fs::read_to_string(file_path).await {
         Ok(c) => c,
@@ -817,16 +900,7 @@ async fn prepare_reindex(
 
     // Calcola hash SHA256 del contenuto e salta se invariato
     let content_hash = sha256_hex(content.as_bytes());
-    let stored_hash: Option<String> = sqlx::query_scalar(
-        "SELECT content_hash FROM file_index_hashes WHERE project_id = $1 AND file_path = $2",
-    )
-    .bind(project_id)
-    .bind(&relative_path)
-    .fetch_optional(db)
-    .await
-    .unwrap_or(None);
-
-    if !force && stored_hash.as_deref() == Some(&content_hash) {
+    if !force && is_content_hash_unchanged(db, project_id, &relative_path, &content_hash).await {
         tracing::debug!("reindex_single_file: {relative_path} — hash invariato, skip");
         return Ok(None);
     }
@@ -838,10 +912,7 @@ async fn prepare_reindex(
             tracing::warn!("reindex_single_file: cleanup failed for {relative_path}: {e}")
         });
 
-    let ui_labels = extract_ui_labels(ext, &content);
-    let labels_str = ui_labels.join(", ");
-    let header = format!("File: {relative_path}\nTipo: {ext}\nLabels UI: {labels_str}\n\n");
-    let chunks = build_code_chunks(&relative_path, &header, &content);
+    let (ui_labels, chunks) = build_labeled_code_chunks(&relative_path, ext, &content);
 
     Ok(Some(ReindexPrep {
         relative_path,
@@ -1326,19 +1397,26 @@ pub async fn spawn_code_index_if_needed(state: &AppState, project_id: Uuid) {
 
     // 5. Prima indicizzazione: lancia in background, poi avvia il watcher.
     state.indexing_projects.insert(project_id);
-    let state_bg = state.clone();
-    let root_bg = root.clone();
     tracing::info!(
         "spawn_code_index_if_needed: avvio indicizzazione project={project_id} root={root_str}"
     );
+    spawn_initial_index_task(state, project_id, root);
+}
+
+/// Lancia in background la prima indicizzazione del codice del progetto: al
+/// termine libera il lock `indexing_projects` e avvia il file watcher. Il
+/// chiamante ha gia' inserito il lock e verificato le precondizioni. Estratto da
+/// `spawn_code_index_if_needed`.
+fn spawn_initial_index_task(state: &AppState, project_id: Uuid, root: std::path::PathBuf) {
+    let state_bg = state.clone();
     tokio::spawn(async move {
-        let result = index_project_code_files(&state_bg, project_id, &root_bg).await;
+        let result = index_project_code_files(&state_bg, project_id, &root).await;
         state_bg.indexing_projects.remove(&project_id);
         tracing::info!(
             "spawn_code_index_if_needed: completata project={project_id} status={}",
             result.get("status").and_then(|v| v.as_str()).unwrap_or("?")
         );
         // Avvia il file watcher ora che l'indice iniziale e' pronto.
-        crate::projects::file_watcher::spawn_file_watcher(&state_bg, project_id, root_bg);
+        crate::projects::file_watcher::spawn_file_watcher(&state_bg, project_id, root);
     });
 }
