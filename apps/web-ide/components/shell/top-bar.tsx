@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
 import type { useThemeColors } from "../../lib/theme";
 import type { UserProjectDetails, UserProjectSummary, WorkbenchLayoutMode } from "../../lib/api-client";
 import { ProjectSwitcher } from "../project-switcher";
@@ -11,10 +12,174 @@ import {
   providerTitle,
   providerDisplayLabel,
   sortProviderNames,
+  summarizeProviderReason,
   type ProviderHealthState,
 } from "./shell-helpers";
 
 type ProviderStatusMap = Record<string, ProviderHealthState>;
+
+/**
+ * Indicatore aggregato dei provider AI nella top bar: due soli LED
+ * (uno per i provider disponibili, uno per quelli non disponibili). Il click
+ * apre un popover con lo stato dettagliato di ogni singolo provider.
+ */
+function ProviderStatusIndicator({
+  tc,
+  providerStatus,
+}: {
+  tc: ReturnType<typeof useThemeColors>;
+  providerStatus: ProviderStatusMap;
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const names = sortProviderNames(Object.keys(providerStatus));
+  if (names.length === 0) return null;
+
+  const okNames = names.filter((name) => providerStatus[name].ok === true);
+  // "non ok" = tutto cio' che non e' confermato disponibile (errori reali,
+  // billing/quota, stato sconosciuto).
+  const koNames = names.filter((name) => providerStatus[name].ok !== true);
+  const hasRealError = koNames.some((name) => providerStatus[name].ok === false && !providerStatus[name].billing);
+  const hasBilling = koNames.some((name) => providerStatus[name].billing);
+  // Il LED "non ok" riflette lo stato peggiore presente: rosso (errore reale) >
+  // giallo (billing/quota) > grigio (solo stato sconosciuto).
+  const koStatusDot = hasRealError
+    ? { ok: false as const, billing: false }
+    : hasBilling
+      ? { ok: false as const, billing: true }
+      : { ok: null, billing: false };
+
+  // Dettaglio testuale mostrato SOLO per stati non-ok (i provider verdi non hanno
+  // riga di dettaglio: il nome + pallino bastano).
+  const detailText = (state: ProviderHealthState): string => {
+    if (state.ok === null) return "Stato sconosciuto";
+    if (state.billing) return summarizeProviderReason(state.reason) ?? "Crediti/quota esauriti";
+    return summarizeProviderReason(state.reason) ?? "Non disponibile";
+  };
+
+  return (
+    <div ref={containerRef} style={{ position: "relative", display: "inline-flex" }}>
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        title="Stato provider AI"
+        aria-label="Stato provider AI"
+        aria-expanded={open}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "3px 8px",
+          borderRadius: 6,
+          border: `1px solid ${tc.border}`,
+          background: open ? tc.bgHover : "transparent",
+          color: tc.textMuted,
+          fontSize: 11,
+          cursor: "pointer",
+        }}
+      >
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+          <StatusDot ok={true} />
+          {okNames.length}
+        </span>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+          <StatusDot ok={koStatusDot.ok} billing={koStatusDot.billing} />
+          {koNames.length}
+        </span>
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          aria-label="Dettaglio stato provider AI"
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            right: 0,
+            zIndex: 50,
+            minWidth: 240,
+            maxWidth: 340,
+            maxHeight: 360,
+            overflowY: "auto",
+            overflowX: "hidden",
+            // Il contenitore dei LED in header impone white-space:nowrap (LED su una
+            // riga); va resettato qui, altrimenti viene ereditato e il testo del
+            // dettaglio non andrebbe a capo (overflow orizzontale).
+            whiteSpace: "normal",
+            padding: 8,
+            borderRadius: 8,
+            border: `1px solid ${tc.border}`,
+            background: tc.bgCard,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              color: tc.textMuted,
+              textTransform: "uppercase",
+              letterSpacing: "0.05em",
+              padding: "2px 6px 6px",
+            }}
+          >
+            Provider AI
+          </div>
+          {names.map((name) => {
+            const label = providerDisplayLabel(name);
+            const state = providerStatus[name];
+            return (
+              <div
+                key={name}
+                title={providerTitle(label, state)}
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 8,
+                  padding: "5px 6px",
+                  borderRadius: 6,
+                  minWidth: 0,
+                }}
+              >
+                <span style={{ marginTop: 3, flexShrink: 0 }}>
+                  <StatusDot ok={state.ok} billing={state.billing} />
+                </span>
+                <span style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 1 }}>
+                  <span style={{ color: tc.text, fontSize: 12, fontWeight: 600 }}>{label}</span>
+                  {/* Provider disponibile (verde): il nome basta, "Disponibile" e' ridondante.
+                      Il dettaglio si mostra solo per stati non-ok (billing/errore/sconosciuto). */}
+                  {state.ok !== true && (
+                    <span style={{ color: tc.textMuted, fontSize: 11, overflowWrap: "anywhere" }}>
+                      {detailText(state)}
+                    </span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function TopBar({
   tc,
@@ -149,20 +314,7 @@ export function TopBar({
         aria-label="Stato provider AI"
       >
         <ConnectionStatusBadge compact={isNarrowViewport} />
-        {sortProviderNames(Object.keys(providerStatus)).map((name) => {
-          const label = providerDisplayLabel(name);
-          const state = providerStatus[name];
-          return (
-            <span
-              key={name}
-              title={providerTitle(label, state)}
-              style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-            >
-              <StatusDot ok={state.ok} billing={state.billing} />
-              {!isNarrowViewport && label}
-            </span>
-          );
-        })}
+        <ProviderStatusIndicator tc={tc} providerStatus={providerStatus} />
       </div>
     </header>
   );
