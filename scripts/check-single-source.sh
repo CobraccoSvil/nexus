@@ -103,6 +103,15 @@ assert_single "flag separazione DB rimosso (mig 0527)" 'db\.project_separation\.
 assert_single "registry DB metadati progetto" "connection_role = 'nexus_metadata'" 'crates/nexus-project-pools/*' crates
 assert_single "directory nexus_data_routing" '(FROM|INTO) nexus_data_routing' 'crates/nexus-project-pools/*' crates
 
+# Derivazione del nome DB fisico del progetto (2026-07-14): viveva in due copie
+# (provision.rs + agent_tools/command.rs::sanitize_app_db_name) che troncavano la
+# base a 52 e a 56. Entrambi i nomi restavano sotto il NAMEDATALEN di Postgres
+# (63), quindi la divergenza non produceva errori: per uno slug oltre 52 caratteri
+# il pannello REST e il tool agente creavano DUE database fisici per lo stesso
+# progetto. Il guard confina la definizione; la divergenza in se' e' coperta dai
+# test di regressione in provision.rs (mod tests).
+assert_single "derivazione nome DB progetto" 'fn derive_project_db_name' 'crates/mcp-core/src/project_db_routes/provision.rs' crates
+
 # Aggregazione problemi ripetitivi (2026-07-09): chiave di gruppo semantica e
 # pipeline dedup+raggruppamento del pannello Problemi. Punto unico:
 # project_workspace/problem_aggregation.rs; get_project_problems delega.

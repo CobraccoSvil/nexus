@@ -70,12 +70,21 @@ pub struct ProvisionDbBody {
     pub connection_string: Option<String>,
 }
 
-/// Legge un setting da DB con fallback conservativo (allineato a
-/// agent_tools::command::ensure_project_db_url).
-async fn load_app_db_setting(db: &sqlx::PgPool, key: &str, default: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1 LIMIT 1")
-        .bind(key)
-        .fetch_optional(db)
+/// Legge un setting con fallback conservativo se assente o su errore DB.
+///
+/// PUNTO UNICO (regola L) della lettura settings-con-default: delega qui anche
+/// `agent_tools::command::ensure_project_db_url`, che ne teneva una copia
+/// byte-identica (`load_setting_or`). La query SQL NON vive qui: entrambe le
+/// copie la re-implementavano, mentre il punto unico della lettura settings e'
+/// `nexus_auth::get_setting` (catalogo ADR 0026).
+///
+/// Si usa `get_setting_checked` e non `get_setting` per PRESERVARE la semantica
+/// dei call site: `get_setting` fa trim e scarta i valori vuoti, e un trim su
+/// `nexus_app_db_password` altererebbe una password con spazi significativi.
+/// Qui il valore resta raw; il default scatta solo se la riga manca o il DB
+/// fallisce, esattamente come nelle due copie precedenti.
+pub(crate) async fn load_app_db_setting(db: &sqlx::PgPool, key: &str, default: &str) -> String {
+    nexus_auth::get_setting_checked(db, key)
         .await
         .ok()
         .flatten()
@@ -99,9 +108,19 @@ fn sanitize_db_ident(input: &str) -> String {
 }
 
 /// Deriva il nome fisico del database dallo slug del progetto (sanitizzato) e
-/// dal `suffix` del ruolo (`_app` o `_nexus`). Stessa logica idempotente di
-/// `ensure_project_db_url` per riconoscere un DB gia' creato.
-fn derive_project_db_name(slug: Option<&str>, project_id: Uuid, suffix: &str) -> String {
+/// dal `role` (`_app` o `_nexus`).
+///
+/// PUNTO UNICO (regola L) della derivazione del nome DB fisico: delega qui anche
+/// `agent_tools::command::ensure_project_db_url`, che ne teneva una copia
+/// (`sanitize_app_db_name`). Le due copie erano identiche riga per riga TRANNE il
+/// troncamento — 52 qui, 56 la', entrambi sotto il NAMEDATALEN di Postgres (63) —
+/// quindi per uno slug sanificato oltre i 52 caratteri il pannello REST e il tool
+/// agente derivavano due nomi diversi e creavano DUE database fisici per lo stesso
+/// progetto, senza alcun errore visibile. La derivazione DEVE restare pura e
+/// suffix-aware: il budget si calcola sul suffisso effettivo, altrimenti `_nexus`
+/// (6 char) e `_app` (4) sforerebbero in modo diverso.
+pub(crate) fn derive_project_db_name(slug: Option<&str>, project_id: Uuid, role: DbRole) -> String {
+    let suffix = role.suffix();
     let base = slug
         .map(|s| s.to_string())
         .unwrap_or_else(|| project_id.simple().to_string());
@@ -294,12 +313,12 @@ pub async fn provision_internal_core(
         Some(explicit) => {
             let cleaned = sanitize_db_ident(explicit);
             if cleaned.is_empty() {
-                derive_project_db_name(slug.as_deref(), project_id, role.suffix())
+                derive_project_db_name(slug.as_deref(), project_id, role)
             } else {
                 cleaned
             }
         }
-        None => derive_project_db_name(slug.as_deref(), project_id, role.suffix()),
+        None => derive_project_db_name(slug.as_deref(), project_id, role),
     };
 
     let host = load_app_db_setting(db, "nexus_app_db_host", "localhost").await;
@@ -799,4 +818,101 @@ pub async fn project_data_pool_by_feedback_from(
     feedback_id: Uuid,
 ) -> sqlx::PgPool {
     project_data_pool_by_search_from(meta, "feedback", "ai_response_feedback", feedback_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Limite Postgres per un identificatore (NAMEDATALEN 64 - 1). Un nome che
+    /// lo supera viene TRONCATO da Postgres, non rifiutato: due nomi diversi
+    /// possono collassare sullo stesso DB senza errore visibile.
+    const PG_MAX_IDENT: usize = 63;
+
+    fn pid() -> Uuid {
+        Uuid::parse_str("98138624-cf23-4edb-a3b6-bbecadcbb809").expect("uuid di test valido")
+    }
+
+    /// Regressione del bug del troncamento divergente: la derivazione viveva in
+    /// due copie (qui e `agent_tools::command::sanitize_app_db_name`) che
+    /// troncavano la base a 52 e a 56. Entrambi i nomi restavano sotto
+    /// PG_MAX_IDENT, quindi nessuno falliva: per uno slug oltre i 52 caratteri il
+    /// pannello REST e il tool agente creavano DUE database fisici distinti per
+    /// lo stesso progetto. Ora la derivazione e' un punto unico (regola L): un
+    /// solo slug -> un solo nome.
+    #[test]
+    fn slug_lungo_deriva_un_nome_solo_e_valido() {
+        let slug = "a".repeat(80);
+        let nome = derive_project_db_name(Some(&slug), pid(), DbRole::App);
+
+        // La base e' troncata lasciando spazio al suffisso: 52 + "_app" = 56.
+        assert_eq!(nome, format!("{}_app", "a".repeat(52)));
+        assert!(nome.len() <= PG_MAX_IDENT);
+
+        // Il vecchio nome divergente (base troncata a 56) non e' piu' derivabile.
+        assert_ne!(nome, format!("{}_app", "a".repeat(56)));
+    }
+
+    /// Il budget di troncamento si calcola sul suffisso EFFETTIVO: `_nexus` (6)
+    /// costa piu' di `_app` (4). Un troncamento a lunghezza fissa che ignora il
+    /// suffisso e' esattamente il difetto che ha prodotto la divergenza.
+    #[test]
+    fn troncamento_e_suffix_aware() {
+        let slug = "b".repeat(80);
+        let app = derive_project_db_name(Some(&slug), pid(), DbRole::App);
+        let nexus = derive_project_db_name(Some(&slug), pid(), DbRole::NexusMetadata);
+
+        assert_eq!(app.len(), 56);
+        assert_eq!(nexus.len(), 56);
+        assert!(app.ends_with("_app") && nexus.ends_with("_nexus"));
+        assert_ne!(app, nexus);
+    }
+
+    /// Sotto la soglia lo slug non viene toccato: il troncamento non deve
+    /// alterare i nomi dei DB gia' esistenti (nessun progetto reale supera 52).
+    #[test]
+    fn slug_corto_resta_intatto() {
+        assert_eq!(
+            derive_project_db_name(Some("beaty-book"), pid(), DbRole::App),
+            "beaty_book_app"
+        );
+    }
+
+    /// Sanitizzazione: solo `[a-z0-9_]`, maiuscole abbassate, resto a `_`.
+    #[test]
+    fn caratteri_non_ammessi_diventano_underscore() {
+        assert_eq!(
+            derive_project_db_name(Some("My-Proj.X 1"), pid(), DbRole::App),
+            "my_proj_x_1_app"
+        );
+    }
+
+    /// Un identificatore Postgres non puo' iniziare con una cifra: prefisso 'p'.
+    #[test]
+    fn slug_che_inizia_con_cifra_riceve_prefisso() {
+        let nome = derive_project_db_name(Some("2024-app"), pid(), DbRole::App);
+        assert_eq!(nome, "p2024_app_app");
+        assert!(!nome.starts_with(|c: char| c.is_ascii_digit()));
+    }
+
+    /// Slug assente: si ricade sul project_id. L'uuid di test inizia con "9",
+    /// quindi riceve anche il prefisso 'p' (un identificatore Postgres non puo'
+    /// iniziare con una cifra): il fallback passa per la stessa sanitizzazione.
+    #[test]
+    fn slug_assente_ricade_su_project_id_prefissato() {
+        let nome = derive_project_db_name(None, pid(), DbRole::App);
+
+        assert_eq!(nome, format!("p{}_app", pid().simple()));
+        assert!(nome.len() <= PG_MAX_IDENT);
+    }
+
+    /// Uno slug fatto di soli caratteri non ammessi sanifica in underscore: NON
+    /// e' vuoto, quindi non innesca il fallback al project_id.
+    #[test]
+    fn slug_non_sanificabile_resta_underscore() {
+        assert_eq!(
+            derive_project_db_name(Some("---"), pid(), DbRole::App),
+            "____app"
+        );
+    }
 }

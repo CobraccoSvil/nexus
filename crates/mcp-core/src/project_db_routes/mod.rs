@@ -48,6 +48,10 @@ pub use migrations::{
     apply_project_migrations, list_project_migrations, request_ddl_override,
     rollback_project_migration,
 };
+// Punto unico (regola L) della derivazione del nome DB fisico del progetto e
+// della lettura dei settings del cluster app: vi delega
+// `agent_tools::command::ensure_project_db_url`, che ne teneva copie divergenti.
+pub(crate) use provision::{derive_project_db_name, load_app_db_setting};
 pub use provision::{
     init_global_pools, list_all_project_ids, project_data_pool,
     project_data_pool_by_correction_from, project_data_pool_by_feedback_from,

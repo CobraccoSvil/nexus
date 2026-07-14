@@ -1,6 +1,8 @@
 //! Tool comandi shell: run_command (con auto-routing long-running) e run_tests.
 
 use super::*;
+// Punto unico (regola L) di derivazione nome DB progetto e settings cluster app.
+use crate::project_db_routes::load_app_db_setting;
 
 /// Durata del "probe" per rilevare comandi long-running non noti.
 /// Se il processo non termina entro questo tempo, viene killato e ri-lanciato nel terminale.
@@ -913,16 +915,22 @@ pub(crate) async fn ensure_project_db_url(
             .ok()
             .flatten();
 
-    let base = slug.unwrap_or_else(|| project_id.simple().to_string());
-    let db_name = sanitize_app_db_name(&base, project_id);
+    // Nome DB e settings dal punto unico (regola L): la derivazione viveva anche
+    // qui in copia, e il troncamento divergente (52 vs 56) faceva creare due
+    // database fisici per lo stesso progetto su slug lunghi.
+    let db_name = crate::project_db_routes::derive_project_db_name(
+        slug.as_deref(),
+        project_id,
+        crate::project_db_routes::DbRole::App,
+    );
 
     // Lettura settings DB-driven (single batch, default conservativi).
-    let host = load_setting_or(db, "nexus_app_db_host", "localhost").await;
-    let port = load_setting_or(db, "nexus_app_db_port", "5434").await;
-    let user = load_setting_or(db, "nexus_app_db_user", "nexus_app").await;
-    let pwd = load_setting_or(db, "nexus_app_db_password", "nexus_app_dev_secret").await;
-    let admin_user = load_setting_or(db, "nexus_app_admin_user", "nexus_admin").await;
-    let admin_pwd = load_setting_or(db, "nexus_app_admin_password", "nexus_admin_secret").await;
+    let host = load_app_db_setting(db, "nexus_app_db_host", "localhost").await;
+    let port = load_app_db_setting(db, "nexus_app_db_port", "5434").await;
+    let user = load_app_db_setting(db, "nexus_app_db_user", "nexus_app").await;
+    let pwd = load_app_db_setting(db, "nexus_app_db_password", "nexus_app_dev_secret").await;
+    let admin_user = load_app_db_setting(db, "nexus_app_admin_user", "nexus_admin").await;
+    let admin_pwd = load_app_db_setting(db, "nexus_app_admin_password", "nexus_admin_secret").await;
 
     provision_app_database(
         &host,
@@ -940,30 +948,6 @@ pub(crate) async fn ensure_project_db_url(
     register_project_db_config(db, project_id, &db_name, &url).await;
 
     (url, db_name)
-}
-
-/// Sanifica lo slug di progetto in un nome DB Postgres valido `<slug>_app`:
-/// solo `[a-z0-9_]`, non inizia con cifra, max 56 char prima del suffisso.
-/// Funzione pura, estratta da `ensure_project_db_url` (behavior-preserving).
-fn sanitize_app_db_name(base: &str, project_id: uuid::Uuid) -> String {
-    let mut sanitized: String = base
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | '0'..='9' | '_' => c,
-            'A'..='Z' => c.to_ascii_lowercase(),
-            _ => '_',
-        })
-        .collect();
-    if sanitized.is_empty() {
-        sanitized = project_id.simple().to_string();
-    }
-    if sanitized.chars().next().is_none_or(|c| c.is_ascii_digit()) {
-        sanitized.insert(0, 'p');
-    }
-    if sanitized.len() > 56 {
-        sanitized.truncate(56);
-    }
-    format!("{sanitized}_app")
 }
 
 /// CREATE DATABASE idempotente sul container postgres-app via admin role.
@@ -1110,17 +1094,6 @@ fn log_project_db_config_result(
     }
 }
 
-/// Helper: legge una setting da DB con fallback hardcoded conservativo.
-/// Niente cache (chiamato max 6 volte per run_command, costo trascurabile vs LLM).
-async fn load_setting_or(db: &sqlx::PgPool, key: &str, default: &str) -> String {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1 LIMIT 1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| default.to_string())
-}
 
 /// Cap massimo (in caratteri) dell'output combinato di `run_command`, DB-driven
 /// (regola G). Default 16000: deliberatamente alto e >= del cap del brain, cosi'
@@ -1130,7 +1103,7 @@ async fn load_setting_or(db: &sqlx::PgPool, key: &str, default: &str) -> String 
 const RUN_COMMAND_MAX_CHARS_DEFAULT: usize = 16000;
 
 async fn load_run_command_max_chars(db: &sqlx::PgPool) -> usize {
-    let raw = load_setting_or(
+    let raw = load_app_db_setting(
         db,
         "agent.command.run_command_max_chars",
         &RUN_COMMAND_MAX_CHARS_DEFAULT.to_string(),
