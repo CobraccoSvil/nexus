@@ -3290,9 +3290,10 @@ pub(crate) async fn spawn_agent_run(
                             .unwrap_or(3);
 
                             // PUNTO UNICO (regola L): counter + degrado a soglia con
-                            // guard capability_source='auto' vivono in tool_capability.
-                            // Le righe curate a mano (manual) non vengono mai degradate
-                            // dal runtime (incidente deepseek-v4, 2026-06-10).
+                            // guard NOT capability_locked (mig 0590) vivono in
+                            // tool_capability. Le righe con lock esplicito non vengono
+                            // mai degradate dal runtime (incidente deepseek-v4,
+                            // 2026-06-10).
                             let rec = crate::tool_capability::record_tool_failure(
                                 &db_clone,
                                 &result.provider,
