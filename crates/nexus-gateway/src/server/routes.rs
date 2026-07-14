@@ -176,11 +176,29 @@ struct ResolvedProvider {
     model: String,
 }
 
+/// Margine sottratto al budget per la DEADLINE INTERNA della pipeline: la
+/// chain deve arrendersi PRIMA che il wrapper esterno (`timeout(budget, ...)`)
+/// spari il 504 anonimo, cosi' il chiamante riceve l'ULTIMO errore STRUTTURATO
+/// del provider (classe/status/codice) e puo' fare failover mirato (regola M).
+/// Non e' configurazione di comportamento: e' il tempo di risposta/serializzazione
+/// riservato alla pipeline stessa.
+const BUDGET_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Esegue la pipeline completa di completion (classify -> route -> fallback ->
 /// rehydrate -> ledger). Ritorna la risposta o un errore tradotto in HTTP.
 async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse, PipelineError> {
     validate_logical_model(&req.model)?;
     let runtime = state.runtime_snapshot().await;
+    // DEADLINE della richiesta (incidente figure 2026-07-14): le ATTESE della
+    // chain (cooldown-in-testa, backoff, Retry-After) non erano confrontate col
+    // budget e potevano dormire OLTRE la deadline esterna: il chiamante moriva
+    // di timeout senza mai ricevere un errore strutturato su cui failovare.
+    let deadline = tokio::time::Instant::now()
+        + runtime
+            .timeouts
+            .request_budget
+            .saturating_sub(BUDGET_RESPONSE_MARGIN)
+            .max(std::time::Duration::from_secs(1));
 
     // Classify + decide.
     let classifier = SensitivityClassifier::new(runtime.presidio.clone());
@@ -313,6 +331,7 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
         &redacted_req,
         strict,
         runtime.timeouts.per_attempt,
+        deadline,
     )
     .await?;
 
@@ -456,6 +475,7 @@ async fn run_fallback(
     base_req: &LlmRequest,
     strict: bool,
     per_attempt: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<LlmResponse, PipelineError> {
     let mut failures: Vec<ProviderFailure> = Vec::new();
     let policy = cooldown.retry_policy();
@@ -484,7 +504,15 @@ async fn run_fallback(
             // (cooldown 21s)"). Oltre il tetto, propaga. NB: `secs` e' troncato a
             // interi, quindi un residuo sub-secondo vale 0: attendere 0s = procedi
             // subito (il cooldown e' di fatto scaduto), non e' un caso di hard-fail.
-            if strict && secs <= policy.wait_short_cooldown_cap_s {
+            // L'attesa deve STARE nel budget della richiesta (incidente figure
+            // 2026-07-14): dormire oltre la deadline consegna al chiamante un 504
+            // anonimo (o un timeout client) invece del fallimento strutturato su
+            // cui failovare subito.
+            let residual = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if strict
+                && secs <= policy.wait_short_cooldown_cap_s
+                && std::time::Duration::from_secs(secs as u64) <= residual
+            {
                 tracing::info!(
                     provider = name,
                     wait_s = secs,
@@ -515,6 +543,7 @@ async fn run_fallback(
             &policy,
             strict,
             per_attempt,
+            deadline,
         )
         .await
         {
@@ -661,6 +690,7 @@ impl CallFailure {
 /// `per_attempt` limita OGNI singolo `provider.complete()`: senza, un provider
 /// appeso consumava tutto il budget della richiesta e la chain non arrivava mai
 /// al provider successivo.
+#[allow(clippy::too_many_arguments)]
 async fn complete_with_retry(
     provider: &dyn LlmProvider,
     req: &LlmRequest,
@@ -669,12 +699,24 @@ async fn complete_with_retry(
     policy: &RetryPolicy,
     strict: bool,
     per_attempt: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
     let mut history_aggressive_retry = true;
     loop {
         attempt += 1;
+        // Cap EFFETTIVO del tentativo = min(cap per-tentativo, budget residuo
+        // della richiesta): un tentativo che non puo' completarsi entro la
+        // deadline non va nemmeno avviato — meglio l'errore strutturato subito
+        // (il chiamante failova) che il 504 anonimo del wrapper esterno.
+        let residual = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if residual < std::time::Duration::from_millis(500) {
+            // Budget esaurito senza aver potuto tentare: NESSUN cooldown (il
+            // provider non ha colpe), solo il fallimento strutturato.
+            return Err(CallFailure::attempt_timeout(residual));
+        }
+        let attempt_cap = per_attempt.min(residual);
         let mut call_req = req.clone();
         let sanitize_mode = if history_aggressive_retry {
             SanitizeMode::Standard
@@ -695,7 +737,7 @@ async fn complete_with_retry(
             );
         }
 
-        let call = match tokio::time::timeout(per_attempt, provider.complete(&call_req)).await {
+        let call = match tokio::time::timeout(attempt_cap, provider.complete(&call_req)).await {
             Ok(r) => r,
             Err(_) => {
                 // Il cap e' scaduto: nessuna risposta da classificare. Il
@@ -703,11 +745,11 @@ async fn complete_with_retry(
                 // transient) e la chain prova il prossimo dentro il budget.
                 tracing::warn!(
                     provider = name,
-                    per_attempt_s = per_attempt.as_secs(),
+                    attempt_cap_s = attempt_cap.as_secs(),
                     attempt,
                     "gateway: cap per-tentativo scaduto -> transient, passo oltre"
                 );
-                let failure = CallFailure::attempt_timeout(per_attempt);
+                let failure = CallFailure::attempt_timeout(attempt_cap);
                 cooldown.mark_transient(name, Some(failure.message.clone()));
                 return Err(failure);
             }
@@ -804,19 +846,27 @@ async fn complete_with_retry(
                     }
                     ProviderErrorKind::Transient => {
                         let cap_s = policy.wait_short_cooldown_cap_s.max(0) as u64;
-                        // Se il provider chiede un'attesa piu' lunga del tetto, non
-                        // bloccare la richiesta cosi' a lungo: arrenditi (cooldown
-                        // breve; la riprova successiva o il re-probe recuperano).
-                        if attempt >= max_attempts || retry_after.is_some_and(|s| s > cap_s) {
-                            cooldown.mark_transient(name, Some(msg));
-                            return Err(failure);
-                        }
                         // Onora `Retry-After` (autoritativo) se presente e sotto il
                         // tetto; altrimenti backoff esponenziale+jitter calcolato.
                         let delay = match retry_after {
                             Some(s) => s.saturating_mul(1000),
                             None => policy.backoff_ms(attempt, jitter_seed()),
                         };
+                        let residual =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        // Arrenditi se: tentativi esauriti, il provider chiede
+                        // un'attesa oltre il tetto, o l'attesa NON sta nel budget
+                        // residuo della richiesta (incidente figure 2026-07-14:
+                        // dormire oltre la deadline nega al chiamante l'errore
+                        // strutturato su cui failovare, e il client muore di
+                        // timeout mentre il gateway lavora per nessuno).
+                        if attempt >= max_attempts
+                            || retry_after.is_some_and(|s| s > cap_s)
+                            || std::time::Duration::from_millis(delay) > residual
+                        {
+                            cooldown.mark_transient(name, Some(msg));
+                            return Err(failure);
+                        }
                         tracing::warn!(
                             provider = name,
                             attempt,
@@ -2100,6 +2150,12 @@ mod tests {
     /// restano su cio' che vogliono verificare. Il cap ha i suoi test dedicati.
     const TEST_PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(30);
 
+    /// Deadline LONTANA per i test che non esercitano il budget: il vincolo
+    /// non deve mai scattare (il budget ha i suoi test dedicati).
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(600)
+    }
+
     // ── Provider finto (no rete) ────────────────────────────────────────────
     enum Behaviour {
         Ok,
@@ -2132,6 +2188,10 @@ mod tests {
         /// TRANSITORIO (503) prima di comportarsi secondo `behaviour`. Serve ai
         /// test del retry strict-pin. Default 0 (nessun fallimento transitorio).
         transient_fail_calls: usize,
+        /// Se `Some(s)`: OGNI chiamata fallisce 429 con `Retry-After: s` (il caso
+        /// Vertex RESOURCE_EXHAUSTED dell'incidente figure 2026-07-14). Serve ai
+        /// test del budget della richiesta.
+        transient_retry_after: Option<u64>,
     }
 
     impl FakeProvider {
@@ -2141,6 +2201,25 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
+                models_result: None,
+                image_capable: false,
+                audio_capable: false,
+                audio_out_capable: false,
+                video_capable: false,
+            })
+        }
+
+        /// Variante che risponde SEMPRE 429 con `Retry-After` esplicito: il caso
+        /// Vertex RESOURCE_EXHAUSTED dell'incidente figure 2026-07-14 (quota
+        /// esaurita, il provider chiede un'attesa che non sta nel budget).
+        fn always_rate_limited(name: &str, retry_after_s: u64) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour: Behaviour::Ok,
+                calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
+                transient_retry_after: Some(retry_after_s),
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2157,6 +2236,7 @@ mod tests {
                 behaviour: Behaviour::Ok,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: fail_n,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2172,6 +2252,7 @@ mod tests {
                 behaviour: Behaviour::Ok,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: Some(models_result),
                 image_capable: false,
                 audio_capable: false,
@@ -2187,6 +2268,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: true,
                 audio_capable: false,
@@ -2202,6 +2284,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: true,
@@ -2217,6 +2300,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2232,6 +2316,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2260,6 +2345,18 @@ mod tests {
         }
         async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            // Rate-limit permanente con Retry-After (429 quota): come Vertex
+            // RESOURCE_EXHAUSTED. Ha precedenza su tutto: la quota non "torna".
+            if let Some(secs) = self.transient_retry_after {
+                return Err(crate::providers::ProviderHttpError {
+                    provider: self.name.clone(),
+                    status: 429,
+                    code: Some("rate_limit_exceeded".into()),
+                    retry_after_seconds: Some(secs),
+                    message: "resource exhausted (quota test)".into(),
+                }
+                .into());
+            }
             // Prime `transient_fail_calls` chiamate: errore transitorio (503),
             // emesso come ProviderHttpError (status certo) come i provider reali.
             if idx < self.transient_fail_calls {
@@ -2517,7 +2614,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
     }
@@ -2566,7 +2663,7 @@ mod tests {
             },
         ];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
     }
@@ -2582,7 +2679,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -2601,7 +2698,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2621,7 +2718,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2641,7 +2738,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2659,7 +2756,7 @@ mod tests {
             model: "mistral-small-latest".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .unwrap();
         assert_eq!(resp.content, "ok-after-sanitize");
@@ -2681,7 +2778,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2707,7 +2804,7 @@ mod tests {
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
         cooldown.mark_billing("openai", Some("insufficient_quota".into()));
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2795,7 +2892,7 @@ aliases:
             chrono::Utc::now(),
             2,
         );
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -2838,7 +2935,7 @@ aliases:
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.err().unwrap();
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
     }
@@ -2900,7 +2997,7 @@ aliases:
         let cooldown = CooldownManager::new();
         cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
 
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
             .await
             .expect_err("provider pinnato in cooldown deve fallire");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -2921,7 +3018,7 @@ aliases:
         let resolved = vec![rp];
 
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
             .await
             .expect_err("provider pinnato fallito deve dare errore, non fallback");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3298,7 +3395,16 @@ aliases:
         // (un test che si blocca inchioda la CI e non dice cosa e' rotto).
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            complete_with_retry(p.as_ref(), &req(), "slow", &cooldown, &policy, true, cap),
+            complete_with_retry(
+                p.as_ref(),
+                &req(),
+                "slow",
+                &cooldown,
+                &policy,
+                true,
+                cap,
+                far_deadline(),
+            ),
         )
         .await
         .expect("cap per-tentativo NON applicato: la chiamata e' rimasta appesa");
@@ -3337,11 +3443,103 @@ aliases:
                 &req(),
                 false,
                 std::time::Duration::from_millis(50),
+                far_deadline(),
             ),
         )
         .await
         .expect("il provider appeso ha bloccato la chain: cap non applicato")
         .expect("la chain deve raggiungere il provider sano");
         assert_eq!(resp.provider_used, "sano");
+    }
+
+    // ── Budget della richiesta: le attese della chain non possono sforarlo ────
+    // (incidente figure 2026-07-14: Vertex 429 RESOURCE_EXHAUSTED con Retry-After
+    // dentro il tetto ma oltre il budget -> il gateway dormiva, il client moriva
+    // di timeout senza MAI ricevere l'errore strutturato su cui failovare.)
+
+    #[tokio::test]
+    async fn retry_after_dentro_il_tetto_ma_oltre_il_budget_fallisce_subito() {
+        // 429 con Retry-After=40s: sotto il tetto (45s) quindi il SOLO check
+        // storico avrebbe dormito 40s. Budget residuo 3s -> deve arrendersi al
+        // primo tentativo con l'errore strutturato del provider.
+        let p = FakeProvider::always_rate_limited("google", 40);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Rete di sicurezza FUORI dalla funzione sotto esame: se il fix viene
+        // neutralizzato il test fallisce NETTO qui (niente sleep di 40s).
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+        )
+        .await
+        .expect("il gateway ha dormito oltre il budget della richiesta")
+        .err()
+        .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            1,
+            "un solo tentativo: l'attesa di 40s non sta nel budget di 3s"
+        );
+        assert!(cooldown.is_in_cooldown("google"));
+    }
+
+    #[tokio::test]
+    async fn budget_esaurito_niente_tentativo_e_niente_cooldown() {
+        // Deadline gia' scaduta: nessun tentativo va nemmeno avviato e il
+        // provider NON va punito con un cooldown (non ha colpe).
+        let p = FakeProvider::new("google", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let deadline = tokio::time::Instant::now();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+        )
+        .await
+        .expect("budget esaurito: la chain deve rispondere subito")
+        .err()
+        .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 0, "nessuna chiamata al provider");
+        assert!(
+            !cooldown.is_in_cooldown("google"),
+            "budget nostro esaurito != colpa del provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_breve_strict_oltre_il_budget_non_attende() {
+        // Provider in cooldown transitorio (residuo ~30s, sotto il tetto 45s):
+        // il SOLO check storico avrebbe dormito il residuo. Budget 2s -> deve
+        // propagare subito la failure "cooldown" senza attendere.
+        let p = FakeProvider::new("google", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        cooldown.mark_transient("google", Some("test".into()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+        )
+        .await
+        .expect("il gateway ha atteso un cooldown oltre il budget della richiesta")
+        .err()
+        .unwrap();
+        assert!(err.message.contains("cooldown"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 0);
     }
 }
