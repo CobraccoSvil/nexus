@@ -156,70 +156,9 @@ impl Orchestrator {
                 return None;
             }
         };
-        // Punto unico tier-based: candidati (provider, model) sani ordinati per
-        // score, uno per provider. La rotazione provider per disponibilita'
-        // vale quindi anche per le richieste slot-routed.
-        let candidates = match crate::routing_matrix_auto_promoter::select_models_for_requirement(
-            db,
-            &req.preferred_tier,
-            &req.required_capabilities,
-            req.requires_tool_use,
-            &req.cost_direction,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    "route_by_slots: selezione tier-based fallita ({e}), fallback intent classico"
-                );
-                return None;
-            }
-        };
-        if candidates.is_empty() {
-            tracing::debug!(
-                "route_by_slots: nessun candidato per tier {} (slots {}, {}, {}, {})",
-                req.preferred_tier,
-                slots.action_verb,
-                slots.target_type,
-                slots.framework,
-                slots.scope,
-            );
-            return None;
-        }
-        // Cooldown-awareness: ritorna il primo provider NON in cooldown.
-        let mut skipped: Vec<String> = Vec::new();
-        for (provider, model) in &candidates {
-            if crate::provider_cooldown::is_provider_in_cooldown(provider) {
-                skipped.push(provider.clone());
-                continue;
-            }
-            if !skipped.is_empty() {
-                tracing::info!(
-                    "route_by_slots: skip provider in cooldown [{}], scelto {}/{} (tier {}, pos {}/{})",
-                    skipped.join(","), provider, model, req.preferred_tier,
-                    skipped.len() + 1, candidates.len(),
-                );
-            } else {
-                tracing::info!(
-                    "route_by_slots: slots=({}, {}, {}, {}) tier={} → {}/{}",
-                    slots.action_verb,
-                    slots.target_type,
-                    slots.framework,
-                    slots.scope,
-                    req.preferred_tier,
-                    provider,
-                    model,
-                );
-            }
-            return Some((provider.clone(), model.clone(), "slots_matrix"));
-        }
-        // Tutti i provider candidati sono in cooldown.
-        tracing::warn!(
-            "route_by_slots: TUTTI i {} provider candidati in cooldown [{}], fallback intent classico",
-            candidates.len(), skipped.join(",")
-        );
-        None
+        let candidates = slot_routing_candidates(db, &req, slots).await?;
+        let (provider, model) = pick_slot_candidate_out_of_cooldown(&candidates, &req, slots)?;
+        Some((provider, model, "slots_matrix"))
     }
 
     /// Helper unico: estrae preferred_provider per intent (da nexus_intent_capability,
@@ -554,38 +493,8 @@ impl Orchestrator {
         intent: &str,
         message: &str,
     ) {
-        // Flag DB (default true). Stesso pattern di lettura settings usato
-        // altrove (es. agent.model_tool_failure_threshold in agent_run.rs).
-        let gate_enabled: bool =
-            crate::settings::get_setting(db, "agent.require_tool_use_capability")
-                .await
-                .ok()
-                .flatten()
-                .map(|v| {
-                    let t = v.trim().to_ascii_lowercase();
-                    !(t == "false" || t == "0" || t == "no")
-                })
-                .unwrap_or(true);
-
-        // Capability del modello risolto dal catalog. None = modello assente
-        // (problema di sync, gestito conservativamente dalla funzione pura).
-        // Leggiamo agentic_thinking_policy: solo 'exclude' (reasoning-only senza
-        // function calling) va scartato dagli agentici; i dual-mode (deepseek-v4,
-        // claude, gemini-2.5) restano e l'adapter forza il non-thinking (ADR 0025).
-        // Leggiamo anche is_enabled: un modello DISABILITATO (es. legacy pruned
-        // dalla mig 0320, raggiunto via una config di default stale) non e'
-        // chiamabile -> va comunque sostituito su un run agentico (robustezza
-        // oltre alla policy).
-        let caps: Option<(bool, String, bool)> = sqlx::query_as::<_, (bool, String, bool)>(
-            "SELECT supports_tool_use, agentic_thinking_policy, is_enabled FROM ai_price_catalog \
-             WHERE provider = $1 AND model = $2 LIMIT 1",
-        )
-        .bind(&*provider)
-        .bind(&*model)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+        let gate_enabled = tool_use_gate_enabled(db).await;
+        let caps = fetch_tool_capability_row(db, provider, model).await;
         let supports: Option<bool> = caps.as_ref().map(|(s, _, _)| *s);
         let policy: Option<&str> = caps.as_ref().map(|(_, p, _)| p.as_str());
         let model_disabled = matches!(caps.as_ref(), Some((_, _, false)));
@@ -598,64 +507,61 @@ impl Orchestrator {
         match gate_decision {
             ToolCapabilityGate::KeepOriginal => {}
             ToolCapabilityGate::NeedsFallback => {
-                // Tier/capability dell'intent dalla cache (mig 0110), stessi
-                // valori usati dal routing dinamico. Default light/chat se
-                // l'intent non e' mappato (helper unico, regola L).
-                let estimated_tokens = estimate_complexity(message);
-                let (tier, capability) =
-                    self.intent_tier_capability(intent, estimated_tokens).await;
+                self.apply_tool_use_fallback(db, provider, model, intent, message)
+                    .await;
+            }
+        }
+    }
 
-                // Fallback deterministico: miglior modello tool-capable del tier
-                // (degradazione di tier controllata in best_model_for_tier).
-                //
-                // RILASSO CAPABILITY (fix incidente UI 2026-06-04): prima prova
-                // con la capability dell'intent (es. "reasoning"); se nessun
-                // modello NON-thinking tool-capable la possiede — caso reale:
-                // tutti i modelli con capability "reasoning" sono is_thinking=true
-                // ed esclusi dal gate (mig 0317/0318) — rilassa la capability e
-                // prende il miglior non-thinking tool-capable del tier. Un modello
-                // non-thinking senza quel tag e' comunque MOLTO meglio di un
-                // thinking model che fallirebbe il loop agentico (deepseek-v4-pro
-                // -> reasoning_content 400). Senza questo rilassamento il gate
-                // teneva il modello thinking originale (override/slot), vanificando
-                // l'esclusione su tutti i path che forzano un modello.
-                let fallback = match best_model_for_tier(db, &tier, Some(&capability), true).await {
-                    Some(x) => Some(x),
-                    None => best_model_for_tier(db, &tier, None, true).await,
-                };
-                match fallback {
-                    Some((alt_provider, alt_model)) => {
-                        tracing::info!(
-                            "routing: {}/{} scartato per run agente (non tool-capable o thinking) \
-                             -> fallback {}/{} (intent={}, tier={}, capability={})",
-                            provider,
-                            model,
-                            alt_provider,
-                            alt_model,
-                            intent,
-                            tier,
-                            capability,
-                        );
-                        *provider = alt_provider;
-                        *model = alt_model;
-                    }
-                    None => {
-                        // Nessun modello non-thinking tool-capable disponibile in
-                        // NESSUNA capability del tier: fail visibile. Non sostituiamo
-                        // silenziosamente con qualcosa di sbagliato.
-                        tracing::warn!(
-                            "routing: {}/{} non utilizzabile per run agente (intent={}) ma \
-                             nessun modello non-thinking tool-capable disponibile nel catalog \
-                             (tier={}, neppure rilassando la capability). Run proseguira' col \
-                             modello originale — verifica ai_price_catalog (supports_tool_use, \
-                             is_thinking) e i provider in cooldown.",
-                            provider,
-                            model,
-                            intent,
-                            tier,
-                        );
-                    }
-                }
+    /// Ramo `NeedsFallback` del gate tool-use, estratto da
+    /// [`Orchestrator::apply_tool_use_capability_gate`] per contenerne la
+    /// lunghezza. Sostituzione in-place e logging invariati: se il catalog non
+    /// offre nessun modello non-thinking tool-capable NON sostituisce e logga un
+    /// WARN esplicito (fail visibile, regola G).
+    async fn apply_tool_use_fallback(
+        &self,
+        db: &PgPool,
+        provider: &mut String,
+        model: &mut String,
+        intent: &str,
+        message: &str,
+    ) {
+        // Tier/capability dell'intent dalla cache (mig 0110), stessi
+        // valori usati dal routing dinamico. Default light/chat se
+        // l'intent non e' mappato (helper unico, regola L).
+        let estimated_tokens = estimate_complexity(message);
+        let (tier, capability) = self.intent_tier_capability(intent, estimated_tokens).await;
+        match select_tool_capable_fallback(db, &tier, &capability).await {
+            Some((alt_provider, alt_model)) => {
+                tracing::info!(
+                    "routing: {}/{} scartato per run agente (non tool-capable o thinking) \
+                     -> fallback {}/{} (intent={}, tier={}, capability={})",
+                    provider,
+                    model,
+                    alt_provider,
+                    alt_model,
+                    intent,
+                    tier,
+                    capability,
+                );
+                *provider = alt_provider;
+                *model = alt_model;
+            }
+            None => {
+                // Nessun modello non-thinking tool-capable disponibile in
+                // NESSUNA capability del tier: fail visibile. Non sostituiamo
+                // silenziosamente con qualcosa di sbagliato.
+                tracing::warn!(
+                    "routing: {}/{} non utilizzabile per run agente (intent={}) ma \
+                     nessun modello non-thinking tool-capable disponibile nel catalog \
+                     (tier={}, neppure rilassando la capability). Run proseguira' col \
+                     modello originale — verifica ai_price_catalog (supports_tool_use, \
+                     is_thinking) e i provider in cooldown.",
+                    provider,
+                    model,
+                    intent,
+                    tier,
+                );
             }
         }
     }
@@ -703,50 +609,67 @@ impl Orchestrator {
         match decide_vision_capability_gate(true, model_supports_vision) {
             VisionCapabilityGate::KeepOriginal => {}
             VisionCapabilityGate::NeedsVisionModel => {
-                // Tier dell'intent dalla cache (mig 0110), stesso meccanismo del
-                // gate tool-use. Default light/chat se l'intent non e' mappato
-                // (helper unico, regola L): qui serve solo il tier.
-                let estimated_tokens = estimate_complexity(message);
-                let (tier, _capability) =
-                    self.intent_tier_capability(intent, estimated_tokens).await;
-                // Run agentico (intent != "chat") -> serve un modello vision CHE
-                // sia anche tool-capable: passiamo requires_tool_use al selettore
-                // unico, cosi' non vanifichiamo il gate tool-use applicato prima.
-                let requires_tool_use = intent != "chat";
-                match best_model_for_tier(db, &tier, Some("vision"), requires_tool_use).await {
-                    Some((vp, vm)) => {
-                        tracing::info!(
-                            "routing(vision): {}/{} senza vision ma il turno ha un'immagine \
-                             -> override {}/{} (intent={}, tier={}, tool_use={})",
-                            provider,
-                            model,
-                            vp,
-                            vm,
-                            intent,
-                            tier,
-                            requires_tool_use,
-                        );
-                        *provider = vp;
-                        *model = vm;
-                    }
-                    None => {
-                        // Nessun modello vision disponibile per quel tier (run
-                        // agentico: nemmeno vision+tool-capable). Fail visibile:
-                        // non sostituiamo con un modello non-vision.
-                        tracing::warn!(
-                            "routing(vision): il turno ha un'immagine ma {}/{} non supporta la \
-                             vision e nessun modello supports_vision=TRUE e' disponibile \
-                             (intent={}, tier={}, tool_use={}). L'immagine resta investigabile \
-                             via nexus_describe_image_attachment — verifica ai_price_catalog \
-                             (supports_vision) e i provider in cooldown.",
-                            provider,
-                            model,
-                            intent,
-                            tier,
-                            requires_tool_use,
-                        );
-                    }
-                }
+                self.override_with_vision_model(db, provider, model, intent, message)
+                    .await;
+            }
+        }
+    }
+
+    /// Ramo `NeedsVisionModel` del gate vision, estratto da
+    /// [`Orchestrator::apply_vision_capability_gate`] per contenerne la
+    /// lunghezza. Selezione (selettore unico `best_model_for_tier` con
+    /// capability `'vision'`), sostituzione in-place e logging sono invariati:
+    /// se nessun modello vision e' disponibile NON sostituisce e logga un WARN.
+    ///
+    /// Il tier dell'intent arriva dalla cache (mig 0110), stesso meccanismo del
+    /// gate tool-use; default light/chat se l'intent non e' mappato (helper
+    /// unico, regola L): qui serve solo il tier. Run agentico (intent != "chat")
+    /// -> serve un modello vision CHE sia anche tool-capable: passiamo
+    /// `requires_tool_use` al selettore unico, cosi' non vanifichiamo il gate
+    /// tool-use applicato prima.
+    async fn override_with_vision_model(
+        &self,
+        db: &PgPool,
+        provider: &mut String,
+        model: &mut String,
+        intent: &str,
+        message: &str,
+    ) {
+        let estimated_tokens = estimate_complexity(message);
+        let (tier, _capability) = self.intent_tier_capability(intent, estimated_tokens).await;
+        let requires_tool_use = intent != "chat";
+        match best_model_for_tier(db, &tier, Some("vision"), requires_tool_use).await {
+            Some((vp, vm)) => {
+                tracing::info!(
+                    "routing(vision): {}/{} senza vision ma il turno ha un'immagine \
+                     -> override {}/{} (intent={}, tier={}, tool_use={})",
+                    provider,
+                    model,
+                    vp,
+                    vm,
+                    intent,
+                    tier,
+                    requires_tool_use,
+                );
+                *provider = vp;
+                *model = vm;
+            }
+            None => {
+                // Nessun modello vision disponibile per quel tier (run
+                // agentico: nemmeno vision+tool-capable). Fail visibile:
+                // non sostituiamo con un modello non-vision.
+                tracing::warn!(
+                    "routing(vision): il turno ha un'immagine ma {}/{} non supporta la \
+                     vision e nessun modello supports_vision=TRUE e' disponibile \
+                     (intent={}, tier={}, tool_use={}). L'immagine resta investigabile \
+                     via nexus_describe_image_attachment — verifica ai_price_catalog \
+                     (supports_vision) e i provider in cooldown.",
+                    provider,
+                    model,
+                    intent,
+                    tier,
+                    requires_tool_use,
+                );
             }
         }
     }
@@ -784,53 +707,11 @@ impl Orchestrator {
             }
         };
         let matrix = &*matrix_arc;
-        // Override espliciti utente (ADR 0023). Gestiamo i quattro casi della
-        // coppia (provider_override, model_override):
-        //   (Some, Some) -> rispetta entrambi cosi' come sono.
-        //   (None, Some) -> un modello identifica univocamente il suo provider:
-        //                   lo ricaviamo dal catalogo prezzi (provider_for_model).
-        //                   Se non trovato, fallback al routing per intent (sotto).
-        //   (Some, None) -> provider forzato, modello dal routing/default provider.
-        //   (None, None) -> routing per intent (nessun ramo qui).
-        let provider_ov = provider_override.filter(|v| !v.trim().is_empty());
-        let model_ov = model_override.filter(|v| !v.trim().is_empty());
-        match (provider_ov, model_ov) {
-            (Some(p), Some(m)) => {
-                return (p.to_string(), m.to_string());
-            }
-            (Some(p), None) => {
-                let routing = match Self::load_routing_config(db).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("load_routing_config (provider_ov): {e}");
-                        RoutingConfig::default()
-                    }
-                };
-                let model = routing.resolve_model(matrix, p, Some(p), model_override);
-                return (p.to_string(), model);
-            }
-            (None, Some(m)) => {
-                // model_override da solo: ricava il provider dal catalogo.
-                match provider_for_model(db, m).await {
-                    Some(provider) => {
-                        tracing::info!(
-                            "Agent routing (model_override): '{}' -> provider '{}' dal catalogo",
-                            m,
-                            provider
-                        );
-                        return (provider, m.to_string());
-                    }
-                    None => {
-                        // Niente provider hardcoded (regola G): se il modello non
-                        // e' nel catalogo, cadiamo nel routing per intent sotto.
-                        tracing::warn!(
-                            "model_override '{}' non trovato nel catalogo, fallback routing per intent",
-                            m
-                        );
-                    }
-                }
-            }
-            (None, None) => {}
+        if let Some(resolved) = self
+            .resolve_user_override(db, matrix, provider_override, model_override)
+            .await
+        {
+            return resolved;
         }
 
         // Routing locale — zero latenza gRPC
@@ -875,100 +756,11 @@ impl Orchestrator {
         // sui provider configurati nell'admin (anthropic/openai prima) e applicano
         // il provider_model_<x> override → risultato: il dinamico non sceglie mai nulla.
         if effective_behavior_mode == "dinamico" {
-            // Risolvi tier/capability dalla cache intent_capability (mig 0110)
-            // invece dal match Rust statico (rimosso). Se intent non mappato,
-            // default light/chat (caso tipico di intent legacy non in seed).
-            let icap_arc = self.intent_capability.current_async().await.ok();
-            let (base_tier, capability) = match icap_arc.as_deref() {
-                Some(map) => match map.get(intent) {
-                    Some(c) => (
-                        c.tier_for_tokens(estimated_tokens),
-                        c.base_capability.clone(),
-                    ),
-                    None => {
-                        // Niente magic fallback "light" (regola G): un intent non
-                        // mappato in nexus_intent_capability e' tipicamente un task
-                        // agentico (es. agentic_default), e degradarlo a "light"
-                        // sceglie un modello debole (mistral-small ecc.). Default
-                        // sicuro medium/reasoning + WARN per accorgersene e
-                        // aggiungerlo alla tabella (mig 0110/0358).
-                        tracing::warn!(
-                            "Agent routing: intent '{}' non in nexus_intent_capability, \
-                             uso default medium/reasoning (aggiungerlo alla tabella)",
-                            intent
-                        );
-                        ("medium".to_string(), "reasoning".to_string())
-                    }
-                },
-                None => {
-                    tracing::warn!(
-                        "intent_capability cache non disponibile, uso default medium/reasoning"
-                    );
-                    ("medium".to_string(), "reasoning".to_string())
-                }
-            };
-            // Turno agentico = intent diverso da "chat" (convenzione del progetto,
-            // model_routing.rs:772). Attiva il pavimento di tier agentico nel
-            // selettore dinamico (regola L: la decisione "agentico?" arriva dal
-            // chiamante che conosce l'intent, non re-implementata nel selettore).
-            // Ricerca web citata (intent ricerca_web): instrada verso un modello con
-            // capability web_search (Perplexity sonar) via il ramo NON-agentico
-            // (requires_tool_use=false), perche' i sonar hanno supports_tool_use=false
-            // e sono esclusi dai selettori agentici. Il gateway non allega tool ai
-            // provider supports_tools=false (garanzia difensiva in generic.rs), quindi
-            // il grafo gira in modalita' testo e completa con le citazioni. Gated su
-            // intent: INERTE finche' il classifier non emette ricerca_web (che richiede
-            // l'attivazione admin del prompt). Se nessun sonar e' disponibile (modelli
-            // disabilitati / api_key assente) cade nel routing normale sotto.
-            if intent == "ricerca_web" {
-                if let Some((provider, model)) = best_model_for_tier_pinned(
-                    db,
-                    &base_tier,
-                    Some("web_search"),
-                    false,
-                    &[],
-                    Some("perplexity"),
-                )
+            if let Some(resolved) = self
+                .resolve_dynamic_catalog_provider(db, intent, estimated_tokens, model_override)
                 .await
-                {
-                    if !is_provider_in_cooldown(&provider) {
-                        let model = model_override
-                            .filter(|v| !v.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or(model);
-                        tracing::info!("Agent routing (ricerca_web): -> {}/{}", provider, model);
-                        return (provider, model);
-                    }
-                }
-                tracing::warn!(
-                    "ricerca_web: nessun modello web_search disponibile (sonar disabilitato / provider non configurato), fallback al routing normale"
-                );
-            }
-            let is_agentic_turn = intent != "chat";
-            if let Some(d) =
-                route_model_from_catalog(db, &base_tier, &capability, "dinamico", is_agentic_turn)
-                    .await
             {
-                let provider = d.provider;
-                if !is_provider_in_cooldown(&provider) {
-                    let model = model_override
-                        .filter(|v| !v.trim().is_empty())
-                        .map(str::to_string)
-                        .unwrap_or(d.model);
-                    tracing::info!(
-                        "Agent routing (dinamico/catalog): intent={} tokens~{} → {}/{}",
-                        intent,
-                        estimated_tokens,
-                        provider,
-                        model
-                    );
-                    return (provider, model);
-                } else {
-                    tracing::warn!(
-                        "Agent routing: '{}' in cooldown (catalog/dinamico), skip",
-                        provider
-                    );
-                }
+                return resolved;
             }
             // Catalogo vuoto → cade nel ramo statico bilanciata sotto
         }
@@ -1049,6 +841,151 @@ impl Orchestrator {
         (provider, model)
     }
 
+    /// Override espliciti utente (ADR 0023), estratti da
+    /// [`Orchestrator::resolve_agent_provider`] per contenerne lunghezza e
+    /// complessita' ciclomatica. Gestisce i quattro casi della coppia
+    /// `(provider_override, model_override)`:
+    ///   - `(Some, Some)` -> rispetta entrambi cosi' come sono.
+    ///   - `(Some, None)` -> provider forzato, modello dal routing/default provider.
+    ///   - `(None, Some)` -> un modello identifica univocamente il suo provider:
+    ///     lo ricaviamo dal catalogo prezzi (`provider_for_model`). Se non
+    ///     trovato, `None` -> il chiamante cade sul routing per intent.
+    ///   - `(None, None)` -> `None`, routing per intent.
+    async fn resolve_user_override(
+        &self,
+        db: &PgPool,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        provider_override: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Option<(String, String)> {
+        let provider_ov = provider_override.filter(|v| !v.trim().is_empty());
+        let model_ov = model_override.filter(|v| !v.trim().is_empty());
+        match (provider_ov, model_ov) {
+            (Some(p), Some(m)) => Some((p.to_string(), m.to_string())),
+            (Some(p), None) => {
+                let routing = match Self::load_routing_config(db).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("load_routing_config (provider_ov): {e}");
+                        RoutingConfig::default()
+                    }
+                };
+                let model = routing.resolve_model(matrix, p, Some(p), model_override);
+                Some((p.to_string(), model))
+            }
+            (None, Some(m)) => match provider_for_model(db, m).await {
+                Some(provider) => {
+                    tracing::info!(
+                        "Agent routing (model_override): '{}' -> provider '{}' dal catalogo",
+                        m,
+                        provider
+                    );
+                    Some((provider, m.to_string()))
+                }
+                None => {
+                    // Niente provider hardcoded (regola G): se il modello non
+                    // e' nel catalogo, cadiamo nel routing per intent.
+                    tracing::warn!(
+                        "model_override '{}' non trovato nel catalogo, fallback routing per intent",
+                        m
+                    );
+                    None
+                }
+            },
+            (None, None) => None,
+        }
+    }
+
+    /// Ramo "dinamico" di [`Orchestrator::resolve_agent_provider`]: il catalogo
+    /// prezzi e' autoritativo. Estratto per contenerne lunghezza e complessita'
+    /// ciclomatica; la logica e il logging sono invariati.
+    ///
+    /// `None` = il catalogo non ha prodotto un provider servibile (vuoto, oppure
+    /// tutti in cooldown) e il chiamante cade sul ramo statico "bilanciata".
+    ///
+    /// Saltiamo `candidates()` e `provider_models` perche' altrimenti riordinano
+    /// sempre sui provider configurati nell'admin (anthropic/openai prima) e
+    /// applicano il `provider_model_<x>` override → risultato: il dinamico non
+    /// sceglie mai nulla.
+    async fn resolve_dynamic_catalog_provider(
+        &self,
+        db: &PgPool,
+        intent: &str,
+        estimated_tokens: u32,
+        model_override: Option<&str>,
+    ) -> Option<(String, String)> {
+        let (base_tier, capability) = self.dynamic_tier_capability(intent, estimated_tokens).await;
+        if intent == "ricerca_web" {
+            if let Some(found) = resolve_web_search_model(db, &base_tier, model_override).await {
+                return Some(found);
+            }
+        }
+        // Turno agentico = intent diverso da "chat" (convenzione del progetto,
+        // model_routing.rs:772). Attiva il pavimento di tier agentico nel
+        // selettore dinamico (regola L: la decisione "agentico?" arriva dal
+        // chiamante che conosce l'intent, non re-implementata nel selettore).
+        let is_agentic_turn = intent != "chat";
+        let d = route_model_from_catalog(db, &base_tier, &capability, "dinamico", is_agentic_turn)
+            .await?;
+        let provider = d.provider;
+        if is_provider_in_cooldown(&provider) {
+            tracing::warn!(
+                "Agent routing: '{}' in cooldown (catalog/dinamico), skip",
+                provider
+            );
+            return None;
+        }
+        let model = model_override
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or(d.model);
+        tracing::info!(
+            "Agent routing (dinamico/catalog): intent={} tokens~{} → {}/{}",
+            intent,
+            estimated_tokens,
+            provider,
+            model
+        );
+        Some((provider, model))
+    }
+
+    /// Tier/capability per il ramo dinamico, dalla cache `intent_capability`
+    /// (mig 0110) invece che da un match Rust statico (rimosso). Estratta da
+    /// [`Orchestrator::resolve_agent_provider`].
+    ///
+    /// Niente magic fallback "light" (regola G): un intent non mappato in
+    /// `nexus_intent_capability` e' tipicamente un task agentico (es.
+    /// `agentic_default`), e degradarlo a "light" sceglie un modello debole
+    /// (mistral-small ecc.). Default sicuro medium/reasoning + WARN per
+    /// accorgersene e aggiungerlo alla tabella (mig 0110/0358). NB: e'
+    /// deliberatamente diverso dall'helper [`Orchestrator::intent_tier_capability`],
+    /// che usa il default light/chat.
+    async fn dynamic_tier_capability(
+        &self,
+        intent: &str,
+        estimated_tokens: u32,
+    ) -> (String, String) {
+        let icap_arc = self.intent_capability.current_async().await.ok();
+        let Some(map) = icap_arc.as_deref() else {
+            tracing::warn!("intent_capability cache non disponibile, uso default medium/reasoning");
+            return ("medium".to_string(), "reasoning".to_string());
+        };
+        match map.get(intent) {
+            Some(c) => (
+                c.tier_for_tokens(estimated_tokens),
+                c.base_capability.clone(),
+            ),
+            None => {
+                tracing::warn!(
+                    "Agent routing: intent '{}' non in nexus_intent_capability, \
+                     uso default medium/reasoning (aggiungerlo alla tabella)",
+                    intent
+                );
+                ("medium".to_string(), "reasoning".to_string())
+            }
+        }
+    }
+
     /// Fallback tier-aware su catalog quando la matrice non e' servibile
     /// direttamente (sentinella `__no_model__` o provider in cooldown). Estratto
     /// da `resolve_agent_provider` per contenerne lunghezza e complessita': la
@@ -1067,47 +1004,14 @@ impl Orchestrator {
         estimated_tokens: u32,
         decision_provider: &str,
     ) -> (String, String) {
-        if decision_provider == "__no_model__" {
-            tracing::warn!(
-                "Agent routing: matrice senza modello per intent={} (provider preferito assente o in cooldown), consulto il catalog tier-aware",
-                intent
-            );
-        } else {
-            tracing::warn!(
-                "Agent routing: '{}' scelto dal routing ma in cooldown, consulto il catalog tier-aware",
-                decision_provider
-            );
-        }
+        log_catalog_fallback_reason(decision_provider, intent);
 
         // Tier/capability dell'intent dalla cache intent_capability (mig 0110):
         // stessi valori del routing dinamico. Default light/chat se non mappato
         // (helper unico, regola L).
         let (tier, cap) = self.intent_tier_capability(intent, estimated_tokens).await;
 
-        // Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
-        // `agentic_tier_chain`, la STESSA usata da route_model_from_catalog e
-        // select_models_tierchain. Provider-agnostico: cerca il tier richiesto tra
-        // TUTTI i provider non in cooldown (stessi criteri), e degrada di UN gradino
-        // solo se quel tier e' vuoto. Prima qui c'era una tier-chain hardcoded con
-        // pavimento diverso -> degradazione incoerente tra i percorsi (rimossa).
-        let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(&tier);
-
-        // PUNTO UNICO di selezione agentica (regola L): miglior modello
-        // tool-capable del tier/capability, da un provider NON in cooldown.
-        // Ordine allineato a route_model_from_catalog (AGENTIC_COST_FIRST_ORDER):
-        // il tier gia' garantisce la fascia di capacita', dentro il tier si
-        // prende il piu' ECONOMICO (obiettivo costi). I modelli economici
-        // problematici sono retrocessi dalla governance telemetria-aware e dagli
-        // esiti dei run, non da un flag `is_featured` statico.
-        let found = select_agentic_model(
-            db,
-            &tiers_to_try,
-            Some(&cap),
-            0,
-            &[],
-            crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
-        )
-        .await;
+        let found = select_catalog_fallback_model(db, &tier, &cap).await;
         if let Some((ref alt_provider, ref alt_model)) = found {
             tracing::info!(
                 "Agent routing (fallback catalog tier-aware, selettore unico): {} → {}/{} (intent={}, tier={}, cap={})",
@@ -1121,24 +1025,9 @@ impl Orchestrator {
         }
 
         // ULTIMA spiaggia: hierarchy classica (candidates), raggiunta SOLO se il
-        // catalog non ha nulla di sano nel tier. Se nemmeno qui c'e' un provider
-        // fuori cooldown si mantiene la sentinella `__no_model__`, cosi' il
-        // chiamante (resolve_agent_provider_detailed) calcoli no_capable_provider
-        // e fermi il run con alert invece di spacciare un modello fittizio.
+        // catalog non ha nulla di sano nel tier.
         found.unwrap_or_else(|| {
-            let alt = routing
-                .candidates(intent, None)
-                .into_iter()
-                .find(|p| !is_provider_in_cooldown(p))
-                .unwrap_or_else(|| decision_provider.to_string());
-            let alt_model = default_model_for_provider(matrix, &alt).to_string();
-            tracing::warn!(
-                "Agent routing (fallback legacy hierarchy, catalog vuoto): {} → {}/{}",
-                decision_provider,
-                alt,
-                alt_model
-            );
-            (alt, alt_model)
+            legacy_hierarchy_fallback(matrix, routing, intent, decision_provider)
         })
     }
 
@@ -1159,79 +1048,111 @@ impl Orchestrator {
         capability: &str,
     ) -> (Option<String>, Option<String>) {
         if behavior_mode == "dinamico" {
-            // Turno agentico = intent != "chat" (convenzione del progetto):
-            // attiva il pavimento di tier agentico nel selettore dinamico.
-            let is_agentic_turn = intent_str != "chat";
-            match route_model_from_catalog(db, base_tier, capability, "dinamico", is_agentic_turn)
+            self.suggest_from_catalog(
+                db,
+                matrix,
+                intent_str,
+                msg_tokens_estimate,
+                base_tier,
+                capability,
+            )
+            .await
+        } else {
+            self.suggest_from_matrix(matrix, behavior_mode, intent_str, msg_tokens_estimate)
                 .await
-            {
-                Some(dyn_decision) if !is_provider_in_cooldown(&dyn_decision.provider) => {
-                    tracing::info!(
-                        "Dynamic catalog routing: intent={} tokens~{} → {}/{}",
-                        intent_str,
-                        msg_tokens_estimate,
-                        dyn_decision.provider,
-                        dyn_decision.model
-                    );
-                    (
-                        Some(dyn_decision.provider.to_string()),
-                        Some(dyn_decision.model.to_string()),
-                    )
-                }
-                other => {
-                    if let Some(ref d) = other {
-                        tracing::warn!(
-                            "Dynamic catalog routing: {}/{} in cooldown, cerco alternativa tier-aware",
-                            d.provider, d.model
-                        );
-                    }
-                    // Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
-                    // stessa `agentic_tier_chain` del selettore principale, non piu'
-                    // una copia hardcoded con degradazione diversa. Provider-agnostico:
-                    // stesso tier tra tutti i provider sani, poi un gradino sotto.
-                    let tiers_to_try =
-                        crate::orchestrator::model_routing::agentic_tier_chain(base_tier);
-                    let catalog_alt = select_agentic_model(
-                        db,
-                        &tiers_to_try,
-                        Some(capability),
-                        0,
-                        &[],
-                        "input_cost_per_million_tokens ASC",
-                    )
-                    .await
-                    .map(|(p, m)| {
-                        tracing::info!(
-                            "Dynamic catalog routing (cooldown-fallback, selettore unico): → {}/{}",
-                            p,
-                            m
-                        );
-                        (Some(p), Some(m))
-                    });
+        }
+    }
 
-                    catalog_alt.unwrap_or_else(|| {
-                        let (pref, thr) =
-                            futures::executor::block_on(self.routing_helpers_for(intent_str));
-                        let d = route_model_with_mode(
-                            matrix,
-                            intent_str,
-                            msg_tokens_estimate,
-                            "bilanciata",
-                            pref.as_deref(),
-                            &thr,
-                        );
-                        tracing::info!(
-                            "Dynamic routing fallback to bilanciata: {}/{}",
-                            d.provider,
-                            d.model
-                        );
-                        (Some(d.provider.to_string()), Some(d.model.to_string()))
-                    })
-                }
+    /// Ramo "dinamico" di [`Orchestrator::resolve_suggested_model`]: il catalogo
+    /// prezzi e' autoritativo. Estratto per contenerne lunghezza e complessita':
+    /// se il provider scelto dal catalog e' sano lo si usa, altrimenti si cerca
+    /// un'alternativa tier-aware (logging invariato).
+    async fn suggest_from_catalog(
+        &self,
+        db: &PgPool,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        intent_str: &str,
+        msg_tokens_estimate: u32,
+        base_tier: &str,
+        capability: &str,
+    ) -> (Option<String>, Option<String>) {
+        // Turno agentico = intent != "chat" (convenzione del progetto):
+        // attiva il pavimento di tier agentico nel selettore dinamico.
+        let is_agentic_turn = intent_str != "chat";
+        match route_model_from_catalog(db, base_tier, capability, "dinamico", is_agentic_turn).await
+        {
+            Some(dyn_decision) if !is_provider_in_cooldown(&dyn_decision.provider) => {
+                tracing::info!(
+                    "Dynamic catalog routing: intent={} tokens~{} → {}/{}",
+                    intent_str,
+                    msg_tokens_estimate,
+                    dyn_decision.provider,
+                    dyn_decision.model
+                );
+                (
+                    Some(dyn_decision.provider.to_string()),
+                    Some(dyn_decision.model.to_string()),
+                )
             }
-        } else if behavior_mode == "manuale" {
-            // Manuale: nessun routing automatico — usa provider/model da config admin
-            let (pref, thr) = self.routing_helpers_for(intent_str).await;
+            other => {
+                if let Some(ref d) = other {
+                    tracing::warn!(
+                        "Dynamic catalog routing: {}/{} in cooldown, cerco alternativa tier-aware",
+                        d.provider,
+                        d.model
+                    );
+                }
+                self.suggest_catalog_cooldown_alternative(
+                    db,
+                    matrix,
+                    intent_str,
+                    msg_tokens_estimate,
+                    base_tier,
+                    capability,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Alternativa tier-aware quando il ramo dinamico non ha prodotto un
+    /// provider sano. Estratta da [`Orchestrator::suggest_from_catalog`].
+    ///
+    /// Tier-chain di degradazione graceful (PUNTO UNICO, regola L): stessa
+    /// `agentic_tier_chain` del selettore principale, non piu' una copia
+    /// hardcoded con degradazione diversa. Provider-agnostico: stesso tier tra
+    /// tutti i provider sani, poi un gradino sotto. Ultima spiaggia: la matrice
+    /// statica in modalita' "bilanciata".
+    async fn suggest_catalog_cooldown_alternative(
+        &self,
+        db: &PgPool,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        intent_str: &str,
+        msg_tokens_estimate: u32,
+        base_tier: &str,
+        capability: &str,
+    ) -> (Option<String>, Option<String>) {
+        let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(base_tier);
+        let catalog_alt = select_agentic_model(
+            db,
+            &tiers_to_try,
+            Some(capability),
+            0,
+            &[],
+            "input_cost_per_million_tokens ASC",
+        )
+        .await
+        .map(|(p, m)| {
+            tracing::info!(
+                "Dynamic catalog routing (cooldown-fallback, selettore unico): → {}/{}",
+                p,
+                m
+            );
+            (Some(p), Some(m))
+        });
+
+        catalog_alt.unwrap_or_else(|| {
+            let (pref, thr) = futures::executor::block_on(self.routing_helpers_for(intent_str));
             let d = route_model_with_mode(
                 matrix,
                 intent_str,
@@ -1241,23 +1162,46 @@ impl Orchestrator {
                 &thr,
             );
             tracing::info!(
+                "Dynamic routing fallback to bilanciata: {}/{}",
+                d.provider,
+                d.model
+            );
+            (Some(d.provider.to_string()), Some(d.model.to_string()))
+        })
+    }
+
+    /// Rami NON dinamici di [`Orchestrator::resolve_suggested_model`]: "manuale"
+    /// (nessun routing automatico — provider/model dalla config admin, risolti
+    /// in "bilanciata") e locale (la modalita' configurata). Estratti per
+    /// contenere la lunghezza del chiamante; i due messaggi di log restano
+    /// distinti come in origine.
+    async fn suggest_from_matrix(
+        &self,
+        matrix: &crate::routing_matrix::RoutingMatrix,
+        behavior_mode: &str,
+        intent_str: &str,
+        msg_tokens_estimate: u32,
+    ) -> (Option<String>, Option<String>) {
+        let manual = behavior_mode == "manuale";
+        let mode = if manual { "bilanciata" } else { behavior_mode };
+        let (pref, thr) = self.routing_helpers_for(intent_str).await;
+        let d = route_model_with_mode(
+            matrix,
+            intent_str,
+            msg_tokens_estimate,
+            mode,
+            pref.as_deref(),
+            &thr,
+        );
+        if manual {
+            tracing::info!(
                 "Manual routing config: intent={} tokens~{} → {}/{}",
                 intent_str,
                 msg_tokens_estimate,
                 d.provider,
                 d.model
             );
-            (Some(d.provider.to_string()), Some(d.model.to_string()))
         } else {
-            let (pref, thr) = self.routing_helpers_for(intent_str).await;
-            let d = route_model_with_mode(
-                matrix,
-                intent_str,
-                msg_tokens_estimate,
-                behavior_mode,
-                pref.as_deref(),
-                &thr,
-            );
             tracing::info!(
                 "Local routing: intent={} tokens~{} mode={} → {}/{}",
                 intent_str,
@@ -1266,8 +1210,8 @@ impl Orchestrator {
                 d.provider,
                 d.model
             );
-            (Some(d.provider.to_string()), Some(d.model.to_string()))
         }
+        (Some(d.provider.to_string()), Some(d.model.to_string()))
     }
 
     /// Esecuzione LLM via Nexus Gateway (PATH A). Estratta da `run` per
@@ -1803,33 +1747,7 @@ impl Orchestrator {
         project_id: Uuid,
         query: &str,
     ) -> anyhow::Result<Vec<Value>> {
-        let globally_enabled = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM settings WHERE key = 'learning_prompt_corrections_enabled'",
-        )
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
-        if !globally_enabled {
-            return Ok(Vec::new());
-        }
-
-        let project_enabled = sqlx::query_scalar::<_, bool>(
-            r#"
-            SELECT prompt_corrections_enabled
-            FROM project_learning_config
-            WHERE project_id = $1
-            "#,
-        )
-        .bind(project_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(true);
-        if !project_enabled {
+        if !prompt_corrections_enabled(db, project_id).await {
             return Ok(Vec::new());
         }
 
@@ -1852,57 +1770,9 @@ impl Orchestrator {
                 }
             };
 
-        let mut corrections = Vec::new();
-        let mut correction_ids = Vec::<Uuid>::new();
-        for hit in hits {
-            if hit.score < 0.78 {
-                continue;
-            }
-            let correction_id = hit
-                .payload
-                .get("correction_id")
-                .and_then(Value::as_str)
-                .and_then(|value| Uuid::parse_str(value).ok());
-            let text = hit
-                .payload
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if text.is_empty() {
-                continue;
-            }
-            if let Some(correction_id) = correction_id {
-                correction_ids.push(correction_id);
-            }
-            corrections.push(json!({
-                "id": correction_id.map(|value| value.to_string()).unwrap_or_default(),
-                "text": text,
-                "score": hit.score,
-                "intent": hit.payload.get("intent").and_then(Value::as_str).unwrap_or("chat"),
-                "pointId": hit.point_id,
-            }));
-        }
-
+        let (corrections, correction_ids) = collect_corrections_from_hits(hits);
         if !correction_ids.is_empty() {
-            // prompt_corrections e' migrata: la tabella vive nel DB del progetto
-            // (separazione DB). settings/project_learning_config sopra restano su
-            // meta (globale/non migrata); la ricerca Qdrant e' multi-tenant per
-            // payload. A flag OFF il pool ritorna il meta-DB.
-            let cpool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-            let _ = sqlx::query(
-                r#"
-                UPDATE prompt_corrections
-                SET retrieved_count = retrieved_count + 1,
-                    last_retrieved_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = ANY($1)
-                "#,
-            )
-            .bind(&correction_ids)
-            .execute(&cpool)
-            .await;
+            bump_correction_retrieval(db, project_id, &correction_ids).await;
         }
 
         Ok(corrections)
@@ -1920,47 +1790,10 @@ impl Orchestrator {
         let mode_instruction =
             crate::prompt_templates::get_template_or_default(db, cache, tpl_key).await;
         let mut sections = vec![mode_instruction];
-
-        if !corrections.is_empty() {
-            let mut block = String::from("Correzioni note (da rispettare se pertinenti):\n");
-            for correction in corrections {
-                if let Some(text) = correction.get("text").and_then(Value::as_str) {
-                    block.push_str("- ");
-                    block.push_str(text.trim());
-                    block.push('\n');
-                }
-            }
-            sections.push(block.trim().to_string());
+        if let Some(block) = corrections_section(corrections) {
+            sections.push(block);
         }
-
-        if !attachments.is_empty() {
-            let text_attachments: Vec<_> = attachments
-                .iter()
-                .filter(|a| !a.text_content.is_empty())
-                .collect();
-            let image_attachments: Vec<_> = attachments
-                .iter()
-                .filter(|a| a.base64_content.is_some())
-                .collect();
-            if !text_attachments.is_empty() {
-                let mut block = String::from("Allegati utente per questo messaggio:\n");
-                for attachment in &text_attachments {
-                    block.push_str(&format!(
-                        "\n### File: {} ({}, {} bytes)\n{}\n",
-                        attachment.name,
-                        attachment.mime_type,
-                        attachment.size_bytes,
-                        attachment.text_content
-                    ));
-                }
-                sections.push(block.trim().to_string());
-            }
-            if !image_attachments.is_empty() {
-                let names: Vec<_> = image_attachments.iter().map(|a| a.name.as_str()).collect();
-                sections.push(format!("L'utente ha allegato {} immagine/i: {}. Le immagini sono incluse come content block nel messaggio.", names.len(), names.join(", ")));
-            }
-        }
-
+        sections.extend(attachment_sections(attachments));
         sections.push(base_prompt.to_string());
         sections.join("\n\n")
     }
@@ -2010,4 +1843,435 @@ impl Orchestrator {
 
         Ok(RoutingConfig::from_settings(&settings))
     }
+}
+
+/// Ricerca web citata (intent `ricerca_web`): instrada verso un modello con
+/// capability `web_search` (Perplexity sonar) via il ramo NON-agentico
+/// (`requires_tool_use=false`), perche' i sonar hanno `supports_tool_use=false`
+/// e sono esclusi dai selettori agentici. Il gateway non allega tool ai provider
+/// `supports_tools=false` (garanzia difensiva in `generic.rs`), quindi il grafo
+/// gira in modalita' testo e completa con le citazioni.
+///
+/// Estratta da [`Orchestrator::resolve_agent_provider`]: gated su intent dal
+/// chiamante, quindi INERTE finche' il classifier non emette `ricerca_web` (che
+/// richiede l'attivazione admin del prompt). `None` (col WARN) se nessun sonar
+/// e' disponibile (modelli disabilitati / api_key assente / cooldown): il
+/// chiamante cade nel routing normale.
+async fn resolve_web_search_model(
+    db: &PgPool,
+    base_tier: &str,
+    model_override: Option<&str>,
+) -> Option<(String, String)> {
+    let found = best_model_for_tier_pinned(
+        db,
+        base_tier,
+        Some("web_search"),
+        false,
+        &[],
+        Some("perplexity"),
+    )
+    .await;
+    if let Some((provider, model)) = found {
+        if !is_provider_in_cooldown(&provider) {
+            let model = model_override
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or(model);
+            tracing::info!("Agent routing (ricerca_web): -> {}/{}", provider, model);
+            return Some((provider, model));
+        }
+    }
+    tracing::warn!(
+        "ricerca_web: nessun modello web_search disponibile (sonar disabilitato / provider non configurato), fallback al routing normale"
+    );
+    None
+}
+
+/// Le correzioni di prompt sono attive per questo progetto? Estratta da
+/// [`Orchestrator::load_prompt_corrections`]: richiede il flag globale
+/// (`settings.learning_prompt_corrections_enabled`) E quello di progetto
+/// (`project_learning_config.prompt_corrections_enabled`), entrambi con default
+/// `true` quando assenti o illeggibili — semantica invariata.
+async fn prompt_corrections_enabled(db: &PgPool, project_id: Uuid) -> bool {
+    let globally_enabled = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'learning_prompt_corrections_enabled'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|value| value.trim().eq_ignore_ascii_case("true"))
+    .unwrap_or(true);
+    if !globally_enabled {
+        return false;
+    }
+
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT prompt_corrections_enabled
+        FROM project_learning_config
+        WHERE project_id = $1
+        "#,
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(true)
+}
+
+/// Correzioni pertinenti a partire dagli hit Qdrant, piu' gli id da contabilizzare.
+/// Estratta da [`Orchestrator::load_prompt_corrections`]: stessa soglia di score
+/// (0.78), stessi scarti (testo vuoto) e stessa forma del JSON prodotto.
+fn collect_corrections_from_hits(
+    hits: Vec<vector_memory::VectorPointHit>,
+) -> (Vec<Value>, Vec<Uuid>) {
+    let mut corrections = Vec::new();
+    let mut correction_ids = Vec::<Uuid>::new();
+    for hit in hits {
+        if hit.score < 0.78 {
+            continue;
+        }
+        let correction_id = hit
+            .payload
+            .get("correction_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let text = hit
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(correction_id) = correction_id {
+            correction_ids.push(correction_id);
+        }
+        corrections.push(json!({
+            "id": correction_id.map(|value| value.to_string()).unwrap_or_default(),
+            "text": text,
+            "score": hit.score,
+            "intent": hit.payload.get("intent").and_then(Value::as_str).unwrap_or("chat"),
+            "pointId": hit.point_id,
+        }));
+    }
+    (corrections, correction_ids)
+}
+
+/// Contabilizza il recupero delle correzioni usate. Estratta da
+/// [`Orchestrator::load_prompt_corrections`]; l'errore resta ignorato come in
+/// origine (contatore non critico per la risposta).
+///
+/// `prompt_corrections` e' migrata: la tabella vive nel DB del progetto
+/// (separazione DB). `settings` / `project_learning_config` restano su meta
+/// (globale/non migrata); la ricerca Qdrant e' multi-tenant per payload.
+async fn bump_correction_retrieval(db: &PgPool, project_id: Uuid, correction_ids: &[Uuid]) {
+    let cpool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let _ = sqlx::query(
+        r#"
+        UPDATE prompt_corrections
+        SET retrieved_count = retrieved_count + 1,
+            last_retrieved_at = NOW(),
+            updated_at = NOW()
+        WHERE id = ANY($1)
+        "#,
+    )
+    .bind(correction_ids)
+    .execute(&cpool)
+    .await;
+}
+
+/// Candidati (provider, model) sani per una richiesta slot-routed, dal punto
+/// unico tier-based `select_models_for_requirement`: ordinati per score, uno per
+/// provider — la rotazione provider per disponibilita' vale quindi anche per le
+/// richieste slot-routed. Estratti da [`Orchestrator::route_by_slots`]: `None`
+/// (col medesimo logging) sia su errore di selezione sia su lista vuota, cosi'
+/// il chiamante cade sul routing intent classico.
+async fn slot_routing_candidates(
+    db: &sqlx::PgPool,
+    req: &crate::routing_slots::SlotRequirement,
+    slots: &crate::routing_slots::ActionSlots,
+) -> Option<Vec<(String, String)>> {
+    let candidates = match crate::routing_matrix_auto_promoter::select_models_for_requirement(
+        db,
+        &req.preferred_tier,
+        &req.required_capabilities,
+        req.requires_tool_use,
+        &req.cost_direction,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "route_by_slots: selezione tier-based fallita ({e}), fallback intent classico"
+            );
+            return None;
+        }
+    };
+    if candidates.is_empty() {
+        tracing::debug!(
+            "route_by_slots: nessun candidato per tier {} (slots {}, {}, {}, {})",
+            req.preferred_tier,
+            slots.action_verb,
+            slots.target_type,
+            slots.framework,
+            slots.scope,
+        );
+        return None;
+    }
+    Some(candidates)
+}
+
+/// Cooldown-awareness del routing slot-first: ritorna il primo candidato con
+/// provider NON in cooldown, oppure `None` (col WARN "tutti in cooldown") se non
+/// ce n'e' nessuno. Estratta da [`Orchestrator::route_by_slots`]: stessa
+/// iterazione, stesso logging. Il tag di sorgente `"slots_matrix"` resta al
+/// chiamante.
+fn pick_slot_candidate_out_of_cooldown(
+    candidates: &[(String, String)],
+    req: &crate::routing_slots::SlotRequirement,
+    slots: &crate::routing_slots::ActionSlots,
+) -> Option<(String, String)> {
+    let mut skipped: Vec<String> = Vec::new();
+    for (provider, model) in candidates {
+        if crate::provider_cooldown::is_provider_in_cooldown(provider) {
+            skipped.push(provider.clone());
+            continue;
+        }
+        if !skipped.is_empty() {
+            tracing::info!(
+                "route_by_slots: skip provider in cooldown [{}], scelto {}/{} (tier {}, pos {}/{})",
+                skipped.join(","),
+                provider,
+                model,
+                req.preferred_tier,
+                skipped.len() + 1,
+                candidates.len(),
+            );
+        } else {
+            tracing::info!(
+                "route_by_slots: slots=({}, {}, {}, {}) tier={} → {}/{}",
+                slots.action_verb,
+                slots.target_type,
+                slots.framework,
+                slots.scope,
+                req.preferred_tier,
+                provider,
+                model,
+            );
+        }
+        return Some((provider.clone(), model.clone()));
+    }
+    // Tutti i provider candidati sono in cooldown.
+    tracing::warn!(
+        "route_by_slots: TUTTI i {} provider candidati in cooldown [{}], fallback intent classico",
+        candidates.len(),
+        skipped.join(",")
+    );
+    None
+}
+
+/// WARN che motiva il fallback su catalog tier-aware: la matrice non aveva un
+/// modello per l'intent (sentinella `__no_model__`) oppure il provider scelto e'
+/// in cooldown. Estratto da [`Orchestrator::resolve_via_catalog_fallback`]:
+/// stessi due messaggi, stessa condizione.
+fn log_catalog_fallback_reason(decision_provider: &str, intent: &str) {
+    if decision_provider == "__no_model__" {
+        tracing::warn!(
+            "Agent routing: matrice senza modello per intent={} (provider preferito assente o in cooldown), consulto il catalog tier-aware",
+            intent
+        );
+    } else {
+        tracing::warn!(
+            "Agent routing: '{}' scelto dal routing ma in cooldown, consulto il catalog tier-aware",
+            decision_provider
+        );
+    }
+}
+
+/// Selezione tier-aware su catalog per il fallback di routing.
+///
+/// Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
+/// `agentic_tier_chain`, la STESSA usata da `route_model_from_catalog` e
+/// `select_models_tierchain`. Provider-agnostico: cerca il tier richiesto tra
+/// TUTTI i provider non in cooldown (stessi criteri), e degrada di UN gradino
+/// solo se quel tier e' vuoto. Prima qui c'era una tier-chain hardcoded con
+/// pavimento diverso -> degradazione incoerente tra i percorsi (rimossa).
+///
+/// PUNTO UNICO di selezione agentica (regola L): miglior modello tool-capable
+/// del tier/capability, da un provider NON in cooldown. Ordine allineato a
+/// `route_model_from_catalog` (AGENTIC_COST_FIRST_ORDER): il tier gia'
+/// garantisce la fascia di capacita', dentro il tier si prende il piu' ECONOMICO
+/// (obiettivo costi). I modelli economici problematici sono retrocessi dalla
+/// governance telemetria-aware e dagli esiti dei run, non da un flag
+/// `is_featured` statico.
+async fn select_catalog_fallback_model(
+    db: &PgPool,
+    tier: &str,
+    cap: &str,
+) -> Option<(String, String)> {
+    let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(tier);
+    select_agentic_model(
+        db,
+        &tiers_to_try,
+        Some(cap),
+        0,
+        &[],
+        crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+    )
+    .await
+}
+
+/// Ultima spiaggia del fallback di routing: hierarchy classica (candidates +
+/// default per-provider), raggiunta SOLO se il catalog non ha nulla di sano nel
+/// tier. Se nemmeno qui c'e' un provider fuori cooldown mantiene la sentinella
+/// `__no_model__`, cosi' il chiamante (`resolve_agent_provider_detailed`)
+/// calcola `no_capable_provider` e ferma il run con alert invece di spacciare un
+/// modello fittizio. Estratta da [`Orchestrator::resolve_via_catalog_fallback`].
+fn legacy_hierarchy_fallback(
+    matrix: &crate::routing_matrix::RoutingMatrix,
+    routing: &RoutingConfig,
+    intent: &str,
+    decision_provider: &str,
+) -> (String, String) {
+    let alt = routing
+        .candidates(intent, None)
+        .into_iter()
+        .find(|p| !is_provider_in_cooldown(p))
+        .unwrap_or_else(|| decision_provider.to_string());
+    let alt_model = default_model_for_provider(matrix, &alt).to_string();
+    tracing::warn!(
+        "Agent routing (fallback legacy hierarchy, catalog vuoto): {} → {}/{}",
+        decision_provider,
+        alt,
+        alt_model
+    );
+    (alt, alt_model)
+}
+
+/// Flag DB `agent.require_tool_use_capability` (default `true`) che governa il
+/// gate tool-use. Estratto da [`Orchestrator::apply_tool_use_capability_gate`]:
+/// stesso pattern di lettura settings usato altrove (es.
+/// `agent.model_tool_failure_threshold` in `agent_run.rs`), stessa semantica dei
+/// valori spenti (`false` / `0` / `no`).
+async fn tool_use_gate_enabled(db: &PgPool) -> bool {
+    crate::settings::get_setting(db, "agent.require_tool_use_capability")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            !(t == "false" || t == "0" || t == "no")
+        })
+        .unwrap_or(true)
+}
+
+/// Capability del modello risolto dal catalog: `(supports_tool_use,
+/// agentic_thinking_policy, is_enabled)`. `None` = modello assente (problema di
+/// sync, gestito conservativamente dalla funzione pura `decide_tool_capability_gate`).
+///
+/// `agentic_thinking_policy`: solo `'exclude'` (reasoning-only senza function
+/// calling) va scartato dagli agentici; i dual-mode (deepseek-v4, claude,
+/// gemini-2.5) restano e l'adapter forza il non-thinking (ADR 0025).
+/// `is_enabled`: un modello DISABILITATO (es. legacy pruned dalla mig 0320,
+/// raggiunto via una config di default stale) non e' chiamabile -> va comunque
+/// sostituito su un run agentico (robustezza oltre alla policy).
+async fn fetch_tool_capability_row(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> Option<(bool, String, bool)> {
+    sqlx::query_as::<_, (bool, String, bool)>(
+        "SELECT supports_tool_use, agentic_thinking_policy, is_enabled FROM ai_price_catalog \
+         WHERE provider = $1 AND model = $2 LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Fallback deterministico del gate tool-use: miglior modello tool-capable del
+/// tier (degradazione di tier controllata in `best_model_for_tier`).
+///
+/// RILASSO CAPABILITY (fix incidente UI 2026-06-04): prima prova con la
+/// capability dell'intent (es. "reasoning"); se nessun modello NON-thinking
+/// tool-capable la possiede — caso reale: tutti i modelli con capability
+/// "reasoning" sono is_thinking=true ed esclusi dal gate (mig 0317/0318) —
+/// rilassa la capability e prende il miglior non-thinking tool-capable del tier.
+/// Un modello non-thinking senza quel tag e' comunque MOLTO meglio di un
+/// thinking model che fallirebbe il loop agentico (deepseek-v4-pro ->
+/// reasoning_content 400). Senza questo rilassamento il gate teneva il modello
+/// thinking originale (override/slot), vanificando l'esclusione su tutti i path
+/// che forzano un modello.
+async fn select_tool_capable_fallback(
+    db: &PgPool,
+    tier: &str,
+    capability: &str,
+) -> Option<(String, String)> {
+    match best_model_for_tier(db, tier, Some(capability), true).await {
+        Some(x) => Some(x),
+        None => best_model_for_tier(db, tier, None, true).await,
+    }
+}
+
+/// Blocco "Correzioni note" del prompt composto: `None` quando non c'e' nessuna
+/// correzione con testo. Estratto da `compose_prompt` per contenerne la
+/// lunghezza: formattazione e contenuto del blocco sono invariati.
+fn corrections_section(corrections: &[Value]) -> Option<String> {
+    if corrections.is_empty() {
+        return None;
+    }
+    let mut block = String::from("Correzioni note (da rispettare se pertinenti):\n");
+    for correction in corrections {
+        if let Some(text) = correction.get("text").and_then(Value::as_str) {
+            block.push_str("- ");
+            block.push_str(text.trim());
+            block.push('\n');
+        }
+    }
+    Some(block.trim().to_string())
+}
+
+/// Sezioni allegati del prompt composto (prima i file testuali, poi l'elenco
+/// delle immagini). Estratte da `compose_prompt`: stesso ordine, stessa
+/// formattazione, e nessuna sezione quando non ci sono allegati del tipo.
+fn attachment_sections(attachments: &[ChatAttachment]) -> Vec<String> {
+    let mut sections = Vec::new();
+    if attachments.is_empty() {
+        return sections;
+    }
+    let text_attachments: Vec<_> = attachments
+        .iter()
+        .filter(|a| !a.text_content.is_empty())
+        .collect();
+    let image_attachments: Vec<_> = attachments
+        .iter()
+        .filter(|a| a.base64_content.is_some())
+        .collect();
+    if !text_attachments.is_empty() {
+        let mut block = String::from("Allegati utente per questo messaggio:\n");
+        for attachment in &text_attachments {
+            block.push_str(&format!(
+                "\n### File: {} ({}, {} bytes)\n{}\n",
+                attachment.name,
+                attachment.mime_type,
+                attachment.size_bytes,
+                attachment.text_content
+            ));
+        }
+        sections.push(block.trim().to_string());
+    }
+    if !image_attachments.is_empty() {
+        let names: Vec<_> = image_attachments.iter().map(|a| a.name.as_str()).collect();
+        sections.push(format!("L'utente ha allegato {} immagine/i: {}. Le immagini sono incluse come content block nel messaggio.", names.len(), names.join(", ")));
+    }
+    sections
 }
