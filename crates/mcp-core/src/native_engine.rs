@@ -1912,7 +1912,28 @@ async fn build_native_engine(
             // 695794af col build verde). Misura via il PUNTO UNICO del runner
             // criteri (regola L/M: exit code strutturato). Un comando non
             // misurabile resta senza baseline -> fail-closed come prima.
+            // MUTUA ESCLUSIONE per project_root su baseline+probe (difetto D2,
+            // incidente consiglio 2026-07-15): il probe PIANTA un file rotto
+            // nell'albero e ri-esegue il comando (verify_probe.rs). Con 6 figure
+            // concorrenti sulla STESSA root le misure si corrompevano a vicenda
+            // (A pianta il file, B misura la baseline e vede exit=1; A rimuove,
+            // B misura il probe e lo dichiara Blind). Serializzare qui e' la
+            // correttezza della MISURA, non una preferenza: due misure
+            // sovrapposte sullo stesso albero non misurano niente.
+            // Il guard e' per ROOT (non per progetto): e' l'albero la risorsa
+            // condivisa. Chi arriva dopo trova baseline/probe gia' persistiti e
+            // salta (i filtri `is_none()` sotto).
+            let _tree_guard = if role.is_shadow() {
+                None
+            } else {
+                let lock = crate::verify_profile::project_tree_lock(&root);
+                Some(lock.lock_owned().await)
+            };
             if !role.is_shadow() {
+                // Ri-lettura DOPO il guard: un'altra figura potrebbe aver
+                // misurato mentre attendevamo (doppio controllo, stesso pattern
+                // di project_meta_pool_core).
+                steps = crate::verify_profile::profile_steps(&db, pid).await;
                 let mut measured = false;
                 for s in steps
                     .iter_mut()

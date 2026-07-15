@@ -287,6 +287,58 @@ async fn infer_call(
     nexus_types::llm_json::extract_json_block(text)
 }
 
+/// Single-flight per `project_id` di [`ensure_profile`] (regola L, stessa forma
+/// di `PROVISION_LOCKS` in `project_db_routes::provision`).
+///
+/// Perche' esiste (incidente consiglio 2026-07-15, difetto D1 PROVATO): il
+/// consiglio convoca 6 figure che entrano CONTEMPORANEAMENTE in `run_native`,
+/// e ognuna chiamava `ensure_profile` sullo STESSO progetto -> fino a 6
+/// inferenze LLM IDENTICHE e duplicate (2 chiamate ciascuna: scelta file +
+/// catena), tutte in volo insieme. E' il lavoro che occupava la finestra dei
+/// ~119s prima che le figure arrivassero al loro modello.
+///
+/// Il guard e' un `tokio::sync::Mutex` per progetto (mai attraverso un lock
+/// sincrono tenuto su un `.await`): il PRIMO arrivato infersce, gli altri
+/// attendono e poi ri-leggono il PERSISTITO — che a quel punto e' fresco, e
+/// l'hash deterministico del passo 2 li fa ritornare subito senza LLM. Cosi'
+/// il risultato e' CONDIVISO invece che ricalcolato (il piano avverte: un lock
+/// che serializza N inferenze invece di condividerne una sarebbe solo un altro
+/// difetto).
+static PROFILE_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Guard single-flight per `project_id`.
+fn profile_lock(project_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut map = PROFILE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.entry(project_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Guard di MUTUA ESCLUSIONE sull'ALBERO di un progetto (difetto D2, incidente
+/// consiglio 2026-07-15). Chi misura la baseline o esegue la prova di efficacia
+/// (`verify_probe::probe_step`, che PIANTA un file sintetico rotto nel working
+/// tree e ri-esegue il comando) deve averlo in esclusiva: due misure
+/// sovrapposte sullo stesso albero si corrompono a vicenda e producono
+/// `Blind`/`Discriminating` casuali. La chiave e' la ROOT (la risorsa
+/// condivisa e' l'albero, non la riga di progetto).
+static TREE_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Guard esclusivo dell'albero `root` (vedi [`TREE_LOCKS`]).
+pub(crate) fn project_tree_lock(root: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut map = TREE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.entry(root.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Garantisce un profilo di verifica AGGIORNATO per il progetto e ne ritorna
 /// gli step. Flusso:
 ///   1. kill-switch `agent.verify_infer.enabled`;
@@ -297,7 +349,23 @@ async fn infer_call(
 ///   5. validazione safety + persistenza (steps + observed_files + hash).
 /// Best-effort: ogni errore ritorna gli step correnti (anche stale) o vuoto,
 /// con WARN — il final_gate degrada alla rete statica, mai un blocco del run.
+///
+/// SINGLE-FLIGHT per progetto (vedi [`PROFILE_LOCKS`]): N chiamanti concorrenti
+/// producono UNA sola inferenza; i successivi ritrovano il profilo fresco e
+/// ritornano al passo 2 senza chiamare l'LLM.
 pub async fn ensure_profile(
+    meta_db: &PgPool,
+    neural: &NeuralCoreClient,
+    project_id: Uuid,
+    root: &Path,
+) -> Vec<VerifyProfileStep> {
+    let lock = profile_lock(project_id);
+    let _guard = lock.lock().await;
+    ensure_profile_locked(meta_db, neural, project_id, root).await
+}
+
+/// Corpo di [`ensure_profile`], gia' sotto il guard single-flight del progetto.
+async fn ensure_profile_locked(
     meta_db: &PgPool,
     neural: &NeuralCoreClient,
     project_id: Uuid,
@@ -585,5 +653,83 @@ mod tests {
         );
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, "a.json");
+    }
+
+    // ── Single-flight (difetto D1, incidente consiglio 2026-07-15) ───────────
+
+    /// Il guard e' PER PROGETTO: due progetti diversi non si serializzano
+    /// (altrimenti il single-flight diventerebbe un collo di bottiglia globale).
+    #[test]
+    fn profile_lock_e_per_progetto() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(
+            std::sync::Arc::ptr_eq(&profile_lock(a), &profile_lock(a)),
+            "stesso progetto -> STESSO guard (altrimenti niente single-flight)"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&profile_lock(a), &profile_lock(b)),
+            "progetti diversi -> guard diversi (nessuna serializzazione globale)"
+        );
+    }
+
+    /// EFFETTO del single-flight: N chiamanti concorrenti sullo stesso progetto
+    /// producono UNA sola sezione critica alla volta, e il secondo entra solo
+    /// dopo che il primo ha finito (nel path reale: trova il profilo persistito
+    /// e ritorna senza inferenza). Il test misura la MUTUA ESCLUSIONE, non la
+    /// presenza del lock: un contatore di ingressi concorrenti che superi 1
+    /// significherebbe inferenze duplicate — il difetto D1.
+    #[tokio::test]
+    async fn single_flight_serializza_i_concorrenti_dello_stesso_progetto() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let pid = Uuid::new_v4();
+        let dentro = Arc::new(AtomicUsize::new(0));
+        let max_visti = Arc::new(AtomicUsize::new(0));
+        let ingressi = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let (dentro, max_visti, ingressi) =
+                (dentro.clone(), max_visti.clone(), ingressi.clone());
+            handles.push(tokio::spawn(async move {
+                let lock = profile_lock(pid);
+                let _g = lock.lock().await;
+                ingressi.fetch_add(1, Ordering::SeqCst);
+                let ora = dentro.fetch_add(1, Ordering::SeqCst) + 1;
+                max_visti.fetch_max(ora, Ordering::SeqCst);
+                // Simula l'inferenza LLM (nel path reale: ~secondi).
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                dentro.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.expect("task");
+        }
+        assert_eq!(
+            max_visti.load(Ordering::SeqCst),
+            1,
+            "MAI due inferenze dello stesso progetto in volo insieme (D1: erano 6)"
+        );
+        assert_eq!(ingressi.load(Ordering::SeqCst), 6, "tutti devono passare");
+    }
+
+    /// Il guard dell'ALBERO (difetto D2) e' per ROOT: la risorsa condivisa e'
+    /// il working tree su cui il probe pianta il file sintetico.
+    #[test]
+    fn tree_lock_e_per_root() {
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &project_tree_lock("D:/progetti/alfa"),
+                &project_tree_lock("D:/progetti/alfa")
+            ),
+            "stessa root -> stesso guard (il probe muta l'albero: esclusione)"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(
+                &project_tree_lock("D:/progetti/alfa"),
+                &project_tree_lock("D:/progetti/beta")
+            ),
+            "root diverse -> guard diversi"
+        );
     }
 }
