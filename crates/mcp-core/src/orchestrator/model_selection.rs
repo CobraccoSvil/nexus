@@ -450,6 +450,19 @@ pub(crate) async fn select_models_tierchain(
             return Ok(rows);
         }
     }
+    if filter.require_qualified {
+        // Pool VUOTO col gate acceso: il sintomo giusto e' "il gate non ha
+        // candidati provati" (es. worker di qualificazione fermo, batteria
+        // troppo severa, qualificazioni scadute in massa), non un generico
+        // "nessun modello". Fail-closed VOLUTO (design gate, regola G): il
+        // chiamante gestisce il None; qui il log dice DOVE guardare.
+        tracing::warn!(
+            capability = filter.capability.unwrap_or("-"),
+            "gate qualificazione: NESSUN modello 'qualified' non scaduto per il \
+             filtro richiesto — verificare il worker di qualificazione \
+             (agent.model_qualification.*) e ai_model_probe_evidence"
+        );
+    }
     Ok(Vec::new())
 }
 

@@ -217,6 +217,59 @@ pub(crate) struct Derived {
     pub state: DerivedState,
     pub qualified_capabilities: Vec<String>,
     pub reason: String,
+    /// Policy thinking DERIVATA dalla `thinking_matrix` (fase 5):
+    /// `Some((agentic_thinking_policy, uses_thinking_mode))`. `None` = matrice
+    /// non eseguita o inconclusiva: la policy del catalog resta invariata.
+    pub thinking: Option<(&'static str, bool)>,
+}
+
+/// Esito AGGREGATO di una configurazione della thinking_matrix (fase 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigOutcome {
+    Pass,
+    FailConclusive,
+    Inconclusive,
+}
+
+impl ConfigOutcome {
+    fn from_run(run: &ProfileRun) -> Self {
+        if run.passed() {
+            Self::Pass
+        } else if run.conclusive_fails > 0 {
+            Self::FailConclusive
+        } else {
+            Self::Inconclusive
+        }
+    }
+}
+
+/// PUNTO UNICO PURO (regola L) della matrice thinking (fase 5 del design):
+/// DERIVA `agentic_thinking_policy` dai FATTI osservati (il modello lavora con
+/// thinking spento? acceso?) invece di dichiararla a mano — era il campo che
+/// nessuno verificava (GAP-5: glm dichiarato reasoning con policy 'none' inerte).
+///
+/// | off  | native | -> policy (uses_thinking_mode)                |
+/// |------|--------|-----------------------------------------------|
+/// | PASS | PASS   | none (il thinking non serve: piu' economico)  |
+/// | PASS | FAIL   | disable_for_tools (dual-mode: spegni nei tool)|
+/// | FAIL | PASS   | native, uses=true (rifiuta thinking spento)   |
+/// | FAIL | FAIL   | exclude (non regge il carico in nessun modo)  |
+///
+/// Qualunque esito inconclusivo -> `None`: nessuna scrittura (mai derivare una
+/// policy da un giro non attribuibile al modello, regola H). Match esaustivo:
+/// un esito nuovo non compila finche' non ne dichiara la semantica.
+pub(crate) fn derive_thinking_policy(
+    off: ConfigOutcome,
+    native: ConfigOutcome,
+) -> Option<(&'static str, bool)> {
+    use ConfigOutcome::*;
+    match (off, native) {
+        (Pass, Pass) => Some(("none", false)),
+        (Pass, FailConclusive) => Some(("disable_for_tools", false)),
+        (FailConclusive, Pass) => Some(("native", true)),
+        (FailConclusive, FailConclusive) => Some(("exclude", false)),
+        (Inconclusive, _) | (_, Inconclusive) => None,
+    }
 }
 
 /// PUNTO UNICO PURO (regola L): l'evidenza diventa stato + capability PROVATE.
@@ -233,6 +286,7 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
                     r.profile_key,
                     r.first_fail_reason.as_deref().unwrap_or("failed")
                 ),
+                thinking: None,
             };
         }
     }
@@ -243,6 +297,7 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
             state: DerivedState::Inconclusive,
             qualified_capabilities: Vec::new(),
             reason: "inconclusive_round".into(),
+            thinking: None,
         };
     }
     // Batteria superata: il PROVATO = unione dei grants dei profili passati,
@@ -264,6 +319,7 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
         state: DerivedState::Qualified,
         qualified_capabilities: caps,
         reason: "suite_passed".into(),
+        thinking: None,
     }
 }
 
@@ -343,7 +399,7 @@ async fn build_profile_request(
             "Sei in una verifica di raggiungibilita'. Rispondi in modo conciso.".to_string(),
         )),
         "tool_minimal" => Ok(crate::model_health_probe::build_tool_probe_request()),
-        "tool_realistic" => {
+        "tool_realistic" | "thinking_matrix" => {
             let tool_names: Vec<String> = profile
                 .payload
                 .get("tool_names")
@@ -460,6 +516,108 @@ async fn insert_evidence(
     .ok()
 }
 
+/// Esegue `repeat` tentativi di UNA richiesta di profilo con configurazione
+/// thinking opzionale e aggrega l'esito. `label` distingue le configurazioni
+/// della thinking_matrix nell'evidence (prefisso del verdict_reason); vuoto
+/// per i profili ordinari. Punto unico del ciclo tentativo->evidence (regola L).
+#[allow(clippy::too_many_arguments)]
+async fn run_profile_attempts(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    profile: &ProbeProfile,
+    request: &(String, String, String),
+    repeat: u32,
+    timeout_s: u64,
+    max_tokens: u32,
+    promote_min: u32,
+    thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+    label: &str,
+    last_evidence: &mut Option<i64>,
+) -> ProfileRun {
+    let (tools_json, messages_json, system_text) = request;
+    let mut run = ProfileRun {
+        profile_key: profile.profile_key.clone(),
+        grants: profile.grants.clone(),
+        is_blocking: profile.is_blocking,
+        passes: 0,
+        conclusive_fails: 0,
+        inconclusive: 0,
+        promote_min,
+        first_fail_reason: None,
+    };
+    for attempt in 1..=repeat {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(timeout_s),
+            orchestrator.neural.generate_agent_turn_with_thinking(
+                provider,
+                model,
+                messages_json,
+                tools_json,
+                max_tokens,
+                system_text,
+                thinking.clone(),
+            ),
+        )
+        .await;
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let mut outcome = match result {
+            Ok(Ok(turn)) => evaluate_attempt(&turn, &profile.pass_predicate, latency_ms),
+            Ok(Err(e)) => {
+                // Errore di chiamata: classifica via error_class canonico
+                // (punto unico del classifier).
+                let ec = orchestrator
+                    .neural
+                    .classify_error(&e.to_string(), provider)
+                    .await;
+                evaluate_attempt(
+                    &json!({ "error_class": ec }),
+                    &profile.pass_predicate,
+                    latency_ms,
+                )
+            }
+            Err(_elapsed) => AttemptOutcome {
+                pass: false,
+                inconclusive: true,
+                reason: format!("probe_timeout:{timeout_s}s"),
+                error_class: None,
+                tool_call_count: 0,
+                content_chars: 0,
+                stop_reason: String::new(),
+            },
+        };
+        if !label.is_empty() {
+            outcome.reason = format!("{label}{}", outcome.reason);
+        }
+        if let Some(id) = insert_evidence(
+            db,
+            provider,
+            model,
+            profile,
+            attempt as i32,
+            latency_ms,
+            &outcome,
+        )
+        .await
+        {
+            *last_evidence = Some(id);
+        }
+        if outcome.inconclusive {
+            run.inconclusive += 1;
+        } else if outcome.pass {
+            run.passes += 1;
+        } else {
+            run.conclusive_fails += 1;
+            if run.first_fail_reason.is_none() {
+                run.first_fail_reason = Some(outcome.reason.clone());
+            }
+        }
+    }
+    run
+}
+
 /// Esegue la batteria su UN modello candidato (gia' claimato `probing`).
 /// Ritorna (Derived, ultimo evidence id).
 async fn qualify_one(
@@ -472,6 +630,7 @@ async fn qualify_one(
 ) -> (Derived, Option<i64>) {
     let mut runs: Vec<ProfileRun> = Vec::new();
     let mut last_evidence: Option<i64> = None;
+    let mut thinking_derived: Option<(&'static str, bool)> = None;
     for profile in profiles.iter().filter(|p| profile_applies(p, declared)) {
         let repeat = profile
             .payload
@@ -498,18 +657,7 @@ async fn qualify_one(
             .map(|n| n.clamp(1, repeat as i64) as u32)
             .unwrap_or(repeat);
 
-        let mut run = ProfileRun {
-            profile_key: profile.profile_key.clone(),
-            grants: profile.grants.clone(),
-            is_blocking: profile.is_blocking,
-            passes: 0,
-            conclusive_fails: 0,
-            inconclusive: 0,
-            promote_min,
-            first_fail_reason: None,
-        };
-        let request = build_profile_request(db, profile).await;
-        match request {
+        let request = match build_profile_request(db, profile).await {
             Err(reason) => {
                 // Profilo non costruibile: giro inconclusivo VISIBILE.
                 tracing::warn!(
@@ -519,79 +667,94 @@ async fn qualify_one(
                     reason = %reason,
                     "model_qualification: profilo non costruibile -> inconclusivo"
                 );
-                run.inconclusive = repeat;
-                runs.push(run);
+                runs.push(ProfileRun {
+                    profile_key: profile.profile_key.clone(),
+                    grants: profile.grants.clone(),
+                    is_blocking: profile.is_blocking,
+                    passes: 0,
+                    conclusive_fails: 0,
+                    inconclusive: repeat,
+                    promote_min,
+                    first_fail_reason: None,
+                });
                 continue;
             }
-            Ok((tools_json, messages_json, system_text)) => {
-                for attempt in 1..=repeat {
-                    let started = std::time::Instant::now();
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(timeout_s),
-                        orchestrator.neural.generate_agent_turn(
-                            provider,
-                            model,
-                            &messages_json,
-                            &tools_json,
-                            max_tokens,
-                            &system_text,
-                        ),
-                    )
-                    .await;
-                    let latency_ms = started.elapsed().as_millis() as i64;
-                    let outcome = match result {
-                        Ok(Ok(turn)) => {
-                            evaluate_attempt(&turn, &profile.pass_predicate, latency_ms)
-                        }
-                        Ok(Err(e)) => {
-                            // Errore di chiamata: classifica via error_class
-                            // canonico (punto unico del classifier).
-                            let ec = orchestrator
-                                .neural
-                                .classify_error(&e.to_string(), provider)
-                                .await;
-                            evaluate_attempt(
-                                &json!({ "error_class": ec }),
-                                &profile.pass_predicate,
-                                latency_ms,
-                            )
-                        }
-                        Err(_elapsed) => AttemptOutcome {
-                            pass: false,
-                            inconclusive: true,
-                            reason: format!("probe_timeout:{timeout_s}s"),
-                            error_class: None,
-                            tool_call_count: 0,
-                            content_chars: 0,
-                            stop_reason: String::new(),
-                        },
-                    };
-                    if let Some(id) = insert_evidence(
-                        db,
-                        provider,
-                        model,
-                        profile,
-                        attempt as i32,
-                        latency_ms,
-                        &outcome,
-                    )
-                    .await
-                    {
-                        last_evidence = Some(id);
-                    }
-                    if outcome.inconclusive {
-                        run.inconclusive += 1;
-                    } else if outcome.pass {
-                        run.passes += 1;
-                    } else {
-                        run.conclusive_fails += 1;
-                        if run.first_fail_reason.is_none() {
-                            run.first_fail_reason = Some(outcome.reason.clone());
-                        }
-                    }
-                }
-            }
+            Ok(r) => r,
+        };
+        if profile.kind == "thinking_matrix" {
+            // FASE 5: la matrice PROVA il modello in DUE configurazioni thinking
+            // esplicite (off e native) e DERIVA agentic_thinking_policy dai
+            // fatti — mai ereditare la policy del catalog che stiamo derivando.
+            let budget = profile
+                .payload
+                .get("thinking_budget_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(2048)
+                .clamp(256, 32768) as u32;
+            let off = run_profile_attempts(
+                orchestrator,
+                db,
+                provider,
+                model,
+                profile,
+                &request,
+                repeat,
+                timeout_s,
+                max_tokens,
+                promote_min,
+                Some(crate::nexus_gateway::GwThinkingConfig {
+                    enabled: false,
+                    budget_tokens: None,
+                    mandatory: false,
+                }),
+                "off:",
+                &mut last_evidence,
+            )
+            .await;
+            let native = run_profile_attempts(
+                orchestrator,
+                db,
+                provider,
+                model,
+                profile,
+                &request,
+                repeat,
+                timeout_s,
+                max_tokens,
+                promote_min,
+                Some(crate::nexus_gateway::GwThinkingConfig {
+                    enabled: true,
+                    budget_tokens: Some(budget),
+                    mandatory: true,
+                }),
+                "native:",
+                &mut last_evidence,
+            )
+            .await;
+            thinking_derived = derive_thinking_policy(
+                ConfigOutcome::from_run(&off),
+                ConfigOutcome::from_run(&native),
+            );
+            runs.push(off);
+            runs.push(native);
+            continue;
         }
+        let run = run_profile_attempts(
+            orchestrator,
+            db,
+            provider,
+            model,
+            profile,
+            &request,
+            repeat,
+            timeout_s,
+            max_tokens,
+            promote_min,
+            None,
+            "",
+            &mut last_evidence,
+        )
+        .await;
         let blocking_conclusive_fail = run.is_blocking && !run.passed() && run.conclusive_fails > 0;
         runs.push(run);
         if blocking_conclusive_fail {
@@ -599,7 +762,9 @@ async fn qualify_one(
             break;
         }
     }
-    (derive_capabilities(declared, &runs), last_evidence)
+    let mut derived = derive_capabilities(declared, &runs);
+    derived.thinking = thinking_derived;
+    (derived, last_evidence)
 }
 
 /// Scrive lo stato derivato sulla riga (writer UNICO della promozione).
@@ -615,6 +780,13 @@ async fn apply_derived(
 ) {
     let res = match derived.state {
         DerivedState::Qualified => {
+            // Policy thinking DERIVATA dalla matrice (fase 5): scritta solo se
+            // presente e MAI sopra una curatela (capability_locked). Il trigger
+            // di invalidazione (0591) non scatta: NEW.capability_source='probe'.
+            let (policy, uses_thinking): (Option<&str>, Option<bool>) = match derived.thinking {
+                Some((p, u)) => (Some(p), Some(u)),
+                None => (None, None),
+            };
             sqlx::query(
                 "UPDATE ai_price_catalog SET \
                      qualification_state = 'qualified', \
@@ -625,6 +797,12 @@ async fn apply_derived(
                      qualification_suite_version = $5, \
                      qualification_reason = $6, \
                      qualification_evidence_id = $7, \
+                     agentic_thinking_policy = CASE \
+                         WHEN capability_locked THEN agentic_thinking_policy \
+                         ELSE COALESCE($8, agentic_thinking_policy) END, \
+                     uses_thinking_mode = CASE \
+                         WHEN capability_locked THEN uses_thinking_mode \
+                         ELSE COALESCE($9, uses_thinking_mode) END, \
                      qualification_started_at = NULL, \
                      qualification_attempts = 0, \
                      qualification_backoff_until = NULL \
@@ -637,6 +815,8 @@ async fn apply_derived(
             .bind(profiles_suite)
             .bind(&derived.reason)
             .bind(evidence_id)
+            .bind(policy)
+            .bind(uses_thinking)
             .execute(db)
             .await
         }
@@ -665,7 +845,9 @@ async fn apply_derived(
         DerivedState::Inconclusive => {
             sqlx::query(
                 "UPDATE ai_price_catalog SET \
-                     qualification_state = 'unqualified', \
+                     qualification_state = CASE \
+                         WHEN qualification_state = 'qualified' THEN 'qualified' \
+                         ELSE 'unqualified' END, \
                      qualification_reason = $3, \
                      qualification_started_at = NULL, \
                      qualification_attempts = qualification_attempts + 1, \
@@ -721,17 +903,25 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
     }
     let suite_version = profiles.iter().map(|p| p.suite_version).max().unwrap_or(1);
 
+    // Claim CAS. I candidati GIA' qualified (scaduti o con suite vecchia) sono
+    // ri-provati IN SHADOW: lo state resta 'qualified' (il pool non si svuota
+    // durante la ri-qualificazione); il lock del claim e' qualification_started_at
+    // (stantio oltre STALE_PROBING_MINUTES = worker morto, riclaimabile).
     let claimed: Vec<(String, String, Value)> = sqlx::query_as(
         "UPDATE ai_price_catalog c SET \
-             qualification_state = 'probing', qualification_started_at = NOW() \
+             qualification_state = CASE WHEN c.qualification_state = 'qualified' \
+                                        THEN 'qualified' ELSE 'probing' END, \
+             qualification_started_at = NOW() \
          FROM ( \
              SELECT provider, model FROM ai_price_catalog \
               WHERE is_enabled = TRUE AND supports_tool_use = TRUE \
                 AND (qualification_backoff_until IS NULL OR qualification_backoff_until < NOW()) \
-                AND (qualification_state IN ('unqualified','quarantined') \
-                     OR (qualification_state = 'qualified' AND qualification_expires_at < NOW()) \
-                     OR (qualification_state = 'probing' \
-                         AND qualification_started_at < NOW() - make_interval(mins => $2::int))) \
+                AND (qualification_started_at IS NULL \
+                     OR qualification_started_at < NOW() - make_interval(mins => $2::int)) \
+                AND (qualification_state IN ('unqualified','quarantined','probing') \
+                     OR (qualification_state = 'qualified' \
+                         AND (qualification_expires_at < NOW() \
+                              OR qualification_suite_version < $3))) \
               ORDER BY (qualification_state = 'unqualified') DESC, \
                        qualification_expires_at ASC NULLS FIRST \
               LIMIT $1 \
@@ -742,6 +932,7 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
     )
     .bind(max_per_round)
     .bind(STALE_PROBING_MINUTES as i32)
+    .bind(suite_version)
     .fetch_all(db)
     .await
     .unwrap_or_else(|e| {
@@ -769,6 +960,7 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
                     state: DerivedState::Inconclusive,
                     qualified_capabilities: Vec::new(),
                     reason: "provider_in_cooldown".into(),
+                    thinking: None,
                 },
                 None,
                 ttl_days,
@@ -981,5 +1173,52 @@ mod tests {
         let out = evaluate_attempt(&turn, &json!({"min_tool_calls": 1, "max_latency_ms": 30000}), 45000);
         assert!(!out.pass);
         assert!(out.reason.starts_with("latency:"));
+    }
+
+    // ── thinking_matrix (fase 5): la policy DERIVATA dai fatti ───────────────
+
+    #[test]
+    fn matrice_thinking_deriva_le_quattro_policy() {
+        use ConfigOutcome::*;
+        // Il modello lavora in entrambe le modalita': niente thinking (economia).
+        assert_eq!(derive_thinking_policy(Pass, Pass), Some(("none", false)));
+        // Dual-mode che degenera col thinking sotto tool: spegnilo nei tool-loop.
+        assert_eq!(
+            derive_thinking_policy(Pass, FailConclusive),
+            Some(("disable_for_tools", false))
+        );
+        // Il caso gemini-3 (rifiuta thinkingBudget=0): thinking OBBLIGATORIO.
+        assert_eq!(
+            derive_thinking_policy(FailConclusive, Pass),
+            Some(("native", true))
+        );
+        // Non regge il carico agentico in NESSUNA configurazione: fuori.
+        assert_eq!(
+            derive_thinking_policy(FailConclusive, FailConclusive),
+            Some(("exclude", false))
+        );
+    }
+
+    #[test]
+    fn matrice_inconclusiva_non_scrive_policy() {
+        use ConfigOutcome::*;
+        // Qualunque lato inconclusivo -> nessuna scrittura (mai derivare una
+        // policy da un giro non attribuibile al modello).
+        assert_eq!(derive_thinking_policy(Inconclusive, Pass), None);
+        assert_eq!(derive_thinking_policy(Pass, Inconclusive), None);
+        assert_eq!(derive_thinking_policy(Inconclusive, FailConclusive), None);
+        assert_eq!(derive_thinking_policy(Inconclusive, Inconclusive), None);
+    }
+
+    #[test]
+    fn config_outcome_da_profile_run() {
+        // passes >= promote_min -> Pass; fail conclusivi -> FailConclusive;
+        // solo inconclusivi -> Inconclusive.
+        let pass = profile_run("m", &[], false, 2, 0, 0, 2, None);
+        assert_eq!(ConfigOutcome::from_run(&pass), ConfigOutcome::Pass);
+        let fail = profile_run("m", &[], false, 1, 1, 0, 2, Some("empty"));
+        assert_eq!(ConfigOutcome::from_run(&fail), ConfigOutcome::FailConclusive);
+        let inc = profile_run("m", &[], false, 1, 0, 1, 2, None);
+        assert_eq!(ConfigOutcome::from_run(&inc), ConfigOutcome::Inconclusive);
     }
 }

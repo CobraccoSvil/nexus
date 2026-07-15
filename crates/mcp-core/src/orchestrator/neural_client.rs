@@ -199,6 +199,35 @@ impl NeuralCoreClient {
         max_tokens: u32,
         system_text: &str,
     ) -> anyhow::Result<Value> {
+        self.generate_agent_turn_with_thinking(
+            provider,
+            model,
+            messages_json,
+            tools_json,
+            max_tokens,
+            system_text,
+            None,
+        )
+        .await
+    }
+
+    /// Variante di [`Self::generate_agent_turn`] con configurazione THINKING
+    /// esplicita (punto unico interno, regola L: i call site storici delegano
+    /// con `None` = comportamento DB-driven del gateway invariato). Usata dalla
+    /// `thinking_matrix` del qualificatore (fase 5): la matrice deve PROVARE il
+    /// modello con thinking off e on, non ereditare la policy del catalog che
+    /// sta proprio cercando di derivare.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_agent_turn_with_thinking(
+        &self,
+        provider: &str,
+        model: &str,
+        messages_json: &str,
+        tools_json: &str,
+        max_tokens: u32,
+        system_text: &str,
+        thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+    ) -> anyhow::Result<Value> {
         let gw = self.gateway().await?;
 
         // Messaggi grezzi -> GwMessage. I call site passano sempre
@@ -251,6 +280,7 @@ impl NeuralCoreClient {
             max_tokens: Some(max_tokens),
             tools,
             pin_provider: Some(provider.to_string()),
+            thinking,
             metadata: GwMetadata {
                 feature: "neural_agent_turn".to_string(),
                 ..Default::default()
