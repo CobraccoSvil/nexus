@@ -321,6 +321,148 @@ pub(crate) fn derive_thinking_policy(
     }
 }
 
+/// I fatti del catalog su cui il PRIOR puo' esprimersi. Sono i dati che il
+/// FORNITORE dichiara (prezzo, finestra) piu' le capability gia' PROVATE dalla
+/// batteria — mai il nome del modello.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CatalogFacts {
+    /// $/M token in input. `None` se il listino non lo dichiara (pricing_state
+    /// 'unknown'): un costo 0 non raffinato NON e' "gratis", e' "non lo so".
+    pub input_cost: Option<f64>,
+    pub context_window: i64,
+    /// Capability gia' PROVATE dalla batteria (`qualified_capabilities`), non
+    /// quelle dichiarate: il prior non si fida della parola del catalog.
+    pub proven_capabilities: Vec<String>,
+}
+
+/// Le soglie del prior, dal DB (regola G, mig 0599).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TierPriorThresholds {
+    pub frontier_min_input_cost: f64,
+    pub heavy_min_input_cost: f64,
+    pub high_min_input_cost: f64,
+    pub long_context_tokens: i64,
+}
+
+/// TIER DAI FATTI DICHIARATI (`facts_prior`). PURA.
+///
+/// E' un RIPIEGO ONESTO in attesa della misura, non una verita': appena la
+/// batteria certifica una banda, `measured` lo sostituisce. Ma e' fondato su
+/// DATI (quello che il fornitore dichiara col listino, e quello che la batteria
+/// ha gia' provato) invece che sul NOME — che e' scorrelato dalla capacita':
+/// misurato sugli indici reali, il token `mini` copre intelligence 6.8-50.2
+/// (spread 43.4) e `-pro` 14.1-46.5. Un `mini` puo' valere piu' di un `pro`.
+///
+/// Il prezzo e' il segnale piu' informativo che il fornitore emette: e' LUI a
+/// posizionare il modello nel proprio listino, e lo fa col denaro — non con un
+/// aggettivo nel nome. Non e' una misura di capacita' (un modello caro puo'
+/// essere scarso), per questo il prior cede il passo alla prima banda misurata.
+///
+/// `None` = nessun fatto utile: il tier resta NULL e il sistema DICE che non lo
+/// sa, invece di scrivere 'medium' e far finta (regola G: niente fallback
+/// magico). Un tier NULL non e' pericoloso: col gate acceso un modello non
+/// qualificato e' gia' fuori dal pool agentico, e resta solo candidato di ultima
+/// istanza del failover (che non filtra per tier).
+pub(crate) fn derive_tier_prior(
+    facts: &CatalogFacts,
+    t: &TierPriorThresholds,
+) -> Option<&'static str> {
+    // Senza prezzo dichiarato il prior non si esprime: `pricing_state='unknown'`
+    // significa "placeholder", non "gratis". Dedurre 'light' da un costo 0 non
+    // raffinato sarebbe la stessa bugia del nome, con un'altra faccia.
+    let cost = facts.input_cost?;
+    if cost <= 0.0 {
+        return None;
+    }
+    let base = if cost >= t.frontier_min_input_cost {
+        "frontier"
+    } else if cost >= t.heavy_min_input_cost {
+        "heavy"
+    } else if cost >= t.high_min_input_cost {
+        "high"
+    } else {
+        "light"
+    };
+    // La finestra lunga alza di UN gradino, mai oltre 'heavy': una finestra
+    // grande e' un fatto dichiarato dal fornitore, NON una prova che il modello
+    // la sappia usare — quella la da' solo il probe `agentic_longctx`. Promuovere
+    // a 'frontier' per la sola finestra sarebbe tornare a credere alle etichette.
+    let with_ctx = if facts.context_window >= t.long_context_tokens {
+        match base {
+            "light" => "medium",
+            "high" => "heavy",
+            other => other,
+        }
+    } else {
+        base
+    };
+    // Il reasoning PROVATO (non dichiarato) alza di un gradino fino a 'heavy':
+    // e' l'unico segnale del prior che viene da una misura nostra.
+    let with_reasoning = if facts
+        .proven_capabilities
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("reasoning"))
+    {
+        match with_ctx {
+            "light" => "medium",
+            "medium" => "high",
+            other => other,
+        }
+    } else {
+        with_ctx
+    };
+    Some(with_reasoning)
+}
+
+/// TIER MISURATO (`measured`): la banda PIU' ALTA certificata dalla batteria.
+/// PURA.
+///
+/// Criterion-referenced: ogni banda chiede una capacita' che la precedente non
+/// ha dimostrato (`high` concatena tool con dipendenza, `heavy` recupera da un
+/// errore strutturato, `frontier` regge 100k con retrieval verificabile). Un
+/// `heavy` ha FATTO qualcosa che un `medium` non ha fatto, e l'evidenza sta nella
+/// riga di `ai_model_probe_evidence`.
+///
+/// ISTERESI (il meccanismo esisteva gia' nel vocabolario dei predicati, mig 0593:
+/// `promote_min_passes` > `hold_min_passes`; qui viene applicato al TIER):
+///   - si PROMUOVE con `promote_min` pass su K;
+///   - si MANTIENE la banda gia' acquisita con `hold_min` (soglia piu' bassa);
+///   - si RETROCEDE solo sotto `hold_min` E con fallimenti CONCLUSIVI.
+/// Il gap fra le due soglie E' l'isteresi: senza, un modello oscillerebbe di
+/// fascia a ogni riqualifica e destabilizzerebbe il routing.
+///
+/// Un esito INCONCLUSIVO non declassa mai (regola H: un transiente non e' colpa
+/// del modello). Overlap = pareggio: la riclassificazione ha bisogno di evidenza,
+/// la conservazione no.
+///
+/// `current` = il tier gia' acquisito (per l'isteresi). `None` -> nessuna banda
+/// certificata: il chiamante ricade sul prior.
+pub(crate) fn derive_tier_measured(
+    runs: &[(ProfileRun, Option<String>)],
+    current: Option<&str>,
+    hold_min: u32,
+) -> Option<String> {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let mut migliore: Option<&str> = None;
+    for (run, certifies) in runs {
+        let Some(banda) = certifies.as_deref() else {
+            continue; // il profilo non certifica un tier (es. tool_smoke)
+        };
+        let acquisita = current.is_some_and(|c| tier_rank(banda) <= tier_rank(c));
+        // Soglia asimmetrica: piu' bassa per CONSERVARE una banda gia' acquisita,
+        // piu' alta per conquistarne una nuova.
+        let soglia = if acquisita {
+            hold_min.min(run.promote_min)
+        } else {
+            run.promote_min
+        };
+        if run.passes >= soglia && migliore.is_none_or(|m| tier_rank(banda) > tier_rank(m)) {
+            migliore = Some(banda);
+        }
+    }
+    migliore.map(str::to_string)
+}
+
 /// PUNTO UNICO PURO (regola L): l'evidenza diventa stato + capability PROVATE.
 /// `declared` = jsonb `capabilities` della riga (il dichiarato).
 pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> Derived {
@@ -1393,5 +1535,120 @@ mod tests {
         assert_eq!(ConfigOutcome::from_run(&fail), ConfigOutcome::FailConclusive);
         let inc = profile_run("m", &[], false, 1, 0, 1, 2, None);
         assert_eq!(ConfigOutcome::from_run(&inc), ConfigOutcome::Inconclusive);
+    }
+    fn soglie() -> TierPriorThresholds {
+        // I valori del seed (mig 0599).
+        TierPriorThresholds {
+            frontier_min_input_cost: 8.0,
+            heavy_min_input_cost: 2.0,
+            high_min_input_cost: 0.5,
+            long_context_tokens: 200_000,
+        }
+    }
+
+    fn fatti(cost: Option<f64>, ctx: i64, proven: &[&str]) -> CatalogFacts {
+        CatalogFacts {
+            input_cost: cost,
+            context_window: ctx,
+            proven_capabilities: proven.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Il prior NON si esprime senza fatti: meglio NULL che una bugia.
+    /// E' la differenza fra "non lo so" e "e' medium", che il DEFAULT 'medium'
+    /// (rimosso dalla mig 0599) rendeva indistinguibili.
+    #[test]
+    fn il_prior_tace_se_non_ha_fatti() {
+        assert_eq!(derive_tier_prior(&fatti(None, 128_000, &[]), &soglie()), None,
+            "prezzo non dichiarato (pricing_state='unknown') -> nessun tier, non 'medium'");
+        assert_eq!(derive_tier_prior(&fatti(Some(0.0), 128_000, &[]), &soglie()), None,
+            "un costo 0 NON raffinato non e' 'gratis', e' 'non lo so': dedurne 'light'              sarebbe la stessa bugia del nome con un'altra faccia");
+    }
+
+    /// Il prezzo e' il segnale che il FORNITORE emette col denaro, non con un
+    /// aggettivo nel nome.
+    #[test]
+    fn il_prior_legge_il_listino_del_fornitore() {
+        assert_eq!(derive_tier_prior(&fatti(Some(30.0), 8192, &[]), &soglie()), Some("frontier"));
+        assert_eq!(derive_tier_prior(&fatti(Some(3.0), 8192, &[]), &soglie()), Some("heavy"));
+        assert_eq!(derive_tier_prior(&fatti(Some(1.0), 8192, &[]), &soglie()), Some("high"));
+        assert_eq!(derive_tier_prior(&fatti(Some(0.1), 8192, &[]), &soglie()), Some("light"));
+    }
+
+    /// La finestra dichiarata alza di UN gradino, MAI a frontier: e' un numero
+    /// del fornitore, non la prova che il modello la sappia usare — quella la da'
+    /// solo il probe agentic_longctx.
+    #[test]
+    fn la_finestra_dichiarata_non_regala_il_frontier() {
+        // light + 1M di finestra -> medium, non frontier.
+        assert_eq!(derive_tier_prior(&fatti(Some(0.1), 1_000_000, &[]), &soglie()), Some("medium"));
+        // heavy + finestra enorme resta heavy: il gradino non scavalca la misura.
+        assert_eq!(derive_tier_prior(&fatti(Some(3.0), 1_000_000, &[]), &soglie()), Some("heavy"));
+    }
+
+    /// Il reasoning PROVATO (non dichiarato) e' l'unico segnale del prior che
+    /// viene da una misura nostra.
+    #[test]
+    fn il_prior_usa_il_reasoning_provato_non_quello_dichiarato() {
+        assert_eq!(
+            derive_tier_prior(&fatti(Some(0.1), 8192, &["reasoning"]), &soglie()),
+            Some("medium"),
+            "light + reasoning PROVATO -> medium"
+        );
+        // Il dichiarato non entra: `proven_capabilities` sono i qualified_capabilities.
+        assert_eq!(derive_tier_prior(&fatti(Some(0.1), 8192, &["chat"]), &soglie()), Some("light"));
+    }
+
+    fn run(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
+        ProfileRun {
+            profile_key: key.to_string(),
+            grants: vec![],
+            is_blocking: false,
+            passes,
+            conclusive_fails: 4 - passes,
+            inconclusive: 0,
+            promote_min,
+            first_fail_reason: None,
+        }
+    }
+
+    /// La banda PIU' ALTA certificata vince: e' criterion-referenced, un heavy ha
+    /// DIMOSTRATO qualcosa che un medium non ha fatto.
+    #[test]
+    fn il_measured_prende_la_banda_piu_alta_certificata() {
+        let runs = vec![
+            (run("chat_smoke", 4, 3), Some("light".to_string())),
+            (run("agentic_real", 4, 3), Some("medium".to_string())),
+            (run("agentic_chain", 3, 3), Some("high".to_string())),
+            (run("agentic_recovery", 1, 3), Some("heavy".to_string())), // NON superata
+        ];
+        assert_eq!(derive_tier_measured(&runs, None, 2), Some("high".to_string()),
+            "3/4 su agentic_chain promuove a high; agentic_recovery con 1/4 non certifica heavy");
+    }
+
+    /// Un profilo che non certifica un tier (tool_smoke) non influenza la banda.
+    #[test]
+    fn un_profilo_senza_banda_non_influenza_il_tier() {
+        let runs = vec![
+            (run("tool_smoke", 4, 3), None),
+            (run("chat_smoke", 4, 3), Some("light".to_string())),
+        ];
+        assert_eq!(derive_tier_measured(&runs, None, 2), Some("light".to_string()));
+    }
+
+    /// L'ISTERESI: la soglia per CONSERVARE una banda gia' acquisita e' piu'
+    /// bassa di quella per conquistarla. Senza, un modello oscillerebbe di fascia
+    /// a ogni riqualifica e destabilizzerebbe il routing.
+    #[test]
+    fn l_isteresi_conserva_la_banda_acquisita_ma_non_ne_regala_di_nuove() {
+        // 2 pass su 4: sotto promote_min (3) ma sopra hold_min (2).
+        let runs = vec![(run("agentic_recovery", 2, 3), Some("heavy".to_string()))];
+        // Chi e' GIA' heavy la mantiene (2 >= hold_min).
+        assert_eq!(derive_tier_measured(&runs, Some("heavy"), 2), Some("heavy".to_string()),
+            "banda acquisita: si conserva con hold_min, la conservazione non ha              bisogno di evidenza nuova");
+        // Chi e' medium NON la conquista (2 < promote_min): serve piu' evidenza
+        // per salire che per restare.
+        assert_eq!(derive_tier_measured(&runs, Some("medium"), 2), None,
+            "banda NUOVA: serve promote_min. Il gap fra le due soglie E' l'isteresi");
     }
 }
