@@ -25,3 +25,15 @@ INSERT INTO settings (key, value, category, description) VALUES
   ('orchestrator.subagent_fanout_max_parallel', '6', 'orchestrator',
    'Massimo numero di sub-run di un FAN-OUT (consiglio delle figure, panel di review, panel multi-provider) realmente in volo insieme. Ogni sub-run gira nel proprio task tokio col proprio timeout; il semaforo libera il permesso appena uno finisce. Default 6 = fan-out nominale del consiglio (nessun tetto artificiale). DB-driven, regola G.')
 ON CONFLICT (key) DO NOTHING;
+
+-- Soglia della SENTINELLA di salute del runtime (runtime_health.rs).
+-- Un task tokio congelato non aveva alcun sensore: i suoi sintomi (timeout in
+-- ritardo, query "lente" su chiave primaria, attese I/O infinite) somigliano a
+-- un guasto del provider/DB/gateway, ed e' cosi' che l'incidente del 15/07 e'
+-- stato attribuito a tre colpevoli sbagliati in due giorni. La sentinella
+-- misura il RITARDO DI RISVEGLIO (regola M: un numero, non una deduzione) e
+-- lo dichiara oltre soglia.
+INSERT INTO settings (key, value, category, description) VALUES
+  ('runtime.starvation_alert_ms', '2000', 'runtime',
+   'Ritardo di risveglio (ms) oltre il quale la sentinella dichiara il runtime AFFAMATO: i task pronti non venivano eseguiti. Sensibilita'' di un sensore diagnostico, non una soglia di prodotto: sotto i ~2s su macchina carica si rischiano falsi positivi. DB-driven, regola G.')
+ON CONFLICT (key) DO NOTHING;

@@ -58,6 +58,7 @@ mod model_catalog_sync;
 mod model_health_probe;
 mod model_observation;
 mod model_qualification;
+mod runtime_health;
 mod models;
 mod mutations_api;
 mod native_engine;
@@ -893,6 +894,12 @@ fn spawn_security_and_catalog_boot(state: &AppState) {
             Err(e) => tracing::warn!("boot reconcile_catalog_with_policy fallito: {e}"),
         }
     });
+
+    // Sentinella di salute del runtime: misura il ritardo di risveglio dei
+    // task. Senza, un congelamento del runtime resta invisibile e i suoi
+    // sintomi vengono attribuiti al provider/DB/gateway di turno (incidente
+    // consiglio 2026-07-15: ~287s di task fermo, tre attribuzioni sbagliate).
+    runtime_health::spawn_runtime_health_sentinel(state.db.clone());
 
     // Port enforcer: killa processi di progetto fuori dal bucket porte assegnato.
     tokio::spawn(security::port_enforcer::port_enforcer_loop(state.clone()));
