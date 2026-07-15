@@ -46,7 +46,10 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
              speed_tier TEXT NOT NULL DEFAULT 'medium', \
              consecutive_failures INT NOT NULL DEFAULT 0, \
              consecutive_tool_failures INT NOT NULL DEFAULT 0, \
-             auto_disabled_reason TEXT \
+             auto_disabled_reason TEXT, \
+             qualification_state TEXT NOT NULL DEFAULT 'unqualified', \
+             qualified_capabilities JSONB NOT NULL DEFAULT '[]', \
+             qualification_expires_at TIMESTAMPTZ \
          )",
     )
     .execute(pool)

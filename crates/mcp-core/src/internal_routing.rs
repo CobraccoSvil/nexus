@@ -352,6 +352,7 @@ pub async fn resolve_purpose_provider_candidates_db(
         return Err(PurposeResolution::NotFound);
     };
 
+    let gate = crate::orchestrator::qualification_gate(db).await;
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: rule.requires_tool_use,
         require_thinking_non_exclude: rule.requires_tool_use,
@@ -360,6 +361,10 @@ pub async fn resolve_purpose_provider_candidates_db(
         exclude_providers: &[],
         apply_cooldown: true,
         only_provider: None,
+        // Il gate segue il profilo d'uso: vale per i purpose AGENTICI (tool),
+        // comportamento storico per gli altri.
+        require_qualified: rule.requires_tool_use && gate.require_qualified,
+        exclude_preview: rule.requires_tool_use && gate.exclude_preview,
     };
     let order_by = if rule.requires_tool_use {
         crate::orchestrator::AGENTIC_COST_FIRST_ORDER

@@ -358,6 +358,7 @@ pub(crate) async fn agentic_failover_candidates(
     exclude: &[String],
     min_context_window: i64,
 ) -> Vec<(String, String, Option<String>)> {
+    let gate = crate::orchestrator::qualification_gate(db).await;
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: true,
         require_thinking_non_exclude: true,
@@ -366,6 +367,8 @@ pub(crate) async fn agentic_failover_candidates(
         exclude_providers: exclude,
         apply_cooldown: true,
         only_provider: None,
+        require_qualified: gate.require_qualified,
+        exclude_preview: gate.exclude_preview,
     };
     // tier_chain VUOTA = nessun filtro tier (query singola su tutti i tier).
     match crate::orchestrator::select_models_tierchain(
@@ -501,6 +504,10 @@ async fn best_non_agentic_model(
         exclude_providers,
         apply_cooldown: true,
         only_provider,
+        // Path NON-agentico (vision/chat/embedding): il gate di qualificazione
+        // copre il profilo d'uso agentico; qui comportamento storico.
+        require_qualified: false,
+        exclude_preview: false,
     };
     // Pre-ordinamento anti "reasoner puro" (incidente 2026-06-10): i modelli
     // con uses_thinking_mode=TRUE e supports_tool_use=FALSE (es. deepseek-v4-flash)
@@ -595,6 +602,7 @@ async fn select_agentic_model_pinned(
     order_by: &str,
     only_provider: Option<&str>,
 ) -> Option<(String, String)> {
+    let gate = crate::orchestrator::qualification_gate(db).await;
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: true,
         require_thinking_non_exclude: true,
@@ -603,6 +611,8 @@ async fn select_agentic_model_pinned(
         exclude_providers,
         apply_cooldown: true,
         only_provider,
+        require_qualified: gate.require_qualified,
+        exclude_preview: gate.exclude_preview,
     };
     match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
         Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
@@ -661,6 +671,7 @@ pub(crate) async fn select_agentic_model_governed(
     }
 
     // Stessa eleggibilita' del punto unico (regola L): NON re-implemento la WHERE.
+    let gate = crate::orchestrator::qualification_gate(db).await;
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: true,
         require_thinking_non_exclude: true,
@@ -669,6 +680,8 @@ pub(crate) async fn select_agentic_model_governed(
         exclude_providers,
         apply_cooldown: true,
         only_provider: None,
+        require_qualified: gate.require_qualified,
+        exclude_preview: gate.exclude_preview,
     };
     let candidates: Vec<(String, String)> = match crate::orchestrator::select_models_tierchain(
         db,

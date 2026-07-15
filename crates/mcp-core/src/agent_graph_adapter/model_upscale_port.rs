@@ -87,6 +87,7 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
         required_tokens: i64,
     ) -> Result<Option<UpscalePick>, PortError> {
         let tier = self.target_tier().await;
+        let gate = crate::orchestrator::qualification_gate(&self.db).await;
         let filter = EligibilityFilter {
             require_tool_use: true,
             require_thinking_non_exclude: true,
@@ -95,6 +96,8 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             exclude_providers: &[],
             apply_cooldown: true,
             only_provider: None,
+            require_qualified: gate.require_qualified,
+            exclude_preview: gate.exclude_preview,
         };
         let rows = match select_models_tierchain(
             &self.db,

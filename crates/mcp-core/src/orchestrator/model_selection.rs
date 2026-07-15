@@ -155,6 +155,102 @@ pub(crate) struct EligibilityFilter<'a> {
     /// comportamento bit-identico per i ~13 costruttori esistenti. Il valore e'
     /// BINDATO (mai interpolato): niente SQL injection.
     pub only_provider: Option<&'a str>,
+    /// `true` => richiede l'EVIDENZA che il modello regga il profilo d'uso reale
+    /// (gate di qualificazione, mig 0591): `qualification_state = 'qualified'`
+    /// non scaduto, e le capability jsonb si filtrano su `qualified_capabilities`
+    /// (PROVATE dal qualificatore) invece di `capabilities` (dichiarate).
+    /// Distinto da `require_tool_use`: dichiarato != provato — e' l'assunzione
+    /// "la salute e' gia' garantita da is_enabled" che ha permesso gli incidenti
+    /// 2026-07-14/15 (11 modelli 404 e un 429-quota scoperti dalle richieste di
+    /// produzione). Acceso dal flag DB `agent.model_qualification.enforce_routing_gate`
+    /// nel solo path AGENTICO; `false` = comportamento storico.
+    pub require_qualified: bool,
+    /// `true` => esclude i modelli preview/experimental dalla selezione. I
+    /// pre-GA girano su capacita' CONDIVISA best-effort (Vertex Dynamic Shared
+    /// Quota: 429 RESOURCE_EXHAUSTED a intermittenza anche a basso volume) e
+    /// vengono ritirati con ~2 settimane di preavviso (404 improvvisi su tutte
+    /// le region) — e' esattamente la coppia di incidenti 2026-07-14/15 dei
+    /// consiglieri. Google stessa dichiara gli experimental non adatti alla
+    /// produzione. Acceso dal flag DB `agent.model_qualification.exclude_preview_agentic`
+    /// nel solo path AGENTICO (le chain agentiche muoiono su un singolo 429/404);
+    /// il pin esplicito dell'utente non passa di qui e resta libero.
+    pub exclude_preview: bool,
+}
+
+/// Frammento WHERE (statico, niente input utente) che riconosce i modelli
+/// pre-GA dal SUFFISSO canonico di naming dei provider: `-preview`/`preview-`,
+/// `-exp` terminale o seguito da separatore (gemini-2.0-flash-exp,
+/// gemini-exp-1206), `experimental`. PUNTO UNICO (regola L) del criterio: i
+/// call site non duplicano la regex.
+const PRE_GA_MODEL_PREDICATE_SQL: &str =
+    " AND model !~* '(preview|experimental|[-_]exp([-_.]|$))'";
+
+/// Flag del gate di qualificazione applicati al path AGENTICO (mig 0591/0592).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct QualificationGate {
+    /// `agent.model_qualification.enforce_routing_gate`: richiede
+    /// `qualification_state='qualified'` non scaduto + capability PROVATE.
+    pub require_qualified: bool,
+    /// `agent.model_qualification.exclude_preview_agentic`: esclude i modelli
+    /// preview/experimental (capacita' best-effort + ritiri improvvisi).
+    pub exclude_preview: bool,
+}
+
+/// PUNTO UNICO (regola L) della lettura dei flag del gate di qualificazione
+/// (mig 0591/0592). UNA query, cache 60s in-process (stesso pattern di
+/// `agent.enforce_port_allocation`): il routing la consulta a ogni selezione
+/// AGENTICA senza martellare il DB. Chiave assente o illeggibile -> `false`
+/// (comportamento storico: i rollout si accendono SOLO con la riga in settings,
+/// regola G, nessun default nascosto che scavalchi il DB).
+pub(crate) async fn qualification_gate(db: &PgPool) -> QualificationGate {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<Option<(QualificationGate, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((value, expires_at)) = *guard {
+            if Instant::now() < expires_at {
+                return value;
+            }
+        }
+    }
+    fn flag(v: &str) -> bool {
+        matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+    }
+    let mut value = QualificationGate::default();
+    match sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM settings WHERE key IN (
+            'agent.model_qualification.enforce_routing_gate',
+            'agent.model_qualification.exclude_preview_agentic'
+        )",
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => {
+            for (k, v) in rows {
+                match k.as_str() {
+                    "agent.model_qualification.enforce_routing_gate" => {
+                        value.require_qualified = flag(&v)
+                    }
+                    "agent.model_qualification.exclude_preview_agentic" => {
+                        value.exclude_preview = flag(&v)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "qualification_gate: lettura settings fallita, gate spento"
+            );
+        }
+    }
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((value, Instant::now() + Duration::from_secs(60)));
+    }
+    value
 }
 
 /// PUNTO UNICO (regola L) del mapping capability -> colonna booleana canonica
@@ -260,6 +356,17 @@ pub(crate) async fn select_models_tierchain(
         if filter.require_tool_use {
             sql.push_str(" AND supports_tool_use = TRUE");
         }
+        if filter.require_qualified {
+            // Gate di qualificazione (mig 0591): solo modelli PROVATI e non
+            // scaduti. Frammento statico, nessun input utente interpolato.
+            sql.push_str(
+                " AND qualification_state = 'qualified' \
+                  AND (qualification_expires_at IS NULL OR qualification_expires_at > NOW())",
+            );
+        }
+        if filter.exclude_preview {
+            sql.push_str(PRE_GA_MODEL_PREDICATE_SQL);
+        }
         if filter.require_thinking_non_exclude {
             sql.push_str(" AND agentic_thinking_policy <> 'exclude'");
         }
@@ -281,7 +388,16 @@ pub(crate) async fn select_models_tierchain(
         }
         if capability_json.is_some() {
             idx += 1;
-            sql.push_str(&format!(" AND capabilities @> ${idx}::jsonb"));
+            // Col gate acceso le capability jsonb si verificano sul PROVATO
+            // (qualified_capabilities, scritto solo dal qualificatore), non sul
+            // dichiarato: una capability affermata a mano e mai dimostrata non
+            // instrada piu' nessuno (nomi colonna statici, niente injection).
+            let cap_col = if filter.require_qualified {
+                "qualified_capabilities"
+            } else {
+                "capabilities"
+            };
+            sql.push_str(&format!(" AND {cap_col} @> ${idx}::jsonb"));
         }
         if filter.min_context_window > 0 {
             idx += 1;
@@ -498,6 +614,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -545,6 +663,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out_none = select_models_tierchain(
             &pool,
@@ -629,6 +749,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -675,6 +797,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -714,6 +838,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -750,6 +876,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -791,6 +919,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -833,6 +963,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -876,6 +1008,8 @@ mod tests {
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
+            require_qualified: false,
+            exclude_preview: false,
         };
         let out = select_models_tierchain(
             &pool,
@@ -937,5 +1071,132 @@ mod tests {
         assert!(out.contains(&"google".to_string()));
         // "OpenAI" e "openai" collassano in un solo elemento.
         assert_eq!(out.iter().filter(|p| *p == "openai").count(), 1);
+    }
+
+    // ── Gate di qualificazione (mig 0591/0592) ────────────────────────────────
+    // Incidenti 2026-07-14/15: il routing pinnava alle figure del consiglio
+    // modelli DICHIARATI nel catalog ma mai provati (404 su Vertex) o pre-GA in
+    // quota condivisa satura (429). Il gate richiede l'EVIDENZA.
+
+    /// Filtro agentico base dei test del gate (i flag del gate variano per test).
+    fn gate_filter(require_qualified: bool, exclude_preview: bool) -> EligibilityFilter<'static> {
+        EligibilityFilter {
+            require_tool_use: true,
+            require_thinking_non_exclude: true,
+            capability: None,
+            min_context_window: 0,
+            exclude_providers: &[],
+            apply_cooldown: false,
+            only_provider: None,
+            require_qualified,
+            exclude_preview,
+        }
+    }
+
+    #[sqlx::test]
+    async fn gate_qualificazione_esclude_i_non_provati_e_gli_scaduti(pool: sqlx::PgPool) {
+        create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, input_cost_per_million_tokens, qualification_state, qualification_expires_at) VALUES \
+             ('a', 'dichiarato-mai-provato', 1.0, 'unqualified', NULL), \
+             ('b', 'provato-ma-scaduto',     2.0, 'qualified',   NOW() - interval '1 hour'), \
+             ('c', 'provato-valido',         3.0, 'qualified',   NOW() + interval '1 day')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // Gate ACCESO: resta solo il provato non scaduto, anche se costa di piu'.
+        let out = select_models_tierchain(
+            &pool,
+            &gate_filter(true, false),
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(
+            out.iter().map(|(_, m, _)| m.as_str()).collect::<Vec<_>>(),
+            vec!["provato-valido"],
+            "il gate deve escludere unqualified e qualified scaduto"
+        );
+        // Gate SPENTO: comportamento storico, tutti e tre eleggibili.
+        let out = select_models_tierchain(
+            &pool,
+            &gate_filter(false, false),
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out.len(), 3, "gate spento = comportamento storico");
+    }
+
+    #[sqlx::test]
+    async fn gate_capability_verificata_sul_provato_non_sul_dichiarato(pool: sqlx::PgPool) {
+        create_ai_price_catalog_table(&pool).await;
+        // 'millantatore' DICHIARA reasoning ma il qualificatore non gliel'ha
+        // provato; 'provato' ce l'ha in qualified_capabilities.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, input_cost_per_million_tokens, capabilities, qualification_state, qualified_capabilities) VALUES \
+             ('a', 'millantatore', 1.0, '[\"chat\",\"reasoning\"]', 'qualified', '[]'), \
+             ('b', 'provato',      2.0, '[\"chat\",\"reasoning\"]', 'qualified', '[\"chat\",\"reasoning\"]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let mut f = gate_filter(true, false);
+        f.capability = Some("reasoning");
+        let out = select_models_tierchain(&pool, &f, &[], "input_cost_per_million_tokens ASC", 10)
+            .await
+            .expect("ok");
+        assert_eq!(
+            out.iter().map(|(_, m, _)| m.as_str()).collect::<Vec<_>>(),
+            vec!["provato"],
+            "col gate la capability si verifica su qualified_capabilities"
+        );
+        // Gate spento: si crede al dichiarato (comportamento storico).
+        let mut f = gate_filter(false, false);
+        f.capability = Some("reasoning");
+        let out = select_models_tierchain(&pool, &f, &[], "input_cost_per_million_tokens ASC", 10)
+            .await
+            .expect("ok");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn exclude_preview_taglia_i_pre_ga_ma_non_i_ga(pool: sqlx::PgPool) {
+        create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, input_cost_per_million_tokens) VALUES \
+             ('g', 'gemini-3.1-pro-preview',  1.0), \
+             ('g', 'gemini-2.0-flash-exp',    1.1), \
+             ('g', 'gemini-exp-1206',         1.2), \
+             ('x', 'modello-experimental',    1.3), \
+             ('g', 'gemini-2.5-flash',        2.0), \
+             ('m', 'model-express',           3.0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let out = select_models_tierchain(
+            &pool,
+            &gate_filter(false, true),
+            &[],
+            "input_cost_per_million_tokens ASC",
+            10,
+        )
+        .await
+        .expect("ok");
+        let models: Vec<&str> = out.iter().map(|(_, m, _)| m.as_str()).collect();
+        assert_eq!(
+            models,
+            vec!["gemini-2.5-flash", "model-express"],
+            "i pre-GA (preview/-exp/experimental) sono esclusi; i GA e i nomi \
+             che CONTENGONO 'exp' senza esserlo (express) restano"
+        );
     }
 }
