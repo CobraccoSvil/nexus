@@ -494,6 +494,193 @@ diagnosi e il prossimo passo, non con una ripetizione."
     }
 }
 
+/// Asse di stallo prioritario del turno (`None` = nessuno stallo bloccante).
+///
+/// La catena `else if` E' l'ordine di precedenza tra assi: esplorazione,
+/// signature-loop, repeated_user_question (cross-run), resource_reallocation,
+/// repeated_action, g1-descrittivo. Il primo asse che scatta vince.
+fn blocking_axis(signals: &ProgressSignals) -> Option<Axis> {
+    if signals.exploration_count >= 2 * signals.exploration_threshold.max(1) {
+        Some(Axis::Exploration)
+    } else if signals
+        .signature_loop_tool
+        .as_deref()
+        .is_some_and(|t| !t.is_empty())
+    {
+        // Python: `elif signals.signature_loop_tool:` — truthy = non vuoto/non None.
+        Some(Axis::Signature)
+    } else if signals.repeated_user_question_count
+        >= signals.repeated_user_question_threshold.max(1)
+    {
+        // Loop clarification CROSS-RUN (l'incidente email Beaty-Book): la STESSA
+        // domanda-chiarimento e' gia' stata posta all'utente >= soglia volte nella
+        // sessione (segnale strutturato dai meta_step `kind='clarify'`, regola M).
+        // Priorita' TRA signature e repeated_action: un loop di TOOL o esplorazione
+        // ha precedenza (piu' locale), ma la ri-domanda ripetuta precede gli assi
+        // intra-run repeated_action/g1. `.max(1)`: soglia degenere <=0 -> almeno 1.
+        Some(Axis::RepeatedUserQuestion)
+    } else if signals.reallocation_count >= signals.reallocation_threshold.max(1) {
+        Some(Axis::ResourceReallocation)
+    } else if signals.repeated_action.is_some() {
+        Some(Axis::RepeatedAction)
+    } else if signals.g1_over_cap {
+        Some(Axis::G1Descriptive)
+    } else {
+        None
+    }
+}
+
+/// Etichetta e conteggio dell'azione ripetuta, con default neutri. Punto unico
+/// (regola L) dei call site che leggono `repeated_action`: l'asse RepeatedAction
+/// nasce da `is_some()`, quindi il default `("", 0)` non e' raggiungibile in
+/// pratica ma tiene la funzione totale senza `unwrap`.
+fn repeated_action_label_and_count(signals: &ProgressSignals) -> (String, i64) {
+    signals
+        .repeated_action
+        .clone()
+        .unwrap_or_else(|| (String::new(), 0))
+}
+
+/// Nudge della GUIDE per l'asse repeated_action: sceglie la variante in base al
+/// TIPO di ripetizione. edit_file/write_file FALLITO -> nudge SPECIFICO (copia
+/// l'old_string esatto dall'estratto gia' nell'errore); servizio long-running
+/// fallito -> nudge log-servizio; lettura ripetuta -> nudge biforcato per
+/// action_oriented (su un fix orienta all'EDIT, su una domanda "concludi con
+/// testo"); altrimenti generico.
+fn repeated_action_guide_nudge(signals: &ProgressSignals) -> String {
+    let (label, count) = repeated_action_label_and_count(signals);
+    if signals.repeated_action_edit_failed {
+        repeated_action_edit_failed_nudge(&label, count)
+    } else if signals.repeated_action_service_failed {
+        repeated_action_service_failed_nudge(&label, count)
+    } else if signals.repeated_action_read_only {
+        if signals.action_oriented {
+            repeated_read_only_action_nudge(&label, count)
+        } else {
+            repeated_read_only_nudge(&label, count)
+        }
+    } else {
+        repeated_action_nudge(&label, count)
+    }
+}
+
+/// Nudge assertivo della GUIDE per l'asse dato.
+fn guide_nudge(signals: &ProgressSignals, axis: Axis) -> String {
+    match axis {
+        Axis::Exploration => {
+            exploration_nudge(signals.exploration_count, signals.has_active_resources)
+        }
+        Axis::Signature => signature_nudge(signals.signature_loop_tool.as_deref().unwrap_or("")),
+        Axis::ResourceReallocation => resource_reallocation_nudge(signals.reallocation_count),
+        Axis::RepeatedAction => repeated_action_guide_nudge(signals),
+        Axis::G1Descriptive => g1_nudge(),
+        // Asse alimentato dal detector clarification cross-run (Task #5): con
+        // reasoner OFF resta la GUIDE fissa (nudge "non ri-chiedere"); con
+        // reasoner ON e' quest'ultimo a decidere la mossa. `decide` non lo
+        // assegna finche' il detector non e' innestato -> arm per esaustivita'.
+        Axis::RepeatedUserQuestion => repeated_user_question_nudge(),
+    }
+}
+
+/// Se la GUIDE per questo asse deve FORZARE una tool call (rimuove i read-only +
+/// tool_choice required) o restare SOFT (solo nudge testuale).
+///
+/// Solo resource_reallocation resta SOFT (il nudge ordina di riusare le porte,
+/// non c'e' un'azione correttiva diretta). Per repeated_action PRODUTTIVA
+/// FORZIAMO una nuova tool call (force-action): un'azione ripetuta che fallisce
+/// va CORRETTA, non ripetuta ne' abbandonata -> rimuove i read-only e impone
+/// tool_choice. Per repeated_action di SOLA LETTURA il comportamento e'
+/// ACTION-AWARE: su un task INFORMATIVO non forziamo (forzare un altro
+/// read-only creerebbe un nuovo loop -> il nudge guida a concludere con testo,
+/// NON-convergenza regola H); su un task di MODIFICA/fix forziamo invece la
+/// tool call cosi' l'agente APPLICA l'edit (il nudge orienta a edit_file/
+/// write_file) invece di rinunciare con 0 file modificati.
+fn guide_force_action(signals: &ProgressSignals, axis: Axis) -> bool {
+    match axis {
+        // resource_reallocation: SOFT (riusa-porte, nessuna azione correttiva).
+        Axis::ResourceReallocation => false,
+        // repeated_user_question: SOFT. Il nudge guida a USARE il valore gia'
+        // fornito (anche se oscurato, come opaco) o a dichiarare il blocco con
+        // task_complete: NON forziamo una tool call (forzare tool_choice
+        // required rimuoverebbe i read-only e obbligherebbe un'azione-tool che
+        // qui non e' la mossa giusta -> alimenterebbe un altro loop). Con
+        // reasoner ON e' quest'ultimo a decidere una mossa piu' ricca.
+        Axis::RepeatedUserQuestion => false,
+        // SERVIZIO long-running fallito: NON forzare. La forza-azione rimuove i
+        // tool read-only, ma qui l'agente DEVE poterli usare (read_service_output/
+        // tail_service_logs) per leggere perche' il servizio e' morto; il nudge lo
+        // guida a diagnosticare e correggere, non a rilanciare. Forzare l'azione
+        // rimuoverebbe i log e lo costringerebbe a ri-avviare -> il loop che
+        // vogliamo spezzare.
+        Axis::RepeatedAction if signals.repeated_action_service_failed => false,
+        // repeated_action di SOLA LETTURA su turno INFORMATIVO: NON forzare
+        // (forzerebbe un altro read-only -> nuovo loop); il nudge guida a
+        // concludere con testo. Su turno ACTION-ORIENTED invece forziamo l'edit.
+        Axis::RepeatedAction if signals.repeated_action_read_only && !signals.action_oriented => {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Motivazione umana della GUIDE (finisce nei log/meta_step).
+fn guide_reason(axis: Axis) -> String {
+    match axis {
+        Axis::RepeatedAction => format!(
+            "stallo {}: forza-azione correttiva (no ripetizione)",
+            axis.as_str()
+        ),
+        Axis::ResourceReallocation => format!(
+            "stallo {}: nudge riusa-porte (no nuova allocazione)",
+            axis.as_str()
+        ),
+        _ => format!(
+            "stallo {}: forza-azione (rimuovo read-only + tool_choice required)",
+            axis.as_str()
+        ),
+    }
+}
+
+/// Decisione del livello 1.5 (FORCE_DIAGNOSE, solo asse repeated_action): la
+/// GUIDE non ha cambiato nulla, si obbliga la diagnosi PRIMA di escalation/abort.
+///
+/// Per l'edit fallito riusa il nudge SPECIFICO (copia l'old_string esatto
+/// dall'estratto); per il servizio fallito il nudge diagnostico-servizio (leggi
+/// i log, correggi la causa); altrimenti quello diagnostico generico.
+fn force_diagnose_decision(signals: &ProgressSignals, axis: Axis) -> ProgressDecision {
+    let (label, count) = repeated_action_label_and_count(signals);
+    let nudge = if signals.repeated_action_edit_failed {
+        repeated_action_edit_failed_nudge(&label, count)
+    } else if signals.repeated_action_service_failed {
+        repeated_action_service_failed_nudge(&label, count)
+    } else {
+        force_diagnose_nudge(&label, count)
+    };
+    let reason = if signals.repeated_action_edit_failed {
+        "stallo repeated_action (edit fallito): correzione old_string forzata, \
+                niente ABORT finche' l'estratto non e' sfruttato"
+            .to_string()
+    } else if signals.repeated_action_service_failed {
+        "stallo repeated_action (servizio fallito): diagnosi log-servizio forzata, \
+                niente ABORT e niente forza-azione (i log restano leggibili)"
+            .to_string()
+    } else {
+        "stallo repeated_action: correzione forzata prima di escalation/abort".to_string()
+    };
+    ProgressDecision {
+        action: Action::ForceDiagnose,
+        axis: Some(axis),
+        // Forza una tool call correttiva: la diagnosi deve sfociare in un edit,
+        // non in testo o resa. ECCEZIONE servizio fallito: NON forzare, cosi' i
+        // tool di lettura log (read-only) restano disponibili per capire perche'
+        // il servizio muore (forzare rimuoverebbe i log -> rilancio cieco -> loop).
+        force_action: !signals.repeated_action_service_failed,
+        nudge_text: Some(nudge),
+        stop_reason: None,
+        reason,
+    }
+}
+
 /// Punto unico: data la fotografia del progresso, decide la prossima mossa.
 ///
 /// Gerarchia, applicata all'asse di stallo a priorita' piu' alta:
@@ -506,38 +693,7 @@ diagnosi e il prossimo passo, non con una ripetizione."
 /// (cross-run), resource_reallocation, repeated_action, g1-descrittivo. Nessuno
 /// stallo -> proceed.
 pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
-    // Determina l'asse di stallo prioritario (None = nessuno stallo bloccante).
-    let axis: Option<Axis> =
-        if signals.exploration_count >= 2 * signals.exploration_threshold.max(1) {
-            Some(Axis::Exploration)
-        } else if signals
-            .signature_loop_tool
-            .as_deref()
-            .is_some_and(|t| !t.is_empty())
-        {
-            // Python: `elif signals.signature_loop_tool:` — truthy = non vuoto/non None.
-            Some(Axis::Signature)
-        } else if signals.repeated_user_question_count
-            >= signals.repeated_user_question_threshold.max(1)
-        {
-            // Loop clarification CROSS-RUN (l'incidente email Beaty-Book): la STESSA
-            // domanda-chiarimento e' gia' stata posta all'utente >= soglia volte nella
-            // sessione (segnale strutturato dai meta_step `kind='clarify'`, regola M).
-            // Priorita' TRA signature e repeated_action: un loop di TOOL o esplorazione
-            // ha precedenza (piu' locale), ma la ri-domanda ripetuta precede gli assi
-            // intra-run repeated_action/g1. `.max(1)`: soglia degenere <=0 -> almeno 1.
-            Some(Axis::RepeatedUserQuestion)
-        } else if signals.reallocation_count >= signals.reallocation_threshold.max(1) {
-            Some(Axis::ResourceReallocation)
-        } else if signals.repeated_action.is_some() {
-            Some(Axis::RepeatedAction)
-        } else if signals.g1_over_cap {
-            Some(Axis::G1Descriptive)
-        } else {
-            None
-        };
-
-    let Some(axis) = axis else {
+    let Some(axis) = blocking_axis(signals) else {
         return ProgressDecision {
             action: Action::Proceed,
             axis: None,
@@ -554,107 +710,15 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
         signals.has_escalation_candidate && signals.escalations < signals.max_escalations;
 
     // Livello 1 — GUIDE (forza-azione): solo se non gia' tentato per questo asse.
+    // Nudge, forza-azione e motivazione sono decisi dai tre helper dedicati.
     if !already {
-        let nudge = match axis {
-            Axis::Exploration => {
-                exploration_nudge(signals.exploration_count, signals.has_active_resources)
-            }
-            Axis::Signature => {
-                signature_nudge(signals.signature_loop_tool.as_deref().unwrap_or(""))
-            }
-            Axis::ResourceReallocation => resource_reallocation_nudge(signals.reallocation_count),
-            Axis::RepeatedAction => {
-                let (label, count) = signals
-                    .repeated_action
-                    .clone()
-                    .unwrap_or_else(|| (String::new(), 0));
-                // edit_file/write_file FALLITO -> nudge SPECIFICO (copia
-                // l'old_string esatto dall'estratto gia' nell'errore); lettura
-                // ripetuta -> nudge biforcato per action_oriented (su un fix orienta
-                // all'EDIT, su una domanda "concludi con testo"); altrimenti generico.
-                if signals.repeated_action_edit_failed {
-                    repeated_action_edit_failed_nudge(&label, count)
-                } else if signals.repeated_action_service_failed {
-                    repeated_action_service_failed_nudge(&label, count)
-                } else if signals.repeated_action_read_only {
-                    if signals.action_oriented {
-                        repeated_read_only_action_nudge(&label, count)
-                    } else {
-                        repeated_read_only_nudge(&label, count)
-                    }
-                } else {
-                    repeated_action_nudge(&label, count)
-                }
-            }
-            Axis::G1Descriptive => g1_nudge(),
-            // Asse alimentato dal detector clarification cross-run (Task #5): con
-            // reasoner OFF resta la GUIDE fissa (nudge "non ri-chiedere"); con
-            // reasoner ON e' quest'ultimo a decidere la mossa. `decide` non lo
-            // assegna finche' il detector non e' innestato -> arm per esaustivita'.
-            Axis::RepeatedUserQuestion => repeated_user_question_nudge(),
-        };
-        // Solo resource_reallocation resta SOFT (il nudge ordina di riusare le porte,
-        // non c'e' un'azione correttiva diretta). Per repeated_action PRODUTTIVA
-        // FORZIAMO una nuova tool call (force-action): un'azione ripetuta che fallisce
-        // va CORRETTA, non ripetuta ne' abbandonata -> rimuove i read-only e impone
-        // tool_choice. Per repeated_action di SOLA LETTURA il comportamento e'
-        // ACTION-AWARE: su un task INFORMATIVO non forziamo (forzare un altro
-        // read-only creerebbe un nuovo loop -> il nudge guida a concludere con testo,
-        // NON-convergenza regola H); su un task di MODIFICA/fix forziamo invece la
-        // tool call cosi' l'agente APPLICA l'edit (il nudge orienta a edit_file/
-        // write_file) invece di rinunciare con 0 file modificati.
-        let force = match axis {
-            // resource_reallocation: SOFT (riusa-porte, nessuna azione correttiva).
-            Axis::ResourceReallocation => false,
-            // repeated_user_question: SOFT. Il nudge guida a USARE il valore gia'
-            // fornito (anche se oscurato, come opaco) o a dichiarare il blocco con
-            // task_complete: NON forziamo una tool call (forzare tool_choice
-            // required rimuoverebbe i read-only e obbligherebbe un'azione-tool che
-            // qui non e' la mossa giusta -> alimenterebbe un altro loop). Con
-            // reasoner ON e' quest'ultimo a decidere una mossa piu' ricca.
-            Axis::RepeatedUserQuestion => false,
-            // SERVIZIO long-running fallito: NON forzare. La forza-azione rimuove i
-            // tool read-only, ma qui l'agente DEVE poterli usare (read_service_output/
-            // tail_service_logs) per leggere perche' il servizio e' morto; il nudge lo
-            // guida a diagnosticare e correggere, non a rilanciare. Forzare l'azione
-            // rimuoverebbe i log e lo costringerebbe a ri-avviare -> il loop che
-            // vogliamo spezzare.
-            Axis::RepeatedAction if signals.repeated_action_service_failed => false,
-            // repeated_action di SOLA LETTURA su turno INFORMATIVO: NON forzare
-            // (forzerebbe un altro read-only -> nuovo loop); il nudge guida a
-            // concludere con testo. Su turno ACTION-ORIENTED invece forziamo l'edit.
-            Axis::RepeatedAction
-                if signals.repeated_action_read_only && !signals.action_oriented =>
-            {
-                false
-            }
-            _ => true,
-        };
-        let reason = match axis {
-            Axis::RepeatedAction => {
-                format!(
-                    "stallo {}: forza-azione correttiva (no ripetizione)",
-                    axis.as_str()
-                )
-            }
-            Axis::ResourceReallocation => {
-                format!(
-                    "stallo {}: nudge riusa-porte (no nuova allocazione)",
-                    axis.as_str()
-                )
-            }
-            _ => format!(
-                "stallo {}: forza-azione (rimuovo read-only + tool_choice required)",
-                axis.as_str()
-            ),
-        };
         return ProgressDecision {
             action: Action::Guide,
             axis: Some(axis),
-            force_action: force,
-            nudge_text: Some(nudge),
+            force_action: guide_force_action(signals, axis),
+            nudge_text: Some(guide_nudge(signals, axis)),
             stop_reason: None,
-            reason,
+            reason: guide_reason(axis),
         };
     }
 
@@ -678,43 +742,7 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
             || signals.repeated_action_service_failed
             || signals.repeated_action_failed);
     if want_force_diagnose {
-        let (label, count) = signals
-            .repeated_action
-            .clone()
-            .unwrap_or_else(|| (String::new(), 0));
-        // Per l'edit fallito riusa il nudge SPECIFICO (copia l'old_string esatto
-        // dall'estratto); per il servizio fallito il nudge diagnostico-servizio (leggi
-        // i log, correggi la causa); altrimenti quello diagnostico generico.
-        let nudge = if signals.repeated_action_edit_failed {
-            repeated_action_edit_failed_nudge(&label, count)
-        } else if signals.repeated_action_service_failed {
-            repeated_action_service_failed_nudge(&label, count)
-        } else {
-            force_diagnose_nudge(&label, count)
-        };
-        let reason = if signals.repeated_action_edit_failed {
-            "stallo repeated_action (edit fallito): correzione old_string forzata, \
-                niente ABORT finche' l'estratto non e' sfruttato"
-                .to_string()
-        } else if signals.repeated_action_service_failed {
-            "stallo repeated_action (servizio fallito): diagnosi log-servizio forzata, \
-                niente ABORT e niente forza-azione (i log restano leggibili)"
-                .to_string()
-        } else {
-            "stallo repeated_action: correzione forzata prima di escalation/abort".to_string()
-        };
-        return ProgressDecision {
-            action: Action::ForceDiagnose,
-            axis: Some(axis),
-            // Forza una tool call correttiva: la diagnosi deve sfociare in un edit,
-            // non in testo o resa. ECCEZIONE servizio fallito: NON forzare, cosi' i
-            // tool di lettura log (read-only) restano disponibili per capire perche'
-            // il servizio muore (forzare rimuoverebbe i log -> rilancio cieco -> loop).
-            force_action: !signals.repeated_action_service_failed,
-            nudge_text: Some(nudge),
-            stop_reason: None,
-            reason,
-        };
+        return force_diagnose_decision(signals, axis);
     }
 
     // Livello 1.9 — CAMBIO DI STRATEGIA (solo repeated_action): guida e diagnosi
@@ -726,10 +754,7 @@ pub fn decide(signals: &ProgressSignals) -> ProgressDecision {
     let want_strategy_shift = matches!(axis, Axis::RepeatedAction)
         && !signals.already_strategy_shifted.contains(axis.as_str());
     if want_strategy_shift {
-        let (label, count) = signals
-            .repeated_action
-            .clone()
-            .unwrap_or_else(|| (String::new(), 0));
+        let (label, count) = repeated_action_label_and_count(signals);
         return ProgressDecision {
             action: Action::ChangeStrategy,
             axis: Some(axis),
