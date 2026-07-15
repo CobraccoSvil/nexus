@@ -57,6 +57,7 @@ mod middleware;
 mod model_catalog_sync;
 mod model_health_probe;
 mod model_observation;
+mod model_qualification;
 mod models;
 mod mutations_api;
 mod native_engine;

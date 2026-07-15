@@ -245,7 +245,7 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
 const COMPLETION_CHANNEL_TOOLS: [&str; 3] =
     ["task_complete", "advisory_verdict", "review_verdict"];
 
-fn build_tools_json(whitelist: &[String]) -> Value {
+pub(crate) fn build_tools_json(whitelist: &[String]) -> Value {
     if whitelist.is_empty() {
         return json!([]);
     }

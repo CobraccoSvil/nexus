@@ -95,6 +95,17 @@ pub fn spawn_model_health_probe(
         // popoli i cooldown dei provider non-funzionanti.
         sleep(Duration::from_secs(60)).await;
         loop {
+            // FASE 0 (gate qualificazione, mig 0591/0593): qualifica i
+            // candidati PRIMA del giro di liveness — nessun secondo worker,
+            // stesso rate limiting. Gated dal setting round_enabled.
+            let qualified =
+                crate::model_qualification::run_qualification_round(&orchestrator, &db).await;
+            if qualified > 0 {
+                tracing::info!(
+                    modelli = qualified,
+                    "model_health_probe: fase 0 qualificazione completata"
+                );
+            }
             run_one_round(&orchestrator, &db, failure_threshold).await;
             sleep(Duration::from_secs(interval_s)).await;
         }
@@ -1157,7 +1168,7 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
 /// system_text)`. Tool fittizio minimale + tool_choice forzato via messaggio: lo
 /// schema generate_agent_turn non ha un campo tool_choice dedicato, ma i provider
 /// OpenAI-compatible accettano la forzatura via messaggio + presenza tool.
-fn build_tool_probe_request() -> (String, String, String) {
+pub(crate) fn build_tool_probe_request() -> (String, String, String) {
     let tools_json = serde_json::json!([
         {
             "name": TOOL_PROBE_TOOL_NAME,
