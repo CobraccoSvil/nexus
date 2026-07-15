@@ -485,7 +485,7 @@ fn tool_blocks_from_gw(resp: &GwResponse) -> (Vec<Value>, Vec<Value>) {
 /// usage, error:null, error_class:null}`. `stop_reason` = "tool_use" se ci sono
 /// tool-call, altrimenti "end_turn" (come il brain, che NON propaga il
 /// finish_reason grezzo qui ma lo deriva dalla presenza di tool-call).
-fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
+pub(crate) fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
     let used_provider = if resp.provider_used.is_empty() {
         provider
     } else {

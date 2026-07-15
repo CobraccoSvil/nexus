@@ -37,7 +37,7 @@ mod core;
 mod intent;
 pub(crate) mod model_routing;
 mod model_selection;
-mod neural_client;
+pub(crate) mod neural_client;
 #[cfg(test)]
 mod tests;
 

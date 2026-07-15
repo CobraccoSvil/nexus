@@ -58,7 +58,7 @@ pub(crate) struct ProbeProfile {
 }
 
 /// Esito STRUTTURATO di UN tentativo (regola M): deriva da error_class /
-/// stop_reason / tool_use_blocks / result, mai dalla prosa.
+/// stop_reason / tool_use_blocks / content, mai dalla prosa.
 #[derive(Debug, Clone)]
 pub(crate) struct AttemptOutcome {
     pub pass: bool,
@@ -121,8 +121,20 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
         .and_then(Value::as_array)
         .map(|a| a.len() as i64)
         .unwrap_or(0);
+    // Il campo e' `content`: e' cosi' che lo nomina `agent_turn_value_from_gw`
+    // (neural_client.rs), l'UNICO produttore di questo Value. Prima leggeva
+    // `result` — una chiave che nessuno scrive — quindi `content_chars` era 0
+    // per COSTRUZIONE e `min_content_chars: 1` non era soddisfacibile da alcun
+    // modello: la batteria bocciava per "empty_content" modelli che rispondevano
+    // regolarmente (misurato: mistral-medium-3.5, codestral, open-mistral-nemo e
+    // x-ai/grok-4.5 rispondono 'ok' in <2s alla richiesta IDENTICA del probe).
+    // Con enforce_routing_gate ogni bocciatura esce dal routing: la batteria
+    // stava smontando il parco 4 modelli per giro. Il test che avrebbe dovuto
+    // proteggere costruiva a mano un turno con la STESSA chiave inventata:
+    // codice e test condividevano l'errore (verifica cieca). Ora il contratto e'
+    // ancorato al produttore da `evaluate_attempt_legge_il_turno_reale_del_gateway`.
     let content_chars = turn
-        .get("result")
+        .get("content")
         .and_then(Value::as_str)
         .map(|s| s.trim().chars().count() as i64)
         .unwrap_or(0);
@@ -1202,10 +1214,69 @@ mod tests {
                          "tool_use_blocks": [{"name": "read_file"}] });
         let out = evaluate_attempt(&ok, &json!({"min_tool_calls": 1}), 100);
         assert!(out.pass, "{}", out.reason);
-        let ko = json!({ "stop_reason": "end_turn", "result": "chiacchiere" });
+        let ko = json!({ "stop_reason": "end_turn", "content": "chiacchiere" });
         let out = evaluate_attempt(&ko, &json!({"min_tool_calls": 1}), 100);
         assert!(!out.pass);
         assert!(out.reason.starts_with("no_tool_call"));
+    }
+
+    /// IL TEST DI CONTRATTO (incidente 2026-07-15). Non costruisce il turno a
+    /// mano: lo fa produrre a `agent_turn_value_from_gw`, l'UNICO produttore
+    /// reale, partendo da una `GwResponse` come quella che il gateway restituisce
+    /// davvero. E' l'unico modo di accorgersi che il probe legge una chiave che
+    /// nessuno scrive.
+    ///
+    /// Il difetto che blinda: `evaluate_attempt` leggeva `turn["result"]` mentre
+    /// il produttore scrive `turn["content"]` -> content_chars = 0 SEMPRE ->
+    /// `min_content_chars: 1` insoddisfacibile da qualunque modello -> la
+    /// batteria bocciava per "empty_content" modelli sani (misurato su
+    /// mistral-medium-3.5, codestral-2508, open-mistral-nemo, x-ai/grok-4.5: tutti
+    /// rispondono 'ok' alla richiesta identica del probe) e, con
+    /// enforce_routing_gate acceso, li ESCLUDEVA dal routing 4 per giro.
+    ///
+    /// I test preesistenti non lo vedevano perche' inventavano il JSON con la
+    /// stessa chiave sbagliata del codice: codice e test condividevano l'errore.
+    #[test]
+    fn evaluate_attempt_legge_il_turno_reale_del_gateway() {
+        use crate::nexus_gateway::{GwResponse, GwUsage};
+        // La risposta REALE misurata sul gateway per il probe chat_smoke:
+        // content='ok', 505ms, nessuna tool-call.
+        let resp = GwResponse {
+            content: "ok".to_string(),
+            tool_calls: None,
+            usage: GwUsage {
+                input_tokens: 49,
+                output_tokens: 2,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            },
+            model_used: "mistral-medium-3.5".to_string(),
+            provider_used: "mistral".to_string(),
+            latency_ms: 505,
+            finish_reason: "stop".to_string(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+            citations: None,
+        };
+        let turn = crate::orchestrator::neural_client::agent_turn_value_from_gw(
+            "mistral",
+            "mistral-medium-3.5",
+            &resp,
+        );
+        // Il predicato REALE del profilo chat_smoke (mig 0593).
+        let out = evaluate_attempt(&turn, &json!({"min_content_chars": 1}), 505);
+        assert!(
+            out.pass,
+            "un modello che risponde 'ok' DEVE passare chat_smoke; verdetto: {} \
+             (turno prodotto dal gateway: {turn})",
+            out.reason
+        );
+        assert_eq!(
+            out.content_chars, 2,
+            "i caratteri devono essere contati dal campo che il produttore \
+             scrive davvero, non da una chiave inventata"
+        );
     }
 
     #[test]
