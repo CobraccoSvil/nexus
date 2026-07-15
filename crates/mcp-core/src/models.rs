@@ -221,6 +221,10 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             "nexus_provider_registry senza litellm_prefixes: applica la migrazione 0575".to_string(),
         );
     }
+    // Le soglie del prior UNA volta per sync (regola G: dal DB), non per modello.
+    // `None` = prior disabilitato dal flag -> il tier resta a `manual`/`measured`,
+    // e un modello mai misurato ha tier NULL.
+    let tier_prior_thresholds = crate::model_catalog_sync::tier_prior_thresholds(db).await;
 
     // Modelli gia' presenti nel catalog: usati per la protezione no-insert dei
     // provider a listino curato (litellm_sync_inserts=false).
@@ -305,31 +309,63 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             &vision_routable,
         );
 
-        // performance_tier inferito dal punto unico (regola L): prima era
-        // applicato SOLO ai nuovi insert (e solo nel path discovery API), quindi
-        // i flagship con naming recente (es. claude-opus-4-8, gpt-5.x) restavano
-        // 'medium' di default e l'auto-promoter non li trovava come 'heavy'.
-        // Qui lo (ri)calcoliamo ad ogni sync e lo propaghiamo anche alle righe
-        // esistenti 'auto' (le 'manual' restano protette dalla CASE sotto).
-        let inferred_tier = crate::model_catalog_sync::infer_tier_from_name(provider, model_id);
+        // performance_tier DAI FATTI (mig 0599), non dal NOME. Qui il listino c'e'
+        // (e' l'upsert dei costi reali), quindi il prior puo' esprimersi: il
+        // prezzo e' il segnale che il FORNITORE emette col denaro. Senza prezzo
+        // TACE -> tier NULL, che e' la verita'.
+        //
+        // Prima: `infer_tier_from_name`, che indovinava dal nome. Cosi'
+        // `gpt-5.6-sol` (il piu' capace del parco, agentic_index 54) e' finito in
+        // 'high' — nessuno aveva aggiunto "5.6" alla lista di if — e
+        // `claude-sonnet-5` (46.7, batte ogni heavy) in 'medium' perche' "non
+        // contiene opus".
+        //
+        // Le capability PROVATE non sono note qui (vivono nella riga): le aggiunge
+        // `refresh_tier_prior` al sync successivo. Il prior e' comunque un ripiego
+        // in attesa della misura della batteria.
+        let inferred_tier: Option<&'static str> = tier_prior_thresholds.as_ref().and_then(|t| {
+            crate::model_qualification::derive_tier_prior(
+                &crate::model_qualification::CatalogFacts {
+                    input_cost: (input_cost > 0.0).then_some(input_cost),
+                    context_window: context_window as i64,
+                    proven_capabilities: Vec::new(),
+                },
+                t,
+            )
+        });
 
         // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'
         // (le righe 'manual' curate da admin/migrazioni sono protette, ADR 0024).
         // I costi/context si aggiornano sempre.
+        //
+        // Il TIER ha una guard SUA (`tier_source`, mig 0599) e non `capability_source`:
+        // un tier `measured` (banda certificata dalla batteria) o `manual` e' PIU'
+        // autorevole di un prior sul prezzo e non va mai sovrascritto. Con la
+        // vecchia guard il sync avrebbe schiacciato una misura reale con una
+        // stima — e viceversa `capability_source='probe'` (che la batteria scrive
+        // alla promozione) CONGELAVA il tier per sempre al valore indovinato dal
+        // nome all'insert. Due difetti opposti, stessa causa: una colonna sola per
+        // due concern.
         let result = sqlx::query(
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
                 currency, context_window, supports_tool_use, supports_vision,
                 is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
-                performance_tier
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, $11)
+                performance_tier, tier_source
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, $11,
+                        CASE WHEN $11::text IS NULL THEN NULL ELSE 'facts_prior' END)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
                 context_window = EXCLUDED.context_window,
-                performance_tier = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                performance_tier = CASE WHEN ai_price_catalog.tier_source IS NULL
+                                          OR ai_price_catalog.tier_source = 'facts_prior'
                                         THEN EXCLUDED.performance_tier
                                         ELSE ai_price_catalog.performance_tier END,
+                tier_source = CASE WHEN ai_price_catalog.tier_source IS NULL
+                                     OR ai_price_catalog.tier_source = 'facts_prior'
+                                   THEN EXCLUDED.tier_source
+                                   ELSE ai_price_catalog.tier_source END,
                 supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                          THEN EXCLUDED.supports_tool_use
                                          ELSE ai_price_catalog.supports_tool_use END,
@@ -631,10 +667,16 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
             if !crate::model_catalog_sync::model_passes_selection_policy(db, provider, m).await {
                 continue;
             }
-            let res = sqlx::query(
+            // Prezzo ignoto -> non routabile, quindi non abilitabile nemmeno per
+            // famiglia (punto unico del predicato: regola L). Senza questo guard,
+            // un solo membro della famiglia a listino noto ne trascinerebbe dentro
+            // altri a costo placeholder.
+            let res = sqlx::query(&format!(
                 "UPDATE ai_price_catalog SET is_enabled = true \
-                 WHERE provider = $1 AND model = $2 AND is_enabled = false",
-            )
+                 WHERE provider = $1 AND model = $2 AND is_enabled = false \
+                   AND NOT {price_unknown}",
+                price_unknown = crate::model_catalog_sync::price_unknown_sql(""),
+            ))
             .bind(provider)
             .bind(m)
             .execute(db)
