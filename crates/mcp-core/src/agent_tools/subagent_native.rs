@@ -3958,35 +3958,46 @@ mod tests {
         );
     }
 
-    /// LIMITE NOTO, misurato e dichiarato (non un difetto del test): `spawn`
-    /// isola i panic e da' a ogni sub-run il PROPRIO timer, ma NON protegge da
-    /// un membro che BLOCCA IL THREAD (`std::thread::sleep`-like) dentro il
-    /// proprio poll: il time driver di tokio ne risente e i timer degli altri
-    /// slittano lo stesso (misurato: 200ms attesi -> ~2060ms reali, sia con
-    /// FuturesUnordered sia con spawn). Cioe': il fan-out con spawn e' igiene
-    /// strutturale necessaria, NON la cura del blocco collettivo del 15/07.
-    /// La cura e' eliminare il blocking dal path (P0c: tokio-console per
-    /// nominarlo). Questo test FISSA il limite: se un domani passasse (timer a
-    /// ~200ms nonostante il bloccante), vorrebbe dire che il blocking e' stato
-    /// rimosso o isolato in spawn_blocking, e allora il commento qui sopra va
-    /// aggiornato.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// LIMITE MISURATO E DICHIARATO (non un difetto del test, non una scusa):
+    /// `spawn` NON protegge in modo affidabile dal blocking sincrono.
+    ///
+    /// Riproduzione fedele dell'incidente: 6 figure nate insieme, una cede una
+    /// volta (le altre armano i loro timer) e POI blocca il thread. Misura: i
+    /// timer delle 5 sane slittano a ~1550ms invece di 200ms — IDENTICO con
+    /// FuturesUnordered e con spawn. Il motivo e' lo scheduling di tokio: i
+    /// task nati dallo stesso worker restano nella sua coda locale, e il
+    /// work-stealing non li salva in tempo quando quel worker si blocca.
+    /// (Contro-misura che aveva illuso: se i bloccanti nascono PRIMA e i sani
+    /// DOPO, questi ultimi finiscono su altri worker e i timer sono puntuali —
+    /// ma e' un ordine che il fan-out reale non garantisce.)
+    ///
+    /// Conseguenza, da dire senza giri di parole: `spawn_fanout` da' isolamento
+    /// dei panic e un timer per sub-run, e resta igiene strutturale necessaria,
+    /// ma NON e' la cura del blocco collettivo del 15/07. La cura e' togliere
+    /// il blocking dal path (misura che lo nomina: tokio-console).
+    ///
+    /// Questo test FISSA il limite: se un domani passa (timer ~200ms nonostante
+    /// il bloccante), il blocking e' stato rimosso o isolato in spawn_blocking
+    /// — allora va aggiornata questa nota e quella su `spawn_fanout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn spawn_non_protegge_dal_blocking_sincrono_limite_dichiarato() {
         use std::sync::Arc;
-        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let sem = Arc::new(tokio::sync::Semaphore::new(6));
         let mut handles = Vec::new();
-        for i in 0..3 {
+        for i in 0..6 {
             let sem = sem.clone();
             handles.push(tokio::spawn(async move {
                 let _p = sem.acquire_owned().await.expect("permit");
                 if i == 0 {
+                    // Cede PRIMA di bloccare: e' l'ordine dell'incidente (le
+                    // altre figure erano gia' partite e avevano armato i timer).
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
                     return 0u128;
                 }
                 let start = std::time::Instant::now();
                 let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_millis(200),
                     std::future::pending::<()>(),
                 )
                 .await;
@@ -3995,12 +4006,12 @@ mod tests {
         }
         let mut durate = Vec::new();
         for h in handles {
-            durate.push(h.await.expect("task"));
+            durate.push(h.await.expect("nessun panic"));
         }
-        let trascinato = durate.iter().skip(1).any(|d| *d > 500);
+        let trascinati = durate.iter().skip(1).filter(|d| **d > 700).count();
         assert!(
-            trascinato,
-            "LIMITE CAMBIATO: i timer NON sono piu' trascinati dal blocking              ({durate:?}). Se e' voluto (blocking rimosso/isolato), aggiornare              questo test e la nota su spawn_fanout."
+            trascinati > 0,
+            "LIMITE CAMBIATO: i timer NON sono piu' trascinati dal blocking              ({durate:?}). Se e' voluto (blocking rimosso o isolato in              spawn_blocking), aggiornare questo test e la nota su spawn_fanout."
         );
     }
 
