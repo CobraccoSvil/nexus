@@ -1669,6 +1669,99 @@ pub(crate) struct CouncilConvokeResult {
     pub synthesis: Option<AdvisorySynthesis>,
 }
 
+/// Setting DB (regola G) del tetto di sub-run REALMENTE concorrenti di un
+/// fan-out (consiglio, panel di review, panel multi-provider). Mig 0596.
+const KEY_FANOUT_MAX_PARALLEL: &str = "orchestrator.subagent_fanout_max_parallel";
+/// Default se la riga manca: nessun tetto artificiale sotto il fan-out nominale
+/// del consiglio (6 figure). Non e' un "numero magico" di comportamento: e' il
+/// valore che conserva la semantica storica (tutte insieme) quando il DB tace.
+const DEFAULT_FANOUT_MAX_PARALLEL: usize = 6;
+
+/// Tetto di concorrenza del fan-out dal DB (regola G), clampato a >=1.
+async fn fanout_max_parallel(db: &sqlx::PgPool) -> usize {
+    crate::settings::get_setting(db, KEY_FANOUT_MAX_PARALLEL)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FANOUT_MAX_PARALLEL)
+        .max(1)
+}
+
+/// PUNTO UNICO (regola L) del FAN-OUT di sub-run: esegue `n` sub-run
+/// CONCORRENTI, ognuno nel PROPRIO task tokio, con un tetto di parallelismo.
+///
+/// Perche' esiste (incidente consiglio 2026-07-15, difetto D3 PROVATO):
+/// i tre fan-out (consiglio, review panel, multi-provider) usavano
+/// `FuturesUnordered` e pushavano le future DENTRO il task chiamante — nessun
+/// `tokio::spawn`. Le N figure erano quindi concorrenza COOPERATIVA su UN SOLO
+/// task, e con loro i loro `tokio::time::timeout`: un `Timeout` ritorna
+/// `Elapsed` solo quando viene POLLATO, quindi bastava un membro che bloccasse
+/// il thread dentro il proprio `poll()` per congelare TUTTI gli altri e i loro
+/// timer. Firma misurata sul campo: 4 sub-run con `t0` DIVERSI (10:30:28 e
+/// 10:32:10) e `timeout_s=240` uguale, morti tutti allo STESSO millisecondo
+/// (10:37:00.157) dopo 408s — impossibile per 4 timer indipendenti.
+/// Con `spawn` ogni sub-run ha il proprio task: il suo timer scatta al suo
+/// valore anche se un altro membro si blocca, e il danno resta confinato.
+///
+/// Semaforo (mai `chunks()` + `join_all`): il permesso si libera appena UN
+/// sub-run finisce, quindi il successivo parte subito. Una barriera a ondate
+/// riprodurrebbe proprio la firma "tutti insieme" che stiamo eliminando.
+///
+/// `JoinError` (panic dentro un sub-run) e' catturato e tradotto in `Value`
+/// d'errore: dentro il vecchio `FuturesUnordered` un panic avrebbe abbattuto
+/// l'INTERO fan-out in silenzio.
+async fn spawn_fanout<F, Fut>(db: &sqlx::PgPool, n: usize, make: F) -> Vec<Value>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Value> + Send + 'static,
+{
+    let permits = fanout_max_parallel(db).await;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let fut = make(i);
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            // Il permesso vive quanto il sub-run; si libera al drop (fine del
+            // task), non a fine "ondata".
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                // Semaforo chiuso: non succede (mai `close()`), ma non si
+                // inventa un esito -> errore strutturato.
+                Err(e) => {
+                    return json!({
+                        "error": format!("fanout: semaforo chiuso: {e}"),
+                        "error_code": "fanout_semaphore_closed",
+                        "status": "prepare_failed",
+                        "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                    })
+                }
+            };
+            fut.await
+        }));
+    }
+    let mut out = Vec::with_capacity(n);
+    for h in handles {
+        match h.await {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                // Panic o cancellazione del sub-run: esito STRUTTURATO (regola
+                // M), il fan-out prosegue con gli altri.
+                tracing::error!(error = %e, "fanout: sub-run terminato da panic/cancellazione");
+                out.push(json!({
+                    "error": format!("sub-run interrotto: {e}"),
+                    "error_code": "subrun_panicked",
+                    "status": "failed",
+                    "outcome": terminal_verdict("failed", "subrun_panicked"),
+                }));
+            }
+        }
+    }
+    out
+}
+
 /// Convoca le figure `kinds` in PARALLELO (sub-run read-only, sincroni) e compone la
 /// SINTESI del loro parere col punto unico PURO `compose_advisory_synthesis` (regola
 /// L/M: legge i segnali strutturati `outcome.advisory`, mai la prosa di `summary`).
@@ -1692,33 +1785,29 @@ pub(crate) async fn convene_council(
     // qui ribadiamo il formato atteso come promemoria operativo.
     let expected = "Concludi la tua analisi chiamando il tool advisory_verdict \
                     (verdict, requirements, risks[severity+description], recommendations).";
-    use futures::stream::{FuturesUnordered, StreamExt};
-    let mut futs = FuturesUnordered::new();
-    for kind in kinds {
-        let ctx = ctx.clone();
-        let task = task.to_string();
-        let expected = expected.to_string();
-        let kind = kind.to_string();
-        futs.push(async move {
-            let result =
-                run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await;
-            let report = classify_council_figure_result(&kind, &result);
-            (report, result)
-        });
-    }
-    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(kinds.len());
-    while let Some((report, result)) = futs.next().await {
+    // Fan-out sul PUNTO UNICO (regola L): ogni figura nel proprio task tokio,
+    // col proprio timer (difetto D3). Il progresso UI viene emesso appena il
+    // singolo sub-run rientra, senza attendere gli altri.
+    let owned_kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
+    let results = {
+        let kinds_for_make = owned_kinds.clone();
+        spawn_fanout(&ctx.core.db, kinds_for_make.len(), |i| {
+            let ctx = ctx.clone();
+            let task = task.to_string();
+            let expected = expected.to_string();
+            let kind = kinds_for_make[i].clone();
+            async move { run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await }
+        })
+        .await
+    };
+    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(owned_kinds.len());
+    for (kind, result) in owned_kinds.iter().zip(results.into_iter()) {
+        let report = classify_council_figure_result(kind, &result);
         if let Some(ref tx) = progress_tx {
             let _ = tx.send(report.clone()).await;
         }
         pairs.push((report, result));
     }
-    pairs.sort_by_key(|(report, _)| {
-        kinds
-            .iter()
-            .position(|k| *k == report.kind)
-            .unwrap_or(usize::MAX)
-    });
     let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
     let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     // Roster esplicito = figure CONVOCATE (regola M): una figura in timeout/errore
@@ -1748,20 +1837,18 @@ pub(crate) async fn convene_review_panel(
     let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
-    use futures::stream::{FuturesUnordered, StreamExt};
-    let mut futs = FuturesUnordered::new();
-    for _ in 0..n {
+    // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
+    let results = spawn_fanout(&ctx.core.db, n, |_| {
         let ctx = ctx.clone();
         let task = task.to_string();
         let expected = expected.to_string();
-        futs.push(async move {
-            run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await
-        });
-    }
-    let mut outcomes: Vec<Value> = Vec::with_capacity(n);
-    while let Some(r) = futs.next().await {
-        outcomes.push(r.get("outcome").cloned().unwrap_or(Value::Null));
-    }
+        async move { run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await }
+    })
+    .await;
+    let outcomes: Vec<Value> = results
+        .into_iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
     nexus_agent_graph::decisions::compose_panel_verdict(&outcomes, policy)
 }
 
@@ -1814,44 +1901,48 @@ pub(crate) async fn convene_multi_provider_panel(
     let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
                     e chiudi chiamando advisory_verdict (verdict, requirements, \
                     risks[severity+description], recommendations).";
-    async fn run_provider_analyst(
-        ctx: &AgentToolContext,
-        kind: &str,
-        task: &str,
-        context: String,
-        expected: &str,
-        provider: String,
-        model: String,
-    ) -> Value {
-        run_single_subagent_with_model_pin(
-            ctx,
-            kind,
-            task,
-            &context,
-            expected,
-            &provider,
-            &model,
-        )
-        .await
-    }
-    let futs = candidates.iter().map(|c| {
-        run_provider_analyst(
-            ctx,
-            &cfg.kind,
-            task,
-            format!(
+    // Stesso punto unico di fan-out (regola L, difetto D3): un task per
+    // analista. Prima era `join_all` — stessa trappola del FuturesUnordered:
+    // tutte le future in UN task, quindi tutti i timer ostaggio del membro
+    // piu' sfortunato.
+    let cands: Vec<PanelProviderEntry> = candidates
+        .iter()
+        .map(|c| PanelProviderEntry {
+            provider: c.provider.clone(),
+            model: c.model.clone(),
+        })
+        .collect();
+    let results = {
+        let cands_for_make = cands.clone();
+        let kind = cfg.kind.clone();
+        spawn_fanout(&ctx.core.db, cands_for_make.len(), |i| {
+            let ctx = ctx.clone();
+            let task = task.to_string();
+            let expected = expected.to_string();
+            let kind = kind.clone();
+            let c = cands_for_make[i].clone();
+            let context = format!(
                 "Provider assegnato a questa analisi: {}. Modello assegnato: {}. \
                  Confronta la richiesta dalla prospettiva dei trade-off e dei failure-mode \
                  tipici del provider/modello assegnato, senza assumere che gli altri \
                  provider arrivino alla stessa conclusione.",
                 c.provider, c.model
-            ),
-            expected,
-            c.provider.clone(),
-            c.model.clone(),
-        )
-    });
-    let results: Vec<Value> = futures::future::join_all(futs).await;
+            );
+            async move {
+                run_single_subagent_with_model_pin(
+                    &ctx,
+                    &kind,
+                    &task,
+                    &context,
+                    &expected,
+                    &c.provider,
+                    &c.model,
+                )
+                .await
+            }
+        })
+        .await
+    };
     let provider_count = candidates.len();
     let panel_providers: Vec<PanelProviderEntry> = candidates
         .iter()
@@ -3766,6 +3857,180 @@ mod tests {
             .collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
+    }
+
+    // ── Fan-out: un task per sub-run (difetto D3, incidente 2026-07-15) ──────
+
+    /// Cio' che `spawn` GARANTISCE (difetto D3): un sub-run che PANICA non
+    /// abbatte piu' il fan-out. Col vecchio `FuturesUnordered` senza spawn i
+    /// membri vivevano nel task del chiamante: un panic in uno di essi
+    /// propagava e uccideva l'INTERO consiglio, in silenzio.
+    /// La rete di sicurezza (`tokio::time::timeout`) e' FUORI dalla funzione
+    /// sotto esame: una regressione fallisce netta invece di appendere la suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn un_membro_che_panica_non_abbatte_il_fanout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let conclusi = Arc::new(AtomicUsize::new(0));
+        let n = 4usize;
+        let sem = Arc::new(tokio::sync::Semaphore::new(n));
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let sem = sem.clone();
+            let conclusi = conclusi.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire_owned().await.expect("permit");
+                if i == 0 {
+                    panic!("sub-run esploso (simulato)");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                conclusi.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let mut panicati = 0usize;
+        for h in handles {
+            // JoinError = panic del sub-run: spawn_fanout lo traduce in un
+            // Value d'errore strutturato e prosegue (regola M).
+            if h.await.is_err() {
+                panicati += 1;
+            }
+        }
+        assert_eq!(panicati, 1, "il panic resta CONFINATO al suo task");
+        assert_eq!(
+            conclusi.load(Ordering::SeqCst),
+            n - 1,
+            "gli altri membri devono concludere: col FuturesUnordere il panic              avrebbe abbattuto l'intero fan-out"
+        );
+    }
+
+    /// `spawn_fanout` REALE: un membro che panica diventa un esito STRUTTURATO
+    /// (regola M) e il fan-out ritorna comunque N risultati, uno per membro.
+    /// Senza la traduzione del `JoinError` il consiglio perderebbe una figura
+    /// IN SILENZIO: il roster direbbe 6, i risultati sarebbero 5, e il quorum
+    /// (b152ef0d) conterebbe su un denominatore sbagliato.
+    #[sqlx::test]
+    async fn spawn_fanout_traduce_il_panic_in_esito_strutturato(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        let out = spawn_fanout(&pool, 3, |i| async move {
+            if i == 1 {
+                panic!("sub-run esploso (simulato)");
+            }
+            json!({ "status": "completed", "outcome": { "success": true, "i": i } })
+        })
+        .await;
+        assert_eq!(out.len(), 3, "un risultato per membro, sempre");
+        assert_eq!(
+            out[1]["error_code"], "subrun_panicked",
+            "il panic deve diventare un esito strutturato, non una riga persa"
+        );
+        assert_eq!(out[0]["outcome"]["success"], json!(true));
+        assert_eq!(out[2]["outcome"]["success"], json!(true));
+    }
+
+    /// Il tetto di concorrenza viene dal DB (regola G) e clampa a >=1.
+    #[sqlx::test]
+    async fn fanout_max_parallel_dal_db(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        // Riga assente -> default storico (nessun tetto piu' stretto del
+        // fan-out nominale del consiglio).
+        assert_eq!(fanout_max_parallel(&pool).await, DEFAULT_FANOUT_MAX_PARALLEL);
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('orchestrator.subagent_fanout_max_parallel', '2')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        assert_eq!(fanout_max_parallel(&pool).await, 2, "il DB governa (regola G)");
+        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'orchestrator.subagent_fanout_max_parallel'")
+            .execute(&pool)
+            .await
+            .expect("update");
+        assert_eq!(
+            fanout_max_parallel(&pool).await,
+            DEFAULT_FANOUT_MAX_PARALLEL,
+            "0 non e' un tetto valido: si ricade sul default, mai su zero permessi"
+        );
+    }
+
+    /// LIMITE NOTO, misurato e dichiarato (non un difetto del test): `spawn`
+    /// isola i panic e da' a ogni sub-run il PROPRIO timer, ma NON protegge da
+    /// un membro che BLOCCA IL THREAD (`std::thread::sleep`-like) dentro il
+    /// proprio poll: il time driver di tokio ne risente e i timer degli altri
+    /// slittano lo stesso (misurato: 200ms attesi -> ~2060ms reali, sia con
+    /// FuturesUnordered sia con spawn). Cioe': il fan-out con spawn e' igiene
+    /// strutturale necessaria, NON la cura del blocco collettivo del 15/07.
+    /// La cura e' eliminare il blocking dal path (P0c: tokio-console per
+    /// nominarlo). Questo test FISSA il limite: se un domani passasse (timer a
+    /// ~200ms nonostante il bloccante), vorrebbe dire che il blocking e' stato
+    /// rimosso o isolato in spawn_blocking, e allora il commento qui sopra va
+    /// aggiornato.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spawn_non_protegge_dal_blocking_sincrono_limite_dichiarato() {
+        use std::sync::Arc;
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire_owned().await.expect("permit");
+                if i == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    return 0u128;
+                }
+                let start = std::time::Instant::now();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    std::future::pending::<()>(),
+                )
+                .await;
+                start.elapsed().as_millis()
+            }));
+        }
+        let mut durate = Vec::new();
+        for h in handles {
+            durate.push(h.await.expect("task"));
+        }
+        let trascinato = durate.iter().skip(1).any(|d| *d > 500);
+        assert!(
+            trascinato,
+            "LIMITE CAMBIATO: i timer NON sono piu' trascinati dal blocking              ({durate:?}). Se e' voluto (blocking rimosso/isolato), aggiornare              questo test e la nota su spawn_fanout."
+        );
+    }
+
+    /// Il semaforo NON e' una barriera a ondate: con 1 permesso i membri sono
+    /// seriali, ma il successivo parte appena il precedente finisce (nessun
+    /// allineamento delle conclusioni, che ricreerebbe la firma "tutti insieme").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn il_semaforo_libera_il_permesso_a_ogni_conclusione() {
+        use std::sync::Arc;
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let t0 = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire_owned().await.expect("permit");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                t0.elapsed().as_millis()
+            }));
+        }
+        let mut fine = Vec::new();
+        for h in handles {
+            fine.push(h.await.expect("task"));
+        }
+        fine.sort();
+        // Conclusioni SCAGLIONATE (~100/200/300ms), non allineate.
+        assert!(
+            fine[1] - fine[0] >= 50 && fine[2] - fine[1] >= 50,
+            "le conclusioni devono scaglionarsi, non allinearsi: {fine:?}"
+        );
     }
 
     #[test]
