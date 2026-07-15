@@ -1212,4 +1212,86 @@ mod tests {
              che CONTENGONO 'exp' senza esserlo (express) restano"
         );
     }
+    /// IL TEST PONTE fra le due meta' del vocabolario (regola L).
+    ///
+    /// La scala dei tier deve vivere in UN posto solo, ma Rust e SQL sono
+    /// linguaggi diversi: l'espressione SQL e' GENERATA da `tier_rank_sql` a
+    /// partire dalle stesse `PERFORMANCE_TIERS`/`tier_rank`. Questo test chiude
+    /// il cerchio provandola su POSTGRES VERO: se le due meta' divergessero —
+    /// com'era successo con la scala a 3 livelli di `agent_run.rs`, dove
+    /// `frontier` e `high` collassavano su 0 come `light` — qui diventa rosso.
+    ///
+    /// Copre anche i casi che il CASE scritto a mano sbagliava piu' spesso: il
+    /// tier NULL (la colonna sta per diventare nullable) e un valore fuori
+    /// vocabolario, che devono prendere lo stesso rank neutro di `tier_rank`.
+    #[sqlx::test]
+    async fn tier_rank_sql_coincide_col_rank_rust(pool: sqlx::PgPool) {
+        use nexus_agent_graph::decisions::tiers::{tier_rank, tier_rank_sql, PERFORMANCE_TIERS};
+
+        let expr = tier_rank_sql("t");
+        for tier in PERFORMANCE_TIERS {
+            let sql_rank: i32 = sqlx::query_scalar(&format!("SELECT {expr} FROM (SELECT $1::text AS t) s"))
+                .bind(tier)
+                .fetch_one(&pool)
+                .await
+                .expect("query rank");
+            assert_eq!(
+                sql_rank as u8,
+                tier_rank(tier),
+                "Postgres e Rust ordinano '{tier}' in modo diverso: la scala si e'                  sdoppiata (SQL={sql_rank}, Rust={})",
+                tier_rank(tier)
+            );
+        }
+        // Tolleranza identica: maiuscole e spazi.
+        let sql_rank: i32 = sqlx::query_scalar(&format!("SELECT {expr} FROM (SELECT '  HEAVY '::text AS t) s"))
+            .fetch_one(&pool)
+            .await
+            .expect("query rank");
+        assert_eq!(sql_rank as u8, tier_rank("  HEAVY "));
+        // Valore ignoto e NULL -> rank neutro, come tier_rank.
+        for ignoto in ["ultra", "fast"] {
+            let sql_rank: i32 = sqlx::query_scalar(&format!("SELECT {expr} FROM (SELECT $1::text AS t) s"))
+                .bind(ignoto)
+                .fetch_one(&pool)
+                .await
+                .expect("query rank");
+            assert_eq!(sql_rank as u8, tier_rank(ignoto), "'{ignoto}' deve avere il rank neutro");
+        }
+        let sql_null: i32 = sqlx::query_scalar(&format!("SELECT {expr} FROM (SELECT NULL::text AS t) s"))
+            .fetch_one(&pool)
+            .await
+            .expect("query rank null");
+        assert_eq!(
+            sql_null as u8,
+            tier_rank(""),
+            "un tier NULL deve prendere il rank neutro, non sparire dall'ordinamento"
+        );
+    }
+
+    /// L'ordinamento REALE sul catalog: il difetto misurato il 15/07 era che
+    /// l'escalation "sali al modello piu' capace" sceglieva un heavy scartando i
+    /// frontier. Con l'espressione generata il primo e' il frontier.
+    #[sqlx::test]
+    async fn ordinare_col_rank_generato_mette_il_frontier_in_testa(pool: sqlx::PgPool) {
+        use nexus_agent_graph::decisions::tiers::tier_rank_sql;
+        create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier) VALUES              ('openai', 'gpt-frontier', 'frontier'),              ('openai', 'gpt-heavy', 'heavy'),              ('mistral', 'mistral-medium', 'medium'),              ('openai', 'gpt-high', 'high'),              ('openai', 'gpt-light', 'light')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let ordinati: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT model FROM ai_price_catalog ORDER BY {} DESC",
+            tier_rank_sql("performance_tier")
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("select");
+        assert_eq!(
+            ordinati,
+            vec!["gpt-frontier", "gpt-heavy", "gpt-high", "mistral-medium", "gpt-light"],
+            "l'ordine deve seguire la scala a 5 livelli; col CASE a 3 livelli              frontier e high finivano in fondo, sotto il medium"
+        );
+    }
 }

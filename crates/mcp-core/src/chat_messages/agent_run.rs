@@ -3496,15 +3496,21 @@ pub(crate) async fn spawn_agent_run(
 
                     // ── ESCALATION su hollow ricorrente ─────────────────────────────
                     // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
-                    // smetti di girare in tondo sui modelli small e scala al primo
-                    // modello "di ordine superiore" disponibile nel catalog:
-                    // performance_tier='heavy' AND is_enabled, ordinato per qualita'
-                    // (costo input desc = proxy di capacita'). Provider-agnostic:
-                    // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
+                    // smetti di girare in tondo sui modelli small e scala al modello
+                    // piu' capace disponibile nel catalog, a parita' di tier il piu'
+                    // costoso (proxy di capacita'). Provider-agnostic: sceglie
+                    // qualunque modello disponibile non gia' tried/in-cooldown.
                     //
-                    // Esempi attesi (sort cost desc):
-                    //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
-                    //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
+                    // L'ordinamento per capacita' viene dal PUNTO UNICO del
+                    // vocabolario (`tier_rank_sql`, regola L). Prima era un CASE
+                    // scritto a mano con una scala a TRE livelli
+                    // (heavy=2, medium=1, ELSE=0) sopravvissuta al passaggio a
+                    // cinque (mig 0528): `frontier` e `high` collassavano a 0 come
+                    // `light`, quindi l'escalation "sali al piu' capace" SCARTAVA
+                    // tutti i frontier e preferiva un medium (1) a un frontier (0).
+                    // Misurato sul catalog vivo: sceglieva openai/gpt-5.4-pro
+                    // (heavy) mentre openai/gpt-5.5-pro (frontier) era disponibile,
+                    // e ignorava claude-fable-5 e claude-opus-4-8.
                     //
                     // Conta come "hollow precedente" se hollow_retry == true ora E
                     // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
@@ -3516,15 +3522,19 @@ pub(crate) async fn spawn_agent_run(
                         // sola volta in select_agentic_model. Esclude i provider gia'
                         // provati; preferisce i piu' "potenti" (tier desc, costo desc) e
                         // con context_window sufficiente.
+                        let order_by_capacita = format!(
+                            "{} DESC, \
+                             input_cost_per_million_tokens DESC NULLS LAST, \
+                             output_cost_per_million_tokens DESC NULLS LAST",
+                            nexus_agent_graph::decisions::tiers::tier_rank_sql("performance_tier")
+                        );
                         crate::orchestrator::select_agentic_model(
                         &db_clone,
                         &[],
                         None,
                         ctx_needed,
                         &tried_models,
-                        "CASE performance_tier WHEN 'heavy' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC, \
-                         input_cost_per_million_tokens DESC NULLS LAST, \
-                         output_cost_per_million_tokens DESC NULLS LAST",
+                        &order_by_capacita,
                     )
                     .await
                     .map(|(p, m)| {
