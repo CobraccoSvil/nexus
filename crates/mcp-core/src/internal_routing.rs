@@ -401,15 +401,19 @@ pub async fn resolve_purpose_provider_candidates_db(
     // Recupera un pool piu' ampio del limite per poter deduplicare per provider
     // senza forzare una query SQL dedicata fuori dal selettore unico.
     let pool_limit = (limit.saturating_mul(4)).max(limit) as i64;
-    let rows = crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        &[rule.tier.as_str()],
-        order_by,
-        pool_limit,
-    )
-    .await
-    .map_err(PurposeResolution::MatrixUnavailable)?;
+    // DEGRADAZIONE come nella risoluzione a figura singola: qui non c'e' pin
+    // (`only_provider: None`), quindi non esiste l'alternativa "togli il pin" e
+    // l'unica scelta e' fra un tier piu' basso e NESSUN candidato. Un fan-out
+    // multi-provider e' anzi il caso che ne ha piu' bisogno: chiede N provider
+    // DISTINTI, e il tier alto e' proprio quello popolato da meno provider (il
+    // 'heavy' vive su openai/anthropic/google soltanto). Il corto-circuito di
+    // `select_models_tierchain` sceglie il PRIMO tier con candidati: i pareri
+    // restano omogenei di fascia, mai un misto heavy+light.
+    let tier_chain = crate::orchestrator::model_routing::agentic_tier_chain(&rule.tier);
+    let rows =
+        crate::orchestrator::select_models_tierchain(db, &filter, &tier_chain, order_by, pool_limit)
+            .await
+            .map_err(PurposeResolution::MatrixUnavailable)?;
 
     let mut seen: Vec<String> = Vec::new();
     let mut out = Vec::new();
@@ -1048,5 +1052,65 @@ mod tests {
         let providers: Vec<_> = candidates.iter().map(|c| c.provider.as_str()).collect();
         assert_eq!(providers, vec!["deepseek", "openai", "anthropic"]);
         assert_eq!(candidates[1].model, "gpt-b", "cost-first sullo stesso provider");
+    }
+    /// REGRESSIONE (incidente consiglio 2026-07-15) sul FAN-OUT multi-provider.
+    /// Il panel chiede N provider DISTINTI, e il tier alto e' proprio quello
+    /// popolato da MENO provider: 'heavy' vive solo su openai/anthropic/google
+    /// (infer_tier_from_name non ammette gli altri). Con openai e anthropic
+    /// insieme in cooldown billing il pool 'heavy' si e' svuotato e il panel non
+    /// si convocava affatto, mentre modelli sani stavano un gradino sotto.
+    /// Il fix a figura singola non copriva questo path: passava ancora
+    /// `&[rule.tier]`, una tier-chain di UN elemento.
+    #[sqlx::test]
+    async fn fanout_degrada_quando_il_tier_richiesto_e_esaurito(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model (                  purpose TEXT PRIMARY KEY,                  tier TEXT,                  required_capability TEXT,                  requires_tool_use BOOLEAN NOT NULL DEFAULT false              )",
+        )
+        .execute(&pool)
+        .await
+        .expect("nexus_purpose_model");
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use)              VALUES ('multi_provider_advisory', 'heavy', 'reasoning', true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        // Gli unici 'heavy' sono di due provider AUTO-DISABILITATI (is_enabled
+        // false = l'effetto del cooldown billing sul pool eleggibile); i modelli
+        // sani vivono nel tier sotto, su provider diversi.
+        for (provider, model, tier, enabled, cost) in [
+            ("openai", "gpt-heavy", "heavy", false, 2.0),
+            ("anthropic", "claude-heavy", "heavy", false, 3.0),
+            ("deepseek", "deepseek-v4-pro", "high", true, 0.5),
+            ("google", "gemini-high", "high", true, 1.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog                  (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,                   performance_tier, capabilities, input_cost_per_million_tokens)                  VALUES ($1, $2, $3, true, 'none', $4, '[\"reasoning\"]'::jsonb, $5)",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(enabled)
+            .bind(tier)
+            .bind(cost)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+        let candidates = resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3)
+            .await
+            .expect("candidati");
+        let providers: Vec<_> = candidates.iter().map(|c| c.provider.as_str()).collect();
+        assert_eq!(
+            providers,
+            vec!["deepseek", "google"],
+            "tier 'heavy' esaurito -> il fan-out DEGRADA a 'high' e convoca i              provider sani, invece di tornare a mani vuote (era l'incidente: il              panel non si convocava con modelli sani un gradino sotto)"
+        );
+        // Fascia OMOGENEA: il corto-circuito prende il primo tier con candidati,
+        // mai un misto di fasce diverse.
+        assert!(
+            candidates.iter().all(|c| c.tier.as_deref() == Some("high")),
+            "i pareri devono restare omogenei di fascia: {candidates:?}"
+        );
     }
 }
