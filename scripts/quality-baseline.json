@@ -1,7 +1,7 @@
 {
-  "total": 8045,
-  "long_functions": 742,
-  "complexity_high": 12,
+  "total": 7992,
+  "long_functions": 736,
+  "complexity_high": 2,
   "security": 44,
   "files_scanned": 886
 }
