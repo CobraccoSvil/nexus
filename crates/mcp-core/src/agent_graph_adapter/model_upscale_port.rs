@@ -17,7 +17,6 @@ use sqlx::PgPool;
 
 use nexus_agent_graph::runtime::ports::{ExecMode, ModelUpscalePort, PortError, UpscalePick};
 
-use crate::orchestrator::select_agentic_model;
 
 /// Adapter [`ModelUpscalePort`] -> `ai_price_catalog` + settings `agent.upscale.*`.
 pub struct CatalogModelUpscalePort {
@@ -157,18 +156,25 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
             // catalog e' cambiato tra primario e resume).
             return Ok(None);
         }
-        // Stesso ordinamento del routing agentico (AGENTIC_COST_FIRST_ORDER): a
-        // tier fissato prende il modello piu' economico che soddisfa i vincoli
+        // SERVIZIO UNICO (regola L). `Exact{ScaleTarget}`: il tier arriva GIA'
+        // deciso dal modulo puro dello scale-controller — questa funzione lo
+        // ESEGUE, non lo negozia. Degradare qui darebbe al chiamante un modello
+        // di un tier diverso da quello che ha chiesto, in silenzio.
+        // `CostFirst`: a tier fissato il piu' economico che soddisfa i vincoli
         // (context_window incluso), is_featured solo come tie-break.
-        let picked = select_agentic_model(
+        let picked = crate::orchestrator::model_service::select_model(
             &self.db,
-            &[tier],
-            capability,
-            min_context_window,
-            exclude_providers,
-            crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+            &crate::orchestrator::model_service::ModelRequest::agentic(tier)
+                .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
+                    why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
+                })
+                .capability(capability)
+                .min_context_window(min_context_window)
+                .exclude(exclude_providers),
         )
-        .await;
+        .await
+        .ok()
+        .map(|c| (c.provider, c.model));
         Ok(picked)
     }
 }

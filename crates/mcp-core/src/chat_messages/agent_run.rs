@@ -1591,21 +1591,55 @@ pub(crate) struct LedgerTotals {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// Numero di righe FINALIZZATE del ledger per il run. E' il segnale
+    /// STRUTTURATO di "il gateway ha contabilizzato questo run" (regola M):
+    /// distingue "nessuna riga" da "righe a costo zero" — due casi che il solo
+    /// `total_cost` confonde.
+    pub rows: i64,
 }
 
 impl LedgerTotals {
-    /// True se il ledger contiene almeno un costo > 0 per il run: condizione
-    /// per considerarlo la fonte autoritativa (un ledger vuoto / a costo zero
-    /// lascia decidere il fallback catalog).
-    fn has_cost(&self) -> bool {
-        self.total_cost > 0.0
+    /// True se il gateway ha contabilizzato almeno una chiamata per il run.
+    ///
+    /// Deliberatamente NON guarda l'importo: un run i cui modelli hanno prezzo
+    /// ignoto produce righe a costo 0, e quelle righe sono comunque la
+    /// contabilita' autoritativa (i token sono reali). Dedurre "il ledger non
+    /// c'e'" da "il costo e' 0" e' inferire lo stato da una grandezza invece che
+    /// dal segnale strutturato — regola M.
+    pub(crate) fn has_rows(&self) -> bool {
+        self.rows > 0
+    }
+
+    /// Token totali coerenti del run. Alcune righe del ledger possono avere
+    /// `total_tokens = 0` pur avendo prompt/completion validi: in quel caso il
+    /// totale va ricostruito, per non pubblicare "0 token" a fronte di chiamate
+    /// realmente avvenute. Punto unico del quirk (regola L): lo usano sia il run
+    /// di chat sia i sub-run.
+    pub(crate) fn coherent_total_tokens(&self) -> i64 {
+        let tt = self.total_tokens.max(0);
+        if tt > 0 {
+            tt
+        } else {
+            self.prompt_tokens
+                .max(0)
+                .saturating_add(self.completion_tokens.max(0))
+        }
     }
 }
 
 /// Aggrega costo e token dal ledger per il `run_id` dato. Best-effort: se il DB
 /// e' irraggiungibile o non esistono righe, ritorna [`LedgerTotals::default`]
-/// (tutti 0) e il chiamante ricade sul fallback catalog. Il `run_id` del ledger
-/// coincide con `agent_runs.id` (il gateway lo popola dal `request_id` del turno).
+/// (tutti 0, `rows = 0`) e il chiamante ricade sul fallback catalog. Il `run_id`
+/// del ledger coincide con `agent_runs.id` (il gateway lo popola dal
+/// `request_id` del turno).
+///
+/// Conta e somma SOLO le righe `status = 'finalized'`: e' l'unico stato che
+/// rappresenta una chiamata effettivamente contabilizzata (gli altri ammessi dal
+/// CHECK — `reserved`, `rejected`, `failed`, `released` — non lo sono). Filtrare
+/// sullo stato strutturato invece che sull'importo e' la regola M.
+///
+/// NB: NON usare `finalized_at IS NOT NULL` come predicato di finalizzazione —
+/// e' NULL sulla quasi totalita' delle righe realmente finalizzate.
 pub(crate) async fn fetch_ledger_totals(db: &PgPool, run_id: Uuid) -> LedgerTotals {
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -1613,14 +1647,16 @@ pub(crate) async fn fetch_ledger_totals(db: &PgPool, run_id: Uuid) -> LedgerTota
         prompt_tokens: i64,
         completion_tokens: i64,
         total_tokens: i64,
+        rows: i64,
     }
     let row: Option<Row> = sqlx::query_as::<_, Row>(
         "SELECT COALESCE(SUM(total_cost), 0)::float8        AS total_cost,
                 COALESCE(SUM(prompt_tokens), 0)::int8       AS prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0)::int8   AS completion_tokens,
-                COALESCE(SUM(total_tokens), 0)::int8        AS total_tokens
+                COALESCE(SUM(total_tokens), 0)::int8        AS total_tokens,
+                COUNT(*)::int8                              AS rows
            FROM ai_usage_ledger
-          WHERE run_id = $1",
+          WHERE run_id = $1 AND status = 'finalized'",
     )
     .bind(run_id)
     .fetch_optional(db)
@@ -1636,44 +1672,46 @@ pub(crate) async fn fetch_ledger_totals(db: &PgPool, run_id: Uuid) -> LedgerTota
             prompt_tokens: r.prompt_tokens,
             completion_tokens: r.completion_tokens,
             total_tokens: r.total_tokens,
+            rows: r.rows,
         },
         None => LedgerTotals::default(),
     }
 }
 
 /// Riconcilia costo e token di `result` con i totali del ledger (punto unico,
-/// regola L). Il ledger e' la fonte autoritativa: se `result.total_cost == 0`
-/// (caso path NATIVO, che non aggrega nel grafo) e il ledger ha un costo > 0,
-/// sovrascrive `total_cost`/`prompt_tokens`/`completion_tokens`/`total_tokens`
-/// di `result` con i valori aggregati, cosi' TUTTI i consumer a valle
-/// (metadata del messaggio assistant, agent_runs, budget provider) vedono il
-/// costo reale.
+/// regola L). Il ledger e' la fonte autoritativa: se il gateway ha
+/// contabilizzato il run (almeno una riga finalizzata), i suoi totali
+/// sovrascrivono `total_cost`/`prompt_tokens`/`completion_tokens`/`total_tokens`
+/// di `result`, cosi' TUTTI i consumer a valle (metadata del messaggio
+/// assistant, agent_runs, budget provider, cap di spesa dei subagenti) vedono il
+/// costo reale del RUN INTERO.
 ///
-/// Funzione pura/isolata (testabile senza DB): ritorna `true` se ha applicato
-/// i valori del ledger, `false` se ha lasciato `result` invariato (perche'
-/// `result` ha gia' un costo, o perche' il ledger e' vuoto/a costo zero — in
-/// quest'ultimo caso il chiamante mantiene il fallback al calcolo-da-catalog).
+/// Perche' il ledger vince SEMPRE quando ha righe: `result.total_cost` arriva da
+/// `state.total_cost_usd`, che il grafo aggiorna con un reducer di tipo
+/// *overwrite* — vale quindi l'ULTIMO TURNO, non il totale del run
+/// (vedi `native_engine.rs`, campo `total_cost` di `NativeRunOutcome`).
+/// La guardia precedente (`result.total_cost > 0.0` -> non riconciliare) si
+/// fondava sulla premessa "il path nativo lascia total_cost = 0, solo il brain
+/// Python lo valorizza": premessa FALSA (il path nativo lo valorizza col costo
+/// del turno) e per giunta riferita a un brain che non esiste piu'. L'effetto era
+/// che la riconciliazione si auto-disabilitava proprio sui run che doveva
+/// correggere, pubblicando il costo di una singola iterazione come totale.
+///
+/// Funzione pura/isolata (testabile senza DB): ritorna `true` se ha applicato i
+/// valori del ledger, `false` se lo ha lasciato invariato perche' il gateway non
+/// ha contabilizzato nulla per questo run (`rows == 0`) — in quel caso il
+/// chiamante mantiene il fallback al calcolo-da-catalog.
 pub(crate) fn reconcile_run_cost_from_ledger(
     result: &mut crate::agent_types::AgentRunResult,
     ledger: &LedgerTotals,
 ) -> bool {
-    if result.total_cost > 0.0 || !ledger.has_cost() {
+    if !ledger.has_rows() {
         return false;
     }
     result.total_cost = ledger.total_cost;
     result.prompt_tokens = ledger.prompt_tokens.max(0) as u32;
     result.completion_tokens = ledger.completion_tokens.max(0) as u32;
-    // Coerenza: se il ledger non riporta un total_tokens (alcune righe possono
-    // averlo 0) ricostruiscilo da prompt+completion per non mostrare 0 token a
-    // fronte di un costo > 0.
-    let tt = ledger.total_tokens.max(0);
-    result.total_tokens = if tt > 0 {
-        tt as u32
-    } else {
-        result
-            .prompt_tokens
-            .saturating_add(result.completion_tokens)
-    };
+    result.total_tokens = ledger.coherent_total_tokens() as u32;
     true
 }
 
@@ -3117,19 +3155,22 @@ pub(crate) async fn spawn_agent_run(
                     "agent_run {}: primario {}/{} non idoneo (ctx {} < {} oppure non tool-capable: {}), re-route agentico",
                     run_id, current_provider, current_model, primary_ctx, ctx_needed, !primary_tool_ok
                 );
-                    // Re-routing AGENTICO. PUNTO UNICO di selezione (regola L):
-                    // l'eleggibilita' agentica (tool_use, policy<>'exclude',
-                    // consecutive_failures, cooldown) e' definita una sola volta in
-                    // select_agentic_model. Vincolo extra: context_window >= ctx_needed.
-                    let alt = crate::orchestrator::select_agentic_model(
+                    // SERVIZIO UNICO (regola L). `AnyTier`: qui il tier non e' un
+                    // vincolo — il primario e' inadatto (finestra o tool) e serve
+                    // QUALUNQUE modello agentico che regga il contesto, il piu'
+                    // economico. Era gia' la semantica (tier-chain `&[]`), ora e'
+                    // DICHIARATA invece di essere un array vuoto da interpretare.
+                    // `CostFirst` aggiunge il tie-break `is_featured DESC` che qui
+                    // mancava: a parita' di costo la scelta diventa deterministica.
+                    let alt = crate::orchestrator::model_service::select_model(
                         &db_clone,
-                        &[],
-                        None,
-                        ctx_needed,
-                        &[],
-                        "input_cost_per_million_tokens ASC NULLS LAST",
+                        &crate::orchestrator::model_service::ModelRequest::agentic("")
+                            .tier_policy(crate::orchestrator::model_service::TierPolicy::AnyTier)
+                            .min_context_window(ctx_needed),
                     )
-                    .await;
+                    .await
+                    .ok()
+                    .map(|c| (c.provider, c.model));
                     if let Some((p, m)) = alt {
                         tracing::info!(
                             "agent_run {}: re-route agentico: {} -> {}/{}",
@@ -3517,27 +3558,25 @@ pub(crate) async fn spawn_agent_run(
                     let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
                     let next_pair: Option<(String, String)> = if escalate_on_hollow {
                         let tried_models: Vec<String> = tried.iter().cloned().collect();
-                        // Escalation su hollow ricorrente: PUNTO UNICO di selezione
-                        // (regola L). Eleggibilita' agentica + cooldown definiti una
-                        // sola volta in select_agentic_model. Esclude i provider gia'
-                        // provati; preferisce i piu' "potenti" (tier desc, costo desc) e
-                        // con context_window sufficiente.
-                        let order_by_capacita = format!(
-                            "{} DESC, \
-                             input_cost_per_million_tokens DESC NULLS LAST, \
-                             output_cost_per_million_tokens DESC NULLS LAST",
-                            nexus_agent_graph::decisions::tiers::tier_rank_sql("performance_tier")
-                        );
-                        crate::orchestrator::select_agentic_model(
-                        &db_clone,
-                        &[],
-                        None,
-                        ctx_needed,
-                        &tried_models,
-                        &order_by_capacita,
-                    )
-                    .await
-                    .map(|(p, m)| {
+                        // SERVIZIO UNICO (regola L): `AnyTier` + `HighestTierFirst`.
+                        // Il tier non e' un vincolo (si cerca il piu' capace
+                        // OVUNQUE), e l'ordinamento per capacita' e' l'UNICO
+                        // ammesso — generato dal vocabolario, non scrivibile a
+                        // mano: e' proprio da un ORDER BY libero che era entrata
+                        // la scala a 3 livelli. Esclude i provider gia' provati e
+                        // richiede la finestra sufficiente.
+                        crate::orchestrator::model_service::select_model(
+                            &db_clone,
+                            &crate::orchestrator::model_service::ModelRequest::agentic("")
+                                .tier_policy(crate::orchestrator::model_service::TierPolicy::AnyTier)
+                                .rank(crate::orchestrator::model_service::Rank::HighestTierFirst)
+                                .min_context_window(ctx_needed)
+                                .exclude(&tried_models),
+                        )
+                        .await
+                        .ok()
+                        .map(|c| (c.provider, c.model))
+                        .map(|(p, m)| {
                         tracing::warn!(
                             "agent_run {}: ESCALATION hollow ricorrente — salto a {}/{} (selettore unico)",
                             run_id, p, m
@@ -3673,11 +3712,12 @@ pub(crate) async fn spawn_agent_run(
             // del costo del run. Il gateway scrive una riga per OGNI chiamata LLM
             // del turno applicando i prezzi corretti del catalog (e gestendo
             // escalation / modelli multipli nello stesso run, cosa che il calcolo
-            // single-price dal catalog NON fa bene). Il path NATIVO non aggrega i
-            // token/costo nel grafo (`result.total_cost/prompt_tokens/...` = 0):
-            // senza questa riconciliazione TUTTI i consumer a valle (metadata del
-            // messaggio assistant totalCost/totalTokens per la UI, agent_runs,
-            // budget provider) vedono $0.00 pur essendo il run costato davvero.
+            // single-price dal catalog NON fa bene). Il grafo nativo, invece,
+            // tiene `total_cost`/`prompt_tokens` con un reducer di tipo overwrite:
+            // valgono l'ULTIMO TURNO, non il run. Senza questa riconciliazione
+            // TUTTI i consumer a valle (metadata del messaggio assistant per la
+            // UI, agent_runs, budget provider) pubblicano il costo di una singola
+            // iterazione spacciandolo per il totale del run.
             //
             // Una sola aggregazione, riusata da messaggio + agent_runs + budget.
             // Autoritativa solo se `result.total_cost == 0` e il ledger ha costo
@@ -7184,6 +7224,7 @@ mod tests_finalize_turn {
             prompt_tokens: 18_000,
             completion_tokens: 1_400,
             total_tokens: 19_400,
+            rows: 3,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
         assert!(
@@ -7197,9 +7238,16 @@ mod tests_finalize_turn {
     }
 
     #[test]
-    fn ledger_non_sovrascrive_costo_gia_propagato() {
-        // Path Python: result ha gia' un costo valido -> il ledger NON lo tocca
-        // (evita doppio conteggio / regressioni dove il brain e' autoritativo).
+    fn ledger_sovrascrive_il_costo_dell_ultimo_turno() {
+        // REGRESSIONE (misurata in produzione, sessione chat 25): result.total_cost
+        // NON e' il totale del run ma il costo dell'ULTIMO TURNO (reducer overwrite
+        // nel grafo). Il ledger ha le righe di TUTTE le chiamate: quando ne ha,
+        // vince, altrimenti il run pubblica l'ultima iterazione come totale
+        // (misurato: 0.0338 invece di 0.1510 -> sottostima 4.5x).
+        //
+        // Il test precedente asseriva il CONTRARIO ("result con costo > 0 non va
+        // sovrascritto"), sancendo il difetto sul razionale "il brain Python e'
+        // autoritativo": premessa falsa e brain non piu' esistente.
         let mut r = mk_result(
             AgentRunStatus::Completed,
             vec![write_step()],
@@ -7208,29 +7256,60 @@ mod tests_finalize_turn {
             "",
             Some("fix"),
         );
-        r.total_cost = 0.05;
-        r.prompt_tokens = 1_000;
-        r.completion_tokens = 200;
-        r.total_tokens = 1_200;
+        r.total_cost = 0.033842; // costo del solo ultimo turno
+        r.prompt_tokens = 13_780;
+        r.completion_tokens = 1_047;
+        r.total_tokens = 14_827;
         let ledger = super::LedgerTotals {
-            total_cost: 0.99,
-            prompt_tokens: 99_999,
-            completion_tokens: 99_999,
-            total_tokens: 199_998,
+            total_cost: 0.150972, // totale reale del run (8 chiamate)
+            prompt_tokens: 63_177,
+            completion_tokens: 4_103,
+            total_tokens: 67_280,
+            rows: 8,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
         assert!(
-            !applied,
-            "result con costo > 0 non va sovrascritto dal ledger"
+            applied,
+            "il ledger con righe e' autoritativo anche se result ha gia' un costo > 0"
         );
-        assert!((r.total_cost - 0.05).abs() < 1e-9);
-        assert_eq!(r.prompt_tokens, 1_000);
-        assert_eq!(r.total_tokens, 1_200);
+        assert!((r.total_cost - 0.150972).abs() < 1e-9, "costo del RUN, non del turno");
+        assert_eq!(r.prompt_tokens, 63_177);
+        assert_eq!(r.total_tokens, 67_280);
+    }
+
+    #[test]
+    fn ledger_con_righe_a_costo_zero_e_comunque_autoritativo() {
+        // Prezzo del modello ignoto (pricing_state='unknown') -> il gateway scrive
+        // righe con token reali e costo 0. Sono contabilita' valida: i token vanno
+        // riconciliati lo stesso. Il vecchio predicato `total_cost > 0` le
+        // scambiava per "ledger assente" (regola M: lo stato non si deduce da una
+        // grandezza).
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
+        );
+        r.total_cost = 0.02;
+        r.prompt_tokens = 10;
+        let ledger = super::LedgerTotals {
+            total_cost: 0.0,
+            prompt_tokens: 15_162_322,
+            completion_tokens: 140_049,
+            total_tokens: 15_302_371,
+            rows: 747,
+        };
+        let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
+        assert!(applied, "righe presenti -> ledger autoritativo anche a costo 0");
+        assert_eq!(r.prompt_tokens, 15_162_322, "i token sono reali e vanno adottati");
+        assert!(r.total_cost.abs() < 1e-9, "costo onestamente 0: il prezzo e' ignoto, non stimato");
     }
 
     #[test]
     fn ledger_vuoto_lascia_result_invariato_per_fallback_catalog() {
-        // Ledger assente per il run (provider che non scrive ledger): nessuna
+        // Ledger SENZA RIGHE per il run (provider che non scrive ledger): nessuna
         // riconciliazione -> il chiamante ricade sul fallback calcolo-da-catalog.
         let mut r = mk_result(
             AgentRunStatus::Completed,
@@ -7250,7 +7329,7 @@ mod tests_finalize_turn {
         );
         let applied =
             super::reconcile_run_cost_from_ledger(&mut r, &super::LedgerTotals::default());
-        assert!(!applied, "ledger a costo zero non e' autoritativo");
+        assert!(!applied, "ledger senza righe: niente da riconciliare");
         assert_eq!(
             (
                 r.total_cost,
@@ -7285,11 +7364,12 @@ mod tests_finalize_turn {
             prompt_tokens: 1_650_000, // cumulativo multi-iterazione
             completion_tokens: 40_000,
             total_tokens: 1_690_000,
+            rows: 12,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
         assert!(
             applied,
-            "ledger con costo > 0 e' autoritativo per il billing"
+            "ledger con righe e' autoritativo per il billing"
         );
         assert_eq!(
             r.prompt_tokens, 1_650_000,
@@ -7319,6 +7399,7 @@ mod tests_finalize_turn {
             prompt_tokens: 800,
             completion_tokens: 150,
             total_tokens: 0,
+            rows: 2,
         };
         assert!(super::reconcile_run_cost_from_ledger(&mut r, &ledger));
         assert_eq!(
