@@ -465,13 +465,64 @@ pub async fn best_model_for_tier_pinned(
     exclude_providers: &[String],
     only_provider: Option<&str>,
 ) -> Option<(String, String)> {
+    // Vista che SCARTA il tier effettivo, per i ~20 chiamanti storici che non ne
+    // hanno bisogno. Chi deve DICHIARARE una degradazione (regola M: il fatto e'
+    // un dato strutturato, non una congettura del lettore) usa la variante
+    // `_with_tier` qui sotto.
+    best_model_for_tier_pinned_with_tier(
+        db,
+        tier,
+        capability,
+        requires_tool_use,
+        exclude_providers,
+        only_provider,
+    )
+    .await
+    .map(|(provider, model, _)| (provider, model))
+}
+
+/// Come [`best_model_for_tier_pinned`], ma ritorna anche il tier EFFETTIVO del
+/// modello scelto: se differisce da quello richiesto c'e' stata una DEGRADAZIONE,
+/// e il chiamante puo' dirlo con un dato invece di lasciarlo dedurre.
+///
+/// DEGRADAZIONE (incidente consiglio 2026-07-15). Prima passava `&[tier]` — una
+/// tier-chain di UN elemento — mentre `route_model_from_catalog` (path della CHAT
+/// utente) usava gia' [`agentic_tier_chain`]: la STESSA domanda ("quale modello
+/// per questo tier?") aveva due risposte diverse a seconda del chiamante (odore
+/// regola L). Conseguenza misurata: openai e anthropic insieme in cooldown
+/// billing hanno svuotato il tier 'heavy' (popolabile solo da loro due + google);
+/// la chat sopravviveva degradando, i purpose del consiglio morivano con
+/// `NoCapableModel` in 6.9s mentre 19 modelli sani (deepseek-v4-pro, sonnet-5)
+/// stavano UN gradino sotto.
+///
+/// La degradazione e' l'ULTIMA risorsa, non la prima: scatta solo SENZA pin.
+/// Col pin (`only_provider = Some`) resta il comportamento storico `&[tier]`,
+/// perche' il chiamante ha un'alternativa MIGLIORE del degradare — togliere il
+/// pin e prendere il tier giusto da un altro provider. Il pin e' una
+/// preferenza-forte TIER-AWARE: cede il provider, non la qualita' (vedi
+/// `pin_non_capable_degrada_al_purpose_normale`). Senza pin quell'alternativa non
+/// esiste: li' l'unica scelta e' fra un modello di un gradino sotto e nessun
+/// modello — e nessun modello era l'incidente.
+pub async fn best_model_for_tier_pinned_with_tier(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    requires_tool_use: bool,
+    exclude_providers: &[String],
+    only_provider: Option<&str>,
+) -> Option<(String, String, Option<String>)> {
     // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
     // applica l'eleggibilita' agentica + cooldown in un solo posto. L'esclusione
     // provider passa da `exclude_providers`; il pin da `only_provider`.
     if requires_tool_use {
-        return select_agentic_model_pinned(
+        let chain: Vec<&str> = if only_provider.is_some() {
+            vec![tier]
+        } else {
+            agentic_tier_chain(tier)
+        };
+        return select_agentic_model_pinned_with_tier(
             db,
-            &[tier],
+            &chain,
             capability,
             0,
             exclude_providers,
@@ -480,7 +531,9 @@ pub async fn best_model_for_tier_pinned(
         )
         .await;
     }
-    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider).await
+    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider)
+        .await
+        .map(|(provider, model)| (provider, model, None))
 }
 
 /// Ramo NON-agentico di [`best_model_for_tier_excluding`] (purpose
@@ -602,6 +655,32 @@ async fn select_agentic_model_pinned(
     order_by: &str,
     only_provider: Option<&str>,
 ) -> Option<(String, String)> {
+    select_agentic_model_pinned_with_tier(
+        db,
+        tier_chain,
+        capability,
+        min_context_window,
+        exclude_providers,
+        order_by,
+        only_provider,
+    )
+    .await
+    .map(|(provider, model, _)| (provider, model))
+}
+
+/// Come [`select_agentic_model_pinned`], ma PROPAGA il `performance_tier` della
+/// riga scelta (gia' ritornato da `select_models_tierchain`, prima scartato con
+/// `.map(|(p, m, _)| ...)`). Serve a distinguere "ho avuto il tier richiesto" da
+/// "ho degradato": senza questo dato il chiamante potrebbe solo congetturarlo.
+async fn select_agentic_model_pinned_with_tier(
+    db: &PgPool,
+    tier_chain: &[&str],
+    capability: Option<&str>,
+    min_context_window: i64,
+    exclude_providers: &[String],
+    order_by: &str,
+    only_provider: Option<&str>,
+) -> Option<(String, String, Option<String>)> {
     let gate = crate::orchestrator::qualification_gate(db).await;
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: true,
@@ -615,7 +694,7 @@ async fn select_agentic_model_pinned(
         exclude_preview: gate.exclude_preview,
     };
     match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
-        Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
+        Ok(mut v) => v.drain(..).next(),
         Err(e) => {
             // Regola H: l'errore SQL viene loggato, non silenziato come "nessun
             // modello" (prima `.ok().flatten()` lo inghiottiva).

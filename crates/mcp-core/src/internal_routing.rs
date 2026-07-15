@@ -259,7 +259,7 @@ async fn resolve_purpose_core(
         tracing::warn!(purpose = %purpose, "resolve_purpose: purpose privo di tier (tier-only)");
         return PurposeResolution::NotFound;
     };
-    match crate::orchestrator::best_model_for_tier_pinned(
+    match crate::orchestrator::best_model_for_tier_pinned_with_tier(
         db,
         &rule.tier,
         rule.capability.as_deref(),
@@ -269,11 +269,37 @@ async fn resolve_purpose_core(
     )
     .await
     {
-        Some((provider, model)) => PurposeResolution::Resolved {
-            provider,
-            model,
-            rationale: format!("tier={}:auto", rule.tier),
-        },
+        Some((provider, model, effective_tier)) => {
+            // DEGRADAZIONE DICHIARATA (regola M). Il tier effettivo arriva dalla
+            // riga scelta: confrontarlo col richiesto e' un FATTO, non una
+            // deduzione. Chi legge il rationale (o il log) sa se la figura ha
+            // parlato col modello che le spettava o con un ripiego, senza doverlo
+            // inferire dal nome del modello.
+            let degraded = effective_tier
+                .as_deref()
+                .is_some_and(|t| !t.eq_ignore_ascii_case(rule.tier.trim()));
+            if degraded {
+                let got = effective_tier.as_deref().unwrap_or("?");
+                tracing::warn!(
+                    purpose = %purpose, tier_richiesto = %rule.tier, tier_effettivo = %got,
+                    provider = %provider, model = %model,
+                    "resolve_purpose: DEGRADAZIONE di tier — nessun modello \
+                     eleggibile nel tier richiesto (cooldown o gate), scelto il \
+                     migliore del primo tier disponibile scendendo"
+                );
+                PurposeResolution::Resolved {
+                    provider,
+                    model,
+                    rationale: format!("tier={}:degraded_to={got}", rule.tier),
+                }
+            } else {
+                PurposeResolution::Resolved {
+                    provider,
+                    model,
+                    rationale: format!("tier={}:auto", rule.tier),
+                }
+            }
+        }
         None => {
             tracing::warn!(
                 purpose = %purpose, tier = %rule.tier,

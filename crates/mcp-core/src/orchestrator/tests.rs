@@ -402,3 +402,135 @@ async fn test_generate_agent_turn_no_grpc_al_brain() {
         .await;
     assert_no_brain_grpc(outcome);
 }
+
+/// REGRESSIONE dell'incidente del consiglio (2026-07-15): il purpose delle figure
+/// senior chiedeva `tier=heavy`; openai e anthropic — gli UNICI provider che
+/// l'euristica del catalog ammette in quel tier insieme a google — sono finiti
+/// insieme in cooldown billing (`credit_balance_too_low`), e l'unico heavy sano
+/// restante era escluso dal gate pre-GA. Pool VUOTO -> `NoCapableModel` -> 2
+/// figure su 6 morte in 6.9s, MENTRE modelli sani stavano un gradino sotto.
+///
+/// La chat utente non moriva: `route_model_from_catalog` usava gia'
+/// `agentic_tier_chain`. Il purpose passava `&[tier]` (catena di UN elemento):
+/// stessa domanda, due risposte diverse (odore regola L).
+///
+/// Invariante: quando il tier richiesto e' esaurito, la selezione DEGRADA al
+/// primo tier con un candidato sano invece di fallire.
+#[sqlx::test]
+async fn purpose_degrada_quando_il_tier_richiesto_e_esaurito(pool: sqlx::PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    // Il catalog dell'incidente, in piccolo: gli unici 'heavy' sono dei due
+    // provider senza credito; il modello sano vive nel tier sotto.
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('openai',    'gpt-heavy',       true, true, 'disable_for_tools', 'heavy',  '[\"reasoning\"]', 2.0), \
+         ('anthropic', 'claude-heavy',    true, true, 'disable_for_tools', 'heavy',  '[\"reasoning\"]', 3.0), \
+         ('deepseek',  'deepseek-v4-pro', true, true, 'none',              'high',   '[\"reasoning\"]', 0.5)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert catalog");
+
+    // openai + anthropic esclusi = il cooldown billing dell'incidente.
+    let out = best_model_for_tier_pinned_with_tier(
+        &pool,
+        "heavy",
+        Some("reasoning"),
+        true,
+        &["openai".to_string(), "anthropic".to_string()],
+        None,
+    )
+    .await;
+
+    let (provider, model, effective_tier) = out.expect(
+        "il tier 'heavy' e' esaurito ma 'high' ha un modello SANO: la selezione \
+         deve degradare, non ritornare None (era l'incidente: NoCapableModel con \
+         19 modelli sani un gradino sotto)",
+    );
+    assert_eq!(
+        (provider.as_str(), model.as_str()),
+        ("deepseek", "deepseek-v4-pro"),
+        "deve scegliere il modello sano del tier immediatamente inferiore"
+    );
+    // Il tier effettivo e' un DATO (regola M): permette di DICHIARARE la
+    // degradazione invece di lasciarla dedurre dal nome del modello.
+    assert_eq!(
+        effective_tier.as_deref(),
+        Some("high"),
+        "il tier effettivo deve tornare al chiamante per poter dichiarare la degradazione"
+    );
+}
+
+/// Complemento del test sopra: quando il tier richiesto HA un candidato sano,
+/// la degradazione NON deve scattare (niente ripieghi gratuiti su modelli piu'
+/// deboli, che sarebbe il difetto opposto).
+#[sqlx::test]
+async fn purpose_resta_sul_tier_richiesto_quando_e_disponibile(pool: sqlx::PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('google',   'gemini-heavy',    true, true, 'disable_for_tools', 'heavy', '[\"reasoning\"]', 2.0), \
+         ('deepseek', 'deepseek-v4-pro', true, true, 'none',              'high',  '[\"reasoning\"]', 0.1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert catalog");
+
+    let out = best_model_for_tier_pinned_with_tier(
+        &pool,
+        "heavy",
+        Some("reasoning"),
+        true,
+        &[],
+        None,
+    )
+    .await;
+
+    let (provider, model, effective_tier) = out.expect("il tier heavy ha un modello sano");
+    assert_eq!(
+        (provider.as_str(), model.as_str(), effective_tier.as_deref()),
+        ("google", "gemini-heavy", Some("heavy")),
+        "col tier richiesto disponibile NON si degrada, benche' 'high' costi 20 volte meno"
+    );
+}
+
+/// Il confine della degradazione: COL PIN non si degrada. Il chiamante ha
+/// un'alternativa migliore (togliere il pin e prendere il tier giusto altrove),
+/// quindi il pin deve cedere il PROVIDER, mai la qualita'. Senza questo confine
+/// un pin su un provider con soli modelli deboli aggancerebbe il run a un tier
+/// inferiore invece di lasciar vincere il modello giusto di un altro provider
+/// (regressione di `pin_non_capable_degrada_al_purpose_normale`).
+#[sqlx::test]
+async fn col_pin_non_si_degrada_il_tier(pool: sqlx::PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('mistral',  'mistral-medium', true, true, 'none', 'medium', '[\"code\"]', 1.0), \
+         ('deepseek', 'deepseek-flash', true, true, 'none', 'light',  '[\"code\"]', 0.5)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert catalog");
+
+    // Pin su deepseek, che NON ha un 'medium': deve ritornare None (il chiamante
+    // ritentera' senza pin e prendera' mistral-medium), NON degradare a
+    // deepseek-flash pur di onorare il pin.
+    let out = best_model_for_tier_pinned_with_tier(
+        &pool,
+        "medium",
+        Some("code"),
+        true,
+        &[],
+        Some("deepseek"),
+    )
+    .await;
+    assert_eq!(
+        out, None,
+        "col pin il tier non si degrada: il provider pinnato non ha il tier \
+         richiesto -> None, cosi' il chiamante abbandona il pin e prende il \
+         modello del tier GIUSTO da un altro provider"
+    );
+}
