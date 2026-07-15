@@ -1119,30 +1119,21 @@ impl Orchestrator {
         // (helper unico, regola L).
         let (tier, cap) = self.intent_tier_capability(intent, estimated_tokens).await;
 
-        // Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
-        // `agentic_tier_chain`, la STESSA usata da route_model_from_catalog e
-        // select_models_tierchain. Provider-agnostico: cerca il tier richiesto tra
-        // TUTTI i provider non in cooldown (stessi criteri), e degrada di UN gradino
-        // solo se quel tier e' vuoto. Prima qui c'era una tier-chain hardcoded con
-        // pavimento diverso -> degradazione incoerente tra i percorsi (rimossa).
-        let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(&tier);
-
-        // PUNTO UNICO di selezione agentica (regola L): miglior modello
-        // tool-capable del tier/capability, da un provider NON in cooldown.
-        // Ordine allineato a route_model_from_catalog (AGENTIC_COST_FIRST_ORDER):
-        // il tier gia' garantisce la fascia di capacita', dentro il tier si
-        // prende il piu' ECONOMICO (obiettivo costi). I modelli economici
-        // problematici sono retrocessi dalla governance telemetria-aware e dagli
-        // esiti dei run, non da un flag `is_featured` statico.
-        let found = select_agentic_model(
+        // SERVIZIO UNICO (regola L): `Degrade` — il tier e' un requisito, e se e'
+        // vuoto si scende lungo `agentic_tier_chain`. Provider-agnostico: cerca
+        // tra TUTTI i provider non in cooldown. `CostFirst` perche' il tier gia'
+        // garantisce la fascia di capacita': dentro il tier si prende il piu'
+        // ECONOMICO (obiettivo costi). I modelli economici problematici li
+        // retrocede la governance telemetria-aware sugli esiti reali, non un flag
+        // `is_featured` statico.
+        let found = crate::orchestrator::model_service::select_model(
             db,
-            &tiers_to_try,
-            Some(&cap),
-            0,
-            &[],
-            crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+            &crate::orchestrator::model_service::ModelRequest::agentic(&tier)
+                .capability(Some(&cap)),
         )
-        .await;
+        .await
+        .ok()
+        .map(|c| (c.provider, c.model));
         if let Some((ref alt_provider, ref alt_model)) = found {
             tracing::info!(
                 "Agent routing (fallback catalog tier-aware, selettore unico): {} → {}/{} (intent={}, tier={}, cap={})",
@@ -1220,21 +1211,22 @@ impl Orchestrator {
                             d.provider, d.model
                         );
                     }
-                    // Tier-chain di degradazione graceful (PUNTO UNICO, regola L):
-                    // stessa `agentic_tier_chain` del selettore principale, non piu'
-                    // una copia hardcoded con degradazione diversa. Provider-agnostico:
-                    // stesso tier tra tutti i provider sani, poi un gradino sotto.
-                    let tiers_to_try =
-                        crate::orchestrator::model_routing::agentic_tier_chain(base_tier);
-                    let catalog_alt = select_agentic_model(
+                    // SERVIZIO UNICO (regola L): `Degrade` — stesso tier fra i
+                    // provider sani, poi un gradino sotto.
+                    //
+                    // NB: qui l'ORDER BY era `input_cost ASC` SENZA il tie-break
+                    // `is_featured DESC` di AGENTIC_COST_FIRST_ORDER — un'altra
+                    // micro-divergenza della stessa famiglia, e per giunta un
+                    // ordine NON deterministico a parita' di costo. `CostFirst`
+                    // allinea al resto del routing e rende la scelta stabile.
+                    let catalog_alt = crate::orchestrator::model_service::select_model(
                         db,
-                        &tiers_to_try,
-                        Some(capability),
-                        0,
-                        &[],
-                        "input_cost_per_million_tokens ASC",
+                        &crate::orchestrator::model_service::ModelRequest::agentic(base_tier)
+                            .capability(Some(capability)),
                     )
                     .await
+                    .ok()
+                    .map(|c| (c.provider, c.model))
                     .map(|(p, m)| {
                         tracing::info!(
                             "Dynamic catalog routing (cooldown-fallback, selettore unico): → {}/{}",
