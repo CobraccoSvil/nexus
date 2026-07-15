@@ -124,6 +124,14 @@ pub enum Rank {
     /// L'espressione viene generata da [`tier_rank_sql`], cioe' dallo stesso
     /// vocabolario di [`tier_rank`]: una scala sola, verificata contro Postgres.
     HighestTierFirst,
+    /// Piu' veloce prima (behavior_mode "veloce"), poi costo. `speed_tier` e' un
+    /// vocabolario SUO (fast/medium/slow), distinto dal performance_tier.
+    Fastest,
+    /// Il piu' capace/caro DENTRO il tier gia' promosso (behavior_mode
+    /// "approfondita"): featured prima, poi costo DECRESCENTE. Non e'
+    /// `HighestTierFirst`: li' il tier e' gia' fissato dal chiamante, qui si
+    /// sceglie il migliore al suo interno.
+    MostCapable,
 }
 
 impl Rank {
@@ -144,6 +152,12 @@ impl Rank {
                  output_cost_per_million_tokens DESC NULLS LAST",
                 tier_rank_sql("performance_tier")
             ),
+            Rank::Fastest => "CASE speed_tier WHEN 'fast' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, \
+                 input_cost_per_million_tokens ASC"
+                .to_string(),
+            Rank::MostCapable => {
+                "is_featured DESC, input_cost_per_million_tokens DESC".to_string()
+            }
         }
     }
 }
@@ -175,6 +189,20 @@ pub struct ModelRequest<'a> {
     /// essere `Exact { why: PinnedProvider }` (invariante I5, verificata).
     pub pin: Option<&'a str>,
     pub rank: Rank,
+    /// Riordino telemetria-aware dei candidati ammissibili (ADR 0030, opt-in dal
+    /// flag DB `agent.governance.telemetry_aware`): un modello con error-rate o
+    /// timeout alti negli ultimi check viene retrocesso, l'alternativa sana
+    /// promossa (regola M: decide la telemetria strutturata, non un flag statico).
+    ///
+    /// E' un PARAMETRO e non un comportamento implicito del servizio: si applica
+    /// alla selezione DINAMICA del turno primario (la chat), dove il modello
+    /// scelto viene poi pinnato/sticky per il run. Accenderlo ovunque cambierebbe
+    /// in silenzio la scelta di siti che oggi non lo usano — es. l'upscale, che
+    /// deve eseguire il bersaglio dello scale-controller, non negoziarlo.
+    ///
+    /// A flag OFF (default) e' bit-identico alla selezione normale: il riordino
+    /// e' STABILE, con telemetria uniforme il top-1 resta quello del `rank`.
+    pub governed: bool,
 }
 
 impl<'a> ModelRequest<'a> {
@@ -189,6 +217,7 @@ impl<'a> ModelRequest<'a> {
             exclude_providers: &[],
             pin: None,
             rank: Rank::CostFirst,
+            governed: false,
         }
     }
 
@@ -234,6 +263,13 @@ impl<'a> ModelRequest<'a> {
 
     pub fn tier_policy(mut self, p: TierPolicy) -> Self {
         self.tier_policy = p;
+        self
+    }
+
+    /// Attiva il riordino telemetria-aware (ADR 0030). Vedi [`ModelRequest::governed`]:
+    /// e' per la selezione DINAMICA del turno primario, non per tutti.
+    pub fn governed(mut self, on: bool) -> Self {
+        self.governed = on;
         self
     }
 }
@@ -285,6 +321,32 @@ impl NoModelReason {
     /// (ritentare senza pin, saltare l'upscale).
     pub fn is_expected(&self) -> bool {
         matches!(self, NoModelReason::ExactTierEmpty { .. })
+    }
+}
+
+/// Testo per log e messaggi. Il TIPO resta il segnale su cui si decide (regola M):
+/// questo e' solo per chi legge.
+impl std::fmt::Display for NoModelReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoModelReason::ChainExhausted { requested_tier } => write!(
+                f,
+                "nessun modello eleggibile in tutta la catena da '{requested_tier}' in giu' \
+                 (il parco e' fermo: provider in cooldown o catalog vuoto)"
+            ),
+            NoModelReason::ExactTierEmpty { requested_tier, why } => write!(
+                f,
+                "il tier '{requested_tier}' e' vuoto e non e' degradabile ({why:?})"
+            ),
+            NoModelReason::GateEmpty { requested_tier } => write!(
+                f,
+                "il gate di qualificazione ha svuotato il pool per '{requested_tier}': \
+                 candidati ci sarebbero, ma nessuno e' qualificato (worker di \
+                 qualificazione fermo o batteria che boccia tutti)"
+            ),
+            NoModelReason::CatalogUnavailable(e) => write!(f, "catalog illeggibile: {e}"),
+            NoModelReason::InvalidRequest(e) => write!(f, "richiesta non valida: {e}"),
+        }
     }
 }
 
@@ -420,7 +482,71 @@ pub async fn select_model(
     req: &ModelRequest<'_>,
 ) -> Result<ModelChoice, NoModelReason> {
     let gate = qualification_gate(db).await;
+    if req.governed && crate::governance_telemetry::governance_enabled(db).await {
+        return select_model_governed(db, req, gate).await;
+    }
     select_model_with_gate(db, req, gate).await
+}
+
+/// Quanti candidati recuperare per il riordino telemetria-aware. Un pool piccolo
+/// del PRIMO tier con candidati: il riordino promuove/retrocede fra alternative
+/// GIA' ammissibili, non allarga la selezione ad altri tier (la degradazione
+/// resta di `TierPolicy`).
+const GOVERNED_CANDIDATE_POOL: i64 = 8;
+
+/// [`select_model`] col riordino telemetria-aware (ADR 0030). Stessa
+/// eleggibilita' e stessa tier-chain: cambia solo QUALE dei candidati ammissibili
+/// vince, in base alla telemetria strutturata (regola M) invece che al solo
+/// `rank`. Il riordino e' STABILE: con telemetria uniforme il top-1 resta quello
+/// del `rank`, quindi a flag OFF il comportamento e' bit-identico.
+async fn select_model_governed(
+    db: &PgPool,
+    req: &ModelRequest<'_>,
+    gate: super::QualificationGate,
+) -> Result<ModelChoice, NoModelReason> {
+    validate(req)?;
+    let chain = chain_for(req);
+    let filter = filter_for(req, gate);
+    let rows =
+        select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), GOVERNED_CANDIDATE_POOL)
+            .await
+            .map_err(NoModelReason::CatalogUnavailable)?;
+    if rows.is_empty() {
+        return Err(diagnose_empty(db, req, &chain, gate).await);
+    }
+    // 0/1 candidati: nulla da riordinare (evita I/O telemetria inutile).
+    if rows.len() < 2 {
+        let (p, m, t) = rows.into_iter().next().expect("len >= 1");
+        return Ok(choice_from(req, p, m, t));
+    }
+    // Il tier effettivo viaggia con la riga: lo si ritrova dopo il riordino, che
+    // lavora su (provider, model). Senza questa mappa `degraded` andrebbe
+    // ri-dedotto — cioe' esattamente cio' che I4 vieta.
+    let tier_by_pair: std::collections::HashMap<(String, String), Option<String>> = rows
+        .iter()
+        .map(|(p, m, t)| ((p.clone(), m.clone()), t.clone()))
+        .collect();
+    let candidates: Vec<(String, String)> =
+        rows.into_iter().map(|(p, m, _)| (p, m)).collect();
+    let telemetry = crate::governance_telemetry::load_model_telemetry(db, &candidates).await;
+    let policy = crate::governance_telemetry::load_governance_policy(db).await;
+    let ranked = nexus_agent_graph::decisions::governance::rank_candidates(
+        &candidates,
+        &telemetry,
+        &[],
+        &policy,
+    );
+    let (provider, model) = ranked
+        .into_iter()
+        .next()
+        .ok_or_else(|| NoModelReason::ChainExhausted {
+            requested_tier: req.tier.to_string(),
+        })?;
+    let effective_tier = tier_by_pair
+        .get(&(provider.clone(), model.clone()))
+        .cloned()
+        .flatten();
+    Ok(choice_from(req, provider, model, effective_tier))
 }
 
 /// Come [`select_model`] ma ritorna fino a `limit` candidati, dello STESSO tier

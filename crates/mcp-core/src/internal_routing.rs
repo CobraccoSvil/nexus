@@ -283,6 +283,9 @@ async fn resolve_purpose_core(
         } else {
             Rank::NonAgenticSafe
         },
+        // Il purpose e' una risoluzione interna, non la selezione dinamica del
+        // turno primario: niente riordino telemetria (vedi ModelRequest::governed).
+        governed: false,
     };
     if let Some(p) = only_provider {
         req.pin = Some(p);
@@ -412,6 +415,9 @@ pub async fn resolve_purpose_provider_candidates_db(
         } else {
             Rank::NonAgenticSafe
         },
+        // Il purpose e' una risoluzione interna, non la selezione dinamica del
+        // turno primario: niente riordino telemetria (vedi ModelRequest::governed).
+        governed: false,
     };
     // Pool piu' ampio del limite per deduplicare per provider senza una query
     // dedicata fuori dal servizio.

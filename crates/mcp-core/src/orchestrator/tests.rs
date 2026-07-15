@@ -130,18 +130,19 @@ async fn coding_fallback_resta_su_tier_heavy_non_su_google_light(pool: sqlx::PgP
 
     // Simula anthropic+openai indisponibili (cooldown) via exclude_providers,
     // con lo stesso ordine usato dal fallback di resolve_agent_provider.
-    let out = select_agentic_model(
+    // SERVIZIO UNICO: Degrade da 'heavy' — la catena scende heavy->high->medium->
+    // light, ma il corto-circuito si ferma al PRIMO tier con candidati: 'heavy' ha
+    // deepseek/reasoner sano, quindi google/gemini-flash (light) non viene mai
+    // raggiunto benche' sia il piu' economico e featured.
+    let out = crate::orchestrator::model_service::select_model(
         &pool,
-        &["heavy", "medium"],
-        Some("reasoning"),
-        0,
-        &["anthropic".to_string(), "openai".to_string()],
-        "is_featured DESC, input_cost_per_million_tokens ASC",
+        &crate::orchestrator::model_service::ModelRequest::agentic("heavy")
+            .capability(Some("reasoning"))
+            .exclude(&["anthropic".to_string(), "openai".to_string()]),
     )
-    .await;
-    // Resta sul tier heavy sano (deepseek/reasoner), NON cade su google/gemini-flash
-    // (light) benche' piu' economico e featured.
-    assert_eq!(out, Some(("deepseek".to_string(), "reasoner".to_string())));
+    .await
+    .map(|c| (c.provider, c.model));
+    assert_eq!(out, Ok(("deepseek".to_string(), "reasoner".to_string())));
 }
 
 #[test]
@@ -433,15 +434,14 @@ async fn purpose_degrada_quando_il_tier_richiesto_e_esaurito(pool: sqlx::PgPool)
     .expect("insert catalog");
 
     // openai + anthropic esclusi = il cooldown billing dell'incidente.
-    let out = best_model_for_tier_pinned_with_tier(
+    let out = crate::orchestrator::model_service::select_model(
         &pool,
-        "heavy",
-        Some("reasoning"),
-        true,
-        &["openai".to_string(), "anthropic".to_string()],
-        None,
+        &crate::orchestrator::model_service::ModelRequest::agentic("heavy")
+            .capability(Some("reasoning"))
+            .exclude(&["openai".to_string(), "anthropic".to_string()]),
     )
-    .await;
+    .await
+    .map(|c| (c.provider, c.model, c.effective_tier));
 
     let (provider, model, effective_tier) = out.expect(
         "il tier 'heavy' e' esaurito ma 'high' ha un modello SANO: la selezione \
@@ -478,15 +478,13 @@ async fn purpose_resta_sul_tier_richiesto_quando_e_disponibile(pool: sqlx::PgPoo
     .await
     .expect("insert catalog");
 
-    let out = best_model_for_tier_pinned_with_tier(
+    let out = crate::orchestrator::model_service::select_model(
         &pool,
-        "heavy",
-        Some("reasoning"),
-        true,
-        &[],
-        None,
+        &crate::orchestrator::model_service::ModelRequest::agentic("heavy")
+            .capability(Some("reasoning")),
     )
-    .await;
+    .await
+    .map(|c| (c.provider, c.model, c.effective_tier));
 
     let (provider, model, effective_tier) = out.expect("il tier heavy ha un modello sano");
     assert_eq!(
@@ -518,15 +516,15 @@ async fn col_pin_non_si_degrada_il_tier(pool: sqlx::PgPool) {
     // Pin su deepseek, che NON ha un 'medium': deve ritornare None (il chiamante
     // ritentera' senza pin e prendera' mistral-medium), NON degradare a
     // deepseek-flash pur di onorare il pin.
-    let out = best_model_for_tier_pinned_with_tier(
+    let out = crate::orchestrator::model_service::select_model(
         &pool,
-        "medium",
-        Some("code"),
-        true,
-        &[],
-        Some("deepseek"),
+        &crate::orchestrator::model_service::ModelRequest::agentic("medium")
+            .capability(Some("code"))
+            .pinned("deepseek"),
     )
-    .await;
+    .await
+    .map(|c| (c.provider, c.model))
+    .ok();
     assert_eq!(
         out, None,
         "col pin il tier non si degrada: il provider pinnato non ha il tier \
@@ -561,15 +559,15 @@ async fn purpose_non_agentico_degrada_e_resta_capace(pool: sqlx::PgPool) {
     .expect("insert catalog");
 
     // openai escluso = il tier vision 'heavy' e' esaurito.
-    let out = best_model_for_tier_pinned_with_tier(
+    let out = crate::orchestrator::model_service::select_model(
         &pool,
-        "heavy",
-        Some("vision"),
-        false, // NON agentico: e' il ramo che restava indietro
-        &["openai".to_string()],
-        None,
+        // NON agentico: e' il ramo che restava indietro
+        &crate::orchestrator::model_service::ModelRequest::non_agentic("heavy")
+            .capability(Some("vision"))
+            .exclude(&["openai".to_string()]),
     )
-    .await;
+    .await
+    .map(|c| (c.provider, c.model, c.effective_tier));
 
     let (provider, model, effective_tier) = out.expect(
         "il tier vision 'heavy' e' esaurito ma 'medium' ha un modello vision SANO: \

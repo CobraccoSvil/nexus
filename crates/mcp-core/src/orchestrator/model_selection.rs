@@ -123,7 +123,7 @@ pub(crate) fn excluded_providers_lower(extra: &[String]) -> Vec<String> {
 /// `is_enabled = TRUE` (il `model_health_probe` auto-disabilita a soglia) e
 /// filtrare `consecutive_failures = 0` causerebbe starvation (ADR 0025).
 #[derive(Debug, Clone)]
-pub(crate) struct EligibilityFilter<'a> {
+pub(super) struct EligibilityFilter<'a> {
     /// `true` => `AND supports_tool_use = TRUE` (path agentico).
     pub require_tool_use: bool,
     /// `true` => `AND agentic_thinking_policy <> 'exclude'` e abilita il
@@ -300,7 +300,7 @@ fn is_media_capability(capability: &str) -> bool {
 /// Ritorna `(provider, model, performance_tier)`: il tier viaggia con la riga
 /// (i selettori tier-aware, es. il failover agentico, lo usano come indicazione
 /// senza un lookup extra); i caller che non ne hanno bisogno lo ignorano.
-pub(crate) async fn select_models_tierchain(
+pub(super) async fn select_models_tierchain(
     db: &PgPool,
     filter: &EligibilityFilter<'_>,
     tier_chain: &[&str],

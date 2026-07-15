@@ -275,31 +275,41 @@ pub(crate) async fn route_model_from_catalog(
     let floor = agentic_min_tier(db).await;
     let required_tier = floor_tier_for_agentic(is_agentic_turn, mode_tier, &floor);
 
-    // Query al catalogo: trova il modello più economico che soddisfa tier+capability.
-    // "veloce" ordina per speed_tier, "economica"/dinamico per costo (il tier gia'
-    // garantisce la capacita', regola costi: AGENTIC_COST_FIRST_ORDER), "approfondita"
-    // preferisce il piu' capace/caro DENTRO il tier gia' promosso.
-    let order_clause = match mode {
-        "veloce"    => "CASE speed_tier WHEN 'fast' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, input_cost_per_million_tokens ASC",
-        "economica" => "input_cost_per_million_tokens ASC",
-        "approfondita" => "is_featured DESC, input_cost_per_million_tokens DESC",
-        _           => AGENTIC_COST_FIRST_ORDER,
+    // L'ordinamento per behavior_mode. `Rank` e' un enum CHIUSO: prima erano 4
+    // stringhe SQL scritte qui, e da un `order_by: &str` libero e' entrata (e
+    // sopravvissuta per mesi) la scala tier a 3 livelli di agent_run.rs.
+    // "veloce" ordina per speed_tier; "economica"/dinamico per costo (il tier gia'
+    // garantisce la capacita', regola costi); "approfondita" preferisce il piu'
+    // capace/caro DENTRO il tier gia' promosso.
+    let rank = match mode {
+        "veloce" => crate::orchestrator::model_service::Rank::Fastest,
+        "economica" => crate::orchestrator::model_service::Rank::CostFirst,
+        "approfondita" => crate::orchestrator::model_service::Rank::MostCapable,
+        _ => crate::orchestrator::model_service::Rank::CostFirst,
     };
 
-    // Selezione tramite il PUNTO UNICO (regola L): l'eleggibilita' agentica
-    // (tool_use, agentic_thinking_policy<>'exclude', consecutive_failures, cooldown)
-    // e' definita una sola volta in select_agentic_model. Degradazione di tier
-    // GRACEFUL: il primo tier con un candidato eleggibile vince; se il tier
-    // minimo (incluso il pavimento agentico) e' tutto in cooldown, scende verso
-    // il basso fino a 'light' invece di fallire (heavy->medium->light).
-    let tier_chain = agentic_tier_chain(required_tier);
-    // Branch: catalog dynamic routing (selettore agentico unico). Variante
-    // GOVERNATA telemetria-aware (opt-in `agent.governance.telemetry_aware`, OFF =
-    // bit-identico al selettore standard). Riordina i candidati ammissibili per
-    // probabilita' di successo (regola M) senza toccare tier/capability/gate.
-    select_agentic_model_governed(db, &tier_chain, Some(capability), 0, &[], order_clause)
-        .await
-        .map(|(provider, model)| DynamicRoutingDecision { provider, model })
+    // SERVIZIO UNICO (regola L). `Degrade`: il primo tier con un candidato
+    // eleggibile vince; se il tier minimo (incluso il pavimento agentico) e' tutto
+    // in cooldown si scende fino a 'light' invece di fallire — e' il path che
+    // sopravviveva all'incidente del consiglio, ora e' lo STESSO codice per tutti.
+    //
+    // `governed`: riordino telemetria-aware (ADR 0030, opt-in dal flag DB; OFF =
+    // bit-identico). Vive QUI e non ovunque perche' e' la selezione DINAMICA del
+    // turno primario, l'unico posto dove ha senso: il modello scelto viene poi
+    // pinnato per il run.
+    crate::orchestrator::model_service::select_model(
+        db,
+        &crate::orchestrator::model_service::ModelRequest::agentic(required_tier)
+            .capability(Some(capability))
+            .rank(rank)
+            .governed(true),
+    )
+    .await
+    .ok()
+    .map(|c| DynamicRoutingDecision {
+        provider: c.provider,
+        model: c.model,
+    })
 }
 
 /// Catena di degradazione graceful dei tier da `top` fino a `light` sulla scala a
@@ -358,27 +368,24 @@ pub(crate) async fn agentic_failover_candidates(
     exclude: &[String],
     min_context_window: i64,
 ) -> Vec<(String, String, Option<String>)> {
-    let gate = crate::orchestrator::qualification_gate(db).await;
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: true,
-        require_thinking_non_exclude: true,
-        capability: None,
-        min_context_window,
-        exclude_providers: exclude,
-        apply_cooldown: true,
-        only_provider: None,
-        require_qualified: gate.require_qualified,
-        exclude_preview: gate.exclude_preview,
-    };
-    // tier_chain VUOTA = nessun filtro tier (query singola su tutti i tier).
-    match crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        &[],
-        AGENTIC_FAILOVER_ORDER,
-        FAILOVER_CANDIDATE_POOL,
-    )
-    .await
+    // SERVIZIO UNICO (regola L). `AnyTier`: qui il tier NON e' un vincolo — si
+    // ENUMERA l'eleggibilita' e la scelta spetta al modulo puro
+    // `pick_failover_model` (salute -> likelihood, col tier come semplice
+    // indicazione). Una tier-chain qui sottrarrebbe la decisione al modulo.
+    // `FailoverSafe`: non-thinking prima, per evitare i vincoli di round-trip
+    // sullo switch mid-run.
+    let req = crate::orchestrator::model_service::ModelRequest::agentic("")
+        .tier_policy(crate::orchestrator::model_service::TierPolicy::AnyTier)
+        .rank(crate::orchestrator::model_service::Rank::FailoverSafe)
+        .min_context_window(min_context_window)
+        .exclude(exclude);
+    match crate::orchestrator::model_service::select_models(db, &req, FAILOVER_CANDIDATE_POOL)
+        .await
+        .map(|v| {
+            v.into_iter()
+                .map(|c| (c.provider, c.model, c.effective_tier))
+                .collect::<Vec<_>>()
+        })
     {
         Ok(v) => {
             if v.len() as i64 >= FAILOVER_CANDIDATE_POOL {
@@ -401,320 +408,13 @@ pub(crate) async fn agentic_failover_candidates(
     }
 }
 
-/// Seleziona il miglior modello del catalog per un dato `tier`, opzionalmente
-/// filtrato per `capability` e `requires_tool_use`. Usato dalla risoluzione
-/// tier-based dei purpose (mig 0203): es. il purpose 'planner' -> tier 'heavy'
-/// + capability 'reasoning' sceglie dinamicamente il miglior modello heavy
-///   disponibile (esclusi i provider in cooldown), il piu' economico tra i
-///   featured. Ritorna None se nessun candidato soddisfa i criteri (il chiamante
-///   cade sul fallback statico del purpose).
-pub async fn best_model_for_tier(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-) -> Option<(String, String)> {
-    // Vista senza esclusioni sul PUNTO UNICO parametrico (regola L): estende
-    // automaticamente tutti i ~20 chiamanti storici senza toccarli.
-    best_model_for_tier_excluding(db, tier, capability, requires_tool_use, &[]).await
-}
 
-/// Variante di [`best_model_for_tier`] che ESCLUDE un insieme di provider dalla
-/// selezione (oltre al cooldown). PUNTO UNICO (regola L): `best_model_for_tier`
-/// vi delega con `exclude_providers = &[]`. Usata per il vincolo giudice != worker
-/// (Fase C2): un sub-run di review risolve il proprio modello ESCLUDENDO il
-/// provider del run padre (worker), cosi' la verifica avversaria gira su un
-/// provider diverso — indipendenza reale, non due modelli dello stesso provider
-/// con bias/failure-mode condivisi. Se l'esclusione svuota il pool il chiamante
-/// applica il fallback (preferenza forte, non hard filter).
-pub async fn best_model_for_tier_excluding(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-    exclude_providers: &[String],
-) -> Option<(String, String)> {
-    // Vista senza PIN sul punto unico parametrico (regola L): tutti i chiamanti
-    // storici (`best_model_for_tier`, review-excluding, ...) restano invariati.
-    best_model_for_tier_pinned(
-        db,
-        tier,
-        capability,
-        requires_tool_use,
-        exclude_providers,
-        None,
-    )
-    .await
-}
 
-/// Variante di [`best_model_for_tier_excluding`] che RESTRINGE la selezione a un
-/// SOLO provider (`only_provider`) oltre alle esclusioni. PUNTO UNICO (regola L):
-/// `best_model_for_tier_excluding` vi delega con `only_provider = None`. Usata per
-/// la propagazione del PIN del provider ai sub-agenti worker: il pin e' una
-/// preferenza-forte tier-aware (tier + capability + tool_use INVARIATI, solo il
-/// provider e' vincolato). Ritorna `None` se nessun modello del provider pinnato
-/// soddisfa il tier/capability (o e' in cooldown): il chiamante applica il
-/// fallback SENZA pin (preferenza forte, non hard filter — regola H fail-loud lato
-/// chiamante). Il filtro provider passa da [`EligibilityFilter::only_provider`],
-/// UNICA sorgente del vincolo (regola L): niente seconda query dedicata.
-pub async fn best_model_for_tier_pinned(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-    exclude_providers: &[String],
-    only_provider: Option<&str>,
-) -> Option<(String, String)> {
-    // Vista che SCARTA il tier effettivo, per i ~20 chiamanti storici che non ne
-    // hanno bisogno. Chi deve DICHIARARE una degradazione (regola M: il fatto e'
-    // un dato strutturato, non una congettura del lettore) usa la variante
-    // `_with_tier` qui sotto.
-    best_model_for_tier_pinned_with_tier(
-        db,
-        tier,
-        capability,
-        requires_tool_use,
-        exclude_providers,
-        only_provider,
-    )
-    .await
-    .map(|(provider, model, _)| (provider, model))
-}
 
-/// Come [`best_model_for_tier_pinned`], ma ritorna anche il tier EFFETTIVO del
-/// modello scelto: se differisce da quello richiesto c'e' stata una DEGRADAZIONE,
-/// e il chiamante puo' dirlo con un dato invece di lasciarlo dedurre.
-///
-/// DEGRADAZIONE (incidente consiglio 2026-07-15). Prima passava `&[tier]` — una
-/// tier-chain di UN elemento — mentre `route_model_from_catalog` (path della CHAT
-/// utente) usava gia' [`agentic_tier_chain`]: la STESSA domanda ("quale modello
-/// per questo tier?") aveva due risposte diverse a seconda del chiamante (odore
-/// regola L). Conseguenza misurata: openai e anthropic insieme in cooldown
-/// billing hanno svuotato il tier 'heavy' (popolabile solo da loro due + google);
-/// la chat sopravviveva degradando, i purpose del consiglio morivano con
-/// `NoCapableModel` in 6.9s mentre 19 modelli sani (deepseek-v4-pro, sonnet-5)
-/// stavano UN gradino sotto.
-///
-/// La degradazione e' l'ULTIMA risorsa, non la prima: scatta solo SENZA pin.
-/// Col pin (`only_provider = Some`) resta il comportamento storico `&[tier]`,
-/// perche' il chiamante ha un'alternativa MIGLIORE del degradare — togliere il
-/// pin e prendere il tier giusto da un altro provider. Il pin e' una
-/// preferenza-forte TIER-AWARE: cede il provider, non la qualita' (vedi
-/// `pin_non_capable_degrada_al_purpose_normale`). Senza pin quell'alternativa non
-/// esiste: li' l'unica scelta e' fra un modello di un gradino sotto e nessun
-/// modello — e nessun modello era l'incidente.
-pub async fn best_model_for_tier_pinned_with_tier(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-    exclude_providers: &[String],
-    only_provider: Option<&str>,
-) -> Option<(String, String, Option<String>)> {
-    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
-    // applica l'eleggibilita' agentica + cooldown in un solo posto. L'esclusione
-    // provider passa da `exclude_providers`; il pin da `only_provider`.
-    if requires_tool_use {
-        let chain: Vec<&str> = if only_provider.is_some() {
-            vec![tier]
-        } else {
-            agentic_tier_chain(tier)
-        };
-        return select_agentic_model_pinned_with_tier(
-            db,
-            &chain,
-            capability,
-            0,
-            exclude_providers,
-            AGENTIC_COST_FIRST_ORDER,
-            only_provider,
-        )
-        .await;
-    }
-    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider).await
-}
 
-/// Ramo NON-agentico di [`best_model_for_tier_excluding`] (purpose
-/// vision/chat/embedding): vista sottile sul punto unico (FASE 2).
-/// `require_tool_use=false` e `require_thinking_non_exclude=false` -> nessun
-/// filtro tool_use/policy e nessun pre-ordinamento non-thinking. La vision e' via
-/// `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
-/// TERZO selettore duplicato) e' stato eliminato (regola L).
-///
-/// DEGRADAZIONE: identica al ramo agentico e per la stessa ragione (incidente
-/// del consiglio, 2026-07-15). Il fix iniziale viveva dentro
-/// `if requires_tool_use { .. }`, quindi questo ramo restava col difetto: i 41
-/// purpose non-agentici (vision/chat/embedding) morivano con `NoCapableModel` se
-/// il loro tier era esaurito, invece di prendere un modello di un gradino sotto
-/// — e la capability (es. `supports_vision`) resta comunque un filtro, quindi il
-/// ripiego e' sempre un modello che sa fare la cosa richiesta, solo meno capace.
-/// Col pin niente degradazione: li' l'alternativa migliore e' togliere il pin.
-async fn best_non_agentic_model(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    exclude_providers: &[String],
-    only_provider: Option<&str>,
-) -> Option<(String, String, Option<String>)> {
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: false,
-        require_thinking_non_exclude: false,
-        capability,
-        min_context_window: 0,
-        exclude_providers,
-        apply_cooldown: true,
-        only_provider,
-        // Path NON-agentico (vision/chat/embedding): il gate di qualificazione
-        // copre il profilo d'uso agentico; qui comportamento storico.
-        require_qualified: false,
-        exclude_preview: false,
-    };
-    // Pre-ordinamento anti "reasoner puro" (incidente 2026-06-10): i modelli
-    // con uses_thinking_mode=TRUE e supports_tool_use=FALSE (es. deepseek-v4-flash)
-    // nelle chiamate TESTUALI senza tool bruciano l'intero budget di output in
-    // reasoning (content vuoto sistematico, finish_reason=length, reasoning 7-8K
-    // su completion 2000) e non hanno un percorso adapter per spegnere il
-    // thinking (la policy 'disable_for_tools' agisce solo nelle richieste con
-    // tool). Con i provider forti in cooldown risalivano la classifica del tier
-    // e avvelenavano i 41 purpose non-agentici. NON esclusi (il pool non si
-    // svuota: restano ultima spiaggia se tutto il resto e' giu'), solo
-    // retrocessi in coda. I thinking CON tool_use (gemini-2.5, claude) non sono
-    // toccati: i loro adapter governano il thinking budget.
-    let chain: Vec<&str> = if only_provider.is_some() {
-        vec![tier]
-    } else {
-        agentic_tier_chain(tier)
-    };
-    match crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        &chain,
-        "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
-         input_cost_per_million_tokens ASC, is_featured DESC",
-        1,
-    )
-    .await
-    {
-        Ok(mut v) => v.drain(..).next(),
-        Err(e) => {
-            tracing::warn!("best_model_for_tier (non-agentico): {e}");
-            None
-        }
-    }
-}
 
-/// PUNTO UNICO di selezione di un modello AGENTICO dal catalog (CLAUDE.md, regola L).
-///
-/// Tutte le selezioni/fallback di un modello per un run a tool DEVONO passare di
-/// qui: niente query SQL duplicate sparse (best_model_for_tier, cooldown-fallback,
-/// re-route context-aware, cascade, dynamic catalog) con filtri copiati a mano.
-///
-/// Eleggibilita' SEMPRE applicata (definita una volta sola):
-///   - `is_enabled = TRUE`
-///   - `supports_tool_use = TRUE`
-///   - `agentic_thinking_policy <> 'exclude'` (i dual-mode sono ammessi; l'adapter
-///     forza il non-thinking nei tool-loop, ADR 0025)
-///   - NB: la salute del modello e' gia' garantita da `is_enabled = TRUE`. Il
-///     `model_health_probe` fa AUTO-DISABLE (`is_enabled=false`) quando
-///     `consecutive_failures >= failure_threshold`; quindi un modello enabled ha
-///     per costruzione `consecutive_failures < threshold`. NON filtriamo qui
-///     `consecutive_failures = 0`: era ridondante con is_enabled e DANNOSO ->
-///     creava starvation (un modello con 1 fail transitorio veniva escluso dai
-///     run reali, quindi mai piu' scelto, quindi il counter mai resettato -> fuori
-///     dal pool per sempre). Vedi ADR 0025.
-///   - provider NON in cooldown (snapshot in-memory) e NON in `exclude_providers`
-///
-/// Filtri opzionali:
-///   - `tier_chain`: tier provati in ordine (degradazione); il primo tier con un
-///     match vince. `&[]` = qualunque tier (singola query, ordinata da `order_by`).
-///   - `capability`: `capabilities @> ["cap"]`.
-///   - `min_context_window`: `context_window >= N` (0 = nessun filtro).
-///   - `order_by`: clausola ORDER BY SQL (UNICA variazione per call site; valori
-///     costanti dal codice, mai input utente).
-pub(crate) async fn select_agentic_model(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-) -> Option<(String, String)> {
-    // Vista SENZA pin sul punto unico interno: i ~6 call site storici non cambiano.
-    select_agentic_model_pinned(
-        db,
-        tier_chain,
-        capability,
-        min_context_window,
-        exclude_providers,
-        order_by,
-        None,
-    )
-    .await
-}
 
-/// Variante di [`select_agentic_model`] che RESTRINGE la selezione a un solo
-/// provider (`only_provider`), propagato a [`EligibilityFilter::only_provider`].
-/// PUNTO UNICO interno (regola L): `select_agentic_model` vi delega con
-/// `only_provider = None` (comportamento bit-identico). Usata dalla risoluzione
-/// pinnata dei purpose worker (propagazione del PIN provider ai sub-agenti). La
-/// WHERE di eleggibilita' resta definita una sola volta in `select_models_tierchain`.
-async fn select_agentic_model_pinned(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-    only_provider: Option<&str>,
-) -> Option<(String, String)> {
-    select_agentic_model_pinned_with_tier(
-        db,
-        tier_chain,
-        capability,
-        min_context_window,
-        exclude_providers,
-        order_by,
-        only_provider,
-    )
-    .await
-    .map(|(provider, model, _)| (provider, model))
-}
 
-/// Come [`select_agentic_model_pinned`], ma PROPAGA il `performance_tier` della
-/// riga scelta (gia' ritornato da `select_models_tierchain`, prima scartato con
-/// `.map(|(p, m, _)| ...)`). Serve a distinguere "ho avuto il tier richiesto" da
-/// "ho degradato": senza questo dato il chiamante potrebbe solo congetturarlo.
-async fn select_agentic_model_pinned_with_tier(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-    only_provider: Option<&str>,
-) -> Option<(String, String, Option<String>)> {
-    let gate = crate::orchestrator::qualification_gate(db).await;
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: true,
-        require_thinking_non_exclude: true,
-        capability,
-        min_context_window,
-        exclude_providers,
-        apply_cooldown: true,
-        only_provider,
-        require_qualified: gate.require_qualified,
-        exclude_preview: gate.exclude_preview,
-    };
-    match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
-        Ok(mut v) => v.drain(..).next(),
-        Err(e) => {
-            // Regola H: l'errore SQL viene loggato, non silenziato come "nessun
-            // modello" (prima `.ok().flatten()` lo inghiottiva).
-            tracing::warn!("select_agentic_model: {e}");
-            None
-        }
-    }
-}
 
 /// Numero di candidati recuperati per il riordino telemetria-aware della
 /// selezione dinamica (governance). Un pool piccolo del PRIMO tier con candidati:
@@ -722,88 +422,6 @@ async fn select_agentic_model_pinned_with_tier(
 /// selezione ad altri tier (la degradazione graceful resta di `select_models_tierchain`).
 const GOVERNED_CANDIDATE_POOL: i64 = 8;
 
-/// Variante GOVERNATA (telemetria-aware) di [`select_agentic_model`] per la
-/// selezione dinamica dal catalog. Opt-in (regola G, flag
-/// `agent.governance.telemetry_aware`, default OFF): a flag OFF DELEGA a
-/// [`select_agentic_model`] -> comportamento BIT-IDENTICO (top-1 per `order_by`).
-///
-/// A flag ON recupera i primi [`GOVERNED_CANDIDATE_POOL`] candidati AMMISSIBILI del
-/// primo tier con match (stessa WHERE del punto unico `select_models_tierchain`,
-/// regola L) e li RIORDINA per probabilita' di successo derivata da telemetria
-/// strutturata (regola M) col modulo PURO
-/// [`nexus_agent_graph::decisions::governance::rank_candidates`]: un modello con
-/// error-rate/timeout alto negli ultimi N check viene retrocesso, l'alternativa
-/// sana promossa. L'ordinamento e' STABILE: con telemetria uniforme il top-1 resta
-/// quello per `order_by` (retro-compat anche nel ramo ON).
-///
-/// REPLAY: la selezione dinamica e' una risoluzione del turno PRIMARIO; il modello
-/// scelto viene PINNATO/sticky per il run, quindi il replay/shadow riusa il pin
-/// checkpointato (nessuna ri-derivazione divergente). FAIL-OPEN: errore di lettura
-/// telemetria -> punteggi neutri -> ordine invariato.
-pub(crate) async fn select_agentic_model_governed(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-) -> Option<(String, String)> {
-    // Flag OFF (default): comportamento bit-identico al selettore standard.
-    if !crate::governance_telemetry::governance_enabled(db).await {
-        return select_agentic_model(
-            db,
-            tier_chain,
-            capability,
-            min_context_window,
-            exclude_providers,
-            order_by,
-        )
-        .await;
-    }
-
-    // Stessa eleggibilita' del punto unico (regola L): NON re-implemento la WHERE.
-    let gate = crate::orchestrator::qualification_gate(db).await;
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: true,
-        require_thinking_non_exclude: true,
-        capability,
-        min_context_window,
-        exclude_providers,
-        apply_cooldown: true,
-        only_provider: None,
-        require_qualified: gate.require_qualified,
-        exclude_preview: gate.exclude_preview,
-    };
-    let candidates: Vec<(String, String)> = match crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        tier_chain,
-        order_by,
-        GOVERNED_CANDIDATE_POOL,
-    )
-    .await
-    {
-        Ok(v) => v.into_iter().map(|(p, m, _)| (p, m)).collect(),
-        Err(e) => {
-            tracing::warn!("select_agentic_model_governed: {e}");
-            return None;
-        }
-    };
-    // 0/1 candidati: nulla da riordinare (evita I/O telemetria inutile).
-    if candidates.len() < 2 {
-        return candidates.into_iter().next();
-    }
-
-    let telemetry = crate::governance_telemetry::load_model_telemetry(db, &candidates).await;
-    let policy = crate::governance_telemetry::load_governance_policy(db).await;
-    let ranked = nexus_agent_graph::decisions::governance::rank_candidates(
-        &candidates,
-        &telemetry,
-        &[],
-        &policy,
-    );
-    ranked.into_iter().next()
-}
 
 /// Mapping intent classificato -> intent_key per il lookup nella routing matrix.
 ///

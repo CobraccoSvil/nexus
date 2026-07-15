@@ -168,6 +168,7 @@ async fn nessuna_modalita_sceglie_un_modello_non_eleggibile(pool: PgPool) {
                 exclude_providers: &[],
                 pin: None,
                 rank,
+                governed: false,
             };
             let out = select_model_with_gate(&pool, &req, gate(gate_acceso)).await;
             match out {
