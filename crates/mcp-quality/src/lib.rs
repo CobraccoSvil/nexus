@@ -23,19 +23,30 @@ static RE_FN_DEF_CAPTURE: LazyLock<Regex> = LazyLock::new(|| {
 static RE_FN_DEF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+\w+").unwrap()
 });
-// Branch keyword per la complessita' ciclomatica (variante completa con ??).
+// Branch keyword per la complessita' ciclomatica.
+//
+// I `\b` valgono SOLO per le keyword alfabetiche: vanno ancorate, o `if` matcherebbe
+// dentro `verify`. Gli operatori (`&&`, `||`, `??`) devono invece restare FUORI
+// dall'ancoraggio. Un `\b` e' un confine fra word char e non-word char, e `&`/`|`/`?`
+// sono gia' non-word: in ` a && b` — la forma idiomatica, con gli spazi — a sinistra di
+// `&&` c'e' uno spazio, quindi nessun confine e nessun match. Tenerli dentro i `\b`
+// significava contarli solo quando scritti SENZA spazi (`a&&b`, dove il confine con `a`
+// esiste): un conteggio incoerente che in pratica li ignorava, sottostimando la
+// complessita di ogni condizione composta.
 // JS/TS don't have `match` as a control-flow keyword; omitting it avoids false
 // positives from variable names like `const match of` or `match.index`.
+// NB: l'ordine delle alternative e' load-bearing — `else if` deve stare dopo `if` come
+// nell'originale, cosi' `} else if x {` continua a valere 1 e non 2.
 static RE_BRANCH_FULL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(if|else if|elif|while|for|switch|case|catch|\?\?|&&|\|\|)\b").unwrap()
+    Regex::new(r"(\b(?:if|else if|elif|while|for|switch|case|catch)\b|\?\?|&&|\|\|)").unwrap()
 });
 // Branch keyword per JS/TS (senza `match`, vedi check_complexity).
 static RE_BRANCH_JS_TS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(if|else\s+if|elif|while|for|switch|case|catch|&&|\|\|)\b").unwrap()
+    Regex::new(r"(\b(?:if|else\s+if|elif|while|for|switch|case|catch)\b|&&|\|\|)").unwrap()
 });
 // Branch keyword per Rust/Python (con `match`).
 static RE_BRANCH_RUST_PY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(if|else\s+if|elif|while|for|match|case|catch|&&|\|\|)\b").unwrap()
+    Regex::new(r"(\b(?:if|else\s+if|elif|while|for|match|case|catch)\b|&&|\|\|)").unwrap()
 });
 // Funzione Rust con nome PascalCase (violazione naming).
 static RE_RS_FN_UPPERCASE: LazyLock<Regex> =
@@ -1321,6 +1332,32 @@ fn check_duplicate_blocks_detailed(lines: &[&str]) -> Vec<QualityFinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gli operatori booleani devono contare anche quando sono SPAZIATI, cioe' nella
+    /// forma in cui si scrivono davvero. Regressione: con i `\b` attorno a `&&`/`||`
+    /// il match non scattava (spazio e `&` sono entrambi non-word: nessun confine),
+    /// e ogni condizione composta veniva contata come un singolo ramo.
+    #[test]
+    fn branch_regex_conta_gli_operatori_spaziati() {
+        assert_eq!(RE_BRANCH_RUST_PY.find_iter("if a && b || c {").count(), 3);
+        assert_eq!(RE_BRANCH_JS_TS.find_iter("if (a && b || c) {").count(), 3);
+        assert_eq!(RE_BRANCH_FULL.find_iter("if (a && b || c) {").count(), 3);
+        // ... e restano contati anche senza spazi, come gia' accadeva
+        assert_eq!(RE_BRANCH_RUST_PY.find_iter("let ok = a&&b;").count(), 1);
+        // `??` (variante FULL) ha lo stesso problema dei booleani
+        assert_eq!(RE_BRANCH_FULL.find_iter("const x = a ?? b;").count(), 1);
+    }
+
+    /// L'ordine delle alternative e' load-bearing: `else if` sta dopo `if`, cosi' un
+    /// `else if` conta 1 (l'alternanza consuma l'intera keyword composta) e non 2.
+    #[test]
+    fn branch_regex_else_if_conta_una_volta() {
+        assert_eq!(RE_BRANCH_RUST_PY.find_iter("} else if x {").count(), 1);
+        assert_eq!(RE_BRANCH_RUST_PY.find_iter("if x {").count(), 1);
+        // le keyword restano ancorate: nessun match dentro un identificatore
+        assert_eq!(RE_BRANCH_RUST_PY.find_iter("let verify = format(x);").count(), 0);
+        assert_eq!(RE_BRANCH_RUST_PY.find_iter("let matcher = 1;").count(), 0);
+    }
 
     #[test]
     fn test_basic_analysis() {
