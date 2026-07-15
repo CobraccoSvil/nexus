@@ -619,9 +619,20 @@ impl Orchestrator {
                 // -> reasoning_content 400). Senza questo rilassamento il gate
                 // teneva il modello thinking originale (override/slot), vanificando
                 // l'esclusione su tutti i path che forzano un modello.
-                let fallback = match best_model_for_tier(db, &tier, Some(&capability), true).await {
-                    Some(x) => Some(x),
-                    None => best_model_for_tier(db, &tier, None, true).await,
+                // SERVIZIO UNICO (regola L): Degrade + Agentic. Il gate segue il
+                // profilo (I2) invece di dipendere da questo call site.
+                use crate::orchestrator::model_service::{select_model, ModelRequest};
+                let fallback = match select_model(
+                    db,
+                    &ModelRequest::agentic(&tier).capability(Some(&capability)),
+                )
+                .await
+                {
+                    Ok(c) => Some((c.provider, c.model)),
+                    Err(_) => select_model(db, &ModelRequest::agentic(&tier))
+                        .await
+                        .ok()
+                        .map(|c| (c.provider, c.model)),
                 };
                 match fallback {
                     Some((alt_provider, alt_model)) => {
@@ -713,8 +724,23 @@ impl Orchestrator {
                 // sia anche tool-capable: passiamo requires_tool_use al selettore
                 // unico, cosi' non vanifichiamo il gate tool-use applicato prima.
                 let requires_tool_use = intent != "chat";
-                match best_model_for_tier(db, &tier, Some("vision"), requires_tool_use).await {
-                    Some((vp, vm)) => {
+                // SERVIZIO UNICO (regola L). Il profilo decide i filtri e il gate
+                // (I2); la degradazione e' esplicita: con un'immagine allegata e
+                // il tier vision esaurito, meglio un modello vision di un gradino
+                // sotto che un turno CIECO — che era il comportamento reale
+                // (WARN + prosegue col modello senza occhi). La capability resta
+                // un filtro: il ripiego VEDE sempre.
+                let vreq = if requires_tool_use {
+                    crate::orchestrator::model_service::ModelRequest::agentic(&tier)
+                } else {
+                    crate::orchestrator::model_service::ModelRequest::non_agentic(&tier)
+                }
+                .capability(Some("vision"));
+                match crate::orchestrator::model_service::select_model(db, &vreq)
+                    .await
+                    .map(|c| (c.provider, c.model))
+                {
+                    Ok((vp, vm)) => {
                         tracing::info!(
                             "routing(vision): {}/{} senza vision ma il turno ha un'immagine \
                              -> override {}/{} (intent={}, tier={}, tool_use={})",
@@ -729,11 +755,16 @@ impl Orchestrator {
                         *provider = vp;
                         *model = vm;
                     }
-                    None => {
-                        // Nessun modello vision disponibile per quel tier (run
+                    Err(motivo) => {
+                        // Nessun modello vision in NESSUN tier della catena (run
                         // agentico: nemmeno vision+tool-capable). Fail visibile:
-                        // non sostituiamo con un modello non-vision.
+                        // non sostituiamo con un modello non-vision. Il motivo e'
+                        // TIPIZZATO (I6): `GateEmpty` dice "il worker di
+                        // qualificazione e' fermo", `ChainExhausted` dice "il
+                        // parco vision e' giu'" — due azioni opposte, che prima
+                        // collassavano nello stesso warning.
                         tracing::warn!(
+                            motivo = ?motivo,
                             "routing(vision): il turno ha un'immagine ma {}/{} non supporta la \
                              vision e nessun modello supports_vision=TRUE e' disponibile \
                              (intent={}, tier={}, tool_use={}). L'immagine resta investigabile \
@@ -921,15 +952,19 @@ impl Orchestrator {
             // l'attivazione admin del prompt). Se nessun sonar e' disponibile (modelli
             // disabilitati / api_key assente) cade nel routing normale sotto.
             if intent == "ricerca_web" {
-                if let Some((provider, model)) = best_model_for_tier_pinned(
+                // SERVIZIO UNICO (regola L). Pin su perplexity -> per I5 e'
+                // `Exact{PinnedProvider}`: se perplexity non ha il tier/capability,
+                // l'esito e' vuoto e si cade nel routing normale sotto (il piano B
+                // c'e' gia'), invece di degradare pur di onorare il pin.
+                if let Some((provider, model)) = crate::orchestrator::model_service::select_model(
                     db,
-                    &base_tier,
-                    Some("web_search"),
-                    false,
-                    &[],
-                    Some("perplexity"),
+                    &crate::orchestrator::model_service::ModelRequest::non_agentic(&base_tier)
+                        .capability(Some("web_search"))
+                        .pinned("perplexity"),
                 )
                 .await
+                .ok()
+                .map(|c| (c.provider, c.model))
                 {
                     if !is_provider_in_cooldown(&provider) {
                         let model = model_override
