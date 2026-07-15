@@ -247,131 +247,128 @@ impl HostMount {
 /// Lista di tool mounts dell'host, calcolata una sola volta all'avvio.
 static HOST_MOUNTS: OnceLock<Vec<HostMount>> = OnceLock::new();
 
+/// Monta ogni path esistente tra i `candidates`, con lo stesso path anche nel
+/// container. I path assenti sull'host vengono semplicemente ignorati.
+fn push_all_existing(mounts: &mut Vec<HostMount>, candidates: &[&str]) {
+    for candidate in candidates {
+        let p = PathBuf::from(*candidate);
+        if p.exists() {
+            mounts.push(HostMount::same(p));
+        }
+    }
+}
+
+/// Monta il PRIMO path esistente tra i `candidates` e ignora i restanti.
+/// Serve per i tool con installazioni alternative (es. `node` vs `nodejs`), di
+/// cui va montata una sola variante.
+fn push_first_existing(mounts: &mut Vec<HostMount>, candidates: &[&str]) {
+    for candidate in candidates {
+        let p = PathBuf::from(*candidate);
+        if p.exists() {
+            mounts.push(HostMount::same(p));
+            return;
+        }
+    }
+}
+
+/// Monta `host` (solo se esiste) sul path `container`, diverso da quello
+/// dell'host.
+fn push_remap_if_exists(mounts: &mut Vec<HostMount>, host: PathBuf, container: &str) {
+    if host.exists() {
+        mounts.push(HostMount::remap(host, container));
+    }
+}
+
+/// Risolve la home di una toolchain: la variabile d'ambiente `env_key` se
+/// valorizzata, altrimenti `$HOME/<fallback_subdir>` con `/root` come ultima
+/// spiaggia. Punto unico della fallback, condivisa da CARGO_HOME e RUSTUP_HOME.
+fn toolchain_home(env_key: &str, fallback_subdir: &str) -> PathBuf {
+    std::env::var(env_key).map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+            .join(fallback_subdir)
+    })
+}
+
+/// Node.js: interprete, package manager e moduli globali.
+fn push_node_mounts(mounts: &mut Vec<HostMount>) {
+    push_first_existing(mounts, &["/usr/bin/node", "/usr/bin/nodejs"]);
+    push_first_existing(mounts, &["/usr/bin/npm", "/usr/local/bin/npm"]);
+    push_first_existing(mounts, &["/usr/bin/npx", "/usr/local/bin/npx"]);
+    push_first_existing(mounts, &["/usr/bin/pnpm", "/usr/local/bin/pnpm"]);
+    // pnpm può essere uno script CJS
+    push_all_existing(
+        mounts,
+        &[
+            "/usr/bin/pnpm.cjs",
+            "/usr/local/bin/pnpm.cjs",
+            "/usr/local/lib/node_modules/pnpm/bin/pnpm.cjs",
+        ],
+    );
+    // Moduli globali node
+    push_all_existing(
+        mounts,
+        &["/usr/local/lib/node_modules", "/usr/lib/node_modules"],
+    );
+}
+
+/// Cargo / Rust: binari nel PATH del container, registry e toolchain rustup.
+fn push_rust_mounts(mounts: &mut Vec<HostMount>) {
+    let cargo_home = toolchain_home("CARGO_HOME", ".cargo");
+    // bin montato in /usr/local/cargo/bin (aggiunto al PATH container)
+    push_remap_if_exists(mounts, cargo_home.join("bin"), "/usr/local/cargo/bin");
+    push_remap_if_exists(
+        mounts,
+        cargo_home.join("registry"),
+        "/usr/local/cargo/registry",
+    );
+    push_remap_if_exists(
+        mounts,
+        toolchain_home("RUSTUP_HOME", ".rustup"),
+        "/usr/local/rustup",
+    );
+}
+
+/// Python: interprete e libreria standard / dist-packages.
+fn push_python_mounts(mounts: &mut Vec<HostMount>) {
+    push_first_existing(
+        mounts,
+        &["/usr/bin/python3", "/usr/bin/python3.12", "/usr/bin/python"],
+    );
+    push_all_existing(
+        mounts,
+        &[
+            "/usr/lib/python3",
+            "/usr/lib/python3.12",
+            "/usr/lib/python3/dist-packages",
+        ],
+    );
+}
+
+/// Git (con i suoi helper in git-core) e shell aggiuntive.
+fn push_git_and_shell_mounts(mounts: &mut Vec<HostMount>) {
+    push_first_existing(mounts, &["/usr/bin/git", "/usr/local/bin/git"]);
+    push_all_existing(mounts, &["/usr/lib/git-core"]);
+    push_all_existing(mounts, &["/bin/bash", "/usr/bin/bash"]);
+}
+
 /// Restituisce i tool dell'host da montare (read-only) in ogni container sandbox.
 fn host_mounts() -> &'static Vec<HostMount> {
     HOST_MOUNTS.get_or_init(|| {
         let mut m: Vec<HostMount> = Vec::new();
 
         // ── Librerie condivise (necessarie per qualsiasi binario dinamico) ────
-        for lib in &[
-            "/lib/x86_64-linux-gnu",
-            "/lib64",
-            "/usr/lib/x86_64-linux-gnu",
-        ] {
-            let p = PathBuf::from(lib);
-            if p.exists() {
-                m.push(HostMount::same(p));
-            }
-        }
-
-        // ── Node.js ───────────────────────────────────────────────────────────
-        for bin in &["/usr/bin/node", "/usr/bin/nodejs"] {
-            if PathBuf::from(bin).exists() {
-                m.push(HostMount::same(*bin));
-                break;
-            }
-        }
-        for bin in &["/usr/bin/npm", "/usr/local/bin/npm"] {
-            if PathBuf::from(bin).exists() {
-                m.push(HostMount::same(*bin));
-                break;
-            }
-        }
-        for bin in &["/usr/bin/npx", "/usr/local/bin/npx"] {
-            if PathBuf::from(bin).exists() {
-                m.push(HostMount::same(*bin));
-                break;
-            }
-        }
-        for bin in &["/usr/bin/pnpm", "/usr/local/bin/pnpm"] {
-            if PathBuf::from(bin).exists() {
-                m.push(HostMount::same(*bin));
-                break;
-            }
-        }
-        // pnpm può essere uno script CJS
-        for p in &[
-            "/usr/bin/pnpm.cjs",
-            "/usr/local/bin/pnpm.cjs",
-            "/usr/local/lib/node_modules/pnpm/bin/pnpm.cjs",
-        ] {
-            if PathBuf::from(p).exists() {
-                m.push(HostMount::same(*p));
-            }
-        }
-        // Moduli globali node
-        for gm in &["/usr/local/lib/node_modules", "/usr/lib/node_modules"] {
-            let p = PathBuf::from(gm);
-            if p.exists() {
-                m.push(HostMount::same(p));
-            }
-        }
-
-        // ── Cargo / Rust ──────────────────────────────────────────────────────
-        let cargo_home = std::env::var("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-                    .join(".cargo")
-            });
-        let cargo_bin = cargo_home.join("bin");
-        if cargo_bin.exists() {
-            // bin montato in /usr/local/cargo/bin (aggiunto al PATH container)
-            m.push(HostMount::remap(&cargo_bin, "/usr/local/cargo/bin"));
-        }
-        let cargo_registry = cargo_home.join("registry");
-        if cargo_registry.exists() {
-            m.push(HostMount::remap(
-                &cargo_registry,
-                "/usr/local/cargo/registry",
-            ));
-        }
-        let rustup_home = std::env::var("RUSTUP_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-                    .join(".rustup")
-            });
-        if rustup_home.exists() {
-            m.push(HostMount::remap(&rustup_home, "/usr/local/rustup"));
-        }
-
-        // ── Python ────────────────────────────────────────────────────────────
-        for py in &["/usr/bin/python3", "/usr/bin/python3.12", "/usr/bin/python"] {
-            if PathBuf::from(py).exists() {
-                m.push(HostMount::same(*py));
-                break;
-            }
-        }
-        for stdlib in &[
-            "/usr/lib/python3",
-            "/usr/lib/python3.12",
-            "/usr/lib/python3/dist-packages",
-        ] {
-            let p = PathBuf::from(stdlib);
-            if p.exists() {
-                m.push(HostMount::same(p));
-            }
-        }
-
-        // ── Git ───────────────────────────────────────────────────────────────
-        for git in &["/usr/bin/git", "/usr/local/bin/git"] {
-            if PathBuf::from(git).exists() {
-                m.push(HostMount::same(*git));
-                break;
-            }
-        }
-        let git_core = PathBuf::from("/usr/lib/git-core");
-        if git_core.exists() {
-            m.push(HostMount::same(git_core));
-        }
-
-        // ── Shell extras ──────────────────────────────────────────────────────
-        for sh in &["/bin/bash", "/usr/bin/bash"] {
-            if PathBuf::from(sh).exists() {
-                m.push(HostMount::same(*sh));
-            }
-        }
+        push_all_existing(
+            &mut m,
+            &[
+                "/lib/x86_64-linux-gnu",
+                "/lib64",
+                "/usr/lib/x86_64-linux-gnu",
+            ],
+        );
+        push_node_mounts(&mut m);
+        push_rust_mounts(&mut m);
+        push_python_mounts(&mut m);
+        push_git_and_shell_mounts(&mut m);
 
         info!(mounts = m.len(), "sandbox: host tool mounts calcolati");
         m
