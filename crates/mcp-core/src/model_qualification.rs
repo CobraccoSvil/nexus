@@ -72,6 +72,43 @@ pub(crate) struct AttemptOutcome {
     pub stop_reason: String,
 }
 
+/// error_class dal segnale STRUTTURATO del gateway (regola M): downcast del
+/// `GatewayHttpError` tipizzato -> `details.primary_cause` mappata dal punto
+/// unico `error_class_from_primary_cause`. In piu', SPECIFICO del
+/// qualificatore: un `client_error` con status 404 sulla richiesta PINNATA e'
+/// un rifiuto del MODELLO (Vertex "Publisher model not found") -> classe
+/// canonica `model_not_found` (fail conclusivo). Senza questo ponte il 404
+/// arrivava al classificatore TESTUALE come 'error' generico -> Transient ->
+/// giro inconclusivo perpetuo (misurato sul primo giro reale post-deploy:
+/// 15 evidence tutte transient:error sui modelli 404).
+/// `None` -> il chiamante ricade sul classificatore testuale.
+fn error_class_from_gateway(err: &anyhow::Error) -> Option<String> {
+    let gw = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())?;
+    let details = gw.details.as_ref()?;
+    let primary = details.get("primary_cause").and_then(Value::as_str)?;
+    if let Some(mapped) =
+        crate::provider_error_classifier::error_class_from_primary_cause(primary)
+    {
+        return Some(mapped.to_string());
+    }
+    if primary == "client_error" {
+        // Status STRUTTURATO del primo fallimento (mai il testo): col pin la
+        // chain ha un solo elemento.
+        let first_status = details
+            .get("failures")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|f| f.get("status"))
+            .and_then(Value::as_i64);
+        if first_status == Some(404) {
+            return Some("model_not_found".to_string());
+        }
+    }
+    None
+}
+
 /// Valuta UN turno di probe contro il `pass_predicate` del profilo. PURA.
 pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64) -> AttemptOutcome {
     let stop_reason = turn
@@ -566,12 +603,17 @@ async fn run_profile_attempts(
         let mut outcome = match result {
             Ok(Ok(turn)) => evaluate_attempt(&turn, &profile.pass_predicate, latency_ms),
             Ok(Err(e)) => {
-                // Errore di chiamata: classifica via error_class canonico
-                // (punto unico del classifier).
-                let ec = orchestrator
-                    .neural
-                    .classify_error(&e.to_string(), provider)
-                    .await;
+                // Errore di chiamata: PRIMA il segnale strutturato del gateway
+                // (regola M), poi il classificatore testuale come fallback.
+                let ec = match error_class_from_gateway(&e) {
+                    Some(ec) => ec,
+                    None => {
+                        orchestrator
+                            .neural
+                            .classify_error(&e.to_string(), provider)
+                            .await
+                    }
+                };
                 evaluate_attempt(
                     &json!({ "error_class": ec }),
                     &profile.pass_predicate,
@@ -1208,6 +1250,66 @@ mod tests {
         assert_eq!(derive_thinking_policy(Pass, Inconclusive), None);
         assert_eq!(derive_thinking_policy(Inconclusive, FailConclusive), None);
         assert_eq!(derive_thinking_policy(Inconclusive, Inconclusive), None);
+    }
+
+    // ── error_class_from_gateway: il ponte strutturato del qualificatore ─────
+
+    fn gw_error(body: Value) -> anyhow::Error {
+        crate::nexus_gateway::GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body.to_string(),
+        )
+        .into()
+    }
+
+    /// Il caso MISURATO sul primo giro reale post-deploy: Vertex 404 sul pin
+    /// arrivava come 'error' testuale -> Transient -> inconclusivo perpetuo.
+    /// Dal segnale strutturato (status 404 del primo fallimento) deve derivare
+    /// `model_not_found` (fail conclusivo -> Disqualified).
+    #[test]
+    fn gateway_404_sul_pin_diventa_model_not_found() {
+        let err = gw_error(json!({
+            "error": "tutti i provider hanno fallito -> google (google HTTP 404: ...)",
+            "code": "PROVIDER_ERROR",
+            "details": {
+                "primary_cause": "client_error",
+                "failures": [{"provider": "google", "class": "client_error",
+                               "status": 404, "code": "not_found", "message": "x"}]
+            }
+        }));
+        assert_eq!(
+            error_class_from_gateway(&err).as_deref(),
+            Some("model_not_found")
+        );
+    }
+
+    #[test]
+    fn gateway_primary_cause_mappata_vince() {
+        let err = gw_error(json!({
+            "error": "x", "code": "PROVIDER_ERROR",
+            "details": { "primary_cause": "empty_completion", "failures": [] }
+        }));
+        assert_eq!(
+            error_class_from_gateway(&err).as_deref(),
+            Some("empty_completion")
+        );
+    }
+
+    #[test]
+    fn gateway_client_error_non_404_resta_al_fallback() {
+        // Un 400 puo' essere history/schema (colpa della richiesta, non del
+        // modello): nessuna classe derivata, si ricade sul testuale.
+        let err = gw_error(json!({
+            "error": "x", "code": "PROVIDER_ERROR",
+            "details": {
+                "primary_cause": "client_error",
+                "failures": [{"provider": "google", "class": "client_error",
+                               "status": 400, "code": "invalid_request_error", "message": "x"}]
+            }
+        }));
+        assert_eq!(error_class_from_gateway(&err), None);
+        // E un errore NON-gateway (nessun downcast) idem.
+        assert_eq!(error_class_from_gateway(&anyhow::anyhow!("boom")), None);
     }
 
     #[test]
