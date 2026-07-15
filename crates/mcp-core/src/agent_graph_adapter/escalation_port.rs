@@ -121,21 +121,55 @@ impl PgEscalationPort {
         // selezioniamo insieme al modello cosi' il tier del modello promosso viaggia
         // nella `ChainEntry` fino al pick, SENZA lookup extra (regola L/H: il DB e'
         // gia' interrogato qui per derivare la catena).
-        match sqlx::query_as::<_, (String, Option<String>)>(
+        // ELEGGIBILITA' (fase 3a del consolidamento, censimento 2026-07-15).
+        // Questa catena serve a USCIRE da un loop agentico: promuovere qui un
+        // modello che il routing live scarta e' un salto verso un altro
+        // fallimento. Mancavano tre filtri:
+        //   - `agentic_thinking_policy <> 'exclude'`: la vista lo espone da
+        //     sempre e questo sito non lo usava. L'onda "FASE 2b" lo aggiunse al
+        //     promoter e SALTO' proprio l'escalation;
+        //   - il modello marcato MORTO dal probe (invalid_model/model_not_found);
+        //   - il gate di qualificazione (mig 0591/0595), i cui campi la vista
+        //     espone dalla mig 0598.
+        //
+        // PRUDENZA sul gate (il piano lo impone): la catena e' INTRA-provider, e
+        // un provider con pochi modelli qualificati puo' restare senza catena ->
+        // l'escalation non scatta -> un run in hollow ci resta. Il rischio e'
+        // accettabile solo perche' il pool qualificato non e' piu' vuoto
+        // (verificato sul campo dopo il fix del probe: 11 modelli promossi da
+        // prove reali, erano 0). Se un giorno il worker di qualificazione si
+        // fermasse, il fail-open resta lo stesso di prima: catena vuota = nessuna
+        // escalation, mai un modello scelto a caso.
+        let gate = crate::orchestrator::qualification_gate(&self.db).await;
+        let mut sql = String::from(
             "SELECT model, performance_tier FROM v_model_escalation_chain \
              WHERE provider = $1 \
                AND supports_tool_use = TRUE \
+               AND agentic_thinking_policy <> 'exclude' \
+               AND (auto_disabled_reason IS NULL \
+                    OR (auto_disabled_reason NOT LIKE 'invalid_model%' \
+                        AND auto_disabled_reason NOT LIKE 'model_not_found%')) \
                AND escalation_rank > COALESCE( \
                      (SELECT escalation_rank FROM v_model_escalation_chain \
                        WHERE provider = $1 AND model = $2), -1) \
-               AND context_window >= $3 \
-             ORDER BY escalation_rank ASC",
-        )
-        .bind(provider)
-        .bind(base_model)
-        .bind(current_window)
-        .fetch_all(&self.db)
-        .await
+               AND context_window >= $3",
+        );
+        if gate.require_qualified {
+            sql.push_str(
+                " AND qualification_state = 'qualified' \
+                  AND (qualification_expires_at IS NULL OR qualification_expires_at > now())",
+            );
+        }
+        if gate.exclude_preview {
+            sql.push_str(" AND model !~* '(preview|experimental|[-_]exp([-_.]|$))'");
+        }
+        sql.push_str(" ORDER BY escalation_rank ASC");
+        match sqlx::query_as::<_, (String, Option<String>)>(&sql)
+            .bind(provider)
+            .bind(base_model)
+            .bind(current_window)
+            .fetch_all(&self.db)
+            .await
         {
             Ok(rows) => rows
                 .into_iter()
@@ -511,6 +545,14 @@ mod tests {
         .execute(pool)
         .await
         .expect("create ai_model_health_history");
+        // SPECCHIO A MANO della vista viva (mig 0471/0475/0528 + 0598). E' un
+        // test-double fragile e lo si sappia: non e' agganciato alla migrazione,
+        // quindi se la vista cambia i test possono restare verdi su una vista
+        // FANTASMA. Qui e' andata bene — la mig 0598 ha aggiunto tre colonne e i
+        // test sono diventati rossi subito, che e' l'esito desiderabile — ma la
+        // garanzia e' un caso fortunato, non una proprieta'. Sostituirlo con una
+        // fixture derivata dalla migrazione reale e' un lavoro suo (annotato dal
+        // censimento dei punti unici), non da fare dentro questo.
         sqlx::query(
             "CREATE VIEW v_model_escalation_chain AS SELECT \
                  provider, model, performance_tier, speed_tier, is_enabled, \
@@ -519,7 +561,8 @@ mod tests {
                  (input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) AS blended_cost, \
                  ((CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) * 1000000 \
                   + round((input_cost_per_million_tokens * 0.75 + output_cost_per_million_tokens * 0.25) * 1000))::bigint AS escalation_rank, \
-                 (CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) AS performance_tier_ord \
+                 (CASE performance_tier WHEN 'light' THEN 0 WHEN 'medium' THEN 1 WHEN 'high' THEN 2 WHEN 'heavy' THEN 3 WHEN 'frontier' THEN 4 ELSE 1 END) AS performance_tier_ord, \
+                 qualification_state, qualification_expires_at, auto_disabled_reason \
              FROM ai_price_catalog WHERE is_enabled = TRUE",
         )
         .execute(pool)
@@ -1146,6 +1189,50 @@ mod tests {
         assert_eq!(
             pick.provider, "deepseek",
             "EmptyCompletion NON filtra la finestra: il sostituto piu' piccolo e' eleggibile"
+        );
+    }
+    /// REGRESSIONE (censimento punti unici, 2026-07-15): la catena di escalation
+    /// serve a USCIRE da un loop agentico, e non filtrava
+    /// `agentic_thinking_policy <> 'exclude'` — benche' la vista lo esponga da
+    /// sempre. L'onda di allineamento "FASE 2b" aggiunse quel filtro al promoter
+    /// e SALTO' proprio questo sito: si poteva salire su un modello che il
+    /// routing live scarta, cioe' saltare verso un altro fallimento.
+    /// Idem per un modello marcato MORTO dal probe (404 riabilitato a mano).
+    #[sqlx::test]
+    async fn catena_esclude_i_modelli_inadatti_ai_tool_loop(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("p", "base", "light", 0.1, true, true),
+                ("p", "sano-sopra", "heavy", 5.0, true, true),
+                ("p", "exclude-sopra", "heavy", 1.0, true, true),
+                ("p", "morto-sopra", "heavy", 0.5, true, true),
+            ],
+        )
+        .await;
+        // I due veleni sono piu' ECONOMICI del sano: a parita' di tier vincono
+        // l'escalation_rank e verrebbero scelti PRIMA, se i filtri mancassero.
+        sqlx::query("UPDATE ai_price_catalog SET agentic_thinking_policy='exclude' WHERE model='exclude-sopra'")
+            .execute(&pool)
+            .await
+            .expect("veleno thinking");
+        sqlx::query("UPDATE ai_price_catalog SET auto_disabled_reason='invalid_model: 404' WHERE model='morto-sopra'")
+            .execute(&pool)
+            .await
+            .expect("veleno morto");
+
+        let port = PgEscalationPort::new(pool.clone());
+        let catena: Vec<String> = port
+            .chain_for("p", "base")
+            .await
+            .into_iter()
+            .map(|e: ChainEntry| e.escalation_model)
+            .collect();
+        assert_eq!(
+            catena,
+            vec!["sano-sopra".to_string()],
+            "l'escalation deve salire SOLO su un modello adatto al tool-loop:              'exclude-sopra' (agentic_thinking_policy='exclude') e 'morto-sopra'              (404 dal probe) sono piu' economici e vincerebbero il rank"
         );
     }
 }
