@@ -546,6 +546,18 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
 }
 
 async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
+    let gate = crate::orchestrator::qualification_gate(db).await;
+    load_catalog_with_gate(db, gate).await
+}
+
+/// Come [`load_catalog`] ma col gate ESPLICITO. La cache di `qualification_gate`
+/// (60s, statica e in-process) renderebbe i test dipendenti dall'ordine di
+/// esecuzione (regola F): il primo test che la popola deciderebbe per tutti.
+/// Stesso pattern del servizio unico; l'ingresso reale resta `load_catalog`.
+async fn load_catalog_with_gate(
+    db: &PgPool,
+    gate: crate::orchestrator::QualificationGate,
+) -> sqlx::Result<Vec<CatalogModel>> {
     // FASE 2b (regola L, allineamento al routing live / ADR 0025): si carica il
     // catalog SANO con il solo `is_enabled = true`. Il filtro
     // `consecutive_failures = 0` e' stato RIMOSSO: la salute e' gia' garantita da
@@ -553,16 +565,45 @@ async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
     // causava starvation (un modello con 1 fail transitorio sparito dal pool e
     // mai piu' scelto -> counter mai resettato). Identica scelta di
     // select_models_tierchain (path live).
-    let rows = sqlx::query(
+    //
+    // GATE DI QUALIFICAZIONE (fase 3b del consolidamento, censimento 2026-07-15).
+    // Questo selettore alimenta `route_by_slots`, che e' il PRIMO routing tentato
+    // per ogni run con slot completi: era l'unico path agentico vivo che
+    // scavalcava il gate (mig 0591/0595) e l'esclusione pre-GA, quindi poteva
+    // instradare un modello non qualificato o preview proprio dove una chain
+    // agentica muore su un singolo errore. Il gate lo applica ora la stessa
+    // sorgente di verita' del routing live (`qualification_gate`), non una
+    // seconda copia di regole.
+    //
+    // Escluso anche il modello marcato MORTO dal probe (`auto_disabled_reason`
+    // invalid_model/model_not_found): un 404 riabilitato a mano risalirebbe lo
+    // scoring senza che nessuno se ne accorga.
+    //
+    // NB: qui NON si tocca l'ALGORITMO (scoring pesato con il tier come
+    // preferenza morbida, peso ~0.35): consolidarlo col servizio unico
+    // cambierebbe il comportamento del routing slot-based e non sarebbe una
+    // migrazione 1:1. E' una decisione di prodotto separata, non un fix.
+    let mut sql = String::from(
         "SELECT provider, model, performance_tier,
                 input_cost_per_million_tokens::float8 AS input_cost,
                 context_window, supports_tool_use,
                 capabilities, agentic_thinking_policy, pricing_state
            FROM ai_price_catalog
-          WHERE is_enabled = true",
-    )
-    .fetch_all(db)
-    .await?;
+          WHERE is_enabled = true
+            AND (auto_disabled_reason IS NULL
+                 OR (auto_disabled_reason NOT LIKE 'invalid_model%'
+                     AND auto_disabled_reason NOT LIKE 'model_not_found%'))",
+    );
+    if gate.require_qualified {
+        sql.push_str(
+            " AND qualification_state = 'qualified'
+              AND (qualification_expires_at IS NULL OR qualification_expires_at > now())",
+        );
+    }
+    if gate.exclude_preview {
+        sql.push_str(" AND model !~* '(preview|experimental|[-_]exp([-_.]|$))'");
+    }
+    let rows = sqlx::query(&sql).fetch_all(db).await?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -1339,6 +1380,40 @@ mod tests {
         assert_eq!(
             pick_best_replacement("deadfamily-2411", &cands).as_deref(),
             Some("other-b")
+        );
+    }
+    /// REGRESSIONE (censimento punti unici, 2026-07-15): `route_by_slots` e' il
+    /// PRIMO routing tentato per ogni run con slot completi, e passa da qui.
+    /// Era l'unico path agentico VIVO che scavalcava il gate di qualificazione
+    /// (mig 0591/0595) e l'esclusione pre-GA: instradava modelli non qualificati
+    /// proprio dove una chain agentica muore su un singolo errore.
+    ///
+    /// Il gate va applicato dalla STESSA sorgente del routing live
+    /// (`qualification_gate`), non da una seconda copia di regole.
+    #[sqlx::test]
+    async fn load_catalog_applica_il_gate_di_qualificazione(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, is_enabled, supports_tool_use, performance_tier,               capabilities, qualification_state, qualification_expires_at,               input_cost_per_million_tokens, auto_disabled_reason) VALUES              ('p', 'qualificato',      true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 1.0, NULL),              ('p', 'non-qualificato',  true, true, 'medium', '[\"code\"]'::jsonb, 'unqualified', NULL, 0.1, NULL),              ('p', 'scaduto',          true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() - interval '1 day', 0.1, NULL),              ('p', 'gemini-preview',   true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, NULL),              ('p', 'morto-404',        true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, 'invalid_model: 404')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let gate = crate::orchestrator::QualificationGate {
+            require_qualified: true,
+            exclude_preview: true,
+        };
+        let caricati: Vec<String> = load_catalog_with_gate(&pool, gate)
+            .await
+            .expect("load_catalog")
+            .into_iter()
+            .map(|m| m.model)
+            .collect();
+        assert_eq!(
+            caricati,
+            vec!["qualificato".to_string()],
+            "col gate acceso il selettore slot-based deve caricare SOLO il modello              qualificato e non scaduto: i non qualificati, gli scaduti, i preview e              i modelli marcati morti dal probe sono tutti piu' economici e              vincerebbero lo scoring se il gate mancasse"
         );
     }
 }
