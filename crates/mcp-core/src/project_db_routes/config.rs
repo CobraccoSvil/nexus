@@ -121,6 +121,166 @@ pub async fn get_project_db_config(
 
 // ── POST /api/projects/:id/db/config ─────────────────────────────────────────
 
+// Write-back della connection string sui file di configurazione del progetto.
+// Tutte le funzioni di questo blocco sono filesystem I/O SINCRONO: sono
+// invocate solo da dentro lo `spawn_blocking` di `set_project_db_config`.
+//
+// NB (regola L): qui si SCRIVE la connection string nei file. La lettura /
+// estrazione dagli stessi `appsettings*.json` vive in `super::connection` ed e'
+// logica distinta (direzione opposta, formato di output diverso): non e' un
+// duplicato da consolidare.
+
+/// Cerca ricorsivamente sotto `dir` i file il cui nome e' in `names`, saltando
+/// le directory nascoste e quelle di build. Profondita' massima: 4 livelli.
+fn find_config_files(
+    dir: &std::path::Path,
+    names: &[&str],
+    out: &mut Vec<std::path::PathBuf>,
+    depth: u8,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if fname.starts_with('.')
+            || fname == "node_modules"
+            || fname == "bin"
+            || fname == "obj"
+            || fname == "target"
+        {
+            continue;
+        }
+        if path.is_file() && names.contains(&fname.as_str()) {
+            out.push(path);
+        } else if path.is_dir() {
+            find_config_files(&path, names, out, depth + 1);
+        }
+    }
+}
+
+/// Sostituisce con `conn_str` TUTTE le voci dell'oggetto `ConnectionStrings`.
+/// Ritorna `true` se il documento e' stato considerato aggiornato (ossia se
+/// `ConnectionStrings` esiste ed e' un oggetto, anche vuoto).
+fn replace_json_connection_strings(doc: &mut serde_json::Value, conn_str: &str) -> bool {
+    let Some(cs) = doc.get_mut("ConnectionStrings") else {
+        return false;
+    };
+    let Some(obj) = cs.as_object_mut() else {
+        return false;
+    };
+    for (_key, val) in obj.iter_mut() {
+        *val = serde_json::Value::String(conn_str.to_string());
+    }
+    true
+}
+
+/// Riscrive la connection string in un singolo `appsettings*.json`.
+/// Ritorna `Some(errore)` SOLO se la scrittura su disco fallisce: file
+/// illeggibile, JSON malformato, `ConnectionStrings` assente o serializzazione
+/// fallita restano non-errori (al massimo un warn), come nell'originale.
+fn write_back_json_config(config_file: &std::path::Path, conn_str: &str) -> Option<String> {
+    let content = match std::fs::read_to_string(config_file) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!("lettura {} fallita: {}", config_file.display(), e);
+            return None;
+        }
+    };
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return None;
+    };
+    if !replace_json_connection_strings(&mut doc, conn_str) {
+        return None;
+    }
+    let Ok(pretty) = serde_json::to_string_pretty(&doc) else {
+        return None;
+    };
+    match std::fs::write(config_file, pretty + "\n") {
+        Ok(()) => {
+            tracing::info!("write-back connection string in {}", config_file.display());
+            None
+        }
+        Err(e) => {
+            tracing::warn!("write-back {} fallito: {}", config_file.display(), e);
+            Some(format!("Scrittura {} fallita: {}", config_file.display(), e))
+        }
+    }
+}
+
+/// Aggiorna in-place le righe `CHIAVE=VALORE` la cui chiave denota una
+/// connessione DB. Le righe commentate sono ignorate. Ritorna `true` se almeno
+/// una riga e' stata riscritta.
+fn replace_env_conn_lines(lines: &mut [String], conn_str: &str) -> bool {
+    let mut found = false;
+    for line in lines.iter_mut() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let kl = k.trim().to_lowercase();
+        if kl.contains("database_url") || kl.contains("connection") || kl.contains("db_url") {
+            *line = format!("{}={}", k.trim(), conn_str);
+            found = true;
+        }
+    }
+    found
+}
+
+/// Riscrive la connection string nei file `.env` noti, cercati SOLO
+/// direttamente sotto la root del progetto (nessuna ricorsione).
+fn write_back_env_files(root_path: &std::path::Path, conn_str: &str) {
+    let env_files = ["env", ".env", ".env.local", ".env.development"];
+    for env_name in &env_files {
+        let env_path = root_path.join(env_name);
+        if !env_path.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&env_path) else {
+            continue;
+        };
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        if replace_env_conn_lines(&mut lines, conn_str) {
+            let _ = std::fs::write(&env_path, lines.join("\n") + "\n");
+            tracing::info!("write-back connection string in {}", env_path.display());
+        }
+    }
+}
+
+/// Propaga `conn_str` nei file di configurazione sotto `root`
+/// (`appsettings*.json` ed `.env`). Bloccante: va invocata in `spawn_blocking`.
+///
+/// Ritorna l'ULTIMO errore di scrittura JSON incontrato (una scrittura riuscita
+/// non azzera un errore precedente); i fallimenti sui `.env` restano silenti,
+/// come nell'originale.
+fn write_back_connection_string(root: &str, conn_str: &str) -> Option<String> {
+    let root_path = std::path::Path::new(root);
+    if !root_path.exists() {
+        return None;
+    }
+
+    let candidates = ["appsettings.Development.json", "appsettings.json"];
+    let mut config_files: Vec<std::path::PathBuf> = Vec::new();
+    find_config_files(root_path, &candidates, &mut config_files, 0);
+
+    let mut wb_error: Option<String> = None;
+    for config_file in &config_files {
+        if let Some(err) = write_back_json_config(config_file, conn_str) {
+            wb_error = Some(err);
+        }
+    }
+
+    write_back_env_files(root_path, conn_str);
+    wb_error
+}
+
 pub async fn set_project_db_config(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -253,130 +413,11 @@ pub async fn set_project_db_config(
                 .filter(|s: &String| !s.is_empty());
         if let Some(root) = project_root {
             let conn_str_owned = conn_str.to_string();
-            let wb_result = tokio::task::spawn_blocking(move || {
-                let root_path = std::path::Path::new(&root);
-                if !root_path.exists() {
-                    return None;
-                }
-                let mut wb_error: Option<String> = None;
-                let candidates = ["appsettings.Development.json", "appsettings.json"];
-                let mut config_files: Vec<std::path::PathBuf> = Vec::new();
-                fn find_configs(
-                    dir: &std::path::Path,
-                    names: &[&str],
-                    out: &mut Vec<std::path::PathBuf>,
-                    depth: u8,
-                ) {
-                    if depth > 4 {
-                        return;
-                    }
-                    let Ok(entries) = std::fs::read_dir(dir) else {
-                        return;
-                    };
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        let path = entry.path();
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname.starts_with('.')
-                            || fname == "node_modules"
-                            || fname == "bin"
-                            || fname == "obj"
-                            || fname == "target"
-                        {
-                            continue;
-                        }
-                        if path.is_file() && names.contains(&fname.as_str()) {
-                            out.push(path);
-                        } else if path.is_dir() {
-                            find_configs(&path, names, out, depth + 1);
-                        }
-                    }
-                }
-                find_configs(root_path, &candidates, &mut config_files, 0);
-                for config_file in &config_files {
-                    match std::fs::read_to_string(config_file) {
-                        Ok(content) => {
-                            if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content)
-                            {
-                                let updated = if let Some(cs) = doc.get_mut("ConnectionStrings") {
-                                    if let Some(obj) = cs.as_object_mut() {
-                                        for (_key, val) in obj.iter_mut() {
-                                            *val =
-                                                serde_json::Value::String(conn_str_owned.clone());
-                                        }
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-                                if updated {
-                                    if let Ok(pretty) = serde_json::to_string_pretty(&doc) {
-                                        if let Err(e) = std::fs::write(config_file, pretty + "\n") {
-                                            tracing::warn!(
-                                                "write-back {} fallito: {}",
-                                                config_file.display(),
-                                                e
-                                            );
-                                            wb_error = Some(format!(
-                                                "Scrittura {} fallita: {}",
-                                                config_file.display(),
-                                                e
-                                            ));
-                                        } else {
-                                            tracing::info!(
-                                                "write-back connection string in {}",
-                                                config_file.display()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("lettura {} fallita: {}", config_file.display(), e);
-                        }
-                    }
-                }
-                let env_files = ["env", ".env", ".env.local", ".env.development"];
-                for env_name in &env_files {
-                    let env_path = root_path.join(env_name);
-                    if env_path.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&env_path) {
-                            let mut lines: Vec<String> =
-                                content.lines().map(String::from).collect();
-                            let mut found = false;
-                            for line in &mut lines {
-                                let trimmed = line.trim();
-                                if trimmed.starts_with('#') {
-                                    continue;
-                                }
-                                if let Some((k, _)) = trimmed.split_once('=') {
-                                    let kl = k.trim().to_lowercase();
-                                    if kl.contains("database_url")
-                                        || kl.contains("connection")
-                                        || kl.contains("db_url")
-                                    {
-                                        *line = format!("{}={}", k.trim(), conn_str_owned);
-                                        found = true;
-                                    }
-                                }
-                            }
-                            if found {
-                                let _ = std::fs::write(&env_path, lines.join("\n") + "\n");
-                                tracing::info!(
-                                    "write-back connection string in {}",
-                                    env_path.display()
-                                );
-                            }
-                        }
-                    }
-                }
-                wb_error
+            writeback_error = tokio::task::spawn_blocking(move || {
+                write_back_connection_string(&root, &conn_str_owned)
             })
             .await
             .unwrap_or(None);
-            writeback_error = wb_result;
         }
     }
 
