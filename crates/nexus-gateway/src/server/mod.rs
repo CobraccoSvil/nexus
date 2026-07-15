@@ -78,6 +78,10 @@ pub struct RuntimeState {
     pub policy: Arc<PolicyEngine>,
     /// Risolutore alias logico -> modello reale.
     pub aliases: Arc<ModelAliasResolver>,
+    /// Timeout LLM derivati dal punto unico (`nexus_auth::llm_timeouts`). Vivono
+    /// qui perche' `/admin/reload` li rilegga dal DB a caldo, insieme al client
+    /// HTTP che ne dipende.
+    pub timeouts: nexus_auth::llm_timeouts::LlmTimeouts,
     /// Client Presidio (per il classificatore di sensibilita').
     pub presidio: PresidioClient,
     /// Profilo operativo corrente (cloud/onprem/hybrid).

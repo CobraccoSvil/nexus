@@ -45,6 +45,6 @@ pub use runtime::{
 };
 pub use shadow::{compute_diff, persist_node_diff, DiffCollector, NodeDiff};
 pub use state::{
-    AgentState, AutomationMode, Message, MetaStep, StateDelta, StopReason, SupervisorMode,
-    TaskComplexity,
+    AgentState, AutomationMode, FinalGateVerdict, Message, MetaStep, StateDelta, StopReason,
+    SupervisorMode, TaskComplexity,
 };

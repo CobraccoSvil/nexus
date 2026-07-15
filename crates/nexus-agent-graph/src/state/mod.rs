@@ -28,6 +28,41 @@ use serde_json::Value;
 use nexus_graph_derive::GraphState as DeriveGraphState;
 
 pub use delta::{put_extra, StateDelta};
+
+/// Esito di UN verdetto del final gate: una variante per ogni ramo di uscita
+/// del nodo (punto unico del vocabolario, regola L+M).
+///
+/// I consumatori DEVONO leggerlo con un `match` esaustivo: e' il meccanismo che
+/// rende il fix duraturo. Aggiungere un ramo al gate senza aggiungere qui la
+/// variante, o aggiungere una variante senza dichiararne la semantica nei
+/// consumatori, NON COMPILA. E' esattamente cio' che mancava quando il ramo
+/// "turno di grazia" fu introdotto: nessuno segnalo' al finalizzatore che il
+/// suo `final_gate_cycle > 0` aveva smesso di significare "bocciato".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalGateVerdict {
+    /// Tutti i criteri superati: il run chiude verificato. (Se il profilo di
+    /// verifica mancava, `final_gate_unverified` lo dice a parte: qui il gate
+    /// ha comunque emesso un verdetto positivo su cio' che ha potuto misurare.)
+    Passed,
+    /// Criteri OGGETTIVI tutti superati; manca SOLO la dichiarazione
+    /// strutturata di chiusura (`task_complete`). Il gate ha concesso il turno
+    /// di grazia per la firma. **Non e' un fallimento**: il lavoro e'
+    /// verificato. Lascia `final_gate_cycle = max_cycles` per non ri-entrare,
+    /// e quel residuo era la causa del falso `FailedDiagnosed`.
+    ObjectivePassedSignatureMissing,
+    /// Criteri oggettivi falliti al cap: il turno e' ceduto all'executor
+    /// perche' promuova un modello piu' capace. Il run PROSEGUE: non e' ancora
+    /// un esito.
+    EscalationHandoff,
+    /// Chiusura al cap / forced_close con criteri NON superati: bocciatura
+    /// esplicita e DEFINITIVA (nessuna ri-verifica era prevista).
+    FailedFinal,
+    /// Bocciatura con correzione RIMANDATA all'executor: la ri-verifica era
+    /// prevista. Se il run muore prima di rientrare nel gate, questo e' l'unico
+    /// caso in cui l'esito "verifica fallita e non ripetuta" e' VERO.
+    FailedPendingCorrection,
+}
 pub use message::{ContentBlock, Message, MessageContent, ToolUse};
 
 /// Modalita' supervisore worker (UI: off / su anomalia / ogni N step / continuo).
@@ -418,8 +453,29 @@ pub struct AgentState {
     pub exploratory_verify_cycle: Option<i64>,
     /// Cap globale per run della verifica esplorativa.
     pub exploratory_verify_total: Option<i64>,
-    /// Ciclo del final gate generale.
+    /// Ciclo del final gate generale. E' un CONTATORE ("quanti giri ha fatto il
+    /// gate"): non risponde e non deve rispondere a "com'e' andata la verifica"
+    /// — per quello c'e' [`AgentState::final_gate_verdict`] (regola M).
     pub final_gate_cycle: Option<i64>,
+    /// ESITO dell'ultimo verdetto del final gate: il segnale STRUTTURATO che
+    /// dice "com'e' andata" (regola M). Lo scrive OGNI ramo del gate, e i
+    /// consumatori lo leggono con un `match` esaustivo invece di dedurre
+    /// l'esito da `final_gate_cycle`.
+    ///
+    /// Perche' esiste: l'esito era INFERITO dal contatore
+    /// (`final_gate_cycle > 0 && !plan_phase_active`) sulla base di
+    /// un'enumerazione dei rami del gate scritta a mano nella doc del
+    /// consumatore — enumerazione FALSA. Il turno di GRAZIA
+    /// (`final_gate.rs`, ramo `completion_grace`) lascia di proposito
+    /// `cycle = max_cycles` pur avendo TUTTI i criteri oggettivi PASSATI
+    /// ("nessun nuovo campo di stato", diceva il commento): quel residuo veniva
+    /// letto come "verifica fallita e non ripetuta" e un lavoro riuscito
+    /// chiudeva `FailedDiagnosed`. Lo stesso falso positivo era gia' emerso per
+    /// la plan-phase ed era stato tappato con un'eccezione ad-hoc su
+    /// `!plan_phase_active`, invece di dare all'esito un campo proprio.
+    ///
+    /// `None` = il gate non e' mai entrato in questo run.
+    pub final_gate_verdict: Option<FinalGateVerdict>,
     /// `true` quando il final gate ha PASSATO la verifica E2E (esito canonico
     /// CompletedVerified lato mcp-core). Settato solo sul ramo PASSED del
     /// `final_gate_node`; il ramo forced_close/cap NON lo imposta (resta

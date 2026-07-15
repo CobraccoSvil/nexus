@@ -94,6 +94,19 @@ pub fn build_client() -> Client {
 }
 
 pub fn build_client_with_config(config: &NexusHttpConfig) -> Client {
+    // safety: reqwest::ClientBuilder::build() puo' fallire solo per
+    // init TLS o allocazione. E' bootstrap del client HTTP globale —
+    // se fallisce qui, l'intera applicazione non puo' fare HTTP comunque.
+    // Ammesso da CLAUDE.md §F come "bootstrap critico".
+    try_build_client_with_config(config)
+        .expect("nexus-http: impossibile costruire il client HTTP")
+}
+
+/// Variante FALLIBILE di [`build_client_with_config`], per i chiamanti che
+/// costruiscono il client a runtime (non al bootstrap) e devono propagare
+/// l'errore al chiamante invece di panicare (regola F: expect solo dove il
+/// fallimento e' davvero irrecuperabile).
+pub fn try_build_client_with_config(config: &NexusHttpConfig) -> reqwest::Result<Client> {
     let mut builder = ClientBuilder::new()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(config.timeout_secs))
@@ -117,11 +130,7 @@ pub fn build_client_with_config(config: &NexusHttpConfig) -> Client {
         }
     }
 
-    // safety: reqwest::ClientBuilder::build() puo' fallire solo per
-    // init TLS o allocazione. E' bootstrap del client HTTP globale —
-    // se fallisce qui, l'intera applicazione non puo' fare HTTP comunque.
-    // Ammesso da CLAUDE.md §F come "bootstrap critico".
-    builder.build().expect("nexus-http: impossibile costruire il client HTTP")
+    builder.build()
 }
 
 #[derive(Clone, Debug)]

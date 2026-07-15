@@ -3290,9 +3290,10 @@ pub(crate) async fn spawn_agent_run(
                             .unwrap_or(3);
 
                             // PUNTO UNICO (regola L): counter + degrado a soglia con
-                            // guard capability_source='auto' vivono in tool_capability.
-                            // Le righe curate a mano (manual) non vengono mai degradate
-                            // dal runtime (incidente deepseek-v4, 2026-06-10).
+                            // guard NOT capability_locked (mig 0590) vivono in
+                            // tool_capability. Le righe con lock esplicito non vengono
+                            // mai degradate dal runtime (incidente deepseek-v4,
+                            // 2026-06-10).
                             let rec = crate::tool_capability::record_tool_failure(
                                 &db_clone,
                                 &result.provider,
@@ -5444,6 +5445,9 @@ async fn maybe_convene_council(
     tracing::info!(
         session_id = %session_id,
         verdict = %synthesis.verdict.as_str(),
+        pareri_validi = synthesis.valid,
+        figure_convocate = synthesis.convened,
+        quorum_minimo = synthesis.required_valid,
         requisiti = synthesis.requirements.len(),
         rischi = synthesis.risks.len(),
         "consiglio a monte: sintesi composta, iniezione nel primo messaggio"
@@ -5809,6 +5813,9 @@ async fn emit_council_of_competencies_meta_step(
                 "figure_count": figure_count,
                 "figure_reports": figure_reports_json,
                 "advisory_verdict": synthesis.verdict.as_str(),
+                "advisory_valid": synthesis.valid,
+                "advisory_convened": synthesis.convened,
+                "advisory_required_valid": synthesis.required_valid,
                 "requirements_count": synthesis.requirements.len(),
                 "risks_count": synthesis.risks.len(),
             }),

@@ -21,7 +21,25 @@
 
 use serde_json::Value;
 
-use super::panel_quorum::{classify_panel, PanelClass, QuorumPolicy, QuorumTally};
+use super::panel_quorum::{classify_panel, required_valid, PanelClass, QuorumPolicy, QuorumTally};
+
+/// Roster del panel advisory: il DENOMINATORE del quorum e' un input esplicito
+/// del chiamante, mai dedotto dalla presenza dei voti (regola M: una figura in
+/// timeout e' un'ASSENZA che pesa, non una riga che sparisce dal conteggio).
+/// Incidente reale: 4 figure su 5 in timeout/errore -> `total_advisories = 1`
+/// -> quorum "raggiunto" con 1 voto -> il consiglio dichiarava `proceed` come
+/// consenso. Enum (non `Option<usize>`) cosi' ogni call site DICHIARA la
+/// semantica del proprio denominatore e un caso nuovo non compila da solo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvisoryRoster {
+    /// Il chiamante CONOSCE quante figure ha convocato al voto (consiglio a
+    /// monte, panel multi-provider): il quorum e' relativo alle convocate.
+    Convened(usize),
+    /// Batch generico (fan-in `dispatch_subagents`): le figure advisory si
+    /// riconoscono solo dal voto dichiarato, il roster non e' noto. Denominatore
+    /// = advisory presenti; vale la sola soglia assoluta (semantica storica).
+    SelfDeclared,
+}
 
 /// Verdetto canonico dichiarato da UNA figura via `advisory_verdict`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,9 +110,14 @@ impl AdvisoryPanelVerdict {
 /// [`super::panel_quorum::QuorumPolicy`] al momento della classificazione.
 #[derive(Debug, Clone, Copy)]
 pub struct AdvisoryPolicy {
-    /// Minimo numero di pareri VALIDI perche' il panel sia conclusivo. Sotto
-    /// soglia -> `Inconclusive`.
+    /// Minimo numero ASSOLUTO di pareri VALIDI perche' il panel sia conclusivo
+    /// (pavimento). Sotto la soglia effettiva -> `Inconclusive`.
     pub min_valid_advisories: usize,
+    /// Percentuale (0-100) delle figure CONVOCATE che deve aver deliberato
+    /// perche' il panel sia conclusivo, quando il roster e' noto
+    /// ([`AdvisoryRoster::Convened`]). La soglia effettiva e'
+    /// `max(min_valid_advisories, ceil(convocate * quorum_pct / 100))`.
+    pub quorum_pct: u8,
     /// Veto avversario: se `true`, UN solo `block` con almeno un rischio di
     /// severity `alta` basta a far vincere il veto (una figura che trova un
     /// rischio grave con evidenza ha ragione anche in minoranza). Se `false`,
@@ -103,12 +126,15 @@ pub struct AdvisoryPolicy {
 }
 
 impl Default for AdvisoryPolicy {
-    /// Default sicuro: 1 parere valido basta a essere conclusivi e il veto su
-    /// high-severity e' ATTIVO (il consiglio deve poter bloccare su un solo
-    /// rischio grave con evidenza).
+    /// Default sicuro: 1 parere valido come pavimento assoluto, quorum al 50%
+    /// delle convocate quando il roster e' noto, veto su high-severity ATTIVO
+    /// (il consiglio deve poter bloccare su un solo rischio grave con evidenza).
+    /// Coincide coi safe-default delle chiavi `orchestrator.council_advisory_*`
+    /// (mig 0548 + 0589): il DB resta la fonte di verita' (regola G).
     fn default() -> Self {
         Self {
             min_valid_advisories: 1,
+            quorum_pct: 50,
             block_on_high_severity: true,
         }
     }
@@ -121,6 +147,13 @@ pub struct AdvisorySynthesis {
     /// Pareri validi / pareri advisory totali trovati.
     pub valid: usize,
     pub total_advisories: usize,
+    /// Figure CONVOCATE al voto (denominatore del quorum). Per
+    /// [`AdvisoryRoster::SelfDeclared`] coincide con `total_advisories`.
+    pub convened: usize,
+    /// Soglia EFFETTIVA di pareri validi usata per il quorum: sotto questa il
+    /// verdetto e' `Inconclusive`. Il lettore puo' dichiarare "X su N (quorum
+    /// Y)" senza ricalcolare nulla.
+    pub required_valid: usize,
     pub proceed: usize,
     pub proceed_with_changes: usize,
     pub block: usize,
@@ -146,6 +179,8 @@ impl AdvisorySynthesis {
             "veto": self.verdict.is_veto(),
             "valid": self.valid,
             "total_advisories": self.total_advisories,
+            "convened": self.convened,
+            "required_valid": self.required_valid,
             "tally": {
                 "proceed": self.proceed,
                 "proceed_with_changes": self.proceed_with_changes,
@@ -237,10 +272,14 @@ fn extend_dedup(acc: &mut Vec<String>, items: Vec<String>) {
 /// Compone la sintesi del panel advisory dagli esiti strutturati dei sub-run
 /// delle figure. `outcomes` e' la lista dei blocchi `outcome` (structured_verdict);
 /// gli elementi senza `advisory` valido sono ignorati (non sono figure del panel).
+/// `roster` e' il denominatore del quorum dichiarato dal chiamante (regola M: le
+/// figure convocate ma senza esito sono astensioni che PESANO, non righe che
+/// spariscono dal conteggio).
 ///
 /// `None` se NESSUN outcome porta un `advisory` (il batch non e' un panel di
 /// analisi): il coordinatore non aggiunge alcuna sintesi. `Some(_)` con
-/// `Inconclusive` se ci sono pareri ma i voti validi sono sotto la soglia.
+/// `Inconclusive` se ci sono pareri ma i voti validi sono sotto la soglia
+/// effettiva (`max(min_valid_advisories, ceil(convocate * quorum_pct / 100))`).
 ///
 /// Determinismo: requisiti e raccomandazioni seguono l'ordine degli `outcomes`
 /// (dedup stabile); i rischi sono ordinati per severity con sort STABILE, quindi
@@ -248,6 +287,7 @@ fn extend_dedup(acc: &mut Vec<String>, items: Vec<String>) {
 pub fn compose_advisory_synthesis(
     outcomes: &[Value],
     policy: &AdvisoryPolicy,
+    roster: AdvisoryRoster,
 ) -> Option<AdvisorySynthesis> {
     // Un batch e' un "panel advisory" se almeno un outcome ha il campo advisory
     // (anche solo dichiarato): distingue un panel di analisi da un batch di worker.
@@ -289,6 +329,15 @@ pub fn compose_advisory_synthesis(
     let distinct =
         usize::from(proceed > 0) + usize::from(proceed_with_changes > 0) + usize::from(block > 0);
 
+    // Denominatore e soglia effettiva del quorum: punto unico `required_valid`
+    // (panel_quorum, regola L). Il match e' esaustivo: un roster nuovo non
+    // compila finche' non dichiara il proprio denominatore.
+    let (convened, roster_size) = match roster {
+        AdvisoryRoster::Convened(n) => (n, Some(n)),
+        AdvisoryRoster::SelfDeclared => (total_advisories, None),
+    };
+    let required = required_valid(policy.min_valid_advisories, roster_size, policy.quorum_pct);
+
     let class = classify_panel(
         &QuorumTally {
             valid,
@@ -297,7 +346,7 @@ pub fn compose_advisory_synthesis(
             any_high_severity_veto: any_high_severity_block,
         },
         &QuorumPolicy {
-            min_valid: policy.min_valid_advisories,
+            min_valid: required,
             veto_on_high_severity: policy.block_on_high_severity,
         },
     );
@@ -312,6 +361,8 @@ pub fn compose_advisory_synthesis(
         verdict,
         valid,
         total_advisories,
+        convened,
+        required_valid: required,
         proceed,
         proceed_with_changes,
         block,
@@ -343,11 +394,22 @@ mod tests {
         })
     }
 
+    /// Blocco outcome di una figura CONVOCATA ma senza esito (timeout/errore):
+    /// astensione che deve pesare nel denominatore, non sparire.
+    fn abstain() -> Value {
+        json!({"verdict": "timed_out", "success": false, "advisory": Value::Null})
+    }
+
     #[test]
     fn nessun_advisory_nel_batch_ritorna_none() {
         // Batch di soli worker (outcome senza advisory): non e' un panel.
         let worker = json!({"verdict": "completed", "success": true, "advisory": Value::Null});
-        assert!(compose_advisory_synthesis(&[worker], &AdvisoryPolicy::default()).is_none());
+        assert!(compose_advisory_synthesis(
+            &[worker],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::SelfDeclared,
+        )
+        .is_none());
     }
 
     #[test]
@@ -358,6 +420,7 @@ mod tests {
                 figure("proceed", json!([]), json!([])),
             ],
             &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(2),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Proceed);
@@ -379,6 +442,7 @@ mod tests {
                 figure("block", high, json!(["usa PKCE"])),
             ],
             &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(2),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Block);
@@ -395,8 +459,10 @@ mod tests {
             &[figure("block", media, json!([]))],
             &AdvisoryPolicy {
                 min_valid_advisories: 1,
+                quorum_pct: 50,
                 block_on_high_severity: true,
             },
+            AdvisoryRoster::Convened(1),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::ProceedWithChanges);
@@ -409,8 +475,10 @@ mod tests {
             &[figure("block", media, json!([]))],
             &AdvisoryPolicy {
                 min_valid_advisories: 1,
+                quorum_pct: 50,
                 block_on_high_severity: false,
             },
+            AdvisoryRoster::Convened(1),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Block);
@@ -424,6 +492,7 @@ mod tests {
                 figure("proceed_with_changes", json!([]), json!(["valida input"])),
             ],
             &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(2),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::ProceedWithChanges);
@@ -435,13 +504,14 @@ mod tests {
     fn astensione_non_conta_come_voto() {
         // Una figura in timeout (success=false, advisory assente) NON vota: sotto
         // min_valid=2 il panel e' inconclusive nonostante un proceed valido.
-        let abstain = json!({"verdict": "timed_out", "success": false, "advisory": Value::Null});
         let out = compose_advisory_synthesis(
-            &[figure("proceed", json!([]), json!([])), abstain],
+            &[figure("proceed", json!([]), json!([])), abstain()],
             &AdvisoryPolicy {
                 min_valid_advisories: 2,
+                quorum_pct: 50,
                 block_on_high_severity: true,
             },
+            AdvisoryRoster::Convened(2),
         )
         .unwrap();
         assert_eq!(out.verdict, AdvisoryPanelVerdict::Inconclusive);
@@ -451,6 +521,80 @@ mod tests {
             out.total_advisories, 1,
             "l'astensione senza advisory non conta"
         );
+        assert_eq!(out.convened, 2, "ma pesa nel denominatore del quorum");
+        assert_eq!(out.required_valid, 2);
+    }
+
+    #[test]
+    fn quorum_relativo_una_su_cinque_inconclusive() {
+        // Il caso di campo (incidente 2026-07-14): 5 figure convocate, 4 in
+        // timeout/errore, 1 sola vota proceed. Il quorum relativo (50% di 5 = 3)
+        // NON e' raggiunto: il panel e' Inconclusive, mai un "proceed" spacciato
+        // per consenso del consiglio.
+        let out = compose_advisory_synthesis(
+            &[
+                figure("proceed", json!([]), json!([])),
+                abstain(),
+                abstain(),
+                abstain(),
+                abstain(),
+            ],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(5),
+        )
+        .unwrap();
+        assert_eq!(out.verdict, AdvisoryPanelVerdict::Inconclusive);
+        assert!(!out.verdict.is_clear());
+        assert_eq!(out.valid, 1);
+        assert_eq!(out.convened, 5);
+        assert_eq!(out.required_valid, 3);
+    }
+
+    #[test]
+    fn quorum_relativo_raggiunto_delibera() {
+        // 3 voti validi su 5 convocate: quorum 50% (ceil(2.5)=3) raggiunto.
+        let out = compose_advisory_synthesis(
+            &[
+                figure("proceed", json!([]), json!([])),
+                figure("proceed", json!([]), json!([])),
+                figure("proceed", json!([]), json!([])),
+                abstain(),
+                abstain(),
+            ],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(5),
+        )
+        .unwrap();
+        assert_eq!(out.verdict, AdvisoryPanelVerdict::Proceed);
+        assert_eq!((out.valid, out.convened, out.required_valid), (3, 5, 3));
+    }
+
+    #[test]
+    fn self_declared_mantiene_soglia_assoluta() {
+        // Fan-in generico: roster ignoto, un solo advisory dichiarato resta
+        // conclusivo con min_valid=1 (semantica storica del batch misto).
+        let out = compose_advisory_synthesis(
+            &[figure("proceed", json!([]), json!([]))],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::SelfDeclared,
+        )
+        .unwrap();
+        assert_eq!(out.verdict, AdvisoryPanelVerdict::Proceed);
+        assert_eq!((out.convened, out.required_valid), (1, 1));
+    }
+
+    #[test]
+    fn to_value_espone_quorum_strutturato() {
+        let out = compose_advisory_synthesis(
+            &[figure("proceed", json!([]), json!([])), abstain()],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(2),
+        )
+        .unwrap();
+        let v = out.to_value();
+        assert_eq!(v["convened"], json!(2));
+        assert_eq!(v["required_valid"], json!(1));
+        assert_eq!(v["valid"], json!(1));
     }
 
     #[test]
@@ -461,6 +605,7 @@ mod tests {
                 figure("proceed_with_changes", json!([]), json!(["B", "C"])),
             ],
             &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(2),
         )
         .unwrap();
         // B compare una sola volta, ordine di prima apparizione.
@@ -482,6 +627,7 @@ mod tests {
                 figure("proceed_with_changes", r3, json!([])),
             ],
             &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(3),
         )
         .unwrap();
         // alta -> media -> bassa.

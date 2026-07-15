@@ -92,8 +92,8 @@ pub use adversarial_review::{
     compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict,
 };
 pub use advisory_panel::{
-    compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisorySynthesis,
-    AdvisoryVerdict,
+    compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster,
+    AdvisorySynthesis, AdvisoryVerdict,
 };
 pub use clarify_signature::{clarify_signature, normalize_question};
 pub use context_reduction::{

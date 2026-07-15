@@ -56,6 +56,7 @@ mod mcp_connectors;
 mod middleware;
 mod model_catalog_sync;
 mod model_health_probe;
+mod model_observation;
 mod models;
 mod mutations_api;
 mod native_engine;
@@ -117,6 +118,7 @@ mod trace_store;
 mod ui_flags;
 mod vector_memory;
 mod verify_profile;
+mod verify_probe;
 mod wiki;
 
 use std::net::SocketAddr;

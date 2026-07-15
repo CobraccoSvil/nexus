@@ -4,10 +4,14 @@
 //!
 //! Tutti i writer automatici — il tool-probe (`model_health_probe`) e il
 //! tracking runtime dei run agentici (`chat_messages::agent_run`) — DEVONO
-//! passare da qui. Il guard `capability_source='auto'` (le righe curate a mano
-//! dall'admin non vengono mai degradate dagli automatismi) e' cosi' applicato
-//! in un solo posto: l'incidente deepseek-v4 (2026-06-10) nacque proprio dal
-//! runtime che degradava righe `manual` senza guard, mentre il probe lo aveva.
+//! passare da qui. Il guard `NOT capability_locked` (le righe con lock
+//! esplicito dell'admin non vengono mai degradate dagli automatismi) e' cosi'
+//! applicato in un solo posto: l'incidente deepseek-v4 (2026-06-10) nacque
+//! proprio dal runtime che degradava righe curate senza guard, mentre il
+//! probe lo aveva. Il lock e' una colonna DEDICATA (`capability_locked`, mig
+//! 0590), separata dalla provenienza `capability_source`: prima il guard era
+//! `capability_source='auto'` e ogni riga dichiarata a mano diventava
+//! INFALSIFICABILE per sempre (fase 2 design gate qualificazione, ANELLO 4).
 //!
 //! Il ripristino e' simmetrico tra le due fonti di degrado: un successo con
 //! tool (run reale o probe) riabilita la capability qualunque sia stata la
@@ -45,23 +49,23 @@ pub fn is_tool_reason(reason: Option<&str>) -> bool {
 /// (catalog_sync "ricomparso API", ciclo billing cooldown) puo' azzerare
 /// `auto_disabled_reason` senza ripristinare `supports_tool_use` — senza
 /// questo ramo il degrado diventa permanente (incidente magistral-small-2509,
-/// 2026-06-10). Le curature admin (`capability_source='manual'`) restano
-/// fuori dal ri-test automatico.
+/// 2026-06-10). Le righe con lock esplicito (`capability_locked`, mig 0590)
+/// restano fuori dal ri-test automatico.
 pub fn was_auto_degraded(
     supports_tool_use: bool,
-    capability_source: &str,
+    capability_locked: bool,
     reason: Option<&str>,
     consecutive_tool_failures: i32,
 ) -> bool {
     !supports_tool_use
-        && capability_source == "auto"
+        && !capability_locked
         && (is_tool_reason(reason) || (reason.is_none() && consecutive_tool_failures > 0))
 }
 
 /// Esito di [`record_tool_failure`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFailureRecord {
-    /// Riga `capability_source='manual'` (protetta) o inesistente: nessuna scrittura.
+    /// Riga con lock esplicito (`capability_locked`) o inesistente: nessuna scrittura.
     Protected,
     /// Counter incrementato, sotto soglia.
     Counted { failures: i32 },
@@ -73,8 +77,8 @@ pub enum ToolFailureRecord {
 /// modello: incrementa `consecutive_tool_failures` e, a soglia, marca
 /// `supports_tool_use=false` con `auto_disabled_reason=reason`.
 ///
-/// Guard `capability_source='auto'`: le righe curate a mano non vengono ne'
-/// contate ne' degradate (ritorna [`ToolFailureRecord::Protected`]).
+/// Guard `NOT capability_locked` (mig 0590): le righe con lock esplicito non
+/// vengono ne' contate ne' degradate (ritorna [`ToolFailureRecord::Protected`]).
 pub async fn record_tool_failure(
     db: &PgPool,
     provider: &str,
@@ -87,7 +91,7 @@ pub async fn record_tool_failure(
             SET consecutive_tool_failures = consecutive_tool_failures + 1,
                 updated_at = NOW()
           WHERE provider = $1 AND model = $2
-            AND capability_source = 'auto'
+            AND NOT capability_locked
       RETURNING consecutive_tool_failures",
     )
     .bind(provider)
@@ -99,7 +103,7 @@ pub async fn record_tool_failure(
 
     let Some(failures) = new_count else {
         tracing::debug!(
-            "tool_capability: {provider}/{model} riga manual o assente — tool-failure non contato"
+            "tool_capability: {provider}/{model} riga lockata o assente — tool-failure non contato"
         );
         return ToolFailureRecord::Protected;
     };
@@ -120,7 +124,7 @@ pub async fn record_tool_failure(
                     auto_disabled_reason = $3,
                     updated_at = NOW()
               WHERE provider = $1 AND model = $2
-                AND capability_source = 'auto'
+                AND NOT capability_locked
                 AND (supports_tool_use = true OR auto_disabled_reason IS NULL)",
         )
         .bind(provider)
@@ -203,13 +207,13 @@ mod tests {
     fn was_auto_degraded_copre_reason_dei_writer() {
         assert!(was_auto_degraded(
             false,
-            "auto",
+            false,
             Some("malformed_tool_calls"),
             0
         ));
         assert!(was_auto_degraded(
             false,
-            "auto",
+            false,
             Some("tool_probe_failed:timeout"),
             0
         ));
@@ -220,30 +224,67 @@ mod tests {
         // Regressione incidente magistral-small-2509 (2026-06-10): re-enable
         // esterno azzera il reason lasciando false + counter > 0. Il ri-test
         // DEVE riagganciare la riga, altrimenti il degrado e' permanente.
-        assert!(was_auto_degraded(false, "auto", None, 4));
+        assert!(was_auto_degraded(false, false, None, 4));
     }
 
     #[test]
-    fn was_auto_degraded_non_tocca_manual_ne_false_by_design() {
-        // Curatela admin: mai ri-testata in automatico.
-        assert!(!was_auto_degraded(false, "manual", None, 4));
+    fn was_auto_degraded_non_tocca_locked_ne_false_by_design() {
+        // Lock esplicito (mig 0590): mai ri-testato in automatico.
+        assert!(!was_auto_degraded(false, true, None, 4));
         assert!(!was_auto_degraded(
             false,
-            "manual",
+            true,
             Some("malformed_tool_calls"),
             4
         ));
         // false dal classify senza alcun fallimento registrato: non e' un
         // degrado automatico, niente ri-test.
-        assert!(!was_auto_degraded(false, "auto", None, 0));
+        assert!(!was_auto_degraded(false, false, None, 0));
         // Reason di un ciclo diverso (is_enabled): non e' un degrado tool.
         assert!(!was_auto_degraded(
             false,
-            "auto",
+            false,
             Some("missing_from_api"),
             2
         ));
         // Riga ancora tool-capable: il gate principale la testa gia'.
-        assert!(!was_auto_degraded(true, "auto", None, 0));
+        assert!(!was_auto_degraded(true, false, None, 0));
+    }
+
+    /// Mig 0590: il guard del ciclo tool-capability e' il lock ESPLICITO
+    /// (`capability_locked`), non piu' la provenienza `capability_source`.
+    #[sqlx::test]
+    async fn record_tool_failure_rispetta_il_lock(pool: sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE ai_price_catalog ( \
+                 provider TEXT NOT NULL, \
+                 model TEXT NOT NULL, \
+                 consecutive_tool_failures INT NOT NULL DEFAULT 0, \
+                 supports_tool_use BOOLEAN NOT NULL DEFAULT true, \
+                 auto_disabled_reason TEXT, \
+                 capability_locked BOOLEAN NOT NULL DEFAULT false, \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema mock");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, capability_locked) \
+             VALUES ('p', 'locked', true), ('p', 'free', false)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        // Riga con lock esplicito: nessun conteggio, nessun degrado.
+        assert_eq!(
+            record_tool_failure(&pool, "p", "locked", 3, REASON_MALFORMED_TOOL_CALLS).await,
+            ToolFailureRecord::Protected
+        );
+        // Riga senza lock: il fallimento viene contato.
+        assert_eq!(
+            record_tool_failure(&pool, "p", "free", 3, REASON_MALFORMED_TOOL_CALLS).await,
+            ToolFailureRecord::Counted { failures: 1 }
+        );
     }
 }

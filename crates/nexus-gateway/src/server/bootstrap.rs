@@ -15,7 +15,7 @@ use reqwest::Client;
 use sqlx::PgPool;
 
 use crate::cooldown::CooldownManager;
-use crate::http_timeouts;
+use nexus_auth::llm_timeouts::LlmTimeouts;
 use crate::model_alias_resolver::ModelAliasResolver;
 use crate::policy_engine::PolicyEngine;
 use crate::provider::LlmProvider;
@@ -379,6 +379,7 @@ pub async fn build_runtime(
     db: &PgPool,
     http: &Client,
     config: GatewayConfig,
+    timeouts: LlmTimeouts,
 ) -> Result<RuntimeState> {
     let descriptors = load_provider_descriptors(db).await;
     let providers = build_providers(db, http, &descriptors).await;
@@ -408,37 +409,56 @@ pub async fn build_runtime(
         presidio,
         profile: config.profile.clone(),
         config: Arc::new(config),
+        timeouts,
     })
+}
+
+/// Punto unico di costruzione del client HTTP verso i provider (regola L).
+///
+/// Esiste perche' `/admin/reload` ne costruiva un GEMELLO con
+/// `reqwest::Client::new()`: dopo un reload i provider perdevano timeout,
+/// keepalive e `pool_max_idle_per_host(0)` — cioe' proprio le protezioni contro
+/// le chiamate appese e le connessioni morte post-sleep. Un solo costruttore,
+/// nessuna copia da tenere allineata.
+///
+/// Resilienza alle connessioni TCP morte (regola H, causa radice): il pool
+/// keep-alive di default (idle illimitato, nessun keepalive) fa RIUSARE
+/// connessioni che muoiono quando la macchina va in sleep; al risveglio la prima
+/// richiesta su una connessione morta fallisce con "error sending request" e il
+/// provider appare down pur essendo raggiungibile (verificato: reqwest da fresco
+/// -> 200). `pool_max_idle_per_host(0)` non trattiene idle: ogni chiamata usa una
+/// connessione fresca. L'handshake (~100-300ms) e' trascurabile sulle chiamate
+/// LLM (secondi di inference); il pool illimitato costava un run KO per risveglio.
+///
+/// Il timeout e' quello del TRASPORTO condiviso (copre lo streaming, il caso piu'
+/// lungo): il budget applicativo delle completion e' la deadline logica in
+/// `routes::complete`, non questo tetto.
+pub fn build_http_client(timeouts: &LlmTimeouts) -> Result<Client> {
+    Client::builder()
+        .timeout(timeouts.client_http_timeout())
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("costruzione client HTTP gateway")
 }
 
 /// Costruisce lo stato applicativo completo all'avvio: pool, token, JWT, runtime
 /// e cooldown manager. NON avvia il re-probe loop ne' il server (lo fa il
 /// binario). Il client HTTP e' condiviso tra tutti i provider (pool riuso).
 pub async fn build_state(db: PgPool) -> Result<AppState> {
-    let http_timeout = http_timeouts::resolve_provider_http_timeout(&db).await;
+    let timeouts = LlmTimeouts::resolve(&db).await;
     tracing::info!(
-        timeout_secs = http_timeout.as_secs(),
-        "gateway: client HTTP provider con timeout DB-driven"
+        transport_timeout_s = timeouts.client_http_timeout().as_secs(),
+        request_budget_s = timeouts.request_budget.as_secs(),
+        per_attempt_s = timeouts.per_attempt.as_secs(),
+        run_timeout_s = timeouts.run_timeout.as_secs(),
+        min_guaranteed_turns = timeouts.min_guaranteed_turns,
+        "gateway: timeout LLM derivati dal punto unico (DB-driven)"
     );
-    // Resilienza alle connessioni TCP morte (regola H, causa radice). Il pool
-    // keep-alive di default (idle illimitato, nessun keepalive) fa RIUSARE
-    // connessioni che muoiono quando la macchina va in sleep: al risveglio la prima
-    // richiesta su una connessione morta fallisce con "error sending request" e il
-    // provider appare down pur essendo raggiungibile (verificato: reqwest da fresco
-    // -> 200). tcp_keepalive rileva le connessioni morte in condizioni normali;
-    // pool_max_idle_per_host(0) NON trattiene connessioni idle nel pool, cosi' ogni
-    // chiamata usa una connessione fresca: nessun riuso di socket morti dopo lo
-    // sleep. L'overhead di handshake (~100-300ms) e' trascurabile sulle chiamate LLM
-    // (secondi di inference); il pool illimitato costava un run KO per ogni risveglio.
-    let http = Client::builder()
-        .timeout(http_timeout)
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("costruzione client HTTP gateway")?;
+    let http = build_http_client(&timeouts)?;
 
     let config = GatewayConfig::load(&db).await;
-    let runtime = build_runtime(&db, &http, config).await?;
+    let runtime = build_runtime(&db, &http, config, timeouts).await?;
 
     let service_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
         .unwrap_or_else(|_| DEV_SERVICE_TOKEN.to_string());
