@@ -259,53 +259,61 @@ async fn resolve_purpose_core(
         tracing::warn!(purpose = %purpose, "resolve_purpose: purpose privo di tier (tier-only)");
         return PurposeResolution::NotFound;
     };
-    match crate::orchestrator::best_model_for_tier_pinned_with_tier(
-        db,
-        &rule.tier,
-        rule.capability.as_deref(),
-        rule.requires_tool_use,
+    // SERVIZIO UNICO (regola L): la degradazione e' un parametro DICHIARATO, non
+    // un effetto di quale strato si chiama. Col pin resta `Exact{PinnedProvider}`
+    // — il pin cede il provider, mai la qualita': se il provider pinnato non ha
+    // il tier, l'esito e' vuoto e il chiamante ritenta SENZA pin (I5).
+    use crate::orchestrator::model_service::{
+        select_model, ExactReason, ModelRequest, NoModelReason, Profile, Rank, TierPolicy,
+    };
+    let mut req = ModelRequest {
+        tier: &rule.tier,
+        tier_policy: TierPolicy::Degrade,
+        profile: if rule.requires_tool_use {
+            Profile::Agentic
+        } else {
+            Profile::NonAgentic
+        },
+        capability: rule.capability.as_deref(),
+        min_context_window: 0,
         exclude_providers,
-        only_provider,
-    )
-    .await
-    {
-        Some((provider, model, effective_tier)) => {
-            // DEGRADAZIONE DICHIARATA (regola M). Il tier effettivo arriva dalla
-            // riga scelta: confrontarlo col richiesto e' un FATTO, non una
-            // deduzione. Chi legge il rationale (o il log) sa se la figura ha
-            // parlato col modello che le spettava o con un ripiego, senza doverlo
-            // inferire dal nome del modello.
-            let degraded = effective_tier
-                .as_deref()
-                .is_some_and(|t| !t.eq_ignore_ascii_case(rule.tier.trim()));
-            if degraded {
-                let got = effective_tier.as_deref().unwrap_or("?");
+        pin: None,
+        rank: if rule.requires_tool_use {
+            Rank::CostFirst
+        } else {
+            Rank::NonAgenticSafe
+        },
+    };
+    if let Some(p) = only_provider {
+        req.pin = Some(p);
+        req.tier_policy = TierPolicy::Exact {
+            why: ExactReason::PinnedProvider,
+        };
+    }
+    match select_model(db, &req).await {
+        // Il `rationale` (`tier=heavy:auto` | `tier=heavy:degraded_to=high`) e il
+        // log della degradazione li produce il SERVIZIO: qui non si ri-deriva
+        // nulla (regola M/I4).
+        Ok(choice) => PurposeResolution::Resolved {
+            provider: choice.provider,
+            model: choice.model,
+            rationale: choice.rationale,
+        },
+        Err(reason) => {
+            // I6: il motivo e' TIPIZZATO. `ExactTierEmpty` col pin e' l'esito
+            // ATTESO (il chiamante ritenta senza pin), non un guasto: non va
+            // loggato come allarme.
+            if !reason.is_expected() {
                 tracing::warn!(
-                    purpose = %purpose, tier_richiesto = %rule.tier, tier_effettivo = %got,
-                    provider = %provider, model = %model,
-                    "resolve_purpose: DEGRADAZIONE di tier — nessun modello \
-                     eleggibile nel tier richiesto (cooldown o gate), scelto il \
-                     migliore del primo tier disponibile scendendo"
+                    purpose = %purpose, tier = %rule.tier, motivo = ?reason,
+                    "resolve_purpose: nessun modello per il tier"
                 );
-                PurposeResolution::Resolved {
-                    provider,
-                    model,
-                    rationale: format!("tier={}:degraded_to={got}", rule.tier),
-                }
-            } else {
-                PurposeResolution::Resolved {
-                    provider,
-                    model,
-                    rationale: format!("tier={}:auto", rule.tier),
-                }
             }
-        }
-        None => {
-            tracing::warn!(
-                purpose = %purpose, tier = %rule.tier,
-                "resolve_purpose: nessun modello catalog per il tier (capability mancante o cooldown)"
-            );
-            PurposeResolution::NoCapableModel { tier: rule.tier }
+            match reason {
+                NoModelReason::CatalogUnavailable(e) => PurposeResolution::MatrixUnavailable(e),
+                NoModelReason::InvalidRequest(e) => PurposeResolution::MatrixUnavailable(e),
+                _ => PurposeResolution::NoCapableModel { tier: rule.tier },
+            }
         }
     }
 }
@@ -378,46 +386,53 @@ pub async fn resolve_purpose_provider_candidates_db(
         return Err(PurposeResolution::NotFound);
     };
 
-    let gate = crate::orchestrator::qualification_gate(db).await;
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: rule.requires_tool_use,
-        require_thinking_non_exclude: rule.requires_tool_use,
+    // SERVIZIO UNICO (regola L): niente EligibilityFilter costruito a mano, niente
+    // gate ricordato dal chiamante (I2), niente tier-chain scelta qui. Il fan-out
+    // e' il caso che ha PIU' bisogno della degradazione, non meno: chiede N
+    // provider DISTINTI proprio nel tier che ne ha di meno (il 'heavy' vive su
+    // openai/anthropic/google soltanto), e senza pin l'unica scelta e' fra un
+    // tier piu' basso e NESSUN candidato.
+    use crate::orchestrator::model_service::{
+        select_models, ModelRequest, NoModelReason, Profile, Rank, TierPolicy,
+    };
+    let req = ModelRequest {
+        tier: &rule.tier,
+        tier_policy: TierPolicy::Degrade,
+        profile: if rule.requires_tool_use {
+            Profile::Agentic
+        } else {
+            Profile::NonAgentic
+        },
         capability: rule.capability.as_deref(),
         min_context_window: 0,
         exclude_providers: &[],
-        apply_cooldown: true,
-        only_provider: None,
-        // Il gate segue il profilo d'uso: vale per i purpose AGENTICI (tool),
-        // comportamento storico per gli altri.
-        require_qualified: rule.requires_tool_use && gate.require_qualified,
-        exclude_preview: rule.requires_tool_use && gate.exclude_preview,
+        pin: None,
+        rank: if rule.requires_tool_use {
+            Rank::CostFirst
+        } else {
+            Rank::NonAgenticSafe
+        },
     };
-    let order_by = if rule.requires_tool_use {
-        crate::orchestrator::AGENTIC_COST_FIRST_ORDER
-    } else {
-        "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
-         input_cost_per_million_tokens ASC, is_featured DESC"
-    };
-    // Recupera un pool piu' ampio del limite per poter deduplicare per provider
-    // senza forzare una query SQL dedicata fuori dal selettore unico.
+    // Pool piu' ampio del limite per deduplicare per provider senza una query
+    // dedicata fuori dal servizio.
     let pool_limit = (limit.saturating_mul(4)).max(limit) as i64;
-    // DEGRADAZIONE come nella risoluzione a figura singola: qui non c'e' pin
-    // (`only_provider: None`), quindi non esiste l'alternativa "togli il pin" e
-    // l'unica scelta e' fra un tier piu' basso e NESSUN candidato. Un fan-out
-    // multi-provider e' anzi il caso che ne ha piu' bisogno: chiede N provider
-    // DISTINTI, e il tier alto e' proprio quello popolato da meno provider (il
-    // 'heavy' vive su openai/anthropic/google soltanto). Il corto-circuito di
-    // `select_models_tierchain` sceglie il PRIMO tier con candidati: i pareri
-    // restano omogenei di fascia, mai un misto heavy+light.
-    let tier_chain = crate::orchestrator::model_routing::agentic_tier_chain(&rule.tier);
-    let rows =
-        crate::orchestrator::select_models_tierchain(db, &filter, &tier_chain, order_by, pool_limit)
-            .await
-            .map_err(PurposeResolution::MatrixUnavailable)?;
+    let rows = match select_models(db, &req, pool_limit).await {
+        Ok(v) => v,
+        // Pool vuoto: per il fan-out non e' un errore da propagare (il chiamante
+        // convoca chi c'e'), salvo il catalog irraggiungibile.
+        Err(NoModelReason::CatalogUnavailable(e)) => {
+            return Err(PurposeResolution::MatrixUnavailable(e))
+        }
+        Err(NoModelReason::InvalidRequest(e)) => {
+            return Err(PurposeResolution::MatrixUnavailable(e))
+        }
+        Err(_) => Vec::new(),
+    };
 
     let mut seen: Vec<String> = Vec::new();
     let mut out = Vec::new();
-    for (provider, model, tier) in rows {
+    for choice in rows {
+        let (provider, model, tier) = (choice.provider, choice.model, choice.effective_tier);
         let key = provider.to_lowercase();
         if seen.iter().any(|p| p == &key) {
             continue;

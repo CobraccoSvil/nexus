@@ -423,6 +423,34 @@ pub async fn select_model(
     select_model_with_gate(db, req, gate).await
 }
 
+/// Come [`select_model`] ma ritorna fino a `limit` candidati, dello STESSO tier
+/// (il corto-circuito della tier-chain sceglie il primo tier con candidati:
+/// i risultati restano omogenei di fascia, mai un misto heavy+light).
+///
+/// Serve ai fan-out multi-provider: il consiglio chiede N provider DISTINTI, e
+/// deduplica a valle. E' il caso che ha PIU' bisogno della degradazione, non
+/// meno: chiede piu' provider proprio nel tier che ne ha di meno.
+pub async fn select_models(
+    db: &PgPool,
+    req: &ModelRequest<'_>,
+    limit: i64,
+) -> Result<Vec<ModelChoice>, NoModelReason> {
+    let gate = qualification_gate(db).await;
+    validate(req)?;
+    let chain = chain_for(req);
+    let filter = filter_for(req, gate);
+    let rows = select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), limit)
+        .await
+        .map_err(NoModelReason::CatalogUnavailable)?;
+    if rows.is_empty() {
+        return Err(diagnose_empty(db, req, &chain, gate).await);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(p, m, t)| choice_from(req, p, m, t))
+        .collect())
+}
+
 /// Come [`select_model`] ma col gate ESPLICITO. Privata: esiste perche' la cache
 /// del gate (60s, statica e in-process) renderebbe i test dipendenti dall'ordine
 /// di esecuzione. Non e' una porta di servizio per i call site — non e' `pub`.

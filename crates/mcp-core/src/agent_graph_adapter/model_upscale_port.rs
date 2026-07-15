@@ -17,7 +17,7 @@ use sqlx::PgPool;
 
 use nexus_agent_graph::runtime::ports::{ExecMode, ModelUpscalePort, PortError, UpscalePick};
 
-use crate::orchestrator::{select_agentic_model, select_models_tierchain, EligibilityFilter};
+use crate::orchestrator::select_agentic_model;
 
 /// Adapter [`ModelUpscalePort`] -> `ai_price_catalog` + settings `agent.upscale.*`.
 pub struct CatalogModelUpscalePort {
@@ -87,41 +87,37 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
         required_tokens: i64,
     ) -> Result<Option<UpscalePick>, PortError> {
         let tier = self.target_tier().await;
-        let gate = crate::orchestrator::qualification_gate(&self.db).await;
-        let filter = EligibilityFilter {
-            require_tool_use: true,
-            require_thinking_non_exclude: true,
-            capability: None,
-            min_context_window: required_tokens,
-            exclude_providers: &[],
-            apply_cooldown: true,
-            only_provider: None,
-            require_qualified: gate.require_qualified,
-            exclude_preview: gate.exclude_preview,
-        };
-        let rows = match select_models_tierchain(
-            &self.db,
-            &filter,
-            &[tier.as_str()],
-            "context_window DESC, input_cost_per_million_tokens ASC NULLS LAST",
-            1,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    current_model = %current_model,
-                    required_tokens,
-                    error = %e,
-                    "model_upscale_port: select_upscale_model fallita, fail-open None"
-                );
+        // SERVIZIO UNICO (regola L). `Exact{ScaleTarget}`: qui il tier NON e' un
+        // requisito da soddisfare al meglio, e' il BERSAGLIO deciso a monte dal
+        // modulo puro dello scale-controller — questa funzione lo ESEGUE, non lo
+        // negozia. Degradare significherebbe fare l'opposto di un upscale. Con
+        // `ExactReason` la differenza fra questo `&[tier]` (voluto) e quello di
+        // `best_non_agentic_model` (che era un difetto) e' finalmente DICIBILE:
+        // prima erano lo stesso identico codice.
+        let req = crate::orchestrator::model_service::ModelRequest::agentic(&tier)
+            .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
+                why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
+            })
+            .rank(crate::orchestrator::model_service::Rank::WidestWindow)
+            .min_context_window(required_tokens);
+        let choice = match crate::orchestrator::model_service::select_model(&self.db, &req).await {
+            Ok(c) => c,
+            // Fail-open invariato: nessun bersaglio -> nessun upscale, non un run
+            // morto. Il motivo TIPIZZATO distingue "il tier e' vuoto" (atteso) da
+            // un guasto del catalog: solo il secondo merita un WARN.
+            Err(reason) => {
+                if !reason.is_expected() {
+                    tracing::warn!(
+                        current_model = %current_model,
+                        required_tokens,
+                        motivo = ?reason,
+                        "model_upscale_port: select_upscale_model senza candidati, fail-open None"
+                    );
+                }
                 return Ok(None);
             }
         };
-        let Some((provider, model, _)) = rows.into_iter().next() else {
-            return Ok(None);
-        };
+        let (provider, model) = (choice.provider, choice.model);
         // Se il migliore coincide col modello corrente non c'e' upscale da fare.
         if model == current_model {
             return Ok(None);
