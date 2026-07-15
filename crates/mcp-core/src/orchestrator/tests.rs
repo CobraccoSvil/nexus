@@ -534,3 +534,57 @@ async fn col_pin_non_si_degrada_il_tier(pool: sqlx::PgPool) {
          modello del tier GIUSTO da un altro provider"
     );
 }
+
+/// REGRESSIONE del ramo NON-agentico (residuo del fix 6006084f, trovato dal
+/// censimento dei punti unici). La degradazione era stata messa dentro
+/// `if requires_tool_use { .. }`: i 41 purpose non-agentici (vision, chat,
+/// embedding) restavano col difetto dell'incidente.
+///
+/// Il caso concreto e' utente-visibile: col gate vision (core.rs:716) un turno
+/// con un'immagine allegata, se il tier vision e' esaurito, NON trova modello,
+/// logga "nessun modello vision disponibile" e prosegue COL MODELLO CIECO —
+/// mentre lo stesso turno in modalita' agentica degraderebbe e vedrebbe
+/// l'immagine. La capability resta un filtro: il ripiego e' sempre un modello
+/// che sa fare la cosa richiesta, solo meno capace.
+#[sqlx::test]
+async fn purpose_non_agentico_degrada_e_resta_capace(pool: sqlx::PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, supports_vision, performance_tier, input_cost_per_million_tokens) VALUES \
+         ('openai',   'gpt-vision-heavy', true, false, true,  'heavy',  2.0), \
+         ('google',   'gemini-vision',    true, false, true,  'medium', 0.5), \
+         ('deepseek', 'deepseek-cieco',   true, false, false, 'medium', 0.1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert catalog");
+
+    // openai escluso = il tier vision 'heavy' e' esaurito.
+    let out = best_model_for_tier_pinned_with_tier(
+        &pool,
+        "heavy",
+        Some("vision"),
+        false, // NON agentico: e' il ramo che restava indietro
+        &["openai".to_string()],
+        None,
+    )
+    .await;
+
+    let (provider, model, effective_tier) = out.expect(
+        "il tier vision 'heavy' e' esaurito ma 'medium' ha un modello vision SANO: \
+         deve degradare, non lasciare il turno senza occhi",
+    );
+    assert_eq!(
+        (provider.as_str(), model.as_str()),
+        ("google", "gemini-vision"),
+        "deve degradare su un modello che VEDE ancora, mai su deepseek-cieco \
+         (piu' economico ma senza supports_vision)"
+    );
+    assert_eq!(
+        effective_tier.as_deref(),
+        Some("medium"),
+        "anche il ramo non-agentico deve dire il tier effettivo, per poter \
+         dichiarare la degradazione (regola M)"
+    );
+}

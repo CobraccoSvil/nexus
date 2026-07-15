@@ -531,9 +531,7 @@ pub async fn best_model_for_tier_pinned_with_tier(
         )
         .await;
     }
-    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider)
-        .await
-        .map(|(provider, model)| (provider, model, None))
+    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider).await
 }
 
 /// Ramo NON-agentico di [`best_model_for_tier_excluding`] (purpose
@@ -542,13 +540,22 @@ pub async fn best_model_for_tier_pinned_with_tier(
 /// filtro tool_use/policy e nessun pre-ordinamento non-thinking. La vision e' via
 /// `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
 /// TERZO selettore duplicato) e' stato eliminato (regola L).
+///
+/// DEGRADAZIONE: identica al ramo agentico e per la stessa ragione (incidente
+/// del consiglio, 2026-07-15). Il fix iniziale viveva dentro
+/// `if requires_tool_use { .. }`, quindi questo ramo restava col difetto: i 41
+/// purpose non-agentici (vision/chat/embedding) morivano con `NoCapableModel` se
+/// il loro tier era esaurito, invece di prendere un modello di un gradino sotto
+/// — e la capability (es. `supports_vision`) resta comunque un filtro, quindi il
+/// ripiego e' sempre un modello che sa fare la cosa richiesta, solo meno capace.
+/// Col pin niente degradazione: li' l'alternativa migliore e' togliere il pin.
 async fn best_non_agentic_model(
     db: &PgPool,
     tier: &str,
     capability: Option<&str>,
     exclude_providers: &[String],
     only_provider: Option<&str>,
-) -> Option<(String, String)> {
+) -> Option<(String, String, Option<String>)> {
     let filter = crate::orchestrator::EligibilityFilter {
         require_tool_use: false,
         require_thinking_non_exclude: false,
@@ -573,17 +580,22 @@ async fn best_non_agentic_model(
     // svuota: restano ultima spiaggia se tutto il resto e' giu'), solo
     // retrocessi in coda. I thinking CON tool_use (gemini-2.5, claude) non sono
     // toccati: i loro adapter governano il thinking budget.
+    let chain: Vec<&str> = if only_provider.is_some() {
+        vec![tier]
+    } else {
+        agentic_tier_chain(tier)
+    };
     match crate::orchestrator::select_models_tierchain(
         db,
         &filter,
-        &[tier],
+        &chain,
         "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
          input_cost_per_million_tokens ASC, is_featured DESC",
         1,
     )
     .await
     {
-        Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
+        Ok(mut v) => v.drain(..).next(),
         Err(e) => {
             tracing::warn!("best_model_for_tier (non-agentico): {e}");
             None
