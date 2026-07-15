@@ -175,6 +175,38 @@ else
   echo "OK tier-scale: nessuna scala tier scritta a mano fuori da tiers.rs"
 fi
 
+# Selezione modelli (2026-07-15): ogni consumatore passa dal SERVIZIO UNICO
+# (orchestrator/model_service.rs). La vecchia famiglia a strati
+# (best_model_for_tier*, select_agentic_model*, best_non_agentic_model) resta
+# solo come implementazione interna: chiamarla da un call site nuovo rimette
+# la degradazione in balia di QUALE strato scegli — il difetto che si e' ripetuto
+# TRE volte (purpose, fan-out del consiglio, ramo non-agentico), ogni volta
+# perche' qualcuno ha chiamato lo strato comodo.
+#
+# Ammessi: gli strati stessi (model_routing.rs), il servizio, i test, e
+# route_model_from_catalog (usa la variante `governed`, non ancora esposta dal
+# servizio: e' il gruppo 6e, dichiarato aperto).
+selettori_fuori="$(grep -rEn \
+  '\b(best_model_for_tier(_excluding|_pinned|_pinned_with_tier)?|select_agentic_model(_pinned|_pinned_with_tier)?|best_non_agentic_model)\(' \
+  crates \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v 'src/orchestrator/model_routing.rs' \
+  | grep -v 'src/orchestrator/model_service' \
+  | grep -vE 'tests\.rs|/tests/' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$selettori_fuori" ]]; then
+  echo "!! model-selection: call site che scavalca il servizio unico:" >&2
+  echo "$selettori_fuori" >&2
+  echo "   Usa orchestrator::model_service::select_model(db, &ModelRequest{..}):" >&2
+  echo "   la degradazione e' un PARAMETRO (TierPolicy), non un effetto di quale" >&2
+  echo "   funzione chiami, e il gate segue il Profile invece della diligenza." >&2
+  fail=1
+else
+  echo "OK model-selection: nessun call site scavalca il servizio unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
