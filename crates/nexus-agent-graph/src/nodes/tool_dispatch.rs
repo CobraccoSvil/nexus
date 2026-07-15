@@ -598,6 +598,75 @@ struct RunCollector {
     awaiting_subagents: std::sync::Mutex<bool>,
 }
 
+/// Effetti dei tool brain-only del turno, estratti dal [`RunCollector`] a
+/// `join_all` concluso (nessuna `run_one` in volo: i `Mutex` sono consumati).
+struct TurnEffects {
+    /// Esiti dichiarati via task_complete (l'ultimo prevale).
+    declared_outcomes: Vec<Value>,
+    /// Verdetti dichiarati via review_verdict (l'ultimo prevale, Fase B).
+    review_verdicts: Vec<Value>,
+    /// Pareri dichiarati via advisory_verdict (l'ultimo prevale, consiglio a monte).
+    advisory_verdicts: Vec<Value>,
+    /// tool_use_id dei task_complete del turno (guard blocked-da-cap).
+    task_complete_ids: Vec<String>,
+    /// Taccuino del run a fine turno (P4).
+    run_notes: Option<String>,
+    /// `true` se almeno un tool e' fallito per infrastruttura (WAVE 2.2).
+    infra_error: bool,
+    /// `true` se almeno un `dispatch_subagent(s)` e' andato in background (Fase D).
+    awaiting_subagents: bool,
+}
+
+impl RunCollector {
+    /// Consuma il collector e ne estrae gli effetti del turno.
+    fn into_turn_effects(self) -> TurnEffects {
+        TurnEffects {
+            declared_outcomes: self.declared_outcomes.into_inner().expect("outcomes"),
+            review_verdicts: self.review_verdicts.into_inner().expect("review verdicts"),
+            advisory_verdicts: self
+                .advisory_verdicts
+                .into_inner()
+                .expect("advisory verdicts"),
+            task_complete_ids: self.task_complete_ids.into_inner().expect("tc ids"),
+            run_notes: self.run_notes.into_inner().expect("run_notes"),
+            infra_error: self.infra_error.into_inner().expect("infra"),
+            awaiting_subagents: self.awaiting_subagents.into_inner().expect("awaiting"),
+        }
+    }
+}
+
+/// Soglie del pre-filtro dei pending (sezione 3), risolte UNA volta per turno:
+/// restano costanti per tutti i pending del turno (il budget allegati si
+/// aggiorna solo a fine turno, 1:1 col Python).
+struct PrefilterGates {
+    /// Finestra (token) per il predictive cap. `<= 0` = cap non applicabile.
+    cap_window: i64,
+    /// Stima del contesto corrente (token) per la proiezione del cap.
+    predictive_tokens: i64,
+    /// Byte allegati gia' letti nella sessione.
+    attachment_bytes_read: i64,
+    /// Budget cumulativo letture allegati della sessione.
+    attachment_budget: i64,
+    /// Tool ammessi da M16 (meta + whitelist + always-on + brain-only).
+    allowed: std::collections::HashSet<String>,
+    /// Tool scoperti nel turno precedente (`discovered_tools_next_turn`).
+    discovered_now: std::collections::HashSet<String>,
+}
+
+/// Segnali strutturati del turno da riversare nel delta (regola M).
+struct TurnSignals<'a> {
+    /// Errore di infrastruttura di almeno un tool (WAVE 2.2).
+    infra_error: bool,
+    /// Sospensione del padre in attesa del fan-in dei sub-run (Fase D).
+    awaiting_subagents: bool,
+    /// Dichiarazione `blocked` rifiutata dal guard blocked-da-cap in questo turno.
+    blocked_cap_rejected: bool,
+    /// Enforcement deterministico dei verdetti aggregati del panel.
+    panel_enforcement: Option<&'a PanelEnforcement>,
+    /// Taccuino del run a fine turno (scritto solo se cambiato).
+    run_notes: Option<String>,
+}
+
 #[async_trait]
 impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
     fn id(&self) -> NodeId {
@@ -655,26 +724,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             &pending,
             &self.cfg.fs_mutator_tools,
         ) {
-            let actions = build_pending_actions_json(&pending, &self.cfg.fs_mutator_tools);
-            let mut extra = state.extra.clone();
-            extra.insert(
-                HITL_PENDING_ACTIONS_EXTRA_KEY.to_string(),
-                Value::Array(actions),
-            );
-            tracing::info!(
-                target: "nexus_agent_graph::tool_dispatch",
-                pending_mutators = pending.len(),
-                "HITL: run sospeso in attesa di conferma utente (tool mutativi pendenti)"
-            );
-            return Ok(StateDelta {
-                awaiting_confirmation: Some(Some(true)),
-                extra: Some(extra),
-                ..Default::default()
-            }
-            .into_opaque());
+            return Ok(self.hitl_suspend_delta(state, &pending));
         }
 
-        // ── (3) Loop sui pending: cap predittivo / M16 / budget allegati ──────
+        // ── (3) Pre-filtro dei pending: cap predittivo / M16 / budget allegati ─
         let ctx_chars = estimate_context_chars(
             &state
                 .messages
@@ -682,105 +735,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
                 .map(message_to_ctx)
                 .collect::<Vec<_>>(),
         );
-        let current_bytes = state.attachment_read_bytes.unwrap_or(0);
-        let budget_total = self.cfg.attachment_budget_bytes;
-        let allowed = self.m16_allowed();
-        let disc_now = Self::discovered_now(state);
-        let predictive_tokens = self.predictive_tokens(state);
-        // Finestra per il predictive cap: quella EFFETTIVA dell'ultimo turno LLM
-        // (scritta dall'executor: config o modello PROMOSSO dallo smart-upscale),
-        // fallback alla finestra statica di config quando assente (primo turno /
-        // checkpoint storici). Regola H (incidente 2026-07-06): col gate fermo
-        // alla finestra del modello di partenza, dopo l'upscale per
-        // context_overflow OGNI tool veniva bloccato per sempre dal cap mentre
-        // le chiamate LLM giravano gia' su un modello con finestra ampia.
-        let cap_window = state
-            .effective_context_window
-            .filter(|w| *w > 0)
-            .unwrap_or(self.cfg.context_window);
-
-        // Esito per posizione: None = ancora da eseguire (kept), Some = synthetic.
-        let mut slots: Vec<Option<ToolResultBlock>> = Vec::with_capacity(pending.len());
-        // Indici dei pending KEPT (da eseguire), nell'ordine originale.
-        let mut kept_indices: Vec<usize> = Vec::new();
-
-        for (i, b) in pending.iter().enumerate() {
-            let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-            let tool_use_id = b.get("id").and_then(Value::as_str).unwrap_or("");
-            let input = b.get("input").cloned().unwrap_or(json!({}));
-
-            // (a) predictive cap (priorita'): esente -> salta; altrimenti la
-            //     proiezione e' valutata SOLO se window e' nota (>0).
-            let cap_msg = if cap_window > 0 && !is_cap_exempt(name) {
-                let expected = estimate_tool_result_size_bytes(name, &input);
-                predictive_cap_check(
-                    self.cfg.predictive_cap_ratio,
-                    cap_window,
-                    expected,
-                    predictive_tokens,
-                )
-            } else {
-                None
-            };
-            if let Some(msg) = cap_msg {
-                // SYNTHETIC-blocked: il content e' il messaggio col SENTINEL in
-                // testa (stringa nuda, NON un JSON {error:...}), 1:1 col Python.
-                slots.push(Some(Self::synthetic_error(tool_use_id, Value::String(msg))));
-                continue;
-            }
-
-            // (b) M16: tool non ammesso e non scoperto -> SYNTHETIC error.
-            if self.cfg.discovery_first_enabled && !is_tool_allowed(name, &allowed, &disc_now) {
-                tracing::info!(
-                    target: "nexus_agent_graph::tool_dispatch",
-                    tool = name,
-                    "M16: tool non scoperto/non in whitelist -> rifiutato"
-                );
-                let err = json!({
-                    "error": format!(
-                        "Il tool '{name}' non e' disponibile direttamente in questo turno. \
-                         Usa prima nexus_mcp_tool_search (query: \"{name}\") per scoprirlo, \
-                         poi richiamalo al turno successivo."
-                    )
-                });
-                slots.push(Some(Self::synthetic_error(
-                    tool_use_id,
-                    Value::String(py_dumps(&err)),
-                )));
-                continue;
-            }
-
-            // (c) budget allegati: tool di lettura allegato oltre il budget.
-            if ATTACHMENT_READ_TOOLS.contains(&name) && current_bytes >= budget_total {
-                tracing::warn!(
-                    target: "nexus_agent_graph::tool_dispatch",
-                    already_read = current_bytes,
-                    budget = budget_total,
-                    tool = name,
-                    "budget letture allegati esaurito, tool bloccato"
-                );
-                let err = json!({
-                    "error": format!(
-                        "budget letture allegati esaurito ({current_bytes} byte gia' letti su \
-                         {budget_total} budget). Usa un tool di estrazione strutturata \
-                         (nexus_extract_pdf_text, nexus_extract_figma_structure, \
-                         nexus_extract_docx_text, nexus_extract_xlsx_data) oppure chiedi \
-                         all'utente una versione testuale del file."
-                    ),
-                    "budget_bytes": budget_total,
-                    "already_read": current_bytes,
-                });
-                slots.push(Some(Self::synthetic_error(
-                    tool_use_id,
-                    Value::String(py_dumps(&err)),
-                )));
-                continue;
-            }
-
-            // KEPT: da eseguire.
-            slots.push(None);
-            kept_indices.push(i);
-        }
+        let gates = self.prefilter_gates(state);
+        let (slots, kept_indices) = self.prefilter_pending(&pending, &gates);
 
         // ── (4) Esecuzione dei KEPT (join_all), ordine preservato per POSIZIONE ─
         let collector = RunCollector {
@@ -791,254 +747,62 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             .iter()
             .map(|&i| self.run_one(&pending[i], mode, &collector));
         let kept_results: Vec<ToolResultBlock> = join_all(kept_futs).await;
-        // Ricompone nell'ordine originale: ogni slot vuoto prende il prossimo kept.
-        let mut kept_iter = kept_results.into_iter();
-        let mut results: Vec<ToolResultBlock> = Vec::with_capacity(pending.len());
-        for slot in slots {
-            match slot {
-                Some(synth) => results.push(synth),
-                None => results.push(
-                    kept_iter
-                        .next()
-                        .expect("ogni slot KEPT ha un risultato corrispondente"),
-                ),
-            }
-        }
+        let mut results = recompose_results(slots, kept_results);
 
         // ── (5) Tronca i singoli tool_result a tool_result_max_chars (offload) ─
-        // Solo i KEPT (non synthetic: i synthetic sono brevi). Stringa-content.
-        // `mode` propagato: in Replay l'offload e' saltato (degrado a troncamento).
-        for (idx, r) in results.iter_mut().enumerate() {
-            if kept_indices.contains(&idx) {
-                self.truncate_content(&mut r.content, self.cfg.tool_result_max_chars, mode)
-                    .await;
-            }
-        }
+        self.truncate_kept_results(&mut results, &kept_indices, mode)
+            .await;
 
         // ── (6) Aggiorna attachment_read_bytes (py:3909-3914) ─────────────────
-        let mut added_bytes = 0i64;
-        for (b, r) in pending.iter().zip(results.iter()) {
-            let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-            if ATTACHMENT_READ_TOOLS.contains(&name) && !r.is_error {
-                added_bytes += extract_returned_bytes(&value_as_json_string(&r.content));
-            }
-        }
-        let new_attachment_read_bytes = current_bytes + added_bytes;
+        let new_attachment_read_bytes =
+            gates.attachment_bytes_read + added_attachment_bytes(&pending, &results);
 
         // ── (7) Guard blocked-da-cap (py:3924-3953) ───────────────────────────
-        let declared_outcomes = collector.declared_outcomes.into_inner().expect("outcomes");
-        let review_verdicts = collector
-            .review_verdicts
-            .into_inner()
-            .expect("review verdicts");
-        let advisory_verdicts = collector
-            .advisory_verdicts
-            .into_inner()
-            .expect("advisory verdicts");
-        let task_complete_ids = collector.task_complete_ids.into_inner().expect("tc ids");
-        let infra_error = collector.infra_error.into_inner().expect("infra");
-        let awaiting_subagents = collector.awaiting_subagents.into_inner().expect("awaiting");
-        let final_run_notes = collector.run_notes.into_inner().expect("run_notes");
-
-        let mut declared_outcomes = declared_outcomes;
-        let mut blocked_cap_rejected_now = false;
-        let last_blocked = declared_outcomes
-            .last()
-            .and_then(|d| d.get("outcome").and_then(Value::as_str))
-            == Some("blocked");
-        let already_rejected = state.blocked_cap_rejected.unwrap_or(false);
-        let any_cap_sentinel = results
-            .iter()
-            .any(|r| value_as_json_string(&r.content).contains(PREDICTIVE_CAP_SENTINEL));
-        if !declared_outcomes.is_empty() && last_blocked && !already_rejected && any_cap_sentinel {
-            // La `reason` e' una stringa SINGOLA (spazi singoli, niente
-            // indentazione spuria): 1:1 col Python (concatenazione implicita di
-            // literal adiacenti). py_dumps -> separatori con spazio come json.dumps.
-            let reason = "Dichiarazione 'blocked' RIFIUTATA: l'unico blocco di questo turno e' \
-il predictive context cap su una singola chiamata, NON un blocco del task. \
-Prosegui col task usando i dati gia' raccolti e rispondi alla richiesta corrente \
-dell'utente.";
-            for r in results.iter_mut() {
-                if task_complete_ids.contains(&r.tool_use_id) {
-                    r.content = Value::String(py_dumps(&json!({
-                        "acknowledged": false,
-                        "reason": reason,
-                    })));
-                    r.is_error = true;
-                }
-            }
-            declared_outcomes.clear();
-            blocked_cap_rejected_now = true;
-            tracing::warn!(
-                target: "nexus_agent_graph::tool_dispatch",
-                "task_complete blocked RIFIUTATO (blocco era del predictive cap, non del task)"
-            );
-        }
+        let turn = collector.into_turn_effects();
+        let mut declared_outcomes = turn.declared_outcomes;
+        let blocked_cap_rejected_now = reject_blocked_from_cap(
+            &mut declared_outcomes,
+            &mut results,
+            &turn.task_complete_ids,
+            state.blocked_cap_rejected.unwrap_or(false),
+        );
 
         let panel_enforcement = panel_enforcement_from_results(&pending, &results);
-        if let Some(enforcement) = &panel_enforcement {
-            if let Some(declared) = &enforcement.declared_outcome {
-                declared_outcomes.push(declared.clone());
-            }
+        if let Some(declared) = panel_enforcement
+            .as_ref()
+            .and_then(|e| e.declared_outcome.as_ref())
+        {
+            declared_outcomes.push(declared.clone());
         }
 
         // ── (8) Persist step incrementale (gata Real, py:3956-4007) ───────────
-        let iteration = state.iterations.unwrap_or(0);
-        if !run_id.is_empty() {
-            for (idx, (b, r)) in pending.iter().zip(results.iter()).enumerate() {
-                let t_name = b.get("name").and_then(Value::as_str).unwrap_or("");
-                let t_input = b.get("input").cloned().unwrap_or(json!({}));
-                let block = json!({"tool_name": t_name, "tool_input": t_input});
-                let result = Some(json!({
-                    "content": value_as_json_string(&r.content),
-                    "status": if r.is_error { "failed" } else { "completed" },
-                }));
-                // Best-effort (errore DB loggato dall'impl, Ok(()) ritornato):
-                // un guasto della persistenza NON deve far fallire il run.
-                let _ = self
-                    .steps
-                    .persist_step(&run_id, iteration, idx as i64, block, result, mode)
-                    .await;
-            }
-        }
+        // PRIMA del cap (9): lo storico conserva il tool_result non compresso.
+        self.persist_turn_steps(&run_id, state, &pending, &results, mode)
+            .await;
 
         // ── (9) Context-budget cap (py:4009-4032) ─────────────────────────────
-        let new_chars: i64 = results
-            .iter()
-            .map(|r| value_as_json_string(&r.content).chars().count() as i64)
-            .sum();
-        if ctx_chars + new_chars > self.cfg.max_context_chars as i64 {
-            let span = self.cfg.max_context_chars as i64 - ctx_chars;
-            let budget_per_tool =
-                std::cmp::max(1500i64, span / std::cmp::max(results.len() as i64, 1)) as usize;
-            for r in results.iter_mut() {
-                self.truncate_content(&mut r.content, budget_per_tool, mode)
-                    .await;
-            }
-            tracing::warn!(
-                target: "nexus_agent_graph::tool_dispatch",
-                ctx_chars,
-                new_chars,
-                budget_per_tool,
-                "contesto vicino al limite, troncamento aggressivo"
-            );
-        }
+        self.apply_context_budget_cap(&mut results, ctx_chars, mode)
+            .await;
 
         // ── (10) Reminder TODO (anti-amnesia, py:4034-4059) ───────────────────
-        let mut new_reminder_counter =
-            state.since_last_todo_reminder.unwrap_or(0) + pending.len() as i64;
-        let mut reminder_text: Option<String> = None;
-        if state.plan_phase_active.unwrap_or(false) {
-            let every_n = std::cmp::max(1, self.cfg.todo_reminder_every_n_steps);
-            if new_reminder_counter >= every_n && !run_id.is_empty() {
-                reminder_text = self
-                    .todos
-                    .build_reminder_text(&run_id)
-                    .await
-                    .unwrap_or(None);
-                if reminder_text.is_some() {
-                    // Best-effort: traccia che i todos sono stati "visti".
-                    let _ = self.todos.increment_iteration_seen(&run_id, mode).await;
-                    new_reminder_counter = 0;
-                }
-            }
-        }
+        let (reminder_text, new_reminder_counter) = self
+            .todo_reminder(state, &run_id, pending.len(), mode)
+            .await;
 
         // ── Costruzione del HumanMessage coi blocchi tool_result ──────────────
-        // final_blocks = i tool_result (senza raw_content) + eventuale reminder.
-        let mut final_blocks: Vec<Value> = results.iter().map(tool_result_to_block).collect();
-        if let Some(enforcement) = &panel_enforcement {
-            final_blocks.push(json!({"type": "text", "text": enforcement.prompt_block()}));
-        }
-        if let Some(txt) = &reminder_text {
-            append_reminder_block(&mut final_blocks, txt);
-        }
-        // Il Python costruisce un HumanMessage con content="" e i blocchi in
-        // additional_kwargs["anthropic_content"]. In Rust la forma autoritativa
-        // del contenuto a blocchi e' MessageContent::Blocks: deserializziamo i
-        // blocchi JSON in ContentBlock (un blocco non riconosciuto, es. il
-        // reminder text, cade su ContentBlock::Text).
-        let tool_msg = human_message_from_blocks(final_blocks);
+        let tool_msg = build_tool_message(
+            &results,
+            panel_enforcement.as_ref(),
+            reminder_text.as_deref(),
+        );
 
         // ── (11) M16: parse dei tool scoperti dal search (py:4116-4196) ───────
-        // discovered_tools_next_turn e' SEMPRE scritto, ANCHE [] (azzera i
-        // discovered del turno prima, durata esatta 1 turno: load-bearing).
-        let mut discovered_next: Vec<DiscoveredTool> = Vec::new();
-        for (b, r) in pending.iter().zip(results.iter()) {
-            let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-            if name != "nexus_mcp_tool_search" || r.is_error {
-                continue;
-            }
-            // JSON INTEGRO (pre-truncation): il raw_content, altrimenti il content.
-            let raw = r
-                .raw_content
-                .clone()
-                .unwrap_or_else(|| value_as_json_string(&r.content));
-            // parse_discovered_tools usa gia' il fix ensure_ascii (PR-G).
-            let parsed =
-                crate::decisions::parse_discovered_tools(&raw, self.cfg.discovery_schema_max_bytes);
-            // Dedup cross-search nel turno: la prima occorrenza vince (come Python
-            // `if not any(d.name == ...)`).
-            for t in parsed {
-                if !discovered_next.iter().any(|d| d.name == t.name) {
-                    discovered_next.push(t);
-                }
-            }
-        }
+        let discovered_next =
+            parse_discovered_next(&pending, &results, self.cfg.discovery_schema_max_bytes);
 
-        // ── meta_steps "tool_executed" (live UX, py:4065-4114) ────────────────
-        // Un MetaStep per OGNI tool del turno (KEPT, synthetic-blocked,
-        // brain-only): l'allineamento per posizione `zip(pending, results)` e'
-        // 1:1 col Python. provider/model emittenti del turno (UI badge): catena
-        // di fallback identica al Python (provider_used -> sticky -> override).
-        let exec_provider = state
-            .provider_used
-            .as_deref()
-            .or(state.sticky_provider.as_deref())
-            .or(state.provider_override.as_deref());
-        let exec_model = state
-            .model_used
-            .as_deref()
-            .or(state.sticky_model.as_deref())
-            .or(state.model_override.as_deref());
-        let tool_steps: Vec<MetaStep> = pending
-            .iter()
-            .zip(results.iter())
-            .map(|(b, r)| tool_executed_meta_step(b, r.is_error, exec_provider, exec_model))
-            .collect();
-        // NARRAZIONE LIVE: ogni tool eseguito diventa una riga della cronaca in
-        // chat ("tool edit_file — src/x.ts", "errore run_command — pnpm build").
-        // Prima restavano solo nel canale stato (delta) e NON arrivavano mai al
-        // frontend ne' al DB: la timeline mostrava solo gli executor_call
-        // ("quale modello") — incidente narrazione 2026-07-02. Pattern
-        // emit (live, sink no-op in shadow) + persist (storico, gata Real),
-        // identico all'executor_call (regola L).
-        for ms in &tool_steps {
-            crate::nodes::emit_phase_meta(
-                ctx.emit.as_ref(),
-                self.meta_steps.as_ref(),
-                ctx.exec_mode(),
-                &ms.kind,
-                ms.title.clone(),
-                ms.payload.clone(),
-            )
-            .await;
-        }
-
-        // ── SSE tool_result verso il frontend (parita' 1:1 con run_via_brain) ──
-        // Un evento per ogni risultato, correlato alla ToolUse via `tool_call_id`,
-        // 1:1 col `tool_result` del brain. Emesso DOPO i cap/troncamenti (5/9)
-        // cosi' il contenuto inviato all'utente coincide con quello consegnato al
-        // modello. Best-effort/infallibile: in shadow il sink iniettato nel ctx e'
-        // `NullEventSink` (no-op) -> nessun evento esce in Replay (gate gia'
-        // assicurato a monte da `build_native_engine`, qui niente `if shadow`).
-        for r in &results {
-            ctx.emit.emit(SseEvent::ToolResult {
-                tool_call_id: r.tool_use_id.clone(),
-                content: r.content.clone(),
-                is_error: r.is_error,
-            });
-        }
+        // ── meta_steps "tool_executed" + narrazione live (py:4065-4114) ───────
+        let tool_steps = build_tool_steps(state, &pending, &results);
+        self.narrate_turn(ctx, &tool_steps, &results).await;
 
         // ── _dispatch_updates ─────────────────────────────────────────────────
         let mut delta = StateDelta {
@@ -1054,95 +818,313 @@ dell'utente.";
             )),
             ..Default::default()
         };
-
-        // P3: accumulo persistente per il run (merge dedup, ultimo schema vince).
-        if !discovered_next.is_empty() {
-            let previous: Vec<DiscoveredTool> = state
-                .discovered_tools_run
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(|v| serde_json::from_value::<DiscoveredTool>(v.clone()).ok())
-                .collect();
-            let merged = merge_discovered_run(&previous, &discovered_next);
-            delta.discovered_tools_run =
-                Some(Some(merged.iter().map(discovered_to_value).collect()));
-        }
-
-        // WAVE 3: esito dichiarato (l'ultimo prevale) + conteggio cumulativo done.
-        if let Some(last) = declared_outcomes.last() {
-            delta.declared_outcome = Some(Some(last.clone()));
-            let done_now = declared_outcomes
-                .iter()
-                .filter(|d| d.get("outcome").and_then(Value::as_str) == Some("done"))
-                .count() as i64;
-            if done_now > 0 {
-                let prev = state.declared_done_count.unwrap_or(0);
-                delta.declared_done_count = Some(Some(prev + done_now));
-            }
-        } else if state.declared_outcome.is_some() {
-            // INVALIDAZIONE dichiarazione STANTIA (ADR 0034): il run PROSEGUE
-            // con altri tool DOPO una dichiarazione precedente -> quella
-            // dichiarazione era intermedia, non l'esito finale. Senza questo
-            // azzeramento, un "partial"/"blocked" dichiarato a meta' run
-            // falsava lo status canonico FINALE anche a lavoro poi completato
-            // (il finalizzatore legge l'ULTIMA dichiarazione dallo stato).
-            // `declared_done_count` resta cumulativo (gate done>=3 in testa).
-            delta.declared_outcome = Some(None);
-        }
-
-        // Fase B (ultracode): verdetto del REVISORE — stessa semantica ADR 0034
-        // dell'esito dichiarato (l'ultimo prevale; se il run prosegue con altri
-        // tool dopo un verdetto, quel verdetto era intermedio e viene azzerato).
-        if let Some(last) = review_verdicts.last() {
-            delta.review_verdict = Some(Some(last.clone()));
-        } else if state.review_verdict.is_some() {
-            delta.review_verdict = Some(None);
-        }
-
-        // Consiglio a monte: parere di una FIGURA — stessa semantica dell'esito
-        // dichiarato (l'ultimo prevale; un parere seguito da altri tool era
-        // intermedio e viene azzerato).
-        if let Some(last) = advisory_verdicts.last() {
-            delta.advisory_verdict = Some(Some(last.clone()));
-        } else if state.advisory_verdict.is_some() {
-            delta.advisory_verdict = Some(None);
-        }
-
-        // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).
-        if infra_error {
-            delta.tool_infra_error = Some(Some(true));
-        }
-        if let Some(enforcement) = &panel_enforcement {
-            let mut extra = state.extra.clone();
-            extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), enforcement.to_value());
-            delta.extra = Some(extra);
-            if enforcement.terminal {
-                delta.result = Some(Some(enforcement.summary.clone()));
-                delta.stop_reason = Some(Some(StopReason::EndTurn));
-            }
-        }
-        // Fase D fan-in: almeno un `dispatch_subagent(s)` background ha risposto col
-        // segnale strutturato -> il padre si sospende. Il motore interrompe su
-        // `is_awaiting_interrupt` (Slice 1) e riprende al fan-in (Slice 3). Scritto
-        // solo quando true (nessun azzeramento qui: il resume lo gestisce Slice 3).
-        if awaiting_subagents {
-            delta.awaiting_subagents = Some(Some(true));
-        }
-        // Guard blocked-da-cap: marca il flag (la 2a dichiarazione sara' onorata).
-        if blocked_cap_rejected_now {
-            delta.blocked_cap_rejected = Some(Some(true));
-        }
-        // P4: persiste il taccuino aggiornato SOLO se cambiato (py:4219).
-        if final_run_notes != state.run_notes {
-            delta.run_notes = Some(final_run_notes);
-        }
+        delta.discovered_tools_run = merged_discovered_run(state, &discovered_next).map(Some);
+        apply_declared_outcome(&mut delta, state, &declared_outcomes);
+        // Fase B (ultracode) + consiglio a monte: il verdetto del REVISORE e il
+        // parere di una FIGURA hanno la STESSA semantica ADR 0034 dell'esito
+        // dichiarato -> stesso punto unico (regola L).
+        delta.review_verdict =
+            last_verdict_or_invalidate(&turn.review_verdicts, state.review_verdict.is_some());
+        delta.advisory_verdict =
+            last_verdict_or_invalidate(&turn.advisory_verdicts, state.advisory_verdict.is_some());
+        apply_turn_signals(
+            &mut delta,
+            state,
+            TurnSignals {
+                infra_error: turn.infra_error,
+                awaiting_subagents: turn.awaiting_subagents,
+                blocked_cap_rejected: blocked_cap_rejected_now,
+                panel_enforcement: panel_enforcement.as_ref(),
+                run_notes: turn.run_notes,
+            },
+        );
 
         Ok(delta.into_opaque())
     }
 }
 
 impl ToolDispatchNode {
+    /// (2b) Delta di sospensione HITL: il run si ferma PRIMA di eseguire i tool
+    /// mutativi e pubblica le azioni pendenti in `extra` per la conferma utente
+    /// (interrupt-resume prima dell'executor, parita' graph.py). NESSUN tool
+    /// eseguito.
+    fn hitl_suspend_delta(&self, state: &AgentState, pending: &[Value]) -> OpaqueDelta {
+        let actions = build_pending_actions_json(pending, &self.cfg.fs_mutator_tools);
+        let mut extra = state.extra.clone();
+        extra.insert(
+            HITL_PENDING_ACTIONS_EXTRA_KEY.to_string(),
+            Value::Array(actions),
+        );
+        tracing::info!(
+            target: "nexus_agent_graph::tool_dispatch",
+            pending_mutators = pending.len(),
+            "HITL: run sospeso in attesa di conferma utente (tool mutativi pendenti)"
+        );
+        StateDelta {
+            awaiting_confirmation: Some(Some(true)),
+            extra: Some(extra),
+            ..Default::default()
+        }
+        .into_opaque()
+    }
+
+    /// (3) Risolve UNA volta per turno le soglie del pre-filtro dei pending.
+    fn prefilter_gates(&self, state: &AgentState) -> PrefilterGates {
+        // Finestra per il predictive cap: quella EFFETTIVA dell'ultimo turno LLM
+        // (scritta dall'executor: config o modello PROMOSSO dallo smart-upscale),
+        // fallback alla finestra statica di config quando assente (primo turno /
+        // checkpoint storici). Regola H (incidente 2026-07-06): col gate fermo
+        // alla finestra del modello di partenza, dopo l'upscale per
+        // context_overflow OGNI tool veniva bloccato per sempre dal cap mentre
+        // le chiamate LLM giravano gia' su un modello con finestra ampia.
+        let cap_window = state
+            .effective_context_window
+            .filter(|w| *w > 0)
+            .unwrap_or(self.cfg.context_window);
+        PrefilterGates {
+            cap_window,
+            predictive_tokens: self.predictive_tokens(state),
+            attachment_bytes_read: state.attachment_read_bytes.unwrap_or(0),
+            attachment_budget: self.cfg.attachment_budget_bytes,
+            allowed: self.m16_allowed(),
+            discovered_now: Self::discovered_now(state),
+        }
+    }
+
+    /// (3) Applica il pre-filtro a TUTTI i pending. Ritorna gli slot per
+    /// POSIZIONE (`Some` = synthetic gia' pronto, tool NON eseguito; `None` =
+    /// KEPT da eseguire) e gli indici dei KEPT nell'ordine originale.
+    fn prefilter_pending(
+        &self,
+        pending: &[Value],
+        gates: &PrefilterGates,
+    ) -> (Vec<Option<ToolResultBlock>>, Vec<usize>) {
+        let slots: Vec<Option<ToolResultBlock>> = pending
+            .iter()
+            .map(|b| self.prefilter_block(b, gates))
+            .collect();
+        let kept_indices: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        (slots, kept_indices)
+    }
+
+    /// (3) Verdetto del pre-filtro per UN pending: `Some` = tool NON eseguito
+    /// (tool_result synthetic), `None` = KEPT. L'ordine dei gate e' load-bearing
+    /// (1:1 col Python): predictive cap (priorita') -> M16 -> budget allegati.
+    /// `or_else` e' lazy: il primo gate che blocca ferma la catena.
+    fn prefilter_block(&self, block: &Value, gates: &PrefilterGates) -> Option<ToolResultBlock> {
+        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+        let tool_use_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+        let input = block.get("input").cloned().unwrap_or(json!({}));
+        self.cap_block(name, tool_use_id, &input, gates)
+            .or_else(|| self.m16_block(name, tool_use_id, gates))
+            .or_else(|| attachment_budget_block(name, tool_use_id, gates))
+    }
+
+    /// (3a) Predictive cap: esente -> nessun blocco; altrimenti la proiezione e'
+    /// valutata SOLO se la finestra e' nota (>0). Il content del synthetic e' il
+    /// messaggio col SENTINEL in testa (stringa nuda, NON un JSON {error:...}),
+    /// 1:1 col Python.
+    fn cap_block(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        input: &Value,
+        gates: &PrefilterGates,
+    ) -> Option<ToolResultBlock> {
+        if gates.cap_window <= 0 || is_cap_exempt(name) {
+            return None;
+        }
+        let expected = estimate_tool_result_size_bytes(name, input);
+        let msg = predictive_cap_check(
+            self.cfg.predictive_cap_ratio,
+            gates.cap_window,
+            expected,
+            gates.predictive_tokens,
+        )?;
+        Some(Self::synthetic_error(tool_use_id, Value::String(msg)))
+    }
+
+    /// (3b) M16: tool non ammesso e non scoperto -> SYNTHETIC error che forza il
+    /// giro via `nexus_mcp_tool_search`.
+    fn m16_block(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        gates: &PrefilterGates,
+    ) -> Option<ToolResultBlock> {
+        if !self.cfg.discovery_first_enabled
+            || is_tool_allowed(name, &gates.allowed, &gates.discovered_now)
+        {
+            return None;
+        }
+        tracing::info!(
+            target: "nexus_agent_graph::tool_dispatch",
+            tool = name,
+            "M16: tool non scoperto/non in whitelist -> rifiutato"
+        );
+        let err = json!({
+            "error": format!(
+                "Il tool '{name}' non e' disponibile direttamente in questo turno. \
+                 Usa prima nexus_mcp_tool_search (query: \"{name}\") per scoprirlo, \
+                 poi richiamalo al turno successivo."
+            )
+        });
+        Some(Self::synthetic_error(
+            tool_use_id,
+            Value::String(py_dumps(&err)),
+        ))
+    }
+
+    /// (5) Tronca i tool_result dei soli KEPT a `tool_result_max_chars` (i
+    /// synthetic sono brevi e restano intatti). `mode` propagato: in Replay
+    /// l'offload e' saltato (degrado a troncamento).
+    async fn truncate_kept_results(
+        &self,
+        results: &mut [ToolResultBlock],
+        kept_indices: &[usize],
+        mode: ExecMode,
+    ) {
+        for (idx, r) in results.iter_mut().enumerate() {
+            if kept_indices.contains(&idx) {
+                self.truncate_content(&mut r.content, self.cfg.tool_result_max_chars, mode)
+                    .await;
+            }
+        }
+    }
+
+    /// (8) Persistenza incrementale degli step del turno (gata Real). No-op senza
+    /// run_id. Best-effort (errore DB loggato dall'impl, `Ok(())` ritornato): un
+    /// guasto della persistenza NON deve far fallire il run.
+    async fn persist_turn_steps(
+        &self,
+        run_id: &str,
+        state: &AgentState,
+        pending: &[Value],
+        results: &[ToolResultBlock],
+        mode: ExecMode,
+    ) {
+        if run_id.is_empty() {
+            return;
+        }
+        let iteration = state.iterations.unwrap_or(0);
+        for (idx, (b, r)) in pending.iter().zip(results.iter()).enumerate() {
+            let t_name = b.get("name").and_then(Value::as_str).unwrap_or("");
+            let t_input = b.get("input").cloned().unwrap_or(json!({}));
+            let block = json!({"tool_name": t_name, "tool_input": t_input});
+            let result = Some(json!({
+                "content": value_as_json_string(&r.content),
+                "status": if r.is_error { "failed" } else { "completed" },
+            }));
+            let _ = self
+                .steps
+                .persist_step(run_id, iteration, idx as i64, block, result, mode)
+                .await;
+        }
+    }
+
+    /// (9) Context-budget cap: se il turno sfonda `max_context_chars`, comprime
+    /// OGNI tool_result (KEPT e synthetic) a una quota equa, con offload
+    /// best-effort e degrado a troncamento testa+coda.
+    async fn apply_context_budget_cap(
+        &self,
+        results: &mut [ToolResultBlock],
+        ctx_chars: i64,
+        mode: ExecMode,
+    ) {
+        let new_chars: i64 = results
+            .iter()
+            .map(|r| value_as_json_string(&r.content).chars().count() as i64)
+            .sum();
+        if ctx_chars + new_chars <= self.cfg.max_context_chars as i64 {
+            return;
+        }
+        let span = self.cfg.max_context_chars as i64 - ctx_chars;
+        let budget_per_tool =
+            std::cmp::max(1500i64, span / std::cmp::max(results.len() as i64, 1)) as usize;
+        for r in results.iter_mut() {
+            self.truncate_content(&mut r.content, budget_per_tool, mode)
+                .await;
+        }
+        tracing::warn!(
+            target: "nexus_agent_graph::tool_dispatch",
+            ctx_chars,
+            new_chars,
+            budget_per_tool,
+            "contesto vicino al limite, troncamento aggressivo"
+        );
+    }
+
+    /// (10) Reminder TODO (anti-amnesia): solo in plan phase, alla soglia di
+    /// tool-use e con run_id. Ritorna il testo del reminder (se prodotto) e il
+    /// contatore aggiornato, azzerato SOLO quando il reminder parte davvero.
+    async fn todo_reminder(
+        &self,
+        state: &AgentState,
+        run_id: &str,
+        pending_len: usize,
+        mode: ExecMode,
+    ) -> (Option<String>, i64) {
+        let counter = state.since_last_todo_reminder.unwrap_or(0) + pending_len as i64;
+        let every_n = std::cmp::max(1, self.cfg.todo_reminder_every_n_steps);
+        if !state.plan_phase_active.unwrap_or(false) || counter < every_n || run_id.is_empty() {
+            return (None, counter);
+        }
+        let text = self.todos.build_reminder_text(run_id).await.unwrap_or(None);
+        if text.is_none() {
+            return (None, counter);
+        }
+        // Best-effort: traccia che i todos sono stati "visti".
+        let _ = self.todos.increment_iteration_seen(run_id, mode).await;
+        (text, 0)
+    }
+
+    /// NARRAZIONE LIVE: ogni tool eseguito diventa una riga della cronaca in chat
+    /// ("tool edit_file — src/x.ts", "errore run_command — pnpm build") e un
+    /// evento SSE `tool_result` verso il frontend (parita' 1:1 con run_via_brain,
+    /// correlato alla ToolUse via `tool_call_id`).
+    ///
+    /// Prima i meta-step restavano solo nel canale stato (delta) e NON arrivavano
+    /// mai al frontend ne' al DB: la timeline mostrava solo gli executor_call
+    /// ("quale modello") — incidente narrazione 2026-07-02. Pattern emit (live,
+    /// sink no-op in shadow) + persist (storico, gata Real), identico
+    /// all'executor_call (regola L).
+    ///
+    /// Chiamata DOPO i cap/troncamenti (5/9), cosi' il contenuto inviato
+    /// all'utente coincide con quello consegnato al modello. Best-effort e
+    /// infallibile: in shadow il sink iniettato nel ctx e' `NullEventSink` (no-op)
+    /// -> nessun evento esce in Replay (gate gia' assicurato a monte da
+    /// `build_native_engine`, qui niente ramo per lo shadow).
+    async fn narrate_turn(
+        &self,
+        ctx: &AgentNodeCtx,
+        tool_steps: &[MetaStep],
+        results: &[ToolResultBlock],
+    ) {
+        for ms in tool_steps {
+            crate::nodes::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                ctx.exec_mode(),
+                &ms.kind,
+                ms.title.clone(),
+                ms.payload.clone(),
+            )
+            .await;
+        }
+        for r in results {
+            ctx.emit.emit(SseEvent::ToolResult {
+                tool_call_id: r.tool_use_id.clone(),
+                content: r.content.clone(),
+                is_error: r.is_error,
+            });
+        }
+    }
+
     /// Tronca `content` (se stringa) a `max_chars` con offload best-effort in RAG
     /// e degrado a troncamento testa+coda (`_smart_truncate_lossless`,
     /// `__init__.py:153-181`). In [`ExecMode::Replay`] l'offload e' un no-op (la
@@ -1196,6 +1178,319 @@ impl ToolDispatchNode {
             )
             .await
             .ok()
+    }
+}
+
+/// (3c) Budget allegati: tool di lettura allegato oltre il budget cumulativo
+/// della sessione -> SYNTHETIC error che indirizza agli estrattori strutturati.
+fn attachment_budget_block(
+    name: &str,
+    tool_use_id: &str,
+    gates: &PrefilterGates,
+) -> Option<ToolResultBlock> {
+    if !ATTACHMENT_READ_TOOLS.contains(&name)
+        || gates.attachment_bytes_read < gates.attachment_budget
+    {
+        return None;
+    }
+    let current_bytes = gates.attachment_bytes_read;
+    let budget_total = gates.attachment_budget;
+    tracing::warn!(
+        target: "nexus_agent_graph::tool_dispatch",
+        already_read = current_bytes,
+        budget = budget_total,
+        tool = name,
+        "budget letture allegati esaurito, tool bloccato"
+    );
+    let err = json!({
+        "error": format!(
+            "budget letture allegati esaurito ({current_bytes} byte gia' letti su \
+             {budget_total} budget). Usa un tool di estrazione strutturata \
+             (nexus_extract_pdf_text, nexus_extract_figma_structure, \
+             nexus_extract_docx_text, nexus_extract_xlsx_data) oppure chiedi \
+             all'utente una versione testuale del file."
+        ),
+        "budget_bytes": budget_total,
+        "already_read": current_bytes,
+    });
+    Some(ToolDispatchNode::synthetic_error(
+        tool_use_id,
+        Value::String(py_dumps(&err)),
+    ))
+}
+
+/// (4) Ricompone i risultati nell'ordine ORIGINALE dei pending: ogni slot vuoto
+/// (KEPT) prende il prossimo esito eseguito, gli altri tengono il synthetic gia'
+/// pronto. Allineamento per POSIZIONE (load-bearing, NON per id).
+fn recompose_results(
+    slots: Vec<Option<ToolResultBlock>>,
+    kept_results: Vec<ToolResultBlock>,
+) -> Vec<ToolResultBlock> {
+    let mut kept_iter = kept_results.into_iter();
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                kept_iter
+                    .next()
+                    .expect("ogni slot KEPT ha un risultato corrispondente")
+            })
+        })
+        .collect()
+}
+
+/// (6) Byte letti dai tool allegato RIUSCITI del turno: il budget cumulativo
+/// della sessione avanza solo sui successi (py:3909-3914).
+fn added_attachment_bytes(pending: &[Value], results: &[ToolResultBlock]) -> i64 {
+    pending
+        .iter()
+        .zip(results.iter())
+        .filter(|(b, r)| {
+            let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+            ATTACHMENT_READ_TOOLS.contains(&name) && !r.is_error
+        })
+        .map(|(_, r)| extract_returned_bytes(&value_as_json_string(&r.content)))
+        .sum()
+}
+
+/// (7) Predicato del guard blocked-da-cap: l'ultima dichiarazione del turno e'
+/// `blocked`, non e' gia' stata rifiutata in questo run e almeno un tool_result
+/// porta il SENTINEL del predictive cap.
+fn should_reject_blocked_from_cap(
+    declared_outcomes: &[Value],
+    results: &[ToolResultBlock],
+    already_rejected: bool,
+) -> bool {
+    let last_blocked = declared_outcomes
+        .last()
+        .and_then(|d| d.get("outcome").and_then(Value::as_str))
+        == Some("blocked");
+    let any_cap_sentinel = results
+        .iter()
+        .any(|r| value_as_json_string(&r.content).contains(PREDICTIVE_CAP_SENTINEL));
+    !declared_outcomes.is_empty() && last_blocked && !already_rejected && any_cap_sentinel
+}
+
+/// (7) Guard blocked-da-cap (py:3924-3953): una dichiarazione `blocked` il cui
+/// UNICO blocco e' il predictive cap su una singola chiamata NON e' un blocco del
+/// task -> la dichiarazione viene rifiutata (UNA volta per run: il flag
+/// `blocked_cap_rejected` onora la seconda). Ritorna `true` se ha rifiutato.
+fn reject_blocked_from_cap(
+    declared_outcomes: &mut Vec<Value>,
+    results: &mut [ToolResultBlock],
+    task_complete_ids: &[String],
+    already_rejected: bool,
+) -> bool {
+    if !should_reject_blocked_from_cap(declared_outcomes, results, already_rejected) {
+        return false;
+    }
+    // La `reason` e' una stringa SINGOLA (spazi singoli, niente indentazione
+    // spuria): 1:1 col Python (concatenazione implicita di literal adiacenti).
+    // py_dumps -> separatori con spazio come json.dumps.
+    let reason = "Dichiarazione 'blocked' RIFIUTATA: l'unico blocco di questo turno e' \
+il predictive context cap su una singola chiamata, NON un blocco del task. \
+Prosegui col task usando i dati gia' raccolti e rispondi alla richiesta corrente \
+dell'utente.";
+    for r in results.iter_mut() {
+        if task_complete_ids.contains(&r.tool_use_id) {
+            r.content = Value::String(py_dumps(&json!({
+                "acknowledged": false,
+                "reason": reason,
+            })));
+            r.is_error = true;
+        }
+    }
+    declared_outcomes.clear();
+    tracing::warn!(
+        target: "nexus_agent_graph::tool_dispatch",
+        "task_complete blocked RIFIUTATO (blocco era del predictive cap, non del task)"
+    );
+    true
+}
+
+/// Costruisce il HumanMessage coi blocchi del turno: i tool_result (senza
+/// `raw_content`) + l'eventuale blocco di enforcement del panel + l'eventuale
+/// reminder TODO.
+///
+/// Il Python costruisce un HumanMessage con content="" e i blocchi in
+/// additional_kwargs["anthropic_content"]. In Rust la forma autoritativa del
+/// contenuto a blocchi e' MessageContent::Blocks: deserializziamo i blocchi JSON
+/// in ContentBlock (un blocco non riconosciuto, es. il reminder text, cade su
+/// ContentBlock::Text).
+fn build_tool_message(
+    results: &[ToolResultBlock],
+    panel_enforcement: Option<&PanelEnforcement>,
+    reminder_text: Option<&str>,
+) -> Message {
+    let mut final_blocks: Vec<Value> = results.iter().map(tool_result_to_block).collect();
+    if let Some(enforcement) = panel_enforcement {
+        final_blocks.push(json!({"type": "text", "text": enforcement.prompt_block()}));
+    }
+    if let Some(txt) = reminder_text {
+        append_reminder_block(&mut final_blocks, txt);
+    }
+    human_message_from_blocks(final_blocks)
+}
+
+/// (11) M16: tool scoperti dai `nexus_mcp_tool_search` RIUSCITI del turno. Il
+/// parse gira sul JSON INTEGRO (il `raw_content` pre-troncamento, altrimenti il
+/// content) e `parse_discovered_tools` usa gia' il fix ensure_ascii (PR-G).
+/// Dedup cross-search nel turno: la prima occorrenza vince (come Python
+/// `if not any(d.name == ...)`).
+fn parse_discovered_next(
+    pending: &[Value],
+    results: &[ToolResultBlock],
+    schema_max_bytes: usize,
+) -> Vec<DiscoveredTool> {
+    let mut discovered_next: Vec<DiscoveredTool> = Vec::new();
+    for (b, r) in pending.iter().zip(results.iter()) {
+        let name = b.get("name").and_then(Value::as_str).unwrap_or("");
+        if name != "nexus_mcp_tool_search" || r.is_error {
+            continue;
+        }
+        let raw = r
+            .raw_content
+            .clone()
+            .unwrap_or_else(|| value_as_json_string(&r.content));
+        for t in crate::decisions::parse_discovered_tools(&raw, schema_max_bytes) {
+            if !discovered_next.iter().any(|d| d.name == t.name) {
+                discovered_next.push(t);
+            }
+        }
+    }
+    discovered_next
+}
+
+/// meta_steps `tool_executed` del turno (live UX, py:4065-4114): un MetaStep per
+/// OGNI tool (KEPT, synthetic-blocked, brain-only), allineato per POSIZIONE ai
+/// pending (`zip(pending, results)`, 1:1 col Python). provider/model emittenti
+/// del turno (UI badge): catena di fallback identica al Python
+/// (provider_used -> sticky -> override).
+fn build_tool_steps(
+    state: &AgentState,
+    pending: &[Value],
+    results: &[ToolResultBlock],
+) -> Vec<MetaStep> {
+    let exec_provider = state
+        .provider_used
+        .as_deref()
+        .or(state.sticky_provider.as_deref())
+        .or(state.provider_override.as_deref());
+    let exec_model = state
+        .model_used
+        .as_deref()
+        .or(state.sticky_model.as_deref())
+        .or(state.model_override.as_deref());
+    pending
+        .iter()
+        .zip(results.iter())
+        .map(|(b, r)| tool_executed_meta_step(b, r.is_error, exec_provider, exec_model))
+        .collect()
+}
+
+/// P3: accumulo persistente dei tool scoperti nel run (merge dedup, l'ultimo
+/// schema vince). `None` = il turno non ha scoperto nulla e il campo NON va
+/// toccato (l'accumulo del run resta quello dello stato).
+fn merged_discovered_run(
+    state: &AgentState,
+    discovered_next: &[DiscoveredTool],
+) -> Option<Vec<Value>> {
+    if discovered_next.is_empty() {
+        return None;
+    }
+    let previous: Vec<DiscoveredTool> = state
+        .discovered_tools_run
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|v| serde_json::from_value::<DiscoveredTool>(v.clone()).ok())
+        .collect();
+    let merged = merge_discovered_run(&previous, discovered_next);
+    Some(merged.iter().map(discovered_to_value).collect())
+}
+
+/// WAVE 3: esito dichiarato del turno (l'ultimo prevale) + conteggio cumulativo
+/// dei `done`.
+///
+/// Senza dichiarazioni nel turno ma con una dichiarazione nello stato scatta
+/// l'INVALIDAZIONE STANTIA (ADR 0034): il run PROSEGUE con altri tool DOPO una
+/// dichiarazione precedente -> quella dichiarazione era intermedia, non l'esito
+/// finale. Senza questo azzeramento, un "partial"/"blocked" dichiarato a meta'
+/// run falsava lo status canonico FINALE anche a lavoro poi completato (il
+/// finalizzatore legge l'ULTIMA dichiarazione dallo stato). `declared_done_count`
+/// resta cumulativo (gate done>=3 in testa).
+fn apply_declared_outcome(delta: &mut StateDelta, state: &AgentState, declared_outcomes: &[Value]) {
+    let Some(last) = declared_outcomes.last() else {
+        if state.declared_outcome.is_some() {
+            delta.declared_outcome = Some(None);
+        }
+        return;
+    };
+    delta.declared_outcome = Some(Some(last.clone()));
+    let done_now = declared_outcomes
+        .iter()
+        .filter(|d| d.get("outcome").and_then(Value::as_str) == Some("done"))
+        .count() as i64;
+    if done_now > 0 {
+        let prev = state.declared_done_count.unwrap_or(0);
+        delta.declared_done_count = Some(Some(prev + done_now));
+    }
+}
+
+/// Semantica ADR 0034 "l'ultimo prevale" per un verdetto dichiarato nel turno:
+/// se il turno ne dichiara uno, quello vince; se non ne dichiara ma lo stato ne
+/// porta uno, quel verdetto era INTERMEDIO (il run e' proseguito con altri tool)
+/// e viene azzerato. `None` = campo del delta non toccato.
+///
+/// PUNTO UNICO (regola L) dei gemelli `review_verdict` (Fase B) e
+/// `advisory_verdict` (consiglio a monte): logica identica, un solo posto.
+fn last_verdict_or_invalidate(
+    declared_now: &[Value],
+    current_is_set: bool,
+) -> Option<Option<Value>> {
+    if let Some(last) = declared_now.last() {
+        return Some(Some(last.clone()));
+    }
+    if current_is_set {
+        return Some(None);
+    }
+    None
+}
+
+/// Riversa nel delta i segnali strutturati del turno (regola M).
+///
+/// - `infra_error` (WAVE 2.2): errore infrastruttura tool (mcp-core NON scala i
+///   provider).
+/// - `panel_enforcement`: pubblicato in `extra`; se terminale chiude il turno.
+/// - `awaiting_subagents` (Fase D fan-in): almeno un `dispatch_subagent(s)`
+///   background ha risposto col segnale strutturato -> il padre si sospende. Il
+///   motore interrompe su `is_awaiting_interrupt` (Slice 1) e riprende al fan-in
+///   (Slice 3). Scritto solo quando true (nessun azzeramento qui: il resume lo
+///   gestisce Slice 3).
+/// - `blocked_cap_rejected`: marca il flag (la 2a dichiarazione sara' onorata).
+/// - `run_notes` (P4): persiste il taccuino aggiornato SOLO se cambiato
+///   (py:4219).
+fn apply_turn_signals(delta: &mut StateDelta, state: &AgentState, signals: TurnSignals<'_>) {
+    if signals.infra_error {
+        delta.tool_infra_error = Some(Some(true));
+    }
+    if let Some(enforcement) = signals.panel_enforcement {
+        let mut extra = state.extra.clone();
+        extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), enforcement.to_value());
+        delta.extra = Some(extra);
+        if enforcement.terminal {
+            delta.result = Some(Some(enforcement.summary.clone()));
+            delta.stop_reason = Some(Some(StopReason::EndTurn));
+        }
+    }
+    if signals.awaiting_subagents {
+        delta.awaiting_subagents = Some(Some(true));
+    }
+    if signals.blocked_cap_rejected {
+        delta.blocked_cap_rejected = Some(Some(true));
+    }
+    if signals.run_notes != state.run_notes {
+        delta.run_notes = Some(signals.run_notes);
     }
 }
 
