@@ -311,6 +311,20 @@ fn engine_from_prisma_schema(schema: &str) -> DbEngine {
     DbEngine::Postgres
 }
 
+/// I file `appsettings` di un progetto .NET, **in ordine di priorità**: `Development`
+/// vince su quello base, quindi chi cerca si ferma al primo che risponde.
+///
+/// Punto unico del dato (regola L): lo condividono sia chi LEGGE la connection string
+/// (`detect_dotnet` qui, `scan_dotnet_appsettings` in mcp-core) sia chi la SCRIVE
+/// (`write_back_connection_string` in mcp-core). Le tre logiche restano distinte —
+/// direzioni opposte — ma l'elenco e il suo ordine sono lo stesso fatto: se un domani
+/// entra `appsettings.Staging.json`, va aggiunto qui e basta.
+///
+/// NON e' l'elenco dei file di config "interessanti" di un progetto: quello vive in
+/// `mcp-core::projects::deep_analyze` ed e' un concern diverso (include manifest di
+/// altri linguaggi e `appsettings.Production.json`, che qui non ha senso).
+pub const APPSETTINGS_FILES: [&str; 2] = ["appsettings.Development.json", "appsettings.json"];
+
 /// Rileva engine e migration tool da progetti .NET (ASP.NET Core, EF Core).
 ///
 /// Legge nell'ordine:
@@ -323,7 +337,7 @@ fn detect_dotnet(project_root: &Path) -> Option<(DbEngine, Option<MigrationTool>
     let mut migration_path: Option<String> = None;
 
     // Cerca file appsettings (Development ha priorità)
-    for settings_file in &["appsettings.Development.json", "appsettings.json"] {
+    for settings_file in &APPSETTINGS_FILES {
         let p = project_root.join(settings_file);
         // Cerca anche nelle sottodirectory (es. backend/FreeLance.Api/)
         let candidates = [

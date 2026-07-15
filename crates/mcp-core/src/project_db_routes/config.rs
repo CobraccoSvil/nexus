@@ -129,6 +129,10 @@ pub async fn get_project_db_config(
 // estrazione dagli stessi `appsettings*.json` vive in `super::connection` ed e'
 // logica distinta (direzione opposta, formato di output diverso): non e' un
 // duplicato da consolidare.
+// Cio' che invece E' condiviso e' il DATO — quali file guardare e in che ordine:
+// `nexus_project_db::detector::APPSETTINGS_FILES`. Chi legge e chi scrive devono
+// per forza concordare sull'elenco, altrimenti si propaga la connection string in
+// un file che poi nessuno rilegge.
 
 /// Cerca ricorsivamente sotto `dir` i file il cui nome e' in `names`, saltando
 /// le directory nascoste e quelle di build. Profondita' massima: 4 livelli.
@@ -266,9 +270,13 @@ fn write_back_connection_string(root: &str, conn_str: &str) -> Option<String> {
         return None;
     }
 
-    let candidates = ["appsettings.Development.json", "appsettings.json"];
     let mut config_files: Vec<std::path::PathBuf> = Vec::new();
-    find_config_files(root_path, &candidates, &mut config_files, 0);
+    find_config_files(
+        root_path,
+        &nexus_project_db::detector::APPSETTINGS_FILES,
+        &mut config_files,
+        0,
+    );
 
     let mut wb_error: Option<String> = None;
     for config_file in &config_files {

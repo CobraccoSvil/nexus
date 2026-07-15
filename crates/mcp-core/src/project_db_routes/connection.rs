@@ -576,7 +576,7 @@ fn scan_dotnet_appsettings(root: &std::path::Path, r: &mut DetectionResult) {
     if r.engine.is_some() {
         return;
     }
-    for settings in ["appsettings.Development.json", "appsettings.json"] {
+    for settings in nexus_project_db::detector::APPSETTINGS_FILES {
         let candidates = [
             root.join(settings),
             root.join("backend").join("FreeLance.Api").join(settings),
