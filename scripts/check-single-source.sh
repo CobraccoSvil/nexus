@@ -133,6 +133,48 @@ else
   echo "OK canonical-identifiers: nessun sinonimo IT nei parser enum"
 fi
 
+# Scala dei performance_tier (2026-07-15): UN solo posto la conosce, anche per
+# chi ordina in SQL. Il vocabolario vive in nexus-agent-graph/decisions/tiers.rs
+# (PERFORMANCE_TIERS + tier_rank) e `tier_rank_sql` GENERA da li' l'espressione
+# SQL: aggiungere un livello lo porta ovunque.
+#
+# Perche' esiste questa guard. La scala viveva solo in Rust, quindi ogni query
+# che voleva ordinare per capacita' era COSTRETTA a riscriverla a mano — 9 copie.
+# Una di queste (agent_run.rs) era rimasta a TRE livelli dopo il passaggio a
+# cinque (mig 0528): 'frontier' e 'high' collassavano su 'light', e l'escalation
+# "sali al modello piu' capace" scartava i 7 modelli frontier del catalog
+# preferendo un medium. Nessun compilatore poteva vederlo: e' una stringa SQL.
+# Il difetto e' sopravvissuto per mesi proprio perche' nessuno lo guardava.
+#
+# Esclusi:
+#  - tiers.rs: e' la FONTE che genera l'espressione;
+#  - le righe di COMMENTO: la documentazione cita il difetto per spiegarlo
+#    (model_service.rs lo riporta verbatim come motivazione del design);
+#  - il test-double della vista in escalation_port.rs (#[cfg(test)]): e' uno
+#    specchio DICHIARATO della vista viva (mig 0528/0598), che nelle migrazioni
+#    ha il CASE a mano perche' l'SQL non puo' chiamare il Rust. Non e' codice di
+#    produzione. Sostituirlo con una fixture derivata dalla migrazione reale e'
+#    un lavoro suo, gia' annotato dal censimento dei punti unici.
+#  - le migrazioni: immutabili e gia' applicate.
+tier_case_hits="$(grep -rEn \
+  "CASE +(lower\(trim\()?performance_tier" \
+  crates apps \
+  --include='*.rs' --include='*.ts' --include='*.tsx' \
+  2>/dev/null \
+  | grep -v 'decisions/tiers.rs' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  | grep -v 'agent_graph_adapter/escalation_port.rs' \
+  || true)"
+if [[ -n "$tier_case_hits" ]]; then
+  echo "!! tier-scale: scala tier scritta a mano fuori dal vocabolario unico:" >&2
+  echo "$tier_case_hits" >&2
+  echo "   Usa nexus_agent_graph::decisions::tiers::tier_rank_sql(col): genera" >&2
+  echo "   l'espressione da PERFORMANCE_TIERS, cosi' la scala resta UNA." >&2
+  fail=1
+else
+  echo "OK tier-scale: nessuna scala tier scritta a mano fuori da tiers.rs"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
