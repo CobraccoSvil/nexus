@@ -330,7 +330,7 @@ pub(crate) struct Derived {
     pub thinking: Option<(&'static str, bool)>,
     /// La banda MISURATA (mig 0599): il tier piu' alto certificato dalla batteria,
     /// con isteresi. `None` = nessuna banda certificata -> il catalog tiene il suo
-    /// `facts_prior` e non viene toccato.
+    /// tier `synced` e non viene toccato.
     pub measured_tier: Option<String>,
 }
 
@@ -383,32 +383,10 @@ pub(crate) fn derive_thinking_policy(
     }
 }
 
-/// I fatti del catalog su cui il PRIOR puo' esprimersi. Sono i dati che il
-/// FORNITORE dichiara (prezzo, finestra) piu' le capability gia' PROVATE dalla
-/// batteria — mai il nome del modello.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct CatalogFacts {
-    /// $/M token in input. `None` se il listino non lo dichiara (pricing_state
-    /// 'unknown'): un costo 0 non raffinato NON e' "gratis", e' "non lo so".
-    pub input_cost: Option<f64>,
-    pub context_window: i64,
-    /// Capability gia' PROVATE dalla batteria (`qualified_capabilities`), non
-    /// quelle dichiarate: il prior non si fida della parola del catalog.
-    pub proven_capabilities: Vec<String>,
-    /// `agentic_index` di Artificial Analysis (mig 0600), `None` se il modello non
-    /// e' coperto o se l'indice e' STANTIO (il chiamante lo azzera oltre
-    /// `max_age_hours`: la fonte e' undocumented e puo' sparire — un indice vecchio
-    /// non deve passare per fresco).
-    pub agentic_index: Option<f64>,
-}
-
-/// Le soglie del prior, dal DB (regola G, mig 0599 + 0600).
+/// Le soglie del tier `synced`, dal DB (regola G, mig 0600; il prezzo e' uscito
+/// dalla classificazione con la mig 0608).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TierPriorThresholds {
-    pub frontier_min_input_cost: f64,
-    pub heavy_min_input_cost: f64,
-    pub high_min_input_cost: f64,
-    pub long_context_tokens: i64,
     /// Soglie sull'`agentic_index`. ASSOLUTE su un indice VERSIONATO (AA v4.1 ha
     /// cambiato 3 benchmark su 9 rispetto a v4.0): per questo stanno nel DB e
     /// vanno riviste a ogni cambio di metodologia.
@@ -418,27 +396,16 @@ pub(crate) struct TierPriorThresholds {
     pub agentic_index_medium_min: f64,
 }
 
-/// TIER DAI FATTI DICHIARATI (`facts_prior`). PURA.
+/// TIER `synced` DALLA CLASSIFICAZIONE ESTERNA. PURA.
 ///
-/// E' un RIPIEGO ONESTO in attesa della misura, non una verita': appena la
-/// batteria certifica una banda, `measured` lo sostituisce. Ma e' fondato su
-/// DATI (quello che il fornitore dichiara col listino, e quello che la batteria
-/// ha gia' provato) invece che sul NOME — che e' scorrelato dalla capacita':
-/// misurato sugli indici reali, il token `mini` copre intelligence 6.8-50.2
-/// (spread 43.4) e `-pro` 14.1-46.5. Un `mini` puo' valere piu' di un `pro`.
-///
-/// Il prezzo e' il segnale piu' informativo che il fornitore emette: e' LUI a
-/// posizionare il modello nel proprio listino, e lo fa col denaro — non con un
-/// aggettivo nel nome. Non e' una misura di capacita' (un modello caro puo'
-/// essere scarso), per questo il prior cede il passo alla prima banda misurata.
-///
-/// `None` = nessun fatto utile: il tier resta NULL e il sistema DICE che non lo
-/// sa, invece di scrivere 'medium' e far finta (regola G: niente fallback
-/// magico). Un tier NULL non e' pericoloso: col gate acceso un modello non
-/// qualificato e' gia' fuori dal pool agentico, e resta solo candidato di ultima
-/// istanza del failover (che non filtra per tier).
-/// L'agentic_index MISURA la capacita' agentica (Agents 34% + Coding 24%
-/// dell'Intelligence Index, su harness con tool): e' il nostro uso esatto.
+/// E' il SEME onesto in attesa della misura, non una verita': appena la
+/// batteria certifica una banda, `measured` lo sostituisce. L'agentic_index
+/// MISURA la capacita' agentica (Agents 34% + Coding 24% dell'Intelligence
+/// Index, su harness con tool): e' il nostro uso esatto — a differenza del NOME
+/// (il token `mini` copre intelligence 6.8-50.2) e del PREZZO (posizionamento
+/// commerciale: gpt-5.4-mini a >$2 diventava 'heavy' con agentic 30.2, e
+/// claude-opus-4-8 a 47.2 veniva DECLASSATO da frontier). Entrambi sono usciti
+/// dalla classificazione: il nome con la mig 0599, il prezzo con la 0608.
 fn tier_from_agentic_index(idx: f64, t: &TierPriorThresholds) -> &'static str {
     if idx >= t.agentic_index_frontier_min {
         "frontier"
@@ -453,71 +420,18 @@ fn tier_from_agentic_index(idx: f64, t: &TierPriorThresholds) -> &'static str {
     }
 }
 
-/// RIPIEGO sul prezzo, per il 61% del parco che l'indice non copre. Batte
-/// comunque il nome (misurato: 64 -> 31 inversioni), ma sbaglia: e' un ripiego
-/// dichiarato, non una verita'.
-///
-/// `None` senza prezzo dichiarato: `pricing_state='unknown'` significa
-/// "placeholder", non "gratis". Dedurre 'light' da un costo 0 non raffinato
-/// sarebbe la stessa bugia del nome, con un'altra faccia.
-fn tier_from_price(facts: &CatalogFacts, t: &TierPriorThresholds) -> Option<&'static str> {
-    let cost = facts.input_cost?;
-    if cost <= 0.0 {
-        return None;
-    }
-    let base = if cost >= t.frontier_min_input_cost {
-        "frontier"
-    } else if cost >= t.heavy_min_input_cost {
-        "heavy"
-    } else if cost >= t.high_min_input_cost {
-        "high"
-    } else {
-        "light"
-    };
-    // La finestra lunga alza di UN gradino, mai oltre 'heavy': una finestra
-    // grande e' un fatto dichiarato dal fornitore, NON una prova che il modello
-    // la sappia usare — quella la da' solo il probe `agentic_longctx`. Promuovere
-    // a 'frontier' per la sola finestra sarebbe tornare a credere alle etichette.
-    let with_ctx = if facts.context_window >= t.long_context_tokens {
-        match base {
-            "light" => "medium",
-            "high" => "heavy",
-            other => other,
-        }
-    } else {
-        base
-    };
-    // Il reasoning PROVATO (non dichiarato) alza di un gradino fino a 'heavy':
-    // e' l'unico segnale del prior che viene da una misura nostra.
-    let proven_reasoning = facts
-        .proven_capabilities
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case("reasoning"));
-    Some(if proven_reasoning {
-        match with_ctx {
-            "light" => "medium",
-            "medium" => "high",
-            other => other,
-        }
-    } else {
-        with_ctx
-    })
-}
-
+/// `None` = indice assente o stantio (il chiamante lo azzera oltre
+/// `max_age_hours`: la fonte e' undocumented e puo' sparire — un indice vecchio
+/// non deve passare per fresco). Il tier resta NULL e il sistema DICE che non lo
+/// sa, invece di scrivere 'medium' e far finta (regola G: niente fallback
+/// magico). Un tier NULL non e' pericoloso: col gate acceso un modello non
+/// qualificato e' gia' fuori dal pool agentico, e la batteria gli dara' una
+/// banda `measured` al primo giro utile.
 pub(crate) fn derive_tier_prior(
-    facts: &CatalogFacts,
+    agentic_index: Option<f64>,
     t: &TierPriorThresholds,
 ) -> Option<&'static str> {
-    // L'indice vince sul prezzo, che e' solo il posizionamento commerciale del
-    // fornitore. Misurato: col solo prezzo, gpt-5.4-mini (agentic 30.2) diventava
-    // 'heavy' perche' costa >$2, e claude-opus-4-8 (47.2) veniva DECLASSATO da
-    // frontier a heavy. Un mini caro e un frontier economico rompono la scala del
-    // prezzo; l'indice no.
-    // Il chiamante passa `None` se l'indice e' stantio (fonte undocumented).
-    match facts.agentic_index {
-        Some(idx) => Some(tier_from_agentic_index(idx, t)),
-        None => tier_from_price(facts, t),
-    }
+    agentic_index.map(|idx| tier_from_agentic_index(idx, t))
 }
 
 /// TIER MISURATO (`measured`): la banda PIU' ALTA certificata dalla batteria.
@@ -1260,7 +1174,7 @@ fn hold_min_passes(profiles: &[ProbeProfile]) -> u32 {
 /// thinking non sovrascrive una policy decisa a mano. Quello su `tier_source`
 /// protegge il tier: 'manual' vince SEMPRE, e 'measured' viene promosso solo
 /// quando una banda e' stata davvero dimostrata ($10 non NULL) — altrimenti il
-/// tier resta quello che c'e' (il facts_prior).
+/// tier resta quello che c'e' (il `synced` dall'indice).
 const SQL_QUALIFIED: &str = "UPDATE ai_price_catalog SET \
      qualification_state = 'qualified', \
      qualified_capabilities = $3, \
@@ -1924,13 +1838,8 @@ mod tests {
         assert_eq!(ConfigOutcome::from_run(&inc), ConfigOutcome::Inconclusive);
     }
     fn soglie() -> TierPriorThresholds {
-        // I valori del seed (mig 0599).
+        // Le soglie dell'indice dal seed (mig 0600).
         TierPriorThresholds {
-            frontier_min_input_cost: 8.0,
-            heavy_min_input_cost: 2.0,
-            high_min_input_cost: 0.5,
-            long_context_tokens: 200_000,
-            // Le soglie dell'indice dal seed (mig 0600).
             agentic_index_frontier_min: 45.0,
             agentic_index_heavy_min: 35.0,
             agentic_index_high_min: 25.0,
@@ -1938,99 +1847,38 @@ mod tests {
         }
     }
 
-    fn fatti(cost: Option<f64>, ctx: i64, proven: &[&str]) -> CatalogFacts {
-        CatalogFacts {
-            input_cost: cost,
-            context_window: ctx,
-            proven_capabilities: proven.iter().map(|s| s.to_string()).collect(),
-            agentic_index: None,
-        }
-    }
-
-    fn con_indice(idx: f64, cost: Option<f64>) -> CatalogFacts {
-        CatalogFacts {
-            agentic_index: Some(idx),
-            ..fatti(cost, 8192, &[])
-        }
-    }
-
-    /// L'agentic_index VINCE sul prezzo: MISURA la capacita' agentica, mentre il
-    /// prezzo e' il posizionamento commerciale del fornitore.
+    /// L'agentic_index e' l'UNICO seme del tier `synced` (mig 0608): MISURA la
+    /// capacita' agentica, mentre il prezzo era il posizionamento commerciale
+    /// del fornitore e il nome un aggettivo di marketing.
     ///
-    /// I due casi REALI che il solo prezzo sbagliava (misurati sul parco il 16/07):
+    /// I due casi REALI che il prezzo sbagliava (misurati sul parco il 16/07):
     /// gpt-5.4-mini costa da heavy (>$2) ma vale 30.2 -> e' 'high', non 'heavy';
     /// claude-opus-4-8 vale 47.2 -> resta 'frontier', il prezzo lo declassava.
     #[test]
-    fn l_agentic_index_vince_sul_prezzo() {
-        // gpt-5.4-mini: prezzo da heavy, indice da high. Vince l'indice.
-        assert_eq!(
-            derive_tier_prior(&con_indice(30.2, Some(3.0)), &soglie()),
-            Some("high"),
-            "un MINI caro non e' heavy: il prezzo diceva heavy, l'indice dice la verita'"
-        );
+    fn l_agentic_index_e_il_solo_seme_del_tier() {
+        // gpt-5.4-mini: un MINI caro non e' heavy, l'indice dice la verita'.
+        assert_eq!(derive_tier_prior(Some(30.2), &soglie()), Some("high"));
         // claude-opus-4-8: 47.2 -> frontier (il prezzo lo faceva scendere a heavy).
-        assert_eq!(derive_tier_prior(&con_indice(47.2, Some(5.0)), &soglie()), Some("frontier"));
+        assert_eq!(derive_tier_prior(Some(47.2), &soglie()), Some("frontier"));
         // gpt-5.6-sol: il migliore del parco.
-        assert_eq!(derive_tier_prior(&con_indice(54.0, Some(3.0)), &soglie()), Some("frontier"));
-        // mistral-large: costa poco E vale poco -> light. Qui prezzo e indice
-        // concordano, ed e' il caso in cui l'euristica sul nome aveva ragione.
-        assert_eq!(derive_tier_prior(&con_indice(5.5, Some(0.1)), &soglie()), Some("light"));
+        assert_eq!(derive_tier_prior(Some(54.0), &soglie()), Some("frontier"));
+        // mistral-large-2512: vale poco -> light, qualunque cosa costi.
+        assert_eq!(derive_tier_prior(Some(5.5), &soglie()), Some("light"));
+        // Le soglie intermedie.
+        assert_eq!(derive_tier_prior(Some(35.0), &soglie()), Some("heavy"));
+        assert_eq!(derive_tier_prior(Some(10.0), &soglie()), Some("medium"));
     }
 
-    /// Senza indice si ricade sul prezzo (61% del parco): un ripiego DICHIARATO,
-    /// che batte comunque il nome (misurato: 64 -> 31 inversioni).
+    /// Senza indice il prior TACE: meglio NULL che una bugia. E' la differenza
+    /// fra "non lo so" e "e' medium", che il DEFAULT 'medium' (rimosso dalla
+    /// mig 0599) rendeva indistinguibili. Il ripiego sul PREZZO e' stato rimosso
+    /// (mig 0608): dava tier opposti allo stesso modello (mistral-medium-2505
+    /// light vs -2604 heavy) e un tier NULL non e' pericoloso — col gate acceso
+    /// un modello non qualificato e' gia' fuori dal pool agentico, e la batteria
+    /// gli dara' una banda `measured` al primo giro.
     #[test]
-    fn senza_indice_il_prior_ricade_sul_prezzo() {
-        let f = CatalogFacts { agentic_index: None, ..fatti(Some(3.0), 8192, &[]) };
-        assert_eq!(derive_tier_prior(&f, &soglie()), Some("heavy"), "nessun indice -> prezzo");
-        // E se manca anche il prezzo, TACE.
-        let f = CatalogFacts { agentic_index: None, ..fatti(None, 8192, &[]) };
-        assert_eq!(derive_tier_prior(&f, &soglie()), None);
-    }
-
-    /// Il prior NON si esprime senza fatti: meglio NULL che una bugia.
-    /// E' la differenza fra "non lo so" e "e' medium", che il DEFAULT 'medium'
-    /// (rimosso dalla mig 0599) rendeva indistinguibili.
-    #[test]
-    fn il_prior_tace_se_non_ha_fatti() {
-        assert_eq!(derive_tier_prior(&fatti(None, 128_000, &[]), &soglie()), None,
-            "prezzo non dichiarato (pricing_state='unknown') -> nessun tier, non 'medium'");
-        assert_eq!(derive_tier_prior(&fatti(Some(0.0), 128_000, &[]), &soglie()), None,
-            "un costo 0 NON raffinato non e' 'gratis', e' 'non lo so': dedurne 'light'              sarebbe la stessa bugia del nome con un'altra faccia");
-    }
-
-    /// Il prezzo e' il segnale che il FORNITORE emette col denaro, non con un
-    /// aggettivo nel nome.
-    #[test]
-    fn il_prior_legge_il_listino_del_fornitore() {
-        assert_eq!(derive_tier_prior(&fatti(Some(30.0), 8192, &[]), &soglie()), Some("frontier"));
-        assert_eq!(derive_tier_prior(&fatti(Some(3.0), 8192, &[]), &soglie()), Some("heavy"));
-        assert_eq!(derive_tier_prior(&fatti(Some(1.0), 8192, &[]), &soglie()), Some("high"));
-        assert_eq!(derive_tier_prior(&fatti(Some(0.1), 8192, &[]), &soglie()), Some("light"));
-    }
-
-    /// La finestra dichiarata alza di UN gradino, MAI a frontier: e' un numero
-    /// del fornitore, non la prova che il modello la sappia usare — quella la da'
-    /// solo il probe agentic_longctx.
-    #[test]
-    fn la_finestra_dichiarata_non_regala_il_frontier() {
-        // light + 1M di finestra -> medium, non frontier.
-        assert_eq!(derive_tier_prior(&fatti(Some(0.1), 1_000_000, &[]), &soglie()), Some("medium"));
-        // heavy + finestra enorme resta heavy: il gradino non scavalca la misura.
-        assert_eq!(derive_tier_prior(&fatti(Some(3.0), 1_000_000, &[]), &soglie()), Some("heavy"));
-    }
-
-    /// Il reasoning PROVATO (non dichiarato) e' l'unico segnale del prior che
-    /// viene da una misura nostra.
-    #[test]
-    fn il_prior_usa_il_reasoning_provato_non_quello_dichiarato() {
-        assert_eq!(
-            derive_tier_prior(&fatti(Some(0.1), 8192, &["reasoning"]), &soglie()),
-            Some("medium"),
-            "light + reasoning PROVATO -> medium"
-        );
-        // Il dichiarato non entra: `proven_capabilities` sono i qualified_capabilities.
-        assert_eq!(derive_tier_prior(&fatti(Some(0.1), 8192, &["chat"]), &soglie()), Some("light"));
+    fn senza_indice_il_prior_tace() {
+        assert_eq!(derive_tier_prior(None, &soglie()), None);
     }
 
     fn run(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
@@ -2089,8 +1937,8 @@ mod tests {
     /// dell'admin vince sempre.
     ///
     /// E' l'ultimo anello: senza, `derive_tier_measured` calcolava una banda che
-    /// nessuno scriveva, e il tier restava per sempre al `facts_prior` (una stima
-    /// sul prezzo) anche dopo che la batteria aveva DIMOSTRATO la capacita'.
+    /// nessuno scriveva, e il tier restava per sempre al `synced` (il seme
+    /// dell'indice) anche dopo che la batteria aveva DIMOSTRATO la capacita'.
     #[sqlx::test]
     async fn la_batteria_scrive_il_tier_misurato_ma_non_tocca_la_curatela(pool: PgPool) {
         crate::test_support::create_ai_price_catalog_table(&pool).await;
@@ -2101,7 +1949,7 @@ mod tests {
         .await
         .expect("colonne");
         sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source) VALUES              ('p', 'stimato', 'medium', 'facts_prior'),              ('p', 'curato',  'light',  'manual')",
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source) VALUES              ('p', 'stimato', 'medium', 'synced'),              ('p', 'curato',  'light',  'manual')",
         )
         .execute(&pool)
         .await
@@ -2155,7 +2003,7 @@ mod tests {
         .await
         .expect("colonne");
         sqlx::query(
-            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source)              VALUES ('p', 'm', 'high', 'facts_prior')",
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source)              VALUES ('p', 'm', 'high', 'synced')",
         )
         .execute(&pool)
         .await
@@ -2176,7 +2024,7 @@ mod tests {
         .expect("m");
         assert_eq!(
             r,
-            (Some("high".into()), Some("facts_prior".into())),
+            (Some("high".into()), Some("synced".into())),
             "nessuna banda certificata: il tier resta il prior, non viene azzerato"
         );
     }
@@ -2184,7 +2032,7 @@ mod tests {
     /// (mig 0599) era letto ma non selezionato, e `Row::get` panicava dentro il
     /// task tokio del worker. Il servizio restava `health: ok` mentre la batteria
     /// era morta a ogni giro: nessun modello ha mai raggiunto `tier_source
-    /// = 'measured'`, e il "tier dai fatti" cadeva in eterno sul prior.
+    /// = 'measured'`, e il "tier dai fatti" cadeva in eterno sul prior del prezzo.
     /// Gli altri test non lo videro perche' NON toccano il DB: qui lo schema e'
     /// quello vero delle migrazioni, non una finzione ricostruita a mano.
     #[sqlx::test]

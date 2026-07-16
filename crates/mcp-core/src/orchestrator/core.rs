@@ -611,8 +611,8 @@ impl Orchestrator {
                 // RILASSO CAPABILITY (fix incidente UI 2026-06-04): prima prova
                 // con la capability dell'intent (es. "reasoning"); se nessun
                 // modello NON-thinking tool-capable la possiede — caso reale:
-                // tutti i modelli con capability "reasoning" sono is_thinking=true
-                // ed esclusi dal gate (mig 0317/0318) — rilassa la capability e
+                // i modelli con capability "reasoning" hanno policy thinking
+                // che li esclude dal gate (mig 0317/0319) — rilassa la capability e
                 // prende il miglior non-thinking tool-capable del tier. Un modello
                 // non-thinking senza quel tag e' comunque MOLTO meglio di un
                 // thinking model che fallirebbe il loop agentico (deepseek-v4-pro
@@ -659,7 +659,7 @@ impl Orchestrator {
                              nessun modello non-thinking tool-capable disponibile nel catalog \
                              (tier={}, neppure rilassando la capability). Run proseguira' col \
                              modello originale — verifica ai_price_catalog (supports_tool_use, \
-                             is_thinking) e i provider in cooldown.",
+                             agentic_thinking_policy) e i provider in cooldown.",
                             provider,
                             model,
                             intent,

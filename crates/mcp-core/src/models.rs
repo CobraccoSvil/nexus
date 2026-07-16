@@ -325,7 +325,7 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         // I costi/context si aggiornano sempre.
         //
         // Il TIER non compare: lo scrive `refresh_tier_prior` (punto unico) dopo
-        // questo upsert, quando la riga ha gia' prezzo, finestra E agentic_index.
+        // questo upsert, dall'agentic_index della riga (unico seme, mig 0608).
         // All'INSERT resta NULL — un modello nuovo non ha ancora fatti su cui
         // fondare una fascia, e NULL e' la verita' (la riga nasce comunque
         // is_enabled=false + unqualified, quindi fuori dal pool agentico).
@@ -333,9 +333,9 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
                 currency, context_window, supports_tool_use, supports_vision,
-                is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
+                uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
                 performance_tier, tier_source
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, NULL, NULL)
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2, NULL, NULL)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
@@ -346,9 +346,6 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
                 supports_vision = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                        THEN EXCLUDED.supports_vision
                                        ELSE ai_price_catalog.supports_vision END,
-                is_thinking = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                   THEN EXCLUDED.is_thinking
-                                   ELSE ai_price_catalog.is_thinking END,
                 uses_thinking_mode = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                           THEN EXCLUDED.uses_thinking_mode
                                           ELSE ai_price_catalog.uses_thinking_mode END,
@@ -365,7 +362,6 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .bind(context_window)
         .bind(caps.supports_tool_use)
         .bind(caps.supports_vision)
-        .bind(caps.is_thinking)
         .bind(caps.uses_thinking_mode)
         .bind(caps.agentic_thinking_policy)
         .fetch_one(db)
