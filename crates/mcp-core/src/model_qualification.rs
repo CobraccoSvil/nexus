@@ -333,15 +333,27 @@ pub(crate) struct CatalogFacts {
     /// Capability gia' PROVATE dalla batteria (`qualified_capabilities`), non
     /// quelle dichiarate: il prior non si fida della parola del catalog.
     pub proven_capabilities: Vec<String>,
+    /// `agentic_index` di Artificial Analysis (mig 0600), `None` se il modello non
+    /// e' coperto o se l'indice e' STANTIO (il chiamante lo azzera oltre
+    /// `max_age_hours`: la fonte e' undocumented e puo' sparire — un indice vecchio
+    /// non deve passare per fresco).
+    pub agentic_index: Option<f64>,
 }
 
-/// Le soglie del prior, dal DB (regola G, mig 0599).
+/// Le soglie del prior, dal DB (regola G, mig 0599 + 0600).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TierPriorThresholds {
     pub frontier_min_input_cost: f64,
     pub heavy_min_input_cost: f64,
     pub high_min_input_cost: f64,
     pub long_context_tokens: i64,
+    /// Soglie sull'`agentic_index`. ASSOLUTE su un indice VERSIONATO (AA v4.1 ha
+    /// cambiato 3 benchmark su 9 rispetto a v4.0): per questo stanno nel DB e
+    /// vanno riviste a ogni cambio di metodologia.
+    pub agentic_index_frontier_min: f64,
+    pub agentic_index_heavy_min: f64,
+    pub agentic_index_high_min: f64,
+    pub agentic_index_medium_min: f64,
 }
 
 /// TIER DAI FATTI DICHIARATI (`facts_prior`). PURA.
@@ -367,6 +379,31 @@ pub(crate) fn derive_tier_prior(
     facts: &CatalogFacts,
     t: &TierPriorThresholds,
 ) -> Option<&'static str> {
+    // 1. L'agentic_index MISURA la capacita' agentica (Agents 34% + Coding 24%
+    //    dell'Intelligence Index, su harness con tool): e' il nostro uso esatto.
+    //    Vince sul prezzo, che e' solo il posizionamento commerciale del
+    //    fornitore. Misurato: col solo prezzo, gpt-5.4-mini (agentic 30.2)
+    //    diventava 'heavy' perche' costa >$2, e claude-opus-4-8 (47.2) veniva
+    //    DECLASSATO da frontier a heavy. Un mini caro e un frontier economico
+    //    rompono la scala del prezzo; l'indice no.
+    //    Il chiamante passa `None` se l'indice e' stantio (fonte undocumented).
+    if let Some(idx) = facts.agentic_index {
+        return Some(if idx >= t.agentic_index_frontier_min {
+            "frontier"
+        } else if idx >= t.agentic_index_heavy_min {
+            "heavy"
+        } else if idx >= t.agentic_index_high_min {
+            "high"
+        } else if idx >= t.agentic_index_medium_min {
+            "medium"
+        } else {
+            "light"
+        });
+    }
+    // 2. RIPIEGO sul prezzo, per il 61% del parco che l'indice non copre. Batte
+    //    comunque il nome (misurato: 64 -> 31 inversioni), ma sbaglia: e' un
+    //    ripiego dichiarato, non una verita'.
+    //
     // Senza prezzo dichiarato il prior non si esprime: `pricing_state='unknown'`
     // significa "placeholder", non "gratis". Dedurre 'light' da un costo 0 non
     // raffinato sarebbe la stessa bugia del nome, con un'altra faccia.
@@ -1543,6 +1580,11 @@ mod tests {
             heavy_min_input_cost: 2.0,
             high_min_input_cost: 0.5,
             long_context_tokens: 200_000,
+            // Le soglie dell'indice dal seed (mig 0600).
+            agentic_index_frontier_min: 45.0,
+            agentic_index_heavy_min: 35.0,
+            agentic_index_high_min: 25.0,
+            agentic_index_medium_min: 10.0,
         }
     }
 
@@ -1551,7 +1593,49 @@ mod tests {
             input_cost: cost,
             context_window: ctx,
             proven_capabilities: proven.iter().map(|s| s.to_string()).collect(),
+            agentic_index: None,
         }
+    }
+
+    fn con_indice(idx: f64, cost: Option<f64>) -> CatalogFacts {
+        CatalogFacts {
+            agentic_index: Some(idx),
+            ..fatti(cost, 8192, &[])
+        }
+    }
+
+    /// L'agentic_index VINCE sul prezzo: MISURA la capacita' agentica, mentre il
+    /// prezzo e' il posizionamento commerciale del fornitore.
+    ///
+    /// I due casi REALI che il solo prezzo sbagliava (misurati sul parco il 16/07):
+    /// gpt-5.4-mini costa da heavy (>$2) ma vale 30.2 -> e' 'high', non 'heavy';
+    /// claude-opus-4-8 vale 47.2 -> resta 'frontier', il prezzo lo declassava.
+    #[test]
+    fn l_agentic_index_vince_sul_prezzo() {
+        // gpt-5.4-mini: prezzo da heavy, indice da high. Vince l'indice.
+        assert_eq!(
+            derive_tier_prior(&con_indice(30.2, Some(3.0)), &soglie()),
+            Some("high"),
+            "un MINI caro non e' heavy: il prezzo diceva heavy, l'indice dice la verita'"
+        );
+        // claude-opus-4-8: 47.2 -> frontier (il prezzo lo faceva scendere a heavy).
+        assert_eq!(derive_tier_prior(&con_indice(47.2, Some(5.0)), &soglie()), Some("frontier"));
+        // gpt-5.6-sol: il migliore del parco.
+        assert_eq!(derive_tier_prior(&con_indice(54.0, Some(3.0)), &soglie()), Some("frontier"));
+        // mistral-large: costa poco E vale poco -> light. Qui prezzo e indice
+        // concordano, ed e' il caso in cui l'euristica sul nome aveva ragione.
+        assert_eq!(derive_tier_prior(&con_indice(5.5, Some(0.1)), &soglie()), Some("light"));
+    }
+
+    /// Senza indice si ricade sul prezzo (61% del parco): un ripiego DICHIARATO,
+    /// che batte comunque il nome (misurato: 64 -> 31 inversioni).
+    #[test]
+    fn senza_indice_il_prior_ricade_sul_prezzo() {
+        let f = CatalogFacts { agentic_index: None, ..fatti(Some(3.0), 8192, &[]) };
+        assert_eq!(derive_tier_prior(&f, &soglie()), Some("heavy"), "nessun indice -> prezzo");
+        // E se manca anche il prezzo, TACE.
+        let f = CatalogFacts { agentic_index: None, ..fatti(None, 8192, &[]) };
+        assert_eq!(derive_tier_prior(&f, &soglie()), None);
     }
 
     /// Il prior NON si esprime senza fatti: meglio NULL che una bugia.

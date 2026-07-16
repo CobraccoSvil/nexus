@@ -323,12 +323,18 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         // Le capability PROVATE non sono note qui (vivono nella riga): le aggiunge
         // `refresh_tier_prior` al sync successivo. Il prior e' comunque un ripiego
         // in attesa della misura della batteria.
+        // L'agentic_index NON e' noto qui (vive nella riga, lo popola
+        // sync_agentic_index): questo path e' l'upsert del LISTINO. Il prior
+        // completo — indice sopra il prezzo — lo applica `refresh_tier_prior` al
+        // sync successivo, che legge la riga. Qui il prezzo e' un ripiego di
+        // primo impianto.
         let inferred_tier: Option<&'static str> = tier_prior_thresholds.as_ref().and_then(|t| {
             crate::model_qualification::derive_tier_prior(
                 &crate::model_qualification::CatalogFacts {
                     input_cost: (input_cost > 0.0).then_some(input_cost),
                     context_window: context_window as i64,
                     proven_capabilities: Vec::new(),
+                    agentic_index: None,
                 },
                 t,
             )

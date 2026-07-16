@@ -1647,21 +1647,34 @@ async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32
     let Some(thresholds) = tier_prior_thresholds(db).await else {
         return 0; // prior disabilitato dal flag DB
     };
-    let row: Option<(Option<f64>, Option<i64>, Option<serde_json::Value>, String)> =
+    // L'indice STANTIO viene scartato QUI (non nella funzione pura): la fonte e'
+    // undocumented e puo' sparire senza preavviso — un indice vecchio non deve
+    // passare per fresco. Oltre `max_age_hours` si ricade sul prezzo.
+    let max_age_h = crate::settings::get_setting(db, "catalog.agentic_index_sync.max_age_hours")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(168);
+    let row: Option<(Option<f64>, Option<i64>, Option<serde_json::Value>, String, Option<f64>)> =
         sqlx::query_as(
             "SELECT CASE WHEN pricing_state = 'unknown' THEN NULL \
                          ELSE input_cost_per_million_tokens::float8 END, \
                     context_window::bigint, qualified_capabilities, \
-                    COALESCE(tier_source, '') \
+                    COALESCE(tier_source, ''), \
+                    CASE WHEN agentic_index_at IS NULL \
+                           OR agentic_index_at < now() - make_interval(hours => $3::int) \
+                         THEN NULL ELSE agentic_index END \
                FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
         )
         .bind(provider)
         .bind(api_model)
+        .bind(max_age_h as i32)
         .fetch_optional(db)
         .await
         .ok()
         .flatten();
-    let Some((cost, ctx, quals, source)) = row else {
+    let Some((cost, ctx, quals, source, agentic_index)) = row else {
         return 0;
     };
     // `measured` e `manual` vincono sul prior: non si toccano.
@@ -1674,6 +1687,7 @@ async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32
         proven_capabilities: quals
             .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
             .unwrap_or_default(),
+        agentic_index,
     };
     let derived = crate::model_qualification::derive_tier_prior(&facts, &thresholds);
     if derived.is_none() {
@@ -1734,6 +1748,12 @@ pub(crate) async fn tier_prior_thresholds(
         heavy_min_input_cost: num("catalog.tier_prior.heavy_min_input_cost")?,
         high_min_input_cost: num("catalog.tier_prior.high_min_input_cost")?,
         long_context_tokens: num("catalog.tier_prior.long_context_tokens")? as i64,
+        agentic_index_frontier_min: num("catalog.tier_prior.agentic_index_frontier_min")
+            .unwrap_or(45.0),
+        agentic_index_heavy_min: num("catalog.tier_prior.agentic_index_heavy_min").unwrap_or(35.0),
+        agentic_index_high_min: num("catalog.tier_prior.agentic_index_high_min").unwrap_or(25.0),
+        agentic_index_medium_min: num("catalog.tier_prior.agentic_index_medium_min")
+            .unwrap_or(10.0),
     })
 }
 
