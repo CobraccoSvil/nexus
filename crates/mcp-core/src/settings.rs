@@ -294,19 +294,67 @@ pub async fn update_setting(
     Ok(Json(serde_json::json!({ "status": "ok", "key": key })))
 }
 
-/// PUT /api/settings — bulk update
+/// Effetti collaterali di una scrittura in blocco: cache DLP e chiavi API.
+///
+/// Estratti da `bulk_update`, che altrimenti mescola la scrittura, gli effetti
+/// e la costruzione della risposta in una funzione sola.
+fn apply_bulk_side_effects(body: &BulkUpdateRequest, all_ok: bool) {
+    // Se sono state cambiate chiavi DLP, invalida la cache in-process.
+    let has_dlp_key = body.settings.iter().any(|e| {
+        matches!(
+            e.key.as_str(),
+            "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"
+        )
+    });
+    if has_dlp_key {
+        crate::dlp::invalidate_dlp_cache();
+    }
+
+    // Se e' stata salvata almeno una API key, ricarica le chiavi nel brain.
+    let has_api_key = body.settings.iter().any(|e| e.key.ends_with("_api_key"));
+    if !has_api_key || !all_ok {
+        return;
+    }
+    // Il brain REST server e' su NEURAL_CORE_URL (porta 8001) o su /neural se
+    // proxied; per il reload interno usiamo l'URL diretto.
+    let brain_url = std::env::var("NEURAL_CORE_REST_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        match client
+            .post(format!("{brain_url}/reload-settings"))
+            .json(&serde_json::json!({"mcp_core_url": "http://localhost:4000"}))
+            .send()
+            .await
+        {
+            Ok(r) => tracing::info!("Brain reload-settings: {}", r.status()),
+            Err(e) => tracing::warn!("Brain reload-settings failed: {e}"),
+        }
+    });
+}
+
+/// PUT /api/admin/settings — aggiorna piu' impostazioni in un colpo.
 ///
 /// Aggiorna, non crea: come il PUT singolo, delega al punto unico
 /// `nexus_auth::update_setting_value` (regola L). Prima faceva un `INSERT ...
 /// VALUES ($1, $2, 'custom', '', FALSE) ON CONFLICT (key) DO UPDATE`, cioe' il
-/// secondo vettore per le stesse righe fantasma in categoria 'custom'. Una
-/// chiave sconosciuta finisce ora tra gli `errors` con status `partial`: le
-/// chiavi che i chiamanti scrivono (routing, gerarchia provider, budget) sono
-/// tutte seedate da migrazione.
+/// secondo vettore per le stesse righe fantasma in categoria 'custom'. Le chiavi
+/// che i chiamanti scrivono (routing, gerarchia provider, budget) sono tutte
+/// seedate da migrazione.
+///
+/// L'esito e' lo STATUS HTTP (regola M): 200 se tutte le chiavi sono passate,
+/// 500 se anche una sola e' stata rifiutata. Prima rispondeva 200 in ogni caso e
+/// l'esito viveva nel solo `status`/`errors` del body: `saveRouting` in
+/// routing-config leggeva solo `res.ok` e mostrava "Salvato" con il DB
+/// invariato. Il campo `error` porta il messaggio pronto per il display; il
+/// dettaglio per chiave resta in `errors`.
 pub async fn bulk_update(
     State(state): State<super::AppState>,
     Json(body): Json<BulkUpdateRequest>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
     ensure_required_settings(&state).await;
 
     let mut updated = 0;
@@ -329,46 +377,29 @@ pub async fn bulk_update(
         }
     }
 
-    // Se sono state cambiate chiavi DLP, invalida la cache in-process
-    let has_dlp_key = body.settings.iter().any(|e| {
-        matches!(
-            e.key.as_str(),
-            "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"
-        )
-    });
-    if has_dlp_key {
-        crate::dlp::invalidate_dlp_cache();
+    apply_bulk_side_effects(&body, errors.is_empty());
+
+    if errors.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok", "updated": updated, "errors": [] })),
+        );
     }
 
-    // Se è stata salvata almeno una API key, ricarica automaticamente le chiavi nel brain
-    let has_api_key = body.settings.iter().any(|e| e.key.ends_with("_api_key"));
-    if has_api_key && errors.is_empty() {
-        // Il brain REST server è su NEURAL_CORE_URL (porta 8001) o su /neural se proxied
-        // Ma per il reload interno usiamo l'URL diretto interno
-        let brain_url = std::env::var("NEURAL_CORE_REST_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
-            match client
-                .post(format!("{brain_url}/reload-settings"))
-                .json(&serde_json::json!({"mcp_core_url": "http://localhost:4000"}))
-                .send()
-                .await
-            {
-                Ok(r) => tracing::info!("Brain reload-settings: {}", r.status()),
-                Err(e) => tracing::warn!("Brain reload-settings failed: {e}"),
-            }
-        });
-    }
-
-    Json(serde_json::json!({
-        "status": if errors.is_empty() { "ok" } else { "partial" },
-        "updated": updated,
-        "errors": errors,
-    }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "status": "partial",
+            "updated": updated,
+            "errors": errors,
+            "error": format!(
+                "{} chiave/i su {} non salvate: {}",
+                errors.len(),
+                body.settings.len(),
+                errors.join(" | ")
+            ),
+        })),
+    )
 }
 
 /// GET /internal/settings/:key — get raw value (internal use, not masked)

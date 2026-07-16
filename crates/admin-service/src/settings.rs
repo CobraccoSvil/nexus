@@ -146,10 +146,15 @@ pub async fn update_setting(
     Ok(Json(json!({ "status": "ok", "key": key })))
 }
 
+/// PUT /api/admin/settings (:4010) — gemella di quella in mcp-core.
+///
+/// Stesso contratto: aggiorna e non crea (punto unico, regola L), e l'esito e'
+/// lo status HTTP (regola M) — 200 se tutte le chiavi passano, 500 se anche una
+/// sola e' rifiutata, col messaggio pronto in `error`.
 pub async fn bulk_update(
     State(state): State<AppState>,
     Json(body): Json<BulkUpdateRequest>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     ensure_required_settings(&state).await;
 
     let mut updated = 0;
@@ -169,7 +174,27 @@ pub async fn bulk_update(
     // ora gestita da mcp-core/nexus-gateway con TTL DB-driven (refresh entro
     // ~60s). Nessun side-effect HTTP da invalidare qui (era best-effort).
 
-    Json(json!({ "status": if errors.is_empty() { "ok" } else { "partial" }, "updated": updated, "errors": errors }))
+    if errors.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "updated": updated, "errors": [] })),
+        );
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "status": "partial",
+            "updated": updated,
+            "errors": errors,
+            "error": format!(
+                "{} chiave/i su {} non salvate: {}",
+                errors.len(),
+                body.settings.len(),
+                errors.join(" | ")
+            ),
+        })),
+    )
 }
 
 pub async fn get_raw_value(

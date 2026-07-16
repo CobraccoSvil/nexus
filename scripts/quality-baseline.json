@@ -1,6 +1,6 @@
 {
   "total": 8272,
-  "long_functions": 804,
+  "long_functions": 803,
   "complexity_high": 16,
   "security": 26,
   "files_scanned": 893
