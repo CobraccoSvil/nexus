@@ -453,6 +453,16 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_admin,
             )),
         )
+        // Admin — curatela del tier: l'unico punto in cui un umano decide la
+        // fascia di un modello (prima serviva una migrazione SQL, cioe' un
+        // deploy). Scrive via apply_tier(Manual), che vince su indice e batteria.
+        .route(
+            "/api/admin/provider-models/tier",
+            put(admin::providers::set_model_tier).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
         .route(
             "/api/gateway/providers",
             get(environment::gateway_providers_handler).layer(axum_mw::from_fn_with_state(

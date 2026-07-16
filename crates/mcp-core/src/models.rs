@@ -20,8 +20,29 @@ pub struct ModelCatalogEntry {
     pub input_cost_per_million_tokens: f64,
     pub output_cost_per_million_tokens: f64,
     pub currency: String,
+    /// `None` = tier ignoto: nessuna fonte si e' espressa (mig 0599/0608).
+    /// Prima era `String` con `#[sqlx(default)]`, che rendeva un NULL
+    /// indistinguibile da una stringa vuota — cioe' l'esatta ambiguita' che la
+    /// 0599 ha eliminato dal DB.
     #[sqlx(default)]
-    pub performance_tier: String,
+    pub performance_tier: Option<String>,
+    /// Chi ha stabilito il tier: `synced` (indice esterno) | `measured`
+    /// (batteria) | `manual` (curatela) | `None` (fonte ignota: il valore c'e'
+    /// ma e' un fossile, e chiunque puo' rimpiazzarlo). Senza questo campo
+    /// l'admin vede un tier e non sa se fidarsi.
+    #[sqlx(default)]
+    pub tier_source: Option<String>,
+    /// L'indice della classificazione esterna (Artificial Analysis via
+    /// OpenRouter): il numero su cui il tier `synced` si fonda. `None` = il
+    /// servizio non copre questo modello (43 su 116, il 16/07).
+    #[sqlx(default)]
+    pub agentic_index: Option<f64>,
+    /// Stato della batteria: `qualified` | `unqualified` | `disqualified` |
+    /// `probing` | `quarantined`. Col gate acceso solo i `qualified` non scaduti
+    /// entrano nel routing agentico: e' la prima cosa da guardare quando un
+    /// modello "non viene mai scelto".
+    #[sqlx(default)]
+    pub qualification_state: Option<String>,
     #[sqlx(default)]
     pub speed_tier: String,
     #[sqlx(default)]
@@ -36,6 +57,37 @@ pub struct ModelCatalogEntry {
     pub is_featured: bool,
     pub is_enabled: bool,
 }
+
+/// La `SELECT` che idrata [`ModelCatalogEntry`], con le colonne in UN posto solo
+/// (regola L). `$coda` e' la parte variabile (`WHERE ... ORDER BY ...`) e deve
+/// essere un LETTERALE: la query si compone a compile-time con `concat!`, quindi
+/// non esiste il modo di interpolarci dentro un valore a runtime (niente
+/// SQL injection possibile per costruzione, non per diligenza).
+///
+/// Perche' esiste: le query che elencavano le colonne a mano erano quattro, su
+/// due file — `/api/models` (con e senza filtro provider) e
+/// `/api/admin/provider-models` (idem). Aggiungere un campo alla struct
+/// significava ricordarsi di tutte e quattro, e dimenticarne una NON e' un
+/// errore che il compilatore veda: `#[sqlx(default)]` riempie il campo mancante
+/// col default e la riga arriva silenziosamente sbagliata. E' la stessa forma
+/// del difetto che ha tenuto la batteria in panic per un giorno
+/// (`load_profiles` leggeva una colonna che la sua SELECT non chiedeva).
+macro_rules! catalog_select {
+    ($coda:literal) => {
+        concat!(
+            "SELECT provider, model, display_name, \
+             input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens, \
+             output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens, \
+             currency, performance_tier, tier_source, \
+             agentic_index::float8 AS agentic_index, qualification_state, speed_tier, \
+             capabilities, context_window, supports_tool_use, batch_discount_pct, \
+             is_featured, is_enabled \
+             FROM ai_price_catalog ",
+            $coda
+        )
+    };
+}
+pub(crate) use catalog_select;
 
 #[derive(Debug, Deserialize)]
 pub struct ModelsQuery {
@@ -58,32 +110,18 @@ pub async fn list_models(
     Query(params): Query<ModelsQuery>,
 ) -> Json<Value> {
     let result: Result<Vec<ModelCatalogEntry>, _> = if let Some(ref provider) = params.provider {
-        sqlx::query_as(
-            r#"SELECT provider, model, display_name,
-               input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-               output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-               currency, performance_tier, speed_tier,
-               capabilities, context_window, supports_tool_use, batch_discount_pct,
-               is_featured, is_enabled
-               FROM ai_price_catalog
-               WHERE provider = $1 AND is_enabled = TRUE
-               ORDER BY is_featured DESC, input_cost_per_million_tokens ASC"#,
-        )
+        sqlx::query_as(catalog_select!(
+            "WHERE provider = $1 AND is_enabled = TRUE \
+             ORDER BY is_featured DESC, input_cost_per_million_tokens ASC"
+        ))
         .bind(provider)
         .fetch_all(&state.db)
         .await
     } else {
-        sqlx::query_as(
-            r#"SELECT provider, model, display_name,
-               input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-               output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-               currency, performance_tier, speed_tier,
-               capabilities, context_window, supports_tool_use, batch_discount_pct,
-               is_featured, is_enabled
-               FROM ai_price_catalog
-               WHERE is_enabled = TRUE
-               ORDER BY provider, is_featured DESC, input_cost_per_million_tokens ASC"#,
-        )
+        sqlx::query_as(catalog_select!(
+            "WHERE is_enabled = TRUE \
+             ORDER BY provider, is_featured DESC, input_cost_per_million_tokens ASC"
+        ))
         .fetch_all(&state.db)
         .await
     };

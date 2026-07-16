@@ -422,7 +422,9 @@ export default function AdminBillingPage() {
                   <td style={{ ...tdStyle(tc), fontFamily: "var(--font-mono)", fontSize: 11 }}>{m.model}</td>
                   <td style={tdStyle(tc)}>{m.displayName}</td>
                   <td style={tdStyle(tc)}>
-                    <span style={tierBadge(tc, m.performanceTier)}>{m.performanceTier}</span>
+                    <span style={tierBadge(tc, m.performanceTier)}>
+                      {m.performanceTier ?? "ignoto"}
+                    </span>
                   </td>
                   <td style={tdStyleR(tc)}>${m.inputCostPerMillionTokens.toFixed(2)}</td>
                   <td style={tdStyleR(tc)}>${m.outputCostPerMillionTokens.toFixed(2)}</td>
@@ -762,9 +764,11 @@ function tdStyleR(tc: Tc): React.CSSProperties {
   return { ...tdStyle(tc), textAlign: "right", fontVariantNumeric: "tabular-nums" };
 }
 
-function tierBadge(tc: Tc, tier: string): React.CSSProperties {
+function tierBadge(tc: Tc, tier: string | null): React.CSSProperties {
   // Scala a 5 livelli (light < medium < high < heavy < frontier, mig 0528/0547):
-  // colori progressivi per capacita' crescente.
+  // colori progressivi per capacita' crescente. `null` = tier ignoto (la colonna
+  // e' nullable dalla mig 0599: nessuna fonte si e' espressa) -> grigio neutro,
+  // non il colore di una fascia che nessuno ha stabilito.
   const colors: Record<string, string> = {
     light: "#10b981",
     medium: "#3b82f6",
@@ -772,7 +776,7 @@ function tierBadge(tc: Tc, tier: string): React.CSSProperties {
     heavy: "#f59e0b",
     frontier: "#ef4444",
   };
-  const bg = colors[tier] || tc.textMuted;
+  const bg = (tier && colors[tier]) || tc.textMuted;
   return {
     display: "inline-block",
     padding: "2px 8px",

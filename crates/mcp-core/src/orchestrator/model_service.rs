@@ -874,6 +874,35 @@ where
     Ok(res.rows_affected() > 0)
 }
 
+/// RIMUOVE la curatela: `tier_source` torna NULL e il tier resta il valore che
+/// ha. Sta qui e non nel call site perche' e' una scrittura di `tier_source`, e
+/// quelle vivono in un solo posto (regola L) — il guard `tier-write` lo verifica.
+///
+/// Non azzera il tier: il valore curato resta finche' l'indice o la batteria non
+/// lo rimpiazzano. E' la differenza fra "avevo sbagliato, decidete voi" e "questo
+/// modello non ha piu' una fascia", che aprirebbe un buco nel routing.
+///
+/// Ritorna `true` se c'era davvero una curatela da rimuovere.
+pub async fn clear_manual_tier<'e, E>(
+    exec: E,
+    provider: &str,
+    model: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let res = sqlx::query(
+        "UPDATE ai_price_catalog SET tier_source = NULL, updated_at = NOW() \
+          WHERE provider = $1 AND model = $2 AND tier_source = $3",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(TierSource::Manual.as_str())
+    .execute(exec)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Le fonti che `nuova` ha l'autorita' di rimpiazzare, come valori di colonna
 /// (`''` = NULL, cioe' nessuna fonte). Derivata da [`puo_sovrascrivere`]: la
 /// regola resta una sola, questa e' solo la sua proiezione in SQL.

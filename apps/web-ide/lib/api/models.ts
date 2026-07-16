@@ -14,6 +14,13 @@ import { API_BASE, fetchJson } from "./_shared";
  * (regola G: niente magic fallback). E' esattamente il difetto che azzerava il
  * footer costo-per-provider del nastro attivita'.
  */
+export type PerformanceTier = "light" | "medium" | "high" | "heavy" | "frontier";
+
+/** Chi ha stabilito il tier (`ai_price_catalog.tier_source`, mig 0608).
+ *  `null` = nessuna fonte si e' espressa: il valore c'e' ma non si sa da dove
+ *  venga (un fossile), e indice o batteria possono rimpiazzarlo. */
+export type TierSource = "synced" | "measured" | "manual";
+
 export interface ModelCatalogEntry {
   provider: string;
   model: string;
@@ -21,7 +28,16 @@ export interface ModelCatalogEntry {
   inputCostPerMillionTokens: number;
   outputCostPerMillionTokens: number;
   currency: string;
-  performanceTier: "light" | "medium" | "high" | "heavy" | "frontier";
+  /** `null` = tier ignoto (mig 0599: la colonna e' nullable, e NULL significa
+   *  "nessuna fonte lo ha stabilito" — non "medium"). */
+  performanceTier: PerformanceTier | null;
+  tierSource: TierSource | null;
+  /** Indice della classificazione esterna (Artificial Analysis via OpenRouter):
+   *  il numero su cui si fonda il tier `synced`. `null` = modello non coperto. */
+  agenticIndex: number | null;
+  /** Stato della batteria di qualificazione. Col gate acceso solo `qualified`
+   *  entra nel routing agentico. */
+  qualificationState: string | null;
   speedTier: "fast" | "medium" | "slow";
   capabilities: string[];
   contextWindow: number;
@@ -98,6 +114,23 @@ export async function setModelEnabled(
   return fetchJson(`${API_BASE}/api/admin/provider-models/enabled`, {
     method: "PUT",
     body: JSON.stringify({ provider, model, enabled }),
+  });
+}
+
+/**
+ * Curatela del tier: decide la fascia di un modello (`tier_source='manual'`,
+ * che vince su indice e batteria). `tier: null` RIMUOVE la curatela senza
+ * azzerare il tier — il valore resta e le fonti automatiche tornano a poterlo
+ * correggere.
+ */
+export async function setModelTier(
+  provider: string,
+  model: string,
+  tier: PerformanceTier | null,
+): Promise<{ ok: boolean; provider: string; model: string; tier: string | null; changed: boolean }> {
+  return fetchJson(`${API_BASE}/api/admin/provider-models/tier`, {
+    method: "PUT",
+    body: JSON.stringify({ provider, model, tier }),
   });
 }
 
