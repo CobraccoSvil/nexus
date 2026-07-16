@@ -1788,9 +1788,17 @@ async fn measure_gate_steps(
     meta_db: &PgPool,
     project_id: Uuid,
     root: &str,
-    steps: &mut [crate::verify_profile::VerifyProfileStep],
+    steps: &mut Vec<crate::verify_profile::VerifyProfileStep>,
     criteria_adapter: &FinalGateCriteriaRunnerAdapter,
 ) {
+    // Niente step -> niente da misurare, e si esce PRIMA del guard. Non e' solo
+    // un risparmio: `steps` vuoto e' anche il modo in cui `ensure_profile` dice
+    // "kill-switch `agent.verify_infer.enabled` OFF", e la ri-lettura qui sotto
+    // ripescherebbe dal DB proprio il profilo che l'interruttore ha escluso.
+    if steps.is_empty() {
+        return;
+    }
+
     // MUTUA ESCLUSIONE per ROOT su baseline+probe (difetto D2, incidente
     // consiglio 2026-07-15; reintrodotto qui risolvendo il merge con main).
     //
@@ -1808,6 +1816,28 @@ async fn measure_gate_steps(
     let _tree_guard = crate::verify_profile::project_tree_lock(root)
         .lock_owned()
         .await;
+
+    // RI-LETTURA DOPO il guard (doppio controllo): chi ha atteso in coda ha in
+    // mano la copia letta PRIMA di entrare, con `baseline_exit_code`/`probe`
+    // ancora a `None` — cioe' i filtri `is_none()` delle due misure rifarebbero
+    // da capo il typecheck e il probe che chi era davanti ha appena eseguito e
+    // persistito. Senza questa riga il guard non CONDIVIDE il lavoro, lo mette
+    // in FILA: 6 figure = 6 baseline + 6 probe in sequenza sullo stesso albero.
+    // E' l'altra meta' del difetto D2 (lo spreco che occupava la finestra prima
+    // che le figure raggiungessero il loro modello); il razionale di
+    // PROFILE_LOCKS avverte esattamente di questo: un lock che serializza N
+    // misure invece di condividerne una sarebbe solo un altro difetto.
+    //
+    // Una ri-lettura VUOTA non e' un profilo svuotato: `profile_steps` inghiotte
+    // l'errore DB e ritorna il default, quindi il `Vec` non distingue "nessuna
+    // riga" da "il DB non ha risposto" (regola M). Su un segnale che non
+    // discrimina si tiene la copia in mano, invece di buttare via gli step da
+    // misurare per una lettura andata storta.
+    let persisted = crate::verify_profile::profile_steps(meta_db, project_id).await;
+    if !persisted.is_empty() {
+        *steps = persisted;
+    }
+
     // `|` e non `||`: la seconda misura va eseguita comunque, non e' un
     // cortocircuito.
     let measured = measure_gate_baselines(steps, criteria_adapter).await
@@ -2044,7 +2074,6 @@ async fn build_native_engine(
 
             if !role.is_shadow() {
                 measure_gate_steps(&db, pid, &root, &mut steps, &criteria_adapter).await;
-
             }
             final_gate_cfg.verify_steps = steps
                 .into_iter()
@@ -4830,5 +4859,193 @@ mod tests {
         assert_eq!(vk["final_gate_passed"], serde_json::json!(false));
         assert_eq!(vk["error_class"], serde_json::json!("context_overflow"));
         assert_eq!(vk["declared"]["outcome"], serde_json::json!("done"));
+    }
+
+    /// Esecutore che CONTA i comandi eseguiti: il numero di `run_command` in
+    /// arrivo e' la misura dello spreco (un typecheck reale dura secondi).
+    struct ContaComandi {
+        eseguiti: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for ContaComandi {
+        async fn execute(
+            &self,
+            call: nexus_agent_graph::runtime::ports::ToolCall,
+            _mode: nexus_agent_graph::runtime::ports::ExecMode,
+        ) -> Result<
+            nexus_agent_graph::runtime::ports::ToolOutcome,
+            nexus_agent_graph::runtime::ports::PortError,
+        > {
+            self.eseguiti
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(nexus_agent_graph::runtime::ports::ToolOutcome {
+                tool_call_id: call.id,
+                // `measure_command_exit` estrae l'exit dal marker del testo.
+                content: serde_json::json!("tutto verde\nEXIT CODE: 0"),
+                exit_code: Some(0),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Le N figure del consiglio entrano insieme sulla STESSA root con la stessa
+    /// copia del profilo, letta PRIMA di mettersi in coda sul guard dell'albero.
+    /// La misura deve essere fatta UNA volta e CONDIVISA: e' il senso del doppio
+    /// controllo dopo il guard. Senza la ri-lettura il guard non condivide il
+    /// lavoro, lo mette in fila — e questo test conta 6 typecheck invece di 1
+    /// (difetto D2, meta' spreco, persa nel refactor e nel merge 9dd68341).
+    #[sqlx::test]
+    async fn misure_gate_condivise_fra_figure_concorrenti(pool: PgPool) {
+        // Come gli altri test del crate: la tabella che serve, senza la FK su
+        // `projects` (qui il progetto non e' il soggetto della prova).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS project_verify_profiles (
+                project_id    UUID PRIMARY KEY,
+                steps         JSONB NOT NULL DEFAULT '[]'::jsonb,
+                environment   JSONB NOT NULL DEFAULT '{}'::jsonb,
+                manifest_hash TEXT NOT NULL DEFAULT '',
+                source        TEXT NOT NULL DEFAULT 'llm',
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tabella profili");
+
+        let pid = Uuid::new_v4();
+        // UNO step gate con la baseline da misurare e il probe GIA' fatto: cosi'
+        // un giro di misure costa ESATTAMENTE un'esecuzione e il conteggio non
+        // dipende dal probe (che pianterebbe un file vero nell'albero).
+        let profilo = vec![crate::verify_profile::VerifyProfileStep {
+            step: "typecheck".to_string(),
+            command: "pnpm typecheck".to_string(),
+            working_dir: None,
+            timeout_s: None,
+            gate: true,
+            rationale: None,
+            baseline_exit_code: None,
+            probe: Some(crate::verify_probe::ProbeOutcome::Discriminating),
+        }];
+        sqlx::query(
+            "INSERT INTO project_verify_profiles (project_id, steps, manifest_hash) \
+             VALUES ($1, $2, 'h')",
+        )
+        .bind(pid)
+        .bind(serde_json::to_value(&profilo).expect("json"))
+        .execute(&pool)
+        .await
+        .expect("profilo persistito");
+
+        let eseguiti = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = Arc::new(FinalGateCriteriaRunnerAdapter::new(
+            Arc::new(ContaComandi {
+                eseguiti: eseguiti.clone(),
+            }),
+            pool.clone(),
+        ));
+        // Root UNICA per questo test: la chiave di TREE_LOCKS e' globale al
+        // processo e i test girano in parallelo (nessun albero viene toccato:
+        // il probe e' gia' risolto).
+        let root = format!("D:/test-albero/{pid}");
+
+        let mut figure = Vec::new();
+        for _ in 0..6 {
+            let (pool, adapter, root) = (pool.clone(), adapter.clone(), root.clone());
+            // Ogni figura ha la PROPRIA copia, letta prima della coda: e' la
+            // copia stantia che i filtri `is_none()` userebbero per rifare tutto.
+            let mut steps = profilo.clone();
+            figure.push(tokio::spawn(async move {
+                measure_gate_steps(&pool, pid, &root, &mut steps, &adapter).await;
+                steps
+            }));
+        }
+        let mut esiti = Vec::new();
+        for f in figure {
+            esiti.push(f.await.expect("figura"));
+        }
+
+        assert_eq!(
+            eseguiti.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "il comando gate si misura UNA volta per albero, non una per figura \
+             (D2: erano 6 typecheck in fila)"
+        );
+        for steps in &esiti {
+            assert_eq!(
+                steps[0].baseline_exit_code,
+                Some(0),
+                "la misura e' CONDIVISA: chi ha atteso il guard esce con la \
+                 baseline letta dal persistito, non senza"
+            );
+        }
+    }
+
+    /// Il kill-switch `agent.verify_infer.enabled` OFF si presenta qui come
+    /// `steps` vuoto: la ri-lettura dopo il guard non deve ripescare dal DB il
+    /// profilo che l'interruttore ha appena escluso.
+    #[sqlx::test]
+    async fn profilo_escluso_dal_killswitch_non_torna_dalla_rilettura(pool: PgPool) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS project_verify_profiles (
+                project_id    UUID PRIMARY KEY,
+                steps         JSONB NOT NULL DEFAULT '[]'::jsonb,
+                environment   JSONB NOT NULL DEFAULT '{}'::jsonb,
+                manifest_hash TEXT NOT NULL DEFAULT '',
+                source        TEXT NOT NULL DEFAULT 'llm',
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tabella profili");
+
+        let pid = Uuid::new_v4();
+        let persistito = vec![crate::verify_profile::VerifyProfileStep {
+            step: "typecheck".to_string(),
+            command: "pnpm typecheck".to_string(),
+            working_dir: None,
+            timeout_s: None,
+            gate: true,
+            rationale: None,
+            baseline_exit_code: None,
+            probe: Some(crate::verify_probe::ProbeOutcome::Discriminating),
+        }];
+        sqlx::query(
+            "INSERT INTO project_verify_profiles (project_id, steps, manifest_hash) \
+             VALUES ($1, $2, 'h')",
+        )
+        .bind(pid)
+        .bind(serde_json::to_value(&persistito).expect("json"))
+        .execute(&pool)
+        .await
+        .expect("profilo persistito");
+
+        let eseguiti = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = FinalGateCriteriaRunnerAdapter::new(
+            Arc::new(ContaComandi {
+                eseguiti: eseguiti.clone(),
+            }),
+            pool.clone(),
+        );
+        let mut steps: Vec<crate::verify_profile::VerifyProfileStep> = Vec::new();
+        measure_gate_steps(
+            &pool,
+            pid,
+            &format!("D:/test-albero/{pid}"),
+            &mut steps,
+            &adapter,
+        )
+        .await;
+
+        assert!(
+            steps.is_empty(),
+            "kill-switch OFF: nessuno step rientra dalla ri-lettura"
+        );
+        assert_eq!(
+            eseguiti.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "kill-switch OFF: nessun comando eseguito"
+        );
     }
 }
