@@ -21,7 +21,7 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     4010, // admin-service
     4020, // ex chat-service (crate rimosso, porta resta riservata nel bucket)
     4030, // doc-service
-    4040, // billing-service
+    4040, // ex billing-service (crate rimosso, porta resta riservata nel bucket)
     4050, // plugin-service
     4060, // nexus-gateway
     4070, // neural-core REST (target migrazione da 8001)

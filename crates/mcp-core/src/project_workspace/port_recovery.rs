@@ -130,7 +130,6 @@ fn is_nexus_process(comm: Option<&str>, cmdline: Option<&str>) -> bool {
         "nexus-gateway",
         "admin-service",
         "doc-service",
-        "billing-service",
         "plugin-service",
         "browser-bridge",
     ];

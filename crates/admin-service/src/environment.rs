@@ -268,7 +268,6 @@ pub async fn get_environment_status(
         svc_mcp,
         svc_admin,
         svc_doc,
-        svc_billing,
         svc_plugin,
     ) = tokio::join!(
         check_db(&state.db),
@@ -281,7 +280,6 @@ pub async fn get_environment_status(
         check_internal_service("svc_mcp_core",    "MCP Core (:4000)",        4000, "/api/health"),
         check_internal_service("svc_admin",        "Admin Service (:4010)",   4010, "/health"),
         check_internal_service("svc_doc",          "Doc Service (:4030)",     4030, "/health"),
-        check_internal_service("svc_billing",      "Billing Service (:4040)", 4040, "/health"),
         check_internal_service("svc_plugin",       "Plugin Service (:4050)",  4050, "/health"),
     );
 
@@ -300,7 +298,6 @@ pub async fn get_environment_status(
         svc_mcp,
         svc_admin,
         svc_doc,
-        svc_billing,
         svc_plugin,
     ];
 

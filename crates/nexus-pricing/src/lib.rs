@@ -9,7 +9,8 @@
 //! ## Perche' esiste
 //!
 //! La stessa funzione era scritta tre volte (mcp-core, nexus-gateway,
-//! billing-service) e le tre copie erano DIVERGENTI su assi che cambiano i soldi:
+//! billing-service) e le tre copie erano DIVERGENTI su assi che cambiano i soldi
+//! (billing-service e' poi stato rimosso: era un fork mai attivato):
 //!
 //! | Asse | mcp-core | nexus-gateway | billing-service |
 //! |---|---|---|---|

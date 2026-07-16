@@ -20,8 +20,12 @@
 //! Riuso punti unici (regola L):
 //!   - `nexus_auth`: lettura settings (`get_setting`), risoluzione porta DB
 //!     (`resolve_port`), validazione JWT (`Claims`, `jsonwebtoken`);
-//!   - `billing` (questo modulo): porting fedele della logica quota/ledger del
-//!     `billing-service` (`ai_quota_policies`, `ai_usage_ledger`, `ai_price_catalog`);
+//!   - `nexus_pricing`: listino dei modelli (`resolve_active_price`,
+//!     `platform_currency`, `calculate_cost`) — punto unico, ADR 0026;
+//!   - `billing` (questo modulo): quota + scrittura del ledger
+//!     (`ai_quota_policies`, `ai_usage_ledger`). E' l'UNICO scrittore reale del
+//!     ledger: il crate `billing-service`, di cui questo modulo era un porting,
+//!     e' stato rimosso senza aver mai scritto una riga;
 //!   - moduli del crate (`CooldownManager`, `PolicyEngine`,
 //!     `ModelAliasResolver`, `RedactionPipeline`, `SensitivityClassifier`).
 

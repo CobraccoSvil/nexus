@@ -16,7 +16,6 @@ members = [
   "crates/nexus-cache",
   "crates/nexus-project-pools",
   "crates/admin-service",
-  "crates/billing-service",
   "crates/doc-service",
   "crates/plugin-service"
 , "crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner", "crates/nexus-mcp-client", "crates/nexus-gateway", "crates/nexus-graph", "crates/nexus-graph-derive", "crates/nexus-agent-graph", "crates/nexus-pricing"]

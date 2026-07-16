@@ -29,7 +29,7 @@ if (Test-Path $PIDFILE) {
 # senza questo pass gli orfani lockano i .exe al successivo `cargo build`. web-ide
 # (node.exe) resta ESCLUSO: killare per nome ucciderebbe altri Node non correlati
 # (viene fermato sopra tramite il pidfile).
-$names = 'mcp-core', 'nexus-gateway', 'admin-service', 'billing-service',
+$names = 'mcp-core', 'nexus-gateway', 'admin-service',
 'doc-service', 'plugin-service', 'qdrant', 'GarnetServer'
 foreach ($n in $names) {
   Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {

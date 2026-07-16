@@ -41,8 +41,9 @@ const nextConfig: NextConfig = {
   async rewrites() {
     const backend = process.env.BACKEND_URL || "http://localhost:4000";
     const adminService = process.env.ADMIN_SERVICE_URL || "http://localhost:4010";
-    // chatService (4020), docService (4030), billingService (4040), pluginService (4050)
-    // non ancora attivi — le loro route cadono nel fallback /api/:path* → backend
+    // docService (4030), pluginService (4050) non ancora attivi — le loro route
+    // cadono nel fallback /api/:path* → backend. chat-service (4020) e billing-service
+    // (4040) sono stati RIMOSSI: stub mai attivati, le loro route vivono in mcp-core.
     return [
       // Embeddings validate/apply → mcp-core (porta 4000), non admin-service (4010)
       // Le route sono implementate in crates/mcp-core/src/environment.rs
@@ -85,10 +86,11 @@ const nextConfig: NextConfig = {
       // (porta 4000) e gestite dal fallback "/api/:path*" → backend qui sotto. Il
       // vecchio crate chat-service (stub abbandonato, mai attivato) è stato rimosso.
       //
-      // NOTA: /api/plugins/*, /api/mcp-servers/*, /api/documents/*, /api/billing/* NON vengono
-      // routati ai rispettivi microservizi (4050, 4030, 4040) perché non ancora attivi.
-      // Tutte queste route sono già implementate in mcp-core (porta 4000) e vengono
-      // gestite dal fallback "/api/:path*" → backend qui sotto.
+      // NOTA: /api/plugins/*, /api/mcp-servers/*, /api/documents/* NON vengono routati
+      // ai rispettivi microservizi (4050, 4030) perché non ancora attivi. /api/billing/*
+      // non ha piu' un microservizio: billing-service è stato rimosso (fork mai attivato,
+      // frontend incompatibile con le sue route). Tutte queste route sono implementate in
+      // mcp-core (porta 4000) e vengono gestite dal fallback "/api/:path*" → backend.
       {
         source: "/api/:path*",
         destination: `${backend}/api/:path*`,

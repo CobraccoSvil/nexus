@@ -199,15 +199,14 @@ async fn probe_microservices(services: &[(&'static str, u16)]) -> Vec<(&'static 
     results
 }
 
-/// Controlla i microservizi Rust ausiliari (admin, doc, billing, plugin).
+/// Controlla i microservizi Rust ausiliari (admin, doc, plugin).
 /// Li verifica in parallelo con TCP connect (1s timeout); restituisce un check
 /// aggregato con il dettaglio per ciascun servizio.
 async fn check_microservices() -> EnvironmentCheck {
-    const LABEL: &str = "Microservizi (admin/chat/doc/billing/plugin)";
+    const LABEL: &str = "Microservizi (admin/doc/plugin)";
     let services = [
         ("admin-service", 4010u16),
         ("doc-service", 4030),
-        ("billing-service", 4040),
         ("plugin-service", 4050),
     ];
 

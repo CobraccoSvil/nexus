@@ -4,7 +4,7 @@
 //!
 //! Punto unico (regola L) del concern "instradare una query del dominio
 //! migrato da un processo che NON e' mcp-core" (admin-service,
-//! billing-service, tool di nexus-tool-kit). Dentro mcp-core il punto unico
+//! tool di nexus-tool-kit). Dentro mcp-core il punto unico
 //! resta `project_db_routes` (che in piu' PROVISIONA il DB e ne applica le
 //! migrazioni al primo accesso): quel contratto non e' replicabile qui perche'
 //! il migrator sqlx non e' concurrency-safe cross-processo — due processi che
