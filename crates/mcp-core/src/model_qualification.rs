@@ -112,6 +112,34 @@ fn error_class_from_gateway(err: &anyhow::Error) -> Option<String> {
     None
 }
 
+/// Il fatto piantato nella history del profilo `long_context`. COSTANTE e
+/// deterministico: il checker deve poterlo ricalcolare senza che il needle
+/// viaggi nel predicato o nel system prompt (dove il modello lo leggerebbe invece
+/// di cercarlo). Non e' un segreto: e' un ago, e il pagliaio e' la history.
+pub(crate) const LONG_CTX_NEEDLE: &str = "NX7K2P9QW4";
+
+/// Costruisce la history del `long_context`: ~`chars` di riempimento con UNA riga
+/// che porta il needle, piantata a META'. PURA.
+///
+/// A meta' e non in fondo: molti modelli hanno un forte bias di recency e
+/// ritroverebbero un fatto in coda senza usare davvero la finestra — il test
+/// misurerebbe la posizione, non la capacita'. Il riempimento e' prosa neutra e
+/// ripetitiva, senza altri codici che possano confondere il checker.
+pub(crate) fn build_needle_history(chars: usize) -> String {
+    const RIGA: &str = "Nota operativa di archivio: la pratica e' stata protocollata \
+                        e non richiede ulteriori azioni da parte dell'ufficio.\n";
+    let mut testo = String::with_capacity(chars + 64);
+    let meta = chars / 2;
+    while testo.len() < meta {
+        testo.push_str(RIGA);
+    }
+    testo.push_str(&format!("CODICE-PRATICA: {LONG_CTX_NEEDLE}\n"));
+    while testo.len() < chars {
+        testo.push_str(RIGA);
+    }
+    testo
+}
+
 /// Valuta UN turno di probe contro il `pass_predicate` del profilo. PURA.
 pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64) -> AttemptOutcome {
     let stop_reason = turn
@@ -207,6 +235,22 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
         ));
     } else if content_chars < min_content_chars {
         fail_reason = Some(format!("empty_content:{content_chars}<{min_content_chars}"));
+    } else if predicate
+        .get("requires_needle")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !turn
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains(LONG_CTX_NEEDLE)
+    {
+        // FRONTIER (`long_context`): il modello deve aver RITROVATO il fatto
+        // piantato a meta' di 100k. Verifica DETERMINISTICA sul testo esatto
+        // (regola M), non un giudizio sulla qualita' della risposta: o il codice
+        // c'e', o non c'e'. Una finestra dichiarata grande non prova nulla se il
+        // modello non la usa.
+        fail_reason = Some("needle_not_found".to_string());
     } else if let Some(cap) = max_latency_ms {
         if latency_ms > cap {
             fail_reason = Some(format!("latency:{latency_ms}>{cap}"));
@@ -709,6 +753,43 @@ async fn build_profile_request(
                               dichiara il tuo parere strutturato." }
             ]);
             Ok((tools.to_string(), messages.to_string(), system))
+        }
+        // FRONTIER: reggere il contesto lungo con retrieval VERIFICABILE. Non e'
+        // "quanto e' grande la finestra dichiarata" (quello e' un numero del
+        // fornitore, e infatti il prior lo usa solo per un gradino): e' se il
+        // modello la USA davvero. Un fatto piantato a meta' della history, e il
+        // checker verifica che lo ritrovi ALLA LETTERA — un needle-in-haystack.
+        //
+        // Single-turn: non serve il loop conversazionale (che invece serve a
+        // tool_chain e tool_recovery). Il needle e' DETERMINISTICO e verificabile
+        // programmaticamente, mai un giudizio sulla prosa (regola M).
+        "long_context" => {
+            let history_chars = profile
+                .payload
+                .get("history_chars")
+                .and_then(Value::as_i64)
+                .unwrap_or(100_000)
+                .clamp(1_000, 400_000) as usize;
+            let history = build_needle_history(history_chars);
+            let messages = json!([
+                { "role": "user", "content": history },
+                { "role": "user", "content":
+                    "Nel testo sopra c'e' esattamente una riga che inizia con \
+                     'CODICE-PRATICA:'. Rispondi SOLO con il codice che segue i due \
+                     punti, senza altro testo." }
+            ]);
+            // Il NEEDLE non compare MAI nel system prompt: il modello deve
+            // trovarlo nella history, non leggerlo nelle istruzioni. E' il
+            // needle-in-haystack: metterlo qui renderebbe il test una formalita'
+            // che chiunque supera — misurerebbe la nostra ingenuita', non il
+            // modello.
+            Ok((
+                "[]".to_string(),
+                messages.to_string(),
+                "Sei in una verifica di recupero da contesto lungo. Rispondi in \
+                 modo conciso, senza commenti."
+                    .to_string(),
+            ))
         }
         other => Err(format!("kind profilo non implementato: {other}")),
     }
@@ -1909,5 +1990,48 @@ mod tests {
             (Some("high".into()), Some("facts_prior".into())),
             "nessuna banda certificata: il tier resta il prior, non viene azzerato"
         );
+    }
+    /// FRONTIER: il needle sta a META' della history, mai nel system prompt.
+    #[test]
+    fn la_history_pianta_il_needle_a_meta_del_pagliaio() {
+        let h = build_needle_history(10_000);
+        assert!(h.len() >= 10_000, "la history deve raggiungere la dimensione chiesta");
+        assert_eq!(h.matches(LONG_CTX_NEEDLE).count(), 1, "UN solo ago nel pagliaio");
+        let pos = h.find(LONG_CTX_NEEDLE).expect("needle");
+        let frazione = pos as f64 / h.len() as f64;
+        assert!(
+            (0.3..0.7).contains(&frazione),
+            "il needle deve stare a META' (era a {frazione:.2}): in coda lo              ritroverebbe il bias di recency senza usare la finestra, e il test              misurerebbe la posizione invece della capacita'"
+        );
+    }
+
+    /// Il checker del needle e' DETERMINISTICO: o il codice c'e', o non c'e'.
+    /// Nessun giudizio sulla prosa (regola M).
+    #[test]
+    fn il_needle_si_verifica_sul_testo_esatto() {
+        let pred = json!({"requires_needle": true, "min_content_chars": 1});
+        // Ha ritrovato il fatto: passa (anche con contorno).
+        let turn = json!({ "content": format!("Il codice e' {LONG_CTX_NEEDLE}."),
+                           "stop_reason": "end_turn" });
+        assert!(evaluate_attempt(&turn, &pred, 100).pass);
+        // Risposta plausibile ma SENZA il fatto: fallisce. E' il caso che conta —
+        // un modello che "sembra" aver capito ma non ha letto la history.
+        let turn = json!({ "content": "Non trovo alcun codice nel testo fornito.",
+                           "stop_reason": "end_turn" });
+        let out = evaluate_attempt(&turn, &pred, 100);
+        assert!(!out.pass);
+        assert_eq!(out.reason, "needle_not_found");
+        // Un codice INVENTATO (allucinato) non passa: deve essere QUELLO.
+        let turn = json!({ "content": "CODICE-PRATICA: AB12CD34", "stop_reason": "end_turn" });
+        assert!(!evaluate_attempt(&turn, &pred, 100).pass, "un codice inventato non e' un recupero");
+    }
+
+    /// Il predicato non e' invasivo: senza `requires_needle` gli altri profili
+    /// non cambiano comportamento.
+    #[test]
+    fn senza_requires_needle_gli_altri_profili_non_cambiano() {
+        let pred = json!({"min_content_chars": 1});
+        let turn = json!({ "content": "ok", "stop_reason": "end_turn" });
+        assert!(evaluate_attempt(&turn, &pred, 100).pass);
     }
 }
