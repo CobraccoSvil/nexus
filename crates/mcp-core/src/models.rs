@@ -221,10 +221,6 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             "nexus_provider_registry senza litellm_prefixes: applica la migrazione 0575".to_string(),
         );
     }
-    // Le soglie del prior UNA volta per sync (regola G: dal DB), non per modello.
-    // `None` = prior disabilitato dal flag -> il tier resta a `manual`/`measured`,
-    // e un modello mai misurato ha tier NULL.
-    let tier_prior_thresholds = crate::model_catalog_sync::tier_prior_thresholds(db).await;
 
     // Modelli gia' presenti nel catalog: usati per la protezione no-insert dei
     // provider a listino curato (litellm_sync_inserts=false).
@@ -309,69 +305,41 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             &vision_routable,
         );
 
-        // performance_tier DAI FATTI (mig 0599), non dal NOME. Qui il listino c'e'
-        // (e' l'upsert dei costi reali), quindi il prior puo' esprimersi: il
-        // prezzo e' il segnale che il FORNITORE emette col denaro. Senza prezzo
-        // TACE -> tier NULL, che e' la verita'.
+        // performance_tier: qui NON si deriva. Il tier ha UN SOLO punto di
+        // derivazione (regola L): `refresh_tier_prior`, chiamato sotto dopo
+        // l'upsert.
         //
-        // Prima: `infer_tier_from_name`, che indovinava dal nome. Cosi'
-        // `gpt-5.6-sol` (il piu' capace del parco, agentic_index 54) e' finito in
-        // 'high' — nessuno aveva aggiunto "5.6" alla lista di if — e
-        // `claude-sonnet-5` (46.7, batte ogni heavy) in 'medium' perche' "non
-        // contiene opus".
-        //
-        // Le capability PROVATE non sono note qui (vivono nella riga): le aggiunge
-        // `refresh_tier_prior` al sync successivo. Il prior e' comunque un ripiego
-        // in attesa della misura della batteria.
-        // L'agentic_index NON e' noto qui (vive nella riga, lo popola
-        // sync_agentic_index): questo path e' l'upsert del LISTINO. Il prior
-        // completo — indice sopra il prezzo — lo applica `refresh_tier_prior` al
-        // sync successivo, che legge la riga. Qui il prezzo e' un ripiego di
-        // primo impianto.
-        let inferred_tier: Option<&'static str> = tier_prior_thresholds.as_ref().and_then(|t| {
-            crate::model_qualification::derive_tier_prior(
-                &crate::model_qualification::CatalogFacts {
-                    input_cost: (input_cost > 0.0).then_some(input_cost),
-                    context_window: context_window as i64,
-                    proven_capabilities: Vec::new(),
-                    agentic_index: None,
-                },
-                t,
-            )
-        });
+        // Perche' (difetto misurato il 16/07, introdotto proprio da questo blocco).
+        // Qui erano noti solo prezzo e finestra, NON l'agentic_index (che vive
+        // nella riga e lo popola sync_agentic_index): il tier veniva derivato dal
+        // solo prezzo e scritto, e `refresh_tier_prior` — l'altro punto, quello
+        // che l'indice ce l'ha — girava su un path diverso (la discovery API) e
+        // non lo correggeva. Due punti per la stessa domanda, e vinceva quello
+        // MENO informato: mistral-large-2512 (agentic 5.5) classificato 'heavy'
+        // perche' costa $0.50 con 262k di finestra, e le inversioni salite a 90
+        // (peggio del nome, che ne faceva 64). Era il difetto che stavamo curando,
+        // rifatto mentre lo curavamo.
 
         // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'
         // (le righe 'manual' curate da admin/migrazioni sono protette, ADR 0024).
         // I costi/context si aggiornano sempre.
         //
-        // Il TIER ha una guard SUA (`tier_source`, mig 0599) e non `capability_source`:
-        // un tier `measured` (banda certificata dalla batteria) o `manual` e' PIU'
-        // autorevole di un prior sul prezzo e non va mai sovrascritto. Con la
-        // vecchia guard il sync avrebbe schiacciato una misura reale con una
-        // stima — e viceversa `capability_source='probe'` (che la batteria scrive
-        // alla promozione) CONGELAVA il tier per sempre al valore indovinato dal
-        // nome all'insert. Due difetti opposti, stessa causa: una colonna sola per
-        // due concern.
+        // Il TIER non compare: lo scrive `refresh_tier_prior` (punto unico) dopo
+        // questo upsert, quando la riga ha gia' prezzo, finestra E agentic_index.
+        // All'INSERT resta NULL — un modello nuovo non ha ancora fatti su cui
+        // fondare una fascia, e NULL e' la verita' (la riga nasce comunque
+        // is_enabled=false + unqualified, quindi fuori dal pool agentico).
         let result = sqlx::query(
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
                 currency, context_window, supports_tool_use, supports_vision,
                 is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
                 performance_tier, tier_source
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, $11,
-                        CASE WHEN $11::text IS NULL THEN NULL ELSE 'facts_prior' END)
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, NULL, NULL)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
                 context_window = EXCLUDED.context_window,
-                performance_tier = CASE WHEN ai_price_catalog.tier_source IS NULL
-                                          OR ai_price_catalog.tier_source = 'facts_prior'
-                                        THEN EXCLUDED.performance_tier
-                                        ELSE ai_price_catalog.performance_tier END,
-                tier_source = CASE WHEN ai_price_catalog.tier_source IS NULL
-                                     OR ai_price_catalog.tier_source = 'facts_prior'
-                                   THEN EXCLUDED.tier_source
-                                   ELSE ai_price_catalog.tier_source END,
                 supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                          THEN EXCLUDED.supports_tool_use
                                          ELSE ai_price_catalog.supports_tool_use END,
@@ -400,7 +368,6 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .bind(caps.is_thinking)
         .bind(caps.uses_thinking_mode)
         .bind(caps.agentic_thinking_policy)
-        .bind(inferred_tier)
         .fetch_one(db)
         .await;
 
@@ -412,6 +379,10 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
                 } else {
                     updated += 1;
                 }
+                // PUNTO UNICO del tier (regola L): la riga ora ha prezzo, finestra,
+                // capability provate E agentic_index. Il prior si esprime con TUTTI
+                // i fatti, non solo col prezzo — che era il difetto di questo blocco.
+                crate::model_catalog_sync::refresh_tier_prior(db, provider, model_id).await;
             }
             Err(_) => {
                 skipped += 1;

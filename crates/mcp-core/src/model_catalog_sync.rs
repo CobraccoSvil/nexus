@@ -1643,7 +1643,7 @@ async fn realign_existing_model(db: &PgPool, provider: &str, api_model: &str) ->
 /// autorevole di un prior sul prezzo e non va mai sovrascritto — era il difetto
 /// del vecchio guard `capability_source='auto'`, che congelava il tier appena un
 /// modello si qualificava.
-async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32 {
+pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32 {
     let Some(thresholds) = tier_prior_thresholds(db).await else {
         return 0; // prior disabilitato dal flag DB
     };
@@ -1672,6 +1672,15 @@ async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32
         .bind(max_age_h as i32)
         .fetch_optional(db)
         .await
+        // Regola H: l'errore SQL si LOGGA, non si inghiotte con `.ok()`. Una
+        // query invalida piu' un `.ok()` resta rotta per mesi senza che nulla
+        // arrossisca — il compilatore non guarda dentro le stringhe SQL.
+        .map_err(|e| {
+            tracing::warn!(
+                provider = %provider, model = %api_model, error = %e,
+                "refresh_tier_prior: lettura dei fatti fallita, tier non derivato"
+            );
+        })
         .ok()
         .flatten();
     let Some((cost, ctx, quals, source, agentic_index)) = row else {
@@ -1710,16 +1719,27 @@ async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32
     .bind(derived)
     .execute(db)
     .await;
-    if let Ok(r) = res {
-        if r.rows_affected() > 0 {
+    match res {
+        Ok(r) if r.rows_affected() > 0 => {
             tracing::info!(
                 provider = %provider, model = %api_model, tier = ?derived,
                 "catalog_sync: tier derivato dai FATTI (facts_prior), non dal nome"
             );
-            return 1;
+            1
+        }
+        Ok(_) => 0,
+        // Regola H: un errore SQL si LOGGA. Con `if let Ok(r)` questo UPDATE e'
+        // rimasto muto mentre falliva (colonna assente nello schema): il tier non
+        // veniva scritto e nulla lo diceva. E' lo stesso pattern che ha tenuto
+        // rotte per mesi le query del pannello DB.
+        Err(e) => {
+            tracing::warn!(
+                provider = %provider, model = %api_model, error = %e,
+                "refresh_tier_prior: UPDATE del tier fallito"
+            );
+            0
         }
     }
-    0
 }
 
 /// Normalizza un id modello per il confronto fra cataloghi diversi (il nostro e
@@ -2842,5 +2862,108 @@ mod tests {
             {"id": "b/modello-20260101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}}
         ]});
         assert_eq!(parse_agentic_index_payload(&payload).len(), 1);
+    }
+    /// REGRESSIONE (difetto misurato sul campo il 16/07, introdotto da me mentre
+    /// curavo lo stesso difetto): il tier deve venire dall'agentic_index, non dal
+    /// prezzo.
+    ///
+    /// `run_catalog_sync` derivava il tier inline coi soli prezzo+finestra (l'indice
+    /// li' non e' noto: vive nella riga) e lo scriveva; `refresh_tier_prior` — che
+    /// l'indice ce l'ha — girava su un ALTRO path e non lo correggeva. Due punti
+    /// per la stessa domanda, e vinceva quello MENO informato. Effetto misurato:
+    /// mistral-large-2512 (agentic 5.5, cioe' quintultimo del parco) classificato
+    /// 'heavy' perche' costa $0.50 con 262k di finestra, e le inversioni salite a
+    /// 90 — peggio del nome, che ne faceva 64.
+    #[sqlx::test]
+    async fn il_tier_viene_dall_indice_non_dal_prezzo(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_prior.frontier_min_input_cost', '8.0'),              ('catalog.tier_prior.heavy_min_input_cost', '2.0'),              ('catalog.tier_prior.high_min_input_cost', '0.5'),              ('catalog.tier_prior.long_context_tokens', '200000'),              ('catalog.tier_prior.agentic_index_frontier_min', '45'),              ('catalog.tier_prior.agentic_index_heavy_min', '35'),              ('catalog.tier_prior.agentic_index_high_min', '25'),              ('catalog.tier_prior.agentic_index_medium_min', '10'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+        )
+        .execute(&pool)
+        .await
+        .expect("soglie");
+        // IL CASO REALE: mistral-large-2512 — costa poco ma ha una finestra enorme
+        // (il prezzo+finestra dicono 'heavy') e un agentic_index bassissimo.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('mistral', 'mistral-large-2512', 0.5, 262144, 5.5, NOW(), NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        // DIAGNOSI: le soglie si caricano davvero?
+        let t = tier_prior_thresholds(&pool).await;
+        assert!(t.is_some(), "tier_prior_thresholds ha ritornato None: il prior non parte");
+        refresh_tier_prior(&pool, "mistral", "mistral-large-2512").await;
+
+        let (tier, src): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='mistral-large-2512'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(
+            (tier.as_deref(), src.as_deref()),
+            (Some("light"), Some("facts_prior")),
+            "agentic 5.5 -> light. Col solo prezzo ($0.50 + 262k di finestra)              sarebbe 'heavy': e' il difetto misurato sul campo"
+        );
+    }
+
+    /// Senza indice si ricade sul prezzo: e' il ripiego per il 61% del parco che
+    /// l'indice non copre. E un indice STANTIO non vale come fresco: la fonte e'
+    /// undocumented e puo' sparire.
+    #[sqlx::test]
+    async fn l_indice_stantio_non_vale_e_si_ricade_sul_prezzo(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_prior.frontier_min_input_cost', '8.0'),              ('catalog.tier_prior.heavy_min_input_cost', '2.0'),              ('catalog.tier_prior.high_min_input_cost', '0.5'),              ('catalog.tier_prior.long_context_tokens', '200000'),              ('catalog.tier_prior.agentic_index_frontier_min', '45'),              ('catalog.tier_prior.agentic_index_heavy_min', '35'),              ('catalog.tier_prior.agentic_index_high_min', '25'),              ('catalog.tier_prior.agentic_index_medium_min', '10'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+        )
+        .execute(&pool)
+        .await
+        .expect("soglie");
+        // Stesso modello, ma l'indice e' di un mese fa: STANTIO -> ignorato.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('mistral', 'vecchio', 0.5, 262144, 5.5, NOW() - interval '30 days', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        refresh_tier_prior(&pool, "mistral", "vecchio").await;
+
+        let tier: Option<String> = sqlx::query_scalar(
+            "SELECT performance_tier FROM ai_price_catalog WHERE model='vecchio'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(
+            tier.as_deref(),
+            Some("heavy"),
+            "indice STANTIO ignorato -> ripiego sul prezzo ($0.50 + 262k = heavy).              Un dato morto non deve passare per fresco"
+        );
     }
 }

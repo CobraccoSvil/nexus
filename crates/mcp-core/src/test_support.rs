@@ -23,6 +23,13 @@ use sqlx::PgPool;
 /// `crate::orchestrator::select_models_tierchain` (in particolare i media kind
 /// della mig 0478, sempre referenziati nella WHERE per i purpose testuali). Una
 /// colonna nuova nel catalog va aggiunta qui e basta: i call site delegano.
+///
+/// ATTENZIONE: e' uno SPECCHIO dello schema reale, tenuto allineato a mano. Se
+/// diverge, i test girano su uno schema che non esiste piu' e il verde non dice
+/// nulla. `performance_tier` e' NULLABLE e SENZA default dalla mig 0599 (il
+/// `DEFAULT 'medium'` era il fallback magico che rendeva "non lo so" e "e' medium"
+/// indistinguibili): questo specchio l'aveva ancora, e un test che seminava un
+/// tier NULL falliva per un vincolo che in produzione non esiste piu'.
 pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
     sqlx::query(
         "CREATE TABLE ai_price_catalog ( \
@@ -37,7 +44,7 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
              supports_video_gen BOOLEAN NOT NULL DEFAULT false, \
              agentic_thinking_policy TEXT NOT NULL DEFAULT 'none', \
              uses_thinking_mode BOOLEAN NOT NULL DEFAULT false, \
-             performance_tier TEXT NOT NULL DEFAULT 'medium', \
+             performance_tier TEXT, \
              capabilities JSONB NOT NULL DEFAULT '[]', \
              context_window INTEGER NOT NULL DEFAULT 8192, \
              input_cost_per_million_tokens DOUBLE PRECISION NOT NULL DEFAULT 0, \
@@ -47,6 +54,7 @@ pub(crate) async fn create_ai_price_catalog_table(pool: &PgPool) {
              consecutive_failures INT NOT NULL DEFAULT 0, \
              consecutive_tool_failures INT NOT NULL DEFAULT 0, \
              auto_disabled_reason TEXT, \
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
              qualification_state TEXT NOT NULL DEFAULT 'unqualified', \
              qualified_capabilities JSONB NOT NULL DEFAULT '[]', \
              qualification_expires_at TIMESTAMPTZ, \
