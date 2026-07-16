@@ -2709,25 +2709,64 @@ pub(crate) async fn spawn_agent_run(
     if let Some(outcome) = &multi_provider_block {
         emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }
-    let initial_msg = match (&council_block, &multi_provider_block) {
-        (Some(council_text), Some(outcome)) => {
-            let mp_block = outcome.render_block();
-            if mp_block.is_empty() {
-                format!("{council_text}\n\n{initial_msg}")
-            } else {
-                format!("{council_text}\n\n{mp_block}\n\n{initial_msg}")
-            }
+    // TESI CONTRAPPOSTE: dopo il consiglio (ne consuma il segnale strutturato
+    // `contested_decision`) e prima dell'assemblaggio del prompt.
+    //
+    // Il piano pre-run NON puo' dimensionare il dibattito: `decision_detected`
+    // nasce DAL consiglio (una decisione architettturale contesa la riconosce
+    // chi ha appena analizzato la richiesta), quindi prima della sua sintesi il
+    // segnale non esiste e il resolver riceve `false` — cioe' zero avvocati.
+    // Il numero di avvocati va quindi RI-risolto ora, con lo stesso punto unico
+    // (regola L) e il segnale finalmente noto: senza questo secondo giro il
+    // dibattito sarebbe codice morto per costruzione (pattern mig 0571,
+    // direttiva senza innesco = 0 esecuzioni).
+    let debate_outcome = match debate_advocate_target(
+        &state,
+        &run_pool,
+        run_id,
+        council_outcome.as_ref(),
+        sizing_complexity,
+        sizing_scope_system_wide,
+    )
+    .await
+    {
+        Some(advocates) => {
+            maybe_convene_debate(
+                &state,
+                &run_pool,
+                &tx_for_brain,
+                params.session_id,
+                run_id,
+                &params.content,
+                council_outcome.as_ref(),
+                advocates,
+            )
+            .await
         }
-        (Some(council_text), None) => format!("{council_text}\n\n{initial_msg}"),
-        (None, Some(outcome)) => {
-            let mp_block = outcome.render_block();
-            if mp_block.is_empty() {
-                initial_msg
-            } else {
-                format!("{mp_block}\n\n{initial_msg}")
-            }
+        None => None,
+    };
+    let debate_block = debate_outcome
+        .as_ref()
+        .map(crate::agent_tools::subagent_native::render_debate_synthesis);
+    // Composizione LINEARE dei blocchi dei panel a monte: ogni blocco presente e
+    // non vuoto precede il messaggio utente, nell'ordine consiglio -> dibattito
+    // -> multi-provider (dal generale al particolare). Un match sulle
+    // combinazioni sarebbe cresciuto esponenzialmente a ogni panel nuovo.
+    let initial_msg = {
+        let blocks: Vec<String> = [
+            council_block.clone(),
+            debate_block,
+            multi_provider_block.as_ref().map(|o| o.render_block()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|b| !b.trim().is_empty())
+        .collect();
+        if blocks.is_empty() {
+            initial_msg
+        } else {
+            format!("{}\n\n{initial_msg}", blocks.join("\n\n"))
         }
-        (None, None) => initial_msg,
     };
     // Enforcement strutturato a valle (regola M): seedano `pre_run_advisory_synthesis`
     // ENTRAMBI i panel — consiglio e multi-provider — col verdetto PIU' RESTRITTIVO
@@ -5495,6 +5534,230 @@ async fn emit_orchestration_plan_meta_step(
     });
 }
 
+/// Estrae `(topic, options)` dalla decisione contesa dichiarata dal CONSIGLIO.
+/// Il segnale arriva dalla sua sintesi: e' il consiglio che sa riconoscere una
+/// decisione architetturale aperta (il classificatore ha un contratto 1:1
+/// congelato e gira su ogni turno, anche di chat pura). `None` = nessuna
+/// decisione contesa dichiarata, o dichiarazione senza opzioni utilizzabili.
+fn contested_decision_from(
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+) -> Option<(String, Vec<String>)> {
+    let synthesis = council_outcome?.advisory_synthesis_value()?;
+    let contested = synthesis.get("contested_decision")?;
+    let topic = contested.get("topic")?.as_str()?.trim().to_string();
+    let options: Vec<String> = contested
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|o| o.as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!topic.is_empty()).then_some((topic, options))
+}
+
+/// Quanti avvocati convocare, RI-risolvendo il piano ora che il segnale
+/// `contested_decision` del consiglio esiste (pre-run vale sempre 0: la
+/// decisione contesa la dichiara il consiglio, non il classificatore).
+///
+/// PUNTO UNICO (regola L): stesso `resolve_orchestration_plan_for` del pre-run,
+/// con `decision_detected=true` e i budget aggiornati — il consiglio ha gia'
+/// speso tempo, e il resolver deve vederlo (un dibattito non si finanzia col
+/// budget che il consiglio ha appena consumato).
+///
+/// `None` = nessun dibattito: niente decisione contesa dichiarata, sizing
+/// spento, o budget che non regge il floor di 2 avvocati (il resolver lo ha
+/// gia' azzerato). Emette il meta-step `orchestration_plan` del secondo giro
+/// cosi' la scelta e' osservabile (regola M).
+async fn debate_advocate_target(
+    state: &AppState,
+    run_pool: &PgPool,
+    run_id: Uuid,
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+    complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    scope_system_wide: bool,
+) -> Option<usize> {
+    // Gate a costo zero: senza decisione contesa non si ri-risolve nulla.
+    let synthesis = council_outcome?.advisory_synthesis_value()?;
+    synthesis.get("contested_decision").filter(|v| !v.is_null())?;
+    let time_remaining =
+        crate::agent_tools::subagent_native::run_time_remaining_s(&state.db, run_pool, run_id)
+            .await;
+    // Costo gia' speso dai panel a monte: il run principale non e' partito, ma
+    // consiglio e multi-provider hanno consumato. Punto unico `cumulative_cost`
+    // (regola L, lo stesso del cost-cap del prepare): i sub-run hanno run_id
+    // propri nel ledger, quindi un'aggregazione per-run del padre li perderebbe.
+    let spent = crate::agent_tools::subagent_native::cumulative_cost(run_pool, run_id).await;
+    let plan = resolve_orchestration_plan_for(
+        state,
+        complexity,
+        scope_system_wide,
+        true, // decision_detected: il consiglio l'ha dichiarata
+        spent,
+        time_remaining,
+    )
+    .await?;
+    if plan.debate_advocates < 2 {
+        tracing::info!(
+            run_id = %run_id,
+            sized_by = plan.sized_by.as_str(),
+            advocates = plan.debate_advocates,
+            "dibattito: decisione contesa dichiarata ma il piano non finanzia il contraddittorio"
+        );
+        return None;
+    }
+    Some(plan.debate_advocates)
+}
+
+/// Convoca il DIBATTITO a tesi contrapposte quando il consiglio ha dichiarato
+/// una decisione architetturale CONTESA (`contested_decision`, segnale
+/// strutturato — regola M: mai dedotto dalla prosa dei pareri).
+///
+/// Innescato dal COORDINATORE e mai da dentro un sub-run del consiglio: un
+/// sub-run che convoca sub-run consuma il budget di profondita'
+/// (`orchestrator.subagent_max_depth`, guard in prepare) e richiederebbe
+/// `dispatch_subagents` nella whitelist delle figure — superficie inutile.
+///
+/// `None` (nessun dibattito) se: nessuna decisione contesa dichiarata, dibattito
+/// spento (`orchestrator.debate_enabled`), piano senza avvocati (budget stretto:
+/// il resolver ha gia' deciso), o nessun avvocato produce una posizione valida.
+async fn maybe_convene_debate(
+    state: &AppState,
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    session_id: Uuid,
+    run_id: Uuid,
+    user_text: &str,
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+    advocate_target: usize,
+) -> Option<crate::agent_tools::subagent_native::DebatePanelOutcome> {
+    if advocate_target < 2 {
+        return None;
+    }
+    let (topic, options) = contested_decision_from(council_outcome)?;
+    let cfg = crate::agent_tools::subagent_native::read_debate_config(&state.db).await?;
+    let deps = build_tool_runner_deps(state);
+    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
+    let ctx = match svc.build_ctx_for_primary_run(session_id, run_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(run_id = %run_id, "dibattito: build_ctx fallita: {e}");
+            return None;
+        }
+    };
+    let (quorum, quorum_pct) = debate_quorum_policy(&ctx).await;
+    tracing::info!(
+        run_id = %run_id,
+        topic = %topic,
+        options = options.len(),
+        advocates = advocate_target,
+        "dibattito: convocazione degli avvocati su decisione contesa"
+    );
+    let outcome = crate::agent_tools::subagent_native::convene_debate_panel(
+        &ctx,
+        &cfg,
+        &topic,
+        &options,
+        advocate_target,
+        user_text,
+        &quorum,
+        quorum_pct,
+    )
+    .await?;
+    emit_debate_meta_step(run_pool, tx, run_id, &outcome).await;
+    Some(outcome)
+}
+
+/// Policy di quorum del dibattito, nel vocabolario GENERICO di `panel_quorum`.
+///
+/// Il dibattito CONDIVIDE le chiavi del quorum dei panel a monte
+/// (`orchestrator.council_advisory_*`): e' la stessa domanda — "quanti voti
+/// servono perche' il panel abbia deliberato" — quindi nessuna chiave nuova da
+/// tenere allineata a mano (regola L). Ritorna anche `quorum_pct`, che nel tipo
+/// generico non esiste (li' la soglia relativa e' un parametro di
+/// `required_valid`, non un campo della policy).
+async fn debate_quorum_policy(
+    ctx: &crate::agent_tools::AgentToolContext,
+) -> (nexus_agent_graph::decisions::panel_quorum::QuorumPolicy, u8) {
+    let advisory = crate::agent_tools::subagent_native::read_advisory_policy(ctx).await;
+    (
+        nexus_agent_graph::decisions::panel_quorum::QuorumPolicy {
+            min_valid: advisory.min_valid_advisories,
+            veto_on_high_severity: advisory.block_on_high_severity,
+        },
+        advisory.quorum_pct,
+    )
+}
+
+/// Payload del meta-step `debate_panel`: la sintesi strutturata + chi difendeva
+/// cosa (regola M: l'assegnazione e' il fatto che rende leggibile il tally).
+fn debate_meta_payload(
+    outcome: &crate::agent_tools::subagent_native::DebatePanelOutcome,
+) -> serde_json::Value {
+    let mut payload = outcome.synthesis.to_value();
+    payload["product_name"] = json!("Tesi contrapposte");
+    payload["topic"] = json!(outcome.topic);
+    payload["assignments"] = json!(outcome
+        .assignments
+        .iter()
+        .map(|a| json!({
+            "advocate_index": a.advocate_index,
+            "assigned_position": a.assigned_position,
+        }))
+        .collect::<Vec<_>>());
+    payload
+}
+
+/// Meta-step strutturato `debate_panel` (regola M): esito, tally per opzione e
+/// base dei voti, osservabili in UI senza rileggere la prosa.
+async fn emit_debate_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    outcome: &crate::agent_tools::subagent_native::DebatePanelOutcome,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let title = format!(
+        "Tesi contrapposte: {} ({})",
+        outcome.topic,
+        outcome.synthesis.verdict.as_str()
+    );
+    let payload = debate_meta_payload(outcome);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("debate_panel")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "dibattito: meta_step persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "debate_panel".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
 async fn maybe_convene_council(
     state: &AppState,
     run_pool: &PgPool,
@@ -5678,7 +5941,7 @@ async fn maybe_convene_council(
         "consiglio a monte: sintesi composta, iniezione nel primo messaggio"
     );
     Some(CouncilConveneOutcome::Active {
-        synthesis,
+        synthesis: Box::new(synthesis),
         figures,
         figure_reports: convoke.figure_reports,
     })
@@ -6491,6 +6754,7 @@ mod tests_select_engine {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,

@@ -15,7 +15,12 @@
 //! Flag:
 //!   --baseline <PATH>   file baseline (default scripts/quality-baseline.json)
 //!   --root <PATH>       radice da scansionare, ripetibile (default crates)
-//!   --include-tests     includi i file di test nei conteggi
+//!   --include-tests     includi i test nei conteggi: sia i file dedicati
+//!                       (`tests/`, `*_tests.rs`) sia i moduli `#[cfg(test)]`
+//!                       inline. Di default sono esclusi: il gate misura il
+//!                       debito del codice di PRODUZIONE, e contare i test
+//!                       penalizzerebbe chi ne aggiunge (regola H: ogni fix
+//!                       vuole il suo test di regressione).
 
 use std::path::PathBuf;
 

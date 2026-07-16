@@ -186,9 +186,9 @@ fn extract_vote(outcome: &Value) -> Option<Vote> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let has_high_severity = findings
-        .iter()
-        .any(|f| f.get("severity").and_then(Value::as_str) == Some("alta"));
+    // Punto unico del vocabolario gravita' (regola L): il test dell'evidenza
+    // grave e' lo stesso del consiglio e del debate — vive in `severity`.
+    let has_high_severity = super::severity::any_high(&findings);
     Some(Vote {
         verdict,
         has_high_severity,

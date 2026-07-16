@@ -105,7 +105,8 @@ use crate::decisions::predictive_cap::{
 use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
     estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
-    normalize_declared_outcome, normalize_review_verdict, ContextMessage,
+    normalize_debate_position, normalize_declared_outcome, normalize_review_verdict,
+    ContextMessage,
 };
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
@@ -136,6 +137,13 @@ const REVIEW_VERDICT_TOOL_NAME: &str = "review_verdict";
 /// registrato nello stato e propagato oltre il confine sub-run via
 /// `structured_verdict` (campo `advisory`, regola M).
 const ADVISORY_VERDICT_TOOL_NAME: &str = "advisory_verdict";
+
+/// Tool brain-only `debate_position` (tesi contrapposte): un AVVOCATO dichiara
+/// la posizione strutturata sulla tesi che gli e' stata assegnata (gemello di
+/// `advisory_verdict` per il canale del dibattito). Non eseguito via
+/// ToolExecutor; registrato nello stato e propagato oltre il confine sub-run via
+/// `structured_verdict` (campo `debate`, regola M).
+const DEBATE_POSITION_TOOL_NAME: &str = "debate_position";
 
 /// Tool di dispatch sub-agente (singolo/batch). Il loro tool_result puo' portare
 /// il SEGNALE STRUTTURATO `background_dispatched: true` (Fase D fan-in): il padre
@@ -168,6 +176,7 @@ const M16_BRAIN_TOOLS: &[&str] = &[
     RUN_NOTES_TOOL_NAME,
     REVIEW_VERDICT_TOOL_NAME,
     ADVISORY_VERDICT_TOOL_NAME,
+    DEBATE_POSITION_TOOL_NAME,
 ];
 
 /// Config DB-driven del nodo tool_dispatch, PASSATA (regola G: nessuna lettura
@@ -520,6 +529,32 @@ impl ToolDispatchNode {
             };
         }
 
+        // ── debate_position (brain-only, avvocato del dibattito) ──────────────
+        if name == DEBATE_POSITION_TOOL_NAME {
+            let decl = normalize_debate_position(&input);
+            let stance = decl
+                .as_ref()
+                .and_then(|d| d.get("stance").cloned())
+                .unwrap_or(Value::Null);
+            let acknowledged = decl.is_some();
+            if let Some(d) = decl {
+                collector
+                    .debate_positions
+                    .lock()
+                    .expect("lock debate positions")
+                    .push(d);
+            }
+            return ToolResultBlock {
+                tool_use_id,
+                content: Value::String(py_dumps(
+                    &json!({"acknowledged": acknowledged, "stance": stance}),
+                )),
+                is_error: !acknowledged,
+                exit_code: None,
+                raw_content: None,
+            };
+        }
+
         // ── tool generico via ToolExecutor ────────────────────────────────────
         let call = ToolCall {
             id: tool_use_id.clone(),
@@ -586,6 +621,8 @@ struct RunCollector {
     review_verdicts: std::sync::Mutex<Vec<Value>>,
     /// Pareri dichiarati via advisory_verdict (l'ultimo prevale, consiglio a monte).
     advisory_verdicts: std::sync::Mutex<Vec<Value>>,
+    /// Posizioni dichiarate via debate_position (l'ultima prevale, dibattito).
+    debate_positions: std::sync::Mutex<Vec<Value>>,
     /// tool_use_id dei task_complete del turno (guard blocked-da-cap).
     task_complete_ids: std::sync::Mutex<Vec<String>>,
     /// Taccuino del run (holder mutabile, P4). Inizializzato al valore di stato.
@@ -835,6 +872,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             .advisory_verdicts
             .into_inner()
             .expect("advisory verdicts");
+        let debate_positions = collector
+            .debate_positions
+            .into_inner()
+            .expect("debate positions");
         let task_complete_ids = collector.task_complete_ids.into_inner().expect("tc ids");
         let infra_error = collector.infra_error.into_inner().expect("infra");
         let awaiting_subagents = collector.awaiting_subagents.into_inner().expect("awaiting");
@@ -1107,6 +1148,15 @@ dell'utente.";
             delta.advisory_verdict = Some(Some(last.clone()));
         } else if state.advisory_verdict.is_some() {
             delta.advisory_verdict = Some(None);
+        }
+
+        // Dibattito: posizione di un AVVOCATO — stessa semantica dei gemelli
+        // (l'ultima prevale; una posizione seguita da altri tool era intermedia
+        // e viene azzerata).
+        if let Some(last) = debate_positions.last() {
+            delta.debate_position = Some(Some(last.clone()));
+        } else if state.debate_position.is_some() {
+            delta.debate_position = Some(None);
         }
 
         // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).

@@ -201,6 +201,14 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub advisory_verdict: Option<Option<Value>>,
+    /// Vedi `AgentState::debate_position`. Reducer overwrite last-wins come i due
+    /// gemelli: l'ultima dichiarazione valida del turno vince.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub debate_position: Option<Option<Value>>,
     /// Vedi `AgentState::tool_infra_error`.
     #[serde(
         default,

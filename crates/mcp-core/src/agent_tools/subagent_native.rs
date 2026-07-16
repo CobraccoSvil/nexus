@@ -240,10 +240,15 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
 /// `declared_outcome`, cosi' il gate G1 (`route_after_executor`) onora la
 /// chiusura su `end_turn` invece di re-instradare all'executor. `task_complete`
 /// e' il canale UNIVERSALE (builtin del run principale); le figure del consiglio
-/// usano `advisory_verdict`, il revisore `review_verdict` come loro equivalente
-/// di ruolo (parere strutturato = dichiarazione d'esito).
-const COMPLETION_CHANNEL_TOOLS: [&str; 3] =
-    ["task_complete", "advisory_verdict", "review_verdict"];
+/// usano `advisory_verdict`, il revisore `review_verdict` e l'avvocato del
+/// dibattito `debate_position` come loro equivalente di ruolo (dichiarazione
+/// strutturata = dichiarazione d'esito).
+const COMPLETION_CHANNEL_TOOLS: [&str; 4] = [
+    "task_complete",
+    "advisory_verdict",
+    "review_verdict",
+    "debate_position",
+];
 
 pub(crate) fn build_tools_json(whitelist: &[String]) -> Value {
     if whitelist.is_empty() {
@@ -382,7 +387,14 @@ fn apply_ledger_to_outcome(
 }
 
 /// Costo cumulativo gia' speso dai sub-run su questo `parent_anchor` (hard cap).
-async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
+///
+/// PUNTO UNICO (regola L) dello speso di una catena di sub-run: lo usano il
+/// Guard 4 del prepare e il dimensionamento del dibattito (che deve vedere cosa
+/// il consiglio ha gia' consumato prima di finanziare gli avvocati). NB: i
+/// sub-run hanno `run_id` PROPRI nel ledger, quindi un'aggregazione per-run del
+/// padre NON li vedrebbe: la fonte e' `nexus_subagent_runs.cost_usd`, popolata
+/// alla finalizzazione di ogni figlio.
+pub(crate) async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
     // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
     sqlx::query_scalar::<_, f64>(
         "SELECT COALESCE(SUM(cost_usd), 0)::double precision \
@@ -1330,10 +1342,14 @@ pub(crate) struct FigureAdvisoryReport {
 /// Esito del pre-step Consiglio delle Competenze: sintesi attiva o degrado esplicito.
 /// `None` dal call site significa che i gate pre-convocazione non sono passati
 /// (feature off, keyword miss, nessuna figura): nessun segnale UI.
+///
+/// `synthesis` e' BOXATA: la sintesi e' molto piu' grande del ramo degradato
+/// (che porta solo un enum di causa), e senza indirezione ogni valore dell'enum
+/// — anche i degradi — pagherebbe la dimensione del caso peggiore.
 #[derive(Debug, Clone)]
 pub(crate) enum CouncilConveneOutcome {
     Active {
-        synthesis: AdvisorySynthesis,
+        synthesis: Box<AdvisorySynthesis>,
         figures: Vec<String>,
         figure_reports: Vec<FigureAdvisoryReport>,
     },
@@ -1406,10 +1422,13 @@ pub(crate) struct PanelProviderEntry {
 }
 
 /// Esito del panel multi-provider: sintesi attiva oppure degrado esplicito.
+/// `synthesis` BOXATA per lo stesso motivo di [`CouncilConveneOutcome`]: il ramo
+/// degradato porta solo due contatori e non deve pagare la dimensione della
+/// sintesi.
 #[derive(Debug, Clone)]
 pub(crate) enum MultiProviderPanelOutcome {
     Active {
-        synthesis: AdvisorySynthesis,
+        synthesis: Box<AdvisorySynthesis>,
         provider_count: usize,
         panel_providers: Vec<PanelProviderEntry>,
         /// Parere INDIVIDUALE di ogni provider (prima della sintesi): provenienza
@@ -2267,7 +2286,7 @@ pub(crate) async fn convene_multi_provider_panel(
         .collect();
     compose_multi_provider_synthesis(&results, policy, provider_count).map(|synthesis| {
         MultiProviderPanelOutcome::Active {
-            synthesis,
+            synthesis: Box::new(synthesis),
             provider_count,
             panel_providers,
             provider_reports,
@@ -2302,6 +2321,245 @@ fn compose_multi_provider_synthesis(
     convened: usize,
 ) -> Option<AdvisorySynthesis> {
     compose_council_synthesis(results, policy, convened)
+}
+
+/// Config del DIBATTITO a tesi contrapposte (mig 0605, regola G). `None` se il
+/// dibattito e' spento o il kind non e' configurato: il coordinatore non convoca
+/// (fail-closed, come il multi-provider).
+pub(crate) struct DebateConfig {
+    pub kind: String,
+    pub max_advocates: usize,
+}
+
+pub(crate) async fn read_debate_config(db: &sqlx::PgPool) -> Option<DebateConfig> {
+    let enabled = nexus_auth::get_bool_setting(db, "orchestrator.debate_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let kind = nexus_auth::get_setting(db, "orchestrator.debate_advocate_kind")
+        .await?
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    let max_advocates = nexus_auth::get_setting(db, "orchestrator.debate_max_advocates")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4);
+    Some(DebateConfig {
+        kind,
+        max_advocates,
+    })
+}
+
+/// Esito della convocazione del dibattito (segnali strutturati per il meta-step).
+pub(crate) struct DebatePanelOutcome {
+    pub topic: String,
+    pub assignments: Vec<nexus_agent_graph::decisions::debate_panel::DebateAssignment>,
+    pub synthesis: nexus_agent_graph::decisions::debate_panel::DebateSynthesis,
+}
+
+/// Task di UN avvocato: la posizione assegnata e' dichiarata nella PRIMA riga in
+/// forma canonica (`POSIZIONE ASSEGNATA: <testo>`), perche' e' la stringa che
+/// l'avvocato deve ripetere alla lettera in `assigned_position` — la chiave con
+/// cui `compose_debate_synthesis` attribuisce il voto. Funzione PURA: testabile
+/// senza DB (regola L: unica sede della forma del task avvocato).
+pub(crate) fn build_advocate_task(
+    topic: &str,
+    assignment: &nexus_agent_graph::decisions::debate_panel::DebateAssignment,
+    user_task: &str,
+) -> String {
+    let opposing = assignment
+        .opposing_positions
+        .iter()
+        .map(|o| format!("- {o}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "POSIZIONE ASSEGNATA: {assigned}\n\n\
+         Sei un avvocato in un dibattito a tesi contrapposte su una decisione \
+         architetturale del progetto.\n\n\
+         DECISIONE IN DISCUSSIONE: {topic}\n\n\
+         POSIZIONI AVVERSE (difese da altri avvocati, in parallelo a te):\n{opposing}\n\n\
+         RICHIESTA ORIGINALE DELL'UTENTE (contesto):\n{user_task}\n\n\
+         Il tuo compito: studia il codice del progetto e costruisci il caso PIU' \
+         FORTE possibile per la tua posizione assegnata, con evidenza concreta \
+         (file:riga). Attacca i punti deboli delle posizioni avverse con prove, \
+         non con retorica. Se studiando scopri che la tua posizione NON regge, \
+         dichiaralo onestamente con stance=oppose e i rischi che l'hanno demolita: \
+         e' il contributo piu' prezioso che puoi dare, non una sconfitta.\n\n\
+         Chiudi OBBLIGATORIAMENTE con il tool debate_position, ripetendo in \
+         assigned_position ESATTAMENTE la posizione assegnata qui sopra.",
+        assigned = assignment.assigned_position,
+    )
+}
+
+/// Fan-out degli avvocati: un task tokio per assegnazione, col proprio timer,
+/// sotto il governor di processo. Stesso punto unico del consiglio (regola L,
+/// difetto D3 dell'incidente fan-out congelato). L'ordine dei risultati segue
+/// quello delle assegnazioni: e' l'ancora dell'attribuzione posizionale.
+async fn spawn_advocates(
+    ctx: &AgentToolContext,
+    cfg: &DebateConfig,
+    topic: &str,
+    assignments: &[nexus_agent_graph::decisions::debate_panel::DebateAssignment],
+    user_task: &str,
+) -> Vec<Value> {
+    let expected = "Chiudi chiamando debate_position (assigned_position ripetuta alla \
+                    lettera, stance support|oppose, key_arguments con evidenza, risks \
+                    con severity). Un oppose richiede almeno un rischio con evidenza.";
+    let assignments_for_make = assignments.to_vec();
+    let topic_owned = topic.to_string();
+    let kind = cfg.kind.clone();
+    spawn_fanout(
+        &ctx.core.db,
+        assignments_for_make.len(),
+        FanoutScope::TopLevel,
+        |i| {
+            let ctx = ctx.clone();
+            let expected = expected.to_string();
+            let kind = kind.clone();
+            let task = build_advocate_task(&topic_owned, &assignments_for_make[i], user_task);
+            async move { run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await }
+        },
+    )
+    .await
+}
+
+/// Convoca gli AVVOCATI del dibattito in PARALLELO (sub-run read-only) e compone
+/// l'esito col punto unico PURO `compose_debate_synthesis` (regola L/M: legge i
+/// segnali strutturati `outcome.debate`, mai la prosa).
+///
+/// `None` se il piano e' vuoto (meno di 2 opzioni o meno di 2 avvocati: senza
+/// contraddittorio non e' un dibattito) o se nessun avvocato produce una
+/// posizione valida.
+pub(crate) async fn convene_debate_panel(
+    ctx: &AgentToolContext,
+    cfg: &DebateConfig,
+    topic: &str,
+    // Opzioni dichiarate dal consiglio: `plan_debate` le taglia a quelle che
+    // avranno davvero un difensore (mai un'opzione indifesa in gara).
+    options: &[String],
+    advocates: usize,
+    user_task: &str,
+    // Tipo GENERICO del quorum (`panel_quorum::QuorumPolicy`, path esplicito): il
+    // re-export `decisions::QuorumPolicy` e' quello della review, con vocabolario
+    // proprio (min_valid_verdicts/fail_on_high_severity). I due non sono
+    // ri-esportati insieme di proposito.
+    policy: &nexus_agent_graph::decisions::panel_quorum::QuorumPolicy,
+    quorum_pct: u8,
+) -> Option<DebatePanelOutcome> {
+    use nexus_agent_graph::decisions::debate_panel::{compose_debate_synthesis, plan_debate};
+    let n = advocates.min(cfg.max_advocates);
+    let assignments = plan_debate(options, n);
+    if assignments.is_empty() {
+        return None;
+    }
+    let results = spawn_advocates(ctx, cfg, topic, &assignments, user_task).await;
+    let outcomes: Vec<Value> = results
+        .into_iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
+    // `outcomes[i]` e' il sub-run di `assignments[i]`: spawn_fanout preserva
+    // l'ordine (awaita gli handle in sequenza). E' su questa corrispondenza che
+    // poggia l'attribuzione POSIZIONALE del voto (regola M): la posizione difesa
+    // e' un fatto deciso da noi, non una stringa che il modello ricopia.
+    // Il roster (denominatore del quorum) e' assignments.len(): un avvocato
+    // morto e' un'astensione che pesa (lezione mig 0589).
+    let synthesis = compose_debate_synthesis(&outcomes, &assignments, policy, quorum_pct)?;
+    Some(DebatePanelOutcome {
+        topic: topic.to_string(),
+        assignments,
+        synthesis,
+    })
+}
+
+/// Corpo del blocco dibattito: sostegno per opzione, argomenti e rischi.
+fn render_debate_tally(
+    s: &nexus_agent_graph::decisions::debate_panel::DebateSynthesis,
+) -> String {
+    let mut out = String::from("Sostegno per opzione:\n");
+    for t in &s.tally {
+        let flag = if t.disqualified {
+            " [SQUALIFICATA: arresa dal suo stesso avvocato con evidenza grave]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "- {}: {} a favore, {} arrese{}\n",
+            t.option, t.support, t.surrendered, flag
+        ));
+    }
+    if !s.key_arguments.is_empty() {
+        out.push_str("Argomenti chiave emersi:\n");
+        for a in &s.key_arguments {
+            out.push_str(&format!("- {a}\n"));
+        }
+    }
+    if !s.risks.is_empty() {
+        out.push_str("Rischi emersi (per severity):\n");
+        for risk in &s.risks {
+            let sev = risk.get("severity").and_then(Value::as_str).unwrap_or("?");
+            let desc = risk.get("description").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&format!("- [{sev}] {desc}\n"));
+        }
+    }
+    out
+}
+
+/// Rende l'esito del dibattito in un blocco `<dibattito_sintesi>` da anteporre al
+/// primo messaggio del run. Deriva dai campi STRUTTURATI (regola M). Dichiara
+/// SEMPRE la base dei voti: un esito senza base dichiarata e' il proxy che ha
+/// prodotto l'incidente "proceed con 1 parere su 5" (mig 0589).
+pub(crate) fn render_debate_synthesis(o: &DebatePanelOutcome) -> String {
+    use nexus_agent_graph::decisions::debate_panel::DebatePanelVerdict;
+    let s = &o.synthesis;
+    let mut out = String::from("<dibattito_sintesi>\n");
+    out.push_str(&format!("Decisione in discussione: {}\n", o.topic));
+    out.push_str(&format!("Esito del dibattito: {}\n", s.verdict.as_str()));
+    out.push_str(&format!(
+        "Posizioni valide: {} su {} avvocati convocati (quorum minimo: {}); opzioni \
+         effettivamente discusse: {}\n",
+        s.valid, s.convened, s.required_valid, s.options_heard
+    ));
+    if s.misattributed > 0 {
+        out.push_str(&format!(
+            "NB: {} avvocati hanno argomentato una posizione diversa da quella assegnata: \
+             i loro voti sono stati scartati.\n",
+            s.misattributed
+        ));
+    }
+    out.push_str(&render_debate_tally(s));
+    // Coda decisa dal VERDETTO con match ESAUSTIVO (regola M): un esito nuovo non
+    // compila finche' non ne viene dichiarata la semantica testuale.
+    let closing = match s.verdict {
+        DebatePanelVerdict::OptionSelected => format!(
+            "(Il dibattito ha selezionato: {}. Non e' un ordine: e' l'opzione che ha \
+             retto al contraddittorio. Se decidi diversamente, dichiara perche'.)\n",
+            s.selected_option.as_deref().unwrap_or("?")
+        ),
+        DebatePanelVerdict::Split => String::from(
+            "(Il dibattito NON ha un vincitore: le posizioni si equivalgono o sono state \
+             tutte demolite. Decidi tu sul merito degli argomenti qui sopra, dichiarando \
+             il criterio che usi.)\n",
+        ),
+        DebatePanelVerdict::Inconclusive => format!(
+            "(ATTENZIONE: il dibattito NON ha deliberato — {} posizioni valide su {} \
+             avvocati convocati (minimo {}), e solo {} opzioni hanno avuto voce. Quanto \
+             sopra e' parziale, NON un confronto concluso: se una sola posizione e' stata \
+             difesa, il fatto che regga non dice nulla sulle alternative, che nessuno ha \
+             sostenuto. Non trattarlo come una scelta.)\n",
+            s.valid, s.convened, s.required_valid, s.options_heard
+        ),
+    };
+    out.push_str(&closing);
+    out.push_str("</dibattito_sintesi>");
+    out
 }
 
 /// Coda del blocco sintesi, decisa dal VERDETTO con match ESAUSTIVO (regola M):
@@ -3961,6 +4219,7 @@ fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
         k::DECLARED: Value::Null,
         k::REVIEW: Value::Null,
         k::ADVISORY: Value::Null,
+        k::DEBATE: Value::Null,
         k::FINAL_GATE_PASSED: Value::Null,
         k::FINAL_GATE_UNVERIFIED: Value::Null,
         k::FINAL_GATE_FAILED_PENDING: false,
@@ -4212,6 +4471,7 @@ mod tests {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
@@ -5466,6 +5726,7 @@ mod tests {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,

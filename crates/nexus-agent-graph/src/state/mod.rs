@@ -305,6 +305,11 @@ pub struct AgentState {
     /// risks[], recommendations[]}. Propagato oltre il confine sub-run in
     /// `structured_verdict` (campo `advisory`, regola M).
     pub advisory_verdict: Option<Value>,
+    /// Posizione strutturata di un AVVOCATO del dibattito a tesi contrapposte via
+    /// tool debate_position: dict normalizzato {assigned_position, stance,
+    /// summary, key_arguments[], risks[]}. Propagato oltre il confine sub-run in
+    /// `structured_verdict` (campo `debate`, regola M).
+    pub debate_position: Option<Value>,
     /// `true` se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
     pub tool_infra_error: Option<bool>,
     /// Passi strutturati del playbook matchato.

@@ -5344,11 +5344,11 @@ azioni concrete e mirate verso il completamento.",
                     // advisory_verdict -> parere reale invece di failed_diagnosed
                     // (n/d). Per i run non-figura e' bit-identico.
                     messages_out.push(recovery_nudge_msg(state, t));
-                } else if is_advisory_figure_without_verdict(state) {
-                    // Reasoner senza nudge ma figura senza parere: inietta comunque
-                    // la direttiva di grazia, altrimenti il turno riparte muto e la
-                    // figura continua a esplorare fino a timeout/cap -> n/d.
-                    messages_out.push(human_msg(ADVISORY_GRACE_DIRECTIVE.trim()));
+                } else if let Some(directive) = pending_role_channel_grace(state) {
+                    // Reasoner senza nudge ma ruolo senza verdetto: inietta comunque
+                    // la direttiva di grazia, altrimenti il turno riparte muto e il
+                    // ruolo continua a esplorare fino a timeout/cap -> n/d.
+                    messages_out.push(human_msg(directive.trim()));
                 }
                 // Il nudge del reasoner riparte con finestra pulita sui detector di
                 // ripetizione (stessa grazia dei rami Escalate: il modello promosso/
@@ -6593,11 +6593,12 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
     /// con esito n/d: e' il percorso reale in cui una figura del consiglio (es.
     /// `functional_analyst` deepseek, run fe4dc12c) muore al cap solo-testo dopo aver
     /// esaurito il budget stall. Se il run e' una figura senza parere
-    /// ([`is_advisory_figure_without_verdict`]) e la grazia non e' ancora stata
-    /// concessa, invece di chiudere concede UN turno mirato per emettere
-    /// `advisory_verdict` (parere reale al posto di n/d). Una-tantum
+    /// ([`pending_role_channel_grace`]) e la grazia non e' ancora stata concessa,
+    /// invece di chiudere concede UN turno mirato per dichiarare col canale del
+    /// ruolo (parere/posizione reale al posto di n/d). Una-tantum
     /// ([`ADVISORY_GRACE_USED_KEY`]) per non ciclare. `None` -> il chiamante procede
-    /// col `close_runaway` (bit-identico per non-figure / grazia gia' concessa).
+    /// col `close_runaway` (bit-identico per i run senza canale di ruolo / grazia
+    /// gia' concessa).
     async fn maybe_advisory_grace_delta(
         &self,
         state: &AgentState,
@@ -6605,9 +6606,7 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        if !is_advisory_figure_without_verdict(state) {
-            return None;
-        }
+        let directive = pending_role_channel_grace(state)?;
         if state
             .extra
             .get(ADVISORY_GRACE_USED_KEY)
@@ -6624,18 +6623,18 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
             ctx,
             mode,
             "advisory_grace",
-            "Turno di grazia: la figura chiude col parere (advisory_verdict)".to_string(),
+            "Turno di grazia: il ruolo chiude col proprio verdetto".to_string(),
             json!({ "iters": iters_in }),
         )
         .await;
         tracing::warn!(
             target: "nexus_agent_graph::executor",
             iters = iters_in,
-            "figura senza parere al backstop runaway -> turno di grazia advisory_verdict"
+            "ruolo senza verdetto al backstop runaway -> turno di grazia sul canale proprio"
         );
         Some(
             StateDelta {
-                messages: Some(vec![human_msg(ADVISORY_GRACE_DIRECTIVE.trim())]),
+                messages: Some(vec![human_msg(directive.trim())]),
                 // Azzera lo streak solo-testo: al re-entry il blocco text-only NON
                 // ri-scatta prima di chiamare l'LLM, cosi' il turno di grazia raggiunge
                 // davvero il modello (che puo' emettere advisory_verdict). Senza
@@ -6757,42 +6756,71 @@ valutazione corrente (verdict + summary + eventuali requirements). NON continuar
 esplorare e NON diagnosticare un fallimento tecnico: emetti il tuo parere consultivo \
 adesso, anche se parziale, basandoti su cio' che hai gia' osservato.";
 
+/// Direttiva di GRAZIA per un AVVOCATO del dibattito impantanato senza posizione
+/// dichiarata. Gemella di [`ADVISORY_GRACE_DIRECTIVE`] sul canale del dibattito:
+/// un avvocato che tace lascia la sua tesi senza voce, e una tesi indifesa non
+/// perde — falsa il confronto (il panel se ne accorge e dichiara `inconclusive`,
+/// ma la spesa e' gia' fatta). Meglio una posizione parziale ma dichiarata.
+const DEBATE_GRACE_DIRECTIVE: &str = "\n\nHai gia' raccolto prove sufficienti. \
+CHIUDI ORA la tua arringa chiamando il tool debate_position con la tua conclusione \
+corrente (assigned_position ripetuta alla lettera, stance, key_arguments). NON \
+continuare a esplorare e NON diagnosticare un fallimento tecnico: se la tua posizione \
+regge dichiara support, se studiando hai visto che non regge dichiara oppose coi \
+rischi trovati. Tacere lascerebbe la tua tesi senza difensore e falserebbe il \
+dibattito.";
+
 /// Chiave `extra` che marca la grazia figura come GIA' concessa (una-tantum): il
 /// backstop runaway ([`ExecutorNode::maybe_advisory_grace_delta`]) la concede una
 /// sola volta per run, per non ciclare (grazia -> di nuovo cap -> grazia).
 const ADVISORY_GRACE_USED_KEY: &str = "advisory_grace_used";
 
-/// True se il run e' una FIGURA del consiglio di analisi (canale di chiusura
-/// `advisory_verdict` disponibile fra i tool) che NON ha ancora dichiarato il
-/// proprio parere. Segnale STRUTTURALE (regola M): presenza del tool nel
-/// `tools_json` + assenza di `advisory_verdict` in stato — nessun parsing di prosa.
-/// Per una figura in questo stato una mossa di recovery generica ("diagnostica il
-/// fallimento") produrrebbe `failed_diagnosed` invece di un parere: il turno di
-/// grazia la dirotta a EMETTERE il verdetto con la sua miglior stima corrente
-/// (parere reale al posto di n/d). Il run principale (niente `advisory_verdict` nel
-/// suo whitelist) e i revisori (`review_verdict`) NON matchano.
-fn is_advisory_figure_without_verdict(state: &AgentState) -> bool {
-    if state.advisory_verdict.is_some() {
-        return false;
-    }
+/// `true` se il `tools_json` del run espone il tool dato (segnale strutturale).
+fn has_tool(state: &AgentState, tool: &str) -> bool {
     state.tools_json.as_ref().is_some_and(|tools| {
         tools
             .iter()
-            .any(|t| t.get("name").and_then(Value::as_str) == Some("advisory_verdict"))
+            .any(|t| t.get("name").and_then(Value::as_str) == Some(tool))
     })
 }
 
-/// Costruisce il messaggio-nudge di recovery applicando il turno di grazia figura:
-/// se il run e' una figura del consiglio senza parere (vedi
-/// [`is_advisory_figure_without_verdict`]), appende [`ADVISORY_GRACE_DIRECTIVE`] al
-/// testo del reasoner cosi' la figura chiude con `advisory_verdict` invece di
-/// diagnosticare un fallimento. Altrimenti bit-identico a `human_msg(nudge)`. Punto
-/// unico (regola L) del turno di grazia figura sui nudge di recovery.
+/// Direttiva di grazia per un run che ha un canale di chiusura di RUOLO ancora
+/// INUTILIZZATO; `None` per tutti gli altri (run principale, revisori, o ruoli
+/// che hanno gia' dichiarato).
+///
+/// PUNTO UNICO (regola L) del riconoscimento: il concern e' "questo ruolo deve
+/// chiudere col PROPRIO canale e non l'ha ancora fatto", identico per la figura
+/// del consiglio e per l'avvocato del dibattito — cambia solo la direttiva.
+/// Senza questa forma, ogni nuovo ruolo con canale proprio avrebbe richiesto di
+/// duplicare lo stesso `if` in tre call site.
+///
+/// Segnale STRUTTURALE (regola M): presenza del tool nel `tools_json` + assenza
+/// della dichiarazione in stato — nessun parsing di prosa. Per un ruolo in questo
+/// stato una mossa di recovery generica ("diagnostica il fallimento") produrrebbe
+/// `failed_diagnosed` invece del contributo atteso: il turno di grazia lo dirotta
+/// a DICHIARARE con la sua miglior stima corrente.
+///
+/// Ordine dei rami: un kind ha UN solo canale di ruolo (le whitelist di 0546 e
+/// 0605 sono disgiunte), quindi non c'e' ambiguita' reale; l'advisory resta
+/// primo per continuita' col comportamento storico.
+fn pending_role_channel_grace(state: &AgentState) -> Option<&'static str> {
+    if state.advisory_verdict.is_none() && has_tool(state, "advisory_verdict") {
+        return Some(ADVISORY_GRACE_DIRECTIVE);
+    }
+    if state.debate_position.is_none() && has_tool(state, "debate_position") {
+        return Some(DEBATE_GRACE_DIRECTIVE);
+    }
+    None
+}
+
+/// Costruisce il messaggio-nudge di recovery applicando il turno di grazia di
+/// ruolo: se il run ha un canale di chiusura proprio non ancora usato (vedi
+/// [`pending_role_channel_grace`]), appende la direttiva corrispondente al testo
+/// del reasoner cosi' il ruolo chiude col proprio verdetto invece di
+/// diagnosticare un fallimento. Altrimenti bit-identico a `human_msg(nudge)`.
 fn recovery_nudge_msg(state: &AgentState, nudge: &str) -> Message {
-    if is_advisory_figure_without_verdict(state) {
-        human_msg(&format!("{nudge}{ADVISORY_GRACE_DIRECTIVE}"))
-    } else {
-        human_msg(nudge)
+    match pending_role_channel_grace(state) {
+        Some(directive) => human_msg(&format!("{nudge}{directive}")),
+        None => human_msg(nudge),
     }
 }
 

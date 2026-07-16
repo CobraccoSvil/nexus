@@ -9,6 +9,19 @@
 
 # Emergenza: LEFTHOOK=0
 
+# Fail-closed della risoluzione di lefthook. L'hook generato, se non trova il proprio
+# binario, stampa "Can't find lefthook in PATH" e ritorna 0: il commit passa con tutti i
+# gate saltati (falso verde). Nei worktree succedeva sempre, perche' il template cerca
+# node_modules sotto la root del worktree, dove non esiste. Questa chiave fa includere
+# .lefthookrc dentro l'hook rigenerato: li' lefthook viene risolto anche dai worktree e,
+# se manca, il commit viene RIFIUTATO. Va qui e non in .git/hooks perche' gli hook sono
+# rigenerati da 'lefthook install'; lefthook.yml e .lefthookrc sono invece versionati.
+# NB il prefisso './' e' obbligatorio: il valore finisce testuale nell'hook come
+# '. <valore>', e il comando '.' di POSIX sh cerca nel PATH (non nella cwd) quando
+# l'argomento non contiene una slash. Con 'rc: .lefthookrc' il source fallisce sempre
+# con "file not found" anche se il file c'e'.
+rc: ./.lefthookrc
+
 # NB Windows: lefthook word-splitta il campo 'run' ignorando le virgolette, quindi
 # 'bash -lc "comando con spazi"' veniva eseguito come 'bash -lc comando con spazi'
 # (bash riceveva come command string solo il primo token -> falso-verde). Per i
@@ -40,6 +53,18 @@ pre-commit:
         - "*.toml"
       run: bash scripts/precommit-cargo-check.sh
       fail_text: "pre-commit cargo fallito: correggi cargo check."
+
+    # Gate ratchet qualita (scripts/quality-baseline.json): ~2-8s a target caldo.
+    # Sta qui e non solo in `pnpm verify`/CI perche' e' un gate GLOBALE: chi lo
+    # esegue paga il debito di tutti. Confinato alla verifica completa, il drift
+    # si accumulava invisibile per decine di commit e ricadeva sul primo che
+    # eseguiva `pnpm verify` (misurato: 92 commit, +812 finding). Ora lo vede chi
+    # lo introduce, quando correggerlo costa poco.
+    quality_scan:
+      glob:
+        - "*.rs"
+      run: bash scripts/precommit-quality-scan.sh
+      fail_text: "pre-commit: regressione qualita (gate ratchet). Riduci le violazioni introdotte; aggiorna la baseline SOLO se il peggioramento e' giustificato, e dichiaralo nel commit."
 
     # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
     # definizioni di un punto unico fuori dal suo modulo. Il gate jscpd "ratchet"

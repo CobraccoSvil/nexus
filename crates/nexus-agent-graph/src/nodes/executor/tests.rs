@@ -5023,7 +5023,7 @@ fn advisory_figure_senza_verdict_e_riconosciuta() {
         ..Default::default()
     };
     assert!(
-        is_advisory_figure_without_verdict(&figura),
+        pending_role_channel_grace(&figura).is_some(),
         "figura con canale advisory e senza parere -> grazia attiva"
     );
 }
@@ -5036,14 +5036,40 @@ fn advisory_figure_con_verdict_gia_dichiarato_non_e_in_grazia() {
         ..Default::default()
     };
     assert!(
-        !is_advisory_figure_without_verdict(&conclusa),
+        pending_role_channel_grace(&conclusa).is_none(),
         "parere gia' dichiarato -> niente grazia (bit-identico)"
     );
 }
 
 #[test]
+fn avvocato_senza_posizione_e_in_grazia_col_proprio_canale() {
+    // L'avvocato del dibattito ha lo stesso problema della figura: se si
+    // impantana e tace, la sua tesi resta senza voce e il confronto e' falsato.
+    let avvocato = AgentState {
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "debate_position"}),
+        ]),
+        debate_position: None,
+        ..Default::default()
+    };
+    let directive = pending_role_channel_grace(&avvocato).expect("grazia per l'avvocato");
+    assert!(
+        directive.contains("debate_position"),
+        "la grazia deve indicare il canale del RUOLO, non quello di un altro"
+    );
+    // Posizione gia' dichiarata -> niente grazia.
+    let concluso = AgentState {
+        tools_json: Some(vec![json!({"name": "debate_position"})]),
+        debate_position: Some(json!({"assigned_position": "A", "stance": "support"})),
+        ..Default::default()
+    };
+    assert!(pending_role_channel_grace(&concluso).is_none());
+}
+
+#[test]
 fn run_principale_e_revisore_non_sono_figure() {
-    // Run principale: task_complete, niente advisory_verdict.
+    // Run principale: task_complete, niente canale di ruolo.
     let principale = AgentState {
         tools_json: Some(vec![
             json!({"name": "task_complete"}),
@@ -5052,21 +5078,22 @@ fn run_principale_e_revisore_non_sono_figure() {
         advisory_verdict: None,
         ..Default::default()
     };
-    assert!(!is_advisory_figure_without_verdict(&principale));
-    // Revisore: review_verdict, non advisory_verdict.
+    assert!(pending_role_channel_grace(&principale).is_none());
+    // Revisore: review_verdict, che NON ha turno di grazia (comportamento
+    // storico invariato: chiude col backstop come prima).
     let revisore = AgentState {
         tools_json: Some(vec![json!({"name": "review_verdict"})]),
         advisory_verdict: None,
         ..Default::default()
     };
-    assert!(!is_advisory_figure_without_verdict(&revisore));
-    // Nessun tool -> non figura.
+    assert!(pending_role_channel_grace(&revisore).is_none());
+    // Nessun tool -> nessun canale di ruolo.
     let vuoto = AgentState {
         tools_json: None,
         advisory_verdict: None,
         ..Default::default()
     };
-    assert!(!is_advisory_figure_without_verdict(&vuoto));
+    assert!(pending_role_channel_grace(&vuoto).is_none());
 }
 
 #[test]
