@@ -55,6 +55,9 @@ pub(crate) struct ProbeProfile {
     pub grants: Vec<String>,
     pub payload: Value,
     pub pass_predicate: Value,
+    /// La banda che questo profilo certifica se superato (mig 0599). `None` = il
+    /// profilo qualifica ma non dice nulla sul tier (es. tool_smoke).
+    pub certifies_tier: Option<String>,
 }
 
 /// Esito STRUTTURATO di UN tentativo (regola M): deriva da error_class /
@@ -270,6 +273,10 @@ pub(crate) struct Derived {
     /// `Some((agentic_thinking_policy, uses_thinking_mode))`. `None` = matrice
     /// non eseguita o inconclusiva: la policy del catalog resta invariata.
     pub thinking: Option<(&'static str, bool)>,
+    /// La banda MISURATA (mig 0599): il tier piu' alto certificato dalla batteria,
+    /// con isteresi. `None` = nessuna banda certificata -> il catalog tiene il suo
+    /// `facts_prior` e non viene toccato.
+    pub measured_tier: Option<String>,
 }
 
 /// Esito AGGREGATO di una configurazione della thinking_matrix (fase 5).
@@ -515,6 +522,7 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
                     r.first_fail_reason.as_deref().unwrap_or("failed")
                 ),
                 thinking: None,
+                measured_tier: None,
             };
         }
     }
@@ -526,6 +534,7 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
             qualified_capabilities: Vec::new(),
             reason: "inconclusive_round".into(),
             thinking: None,
+            measured_tier: None,
         };
     }
     // Batteria superata: il PROVATO = unione dei grants dei profili passati,
@@ -548,6 +557,11 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
         qualified_capabilities: caps,
         reason: "suite_passed".into(),
         thinking: None,
+        // La banda MISURATA non si deriva qui: `derive_capabilities` non vede i
+        // `certifies_tier` dei profili. La calcola il chiamante con
+        // `derive_tier_measured` e la deposita qui — un solo punto che decide il
+        // tier (regola L), separato da quello che decide le capability.
+        measured_tier: None,
     }
 }
 
@@ -579,6 +593,7 @@ async fn load_profiles(db: &PgPool) -> Vec<ProbeProfile> {
             suite_version: r.get("suite_version"),
             kind: r.get("kind"),
             is_blocking: r.get("is_blocking"),
+            certifies_tier: r.get("certifies_tier"),
             applies_when: r.get("applies_when"),
             grants: r
                 .get::<Value, _>("grants")
@@ -997,7 +1012,57 @@ async fn qualify_one(
     }
     let mut derived = derive_capabilities(declared, &runs);
     derived.thinking = thinking_derived;
+    // LA BANDA MISURATA (mig 0599). Solo su un esito QUALIFIED: una squalifica o
+    // un giro inconclusivo non misurano nulla, e un tier scritto su un esito non
+    // attribuibile al modello sarebbe la stessa bugia del nome.
+    if derived.state == DerivedState::Qualified {
+        // Accoppia ogni run con la banda che il suo profilo certifica. `runs` e
+        // `profiles` non sono allineati per indice (i profili non applicabili
+        // vengono saltati da `profile_applies`, e l'early-stop tronca `runs`):
+        // il join va fatto sulla CHIAVE, mai sulla posizione.
+        let con_bande: Vec<(ProfileRun, Option<String>)> = runs
+            .iter()
+            .map(|r| {
+                let banda = profiles
+                    .iter()
+                    .find(|p| p.profile_key == r.profile_key)
+                    .and_then(|p| p.certifies_tier.clone());
+                (r.clone(), banda)
+            })
+            .collect();
+        // Il tier ATTUALE serve all'isteresi: conservare una banda gia' acquisita
+        // costa meno che conquistarne una nuova.
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT performance_tier FROM ai_price_catalog \
+              WHERE provider = $1 AND model = $2 LIMIT 1",
+        )
+        .bind(provider)
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        let hold_min = hold_min_passes(profiles);
+        derived.measured_tier = derive_tier_measured(&con_bande, current.as_deref(), hold_min);
+    }
     (derived, last_evidence)
+}
+
+/// `hold_min_passes` dal `pass_predicate` dei profili (mig 0593: la soglia doppia
+/// asimmetrica esiste gia' nel vocabolario). Il MINIMO fra i profili: conservare
+/// una banda non deve dipendere da quale profilo la certifica. Default 2 = il
+/// valore del seed.
+fn hold_min_passes(profiles: &[ProbeProfile]) -> u32 {
+    profiles
+        .iter()
+        .filter_map(|p| {
+            p.pass_predicate
+                .get("hold_min_passes")
+                .and_then(Value::as_u64)
+        })
+        .min()
+        .unwrap_or(2) as u32
 }
 
 /// Scrive lo stato derivato sulla riga (writer UNICO della promozione).
@@ -1036,6 +1101,14 @@ async fn apply_derived(
                      uses_thinking_mode = CASE \
                          WHEN capability_locked THEN uses_thinking_mode \
                          ELSE COALESCE($9, uses_thinking_mode) END, \
+                     performance_tier = CASE \
+                         WHEN $10::text IS NULL THEN performance_tier \
+                         WHEN tier_source = 'manual' THEN performance_tier \
+                         ELSE $10 END, \
+                     tier_source = CASE \
+                         WHEN $10::text IS NULL THEN tier_source \
+                         WHEN tier_source = 'manual' THEN tier_source \
+                         ELSE 'measured' END, \
                      qualification_started_at = NULL, \
                      qualification_attempts = 0, \
                      qualification_backoff_until = NULL \
@@ -1050,6 +1123,11 @@ async fn apply_derived(
             .bind(evidence_id)
             .bind(policy)
             .bind(uses_thinking)
+            // La banda MISURATA: NULL = nessuna certificata -> il tier resta
+            // quello che c'e' (il facts_prior). Il CASE protegge la curatela
+            // ('manual' vince sempre) e promuove tier_source a 'measured' solo
+            // quando una banda e' stata davvero dimostrata.
+            .bind(derived.measured_tier.as_deref())
             .execute(db)
             .await
         }
@@ -1194,6 +1272,8 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
                     qualified_capabilities: Vec::new(),
                     reason: "provider_in_cooldown".into(),
                     thinking: None,
+                    // Un giro non attribuibile al modello non misura nessuna banda.
+                    measured_tier: None,
                 },
                 None,
                 ttl_days,
@@ -1734,5 +1814,100 @@ mod tests {
         // per salire che per restare.
         assert_eq!(derive_tier_measured(&runs, Some("medium"), 2), None,
             "banda NUOVA: serve promote_min. Il gap fra le due soglie E' l'isteresi");
+    }
+    /// IL CERCHIO SI CHIUDE: la batteria SCRIVE il tier misurato, e la curatela
+    /// dell'admin vince sempre.
+    ///
+    /// E' l'ultimo anello: senza, `derive_tier_measured` calcolava una banda che
+    /// nessuno scriveva, e il tier restava per sempre al `facts_prior` (una stima
+    /// sul prezzo) anche dopo che la batteria aveva DIMOSTRATO la capacita'.
+    #[sqlx::test]
+    async fn la_batteria_scrive_il_tier_misurato_ma_non_tocca_la_curatela(pool: PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN capability_locked BOOLEAN NOT NULL DEFAULT false,                ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto',                ADD COLUMN qualified_at TIMESTAMPTZ,                ADD COLUMN qualification_suite_version INT,                ADD COLUMN qualification_reason TEXT,                ADD COLUMN qualification_evidence_id BIGINT,                ADD COLUMN qualification_started_at TIMESTAMPTZ,                ADD COLUMN qualification_attempts INT NOT NULL DEFAULT 0,                ADD COLUMN qualification_backoff_until TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source) VALUES              ('p', 'stimato', 'medium', 'facts_prior'),              ('p', 'curato',  'light',  'manual')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let derived = Derived {
+            state: DerivedState::Qualified,
+            qualified_capabilities: vec!["chat".into()],
+            reason: "suite_passed".into(),
+            thinking: None,
+            measured_tier: Some("heavy".to_string()),
+        };
+        for model in ["stimato", "curato"] {
+            apply_derived(&pool, "p", model, 2, &derived, None, 30, 24).await;
+        }
+
+        let stimato: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='stimato'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("stimato");
+        assert_eq!(
+            stimato,
+            (Some("heavy".into()), Some("measured".into())),
+            "la banda DIMOSTRATA sostituisce la stima sul prezzo, e tier_source lo dice"
+        );
+
+        let curato: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='curato'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("curato");
+        assert_eq!(
+            curato,
+            (Some("light".into()), Some("manual".into())),
+            "la CURATELA dell'admin vince sempre: la batteria non la tocca"
+        );
+    }
+
+    /// Nessuna banda certificata -> il tier NON viene toccato: resta il prior.
+    /// (Il difetto opposto sarebbe azzerare il tier a ogni giro senza bande.)
+    #[sqlx::test]
+    async fn senza_banda_certificata_il_tier_resta_il_prior(pool: PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN capability_locked BOOLEAN NOT NULL DEFAULT false,                ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto',                ADD COLUMN qualified_at TIMESTAMPTZ,                ADD COLUMN qualification_suite_version INT,                ADD COLUMN qualification_reason TEXT,                ADD COLUMN qualification_evidence_id BIGINT,                ADD COLUMN qualification_started_at TIMESTAMPTZ,                ADD COLUMN qualification_attempts INT NOT NULL DEFAULT 0,                ADD COLUMN qualification_backoff_until TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source)              VALUES ('p', 'm', 'high', 'facts_prior')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+        let derived = Derived {
+            state: DerivedState::Qualified,
+            qualified_capabilities: vec!["chat".into()],
+            reason: "suite_passed".into(),
+            thinking: None,
+            measured_tier: None,
+        };
+        apply_derived(&pool, "p", "m", 2, &derived, None, 30, 24).await;
+        let r: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='m'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("m");
+        assert_eq!(
+            r,
+            (Some("high".into()), Some("facts_prior".into())),
+            "nessuna banda certificata: il tier resta il prior, non viene azzerato"
+        );
     }
 }
