@@ -30,12 +30,14 @@ pub const PREDICTIVE_CAP_SENTINEL: &str = "[ERROR: chiamata bloccata da predicti
 /// senza esenzione il cap lo bloccherebbe proprio quando serve e il tentativo
 /// bloccato azzererebbe anche un verdetto precedente (invalidazione ADR 0034).
 /// Stesso ragionamento per `advisory_verdict` (canale di CHIUSURA del parere
-/// delle figure del consiglio di analisi a monte).
+/// delle figure del consiglio di analisi a monte) e per `debate_position`
+/// (canale di CHIUSURA dell'avvocato del dibattito).
 static CAP_EXEMPT_TOOLS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
         "task_complete",
         "review_verdict",
         "advisory_verdict",
+        "debate_position",
         "nexus_mcp_tool_call",
         "nexus_mcp_tool_search",
         "nexus_get_worklog",

@@ -316,6 +316,153 @@ fn affordable_by_time(
     Some(waves.saturating_mul(parallelism.max(1)))
 }
 
+/// Domanda del profilo normalizzata su floor e backstop, per i quattro panel.
+/// Ritorna `(council, review, providers, advocates, backstop_clamped)`.
+///
+/// Bump sistemico: uno `scope=system_wide` alza di 1 le lenti (consiglio) e i
+/// provider — un problema che tocca tutto il sistema merita una voce in piu'.
+/// Un panel che l'admin ha escluso dalla classe (0 nel profilo) resta 0: il
+/// bump non resuscita un panel spento.
+///
+/// Il debate e' l'unico dimensionato da un segnale di RUNTIME
+/// (`decision_detected`): senza decisione contesa dichiarata non si riserva
+/// spesa per un dibattito che potrebbe non esserci.
+fn normalized_demand(
+    demand: &PanelDemand,
+    scope_system_wide: bool,
+    decision_detected: bool,
+    backstops: &OrchestrationBackstops,
+) -> (usize, usize, usize, usize, bool) {
+    let bump = usize::from(scope_system_wide);
+    let raw_council = demand.council_figures.saturating_add(bump);
+    let raw_providers = if demand.providers > 0 {
+        demand.providers.saturating_add(bump)
+    } else {
+        0
+    };
+    let raw_advocates = if decision_detected { demand.advocates } else { 0 };
+
+    let (council, clamp_c) = normalize(
+        raw_council,
+        panel_floor(PanelKind::Council, backstops),
+        backstops.council_max,
+    );
+    let (review, clamp_r) = normalize(
+        demand.reviewers,
+        panel_floor(PanelKind::Review, backstops),
+        backstops.review_max,
+    );
+    let (providers, clamp_p) = normalize(
+        raw_providers,
+        panel_floor(PanelKind::MultiProvider, backstops),
+        backstops.multi_provider_max,
+    );
+    let (advocates, clamp_a) = normalize(
+        raw_advocates,
+        panel_floor(PanelKind::Debate, backstops),
+        backstops.debate_max,
+    );
+    (
+        council,
+        review,
+        providers,
+        advocates,
+        clamp_c || clamp_r || clamp_p || clamp_a,
+    )
+}
+
+/// Sub-run che l'OFFERTA consente in totale, e QUALE dei due assi (costo o
+/// tempo) e' il piu' stretto — cioe' quello che va dichiarato in `sized_by`
+/// (regola M: il vincolo che ha deciso e' un dato osservabile, non un'ipotesi
+/// del lettore).
+///
+/// `None` = nessun vincolo calcolabile (budget non configurati o stima unitaria
+/// degenere): il piano resta quello della domanda.
+fn offer_and_tighter(
+    budgets: &OrchestrationBudgets,
+    unit: &PanelUnitEstimate,
+    cfg: &OrchestrationSizingConfig,
+    parallelism: usize,
+) -> (Option<usize>, SizingConstraint) {
+    let by_cost = affordable_by_cost(budgets, unit, cfg.budget_share_pct);
+    let by_time = affordable_by_time(budgets, unit, parallelism);
+    let offer = match (by_cost, by_time) {
+        (Some(c), Some(t)) => Some(c.min(t)),
+        (Some(c), None) => Some(c),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    };
+    let tighter = match (by_cost, by_time) {
+        (Some(c), Some(t)) if t < c => SizingConstraint::TimeBudget,
+        (None, Some(_)) => SizingConstraint::TimeBudget,
+        _ => SizingConstraint::CostBudget,
+    };
+    (offer, tighter)
+}
+
+/// Indice del panel in `slots` di [`degrade_to_offer`] (ordine fisso: council,
+/// review, providers, advocates).
+fn slot_index(kind: PanelKind) -> usize {
+    match kind {
+        PanelKind::Council => 0,
+        PanelKind::Review => 1,
+        PanelKind::MultiProvider => 2,
+        PanelKind::Debate => 3,
+    }
+}
+
+/// Riduce i panel finche' il totale non sta nell'offerta, IN DUE PASSI.
+///
+/// Passo A — riduzione verso i floor in ordine INVERSO di priorita' (l'ultimo si
+/// sacrifica per primo), con riduzioni PARZIALI: si ferma appena l'offerta copre
+/// la domanda.
+///
+/// Passo B — se anche tutti-al-floor eccede l'offerta: ricostruzione FIT-FIRST
+/// in ordine DIRETTO di priorita' — ogni panel entra al proprio floor solo se ci
+/// sta PER INTERO nella capienza residua, altrimenti va a 0 (mai monco, lezione
+/// mig 0589). Cosi' con capienza minima sopravvive il panel a priorita' piu' alta
+/// che ci sta davvero: non si azzera tutto e non si spreca offerta.
+fn degrade_to_offer(
+    slots: &mut [usize; 4],
+    offer_total: usize,
+    backstops: &OrchestrationBackstops,
+    cfg: &OrchestrationSizingConfig,
+) {
+    let priority = if cfg.panel_priority.is_empty() {
+        DEFAULT_PANEL_PRIORITY.to_vec()
+    } else {
+        cfg.panel_priority.clone()
+    };
+    let total = |s: &[usize; 4]| s.iter().sum::<usize>();
+
+    // Passo A: verso i floor, in ordine inverso, riduzioni parziali.
+    for kind in priority.iter().rev() {
+        let excess = total(slots).saturating_sub(offer_total);
+        if excess == 0 {
+            return;
+        }
+        let i = slot_index(*kind);
+        if slots[i] == 0 {
+            continue;
+        }
+        let reducible = slots[i].saturating_sub(panel_floor(*kind, backstops));
+        slots[i] -= reducible.min(excess);
+    }
+    if total(slots) <= offer_total {
+        return;
+    }
+    // Passo B: floors ancora oltre l'offerta -> fit-first per priorita'.
+    let mut remaining = offer_total;
+    for kind in priority.iter() {
+        let i = slot_index(*kind);
+        if slots[i] > 0 && slots[i] <= remaining {
+            remaining -= slots[i];
+        } else {
+            slots[i] = 0;
+        }
+    }
+}
+
 /// Risolve il piano di orchestrazione: domanda per-classe vs offerta a doppio
 /// vincolo, degrado per priorita', clamp sui backstop. PUNTO UNICO (regola L):
 /// `spawn_agent_run` lo chiama pre-run e `maybe_convene_review_panel` lo
@@ -340,131 +487,46 @@ pub fn resolve_orchestration_plan(
         return legacy_plan(backstops);
     }
 
-    // 1) DOMANDA: profilo della classe, con bump sistemico e gate del debate.
-    let bump = usize::from(scope_system_wide);
-    let raw_council = demand.council_figures.saturating_add(bump);
-    let raw_providers = if demand.providers > 0 {
-        demand.providers.saturating_add(bump)
-    } else {
-        0
-    };
-    let raw_advocates = if decision_detected { demand.advocates } else { 0 };
-
-    let (mut council, clamp_c) = normalize(
-        raw_council,
-        panel_floor(PanelKind::Council, backstops),
-        backstops.council_max,
-    );
-    let (mut review, clamp_r) = normalize(
-        demand.reviewers,
-        panel_floor(PanelKind::Review, backstops),
-        backstops.review_max,
-    );
-    let (mut providers, clamp_p) = normalize(
-        raw_providers,
-        panel_floor(PanelKind::MultiProvider, backstops),
-        backstops.multi_provider_max,
-    );
-    let (mut advocates, clamp_a) = normalize(
-        raw_advocates,
-        panel_floor(PanelKind::Debate, backstops),
-        backstops.debate_max,
-    );
-    let backstop_clamped = clamp_c || clamp_r || clamp_p || clamp_a;
+    // 1) DOMANDA: profilo della classe, normalizzata su floor e backstop.
+    let (council, review, providers, advocates, backstop_clamped) =
+        normalized_demand(demand, scope_system_wide, decision_detected, backstops);
+    let mut slots = [council, review, providers, advocates];
 
     // 2) OFFERTA: doppio vincolo, vince il piu' stretto (regola M su sized_by).
     let parallelism = backstops.fanout_max_parallel.max(1);
-    let by_cost = affordable_by_cost(budgets, unit, cfg.budget_share_pct);
-    let by_time = affordable_by_time(budgets, unit, parallelism);
-    let offer = match (by_cost, by_time) {
-        (Some(c), Some(t)) => Some(c.min(t)),
-        (Some(c), None) => Some(c),
-        (None, Some(t)) => Some(t),
-        (None, None) => None,
-    };
+    let (offer, tighter) = offer_and_tighter(budgets, unit, cfg, parallelism);
 
-    // 3) DEGRADO in due passi.
-    //    Passo A — riduzione verso i floor in ordine INVERSO di priorita' (l'ultimo
-    //    si sacrifica per primo), con riduzioni PARZIALI: si ferma appena l'offerta
-    //    copre la domanda.
-    //    Passo B — se anche tutti-al-floor eccede l'offerta: ricostruzione
-    //    FIT-FIRST in ordine DIRETTO di priorita' — ogni panel entra al proprio
-    //    floor solo se ci sta PER INTERO nella capienza residua, altrimenti va a 0
-    //    (mai monco). Cosi' con capienza minima sopravvive il panel a priorita'
-    //    piu' alta che ci sta davvero (non si azzera tutto, non si spreca offerta).
+    // 3) DEGRADO se l'offerta non copre la domanda (vedi [`degrade_to_offer`]).
     let mut budget_bound: Option<SizingConstraint> = None;
     if let Some(offer_total) = offer {
-        let priority = if cfg.panel_priority.is_empty() {
-            DEFAULT_PANEL_PRIORITY.to_vec()
-        } else {
-            cfg.panel_priority.clone()
-        };
-        let total =
-            |c: usize, r: usize, p: usize, a: usize| c.saturating_add(r).saturating_add(p).saturating_add(a);
-        if total(council, review, providers, advocates) > offer_total {
-            budget_bound = Some(match (by_cost, by_time) {
-                (Some(c), Some(t)) if t < c => SizingConstraint::TimeBudget,
-                (None, Some(_)) => SizingConstraint::TimeBudget,
-                _ => SizingConstraint::CostBudget,
-            });
-            // Passo A: verso i floor, in ordine inverso, riduzioni parziali.
-            for kind in priority.iter().rev() {
-                let excess = total(council, review, providers, advocates).saturating_sub(offer_total);
-                if excess == 0 {
-                    break;
-                }
-                let (slot, floor) = match kind {
-                    PanelKind::Council => (&mut council, panel_floor(PanelKind::Council, backstops)),
-                    PanelKind::Review => (&mut review, panel_floor(PanelKind::Review, backstops)),
-                    PanelKind::MultiProvider => (
-                        &mut providers,
-                        panel_floor(PanelKind::MultiProvider, backstops),
-                    ),
-                    PanelKind::Debate => (&mut advocates, panel_floor(PanelKind::Debate, backstops)),
-                };
-                if *slot == 0 {
-                    continue;
-                }
-                let reducible = slot.saturating_sub(floor);
-                *slot -= reducible.min(excess);
-            }
-            // Passo B: floors ancora oltre l'offerta -> fit-first per priorita'.
-            if total(council, review, providers, advocates) > offer_total {
-                let mut remaining = offer_total;
-                for kind in priority.iter() {
-                    let slot = match kind {
-                        PanelKind::Council => &mut council,
-                        PanelKind::Review => &mut review,
-                        PanelKind::MultiProvider => &mut providers,
-                        PanelKind::Debate => &mut advocates,
-                    };
-                    if *slot > 0 && *slot <= remaining {
-                        remaining -= *slot;
-                    } else {
-                        *slot = 0;
-                    }
-                }
-            }
+        if slots.iter().sum::<usize>() > offer_total {
+            budget_bound = Some(tighter);
+            degrade_to_offer(&mut slots, offer_total, backstops, cfg);
         }
     }
 
-    let sized_by = if let Some(bound) = budget_bound {
-        bound
-    } else if backstop_clamped {
-        SizingConstraint::Backstop
-    } else {
-        SizingConstraint::Complexity
+    let sized_by = match (budget_bound, backstop_clamped) {
+        (Some(bound), _) => bound,
+        (None, true) => SizingConstraint::Backstop,
+        (None, false) => SizingConstraint::Complexity,
     };
+    plan_from(slots, parallelism, sized_by)
+}
 
-    let planned_total = council
-        .saturating_add(review)
-        .saturating_add(providers)
-        .saturating_add(advocates);
+/// Assembla il piano dagli slot risolti (ordine fisso: council, review,
+/// providers, advocates — vedi [`slot_index`]). Il parallelismo non supera mai
+/// il totale pianificato: aprire 6 permessi per 3 sub-run non serve a nessuno.
+fn plan_from(
+    slots: [usize; 4],
+    parallelism: usize,
+    sized_by: SizingConstraint,
+) -> OrchestrationPlan {
+    let planned_total: usize = slots.iter().sum();
     OrchestrationPlan {
-        council_figures: council,
-        review_panel_size: review,
-        multi_provider_providers: providers,
-        debate_advocates: advocates,
+        council_figures: slots[0],
+        review_panel_size: slots[1],
+        multi_provider_providers: slots[2],
+        debate_advocates: slots[3],
         fanout_parallelism: parallelism.min(planned_total.max(1)),
         sized_by,
     }

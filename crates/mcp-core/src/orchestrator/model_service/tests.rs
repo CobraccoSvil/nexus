@@ -165,6 +165,7 @@ async fn nessuna_modalita_sceglie_un_modello_non_eleggibile(pool: PgPool) {
                 profile,
                 capability: Some("reasoning"),
                 min_context_window: 0,
+                min_tier: None,
                 exclude_providers: &[],
                 pin: None,
                 rank,
@@ -403,4 +404,66 @@ fn il_rank_per_tier_viene_dal_vocabolario_unico() {
             "il livello '{t}' manca nell'ordinamento per tier: {sql}"
         );
     }
+}
+
+/// IL PAVIMENTO (misurato sul campo il 16/07): un modello sotto la soglia non
+/// e' un'alternativa peggiore, e' un'alternativa che NON FUNZIONA.
+///
+/// Il failover enumerava con AnyTier e sceglieva col "tier come indicazione":
+/// con openai e anthropic senza credito e' finito su groq/gpt-oss-20b
+/// (agentic_index 3.1, il peggiore del parco). Il run non e' fallito — ha
+/// prodotto una risposta FUORI TEMA e l'ha dichiarata 'completed'. Un esito
+/// bugiardo e' peggio di un fallimento: l'utente ci si fida.
+#[sqlx::test]
+async fn il_pavimento_scarta_i_modelli_troppo_deboli(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    // Il caso REALE: il 'light' e' il piu' economico, quindi vincerebbe
+    // qualunque ordinamento cost-first se il pavimento mancasse.
+    sqlx::query(
+        "INSERT INTO ai_price_catalog              (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,               performance_tier, capabilities, input_cost_per_million_tokens) VALUES              ('groq',     'gpt-oss-20b',       true, true, 'none', 'light',  '[\"code\"]'::jsonb, 0.01),              ('deepseek', 'deepseek-v4-flash', true, true, 'none', 'medium', '[\"code\"]'::jsonb, 5.00)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    // SENZA pavimento: vince il light (e' 500 volte piu' economico).
+    let req = ModelRequest::agentic("")
+        .tier_policy(TierPolicy::AnyTier)
+        .capability(Some("code"));
+    let c = select_model_with_gate(&pool, &req, gate(false)).await.expect("un modello");
+    assert_eq!(c.model, "gpt-oss-20b", "senza pavimento vince il piu' economico: e' il difetto");
+
+    // COL pavimento 'medium': il light e' ESCLUSO, anche se costa 500 volte meno.
+    let req = ModelRequest::agentic("")
+        .tier_policy(TierPolicy::AnyTier)
+        .capability(Some("code"))
+        .min_tier("medium");
+    let c = select_model_with_gate(&pool, &req, gate(false)).await.expect("un modello sopra il pavimento");
+    assert_eq!(
+        c.model, "deepseek-v4-flash",
+        "col pavimento il modello sotto soglia NON e' ammissibile: meglio pagare              500 volte tanto che rispondere fuori tema dichiarando 'completed'"
+    );
+}
+
+/// Se sotto il pavimento non c'e' NULLA, si fallisce ONESTAMENTE invece di
+/// rispondere male. E' la scelta dichiarata: un esito bugiardo e' peggio di un
+/// fallimento.
+#[sqlx::test]
+async fn sotto_il_pavimento_si_fallisce_onestamente(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog              (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,               performance_tier, capabilities, input_cost_per_million_tokens) VALUES              ('groq', 'solo-light', true, true, 'none', 'light', '[\"code\"]'::jsonb, 0.01)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let req = ModelRequest::agentic("")
+        .tier_policy(TierPolicy::AnyTier)
+        .capability(Some("code"))
+        .min_tier("medium");
+    let err = select_model_with_gate(&pool, &req, gate(false)).await.expect_err(
+        "sotto il pavimento non c'e' nulla: meglio un fallimento TIPIZZATO che              una risposta inaffidabile spacciata per buona",
+    );
+    // L'esito e' comunque TIPIZZATO (I6): mai un None muto.
+    assert!(!matches!(err, NoModelReason::InvalidRequest(_)), "{err:?}");
 }

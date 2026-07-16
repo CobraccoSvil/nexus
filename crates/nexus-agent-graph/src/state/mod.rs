@@ -305,6 +305,11 @@ pub struct AgentState {
     /// risks[], recommendations[]}. Propagato oltre il confine sub-run in
     /// `structured_verdict` (campo `advisory`, regola M).
     pub advisory_verdict: Option<Value>,
+    /// Posizione strutturata di un AVVOCATO del dibattito a tesi contrapposte via
+    /// tool debate_position: dict normalizzato {assigned_position, stance,
+    /// summary, key_arguments[], risks[]}. Propagato oltre il confine sub-run in
+    /// `structured_verdict` (campo `debate`, regola M).
+    pub debate_position: Option<Value>,
     /// `true` se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
     pub tool_infra_error: Option<bool>,
     /// Passi strutturati del playbook matchato.
@@ -559,6 +564,13 @@ pub struct AgentState {
     /// (come `tokens_used_total`). `None` = nessun costo noto ancora (turno senza
     /// prezzo in catalog o run appena avviato).
     pub run_cost_cumulative_usd: Option<f64>,
+    /// Epoch UNIX (secondi) di AVVIO del run primario, valorizzato UNA volta da
+    /// `build_initial_state` e CHECKPOINTATO: la deadline di run
+    /// (`ExecutorConfig::run_time_budget_s`) misura il tempo di parete del run
+    /// INTERO anche dopo un resume/recovery, non dell'ultimo spezzone. `None` =
+    /// run avviato prima della fase 3: nessun enforcement (mai un default
+    /// inventato). Reducer overwrite come gli altri contatori.
+    pub run_started_at_epoch_s: Option<i64>,
     /// Turni solo-testo CONSECUTIVI del run (la risposta LLM non conteneva tool_use
     /// mentre il loop si aspettava azioni; segnale strutturato `LlmResponse.tool_calls`,
     /// regola M). Azzerato appena il modello emette un tool_use, incrementato quando

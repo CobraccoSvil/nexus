@@ -4861,6 +4861,80 @@ async fn run_cost_budget_sotto_soglia_prosegue() {
 }
 
 #[tokio::test]
+async fn run_time_budget_oltre_deadline_chiude_diretto() {
+    // Deadline del run (fase 3, mig 0604): epoch di avvio nel PASSATO oltre il
+    // budget -> chiusura d'autorita' (close_runaway, reason canonico
+    // "time_budget"), senza chiamare il modello. Gemello del cap di spesa.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 600,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let started_way_back = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs() as i64
+        - 3_600; // avviato un'ora fa, budget 600s
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        run_started_at_epoch_s: Some(started_way_back),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway (time)");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("time_budget")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn run_time_budget_disattivato_o_senza_epoch_prosegue() {
+    // Budget 0 (disattivato) O epoch assente (run precedente alla fase 3):
+    // il ramo deadline NON scatta, il turno prosegue (LLM chiamato). Mai un
+    // enforcement su un default inventato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 600,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("ok"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        run_started_at_epoch_s: None, // epoch assente -> nessun enforcement
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _out = apply(state, delta);
+    assert!(!llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn runaway_budget_esaurito_a_flag_on_ricade_su_close_runaway() {
     // Meta-reasoner acceso ma budget consultazioni per-sessione esaurito: il gate
     // runaway NON emette StallReason (rete di sicurezza) e ricade sul backstop
@@ -4949,7 +5023,7 @@ fn advisory_figure_senza_verdict_e_riconosciuta() {
         ..Default::default()
     };
     assert!(
-        is_advisory_figure_without_verdict(&figura),
+        pending_role_channel_grace(&figura).is_some(),
         "figura con canale advisory e senza parere -> grazia attiva"
     );
 }
@@ -4962,14 +5036,40 @@ fn advisory_figure_con_verdict_gia_dichiarato_non_e_in_grazia() {
         ..Default::default()
     };
     assert!(
-        !is_advisory_figure_without_verdict(&conclusa),
+        pending_role_channel_grace(&conclusa).is_none(),
         "parere gia' dichiarato -> niente grazia (bit-identico)"
     );
 }
 
 #[test]
+fn avvocato_senza_posizione_e_in_grazia_col_proprio_canale() {
+    // L'avvocato del dibattito ha lo stesso problema della figura: se si
+    // impantana e tace, la sua tesi resta senza voce e il confronto e' falsato.
+    let avvocato = AgentState {
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "debate_position"}),
+        ]),
+        debate_position: None,
+        ..Default::default()
+    };
+    let directive = pending_role_channel_grace(&avvocato).expect("grazia per l'avvocato");
+    assert!(
+        directive.contains("debate_position"),
+        "la grazia deve indicare il canale del RUOLO, non quello di un altro"
+    );
+    // Posizione gia' dichiarata -> niente grazia.
+    let concluso = AgentState {
+        tools_json: Some(vec![json!({"name": "debate_position"})]),
+        debate_position: Some(json!({"assigned_position": "A", "stance": "support"})),
+        ..Default::default()
+    };
+    assert!(pending_role_channel_grace(&concluso).is_none());
+}
+
+#[test]
 fn run_principale_e_revisore_non_sono_figure() {
-    // Run principale: task_complete, niente advisory_verdict.
+    // Run principale: task_complete, niente canale di ruolo.
     let principale = AgentState {
         tools_json: Some(vec![
             json!({"name": "task_complete"}),
@@ -4978,21 +5078,22 @@ fn run_principale_e_revisore_non_sono_figure() {
         advisory_verdict: None,
         ..Default::default()
     };
-    assert!(!is_advisory_figure_without_verdict(&principale));
-    // Revisore: review_verdict, non advisory_verdict.
+    assert!(pending_role_channel_grace(&principale).is_none());
+    // Revisore: review_verdict, che NON ha turno di grazia (comportamento
+    // storico invariato: chiude col backstop come prima).
     let revisore = AgentState {
         tools_json: Some(vec![json!({"name": "review_verdict"})]),
         advisory_verdict: None,
         ..Default::default()
     };
-    assert!(!is_advisory_figure_without_verdict(&revisore));
-    // Nessun tool -> non figura.
+    assert!(pending_role_channel_grace(&revisore).is_none());
+    // Nessun tool -> nessun canale di ruolo.
     let vuoto = AgentState {
         tools_json: None,
         advisory_verdict: None,
         ..Default::default()
     };
-    assert!(!is_advisory_figure_without_verdict(&vuoto));
+    assert!(pending_role_channel_grace(&vuoto).is_none());
 }
 
 #[test]

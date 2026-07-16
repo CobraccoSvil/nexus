@@ -22,6 +22,7 @@
 use serde_json::Value;
 
 use super::panel_quorum::{classify_panel, required_valid, PanelClass, QuorumPolicy, QuorumTally};
+use super::severity::rank as severity_rank;
 
 /// Roster del panel advisory: il DENOMINATORE del quorum e' un input esplicito
 /// del chiamante, mai dedotto dalla presenza dei voti (regola M: una figura in
@@ -167,6 +168,13 @@ pub struct AdvisorySynthesis {
     pub risks: Vec<Value>,
     /// Raccomandazioni unite, deduplicate mantenendo l'ordine.
     pub recommendations: Vec<String>,
+    /// Decisione architetturale CONTESA, se una figura ne ha dichiarata una:
+    /// `{topic, options[]}`. Vince la PRIMA dichiarazione valida nell'ordine
+    /// degli `outcomes` (deterministico e replay-stabile; le successive sono
+    /// ignorate — un dibattito ha UN oggetto, non uno per figura). E' il segnale
+    /// strutturato che innesca le tesi contrapposte (regola M: mai dedotto dalla
+    /// prosa dei pareri).
+    pub contested_decision: Option<Value>,
 }
 
 impl AdvisorySynthesis {
@@ -190,6 +198,7 @@ impl AdvisorySynthesis {
             "requirements": self.requirements,
             "risks": self.risks,
             "recommendations": self.recommendations,
+            "contested_decision": self.contested_decision,
         })
     }
 }
@@ -201,17 +210,9 @@ struct Advice {
     requirements: Vec<String>,
     risks: Vec<Value>,
     recommendations: Vec<String>,
-}
-
-/// Rank di severity per l'ordinamento dei rischi (piu' basso = piu' grave, cosi'
-/// il sort ascendente porta le `alta` in cima). Severity ignota -> in fondo.
-fn severity_rank(v: &Value) -> u8 {
-    match v.get("severity").and_then(Value::as_str) {
-        Some("alta") => 0,
-        Some("media") => 1,
-        Some("bassa") => 2,
-        _ => 3,
-    }
+    /// Decisione architetturale CONTESA dichiarata da questa figura (innesca il
+    /// dibattito a tesi contrapposte). Gia' normalizzata alla frontiera.
+    contested_decision: Option<Value>,
 }
 
 /// Estrae la lista di stringhe non vuote da un campo array (`requirements`,
@@ -246,15 +247,21 @@ fn extract_advice(outcome: &Value) -> Option<Advice> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let has_high_severity = risks
-        .iter()
-        .any(|r| r.get("severity").and_then(Value::as_str) == Some("alta"));
+    // Punto unico del vocabolario gravita' (regola L): il test dell'evidenza
+    // grave e' lo stesso di review e debate — vive in `severity`, non qui.
+    let has_high_severity = super::severity::any_high(&risks);
     Some(Advice {
         verdict,
         has_high_severity,
         requirements: string_list(advisory, "requirements"),
         risks,
         recommendations: string_list(advisory, "recommendations"),
+        // Ri-validata QUI e non data per buona: l'outcome puo' arrivare da un
+        // sub-run vecchio o da un percorso che non e' passato dal normalizzatore
+        // del tool (regola M: si valida al confine che si attraversa).
+        contested_decision: super::tool_dispatch::normalize_contested_decision(
+            advisory.get("contested_decision"),
+        ),
     })
 }
 
@@ -307,6 +314,7 @@ pub fn compose_advisory_synthesis(
     let mut requirements: Vec<String> = Vec::new();
     let mut recommendations: Vec<String> = Vec::new();
     let mut risks: Vec<Value> = Vec::new();
+    let mut contested_decision: Option<Value> = None;
     for a in &advices {
         match a.verdict {
             AdvisoryVerdict::Proceed => proceed += 1,
@@ -321,6 +329,11 @@ pub fn compose_advisory_synthesis(
         extend_dedup(&mut requirements, a.requirements.clone());
         extend_dedup(&mut recommendations, a.recommendations.clone());
         risks.extend(a.risks.iter().cloned());
+        // Prima dichiarazione valida nell'ordine degli outcomes: un dibattito ha
+        // UN oggetto conteso, non uno per figura (le successive sono ignorate).
+        if contested_decision.is_none() {
+            contested_decision.clone_from(&a.contested_decision);
+        }
     }
     // Ordine per severity, STABILE (a parita' resta l'ordine di apparizione).
     risks.sort_by_key(severity_rank);
@@ -370,6 +383,7 @@ pub fn compose_advisory_synthesis(
         requirements,
         risks,
         recommendations,
+        contested_decision,
     })
 }
 

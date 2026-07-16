@@ -1618,9 +1618,26 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "summary": {"type": "string", "description": "Resoconto umano del parere (cosa hai analizzato e con quale conclusione)."},
         "requirements": {"type": "array", "items": {"type": "string"}, "description": "Vincoli/requisiti che l'esecuzione DEVE rispettare secondo la tua lente. Ognuno una frase azionabile."},
         "risks": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["alta", "media", "bassa"], "description": "Severita' del rischio."}, "area": {"type": "string", "description": "Ambito del rischio (es. sicurezza, dati, deploy)."}, "description": {"type": "string", "description": "Il rischio e la sua evidenza concreta."}}, "required": ["description"]}, "description": "Rischi con evidenza. Obbligatorio (non vuoto) con verdict=block: un veto senza evidenza viene rifiutato."},
-        "recommendations": {"type": "array", "items": {"type": "string"}, "description": "Suggerimenti non vincolanti dalla tua prospettiva."}
+        "recommendations": {"type": "array", "items": {"type": "string"}, "description": "Suggerimenti non vincolanti dalla tua prospettiva."},
+        "contested_decision": {"type": "object", "properties": {"topic": {"type": "string", "description": "La decisione in una riga (es. 'come isolare i sub-run che scrivono')."}, "options": {"type": "array", "items": {"type": "string"}, "description": "Le alternative REALI e mutuamente esclusive, almeno due, ognuna descritta in modo autonomo e comprensibile senza il resto del parere."}}, "required": ["topic", "options"], "description": "Dichiaralo SOLO se la richiesta nasconde una DECISIONE ARCHITETTURALE aperta: piu' strade alternative difendibili, dove la scelta cambia il progetto e nessuna e' ovviamente superiore. Non dichiararlo per un dettaglio implementativo, per una scelta gia' presa nel repo (ADR/punto unico esistente), ne' quando una strada e' chiaramente giusta: farebbe convocare un dibattito costoso su una domanda gia' risolta. Se lo dichiari, avvocati indipendenti riceveranno UNA opzione ciascuno da difendere con evidenza, e il coordinatore decidera' sul merito del confronto."}
       },
       "required": ["verdict", "summary"]
+    }
+  }
+  ,
+  {
+    "name": "debate_position",
+    "description": "Dichiara la POSIZIONE strutturata di un avvocato in un dibattito a tesi contrapposte. Chiamalo UNA SOLA VOLTA, come ULTIMISSIMA azione, DOPO aver studiato il codice: se dopo la dichiarazione esegui altri tool, la posizione viene invalidata. assigned_position DEVE ripetere ALLA LETTERA la posizione che ti e' stata assegnata nel task: e' la chiave con cui il tuo voto viene attribuito, una posizione riscritta o inventata non viene conteggiata. stance=support se, studiate le prove, la tua posizione REGGE ed e' preferibile alle avverse; stance=oppose se onestamente NON regge: sei un avvocato, non un tifoso — arrendere la propria tesi davanti all'evidenza e' il contributo piu' prezioso del dibattito, non una sconfitta. key_arguments sono gli argomenti concreti (con file:riga dove possibile) a sostegno della tua conclusione; risks i rischi che hai trovato, con la loro severity. Un oppose con un rischio di severity alta squalifica la posizione anche se altri avvocati la sostengono: dichiara alta solo con evidenza verificata nel codice.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "assigned_position": {"type": "string", "description": "La posizione che ti e' stata assegnata, ripetuta ALLA LETTERA come compare nel task. E' la chiave di attribuzione del voto."},
+        "stance": {"type": "string", "enum": ["support", "oppose"], "description": "support = la posizione assegnata regge ed e' preferibile; oppose = studiate le prove NON regge (resa onesta: non e' una sconfitta, e' evidenza)."},
+        "summary": {"type": "string", "description": "Resoconto umano della tua arringa (cosa hai verificato e con quale conclusione)."},
+        "key_arguments": {"type": "array", "items": {"type": "string"}, "description": "Argomenti concreti a sostegno della tua conclusione, ognuno una frase con evidenza (file:riga dove possibile). Niente retorica: prove."},
+        "risks": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["alta", "media", "bassa"], "description": "Severita' del rischio."}, "area": {"type": "string", "description": "Ambito del rischio (es. sicurezza, dati, deploy)."}, "description": {"type": "string", "description": "Il rischio e la sua evidenza concreta."}}, "required": ["description"]}, "description": "Rischi trovati, con evidenza. Obbligatorio (non vuoto) con stance=oppose: arrendere la tesi senza spiegare perche' non e' evidenza, e viene rifiutato."}
+      },
+      "required": ["assigned_position", "stance", "summary"]
     }
   }
   ,
@@ -1650,7 +1667,11 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
 /// (consiglio di figure a monte): canale dichiarativo delle figure di analisi
 /// (program_manager, software_architect, security_engineer, ...); come sopra e'
 /// esposto SOLO ai kind che lo whitelistano, mai al run principale.
-pub const SUBAGENT_ONLY_TOOLS: &[&str] = &["review_verdict", "advisory_verdict"];
+/// `debate_position` (tesi contrapposte): canale dichiarativo del kind
+/// `advocate`; il coordinatore consuma la SINTESI del dibattito, non i singoli
+/// voti, e il run principale non ha una posizione assegnata da difendere.
+pub const SUBAGENT_ONLY_TOOLS: &[&str] =
+    &["review_verdict", "advisory_verdict", "debate_position"];
 
 #[cfg(test)]
 mod tests {

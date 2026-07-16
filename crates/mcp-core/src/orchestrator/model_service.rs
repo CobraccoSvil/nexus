@@ -184,6 +184,10 @@ pub struct ModelRequest<'a> {
     pub profile: Profile,
     pub capability: Option<&'a str>,
     pub min_context_window: i64,
+    /// PAVIMENTO di capacita': nessun modello sotto questo tier e' ammissibile.
+    /// E' eleggibilita', non preferenza — vedi [`EligibilityFilter::min_tier`].
+    /// `None` = nessun pavimento (il default storico).
+    pub min_tier: Option<&'a str>,
     pub exclude_providers: &'a [String],
     /// `Some(p)` RESTRINGE al provider `p`. Con un pin la `tier_policy` DEVE
     /// essere `Exact { why: PinnedProvider }` (invariante I5, verificata).
@@ -214,6 +218,7 @@ impl<'a> ModelRequest<'a> {
             profile: Profile::Agentic,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             pin: None,
             rank: Rank::CostFirst,
@@ -247,6 +252,14 @@ impl<'a> ModelRequest<'a> {
 
     pub fn min_context_window(mut self, n: i64) -> Self {
         self.min_context_window = n;
+        self
+    }
+
+    /// Pavimento di capacita' (eleggibilita'): scarta i modelli sotto `tier`.
+    /// Da usare quando un modello troppo debole non e' un ripiego ma un danno —
+    /// es. il failover di un run agentico (vedi `EligibilityFilter::min_tier`).
+    pub fn min_tier(mut self, tier: &'a str) -> Self {
+        self.min_tier = Some(tier);
         self
     }
 
@@ -400,6 +413,7 @@ fn filter_for<'a>(
         require_thinking_non_exclude: agentic,
         capability: req.capability,
         min_context_window: req.min_context_window,
+        min_tier: req.min_tier,
         exclude_providers: req.exclude_providers,
         apply_cooldown: true,
         only_provider: req.pin,

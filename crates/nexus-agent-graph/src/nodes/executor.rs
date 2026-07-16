@@ -352,6 +352,15 @@ pub struct ExecutorConfig {
     /// dollari invece che in token (400k token costano ~64x su gpt-5.5 vs
     /// deepseek-flash). Regola G: DB-driven, mai hardcoded.
     pub run_cost_budget_usd: f64,
+    /// Deadline in SECONDI dell'INTERO run (`agent.run_time_budget_s`, default 0
+    /// = disabilitato -> bit-identico). Terzo asse del budget accanto a token e
+    /// dollari (fase 3 paradigma orchestrazione): tempo di parete dal via del
+    /// run primario (`AgentState::run_started_at_epoch_s`, checkpointato ->
+    /// sopravvive ai resume, misura il run INTERO e non l'ultimo spezzone). Al
+    /// raggiungimento (`>=`) l'executor chiude d'autorita' (`close_runaway`) con
+    /// reason canonico `time_budget` (regola M/N), come il cap di spesa. NON si
+    /// resetta all'escalation. Regola G: DB-driven, mai hardcoded.
+    pub run_time_budget_s: u64,
     /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
     /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
     /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
@@ -610,6 +619,9 @@ impl Default for ExecutorConfig {
             // 0 = disabilitato (bit-identico): il freno di spesa in dollari e' attivato
             // dal setting DB agent.run_cost_budget_usd (mig 0533).
             run_cost_budget_usd: 0.0,
+            // 0 = disabilitato (bit-identico): la deadline di run e' attivata
+            // dal setting DB agent.run_time_budget_s (mig 0604).
+            run_time_budget_s: 0,
             max_consecutive_text_only_turns: 3,
             // 3.4 default OFF -> comportamento bit-identico (chiusura backstop).
             provider_no_progress_switch_enabled: false,
@@ -1428,6 +1440,44 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
                         "run_cost_budget_usd": self.cfg.run_cost_budget_usd,
                     }),
                 ));
+            }
+        }
+        // Deadline dell'INTERO run in tempo di parete (fase 3 paradigma
+        // orchestrazione): epoch di avvio CHECKPOINTATO nello stato -> la misura
+        // sopravvive ai resume e copre il run intero. `0` = disabilitato; run
+        // senza epoch (avviati prima della fase 3) -> nessun enforcement, mai un
+        // default inventato. Chiusura PULITA con reason canonico `time_budget`
+        // (regola M/N), gemella del cap di spesa qui sopra.
+        if self.cfg.run_time_budget_s > 0 {
+            if let Some(started) = state.run_started_at_epoch_s {
+                let now_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(started);
+                let elapsed_s = now_s.saturating_sub(started).max(0) as u64;
+                if elapsed_s >= self.cfg.run_time_budget_s {
+                    let time_text = format!(
+                        "Raggiunta la deadline del run ({elapsed_s}s trascorsi, budget {}s). \
+Interrompo d'autorita' per rispettare il tempo massimo: riformula la richiesta in modo \
+piu' specifico, oppure alza agent.run_time_budget_s se il task richiede piu' tempo.",
+                        self.cfg.run_time_budget_s
+                    );
+                    tracing::error!(
+                        target: "nexus_agent_graph::executor",
+                        elapsed_s,
+                        run_time_budget_s = self.cfg.run_time_budget_s,
+                        "DEADLINE del run raggiunta -> chiusura d'autorita' (tempo di parete)"
+                    );
+                    return Ok(self.close_runaway(
+                        iters_in,
+                        time_text,
+                        "time_budget",
+                        json!({
+                            "elapsed_s": elapsed_s,
+                            "run_time_budget_s": self.cfg.run_time_budget_s,
+                        }),
+                    ));
+                }
             }
         }
         if self.cfg.run_token_budget > 0 && tokens_used_total >= self.cfg.run_token_budget {
@@ -3026,6 +3076,14 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                                     cutoff = cut,
                                     "rolling summary: prefisso conversazione riassunto"
                                 );
+                                // HEARTBEAT: il rolling summary e' lavoro LUNGO (una
+                                // chiamata LLM + l'offload su RAG con embedding) e
+                                // sta FRA due battiti (il precedente e' a :2916,
+                                // prima del context reduction; il prossimo e' alla
+                                // prossima iterazione). Un run che comprime il
+                                // contesto sta lavorando, e deve poterlo dimostrare
+                                // al reaper invece di sembrare fermo.
+                                let _ = self.run_control.heartbeat(&run_id, mode).await;
                             }
                             Ok(_) => {
                                 // Summary vuoto: degrada (history invariata).
@@ -3542,6 +3600,20 @@ della finestra {effective_window} del modello {provider}/{model}"
                                 tried = tried.len(),
                                 "provider caduto -> FAILOVER cross-provider via routing (cascata)"
                             );
+                            // HEARTBEAT: un cambio di provider e' la PROVA che il
+                            // run sta lavorando — non e' appeso, sta girando la
+                            // cascata. Senza questo battito la liveness si misura
+                            // una volta per ITERAZIONE (executor.rs:2916, prima del
+                            // context reduction), e una prima iterazione con piu'
+                            // failover puo' superare la soglia del reaper (900s,
+                            // mig 0392) mentre lavora: il run verrebbe ucciso
+                            // proprio perche' si sta sforzando di sopravvivere.
+                            // MISURATO (16/07): un run reale ha impiegato 1145s con
+                            // 5 provider su 6 in errore — 245s oltre la soglia. E'
+                            // sopravvissuto solo perche' le iterazioni successive
+                            // battevano. La mig 0392 dichiara il limite: "il battito
+                            // si ferma durante un tool sincrono lungo".
+                            let _ = self.run_control.heartbeat(&run_id, mode).await;
                             // Motivo ONESTO dello switch (regola M): la causa
                             // tipizzata arriva dal body strutturato del gateway
                             // (details.primary_cause / POLICY_TIER_EXCLUDED), mai
@@ -5272,11 +5344,11 @@ azioni concrete e mirate verso il completamento.",
                     // advisory_verdict -> parere reale invece di failed_diagnosed
                     // (n/d). Per i run non-figura e' bit-identico.
                     messages_out.push(recovery_nudge_msg(state, t));
-                } else if is_advisory_figure_without_verdict(state) {
-                    // Reasoner senza nudge ma figura senza parere: inietta comunque
-                    // la direttiva di grazia, altrimenti il turno riparte muto e la
-                    // figura continua a esplorare fino a timeout/cap -> n/d.
-                    messages_out.push(human_msg(ADVISORY_GRACE_DIRECTIVE.trim()));
+                } else if let Some(directive) = pending_role_channel_grace(state) {
+                    // Reasoner senza nudge ma ruolo senza verdetto: inietta comunque
+                    // la direttiva di grazia, altrimenti il turno riparte muto e il
+                    // ruolo continua a esplorare fino a timeout/cap -> n/d.
+                    messages_out.push(human_msg(directive.trim()));
                 }
                 // Il nudge del reasoner riparte con finestra pulita sui detector di
                 // ripetizione (stessa grazia dei rami Escalate: il modello promosso/
@@ -6521,11 +6593,12 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
     /// con esito n/d: e' il percorso reale in cui una figura del consiglio (es.
     /// `functional_analyst` deepseek, run fe4dc12c) muore al cap solo-testo dopo aver
     /// esaurito il budget stall. Se il run e' una figura senza parere
-    /// ([`is_advisory_figure_without_verdict`]) e la grazia non e' ancora stata
-    /// concessa, invece di chiudere concede UN turno mirato per emettere
-    /// `advisory_verdict` (parere reale al posto di n/d). Una-tantum
+    /// ([`pending_role_channel_grace`]) e la grazia non e' ancora stata concessa,
+    /// invece di chiudere concede UN turno mirato per dichiarare col canale del
+    /// ruolo (parere/posizione reale al posto di n/d). Una-tantum
     /// ([`ADVISORY_GRACE_USED_KEY`]) per non ciclare. `None` -> il chiamante procede
-    /// col `close_runaway` (bit-identico per non-figure / grazia gia' concessa).
+    /// col `close_runaway` (bit-identico per i run senza canale di ruolo / grazia
+    /// gia' concessa).
     async fn maybe_advisory_grace_delta(
         &self,
         state: &AgentState,
@@ -6533,9 +6606,7 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        if !is_advisory_figure_without_verdict(state) {
-            return None;
-        }
+        let directive = pending_role_channel_grace(state)?;
         if state
             .extra
             .get(ADVISORY_GRACE_USED_KEY)
@@ -6552,18 +6623,18 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
             ctx,
             mode,
             "advisory_grace",
-            "Turno di grazia: la figura chiude col parere (advisory_verdict)".to_string(),
+            "Turno di grazia: il ruolo chiude col proprio verdetto".to_string(),
             json!({ "iters": iters_in }),
         )
         .await;
         tracing::warn!(
             target: "nexus_agent_graph::executor",
             iters = iters_in,
-            "figura senza parere al backstop runaway -> turno di grazia advisory_verdict"
+            "ruolo senza verdetto al backstop runaway -> turno di grazia sul canale proprio"
         );
         Some(
             StateDelta {
-                messages: Some(vec![human_msg(ADVISORY_GRACE_DIRECTIVE.trim())]),
+                messages: Some(vec![human_msg(directive.trim())]),
                 // Azzera lo streak solo-testo: al re-entry il blocco text-only NON
                 // ri-scatta prima di chiamare l'LLM, cosi' il turno di grazia raggiunge
                 // davvero il modello (che puo' emettere advisory_verdict). Senza
@@ -6685,42 +6756,71 @@ valutazione corrente (verdict + summary + eventuali requirements). NON continuar
 esplorare e NON diagnosticare un fallimento tecnico: emetti il tuo parere consultivo \
 adesso, anche se parziale, basandoti su cio' che hai gia' osservato.";
 
+/// Direttiva di GRAZIA per un AVVOCATO del dibattito impantanato senza posizione
+/// dichiarata. Gemella di [`ADVISORY_GRACE_DIRECTIVE`] sul canale del dibattito:
+/// un avvocato che tace lascia la sua tesi senza voce, e una tesi indifesa non
+/// perde — falsa il confronto (il panel se ne accorge e dichiara `inconclusive`,
+/// ma la spesa e' gia' fatta). Meglio una posizione parziale ma dichiarata.
+const DEBATE_GRACE_DIRECTIVE: &str = "\n\nHai gia' raccolto prove sufficienti. \
+CHIUDI ORA la tua arringa chiamando il tool debate_position con la tua conclusione \
+corrente (assigned_position ripetuta alla lettera, stance, key_arguments). NON \
+continuare a esplorare e NON diagnosticare un fallimento tecnico: se la tua posizione \
+regge dichiara support, se studiando hai visto che non regge dichiara oppose coi \
+rischi trovati. Tacere lascerebbe la tua tesi senza difensore e falserebbe il \
+dibattito.";
+
 /// Chiave `extra` che marca la grazia figura come GIA' concessa (una-tantum): il
 /// backstop runaway ([`ExecutorNode::maybe_advisory_grace_delta`]) la concede una
 /// sola volta per run, per non ciclare (grazia -> di nuovo cap -> grazia).
 const ADVISORY_GRACE_USED_KEY: &str = "advisory_grace_used";
 
-/// True se il run e' una FIGURA del consiglio di analisi (canale di chiusura
-/// `advisory_verdict` disponibile fra i tool) che NON ha ancora dichiarato il
-/// proprio parere. Segnale STRUTTURALE (regola M): presenza del tool nel
-/// `tools_json` + assenza di `advisory_verdict` in stato — nessun parsing di prosa.
-/// Per una figura in questo stato una mossa di recovery generica ("diagnostica il
-/// fallimento") produrrebbe `failed_diagnosed` invece di un parere: il turno di
-/// grazia la dirotta a EMETTERE il verdetto con la sua miglior stima corrente
-/// (parere reale al posto di n/d). Il run principale (niente `advisory_verdict` nel
-/// suo whitelist) e i revisori (`review_verdict`) NON matchano.
-fn is_advisory_figure_without_verdict(state: &AgentState) -> bool {
-    if state.advisory_verdict.is_some() {
-        return false;
-    }
+/// `true` se il `tools_json` del run espone il tool dato (segnale strutturale).
+fn has_tool(state: &AgentState, tool: &str) -> bool {
     state.tools_json.as_ref().is_some_and(|tools| {
         tools
             .iter()
-            .any(|t| t.get("name").and_then(Value::as_str) == Some("advisory_verdict"))
+            .any(|t| t.get("name").and_then(Value::as_str) == Some(tool))
     })
 }
 
-/// Costruisce il messaggio-nudge di recovery applicando il turno di grazia figura:
-/// se il run e' una figura del consiglio senza parere (vedi
-/// [`is_advisory_figure_without_verdict`]), appende [`ADVISORY_GRACE_DIRECTIVE`] al
-/// testo del reasoner cosi' la figura chiude con `advisory_verdict` invece di
-/// diagnosticare un fallimento. Altrimenti bit-identico a `human_msg(nudge)`. Punto
-/// unico (regola L) del turno di grazia figura sui nudge di recovery.
+/// Direttiva di grazia per un run che ha un canale di chiusura di RUOLO ancora
+/// INUTILIZZATO; `None` per tutti gli altri (run principale, revisori, o ruoli
+/// che hanno gia' dichiarato).
+///
+/// PUNTO UNICO (regola L) del riconoscimento: il concern e' "questo ruolo deve
+/// chiudere col PROPRIO canale e non l'ha ancora fatto", identico per la figura
+/// del consiglio e per l'avvocato del dibattito — cambia solo la direttiva.
+/// Senza questa forma, ogni nuovo ruolo con canale proprio avrebbe richiesto di
+/// duplicare lo stesso `if` in tre call site.
+///
+/// Segnale STRUTTURALE (regola M): presenza del tool nel `tools_json` + assenza
+/// della dichiarazione in stato — nessun parsing di prosa. Per un ruolo in questo
+/// stato una mossa di recovery generica ("diagnostica il fallimento") produrrebbe
+/// `failed_diagnosed` invece del contributo atteso: il turno di grazia lo dirotta
+/// a DICHIARARE con la sua miglior stima corrente.
+///
+/// Ordine dei rami: un kind ha UN solo canale di ruolo (le whitelist di 0546 e
+/// 0605 sono disgiunte), quindi non c'e' ambiguita' reale; l'advisory resta
+/// primo per continuita' col comportamento storico.
+fn pending_role_channel_grace(state: &AgentState) -> Option<&'static str> {
+    if state.advisory_verdict.is_none() && has_tool(state, "advisory_verdict") {
+        return Some(ADVISORY_GRACE_DIRECTIVE);
+    }
+    if state.debate_position.is_none() && has_tool(state, "debate_position") {
+        return Some(DEBATE_GRACE_DIRECTIVE);
+    }
+    None
+}
+
+/// Costruisce il messaggio-nudge di recovery applicando il turno di grazia di
+/// ruolo: se il run ha un canale di chiusura proprio non ancora usato (vedi
+/// [`pending_role_channel_grace`]), appende la direttiva corrispondente al testo
+/// del reasoner cosi' il ruolo chiude col proprio verdetto invece di
+/// diagnosticare un fallimento. Altrimenti bit-identico a `human_msg(nudge)`.
 fn recovery_nudge_msg(state: &AgentState, nudge: &str) -> Message {
-    if is_advisory_figure_without_verdict(state) {
-        human_msg(&format!("{nudge}{ADVISORY_GRACE_DIRECTIVE}"))
-    } else {
-        human_msg(nudge)
+    match pending_role_channel_grace(state) {
+        Some(directive) => human_msg(&format!("{nudge}{directive}")),
+        None => human_msg(nudge),
     }
 }
 

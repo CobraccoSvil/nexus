@@ -240,10 +240,15 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
 /// `declared_outcome`, cosi' il gate G1 (`route_after_executor`) onora la
 /// chiusura su `end_turn` invece di re-instradare all'executor. `task_complete`
 /// e' il canale UNIVERSALE (builtin del run principale); le figure del consiglio
-/// usano `advisory_verdict`, il revisore `review_verdict` come loro equivalente
-/// di ruolo (parere strutturato = dichiarazione d'esito).
-const COMPLETION_CHANNEL_TOOLS: [&str; 3] =
-    ["task_complete", "advisory_verdict", "review_verdict"];
+/// usano `advisory_verdict`, il revisore `review_verdict` e l'avvocato del
+/// dibattito `debate_position` come loro equivalente di ruolo (dichiarazione
+/// strutturata = dichiarazione d'esito).
+const COMPLETION_CHANNEL_TOOLS: [&str; 4] = [
+    "task_complete",
+    "advisory_verdict",
+    "review_verdict",
+    "debate_position",
+];
 
 pub(crate) fn build_tools_json(whitelist: &[String]) -> Value {
     if whitelist.is_empty() {
@@ -382,7 +387,14 @@ fn apply_ledger_to_outcome(
 }
 
 /// Costo cumulativo gia' speso dai sub-run su questo `parent_anchor` (hard cap).
-async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
+///
+/// PUNTO UNICO (regola L) dello speso di una catena di sub-run: lo usano il
+/// Guard 4 del prepare e il dimensionamento del dibattito (che deve vedere cosa
+/// il consiglio ha gia' consumato prima di finanziare gli avvocati). NB: i
+/// sub-run hanno `run_id` PROPRI nel ledger, quindi un'aggregazione per-run del
+/// padre NON li vedrebbe: la fonte e' `nexus_subagent_runs.cost_usd`, popolata
+/// alla finalizzazione di ogni figlio.
+pub(crate) async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
     // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
     sqlx::query_scalar::<_, f64>(
         "SELECT COALESCE(SUM(cost_usd), 0)::double precision \
@@ -1330,10 +1342,14 @@ pub(crate) struct FigureAdvisoryReport {
 /// Esito del pre-step Consiglio delle Competenze: sintesi attiva o degrado esplicito.
 /// `None` dal call site significa che i gate pre-convocazione non sono passati
 /// (feature off, keyword miss, nessuna figura): nessun segnale UI.
+///
+/// `synthesis` e' BOXATA: la sintesi e' molto piu' grande del ramo degradato
+/// (che porta solo un enum di causa), e senza indirezione ogni valore dell'enum
+/// — anche i degradi — pagherebbe la dimensione del caso peggiore.
 #[derive(Debug, Clone)]
 pub(crate) enum CouncilConveneOutcome {
     Active {
-        synthesis: AdvisorySynthesis,
+        synthesis: Box<AdvisorySynthesis>,
         figures: Vec<String>,
         figure_reports: Vec<FigureAdvisoryReport>,
     },
@@ -1406,10 +1422,13 @@ pub(crate) struct PanelProviderEntry {
 }
 
 /// Esito del panel multi-provider: sintesi attiva oppure degrado esplicito.
+/// `synthesis` BOXATA per lo stesso motivo di [`CouncilConveneOutcome`]: il ramo
+/// degradato porta solo due contatori e non deve pagare la dimensione della
+/// sintesi.
 #[derive(Debug, Clone)]
 pub(crate) enum MultiProviderPanelOutcome {
     Active {
-        synthesis: AdvisorySynthesis,
+        synthesis: Box<AdvisorySynthesis>,
         provider_count: usize,
         panel_providers: Vec<PanelProviderEntry>,
         /// Parere INDIVIDUALE di ogni provider (prima della sintesi): provenienza
@@ -1663,6 +1682,43 @@ pub(crate) async fn read_panel_unit_estimate(
     }
 }
 
+/// Tempo RESIDUO (secondi) della deadline del run primario (fase 3, mig 0604).
+/// PUNTO UNICO (regola L) usato dal clamp del timeout sub-run in prepare, dal
+/// resolver di dimensionamento pre-run e dalla review post-run. Derivato DAL DB
+/// (`agent_runs.created_at` del run ancorato + setting `agent.run_time_budget_s`):
+/// nessun threading di Instant nei ctx, vale per OGNI percorso di dispatch.
+/// `None` = deadline disattivata (setting 0/assente) o run non ancorato.
+pub(crate) async fn run_time_remaining_s(
+    meta_db: &sqlx::PgPool,
+    run_pool: &sqlx::PgPool,
+    anchor_run_id: Uuid,
+) -> Option<i64> {
+    let budget_s = nexus_auth::get_setting(meta_db, "agent.run_time_budget_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|b| *b > 0)?;
+    let started: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM agent_runs WHERE id = $1")
+            .bind(anchor_run_id)
+            .fetch_optional(run_pool)
+            .await
+            .ok()
+            .flatten()?;
+    let elapsed_s = (chrono::Utc::now() - started).num_seconds().max(0);
+    Some(budget_s - elapsed_s)
+}
+
+/// Floor del timeout sub-run sotto deadline (`orchestrator.subagent_min_timeout_s`,
+/// mig 0604): sotto questo residuo una figura NON parte (prepare_reject
+/// strutturato), un timeout ridicolo produrrebbe solo spesa senza esito.
+pub(crate) async fn subagent_min_timeout_s(db: &sqlx::PgPool) -> i64 {
+    nexus_auth::get_setting(db, "orchestrator.subagent_min_timeout_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30)
+}
+
 /// Costo atteso di UN sub-run advisory dal listino (tier-only + nexus-pricing).
 async fn panel_unit_cost(db: &sqlx::PgPool, est_tokens: i64) -> Option<f64> {
     let figures_csv = nexus_auth::get_setting(db, "orchestrator.council_figures").await?;
@@ -1877,6 +1933,53 @@ async fn fanout_max_parallel(db: &sqlx::PgPool) -> usize {
         .max(1)
 }
 
+/// Setting DB (regola G) del tetto di sub-run concorrenti dell'INTERO processo
+/// (mig 0603). Serve da quando i panel girano in parallelo (`tokio::join!` di
+/// consiglio + multi-provider): ogni fan-out ha il suo semaforo locale, quindi
+/// K panel insieme = K x permits senza un tetto globale — questo lo mette.
+const KEY_FANOUT_PROCESS_MAX_PARALLEL: &str = "orchestrator.fanout_process_max_parallel";
+/// Default se la riga manca: 2 panel pieni (2 x 6) come i due panel pre-run.
+const DEFAULT_FANOUT_PROCESS_MAX_PARALLEL: usize = 12;
+
+/// Semaforo di PROCESSO dei fan-out top-level. Dimensionato UNA volta al primo
+/// uso (riavvio del servizio per applicare una modifica del setting: un semaforo
+/// non e' ridimensionabile a caldo senza reintrodurre stati transitori).
+static PROCESS_FANOUT_SEM: tokio::sync::OnceCell<std::sync::Arc<tokio::sync::Semaphore>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn process_fanout_semaphore(db: &sqlx::PgPool) -> std::sync::Arc<tokio::sync::Semaphore> {
+    PROCESS_FANOUT_SEM
+        .get_or_init(|| async {
+            let permits = crate::settings::get_setting(db, KEY_FANOUT_PROCESS_MAX_PARALLEL)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_FANOUT_PROCESS_MAX_PARALLEL)
+                .max(1);
+            std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
+        })
+        .await
+        .clone()
+}
+
+/// Ambito del fan-out rispetto al governo della concorrenza, DICHIARATO dal
+/// call site (regola M: segnale esplicito, non inferito dal ctx — il ctx del
+/// consiglio ha `parent_run_id` valorizzato pur essendo del coordinatore).
+///
+/// - `TopLevel`: convocazione del COORDINATORE (consiglio, review panel,
+///   multi-provider, debate). Acquisisce ANCHE il semaforo di processo.
+/// - `Nested`: fan-out dentro un sub-run. SOLO semaforo locale: un membro
+///   padre che tenesse un permesso di processo mentre il figlio ne attende un
+///   altro dallo stesso semaforo creerebbe hold-and-wait (deadlock di classe);
+///   la concorrenza dei nested resta bounded dal semaforo locale + depth guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FanoutScope {
+    TopLevel,
+    Nested,
+}
+
 /// PUNTO UNICO (regola L) del FAN-OUT di sub-run: esegue `n` sub-run
 /// CONCORRENTI, ognuno nel PROPRIO task tokio, con un tetto di parallelismo.
 ///
@@ -1904,21 +2007,43 @@ async fn fanout_max_parallel(db: &sqlx::PgPool) -> usize {
 /// `JoinError` (panic dentro un sub-run) e' catturato e tradotto in `Value`
 /// d'errore: dentro il vecchio `FuturesUnordered` un panic avrebbe abbattuto
 /// l'INTERO fan-out in silenzio.
-async fn spawn_fanout<F, Fut>(db: &sqlx::PgPool, n: usize, make: F) -> Vec<Value>
+async fn spawn_fanout<F, Fut>(db: &sqlx::PgPool, n: usize, scope: FanoutScope, make: F) -> Vec<Value>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Value> + Send + 'static,
 {
     let permits = fanout_max_parallel(db).await;
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let local = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let process = match scope {
+        FanoutScope::TopLevel => Some(process_fanout_semaphore(db).await),
+        FanoutScope::Nested => None,
+    };
+    spawn_fanout_with(local, process, n, make).await
+}
+
+/// Corpo del fan-out con semafori ESPLICITI (testabile senza stato globale).
+/// Ordine di acquisizione FISSO e uniforme: LOCALE -> PROCESSO. Il grafo delle
+/// attese resta aciclico: chi tiene un permesso di processo non attende mai un
+/// semaforo locale altrui (ogni fan-out ha il proprio), quindi niente cicli.
+async fn spawn_fanout_with<F, Fut>(
+    local: std::sync::Arc<tokio::sync::Semaphore>,
+    process: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    n: usize,
+    make: F,
+) -> Vec<Value>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Value> + Send + 'static,
+{
     let mut handles = Vec::with_capacity(n);
     for i in 0..n {
         let fut = make(i);
-        let sem = sem.clone();
+        let local = local.clone();
+        let process = process.clone();
         handles.push(tokio::spawn(async move {
-            // Il permesso vive quanto il sub-run; si libera al drop (fine del
-            // task), non a fine "ondata".
-            let _permit = match sem.acquire_owned().await {
+            // I permessi vivono quanto il sub-run; si liberano al drop (fine
+            // del task), non a fine "ondata".
+            let _local_permit = match local.acquire_owned().await {
                 Ok(p) => p,
                 // Semaforo chiuso: non succede (mai `close()`), ma non si
                 // inventa un esito -> errore strutturato.
@@ -1930,6 +2055,20 @@ where
                         "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
                     })
                 }
+            };
+            let _process_permit = match process {
+                Some(sem) => match sem.acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        return json!({
+                            "error": format!("fanout: semaforo di processo chiuso: {e}"),
+                            "error_code": "fanout_semaphore_closed",
+                            "status": "prepare_failed",
+                            "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                        })
+                    }
+                },
+                None => None,
             };
             fut.await
         }));
@@ -1983,7 +2122,7 @@ pub(crate) async fn convene_council(
     let owned_kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
     let results = {
         let kinds_for_make = owned_kinds.clone();
-        spawn_fanout(&ctx.core.db, kinds_for_make.len(), |i| {
+        spawn_fanout(&ctx.core.db, kinds_for_make.len(), FanoutScope::TopLevel, |i| {
             let ctx = ctx.clone();
             let task = task.to_string();
             let expected = expected.to_string();
@@ -2030,7 +2169,7 @@ pub(crate) async fn convene_review_panel(
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
-    let results = spawn_fanout(&ctx.core.db, n, |_| {
+    let results = spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, |_| {
         let ctx = ctx.clone();
         let task = task.to_string();
         let expected = expected.to_string();
@@ -2107,7 +2246,7 @@ pub(crate) async fn convene_multi_provider_panel(
     let results = {
         let cands_for_make = cands.clone();
         let kind = cfg.kind.clone();
-        spawn_fanout(&ctx.core.db, cands_for_make.len(), |i| {
+        spawn_fanout(&ctx.core.db, cands_for_make.len(), FanoutScope::TopLevel, |i| {
             let ctx = ctx.clone();
             let task = task.to_string();
             let expected = expected.to_string();
@@ -2151,7 +2290,7 @@ pub(crate) async fn convene_multi_provider_panel(
         .collect();
     compose_multi_provider_synthesis(&results, policy, provider_count).map(|synthesis| {
         MultiProviderPanelOutcome::Active {
-            synthesis,
+            synthesis: Box::new(synthesis),
             provider_count,
             panel_providers,
             provider_reports,
@@ -2186,6 +2325,245 @@ fn compose_multi_provider_synthesis(
     convened: usize,
 ) -> Option<AdvisorySynthesis> {
     compose_council_synthesis(results, policy, convened)
+}
+
+/// Config del DIBATTITO a tesi contrapposte (mig 0605, regola G). `None` se il
+/// dibattito e' spento o il kind non e' configurato: il coordinatore non convoca
+/// (fail-closed, come il multi-provider).
+pub(crate) struct DebateConfig {
+    pub kind: String,
+    pub max_advocates: usize,
+}
+
+pub(crate) async fn read_debate_config(db: &sqlx::PgPool) -> Option<DebateConfig> {
+    let enabled = nexus_auth::get_bool_setting(db, "orchestrator.debate_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let kind = nexus_auth::get_setting(db, "orchestrator.debate_advocate_kind")
+        .await?
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    let max_advocates = nexus_auth::get_setting(db, "orchestrator.debate_max_advocates")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4);
+    Some(DebateConfig {
+        kind,
+        max_advocates,
+    })
+}
+
+/// Esito della convocazione del dibattito (segnali strutturati per il meta-step).
+pub(crate) struct DebatePanelOutcome {
+    pub topic: String,
+    pub assignments: Vec<nexus_agent_graph::decisions::debate_panel::DebateAssignment>,
+    pub synthesis: nexus_agent_graph::decisions::debate_panel::DebateSynthesis,
+}
+
+/// Task di UN avvocato: la posizione assegnata e' dichiarata nella PRIMA riga in
+/// forma canonica (`POSIZIONE ASSEGNATA: <testo>`), perche' e' la stringa che
+/// l'avvocato deve ripetere alla lettera in `assigned_position` — la chiave con
+/// cui `compose_debate_synthesis` attribuisce il voto. Funzione PURA: testabile
+/// senza DB (regola L: unica sede della forma del task avvocato).
+pub(crate) fn build_advocate_task(
+    topic: &str,
+    assignment: &nexus_agent_graph::decisions::debate_panel::DebateAssignment,
+    user_task: &str,
+) -> String {
+    let opposing = assignment
+        .opposing_positions
+        .iter()
+        .map(|o| format!("- {o}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "POSIZIONE ASSEGNATA: {assigned}\n\n\
+         Sei un avvocato in un dibattito a tesi contrapposte su una decisione \
+         architetturale del progetto.\n\n\
+         DECISIONE IN DISCUSSIONE: {topic}\n\n\
+         POSIZIONI AVVERSE (difese da altri avvocati, in parallelo a te):\n{opposing}\n\n\
+         RICHIESTA ORIGINALE DELL'UTENTE (contesto):\n{user_task}\n\n\
+         Il tuo compito: studia il codice del progetto e costruisci il caso PIU' \
+         FORTE possibile per la tua posizione assegnata, con evidenza concreta \
+         (file:riga). Attacca i punti deboli delle posizioni avverse con prove, \
+         non con retorica. Se studiando scopri che la tua posizione NON regge, \
+         dichiaralo onestamente con stance=oppose e i rischi che l'hanno demolita: \
+         e' il contributo piu' prezioso che puoi dare, non una sconfitta.\n\n\
+         Chiudi OBBLIGATORIAMENTE con il tool debate_position, ripetendo in \
+         assigned_position ESATTAMENTE la posizione assegnata qui sopra.",
+        assigned = assignment.assigned_position,
+    )
+}
+
+/// Fan-out degli avvocati: un task tokio per assegnazione, col proprio timer,
+/// sotto il governor di processo. Stesso punto unico del consiglio (regola L,
+/// difetto D3 dell'incidente fan-out congelato). L'ordine dei risultati segue
+/// quello delle assegnazioni: e' l'ancora dell'attribuzione posizionale.
+async fn spawn_advocates(
+    ctx: &AgentToolContext,
+    cfg: &DebateConfig,
+    topic: &str,
+    assignments: &[nexus_agent_graph::decisions::debate_panel::DebateAssignment],
+    user_task: &str,
+) -> Vec<Value> {
+    let expected = "Chiudi chiamando debate_position (assigned_position ripetuta alla \
+                    lettera, stance support|oppose, key_arguments con evidenza, risks \
+                    con severity). Un oppose richiede almeno un rischio con evidenza.";
+    let assignments_for_make = assignments.to_vec();
+    let topic_owned = topic.to_string();
+    let kind = cfg.kind.clone();
+    spawn_fanout(
+        &ctx.core.db,
+        assignments_for_make.len(),
+        FanoutScope::TopLevel,
+        |i| {
+            let ctx = ctx.clone();
+            let expected = expected.to_string();
+            let kind = kind.clone();
+            let task = build_advocate_task(&topic_owned, &assignments_for_make[i], user_task);
+            async move { run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await }
+        },
+    )
+    .await
+}
+
+/// Convoca gli AVVOCATI del dibattito in PARALLELO (sub-run read-only) e compone
+/// l'esito col punto unico PURO `compose_debate_synthesis` (regola L/M: legge i
+/// segnali strutturati `outcome.debate`, mai la prosa).
+///
+/// `None` se il piano e' vuoto (meno di 2 opzioni o meno di 2 avvocati: senza
+/// contraddittorio non e' un dibattito) o se nessun avvocato produce una
+/// posizione valida.
+pub(crate) async fn convene_debate_panel(
+    ctx: &AgentToolContext,
+    cfg: &DebateConfig,
+    topic: &str,
+    // Opzioni dichiarate dal consiglio: `plan_debate` le taglia a quelle che
+    // avranno davvero un difensore (mai un'opzione indifesa in gara).
+    options: &[String],
+    advocates: usize,
+    user_task: &str,
+    // Tipo GENERICO del quorum (`panel_quorum::QuorumPolicy`, path esplicito): il
+    // re-export `decisions::QuorumPolicy` e' quello della review, con vocabolario
+    // proprio (min_valid_verdicts/fail_on_high_severity). I due non sono
+    // ri-esportati insieme di proposito.
+    policy: &nexus_agent_graph::decisions::panel_quorum::QuorumPolicy,
+    quorum_pct: u8,
+) -> Option<DebatePanelOutcome> {
+    use nexus_agent_graph::decisions::debate_panel::{compose_debate_synthesis, plan_debate};
+    let n = advocates.min(cfg.max_advocates);
+    let assignments = plan_debate(options, n);
+    if assignments.is_empty() {
+        return None;
+    }
+    let results = spawn_advocates(ctx, cfg, topic, &assignments, user_task).await;
+    let outcomes: Vec<Value> = results
+        .into_iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
+    // `outcomes[i]` e' il sub-run di `assignments[i]`: spawn_fanout preserva
+    // l'ordine (awaita gli handle in sequenza). E' su questa corrispondenza che
+    // poggia l'attribuzione POSIZIONALE del voto (regola M): la posizione difesa
+    // e' un fatto deciso da noi, non una stringa che il modello ricopia.
+    // Il roster (denominatore del quorum) e' assignments.len(): un avvocato
+    // morto e' un'astensione che pesa (lezione mig 0589).
+    let synthesis = compose_debate_synthesis(&outcomes, &assignments, policy, quorum_pct)?;
+    Some(DebatePanelOutcome {
+        topic: topic.to_string(),
+        assignments,
+        synthesis,
+    })
+}
+
+/// Corpo del blocco dibattito: sostegno per opzione, argomenti e rischi.
+fn render_debate_tally(
+    s: &nexus_agent_graph::decisions::debate_panel::DebateSynthesis,
+) -> String {
+    let mut out = String::from("Sostegno per opzione:\n");
+    for t in &s.tally {
+        let flag = if t.disqualified {
+            " [SQUALIFICATA: arresa dal suo stesso avvocato con evidenza grave]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "- {}: {} a favore, {} arrese{}\n",
+            t.option, t.support, t.surrendered, flag
+        ));
+    }
+    if !s.key_arguments.is_empty() {
+        out.push_str("Argomenti chiave emersi:\n");
+        for a in &s.key_arguments {
+            out.push_str(&format!("- {a}\n"));
+        }
+    }
+    if !s.risks.is_empty() {
+        out.push_str("Rischi emersi (per severity):\n");
+        for risk in &s.risks {
+            let sev = risk.get("severity").and_then(Value::as_str).unwrap_or("?");
+            let desc = risk.get("description").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&format!("- [{sev}] {desc}\n"));
+        }
+    }
+    out
+}
+
+/// Rende l'esito del dibattito in un blocco `<dibattito_sintesi>` da anteporre al
+/// primo messaggio del run. Deriva dai campi STRUTTURATI (regola M). Dichiara
+/// SEMPRE la base dei voti: un esito senza base dichiarata e' il proxy che ha
+/// prodotto l'incidente "proceed con 1 parere su 5" (mig 0589).
+pub(crate) fn render_debate_synthesis(o: &DebatePanelOutcome) -> String {
+    use nexus_agent_graph::decisions::debate_panel::DebatePanelVerdict;
+    let s = &o.synthesis;
+    let mut out = String::from("<dibattito_sintesi>\n");
+    out.push_str(&format!("Decisione in discussione: {}\n", o.topic));
+    out.push_str(&format!("Esito del dibattito: {}\n", s.verdict.as_str()));
+    out.push_str(&format!(
+        "Posizioni valide: {} su {} avvocati convocati (quorum minimo: {}); opzioni \
+         effettivamente discusse: {}\n",
+        s.valid, s.convened, s.required_valid, s.options_heard
+    ));
+    if s.misattributed > 0 {
+        out.push_str(&format!(
+            "NB: {} avvocati hanno argomentato una posizione diversa da quella assegnata: \
+             i loro voti sono stati scartati.\n",
+            s.misattributed
+        ));
+    }
+    out.push_str(&render_debate_tally(s));
+    // Coda decisa dal VERDETTO con match ESAUSTIVO (regola M): un esito nuovo non
+    // compila finche' non ne viene dichiarata la semantica testuale.
+    let closing = match s.verdict {
+        DebatePanelVerdict::OptionSelected => format!(
+            "(Il dibattito ha selezionato: {}. Non e' un ordine: e' l'opzione che ha \
+             retto al contraddittorio. Se decidi diversamente, dichiara perche'.)\n",
+            s.selected_option.as_deref().unwrap_or("?")
+        ),
+        DebatePanelVerdict::Split => String::from(
+            "(Il dibattito NON ha un vincitore: le posizioni si equivalgono o sono state \
+             tutte demolite. Decidi tu sul merito degli argomenti qui sopra, dichiarando \
+             il criterio che usi.)\n",
+        ),
+        DebatePanelVerdict::Inconclusive => format!(
+            "(ATTENZIONE: il dibattito NON ha deliberato — {} posizioni valide su {} \
+             avvocati convocati (minimo {}), e solo {} opzioni hanno avuto voce. Quanto \
+             sopra e' parziale, NON un confronto concluso: se una sola posizione e' stata \
+             difesa, il fatto che regga non dice nulla sulle alternative, che nessuno ha \
+             sostenuto. Non trattarlo come una scelta.)\n",
+            s.valid, s.convened, s.required_valid, s.options_heard
+        ),
+    };
+    out.push_str(&closing);
+    out.push_str("</dibattito_sintesi>");
+    out
 }
 
 /// Coda del blocco sintesi, decisa dal VERDETTO con match ESAUSTIVO (regola M):
@@ -2787,6 +3165,26 @@ async fn prepare_subagent_run(
         definition.timeout_s
     } else {
         settings.default_timeout_s
+    };
+    // Clamp alla DEADLINE del run primario (fase 3, mig 0604): un sub-run non
+    // vive oltre il tempo residuo del run che lo ha convocato. Sotto il floor
+    // (`subagent_min_timeout_s`) la figura NON parte: rifiuto strutturato
+    // (regola M), un timeout ridicolo produrrebbe solo spesa senza esito.
+    let timeout_s = match run_time_remaining_s(&ctx.core.db, &proj_pool, anchor).await {
+        Some(remaining_s) => {
+            let floor_s = subagent_min_timeout_s(&ctx.core.db).await;
+            if remaining_s < floor_s {
+                return Err(prepare_reject(
+                    "deadline_exhausted",
+                    format!(
+                        "deadline del run quasi esaurita per parent={anchor} \
+                         (residuo {remaining_s}s < floor {floor_s}s)"
+                    ),
+                ));
+            }
+            timeout_s.min(remaining_s)
+        }
+        None => timeout_s,
     };
 
     // Embedding del context/expected nel task (parita' col brain `run_subagent`).
@@ -3825,6 +4223,7 @@ fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
         k::DECLARED: Value::Null,
         k::REVIEW: Value::Null,
         k::ADVISORY: Value::Null,
+        k::DEBATE: Value::Null,
         k::FINAL_GATE_PASSED: Value::Null,
         k::FINAL_GATE_UNVERIFIED: Value::Null,
         k::FINAL_GATE_FAILED_PENDING: false,
@@ -4076,6 +4475,7 @@ mod tests {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
@@ -4227,7 +4627,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("settings");
-        let out = spawn_fanout(&pool, 3, |i| async move {
+        // Scope Nested: il test resta ermetico (non tocca il semaforo di
+        // processo globale OnceCell, condiviso tra i test).
+        let out = spawn_fanout(&pool, 3, FanoutScope::Nested, |i| async move {
             if i == 1 {
                 panic!("sub-run esploso (simulato)");
             }
@@ -4241,6 +4643,81 @@ mod tests {
         );
         assert_eq!(out[0]["outcome"]["success"], json!(true));
         assert_eq!(out[2]["outcome"]["success"], json!(true));
+    }
+
+    /// GOVERNOR (mig 0603): due fan-out top-level CONCORRENTI condividono il
+    /// semaforo di processo — la concorrenza TOTALE non supera mai il suo tetto,
+    /// anche se i semafori locali permetterebbero di piu'. Semafori ESPLICITI
+    /// via `spawn_fanout_with`: niente stato globale nel test (regola F).
+    #[tokio::test]
+    async fn fanout_process_semaphore_limita_la_concorrenza_totale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let process = Arc::new(tokio::sync::Semaphore::new(4));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let make = |in_flight: Arc<AtomicUsize>, peak: Arc<AtomicUsize>| {
+            move |_i: usize| {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    json!({ "ok": true })
+                }
+            }
+        };
+        // Due panel da 6 con semafori locali larghi (6): senza il semaforo di
+        // processo la concorrenza arriverebbe a 12.
+        let (a, b) = tokio::join!(
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(6)),
+                Some(process.clone()),
+                6,
+                make(in_flight.clone(), peak.clone()),
+            ),
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(6)),
+                Some(process.clone()),
+                6,
+                make(in_flight.clone(), peak.clone()),
+            ),
+        );
+        assert_eq!(a.len(), 6);
+        assert_eq!(b.len(), 6);
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "picco {} oltre il tetto di processo 4",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    /// GOVERNOR: un fan-out `Nested` NON tocca il semaforo di processo — anche
+    /// con il processo SATURO (zero permessi) i nested completano. E' la
+    /// proprieta' anti-deadlock: un figlio non attende mai un permesso tenuto
+    /// dal proprio padre.
+    #[tokio::test]
+    async fn fanout_nested_non_attende_il_semaforo_di_processo() {
+        use std::sync::Arc;
+        let process = Arc::new(tokio::sync::Semaphore::new(1));
+        // Satura il processo: un top-level fittizio tiene l'unico permesso.
+        let _held = process.clone().acquire_owned().await.expect("permesso");
+        // Il nested (process=None) deve completare comunque, entro un timeout
+        // stretto: se per errore acquisisse il semaforo saturo, appenderebbe.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(2)),
+                None,
+                3,
+                |i| async move { json!({ "i": i }) },
+            ),
+        )
+        .await
+        .expect("il nested non deve attendere il semaforo di processo");
+        assert_eq!(out.len(), 3);
     }
 
     /// Il tetto di concorrenza viene dal DB (regola G) e clampa a >=1.
@@ -5299,6 +5776,7 @@ mod tests {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,

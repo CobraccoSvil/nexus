@@ -185,9 +185,92 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Option<Value> {
 /// mai dedotto dalla prosa della review).
 pub const VALID_REVIEW_VERDICTS: &[&str] = &["pass", "fail", "needs_changes"];
 
-/// Severita' valide di un finding. Fuori enum -> default `media` (il finding
-/// resta: la severita' e' un attributo, non un gate di validita').
-pub const VALID_FINDING_SEVERITIES: &[&str] = &["alta", "media", "bassa"];
+/// Severita' valide di un finding/rischio. Fuori enum -> default `media` (il
+/// finding resta: la severita' e' un attributo, non un gate di validita').
+///
+/// Deriva dal PUNTO UNICO del vocabolario ([`super::severity::Severity`], regola
+/// L): resta un `&[&str]` perche' e' cosi' che il test di coerenza cross-crate
+/// lo confronta con l'enum dello schema del tool. Il RICONOSCIMENTO delega a
+/// `Severity::try_parse` ([`normalize_severity`]), non a questa lista.
+pub const VALID_FINDING_SEVERITIES: &[&str] = &[
+    super::severity::Severity::High.as_str(),
+    super::severity::Severity::Medium.as_str(),
+    super::severity::Severity::Low.as_str(),
+];
+
+/// Severita' sanificata alla FRONTIERA (input LLM): riconosciuta dal punto unico
+/// [`super::severity::Severity::try_parse`]; fuori vocabolario -> `media`, cosi'
+/// a valle i panel leggono sempre un valore canonico. Regola L: unica sede della
+/// sanificazione, condivisa da review/advisory/debate.
+fn normalize_severity(raw: Option<&str>) -> String {
+    raw.and_then(super::severity::Severity::try_parse)
+        .unwrap_or(super::severity::Severity::Medium)
+        .as_str()
+        .to_string()
+}
+
+/// Sanifica una lista di stringhe di un verdetto strutturato (`requirements`,
+/// `recommendations`, `key_arguments`): trim, scarto delle vuote, lista bounded.
+fn normalize_string_list(obj: &serde_json::Map<String, Value>, key: &str) -> Vec<Value> {
+    obj.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let s = v.as_str()?.trim();
+                    (!s.is_empty()).then(|| Value::String(s.to_string()))
+                })
+                .take(ADVISORY_LIST_CAP)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sanifica la lista `risks` di un verdetto strutturato. PUNTO UNICO (regola L)
+/// condiviso da `advisory_verdict` e `debate_position`: stessa forma
+/// (`{severity, area?, description}`), stesse regole (description non vuota
+/// obbligatoria, severity normalizzata, area solo se valorizzata, lista
+/// bounded). Erano due blocchi identici, uno per tool.
+///
+/// I `findings` della review NON passano di qui: hanno una forma diversa
+/// (`file` obbligatorio, `line` opzionale) — condividerebbero la firma ma non
+/// la semantica, e forzarli in un'unica funzione parametrica sarebbe il tipo di
+/// astrazione che si paga a ogni lettura.
+fn normalize_risk_list(obj: &serde_json::Map<String, Value>) -> Vec<Value> {
+    obj.get("risks")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let ro = r.as_object()?;
+                    let description = ro.get("description").and_then(Value::as_str)?.trim();
+                    if description.is_empty() {
+                        return None;
+                    }
+                    let mut out = serde_json::Map::new();
+                    out.insert(
+                        "severity".to_string(),
+                        Value::String(normalize_severity(
+                            ro.get("severity").and_then(Value::as_str),
+                        )),
+                    );
+                    if let Some(area) = ro.get("area").and_then(Value::as_str) {
+                        let area = area.trim();
+                        if !area.is_empty() {
+                            out.insert("area".to_string(), Value::String(area.to_string()));
+                        }
+                    }
+                    out.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+                    Some(Value::Object(out))
+                })
+                .take(ADVISORY_LIST_CAP)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Cap sul numero di findings accettati (stesso razionale di
 /// [`FILES_TOUCHED_CAP`]: self-report bounded, mai illimitato).
@@ -232,12 +315,7 @@ pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
                     if file.is_empty() || description.is_empty() {
                         return None;
                     }
-                    let severity = fo
-                        .get("severity")
-                        .and_then(Value::as_str)
-                        .map(|s| s.trim().to_lowercase())
-                        .filter(|s| VALID_FINDING_SEVERITIES.contains(&s.as_str()))
-                        .unwrap_or_else(|| "media".to_string());
+                    let severity = normalize_severity(fo.get("severity").and_then(Value::as_str));
                     let mut out = serde_json::Map::new();
                     out.insert("file".to_string(), Value::String(file.to_string()));
                     if let Some(line) = fo.get("line").and_then(Value::as_i64) {
@@ -311,61 +389,9 @@ pub fn normalize_advisory_verdict(tool_input: &Value) -> Option<Value> {
         .unwrap_or("")
         .trim()
         .to_string();
-    let string_list = |key: &str| -> Vec<Value> {
-        obj.get(key)
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        let s = v.as_str()?.trim();
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(Value::String(s.to_string()))
-                        }
-                    })
-                    .take(ADVISORY_LIST_CAP)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let requirements = string_list("requirements");
-    let recommendations = string_list("recommendations");
-    let risks: Vec<Value> = obj
-        .get("risks")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| {
-                    let ro = r.as_object()?;
-                    let description = ro.get("description").and_then(Value::as_str)?.trim();
-                    if description.is_empty() {
-                        return None;
-                    }
-                    let severity = ro
-                        .get("severity")
-                        .and_then(Value::as_str)
-                        .map(|s| s.trim().to_lowercase())
-                        .filter(|s| VALID_FINDING_SEVERITIES.contains(&s.as_str()))
-                        .unwrap_or_else(|| "media".to_string());
-                    let mut out = serde_json::Map::new();
-                    out.insert("severity".to_string(), Value::String(severity));
-                    if let Some(area) = ro.get("area").and_then(Value::as_str) {
-                        let area = area.trim();
-                        if !area.is_empty() {
-                            out.insert("area".to_string(), Value::String(area.to_string()));
-                        }
-                    }
-                    out.insert(
-                        "description".to_string(),
-                        Value::String(description.to_string()),
-                    );
-                    Some(Value::Object(out))
-                })
-                .take(ADVISORY_LIST_CAP)
-                .collect()
-        })
-        .unwrap_or_default();
+    let requirements = normalize_string_list(obj, "requirements");
+    let recommendations = normalize_string_list(obj, "recommendations");
+    let risks = normalize_risk_list(obj);
     // Veto senza evidenza: rifiutato alla fonte (regola M — il coordinatore non
     // deve mai dover "credere" a un block senza rischi con descrizione).
     if verdict == "block" && risks.is_empty() {
@@ -382,6 +408,130 @@ pub fn normalize_advisory_verdict(tool_input: &Value) -> Option<Value> {
     }
     if !recommendations.is_empty() {
         out.insert("recommendations".to_string(), Value::Array(recommendations));
+    }
+    if let Some(cd) = normalize_contested_decision(obj.get("contested_decision")) {
+        out.insert("contested_decision".to_string(), cd);
+    }
+    Some(Value::Object(out))
+}
+
+/// Minimo di opzioni perche' una decisione sia CONTESA: una sola alternativa non
+/// e' una scelta, e' una constatazione. Soglia di forma del dato (non config di
+/// business): sotto questa il campo non esiste proprio.
+const CONTESTED_MIN_OPTIONS: usize = 2;
+
+/// Cap sulle opzioni di una decisione contesa: oltre, il dibattito diventa un
+/// sondaggio (ogni opzione va difesa da un avvocato). Stesso razionale bounded
+/// di [`ADVISORY_LIST_CAP`].
+const CONTESTED_MAX_OPTIONS: usize = 5;
+
+/// Valida/normalizza il campo `contested_decision` di `advisory_verdict`: la
+/// DICHIARAZIONE di una decisione architetturale aperta, che innesca il dibattito
+/// a tesi contrapposte (regola M: segnale strutturato, mai dedotto dalla prosa
+/// del parere).
+///
+/// `None` (campo assente dall'output) se: non e' un oggetto, `topic` vuoto, o le
+/// opzioni distinte non vuote sono meno di [`CONTESTED_MIN_OPTIONS`]. Una
+/// dichiarazione monca NON deve convocare avvocati: sarebbe spesa garantita per
+/// un dibattito senza contraddittorio.
+///
+/// Le opzioni sono deduplicate (case-insensitive, trim) preservando l'ordine di
+/// prima apparizione: e' l'ordine che [`super::debate_panel::plan_debate`] usa
+/// per il round-robin e [`super::debate_panel::compose_debate_synthesis`] per il
+/// tally stabile.
+pub fn normalize_contested_decision(raw: Option<&Value>) -> Option<Value> {
+    let obj = raw?.as_object()?;
+    let topic = obj.get("topic").and_then(Value::as_str)?.trim();
+    if topic.is_empty() {
+        return None;
+    }
+    let mut options: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for o in obj.get("options").and_then(Value::as_array)? {
+        let Some(s) = o.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let key = s.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        options.push(Value::String(s.to_string()));
+        if options.len() >= CONTESTED_MAX_OPTIONS {
+            break;
+        }
+    }
+    if options.len() < CONTESTED_MIN_OPTIONS {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("topic".to_string(), Value::String(topic.to_string()));
+    out.insert("options".to_string(), Value::Array(options));
+    Some(Value::Object(out))
+}
+
+/// Posizioni dichiarabili da un avvocato via `debate_position` (segnale ENUM,
+/// regola M). Derivate dal punto unico [`super::debate_panel::Stance`].
+pub const VALID_DEBATE_STANCES: &[&str] = &[
+    super::debate_panel::Stance::Support.as_str(),
+    super::debate_panel::Stance::Oppose.as_str(),
+];
+
+/// Valida/normalizza l'input di `debate_position` (gemello di
+/// [`normalize_advisory_verdict`] per il canale degli AVVOCATI del dibattito).
+///
+/// `None` se invalido: input non-oggetto, `assigned_position` vuota (senza la
+/// chiave di attribuzione il voto non e' assegnabile a un'opzione), `stance`
+/// fuori enum, oppure `stance=oppose` SENZA alcun rischio con descrizione —
+/// arrendere la propria tesi e' un segnale FORTE (squalifica l'opzione anche in
+/// minoranza): senza evidenza non e' componibile e va rifiutato alla fonte,
+/// esattamente come un `block` senza rischi.
+///
+/// L'output mantiene sempre `assigned_position`, `stance`, `summary`; le liste
+/// solo se non vuote. La forma e' quella letta da
+/// [`super::debate_panel::compose_debate_synthesis`] nel campo `debate`.
+pub fn normalize_debate_position(tool_input: &Value) -> Option<Value> {
+    let obj = tool_input.as_object()?;
+    let assigned = obj
+        .get("assigned_position")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if assigned.is_empty() {
+        return None;
+    }
+    let stance = obj
+        .get("stance")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !VALID_DEBATE_STANCES.contains(&stance.as_str()) {
+        return None;
+    }
+    let summary = obj
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let key_arguments = normalize_string_list(obj, "key_arguments");
+    let risks = normalize_risk_list(obj);
+    // Resa senza evidenza: rifiutata alla fonte (regola M). Un `oppose` squalifica
+    // l'opzione anche in minoranza: deve portare prove, non solo una conclusione.
+    if stance == super::debate_panel::Stance::Oppose.as_str() && risks.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("assigned_position".to_string(), Value::String(assigned));
+    out.insert("stance".to_string(), Value::String(stance));
+    out.insert("summary".to_string(), Value::String(summary));
+    if !key_arguments.is_empty() {
+        out.insert("key_arguments".to_string(), Value::Array(key_arguments));
+    }
+    if !risks.is_empty() {
+        out.insert("risks".to_string(), Value::Array(risks));
     }
     Some(Value::Object(out))
 }
