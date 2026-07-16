@@ -276,6 +276,9 @@ async fn resolve_purpose_core(
         },
         capability: rule.capability.as_deref(),
         min_context_window: 0,
+        // Il purpose non impone un pavimento: il suo `tier` E' gia' il requisito,
+        // e la degradazione lungo la catena e' voluta e dichiarata nel rationale.
+        min_tier: None,
         exclude_providers,
         pin: None,
         rank: if rule.requires_tool_use {
@@ -408,6 +411,7 @@ pub async fn resolve_purpose_provider_candidates_db(
         },
         capability: rule.capability.as_deref(),
         min_context_window: 0,
+        min_tier: None,
         exclude_providers: &[],
         pin: None,
         rank: if rule.requires_tool_use {

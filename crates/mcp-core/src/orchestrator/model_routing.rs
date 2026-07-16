@@ -368,16 +368,32 @@ pub(crate) async fn agentic_failover_candidates(
     exclude: &[String],
     min_context_window: i64,
 ) -> Vec<(String, String, Option<String>)> {
-    // SERVIZIO UNICO (regola L). `AnyTier`: qui il tier NON e' un vincolo — si
-    // ENUMERA l'eleggibilita' e la scelta spetta al modulo puro
-    // `pick_failover_model` (salute -> likelihood, col tier come semplice
-    // indicazione). Una tier-chain qui sottrarrebbe la decisione al modulo.
-    // `FailoverSafe`: non-thinking prima, per evitare i vincoli di round-trip
-    // sullo switch mid-run.
+    // SERVIZIO UNICO (regola L). `AnyTier`: il tier non ORDINA qui — si ENUMERA
+    // l'eleggibilita' e la SCELTA spetta al modulo puro `pick_failover_model`
+    // (salute -> likelihood). Una tier-chain sottrarrebbe la decisione al modulo.
+    //
+    // Ma il PAVIMENTO e' un'altra cosa: non e' una preferenza fra alternative, e'
+    // la soglia sotto la quale un modello NON E' un'alternativa. Misurato il
+    // 16/07: con openai e anthropic senza credito, il failover — che trattava il
+    // tier come "semplice indicazione" — e' sceso fino a `groq/gpt-oss-20b`
+    // (agentic_index 3.1, il peggiore del parco). Il run non e' fallito: ha
+    // prodotto una risposta FUORI TEMA (parlava del modello invece del task) e
+    // l'ha dichiarata `completed`. Un esito bugiardo e' peggio di un fallimento,
+    // perche' l'utente ci si fida.
+    //
+    // Prima questa scelta era difendibile: il tier era dedotto dal NOME, quindi
+    // inaffidabile come vincolo. Ora il tier viene dai FATTI (mig 0599/0600), e la
+    // premessa e' cambiata: il pavimento e' esprimibile e va rispettato.
+    //
+    // Resta GRACEFUL rispetto all'incidente del 15/07 (il consiglio che moriva):
+    // li' il difetto era non scendere da `heavy` a tier SANI (high/medium); qui si
+    // toglie solo l'ultimo gradino, quello sotto il pavimento agentico.
+    let floor = agentic_min_tier(db).await;
     let req = crate::orchestrator::model_service::ModelRequest::agentic("")
         .tier_policy(crate::orchestrator::model_service::TierPolicy::AnyTier)
         .rank(crate::orchestrator::model_service::Rank::FailoverSafe)
         .min_context_window(min_context_window)
+        .min_tier(&floor)
         .exclude(exclude);
     match crate::orchestrator::model_service::select_models(db, &req, FAILOVER_CANDIDATE_POOL)
         .await

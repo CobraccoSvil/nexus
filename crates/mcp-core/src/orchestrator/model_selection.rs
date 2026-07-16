@@ -143,6 +143,22 @@ pub(super) struct EligibilityFilter<'a> {
     pub capability: Option<&'a str>,
     /// `>0` => `AND context_window >= N`.
     pub min_context_window: i64,
+    /// `Some(t)` => `AND tier_rank(performance_tier) >= tier_rank(t)`: il PAVIMENTO
+    /// di capacita'. E' ELEGGIBILITA', non preferenza — un modello sotto il
+    /// pavimento non e' un'alternativa peggiore, e' un'alternativa che NON
+    /// FUNZIONA per un run agentico.
+    ///
+    /// Perche' esiste (misurato il 16/07): il failover enumerava con `AnyTier` e
+    /// lasciava scegliere al modulo puro col "tier come indicazione". Con openai e
+    /// anthropic senza credito, il piu' economico e sano e' risultato
+    /// `groq/gpt-oss-20b` — agentic_index **3.1**, il peggiore del parco. Il run
+    /// non e' fallito: ha prodotto una risposta FUORI TEMA (parlava del modello
+    /// stesso invece del task) e l'ha dichiarata `completed`. Un esito bugiardo e'
+    /// peggio di un fallimento, perche' l'utente ci si fida.
+    ///
+    /// Il confronto usa il vocabolario unico (`tier_rank_sql`, regola L): un tier
+    /// NULL o ignoto prende il rank neutro di `tier_rank` (medium), come ovunque.
+    pub min_tier: Option<&'a str>,
     /// Provider extra da escludere (oltre al cooldown se `apply_cooldown`).
     pub exclude_providers: &'a [String],
     /// `true` => esclude anche i provider attualmente in cooldown (snapshot).
@@ -403,6 +419,18 @@ pub(super) async fn select_models_tierchain(
             idx += 1;
             sql.push_str(&format!(" AND context_window >= ${idx}"));
         }
+        // PAVIMENTO di capacita' (eleggibilita', non preferenza). L'espressione del
+        // rank viene GENERATA dal vocabolario unico: la scala non si riscrive a
+        // mano nemmeno qui (regola L). `tier_rank` del floor e' calcolato in Rust
+        // dalla STESSA funzione, quindi le due meta' non possono divergere.
+        if let Some(floor) = filter.min_tier {
+            use nexus_agent_graph::decisions::tiers::{tier_rank, tier_rank_sql};
+            sql.push_str(&format!(
+                " AND {} >= {}",
+                tier_rank_sql("performance_tier"),
+                tier_rank(floor)
+            ));
+        }
         if filter.only_provider.is_some() {
             // PIN provider (filtro POSITIVO): restringe al solo provider pinnato.
             // Ultimo placeholder DOPO min_context_window per preservare lo schema
@@ -624,6 +652,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -673,6 +702,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -759,6 +789,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -807,6 +838,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -848,6 +880,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -886,6 +919,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -929,6 +963,7 @@ mod tests {
             require_thinking_non_exclude: false,
             capability: Some("vision"),
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -973,6 +1008,7 @@ mod tests {
             require_thinking_non_exclude: false,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -1018,6 +1054,7 @@ mod tests {
             require_thinking_non_exclude: false,
             capability: Some("image_gen"),
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
@@ -1098,6 +1135,7 @@ mod tests {
             require_thinking_non_exclude: true,
             capability: None,
             min_context_window: 0,
+            min_tier: None,
             exclude_providers: &[],
             apply_cooldown: false,
             only_provider: None,
