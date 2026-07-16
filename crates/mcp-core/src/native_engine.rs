@@ -364,7 +364,17 @@ pub struct NativeRunOutcome {
     pub completion_tokens: i64,
     /// Token totali dell'ultima iterazione (stesso reducer last-write).
     pub total_tokens: i64,
-    /// Costo totale stimato in USD (0.0 se non calcolato a monte).
+    /// Costo CUMULATIVO del run in USD (`run_cost_cumulative_usd` dello stato:
+    /// somma dei costi di tutti i turni). 0.0 se non calcolato a monte.
+    ///
+    /// ASIMMETRIA VOLUTA rispetto ai token qui sopra, che sono dell'ULTIMO turno:
+    /// il costo serve al billing (che vuole il run intero), i token servono al
+    /// context ratio (che vuole l'ultima iterazione). Non e' un'incoerenza da
+    /// "uniformare": rendere cumulativi i token romperebbe `last_prompt_tokens`
+    /// (badge "5046% ctx"). Nel percorso normale entrambi vengono comunque
+    /// sovrascritti dal ledger, che e' la fonte autoritativa
+    /// (`reconcile_run_cost_from_ledger`); questi valori restano quelli pubblicati
+    /// solo quando il gateway non ha contabilizzato nulla per il run.
     pub total_cost: f64,
     /// Intent del turno (campo `user_intent` dello stato): pilota la decisione
     /// hollow/conversational del finalizzatore (parita' col `nexus_task_type`
@@ -2856,7 +2866,13 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         prompt_tokens: state.prompt_tokens.unwrap_or(0),
         completion_tokens: state.completion_tokens.unwrap_or(0),
         total_tokens: state.total_tokens.unwrap_or(0),
-        total_cost: state.total_cost_usd.unwrap_or(0.0),
+        // Costo del RUN, non del turno: `total_cost_usd` ha un reducer overwrite e
+        // vale l'ULTIMA iterazione, mentre `run_cost_cumulative_usd` somma i costi
+        // di tutti i turni (executor.rs, "Costo cumulativo REALE del run") ed e' lo
+        // STESSO campo su cui gia' decide il freno di spesa. Asimmetria VOLUTA coi
+        // token qui sopra, che restano dell'ultimo turno by design (alimentano
+        // `last_prompt_tokens` = riempimento contesto): non "uniformarli".
+        total_cost: state.run_cost_cumulative_usd.unwrap_or(0.0),
         user_intent: state.user_intent.clone(),
         reasoning: state.reasoning_acc.clone().filter(|s| !s.trim().is_empty()),
         // Conversazione finale serializzata per agent_runs.messages_json (resume +

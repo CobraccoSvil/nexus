@@ -3720,12 +3720,19 @@ pub(crate) async fn spawn_agent_run(
             // iterazione spacciandolo per il totale del run.
             //
             // Una sola aggregazione, riusata da messaggio + agent_runs + budget.
-            // Autoritativa solo se `result.total_cost == 0` e il ledger ha costo
-            // > 0; altrimenti si tiene il valore gia' propagato (path Python che
-            // emette total_cost) e resta il fallback al calcolo-da-catalog piu'
-            // sotto per il caso "ledger vuoto" (provider senza ledger).
+            // Autoritativa ogni volta che il gateway ha contabilizzato il run
+            // (almeno una riga finalizzata); resta il fallback al calcolo-da-catalog
+            // piu' sotto solo per il caso "nessuna riga di ledger" (provider che non
+            // scrive ledger, o META irraggiungibile).
             let ledger_totals = fetch_ledger_totals(&db_clone, run_id).await;
-            if reconcile_run_cost_from_ledger(&mut result, &ledger_totals) {
+            // ESITO STRUTTURATO della riconciliazione (regola M): `true` = il
+            // gateway ha contabilizzato il run e i suoi totali sono stati adottati.
+            // Va tenuto: piu' sotto il budget provider deve sapere SE il costo e'
+            // autoritativo, e non puo' dedurlo da "total_cost > 0" — un run
+            // riconciliato con costo 0 (prezzo ignoto) e' contabilita' valida, non
+            // un dato mancante.
+            let cost_reconciled = reconcile_run_cost_from_ledger(&mut result, &ledger_totals);
+            if cost_reconciled {
                 tracing::debug!(
                     run_id = %run_id,
                     cost = result.total_cost,
@@ -4223,14 +4230,21 @@ pub(crate) async fn spawn_agent_run(
             // budget va stimato sommando il cost dei run reali.
             //
             // Calcolo del cost (gerarchia: ledger -> catalog -> 0):
-            //   - result.total_cost > 0 -> usalo. Copre sia il path Python che
-            //     propaga total_cost, sia il path NATIVO gia' RICONCILIATO dal
-            //     ledger sopra (fonte autoritativa: il gateway ha applicato i
-            //     prezzi corretti per ogni chiamata del run).
-            //   - Altrimenti (ledger vuoto per il run, es. provider che non
-            //     scrive ledger): fallback al calcolo da prompt/completion_tokens
+            //   - riconciliato dal ledger -> usa quel costo, SEMPRE. Il gateway ha
+            //     applicato i prezzi corretti a ogni chiamata del run; se il totale
+            //     e' 0 perche' il prezzo del modello e' ignoto, 0 e' la risposta
+            //     onesta e va addebitata come tale.
+            //   - Altrimenti (nessuna riga di ledger per il run, es. provider che
+            //     non scrive ledger): fallback al calcolo da prompt/completion_tokens
             //     × prezzi del catalog.
-            let cost_to_charge: f64 = if result.total_cost > 0.0 {
+            //
+            // La condizione e' il SEGNALE `cost_reconciled`, non `total_cost > 0`
+            // (regola M). Con la vecchia soglia, i run riconciliati a costo 0 —
+            // misurate 875 righe di ledger con token > 0 e costo 0 — cadevano nel
+            // fallback, che STIMAVA dal catalog un costo che il gateway si era
+            // deliberatamente rifiutato di attribuire, e lo addebitava al budget
+            // del provider. Una stima inventata sopra un dato dichiarato ignoto.
+            let cost_to_charge: f64 = if cost_reconciled {
                 result.total_cost
             } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
                 // Look up prezzi dal catalog. Costo per milione di token.

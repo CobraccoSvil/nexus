@@ -1066,15 +1066,18 @@ async fn try_resume_interrupted_run(
         // reale invece di $0.00.
         let ledger_totals =
             crate::chat_messages::agent_run::fetch_ledger_totals(&db_clone2, new_run_id).await;
-        let _ = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
+        let cost_reconciled = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
             &mut result,
             &ledger_totals,
         );
-        // finalize_agent_run NON scrive token/costo: se il brain non
-        // li ha persistiti su agent_runs ma il ledger li ha, allinea
-        // qui (idempotente: tocca solo i run rimasti a 0, non
-        // sovrascrive un valore gia' corretto del path Python).
-        if result.total_cost > 0.0 {
+        // finalize_agent_run NON scrive token/costo: se il ledger li ha, allinea
+        // qui (idempotente: la WHERE tocca solo i run rimasti a 0).
+        //
+        // La condizione e' il SEGNALE di riconciliazione, non `total_cost > 0`
+        // (regola M, gemello di `agent_run.rs`): un run contabilizzato a costo 0
+        // perche' il prezzo del modello e' ignoto ha comunque token reali da
+        // allineare, e la vecchia soglia lo saltava.
+        if cost_reconciled {
             // agent_runs e' migrata: instrada sul pool del progetto
             // (risolto in-task da db_clone2 + project_id_r, come la
             // INSERT chat_messages piu' sotto). ai_usage_ledger (sopra)

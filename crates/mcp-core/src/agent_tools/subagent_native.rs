@@ -339,6 +339,48 @@ async fn current_chain_depth(pool: &sqlx::PgPool, dispatcher_run_id: Uuid) -> i6
     .unwrap_or(0)
 }
 
+/// Adotta i totali AUTORITATIVI del ledger sui contatori del sub-run.
+///
+/// Un sub-run e' un run a se': il gateway gli scrive le proprie righe di
+/// `ai_usage_ledger`, una per chiamata LLM. `NativeRunOutcome` invece porta i
+/// contatori dell'ULTIMO TURNO — lo stato del grafo usa un reducer di tipo
+/// overwrite (vedi la doc dei campi in `native_engine.rs`). Pubblicarli come
+/// totale del sub-run sottostima tutte le iterazioni precedenti: misurato
+/// $0,0338 contro $0,1510 reali (4,5x) sul sub-run software_architect della
+/// chat 25, con la stessa firma su ogni sub-run multi-turno.
+///
+/// Il run di chat riconcilia gia' cosi' (`reconcile_run_cost_from_ledger`); per i
+/// sub-run la riconciliazione non era disattivata: non esisteva. La conseguenza
+/// peggiore non era cosmetica — `cumulative_cost` alimenta l'HARD CAP di spesa
+/// leggendo `nexus_subagent_runs.cost_usd`, quindi il freno vedeva $0,10 dove la
+/// spesa reale era $1,69 (16x).
+///
+/// `meta_db` DEVE essere il pool META: `ai_usage_ledger` vive li', mentre
+/// `nexus_subagent_runs`/`agent_runs` stanno sul pool del progetto.
+/// Best-effort come per il padre: senza righe contabilizzate i contatori del
+/// grafo restano invariati (nessun dato inventato).
+async fn adopt_ledger_totals(meta_db: &sqlx::PgPool, sub_run_id: Uuid, o: &mut NativeRunOutcome) {
+    let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
+    apply_ledger_to_outcome(o, &ledger);
+}
+
+/// Parte PURA di [`adopt_ledger_totals`] (testabile senza DB), speculare a
+/// `reconcile_run_cost_from_ledger` del run di chat. Ritorna `true` se ha adottato
+/// i totali del ledger.
+fn apply_ledger_to_outcome(
+    o: &mut NativeRunOutcome,
+    ledger: &crate::chat_messages::LedgerTotals,
+) -> bool {
+    if !ledger.has_rows() {
+        return false;
+    }
+    o.total_cost = ledger.total_cost;
+    o.prompt_tokens = ledger.prompt_tokens;
+    o.completion_tokens = ledger.completion_tokens;
+    o.total_tokens = ledger.coherent_total_tokens();
+    true
+}
+
 /// Costo cumulativo gia' speso dai sub-run su questo `parent_anchor` (hard cap).
 async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
     // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
@@ -2886,6 +2928,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
                 // sospeso per sempre). Non esce con return diretto.
                 let out = finalize_timeout(
                     &proj_pool,
+                    &ctx.core.db,
                     narrator.as_deref(),
                     subagent_run_id,
                     &kind,
@@ -2909,7 +2952,11 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     stop_bridge(bridge).await;
 
     let out = match outcome {
-        Ok(o) => {
+        Ok(mut o) => {
+            // Costo/token del sub-run INTERO dal ledger (punto unico), non
+            // dell'ultimo turno: intercetto qui, cosi' mark_run, la narrazione e
+            // il tool_result al padre vedono tutti lo stesso numero onesto.
+            adopt_ledger_totals(&ctx.core.db, subagent_run_id, &mut o).await;
             finalize_success(
                 &proj_pool,
                 narrator.as_deref(),
@@ -2923,6 +2970,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         Err(e) => {
             finalize_failure(
                 &proj_pool,
+                &ctx.core.db,
                 narrator.as_deref(),
                 subagent_run_id,
                 &kind,
@@ -3319,6 +3367,7 @@ async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
 /// Chiusura del sub-run in TIMEOUT: mark_run + narrazione + tool_result.
 async fn finalize_timeout(
     pool: &sqlx::PgPool,
+    meta_db: &sqlx::PgPool,
     narrator: Option<&ParentNarrator>,
     sub_run_id: Uuid,
     kind: &str,
@@ -3327,10 +3376,12 @@ async fn finalize_timeout(
     model: &str,
 ) -> Value {
     let verdict = terminal_verdict("timed_out", "timeout");
+    // Un timeout non azzera la spesa gia' fatturata: la prendo dal ledger (META).
+    let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
     let _ = mark_run(
         pool,
         sub_run_id,
-        SubRunClosure::without_metrics("timeout", "[Sub-agent timeout]", verdict.clone()),
+        SubRunClosure::from_ledger("timeout", "[Sub-agent timeout]", verdict.clone(), &ledger),
     )
     .await;
     if let Some(n) = narrator {
@@ -3461,6 +3512,7 @@ async fn finalize_success(
 /// Chiusura del ramo ERRORE del sub-run (fallback onesto: errore al chiamante).
 async fn finalize_failure(
     pool: &sqlx::PgPool,
+    meta_db: &sqlx::PgPool,
     narrator: Option<&ParentNarrator>,
     sub_run_id: Uuid,
     kind: &str,
@@ -3470,10 +3522,13 @@ async fn finalize_failure(
 ) -> Value {
     let msg = format!("[errore grafo nativo: {e}]");
     let verdict = terminal_verdict("failed", "engine_error");
+    // Come per il timeout: un errore del grafo non cancella le chiamate gia'
+    // fatturate prima del guasto.
+    let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
     let _ = mark_run(
         pool,
         sub_run_id,
-        SubRunClosure::without_metrics("failed", &msg, verdict.clone()),
+        SubRunClosure::from_ledger("failed", &msg, verdict.clone(), &ledger),
     )
     .await;
     tracing::warn!(
@@ -3571,16 +3626,33 @@ struct SubRunClosure<'a> {
 }
 
 impl<'a> SubRunClosure<'a> {
-    /// Chiusura senza metriche: il run e' morto prima di produrre usage
-    /// (timeout, errore del grafo) — contatori a zero.
-    fn without_metrics(status: &'a str, summary: &'a str, verdict: Value) -> Self {
+    /// Chiusura dei rami TERMINALI senza [`NativeRunOutcome`] (timeout, errore del
+    /// grafo): le metriche vengono dal ledger, l'unica fonte che sopravvive alla
+    /// morte del run.
+    ///
+    /// Sostituisce una `without_metrics` che azzerava i contatori sulla premessa
+    /// "il run e' morto prima di produrre usage". Premessa misuratamente FALSA: un
+    /// sub-run va in timeout DOPO aver bruciato iterazioni, e il gateway le ha gia'
+    /// fatturate (misurati 3 sub-run con iterations=0 e ledger $0,80 / $0,37 /
+    /// $0,04; sulla chat 25, 19 run in timeout dichiaravano $0 contro $1,28 reali).
+    /// Azzerare qui non "non contava": sottraeva spesa reale al cap.
+    ///
+    /// `iterations` resta 0: il conteggio vive solo nello stato del grafo, che qui
+    /// non c'e'. Il ledger conosce il costo, non le iterazioni — meglio un
+    /// contatore onestamente ignoto che un costo inventato.
+    fn from_ledger(
+        status: &'a str,
+        summary: &'a str,
+        verdict: Value,
+        ledger: &crate::chat_messages::LedgerTotals,
+    ) -> Self {
         Self {
             status,
             summary,
             iterations: 0,
-            tokens_prompt: 0,
-            tokens_completion: 0,
-            cost_usd: 0.0,
+            tokens_prompt: ledger.prompt_tokens,
+            tokens_completion: ledger.completion_tokens,
+            cost_usd: ledger.total_cost,
             verdict,
         }
     }
@@ -3831,6 +3903,97 @@ mod tests {
         let m = err("boom");
         assert!(m.starts_with('\u{274C}'));
         assert!(m.contains("dispatch_subagent"));
+    }
+
+    /// Outcome minimo per i test dei contatori: tutti i campi a zero/None.
+    fn outcome_zero() -> crate::native_engine::NativeRunOutcome {
+        crate::native_engine::NativeRunOutcome {
+            completed: true,
+            awaiting_subagents: false,
+            final_answer: None,
+            stop_reason: None,
+            provider_used: None,
+            model_used: None,
+            resume_at: None,
+            iterations: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            user_intent: None,
+            reasoning: None,
+            messages_json: None,
+            declared_outcome: None,
+            review_verdict: None,
+            advisory_verdict: None,
+            error_class: None,
+            forced_close_unverified: false,
+            final_gate_passed: None,
+            final_gate_unverified: None,
+            final_gate_failed_pending: false,
+            pending_actions: Vec::new(),
+        }
+    }
+
+    /// REGRESSIONE (misurata, chat 25): il sub-run pubblicava i contatori
+    /// dell'ULTIMO TURNO come totale — $0,0338 contro $0,1510 reali (4,5x). Lo
+    /// stesso numero alimenta l'hard cap di spesa via nexus_subagent_runs.cost_usd.
+    #[test]
+    fn sub_run_adotta_i_totali_del_ledger_non_quelli_dell_ultimo_turno() {
+        let mut o = outcome_zero();
+        // Contatori del grafo = ultima chiamata (openrouter/x-ai/grok-4.5).
+        o.total_cost = 0.033842;
+        o.prompt_tokens = 13_780;
+        o.completion_tokens = 1_047;
+        o.total_tokens = 14_827;
+        let ledger = crate::chat_messages::LedgerTotals {
+            total_cost: 0.150972,
+            prompt_tokens: 63_177,
+            completion_tokens: 4_103,
+            total_tokens: 67_280,
+            rows: 8,
+        };
+        assert!(super::apply_ledger_to_outcome(&mut o, &ledger));
+        assert!(
+            (o.total_cost - 0.150972).abs() < 1e-9,
+            "costo del sub-run INTERO"
+        );
+        assert_eq!(o.prompt_tokens, 63_177);
+        assert_eq!(o.total_tokens, 67_280);
+    }
+
+    #[test]
+    fn sub_run_senza_righe_ledger_conserva_i_contatori_del_grafo() {
+        // Nessuna chiamata contabilizzata (provider che non scrive ledger):
+        // non inventare, lascia quello che il grafo ha misurato.
+        let mut o = outcome_zero();
+        o.total_cost = 0.02;
+        o.prompt_tokens = 900;
+        let vuoto = crate::chat_messages::LedgerTotals::default();
+        assert!(!super::apply_ledger_to_outcome(&mut o, &vuoto));
+        assert!((o.total_cost - 0.02).abs() < 1e-9);
+        assert_eq!(o.prompt_tokens, 900);
+    }
+
+    /// Il ramo TIMEOUT azzerava i contatori sulla premessa "il run e' morto prima
+    /// di produrre usage": falsa (misurati 3 sub-run con iterations=0 e ledger
+    /// $0,80 / $0,37 / $0,04). La spesa reale va al cap, non persa.
+    #[test]
+    fn chiusura_terminale_prende_la_spesa_dal_ledger() {
+        let ledger = crate::chat_messages::LedgerTotals {
+            total_cost: 0.801292,
+            prompt_tokens: 120_000,
+            completion_tokens: 3_400,
+            total_tokens: 123_400,
+            rows: 5,
+        };
+        let c = super::SubRunClosure::from_ledger("timeout", "[Sub-agent timeout]", json!({}), &ledger);
+        assert!(
+            (c.cost_usd - 0.801292).abs() < 1e-9,
+            "il timeout non cancella la spesa gia' fatturata"
+        );
+        assert_eq!(c.tokens_prompt, 120_000);
+        assert_eq!(c.status, "timeout");
     }
 
     #[test]
