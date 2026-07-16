@@ -316,6 +316,150 @@ fn is_media_capability(capability: &str) -> bool {
 /// Ritorna `(provider, model, performance_tier)`: il tier viaggia con la riga
 /// (i selettori tier-aware, es. il failover agentico, lo usano come indicazione
 /// senza un lookup extra); i caller che non ne hanno bisogno lo ignorano.
+/// Come la capability richiesta si traduce in filtri: colonna dedicata, jsonb, o
+/// esclusione dei media. Calcolata una volta per tutta la tier-chain.
+struct QueryShape {
+    /// PUNTO UNICO (regola L) del mapping capability -> colonna canonica del
+    /// catalog. Le capability con una colonna booleana dedicata (vision + i media
+    /// kind della mig 0478) si filtrano via colonna; ogni altra capability (chat,
+    /// 'code', 'reasoning', ...) resta nel jsonb `capabilities`. Aggiungere un
+    /// nuovo media kind = una riga in `capability_to_column`, niente if sparsi.
+    capability_column: Option<&'static str>,
+    capability_json: Option<String>,
+    requested_is_media: bool,
+}
+
+/// Costruisce la query di UN anello della tier-chain.
+///
+/// I placeholder sono assegnati con un idx incrementale: $1 = array provider
+/// esclusi (sempre), poi tier, capability jsonb, min_context_window, only_provider.
+/// **L'ordine dei `push_str` qui DEVE combaciare con l'ordine dei `bind` nel
+/// chiamante**: e' un accoppiamento posizionale che il tipo non protegge, ed e'
+/// l'unica ragione per cui le due meta' vanno lette insieme.
+fn build_tierchain_sql(
+    filter: &EligibilityFilter<'_>,
+    shape: &QueryShape,
+    tier: Option<&str>,
+    order_by: &str,
+    limit: i64,
+) -> String {
+    let mut idx = 1;
+    let mut sql = String::from(
+        "SELECT provider, model, performance_tier FROM ai_price_catalog \
+         WHERE is_enabled = TRUE \
+           AND LOWER(provider) <> ALL($1) \
+           AND (auto_disabled_reason IS NULL \
+                OR (auto_disabled_reason NOT LIKE 'invalid_model%' \
+                    AND auto_disabled_reason NOT LIKE 'model_not_found%'))",
+    );
+    push_gate_predicates(&mut sql, filter, shape);
+    if tier.is_some() {
+        idx += 1;
+        sql.push_str(&format!(" AND performance_tier = ${idx}"));
+    }
+    if shape.capability_json.is_some() {
+        idx += 1;
+        push_capability_json(&mut sql, filter, idx);
+    }
+    if filter.min_context_window > 0 {
+        idx += 1;
+        sql.push_str(&format!(" AND context_window >= ${idx}"));
+    }
+    push_min_tier(&mut sql, filter);
+    if filter.only_provider.is_some() {
+        // PIN provider (filtro POSITIVO): restringe al solo provider pinnato.
+        // Ultimo placeholder DOPO min_context_window per preservare lo schema idx
+        // incrementale; il valore e' bindato lowercase (no interpolazione).
+        idx += 1;
+        sql.push_str(&format!(" AND LOWER(provider) = ${idx}"));
+    }
+    push_order_by(&mut sql, filter, order_by, limit);
+    sql
+}
+
+/// PAVIMENTO di capacita' (ELEGGIBILITA', non preferenza: un modello sotto soglia
+/// non e' un'alternativa peggiore, e' un'alternativa che non funziona).
+/// L'espressione del rank viene GENERATA dal vocabolario unico: la scala non si
+/// riscrive a mano nemmeno qui (regola L). `tier_rank` del floor e' calcolato in
+/// Rust dalla STESSA funzione, quindi le due meta' non possono divergere.
+fn push_min_tier(sql: &mut String, filter: &EligibilityFilter<'_>) {
+    if let Some(floor) = filter.min_tier {
+        use nexus_agent_graph::decisions::tiers::{tier_rank, tier_rank_sql};
+        sql.push_str(&format!(
+            " AND {} >= {}",
+            tier_rank_sql("performance_tier"),
+            tier_rank(floor)
+        ));
+    }
+}
+
+/// Col gate acceso le capability jsonb si verificano sul PROVATO
+/// (`qualified_capabilities`, scritto solo dal qualificatore), non sul dichiarato:
+/// una capability affermata a mano e mai dimostrata non instrada piu' nessuno.
+/// Nomi colonna statici, niente injection.
+fn push_capability_json(sql: &mut String, filter: &EligibilityFilter<'_>, idx: i32) {
+    let cap_col = if filter.require_qualified {
+        "qualified_capabilities"
+    } else {
+        "capabilities"
+    };
+    sql.push_str(&format!(" AND {cap_col} @> ${idx}::jsonb"));
+}
+
+/// I predicati di ELEGGIBILITA' che non dipendono dall'anello di tier-chain:
+/// gate di qualificazione, tool use, pre-GA, thinking, capability per colonna,
+/// esclusione dei media. Tutti frammenti statici, nessun input interpolato.
+fn push_gate_predicates(sql: &mut String, filter: &EligibilityFilter<'_>, shape: &QueryShape) {
+    if filter.require_tool_use {
+        sql.push_str(" AND supports_tool_use = TRUE");
+    }
+    if filter.require_qualified {
+        // Gate di qualificazione (mig 0591): solo modelli PROVATI e non scaduti.
+        sql.push_str(
+            " AND qualification_state = 'qualified' \
+              AND (qualification_expires_at IS NULL OR qualification_expires_at > NOW())",
+        );
+    }
+    if filter.exclude_preview {
+        sql.push_str(PRE_GA_MODEL_PREDICATE_SQL);
+    }
+    if filter.require_thinking_non_exclude {
+        sql.push_str(" AND agentic_thinking_policy <> 'exclude'");
+    }
+    if let Some(col) = shape.capability_column {
+        // `col` proviene da `capability_to_column` (whitelist statica di nomi
+        // colonna): nessun input utente interpolato, niente SQL injection.
+        sql.push_str(&format!(" AND {col} = TRUE"));
+    }
+    if !shape.requested_is_media {
+        // I modelli media non risalgono la classifica dei purpose testuali.
+        sql.push_str(
+            " AND supports_image_gen = FALSE AND supports_audio_in = FALSE \
+              AND supports_audio_out = FALSE AND supports_video_gen = FALSE",
+        );
+    }
+}
+
+/// ORDER BY: capacita'/costo (`order_by`) e' il criterio PRIMARIO. Il
+/// pre-ordinamento ADR 0025 (preferire i modelli nativamente non-thinking,
+/// `policy='none'`) e' declassato a TIE-BREAKER finale. Razionale (regola H,
+/// causa radice): i modelli forti moderni sono ORMAI TUTTI dual-mode
+/// (`disable_for_tools`: claude opus/sonnet, gpt-5.x, deepseek-v4), mentre i
+/// `none` rimasti sono i completion/legacy deboli (deepseek-coder/chat,
+/// codestral, gpt-4.1). Con `none` come criterio PRIMARIO il routing agentico
+/// sceglieva sistematicamente i modelli peggiori. L'affidabilita' sotto
+/// `tool_choice` forzato e' garantita a monte dal gateway (disabilita il thinking
+/// quando ci sono tool, vedi nexus-gateway providers). Resta come SPAREGGIO a
+/// parita' di `order_by` (preferenza conservata dove non costa).
+fn push_order_by(sql: &mut String, filter: &EligibilityFilter<'_>, order_by: &str, limit: i64) {
+    sql.push_str(" ORDER BY ");
+    sql.push_str(order_by);
+    if filter.require_thinking_non_exclude {
+        sql.push_str(", (agentic_thinking_policy = 'none') DESC");
+    }
+    sql.push_str(&format!(" LIMIT {limit}"));
+}
+
 pub(super) async fn select_models_tierchain(
     db: &PgPool,
     filter: &EligibilityFilter<'_>,
@@ -344,123 +488,27 @@ pub(super) async fn select_models_tierchain(
     // kind della mig 0478) si filtrano via colonna; ogni altra capability (chat,
     // 'code', 'reasoning', ...) resta nel jsonb `capabilities`. Aggiungere un
     // nuovo media kind = una riga qui (e la colonna in mig), niente if sparsi.
-    let capability_column: Option<&'static str> = filter.capability.and_then(capability_to_column);
-    // jsonb solo per le capability SENZA colonna dedicata.
-    let capability_json = filter
-        .capability
-        .filter(|_| capability_column.is_none())
-        .map(|c| format!("[\"{c}\"]"));
-    // Una capability media o vision e' "specializzata": NON va esclusa da se
-    // stessa. Le capability TESTUALI (chat/code/None/vision) NON devono pescare
-    // modelli media (un image-gen non e' un modello di testo): esclusione esplicita
-    // dei flag media quando la capability richiesta NON e' un media kind.
-    let requested_is_media = filter.capability.map(is_media_capability).unwrap_or(false);
+    let shape = QueryShape {
+        capability_column: filter.capability.and_then(capability_to_column),
+        // jsonb solo per le capability SENZA colonna dedicata.
+        capability_json: filter
+            .capability
+            .filter(|c| capability_to_column(c).is_none())
+            .map(|c| format!("[\"{c}\"]")),
+        // Una capability media o vision e' "specializzata": NON va esclusa da se
+        // stessa. Le capability TESTUALI (chat/code/None/vision) NON devono pescare
+        // modelli media (un image-gen non e' un modello di testo): esclusione
+        // esplicita dei flag media quando la capability richiesta NON e' un media kind.
+        requested_is_media: filter.capability.map(is_media_capability).unwrap_or(false),
+    };
 
     for tier in tiers {
-        // $1 = array provider esclusi (sempre). Placeholder successivi assegnati
-        // in ordine per tenere bind e SQL coerenti (stesso schema di idx manuale
-        // del precedente select_agentic_model).
-        let mut idx = 1;
-        let mut sql = String::from(
-            "SELECT provider, model, performance_tier FROM ai_price_catalog \
-             WHERE is_enabled = TRUE \
-               AND LOWER(provider) <> ALL($1) \
-               AND (auto_disabled_reason IS NULL \
-                    OR (auto_disabled_reason NOT LIKE 'invalid_model%' \
-                        AND auto_disabled_reason NOT LIKE 'model_not_found%'))",
-        );
-        if filter.require_tool_use {
-            sql.push_str(" AND supports_tool_use = TRUE");
-        }
-        if filter.require_qualified {
-            // Gate di qualificazione (mig 0591): solo modelli PROVATI e non
-            // scaduti. Frammento statico, nessun input utente interpolato.
-            sql.push_str(
-                " AND qualification_state = 'qualified' \
-                  AND (qualification_expires_at IS NULL OR qualification_expires_at > NOW())",
-            );
-        }
-        if filter.exclude_preview {
-            sql.push_str(PRE_GA_MODEL_PREDICATE_SQL);
-        }
-        if filter.require_thinking_non_exclude {
-            sql.push_str(" AND agentic_thinking_policy <> 'exclude'");
-        }
-        if let Some(col) = capability_column {
-            // `col` proviene da `capability_to_column` (whitelist statica di nomi
-            // colonna): nessun input utente interpolato, niente SQL injection.
-            sql.push_str(&format!(" AND {col} = TRUE"));
-        }
-        if !requested_is_media {
-            // I modelli media non risalgono la classifica dei purpose testuali.
-            sql.push_str(
-                " AND supports_image_gen = FALSE AND supports_audio_in = FALSE \
-                  AND supports_audio_out = FALSE AND supports_video_gen = FALSE",
-            );
-        }
-        if tier.is_some() {
-            idx += 1;
-            sql.push_str(&format!(" AND performance_tier = ${idx}"));
-        }
-        if capability_json.is_some() {
-            idx += 1;
-            // Col gate acceso le capability jsonb si verificano sul PROVATO
-            // (qualified_capabilities, scritto solo dal qualificatore), non sul
-            // dichiarato: una capability affermata a mano e mai dimostrata non
-            // instrada piu' nessuno (nomi colonna statici, niente injection).
-            let cap_col = if filter.require_qualified {
-                "qualified_capabilities"
-            } else {
-                "capabilities"
-            };
-            sql.push_str(&format!(" AND {cap_col} @> ${idx}::jsonb"));
-        }
-        if filter.min_context_window > 0 {
-            idx += 1;
-            sql.push_str(&format!(" AND context_window >= ${idx}"));
-        }
-        // PAVIMENTO di capacita' (eleggibilita', non preferenza). L'espressione del
-        // rank viene GENERATA dal vocabolario unico: la scala non si riscrive a
-        // mano nemmeno qui (regola L). `tier_rank` del floor e' calcolato in Rust
-        // dalla STESSA funzione, quindi le due meta' non possono divergere.
-        if let Some(floor) = filter.min_tier {
-            use nexus_agent_graph::decisions::tiers::{tier_rank, tier_rank_sql};
-            sql.push_str(&format!(
-                " AND {} >= {}",
-                tier_rank_sql("performance_tier"),
-                tier_rank(floor)
-            ));
-        }
-        if filter.only_provider.is_some() {
-            // PIN provider (filtro POSITIVO): restringe al solo provider pinnato.
-            // Ultimo placeholder DOPO min_context_window per preservare lo schema
-            // idx incrementale; il valore e' bindato lowercase (no interpolazione).
-            idx += 1;
-            sql.push_str(&format!(" AND LOWER(provider) = ${idx}"));
-        }
-        // ORDER BY: capacita'/costo (`order_by`) e' il criterio PRIMARIO. Il
-        // pre-ordinamento ADR 0025 (preferire i modelli nativamente non-thinking,
-        // `policy='none'`) e' declassato a TIE-BREAKER finale. Razionale (regola H,
-        // causa radice): i modelli forti moderni sono ORMAI TUTTI dual-mode
-        // (`disable_for_tools`: claude opus/sonnet, gpt-5.x, deepseek-v4), mentre i
-        // `none` rimasti sono i completion/legacy deboli (deepseek-coder/chat,
-        // codestral, gpt-4.1). Con `none` come criterio PRIMARIO il routing agentico
-        // sceglieva sistematicamente i modelli peggiori. L'affidabilita' sotto
-        // `tool_choice` forzato e' garantita a monte dal gateway (disabilita il
-        // thinking quando ci sono tool, vedi nexus-gateway providers). Resta come
-        // SPAREGGIO a parita' di `order_by` (preferenza conservata dove non costa).
-        sql.push_str(" ORDER BY ");
-        sql.push_str(order_by);
-        if filter.require_thinking_non_exclude {
-            sql.push_str(", (agentic_thinking_policy = 'none') DESC");
-        }
-        sql.push_str(&format!(" LIMIT {limit}"));
-
+        let sql = build_tierchain_sql(filter, &shape, tier, order_by, limit);
         let mut q = sqlx::query_as::<_, (String, String, Option<String>)>(&sql).bind(&excluded);
         if let Some(t) = tier {
             q = q.bind(t);
         }
-        if let Some(c) = capability_json.as_ref() {
+        if let Some(c) = shape.capability_json.as_ref() {
             q = q.bind(c);
         }
         if filter.min_context_window > 0 {

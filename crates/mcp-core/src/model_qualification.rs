@@ -140,18 +140,33 @@ pub(crate) fn build_needle_history(chars: usize) -> String {
     testo
 }
 
-/// Valuta UN turno di probe contro il `pass_predicate` del profilo. PURA.
-pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64) -> AttemptOutcome {
-    let stop_reason = turn
-        .get("stop_reason")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let tool_call_count = turn
-        .get("tool_use_blocks")
-        .and_then(Value::as_array)
-        .map(|a| a.len() as i64)
-        .unwrap_or(0);
+/// I segnali GREZZI di un turno di probe. Separare la LETTURA dal GIUDIZIO tiene
+/// in un solo posto il contratto col produttore del Value (vedi `content` sotto),
+/// che e' esattamente il punto in cui la batteria si era rotta.
+struct TurnSignals {
+    stop_reason: String,
+    tool_call_count: i64,
+    content_chars: i64,
+    error_class: Option<String>,
+}
+
+impl TurnSignals {
+    /// Compone l'esito portandosi dietro i segnali misurati. I campi di misura
+    /// accompagnano OGNI verdetto: senza, un fallimento non sarebbe diagnosticabile.
+    fn outcome(self, pass: bool, inconclusive: bool, reason: String) -> AttemptOutcome {
+        AttemptOutcome {
+            pass,
+            inconclusive,
+            reason,
+            error_class: self.error_class,
+            tool_call_count: self.tool_call_count,
+            content_chars: self.content_chars,
+            stop_reason: self.stop_reason,
+        }
+    }
+}
+
+fn read_turn_signals(turn: &Value) -> TurnSignals {
     // Il campo e' `content`: e' cosi' che lo nomina `agent_turn_value_from_gw`
     // (neural_client.rs), l'UNICO produttore di questo Value. Prima leggeva
     // `result` — una chiave che nessuno scrive — quindi `content_chars` era 0
@@ -164,56 +179,49 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
     // proteggere costruiva a mano un turno con la STESSA chiave inventata:
     // codice e test condividevano l'errore (verifica cieca). Ora il contratto e'
     // ancorato al produttore da `evaluate_attempt_legge_il_turno_reale_del_gateway`.
-    let content_chars = turn
-        .get("content")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().chars().count() as i64)
-        .unwrap_or(0);
-    let error_class = turn
-        .get("error_class")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    TurnSignals {
+        stop_reason: turn
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        tool_call_count: turn
+            .get("tool_use_blocks")
+            .and_then(Value::as_array)
+            .map(|a| a.len() as i64)
+            .unwrap_or(0),
+        content_chars: turn
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().chars().count() as i64)
+            .unwrap_or(0),
+        error_class: turn
+            .get("error_class")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    }
+}
 
-    // 1. Errore classificato: la classificazione canonica decide se e' colpa
-    //    del modello (conclusivo) o no (inconclusivo). Punto unico riusato dal
-    //    probe (regola L).
-    if let Some(ec) = &error_class {
-        use crate::model_health_probe::Classification;
-        let (pass, inconclusive, reason) =
-            match crate::model_health_probe::classification_from_error_class(ec) {
-                Classification::ModelSpecific(kind, _) => {
-                    (false, false, format!("error_class:{kind}"))
-                }
-                Classification::ProviderWide(kind, _) => {
-                    (false, true, format!("provider_wide:{kind}"))
-                }
-                Classification::Transient(kind, _) => (false, true, format!("transient:{kind}")),
-                Classification::Ok => (false, false, format!("error_class:{ec}")),
-            };
-        return AttemptOutcome {
-            pass,
-            inconclusive,
-            reason,
-            error_class,
-            tool_call_count,
-            content_chars,
-            stop_reason,
-        };
+/// La classificazione canonica decide se l'errore e' colpa del modello
+/// (conclusivo) o no (inconclusivo). Punto unico riusato dal probe (regola L).
+fn verdict_from_error_class(ec: &str) -> (bool, bool, String) {
+    use crate::model_health_probe::Classification;
+    match crate::model_health_probe::classification_from_error_class(ec) {
+        Classification::ModelSpecific(kind, _) => (false, false, format!("error_class:{kind}")),
+        Classification::ProviderWide(kind, _) => (false, true, format!("provider_wide:{kind}")),
+        Classification::Transient(kind, _) => (false, true, format!("transient:{kind}")),
+        Classification::Ok => (false, false, format!("error_class:{ec}")),
     }
-    // 2. stop_reason=error senza classe: inconclusivo (stessa prudenza del probe).
-    if stop_reason == "error" {
-        return AttemptOutcome {
-            pass: false,
-            inconclusive: true,
-            reason: "stop_reason_error".into(),
-            error_class,
-            tool_call_count,
-            content_chars,
-            stop_reason,
-        };
-    }
-    // 3. Predicato del profilo (soglie dal DB, regola G).
+}
+
+/// Il predicato del profilo (soglie dal DB, regola G): `None` = superato.
+fn predicate_fail_reason(
+    turn: &Value,
+    predicate: &Value,
+    sig: &TurnSignals,
+    latency_ms: i64,
+) -> Option<String> {
     let min_tool_calls = predicate
         .get("min_tool_calls")
         .and_then(Value::as_i64)
@@ -222,20 +230,38 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
         .get("min_content_chars")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let max_latency_ms = predicate.get("max_latency_ms").and_then(Value::as_i64);
-    let mut fail_reason: Option<String> = None;
-    if tool_call_count < min_tool_calls {
-        fail_reason = Some(format!(
-            "no_tool_call:{tool_call_count}<{min_tool_calls}{}",
-            if stop_reason.is_empty() {
-                String::new()
-            } else {
-                format!(":{stop_reason}")
-            }
+    if sig.tool_call_count < min_tool_calls {
+        let coda = if sig.stop_reason.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", sig.stop_reason)
+        };
+        return Some(format!(
+            "no_tool_call:{}<{min_tool_calls}{coda}",
+            sig.tool_call_count
         ));
-    } else if content_chars < min_content_chars {
-        fail_reason = Some(format!("empty_content:{content_chars}<{min_content_chars}"));
-    } else if predicate
+    }
+    if sig.content_chars < min_content_chars {
+        return Some(format!(
+            "empty_content:{}<{min_content_chars}",
+            sig.content_chars
+        ));
+    }
+    if needle_missing(turn, predicate) {
+        return Some("needle_not_found".to_string());
+    }
+    match predicate.get("max_latency_ms").and_then(Value::as_i64) {
+        Some(cap) if latency_ms > cap => Some(format!("latency:{latency_ms}>{cap}")),
+        _ => None,
+    }
+}
+
+/// FRONTIER (`long_context`): il modello deve aver RITROVATO il fatto piantato a
+/// meta' di 100k. Verifica DETERMINISTICA sul testo esatto (regola M), non un
+/// giudizio sulla qualita' della risposta: o il codice c'e', o non c'e'. Una
+/// finestra dichiarata grande non prova nulla se il modello non la usa.
+fn needle_missing(turn: &Value, predicate: &Value) -> bool {
+    predicate
         .get("requires_needle")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -244,37 +270,22 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
             .and_then(Value::as_str)
             .unwrap_or("")
             .contains(LONG_CTX_NEEDLE)
-    {
-        // FRONTIER (`long_context`): il modello deve aver RITROVATO il fatto
-        // piantato a meta' di 100k. Verifica DETERMINISTICA sul testo esatto
-        // (regola M), non un giudizio sulla qualita' della risposta: o il codice
-        // c'e', o non c'e'. Una finestra dichiarata grande non prova nulla se il
-        // modello non la usa.
-        fail_reason = Some("needle_not_found".to_string());
-    } else if let Some(cap) = max_latency_ms {
-        if latency_ms > cap {
-            fail_reason = Some(format!("latency:{latency_ms}>{cap}"));
-        }
+}
+
+/// Valuta UN turno di probe contro il `pass_predicate` del profilo. PURA.
+pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64) -> AttemptOutcome {
+    let sig = read_turn_signals(turn);
+    if let Some(ec) = sig.error_class.clone() {
+        let (pass, inconclusive, reason) = verdict_from_error_class(&ec);
+        return sig.outcome(pass, inconclusive, reason);
     }
-    match fail_reason {
-        None => AttemptOutcome {
-            pass: true,
-            inconclusive: false,
-            reason: "ok".into(),
-            error_class,
-            tool_call_count,
-            content_chars,
-            stop_reason,
-        },
-        Some(reason) => AttemptOutcome {
-            pass: false,
-            inconclusive: false,
-            reason,
-            error_class,
-            tool_call_count,
-            content_chars,
-            stop_reason,
-        },
+    // stop_reason=error senza classe: inconclusivo (stessa prudenza del probe).
+    if sig.stop_reason == "error" {
+        return sig.outcome(false, true, "stop_reason_error".into());
+    }
+    match predicate_fail_reason(turn, predicate, &sig, latency_ms) {
+        None => sig.outcome(true, false, "ok".into()),
+        Some(reason) => sig.outcome(false, false, reason),
     }
 }
 
@@ -426,38 +437,30 @@ pub(crate) struct TierPriorThresholds {
 /// magico). Un tier NULL non e' pericoloso: col gate acceso un modello non
 /// qualificato e' gia' fuori dal pool agentico, e resta solo candidato di ultima
 /// istanza del failover (che non filtra per tier).
-pub(crate) fn derive_tier_prior(
-    facts: &CatalogFacts,
-    t: &TierPriorThresholds,
-) -> Option<&'static str> {
-    // 1. L'agentic_index MISURA la capacita' agentica (Agents 34% + Coding 24%
-    //    dell'Intelligence Index, su harness con tool): e' il nostro uso esatto.
-    //    Vince sul prezzo, che e' solo il posizionamento commerciale del
-    //    fornitore. Misurato: col solo prezzo, gpt-5.4-mini (agentic 30.2)
-    //    diventava 'heavy' perche' costa >$2, e claude-opus-4-8 (47.2) veniva
-    //    DECLASSATO da frontier a heavy. Un mini caro e un frontier economico
-    //    rompono la scala del prezzo; l'indice no.
-    //    Il chiamante passa `None` se l'indice e' stantio (fonte undocumented).
-    if let Some(idx) = facts.agentic_index {
-        return Some(if idx >= t.agentic_index_frontier_min {
-            "frontier"
-        } else if idx >= t.agentic_index_heavy_min {
-            "heavy"
-        } else if idx >= t.agentic_index_high_min {
-            "high"
-        } else if idx >= t.agentic_index_medium_min {
-            "medium"
-        } else {
-            "light"
-        });
+/// L'agentic_index MISURA la capacita' agentica (Agents 34% + Coding 24%
+/// dell'Intelligence Index, su harness con tool): e' il nostro uso esatto.
+fn tier_from_agentic_index(idx: f64, t: &TierPriorThresholds) -> &'static str {
+    if idx >= t.agentic_index_frontier_min {
+        "frontier"
+    } else if idx >= t.agentic_index_heavy_min {
+        "heavy"
+    } else if idx >= t.agentic_index_high_min {
+        "high"
+    } else if idx >= t.agentic_index_medium_min {
+        "medium"
+    } else {
+        "light"
     }
-    // 2. RIPIEGO sul prezzo, per il 61% del parco che l'indice non copre. Batte
-    //    comunque il nome (misurato: 64 -> 31 inversioni), ma sbaglia: e' un
-    //    ripiego dichiarato, non una verita'.
-    //
-    // Senza prezzo dichiarato il prior non si esprime: `pricing_state='unknown'`
-    // significa "placeholder", non "gratis". Dedurre 'light' da un costo 0 non
-    // raffinato sarebbe la stessa bugia del nome, con un'altra faccia.
+}
+
+/// RIPIEGO sul prezzo, per il 61% del parco che l'indice non copre. Batte
+/// comunque il nome (misurato: 64 -> 31 inversioni), ma sbaglia: e' un ripiego
+/// dichiarato, non una verita'.
+///
+/// `None` senza prezzo dichiarato: `pricing_state='unknown'` significa
+/// "placeholder", non "gratis". Dedurre 'light' da un costo 0 non raffinato
+/// sarebbe la stessa bugia del nome, con un'altra faccia.
+fn tier_from_price(facts: &CatalogFacts, t: &TierPriorThresholds) -> Option<&'static str> {
     let cost = facts.input_cost?;
     if cost <= 0.0 {
         return None;
@@ -486,11 +489,11 @@ pub(crate) fn derive_tier_prior(
     };
     // Il reasoning PROVATO (non dichiarato) alza di un gradino fino a 'heavy':
     // e' l'unico segnale del prior che viene da una misura nostra.
-    let with_reasoning = if facts
+    let proven_reasoning = facts
         .proven_capabilities
         .iter()
-        .any(|c| c.eq_ignore_ascii_case("reasoning"))
-    {
+        .any(|c| c.eq_ignore_ascii_case("reasoning"));
+    Some(if proven_reasoning {
         match with_ctx {
             "light" => "medium",
             "medium" => "high",
@@ -498,8 +501,23 @@ pub(crate) fn derive_tier_prior(
         }
     } else {
         with_ctx
-    };
-    Some(with_reasoning)
+    })
+}
+
+pub(crate) fn derive_tier_prior(
+    facts: &CatalogFacts,
+    t: &TierPriorThresholds,
+) -> Option<&'static str> {
+    // L'indice vince sul prezzo, che e' solo il posizionamento commerciale del
+    // fornitore. Misurato: col solo prezzo, gpt-5.4-mini (agentic 30.2) diventava
+    // 'heavy' perche' costa >$2, e claude-opus-4-8 (47.2) veniva DECLASSATO da
+    // frontier a heavy. Un mini caro e un frontier economico rompono la scala del
+    // prezzo; l'indice no.
+    // Il chiamante passa `None` se l'indice e' stantio (fonte undocumented).
+    match facts.agentic_index {
+        Some(idx) => Some(tier_from_agentic_index(idx, t)),
+        None => tier_from_price(facts, t),
+    }
 }
 
 /// TIER MISURATO (`measured`): la banda PIU' ALTA certificata dalla batteria.
@@ -551,13 +569,14 @@ pub(crate) fn derive_tier_measured(
     migliore.map(str::to_string)
 }
 
-/// PUNTO UNICO PURO (regola L): l'evidenza diventa stato + capability PROVATE.
-/// `declared` = jsonb `capabilities` della riga (il dichiarato).
-pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> Derived {
-    // Un blocking con fallimenti CONCLUSIVI sotto soglia squalifica.
+/// Verdetto NEGATIVO della batteria, se c'e'. Distingue le due cause, che non
+/// vanno confuse: un fallimento CONCLUSIVO e' del modello (squalifica), mentre
+/// il non raggiungimento della soglia per troppi inconclusivi e' del giro (rete,
+/// provider) e non gli e' attribuibile.
+fn blocking_verdict(runs: &[ProfileRun]) -> Option<Derived> {
     for r in runs {
         if r.is_blocking && !r.passed() && r.conclusive_fails > 0 {
-            return Derived {
+            return Some(Derived {
                 state: DerivedState::Disqualified,
                 qualified_capabilities: Vec::new(),
                 reason: format!(
@@ -567,22 +586,24 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
                 ),
                 thinking: None,
                 measured_tier: None,
-            };
+            });
         }
     }
-    // Nessun fallimento conclusivo ma qualche blocking non ha raggiunto la
-    // soglia (troppi inconclusivi): giro non attribuibile al modello.
-    if runs.iter().any(|r| r.is_blocking && !r.passed()) {
-        return Derived {
+    runs.iter()
+        .any(|r| r.is_blocking && !r.passed())
+        .then(|| Derived {
             state: DerivedState::Inconclusive,
             qualified_capabilities: Vec::new(),
             reason: "inconclusive_round".into(),
             thinking: None,
             measured_tier: None,
-        };
-    }
-    // Batteria superata: il PROVATO = unione dei grants dei profili passati,
-    // piu' i tag dichiarati che la suite v1 non misura (vedi MEASURED_V1).
+        })
+}
+
+/// Il PROVATO: unione dei grants dei profili passati, piu' i tag dichiarati che
+/// la suite v1 non misura (vedi MEASURED_V1) — su quelli il dichiarato resta
+/// l'unica evidenza disponibile.
+fn union_proven_capabilities(declared: &[String], runs: &[ProfileRun]) -> Vec<String> {
     let mut caps: Vec<String> = Vec::new();
     for r in runs.iter().filter(|r| r.passed()) {
         for g in &r.grants {
@@ -596,9 +617,18 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
             caps.push(d.clone());
         }
     }
+    caps
+}
+
+/// PUNTO UNICO PURO (regola L): l'evidenza diventa stato + capability PROVATE.
+/// `declared` = jsonb `capabilities` della riga (il dichiarato).
+pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> Derived {
+    if let Some(negativo) = blocking_verdict(runs) {
+        return negativo;
+    }
     Derived {
         state: DerivedState::Qualified,
-        qualified_capabilities: caps,
+        qualified_capabilities: union_proven_capabilities(declared, runs),
         reason: "suite_passed".into(),
         thinking: None,
         // La banda MISURATA non si deriva qui: `derive_capabilities` non vede i
@@ -673,6 +703,116 @@ fn profile_applies(profile: &ProbeProfile, declared: &[String]) -> bool {
 /// Costruisce `(tools_json, messages_json, system_text)` per il profilo.
 /// `Err(reason)` se il profilo non e' costruibile (es. template mancante):
 /// esito INCONCLUSIVO visibile, mai un fallback silenzioso (regola G/H).
+/// Gli schemi REALI dal catalogo statico (punto unico, regola L): la prova usa
+/// gli artefatti di produzione, non repliche giocattolo — un tool finto
+/// misurerebbe il nostro mock, non il modello.
+fn resolve_probe_tools(profile: &ProbeProfile) -> Result<Value, String> {
+    let tool_names: Vec<String> = profile
+        .payload
+        .get("tool_names")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if tool_names.is_empty() {
+        return Err("payload.tool_names vuoto".into());
+    }
+    let tools = crate::agent_tools::subagent_native::build_tools_json(&tool_names);
+    if tools.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return Err("nessun tool della whitelist esiste nel catalogo statico".into());
+    }
+    Ok(tools)
+}
+
+/// Il system prompt REALE dal DB (regola G): la figura provata e' quella che gira
+/// in produzione.
+async fn resolve_probe_system(db: &PgPool, profile: &ProbeProfile) -> Result<String, String> {
+    let template_key = profile
+        .payload
+        .get("system_template_key")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if template_key.is_empty() {
+        return Err("payload.system_template_key assente".into());
+    }
+    let system: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM nexus_prompt_templates \
+          WHERE key = $1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(template_key)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("lettura template '{template_key}': {e}"))?;
+    system
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("template '{template_key}' assente o vuoto"))
+}
+
+/// Filler DETERMINISTICO che simula la history reale di una figura (contesto
+/// progetto + richiesta): dimensiona il CARICO, non il contenuto.
+fn build_realistic_messages(profile: &ProbeProfile) -> String {
+    let history_chars = profile
+        .payload
+        .get("history_chars")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize;
+    let filler_unit = "Contesto di progetto: applicazione web con autenticazione JWT, \
+                       database Postgres, servizi containerizzati e pipeline di build. ";
+    let filler: String = filler_unit.chars().cycle().take(history_chars).collect();
+    json!([
+        { "role": "user",
+          "content": format!("Materiale di contesto per l'analisi:\n{filler}") },
+        { "role": "assistant",
+          "content": "Ho letto il contesto. Procedo con l'analisi richiesta." },
+        { "role": "user",
+          "content": "Analizza i rischi dell'autenticazione del progetto: inizia \
+                      ispezionando i file rilevanti con i tool a disposizione, poi \
+                      dichiara il tuo parere strutturato." }
+    ])
+    .to_string()
+}
+
+/// FRONTIER: reggere il contesto lungo con retrieval VERIFICABILE. Non e' "quanto
+/// e' grande la finestra dichiarata" (quello e' un numero del fornitore, e infatti
+/// il prior lo usa solo per un gradino): e' se il modello la USA davvero. Un fatto
+/// piantato a meta' della history, e il checker verifica che lo ritrovi ALLA
+/// LETTERA — un needle-in-haystack.
+///
+/// Single-turn: non serve il loop conversazionale (che invece serve a tool_chain e
+/// tool_recovery). Il needle e' DETERMINISTICO e verificabile programmaticamente,
+/// mai un giudizio sulla prosa (regola M).
+fn build_long_context_request(profile: &ProbeProfile) -> (String, String, String) {
+    let history_chars = profile
+        .payload
+        .get("history_chars")
+        .and_then(Value::as_i64)
+        .unwrap_or(100_000)
+        .clamp(1_000, 400_000) as usize;
+    let messages = json!([
+        { "role": "user", "content": build_needle_history(history_chars) },
+        { "role": "user", "content":
+            "Nel testo sopra c'e' esattamente una riga che inizia con \
+             'CODICE-PRATICA:'. Rispondi SOLO con il codice che segue i due \
+             punti, senza altro testo." }
+    ]);
+    // Il NEEDLE non compare MAI nel system prompt: il modello deve trovarlo nella
+    // history, non leggerlo nelle istruzioni. Metterlo qui renderebbe il test una
+    // formalita' che chiunque supera — misurerebbe la nostra ingenuita', non il
+    // modello.
+    (
+        "[]".to_string(),
+        messages.to_string(),
+        "Sei in una verifica di recupero da contesto lungo. Rispondi in \
+         modo conciso, senza commenti."
+            .to_string(),
+    )
+}
+
 async fn build_profile_request(
     db: &PgPool,
     profile: &ProbeProfile,
@@ -687,110 +827,15 @@ async fn build_profile_request(
         )),
         "tool_minimal" => Ok(crate::model_health_probe::build_tool_probe_request()),
         "tool_realistic" | "thinking_matrix" => {
-            let tool_names: Vec<String> = profile
-                .payload
-                .get("tool_names")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if tool_names.is_empty() {
-                return Err("payload.tool_names vuoto".into());
-            }
-            // Schemi REALI dal catalogo statico (punto unico, regola L): la
-            // prova usa gli artefatti di produzione, non repliche giocattolo.
-            let tools = crate::agent_tools::subagent_native::build_tools_json(&tool_names);
-            if tools.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-                return Err("nessun tool della whitelist esiste nel catalogo statico".into());
-            }
-            let template_key = profile
-                .payload
-                .get("system_template_key")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if template_key.is_empty() {
-                return Err("payload.system_template_key assente".into());
-            }
-            let system: Option<String> = sqlx::query_scalar(
-                "SELECT content FROM nexus_prompt_templates \
-                  WHERE key = $1 ORDER BY version DESC LIMIT 1",
-            )
-            .bind(template_key)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| format!("lettura template '{template_key}': {e}"))?;
-            let Some(system) = system.filter(|s| !s.trim().is_empty()) else {
-                return Err(format!("template '{template_key}' assente o vuoto"));
-            };
-            let history_chars = profile
-                .payload
-                .get("history_chars")
-                .and_then(Value::as_i64)
-                .unwrap_or(0)
-                .max(0) as usize;
-            // Filler DETERMINISTICO che simula la history reale di una figura
-            // (contesto progetto + richiesta): dimensiona il carico, non il
-            // contenuto.
-            let filler_unit = "Contesto di progetto: applicazione web con autenticazione JWT, \
-                               database Postgres, servizi containerizzati e pipeline di build. ";
-            let filler: String = filler_unit
-                .chars()
-                .cycle()
-                .take(history_chars)
-                .collect();
-            let messages = json!([
-                { "role": "user",
-                  "content": format!("Materiale di contesto per l'analisi:\n{filler}") },
-                { "role": "assistant",
-                  "content": "Ho letto il contesto. Procedo con l'analisi richiesta." },
-                { "role": "user",
-                  "content": "Analizza i rischi dell'autenticazione del progetto: inizia \
-                              ispezionando i file rilevanti con i tool a disposizione, poi \
-                              dichiara il tuo parere strutturato." }
-            ]);
-            Ok((tools.to_string(), messages.to_string(), system))
-        }
-        // FRONTIER: reggere il contesto lungo con retrieval VERIFICABILE. Non e'
-        // "quanto e' grande la finestra dichiarata" (quello e' un numero del
-        // fornitore, e infatti il prior lo usa solo per un gradino): e' se il
-        // modello la USA davvero. Un fatto piantato a meta' della history, e il
-        // checker verifica che lo ritrovi ALLA LETTERA — un needle-in-haystack.
-        //
-        // Single-turn: non serve il loop conversazionale (che invece serve a
-        // tool_chain e tool_recovery). Il needle e' DETERMINISTICO e verificabile
-        // programmaticamente, mai un giudizio sulla prosa (regola M).
-        "long_context" => {
-            let history_chars = profile
-                .payload
-                .get("history_chars")
-                .and_then(Value::as_i64)
-                .unwrap_or(100_000)
-                .clamp(1_000, 400_000) as usize;
-            let history = build_needle_history(history_chars);
-            let messages = json!([
-                { "role": "user", "content": history },
-                { "role": "user", "content":
-                    "Nel testo sopra c'e' esattamente una riga che inizia con \
-                     'CODICE-PRATICA:'. Rispondi SOLO con il codice che segue i due \
-                     punti, senza altro testo." }
-            ]);
-            // Il NEEDLE non compare MAI nel system prompt: il modello deve
-            // trovarlo nella history, non leggerlo nelle istruzioni. E' il
-            // needle-in-haystack: metterlo qui renderebbe il test una formalita'
-            // che chiunque supera — misurerebbe la nostra ingenuita', non il
-            // modello.
+            let tools = resolve_probe_tools(profile)?;
+            let system = resolve_probe_system(db, profile).await?;
             Ok((
-                "[]".to_string(),
-                messages.to_string(),
-                "Sei in una verifica di recupero da contesto lungo. Rispondi in \
-                 modo conciso, senza commenti."
-                    .to_string(),
+                tools.to_string(),
+                build_realistic_messages(profile),
+                system,
             ))
         }
+        "long_context" => Ok(build_long_context_request(profile)),
         other => Err(format!("kind profilo non implementato: {other}")),
     }
 }
@@ -844,87 +889,142 @@ async fn insert_evidence(
 /// thinking opzionale e aggrega l'esito. `label` distingue le configurazioni
 /// della thinking_matrix nell'evidence (prefisso del verdict_reason); vuoto
 /// per i profili ordinari. Punto unico del ciclo tentativo->evidence (regola L).
-#[allow(clippy::too_many_arguments)]
-async fn run_profile_attempts(
-    orchestrator: &Orchestrator,
-    db: &PgPool,
-    provider: &str,
-    model: &str,
-    profile: &ProbeProfile,
-    request: &(String, String, String),
+/// Le soglie di UN profilo, gia' clampate. Vengono dal payload (regola G) e
+/// restano fisse per tutte le passate su quel profilo.
+#[derive(Clone, Copy)]
+struct ProfileParams {
     repeat: u32,
     timeout_s: u64,
     max_tokens: u32,
     promote_min: u32,
-    thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
-    label: &str,
-    last_evidence: &mut Option<i64>,
-) -> ProfileRun {
-    let (tools_json, messages_json, system_text) = request;
-    let mut run = ProfileRun {
-        profile_key: profile.profile_key.clone(),
-        grants: profile.grants.clone(),
-        is_blocking: profile.is_blocking,
-        passes: 0,
-        conclusive_fails: 0,
-        inconclusive: 0,
-        promote_min,
-        first_fail_reason: None,
-    };
-    for attempt in 1..=repeat {
+}
+
+/// Il contesto STABILE di una batteria su un modello: fra una passata e l'altra
+/// cambiano solo la configurazione thinking e l'etichetta. Raggrupparlo qui
+/// toglie i 13 parametri posizionali (e il `too_many_arguments` che li copriva)
+/// dalle tre chiamate di `qualify_one`.
+struct ProbeCtx<'a> {
+    orchestrator: &'a Orchestrator,
+    db: &'a PgPool,
+    provider: &'a str,
+    model: &'a str,
+    profile: &'a ProbeProfile,
+    /// `(tools_json, messages_json, system_text)`, come lo costruisce
+    /// `build_profile_request`.
+    request: &'a (String, String, String),
+    params: ProfileParams,
+}
+
+impl ProbeCtx<'_> {
+    /// La classe d'errore di una chiamata fallita: PRIMA il segnale STRUTTURATO
+    /// del gateway (regola M), poi il classificatore testuale come ripiego —
+    /// quest'ultimo e' un LLM, quindi costa e puo' sbagliare: si usa solo quando
+    /// il segnale strutturato non c'e'.
+    async fn error_class_for(&self, e: &anyhow::Error) -> String {
+        match error_class_from_gateway(e) {
+            Some(ec) => ec,
+            None => {
+                self.orchestrator
+                    .neural
+                    .classify_error(&e.to_string(), self.provider)
+                    .await
+            }
+        }
+    }
+
+    /// UN tentativo: chiama il modello e ne giudica il turno. La latenza e'
+    /// misurata qui perche' e' parte dell'esito (il predicato puo' bocciare su
+    /// `max_latency_ms`).
+    async fn single_attempt(
+        &self,
+        thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+    ) -> (AttemptOutcome, i64) {
+        let (tools_json, messages_json, system_text) = self.request;
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
-            Duration::from_secs(timeout_s),
-            orchestrator.neural.generate_agent_turn_with_thinking(
-                provider,
-                model,
-                messages_json,
-                tools_json,
-                max_tokens,
-                system_text,
-                thinking.clone(),
-            ),
+            Duration::from_secs(self.params.timeout_s),
+            self.orchestrator
+                .neural
+                .generate_agent_turn_with_thinking(
+                    self.provider,
+                    self.model,
+                    messages_json,
+                    tools_json,
+                    self.params.max_tokens,
+                    system_text,
+                    thinking,
+                ),
         )
         .await;
         let latency_ms = started.elapsed().as_millis() as i64;
-        let mut outcome = match result {
-            Ok(Ok(turn)) => evaluate_attempt(&turn, &profile.pass_predicate, latency_ms),
+        let outcome = match result {
+            Ok(Ok(turn)) => evaluate_attempt(&turn, &self.profile.pass_predicate, latency_ms),
             Ok(Err(e)) => {
-                // Errore di chiamata: PRIMA il segnale strutturato del gateway
-                // (regola M), poi il classificatore testuale come fallback.
-                let ec = match error_class_from_gateway(&e) {
-                    Some(ec) => ec,
-                    None => {
-                        orchestrator
-                            .neural
-                            .classify_error(&e.to_string(), provider)
-                            .await
-                    }
-                };
+                let ec = self.error_class_for(&e).await;
                 evaluate_attempt(
                     &json!({ "error_class": ec }),
-                    &profile.pass_predicate,
+                    &self.profile.pass_predicate,
                     latency_ms,
                 )
             }
             Err(_elapsed) => AttemptOutcome {
                 pass: false,
                 inconclusive: true,
-                reason: format!("probe_timeout:{timeout_s}s"),
+                reason: format!("probe_timeout:{}s", self.params.timeout_s),
                 error_class: None,
                 tool_call_count: 0,
                 content_chars: 0,
                 stop_reason: String::new(),
             },
         };
+        (outcome, latency_ms)
+    }
+}
+
+impl ProfileRun {
+    /// Contabilizza UN esito. L'inconclusivo NON e' un fallimento: e' un giro non
+    /// attribuibile al modello, e tenerli distinti e' cio' che impedisce alla
+    /// batteria di squalificare per colpa della rete.
+    fn tally(&mut self, outcome: &AttemptOutcome) {
+        if outcome.inconclusive {
+            self.inconclusive += 1;
+        } else if outcome.pass {
+            self.passes += 1;
+        } else {
+            self.conclusive_fails += 1;
+            if self.first_fail_reason.is_none() {
+                self.first_fail_reason = Some(outcome.reason.clone());
+            }
+        }
+    }
+}
+
+async fn run_profile_attempts(
+    ctx: &ProbeCtx<'_>,
+    thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+    label: &str,
+    last_evidence: &mut Option<i64>,
+) -> ProfileRun {
+    let mut run = ProfileRun {
+        profile_key: ctx.profile.profile_key.clone(),
+        grants: ctx.profile.grants.clone(),
+        is_blocking: ctx.profile.is_blocking,
+        passes: 0,
+        conclusive_fails: 0,
+        inconclusive: 0,
+        promote_min: ctx.params.promote_min,
+        first_fail_reason: None,
+    };
+    for attempt in 1..=ctx.params.repeat {
+        let (mut outcome, latency_ms) = ctx.single_attempt(thinking.clone()).await;
         if !label.is_empty() {
             outcome.reason = format!("{label}{}", outcome.reason);
         }
         if let Some(id) = insert_evidence(
-            db,
-            provider,
-            model,
-            profile,
+            ctx.db,
+            ctx.provider,
+            ctx.model,
+            ctx.profile,
             attempt as i32,
             latency_ms,
             &outcome,
@@ -933,18 +1033,159 @@ async fn run_profile_attempts(
         {
             *last_evidence = Some(id);
         }
-        if outcome.inconclusive {
-            run.inconclusive += 1;
-        } else if outcome.pass {
-            run.passes += 1;
-        } else {
-            run.conclusive_fails += 1;
-            if run.first_fail_reason.is_none() {
-                run.first_fail_reason = Some(outcome.reason.clone());
-            }
-        }
+        run.tally(&outcome);
     }
     run
+}
+
+/// Le soglie del profilo, clampate. I default vivono qui e non nel DB perche'
+/// sono limiti di SICUREZZA del probe (un `repeat: 500` da payload non deve
+/// poter partire), non configurazione di routing.
+fn profile_params(profile: &ProbeProfile) -> ProfileParams {
+    let repeat = profile
+        .payload
+        .get("repeat")
+        .and_then(Value::as_i64)
+        .unwrap_or(1)
+        .clamp(1, 5) as u32;
+    ProfileParams {
+        repeat,
+        timeout_s: profile
+            .payload
+            .get("timeout_s")
+            .and_then(Value::as_i64)
+            .unwrap_or(90)
+            .clamp(10, 300) as u64,
+        max_tokens: profile
+            .payload
+            .get("max_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(512)
+            .clamp(16, 16384) as u32,
+        promote_min: profile
+            .pass_predicate
+            .get("promote_min_passes")
+            .and_then(Value::as_i64)
+            .map(|n| n.clamp(1, repeat as i64) as u32)
+            .unwrap_or(repeat),
+    }
+}
+
+/// Profilo non costruibile: il giro e' inconclusivo, non fallito. La differenza
+/// e' sostanziale — un profilo che non si costruisce e' un difetto NOSTRO, e
+/// addebitarlo al modello lo squalificherebbe a torto. Il warn sta qui perche' e'
+/// parte del rendere l'inconclusivo VISIBILE: un giro che non misura nulla in
+/// silenzio e' indistinguibile da un giro riuscito.
+fn unbuildable_run(
+    profile: &ProbeProfile,
+    params: &ProfileParams,
+    provider: &str,
+    model: &str,
+    reason: &str,
+) -> ProfileRun {
+    tracing::warn!(
+        provider = %provider,
+        model = %model,
+        profile = %profile.profile_key,
+        reason = %reason,
+        "model_qualification: profilo non costruibile -> inconclusivo"
+    );
+    ProfileRun {
+        profile_key: profile.profile_key.clone(),
+        grants: profile.grants.clone(),
+        is_blocking: profile.is_blocking,
+        passes: 0,
+        conclusive_fails: 0,
+        inconclusive: params.repeat,
+        promote_min: params.promote_min,
+        first_fail_reason: None,
+    }
+}
+
+/// FASE 5: la matrice PROVA il modello in DUE configurazioni thinking esplicite
+/// (off e native) e DERIVA agentic_thinking_policy dai fatti — mai ereditare la
+/// policy del catalog che stiamo derivando.
+async fn run_thinking_matrix(
+    ctx: &ProbeCtx<'_>,
+    last_evidence: &mut Option<i64>,
+) -> (ProfileRun, ProfileRun, Option<(&'static str, bool)>) {
+    let budget = ctx
+        .profile
+        .payload
+        .get("thinking_budget_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(2048)
+        .clamp(256, 32768) as u32;
+    let off = run_profile_attempts(
+        ctx,
+        Some(crate::nexus_gateway::GwThinkingConfig {
+            enabled: false,
+            budget_tokens: None,
+            mandatory: false,
+        }),
+        "off:",
+        last_evidence,
+    )
+    .await;
+    let native = run_profile_attempts(
+        ctx,
+        Some(crate::nexus_gateway::GwThinkingConfig {
+            enabled: true,
+            budget_tokens: Some(budget),
+            mandatory: true,
+        }),
+        "native:",
+        last_evidence,
+    )
+    .await;
+    let policy =
+        derive_thinking_policy(ConfigOutcome::from_run(&off), ConfigOutcome::from_run(&native));
+    (off, native, policy)
+}
+
+/// LA BANDA MISURATA (mig 0599). Solo su un esito QUALIFIED: una squalifica o un
+/// giro inconclusivo non misurano nulla, e un tier scritto su un esito non
+/// attribuibile al modello sarebbe la stessa bugia del nome.
+async fn attach_measured_tier(
+    derived: &mut Derived,
+    runs: &[ProfileRun],
+    profiles: &[ProbeProfile],
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) {
+    if derived.state != DerivedState::Qualified {
+        return;
+    }
+    // Accoppia ogni run con la banda che il suo profilo certifica. `runs` e
+    // `profiles` non sono allineati per indice (i profili non applicabili vengono
+    // saltati da `profile_applies`, e l'early-stop tronca `runs`): il join va
+    // fatto sulla CHIAVE, mai sulla posizione.
+    let con_bande: Vec<(ProfileRun, Option<String>)> = runs
+        .iter()
+        .map(|r| {
+            let banda = profiles
+                .iter()
+                .find(|p| p.profile_key == r.profile_key)
+                .and_then(|p| p.certifies_tier.clone());
+            (r.clone(), banda)
+        })
+        .collect();
+    // Il tier ATTUALE serve all'isteresi: conservare una banda gia' acquisita
+    // costa meno che conquistarne una nuova.
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT performance_tier FROM ai_price_catalog \
+          WHERE provider = $1 AND model = $2 LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    derived.measured_tier =
+        derive_tier_measured(&con_bande, current.as_deref(), hold_min_passes(profiles));
 }
 
 /// Esegue la batteria su UN modello candidato (gia' claimato `probing`).
@@ -961,129 +1202,31 @@ async fn qualify_one(
     let mut last_evidence: Option<i64> = None;
     let mut thinking_derived: Option<(&'static str, bool)> = None;
     for profile in profiles.iter().filter(|p| profile_applies(p, declared)) {
-        let repeat = profile
-            .payload
-            .get("repeat")
-            .and_then(Value::as_i64)
-            .unwrap_or(1)
-            .clamp(1, 5) as u32;
-        let timeout_s = profile
-            .payload
-            .get("timeout_s")
-            .and_then(Value::as_i64)
-            .unwrap_or(90)
-            .clamp(10, 300) as u64;
-        let max_tokens = profile
-            .payload
-            .get("max_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(512)
-            .clamp(16, 16384) as u32;
-        let promote_min = profile
-            .pass_predicate
-            .get("promote_min_passes")
-            .and_then(Value::as_i64)
-            .map(|n| n.clamp(1, repeat as i64) as u32)
-            .unwrap_or(repeat);
-
+        let params = profile_params(profile);
         let request = match build_profile_request(db, profile).await {
             Err(reason) => {
-                // Profilo non costruibile: giro inconclusivo VISIBILE.
-                tracing::warn!(
-                    provider = %provider,
-                    model = %model,
-                    profile = %profile.profile_key,
-                    reason = %reason,
-                    "model_qualification: profilo non costruibile -> inconclusivo"
-                );
-                runs.push(ProfileRun {
-                    profile_key: profile.profile_key.clone(),
-                    grants: profile.grants.clone(),
-                    is_blocking: profile.is_blocking,
-                    passes: 0,
-                    conclusive_fails: 0,
-                    inconclusive: repeat,
-                    promote_min,
-                    first_fail_reason: None,
-                });
+                runs.push(unbuildable_run(profile, &params, provider, model, &reason));
                 continue;
             }
             Ok(r) => r,
         };
-        if profile.kind == "thinking_matrix" {
-            // FASE 5: la matrice PROVA il modello in DUE configurazioni thinking
-            // esplicite (off e native) e DERIVA agentic_thinking_policy dai
-            // fatti — mai ereditare la policy del catalog che stiamo derivando.
-            let budget = profile
-                .payload
-                .get("thinking_budget_tokens")
-                .and_then(Value::as_i64)
-                .unwrap_or(2048)
-                .clamp(256, 32768) as u32;
-            let off = run_profile_attempts(
-                orchestrator,
-                db,
-                provider,
-                model,
-                profile,
-                &request,
-                repeat,
-                timeout_s,
-                max_tokens,
-                promote_min,
-                Some(crate::nexus_gateway::GwThinkingConfig {
-                    enabled: false,
-                    budget_tokens: None,
-                    mandatory: false,
-                }),
-                "off:",
-                &mut last_evidence,
-            )
-            .await;
-            let native = run_profile_attempts(
-                orchestrator,
-                db,
-                provider,
-                model,
-                profile,
-                &request,
-                repeat,
-                timeout_s,
-                max_tokens,
-                promote_min,
-                Some(crate::nexus_gateway::GwThinkingConfig {
-                    enabled: true,
-                    budget_tokens: Some(budget),
-                    mandatory: true,
-                }),
-                "native:",
-                &mut last_evidence,
-            )
-            .await;
-            thinking_derived = derive_thinking_policy(
-                ConfigOutcome::from_run(&off),
-                ConfigOutcome::from_run(&native),
-            );
-            runs.push(off);
-            runs.push(native);
-            continue;
-        }
-        let run = run_profile_attempts(
+        let ctx = ProbeCtx {
             orchestrator,
             db,
             provider,
             model,
             profile,
-            &request,
-            repeat,
-            timeout_s,
-            max_tokens,
-            promote_min,
-            None,
-            "",
-            &mut last_evidence,
-        )
-        .await;
+            request: &request,
+            params,
+        };
+        if profile.kind == "thinking_matrix" {
+            let (off, native, policy) = run_thinking_matrix(&ctx, &mut last_evidence).await;
+            thinking_derived = policy;
+            runs.push(off);
+            runs.push(native);
+            continue;
+        }
+        let run = run_profile_attempts(&ctx, None, "", &mut last_evidence).await;
         let blocking_conclusive_fail = run.is_blocking && !run.passed() && run.conclusive_fails > 0;
         runs.push(run);
         if blocking_conclusive_fail {
@@ -1093,40 +1236,7 @@ async fn qualify_one(
     }
     let mut derived = derive_capabilities(declared, &runs);
     derived.thinking = thinking_derived;
-    // LA BANDA MISURATA (mig 0599). Solo su un esito QUALIFIED: una squalifica o
-    // un giro inconclusivo non misurano nulla, e un tier scritto su un esito non
-    // attribuibile al modello sarebbe la stessa bugia del nome.
-    if derived.state == DerivedState::Qualified {
-        // Accoppia ogni run con la banda che il suo profilo certifica. `runs` e
-        // `profiles` non sono allineati per indice (i profili non applicabili
-        // vengono saltati da `profile_applies`, e l'early-stop tronca `runs`):
-        // il join va fatto sulla CHIAVE, mai sulla posizione.
-        let con_bande: Vec<(ProfileRun, Option<String>)> = runs
-            .iter()
-            .map(|r| {
-                let banda = profiles
-                    .iter()
-                    .find(|p| p.profile_key == r.profile_key)
-                    .and_then(|p| p.certifies_tier.clone());
-                (r.clone(), banda)
-            })
-            .collect();
-        // Il tier ATTUALE serve all'isteresi: conservare una banda gia' acquisita
-        // costa meno che conquistarne una nuova.
-        let current: Option<String> = sqlx::query_scalar(
-            "SELECT performance_tier FROM ai_price_catalog \
-              WHERE provider = $1 AND model = $2 LIMIT 1",
-        )
-        .bind(provider)
-        .bind(model)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-        let hold_min = hold_min_passes(profiles);
-        derived.measured_tier = derive_tier_measured(&con_bande, current.as_deref(), hold_min);
-    }
+    attach_measured_tier(&mut derived, &runs, profiles, db, provider, model).await;
     (derived, last_evidence)
 }
 
@@ -1146,7 +1256,129 @@ fn hold_min_passes(profiles: &[ProbeProfile]) -> u32 {
         .unwrap_or(2) as u32
 }
 
+/// PROMOZIONE. Il `CASE` su `capability_locked` protegge la curatela: la matrice
+/// thinking non sovrascrive una policy decisa a mano. Quello su `tier_source`
+/// protegge il tier: 'manual' vince SEMPRE, e 'measured' viene promosso solo
+/// quando una banda e' stata davvero dimostrata ($10 non NULL) — altrimenti il
+/// tier resta quello che c'e' (il facts_prior).
+const SQL_QUALIFIED: &str = "UPDATE ai_price_catalog SET \
+     qualification_state = 'qualified', \
+     qualified_capabilities = $3, \
+     capability_source = 'probe', \
+     qualified_at = NOW(), \
+     qualification_expires_at = NOW() + make_interval(days => $4::int), \
+     qualification_suite_version = $5, \
+     qualification_reason = $6, \
+     qualification_evidence_id = $7, \
+     agentic_thinking_policy = CASE \
+         WHEN capability_locked THEN agentic_thinking_policy \
+         ELSE COALESCE($8, agentic_thinking_policy) END, \
+     uses_thinking_mode = CASE \
+         WHEN capability_locked THEN uses_thinking_mode \
+         ELSE COALESCE($9, uses_thinking_mode) END, \
+     performance_tier = CASE \
+         WHEN $10::text IS NULL THEN performance_tier \
+         WHEN tier_source = 'manual' THEN performance_tier \
+         ELSE $10 END, \
+     tier_source = CASE \
+         WHEN $10::text IS NULL THEN tier_source \
+         WHEN tier_source = 'manual' THEN tier_source \
+         ELSE 'measured' END, \
+     qualification_started_at = NULL, \
+     qualification_attempts = 0, \
+     qualification_backoff_until = NULL \
+ WHERE provider = $1 AND model = $2";
+
+/// SQUALIFICA: backoff esponenziale sui tentativi, con tetto.
+const SQL_DISQUALIFIED: &str = "UPDATE ai_price_catalog SET \
+     qualification_state = 'disqualified', \
+     qualified_capabilities = '[]'::jsonb, \
+     qualification_reason = $3, \
+     qualification_evidence_id = $4, \
+     qualification_started_at = NULL, \
+     qualification_attempts = qualification_attempts + 1, \
+     qualification_backoff_until = NOW() + make_interval(hours => \
+         LEAST($5::int * (1 << LEAST(qualification_attempts, 6)), $6::int)) \
+ WHERE provider = $1 AND model = $2";
+
+/// INCONCLUSIVO: un giro non attribuibile al modello NON declassa chi era gia'
+/// qualificato (il CASE lo conserva). Si ritenta col backoff.
+const SQL_INCONCLUSIVE: &str = "UPDATE ai_price_catalog SET \
+     qualification_state = CASE \
+         WHEN qualification_state = 'qualified' THEN 'qualified' \
+         ELSE 'unqualified' END, \
+     qualification_reason = $3, \
+     qualification_started_at = NULL, \
+     qualification_attempts = qualification_attempts + 1, \
+     qualification_backoff_until = NOW() + make_interval(hours => \
+         LEAST($4::int * (1 << LEAST(qualification_attempts, 6)), $5::int)) \
+ WHERE provider = $1 AND model = $2";
+
+/// Una scrittura dello stato derivato: raggruppa cio' che le tre query hanno in
+/// comune, cosi' ogni ramo dichiara solo i propri bind.
+struct DerivedWrite<'a> {
+    db: &'a PgPool,
+    provider: &'a str,
+    model: &'a str,
+    profiles_suite: i32,
+    derived: &'a Derived,
+    evidence_id: Option<i64>,
+    ttl_days: i64,
+    backoff_base_hours: i64,
+}
+
+type WriteResult = Result<sqlx::postgres::PgQueryResult, sqlx::Error>;
+
+impl DerivedWrite<'_> {
+    async fn qualified(&self) -> WriteResult {
+        // Policy thinking DERIVATA dalla matrice (fase 5): scritta solo se
+        // presente. Il trigger di invalidazione (0591) non scatta:
+        // NEW.capability_source='probe'.
+        let (policy, uses_thinking): (Option<&str>, Option<bool>) = match self.derived.thinking {
+            Some((p, u)) => (Some(p), Some(u)),
+            None => (None, None),
+        };
+        sqlx::query(SQL_QUALIFIED)
+            .bind(self.provider)
+            .bind(self.model)
+            .bind(json!(self.derived.qualified_capabilities))
+            .bind(self.ttl_days as i32)
+            .bind(self.profiles_suite)
+            .bind(&self.derived.reason)
+            .bind(self.evidence_id)
+            .bind(policy)
+            .bind(uses_thinking)
+            .bind(self.derived.measured_tier.as_deref())
+            .execute(self.db)
+            .await
+    }
+
+    async fn disqualified(&self) -> WriteResult {
+        sqlx::query(SQL_DISQUALIFIED)
+            .bind(self.provider)
+            .bind(self.model)
+            .bind(&self.derived.reason)
+            .bind(self.evidence_id)
+            .bind(self.backoff_base_hours as i32)
+            .bind(BACKOFF_CAP_HOURS as i32)
+            .execute(self.db)
+            .await
+    }
+
+    async fn inconclusive(&self) -> WriteResult {
+        sqlx::query(SQL_INCONCLUSIVE)
+            .bind(self.provider)
+            .bind(self.model)
+            .bind(&self.derived.reason)
+            .bind(self.backoff_base_hours as i32)
+            .bind(BACKOFF_CAP_HOURS as i32)
+            .execute(self.db)
+            .await
+    }
+}
+
 /// Scrive lo stato derivato sulla riga (writer UNICO della promozione).
+#[allow(clippy::too_many_arguments)]
 async fn apply_derived(
     db: &PgPool,
     provider: &str,
@@ -1157,104 +1389,20 @@ async fn apply_derived(
     ttl_days: i64,
     backoff_base_hours: i64,
 ) {
+    let w = DerivedWrite {
+        db,
+        provider,
+        model,
+        profiles_suite,
+        derived,
+        evidence_id,
+        ttl_days,
+        backoff_base_hours,
+    };
     let res = match derived.state {
-        DerivedState::Qualified => {
-            // Policy thinking DERIVATA dalla matrice (fase 5): scritta solo se
-            // presente e MAI sopra una curatela (capability_locked). Il trigger
-            // di invalidazione (0591) non scatta: NEW.capability_source='probe'.
-            let (policy, uses_thinking): (Option<&str>, Option<bool>) = match derived.thinking {
-                Some((p, u)) => (Some(p), Some(u)),
-                None => (None, None),
-            };
-            sqlx::query(
-                "UPDATE ai_price_catalog SET \
-                     qualification_state = 'qualified', \
-                     qualified_capabilities = $3, \
-                     capability_source = 'probe', \
-                     qualified_at = NOW(), \
-                     qualification_expires_at = NOW() + make_interval(days => $4::int), \
-                     qualification_suite_version = $5, \
-                     qualification_reason = $6, \
-                     qualification_evidence_id = $7, \
-                     agentic_thinking_policy = CASE \
-                         WHEN capability_locked THEN agentic_thinking_policy \
-                         ELSE COALESCE($8, agentic_thinking_policy) END, \
-                     uses_thinking_mode = CASE \
-                         WHEN capability_locked THEN uses_thinking_mode \
-                         ELSE COALESCE($9, uses_thinking_mode) END, \
-                     performance_tier = CASE \
-                         WHEN $10::text IS NULL THEN performance_tier \
-                         WHEN tier_source = 'manual' THEN performance_tier \
-                         ELSE $10 END, \
-                     tier_source = CASE \
-                         WHEN $10::text IS NULL THEN tier_source \
-                         WHEN tier_source = 'manual' THEN tier_source \
-                         ELSE 'measured' END, \
-                     qualification_started_at = NULL, \
-                     qualification_attempts = 0, \
-                     qualification_backoff_until = NULL \
-                 WHERE provider = $1 AND model = $2",
-            )
-            .bind(provider)
-            .bind(model)
-            .bind(json!(derived.qualified_capabilities))
-            .bind(ttl_days as i32)
-            .bind(profiles_suite)
-            .bind(&derived.reason)
-            .bind(evidence_id)
-            .bind(policy)
-            .bind(uses_thinking)
-            // La banda MISURATA: NULL = nessuna certificata -> il tier resta
-            // quello che c'e' (il facts_prior). Il CASE protegge la curatela
-            // ('manual' vince sempre) e promuove tier_source a 'measured' solo
-            // quando una banda e' stata davvero dimostrata.
-            .bind(derived.measured_tier.as_deref())
-            .execute(db)
-            .await
-        }
-        DerivedState::Disqualified => {
-            sqlx::query(
-                "UPDATE ai_price_catalog SET \
-                     qualification_state = 'disqualified', \
-                     qualified_capabilities = '[]'::jsonb, \
-                     qualification_reason = $3, \
-                     qualification_evidence_id = $4, \
-                     qualification_started_at = NULL, \
-                     qualification_attempts = qualification_attempts + 1, \
-                     qualification_backoff_until = NOW() + make_interval(hours => \
-                         LEAST($5::int * (1 << LEAST(qualification_attempts, 6)), $6::int)) \
-                 WHERE provider = $1 AND model = $2",
-            )
-            .bind(provider)
-            .bind(model)
-            .bind(&derived.reason)
-            .bind(evidence_id)
-            .bind(backoff_base_hours as i32)
-            .bind(BACKOFF_CAP_HOURS as i32)
-            .execute(db)
-            .await
-        }
-        DerivedState::Inconclusive => {
-            sqlx::query(
-                "UPDATE ai_price_catalog SET \
-                     qualification_state = CASE \
-                         WHEN qualification_state = 'qualified' THEN 'qualified' \
-                         ELSE 'unqualified' END, \
-                     qualification_reason = $3, \
-                     qualification_started_at = NULL, \
-                     qualification_attempts = qualification_attempts + 1, \
-                     qualification_backoff_until = NOW() + make_interval(hours => \
-                         LEAST($4::int * (1 << LEAST(qualification_attempts, 6)), $5::int)) \
-                 WHERE provider = $1 AND model = $2",
-            )
-            .bind(provider)
-            .bind(model)
-            .bind(&derived.reason)
-            .bind(backoff_base_hours as i32)
-            .bind(BACKOFF_CAP_HOURS as i32)
-            .execute(db)
-            .await
-        }
+        DerivedState::Qualified => w.qualified().await,
+        DerivedState::Disqualified => w.disqualified().await,
+        DerivedState::Inconclusive => w.inconclusive().await,
     };
     if let Err(e) = res {
         tracing::warn!(
@@ -1293,109 +1441,150 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
         );
         return 0;
     }
-    let suite_version = profiles.iter().map(|p| p.suite_version).max().unwrap_or(1);
-
-    // Claim CAS. I candidati GIA' qualified (scaduti o con suite vecchia) sono
-    // ri-provati IN SHADOW: lo state resta 'qualified' (il pool non si svuota
-    // durante la ri-qualificazione); il lock del claim e' qualification_started_at
-    // (stantio oltre STALE_PROBING_MINUTES = worker morto, riclaimabile).
-    let claimed: Vec<(String, String, Value)> = sqlx::query_as(
-        "UPDATE ai_price_catalog c SET \
-             qualification_state = CASE WHEN c.qualification_state = 'qualified' \
-                                        THEN 'qualified' ELSE 'probing' END, \
-             qualification_started_at = NOW() \
-         FROM ( \
-             SELECT provider, model FROM ai_price_catalog \
-              WHERE is_enabled = TRUE AND supports_tool_use = TRUE \
-                AND (qualification_backoff_until IS NULL OR qualification_backoff_until < NOW()) \
-                AND (qualification_started_at IS NULL \
-                     OR qualification_started_at < NOW() - make_interval(mins => $2::int)) \
-                AND (qualification_state IN ('unqualified','quarantined','probing') \
-                     OR (qualification_state = 'qualified' \
-                         AND (qualification_expires_at < NOW() \
-                              OR qualification_suite_version < $3))) \
-              ORDER BY (qualification_state = 'unqualified') DESC, \
-                       qualification_expires_at ASC NULLS FIRST \
-              LIMIT $1 \
-              FOR UPDATE SKIP LOCKED \
-         ) cand \
-         WHERE c.provider = cand.provider AND c.model = cand.model \
-         RETURNING c.provider, c.model, c.capabilities",
-    )
-    .bind(max_per_round)
-    .bind(STALE_PROBING_MINUTES as i32)
-    .bind(suite_version)
-    .fetch_all(db)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "model_qualification: claim candidati fallito");
-        Vec::new()
-    });
+    let cfg = RoundConfig {
+        suite_version: profiles.iter().map(|p| p.suite_version).max().unwrap_or(1),
+        ttl_days,
+        backoff_hours,
+    };
+    let claimed = claim_candidates(db, max_per_round, cfg.suite_version).await;
     if claimed.is_empty() {
         return 0;
     }
     tracing::info!(
         candidati = claimed.len(),
-        suite_version,
+        suite_version = cfg.suite_version,
         "model_qualification: giro di qualificazione avviato"
     );
     let mut done = 0usize;
     for (provider, model, caps) in &claimed {
-        // Provider in cooldown: non sprecare il giro (esito non attribuibile).
-        if crate::provider_cooldown::is_provider_in_cooldown(provider) {
-            apply_derived(
-                db,
-                provider,
-                model,
-                suite_version,
-                &Derived {
-                    state: DerivedState::Inconclusive,
-                    qualified_capabilities: Vec::new(),
-                    reason: "provider_in_cooldown".into(),
-                    thinking: None,
-                    // Un giro non attribuibile al modello non misura nessuna banda.
-                    measured_tier: None,
-                },
-                None,
-                ttl_days,
-                backoff_hours,
-            )
-            .await;
-            continue;
+        if qualify_claimed(orchestrator, db, provider, model, caps, &profiles, &cfg).await {
+            done += 1;
         }
-        let declared: Vec<String> = caps
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (derived, evidence_id) =
-            qualify_one(orchestrator, db, provider, model, &declared, &profiles).await;
-        tracing::info!(
-            provider = %provider,
-            model = %model,
-            state = ?derived.state,
-            reason = %derived.reason,
-            qualified_capabilities = %json!(derived.qualified_capabilities),
-            "model_qualification: verdetto"
-        );
-        apply_derived(
-            db,
-            provider,
-            model,
-            suite_version,
-            &derived,
-            evidence_id,
-            ttl_days,
-            backoff_hours,
-        )
-        .await;
-        done += 1;
     }
     done
+}
+
+/// I parametri del giro, letti una volta dal DB (regola G).
+struct RoundConfig {
+    suite_version: i32,
+    ttl_days: i64,
+    backoff_hours: i64,
+}
+
+/// Claim CAS. I candidati GIA' qualified (scaduti o con suite vecchia) sono
+/// ri-provati IN SHADOW: lo state resta 'qualified' (il pool non si svuota durante
+/// la ri-qualificazione); il lock del claim e' qualification_started_at (stantio
+/// oltre STALE_PROBING_MINUTES = worker morto, riclaimabile).
+const SQL_CLAIM: &str = "UPDATE ai_price_catalog c SET \
+     qualification_state = CASE WHEN c.qualification_state = 'qualified' \
+                                THEN 'qualified' ELSE 'probing' END, \
+     qualification_started_at = NOW() \
+ FROM ( \
+     SELECT provider, model FROM ai_price_catalog \
+      WHERE is_enabled = TRUE AND supports_tool_use = TRUE \
+        AND (qualification_backoff_until IS NULL OR qualification_backoff_until < NOW()) \
+        AND (qualification_started_at IS NULL \
+             OR qualification_started_at < NOW() - make_interval(mins => $2::int)) \
+        AND (qualification_state IN ('unqualified','quarantined','probing') \
+             OR (qualification_state = 'qualified' \
+                 AND (qualification_expires_at < NOW() \
+                      OR qualification_suite_version < $3))) \
+      ORDER BY (qualification_state = 'unqualified') DESC, \
+               qualification_expires_at ASC NULLS FIRST \
+      LIMIT $1 \
+      FOR UPDATE SKIP LOCKED \
+ ) cand \
+ WHERE c.provider = cand.provider AND c.model = cand.model \
+ RETURNING c.provider, c.model, c.capabilities";
+
+async fn claim_candidates(
+    db: &PgPool,
+    max_per_round: i64,
+    suite_version: i32,
+) -> Vec<(String, String, Value)> {
+    sqlx::query_as(SQL_CLAIM)
+        .bind(max_per_round)
+        .bind(STALE_PROBING_MINUTES as i32)
+        .bind(suite_version)
+        .fetch_all(db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "model_qualification: claim candidati fallito");
+            Vec::new()
+        })
+}
+
+/// Il provider e' in cooldown: il giro NON e' un fallimento del modello, e
+/// registrarlo come tale lo squalificherebbe per colpa d'altri.
+async fn mark_provider_cooldown(db: &PgPool, provider: &str, model: &str, cfg: &RoundConfig) {
+    let inconclusive = Derived {
+        state: DerivedState::Inconclusive,
+        qualified_capabilities: Vec::new(),
+        reason: "provider_in_cooldown".into(),
+        thinking: None,
+        // Un giro non attribuibile al modello non misura nessuna banda.
+        measured_tier: None,
+    };
+    apply_derived(
+        db,
+        provider,
+        model,
+        cfg.suite_version,
+        &inconclusive,
+        None,
+        cfg.ttl_days,
+        cfg.backoff_hours,
+    )
+    .await;
+}
+
+/// Qualifica UN candidato gia' claimato. `false` = giro non speso (il modello non
+/// e' stato provato).
+async fn qualify_claimed(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    caps: &Value,
+    profiles: &[ProbeProfile],
+    cfg: &RoundConfig,
+) -> bool {
+    // Provider in cooldown: non sprecare il giro (esito non attribuibile).
+    if crate::provider_cooldown::is_provider_in_cooldown(provider) {
+        mark_provider_cooldown(db, provider, model, cfg).await;
+        return false;
+    }
+    let declared: Vec<String> = caps
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let (derived, evidence_id) =
+        qualify_one(orchestrator, db, provider, model, &declared, profiles).await;
+    tracing::info!(
+        provider = %provider,
+        model = %model,
+        state = ?derived.state,
+        reason = %derived.reason,
+        qualified_capabilities = %json!(derived.qualified_capabilities),
+        "model_qualification: verdetto"
+    );
+    apply_derived(
+        db,
+        provider,
+        model,
+        cfg.suite_version,
+        &derived,
+        evidence_id,
+        cfg.ttl_days,
+        cfg.backoff_hours,
+    )
+    .await;
+    true
 }
 
 #[cfg(test)]

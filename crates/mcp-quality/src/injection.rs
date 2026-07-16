@@ -52,6 +52,30 @@ static SQL_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+// Costrutti che ESEGUONO o preparano una query. Se la riga ne contiene uno,
+// l'esenzione diagnostica sotto NON si applica: una query costruita ed eseguita
+// sulla stessa riga di un log/expect deve restare rilevata.
+static QUERY_EXEC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:sqlx::query|query_as|query_scalar|\.execute\s*\(|\.fetch_|\.query\s*\(|cursor\.|conn\.|\.prepare\s*\()",
+    )
+    .unwrap()
+});
+
+// Costrutti che costruiscono un MESSAGGIO diagnostico (errore, log, panic).
+// Un messaggio non e' una query: la keyword SQL vi compare solo perche' il
+// messaggio NOMINA l'operazione fallita — es.
+// `map_err(|e| format!("select catalog: {e}"))`, dove `select` e' prosa, non
+// codice. Senza questa distinzione il detector segnalava ogni diagnostica che
+// nominasse l'operazione, e per farla tacere si finiva per riscrivere il
+// messaggio: il codice si piegava al detector invece del contrario.
+static DIAGNOSTIC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:map_err|with_context|\.context\s*\(|\.expect\s*\(|\.expect_err\s*\(|unwrap_or_else|panic!|bail!|anyhow!|format_err!|todo!|unimplemented!|assert\w*!|(?:e?print|e?println|write|writeln)!|(?:tracing|log|slog)::\w+!|(?:^|[^\w.])(?:trace|debug|info|warn|error)!\s*\(|raise\s+\w+|console\.(?:log|error|warn|info|debug)|throw\s+|new\s+Error\s*\()",
+    )
+    .unwrap()
+});
+
 // Nomi di variabile che suggeriscono input esterno => severity high.
 static EXTERNAL_INPUT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -171,6 +195,19 @@ fn has_top_level_comma(s: &str) -> bool {
     false
 }
 
+/// True se l'interpolazione della riga costruisce un MESSAGGIO diagnostico e non
+/// una query: la keyword SQL vi compare come prosa (il messaggio nomina
+/// l'operazione fallita), non come codice eseguito.
+///
+/// Vale per tutti i linguaggi supportati: il costrutto cambia (`map_err` in
+/// Rust, `raise` in Python, `throw`/`console.error` in TS), il principio no.
+/// L'esenzione decade se la riga contiene anche un costrutto di esecuzione
+/// query: in quel caso la stringa puo' essere davvero una query, e il fatto che
+/// sia pure loggata non la rende sicura.
+fn is_diagnostic_message(line: &str) -> bool {
+    !QUERY_EXEC_RE.is_match(line) && DIAGNOSTIC_RE.is_match(line)
+}
+
 /// True se la riga contiene un costrutto di interpolazione/concatenazione del
 /// linguaggio applicato a una stringa (potenziale costruzione query dinamica).
 fn has_interpolation(lang: Lang, line: &str) -> bool {
@@ -233,6 +270,10 @@ pub fn detect_sql_injection(file_path: &str, source: &str) -> Vec<InjectionFindi
         }
         // Whitelist: query parametrizzata sicura => non segnalare.
         if is_parameterized_safe(lang, line) {
+            continue;
+        }
+        // La keyword e' prosa di un messaggio diagnostico, non codice SQL.
+        if is_diagnostic_message(line) {
             continue;
         }
         // Condizione 2+3: interpolazione/concatenazione di valore non-costante.
@@ -388,5 +429,72 @@ mod tests {
         // Anche con contenuto che sembrerebbe sospetto, i `.sql` non sono analizzati.
         let src = "INSERT INTO users VALUES ('a', '$2a$10$hash');";
         assert_eq!(count("schema.sql", src), 0);
+    }
+
+    // --- MESSAGGI DIAGNOSTICI (la keyword SQL e' prosa, non codice) ---
+
+    #[test]
+    fn rust_map_err_message_naming_operation_not_flagged() {
+        // Il caso incident (model_catalog_sync.rs): il messaggio NOMINA
+        // l'operazione fallita. `select` e' prosa; la query vera e' altrove ed e'
+        // parametrizzata.
+        let src = r#".map_err(|e| format!("select catalog: {e}"))?;"#;
+        assert_eq!(count("x.rs", src), 0);
+    }
+
+    #[test]
+    fn rust_diagnostic_variants_not_flagged() {
+        for src in [
+            r#".expect(&format!("insert fallito su {table}"))"#,
+            r#"return Err(anyhow!("update fallito: {e}"));"#,
+            r#"tracing::warn!("delete from {tabella} ha toccato {n} righe");"#,
+            r#"panic!("select impossibile: {motivo}");"#,
+        ] {
+            assert_eq!(count("x.rs", src), 0, "diagnostica segnalata: {src}");
+        }
+    }
+
+    #[test]
+    fn py_raise_message_naming_operation_not_flagged() {
+        let src = r#"raise RuntimeError(f"select fallita per {tabella}")"#;
+        assert_eq!(count("x.py", src), 0);
+    }
+
+    #[test]
+    fn ts_console_error_naming_operation_not_flagged() {
+        let src = r#"console.error(`select fallita: ${err}`);"#;
+        assert_eq!(count("x.ts", src), 0);
+    }
+
+    // --- L'ESENZIONE DIAGNOSTICA NON DEVE APRIRE UN BUCO ---
+
+    #[test]
+    fn rust_query_executed_and_logged_same_line_still_flagged() {
+        // Query costruita ED eseguita sulla stessa riga di un .expect(): il fatto
+        // che sia loggata non la rende sicura. L'esenzione deve decadere.
+        let src =
+            r#"sqlx::query(&format!("DELETE FROM {t}")).execute(db).await.expect("delete");"#;
+        assert_eq!(count("x.rs", src), 1);
+    }
+
+    #[test]
+    fn rust_fetch_with_interpolated_query_still_flagged() {
+        let src = r#"let r = conn.query(&format!("SELECT * FROM {tabella}")).map_err(|e| e)?;"#;
+        assert_eq!(count("x.rs", src), 1);
+    }
+
+    #[test]
+    fn py_execute_with_fstring_and_raise_still_flagged() {
+        // `raise` E' un costrutto diagnostico, ma la riga esegue anche la query:
+        // l'esenzione deve decadere.
+        let src = r#"raise Err("ko") if not cursor.execute(f"SELECT * FROM {t}") else None"#;
+        assert_eq!(count("x.py", src), 1);
+    }
+
+    #[test]
+    fn rust_real_injection_still_flagged_after_exemption() {
+        // Il vero positivo originale non deve essere toccato dall'esenzione.
+        let src = r#"let q = format!("SELECT * FROM users WHERE name = '{}'", user_input);"#;
+        assert_eq!(count("x.rs", src), 1);
     }
 }
