@@ -467,3 +467,157 @@ async fn sotto_il_pavimento_si_fallisce_onestamente(pool: PgPool) {
     // L'esito e' comunque TIPIZZATO (I6): mai un None muto.
     assert!(!matches!(err, NoModelReason::InvalidRequest(_)), "{err:?}");
 }
+
+// ── Scrittura del tier: la precedenza delle fonti ───────────────────────────
+
+/// La tabella di verita' dell'autorita', per intero. E' la regola che prima
+/// viveva DUE volte — una WHERE in refresh_tier_prior e un CASE in
+/// SQL_QUALIFIED — in due linguaggi diversi, allineate solo dalla diligenza.
+#[test]
+fn la_precedenza_delle_fonti_e_una_sola_regola() {
+    use TierSource::*;
+    // Nessuna fonte (colonna NULL): il tier c'e' ma non si sa da dove venga.
+    // Chiunque lo rimpiazza — e' cosi' che i 49 fossili del nome declassati
+    // dalla mig 0608 tornano correggibili.
+    for nuova in [Synced, Measured, Manual] {
+        assert!(puo_sovrascrivere(None, nuova), "{nuova:?} su fonte ignota");
+    }
+    // Ogni fonte corregge se stessa: un sync nuovo aggiorna il sync vecchio,
+    // una misura nuova aggiorna la precedente.
+    for f in [Synced, Measured, Manual] {
+        assert!(puo_sovrascrivere(Some(f), f), "{f:?} su se stessa");
+    }
+    // Si sale: la misura batte il seme, la curatela batte tutto.
+    assert!(puo_sovrascrivere(Some(Synced), Measured));
+    assert!(puo_sovrascrivere(Some(Synced), Manual));
+    assert!(puo_sovrascrivere(Some(Measured), Manual));
+    // NON si scende: il caso che conta. Il sync gira ogni 12h e passerebbe la
+    // vita a sovrascrivere le misure e le decisioni dell'admin.
+    assert!(!puo_sovrascrivere(Some(Measured), Synced));
+    assert!(!puo_sovrascrivere(Some(Manual), Synced));
+    assert!(!puo_sovrascrivere(Some(Manual), Measured));
+}
+
+/// La proiezione SQL della regola DERIVA dalla regola: non e' una seconda
+/// lista da tenere allineata a mano (che e' esattamente com'era prima).
+#[test]
+fn le_fonti_sovrascrivibili_derivano_dalla_regola() {
+    use TierSource::*;
+    assert_eq!(fonti_sovrascrivibili(Synced), vec!["", "synced"]);
+    assert_eq!(fonti_sovrascrivibili(Measured), vec!["", "synced", "measured"]);
+    assert_eq!(
+        fonti_sovrascrivibili(Manual),
+        vec!["", "synced", "measured", "manual"]
+    );
+}
+
+/// Il vocabolario e' chiuso e round-trip (regola N): un valore ignoto in
+/// colonna vale "nessuna fonte", non un panic ne' un default silenzioso.
+#[test]
+fn il_vocabolario_delle_fonti_e_chiuso() {
+    for f in [TierSource::Synced, TierSource::Measured, TierSource::Manual] {
+        assert_eq!(TierSource::parse(Some(f.as_str())), Some(f));
+    }
+    assert_eq!(TierSource::parse(None), None);
+    assert_eq!(TierSource::parse(Some("facts_prior")), None, "vocabolario pre-0608");
+    assert_eq!(TierSource::parse(Some("")), None);
+}
+
+/// L'autorita' vale sul DB, non solo nella funzione pura: la WHERE ricontrolla
+/// la fonte, cosi' una scrittura concorrente non si perde fra la lettura e
+/// l'UPDATE (il sync e il worker di qualificazione girano insieme).
+#[sqlx::test]
+async fn apply_tier_rispetta_l_autorita_sul_db(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query("ALTER TABLE ai_price_catalog ADD COLUMN tier_source TEXT")
+        .execute(&pool)
+        .await
+        .expect("colonna");
+    sqlx::query(
+        "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source) VALUES \
+         ('p', 'fossile',  'medium', NULL), \
+         ('p', 'sincro',   'medium', 'synced'), \
+         ('p', 'misurato', 'medium', 'measured'), \
+         ('p', 'curato',   'medium', 'manual')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    let leggi = |m: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model = $1",
+            )
+            .bind(m)
+            .fetch_one(&pool)
+            .await
+            .expect("riga")
+        }
+    };
+
+    // Il seme corregge il fossile e se stesso, ma non tocca misura ne' curatela.
+    assert!(apply_tier(&pool, "p", "fossile", "heavy", TierSource::Synced)
+        .await
+        .expect("sql"));
+    assert!(apply_tier(&pool, "p", "sincro", "heavy", TierSource::Synced)
+        .await
+        .expect("sql"));
+    assert!(
+        !apply_tier(&pool, "p", "misurato", "heavy", TierSource::Synced)
+            .await
+            .expect("sql"),
+        "il sync gira ogni 12h: se sovrascrivesse la misura, la batteria non         servirebbe a nulla"
+    );
+    assert!(!apply_tier(&pool, "p", "curato", "heavy", TierSource::Synced)
+        .await
+        .expect("sql"));
+
+    assert_eq!(leggi("fossile").await, (Some("heavy".into()), Some("synced".into())));
+    assert_eq!(leggi("sincro").await, (Some("heavy".into()), Some("synced".into())));
+    assert_eq!(leggi("misurato").await, (Some("medium".into()), Some("measured".into())));
+    assert_eq!(leggi("curato").await, (Some("medium".into()), Some("manual".into())));
+
+    // La misura batte il seme; la curatela batte la misura.
+    assert!(apply_tier(&pool, "p", "sincro", "frontier", TierSource::Measured)
+        .await
+        .expect("sql"));
+    assert!(apply_tier(&pool, "p", "misurato", "light", TierSource::Manual)
+        .await
+        .expect("sql"));
+    assert_eq!(leggi("sincro").await, (Some("frontier".into()), Some("measured".into())));
+    assert_eq!(leggi("misurato").await, (Some("light".into()), Some("manual".into())));
+}
+
+/// Scrivere lo stesso valore dalla stessa fonte non e' una scrittura: evita
+/// updated_at che sfarfalla a ogni giro del sync.
+#[sqlx::test]
+async fn apply_tier_non_scrive_se_nulla_cambia(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query("ALTER TABLE ai_price_catalog ADD COLUMN tier_source TEXT")
+        .execute(&pool)
+        .await
+        .expect("colonna");
+    sqlx::query(
+        "INSERT INTO ai_price_catalog (provider, model, performance_tier, tier_source) \
+         VALUES ('p', 'stabile', 'heavy', 'synced')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    assert!(
+        !apply_tier(&pool, "p", "stabile", "heavy", TierSource::Synced)
+            .await
+            .expect("sql"),
+        "stesso tier, stessa fonte: nessuna riga toccata"
+    );
+    // Ma se la PROVENIENZA cambia, la riga si scrive anche a tier uguale: un
+    // fossile appena convalidato dall'indice deve smettere di dire "non so".
+    assert!(
+        apply_tier(&pool, "p", "stabile", "heavy", TierSource::Measured)
+            .await
+            .expect("sql"),
+        "stesso tier ma fonte piu' autorevole: la provenienza va registrata"
+    );
+}

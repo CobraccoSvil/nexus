@@ -1171,10 +1171,13 @@ fn hold_min_passes(profiles: &[ProbeProfile]) -> u32 {
 }
 
 /// PROMOZIONE. Il `CASE` su `capability_locked` protegge la curatela: la matrice
-/// thinking non sovrascrive una policy decisa a mano. Quello su `tier_source`
-/// protegge il tier: 'manual' vince SEMPRE, e 'measured' viene promosso solo
-/// quando una banda e' stata davvero dimostrata ($10 non NULL) — altrimenti il
-/// tier resta quello che c'e' (il `synced` dall'indice).
+/// thinking non sovrascrive una policy decisa a mano.
+///
+/// Il TIER non compare: lo scrive [`apply_tier`] (punto unico, regola L) nella
+/// STESSA transazione di questa query. Prima la precedenza delle fonti era un
+/// `CASE WHEN tier_source = 'manual'` scritto qui a mano, gemello della WHERE
+/// scritta a mano in `refresh_tier_prior`: due formulazioni della stessa regola
+/// in due linguaggi diversi, che reggevano solo finche' restavano allineate.
 const SQL_QUALIFIED: &str = "UPDATE ai_price_catalog SET \
      qualification_state = 'qualified', \
      qualified_capabilities = $3, \
@@ -1190,14 +1193,6 @@ const SQL_QUALIFIED: &str = "UPDATE ai_price_catalog SET \
      uses_thinking_mode = CASE \
          WHEN capability_locked THEN uses_thinking_mode \
          ELSE COALESCE($9, uses_thinking_mode) END, \
-     performance_tier = CASE \
-         WHEN $10::text IS NULL THEN performance_tier \
-         WHEN tier_source = 'manual' THEN performance_tier \
-         ELSE $10 END, \
-     tier_source = CASE \
-         WHEN $10::text IS NULL THEN tier_source \
-         WHEN tier_source = 'manual' THEN tier_source \
-         ELSE 'measured' END, \
      qualification_started_at = NULL, \
      qualification_attempts = 0, \
      qualification_backoff_until = NULL \
@@ -1252,7 +1247,13 @@ impl DerivedWrite<'_> {
             Some((p, u)) => (Some(p), Some(u)),
             None => (None, None),
         };
-        sqlx::query(SQL_QUALIFIED)
+        // Verdetto e banda misurata atterrano INSIEME o niente: il tier lo
+        // scrive apply_tier (punto unico), ma dentro questa transazione. Con due
+        // statement sciolti un errore fra l'uno e l'altro lascerebbe un modello
+        // 'qualified' con la banda di ieri — uno stato che nessuno dei due
+        // writer avrebbe voluto.
+        let mut tx = self.db.begin().await?;
+        let res = sqlx::query(SQL_QUALIFIED)
             .bind(self.provider)
             .bind(self.model)
             .bind(json!(self.derived.qualified_capabilities))
@@ -1262,9 +1263,23 @@ impl DerivedWrite<'_> {
             .bind(self.evidence_id)
             .bind(policy)
             .bind(uses_thinking)
-            .bind(self.derived.measured_tier.as_deref())
-            .execute(self.db)
-            .await
+            .execute(&mut *tx)
+            .await?;
+        // `None` = nessuna banda certificata da questo giro: il tier resta
+        // quello che c'e' (regola H: un giro che non dimostra nulla non declassa
+        // nessuno).
+        if let Some(tier) = self.derived.measured_tier.as_deref() {
+            crate::orchestrator::model_service::apply_tier(
+                &mut *tx,
+                self.provider,
+                self.model,
+                tier,
+                crate::orchestrator::model_service::TierSource::Measured,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(res)
     }
 
     async fn disqualified(&self) -> WriteResult {

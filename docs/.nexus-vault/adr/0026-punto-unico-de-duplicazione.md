@@ -75,6 +75,7 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Capability modello (vision/tool/thinking) | vista `v_model_capabilities` (mig 0318) + classificatore `model_catalog_sync.rs::{classify_capabilities, infer_capabilities_from_name}` (ADR 0024) | esistente |
 | Routing/default/purpose model | `routing_matrix.rs` + tabelle mig 0101/0102 | esistente |
 | Selezione catalog: eleggibilita' + pesi scoring | `orchestrator/model_selection.rs` (`EligibilityFilter`, `select_models_tierchain`, `default_scoring_weights`) + riga sentinella mig 0379 (ADR 0030) | esistente |
+| Scrittura del tier: precedenza fra le fonti (`manual` > `measured` > `synced` > fonte ignota) | `orchestrator/model_service.rs` (`apply_tier`, `TierSource`, `puo_sovrascrivere`); il sync dell'indice (`refresh_tier_prior`) e la batteria (`SQL_QUALIFIED`) delegano. Guard `tier-write` in `check-single-source.sh` | 2026-07-16 |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` | Wave 1 |
 | Cache TTL (Rust) | crate `nexus-cache` (`TtlCache<K,V>`) | Wave 2 |
 | Lettura settings (Rust) | `nexus-auth::settings` (`get_setting`, `get_setting_nonempty`, bool/int) | Wave 3 |

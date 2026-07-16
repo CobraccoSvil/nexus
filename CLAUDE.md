@@ -272,6 +272,7 @@ condividere codice (fragile base class).
 | SQL-injection detector | ADR 0021 |
 | Capability modello (vision/tool/thinking) | vista `0318` + `mcp-core/src/capability.rs` (ADR 0024) |
 | Routing/default/purpose model | `routing_matrix.rs` + tabelle mig 0101/0102 (regola G) |
+| Scrittura del tier di un modello (precedenza `manual` > `measured` > `synced` > fonte ignota) | `mcp-core/src/orchestrator/model_service.rs` (`apply_tier`, `TierSource`, `puo_sovrascrivere`); il sync dell'indice e la batteria delegano. Guard `tier-write` |
 | Listino modelli (prezzo di una chiamata + currency di piattaforma) | crate `nexus-pricing` (`resolve_active_price` -> `PriceLookup{Priced\|Unknown\|NotInCatalog}`, `platform_currency`, `calculate_cost`, `assert_configured`). Guard `pricing-single-source` |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |

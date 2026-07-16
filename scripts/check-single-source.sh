@@ -245,6 +245,41 @@ else
   echo "OK model-selection: nessun call site scavalca il servizio unico"
 fi
 
+# Scrittura del tier (2026-07-16): performance_tier + tier_source si scrivono
+# SOLO da model_service::apply_tier, che conosce la precedenza delle fonti
+# (manual > measured > synced > fonte ignota).
+#
+# Perche' un guard e non la sola buona volonta': la regola e' gia' stata scritta
+# due volte, in due linguaggi diversi e lontani — una WHERE in
+# `refresh_tier_prior` ("tocca solo NULL o facts_prior") e un CASE dentro
+# SQL_QUALIFIED ("salta se manual") — e reggevano solo finche' restavano
+# allineate a mano. Il doppione del tier si e' gia' ripresentato una volta
+# (models.rs derivava il tier dal solo prezzo mentre l'altro punto aveva anche
+# l'indice: vinceva il meno informato). Un terzo writer domani non deve poter
+# nascere per distrazione.
+#
+# Ammessi: il servizio stesso, i test, e le migrazioni (immutabili, gia'
+# applicate: una migrazione SQL non puo' chiamare Rust).
+tier_writers="$(grep -rEn \
+  "(UPDATE|SET)[^\"']*\b(performance_tier|tier_source) *=" \
+  crates apps \
+  --include='*.rs' --include='*.ts' --include='*.tsx' \
+  2>/dev/null \
+  | grep -v 'src/orchestrator/model_service' \
+  | grep -vE 'tests\.rs|/tests/' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$tier_writers" ]]; then
+  echo "!! tier-write: scrittura del tier fuori dal punto unico:" >&2
+  echo "$tier_writers" >&2
+  echo "   Usa orchestrator::model_service::apply_tier(exec, provider, model," >&2
+  echo "   tier, TierSource::{Synced|Measured|Manual}): la precedenza fra le" >&2
+  echo "   fonti vive li' ed e' testata una volta sola." >&2
+  fail=1
+else
+  echo "OK tier-write: il tier si scrive solo dal punto unico (apply_tier)"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

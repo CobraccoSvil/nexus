@@ -638,5 +638,125 @@ async fn select_model_with_gate(
     Ok(choice)
 }
 
+// ── Scrittura del tier: l'altra meta' del servizio ──────────────────────────
+
+/// Chi ha stabilito il tier di un modello. Ordinato per AUTORITA' crescente:
+/// `Synced` < `Measured` < `Manual`.
+///
+/// Il vocabolario e' quello della colonna `tier_source` (regola N, mig 0608):
+/// niente stringhe sparse nei call site, e il compilatore impedisce di
+/// inventarne una quarta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TierSource {
+    /// Derivato dall'`agentic_index` che il servizio esterno pubblica: la BASE
+    /// della classificazione. E' un seme, non una misura nostra.
+    Synced,
+    /// La banda che la batteria ha CERTIFICATO: un `heavy` ha fatto qualcosa che
+    /// un `medium` non ha fatto, e l'evidenza sta in `ai_model_probe_evidence`.
+    Measured,
+    /// La decisione di un umano. Vince su tutto perche' e' l'unica fonte che sa
+    /// qualcosa che i fatti non dicono ancora.
+    Manual,
+}
+
+impl TierSource {
+    /// Il valore testuale della colonna. Punto unico della traduzione.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TierSource::Synced => "synced",
+            TierSource::Measured => "measured",
+            TierSource::Manual => "manual",
+        }
+    }
+
+    /// Dal valore in colonna. `None` = fonte assente o ignota (la colonna e'
+    /// NULL): nessuna autorita', chiunque puo' scrivere.
+    fn parse(raw: Option<&str>) -> Option<Self> {
+        match raw?.trim() {
+            "synced" => Some(TierSource::Synced),
+            "measured" => Some(TierSource::Measured),
+            "manual" => Some(TierSource::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// PUNTO UNICO (regola L) della precedenza fra le fonti del tier. PURA.
+///
+/// `true` se una scrittura di `nuova` puo' sovrascrivere cio' che ha scritto
+/// `attuale`. Una fonte sovrascrive sempre se stessa (un nuovo sync corregge il
+/// sync precedente; una nuova misura corregge la precedente).
+fn puo_sovrascrivere(attuale: Option<TierSource>, nuova: TierSource) -> bool {
+    match attuale {
+        // Nessuna fonte si e' espressa: il tier c'e' ma non si sa da dove venga
+        // (fossile). Chiunque puo' rimpiazzarlo, ed e' cosi' che i 49 tier
+        // dedotti dal nome tornano correggibili (mig 0608).
+        None => true,
+        Some(a) => nuova >= a,
+    }
+}
+
+/// Scrive il tier di un modello RISPETTANDO l'autorita' della fonte che c'e'
+/// gia'. E' l'UNICO punto che scrive `performance_tier` + `tier_source`
+/// (regola L): il sync dell'indice e la batteria delegano qui.
+///
+/// # Perche' esiste
+///
+/// Prima la precedenza viveva come guard SQL DUPLICATO in due UPDATE lontani:
+/// `refresh_tier_prior` filtrava `WHERE tier_source IS NULL OR = 'facts_prior'`,
+/// e `SQL_QUALIFIED` ripeteva la regola come `CASE WHEN tier_source = 'manual'`.
+/// Due formulazioni della stessa regola, in due linguaggi diversi (una WHERE e
+/// un CASE), che reggevano solo finche' entrambe restavano allineate a mano —
+/// e il doppione "tier dal prezzo" si era gia' ripresentato una volta
+/// (models.rs). Qui la regola e' UNA, in Rust, testata una volta sola.
+///
+/// Generica sull'executor: la batteria la chiama dentro la propria transazione
+/// (il verdetto e il tier devono atterrare insieme o niente), il sync le passa
+/// il pool.
+///
+/// Ritorna `true` se la riga e' stata scritta davvero.
+pub async fn apply_tier<'e, E>(
+    exec: E,
+    provider: &str,
+    model: &str,
+    tier: &str,
+    source: TierSource,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    // La precedenza si decide in Rust (testabile, un posto solo); la WHERE
+    // ricontrolla la fonte per non perdere una scrittura concorrente fra la
+    // lettura e l'UPDATE (il worker di qualificazione e il sync girano insieme).
+    let res = sqlx::query(
+        "UPDATE ai_price_catalog \
+            SET performance_tier = $3, tier_source = $4, updated_at = NOW() \
+          WHERE provider = $1 AND model = $2 \
+            AND ($5::text[] @> ARRAY[COALESCE(tier_source, '')] ) \
+            AND (performance_tier IS DISTINCT FROM $3 OR tier_source IS DISTINCT FROM $4)",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(tier)
+    .bind(source.as_str())
+    .bind(fonti_sovrascrivibili(source))
+    .execute(exec)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Le fonti che `nuova` ha l'autorita' di rimpiazzare, come valori di colonna
+/// (`''` = NULL, cioe' nessuna fonte). Derivata da [`puo_sovrascrivere`]: la
+/// regola resta una sola, questa e' solo la sua proiezione in SQL.
+fn fonti_sovrascrivibili(nuova: TierSource) -> Vec<String> {
+    let mut fonti = vec![String::new()]; // NULL: nessuna autorita'
+    for a in [TierSource::Synced, TierSource::Measured, TierSource::Manual] {
+        if puo_sovrascrivere(Some(a), nuova) {
+            fonti.push(a.as_str().to_string());
+        }
+    }
+    fonti
+}
+
 #[cfg(test)]
 mod tests;

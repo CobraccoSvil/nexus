@@ -1637,36 +1637,30 @@ async fn realign_existing_model(db: &PgPool, provider: &str, api_model: &str) ->
     refresh_tier_prior(db, provider, api_model).await
 }
 
-/// Ricalcola il tier `synced` di UN modello dai fatti attuali del catalog.
+/// Ricalcola il tier `synced` di UN modello dall'indice della classificazione
+/// esterna. Sostituisce `infer_tier_from_name`, che indovinava la fascia dal
+/// NOME, e il ripiego sul prezzo (mig 0608).
 ///
-/// Sostituisce `infer_tier_from_name`, che indovinava la fascia dal NOME. Il
-/// prior si esprime SOLO dai fatti dichiarati dal fornitore (prezzo, finestra) e
-/// dalle capability gia' PROVATE dalla batteria; se non ce ne sono, TACE — e il
-/// tier resta/diventa NULL, che e' la verita' (regola G: niente fallback magico).
-///
-/// GUARD DI AUTORITA' (mig 0599, vocabolario 'synced' da mig 0608): tocca solo
-/// le righe con `tier_source IS NULL OR tier_source = 'synced'`. Un tier
-/// `manual` (curatela dell'admin) o `measured` (banda certificata dalla
-/// batteria) e' piu' autorevole di un prior e non va mai sovrascritto — era il
-/// difetto del vecchio guard `capability_source='auto'`, che congelava il tier
-/// appena un modello si qualificava.
+/// La PRECEDENZA fra le fonti non si decide qui: la scrittura delega ad
+/// [`apply_tier`] (punto unico, regola L), che sa che `measured` e `manual`
+/// sono piu' autorevoli di un seme sincronizzato. Prima quella regola era una
+/// WHERE scritta a mano in questa funzione e un CASE scritto a mano nella
+/// batteria: due formulazioni della stessa cosa, allineate solo dalla diligenza.
 pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32 {
     let Some(thresholds) = tier_prior_thresholds(db).await else {
         return 0; // prior disabilitato dal flag DB (o soglie mancanti)
     };
     // L'indice STANTIO viene scartato QUI (non nella funzione pura): la fonte e'
     // undocumented e puo' sparire senza preavviso — un indice vecchio non deve
-    // passare per fresco. Oltre `max_age_hours` il tier torna NULL finche' la
-    // batteria non misura (il ripiego sul prezzo e' stato rimosso, mig 0608).
+    // passare per fresco.
     let max_age_h = crate::settings::get_setting(db, "catalog.agentic_index_sync.max_age_hours")
         .await
         .ok()
         .flatten()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(168);
-    let row: Option<(String, Option<f64>)> = sqlx::query_as(
-        "SELECT COALESCE(tier_source, ''), \
-                CASE WHEN agentic_index_at IS NULL \
+    let agentic_index: Option<Option<f64>> = sqlx::query_scalar(
+        "SELECT CASE WHEN agentic_index_at IS NULL \
                        OR agentic_index_at < now() - make_interval(hours => $3::int) \
                      THEN NULL ELSE agentic_index END \
            FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
@@ -1682,18 +1676,11 @@ pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &
     .map_err(|e| {
         tracing::warn!(
             provider = %provider, model = %api_model, error = %e,
-            "refresh_tier_prior: lettura dei fatti fallita, tier non derivato"
+            "refresh_tier_prior: lettura dell'indice fallita, tier non derivato"
         );
     })
     .ok()
     .flatten();
-    let Some((source, agentic_index)) = row else {
-        return 0;
-    };
-    // `measured` e `manual` vincono sul prior: non si toccano.
-    if source == "measured" || source == "manual" {
-        return 0;
-    }
     // Indice assente o stantio: NON si azzera il tier esistente. Un tier vecchio
     // e' peggio di uno misurato ma MOLTO meglio di nessuno: `performance_tier`
     // NULL non matcha il filtro della tier-chain, quindi azzerare toglierebbe il
@@ -1701,7 +1688,8 @@ pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &
     // QUALIFICATI (21 heavy, 10 medium, 6 frontier) sono scoperti dall'indice —
     // OpenRouter non lista quei nomi, e non e' una lacuna temporanea. Restano
     // routabili col tier che hanno finche' la batteria non scrive 'measured'.
-    let Some(derived) = crate::model_qualification::derive_tier_prior(agentic_index, &thresholds)
+    let Some(derived) =
+        crate::model_qualification::derive_tier_prior(agentic_index.flatten(), &thresholds)
     else {
         tracing::debug!(
             provider = %provider, model = %api_model,
@@ -1709,33 +1697,16 @@ pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &
         );
         return 0;
     };
-    // La riga si scrive anche quando l'indice CONFERMA il tier gia' presente ma
-    // la provenienza non lo dice ancora (`tier_source` NULL): il valore era un
-    // fossile del nome che l'indice ha appena convalidato, e la fonte deve
-    // registrarlo. Col solo `performance_tier IS DISTINCT FROM $3` quei modelli
-    // restavano a provenienza ignota per sempre — proprio la bugia che questo
-    // lavoro rimuove.
-    let res = sqlx::query(
-        "UPDATE ai_price_catalog \
-            SET performance_tier = $3, tier_source = 'synced', updated_at = NOW() \
-          WHERE provider = $1 AND model = $2 \
-            AND (tier_source IS NULL OR tier_source = 'synced') \
-            AND (performance_tier IS DISTINCT FROM $3 OR tier_source IS DISTINCT FROM 'synced')",
-    )
-    .bind(provider)
-    .bind(api_model)
-    .bind(derived)
-    .execute(db)
-    .await;
-    match res {
-        Ok(r) if r.rows_affected() > 0 => {
+    use crate::orchestrator::model_service::{apply_tier, TierSource};
+    match apply_tier(db, provider, api_model, derived, TierSource::Synced).await {
+        Ok(true) => {
             tracing::info!(
-                provider = %provider, model = %api_model, tier = ?derived,
-                "catalog_sync: tier derivato dai FATTI (synced), non dal nome"
+                provider = %provider, model = %api_model, tier = %derived,
+                "catalog_sync: tier dalla classificazione esterna (synced), non dal nome"
             );
             1
         }
-        Ok(_) => 0,
+        Ok(false) => 0,
         // Regola H: un errore SQL si LOGGA. Con `if let Ok(r)` questo UPDATE e'
         // rimasto muto mentre falliva (colonna assente nello schema): il tier non
         // veniva scritto e nulla lo diceva. E' lo stesso pattern che ha tenuto
