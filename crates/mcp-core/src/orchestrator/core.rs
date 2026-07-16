@@ -86,12 +86,32 @@ impl Orchestrator {
         // Punto unico di scelta motore (regola L, flag mig 0458): `rust` ->
         // classificatore in-process; `python` (default) -> endpoint brain. Il
         // path rust richiede il gateway; senza, si resta sul path Python.
-        if let (ClassifierEngine::Rust, Some(gw)) = (
-            select_classifier_engine(db).await,
-            self.nexus_gateway.as_ref(),
-        ) {
-            let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
-            return classified;
+        //
+        // La scelta si DICE (regola M). Il ramo python oggi non puo' risolvere
+        // nulla — il brain e' stato rimosso (mig 0462/0532) — quindi finirci
+        // per una condizione tacita (gateway assente col motore su 'rust')
+        // significa nessuna classificazione, nessun dimensionamento e nessuna
+        // traccia del perche'. Il 2026-07-16 e' costato a due sessioni una
+        // diagnosi sbagliata: i log non dicevano nemmeno quale ramo girasse.
+        let engine = select_classifier_engine(db).await;
+        let gateway = self.nexus_gateway.as_ref();
+        match (engine, gateway) {
+            (ClassifierEngine::Rust, Some(gw)) => {
+                tracing::debug!(ramo = "rust", "classifier: motore in-process (gateway presente)");
+                let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
+                return classified;
+            }
+            (ClassifierEngine::Rust, None) => tracing::warn!(
+                ramo = "python",
+                motivo = "gateway_assente_con_motore_rust",
+                "classifier: il setting chiede il motore 'rust' ma il gateway non e' \
+                 configurato -> si ripiega sul ramo python, che senza brain (rimosso, \
+                 mig 0462/0532) non classifica: il dimensionamento restera' legacy"
+            ),
+            (ClassifierEngine::Python, _) => tracing::debug!(
+                ramo = "python",
+                "classifier: motore 'python' da settings (routing.classifier_engine)"
+            ),
         }
         let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
             Ok(t) => (

@@ -421,7 +421,22 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
     // `agentic_default` (un solo candidato, niente ambiguita'). Usato quando NON
     // otteniamo una classificazione semantica dall'LLM (down/timeout/JSON/brain
     // in fallback). L'agente parte col _LAZY_MINIMAL_TOOLKIT e interpreta da se'.
-    let neutral_full = || -> ClassifiedIntent {
+    //
+    // Il `motivo` NON e' decorazione: ogni uscita di qui produce
+    // classifier_resolved=false, che a valle SPEGNE il dimensionamento
+    // (agent_run.rs:2650 scarta la complexity di un classificatore non risolto).
+    // Prima queste sei uscite erano MUTE: il 2026-07-16 il sizing non si
+    // attivava e nei log non c'era una sola riga del classificatore — due
+    // sessioni hanno diagnosticato la causa sbagliata (una tabella morta dalla
+    // mig 0338) perche' il silenzio non lasciava altro da guardare. Un degrado
+    // che non si annuncia non e' un fail-safe: e' un buco nero.
+    let neutral_full = |motivo: &'static str| -> ClassifiedIntent {
+        tracing::warn!(
+            ramo = "python",
+            motivo,
+            "classifier: NON risolto -> intent neutro 'agentic_default'. \
+             classifier_resolved=false: il dimensionamento restera' al piano legacy"
+        );
         ClassifiedIntent {
             intent: "agentic_default",
             confidence: 0.5,
@@ -436,8 +451,11 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
         }
     };
 
-    if !llm_enabled || message.trim().is_empty() {
-        return neutral_full();
+    if !llm_enabled {
+        return neutral_full("llm_classifier_disabilitato");
+    }
+    if message.trim().is_empty() {
+        return neutral_full("messaggio_vuoto");
     }
 
     let brain_url =
@@ -450,29 +468,40 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
     let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
         Ok(c) => c,
-        Err(_) => return neutral_full(),
+        Err(_) => return neutral_full("client_http_non_costruibile"),
     };
 
     let body = serde_json::json!({ "message": message });
+    // `brain_non_raggiungibile` e' oggi il caso NORMALE, non l'eccezione: il
+    // brain Python e' stato rimosso (mig 0462/0532) e nessuno ascolta su :8001.
+    // Chi finisce qui non ottiene MAI una classificazione — e prima non lo
+    // sapeva nessuno, perche' questo ramo usciva in silenzio.
     let resp = match http.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return neutral_full(),
+        Ok(r) => {
+            tracing::warn!(url = %url, status = r.status().as_u16(), "classifier: brain ha risposto non-2xx");
+            return neutral_full("brain_status_non_2xx");
+        }
+        Err(e) => {
+            tracing::warn!(url = %url, error = %e, "classifier: brain non raggiungibile");
+            return neutral_full("brain_non_raggiungibile");
+        }
     };
 
     let parsed: AgenticIntentResponse = match resp.json().await {
         Ok(p) => p,
-        Err(_) => return neutral_full(),
+        Err(_) => return neutral_full("risposta_brain_non_parsabile"),
     };
 
     // Il brain stesso non e' riuscito a classificare con l'LLM: niente keyword,
     // si va sul neutro di sistema.
     if parsed.fallback_used {
-        return neutral_full();
+        return neutral_full("brain_in_fallback");
     }
 
     let intent_static = match intent_str_to_static(&parsed.intent) {
         Some(s) => s,
-        None => return neutral_full(),
+        None => return neutral_full("intent_fuori_vocabolario"),
     };
 
     // Confidence sotto soglia: l'LLM HA interpretato ma e' incerto. Conserviamo
