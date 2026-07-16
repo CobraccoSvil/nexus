@@ -10,9 +10,18 @@
 //! esplicitamente: "l'handler ritorna status=error". Quel guard era di fatto
 //! muto in UI.
 //!
+//! Il contratto ha tre casi: 200 su scrittura riuscita, 500 su rifiuto del DB,
+//! 404 su chiave assente. Il 404 e' l'altra meta' del fix: il PUT aggiorna e non
+//! crea, perche' un refuso nel nome produceva una riga nuova al posto di un
+//! errore -- una scrittura senza effetto spacciata per riuscita.
+//!
 //! Test opportunistico (stesso pattern di `m71_cost_breakdown`): fa skip se
-//! mancano server, DB o JWT. Idempotente e indipendente dall'ordine (regola F):
-//! crea le proprie righe con un suffisso unico e le rimuove in chiusura.
+//! mancano server, DB o JWT -- ATTENZIONE, uno skip qui si presenta come "ok"
+//! nel gate, quindi il 404 non e' verificato al wire senza NEXUS_TEST_JWT e un
+//! mcp-core aggiornato in ascolto. La rete di sicurezza e' `settings_write.rs`
+//! in nexus-auth, che copre lo stesso contratto sul punto unico col solo DB.
+//! Idempotente e indipendente dall'ordine (regola F): crea le proprie righe con
+//! un suffisso unico e le rimuove in chiusura.
 
 use sqlx::PgPool;
 use std::env;
@@ -55,14 +64,21 @@ async fn cleanup(pool: &PgPool, key: &str) {
 /// Il token viaggia nel COOKIE, non nell'header Authorization:
 /// `nexus_auth::validate_token` lo estrae solo da li' (`extract_token_from_cookie`).
 /// Con `bearer_auth` la risposta e' sempre 401, qualunque sia il contratto sotto test.
-async fn put_setting(token: &str, key: &str, value: &str) -> reqwest::Response {
+///
+/// Ritorna `None` se il server non risponde: il chiamante fa cleanup e skip. Un
+/// panic qui (era `.expect(...)`) lascerebbe nel DB la riga appena seedata, e
+/// quella protetta non e' piu' rimovibile da nessun endpoint admin: l'UPDATE lo
+/// nega il trigger della mig 0499 e un DELETE non e' esposto. Resterebbe anche
+/// una categoria 'test' fantasma nella sidebar, che deriva dai dati
+/// (`list_categories`).
+async fn put_setting(token: &str, key: &str, value: &str) -> Option<reqwest::Response> {
     reqwest::Client::new()
         .put(format!("{}/api/admin/setting/{}", base_url(), key))
         .header("Cookie", format!("token={token}"))
         .json(&serde_json::json!({ "value": value }))
         .send()
         .await
-        .expect("PUT /api/admin/setting")
+        .ok()
 }
 
 /// Una scrittura che il DB rifiuta deve essere non-2xx: il client la vede.
@@ -83,18 +99,25 @@ async fn scrittura_rifiutata_dal_db_non_e_un_200() {
 
     // Valore DIVERSO da quello seedato: il trigger scatta su
     // `NEW.value IS DISTINCT FROM OLD.value`.
-    let res = put_setting(&token, &key, "valore-nuovo").await;
+    let Some(res) = put_setting(&token, &key, "valore-nuovo").await else {
+        cleanup(&pool, &key).await;
+        eprintln!("skip: {} non raggiungibile", base_url());
+        return;
+    };
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
 
     // Prova che la scrittura e' stata davvero rifiutata: il valore non e'
-    // cambiato. Senza questa asserzione un 500 per un motivo qualsiasi
-    // (es. server assente) farebbe passare il test per la ragione sbagliata.
+    // cambiato. Senza questa asserzione un 500 per un motivo qualunque
+    // (es. errore di configurazione del server) farebbe passare il test per la
+    // ragione sbagliata. `.ok().flatten()` e non `.expect(...)`: un panic qui
+    // salterebbe il cleanup sotto e lascerebbe la riga protetta nel DB.
     let stored: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
         .bind(&key)
         .fetch_optional(&pool)
         .await
-        .expect("rilettura del valore");
+        .ok()
+        .flatten();
     cleanup(&pool, &key).await;
 
     assert_eq!(
@@ -125,7 +148,11 @@ async fn scrittura_riuscita_e_un_200_ok() {
     let key = format!("test.update_contract.normale.{}", Uuid::new_v4());
     seed(&pool, &key, false).await;
 
-    let res = put_setting(&token, &key, "valore-nuovo").await;
+    let Some(res) = put_setting(&token, &key, "valore-nuovo").await else {
+        cleanup(&pool, &key).await;
+        eprintln!("skip: {} non raggiungibile", base_url());
+        return;
+    };
     let status = res.status();
     let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
 
@@ -133,7 +160,8 @@ async fn scrittura_riuscita_e_un_200_ok() {
         .bind(&key)
         .fetch_optional(&pool)
         .await
-        .expect("rilettura del valore");
+        .ok()
+        .flatten();
     cleanup(&pool, &key).await;
 
     assert_eq!(status.as_u16(), 200, "body: {body}");
@@ -163,7 +191,10 @@ async fn chiave_assente_e_un_404_e_non_crea_la_riga() {
     let key = format!("test.update_contract.refuso.{}", Uuid::new_v4());
     cleanup(&pool, &key).await;
 
-    let res = put_setting(&token, &key, "valore-fantasma").await;
+    let Some(res) = put_setting(&token, &key, "valore-inefficace").await else {
+        eprintln!("skip: {} non raggiungibile", base_url());
+        return;
+    };
     let status = res.status();
     let body = res.text().await.unwrap_or_default();
 
@@ -174,7 +205,8 @@ async fn chiave_assente_e_un_404_e_non_crea_la_riga() {
         .bind(&key)
         .fetch_optional(&pool)
         .await
-        .expect("rilettura del valore");
+        .ok()
+        .flatten();
     cleanup(&pool, &key).await;
 
     assert_eq!(
