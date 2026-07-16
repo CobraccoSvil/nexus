@@ -46,8 +46,9 @@ pub use stall_recovery::{stall_move_key, StallRecoveryNode, STALL_CONTEXT_KEY};
 pub use supervisor::{SupervisorNode, SUPERVISOR_ABANDON_KEY};
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
 pub use tool_dispatch::{
-    panel_enforcement_from_advisory_synthesis, tool_target_from_input, ToolDispatchConfig,
-    ToolDispatchNode, PANEL_ENFORCEMENT_KEY, PRE_RUN_ADVISORY_SYNTHESIS_KEY,
+    panel_enforcement_from_advisory_synthesis, tool_target_from_input, AdvisoryGateState,
+    ToolDispatchConfig, ToolDispatchNode, ADVISORY_GATE_KEY, PANEL_ENFORCEMENT_KEY,
+    PRE_RUN_ADVISORY_SYNTHESIS_KEY,
 };
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
 

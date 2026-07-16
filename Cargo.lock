@@ -2187,6 +2187,7 @@ dependencies = [
  "futures",
  "nexus-graph",
  "nexus-graph-derive",
+ "nexus-types",
  "rand 0.8.5",
  "regex",
  "ryu",

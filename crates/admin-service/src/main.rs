@@ -18,6 +18,7 @@ mod alignment;
 mod browser_bridge;
 mod environment;
 mod experiments;
+mod figures;
 mod long_running;
 mod orchestrator_panel;
 mod prompt_templates;
@@ -242,6 +243,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/orchestrator/subagents/runs",
             get(orchestrator_panel::list_subagent_runs),
+        )
+        // Figure (kind di sub-agente): creazione ATOMICA dei 4 pezzi che rendono
+        // un kind vivo (prompt + purpose tier-only + definition + whitelist).
+        // Gli editor qui sopra restano per la MODIFICA di un pezzo singolo; qui
+        // la figura nasce tutta intera o non nasce.
+        .route("/orchestrator/figures", post(figures::create_figure))
+        .route(
+            "/orchestrator/figures/:kind",
+            axum::routing::delete(figures::delete_figure),
+        )
+        .route(
+            "/orchestrator/subagents/whitelist",
+            post(figures::update_kinds_whitelist),
         )
         // Dashboard allineamento direttive prompt (MVP read-only)
         .route(

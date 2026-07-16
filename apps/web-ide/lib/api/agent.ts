@@ -570,6 +570,70 @@ export async function resetProviderCooldown(_providerKey: string): Promise<{ ok:
   return { ok: true };
 }
 
+// ── Figure (lenti) del consiglio ─────────────────────────────────────────────
+// Una figura convocabile richiede QUATTRO pezzi coerenti: definition, prompt
+// subagent.<kind>.base, purpose subagent_<kind> e appartenenza alla whitelist del
+// dispatcher. upsertSubagentDefinition ne crea UNO (la definition): un kind creato
+// solo cosi' resta muto. L'endpoint /orchestrator/figures li crea in UNA
+// transazione (tutti o nessuno).
+
+/** Body di POST /api/admin/orchestrator/figures (snake_case, come l'upsert definitions). */
+export interface CreateFigureBody {
+  kind: string;
+  description: string;
+  /** true = figura read-only che chiude con advisory_verdict; false = sub-agente esecutivo. */
+  advisory: boolean;
+  /** Fascia di capacita' canonica (light|medium|high|heavy|frontier). Il purpose nasce
+   *  con provider/model_id vuoti: il modello concreto lo sceglie best_model_for_tier
+   *  dal catalog a ogni convocazione (regola G) — qui non si nomina mai un modello. */
+  tier: string;
+  prompt_content: string;
+  prompt_title?: string;
+  tool_whitelist: string[];
+  /** Omessi = il backend applica i propri default (unica fonte del valore). */
+  max_iterations?: number;
+  timeout_s?: number;
+}
+
+/** Chiavi derivate SERVER-side (punto unico delle derivazioni canoniche). */
+export interface CreateFigureResult {
+  ok: boolean;
+  kind: string;
+  prompt_key: string;
+  purpose: string;
+  whitelisted: boolean;
+}
+
+/** In errore il backend risponde {error, code, field}: fetchJson lo trasforma in
+ *  ApiError con lo status HTTP (segnale strutturato su cui decidere, regola M) e
+ *  il testo di `error` nel messaggio per il display. */
+export async function createFigure(body: CreateFigureBody): Promise<CreateFigureResult> {
+  return fetchJson(adminServiceUrl("/orchestrator/figures"), {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Soft-delete della definition + rimozione dalla whitelist. Prompt e purpose restano (innocui). */
+export async function deleteFigure(kind: string): Promise<{ ok: boolean; kind: string }> {
+  return fetchJson(adminServiceUrl(`/orchestrator/figures/${encodeURIComponent(kind)}`), {
+    method: "DELETE",
+  });
+}
+
+/** Riparazione mirata della whitelist del dispatcher
+ *  (setting orchestrator.subagent_kinds_whitelist): un kind fuori whitelist esiste
+ *  ma non e' convocabile. add/remove sempre espliciti. */
+export async function mutateKindsWhitelist(args: {
+  add?: string[];
+  remove?: string[];
+}): Promise<{ ok: boolean }> {
+  return fetchJson(adminServiceUrl("/orchestrator/subagents/whitelist"), {
+    method: "POST",
+    body: JSON.stringify({ add: args.add ?? [], remove: args.remove ?? [] }),
+  });
+}
+
 // Tipi Orchestrator. Plan* restano stub-shaped (pagina non cablata); i tipi
 // subagent rispecchiano il payload camelCase di admin-service
 // (crates/admin-service/src/orchestrator_panel.rs).

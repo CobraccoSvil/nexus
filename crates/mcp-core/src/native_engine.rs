@@ -252,6 +252,15 @@ pub struct NativeRunInput {
     pub pre_run_advisory_synthesis: Option<serde_json::Value>,
     /// Fonte del segnale pre-run (`multi_provider_synthesis` | `advisory_synthesis`).
     pub pre_run_advisory_source: Option<&'static str>,
+    /// Barriera di scrittura advisory (overlap consiglio ∥ run, mig 0606).
+    /// `Some(rx)` = il run parte SUBITO mentre i panel deliberano: la prima
+    /// modifica attendera' il loro verdetto (gate nel ToolDispatchNode). `None`
+    /// (default) = ramo classico, i verdetti sono gia' in
+    /// `pre_run_advisory_synthesis` -> gate inerte, comportamento bit-identico.
+    /// Alternativi per costruzione: o si attende prima, o si attende alla prima
+    /// scrittura.
+    pub advisory_gate:
+        Option<tokio::sync::watch::Receiver<nexus_agent_graph::nodes::AdvisoryGateState>>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -1114,6 +1123,31 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
 /// `Default` valgono SOLO se la chiave manca o il DB e' irraggiungibile). Le chiavi
 /// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
 /// usano l'underscore: e' la chiave reale del setting nel DB.
+/// Attesa massima della barriera di scrittura advisory (mig 0606), CLAMPATA
+/// alla deadline residua del run (fase 3, mig 0604).
+///
+/// Perche' il clamp: se la barriera potesse attendere oltre la deadline, un run
+/// col tempo scaduto verrebbe chiuso dall'executor con reason `time_budget`
+/// mentre in realta' stava aspettando il consiglio — la causa vera sparirebbe
+/// dietro un sintomo (regola M: il motivo dichiarato dev'essere quello reale).
+/// Senza deadline configurata (`run_time_budget_s=0`) resta il timeout nudo.
+async fn advisory_gate_timeout(db: &PgPool) -> u64 {
+    let configured = setting_i64(
+        db,
+        "orchestrator.advisory_gate_timeout_s",
+        ToolDispatchConfig::default().advisory_gate_timeout_s as i64,
+    )
+    .await
+    .max(0) as u64;
+    let deadline_s = setting_i64(db, "agent.run_time_budget_s", 0).await;
+    if deadline_s <= 0 {
+        return configured;
+    }
+    // Il run e' appena partito: il residuo e' l'intera deadline meno il tempo
+    // gia' speso dai panel (che qui e' ~0: nel ramo overlap partono INSIEME).
+    configured.min(deadline_s as u64)
+}
+
 async fn load_executor_config(
     db: &PgPool,
     provider: &str,
@@ -2112,6 +2146,10 @@ async fn build_native_engine(
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
         fs_mutator_tools: routing_cfg.fs_mutator_tools.clone(),
+        // Barriera advisory (mig 0606): attesa massima della prima scrittura.
+        // CLAMP alla deadline residua del run (fase 3): una barriera che attende
+        // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
+        advisory_gate_timeout_s: advisory_gate_timeout(&db).await,
         ..ToolDispatchConfig::default()
     };
 
@@ -2830,6 +2868,10 @@ async fn run_engine(
         // Fase C3 Part B: isolamento fisico dei sub-run disponibile (calcolato in
         // build_native_engine, flag-gated). Alimenta il gate di orchestrazione.
         isolation_available,
+        // Barriera di scrittura advisory (overlap, mig 0606): presente solo se il
+        // chiamante ha avviato il run PRIMA dei panel. `None` = ramo classico
+        // (verdetti gia' nello stato iniziale) -> gate inerte, bit-identico.
+        advisory_gate: input.advisory_gate.clone(),
     };
 
     // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.
@@ -3328,6 +3370,9 @@ mod tests {
             working_root: None,
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
+            // Nessun overlap nei test di costruzione dello stato: la barriera e'
+            // esercitata dai test del ToolDispatchNode.
+            advisory_gate: None,
         }
     }
 
