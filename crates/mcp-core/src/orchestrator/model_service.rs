@@ -55,7 +55,7 @@
 
 use sqlx::PgPool;
 
-use nexus_agent_graph::decisions::tiers::{tier_rank, tier_rank_sql};
+use nexus_agent_graph::decisions::tiers::{tier_chain_up, tier_rank, tier_rank_sql};
 
 use super::model_routing::{agentic_tier_chain, AGENTIC_COST_FIRST_ORDER, AGENTIC_FAILOVER_ORDER};
 use super::{qualification_gate, select_models_tierchain, EligibilityFilter};
@@ -69,6 +69,26 @@ pub enum TierPolicy {
     /// servire una richiesta: l'alternativa e' "nessun modello", che era
     /// l'incidente del 2026-07-15.
     Degrade,
+    /// Il tier e' una PREFERENZA e `min_tier` e' il VINCOLO: si prova il tier
+    /// richiesto, poi si scende fino al pavimento, poi — se non e' rimasto
+    /// nulla — si SALE. Sotto il pavimento non si va mai.
+    ///
+    /// Nasce da DUE incidenti opposti, che nessuna delle altre policy concilia:
+    ///
+    /// - 2026-07-15: il consiglio moriva con `NoCapableModel` mentre 19 modelli
+    ///   sani stavano UN gradino sotto (i `heavy` erano auto-disabilitati). Non
+    ///   scendere e' un danno: `deepseek-v4-pro` e' `high` con agentic_index
+    ///   36.4, e come consigliere vale eccome.
+    /// - 2026-07-16: le figure `medium` finivano su `groq/gpt-oss-20b` — agentic
+    ///   3.1, il peggiore del parco — perche' openai e anthropic erano in
+    ///   cooldown e la catena scendeva fino a `light`. Quel run non falliva:
+    ///   rispondeva FUORI TEMA dichiarandosi `completed`.
+    ///
+    /// I due casi non si distinguono per la DIREZIONE ma per QUANTO in basso si
+    /// arriva: scendere e' innocuo finche' si resta sopra una soglia di dignita'.
+    /// Quella soglia e' `agent.routing.agentic_min_tier` (DB, regola G), e
+    /// arriva qui come `min_tier` — che [`validate`] esige.
+    Flexible,
     /// Il tier e' il BERSAGLIO della richiesta: nessun altro tier e' accettabile,
     /// e l'esito e' GARANTITO di quel tier. Il `why` e' obbligatorio: e' cio' che
     /// rende dicibile la differenza fra "voluto" e "non ci ho pensato" — la
@@ -287,8 +307,22 @@ impl<'a> ModelRequest<'a> {
     }
 }
 
-/// L'esito DICE cosa e' successo (regola M): `degraded` e' calcolato dal servizio
-/// confrontando richiesto ed effettivo, mai lasciato dedurre a chi legge.
+/// Come il tier ottenuto si scosta da quello richiesto. Ha un SEGNO: scendere e
+/// salire sono esiti opposti (uno e' un ripiego, l'altro un costo deliberato) e
+/// vanno distinti dal TIPO, non da un confronto di rank rifatto da chi legge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierShift {
+    /// Il tier ottenuto e' quello richiesto (o la policy non ne aveva uno).
+    None,
+    /// Si e' SCESO: nessun candidato nel tier richiesto (`Degrade`).
+    Degraded,
+    /// Si e' SALITO: il tier richiesto era vuoto e scendere non era ammesso
+    /// (`Upgrade`). Costa di piu' ed e' voluto.
+    Upgraded,
+}
+
+/// L'esito DICE cosa e' successo (regola M): lo scostamento e' calcolato dal
+/// servizio confrontando richiesto ed effettivo, mai lasciato dedurre a chi legge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelChoice {
     pub provider: String,
@@ -297,9 +331,13 @@ pub struct ModelChoice {
     /// Il `performance_tier` della riga scelta. `None` se la colonna e' NULL
     /// (il tier sta per diventare nullable) o se la policy era `AnyTier`.
     pub effective_tier: Option<String>,
-    /// I4: un DATO, non una deduzione.
+    /// I4: un DATO, non una deduzione. `true` solo se si e' SCESO — conservato
+    /// per i ~20 call site storici; il segnale completo e' [`ModelChoice::shift`].
     pub degraded: bool,
-    /// Per log e rationale: `tier=heavy:auto` | `tier=heavy:degraded_to=high`.
+    /// Lo scostamento CON il segno: distingue "sono sceso" da "sono salito".
+    pub shift: TierShift,
+    /// Per log e rationale: `tier=heavy:auto` | `tier=heavy:degraded_to=high` |
+    /// `tier=medium:upgraded_to=high`.
     pub rationale: String,
 }
 
@@ -373,6 +411,18 @@ fn validate(req: &ModelRequest<'_>) -> Result<(), NoModelReason> {
             req.tier_policy
         )));
     }
+    // I8: `Flexible` SENZA pavimento sarebbe una degradazione senza freni con un
+    // nome rassicurante — cioe' il difetto del 2026-07-16 travestito. Il
+    // pavimento e' il solo motivo per cui scendere e' ammesso: senza, la policy
+    // non ha significato.
+    if req.tier_policy == TierPolicy::Flexible && req.min_tier.is_none() {
+        return Err(NoModelReason::InvalidRequest(
+            "tier_policy=Flexible senza min_tier: il pavimento e' cio' che rende \
+             sicuro scendere (I8). Passa min_tier(agentic_min_tier(db)) — il \
+             setting agent.routing.agentic_min_tier."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -382,6 +432,28 @@ fn chain_for<'a>(req: &ModelRequest<'a>) -> Vec<&'a str> {
         // Il punto unico della degradazione (regola L): non si costruisce una
         // catena a mano qui.
         TierPolicy::Degrade => agentic_tier_chain(req.tier),
+        // Preferenza + pavimento: prima il bersaglio, poi giu' FINO al pavimento
+        // (mai sotto), poi su. Entrambi i tratti sono GENERATI dal vocabolario
+        // (regola L): nessuna scala scritta a mano qui.
+        //
+        // Perche' giu' prima di su: sotto il pavimento non c'e' nulla di
+        // pericoloso per definizione, e un tier piu' basso costa meno — con
+        // `Rank::CostFirst` e' la scelta coerente. Salire e' l'ultima risorsa,
+        // non la prima.
+        TierPolicy::Flexible => {
+            let floor = req.min_tier.unwrap_or(req.tier);
+            let mut chain: Vec<&str> = agentic_tier_chain(req.tier)
+                .into_iter()
+                .filter(|t| tier_rank(t) >= tier_rank(floor))
+                .collect();
+            // `skip(1)`: il bersaglio e' gia' in testa alla catena discendente.
+            for t in tier_chain_up(req.tier).into_iter().skip(1) {
+                if !chain.contains(&t) {
+                    chain.push(t);
+                }
+            }
+            chain
+        }
         TierPolicy::Exact { .. } => vec![req.tier],
         // Catena vuota = nessun filtro tier: decide l'ordinamento.
         TierPolicy::AnyTier => vec![],
@@ -429,28 +501,45 @@ fn choice_from(
     model: String,
     effective_tier: Option<String>,
 ) -> ModelChoice {
-    let degraded = match req.tier_policy {
-        // AnyTier non ha un tier richiesto da confrontare: non e' degradazione.
-        TierPolicy::AnyTier => false,
-        _ => effective_tier
-            .as_deref()
-            .is_some_and(|t| !t.eq_ignore_ascii_case(req.tier.trim())),
+    // Lo SCOSTAMENTO dal tier richiesto e' un dato con un SEGNO (regola M):
+    // scendere e salire sono esiti opposti, e un `degraded: bool` da solo li
+    // confonderebbe — chi legge non deve dedurre la direzione dal confronto dei
+    // rank.
+    let shift = match req.tier_policy {
+        // AnyTier non ha un tier richiesto da confrontare: nessuno scostamento.
+        TierPolicy::AnyTier => TierShift::None,
+        _ => match effective_tier.as_deref() {
+            Some(t) if !t.eq_ignore_ascii_case(req.tier.trim()) => {
+                if tier_rank(t) > tier_rank(req.tier) {
+                    TierShift::Upgraded
+                } else {
+                    TierShift::Degraded
+                }
+            }
+            _ => TierShift::None,
+        },
     };
-    let rationale = match (&req.tier_policy, degraded) {
+    let rationale = match (&req.tier_policy, shift) {
         (TierPolicy::AnyTier, _) => "tier=any".to_string(),
-        (_, true) => format!(
+        (_, TierShift::Degraded) => format!(
             "tier={}:degraded_to={}",
             req.tier,
             effective_tier.as_deref().unwrap_or("?")
         ),
-        (_, false) => format!("tier={}:auto", req.tier),
+        (_, TierShift::Upgraded) => format!(
+            "tier={}:upgraded_to={}",
+            req.tier,
+            effective_tier.as_deref().unwrap_or("?")
+        ),
+        (_, TierShift::None) => format!("tier={}:auto", req.tier),
     };
     ModelChoice {
         provider,
         model,
         requested_tier: req.tier.to_string(),
         effective_tier,
-        degraded,
+        degraded: shift == TierShift::Degraded,
+        shift,
         rationale,
     }
 }
@@ -609,33 +698,73 @@ async fn select_model_with_gate(
         return Err(diagnose_empty(db, req, &chain, gate).await);
     };
     let choice = choice_from(req, provider, model, effective_tier);
-    // I3: la degradazione e' MONOTONA. Non e' un commento: e' un controllo.
+    verifica_i3(req, &choice);
+    log_shift(&choice);
+    Ok(choice)
+}
+
+/// I3: lo scostamento sta DENTRO cio' che la policy ammette. Non e' un commento:
+/// e' un controllo. `Degrade` scende (fino a light), `Flexible` scende ma non
+/// sotto il pavimento e in ultima istanza sale, `Exact` non si muove, `AnyTier`
+/// non ha un bersaglio.
+fn verifica_i3(req: &ModelRequest<'_>, choice: &ModelChoice) {
     debug_assert!(
-        !choice.degraded || matches!(req.tier_policy, TierPolicy::Degrade),
+        !choice.degraded || matches!(req.tier_policy, TierPolicy::Degrade | TierPolicy::Flexible),
         "I3 violata: degradazione con tier_policy={:?}",
         req.tier_policy
     );
     debug_assert!(
-        choice
-            .effective_tier
-            .as_deref()
-            .is_none_or(|t| tier_rank(t) <= tier_rank(req.tier))
-            || req.tier_policy == TierPolicy::AnyTier,
-        "I3 violata: il tier effettivo ({:?}) e' PIU' capace del richiesto ({})",
-        choice.effective_tier,
-        req.tier
+        choice.shift != TierShift::Upgraded || req.tier_policy == TierPolicy::Flexible,
+        "I3 violata: upscale con tier_policy={:?}",
+        req.tier_policy
     );
-    if choice.degraded {
-        tracing::warn!(
+    debug_assert!(
+        match req.tier_policy {
+            TierPolicy::AnyTier => true,
+            // Flexible: il vincolo NON e' il tier richiesto (si puo' scendere) ma
+            // il PAVIMENTO. Se questo scatta, un modello sotto il pavimento e'
+            // entrato — cioe' esattamente il danno che la policy esiste per
+            // impedire.
+            TierPolicy::Flexible => choice
+                .effective_tier
+                .as_deref()
+                .is_none_or(|t| tier_rank(t) >= tier_rank(req.min_tier.unwrap_or(req.tier))),
+            _ => choice
+                .effective_tier
+                .as_deref()
+                .is_none_or(|t| tier_rank(t) <= tier_rank(req.tier)),
+        },
+        "I3 violata: tier effettivo {:?} incompatibile con {} (pavimento {:?}) sotto {:?}",
+        choice.effective_tier,
+        req.tier,
+        req.min_tier,
+        req.tier_policy
+    );
+}
+
+/// Uno scostamento di tier non passa mai in silenzio: scendere e' un avviso
+/// (il parco e' in difficolta'), salire e' un'informazione (si sta pagando di
+/// piu', deliberatamente).
+fn log_shift(choice: &ModelChoice) {
+    match choice.shift {
+        TierShift::Degraded => tracing::warn!(
             tier_richiesto = %choice.requested_tier,
             tier_effettivo = %choice.effective_tier.as_deref().unwrap_or("?"),
             provider = %choice.provider, model = %choice.model,
             "model_service: DEGRADAZIONE di tier — nessun modello eleggibile nel \
              tier richiesto (cooldown o gate), scelto il migliore del primo tier \
              disponibile scendendo"
-        );
+        ),
+        TierShift::Upgraded => tracing::info!(
+            tier_richiesto = %choice.requested_tier,
+            tier_effettivo = %choice.effective_tier.as_deref().unwrap_or("?"),
+            provider = %choice.provider, model = %choice.model,
+            "model_service: UPSCALE di tier — il tier richiesto e' vuoto (cooldown \
+             o gate) e sotto il pavimento non si scende: scelto il piu' economico \
+             del primo tier disponibile salendo. Costa di piu', ed e' voluto"
+        ),
+        TierShift::None => {}
     }
-    Ok(choice)
 }
 
 // ── Scrittura del tier: l'altra meta' del servizio ──────────────────────────

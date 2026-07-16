@@ -44,6 +44,29 @@ pub fn is_performance_tier(tier: &str) -> bool {
     PERFORMANCE_TIERS.contains(&t.as_str())
 }
 
+/// La catena dei tier da `from` IN SU, dal meno al piu' capace (`from` incluso).
+/// GENERATA da [`PERFORMANCE_TIERS`]: nessuna scala scritta a mano.
+///
+/// E' la gemella ascendente della degradazione, per i casi in cui scendere non
+/// e' un ripiego ma un danno. Il caso reale (misurato 2026-07-16): le figure del
+/// consiglio chiedono `medium`; con openai e anthropic in cooldown per credito
+/// esaurito il tier restava vuoto e la catena discendente arrivava a `light`,
+/// dove il piu' economico e' `groq/gpt-oss-20b` (agentic_index 3.1, il peggiore
+/// del parco). Quel run non falliva: rispondeva FUORI TEMA e si dichiarava
+/// `completed`. Per un consigliere un modello piu' caro e' un costo; uno che
+/// mente e' un danno — quindi si sale.
+///
+/// Un `from` fuori vocabolario prende il rank neutro di [`tier_rank`]
+/// (`medium`), come ovunque: la catena parte da li' in su.
+pub fn tier_chain_up(from: &str) -> Vec<&'static str> {
+    let soglia = tier_rank(from);
+    PERFORMANCE_TIERS
+        .iter()
+        .filter(|t| tier_rank(t) >= soglia)
+        .copied()
+        .collect()
+}
+
 /// Rank del tier come espressione SQL, GENERATA da [`PERFORMANCE_TIERS`] e
 /// [`tier_rank`]: la scala ha UN solo posto anche per chi ordina in SQL.
 ///
@@ -105,6 +128,27 @@ mod tests {
     fn rank_case_insensitive_e_trim() {
         assert_eq!(tier_rank("  HEAVY "), tier_rank("heavy"));
         assert_eq!(tier_rank("Frontier"), 5);
+    }
+
+    #[test]
+    fn la_catena_ascendente_parte_dal_tier_e_sale() {
+        assert_eq!(tier_chain_up("medium"), vec!["medium", "high", "heavy", "frontier"]);
+        assert_eq!(tier_chain_up("heavy"), vec!["heavy", "frontier"]);
+        // Il piu' capace non ha dove salire: resta solo se stesso (la catena non
+        // e' mai vuota, quindi il bersaglio viene sempre provato).
+        assert_eq!(tier_chain_up("frontier"), vec!["frontier"]);
+        assert_eq!(tier_chain_up("light"), PERFORMANCE_TIERS.to_vec());
+        // MAI verso il basso: e' l'unica proprieta' che conta, ed e' il motivo
+        // per cui la catena esiste (un consigliere 'light' che mente e' peggio
+        // di uno 'heavy' che costa).
+        for t in PERFORMANCE_TIERS {
+            assert!(
+                tier_chain_up(t).iter().all(|c| tier_rank(c) >= tier_rank(t)),
+                "la catena ascendente di {t} contiene un tier piu' debole"
+            );
+        }
+        // Fuori vocabolario: parte dal neutro (medium), come tier_rank.
+        assert_eq!(tier_chain_up("boh"), tier_chain_up("medium"));
     }
 
     #[test]

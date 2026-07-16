@@ -168,7 +168,7 @@ const AGENTIC_MIN_TIER_DEFAULT: &str = "medium";
 /// ai_price_catalog). Qualunque valore non riconosciuto o assenza del setting ->
 /// [`AGENTIC_MIN_TIER_DEFAULT`]. Best-effort: un errore DB non fa fallire il
 /// routing, degrada al default.
-async fn agentic_min_tier(db: &PgPool) -> String {
+pub(crate) async fn agentic_min_tier(db: &PgPool) -> String {
     let raw = crate::settings::get_setting(db, AGENTIC_MIN_TIER_KEY)
         .await
         .ok()

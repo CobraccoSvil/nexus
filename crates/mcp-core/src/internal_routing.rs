@@ -248,6 +248,28 @@ impl PurposeResolution {
 ///
 /// - tier_rule assente  -> NotFound (purpose senza tier: non risolvibile)
 /// - tier senza modello -> NoCapableModel (catalog/cooldown)
+/// Il PAVIMENTO di un purpose: la soglia sotto cui la degradazione smette di
+/// essere un ripiego e diventa un danno.
+///
+/// Viene da `agent.routing.agentic_min_tier` (DB, regola G) ma NON puo' mai
+/// ALZARE il tier richiesto: un purpose configurato `light` lo e' per scelta —
+/// i task banali (titoli, doc) usano un modello debole per costo — e promuoverlo
+/// sarebbe una decisione presa alle sue spalle, per giunta piu' cara. Il
+/// pavimento limita la DEGRADAZIONE, non la richiesta.
+///
+/// Serve percio' il MENO capace fra i due: `light` chiesto con pavimento
+/// `medium` resta `light` (non degrada, ci e' gia'); `heavy` chiesto con
+/// pavimento `medium` puo' scendere fino a `medium`, mai a `light`.
+async fn purpose_floor(db: &PgPool, tier_richiesto: &str) -> String {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let globale = crate::orchestrator::model_routing::agentic_min_tier(db).await;
+    if tier_rank(tier_richiesto) < tier_rank(&globale) {
+        tier_richiesto.to_string()
+    } else {
+        globale
+    }
+}
+
 async fn resolve_purpose_core(
     db: &PgPool,
     purpose: &str,
@@ -266,9 +288,13 @@ async fn resolve_purpose_core(
     use crate::orchestrator::model_service::{
         select_model, ExactReason, ModelRequest, NoModelReason, Profile, Rank, TierPolicy,
     };
+    let floor = purpose_floor(db, &rule.tier).await;
     let mut req = ModelRequest {
         tier: &rule.tier,
-        tier_policy: TierPolicy::Degrade,
+        // Preferenza + pavimento, non "il tier o niente": scendere di un gradino
+        // resta ammesso (il 2026-07-15 il consiglio moriva con 19 modelli sani
+        // un gradino sotto), ma mai sotto il pavimento.
+        tier_policy: TierPolicy::Flexible,
         profile: if rule.requires_tool_use {
             Profile::Agentic
         } else {
@@ -276,9 +302,7 @@ async fn resolve_purpose_core(
         },
         capability: rule.capability.as_deref(),
         min_context_window: 0,
-        // Il purpose non impone un pavimento: il suo `tier` E' gia' il requisito,
-        // e la degradazione lungo la catena e' voluta e dichiarata nel rationale.
-        min_tier: None,
+        min_tier: Some(&floor),
         exclude_providers,
         pin: None,
         rank: if rule.requires_tool_use {
@@ -297,8 +321,8 @@ async fn resolve_purpose_core(
         };
     }
     match select_model(db, &req).await {
-        // Il `rationale` (`tier=heavy:auto` | `tier=heavy:degraded_to=high`) e il
-        // log della degradazione li produce il SERVIZIO: qui non si ri-deriva
+        // Il `rationale` (`tier=medium:auto` | `tier=medium:upgraded_to=high`) e
+        // il log dello scostamento li produce il SERVIZIO: qui non si ri-deriva
         // nulla (regola M/I4).
         Ok(choice) => PurposeResolution::Resolved {
             provider: choice.provider,
@@ -393,17 +417,24 @@ pub async fn resolve_purpose_provider_candidates_db(
     };
 
     // SERVIZIO UNICO (regola L): niente EligibilityFilter costruito a mano, niente
-    // gate ricordato dal chiamante (I2), niente tier-chain scelta qui. Il fan-out
-    // e' il caso che ha PIU' bisogno della degradazione, non meno: chiede N
-    // provider DISTINTI proprio nel tier che ne ha di meno (il 'heavy' vive su
-    // openai/anthropic/google soltanto), e senza pin l'unica scelta e' fra un
-    // tier piu' basso e NESSUN candidato.
+    // gate ricordato dal chiamante (I2), niente tier-chain scelta qui.
+    //
+    // Il fan-out chiede N provider DISTINTI proprio nel tier che ne ha di meno
+    // (il 'heavy' vive su pochi provider), quindi qui la tentazione di scendere
+    // e' massima: piu' scendi, piu' provider trovi. Scendere di un gradino e'
+    // giusto — il 2026-07-15 il panel non si convocava affatto mentre 19 modelli
+    // sani stavano appena sotto — ma sotto il PAVIMENTO il compromesso cambia
+    // natura: non e' "meno pareri", e' "pareri inaffidabili". Il 2026-07-16 la
+    // catena arrivava a groq/gpt-oss-20b (agentic_index 3.1), che ha risposto
+    // fuori tema dichiarandosi `completed`. Un consigliere che mente non e' un
+    // consigliere in meno: e' un danno in piu'.
     use crate::orchestrator::model_service::{
         select_models, ModelRequest, NoModelReason, Profile, Rank, TierPolicy,
     };
+    let floor = purpose_floor(db, &rule.tier).await;
     let req = ModelRequest {
         tier: &rule.tier,
-        tier_policy: TierPolicy::Degrade,
+        tier_policy: TierPolicy::Flexible,
         profile: if rule.requires_tool_use {
             Profile::Agentic
         } else {
@@ -411,7 +442,7 @@ pub async fn resolve_purpose_provider_candidates_db(
         },
         capability: rule.capability.as_deref(),
         min_context_window: 0,
-        min_tier: None,
+        min_tier: Some(&floor),
         exclude_providers: &[],
         pin: None,
         rank: if rule.requires_tool_use {
@@ -1137,5 +1168,31 @@ mod tests {
             candidates.iter().all(|c| c.tier.as_deref() == Some("high")),
             "i pareri devono restare omogenei di fascia: {candidates:?}"
         );
+    }
+
+    /// Il pavimento LIMITA la degradazione, non ALZA la richiesta. Un purpose
+    /// configurato `light` lo e' per scelta (titoli chat, doc: task banali dove
+    /// un modello debole basta e costa meno): promuoverlo a `medium` perche' il
+    /// pavimento agentico dice `medium` sarebbe una decisione presa alle sue
+    /// spalle, e piu' cara. Sei test del routing sub-agente lo hanno colto
+    /// mentre lo stavo introducendo.
+    #[sqlx::test]
+    async fn il_pavimento_non_alza_mai_il_tier_richiesto(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('agent.routing.agentic_min_tier', 'medium')")
+            .execute(&pool)
+            .await
+            .expect("seed");
+
+        // Chi chiede MENO del pavimento resta dov'e': nessuna promozione.
+        assert_eq!(purpose_floor(&pool, "light").await, "light");
+        // Chi chiede il pavimento o piu' e' limitato dal pavimento: puo'
+        // scendere, ma non sotto.
+        assert_eq!(purpose_floor(&pool, "medium").await, "medium");
+        assert_eq!(purpose_floor(&pool, "heavy").await, "medium");
+        assert_eq!(purpose_floor(&pool, "frontier").await, "medium");
     }
 }

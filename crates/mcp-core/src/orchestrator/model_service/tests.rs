@@ -621,3 +621,226 @@ async fn apply_tier_non_scrive_se_nulla_cambia(pool: PgPool) {
         "stesso tier ma fonte piu' autorevole: la provenienza va registrata"
     );
 }
+
+// ── Il pavimento: quando scendere e' un danno, non un ripiego ───────────────
+
+/// IL CASO REALE (misurato sul catalogo il 2026-07-16, riprodotto qui).
+///
+/// Le figure `medium` del consiglio avevano i loro unici candidati su openai e
+/// anthropic; entrambi erano in cooldown per credito esaurito. Con `Degrade` la
+/// catena scendeva a `light` e sceglieva il piu' economico rimasto:
+/// groq/gpt-oss-20b, agentic_index 3.1 contro il 31.1 del modello atteso. Quel
+/// run non falliva — rispondeva FUORI TEMA e si dichiarava `completed`.
+///
+/// Con `Upgrade` lo stesso parco produce un modello PIU' capace del richiesto:
+/// costa di piu', ed e' esattamente cio' che vogliamo pagare.
+#[sqlx::test]
+async fn col_tier_vuoto_e_niente_sotto_il_pavimento_si_sale(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+          performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('groq',      'gpt-oss-20b', true, true, 'none', 'light',  '[\"chat\"]'::jsonb, 0.075), \
+         ('openrouter','glm-5.2',     true, true, 'none', 'high',   '[\"chat\"]'::jsonb, 0.42), \
+         ('anthropic', 'opus-4-7',    true, true, 'none', 'heavy',  '[\"chat\"]'::jsonb, 5.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    // Nessun 'medium' nel parco: e' la situazione del cooldown.
+    let req = ModelRequest::agentic("medium")
+        .tier_policy(TierPolicy::Flexible)
+        .min_tier("medium")
+        .capability(Some("chat"));
+    let scelto = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("il tier superiore ha candidati: si sale");
+
+    assert_eq!(scelto.model, "glm-5.2", "sale al PRIMO tier disponibile (high), non al piu' caro");
+    assert_eq!(scelto.effective_tier.as_deref(), Some("high"));
+    assert_eq!(scelto.shift, TierShift::Upgraded);
+    assert!(!scelto.degraded, "salire NON e' degradare: il flag storico resta falso");
+    assert_eq!(scelto.rationale, "tier=medium:upgraded_to=high");
+    assert_ne!(
+        scelto.model, "gpt-oss-20b",
+        "REGRESSIONE: e' il modello che rispondeva fuori tema dichiarandosi         completed. Se questo test fallisce, il consiglio e' tornato a fidarsi         di un agentic_index 3.1"
+    );
+}
+
+/// Con `Degrade` lo STESSO parco sceglie il light: il discriminante e' la
+/// policy, non i dati. E' la prova che il difetto era la policy.
+#[sqlx::test]
+async fn lo_stesso_parco_con_degrade_cadrebbe_sul_light(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+          performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('groq',      'gpt-oss-20b', true, true, 'none', 'light',  '[\"chat\"]'::jsonb, 0.075), \
+         ('openrouter','glm-5.2',     true, true, 'none', 'high',   '[\"chat\"]'::jsonb, 0.42)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let req = ModelRequest::agentic("medium").capability(Some("chat"));
+    let scelto = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("degradando un candidato c'e'");
+    assert_eq!(
+        scelto.model, "gpt-oss-20b",
+        "Degrade scende: e' il comportamento storico, corretto per i turni dove         un modello debole e' meglio di nessuna risposta"
+    );
+    assert_eq!(scelto.shift, TierShift::Degraded);
+    assert_eq!(scelto.rationale, "tier=medium:degraded_to=light");
+}
+
+/// Il bersaglio resta il bersaglio: se il tier richiesto ha candidati, non si
+/// sale (altrimenti ogni run pagherebbe il tier superiore).
+#[sqlx::test]
+async fn con_upgrade_il_tier_richiesto_vince_se_c_e(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+          performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('mistral',  'giusto', true, true, 'none', 'medium', '[\"chat\"]'::jsonb, 1.5), \
+         ('anthropic','caro',   true, true, 'none', 'heavy',  '[\"chat\"]'::jsonb, 5.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let req = ModelRequest::agentic("medium")
+        .tier_policy(TierPolicy::Flexible)
+        .min_tier("medium")
+        .capability(Some("chat"));
+    let scelto = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect("il medium c'e'");
+    assert_eq!(scelto.model, "giusto");
+    assert_eq!(scelto.shift, TierShift::None);
+    assert_eq!(scelto.rationale, "tier=medium:auto");
+}
+
+/// Se non c'e' nulla NEMMENO salendo, si fallisce in modo TIPIZZATO (I6): il
+/// chiamante convoca chi c'e' o rinuncia, ma nessuno gli passa di nascosto un
+/// modello sotto il pavimento.
+#[sqlx::test]
+async fn se_non_c_e_nulla_sopra_si_fallisce_invece_di_scendere(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+          performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('groq', 'gpt-oss-20b', true, true, 'none', 'light', '[\"chat\"]'::jsonb, 0.075)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let req = ModelRequest::agentic("heavy")
+        .tier_policy(TierPolicy::Flexible)
+        .min_tier("heavy")
+        .capability(Some("chat"));
+    let err = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect_err("sotto il pavimento c'e' solo un light: non e' un candidato");
+    assert!(
+        matches!(err, NoModelReason::ChainExhausted { .. }),
+        "l'esito e' TIPIZZATO, mai un ripiego silenzioso: {err:?}"
+    );
+}
+
+/// I DUE INCIDENTI OPPOSTI, conciliati dalla stessa policy. E' il test che
+/// impedisce di "risolverne" uno riaprendo l'altro — cosa che e' gia' successa:
+/// il fix del 15/07 (degrada, altrimenti il consiglio non si convoca) ha
+/// causato il difetto del 16/07 (degrada troppo, fino a un modello che mente).
+///
+/// Il discriminante non e' la direzione: e' il PAVIMENTO.
+#[sqlx::test]
+async fn il_pavimento_concilia_i_due_incidenti_opposti(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    sqlx::query(
+        "INSERT INTO ai_price_catalog \
+         (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+          performance_tier, capabilities, input_cost_per_million_tokens) VALUES \
+         ('groq',    'gpt-oss-20b',     true, true, 'none', 'light', '[\"chat\"]'::jsonb, 0.075), \
+         ('deepseek','deepseek-v4-pro', true, true, 'none', 'high',  '[\"chat\"]'::jsonb, 0.5)",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+
+    // 15/07 — purpose 'heavy', gli heavy sono spariti (cooldown). Il modello
+    // sano sta UN gradino sotto e vale 36.4 di agentic_index: si DEVE scendere,
+    // altrimenti il consiglio non si convoca affatto.
+    let heavy = ModelRequest::agentic("heavy")
+        .tier_policy(TierPolicy::Flexible)
+        .min_tier("medium")
+        .capability(Some("chat"));
+    let scelto = select_model_with_gate(&pool, &heavy, gate(false))
+        .await
+        .expect("scendere di un gradino e' ammesso: sopra il pavimento");
+    assert_eq!(scelto.model, "deepseek-v4-pro");
+    assert_eq!(scelto.shift, TierShift::Degraded, "e' una degradazione, e va bene");
+
+    // 16/07 — purpose 'medium', i medium sono spariti (stesso cooldown). Sotto
+    // c'e' solo il light che mente: NON si scende, si sale.
+    let medium = ModelRequest::agentic("medium")
+        .tier_policy(TierPolicy::Flexible)
+        .min_tier("medium")
+        .capability(Some("chat"));
+    let scelto = select_model_with_gate(&pool, &medium, gate(false))
+        .await
+        .expect("sopra il pavimento c'e' un high: si sale");
+    assert_eq!(
+        scelto.model, "deepseek-v4-pro",
+        "REGRESSIONE: se qui compare gpt-oss-20b, il consiglio e' tornato a         fidarsi di un agentic_index 3.1 che si dichiara completed"
+    );
+    assert_eq!(scelto.shift, TierShift::Upgraded);
+}
+
+/// `Flexible` senza pavimento e' una degradazione senza freni con un nome
+/// rassicurante: il servizio la RIFIUTA (I8) invece di scegliere un default
+/// implicito, che e' come nascono i difetti di questo modulo.
+#[sqlx::test]
+async fn flexible_senza_pavimento_e_una_richiesta_invalida(pool: PgPool) {
+    create_ai_price_catalog_table(&pool).await;
+    let req = ModelRequest {
+        min_tier: None,
+        ..ModelRequest::agentic("medium").tier_policy(TierPolicy::Flexible)
+    };
+    let err = select_model_with_gate(&pool, &req, gate(false))
+        .await
+        .expect_err("senza pavimento la policy non ha significato");
+    assert!(matches!(err, NoModelReason::InvalidRequest(_)), "{err:?}");
+}
+
+/// La catena di `Flexible`: bersaglio, poi giu' FINO al pavimento, poi su.
+/// Nessun tier sotto il pavimento vi compare mai, per nessun bersaglio.
+#[test]
+fn la_catena_flexible_non_scende_mai_sotto_il_pavimento() {
+    for tier in ["light", "medium", "high", "heavy", "frontier"] {
+        let req = ModelRequest::agentic(tier)
+            .tier_policy(TierPolicy::Flexible)
+            .min_tier("medium");
+        let chain = chain_for(&req);
+        assert!(
+            chain.iter().all(|t| tier_rank(t) >= tier_rank("medium")),
+            "bersaglio {tier}: la catena {chain:?} scende sotto il pavimento"
+        );
+        assert_eq!(chain.first(), Some(&tier).filter(|t| tier_rank(t) >= 2).or(Some(&"medium")),
+            "il bersaglio (o il pavimento, se il bersaglio e' sotto) va provato per primo: {chain:?}");
+        // Nessun duplicato: la coda ascendente non ripete cio' che la discendente
+        // ha gia' incluso.
+        let mut visti = chain.clone();
+        visti.sort_unstable();
+        visti.dedup();
+        assert_eq!(visti.len(), chain.len(), "catena con duplicati: {chain:?}");
+    }
+    // Bersaglio heavy, pavimento medium: giu' fino a medium, poi frontier.
+    let req = ModelRequest::agentic("heavy")
+        .tier_policy(TierPolicy::Flexible)
+        .min_tier("medium");
+    assert_eq!(chain_for(&req), vec!["heavy", "high", "medium", "frontier"]);
+}
