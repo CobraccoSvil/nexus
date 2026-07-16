@@ -290,6 +290,37 @@ else
   echo "OK tier-write: il tier si scrive solo dal punto unico (apply_tier)"
 fi
 
+# Il nome del modello e' OPACO (2026-07-16): la slash in `openai/gpt-oss-120b`
+# (groq) o `z-ai/glm-5.2` (openrouter) e' parte del NOME pubblicato dal
+# provider, non il separatore della nostra convenzione `provider/modello`.
+# Toglierla senza verificare che il prefisso sia DAVVERO il provider produce un
+# nome mutilato e un 404: misurato contro l'API di groq,
+#   openai/gpt-oss-120b -> 200 | gpt-oss-120b -> 404.
+#
+# La regola viveva in due copie divergenti (`strip_model_prefix` in routes.rs
+# strippava alla cieca, `strip_provider_prefix` nel resolver alias no) e il
+# commento della prima ammetteva "allineato a ... qui in locale". Ora e' una
+# sola funzione, e questo guard impedisce che ne nasca un'altra.
+split_cieco="$(grep -rEn \
+  "(model|modello)[a-z_]*\.split(_once)?\('/'\)" \
+  crates/nexus-gateway/src \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v 'model_alias_resolver.rs' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$split_cieco" ]]; then
+  echo "!! model-name-opaco: split del nome modello fuori dal punto unico:" >&2
+  echo "$split_cieco" >&2
+  echo "   Il nome di un modello e' OPACO: una slash NON significa provider/modello" >&2
+  echo "   (groq: openai/gpt-oss-120b, openrouter: z-ai/glm-5.2 — la slash e' nel nome)." >&2
+  echo "   Usa model_alias_resolver::strip_provider_prefix(model, provider): toglie il" >&2
+  echo "   prefisso solo se e' davvero il provider di destinazione." >&2
+  fail=1
+else
+  echo "OK model-name-opaco: il nome del modello si splitta solo nel punto unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

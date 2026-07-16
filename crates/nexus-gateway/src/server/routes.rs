@@ -38,7 +38,7 @@ use crate::batch::{
 };
 use crate::cooldown::{CooldownManager, RetryPolicy};
 use crate::history_sanitizer::{self, SanitizeMode};
-use crate::model_alias_resolver::ModelAliasResolver;
+use crate::model_alias_resolver::{strip_provider_prefix, ModelAliasResolver};
 use crate::provider::LlmProvider;
 use crate::providers::{classify_provider_error, ProviderErrorKind, ProviderHttpError};
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
@@ -440,20 +440,11 @@ fn resolve_pinned_provider(
     };
     Ok(ResolvedProvider {
         provider: provider.clone(),
-        // Strip del prefisso "provider/" se presente; modello as-is altrimenti.
-        model: strip_model_prefix(logical_model),
+        // Strip del prefisso SOLO se e' davvero il provider di destinazione: la
+        // slash in `openai/gpt-oss-120b` (groq) o `z-ai/glm-5.2` (openrouter)
+        // e' parte del NOME, non un separatore nostro.
+        model: strip_provider_prefix(logical_model, pin),
     })
-}
-
-/// Rimuove il prefisso `provider/` da `provider/modello`, ritornando tutto cio'
-/// che segue il primo `/`. Senza `/` ritorna la stringa invariata. Allineato a
-/// `strip_provider_prefix` del resolver alias, qui in locale per il path pin
-/// (non passa dall'alias resolver).
-fn strip_model_prefix(model: &str) -> String {
-    match model.split_once('/') {
-        Some((_, rest)) => rest.to_string(),
-        None => model.to_string(),
-    }
 }
 
 /// Esegue il fallback sui provider risolti: prova in ordine, con retry sullo
@@ -1315,7 +1306,9 @@ async fn run_generate_image(
         body.pin_provider.as_deref(),
         &state.cooldown,
     )?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L): stima dal prompt come singolo messaggio user.
@@ -1459,7 +1452,9 @@ async fn run_generate_video(
     // primo video-capable non in cooldown.
     let provider =
         select_video_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L): stima dal prompt come singolo messaggio user.
@@ -1598,7 +1593,9 @@ async fn run_transcribe_audio(
     // primo audio-capable non in cooldown.
     let provider =
         select_audio_in_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L). Il testo risultante non e' noto a priori e
@@ -1739,7 +1736,9 @@ async fn run_text_to_speech(
     // primo audio-out-capable non in cooldown.
     let provider =
         select_audio_out_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L). A differenza di transcribe, qui l'input testuale
