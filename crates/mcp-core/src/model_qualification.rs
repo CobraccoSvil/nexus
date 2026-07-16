@@ -1404,12 +1404,32 @@ struct RoundConfig {
 /// ri-provati IN SHADOW: lo state resta 'qualified' (il pool non si svuota durante
 /// la ri-qualificazione); il lock del claim e' qualification_started_at (stantio
 /// oltre STALE_PROBING_MINUTES = worker morto, riclaimabile).
+/// I candidati del giro. Il filtro sul COOLDOWN sta QUI, non solo a valle:
+/// `qualify_claimed` controlla `is_provider_in_cooldown` col commento "non
+/// sprecare il giro", ma a quel punto il giro e' gia' speso — il claim ha
+/// consumato uno dei `max_per_round` posti per un modello che verra' scartato
+/// in 10 millisecondi.
+///
+/// Misurato il 2026-07-16, dopo il fix del panic: due giri consecutivi hanno
+/// reclamato 8 modelli, TUTTI di openai/anthropic (in cooldown per
+/// `credit_balance_too_low`), e li hanno buttati tutti. Non e' sfortuna: quei
+/// due provider sono 76 modelli su 116 e l'ORDER BY per scadenza li pesca
+/// quasi sempre. A 4 per giro ogni 30 minuti servivano ~9 ore per smaltirli
+/// prima di toccare i 34 modelli misurabili — cioe' il "tier dai fatti" non
+/// avrebbe misurato nulla per un'intera giornata, con la batteria che girava
+/// e sembrava sana.
+///
+/// Il filtro usa `nexus_provider_health.billing_cooldown_until` (la fonte
+/// PERSISTENTE del cooldown lungo, ADR 0020/0030). Il cooldown breve vive in
+/// memoria e non e' interrogabile da SQL: per quello resta il check a valle,
+/// che da rete di sicurezza torna a essere cio' che deve essere — un caso raro,
+/// non la norma.
 const SQL_CLAIM: &str = "UPDATE ai_price_catalog c SET \
      qualification_state = CASE WHEN c.qualification_state = 'qualified' \
                                 THEN 'qualified' ELSE 'probing' END, \
      qualification_started_at = NOW() \
  FROM ( \
-     SELECT provider, model FROM ai_price_catalog \
+     SELECT provider, model FROM ai_price_catalog p \
       WHERE is_enabled = TRUE AND supports_tool_use = TRUE \
         AND (qualification_backoff_until IS NULL OR qualification_backoff_until < NOW()) \
         AND (qualification_started_at IS NULL \
@@ -1418,6 +1438,9 @@ const SQL_CLAIM: &str = "UPDATE ai_price_catalog c SET \
              OR (qualification_state = 'qualified' \
                  AND (qualification_expires_at < NOW() \
                       OR qualification_suite_version < $3))) \
+        AND NOT EXISTS (SELECT 1 FROM nexus_provider_health h \
+                         WHERE h.provider = p.provider \
+                           AND h.billing_cooldown_until > NOW()) \
       ORDER BY (qualification_state = 'unqualified') DESC, \
                qualification_expires_at ASC NULLS FIRST \
       LIMIT $1 \
@@ -2093,6 +2116,74 @@ mod tests {
             profiles[1].certifies_tier, None,
             "NULL resta NULL: un profilo che qualifica senza certificare una banda"
         );
+    }
+
+    /// Il claim NON spende un posto del giro per un modello che verra' buttato.
+    ///
+    /// Il check `is_provider_in_cooldown` in `qualify_claimed` dice "non sprecare
+    /// il giro", ma scatta DOPO il claim: il posto e' gia' consumato. Misurato il
+    /// 2026-07-16 sul sistema vivo: due giri di fila hanno reclamato 8 modelli,
+    /// tutti di openai/anthropic in cooldown per credito esaurito, e li hanno
+    /// scartati in 10ms — 76 modelli su 116 stanno su quei due provider, quindi
+    /// servivano ~9 ore di giri a vuoto prima di toccare un modello misurabile.
+    /// La batteria girava, sembrava sana, e non misurava nulla.
+    #[sqlx::test]
+    async fn il_claim_salta_i_provider_in_cooldown_invece_di_sprecarci_il_giro(pool: PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // `qualification_state` e `qualification_expires_at` le crea gia'
+        // l'helper: qui solo le colonne del CLAIM che gli mancano.
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog \
+               ADD COLUMN qualification_suite_version INT, \
+               ADD COLUMN qualification_started_at TIMESTAMPTZ, \
+               ADD COLUMN qualification_backoff_until TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne qualification");
+        // La fonte PERSISTENTE del cooldown lungo (ADR 0020).
+        sqlx::query(
+            "CREATE TABLE nexus_provider_health ( \
+               provider TEXT PRIMARY KEY, \
+               billing_cooldown_until TIMESTAMPTZ)",
+        )
+        .execute(&pool)
+        .await
+        .expect("health");
+        sqlx::query(
+            "INSERT INTO nexus_provider_health (provider, billing_cooldown_until) VALUES \
+             ('openai', NOW() + INTERVAL '6 hours'), \
+             ('mistral', NOW() - INTERVAL '1 hour')",
+        )
+        .execute(&pool)
+        .await
+        .expect("cooldown");
+        // openai e' il piu' "urgente" per l'ORDER BY (unqualified, scadenza
+        // NULL): senza il filtro vincerebbe entrambi i posti del giro.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, is_enabled, supports_tool_use, qualification_state) VALUES \
+             ('openai',  'gpt-in-cooldown-1', true, true, 'unqualified'), \
+             ('openai',  'gpt-in-cooldown-2', true, true, 'unqualified'), \
+             ('mistral', 'sano',              true, true, 'unqualified'), \
+             ('google',  'sano-2',            true, true, 'unqualified')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let claimed = claim_candidates(&pool, 2, 2).await;
+
+        let modelli: Vec<&str> = claimed.iter().map(|(_, m, _)| m.as_str()).collect();
+        assert_eq!(claimed.len(), 2, "il giro deve riempire i suoi posti: {modelli:?}");
+        assert!(
+            !modelli.iter().any(|m| m.contains("cooldown")),
+            "REGRESSIONE: il claim ha speso un posto per un modello di un provider \
+             in cooldown, che verra' buttato in 10ms. Reclamati: {modelli:?}"
+        );
+        // Il provider il cui cooldown e' SCADUTO torna candidabile: il filtro
+        // guarda l'orologio, non la presenza della riga.
+        assert!(modelli.contains(&"sano"), "mistral (cooldown scaduto) e' candidabile: {modelli:?}");
     }
 
     /// FRONTIER: il needle sta a META' della history, mai nel system prompt.
