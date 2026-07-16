@@ -31,15 +31,19 @@ export async function PUT(
       body,
     });
 
-    if (!response.ok) {
+    const data = await response.json().catch(() => null);
+
+    // Lo status di mcp-core passa intatto (200 aggiornata, 404 chiave assente,
+    // 500 rifiutata dal DB), e con esso il body: contiene il motivo del rifiuto
+    // — es. il guard sui setting protetti della mig 0499. Sostituirlo con lo
+    // status testuale lascerebbe l'admin senza la ragione dell'errore.
+    if (data === null) {
       return NextResponse.json(
         { error: `Errore mcp-core: ${response.status} ${response.statusText}` },
-        { status: response.status },
+        { status: response.ok ? 502 : response.status },
       );
     }
-
-    const data = await response.json();
-    return NextResponse.json(data);
+    return NextResponse.json(data, { status: response.status });
   } catch (err) {
     console.error("[api/admin/setting/[key]] Errore connessione mcp-core:", err);
     return NextResponse.json(

@@ -57,6 +57,17 @@ pub struct AgentNodeCtx {
     /// degrada a `Sequential` (comportamento invariato). Con flag OFF il probe
     /// NON viene eseguito (corto-circuito): costo zero sul percorso normale.
     pub isolation_available: bool,
+    /// Osservatore della BARRIERA DI SCRITTURA advisory (overlap consiglio ∥ run,
+    /// mig 0606). `None` = nessun overlap (ramo legacy: il run parte solo DOPO i
+    /// panel, e i loro verdetti sono gia' nello stato iniziale) -> il gate del
+    /// ToolDispatchNode e' inerte, comportamento bit-identico.
+    ///
+    /// `Some(rx)`: il run e' partito SUBITO, mentre i panel deliberano in
+    /// parallelo. I tool read-only girano liberi (la ricognizione e' il grosso
+    /// del lavoro iniziale e non ha bisogno del consiglio); il primo tool
+    /// MUTATIVO attende che la barriera si sciolga. E' un `watch`: leggerlo non
+    /// consuma nulla, e chi arriva tardi vede subito l'ultimo stato.
+    pub advisory_gate: Option<tokio::sync::watch::Receiver<crate::nodes::AdvisoryGateState>>,
 }
 
 impl AgentNodeCtx {

@@ -5,6 +5,7 @@ export const en = {
     "admin.appearance": "Appearance",
     "admin.appearance.desc": "Choose how Nexus looks. Changes are saved automatically.",
     "admin.council": "Competency Council",
+    "admin.sizing.nav": "Sizing",
     "admin.users": "Users",
     "admin.users.desc": "Manage system users.",
     "admin.users.placeholder": "Users who have signed in via GitHub will appear here.",

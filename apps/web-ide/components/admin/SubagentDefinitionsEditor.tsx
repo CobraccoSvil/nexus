@@ -16,11 +16,16 @@ import {
   type SubagentDefinition,
   type OrchestratorSubagentRun,
 } from "../../lib/api-client";
+import { AdminModal } from "./AdminModal";
+import { FigureWizard } from "./FigureWizard";
 
+/** Solo MODIFICA di una definition esistente: la creazione passa dal FigureWizard,
+ *  che crea i quattro pezzi in transazione. Il ramo "nuovo kind" viveva qui e
+ *  creava la sola definition, lasciando il kind muto (senza prompt, senza purpose,
+ *  fuori dalla whitelist del dispatcher).
+ *  Il kind non e' mai editabile: l'upsert e' ON CONFLICT (kind), rinominarlo
+ *  creerebbe una riga duplicata invece di rinominare. */
 interface EditState {
-  /** true = creazione: il kind e' editabile. In modifica il kind e' bloccato
-   *  (l'upsert e' ON CONFLICT (kind): rinominare creerebbe una riga duplicata). */
-  isNew: boolean;
   kind: string;
   description: string;
   promptKey: string;
@@ -32,21 +37,6 @@ interface EditState {
   isEnabled: boolean;
 }
 
-function emptyEdit(): EditState {
-  return {
-    isNew: true,
-    kind: "",
-    description: "",
-    promptKey: "",
-    toolWhitelistCsv: "list_files,read_file,search_in_files",
-    modelPurpose: "planner",
-    maxIterations: "25",
-    timeoutS: "300",
-    isBackground: false,
-    isEnabled: true,
-  };
-}
-
 export function SubagentDefinitionsEditor() {
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
@@ -55,6 +45,7 @@ export function SubagentDefinitionsEditor() {
   const [recentRuns, setRecentRuns] = useState<Record<string, OrchestratorSubagentRun[]>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -108,13 +99,8 @@ export function SubagentDefinitionsEditor() {
     }
   };
 
-  const startEdit = (def?: SubagentDefinition) => {
-    if (!def) {
-      setEditing(emptyEdit());
-      return;
-    }
+  const startEdit = (def: SubagentDefinition) => {
     setEditing({
-      isNew: false,
       kind: def.kind,
       description: def.description ?? "",
       promptKey: def.promptKey,
@@ -153,7 +139,7 @@ export function SubagentDefinitionsEditor() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <a href="/admin/orchestrator" style={{ padding: "6px 12px", border: `1px solid ${tc.border}`, borderRadius: 4, textDecoration: "none", color: tc.text }}>← Orchestrator</a>
-          <button onClick={() => startEdit()} style={{ padding: "6px 12px", background: "#2563eb", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>+ Nuovo kind</button>
+          <button onClick={() => setWizardOpen(true)} style={{ padding: "6px 12px", background: "#2563eb", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>+ Nuova figura</button>
         </div>
       </header>
 
@@ -217,14 +203,25 @@ export function SubagentDefinitionsEditor() {
         </tbody>
       </table>
 
-      {editing && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", justifyContent: "center", alignItems: "center" }} onClick={() => setEditing(null)}>
-          <div onClick={(e) => e.stopPropagation()} style={{ background: tc.bg, color: tc.text, padding: 24, borderRadius: 8, width: 560, maxHeight: "90vh", overflowY: "auto" }}>
-            <h2 style={{ marginTop: 0 }}>{editing.isNew ? "Nuovo sub-agent kind" : `Edit '${editing.kind}'`}</h2>
+      <FigureWizard
+        open={wizardOpen}
+        onClose={() => setWizardOpen(false)}
+        onCreated={() => void reload()}
+      />
+
+      {/* Modale su AdminModal (punto unico): il backdrop + dialog inline che stavano
+          qui duplicavano esattamente cio' che AdminModal esiste per centralizzare. */}
+      <AdminModal
+        open={editing !== null}
+        onClose={() => setEditing(null)}
+        title={editing ? `Edit '${editing.kind}'` : undefined}
+        maxWidth={560}
+      >
+        {editing && (
             <div style={{ display: "grid", gap: 12 }}>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
-                <span>Kind (slug a-z_){editing.isNew ? "" : " — non modificabile"}</span>
-                <input value={editing.kind} disabled={!editing.isNew} onChange={(e) => setEditing((s) => s && { ...s, kind: e.target.value })} style={{ ...fieldStyle(tc), opacity: editing.isNew ? 1 : 0.6 }} />
+                <span>Kind — non modificabile</span>
+                <input value={editing.kind} disabled style={{ ...fieldStyle(tc), opacity: 0.6 }} />
               </label>
               <label style={{ display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
                 <span>Description (usato per auto-delegation by description)</span>
@@ -267,9 +264,8 @@ export function SubagentDefinitionsEditor() {
                 <button onClick={handleSave} style={{ padding: "6px 12px", background: "#2563eb", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>Save</button>
               </div>
             </div>
-          </div>
-        </div>
-      )}
+        )}
+      </AdminModal>
     </div>
   );
 }

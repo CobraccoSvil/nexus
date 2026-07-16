@@ -96,7 +96,8 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::hitl::{
-    build_pending_actions_json, should_suspend_for_hitl, HITL_PENDING_ACTIONS_EXTRA_KEY,
+    build_pending_actions_json, pending_contains_mutator, should_suspend_for_hitl,
+    HITL_PENDING_ACTIONS_EXTRA_KEY,
 };
 use crate::decisions::m16::DiscoveredTool;
 use crate::decisions::predictive_cap::{
@@ -158,6 +159,81 @@ pub const PANEL_ENFORCEMENT_KEY: &str = "agentic_panel_enforcement";
 /// (panel multi-provider o consiglio a monte). Il coordinatore legge questo
 /// segnale (regola M), non il blocco testuale in `initial_msg`.
 pub const PRE_RUN_ADVISORY_SYNTHESIS_KEY: &str = "pre_run_advisory_synthesis";
+
+/// Chiave extra nello stato: esito della BARRIERA DI SCRITTURA advisory
+/// (overlap consiglio ∥ run, mig 0606). Segnale strutturato (regola M) con la
+/// forma `{status, reason_code?}`: la UI e il resoconto sanno DA QUI se il run
+/// ha atteso il consiglio, se e' partito perche' il panel non ha risposto, o se
+/// e' stato fermato dal veto — senza dedurlo dalla prosa.
+pub const ADVISORY_GATE_KEY: &str = "advisory_gate";
+
+/// Nota iniettata quando la barriera si scioglie SENZA un verdetto utilizzabile
+/// (panel morto o timeout): il modello deve sapere che sta procedendo senza
+/// approvazione, non credere di averla ricevuta (regola M — un'assenza di
+/// verdetto non e' un verdetto favorevole).
+const GATE_UNAVAILABLE_NOTE: &str = "Il consiglio di analisi NON ha prodotto un parere \
+utilizzabile in tempo per questa modifica: procedi pure, ma sappi che NON hai \
+un'approvazione — nessuno ha validato l'approccio. Sii conservativo: preferisci la \
+modifica minima e reversibile, e dichiara nel resoconto che il parere e' mancato.";
+
+/// Esito della barriera per il chiamante.
+enum AdvisoryBarrier {
+    /// Nessuna barriera applicabile: il turno prosegue invariato (bit-identico).
+    Inert,
+    /// Barriera sciolta: il turno prosegue con `extra` aggiornato (esito del gate
+    /// + eventuale enforcement) e un promemoria da mettere davanti al modello
+    /// PRIMA che scriva.
+    Proceed {
+        extra: serde_json::Map<String, Value>,
+        reminder: Option<String>,
+    },
+    /// Veto: il turno si chiude qui.
+    Veto(OpaqueDelta),
+}
+
+/// Promemoria dei vincoli del consiglio, reso dai campi STRUTTURATI
+/// dell'enforcement (regola M). Il modello sta per SCRIVERE: i requisiti gli
+/// servono ora, non a fine run.
+fn render_gate_requirements(enforcement: &Value) -> String {
+    let verdict = enforcement
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let summary = enforcement
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!(
+        "Il consiglio di analisi ha deliberato mentre lavoravi (verdetto: {verdict}). \
+         Prima di modificare il codice, incorpora i suoi vincoli: {summary}"
+    )
+}
+
+/// Stato della barriera di scrittura advisory, osservato dal ToolDispatchNode
+/// via `watch::Receiver` (vedi [`crate::runtime::ctx::AgentNodeCtx::advisory_gate`]).
+///
+/// Perche' un `watch` e non un `mpsc`: e' uno STATO CORRENTE, non una coda di
+/// eventi. Il nodo puo' osservarlo a ogni iterazione (o mai, se il run non
+/// scrive nulla) e i late-joiner leggono l'ultimo valore senza consumarlo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvisoryGateState {
+    /// I panel a monte stanno ancora deliberando: la ricognizione read-only
+    /// procede, la prima SCRITTURA attende.
+    Pending,
+    /// Il consiglio ha deliberato e non veta: si puo' scrivere. `enforcement`
+    /// porta i requisiti da iniettare come promemoria prima della modifica
+    /// (`None` = via libera piena, nessun vincolo da ricordare).
+    Released { enforcement: Option<Value> },
+    /// Veto del consiglio: il run va fermato PRIMA della prima modifica.
+    /// `enforcement` e' gia' nella forma di `PANEL_ENFORCEMENT_KEY` (terminal),
+    /// cosi' l'edge esistente `terminal_panel_veto` lo instrada al Learner senza
+    /// routing nuovo.
+    Vetoed { enforcement: Value },
+    /// Il panel non e' arrivato a un esito utilizzabile (roster morto, errore di
+    /// convocazione, kill-switch): il run PROSEGUE, ma il motivo e' DICHIARATO
+    /// (regola M) e va detto al modello — inconclusive non e' un'approvazione.
+    Unavailable { reason_code: String },
+}
 
 /// Chiave del segnale strutturato (regola M) emesso da `dispatch_subagent(s)` in
 /// modalita' background: `true` -> il padre si sospende in attesa del fan-in.
@@ -224,8 +300,16 @@ pub struct ToolDispatchConfig {
     /// tool_result vengono compressi (offload + troncamento testa+coda).
     pub max_context_chars: usize,
     /// Tool mutativi (setting `agent.tools.result_cache_mutators`): usati dal
-    /// gate HITL in modalita' Conferma (punto unico `decisions::hitl`).
+    /// gate HITL in modalita' Conferma e dalla BARRIERA DI SCRITTURA advisory
+    /// (punto unico `decisions::hitl`, stessa domanda: "questo tool muta lo
+    /// stato?").
     pub fs_mutator_tools: Vec<String>,
+    /// Attesa massima (secondi) della barriera di scrittura advisory prima di
+    /// procedere senza il verdetto del consiglio
+    /// (`orchestrator.advisory_gate_timeout_s`, mig 0606). Il chiamante lo
+    /// clampa alla deadline residua del run: una barriera che attende oltre la
+    /// deadline produrrebbe un `time_budget` mascherato da gate.
+    pub advisory_gate_timeout_s: u64,
 }
 
 impl Default for ToolDispatchConfig {
@@ -249,6 +333,10 @@ impl Default for ToolDispatchConfig {
             fs_mutator_tools: crate::routing::RoutingConfig::default()
                 .fs_mutator_tools
                 .clone(),
+            // Safe-default = il timeout tipico di un panel a monte (mig 0546:
+            // 240-300s per figura). Vale solo se il DB tace; il valore vero e'
+            // orchestrator.advisory_gate_timeout_s (mig 0606).
+            advisory_gate_timeout_s: 300,
         }
     }
 }
@@ -361,6 +449,128 @@ impl ToolDispatchNode {
             &self.cfg.always_on_tools,
             M16_BRAIN_TOOLS,
         )
+    }
+
+    /// BARRIERA DI SCRITTURA advisory (overlap consiglio ∥ run, mig 0606).
+    ///
+    /// Inerte (zero costo) quando: non c'e' canale (ramo legacy: il run e'
+    /// partito DOPO i panel), la barriera si e' gia' sciolta in questo run,
+    /// oppure il batch non contiene tool mutativi — la ricognizione read-only
+    /// non aspetta nessuno, ed e' proprio questo che rende l'overlap utile.
+    async fn advisory_barrier(
+        &self,
+        state: &AgentState,
+        pending: &[Value],
+        ctx: &AgentNodeCtx,
+    ) -> AdvisoryBarrier {
+        let Some(mut rx) = ctx.advisory_gate.clone() else {
+            return AdvisoryBarrier::Inert;
+        };
+        // La barriera scatta al massimo UNA volta per run: dopo lo scioglimento
+        // lo stato porta l'esito e non si attende piu'.
+        if state.extra.contains_key(ADVISORY_GATE_KEY) {
+            return AdvisoryBarrier::Inert;
+        }
+        // Punto unico "tool mutativo" (regola L): lo STESSO del gate HITL.
+        if !pending_contains_mutator(pending, &self.cfg.fs_mutator_tools) {
+            return AdvisoryBarrier::Inert;
+        }
+        let resolved = self.await_gate(&mut rx).await;
+        self.apply_gate_outcome(state, resolved)
+    }
+
+    /// Attende che la barriera esca da `Pending`, entro il timeout configurato.
+    /// Non attende mai per sempre: un panel che non risponde NON deve congelare
+    /// il run (sarebbe un deadlock mascherato da attesa).
+    async fn await_gate(
+        &self,
+        rx: &mut tokio::sync::watch::Receiver<AdvisoryGateState>,
+    ) -> AdvisoryGateState {
+        {
+            let now = rx.borrow_and_update().clone();
+            if now != AdvisoryGateState::Pending {
+                return now;
+            }
+        }
+        tracing::info!(
+            target: "nexus_agent_graph::tool_dispatch",
+            timeout_s = self.cfg.advisory_gate_timeout_s,
+            "barriera advisory: prima scrittura in attesa del verdetto dei panel a monte"
+        );
+        let wait = rx.wait_for(|s| *s != AdvisoryGateState::Pending);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(self.cfg.advisory_gate_timeout_s),
+            wait,
+        )
+        .await
+        {
+            Ok(Ok(v)) => v.clone(),
+            // Sender droppato: il task dei panel e' morto senza dichiarare nulla.
+            // Non e' un'approvazione: e' un'assenza, e va detta (regola M).
+            Ok(Err(_)) => AdvisoryGateState::Unavailable {
+                reason_code: "advisory_channel_closed".to_string(),
+            },
+            Err(_) => AdvisoryGateState::Unavailable {
+                reason_code: "advisory_gate_timeout".to_string(),
+            },
+        }
+    }
+
+    /// Traduce l'esito della barriera: veto -> chiusura terminale; release ->
+    /// enforcement + promemoria dei vincoli PRIMA della scrittura; indisponibile
+    /// -> si procede, ma dichiarandolo al modello (inconclusive non e' un via
+    /// libera).
+    fn apply_gate_outcome(&self, state: &AgentState, resolved: AdvisoryGateState) -> AdvisoryBarrier {
+        let mut extra = state.extra.clone();
+        match resolved {
+            // Non raggiungibile (await_gate esce solo su non-Pending), difensivo.
+            AdvisoryGateState::Pending => AdvisoryBarrier::Inert,
+            AdvisoryGateState::Vetoed { enforcement } => {
+                extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), enforcement);
+                extra.insert(ADVISORY_GATE_KEY.to_string(), json!({ "status": "vetoed" }));
+                tracing::warn!(
+                    target: "nexus_agent_graph::tool_dispatch",
+                    "barriera advisory: VETO del consiglio prima della prima scrittura -> run fermato"
+                );
+                // L'edge esistente (graph.rs: terminal_panel_veto -> Learner)
+                // instrada la chiusura: nessun routing nuovo (regola L).
+                AdvisoryBarrier::Veto(
+                    StateDelta {
+                        extra: Some(extra),
+                        stop_reason: Some(Some(StopReason::EndTurn)),
+                        ..Default::default()
+                    }
+                    .into_opaque(),
+                )
+            }
+            AdvisoryGateState::Released { enforcement } => {
+                let reminder = enforcement.as_ref().map(render_gate_requirements);
+                if let Some(e) = enforcement {
+                    extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), e);
+                }
+                extra.insert(ADVISORY_GATE_KEY.to_string(), json!({ "status": "released" }));
+                tracing::info!(
+                    target: "nexus_agent_graph::tool_dispatch",
+                    "barriera advisory: verdetto arrivato, la scrittura procede"
+                );
+                AdvisoryBarrier::Proceed { extra, reminder }
+            }
+            AdvisoryGateState::Unavailable { reason_code } => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::tool_dispatch",
+                    reason_code = %reason_code,
+                    "barriera advisory: nessun verdetto utilizzabile, il run procede SENZA approvazione"
+                );
+                extra.insert(
+                    ADVISORY_GATE_KEY.to_string(),
+                    json!({ "status": "unavailable", "reason_code": reason_code }),
+                );
+                AdvisoryBarrier::Proceed {
+                    extra,
+                    reminder: Some(GATE_UNAVAILABLE_NOTE.to_string()),
+                }
+            }
+        }
     }
 
     /// Insieme dei nomi dei tool scoperti nel turno precedente
@@ -711,6 +921,17 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             .into_opaque());
         }
 
+        // ── (2c) BARRIERA DI SCRITTURA advisory (overlap, mig 0606) ───────────
+        // Il run e' partito mentre i panel a monte deliberavano: la ricognizione
+        // read-only e' gia' andata avanti, ma la prima MODIFICA deve attendere il
+        // verdetto. Gemello del gate HITL qui sopra: stessa domanda ("questo
+        // batch muta lo stato?"), stesso punto unico (`fs_mutator_tools`).
+        let (gate_extra, gate_reminder) = match self.advisory_barrier(state, &pending, ctx).await {
+            AdvisoryBarrier::Veto(delta) => return Ok(delta),
+            AdvisoryBarrier::Proceed { extra, reminder } => (Some(extra), reminder),
+            AdvisoryBarrier::Inert => (None, None),
+        };
+
         // ── (3) Loop sui pending: cap predittivo / M16 / budget allegati ──────
         let ctx_chars = estimate_context_chars(
             &state
@@ -991,6 +1212,12 @@ dell'utente.";
         if let Some(enforcement) = &panel_enforcement {
             final_blocks.push(json!({"type": "text", "text": enforcement.prompt_block()}));
         }
+        // Promemoria della BARRIERA: i vincoli del consiglio (o la sua assenza)
+        // arrivano al modello nello stesso turno in cui ha scritto, non a fine
+        // run — e' l'unico momento in cui puo' ancora tenerne conto.
+        if let Some(txt) = &gate_reminder {
+            append_reminder_block(&mut final_blocks, txt);
+        }
         if let Some(txt) = &reminder_text {
             append_reminder_block(&mut final_blocks, txt);
         }
@@ -1163,14 +1390,19 @@ dell'utente.";
         if infra_error {
             delta.tool_infra_error = Some(Some(true));
         }
+        // L'extra finale parte da quello aggiornato dalla BARRIERA se si e'
+        // sciolta in questo turno (altrimenti il suo esito andrebbe perso), e
+        // l'enforcement dei panel dispatchati vi si somma sopra.
         if let Some(enforcement) = &panel_enforcement {
-            let mut extra = state.extra.clone();
+            let mut extra = gate_extra.unwrap_or_else(|| state.extra.clone());
             extra.insert(PANEL_ENFORCEMENT_KEY.to_string(), enforcement.to_value());
             delta.extra = Some(extra);
             if enforcement.terminal {
                 delta.result = Some(Some(enforcement.summary.clone()));
                 delta.stop_reason = Some(Some(StopReason::EndTurn));
             }
+        } else if let Some(extra) = gate_extra {
+            delta.extra = Some(extra);
         }
         // Fase D fan-in: almeno un `dispatch_subagent(s)` background ha risposto col
         // segnale strutturato -> il padre si sospende. Il motore interrompe su
@@ -1820,6 +2052,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
             shadow,
+            advisory_gate: None,
         }
     }
 
@@ -1917,6 +2150,243 @@ mod tests {
                 .is_some_and(|a| !a.is_empty())
         );
         assert!(steps.steps.lock().unwrap().is_empty(), "nessun tool eseguito");
+    }
+
+    // ── Barriera di scrittura advisory (overlap, mig 0606) ───────────────────
+
+    /// Ctx con la barriera armata sullo stato dato.
+    fn ctx_with_gate(
+        state: AdvisoryGateState,
+    ) -> (
+        AgentNodeCtx,
+        tokio::sync::watch::Sender<AdvisoryGateState>,
+    ) {
+        let (tx, rx) = tokio::sync::watch::channel(state);
+        let mut ctx = ctx_with(false, CancellationToken::new());
+        ctx.advisory_gate = Some(rx);
+        (ctx, tx)
+    }
+
+    fn enforcement_terminale() -> Value {
+        json!({
+            "source": "council_synthesis",
+            "verdict": "block",
+            "terminal": true,
+            "summary": "Il consiglio veta: il fix e' una toppa.",
+            "payload": {},
+        })
+    }
+
+    fn writer_node() -> (ToolDispatchNode, Arc<StubAgentStepStore>) {
+        let (n, steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(
+                MapToolExecutor::new().with(
+                    "write_file",
+                    ToolOutcome {
+                        tool_call_id: "w1".into(),
+                        content: json!("scritto"),
+                        is_error: false,
+                        ..Default::default()
+                    },
+                ),
+            ),
+        );
+        (n, steps)
+    }
+
+    #[tokio::test]
+    async fn barriera_i_tool_read_only_non_attendono_il_consiglio() {
+        // E' il senso dell'overlap: la ricognizione parte subito. Con la barriera
+        // ancora Pending un read_file DEVE eseguire senza attendere (se
+        // attendesse, il test andrebbe in timeout).
+        let (n, steps, _rc) = node(
+            ToolDispatchConfig {
+                // Se per errore attendesse, si vedrebbe: 1s e non 300.
+                advisory_gate_timeout_s: 1,
+                ..ToolDispatchConfig::default()
+            },
+            Arc::new(
+                MapToolExecutor::new().with(
+                    "read_file",
+                    ToolOutcome {
+                        tool_call_id: "r1".into(),
+                        content: json!("contenuto"),
+                        is_error: false,
+                        ..Default::default()
+                    },
+                ),
+            ),
+        );
+        let (ctx, _tx) = ctx_with_gate(AdvisoryGateState::Pending);
+        let st = state_with_pending(vec![pending_tool(
+            "r1",
+            "read_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        let started = std::time::Instant::now();
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(900),
+            "un tool read-only NON deve attendere la barriera"
+        );
+        assert_eq!(steps.steps.lock().unwrap().len(), 1, "il read ha eseguito");
+        assert!(
+            !out.extra.contains_key(ADVISORY_GATE_KEY),
+            "la barriera non si e' nemmeno consultata"
+        );
+    }
+
+    #[tokio::test]
+    async fn barriera_la_prima_scrittura_attende_e_poi_procede() {
+        let (n, steps) = writer_node();
+        let (ctx, tx) = ctx_with_gate(AdvisoryGateState::Pending);
+        // Il consiglio delibera mentre il nodo e' gia' in attesa.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let _ = tx.send(AdvisoryGateState::Released {
+                enforcement: Some(json!({
+                    "verdict": "proceed_with_changes",
+                    "summary": "Usa il punto unico esistente.",
+                    "terminal": false,
+                })),
+            });
+        });
+        let st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(steps.steps.lock().unwrap().len(), 1, "la scrittura procede");
+        assert_eq!(
+            out.extra
+                .get(ADVISORY_GATE_KEY)
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("released")
+        );
+        // I requisiti arrivano al modello NELLO STESSO turno in cui ha scritto.
+        let blocks = blocks_of(out.messages.last().expect("messaggio"));
+        let testo = serde_json::to_string(&blocks).unwrap();
+        assert!(
+            testo.contains("punto unico esistente"),
+            "il promemoria dei vincoli deve raggiungere il modello: {testo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn barriera_il_veto_ferma_prima_della_prima_modifica() {
+        let (n, steps) = writer_node();
+        let (ctx, _tx) = ctx_with_gate(AdvisoryGateState::Vetoed {
+            enforcement: enforcement_terminale(),
+        });
+        let st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert!(
+            steps.steps.lock().unwrap().is_empty(),
+            "NESSUN file deve essere toccato dopo un veto"
+        );
+        // L'edge esistente (graph.rs: terminal_panel_veto -> Learner) legge questo.
+        assert_eq!(
+            out.extra
+                .get(PANEL_ENFORCEMENT_KEY)
+                .and_then(|v| v.get("terminal"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            out.extra
+                .get(ADVISORY_GATE_KEY)
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("vetoed")
+        );
+        assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn barriera_il_timeout_non_blocca_mai_il_run() {
+        // Un panel che non risponde NON deve congelare il run: si procede, ma
+        // dichiarando che NON c'e' approvazione (regola M).
+        let (n, steps) = writer_node();
+        let (ctx, _tx) = ctx_with_gate(AdvisoryGateState::Pending);
+        let n = ToolDispatchNode {
+            cfg: ToolDispatchConfig {
+                advisory_gate_timeout_s: 1,
+                ..ToolDispatchConfig::default()
+            },
+            ..n
+        };
+        let st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(steps.steps.lock().unwrap().len(), 1, "il run prosegue");
+        let gate = out.extra.get(ADVISORY_GATE_KEY).expect("esito dichiarato");
+        assert_eq!(gate.get("status").and_then(Value::as_str), Some("unavailable"));
+        assert_eq!(
+            gate.get("reason_code").and_then(Value::as_str),
+            Some("advisory_gate_timeout"),
+            "il motivo e' un segnale, non una deduzione"
+        );
+        let testo = serde_json::to_string(&blocks_of(out.messages.last().expect("msg"))).unwrap();
+        assert!(
+            testo.contains("NON hai"),
+            "il modello deve sapere che procede senza approvazione: {testo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn barriera_sender_droppato_non_appende_il_run() {
+        // Il task dei panel muore senza dichiarare nulla: il canale si chiude.
+        // Un'assenza non e' un'approvazione, ma non deve nemmeno bloccare.
+        let (n, steps) = writer_node();
+        let (ctx, tx) = ctx_with_gate(AdvisoryGateState::Pending);
+        drop(tx);
+        let st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            n.run(&st, &ctx),
+        )
+        .await
+        .expect("il run non deve appendere sul sender caduto")
+        .expect("run ok");
+        let out = apply(st, out);
+        assert_eq!(steps.steps.lock().unwrap().len(), 1);
+        assert_eq!(
+            out.extra
+                .get(ADVISORY_GATE_KEY)
+                .and_then(|v| v.get("reason_code"))
+                .and_then(Value::as_str),
+            Some("advisory_channel_closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn barriera_assente_e_bit_identica_al_ramo_classico() {
+        // Flag OFF (nessun canale nel ctx): il gate non esiste, la scrittura
+        // procede come prima e nessuna chiave sporca lo stato.
+        let (n, steps) = writer_node();
+        let ctx = ctx_with(false, CancellationToken::new());
+        let st = state_with_pending(vec![pending_tool(
+            "w1",
+            "write_file",
+            json!({"path": "src/main.rs"}),
+        )]);
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(steps.steps.lock().unwrap().len(), 1);
+        assert!(!out.extra.contains_key(ADVISORY_GATE_KEY));
     }
 
     #[tokio::test]
@@ -2776,6 +3246,9 @@ mod golden {
             max_context_chars: usize::MAX,
             todo_reminder_every_n_steps: d.todo_reminder_every_n_steps,
             fs_mutator_tools: d.fs_mutator_tools,
+            // Il golden non esercita la barriera advisory (nessun canale nel ctx
+            // -> gate inerte): il valore e' irrilevante.
+            advisory_gate_timeout_s: d.advisory_gate_timeout_s,
         }
     }
 
@@ -2846,6 +3319,7 @@ mod golden {
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
             shadow: false,
+            advisory_gate: None,
         }
     }
 

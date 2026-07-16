@@ -252,6 +252,15 @@ pub struct NativeRunInput {
     pub pre_run_advisory_synthesis: Option<serde_json::Value>,
     /// Fonte del segnale pre-run (`multi_provider_synthesis` | `advisory_synthesis`).
     pub pre_run_advisory_source: Option<&'static str>,
+    /// Barriera di scrittura advisory (overlap consiglio ∥ run, mig 0606).
+    /// `Some(rx)` = il run parte SUBITO mentre i panel deliberano: la prima
+    /// modifica attendera' il loro verdetto (gate nel ToolDispatchNode). `None`
+    /// (default) = ramo classico, i verdetti sono gia' in
+    /// `pre_run_advisory_synthesis` -> gate inerte, comportamento bit-identico.
+    /// Alternativi per costruzione: o si attende prima, o si attende alla prima
+    /// scrittura.
+    pub advisory_gate:
+        Option<tokio::sync::watch::Receiver<nexus_agent_graph::nodes::AdvisoryGateState>>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -1114,6 +1123,31 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
 /// `Default` valgono SOLO se la chiave manca o il DB e' irraggiungibile). Le chiavi
 /// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
 /// usano l'underscore: e' la chiave reale del setting nel DB.
+/// Attesa massima della barriera di scrittura advisory (mig 0606), CLAMPATA
+/// alla deadline residua del run (fase 3, mig 0604).
+///
+/// Perche' il clamp: se la barriera potesse attendere oltre la deadline, un run
+/// col tempo scaduto verrebbe chiuso dall'executor con reason `time_budget`
+/// mentre in realta' stava aspettando il consiglio — la causa vera sparirebbe
+/// dietro un sintomo (regola M: il motivo dichiarato dev'essere quello reale).
+/// Senza deadline configurata (`run_time_budget_s=0`) resta il timeout nudo.
+async fn advisory_gate_timeout(db: &PgPool) -> u64 {
+    let configured = setting_i64(
+        db,
+        "orchestrator.advisory_gate_timeout_s",
+        ToolDispatchConfig::default().advisory_gate_timeout_s as i64,
+    )
+    .await
+    .max(0) as u64;
+    let deadline_s = setting_i64(db, "agent.run_time_budget_s", 0).await;
+    if deadline_s <= 0 {
+        return configured;
+    }
+    // Il run e' appena partito: il residuo e' l'intera deadline meno il tempo
+    // gia' speso dai panel (che qui e' ~0: nel ramo overlap partono INSIEME).
+    configured.min(deadline_s as u64)
+}
+
 async fn load_executor_config(
     db: &PgPool,
     provider: &str,
@@ -1784,6 +1818,43 @@ async fn probe_gate_steps(
 /// Entrambe le misure passano dal PUNTO UNICO del runner criteri (regola L/M:
 /// exit code strutturato), e questo e' l'unico posto che esegue i comandi gate
 /// ad albero pulito.
+///
+/// # Mutua esclusione per ROOT (difetto D2, incidente consiglio 2026-07-15)
+///
+/// Il probe PIANTA un file rotto nell'albero e ri-esegue il comando
+/// ([`crate::verify_probe`]). Con 6 figure concorrenti sulla STESSA root le
+/// misure si corrompevano a vicenda: A pianta il file, B misura la baseline e
+/// vede exit=1; A rimuove, B misura il probe e lo dichiara `Blind`.
+/// Serializzare e' la CORRETTEZZA della misura, non una preferenza: due misure
+/// sovrapposte sullo stesso albero non misurano niente.
+///
+/// Il guard e' per ROOT (non per progetto): e' l'albero la risorsa condivisa. E
+/// sta DENTRO questa funzione, non al call site, perche' e' il lavoro
+/// sull'albero a dover essere serializzato: chi la ri-estrae domani non deve
+/// poter dimenticare il guard restandone fuori. E' esattamente cosi' che si era
+/// perso (il refactor `1207a229` l'ha estratta da una versione che non l'aveva
+/// ancora, e main e' rimasto scoperto finche' non e' rientrato il ramo).
+///
+/// # Ri-lettura dopo il guard (doppio controllo)
+///
+/// Chi ha atteso in coda ha in mano la copia letta PRIMA di entrare, con
+/// `baseline_exit_code`/`probe` ancora a `None`: i filtri `is_none()` delle due
+/// misure rifarebbero da capo il typecheck e il probe che chi era davanti ha
+/// appena eseguito e persistito. Senza la ri-lettura il guard non CONDIVIDE il
+/// lavoro, lo mette in FILA (6 figure = 6 baseline + 6 probe in sequenza sullo
+/// stesso albero): e' l'altra meta' del difetto D2, lo spreco che occupava la
+/// finestra prima che le figure raggiungessero il loro modello. Il razionale di
+/// `PROFILE_LOCKS` avverte esattamente di questo: un lock che serializza N
+/// misure invece di condividerne una sarebbe solo un altro difetto.
+///
+/// Due sottigliezze del contratto, entrambe mutation-checked:
+/// - `steps` vuoto e' anche il modo in cui `ensure_profile` segnala il
+///   kill-switch `agent.verify_infer.enabled` OFF -> si esce PRIMA del guard,
+///   altrimenti la ri-lettura ripescherebbe dal DB il profilo appena escluso;
+/// - una ri-lettura VUOTA non e' un profilo svuotato: `profile_steps` inghiotte
+///   l'errore DB e ritorna il default, quindi il `Vec` non distingue "nessuna
+///   riga" da "il DB non ha risposto" (regola M). Su un segnale che non
+///   discrimina si tiene la copia in mano.
 async fn measure_gate_steps(
     meta_db: &PgPool,
     project_id: Uuid,
@@ -1791,53 +1862,18 @@ async fn measure_gate_steps(
     steps: &mut Vec<crate::verify_profile::VerifyProfileStep>,
     criteria_adapter: &FinalGateCriteriaRunnerAdapter,
 ) {
-    // Niente step -> niente da misurare, e si esce PRIMA del guard. Non e' solo
-    // un risparmio: `steps` vuoto e' anche il modo in cui `ensure_profile` dice
-    // "kill-switch `agent.verify_infer.enabled` OFF", e la ri-lettura qui sotto
-    // ripescherebbe dal DB proprio il profilo che l'interruttore ha escluso.
+    // Kill-switch OFF o profilo assente: niente da misurare, niente guard.
     if steps.is_empty() {
         return;
     }
-
-    // MUTUA ESCLUSIONE per ROOT su baseline+probe (difetto D2, incidente
-    // consiglio 2026-07-15; reintrodotto qui risolvendo il merge con main).
-    //
-    // Il probe PIANTA un file rotto nell'albero e ri-esegue il comando
-    // (verify_probe.rs). Con 6 figure concorrenti sulla STESSA root le misure si
-    // corrompevano a vicenda: A pianta il file, B misura la baseline e vede
-    // exit=1; A rimuove, B misura il probe e lo dichiara Blind. Serializzare e'
-    // la CORRETTEZZA della misura, non una preferenza: due misure sovrapposte
-    // sullo stesso albero non misurano niente.
-    //
-    // Il guard e' per ROOT (non per progetto): e' l'albero la risorsa condivisa.
-    // Sta DENTRO la funzione estratta e non al call site perche' e' il lavoro
-    // sull'albero a dover essere serializzato — chi estrae questa funzione domani
-    // non deve poter dimenticare il guard restandone fuori.
     let _tree_guard = crate::verify_profile::project_tree_lock(root)
         .lock_owned()
         .await;
-
-    // RI-LETTURA DOPO il guard (doppio controllo): chi ha atteso in coda ha in
-    // mano la copia letta PRIMA di entrare, con `baseline_exit_code`/`probe`
-    // ancora a `None` — cioe' i filtri `is_none()` delle due misure rifarebbero
-    // da capo il typecheck e il probe che chi era davanti ha appena eseguito e
-    // persistito. Senza questa riga il guard non CONDIVIDE il lavoro, lo mette
-    // in FILA: 6 figure = 6 baseline + 6 probe in sequenza sullo stesso albero.
-    // E' l'altra meta' del difetto D2 (lo spreco che occupava la finestra prima
-    // che le figure raggiungessero il loro modello); il razionale di
-    // PROFILE_LOCKS avverte esattamente di questo: un lock che serializza N
-    // misure invece di condividerne una sarebbe solo un altro difetto.
-    //
-    // Una ri-lettura VUOTA non e' un profilo svuotato: `profile_steps` inghiotte
-    // l'errore DB e ritorna il default, quindi il `Vec` non distingue "nessuna
-    // riga" da "il DB non ha risposto" (regola M). Su un segnale che non
-    // discrimina si tiene la copia in mano, invece di buttare via gli step da
-    // misurare per una lettura andata storta.
+    // Doppio controllo: chi era davanti puo' aver gia' misurato tutto.
     let persisted = crate::verify_profile::profile_steps(meta_db, project_id).await;
     if !persisted.is_empty() {
         *steps = persisted;
     }
-
     // `|` e non `||`: la seconda misura va eseguita comunque, non e' un
     // cortocircuito.
     let measured = measure_gate_baselines(steps, criteria_adapter).await
@@ -2112,6 +2148,10 @@ async fn build_native_engine(
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
         fs_mutator_tools: routing_cfg.fs_mutator_tools.clone(),
+        // Barriera advisory (mig 0606): attesa massima della prima scrittura.
+        // CLAMP alla deadline residua del run (fase 3): una barriera che attende
+        // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
+        advisory_gate_timeout_s: advisory_gate_timeout(&db).await,
         ..ToolDispatchConfig::default()
     };
 
@@ -2830,6 +2870,10 @@ async fn run_engine(
         // Fase C3 Part B: isolamento fisico dei sub-run disponibile (calcolato in
         // build_native_engine, flag-gated). Alimenta il gate di orchestrazione.
         isolation_available,
+        // Barriera di scrittura advisory (overlap, mig 0606): presente solo se il
+        // chiamante ha avviato il run PRIMA dei panel. `None` = ramo classico
+        // (verdetti gia' nello stato iniziale) -> gate inerte, bit-identico.
+        advisory_gate: input.advisory_gate.clone(),
     };
 
     // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.
@@ -3328,6 +3372,9 @@ mod tests {
             working_root: None,
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
+            // Nessun overlap nei test di costruzione dello stato: la barriera e'
+            // esercitata dai test del ToolDispatchNode.
+            advisory_gate: None,
         }
     }
 

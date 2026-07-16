@@ -2187,6 +2187,7 @@ dependencies = [
  "futures",
  "nexus-graph",
  "nexus-graph-derive",
+ "nexus-types",
  "rand 0.8.5",
  "regex",
  "ryu",
@@ -2245,8 +2246,10 @@ dependencies = [
  "serde",
  "sha2",
  "sqlx",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

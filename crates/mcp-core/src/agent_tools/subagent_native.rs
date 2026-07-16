@@ -1993,8 +1993,12 @@ pub(crate) enum FanoutScope {
 /// timer. Firma misurata sul campo: 4 sub-run con `t0` DIVERSI (10:30:28 e
 /// 10:32:10) e `timeout_s=240` uguale, morti tutti allo STESSO millisecondo
 /// (10:37:00.157) dopo 408s — impossibile per 4 timer indipendenti.
-/// Con `spawn` ogni sub-run ha il proprio task: il suo timer scatta al suo
-/// valore anche se un altro membro si blocca, e il danno resta confinato.
+/// Con `spawn` ogni sub-run ha il proprio task: un panic resta confinato e i
+/// timer non dipendono piu' dal poll di un membro vicino. Da qui NON segue la
+/// garanzia che il timer scatti al suo valore quando un altro membro blocca il
+/// thread: non scatta, e il test `spawn_non_protegge_dal_blocking_sincrono_
+/// limite_dichiarato` lo dimostra. `spawn` toglie l'accoppiamento cooperativo
+/// dentro un task, non toglie il blocking dal path.
 ///
 /// Semaforo (mai `chunks()` + `join_all`): il permesso si libera appena UN
 /// sub-run finisce, quindi il successivo parte subito. Una barriera a ondate
@@ -3450,6 +3454,10 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         working_root,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        // Un SUB-RUN non ha barriera: i panel a monte sono del coordinatore, non
+        // suoi. Un figlio che attendesse il consiglio del padre sarebbe un'attesa
+        // circolare (il padre sta aspettando lui).
+        advisory_gate: None,
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
@@ -4745,59 +4753,105 @@ mod tests {
     }
 
     /// LIMITE MISURATO E DICHIARATO (non un difetto del test, non una scusa):
-    /// `spawn` NON protegge in modo affidabile dal blocking sincrono.
+    /// il timer di un sub-run NON e' protetto dal blocking sincrono di un altro
+    /// sub-run, nemmeno dando a ognuno il proprio task con `spawn`.
     ///
-    /// Riproduzione fedele dell'incidente: 6 figure nate insieme, una cede una
-    /// volta (le altre armano i loro timer) e POI blocca il thread. Misura: i
-    /// timer delle 5 sane slittano a ~1550ms invece di 200ms — IDENTICO con
-    /// FuturesUnordered e con spawn. Il motivo e' lo scheduling di tokio: i
-    /// task nati dallo stesso worker restano nella sua coda locale, e il
-    /// work-stealing non li salva in tempo quando quel worker si blocca.
-    /// (Contro-misura che aveva illuso: se i bloccanti nascono PRIMA e i sani
-    /// DOPO, questi ultimi finiscono su altri worker e i timer sono puntuali —
-    /// ma e' un ordine che il fan-out reale non garantisce.)
+    /// Meccanica, misurata il 16/07 (e diversa da quella che questa nota
+    /// affermava prima): tokio non ha un thread dedicato ai timer. La scadenza
+    /// viene consegnata da un worker che polla il time driver, e un worker fermo
+    /// dentro un `poll()` bloccante non polla nulla. Quando nessun worker libero
+    /// raccoglie il driver, slittano insieme TUTTI i timer del runtime: la firma
+    /// e' che le vittime riportano lo STESSO ritardo al millisecondo (5 su 5 a
+    /// 1571ms), mai un ritardo a macchia di leopardo. E' un fattore globale del
+    /// runtime, non la vicinanza al bloccante: la spiegazione precedente (i task
+    /// nella coda locale del worker bloccato, non salvati dal work-stealing) e'
+    /// falsificata da quella firma e dal fatto che qui i task nascono dal thread
+    /// del test, quindi dalla coda globale, non da un worker.
+    ///
+    /// Perche' `worker_threads = 1` e non gli 8 di prima: con un worker i worker
+    /// liberi sono zero PER COSTRUZIONE e il limite si riproduce sempre. Con piu'
+    /// worker il fenomeno e' lo stesso, ma il suo manifestarsi diventa un lancio
+    /// di dadi: dipende da quale worker parcheggia (e quindi raccoglie il driver)
+    /// dopo che il blocco e' cominciato. Gradiente misurato, stessa macchina,
+    /// 6 task di cui 1 bloccante:
+    ///   1 worker -> 5/5 riprodotto      2 worker  -> 6/6
+    ///   8 worker -> 7/8 a vuoto, 3/6 sotto carico leggero, 1/8 a CPU sature
+    ///   32 worker -> 0/5 a vuoto (i timer restano puntuali)
+    /// La versione a 8 worker falliva ~1 volta su 3 nella suite (regola F): non
+    /// per una misura imprecisa, ma perche' asseriva un esito che lo scheduler
+    /// non garantisce. Quella flakiness ERA il limite: se il trascinamento fosse
+    /// garantito `spawn` sarebbe inutile, se lo fosse la puntualita' `spawn`
+    /// sarebbe la cura; non e' ne' l'uno ne' l'altro. Il test tiene quindi il
+    /// caso limite (zero worker liberi), che e' deterministico e dimostra la
+    /// non-garanzia; il gradiente qui sopra resta come misura, non come assert.
     ///
     /// Conseguenza, da dire senza giri di parole: `spawn_fanout` da' isolamento
     /// dei panic e un timer per sub-run, e resta igiene strutturale necessaria,
     /// ma NON e' la cura del blocco collettivo del 15/07. La cura e' togliere
     /// il blocking dal path (misura che lo nomina: tokio-console).
     ///
-    /// Questo test FISSA il limite: se un domani passa (timer ~200ms nonostante
-    /// il bloccante), il blocking e' stato rimosso o isolato in spawn_blocking
-    /// — allora va aggiornata questa nota e quella su `spawn_fanout`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    /// Come e' costruito: le figure sane armano il timer e lo DICHIARANO su un
+    /// canale (`send` e arm stanno nello stesso poll, senza await in mezzo:
+    /// quando la conferma parte il timer c'e' gia'); il bloccante comincia solo
+    /// quando TUTTE hanno dichiarato. E' l'ordine dell'incidente — le altre
+    /// figure erano gia' partite — ottenuto pero' con una barriera causale e non
+    /// con uno sleep di cortesia che il carico puo' sfasare: un test in cui il
+    /// bloccante viene pollato per primo sarebbe CIECO, le vittime armerebbero i
+    /// timer a danno gia' fatto. L'assert e' sull'ORDINE degli eventi e non su
+    /// soglie dell'orologio: i timer scadono a 200ms dentro un blocco da 800ms
+    /// cominciato dopo che erano armati, quindi se il blocking non li
+    /// trascinasse il primo evento osservato sarebbe un TimerScattato. Che non
+    /// sia cieco e' verificato per mutation: sostituendo il blocco con
+    /// `tokio::time::sleep`, che cede il worker invece di rubarlo, il test
+    /// diventa rosso 10 volte su 10.
+    ///
+    /// Un rosso qui significa che il blocking sincrono non trascina piu' i timer
+    /// nemmeno a worker liberi zero: tokio ha cambiato meccanica, o il blocco di
+    /// questo test non blocca piu'. Aggiornare questa nota e quella su
+    /// `spawn_fanout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn spawn_non_protegge_dal_blocking_sincrono_limite_dichiarato() {
-        use std::sync::Arc;
-        let sem = Arc::new(tokio::sync::Semaphore::new(6));
-        let mut handles = Vec::new();
-        for i in 0..6 {
-            let sem = sem.clone();
-            handles.push(tokio::spawn(async move {
-                let _p = sem.acquire_owned().await.expect("permit");
-                if i == 0 {
-                    // Cede PRIMA di bloccare: e' l'ordine dell'incidente (le
-                    // altre figure erano gia' partite e avevano armato i timer).
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    return 0u128;
-                }
-                let start = std::time::Instant::now();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    std::future::pending::<()>(),
-                )
-                .await;
-                start.elapsed().as_millis()
-            }));
+        #[derive(Debug, PartialEq, Eq)]
+        enum Evento {
+            Sbloccato,
+            TimerScattato,
         }
-        let mut durate = Vec::new();
-        for h in handles {
-            durate.push(h.await.expect("nessun panic"));
+        const SANI: usize = 5;
+        const TIMER: std::time::Duration = std::time::Duration::from_millis(200);
+        const BLOCCO: std::time::Duration = std::time::Duration::from_millis(800);
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Evento>();
+        let (armato_tx, mut armato_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        for _ in 0..SANI {
+            let ev_tx = ev_tx.clone();
+            let armato_tx = armato_tx.clone();
+            tokio::spawn(async move {
+                armato_tx.send(()).expect("conferma armato");
+                let _ = tokio::time::timeout(TIMER, std::future::pending::<()>()).await;
+                let _ = ev_tx.send(Evento::TimerScattato);
+            });
         }
-        let trascinati = durate.iter().skip(1).filter(|d| **d > 700).count();
-        assert!(
-            trascinati > 0,
-            "LIMITE CAMBIATO: i timer NON sono piu' trascinati dal blocking              ({durate:?}). Se e' voluto (blocking rimosso o isolato in              spawn_blocking), aggiornare questo test e la nota su spawn_fanout."
+
+        tokio::spawn(async move {
+            for _ in 0..SANI {
+                armato_rx.recv().await.expect("timer armato");
+            }
+            std::thread::sleep(BLOCCO);
+            ev_tx.send(Evento::Sbloccato).expect("sblocco");
+        });
+
+        let mut sequenza = Vec::with_capacity(SANI + 1);
+        for _ in 0..(SANI + 1) {
+            sequenza.push(ev_rx.recv().await.expect("evento"));
+        }
+        assert_eq!(
+            sequenza[0],
+            Evento::Sbloccato,
+            "LIMITE CAMBIATO: un timer da {TIMER:?} e' scattato durante un blocco \
+             sincrono da {BLOCCO:?} ({sequenza:?}). Se e' voluto (blocking rimosso \
+             o isolato in spawn_blocking), aggiornare questo test e la nota su \
+             spawn_fanout."
         );
     }
 

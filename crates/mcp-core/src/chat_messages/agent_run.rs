@@ -2587,7 +2587,11 @@ pub(crate) async fn spawn_agent_run(
         String::new()
     };
 
-    let system_text = format!(
+    // `mut`: nel ramo classico la direttiva <consiglio_analisi> viene tolta qui
+    // sotto se il consiglio ha gia' parlato (il suo parere e' nel prompt, la
+    // direttiva sarebbe rumore). Nel ramo overlap resta: il consiglio non ha
+    // ancora deliberato.
+    let mut system_text = format!(
         "{}{}{}{}{}{}{}{}{}",
         project_header,
         risorse_block,
@@ -2678,113 +2682,51 @@ pub(crate) async fn spawn_agent_run(
     // pressione sub-run e' governata dal semaforo di processo del fan-out
     // (FanoutGovernor, mig 0603). Le emissioni meta-step restano sequenziali
     // DOPO la join: ordine deterministico degli step.
-    let (council_outcome, multi_provider_block) = tokio::join!(
-        maybe_convene_council(
-            &state,
-            &run_pool,
-            &tx_for_brain,
-            params.session_id,
-            run_id,
-            &params.content,
-            deliberate,
-            orchestration_plan.as_ref().map(|p| p.council_figures),
-        ),
-        maybe_convene_multi_provider_panel(
-            &state,
-            params.session_id,
-            &params.content,
-            deliberate,
-            orchestration_plan
-                .as_ref()
-                .map(|p| p.multi_provider_providers),
-        )
-    );
-    if let Some(ref outcome) = council_outcome {
-        emit_council_of_competencies_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
-    }
-    let council_block = council_outcome
-        .as_ref()
-        .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
-        .filter(|b| !b.is_empty());
-    if let Some(outcome) = &multi_provider_block {
-        emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
-    }
-    // TESI CONTRAPPOSTE: dopo il consiglio (ne consuma il segnale strutturato
-    // `contested_decision`) e prima dell'assemblaggio del prompt.
-    //
-    // Il piano pre-run NON puo' dimensionare il dibattito: `decision_detected`
-    // nasce DAL consiglio (una decisione architettturale contesa la riconosce
-    // chi ha appena analizzato la richiesta), quindi prima della sua sintesi il
-    // segnale non esiste e il resolver riceve `false` — cioe' zero avvocati.
-    // Il numero di avvocati va quindi RI-risolto ora, con lo stesso punto unico
-    // (regola L) e il segnale finalmente noto: senza questo secondo giro il
-    // dibattito sarebbe codice morto per costruzione (pattern mig 0571,
-    // direttiva senza innesco = 0 esecuzioni).
-    let debate_outcome = match debate_advocate_target(
-        &state,
-        &run_pool,
+    let upstream_inputs = UpstreamInputs {
+        state: state.clone(),
+        run_pool: run_pool.clone(),
+        tx: tx_for_brain.clone(),
+        session_id: params.session_id,
         run_id,
-        council_outcome.as_ref(),
-        sizing_complexity,
-        sizing_scope_system_wide,
-    )
-    .await
-    {
-        Some(advocates) => {
-            maybe_convene_debate(
-                &state,
-                &run_pool,
-                &tx_for_brain,
-                params.session_id,
-                run_id,
-                &params.content,
-                council_outcome.as_ref(),
-                advocates,
-            )
-            .await
-        }
-        None => None,
+        user_text: params.content.clone(),
+        deliberate,
+        plan: orchestration_plan,
+        complexity: sizing_complexity,
+        scope_system_wide: sizing_scope_system_wide,
     };
-    let debate_block = debate_outcome
-        .as_ref()
-        .map(crate::agent_tools::subagent_native::render_debate_synthesis);
-    // Composizione LINEARE dei blocchi dei panel a monte: ogni blocco presente e
-    // non vuoto precede il messaggio utente, nell'ordine consiglio -> dibattito
-    // -> multi-provider (dal generale al particolare). Un match sulle
-    // combinazioni sarebbe cresciuto esponenzialmente a ogni panel nuovo.
-    let initial_msg = {
-        let blocks: Vec<String> = [
-            council_block.clone(),
-            debate_block,
-            multi_provider_block.as_ref().map(|o| o.render_block()),
-        ]
-        .into_iter()
+    // OVERLAP (mig 0606): il run parte SUBITO e i panel deliberano in parallelo,
+    // oppure — ramo classico, flag OFF — si attende il loro verdetto qui.
+    // I due rami condividono `run_upstream_panels` (regola L): cambia SOLO chi
+    // aspetta chi.
+    let overlap = nexus_auth::get_bool_setting(&state.db, "orchestrator.advisory_overlap_enabled")
+        .await
+        .ok()
         .flatten()
-        .filter(|b| !b.trim().is_empty())
-        .collect();
-        if blocks.is_empty() {
-            initial_msg
+        .unwrap_or(false)
+        && deliberate;
+    let (initial_msg, pre_run_advisory_synthesis, pre_run_advisory_source, advisory_gate) =
+        if overlap {
+            // Il modello NON vede i blocchi nel prompt iniziale (non esistono
+            // ancora): li ricevera' come promemoria alla release della barriera,
+            // prima di poter scrivere. Il system prompt tiene la direttiva
+            // <consiglio_analisi>: qui il consiglio non ha ancora parlato.
+            let (gate_tx, gate_rx) = tokio::sync::watch::channel(
+                nexus_agent_graph::nodes::AdvisoryGateState::Pending,
+            );
+            spawn_advisory_gate_task(upstream_inputs, gate_tx);
+            (initial_msg, None, None, Some(gate_rx))
         } else {
-            format!("{}\n\n{initial_msg}", blocks.join("\n\n"))
-        }
-    };
-    // Enforcement strutturato a valle (regola M): seedano `pre_run_advisory_synthesis`
-    // ENTRAMBI i panel — consiglio e multi-provider — col verdetto PIU' RESTRITTIVO
-    // che vince (asimmetria chiusa: prima solo il multi-provider era hard-enforced,
-    // un `block` del consiglio restava sola guida testuale).
-    let (pre_run_advisory_synthesis, pre_run_advisory_source) = select_pre_run_advisory(
-        council_outcome
-            .as_ref()
-            .and_then(|o| o.advisory_synthesis_value()),
-        multi_provider_block
-            .as_ref()
-            .and_then(|o| o.advisory_synthesis_value()),
-    );
-    let system_text = if council_block.is_some() {
-        crate::prompt_templates::strip_council_directive(&system_text)
-    } else {
-        system_text
-    };
+            let panels = run_upstream_panels(&upstream_inputs).await;
+            let msg = if panels.blocks.is_empty() {
+                initial_msg
+            } else {
+                format!("{}\n\n{initial_msg}", panels.blocks.join("\n\n"))
+            };
+            if panels.council_present {
+                system_text = crate::prompt_templates::strip_council_directive(&system_text);
+            }
+            (msg, panels.synthesis, panels.source, None)
+        };
 
     // Se questo run ha SUPERATO run attivi (last-wins), il modello vedra' nella
     // history della sessione il task precedente ancora "aperto" e tende a
@@ -2875,6 +2817,9 @@ pub(crate) async fn spawn_agent_run(
     let classifier_input_for_shadow: String = classifier_input.clone();
     let pre_run_advisory_synthesis_clone = pre_run_advisory_synthesis.clone();
     let pre_run_advisory_source_clone = pre_run_advisory_source;
+    // Barriera advisory (overlap, mig 0606): il receiver entra nel ctx del grafo
+    // e arma il gate del ToolDispatchNode. `None` nel ramo classico.
+    let advisory_gate_for_run = advisory_gate;
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
@@ -3017,6 +2962,7 @@ pub(crate) async fn spawn_agent_run(
                     working_root: None,
                     pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone.clone(),
                     pre_run_advisory_source: pre_run_advisory_source_clone,
+                    advisory_gate: advisory_gate_for_run.clone(),
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
                     Ok(mut outcome) => {
@@ -4528,6 +4474,9 @@ pub(crate) async fn spawn_agent_run(
                     working_root: None,
                     pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone,
                     pre_run_advisory_source: pre_run_advisory_source_clone,
+                    // Lo SHADOW e' Replay-only: non scrive nulla, quindi non ha
+                    // niente da far attendere a una barriera di scrittura.
+                    advisory_gate: None,
                 };
                 let primary_run_id = run_id;
                 tokio::spawn(async move {
@@ -4893,6 +4842,11 @@ pub(crate) async fn confirm_native_run(
         working_root: None,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
+        // tratto del run e il loro esito e' nello stato checkpointato (chiave
+        // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
+        // che e' gia' arrivato.
+        advisory_gate: None,
     };
 
     let outcome = resume_via_native(state, &input, resume_message).await;
@@ -5272,6 +5226,11 @@ pub(crate) async fn resume_fanin(
         working_root: None,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
+        // tratto del run e il loro esito e' nello stato checkpointato (chiave
+        // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
+        // che e' gia' arrivato.
+        advisory_gate: None,
     };
 
     // Costruisce le NativeDeps da AppState (PUNTO UNICO build_native_deps, regola
@@ -5532,6 +5491,196 @@ async fn emit_orchestration_plan_meta_step(
             created_at,
         }),
     });
+}
+
+/// Ingredienti dei panel A MONTE, identici nei due rami (bloccante e overlap).
+/// Raggrupparli evita di passare 8 argomenti a ogni funzione e di clonarli a
+/// mano nel task dell'overlap.
+struct UpstreamInputs {
+    state: AppState,
+    run_pool: PgPool,
+    tx: broadcast::Sender<AgentStepEvent>,
+    session_id: Uuid,
+    run_id: Uuid,
+    user_text: String,
+    deliberate: bool,
+    plan: Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan>,
+    complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    scope_system_wide: bool,
+}
+
+/// Esito dei panel a monte: i blocchi testuali per il prompt + il verdetto
+/// strutturato per l'enforcement (regola M).
+struct UpstreamPanels {
+    /// Blocchi gia' renderizzati, nell'ordine consiglio -> dibattito ->
+    /// multi-provider (dal generale al particolare), vuoti scartati.
+    blocks: Vec<String>,
+    synthesis: Option<serde_json::Value>,
+    source: Option<&'static str>,
+    /// `true` se il consiglio ha prodotto un blocco: la direttiva
+    /// `<consiglio_analisi>` va tolta dal system prompt (l'ha gia' fatto).
+    council_present: bool,
+}
+
+/// Dibattito, se il consiglio ha dichiarato una decisione contesa: consuma il
+/// suo segnale strutturato, quindi puo' girare solo DOPO di lui. `None` = niente
+/// decisione contesa, o budget che non finanzia il contraddittorio.
+async fn run_debate_if_contested(
+    inp: &UpstreamInputs,
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+) -> Option<String> {
+    let advocates = debate_advocate_target(
+        &inp.state,
+        &inp.run_pool,
+        inp.run_id,
+        council_outcome,
+        inp.complexity,
+        inp.scope_system_wide,
+    )
+    .await?;
+    let outcome = maybe_convene_debate(
+        &inp.state,
+        &inp.run_pool,
+        &inp.tx,
+        inp.session_id,
+        inp.run_id,
+        &inp.user_text,
+        council_outcome,
+        advocates,
+    )
+    .await?;
+    Some(crate::agent_tools::subagent_native::render_debate_synthesis(
+        &outcome,
+    ))
+}
+
+/// Esegue TUTTI i panel a monte: consiglio ∥ multi-provider, poi il dibattito
+/// se il consiglio dichiara una decisione contesa.
+///
+/// PUNTO UNICO (regola L) dei due rami: bloccante (il run parte dopo) e overlap
+/// (il run e' gia' partito e questa gira in un task). Senza, l'ordine dei panel
+/// e le loro condizioni sarebbero scritti due volte e divergerebbero al primo
+/// panel nuovo.
+async fn run_upstream_panels(inp: &UpstreamInputs) -> UpstreamPanels {
+    // I due panel a monte non condividono dati (le sintesi si riconciliano solo
+    // a valle): la serializzazione era implementativa, non necessaria.
+    let (council_outcome, multi_provider) = tokio::join!(
+        maybe_convene_council(
+            &inp.state,
+            &inp.run_pool,
+            &inp.tx,
+            inp.session_id,
+            inp.run_id,
+            &inp.user_text,
+            inp.deliberate,
+            inp.plan.as_ref().map(|p| p.council_figures),
+        ),
+        maybe_convene_multi_provider_panel(
+            &inp.state,
+            inp.session_id,
+            &inp.user_text,
+            inp.deliberate,
+            inp.plan.as_ref().map(|p| p.multi_provider_providers),
+        )
+    );
+    if let Some(outcome) = &council_outcome {
+        emit_council_of_competencies_meta_step(&inp.run_pool, &inp.tx, inp.run_id, outcome).await;
+    }
+    if let Some(outcome) = &multi_provider {
+        emit_multi_provider_panel_meta_step(&inp.run_pool, &inp.tx, inp.run_id, outcome).await;
+    }
+    let council_block = council_outcome
+        .as_ref()
+        .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
+        .filter(|b| !b.is_empty());
+    let debate_block = run_debate_if_contested(inp, council_outcome.as_ref()).await;
+
+    let (synthesis, source) = select_pre_run_advisory(
+        council_outcome
+            .as_ref()
+            .and_then(|o| o.advisory_synthesis_value()),
+        multi_provider
+            .as_ref()
+            .and_then(|o| o.advisory_synthesis_value()),
+    );
+    UpstreamPanels {
+        council_present: council_block.is_some(),
+        blocks: [
+            council_block,
+            debate_block,
+            multi_provider.as_ref().map(|o| o.render_block()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|b| !b.trim().is_empty())
+        .collect(),
+        synthesis,
+        source,
+    }
+}
+
+/// Spawna il task dei panel a monte in OVERLAP col run (mig 0606) e scioglie la
+/// barriera di scrittura col loro esito.
+///
+/// Invariante: la barriera si scioglie SEMPRE, su ogni percorso. Un panel che
+/// muore, un panic o un errore devono produrre `Unavailable` — mai il silenzio,
+/// che al gate diventerebbe un'attesa fino al timeout (il run resterebbe fermo
+/// per nulla). Il `Drop` del sender chiuderebbe comunque il canale e il gate lo
+/// leggerebbe come `advisory_channel_closed`: la rete c'e' comunque, ma dire il
+/// motivo vero e' meglio che dedurlo da un'assenza (regola M).
+fn spawn_advisory_gate_task(
+    inp: UpstreamInputs,
+    gate_tx: tokio::sync::watch::Sender<nexus_agent_graph::nodes::AdvisoryGateState>,
+) {
+    let run_id = inp.run_id;
+    tokio::spawn(async move {
+        let panels = run_upstream_panels(&inp).await;
+        let state = gate_state_from_panels(&panels);
+        tracing::info!(
+            run_id = %run_id,
+            gate = ?state,
+            "barriera advisory: panel a monte conclusi, barriera sciolta"
+        );
+        // Il receiver puo' essere gia' caduto (run finito prima che i panel
+        // deliberassero: succede sui task brevi che non scrivono nulla). Non e'
+        // un errore: il verdetto semplicemente non serve piu'.
+        let _ = gate_tx.send(state);
+    });
+}
+
+/// Traduce l'esito dei panel nello stato della barriera. Nessuna sintesi = i
+/// panel non hanno deliberato (roster morto, gate non passato): il run prosegue
+/// SENZA approvazione e il modello deve saperlo (regola M).
+fn gate_state_from_panels(
+    panels: &UpstreamPanels,
+) -> nexus_agent_graph::nodes::AdvisoryGateState {
+    use nexus_agent_graph::nodes::AdvisoryGateState;
+    let Some(synthesis) = panels.synthesis.as_ref() else {
+        return AdvisoryGateState::Unavailable {
+            reason_code: "advisory_synthesis_unavailable".to_string(),
+        };
+    };
+    // Enforcement col PUNTO UNICO gia' usato dal ramo classico (native_engine):
+    // stessa forma, stessa semantica del veto.
+    let source = panels.source.unwrap_or("advisory_synthesis");
+    match nexus_agent_graph::nodes::panel_enforcement_from_advisory_synthesis(synthesis, source) {
+        Some(enforcement) => {
+            let terminal = enforcement
+                .get("terminal")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if terminal {
+                AdvisoryGateState::Vetoed { enforcement }
+            } else {
+                AdvisoryGateState::Released {
+                    enforcement: Some(enforcement),
+                }
+            }
+        }
+        // Sintesi senza enforcement = via libera piena: niente vincoli da
+        // ricordare.
+        None => AdvisoryGateState::Released { enforcement: None },
+    }
 }
 
 /// Estrae `(topic, options)` dalla decisione contesa dichiarata dal CONSIGLIO.

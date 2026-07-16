@@ -533,6 +533,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             thread_id: run_id,
             shadow: false,
+            advisory_gate: None,
         }
     }
 

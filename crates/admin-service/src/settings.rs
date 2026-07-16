@@ -19,7 +19,9 @@ use nexus_types::fs_browse::{list_directories, list_root_candidates};
 // Tipi e helper API: punto unico in nexus_types (regola L / ADR 0026, cluster E6).
 // Prima `ApiError`/`ApiResult`/`api_error`/`validate_directory_name` erano
 // ri-implementati identici qui e in crates/mcp-core/src/settings.rs.
-use nexus_types::{api_error, validate_directory_name_api as validate_directory_name, ApiResult};
+use nexus_types::{
+    api_error, validate_directory_name_api as validate_directory_name, ApiError, ApiResult,
+};
 
 async fn ensure_required_settings(state: &AppState) {
     // Default statici: migrazione 0325 (regola G/H). Parte dinamica
@@ -119,39 +121,51 @@ pub async fn list_by_category(
     Json(json!({ "settings": masked }))
 }
 
+/// PUT /api/admin/setting/:key (:4010) — copia gemella di quella in mcp-core.
+///
+/// La UI non passa di qui: `app/api/admin/setting/[key]/route.ts` proxya su
+/// :4000, e in Next una route handler vince sul rewrite catch-all
+/// `/api/admin/:path*` -> :4010 (i rewrite dichiarati in array sono afterFiles).
+/// Verificato al wire, non dedotto: `/api/admin/settings-categories` — che
+/// esiste solo in mcp-core — risponde 401 via :3000 e 404 qui, quindi le rotte
+/// settings arrivano a :4000. Le rotte SENZA route handler (`/orchestrator/*`,
+/// `/alignment/*`, ...) invece arrivano davvero qui.
+///
+/// La rotta resta e deve rispettare lo stesso contratto. La scrittura delega al punto unico
+/// `nexus_auth::update_setting_value` (regola L), che porta con se' sia l'esito
+/// via status HTTP (200/404/500, regola M) sia il divieto di creare chiavi
+/// implicitamente.
 pub async fn update_setting(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Json(body): Json<UpdateSettingRequest>,
-) -> Json<Value> {
-    let result = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
-        .bind(&body.value).bind(&key).execute(&state.db).await;
-
-    match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({ "status": "ok", "key": key })),
-        Ok(_) => {
-            let _ = sqlx::query("INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)")
-                .bind(&key).bind(&body.value).execute(&state.db).await;
-            Json(json!({ "status": "created", "key": key }))
-        }
-        Err(e) => Json(json!({ "status": "error", "error": e.to_string() })),
-    }
+) -> Result<Json<Value>, ApiError> {
+    nexus_auth::update_setting_value(&state.db, &key, &body.value)
+        .await
+        .map_err(|e| api_error(e.status_code(), e.to_string()))?;
+    Ok(Json(json!({ "status": "ok", "key": key })))
 }
 
+/// PUT /api/admin/settings (:4010) — gemella di quella in mcp-core.
+///
+/// Stesso contratto: aggiorna e non crea (punto unico, regola L), e l'esito e'
+/// lo status HTTP (regola M) — 200 se tutte le chiavi passano, 500 se anche una
+/// sola e' rifiutata, col messaggio pronto in `error`.
 pub async fn bulk_update(
     State(state): State<AppState>,
     Json(body): Json<BulkUpdateRequest>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     ensure_required_settings(&state).await;
 
     let mut updated = 0;
     let mut errors = Vec::new();
 
     for entry in &body.settings {
-        match sqlx::query(
-            "INSERT INTO settings (key, value, category, description, is_secret, updated_at) VALUES ($1, $2, 'custom', '', FALSE, NOW()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        ).bind(&entry.key).bind(&entry.value).execute(&state.db).await {
-            Ok(_) => updated += 1,
+        // Aggiorna, non crea: stesso punto unico del PUT singolo (regola L).
+        // Prima era un `INSERT ... 'custom' ... ON CONFLICT DO UPDATE`, cioe' il
+        // secondo vettore per le scritture inefficaci in categoria 'custom'.
+        match nexus_auth::update_setting_value(&state.db, &entry.key, &entry.value).await {
+            Ok(()) => updated += 1,
             Err(e) => errors.push(format!("{}: {}", entry.key, e)),
         }
     }
@@ -160,7 +174,27 @@ pub async fn bulk_update(
     // ora gestita da mcp-core/nexus-gateway con TTL DB-driven (refresh entro
     // ~60s). Nessun side-effect HTTP da invalidare qui (era best-effort).
 
-    Json(json!({ "status": if errors.is_empty() { "ok" } else { "partial" }, "updated": updated, "errors": errors }))
+    if errors.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "updated": updated, "errors": [] })),
+        );
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "status": "partial",
+            "updated": updated,
+            "errors": errors,
+            "error": format!(
+                "{} chiave/i su {} non salvate: {}",
+                errors.len(),
+                body.settings.len(),
+                errors.join(" | ")
+            ),
+        })),
+    )
 }
 
 pub async fn get_raw_value(

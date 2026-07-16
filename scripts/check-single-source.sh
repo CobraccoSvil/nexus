@@ -55,6 +55,16 @@ assert_single "TemplateCache" 'struct TemplateCache' 'crates/nexus-types/src/tem
 # Wave 3:
 assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/lib.rs' crates
 
+# Scrittura settings (2026-07-16): la scrittura vive accanto alla lettura, in
+# nexus-auth. Prima `update_setting` era duplicato in mcp-core e admin-service,
+# ed entrambe le copie creavano la chiave assente con un INSERT in categoria
+# 'custom': un refuso nel nome produceva una scrittura inefficace spacciata per
+# riuscita (il sistema legge la chiave giusta, mai quella col refuso).
+# Il primo check protegge la definizione, il secondo il divieto: un handler che
+# reintroduca l'INSERT di ripiego lo fa ricomparire fuori dal punto unico.
+assert_single "update_setting_value" 'fn update_setting_value' 'crates/nexus-auth/src/lib.rs' crates
+assert_single "settings INSERT di ripiego" "INSERT INTO settings \(key, value, category" 'crates/nexus-auth/src/lib.rs' crates/mcp-core/src/settings.rs crates/admin-service/src/settings.rs
+
 # Wave 4 (capability: la fonte DATI e' gia' unica via ADR 0024, vista
 # v_model_capabilities; qui si protegge il classificatore di scrittura).
 assert_single "classify_capabilities" 'fn classify_capabilities' 'crates/mcp-core/src/model_catalog_sync.rs' crates

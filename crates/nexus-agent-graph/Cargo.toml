@@ -19,6 +19,10 @@ path = "src/lib.rs"
 [dependencies]
 nexus-graph = { path = "../nexus-graph" }
 nexus-graph-derive = { path = "../nexus-graph-derive" }
+# Vocabolario performance-tier (punto unico, re-export in decisions/tiers.rs):
+# vive nel crate leaf perche' lo usa anche admin-service, che non puo' dipendere
+# da questo crate.
+nexus-types = { path = "../nexus-types" }
 async-trait = "0.1"
 chrono.workspace = true
 futures.workspace = true

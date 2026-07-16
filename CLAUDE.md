@@ -276,10 +276,17 @@ condividere codice (fragile base class).
 | Listino modelli (prezzo di una chiamata + currency di piattaforma) | crate `nexus-pricing` (`resolve_active_price` -> `PriceLookup{Priced\|Unknown\|NotInCatalog}`, `platform_currency`, `calculate_cost`, `assert_configured`). Guard `pricing-single-source` |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |
+| Scrittura settings (aggiorna, non crea: chiave assente -> 404) | `nexus-auth` (`update_setting_value` -> `SettingWriteError{UnknownKey\|Db}` + `status_code()`). Guard `update_setting_value` e `settings INSERT di ripiego` |
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
 | Pool DB metadati per-progetto (registry, elenco progetti, directory routing, cache pool) | crate `nexus-project-pools` (separazione sempre attiva, flag rimosso mig 0527); `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
 | Aggregazione problemi ripetitivi (pannello Problemi) | `mcp-core/src/project_workspace/problem_aggregation.rs` (`problem_group_key`, `aggregate_problems`); `get_project_problems` delega |
+| Dimensionamento dei panel multi-agente (quante figure/revisori/provider/avvocati) | `nexus-agent-graph/src/decisions/orchestration_sizing.rs` (`resolve_orchestration_plan`; i cap storici restano backstop). ADR 0040 |
+| Tesi contrapposte (assegnazione posizioni + selezione opzione) | `nexus-agent-graph/src/decisions/debate_panel.rs` (`plan_debate`, `compose_debate_synthesis`). ADR 0040 |
+| Vocabolario gravita' evidenza (alta/media/bassa) + test "evidenza grave" | `nexus-agent-graph/src/decisions/severity.rs`; advisory/review/debate delegano |
+| Vocabolario performance-tier (light<medium<high<heavy<frontier) | `nexus-types/src/tiers.rs`; `decisions/tiers.rs` e' un re-export |
+| Tool mutativo ("questo tool scrive?") | `nexus-agent-graph/src/decisions/hitl.rs` (`is_mutator_tool_name`, `pending_contains_mutator`) su `agent.tools.result_cache_mutators`; gate HITL e barriera advisory delegano |
+| Whitelist runtime dei kind (CSV `orchestrator.subagent_kinds_whitelist`) | `admin-service/src/figures.rs` (`mutate_kinds_whitelist`) |
 
 ### Enforcement automatico (la regola e' duratura, non una-tantum)
 
