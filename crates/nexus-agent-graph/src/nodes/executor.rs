@@ -352,6 +352,15 @@ pub struct ExecutorConfig {
     /// dollari invece che in token (400k token costano ~64x su gpt-5.5 vs
     /// deepseek-flash). Regola G: DB-driven, mai hardcoded.
     pub run_cost_budget_usd: f64,
+    /// Deadline in SECONDI dell'INTERO run (`agent.run_time_budget_s`, default 0
+    /// = disabilitato -> bit-identico). Terzo asse del budget accanto a token e
+    /// dollari (fase 3 paradigma orchestrazione): tempo di parete dal via del
+    /// run primario (`AgentState::run_started_at_epoch_s`, checkpointato ->
+    /// sopravvive ai resume, misura il run INTERO e non l'ultimo spezzone). Al
+    /// raggiungimento (`>=`) l'executor chiude d'autorita' (`close_runaway`) con
+    /// reason canonico `time_budget` (regola M/N), come il cap di spesa. NON si
+    /// resetta all'escalation. Regola G: DB-driven, mai hardcoded.
+    pub run_time_budget_s: u64,
     /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
     /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
     /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
@@ -610,6 +619,9 @@ impl Default for ExecutorConfig {
             // 0 = disabilitato (bit-identico): il freno di spesa in dollari e' attivato
             // dal setting DB agent.run_cost_budget_usd (mig 0533).
             run_cost_budget_usd: 0.0,
+            // 0 = disabilitato (bit-identico): la deadline di run e' attivata
+            // dal setting DB agent.run_time_budget_s (mig 0604).
+            run_time_budget_s: 0,
             max_consecutive_text_only_turns: 3,
             // 3.4 default OFF -> comportamento bit-identico (chiusura backstop).
             provider_no_progress_switch_enabled: false,
@@ -1428,6 +1440,44 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
                         "run_cost_budget_usd": self.cfg.run_cost_budget_usd,
                     }),
                 ));
+            }
+        }
+        // Deadline dell'INTERO run in tempo di parete (fase 3 paradigma
+        // orchestrazione): epoch di avvio CHECKPOINTATO nello stato -> la misura
+        // sopravvive ai resume e copre il run intero. `0` = disabilitato; run
+        // senza epoch (avviati prima della fase 3) -> nessun enforcement, mai un
+        // default inventato. Chiusura PULITA con reason canonico `time_budget`
+        // (regola M/N), gemella del cap di spesa qui sopra.
+        if self.cfg.run_time_budget_s > 0 {
+            if let Some(started) = state.run_started_at_epoch_s {
+                let now_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(started);
+                let elapsed_s = now_s.saturating_sub(started).max(0) as u64;
+                if elapsed_s >= self.cfg.run_time_budget_s {
+                    let time_text = format!(
+                        "Raggiunta la deadline del run ({elapsed_s}s trascorsi, budget {}s). \
+Interrompo d'autorita' per rispettare il tempo massimo: riformula la richiesta in modo \
+piu' specifico, oppure alza agent.run_time_budget_s se il task richiede piu' tempo.",
+                        self.cfg.run_time_budget_s
+                    );
+                    tracing::error!(
+                        target: "nexus_agent_graph::executor",
+                        elapsed_s,
+                        run_time_budget_s = self.cfg.run_time_budget_s,
+                        "DEADLINE del run raggiunta -> chiusura d'autorita' (tempo di parete)"
+                    );
+                    return Ok(self.close_runaway(
+                        iters_in,
+                        time_text,
+                        "time_budget",
+                        json!({
+                            "elapsed_s": elapsed_s,
+                            "run_time_budget_s": self.cfg.run_time_budget_s,
+                        }),
+                    ));
+                }
             }
         }
         if self.cfg.run_token_budget > 0 && tokens_used_total >= self.cfg.run_token_budget {
@@ -3026,6 +3076,14 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                                     cutoff = cut,
                                     "rolling summary: prefisso conversazione riassunto"
                                 );
+                                // HEARTBEAT: il rolling summary e' lavoro LUNGO (una
+                                // chiamata LLM + l'offload su RAG con embedding) e
+                                // sta FRA due battiti (il precedente e' a :2916,
+                                // prima del context reduction; il prossimo e' alla
+                                // prossima iterazione). Un run che comprime il
+                                // contesto sta lavorando, e deve poterlo dimostrare
+                                // al reaper invece di sembrare fermo.
+                                let _ = self.run_control.heartbeat(&run_id, mode).await;
                             }
                             Ok(_) => {
                                 // Summary vuoto: degrada (history invariata).
@@ -3542,6 +3600,20 @@ della finestra {effective_window} del modello {provider}/{model}"
                                 tried = tried.len(),
                                 "provider caduto -> FAILOVER cross-provider via routing (cascata)"
                             );
+                            // HEARTBEAT: un cambio di provider e' la PROVA che il
+                            // run sta lavorando — non e' appeso, sta girando la
+                            // cascata. Senza questo battito la liveness si misura
+                            // una volta per ITERAZIONE (executor.rs:2916, prima del
+                            // context reduction), e una prima iterazione con piu'
+                            // failover puo' superare la soglia del reaper (900s,
+                            // mig 0392) mentre lavora: il run verrebbe ucciso
+                            // proprio perche' si sta sforzando di sopravvivere.
+                            // MISURATO (16/07): un run reale ha impiegato 1145s con
+                            // 5 provider su 6 in errore — 245s oltre la soglia. E'
+                            // sopravvissuto solo perche' le iterazioni successive
+                            // battevano. La mig 0392 dichiara il limite: "il battito
+                            // si ferma durante un tool sincrono lungo".
+                            let _ = self.run_control.heartbeat(&run_id, mode).await;
                             // Motivo ONESTO dello switch (regola M): la causa
                             // tipizzata arriva dal body strutturato del gateway
                             // (details.primary_cause / POLICY_TIER_EXCLUDED), mai

@@ -1150,6 +1150,11 @@ async fn load_executor_config(
         run_cost_budget_usd: setting_f64(db, "agent.run_cost_budget_usd", d.run_cost_budget_usd)
             .await
             .max(0.0),
+        // Deadline dell'intero run in secondi (mig 0604, fase 3 paradigma
+        // orchestrazione): 0 = disabilitato (bit-identico).
+        run_time_budget_s: setting_i64(db, "agent.run_time_budget_s", d.run_time_budget_s as i64)
+            .await
+            .max(0) as u64,
         max_consecutive_text_only_turns: setting_i64(
             db,
             "agent.max_consecutive_text_only_turns",
@@ -2518,6 +2523,14 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
         parent_run_id: input.parent_run_id.map(|u| u.to_string()),
         subagent_depth: input.subagent_depth,
+        // Epoch di avvio per la deadline di run (fase 3): scritto UNA volta qui
+        // e checkpointato — un resume riparte dal checkpoint, quindi la deadline
+        // misura il run INTERO. I sub-run hanno il proprio epoch ma il loro
+        // tetto effettivo resta il tokio timeout clampato in prepare.
+        run_started_at_epoch_s: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64),
         ..Default::default()
     }
 }

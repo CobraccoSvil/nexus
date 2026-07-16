@@ -4861,6 +4861,80 @@ async fn run_cost_budget_sotto_soglia_prosegue() {
 }
 
 #[tokio::test]
+async fn run_time_budget_oltre_deadline_chiude_diretto() {
+    // Deadline del run (fase 3, mig 0604): epoch di avvio nel PASSATO oltre il
+    // budget -> chiusura d'autorita' (close_runaway, reason canonico
+    // "time_budget"), senza chiamare il modello. Gemello del cap di spesa.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 600,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let started_way_back = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs() as i64
+        - 3_600; // avviato un'ora fa, budget 600s
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        run_started_at_epoch_s: Some(started_way_back),
+        iterations: Some(15),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(out.forced_close_unverified, Some(true));
+    let ms = out
+        .meta_steps
+        .iter()
+        .find(|m| m.kind == "anti_runaway")
+        .expect("meta_step anti_runaway (time)");
+    assert_eq!(
+        ms.payload.get("reason").and_then(Value::as_str),
+        Some("time_budget")
+    );
+    assert!(llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn run_time_budget_disattivato_o_senza_epoch_prosegue() {
+    // Budget 0 (disattivato) O epoch assente (run precedente alla fase 3):
+    // il ramo deadline NON scatta, il turno prosegue (LLM chiamato). Mai un
+    // enforcement su un default inventato.
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_token_budget: 0,
+        run_token_hard_cap: 0,
+        run_cost_budget_usd: 0.0,
+        run_time_budget_s: 600,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("ok"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("continua")],
+        run_started_at_epoch_s: None, // epoch assente -> nessun enforcement
+        iterations: Some(5),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let _out = apply(state, delta);
+    assert!(!llm.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn runaway_budget_esaurito_a_flag_on_ricade_su_close_runaway() {
     // Meta-reasoner acceso ma budget consultazioni per-sessione esaurito: il gate
     // runaway NON emette StallReason (rete di sicurezza) e ricade sul backstop

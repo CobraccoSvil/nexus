@@ -828,6 +828,15 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub run_cost_cumulative_usd: Option<Option<f64>>,
+    /// Vedi `AgentState::run_started_at_epoch_s`. Scritto solo alla costruzione
+    /// dello stato iniziale (nessun nodo lo muta a run avviato); presente qui
+    /// perche' il derive GraphState genera il merge per NOME su ogni campo.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub run_started_at_epoch_s: Option<Option<i64>>,
     /// Vedi `AgentState::consecutive_text_only_turns`. Reducer overwrite: `0` al
     /// primo tool_use, `prev + 1` su turno solo-testo.
     #[serde(

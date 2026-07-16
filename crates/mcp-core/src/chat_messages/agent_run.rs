@@ -2652,12 +2652,17 @@ pub(crate) async fn spawn_agent_run(
     };
     let sizing_scope_system_wide = classified.slots.scope.trim() == "system_wide";
     let orchestration_plan = if deliberate {
+        let time_remaining = crate::agent_tools::subagent_native::run_time_remaining_s(
+            &state.db, &run_pool, run_id,
+        )
+        .await;
         resolve_orchestration_plan_for(
             &state,
             sizing_complexity,
             sizing_scope_system_wide,
             false,
             0.0,
+            time_remaining,
         )
         .await
     } else {
@@ -5400,6 +5405,7 @@ async fn resolve_orchestration_plan_for(
     scope_system_wide: bool,
     decision_detected: bool,
     cost_spent_usd: f64,
+    time_remaining_s: Option<i64>,
 ) -> Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan> {
     use nexus_agent_graph::decisions::orchestration_sizing as sizing;
     let cfg =
@@ -5421,9 +5427,9 @@ async fn resolve_orchestration_plan_for(
         .filter(|b| *b > 0.0);
     let budgets = sizing::OrchestrationBudgets {
         cost_remaining_usd: cost_budget.map(|b| (b - cost_spent_usd).max(0.0)),
-        // Deadline di run: fase 3 (mig 0604). Finche' non esiste, nessun
-        // vincolo di tempo (None), mai un default inventato.
-        time_remaining_s: None,
+        // Deadline di run (fase 3, mig 0604): residuo calcolato dal chiamante
+        // col punto unico `run_time_remaining_s`. None = deadline disattivata.
+        time_remaining_s,
     };
     Some(sizing::resolve_orchestration_plan(
         Some(complexity),
@@ -5838,12 +5844,17 @@ async fn maybe_convene_review_panel(
     // pre-run, regola L): il costo gia' speso dal run stringe la review a valle.
     // `outcome.total_cost` e' il cumulativo del run (asimmetria documentata in
     // NativeRunOutcome). Sizing spento/non risolto -> backstop storico.
+    let review_time_remaining = crate::agent_tools::subagent_native::run_time_remaining_s(
+        &state.db, steps_pool, run_id,
+    )
+    .await;
     let reviewers = match resolve_orchestration_plan_for(
         state,
         sizing_complexity,
         sizing_scope_system_wide,
         false,
         outcome.total_cost,
+        review_time_remaining,
     )
     .await
     {

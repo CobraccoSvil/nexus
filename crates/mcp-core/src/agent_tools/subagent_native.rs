@@ -1663,6 +1663,43 @@ pub(crate) async fn read_panel_unit_estimate(
     }
 }
 
+/// Tempo RESIDUO (secondi) della deadline del run primario (fase 3, mig 0604).
+/// PUNTO UNICO (regola L) usato dal clamp del timeout sub-run in prepare, dal
+/// resolver di dimensionamento pre-run e dalla review post-run. Derivato DAL DB
+/// (`agent_runs.created_at` del run ancorato + setting `agent.run_time_budget_s`):
+/// nessun threading di Instant nei ctx, vale per OGNI percorso di dispatch.
+/// `None` = deadline disattivata (setting 0/assente) o run non ancorato.
+pub(crate) async fn run_time_remaining_s(
+    meta_db: &sqlx::PgPool,
+    run_pool: &sqlx::PgPool,
+    anchor_run_id: Uuid,
+) -> Option<i64> {
+    let budget_s = nexus_auth::get_setting(meta_db, "agent.run_time_budget_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|b| *b > 0)?;
+    let started: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM agent_runs WHERE id = $1")
+            .bind(anchor_run_id)
+            .fetch_optional(run_pool)
+            .await
+            .ok()
+            .flatten()?;
+    let elapsed_s = (chrono::Utc::now() - started).num_seconds().max(0);
+    Some(budget_s - elapsed_s)
+}
+
+/// Floor del timeout sub-run sotto deadline (`orchestrator.subagent_min_timeout_s`,
+/// mig 0604): sotto questo residuo una figura NON parte (prepare_reject
+/// strutturato), un timeout ridicolo produrrebbe solo spesa senza esito.
+pub(crate) async fn subagent_min_timeout_s(db: &sqlx::PgPool) -> i64 {
+    nexus_auth::get_setting(db, "orchestrator.subagent_min_timeout_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30)
+}
+
 /// Costo atteso di UN sub-run advisory dal listino (tier-only + nexus-pricing).
 async fn panel_unit_cost(db: &sqlx::PgPool, est_tokens: i64) -> Option<f64> {
     let figures_csv = nexus_auth::get_setting(db, "orchestrator.council_figures").await?;
@@ -2866,6 +2903,26 @@ async fn prepare_subagent_run(
         definition.timeout_s
     } else {
         settings.default_timeout_s
+    };
+    // Clamp alla DEADLINE del run primario (fase 3, mig 0604): un sub-run non
+    // vive oltre il tempo residuo del run che lo ha convocato. Sotto il floor
+    // (`subagent_min_timeout_s`) la figura NON parte: rifiuto strutturato
+    // (regola M), un timeout ridicolo produrrebbe solo spesa senza esito.
+    let timeout_s = match run_time_remaining_s(&ctx.core.db, &proj_pool, anchor).await {
+        Some(remaining_s) => {
+            let floor_s = subagent_min_timeout_s(&ctx.core.db).await;
+            if remaining_s < floor_s {
+                return Err(prepare_reject(
+                    "deadline_exhausted",
+                    format!(
+                        "deadline del run quasi esaurita per parent={anchor} \
+                         (residuo {remaining_s}s < floor {floor_s}s)"
+                    ),
+                ));
+            }
+            timeout_s.min(remaining_s)
+        }
+        None => timeout_s,
     };
 
     // Embedding del context/expected nel task (parita' col brain `run_subagent`).

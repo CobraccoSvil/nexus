@@ -559,6 +559,13 @@ pub struct AgentState {
     /// (come `tokens_used_total`). `None` = nessun costo noto ancora (turno senza
     /// prezzo in catalog o run appena avviato).
     pub run_cost_cumulative_usd: Option<f64>,
+    /// Epoch UNIX (secondi) di AVVIO del run primario, valorizzato UNA volta da
+    /// `build_initial_state` e CHECKPOINTATO: la deadline di run
+    /// (`ExecutorConfig::run_time_budget_s`) misura il tempo di parete del run
+    /// INTERO anche dopo un resume/recovery, non dell'ultimo spezzone. `None` =
+    /// run avviato prima della fase 3: nessun enforcement (mai un default
+    /// inventato). Reducer overwrite come gli altri contatori.
+    pub run_started_at_epoch_s: Option<i64>,
     /// Turni solo-testo CONSECUTIVI del run (la risposta LLM non conteneva tool_use
     /// mentre il loop si aspettava azioni; segnale strutturato `LlmResponse.tool_calls`,
     /// regola M). Azzerato appena il modello emette un tool_use, incrementato quando
