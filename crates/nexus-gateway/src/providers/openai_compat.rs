@@ -1204,6 +1204,17 @@ fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind
         {
             return ProviderErrorKind::Billing;
         }
+        // Rate-limit DICHIARATO dal provider: vince sullo status, perche' lo
+        // status da solo mente. groq manda 413 (non 429) quando la richiesta
+        // supera il tetto token/minuto del piano: "on tokens per minute (TPM):
+        // Limit 8000, Requested 20083", code=rate_limit_exceeded. Leggendo solo
+        // il 413 lo si scambia per "richiesta troppo grande per la finestra" e
+        // il motore fa failover cross-provider su un altro provider, mentre la
+        // cura giusta e' aspettare: il provider e' sano e la stessa richiesta
+        // passera' fra un minuto.
+        if c.contains("rate_limit") {
+            return ProviderErrorKind::Transient;
+        }
     }
     // Mappatura verificata sulle tabelle ufficiali (Anthropic/OpenAI, 2026):
     //   402 billing_error (Anthropic) -> Billing;
@@ -2374,6 +2385,15 @@ mod tests {
         // 429 rate-limit puro (senza codice credito) -> Transient (ritentabile).
         assert_eq!(
             classify_provider_error(&http(429, Some("rate_limit_exceeded"))),
+            ProviderErrorKind::Transient
+        );
+        // MISURATO su groq il 2026-07-16: il tetto token/minuto del piano viene
+        // rifiutato con 413, NON con 429 ("TPM: Limit 8000, Requested 20083",
+        // code=rate_limit_exceeded). Il codice dichiarato vince sullo status: e'
+        // un rate-limit da aspettare, non una richiesta fuori finestra da mandare
+        // in failover su un altro provider.
+        assert_eq!(
+            classify_provider_error(&http(413, Some("rate_limit_exceeded"))),
             ProviderErrorKind::Transient
         );
         assert_eq!(
