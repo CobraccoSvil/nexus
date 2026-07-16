@@ -22,9 +22,11 @@ import { Fragment, useCallback, useMemo, useState, type CSSProperties, type Reac
 
 import { AdminModal } from "../../../components/admin/AdminModal";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
+import { FigureWizard } from "../../../components/admin/FigureWizard";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
 import {
   listSubagentDefinitions,
+  mutateKindsWhitelist,
   toSubagentUpsertBody,
   upsertSubagentDefinition,
   type SubagentDefinition,
@@ -235,6 +237,23 @@ export default function CouncilPage() {
   const [rowError, setRowError] = useState<string | null>(null);
   const [promptEditor, setPromptEditor] = useState<PromptEditorState | null>(null);
   const [descEditor, setDescEditor] = useState<DescEditorState | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+
+  /** Ripara il badge "Fuori whitelist dispatcher": senza il kind nel CSV
+   *  orchestrator.subagent_kinds_whitelist la figura e' definita ma il dispatcher
+   *  la rifiuta (Guard 1), quindi non viene mai convocata. */
+  const addToWhitelist = async (kind: string) => {
+    setRowBusy(kind);
+    setRowError(null);
+    try {
+      await mutateKindsWhitelist({ add: [kind] });
+      await reloadSettings();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : "Errore aggiornamento whitelist");
+    } finally {
+      setRowBusy(null);
+    }
+  };
 
   const toggleEnabled = async (member: CouncilMember) => {
     const def = member.definition;
@@ -427,11 +446,20 @@ export default function CouncilPage() {
         title="Consiglio delle Competenze"
         description="Figure advisory read-only convocate prima dell'esecuzione dei task sensibili. Da qui si modificano i prompt che le descrivono (con versionamento), l'abilitazione e la composizione dei gruppi."
         action={
-          <button type="button" onClick={reloadAll} style={btnStyle(tc, "ghost")}>
-            Ricarica
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={() => setWizardOpen(true)} style={btnStyle(tc, "primary")}>
+              Nuova figura
+            </button>
+            <button type="button" onClick={reloadAll} style={btnStyle(tc, "ghost")}>
+              Ricarica
+            </button>
+          </div>
         }
       />
+
+      {/* Creazione transazionale dei 4 pezzi (definition + prompt + purpose +
+          whitelist): reloadAll perche' la figura tocca sia le definitions sia i settings. */}
+      <FigureWizard open={wizardOpen} onClose={() => setWizardOpen(false)} onCreated={() => reloadAll()} />
 
       {/* ── Sezione A: stato del consiglio ─────────────────────────────────── */}
       <SectionShell
@@ -544,7 +572,20 @@ export default function CouncilPage() {
                           ) : (
                             <Badge tc={tc} tone="warn" label="Definizione mancante" />
                           )}
-                          {def && !m.inWhitelist ? <Badge tc={tc} tone="warn" label="Fuori whitelist dispatcher" /> : null}
+                          {def && !m.inWhitelist ? (
+                            <>
+                              <Badge tc={tc} tone="warn" label="Fuori whitelist dispatcher" />
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void addToWhitelist(m.kind)}
+                                style={btnStyle(tc, "ghost", busy)}
+                                title="Aggiunge il kind a orchestrator.subagent_kinds_whitelist: senza, il dispatcher non lo convoca mai"
+                              >
+                                {busy ? "…" : "Aggiungi alla whitelist"}
+                              </button>
+                            </>
+                          ) : null}
                           {def && !m.hasAdvisoryVerdict ? <Badge tc={tc} tone="warn" label="Senza advisory_verdict" /> : null}
                         </div>
                       </td>

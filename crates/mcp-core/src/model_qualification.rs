@@ -654,8 +654,8 @@ async fn setting_i64(db: &PgPool, key: &str, default: i64) -> i64 {
 /// Carica i profili ENABLED della batteria, ordinati per `ord`.
 async fn load_profiles(db: &PgPool) -> Vec<ProbeProfile> {
     let rows = sqlx::query(
-        "SELECT profile_key, suite_version, kind, is_blocking, applies_when, \
-                grants, payload, pass_predicate \
+        "SELECT profile_key, suite_version, kind, is_blocking, certifies_tier, \
+                applies_when, grants, payload, pass_predicate \
            FROM ai_model_probe_profile WHERE enabled = TRUE ORDER BY ord",
     )
     .fetch_all(db)
@@ -2180,6 +2180,58 @@ mod tests {
             "nessuna banda certificata: il tier resta il prior, non viene azzerato"
         );
     }
+    /// La SELECT deve CHIEDERE tutto cio' che il mapper LEGGE: `certifies_tier`
+    /// (mig 0599) era letto ma non selezionato, e `Row::get` panicava dentro il
+    /// task tokio del worker. Il servizio restava `health: ok` mentre la batteria
+    /// era morta a ogni giro: nessun modello ha mai raggiunto `tier_source
+    /// = 'measured'`, e il "tier dai fatti" cadeva in eterno sul prior del prezzo.
+    /// Gli altri test non lo videro perche' NON toccano il DB: qui lo schema e'
+    /// quello vero delle migrazioni, non una finzione ricostruita a mano.
+    #[sqlx::test]
+    async fn la_select_dei_profili_chiede_ogni_colonna_che_il_mapper_legge(pool: PgPool) {
+        // Schema come mig 0591 (tabella) + 0599 (certifies_tier).
+        sqlx::query(
+            "CREATE TABLE ai_model_probe_profile (
+               profile_key    TEXT PRIMARY KEY,
+               suite_version  INT NOT NULL,
+               ord            INT NOT NULL,
+               kind           TEXT NOT NULL,
+               is_blocking    BOOLEAN NOT NULL,
+               applies_when   JSONB,
+               grants         JSONB NOT NULL DEFAULT '[]'::jsonb,
+               payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+               pass_predicate JSONB NOT NULL DEFAULT '{}'::jsonb,
+               enabled        BOOLEAN NOT NULL DEFAULT TRUE,
+               certifies_tier TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema profili");
+        sqlx::query(
+            "INSERT INTO ai_model_probe_profile
+               (profile_key, suite_version, ord, kind, is_blocking, grants, certifies_tier)
+             VALUES ('agentic_recovery', 2, 1, 'tool_realistic', true, '[\"chat\"]'::jsonb, 'heavy'),
+                    ('tool_smoke',       2, 2, 'tool_minimal',   true, '[]'::jsonb,        NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed profili");
+
+        let profiles = load_profiles(&pool).await;
+
+        assert_eq!(profiles.len(), 2, "entrambi i profili enabled vanno caricati");
+        assert_eq!(
+            profiles[0].certifies_tier.as_deref(),
+            Some("heavy"),
+            "la banda certificata deve ARRIVARE dal DB: senza, derive_tier_measured \
+             non ha nulla da certificare e il tier non lascia mai il prior"
+        );
+        assert_eq!(
+            profiles[1].certifies_tier, None,
+            "NULL resta NULL: un profilo che qualifica senza certificare una banda"
+        );
+    }
+
     /// FRONTIER: il needle sta a META' della history, mai nel system prompt.
     #[test]
     fn la_history_pianta_il_needle_a_meta_del_pagliaio() {

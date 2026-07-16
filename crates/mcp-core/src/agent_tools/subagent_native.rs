@@ -3454,6 +3454,10 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         working_root,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        // Un SUB-RUN non ha barriera: i panel a monte sono del coordinatore, non
+        // suoi. Un figlio che attendesse il consiglio del padre sarebbe un'attesa
+        // circolare (il padre sta aspettando lui).
+        advisory_gate: None,
     };
 
     // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).

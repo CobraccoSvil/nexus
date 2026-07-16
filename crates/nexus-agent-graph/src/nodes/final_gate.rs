@@ -1204,6 +1204,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
             shadow,
+            advisory_gate: None,
         }
     }
 
