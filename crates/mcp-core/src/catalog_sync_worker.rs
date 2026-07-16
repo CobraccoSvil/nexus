@@ -51,6 +51,17 @@ pub fn spawn_catalog_sync_worker(db: PgPool, enabled: bool, interval_s: u64) {
 }
 
 async fn run_one_round(db: &PgPool) {
+    // L'agentic_index PRIMA del sync del listino: cosi' `refresh_tier_prior`
+    // (che gira dentro run_catalog_sync) trova gia' l'indice fresco e deriva il
+    // tier dalla MISURA invece che dal ripiego sul prezzo.
+    match crate::model_catalog_sync::sync_agentic_index(db).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("catalog_sync_worker: agentic_index aggiornato su {n} modelli"),
+        // Non e' fatale: il prior ricade sul prezzo (che batte comunque il nome),
+        // e gli indici gia' presenti invecchiano finche' max_age_hours li scarta.
+        // La fonte e' undocumented: un suo cambiamento non deve fermare il sync.
+        Err(e) => tracing::warn!("catalog_sync_worker: agentic_index non aggiornato: {e}"),
+    }
     match models::run_catalog_sync(db).await {
         Ok((added, updated, skipped)) => {
             tracing::info!(

@@ -1722,6 +1722,200 @@ async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32
     0
 }
 
+/// Normalizza un id modello per il confronto fra cataloghi diversi (il nostro e
+/// quello di OpenRouter). PURA.
+///
+/// Toglie il prefisso provider (`openai/gpt-5` -> `gpt-5`), il suffisso DATA e i
+/// separatori. Lo strip della data e' SICURO e misurato: `claude-opus-4-5-20251101`
+/// e' lo stesso modello di `claude-opus-4.5`, `gpt-5.4-mini-2026-03-17` di
+/// `gpt-5.4-mini`. Sul parco reale porta la copertura da 31/110 (28%) a 43/110
+/// (39%) con **zero chiavi ambigue**.
+///
+/// NON fa prefix-match, e non deve mai farlo: `gpt-5-nano` matcherebbe `gpt-5` e
+/// un nano si prenderebbe l'indice del flagship — cioe' verrebbe promosso a
+/// heavy. E' un errore gia' commesso in una prima analisi manuale (`o3` matchato
+/// con `o3-mini-high`): qui e' escluso per costruzione.
+pub(crate) fn normalize_model_key(id: &str) -> String {
+    let senza_provider = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+    // -2026-03-17 oppure -20251101 in coda (e SOLO in coda).
+    let senza_data = strip_date_suffix(&senza_provider);
+    senza_data
+        .chars()
+        .filter(|c| *c != '-' && *c != '_' && *c != '.')
+        .collect()
+}
+
+/// Toglie un suffisso data (`-YYYY-MM-DD` o `-YYYYMMDD`) in coda. PURA.
+///
+/// PUNTO UNICO (regola L). Ne esistevano DUE con lo stesso nome: questa e una che
+/// gestiva solo `-YYYYMMDD` (8 cifre) lasciando passare il formato ISO
+/// `-YYYY-MM-DD`. Il suo test lo ASSERIVA (`gpt-4o-mini-2024-07-18` invariato),
+/// ma il chiamante — `catalog_sync`, "skip alias con suffisso data se la base
+/// name e' nell'API" — dichiara l'intento OPPOSTO: era un limite
+/// dell'implementazione fossilizzato in un test, non una scelta di design.
+///
+/// Consolidando, un alias con data ISO viene ora riconosciuto come alias della
+/// sua base, quindi PRESERVATO invece che disabilitato quando la base e' viva
+/// nell'API: il cambio va verso il "non disabilitare", che e' il lato sicuro.
+fn strip_date_suffix(s: &str) -> String {
+    let b = s.as_bytes();
+    // -YYYY-MM-DD (11 char)
+    if b.len() > 11 {
+        let coda = &s[s.len() - 11..];
+        let c: Vec<char> = coda.chars().collect();
+        if c[0] == '-'
+            && c[5] == '-'
+            && c[8] == '-'
+            && c.iter()
+                .enumerate()
+                .all(|(i, ch)| matches!(i, 0 | 5 | 8) || ch.is_ascii_digit())
+        {
+            return s[..s.len() - 11].to_string();
+        }
+    }
+    // -YYYYMMDD (9 char)
+    if b.len() > 9 {
+        let coda = &s[s.len() - 9..];
+        let c: Vec<char> = coda.chars().collect();
+        if c[0] == '-' && c[1..].iter().all(char::is_ascii_digit) {
+            return s[..s.len() - 9].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Estrae `{chiave_normalizzata -> agentic_index}` dal JSON di OpenRouter. PURA
+/// (nessun I/O: il payload arriva dal chiamante, cosi' il parsing e' testabile
+/// senza rete).
+///
+/// Scarta le chiavi AMBIGUE: se due id diversi normalizzano alla stessa chiave con
+/// indici DIVERSI, nessuno dei due entra. Meglio nessun indice che quello del
+/// modello sbagliato — un indice sbagliato promuove un modello nel routing, un
+/// indice assente lo lascia al ripiego sul prezzo.
+pub(crate) fn parse_agentic_index_payload(
+    payload: &Value,
+) -> std::collections::HashMap<String, f64> {
+    use std::collections::HashMap;
+    let mut per_chiave: HashMap<String, Vec<f64>> = HashMap::new();
+    let Some(models) = payload.get("data").and_then(Value::as_array) else {
+        return HashMap::new();
+    };
+    for m in models {
+        let Some(id) = m.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(idx) = m
+            .get("benchmarks")
+            .and_then(|b| b.get("artificial_analysis"))
+            .and_then(|a| a.get("agentic_index"))
+            .and_then(Value::as_f64)
+        else {
+            continue;
+        };
+        per_chiave.entry(normalize_model_key(id)).or_default().push(idx);
+    }
+    per_chiave
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let primo = *v.first()?;
+            // Ambigua = stessi nome normalizzato, indici diversi -> si scarta.
+            if v.iter().any(|x| (x - primo).abs() > f64::EPSILON) {
+                tracing::warn!(
+                    chiave = %k, valori = ?v,
+                    "agentic_index: chiave AMBIGUA, scartata (meglio nessun indice \
+                     che quello del modello sbagliato)"
+                );
+                return None;
+            }
+            Some((k, primo))
+        })
+        .collect()
+}
+
+/// Sincronizza l'`agentic_index` dal catalogo OpenRouter (mig 0600).
+///
+/// La fonte e' pubblica e senza autenticazione, ma il campo
+/// `benchmarks.artificial_analysis` e' UNDOCUMENTED (le doc citano solo Design
+/// Arena): puo' sparire senza preavviso. Per questo scrive anche
+/// `agentic_index_at` — cosi' `refresh_tier_prior` scarta un indice STANTIO e
+/// ricade sul prezzo, invece di fidarsi per sempre di un dato morto.
+///
+/// Ritorna quanti modelli hanno ricevuto un indice.
+pub async fn sync_agentic_index(db: &PgPool) -> Result<u64, String> {
+    let on = crate::settings::get_setting(db, "catalog.agentic_index_sync.enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
+        .unwrap_or(false);
+    if !on {
+        return Ok(0);
+    }
+    let url = crate::settings::get_setting(db, "catalog.agentic_index_sync.url")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "catalog.agentic_index_sync.url assente in settings (mig 0600)".to_string()
+        })?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let payload: Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch {url}: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("json {url}: {e}"))?;
+    let per_chiave = parse_agentic_index_payload(&payload);
+    if per_chiave.is_empty() {
+        // Il campo e' undocumented: se sparisce, questo e' il segnale. Non si
+        // azzerano gli indici esistenti — invecchiano, e max_age_hours li scarta.
+        return Err(
+            "nessun agentic_index nel payload: la fonte (undocumented) potrebbe \
+             essere cambiata. Gli indici esistenti restano e invecchiano."
+                .to_string(),
+        );
+    }
+    // Il match avviene in SQL sulla chiave normalizzata, calcolata sui NOSTRI id
+    // con la STESSA funzione pura (regola L: una sola normalizzazione).
+    let nostri: Vec<(String, String)> =
+        sqlx::query_as("SELECT provider, model FROM ai_price_catalog")
+            .fetch_all(db)
+            .await
+            .map_err(|e| format!("select catalog: {e}"))?;
+    let mut aggiornati = 0u64;
+    for (provider, model) in nostri {
+        let Some(idx) = per_chiave.get(&normalize_model_key(&model)) else {
+            continue;
+        };
+        let res = sqlx::query(
+            "UPDATE ai_price_catalog \
+                SET agentic_index = $3, agentic_index_at = NOW(), updated_at = NOW() \
+              WHERE provider = $1 AND model = $2 \
+                AND (agentic_index IS DISTINCT FROM $3 OR agentic_index_at IS NULL)",
+        )
+        .bind(&provider)
+        .bind(&model)
+        .bind(idx)
+        .execute(db)
+        .await;
+        if let Ok(r) = res {
+            aggiornati += r.rows_affected();
+        }
+    }
+    tracing::info!(
+        indici_disponibili = per_chiave.len(),
+        modelli_aggiornati = aggiornati,
+        "agentic_index: sync completato"
+    );
+    Ok(aggiornati)
+}
+
 /// Le soglie del prior dal DB (regola G, mig 0599). `None` = prior disabilitato
 /// dal flag: restano solo `manual` e `measured`, e un modello mai misurato ha
 /// tier NULL.
@@ -2060,18 +2254,6 @@ async fn write_probe_healthy_flags(
     .await;
 }
 
-/// Rimuove suffisso data ISO (es. -20251201) dal model name per gestire alias.
-fn strip_date_suffix(model: &str) -> String {
-    // Pattern: trailing -YYYYMMDD (8 digits dopo dash)
-    if let Some(idx) = model.rfind('-') {
-        let suffix = &model[idx + 1..];
-        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            return model[..idx].to_string();
-        }
-    }
-    model.to_string()
-}
-
 /// FIX 2: verifica se un modello e' "recentemente sano" secondo l'account,
 /// non secondo la lista upstream. Usato dal catalog_sync per NON disabilitare
 /// modelli assenti da upstream ma ancora funzionanti per l'account.
@@ -2273,11 +2455,11 @@ mod tests {
             "claude-sonnet-4-6"
         );
         assert_eq!(strip_date_suffix("gpt-4o-mini"), "gpt-4o-mini");
-        assert_eq!(
-            strip_date_suffix("gpt-4o-mini-2024-07-18"),
-            "gpt-4o-mini-2024-07-18"
-        );
-        // (sopra ha 2 digits-2 digits-2 digits, non matcha 8 digits)
+        // Il formato ISO ORA viene rimosso: prima no, e il test lo asseriva — ma
+        // il chiamante vuole proprio riconoscere l'alias della sua base (vedi il
+        // doc di strip_date_suffix). Consolidamento delle due copie omonime.
+        assert_eq!(strip_date_suffix("gpt-4o-mini-2024-07-18"), "gpt-4o-mini");
+        // NON e' una data: 4 cifre. 'ministral-8b-2512' e' un nome di modello.
         assert_eq!(strip_date_suffix("ministral-8b-2512"), "ministral-8b-2512");
     }
 
@@ -2587,5 +2769,78 @@ mod tests {
         assert!(RECONCILE_PASSES_POLICY_SQL.contains("c.model ~ ANY(p.allowed_patterns)"));
         assert!(RECONCILE_PASSES_POLICY_SQL.contains("cardinality(p.allowed_patterns) = 0"));
         assert!(RECONCILE_PASSES_POLICY_SQL.contains("NOT ( c.model ~ ANY(p.denied_patterns) )"));
+    }
+    /// Lo strip della DATA e' sicuro: e' lo stesso modello. Misurato sul parco:
+    /// porta la copertura da 28% a 39% con ZERO ambiguita'.
+    #[test]
+    fn la_chiave_ignora_provider_separatori_e_data() {
+        // Casi REALI del catalog (i nostri id vs quelli di OpenRouter).
+        assert_eq!(
+            normalize_model_key("claude-opus-4-5-20251101"),
+            normalize_model_key("anthropic/claude-opus-4.5")
+        );
+        assert_eq!(
+            normalize_model_key("gpt-5.4-mini-2026-03-17"),
+            normalize_model_key("openai/gpt-5.4-mini")
+        );
+        assert_eq!(
+            normalize_model_key("claude-haiku-4-5-20251001"),
+            normalize_model_key("anthropic/claude-haiku-4.5")
+        );
+    }
+
+    /// IL CONFINE: niente prefix-match. `gpt-5-nano` NON e' `gpt-5` — prendersi
+    /// l'indice del flagship significherebbe promuovere un nano a heavy. E' un
+    /// errore gia' commesso in una prima analisi manuale (o3 -> o3-mini-high).
+    #[test]
+    fn un_nano_non_e_il_suo_flagship() {
+        assert_ne!(normalize_model_key("gpt-5-nano"), normalize_model_key("gpt-5"));
+        assert_ne!(normalize_model_key("gpt-5.4-mini"), normalize_model_key("gpt-5.4"));
+        assert_ne!(normalize_model_key("o3-mini-high"), normalize_model_key("o3"));
+        // E una data NON in coda non e' un suffisso data.
+        assert_eq!(normalize_model_key("gpt-4o-2024-05-13-preview"),
+                   "gpt4o20240513preview".replace('-', ""));
+    }
+
+    /// Il parsing del payload REALE di OpenRouter (forma verificata sull'API viva
+    /// il 16/07): l'indice sta in benchmarks.artificial_analysis.agentic_index.
+    #[test]
+    fn estrae_l_indice_dal_payload_reale() {
+        let payload = json!({"data": [
+            {"id": "openai/gpt-5.6-sol",
+             "benchmarks": {"artificial_analysis": {"intelligence_index": 58.9,
+                                                    "coding_index": 77.4,
+                                                    "agentic_index": 54.0}}},
+            {"id": "mistralai/mistral-large-2512",
+             "benchmarks": {"artificial_analysis": {"agentic_index": 5.5}}},
+            // Senza benchmarks: il campo e' omesso per i modelli non valutati.
+            {"id": "openai/gpt-image-1"},
+            // Solo Design Arena (l'UNICA fonte documentata): niente indice.
+            {"id": "x/y", "benchmarks": {"design_arena": [{"elo": 1172}]}}
+        ]});
+        let m = parse_agentic_index_payload(&payload);
+        assert_eq!(m.len(), 2, "solo i modelli con agentic_index");
+        assert_eq!(m.get(&normalize_model_key("gpt-5.6-sol")), Some(&54.0));
+        assert_eq!(m.get(&normalize_model_key("mistral-large-2512")), Some(&5.5));
+    }
+
+    /// Una chiave AMBIGUA viene scartata: meglio NESSUN indice che quello del
+    /// modello sbagliato. Un indice errato promuove un modello nel routing; uno
+    /// assente lo lascia al ripiego sul prezzo.
+    #[test]
+    fn le_chiavi_ambigue_vengono_scartate() {
+        let payload = json!({"data": [
+            {"id": "a/modello-20250101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}},
+            {"id": "b/modello-20260101", "benchmarks": {"artificial_analysis": {"agentic_index": 50.0}}}
+        ]});
+        // Entrambi normalizzano a "modello" ma con indici DIVERSI.
+        let m = parse_agentic_index_payload(&payload);
+        assert!(m.is_empty(), "chiave ambigua -> nessun indice, non uno a caso: {m:?}");
+        // Stesso nome, STESSO indice: nessuna ambiguita', si tiene.
+        let payload = json!({"data": [
+            {"id": "a/modello-20250101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}},
+            {"id": "b/modello-20260101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}}
+        ]});
+        assert_eq!(parse_agentic_index_payload(&payload).len(), 1);
     }
 }
