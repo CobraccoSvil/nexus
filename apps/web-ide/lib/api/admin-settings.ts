@@ -22,10 +22,29 @@ export async function listAdminSettingsByCategory(
   );
 }
 
+/** L'unico esito di SUCCESSO di una scrittura su settings: la chiave esisteva
+ *  ed e' stata aggiornata. Il fallimento non e' un valore di questa unione — il
+ *  backend lo dice con lo status HTTP e `fetchJson` solleva `ApiError` (regola M
+ *  — lo status e' il segnale, il messaggio serve solo per il display): 404 se la
+ *  chiave non esiste, 500 se il DB rifiuta la scrittura.
+ *
+ *  Il PUT aggiorna, non crea: una chiave nuova si dichiara alla fonte (una
+ *  migrazione per i default, `plugins::integrate::publish` per i secret dei
+ *  plugin), dove categoria e `is_secret` sono veri. Prima il backend ripiegava
+ *  su un INSERT in categoria 'custom' e rispondeva `created`: un refuso nel nome
+ *  bastava a creare una riga fantasma, che le pagine admin non mostrano ma che
+ *  `get_setting` legge regolarmente. */
+export type AdminSettingUpdateStatus = "ok";
+
+export interface AdminSettingUpdateResult {
+  status: AdminSettingUpdateStatus;
+  key: string;
+}
+
 export async function updateAdminSetting(
   key: string,
   value: string,
-): Promise<{ status: string; key: string }> {
+): Promise<AdminSettingUpdateResult> {
   return fetchJson(`${API_BASE}/api/admin/setting/${key}`, {
     method: "PUT",
     body: JSON.stringify({ value }),

@@ -218,33 +218,30 @@ pub async fn list_categories(State(state): State<super::AppState>) -> Json<serde
     Json(serde_json::json!({ "categories": categories }))
 }
 
-/// PUT /api/settings/:key — update a single setting
+/// PUT /api/admin/setting/:key — aggiorna una singola impostazione.
+///
+/// E' l'endpoint che serve le pagine admin (la route Next.js proxya qui, non su
+/// admin-service, che ne ha una copia gemella).
+///
+/// L'esito e' lo STATUS HTTP (regola M): 200 aggiornata, 404 chiave assente,
+/// 500 se il DB rifiuta. Prima rispondeva 200 in ogni caso, con l'esito nel solo
+/// campo `status` del body: `fetchJson` decide sullo status e quindi non
+/// sollevava, e ogni pagina admin mostrava "salvato" su una scrittura che il DB
+/// aveva rifiutato. Il caso non e' teorico: il trigger
+/// `trg_settings_guard_protected` (mig 0499) nega gli UPDATE sui setting
+/// protetti proprio contando sul fatto che l'errore risalga al client.
+///
+/// La scrittura delega al punto unico `nexus_auth::update_setting_value`
+/// (regola L), che e' anche il posto dove vive il divieto di creare chiavi
+/// implicitamente.
 pub async fn update_setting(
     State(state): State<super::AppState>,
     Path(key): Path<String>,
     Json(body): Json<UpdateSettingRequest>,
-) -> Json<serde_json::Value> {
-    let result = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
-        .bind(&body.value)
-        .bind(&key)
-        .execute(&state.db)
-        .await;
-
-    let status = match result {
-        Ok(r) if r.rows_affected() > 0 => "ok",
-        Ok(_) => {
-            // Key doesn't exist, insert it
-            let _ = sqlx::query(
-                "INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)",
-            )
-            .bind(&key)
-            .bind(&body.value)
-            .execute(&state.db)
-            .await;
-            "created"
-        }
-        Err(e) => return Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
-    };
+) -> Result<Json<serde_json::Value>, ApiError> {
+    nexus_auth::update_setting_value(&state.db, &key, &body.value)
+        .await
+        .map_err(|e| api_error(e.status_code(), e.to_string()))?;
 
     // Notifica tutti i client connessi (evento system-wide)
     let ns = key.split('_').next().unwrap_or("admin").to_string();
@@ -294,10 +291,18 @@ pub async fn update_setting(
         _ => {}
     }
 
-    Json(serde_json::json!({ "status": status, "key": key }))
+    Ok(Json(serde_json::json!({ "status": "ok", "key": key })))
 }
 
 /// PUT /api/settings — bulk update
+///
+/// Aggiorna, non crea: come il PUT singolo, delega al punto unico
+/// `nexus_auth::update_setting_value` (regola L). Prima faceva un `INSERT ...
+/// VALUES ($1, $2, 'custom', '', FALSE) ON CONFLICT (key) DO UPDATE`, cioe' il
+/// secondo vettore per le stesse righe fantasma in categoria 'custom'. Una
+/// chiave sconosciuta finisce ora tra gli `errors` con status `partial`: le
+/// chiavi che i chiamanti scrivono (routing, gerarchia provider, budget) sono
+/// tutte seedate da migrazione.
 pub async fn bulk_update(
     State(state): State<super::AppState>,
     Json(body): Json<BulkUpdateRequest>,
@@ -308,15 +313,8 @@ pub async fn bulk_update(
     let mut errors = Vec::new();
 
     for entry in &body.settings {
-        match sqlx::query(
-            "INSERT INTO settings (key, value, category, description, is_secret, updated_at) VALUES ($1, $2, 'custom', '', FALSE, NOW()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        )
-        .bind(&entry.key)
-        .bind(&entry.value)
-        .execute(&state.db)
-        .await
-        {
-            Ok(_) => {
+        match nexus_auth::update_setting_value(&state.db, &entry.key, &entry.value).await {
+            Ok(()) => {
                 updated += 1;
                 // Notifica per ogni setting aggiornato
                 let ns = entry.key.split('_').next().unwrap_or("admin").to_string();

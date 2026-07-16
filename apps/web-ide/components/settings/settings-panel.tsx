@@ -17,6 +17,7 @@ import { GatewayConfig } from "./gateway-config";
 import { CatalogMaintenance } from "./catalog-maintenance";
 import { ProvidersOverview } from "./providers-overview";
 import { getGatewayProviders } from "../../lib/api-client";
+import { updateAdminSetting } from "../../lib/api/admin-settings";
 import { labelForCategory } from "../../lib/settings-categories";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
@@ -162,13 +163,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
 
     setSaving((current) => ({ ...current, [key]: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/admin/setting/${key}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ value }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await updateAdminSetting(key, value);
       setSaved((current) => ({ ...current, [key]: true }));
       setTimeout(() => setSaved((current) => ({ ...current, [key]: false })), 2000);
       setEditValues((current) => {
@@ -203,13 +198,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   const handleSaveImmediate = async (key: string, value: string) => {
     setSaving((current) => ({ ...current, [key]: true }));
     try {
-      const res = await fetch(`${API_BASE}/api/admin/setting/${key}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ value }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await updateAdminSetting(key, value);
       await fetchSettings();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Save failed");

@@ -63,6 +63,69 @@ pub async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+// Scrittura settings: punto unico (regola L / ADR 0026), accanto alla lettura.
+// Prima la stessa logica viveva duplicata in `mcp-core::settings::update_setting`
+// e `admin-service::settings::update_setting`.
+
+/// Errore di una scrittura su `settings`.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingWriteError {
+    /// La chiave non esiste. Il PUT aggiorna, non crea: vedi
+    /// `update_setting_value` per il razionale.
+    #[error("setting '{0}' inesistente: le chiavi si creano da una migrazione, non da una scrittura")]
+    UnknownKey(String),
+    #[error("scrittura setting '{key}' fallita: {source}")]
+    Db { key: String, source: sqlx::Error },
+}
+
+impl SettingWriteError {
+    /// Status HTTP dell'errore. Vive qui perche' la mappatura e' la STESSA per
+    /// ogni chiamante (regola L): chiave assente => 404, DB che rifiuta => 500.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            Self::UnknownKey(_) => StatusCode::NOT_FOUND,
+            Self::Db { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// Aggiorna il valore di una setting ESISTENTE. Punto di verita' della scrittura.
+///
+/// Una chiave assente e' un errore (`UnknownKey`), non un invito a crearla.
+/// Prima l'handler ripiegava su un `INSERT ... VALUES (key, value, 'custom', '',
+/// FALSE)`: un refuso nel nome della chiave produceva una riga fantasma in
+/// categoria 'custom', che le pagine admin non leggono (filtrano per categoria
+/// naturale) ma che `get_setting` serve regolarmente. Il sistema leggeva un
+/// valore che la UI non mostrava piu'.
+///
+/// Il censimento dei chiamanti (pagine admin, plugin manager, toggle provider,
+/// pannello orchestrator, council) non ha trovato un flusso che dipenda dalla
+/// creazione: scrivono chiavi seedate da migrazione, o chiavi lette da
+/// `GET /api/admin/settings`, che per costruzione esistono gia'. Chi ha bisogno
+/// di una chiave nuova la dichiara alla fonte, con categoria e `is_secret`
+/// veri: le migrazioni per i default statici, `plugins::integrate::publish` per
+/// i secret dei plugin integrati a runtime.
+pub async fn update_setting_value(
+    db: &PgPool,
+    key: &str,
+    value: &str,
+) -> Result<(), SettingWriteError> {
+    let result = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
+        .bind(value)
+        .bind(key)
+        .execute(db)
+        .await
+        .map_err(|source| SettingWriteError::Db {
+            key: key.to_string(),
+            source,
+        })?;
+
+    if result.rows_affected() == 0 {
+        return Err(SettingWriteError::UnknownKey(key.to_string()));
+    }
+    Ok(())
+}
+
 /// Legge una setting booleana (`true`/`1`/`yes`/`on` => true). Propaga l'errore DB.
 pub async fn get_bool_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<bool>> {
     Ok(get_setting_nonempty(db, key)

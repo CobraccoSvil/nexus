@@ -275,6 +275,7 @@ condividere codice (fragile base class).
 | Listino modelli (prezzo di una chiamata + currency di piattaforma) | crate `nexus-pricing` (`resolve_active_price` -> `PriceLookup{Priced\|Unknown\|NotInCatalog}`, `platform_currency`, `calculate_cost`, `assert_configured`). Guard `pricing-single-source` |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |
+| Scrittura settings (aggiorna, non crea: chiave assente -> 404) | `nexus-auth` (`update_setting_value` -> `SettingWriteError{UnknownKey\|Db}` + `status_code()`). Guard `update_setting_value` e `settings INSERT di ripiego` |
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
 | Pool DB metadati per-progetto (registry, elenco progetti, directory routing, cache pool) | crate `nexus-project-pools` (separazione sempre attiva, flag rimosso mig 0527); `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
