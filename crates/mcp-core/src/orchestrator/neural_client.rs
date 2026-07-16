@@ -536,16 +536,46 @@ pub(crate) fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwRes
 /// PUNTO UNICO del ponte segnale-strutturato -> `error_class` per il path neural: la
 /// mappa cause->classe vive in `provider_error_classifier` (regola L), qui c'e' solo
 /// l'estrazione.
+///
+/// Questo e' il ponte VIVO: e' l'unico punto in cui un errore del provider viene
+/// classificato, perche' `generate_agent_turn_with_thinking` non ritorna mai `Err`
+/// su un fallimento del provider — lo impacchetta in un `Ok(turn)` con dentro
+/// `error_class`. Un gemello di questa funzione viveva in
+/// `model_qualification::error_class_from_gateway` e disambiguava anche lo status
+/// (404 -> modello inesistente), ma stava sul ramo `Ok(Err(_))`, che riceve solo
+/// errori LOCALI (bridge non configurato, JSON invalido): mai un `GatewayHttpError`.
+/// Era codice morto con tre test verdi che lo chiamavano a mano, mentre il sintomo
+/// che diceva di aver curato era vivo nel DB — 28/28 evidence di `agentic_longctx`
+/// e 56 righe google con `error_class='error'` su 404 conclamati. Ora il ramo dello
+/// status e' QUI, dove l'errore passa davvero.
 fn structured_error_class(err: &anyhow::Error) -> Option<&'static str> {
     let gw_err = err
         .chain()
         .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())?;
-    let cause = gw_err
-        .details
-        .as_ref()?
-        .get("primary_cause")?
-        .as_str()?;
-    crate::provider_error_classifier::error_class_from_primary_cause(cause)
+    let details = gw_err.details.as_ref()?;
+    let cause = details.get("primary_cause")?.as_str()?;
+    if let Some(mapped) = crate::provider_error_classifier::error_class_from_primary_cause(cause) {
+        return Some(mapped);
+    }
+    // `client_error` e' l'unica causa che la sola stringa non basta a decidere: la
+    // disambigua lo status del PRIMO fallimento (col pin la chain ne ha uno solo).
+    if cause == "client_error" {
+        return Some(crate::provider_error_classifier::client_error_class_from_status(
+            first_failure_status(details),
+        ));
+    }
+    None
+}
+
+/// Lo status del primo fallimento nei `details` del gateway: segnale strutturato
+/// (regola M), mai ri-parsato dal testo del messaggio.
+fn first_failure_status(details: &Value) -> Option<i64> {
+    details
+        .get("failures")?
+        .as_array()?
+        .first()?
+        .get("status")?
+        .as_i64()
 }
 
 /// Come [`error_agent_turn_value`] ma con la classe gia' derivata da un segnale
@@ -619,6 +649,129 @@ fn gw_message_from_value(v: Value) -> GwMessage {
         tool_call_id,
         reasoning,
         thinking_signature: None,
+    }
+}
+
+/// Il ponte structured -> `error_class`, provato lungo la catena INTERA: dal body
+/// che il gateway manda davvero fino al verdetto che ne consegue.
+///
+/// Il ponte precedente aveva tre test verdi e non funzionava, per due rotture
+/// indipendenti che nessuno dei tre poteva vedere: viveva su un ramo mai eseguito,
+/// e ritornava una stringa (`model_not_found`) che nessun consumatore conosce. Il
+/// primo difetto sfuggiva perche' i test chiamavano la funzione a mano invece di
+/// passare dal produttore; il secondo perche' si fermavano alla stringa senza mai
+/// chiedere che verdetto ne uscisse. Questi test chiudono entrambi i buchi.
+#[cfg(test)]
+mod ponte_errore_tests {
+    use super::*;
+    use crate::model_health_probe::{Classification, classification_from_error_class};
+
+    /// Il body VERBATIM che il gateway produce su un 404 pinnato. Non e' inventato:
+    /// e' la forma che `provider_with_details` costruisce (500 + `details` con
+    /// `primary_cause` e `failures[].status`), asserita dall'altra sponda dal test
+    /// `nexus-gateway::server::routes` (`details["primary_cause"] == "client_error"`,
+    /// `failures[0]["status"]`), e osservata sul vivo il 2026-07-16 21:23 UTC:
+    /// "gateway: modello invalido/deprecato (client_error, niente cooldown provider)
+    ///  provider=google status=404 code=not_found".
+    fn errore_404_dal_gateway() -> anyhow::Error {
+        crate::nexus_gateway::GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "tutti i provider hanno fallito -> google (google HTTP 404: ...)",
+                "code": "PROVIDER_ERROR",
+                "details": {
+                    "primary_cause": "client_error",
+                    "failures": [{"provider": "google", "class": "client_error",
+                                  "status": 404, "code": "not_found",
+                                  "message": "Publisher Model not found"}]
+                }
+            })
+            .to_string(),
+        )
+        .into()
+    }
+
+    /// PRIMA ROTTURA: il 404 deve diventare una causa NOMINATA, non 'error'.
+    #[test]
+    fn il_ponte_derrore_classifica_un_404_pinnato() {
+        assert_eq!(
+            structured_error_class(&errore_404_dal_gateway()),
+            Some("not_found")
+        );
+    }
+
+    /// Il turno che il ramo d'errore consegna al chiamante: la classe struttura il
+    /// verdetto, il testo resta solo da leggere. Attraversa il produttore vero
+    /// (`error_agent_turn_value_with_class`), che e' cio' che i tre test rimossi
+    /// non facevano.
+    #[test]
+    fn il_404_arriva_al_turno_come_classe_e_non_come_testo() {
+        let e = errore_404_dal_gateway();
+        let turn = error_agent_turn_value_with_class(
+            "google",
+            "gemini-2.0-flash-lite-001",
+            &e.to_string(),
+            structured_error_class(&e),
+        );
+        assert_eq!(turn["error_class"], "not_found");
+        assert_eq!(turn["stop_reason"], "error");
+    }
+
+    /// SECONDA ROTTURA: la classe deve produrre un verdetto CONCLUSIVO. Era qui che
+    /// il ponte vecchio si sarebbe rotto anche da vivo, e nessun test guardava.
+    #[test]
+    fn la_classe_del_404_produce_un_verdetto_conclusivo() {
+        assert!(matches!(
+            classification_from_error_class("not_found"),
+            Classification::ModelSpecific(..)
+        ));
+    }
+
+    /// La prova della seconda rottura: `model_not_found` — la stringa che il ponte
+    /// morto ritornava — non appartiene al vocabolario e cade nel catch-all, cioe'
+    /// nello stesso `Transient` ("stato invariato, ritento") da cui il ponte doveva
+    /// far uscire il 404. Anche raggiungendolo, non avrebbe curato nulla.
+    #[test]
+    fn la_stringa_del_ponte_morto_non_esiste_nel_vocabolario() {
+        assert!(matches!(
+            classification_from_error_class("model_not_found"),
+            Classification::Transient(..)
+        ));
+    }
+
+    /// Gli altri 4xx che `client_error` appiattisce: conseguenze diverse, nessuna
+    /// indovinata. Un 400 e' colpa della richiesta, un 401 di tutto il provider.
+    #[test]
+    fn ogni_4xx_ha_la_sua_conseguenza() {
+        use crate::provider_error_classifier::client_error_class_from_status as classe;
+        assert!(matches!(
+            classification_from_error_class(classe(Some(401))),
+            Classification::ProviderWide(..)
+        ));
+        assert!(matches!(
+            classification_from_error_class(classe(Some(403))),
+            Classification::ModelSpecific(..)
+        ));
+        assert!(matches!(
+            classification_from_error_class(classe(Some(400))),
+            Classification::ModelSpecific(..)
+        ));
+        // Status assente o 4xx ignoto: OPACO -> Transient, mai una punizione a caso.
+        assert!(matches!(
+            classification_from_error_class(classe(None)),
+            Classification::Transient(..)
+        ));
+        assert!(matches!(
+            classification_from_error_class(classe(Some(409))),
+            Classification::Transient(..)
+        ));
+    }
+
+    /// Un errore che non viene dal gateway non ha segnale strutturato da leggere:
+    /// nessuna classe inventata.
+    #[test]
+    fn un_errore_locale_non_ha_segnale_strutturato() {
+        assert_eq!(structured_error_class(&anyhow::anyhow!("boom")), None);
     }
 }
 

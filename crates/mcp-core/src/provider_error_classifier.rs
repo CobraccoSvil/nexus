@@ -28,11 +28,17 @@ pub struct ClassifiedError {
 /// call site lo nominano, cosi' non puo' divergere per un refuso.
 pub const CONTEXT_TOO_LONG: &str = "context_too_long";
 
+/// La classe "le credenziali non sono valide" (401). Come [`CONTEXT_TOO_LONG`]:
+/// la nominano il ponte dello status, la tabella HTTP e il classificatore
+/// testuale — tre punti che devono dire la STESSA parola, perche' e' quella che
+/// `classification_from_error_class` traduce in "spegni il provider".
+pub const AUTH_ERROR: &str = "auth_error";
+
 /// HTTP status -> (stop_reason, retriable).
 fn http_status_to_reason(status: u16) -> Option<(&'static str, bool)> {
     match status {
         400 => Some(("invalid_request", false)),
-        401 => Some(("auth_error", false)),
+        401 => Some((AUTH_ERROR, false)),
         403 => Some(("forbidden", false)),
         404 => Some(("not_found", false)),
         413 => Some((CONTEXT_TOO_LONG, false)),
@@ -100,10 +106,42 @@ pub fn error_class_from_primary_cause(cause: &str) -> Option<&'static str> {
         "request_budget_exceeded" => Some("request_budget_exceeded"),
         // `client_error` copre 400/401/403/404/422: classi con conseguenze OPPOSTE
         // (404 = modello inesistente -> disable; 400 = richiesta malformata ->
-        // niente). Le distingue lo status del primo failure, che sta nei `details`
-        // e non in questa stringa: decide il chiamante (vedi
-        // `model_qualification::error_class_from_gateway`).
+        // niente). Non le distingue questa stringa ma lo STATUS del primo failure,
+        // che sta nei `details`: lo disambigua `client_error_class_from_status`,
+        // che il chiamante invoca quando ha i details sotto mano.
         _ => None,
+    }
+}
+
+/// PUNTO UNICO (regola L) della disambiguazione `client_error` -> classe canonica.
+///
+/// Il gateway appiattisce cinque 4xx in una sola causa (`client_error`), ma le loro
+/// conseguenze sono opposte: un 404 dice "questo modello non esiste" (va disabilitato),
+/// un 400 dice "questa richiesta era malformata" (il modello non c'entra). Lo status
+/// numerico e' il segnale certo (regola M) e sta gia' nei `details`: si legge, non si
+/// ri-deduce dal Display.
+///
+/// Le classi ritornate appartengono al vocabolario di `classification_from_error_class`
+/// (model_health_probe): e' quello che decide la conseguenza. Inventarne una fuori
+/// vocabolario significa cadere nel suo catch-all -> `Transient` -> "stato invariato,
+/// ritento" — cioe' l'esatto silenzio che questa funzione esiste per rompere. E'
+/// successo davvero: il ponte precedente ritornava `model_not_found`, stringa che
+/// NESSUN consumatore conosce.
+pub fn client_error_class_from_status(status: Option<i64>) -> &'static str {
+    match status {
+        // Il modello non esiste (o non e' servito da quel provider): ModelSpecific
+        // -> conta come fallimento del modello e alimenta l'auto-disable.
+        Some(404) => "not_found",
+        // Credenziali invalide: e' tutto il provider a essere inutilizzabile.
+        Some(401) => AUTH_ERROR,
+        // Accesso negato a QUELLA risorsa (es. modello Labs non abilitato per l'org):
+        // model-specific, non si spegne il provider.
+        Some(403) => "forbidden",
+        Some(422) => "unprocessable",
+        Some(400) => "invalid_request",
+        // Status assente o 4xx non previsto: OPACO. Non si indovina (regola H):
+        // `Transient` lascia lo stato invariato invece di punire a caso.
+        _ => "client_error_unknown",
     }
 }
 
@@ -223,7 +261,7 @@ pub fn classify_with_status(raw: &str, known_status: Option<u16>) -> ClassifiedE
     }
     if auth_re().is_match(&raw_lower) {
         return ClassifiedError {
-            stop_reason: "auth_error".into(),
+            stop_reason: AUTH_ERROR.into(),
             retriable: false,
             http_status,
         };
