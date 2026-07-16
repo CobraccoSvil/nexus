@@ -34,10 +34,12 @@ fn collect_secret_refs(groups: &[&Value]) -> Vec<String> {
 /// leggera' quelle chiavi: la riga nasce qui, dove categoria e `is_secret` sono
 /// noti e veri. Prima il catalogo le registrava senza crearle, e l'unico modo di
 /// valorizzarle dalla UI era il ramo INSERT di `settings::update_setting`, che le
-/// materializzava in categoria 'custom' con `is_secret = FALSE`: un token
-/// mostrato in chiaro da `mask_settings` e invisibile alla pagina connectors.
-/// Quel ramo non esiste piu' (il PUT risponde 404 su chiave assente), quindi il
-/// seeding qui e' cio' che tiene configurabili i plugin integrati a runtime.
+/// materializzava in categoria 'custom' con `is_secret = FALSE`: `mask_settings`
+/// maschera solo cio' che e' marcato secret, quindi il token finiva IN CHIARO
+/// nella risposta di `GET /api/admin/settings` (che la UI legge tutta, senza
+/// filtro di categoria). Quel ramo non esiste piu' (il PUT risponde 404 su
+/// chiave assente), quindi il seeding qui e' cio' che tiene configurabili i
+/// plugin integrati a runtime — e li fa nascere mascherati.
 ///
 /// `ON CONFLICT DO NOTHING`: le chiavi gia' seedate da una migrazione (es.
 /// `figma_oauth_token`, mig 0017) tengono descrizione e valore che hanno.

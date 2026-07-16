@@ -58,7 +58,8 @@ assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/li
 # Scrittura settings (2026-07-16): la scrittura vive accanto alla lettura, in
 # nexus-auth. Prima `update_setting` era duplicato in mcp-core e admin-service,
 # ed entrambe le copie creavano la chiave assente con un INSERT in categoria
-# 'custom' (riga fantasma: invisibile alle pagine admin, letta da get_setting).
+# 'custom': un refuso nel nome produceva una scrittura inefficace spacciata per
+# riuscita (il sistema legge la chiave giusta, mai quella col refuso).
 # Il primo check protegge la definizione, il secondo il divieto: un handler che
 # reintroduca l'INSERT di ripiego lo fa ricomparire fuori dal punto unico.
 assert_single "update_setting_value" 'fn update_setting_value' 'crates/nexus-auth/src/lib.rs' crates

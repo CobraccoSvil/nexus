@@ -32,8 +32,9 @@ export async function listAdminSettingsByCategory(
  *  migrazione per i default, `plugins::integrate::publish` per i secret dei
  *  plugin), dove categoria e `is_secret` sono veri. Prima il backend ripiegava
  *  su un INSERT in categoria 'custom' e rispondeva `created`: un refuso nel nome
- *  bastava a creare una riga fantasma, che le pagine admin non mostrano ma che
- *  `get_setting` legge regolarmente. */
+ *  creava una riga nuova invece di dare errore, e la pagina diceva "salvato" a
+ *  una scrittura senza effetto — il sistema legge la chiave giusta, mai quella
+ *  col refuso. */
 export type AdminSettingUpdateStatus = "ok";
 
 export interface AdminSettingUpdateResult {

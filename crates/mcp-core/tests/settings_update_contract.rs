@@ -144,11 +144,10 @@ async fn scrittura_riuscita_e_un_200_ok() {
 /// Il PUT aggiorna, non crea: una chiave assente e' un 404 e NON lascia righe.
 ///
 /// Regressione catturata: l'handler ripiegava su un `INSERT ... 'custom'` e
-/// rispondeva 201 `created`. Un refuso nel nome della chiave (da una pagina
-/// admin) creava cosi' una riga fantasma in categoria 'custom' con descrizione
-/// vuota: invisibile a `listAdminSettingsByCategory`, che filtra per categoria
-/// naturale, ma regolarmente leggibile da `get_setting`. Il sistema leggeva un
-/// valore che la UI non mostrava piu'.
+/// rispondeva 201 `created`. Un refuso nel nome (da una pagina admin) creava
+/// cosi' una riga nuova invece di dare errore, e la UI diceva "salvato" a una
+/// scrittura senza effetto: il sistema continua a leggere la chiave GIUSTA, mai
+/// quella col refuso.
 #[tokio::test]
 async fn chiave_assente_e_un_404_e_non_crea_la_riga() {
     let Some(token) = jwt() else {
@@ -181,7 +180,7 @@ async fn chiave_assente_e_un_404_e_non_crea_la_riga() {
     assert_eq!(
         stored, None,
         "il PUT su una chiave assente non deve creare la riga (era un INSERT in \
-         categoria 'custom', invisibile alle pagine admin ma letto da get_setting)"
+         categoria 'custom': una scrittura inefficace spacciata per riuscita)"
     );
     assert_eq!(
         status.as_u16(),

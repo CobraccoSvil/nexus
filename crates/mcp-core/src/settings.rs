@@ -341,9 +341,9 @@ fn apply_bulk_side_effects(body: &BulkUpdateRequest, all_ok: bool) {
 /// Aggiorna, non crea: come il PUT singolo, delega al punto unico
 /// `nexus_auth::update_setting_value` (regola L). Prima faceva un `INSERT ...
 /// VALUES ($1, $2, 'custom', '', FALSE) ON CONFLICT (key) DO UPDATE`, cioe' il
-/// secondo vettore per le stesse righe fantasma in categoria 'custom'. Le chiavi
-/// che i chiamanti scrivono (routing, gerarchia provider, budget) sono tutte
-/// seedate da migrazione.
+/// secondo vettore per le stesse scritture inefficaci in categoria 'custom'. Le
+/// chiavi che i chiamanti scrivono (routing, gerarchia provider, budget) sono
+/// tutte seedate da migrazione.
 ///
 /// L'esito e' lo STATUS HTTP (regola M): 200 se tutte le chiavi sono passate,
 /// 500 se anche una sola e' stata rifiutata. Prima rispondeva 200 in ogni caso e

@@ -163,7 +163,7 @@ pub async fn bulk_update(
     for entry in &body.settings {
         // Aggiorna, non crea: stesso punto unico del PUT singolo (regola L).
         // Prima era un `INSERT ... 'custom' ... ON CONFLICT DO UPDATE`, cioe' il
-        // secondo vettore per le righe fantasma in categoria 'custom'.
+        // secondo vettore per le scritture inefficaci in categoria 'custom'.
         match nexus_auth::update_setting_value(&state.db, &entry.key, &entry.value).await {
             Ok(()) => updated += 1,
             Err(e) => errors.push(format!("{}: {}", entry.key, e)),

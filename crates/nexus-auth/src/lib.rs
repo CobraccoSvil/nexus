@@ -93,10 +93,18 @@ impl SettingWriteError {
 ///
 /// Una chiave assente e' un errore (`UnknownKey`), non un invito a crearla.
 /// Prima l'handler ripiegava su un `INSERT ... VALUES (key, value, 'custom', '',
-/// FALSE)`: un refuso nel nome della chiave produceva una riga fantasma in
-/// categoria 'custom', che le pagine admin non leggono (filtrano per categoria
-/// naturale) ma che `get_setting` serve regolarmente. Il sistema leggeva un
-/// valore che la UI non mostrava piu'.
+/// FALSE)`, e un refuso nel nome creava una riga NUOVA invece di dare errore: la
+/// UI rispondeva "salvato" a una scrittura senza alcun effetto. Chi scrive
+/// `nexus_behavior_moda` crede di aver cambiato il comportamento, ma il sistema
+/// continua a leggere `nexus_behavior_mode` — nessuno legge mai la chiave col
+/// refuso. Il danno e' la scrittura silenziosamente inefficace, piu' la
+/// spazzatura che si accumula in 'custom'.
+///
+/// NON e' un problema di invisibilita': la riga si vede eccome. `list_categories`
+/// e' data-driven (`GROUP BY category`, nessuna whitelist) e `buildList`
+/// (`apps/web-ide/lib/settings-categories.ts`) accoda in fondo ogni categoria
+/// sconosciuta, quindi 'custom' compare nella sidebar ed e' navigabile.
+/// Verificato contro il DB, non dedotto.
 ///
 /// Il censimento dei chiamanti (pagine admin, plugin manager, toggle provider,
 /// pannello orchestrator, council) non ha trovato un flusso che dipenda dalla
