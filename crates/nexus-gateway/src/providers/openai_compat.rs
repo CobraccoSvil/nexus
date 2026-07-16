@@ -1144,17 +1144,31 @@ pub async fn provider_http_error(provider: &str, resp: reqwest::Response) -> Pro
 }
 
 /// Estrae il codice d'errore STRUTTURATO da un body JSON di errore provider.
-/// Cerca (in ordine) `error.type`, `error.code` (se stringa), `error.status`
+/// Cerca (in ordine) `error.code` (se stringa), `error.type`, `error.status`
 /// (enum Google), e i corrispettivi top-level. Ritorna il valore in lowercase.
 /// NB: parsa CAMPI JSON del contratto macchina del provider, non testo libero.
+///
+/// L'ordine `code` PRIMA di `type` non e' un dettaglio: dove un provider valorizza
+/// entrambi, `code` e' l'identificatore dell'errore e `type` la sua categoria — e
+/// una categoria non basta a decidere. Misurato su groq il 2026-07-16: un rifiuto
+/// per tetto token/minuto arriva come
+///   {"error":{"type":"tokens","code":"rate_limit_exceeded"}}
+/// Preferendo `type` si legge "tokens", che non dice cosa sia successo: il
+/// rate-limit non veniva riconosciuto, restava la tabella per status (413 ->
+/// ContextTooLong) e il rifiuto diventava colpa del MODELLO. La batteria ha
+/// squalificato quattro modelli groq che nello stesso giro passavano chat_smoke e
+/// tool_smoke: il piano non regge 20k token al minuto, i modelli stanno benissimo.
+/// Dove i due campi coincidono (OpenAI: code=type=insufficient_quota) l'ordine e'
+/// indifferente; dove `code` e' numerico (Google) non e' una stringa e si scende
+/// a `status`. I test di questa funzione coprono tutti e tre i casi.
 fn extract_structured_error_code(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let candidates = [
-        v.pointer("/error/type"),
         v.pointer("/error/code"),
+        v.pointer("/error/type"),
         v.pointer("/error/status"),
-        v.get("type"),
         v.get("code"),
+        v.get("type"),
         v.get("status"),
     ];
     for c in candidates.into_iter().flatten() {
@@ -2295,6 +2309,16 @@ mod tests {
             .as_deref(),
             Some("invalid_argument")
         );
+        // groq: `type` e' la CATEGORIA ("tokens"), `code` e' l'errore. Preferendo
+        // `type` si perde l'unica informazione che decide, e un rate-limit del
+        // piano diventa un difetto del modello. Corpo VERBATIM del 2026-07-16.
+        assert_eq!(
+            extract_structured_error_code(
+                r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 8000, Requested 20083","type":"tokens","code":"rate_limit_exceeded"}}"#
+            )
+            .as_deref(),
+            Some("rate_limit_exceeded")
+        );
         // Body non-JSON o senza campi: None.
         assert_eq!(extract_structured_error_code("502 Bad Gateway (html)"), None);
     }
@@ -2341,6 +2365,30 @@ mod tests {
             HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
         );
         assert_eq!(parse_retry_after(&h), None);
+    }
+
+    /// LA REGRESSIONE, dal body alla classe: il 413 di groq attraversa
+    /// `from_response` (il produttore vero del `ProviderHttpError`, che estrae il
+    /// codice) e deve arrivare a `Transient`.
+    ///
+    /// Il 2026-07-16 finiva in `ContextTooLong` — cioe' "colpa della richiesta per
+    /// QUESTO modello" — e la batteria ha squalificato quattro modelli groq che
+    /// nello stesso giro passavano chat_smoke e tool_smoke. Il guard sul codice
+    /// c'era gia': non scattava perche' l'estrattore preferiva `type` ("tokens") a
+    /// `code` ("rate_limit_exceeded"). Un test sul solo `classify_by_status_code`
+    /// non poteva vederlo: passava un codice che in produzione non arrivava mai.
+    #[test]
+    fn il_413_di_groq_e_un_rate_limit_dal_body_alla_classe() {
+        let body = r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 20083, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        let err: anyhow::Error =
+            ProviderHttpError::from_response("groq", 413, body.to_string()).into();
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::Transient,
+            "il tetto token/minuto del piano e' transitorio: il provider e' sano e \
+             la stessa richiesta passa fra un minuto. Trattarlo come ContextTooLong \
+             lo attribuisce al modello e lo fa squalificare"
+        );
     }
 
     #[test]
