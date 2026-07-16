@@ -1,0 +1,13 @@
+[package]
+name = "nexus-pricing"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+nexus-auth = { path = "../nexus-auth" }
+
+[lints]
+workspace = true

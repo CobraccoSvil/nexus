@@ -270,6 +270,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "nexus-auth",
+ "nexus-pricing",
  "nexus-project-pools",
  "serde",
  "serde_json",
@@ -1997,6 +1998,7 @@ dependencies = [
  "nexus-http",
  "nexus-mcp-client",
  "nexus-orchestrator",
+ "nexus-pricing",
  "nexus-project-db",
  "nexus-project-pools",
  "nexus-tool-kit",
@@ -2326,6 +2328,7 @@ dependencies = [
  "jsonwebtoken",
  "nexus-auth",
  "nexus-cache",
+ "nexus-pricing",
  "nexus-tool-kit",
  "regex",
  "reqwest",
@@ -2413,6 +2416,16 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nexus-pricing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nexus-auth",
+ "sqlx",
+ "tracing",
 ]
 
 [[package]]

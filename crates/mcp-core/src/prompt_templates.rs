@@ -1008,7 +1008,19 @@ async fn insert_batch_job_marker(
 ) {
     // Marker “hard” per rendere verificabile che il job è partito e che scrive sul DB giusto.
     // Non dipende da orchestrator_runs/run_id e non blocca il job se fallisce.
+    //
+    // La currency viene dal punto unico (regola G): era hardcoded a 'EUR' mentre la
+    // piattaforma e' su USD — quarto scrittore del ledger, e l'unico rimasto a
+    // dichiarare una valuta di propria iniziativa. Riga a costo 0, quindi la valuta
+    // e' vacua, ma "un solo punto per la currency" o e' vero o non lo e'.
     let marker_id = uuid::Uuid::new_v4();
+    let currency = match nexus_pricing::platform_currency(db).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("batch_assign_tools: marker insert saltato, currency non configurata: {e}");
+            return;
+        }
+    };
     if let Err(e) = sqlx::query(
         r#"
         INSERT INTO ai_usage_ledger (
@@ -1016,7 +1028,7 @@ async fn insert_batch_job_marker(
             prompt_tokens, completion_tokens, total_tokens,
             input_cost, output_cost, total_cost, currency,
             status, details
-        ) VALUES ($1, $2, $3, 'internal', 'batch_assign_tools_job', 0, 0, 0, 0, 0, 0, 'EUR', 'reserved', $4)
+        ) VALUES ($1, $2, $3, 'internal', 'batch_assign_tools_job', 0, 0, 0, 0, 0, 0, $5, 'reserved', $4)
         "#,
     )
     .bind(marker_id)
@@ -1026,6 +1038,7 @@ async fn insert_batch_job_marker(
         "feature": "batch_assign_tools",
         "event": "job_started",
     }))
+    .bind(&currency)
     .execute(db)
     .await
     {

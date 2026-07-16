@@ -49,6 +49,15 @@ async fn main() -> anyhow::Result<()> {
         .context("connessione Postgres")?;
     tracing::info!("nexus-gateway: connesso a PostgreSQL");
 
+    // Listino configurato? Verifica ALL'AVVIO (regola G). La currency di
+    // piattaforma non ha piu' un default hardcoded ('EUR' qui, 'USD' in mcp-core:
+    // la divergenza aveva gia' prodotto righe di ledger orfane). Scoprirlo qui
+    // costa un avvio fallito; scoprirlo a runtime costerebbe le richieste, perche'
+    // il billing sta sul percorso di ogni chiamata LLM.
+    nexus_pricing::assert_configured(&db)
+        .await
+        .context("listino non configurato: valorizzare settings.billing_base_currency (mig 0294)")?;
+
     // Stato applicativo (provider, policy, alias, presidio, auth).
     let state: AppState = bootstrap::build_state(db.clone()).await?;
 

@@ -655,6 +655,17 @@ struct RoutingAndPortCaches {
 /// invariati). Le cache che panicano se il DB e' irraggiungibile (routing matrix,
 /// thresholds, intent) lo fanno qui, coerentemente con il comportamento pre-refactor.
 async fn init_routing_and_port_caches(db: &sqlx::PgPool) -> RoutingAndPortCaches {
+    // Listino configurato? Verifica ALL'AVVIO (regola G): la currency di
+    // piattaforma non ha piu' un default hardcoded, quindi la sua assenza va
+    // scoperta qui — dove fallire e' gratuito e rumoroso — e non a ogni chiamata
+    // LLM, dove propagare l'errore significherebbe respingere le richieste.
+    if let Err(e) = nexus_pricing::assert_configured(db).await {
+        panic!(
+            "nexus-pricing: configurazione del listino assente o illeggibile: {e}\n\
+             Applicare la migrazione 0294 (settings.billing_base_currency) prima di avviare."
+        );
+    }
+
     // Inizializza la cache routing matrix (legge da DB + spawn refresh background 60s).
     // Va inizializzata PRIMA di Orchestrator::new perche' viene clonata dentro l'orchestrator.
     let routing_matrix = routing_matrix::RoutingMatrixCache::init(db.clone()).await;

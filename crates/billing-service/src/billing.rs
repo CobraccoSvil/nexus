@@ -17,12 +17,11 @@ use crate::AppState;
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct PriceSnapshot {
-    pub input_cost_per_million_tokens: f64,
-    pub output_cost_per_million_tokens: f64,
-    pub currency: String,
-}
+// Listino: punto unico `nexus-pricing` (regola L). Questo crate ne teneva una
+// copia FORKATA e divergente: filtrava `is_enabled` sulla contabilita' (sottostima
+// silenziosa sui modelli disabilitati ma chiamati) e usava `EUR` come currency di
+// default, il difetto che mcp-core aveva gia' corretto con la mig 0294.
+pub use nexus_pricing::{calculate_cost, PriceLookup};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct QuotaPolicy {
@@ -38,7 +37,11 @@ struct QuotaPolicy {
 #[derive(Debug, Clone)]
 pub struct UsageReservation {
     pub ledger_id: Uuid,
-    pub price: PriceSnapshot,
+    /// Esito STRUTTURATO del listino (regola M): "non so quanto costa" resta
+    /// dichiarato fino al ledger, invece di collassare in un `{0,0}` fabbricato.
+    pub lookup: PriceLookup,
+    /// Currency delle righe di ledger di questa prenotazione (colonna NOT NULL).
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,87 +176,13 @@ fn claims_user_id(claims: &Claims) -> Result<Uuid, ApiError> {
     parse_uuid(&claims.sub)
 }
 
-async fn get_platform_currency(db: &PgPool) -> anyhow::Result<String> {
-    let currency = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM settings WHERE key = 'billing_base_currency'",
-    )
-    .fetch_optional(db)
-    .await?
-    .unwrap_or_else(|| "EUR".to_string());
-
-    Ok(currency.trim().to_uppercase())
-}
-
-async fn resolve_active_price(
-    db: &PgPool,
-    provider: &str,
-    model: &str,
-) -> anyhow::Result<PriceSnapshot> {
-    let currency = get_platform_currency(db).await?;
-    // 1) Prima prova: currency di piattaforma (default EUR)
-    let price = sqlx::query_as::<_, PriceSnapshot>(
-        r#"
-        SELECT input_cost_per_million_tokens, output_cost_per_million_tokens, currency
-        FROM ai_price_catalog
-        WHERE provider = $1
-          AND model = $2
-          AND currency = $3
-          AND is_enabled = TRUE
-          AND effective_from <= NOW()
-          AND (effective_to IS NULL OR effective_to > NOW())
-        ORDER BY effective_from DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(provider)
-    .bind(model)
-    .bind(&currency)
-    .fetch_optional(db)
-    .await?;
-
-    if let Some(p) = price {
-        return Ok(p);
+/// Costo dai token, solo se il listino e' noto. Su prezzo ignoto/assente si
+/// registra uno zero DICHIARATO, mai un costo calcolato su un placeholder.
+fn cost_of(lookup: &PriceLookup, prompt_tokens: i32, completion_tokens: i32) -> (f64, f64, f64) {
+    match lookup {
+        PriceLookup::Priced(p) => calculate_cost(p, prompt_tokens as i64, completion_tokens as i64),
+        _ => (0.0, 0.0, 0.0),
     }
-
-    // 2) Fallback: prezzo più recente in qualunque currency (es. USD)
-    let fallback = sqlx::query_as::<_, PriceSnapshot>(
-        r#"
-        SELECT input_cost_per_million_tokens, output_cost_per_million_tokens, currency
-        FROM ai_price_catalog
-        WHERE provider = $1
-          AND model = $2
-          AND is_enabled = TRUE
-          AND effective_from <= NOW()
-          AND (effective_to IS NULL OR effective_to > NOW())
-        ORDER BY effective_from DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(provider)
-    .bind(model)
-    .fetch_optional(db)
-    .await?;
-
-    // Ultimo fallback: se manca completamente la voce (provider/model non censiti),
-    // non bloccare la pipeline: registra comunque i token con costo=0.
-    Ok(fallback.unwrap_or(PriceSnapshot {
-        input_cost_per_million_tokens: 0.0,
-        output_cost_per_million_tokens: 0.0,
-        currency,
-    }))
-}
-
-fn calculate_cost(
-    price: &PriceSnapshot,
-    prompt_tokens: i32,
-    completion_tokens: i32,
-) -> (f64, f64, f64) {
-    let input_cost =
-        (prompt_tokens.max(0) as f64 / 1_000_000.0) * price.input_cost_per_million_tokens;
-    let output_cost =
-        (completion_tokens.max(0) as f64 / 1_000_000.0) * price.output_cost_per_million_tokens;
-    let total = input_cost + output_cost;
-    (input_cost, output_cost, total)
 }
 
 async fn read_active_quotas(
@@ -369,10 +298,11 @@ async fn reserve_usage_impl(
     estimated_completion_tokens: i32,
     details: Value,
 ) -> anyhow::Result<UsageReservation> {
-    let price = resolve_active_price(db, provider, model).await?;
+    let lookup = nexus_pricing::resolve_active_price(db, provider, model).await?;
+    let currency = nexus_pricing::platform_currency(db).await?;
     let estimated_total_tokens = prompt_tokens.saturating_add(estimated_completion_tokens);
     let (input_cost, output_cost, estimated_total_cost) =
-        calculate_cost(&price, prompt_tokens, estimated_completion_tokens);
+        cost_of(&lookup, prompt_tokens, estimated_completion_tokens);
 
     let mut tx = db.begin().await?;
     let quotas = read_active_quotas(&mut tx, user_id, project_id).await?;
@@ -402,7 +332,7 @@ async fn reserve_usage_impl(
                 .bind(input_cost)
                 .bind(output_cost)
                 .bind(estimated_total_cost)
-                .bind(&price.currency)
+                .bind(&currency)
                 .bind(format!("quota_exceeded:{}:token_limit", quota.scope_type))
                 .bind(details.clone())
                 .execute(&mut *tx)
@@ -438,7 +368,7 @@ async fn reserve_usage_impl(
                 .bind(input_cost)
                 .bind(output_cost)
                 .bind(estimated_total_cost)
-                .bind(&price.currency)
+                .bind(&currency)
                 .bind(format!("quota_exceeded:{}:cost_limit", quota.scope_type))
                 .bind(details.clone())
                 .execute(&mut *tx)
@@ -474,13 +404,17 @@ async fn reserve_usage_impl(
     .bind(input_cost)
     .bind(output_cost)
     .bind(estimated_total_cost)
-    .bind(&price.currency)
+    .bind(&currency)
     .bind(details)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
-    Ok(UsageReservation { ledger_id, price })
+    Ok(UsageReservation {
+        ledger_id,
+        lookup,
+        currency,
+    })
 }
 
 async fn finalize_usage_impl(
@@ -491,9 +425,10 @@ async fn finalize_usage_impl(
     model: &str,
     usage: &UsageNumbers,
 ) -> anyhow::Result<(f64, f64, f64, String)> {
-    let price = resolve_active_price(db, provider, model).await?;
+    let lookup = nexus_pricing::resolve_active_price(db, provider, model).await?;
+    let currency = nexus_pricing::platform_currency(db).await?;
     let (input_cost, output_cost, total_cost) =
-        calculate_cost(&price, usage.prompt_tokens, usage.completion_tokens);
+        cost_of(&lookup, usage.prompt_tokens, usage.completion_tokens);
 
     // run_id bindato diretto: la FK verso orchestrator_runs e' stata rimossa
     // (mig 0276, run LangGraph legittimi fuori tabella) e orchestrator_runs
@@ -525,7 +460,7 @@ async fn finalize_usage_impl(
     .execute(db)
     .await?;
 
-    Ok((input_cost, output_cost, total_cost, price.currency.clone()))
+    Ok((input_cost, output_cost, total_cost, currency))
 }
 
 async fn release_usage_impl(db: &PgPool, ledger_id: Uuid, reason: &str) {
@@ -1003,14 +938,28 @@ pub async fn internal_reserve(
     )
     .await
     {
-        Ok(reservation) => Ok(Json(json!({
-            "ledger_id": reservation.ledger_id,
-            "price": {
-                "input_cost_per_million_tokens": reservation.price.input_cost_per_million_tokens,
-                "output_cost_per_million_tokens": reservation.price.output_cost_per_million_tokens,
-                "currency": reservation.price.currency,
-            }
-        }))),
+        Ok(reservation) => {
+            // `price_state` e' il segnale strutturato: un client che vede
+            // costi 0 deve poter distinguere "gratis" da "prezzo ignoto"
+            // senza dedurlo dall'importo (regola M). I due campi di costo
+            // restano per compatibilita' col contratto esistente.
+            let (input, output) = match &reservation.lookup {
+                PriceLookup::Priced(p) => (
+                    p.input_cost_per_million_tokens,
+                    p.output_cost_per_million_tokens,
+                ),
+                _ => (0.0, 0.0),
+            };
+            Ok(Json(json!({
+                "ledger_id": reservation.ledger_id,
+                "price": {
+                    "input_cost_per_million_tokens": input,
+                    "output_cost_per_million_tokens": output,
+                    "currency": reservation.currency,
+                    "price_state": reservation.lookup.state_label(),
+                }
+            })))
+        }
         Err(e) => {
             if e.downcast_ref::<QuotaExceededError>().is_some() {
                 Err((

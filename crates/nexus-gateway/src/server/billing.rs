@@ -1,20 +1,20 @@
 //! Enforcement quota e registrazione usage nel ledger.
 //!
-//! Porting fedele delle funzioni `enforceQuota` / `recordUsageToLedger` /
-//! `resolveActivePrice` / `calculateCost` di `server.ts`, che a loro volta
-//! parlano alle stesse tabelle del `crates/billing-service`
-//! (`ai_quota_policies`, `ai_usage_ledger`, `ai_price_catalog`).
+//! Convenzione Nexus: `tenant_id = project_id` (UUID).
 //!
-//! Convenzione Nexus (come nel server.ts): `tenant_id = project_id` (UUID).
+//! Regola L: il LISTINO (quanto costa un modello) vive nel punto unico
+//! `nexus-pricing`, non qui. Questo modulo tiene solo cio' che e' suo: la POLICY
+//! di quota e la scrittura del ledger. La differenza conta — la domanda "quanto
+//! costa (provider, model)?" e' una sola, mentre "cosa faccio se non lo so"
+//! dipende dal chiamante, e qui la risposta e' sempre "degrada e annota, mai
+//! respingere la richiesta".
 //!
-//! Regola L: la logica di prezzo/quota vive nel `billing-service` come API
-//! interna autoritativa (`/internal/reserve|finalize|release`). Qui pero' il
-//! gateway Node NON chiama quell'API: implementa la stima inline come "guardrail
-//! perfetto" PRIMA della chiamata al provider (preview). Replichiamo lo stesso
-//! comportamento per parita' funzionale alla Fase 5; la Fase 6 potra' far
-//! convergere il gateway sull'API interna del billing-service (cosi' resta UN
-//! solo punto di reservation/ledger transazionale). Documentato qui per non
-//! perdere la traccia del consolidamento.
+//! NB storica: una versione precedente di questa doc indicava
+//! `crates/billing-service` come "API interna autoritativa" verso cui far
+//! convergere il gateway alla "Fase 6". Era la direzione sbagliata: quel crate e'
+//! un fork divergente che non scrive alcuna riga di ledger e porta ancora i
+//! difetti (default currency EUR, filtro `is_enabled` sulla contabilita') che
+//! mcp-core aveva gia' corretto. La convergenza e' su `nexus-pricing`.
 //!
 //! Regola F: nessun prompt/response/segreto nei log; solo importi/conteggi.
 
@@ -23,15 +23,9 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::types::{LlmRequest, LlmResponse, MessageContent};
+use nexus_pricing::{calculate_cost, resolve_active_price_in, PriceLookup};
 
-/// Snapshot di prezzo (parita' con `PriceSnapshot` del billing-service).
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct PriceSnapshot {
-    input_cost_per_million_tokens: f64,
-    output_cost_per_million_tokens: f64,
-    currency: String,
-}
+use crate::types::{LlmRequest, LlmResponse, MessageContent};
 
 /// Riga di quota attiva (parita' con la query del server.ts).
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -51,55 +45,38 @@ pub struct QuotaExceeded {
     pub reason: String,
 }
 
-/// Currency di piattaforma (`billing_base_currency`, default EUR). Letta col
-/// punto unico settings.
-async fn platform_currency(db: &PgPool) -> String {
-    nexus_auth::get_setting(db, "billing_base_currency")
-        .await
-        .map(|v| v.trim().to_uppercase())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "EUR".to_string())
-}
-
-/// Prezzo attivo per (provider, model) nella currency di piattaforma. `None` se
-/// la voce non e' censita: il costo si tratta come 0 (parita' col server.ts).
-async fn resolve_active_price(
-    db: &PgPool,
-    provider: &str,
-    model: &str,
-) -> Result<Option<PriceSnapshot>> {
-    let currency = platform_currency(db).await;
-    let price = sqlx::query_as::<_, PriceSnapshot>(
-        r#"
-        SELECT
-            input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-            output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-            currency
-        FROM ai_price_catalog
-        WHERE provider = $1
-          AND model = $2
-          AND currency = $3
-          AND is_enabled = TRUE
-          AND effective_from <= NOW()
-          AND (effective_to IS NULL OR effective_to > NOW())
-        ORDER BY effective_from DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(provider)
-    .bind(model)
-    .bind(&currency)
-    .fetch_optional(db)
-    .await?;
-    Ok(price)
-}
-
-/// Costo (input, output, totale) dato il prezzo e i token. Parita' con `calculateCost`.
-fn calculate_cost(price: &PriceSnapshot, prompt_tokens: i64, completion_tokens: i64) -> (f64, f64, f64) {
-    let input_cost = (prompt_tokens.max(0) as f64 / 1_000_000.0) * price.input_cost_per_million_tokens;
-    let output_cost =
-        (completion_tokens.max(0) as f64 / 1_000_000.0) * price.output_cost_per_million_tokens;
-    (input_cost, output_cost, input_cost + output_cost)
+/// Listino di (provider, model) + currency di piattaforma, dal punto unico.
+///
+/// DEGRADO ESPLICITO (policy del gateway): se la currency non e' configurata o il
+/// DB del listino non risponde, questa funzione NON propaga l'errore. Il motivo e'
+/// che i suoi chiamanti stanno sul percorso della richiesta: `enforce_quota`
+/// propaga con `?` e il suo errore diventa una richiesta RESPINTA. Far fallire una
+/// chiamata LLM perche' non sappiamo prezzarla sostituirebbe una sottostima con un
+/// outage — un prezzo troppo alto per un problema di contabilita'.
+///
+/// La visibilita' che la regola G esige non viene sacrificata: si ottiene ALL'AVVIO
+/// con `nexus_pricing::assert_configured`, dove fallire e' gratuito, piu' il WARN
+/// qui sotto e `details.price_state` sulla riga di ledger.
+async fn lookup_price(db: &PgPool, provider: &str, model: &str) -> PriceLookup {
+    let currency = match nexus_pricing::platform_currency(db).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "gateway-billing: currency di piattaforma non risolvibile -> costo non calcolabile \
+                 (la richiesta prosegue: vedi assert_configured all'avvio)"
+            );
+            return PriceLookup::NotInCatalog;
+        }
+    };
+    match resolve_active_price_in(db, provider, model, &currency).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, provider = %provider, model = %model,
+                "gateway-billing: lettura listino fallita -> costo non calcolabile");
+            PriceLookup::NotInCatalog
+        }
+    }
 }
 
 /// Stima i token di input dai messaggi (char/4, parita' col server.ts).
@@ -137,15 +114,32 @@ pub async fn enforce_quota(
         return Ok(());
     };
 
-    let currency = platform_currency(db).await;
+    // Solo per il log della quota superata: se non e' risolvibile lo si dice,
+    // non si inventa una valuta (regola G).
+    let currency = nexus_pricing::platform_currency(db)
+        .await
+        .unwrap_or_else(|_| "currency non configurata".to_string());
 
     let estimated_prompt = estimate_prompt_tokens(req);
     let estimated_completion = req.max_tokens.map(|t| t as i64).unwrap_or(0);
     let estimated_total = estimated_prompt + estimated_completion;
 
-    let estimated_cost = match resolve_active_price(db, provider, model).await? {
-        Some(p) => calculate_cost(&p, estimated_prompt, estimated_completion).2,
-        None => 0.0,
+    // Stima per le quote: senza listino resta 0 (non si inventa un prezzo, e
+    // rifiutare qui sarebbe un cambio di policy). Lo zero e' pero' dichiarato,
+    // non implicito: `Unknown` viene loggato perche' una stima a 0 non consuma
+    // quota di costo e lascia sforare in silenzio.
+    let estimated_cost = match lookup_price(db, provider, model).await {
+        PriceLookup::Priced(p) => calculate_cost(&p, estimated_prompt, estimated_completion).2,
+        PriceLookup::Unknown => {
+            tracing::warn!(
+                provider = %provider,
+                model = %model,
+                "gateway-quota: prezzo IGNOTO (pricing_state='unknown') -> stima costo 0, \
+                 la quota di costo non viene consumata per questa chiamata"
+            );
+            0.0
+        }
+        PriceLookup::NotInCatalog => 0.0,
     };
 
     let quotas = sqlx::query_as::<_, QuotaRow>(
@@ -258,25 +252,44 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
     let completion_tokens = resp.usage.output_tokens as i64;
     let total_tokens = prompt_tokens + completion_tokens;
 
-    let price = match resolve_active_price(db, provider, model).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "gateway-ledger: lettura prezzo fallita, registro costo 0");
-            None
-        }
-    };
-    let (currency, input_cost, output_cost, total_cost, price_missing) = match &price {
-        Some(p) => {
+    let price = lookup_price(db, provider, model).await;
+    // `price_state` e' il segnale STRUTTURATO del perche' di un costo: chi legge il
+    // ledger distingue "0 perche' gratis" da "0 perche' non so quanto costa" senza
+    // dedurlo dall'importo. `price_missing` resta per i lettori esistenti ed e'
+    // `true` in ENTRAMBI i casi di costo non calcolabile.
+    let price_state = price.state_label();
+    let price_missing = price.is_missing();
+    let (currency, input_cost, output_cost, total_cost) = match &price {
+        PriceLookup::Priced(p) => {
             let (i, o, t) = calculate_cost(p, prompt_tokens, completion_tokens);
-            (p.currency.trim().to_uppercase(), i, o, t, false)
+            (p.currency.trim().to_uppercase(), i, o, t)
         }
-        None => (platform_currency(db).await, 0.0, 0.0, 0.0, true),
+        _ => {
+            if matches!(price, PriceLookup::Unknown) {
+                tracing::warn!(
+                    provider = %provider,
+                    model = %model,
+                    prompt_tokens,
+                    completion_tokens,
+                    "gateway-ledger: prezzo IGNOTO (pricing_state='unknown') -> costo NON calcolabile, \
+                     registro 0 esplicito. Il modello non dovrebbe essere routabile: vedi il ciclo \
+                     reconcile_disable_price_unknown del catalog_sync"
+                );
+            }
+            // Costo 0 -> la currency e' vacua, ma la colonna e' NOT NULL: si annota
+            // quella di piattaforma. Se nemmeno quella e' leggibile il DB e' giu' e
+            // l'INSERT qui sotto fallisce comunque, quindi la stringa vuota non
+            // raggiunge una riga persistita.
+            let cur = nexus_pricing::platform_currency(db).await.unwrap_or_default();
+            (cur, 0.0, 0.0, 0.0)
+        }
     };
 
     let details = json!({
         "request_id": req.metadata.request_id,
         "feature": req.metadata.feature,
         "price_missing": price_missing,
+        "price_state": price_state,
     });
 
     // run_id (= request_id nei metadata): abilita il breakdown costo per run /
@@ -368,22 +381,9 @@ mod tests {
         assert_eq!(estimate_prompt_tokens(&req(vec![""], None)), 0);
     }
 
-    #[test]
-    fn calculate_cost_scala_per_milione() {
-        let p = PriceSnapshot {
-            input_cost_per_million_tokens: 2.0,
-            output_cost_per_million_tokens: 6.0,
-            currency: "EUR".into(),
-        };
-        // 1M input -> 2.0 ; 1M output -> 6.0 ; totale 8.0.
-        let (i, o, t) = calculate_cost(&p, 1_000_000, 1_000_000);
-        assert!((i - 2.0).abs() < 1e-9);
-        assert!((o - 6.0).abs() < 1e-9);
-        assert!((t - 8.0).abs() < 1e-9);
-        // token negativi clampati a 0.
-        let (i2, _, _) = calculate_cost(&p, -100, 0);
-        assert_eq!(i2, 0.0);
-    }
+    // NB: il test `calculate_cost_scala_per_milione` (e il clamp dei token
+    // negativi) vive ora accanto alla funzione, in `nexus-pricing`. Riprodurlo qui
+    // testerebbe una funzione che questo crate non possiede piu'.
 
     #[test]
     fn quota_exceeded_display() {

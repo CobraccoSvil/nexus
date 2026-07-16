@@ -33,6 +33,7 @@ nexus-wiki = { path = "../nexus-wiki" }
 mcp-db = { path = "../mcp-db" }
 mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }
+nexus-pricing = { path = "../nexus-pricing" }
 nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
 nexus-cache = { path = "../nexus-cache" }

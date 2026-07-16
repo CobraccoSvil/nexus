@@ -13,6 +13,7 @@ axum.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
 nexus-auth = { path = "../nexus-auth" }
+nexus-pricing = { path = "../nexus-pricing" }
 nexus-project-pools = { path = "../nexus-project-pools" }
 serde.workspace = true
 serde_json.workspace = true

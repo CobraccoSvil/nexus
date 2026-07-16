@@ -7,6 +7,10 @@ build/
 __pycache__/
 *.pyc
 target/
+# Target dir alternative (CARGO_TARGET_DIR=target-verify e gemelli): sono build
+# artifact come target/, ma non essendo ignorate un `git add -A` le trascinava
+# dentro insieme al lavoro altrui.
+target-*/
 coverage/
 .DS_Store
 .env

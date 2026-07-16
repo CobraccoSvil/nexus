@@ -118,6 +118,44 @@ assert_single "derivazione nome DB progetto" 'fn derive_project_db_name' 'crates
 assert_single "problem_group_key" 'fn problem_group_key' 'crates/mcp-core/src/project_workspace/problem_aggregation.rs' crates
 assert_single "aggregate_problems" 'fn aggregate_problems' 'crates/mcp-core/src/project_workspace/problem_aggregation.rs' crates
 
+# Listino modelli (2026-07-15): "quanto costa (provider, model)?" e' UNA domanda,
+# e la risposta vive solo in crates/nexus-pricing. Era scritta TRE volte (mcp-core,
+# nexus-gateway, billing-service) e le copie erano divergenti sui soldi: filtro
+# `is_enabled` sulla contabilita' (sottostima sui modelli disabilitati ma chiamati),
+# currency di default USD contro EUR (il default EUR aveva gia' prodotto 3.993
+# righe di ledger orfane, corrette dalla mig 0294) e `pricing_state` letto da una
+# sola delle tre. Nessun compilatore poteva vederlo: sono tre funzioni private
+# omonime in crate che non si conoscono.
+#
+# Il guard NON vieta di leggere `ai_price_catalog` (context_window, elenco
+# provider, capability sono letture legittime che non prezzano nulla). Confina due
+# cose precise:
+#   1. la currency di piattaforma: `billing_base_currency` ha UN solo lettore;
+#   2. le funzioni omonime: erano tre `fn resolve_active_price` private in crate
+#      diversi — invisibili l'una all'altra, quindi impossibili da confrontare.
+# Le CHIAMATE `nexus_pricing::...` restano libere ovunque.
+# La chiave si cerca QUOTATA (`"billing_base_currency"` o `'...'` in SQL): cosi'
+# il guard becca le letture e non i messaggi d'errore che la nominano per aiutare
+# chi legge il log.
+pricing_hits="$(grep -rEn \
+  "[\"']billing_base_currency[\"']|fn +(resolve_active_price|calculate_cost|get_platform_currency|platform_currency)\b" \
+  crates \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v '^crates/nexus-pricing/' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$pricing_hits" ]]; then
+  echo "!! pricing-single-source: listino/currency definiti fuori da nexus-pricing:" >&2
+  echo "$pricing_hits" >&2
+  echo "   Chiama nexus_pricing::{resolve_active_price, platform_currency, calculate_cost}." >&2
+  echo "   Le tre copie storiche divergevano sui soldi (filtro is_enabled, default" >&2
+  echo "   USD vs EUR, pricing_state letto da una sola): tenerne UNA e' il punto." >&2
+  fail=1
+else
+  echo "OK pricing-single-source: listino e currency vivono solo in nexus-pricing"
+fi
+
 # Identificatori canonici (2026-07-09): enum/command identifiers in inglese,
 # niente sinonimi IT negli parser Rust (regola CLAUDE.md sezione N).
 alias_hits="$(grep -rEn \

@@ -11,12 +11,11 @@ use uuid::Uuid;
 
 use crate::{auth::Claims, AppState};
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct PriceSnapshot {
-    pub input_cost_per_million_tokens: f64,
-    pub output_cost_per_million_tokens: f64,
-    pub currency: String,
-}
+// Listino: punto unico `nexus-pricing` (regola L). Qui restava una copia della
+// query + del calcolo, divergente dalle altre due su filtro `is_enabled`,
+// currency di default e lettura di `pricing_state`. Ri-esportati per i call site
+// storici che li importano da `crate::billing`.
+pub use nexus_pricing::{calculate_cost, PriceLookup};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct QuotaPolicy {
@@ -32,7 +31,17 @@ struct QuotaPolicy {
 #[derive(Debug, Clone)]
 pub struct UsageReservation {
     pub ledger_id: Uuid,
-    pub price: PriceSnapshot,
+    /// Esito STRUTTURATO del listino al momento della prenotazione (regola M).
+    ///
+    /// Prima era un `PriceSnapshot` secco: quando il prezzo non era noto,
+    /// `reserve_usage` era costretta a fabbricare un `{0, 0, currency}` e a
+    /// infilarlo qui, cosi' `finalize_usage` calcolava un costo 0 senza sapere
+    /// perche'. Il magic fallback sopravviveva alla struct. Con l'enum, "non so
+    /// quanto costa" resta dichiarato fino alla scrittura del ledger.
+    pub lookup: PriceLookup,
+    /// Currency da annotare sulle righe di ledger di questa prenotazione. Serve
+    /// anche quando il prezzo non e' noto: la colonna e' NOT NULL.
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,113 +125,6 @@ pub struct UsageQuery {
 
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
-
-pub async fn get_platform_currency(db: &PgPool) -> anyhow::Result<String> {
-    // Default USD: i provider AI fatturano in dollari, ai_price_catalog e' in
-    // USD. Tenere "EUR" come default produceva ledger con currency='EUR' e
-    // total_cost=0 quando il fallback price-snapshot non trovava match
-    // (3.993 righe orfane osservate prima del fix 2026-06-04).
-    // Settings.billing_base_currency = 'USD' allineato in mig 0294.
-    let currency = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM settings WHERE key = 'billing_base_currency'",
-    )
-    .fetch_optional(db)
-    .await?
-    .unwrap_or_else(|| "USD".to_string());
-
-    Ok(currency.trim().to_uppercase())
-}
-
-pub async fn resolve_active_price(
-    db: &PgPool,
-    provider: &str,
-    model: &str,
-) -> anyhow::Result<PriceSnapshot> {
-    let currency = get_platform_currency(db).await?;
-    // NB IMPORTANTE: NON filtriamo per `is_enabled = TRUE`. Il billing deve
-    // conoscere il prezzo del modello effettivamente CHIAMATO, anche se nel
-    // catalogo il flag enabled e' stato disattivato dall'admin (es. mistral-
-    // large-2411 disabled ma usato da run legacy/pinning). Filtrare per enabled
-    // produceva cost=0 = sottostima silenziosa. Il filtro enabled e' invece
-    // corretto nel routing (chi puo' usare quale modello), non qui (quanto
-    // costa quella chiamata gia' avvenuta).
-    //
-    // 1) Match per (provider, model, currency di piattaforma).
-    let price = sqlx::query_as::<_, PriceSnapshot>(
-        r#"
-        SELECT input_cost_per_million_tokens::float8,
-               output_cost_per_million_tokens::float8,
-               currency
-        FROM ai_price_catalog
-        WHERE provider = $1
-          AND model = $2
-          AND currency = $3
-          AND effective_from <= NOW()
-          AND (effective_to IS NULL OR effective_to > NOW())
-        ORDER BY effective_from DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(provider)
-    .bind(model)
-    .bind(&currency)
-    .fetch_optional(db)
-    .await?;
-
-    if let Some(p) = price {
-        return Ok(p);
-    }
-
-    // 2) Fallback: prezzo attivo in QUALUNQUE currency (es. catalog tutto USD
-    //    ma platform_currency=EUR -> usa USD per non perdere il dato).
-    let fallback = sqlx::query_as::<_, PriceSnapshot>(
-        r#"
-        SELECT input_cost_per_million_tokens::float8,
-               output_cost_per_million_tokens::float8,
-               currency
-        FROM ai_price_catalog
-        WHERE provider = $1
-          AND model = $2
-          AND effective_from <= NOW()
-          AND (effective_to IS NULL OR effective_to > NOW())
-        ORDER BY effective_from DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(provider)
-    .bind(model)
-    .fetch_optional(db)
-    .await?;
-
-    // Ultimo fallback: provider/model non censiti -> log warning + cost=0.
-    // Audit `nexus_provider_empty_responses` puo' rilevarli e l'admin
-    // aggiunge la riga al catalog.
-    if fallback.is_none() {
-        tracing::warn!(
-            target: "billing",
-            "resolve_active_price: provider/model non in ai_price_catalog -> cost=0 (provider={}, model={})",
-            provider, model,
-        );
-    }
-    Ok(fallback.unwrap_or(PriceSnapshot {
-        input_cost_per_million_tokens: 0.0,
-        output_cost_per_million_tokens: 0.0,
-        currency,
-    }))
-}
-
-fn calculate_cost(
-    price: &PriceSnapshot,
-    prompt_tokens: i32,
-    completion_tokens: i32,
-) -> (f64, f64, f64) {
-    let input_cost =
-        (prompt_tokens.max(0) as f64 / 1_000_000.0) * price.input_cost_per_million_tokens;
-    let output_cost =
-        (completion_tokens.max(0) as f64 / 1_000_000.0) * price.output_cost_per_million_tokens;
-    let total = input_cost + output_cost;
-    (input_cost, output_cost, total)
-}
 
 async fn read_active_quotas(
     tx: &mut Transaction<'_, Postgres>,
@@ -349,10 +251,29 @@ pub async fn reserve_usage(
     estimated_completion_tokens: i32,
     details: Value,
 ) -> anyhow::Result<UsageReservation> {
-    let price = resolve_active_price(db, provider, model).await?;
+    let lookup = nexus_pricing::resolve_active_price(db, provider, model).await?;
+    let currency = nexus_pricing::platform_currency(db).await?;
+    if matches!(lookup, PriceLookup::Unknown) {
+        // Stima a 0 su prezzo IGNOTO: non blocca la richiesta (sarebbe un cambio
+        // di policy sulle quote), ma va detto — una stima 0 non consuma quota di
+        // costo e lascia sforare senza che nessuno se ne accorga. Il fix
+        // strutturale e' a monte: un modello a prezzo ignoto non deve essere
+        // routabile (`model_catalog_sync::price_unknown_sql`).
+        tracing::warn!(
+            target: "billing",
+            "reserve_usage: prezzo IGNOTO (pricing_state='unknown') -> stima quota a 0 \
+             (provider={provider}, model={model})",
+        );
+    }
     let estimated_total_tokens = prompt_tokens.saturating_add(estimated_completion_tokens);
-    let (input_cost, output_cost, estimated_total_cost) =
-        calculate_cost(&price, prompt_tokens, estimated_completion_tokens);
+    let (input_cost, output_cost, estimated_total_cost) = match &lookup {
+        PriceLookup::Priced(p) => calculate_cost(
+            p,
+            prompt_tokens as i64,
+            estimated_completion_tokens as i64,
+        ),
+        _ => (0.0, 0.0, 0.0),
+    };
 
     let mut tx = db.begin().await?;
     let quotas = read_active_quotas(&mut tx, user_id, project_id).await?;
@@ -382,7 +303,7 @@ pub async fn reserve_usage(
                 .bind(input_cost)
                 .bind(output_cost)
                 .bind(estimated_total_cost)
-                .bind(&price.currency)
+                .bind(&currency)
                 .bind(format!("quota_exceeded:{}:token_limit", quota.scope_type))
                 .bind(details.clone())
                 .execute(&mut *tx)
@@ -418,7 +339,7 @@ pub async fn reserve_usage(
                 .bind(input_cost)
                 .bind(output_cost)
                 .bind(estimated_total_cost)
-                .bind(&price.currency)
+                .bind(&currency)
                 .bind(format!("quota_exceeded:{}:cost_limit", quota.scope_type))
                 .bind(details.clone())
                 .execute(&mut *tx)
@@ -454,13 +375,17 @@ pub async fn reserve_usage(
     .bind(input_cost)
     .bind(output_cost)
     .bind(estimated_total_cost)
-    .bind(&price.currency)
+    .bind(&currency)
     .bind(details)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
-    Ok(UsageReservation { ledger_id, price })
+    Ok(UsageReservation {
+        ledger_id,
+        lookup,
+        currency,
+    })
 }
 
 pub async fn finalize_usage(
@@ -469,11 +394,17 @@ pub async fn finalize_usage(
     run_id: Uuid,
     usage: &UsageNumbers,
 ) -> anyhow::Result<(f64, f64, f64, String)> {
-    let (input_cost, output_cost, total_cost) = calculate_cost(
-        &reservation.price,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-    );
+    // Costo dai token REALI, ma solo se il listino era noto: su prezzo ignoto il
+    // ledger registra uno zero DICHIARATO (`price_state`), non un costo calcolato
+    // su un prezzo placeholder.
+    let (input_cost, output_cost, total_cost) = match &reservation.lookup {
+        PriceLookup::Priced(p) => calculate_cost(
+            p,
+            usage.prompt_tokens as i64,
+            usage.completion_tokens as i64,
+        ),
+        _ => (0.0, 0.0, 0.0),
+    };
 
     sqlx::query(
         r#"
@@ -505,7 +436,7 @@ pub async fn finalize_usage(
         input_cost,
         output_cost,
         total_cost,
-        reservation.price.currency.clone(),
+        reservation.currency.clone(),
     ))
 }
 
@@ -1101,3 +1032,4 @@ async fn usage_report(db: &PgPool, query: UsageQuery) -> ApiResult {
         "breakdown": list
     })))
 }
+
