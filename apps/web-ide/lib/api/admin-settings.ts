@@ -22,10 +22,29 @@ export async function listAdminSettingsByCategory(
   );
 }
 
+/** Esiti di SUCCESSO di una scrittura su settings. Il fallimento non e' un
+ *  valore di questa unione: il backend lo dice con lo status HTTP (500) e
+ *  `fetchJson` solleva `ApiError` (regola M — lo status e' il segnale, il
+ *  messaggio serve solo per il display).
+ *
+ *  `created` e' un successo per il DB ma un campanello per l'admin: la chiave
+ *  non esisteva ed e' stata creata dal PUT, in categoria 'custom' e con
+ *  descrizione vuota, invece di essere rifiutata. Chi scrive una chiave che si
+ *  aspetta gia' seedata da una migrazione dovrebbe trattarlo come anomalia: il
+ *  caso tipico e' un refuso nel nome, che cosi' produce una riga nuova al posto
+ *  di un errore. (La riga resta visibile in UI, sotto la categoria 'custom':
+ *  la sidebar deriva dai dati, vedi `list_categories` e `buildList`.) */
+export type AdminSettingUpdateStatus = "ok" | "created";
+
+export interface AdminSettingUpdateResult {
+  status: AdminSettingUpdateStatus;
+  key: string;
+}
+
 export async function updateAdminSetting(
   key: string,
   value: string,
-): Promise<{ status: string; key: string }> {
+): Promise<AdminSettingUpdateResult> {
   return fetchJson(`${API_BASE}/api/admin/setting/${key}`, {
     method: "PUT",
     body: JSON.stringify({ value }),

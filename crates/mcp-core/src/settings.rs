@@ -218,32 +218,45 @@ pub async fn list_categories(State(state): State<super::AppState>) -> Json<serde
     Json(serde_json::json!({ "categories": categories }))
 }
 
-/// PUT /api/settings/:key — update a single setting
+/// PUT /api/admin/setting/:key — aggiorna una singola impostazione.
+///
+/// E' l'endpoint che serve le pagine admin (la route Next.js proxya qui, non su
+/// admin-service, che ne ha una copia gemella).
+///
+/// L'esito e' lo STATUS HTTP (regola M): 200 aggiornata, 201 creata, 500 se il
+/// DB rifiuta. Prima rispondeva 200 in ogni caso, con l'esito nel solo campo
+/// `status` del body: `fetchJson` decide sullo status e quindi non sollevava,
+/// e ogni pagina admin mostrava "salvato" su una scrittura che il DB aveva
+/// rifiutato. Il caso non e' teorico: il trigger `trg_settings_guard_protected`
+/// (mig 0499) nega gli UPDATE sui setting protetti proprio contando sul fatto
+/// che l'errore risalga al client.
 pub async fn update_setting(
     State(state): State<super::AppState>,
     Path(key): Path<String>,
     Json(body): Json<UpdateSettingRequest>,
-) -> Json<serde_json::Value> {
-    let result = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let updated = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
         .bind(&body.value)
         .bind(&key)
         .execute(&state.db)
-        .await;
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let status = match result {
-        Ok(r) if r.rows_affected() > 0 => "ok",
-        Ok(_) => {
-            // Key doesn't exist, insert it
-            let _ = sqlx::query(
-                "INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)",
-            )
-            .bind(&key)
-            .bind(&body.value)
-            .execute(&state.db)
-            .await;
-            "created"
-        }
-        Err(e) => return Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
+    let (http_status, status) = if updated.rows_affected() > 0 {
+        (StatusCode::OK, "ok")
+    } else {
+        // Chiave assente: la riga viene creata in categoria 'custom'. L'errore
+        // di questo INSERT era scartato (`let _ =`), quindi la risposta diceva
+        // "created" anche quando la riga non era stata scritta.
+        sqlx::query(
+            "INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)",
+        )
+        .bind(&key)
+        .bind(&body.value)
+        .execute(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (StatusCode::CREATED, "created")
     };
 
     // Notifica tutti i client connessi (evento system-wide)
@@ -294,14 +307,22 @@ pub async fn update_setting(
         _ => {}
     }
 
-    Json(serde_json::json!({ "status": status, "key": key }))
+    Ok((http_status, Json(serde_json::json!({ "status": status, "key": key }))))
 }
 
-/// PUT /api/settings — bulk update
+/// PUT /api/admin/settings — aggiorna piu' impostazioni in un colpo.
+///
+/// Stesso contratto di `update_setting`: l'esito e' lo STATUS HTTP (regola M).
+/// 200 se tutte le chiavi sono state scritte, 500 se anche una sola e' stata
+/// rifiutata. Prima rispondeva 200 anche con `errors` non vuoto: il pannello
+/// Routing (`saveRouting`) controlla solo `res.ok`, quindi mostrava "Salvato"
+/// con il DB invariato. Il dettaglio strutturato resta nel body (`updated`,
+/// `errors`); `error` e' la stessa cosa appiattita per il display, dove il
+/// client la cerca.
 pub async fn bulk_update(
     State(state): State<super::AppState>,
     Json(body): Json<BulkUpdateRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     ensure_required_settings(&state).await;
 
     let mut updated = 0;
@@ -366,11 +387,27 @@ pub async fn bulk_update(
         });
     }
 
-    Json(serde_json::json!({
-        "status": if errors.is_empty() { "ok" } else { "partial" },
-        "updated": updated,
-        "errors": errors,
-    }))
+    if errors.is_empty() {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok", "updated": updated, "errors": [] })),
+        ));
+    }
+
+    Ok((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "status": "partial",
+            "updated": updated,
+            "errors": errors,
+            "error": format!(
+                "{} chiave/i su {} non salvate: {}",
+                errors.len(),
+                body.settings.len(),
+                errors.join(" | ")
+            ),
+        })),
+    ))
 }
 
 /// GET /internal/settings/:key — get raw value (internal use, not masked)

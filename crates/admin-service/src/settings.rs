@@ -19,7 +19,9 @@ use nexus_types::fs_browse::{list_directories, list_root_candidates};
 // Tipi e helper API: punto unico in nexus_types (regola L / ADR 0026, cluster E6).
 // Prima `ApiError`/`ApiResult`/`api_error`/`validate_directory_name` erano
 // ri-implementati identici qui e in crates/mcp-core/src/settings.rs.
-use nexus_types::{api_error, validate_directory_name_api as validate_directory_name, ApiResult};
+use nexus_types::{
+    api_error, validate_directory_name_api as validate_directory_name, ApiError, ApiResult,
+};
 
 async fn ensure_required_settings(state: &AppState) {
     // Default statici: migrazione 0325 (regola G/H). Parte dinamica
@@ -119,29 +121,49 @@ pub async fn list_by_category(
     Json(json!({ "settings": masked }))
 }
 
+/// PUT /api/admin/setting/:key — aggiorna una singola impostazione.
+///
+/// L'esito e' lo STATUS HTTP (regola M): 200 aggiornata, 201 creata, 500 se il
+/// DB rifiuta. Prima rispondeva 200 in ogni caso, con l'esito nel solo campo
+/// `status` del body: `fetchJson` decide sullo status e quindi non sollevava,
+/// e ogni pagina admin mostrava "salvato" su una scrittura che il DB aveva
+/// rifiutato. Il caso non e' teorico: il trigger `trg_settings_guard_protected`
+/// (mig 0499) nega gli UPDATE sui setting protetti proprio contando sul fatto
+/// che l'errore risalga al client.
 pub async fn update_setting(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Json(body): Json<UpdateSettingRequest>,
-) -> Json<Value> {
-    let result = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
-        .bind(&body.value).bind(&key).execute(&state.db).await;
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let updated = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
+        .bind(&body.value).bind(&key).execute(&state.db).await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    match result {
-        Ok(r) if r.rows_affected() > 0 => Json(json!({ "status": "ok", "key": key })),
-        Ok(_) => {
-            let _ = sqlx::query("INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)")
-                .bind(&key).bind(&body.value).execute(&state.db).await;
-            Json(json!({ "status": "created", "key": key }))
-        }
-        Err(e) => Json(json!({ "status": "error", "error": e.to_string() })),
+    if updated.rows_affected() > 0 {
+        return Ok((StatusCode::OK, Json(json!({ "status": "ok", "key": key }))));
     }
+
+    // Chiave assente: la riga viene creata in categoria 'custom'. L'errore di
+    // questo INSERT era scartato (`let _ =`), quindi la risposta diceva
+    // "created" anche quando la riga non era stata scritta.
+    sqlx::query("INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)")
+        .bind(&key).bind(&body.value).execute(&state.db).await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((StatusCode::CREATED, Json(json!({ "status": "created", "key": key }))))
 }
 
+/// PUT /api/admin/settings — aggiorna piu' impostazioni in un colpo.
+///
+/// Stesso contratto di `update_setting`: l'esito e' lo STATUS HTTP (regola M).
+/// 200 se tutte le chiavi sono state scritte, 500 se anche una sola e' stata
+/// rifiutata. Prima rispondeva 200 anche con `errors` non vuoto, e un client che
+/// guarda solo lo status vedeva un successo con il DB invariato. Il dettaglio
+/// resta nel body (`updated`, `errors`); `error` e' l'appiattimento per display.
 pub async fn bulk_update(
     State(state): State<AppState>,
     Json(body): Json<BulkUpdateRequest>,
-) -> Json<Value> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     ensure_required_settings(&state).await;
 
     let mut updated = 0;
@@ -160,7 +182,19 @@ pub async fn bulk_update(
     // ora gestita da mcp-core/nexus-gateway con TTL DB-driven (refresh entro
     // ~60s). Nessun side-effect HTTP da invalidare qui (era best-effort).
 
-    Json(json!({ "status": if errors.is_empty() { "ok" } else { "partial" }, "updated": updated, "errors": errors }))
+    if errors.is_empty() {
+        return Ok((StatusCode::OK, Json(json!({ "status": "ok", "updated": updated, "errors": [] }))));
+    }
+
+    Ok((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "status": "partial",
+            "updated": updated,
+            "errors": errors,
+            "error": format!("{} chiave/i su {} non salvate: {}", errors.len(), body.settings.len(), errors.join(" | ")),
+        })),
+    ))
 }
 
 pub async fn get_raw_value(

@@ -135,10 +135,12 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         }),
       });
       const payload = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      if (payload && payload.status && payload.status !== "ok") {
-        const errors = Array.isArray(payload.errors) ? payload.errors.join(" | ") : "Errore salvataggio";
-        throw new Error(errors);
+      // L'esito e' lo status HTTP (il backend risponde 500 se anche una sola
+      // chiave e' stata rifiutata); il body serve solo a dire QUALE, per il
+      // display. Prima il 200-sempre rendeva il controllo su payload.status
+      // l'unico presidio, e il gemello saveRouting non ce l'aveva affatto.
+      if (!res.ok) {
+        throw new Error(payload?.error ?? `HTTP ${res.status}`);
       }
       setNexusPctSaved(true);
       setTimeout(() => setNexusPctSaved(false), 2000);
@@ -177,7 +179,14 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         }),
       });
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Difetto corretto: qui `res.ok` era l'unico controllo, e bulk_update
+      // rispondeva 200 anche quando il DB rifiutava ogni chiave (l'esito viveva
+      // solo in payload.status/errors, che questa funzione non leggeva): il
+      // pannello mostrava "Salvato" con il DB invariato.
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        throw new Error(payload?.error ?? `HTTP ${res.status}`);
+      }
 
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
