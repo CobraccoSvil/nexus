@@ -552,10 +552,7 @@ export default function CouncilPage() {
                           <span>
                             <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>{def.modelPurpose}</span>
                             {m.purposeModel ? (
-                              <span style={{ color: tc.textMuted, fontSize: 11 }}>
-                                {" "}
-                                · {m.purposeModel.tier ?? "—"} · {m.purposeModel.provider}/{m.purposeModel.model_id}
-                              </span>
+                              <ModelloRisolto tc={tc} pm={m.purposeModel} />
                             ) : null}
                           </span>
                         ) : (
@@ -1007,6 +1004,72 @@ function Badge({ tc, label, tone }: { tc: ThemeColors; label: string; tone: "ok"
       }}
     >
       {label}
+    </span>
+  );
+}
+
+/**
+ * Il modello di una figura: quello che RISPONDE, non quello configurato.
+ *
+ * Perche' esiste. Questa colonna mostrava `provider/model_id` della riga
+ * `nexus_purpose_model`, ma quando il purpose ha un `tier` il resolver e'
+ * tier-only e quel campo lo IGNORA. Misurato il 2026-07-16: il pannello
+ * dichiarava `deepseek/deepseek-v4-flash` per cinque figure che giravano su
+ * `groq/gpt-oss-20b` — agentic_index 3.1 contro 31.1. Chi guardava la pagina
+ * per capire perche' il consiglio rispondeva male leggeva un dato che nessuno
+ * usa: un pannello che mostra la configurazione invece dell'effetto non e'
+ * incompleto, e' fuorviante.
+ *
+ * Il campo statico resta visibile solo quando e' davvero la risposta (purpose
+ * senza tier); altrimenti e' dichiarato "ignorato" invece di essere spacciato
+ * per la verita'.
+ */
+function ModelloRisolto({ tc, pm }: { tc: ThemeColors; pm: PurposeModelEntry }) {
+  const stile: CSSProperties = { color: tc.textMuted, fontSize: 11 };
+  // Purpose statico: nessun tier -> provider/model_id SONO la risposta.
+  if (!pm.tier) {
+    return (
+      <span style={stile}>
+        {" "}
+        · statico · {pm.provider}/{pm.model_id}
+      </span>
+    );
+  }
+  // Tier-based: la risposta la da' il resolver.
+  const r = pm.resolved;
+  // Lo scostamento e' un dato STRUTTURATO del servizio (regola M): non si
+  // deduce dal confronto dei tier, si legge dal rationale.
+  const sceso = r?.rationale.includes(":degraded_to=");
+  const salito = r?.rationale.includes(":upgraded_to=");
+  return (
+    <span style={stile}>
+      {" "}
+      · {pm.tier}
+      {r ? (
+        <>
+          {" · "}
+          <span
+            title={r.rationale}
+            style={{
+              color: sceso ? tc.error : tc.text,
+              fontWeight: sceso || salito ? 600 : 400,
+            }}
+          >
+            {r.provider}/{r.model}
+          </span>
+          {sceso ? (
+            <span title={r.rationale} style={{ color: tc.error }}>
+              {" "}
+              (sotto il tier)
+            </span>
+          ) : null}
+          {salito ? <span title={r.rationale}> (sopra il tier)</span> : null}
+        </>
+      ) : (
+        <span style={{ color: tc.error }} title="Nessun modello risolvibile ora: catalog, gate di qualificazione o provider in cooldown">
+          {" · non risolvibile ora"}
+        </span>
+      )}
     </span>
   );
 }

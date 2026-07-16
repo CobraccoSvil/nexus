@@ -53,8 +53,20 @@ export async function updateAdminSetting(
 }
 
 // --- Admin Routing: Purpose models ---
+/** La risoluzione LIVE di un purpose: chi risponde ADESSO, e perche'.
+ *  `rationale` e' il segnale strutturato del servizio (regola M):
+ *  `tier=medium:auto` | `tier=medium:degraded_to=light` | `...:upgraded_to=high`. */
+export interface ResolvedPurposeModel {
+  provider: string;
+  model: string;
+  rationale: string;
+}
+
 export interface PurposeModelEntry {
   purpose: string;
+  /** Il valore in tabella. Quando `tier` e' valorizzato NON viene usato: il
+   *  resolver e' tier-only. Mostrare questo campo come "il modello del purpose"
+   *  e' la bugia che il pannello raccontava (vedi `resolved`). */
   provider: string;
   model_id: string;
   notes?: string | null;
@@ -62,6 +74,9 @@ export interface PurposeModelEntry {
   required_capability?: string | null;
   requires_tool_use?: boolean;
   updated_at: string;
+  /** Cosa risolve davvero. `null` = purpose statico (senza tier: allora
+   *  provider/model_id SONO la risposta) oppure non risolvibile ora. */
+  resolved?: ResolvedPurposeModel | null;
 }
 
 export async function listAdminPurposeModels(): Promise<{ items: PurposeModelEntry[] }> {
