@@ -1554,6 +1554,152 @@ pub(crate) async fn read_multi_provider_config(db: &sqlx::PgPool) -> Option<Mult
     })
 }
 
+// ── Dimensionamento orchestrazione (mig 0602) ──────────────────────────────
+// Loader I/O del resolver PURO `orchestration_sizing` (regola L: la decisione
+// vive nel modulo puro di nexus-agent-graph; qui SOLO la lettura di settings,
+// definitions e listino, coi safe-default che coincidono coi seed della mig).
+
+/// Backstop ASSOLUTI del dimensionamento: le STESSE chiavi storiche dei cap
+/// (nessuna seconda fonte di verita'). Il resolver decide, questi limano.
+pub(crate) async fn read_orchestration_backstops(
+    db: &sqlx::PgPool,
+) -> nexus_agent_graph::decisions::orchestration_sizing::OrchestrationBackstops {
+    async fn usize_setting(db: &sqlx::PgPool, key: &str, default: usize) -> usize {
+        nexus_auth::get_setting(db, key)
+            .await
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+    let multi_provider_max =
+        usize_setting(db, "orchestrator.multi_provider_max_providers", 3)
+            .await
+            .max(1);
+    nexus_agent_graph::decisions::orchestration_sizing::OrchestrationBackstops {
+        council_max: usize_setting(db, "orchestrator.council_max_figures", 6)
+            .await
+            .max(1),
+        review_max: usize_setting(db, "orchestrator.review_panel_size", 2)
+            .await
+            .max(1),
+        multi_provider_min: usize_setting(db, "orchestrator.multi_provider_min_providers", 2)
+            .await
+            .max(1)
+            .min(multi_provider_max),
+        multi_provider_max,
+        debate_max: usize_setting(db, "orchestrator.debate_max_advocates", 4).await,
+        fanout_max_parallel: fanout_max_parallel(db).await,
+    }
+}
+
+/// Config del resolver di dimensionamento (chiavi mig 0602, regola G).
+pub(crate) async fn read_orchestration_sizing_config(
+    db: &sqlx::PgPool,
+) -> nexus_agent_graph::decisions::orchestration_sizing::OrchestrationSizingConfig {
+    use nexus_agent_graph::decisions::orchestration_sizing::parse_panel_priority;
+    let enabled = nexus_auth::get_bool_setting(db, "orchestrator.sizing_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let budget_share_pct = nexus_auth::get_setting(db, "orchestrator.sizing.budget_share_pct")
+        .await
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .unwrap_or(20)
+        .min(100);
+    let priority_csv = nexus_auth::get_setting(db, "orchestrator.sizing.panel_priority")
+        .await
+        .unwrap_or_default();
+    nexus_agent_graph::decisions::orchestration_sizing::OrchestrationSizingConfig {
+        enabled,
+        budget_share_pct,
+        panel_priority: parse_panel_priority(&priority_csv),
+    }
+}
+
+/// Profilo di DOMANDA per-classe (`orchestrator.sizing_profile_<class>`, JSON).
+/// Profilo assente o malformato -> `None`: il chiamante degrada al piano legacy
+/// (fail-safe, mai numeri inventati).
+pub(crate) async fn read_sizing_profile(
+    db: &sqlx::PgPool,
+    complexity: nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity,
+) -> Option<nexus_agent_graph::decisions::orchestration_sizing::PanelDemand> {
+    let key = format!("orchestrator.sizing_profile_{}", complexity.as_str());
+    let raw = nexus_auth::get_setting(db, &key).await?;
+    let v: Value = serde_json::from_str(raw.trim()).ok()?;
+    let field = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
+    Some(
+        nexus_agent_graph::decisions::orchestration_sizing::PanelDemand {
+            council_figures: field("council_figures")?,
+            reviewers: field("reviewers")?,
+            providers: field("providers")?,
+            advocates: field("advocates")?,
+        },
+    )
+}
+
+/// Stima UNITARIA di un sub-run advisory per il vincolo di budget. Il modello
+/// rappresentativo e' quello del purpose della PRIMA figura base del consiglio,
+/// risolto VIA TIER (`resolve_purpose_model_db`, mai un nome modello) e prezzato
+/// dal punto unico `nexus-pricing`. Se un anello manca (figura, purpose, tier,
+/// listino unknown) il costo resta 0.0 = vincolo NON calcolabile: il resolver
+/// non applica il cap di costo (regola M: nessun prezzo inventato).
+pub(crate) async fn read_panel_unit_estimate(
+    db: &sqlx::PgPool,
+) -> nexus_agent_graph::decisions::orchestration_sizing::PanelUnitEstimate {
+    let est_tokens = nexus_auth::get_setting(db, "orchestrator.sizing.est_subrun_tokens")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60_000);
+    let duration_s = nexus_auth::get_setting(db, "orchestrator.sizing.est_subrun_duration_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(240);
+    let cost_usd = panel_unit_cost(db, est_tokens).await.unwrap_or(0.0);
+    nexus_agent_graph::decisions::orchestration_sizing::PanelUnitEstimate {
+        cost_usd,
+        duration_s,
+    }
+}
+
+/// Costo atteso di UN sub-run advisory dal listino (tier-only + nexus-pricing).
+async fn panel_unit_cost(db: &sqlx::PgPool, est_tokens: i64) -> Option<f64> {
+    let figures_csv = nexus_auth::get_setting(db, "orchestrator.council_figures").await?;
+    let first_figure = figures_csv
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())?
+        .to_string();
+    let purpose: String = sqlx::query_scalar(
+        "SELECT model_purpose FROM nexus_subagent_definitions \
+          WHERE kind = $1 AND is_enabled = true",
+    )
+    .bind(&first_figure)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    let (provider, model) = crate::internal_routing::resolve_purpose_model_db(db, &purpose)
+        .await
+        .into_model(&purpose)
+        .ok()?;
+    let lookup = nexus_pricing::resolve_active_price(db, &provider, &model)
+        .await
+        .ok()?;
+    let nexus_pricing::PriceLookup::Priced(price) = lookup else {
+        // Unknown/NotInCatalog: prezzo ignoto NON e' prezzo zero (mig 0477).
+        return None;
+    };
+    // Ripartizione DETERMINISTICA del budget token atteso: i sub-run advisory
+    // sono read-heavy (contesto + tool_result >> risposta). Derivazione di
+    // calcolo, non config di business (come le soglie di orchestration_reason).
+    let prompt_tokens = est_tokens * 4 / 5;
+    let completion_tokens = est_tokens - prompt_tokens;
+    let (_, _, total) = nexus_pricing::calculate_cost(&price, prompt_tokens, completion_tokens);
+    Some(total)
+}
+
 /// Segnale strutturato di rifiuto in fase PREPARE (regola M): il coordinatore
 /// legge `error_code`, non il testo di `error`.
 fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value {

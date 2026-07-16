@@ -30,6 +30,11 @@
 //!     l'I/O (catena DB + cooldown) e' la porta [`crate::runtime::ports::EscalationPort`].
 //!   - [`helpers`]: tool_choice forcing, segnale strutturale, action-oriented,
 //!     stima complessita' e budget iterazioni.
+//!   - [`orchestration_sizing`]: PUNTO UNICO del dimensionamento dei panel
+//!     multi-agente (consiglio/review/multi-provider/debate) dalla classe di
+//!     complessita' + profili admin + budget residuo costo/tempo; i cap storici
+//!     restano backstop. DISGIUNTO da `orchestration_reason` (mosse a run
+//!     avviato) e `scale_reason` (tier/contesto del singolo agente).
 //!   - [`tiers`]: PUNTO UNICO del vocabolario performance-tier (scala a 5 livelli
 //!     light<medium<high<heavy<frontier): ordinamento (`tier_rank`) e validazione
 //!     (`is_performance_tier`). I due `tier_rank` storici (escalation qui,
@@ -77,6 +82,7 @@ pub mod loop_signatures;
 pub mod m16;
 pub mod meta_reason;
 pub mod orchestration_reason;
+pub mod orchestration_sizing;
 pub mod panel_quorum;
 pub mod predictive_cap;
 pub mod progress_controller;

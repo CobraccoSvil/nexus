@@ -201,14 +201,16 @@ static FILE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("regex file path valido")
 });
 
-/// Mappa label complexity del classifier LLM -> score 0-100. Vedi
-/// `_COMPLEXITY_LABEL_SCORE` Python.
+/// Mappa label complexity del classifier LLM -> score 0-100. Il RICONOSCIMENTO
+/// della label delega al punto unico
+/// [`super::orchestration_sizing::TaskComplexity::try_parse`] (regola N: un solo
+/// parse nel codebase); qui resta solo la conversione in score numerico.
 fn complexity_label_score(label: &str) -> Option<i64> {
-    match label {
-        "low" => Some(10),
-        "medium" => Some(40),
-        "high" => Some(70),
-        _ => None,
+    use super::orchestration_sizing::TaskComplexity;
+    match TaskComplexity::try_parse(label)? {
+        TaskComplexity::Low => Some(10),
+        TaskComplexity::Medium => Some(40),
+        TaskComplexity::High => Some(70),
     }
 }
 

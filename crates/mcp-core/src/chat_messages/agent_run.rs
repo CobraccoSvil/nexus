@@ -2639,6 +2639,33 @@ pub(crate) async fn spawn_agent_run(
     } else {
         classified.complexity != "low"
     };
+    // Dimensionamento dell'orchestrazione (punto unico orchestration_sizing):
+    // classe del classificatore + profilo admin della classe + budget residuo
+    // -> target dei panel. `None` = sizing spento o segnali non risolti -> cap
+    // storici invariati (bit-identico a flag OFF).
+    let sizing_complexity = if classified.classifier_resolved {
+        nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity::try_parse(
+            &classified.complexity,
+        )
+    } else {
+        None
+    };
+    let sizing_scope_system_wide = classified.slots.scope.trim() == "system_wide";
+    let orchestration_plan = if deliberate {
+        resolve_orchestration_plan_for(
+            &state,
+            sizing_complexity,
+            sizing_scope_system_wide,
+            false,
+            0.0,
+        )
+        .await
+    } else {
+        None
+    };
+    if let Some(plan) = &orchestration_plan {
+        emit_orchestration_plan_meta_step(&run_pool, &tx_for_brain, run_id, plan, "pre_run").await;
+    }
     let council_outcome = maybe_convene_council(
         &state,
         &run_pool,
@@ -2647,6 +2674,7 @@ pub(crate) async fn spawn_agent_run(
         run_id,
         &params.content,
         deliberate,
+        orchestration_plan.as_ref().map(|p| p.council_figures),
     )
     .await;
     if let Some(ref outcome) = council_outcome {
@@ -2656,9 +2684,16 @@ pub(crate) async fn spawn_agent_run(
         .as_ref()
         .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
         .filter(|b| !b.is_empty());
-    let multi_provider_block =
-        maybe_convene_multi_provider_panel(&state, params.session_id, &params.content, deliberate)
-            .await;
+    let multi_provider_block = maybe_convene_multi_provider_panel(
+        &state,
+        params.session_id,
+        &params.content,
+        deliberate,
+        orchestration_plan
+            .as_ref()
+            .map(|p| p.multi_provider_providers),
+    )
+    .await;
     if let Some(outcome) = &multi_provider_block {
         emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }
@@ -2973,6 +3008,8 @@ pub(crate) async fn spawn_agent_run(
                             session_id_cp,
                             run_id,
                             &mut outcome,
+                            sizing_complexity,
+                            sizing_scope_system_wide,
                         )
                         .await;
                         native_result =
@@ -5344,6 +5381,107 @@ fn select_pre_run_advisory(
     }
 }
 
+/// Risolve il piano di orchestrazione dimensionato (regola L: punto unico
+/// `orchestration_sizing` in nexus-agent-graph; qui SOLO il caricamento degli
+/// input). Riusato pre-run (`cost_spent_usd=0`) e post-run (budget residui
+/// reali dalla review). `None` = sizing spento o segnali non risolti ->
+/// comportamento legacy coi cap storici (fail-safe, mai un piano dimensionato
+/// su un fallback del classificatore).
+async fn resolve_orchestration_plan_for(
+    state: &AppState,
+    complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    scope_system_wide: bool,
+    decision_detected: bool,
+    cost_spent_usd: f64,
+) -> Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan> {
+    use nexus_agent_graph::decisions::orchestration_sizing as sizing;
+    let cfg =
+        crate::agent_tools::subagent_native::read_orchestration_sizing_config(&state.db).await;
+    if !cfg.enabled {
+        return None;
+    }
+    let complexity = complexity?;
+    let demand =
+        crate::agent_tools::subagent_native::read_sizing_profile(&state.db, complexity).await?;
+    let backstops =
+        crate::agent_tools::subagent_native::read_orchestration_backstops(&state.db).await;
+    let unit = crate::agent_tools::subagent_native::read_panel_unit_estimate(&state.db).await;
+    // Budget di costo del run: la STESSA chiave anti-runaway dell'executor
+    // (`agent.run_cost_budget_usd`, 0 = off). Nessuna seconda fonte di verita'.
+    let cost_budget = nexus_auth::get_setting(&state.db, "agent.run_cost_budget_usd")
+        .await
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|b| *b > 0.0);
+    let budgets = sizing::OrchestrationBudgets {
+        cost_remaining_usd: cost_budget.map(|b| (b - cost_spent_usd).max(0.0)),
+        // Deadline di run: fase 3 (mig 0604). Finche' non esiste, nessun
+        // vincolo di tempo (None), mai un default inventato.
+        time_remaining_s: None,
+    };
+    Some(sizing::resolve_orchestration_plan(
+        Some(complexity),
+        scope_system_wide,
+        decision_detected,
+        &budgets,
+        &unit,
+        &demand,
+        &backstops,
+        &cfg,
+    ))
+}
+
+/// Meta-step strutturato `orchestration_plan` (regola M): i numeri del piano e
+/// QUALE vincolo li ha decisi (`sized_by`), osservabili in UI e nei log.
+async fn emit_orchestration_plan_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    plan: &nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan,
+    phase: &str,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let title = format!(
+        "Orchestrazione dimensionata: vincolo {}",
+        plan.sized_by.as_str()
+    );
+    let mut payload = plan.to_value();
+    payload["phase"] = json!(phase);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("orchestration_plan")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "orchestration plan: meta_step persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "orchestration_plan".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
 async fn maybe_convene_council(
     state: &AppState,
     run_pool: &PgPool,
@@ -5352,6 +5490,7 @@ async fn maybe_convene_council(
     run_id: Uuid,
     user_text: &str,
     deliberate: bool,
+    figure_target: Option<usize>,
 ) -> Option<crate::agent_tools::subagent_native::CouncilConveneOutcome> {
     use crate::agent_tools::subagent_native::{
         CouncilConveneOutcome, CouncilDegradeReason,
@@ -5375,7 +5514,16 @@ async fn maybe_convene_council(
     }
     // Selezione figure (DB-driven + routing per ambito): lista vuota -> niente.
     let cfg = crate::agent_tools::subagent_native::read_council_config(&state.db).await;
-    let figures = crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg);
+    let mut figures = crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg);
+    // Target del piano di orchestrazione (punto unico orchestration_sizing): la
+    // DECISIONE del numero e' del resolver, qui si applica. 0 = panel azzerato
+    // dal budget: non si convoca (il meta-step `orchestration_plan` lo documenta).
+    if let Some(target) = figure_target {
+        if target == 0 {
+            return None;
+        }
+        figures.truncate(target);
+    }
     if figures.is_empty() {
         return None;
     }
@@ -5621,6 +5769,8 @@ async fn maybe_convene_review_panel(
     session_id: Uuid,
     run_id: Uuid,
     outcome: &mut crate::native_engine::NativeRunOutcome,
+    sizing_complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    sizing_scope_system_wide: bool,
 ) {
     // Solo su un run CHIUSO come done: rivedere un lavoro dichiarato incompleto
     // (blocked/partial/needs_input) o non completato e' rumore.
@@ -5672,11 +5822,37 @@ async fn maybe_convene_review_panel(
         .flatten()
         .unwrap_or(true),
     };
-    let reviewers = nexus_auth::get_setting(&state.db, "orchestrator.review_panel_size")
+    let reviewers_backstop = nexus_auth::get_setting(&state.db, "orchestrator.review_panel_size")
         .await
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(2)
         .max(1);
+    // Re-risoluzione del piano coi budget RESIDUI reali (stesso punto unico del
+    // pre-run, regola L): il costo gia' speso dal run stringe la review a valle.
+    // `outcome.total_cost` e' il cumulativo del run (asimmetria documentata in
+    // NativeRunOutcome). Sizing spento/non risolto -> backstop storico.
+    let reviewers = match resolve_orchestration_plan_for(
+        state,
+        sizing_complexity,
+        sizing_scope_system_wide,
+        false,
+        outcome.total_cost,
+    )
+    .await
+    {
+        Some(plan) => {
+            if plan.review_panel_size == 0 {
+                tracing::info!(
+                    run_id = %run_id,
+                    sized_by = plan.sized_by.as_str(),
+                    "review panel: azzerato dal dimensionamento (budget residuo insufficiente)"
+                );
+                return;
+            }
+            plan.review_panel_size
+        }
+        None => reviewers_backstop,
+    };
     let files_line = modified
         .iter()
         .map(|f| format!("- {f}"))
@@ -5715,6 +5891,7 @@ async fn maybe_convene_multi_provider_panel(
     session_id: Uuid,
     user_text: &str,
     deliberate: bool,
+    provider_target: Option<usize>,
 ) -> Option<crate::agent_tools::subagent_native::MultiProviderPanelOutcome> {
     // Decisione AGENTICA (regola M): stesso segnale del consiglio (giudizio del
     // classificatore, fallback keyword se down). Il multi-provider e' un panel di
@@ -5722,7 +5899,17 @@ async fn maybe_convene_multi_provider_panel(
     if !deliberate {
         return None;
     }
-    let cfg = crate::agent_tools::subagent_native::read_multi_provider_config(&state.db).await?;
+    let mut cfg = crate::agent_tools::subagent_native::read_multi_provider_config(&state.db).await?;
+    // Target del piano di orchestrazione (punto unico orchestration_sizing):
+    // 0 = panel azzerato dal budget, non si convoca; altrimenti il target lima
+    // max_providers (il floor di quorum e' gia' garantito dal resolver).
+    if let Some(target) = provider_target {
+        if target == 0 {
+            return None;
+        }
+        cfg.max_providers = cfg.max_providers.min(target);
+        cfg.min_providers = cfg.min_providers.min(cfg.max_providers);
+    }
     let deps = build_tool_runner_deps(state);
     let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
     let ctx = match svc.build_ctx(session_id).await {

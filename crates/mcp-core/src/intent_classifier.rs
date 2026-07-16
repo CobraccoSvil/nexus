@@ -189,13 +189,9 @@ pub struct AgenticIntent {
     pub intent: String,
     pub agentic_score: f32,
     pub requires_tools: bool,
-    /// Complessita' del task (`low`/`medium`/`high`). Parte del porting 1:1 e del
-    /// JSON del classifier; alimentera' l'escalation per difficolta' quando il
-    /// `RouterNode` Rust la consumera' (TODO). Non ancora letto dai call site.
-    #[allow(
-        dead_code,
-        reason = "campo del contratto classifier (escalation per difficolta'): consumato dal RouterNode Rust quando portato, vedi router.rs TODO"
-    )]
+    /// Complessita' del task (`low`/`medium`/`high`). Consumata dal gate
+    /// `deliberate` del consiglio e dal resolver di dimensionamento
+    /// (`orchestration_sizing::TaskComplexity::try_parse`, punto unico del parse).
     pub complexity: String,
     pub confidence: f32,
     pub model_used: String,
