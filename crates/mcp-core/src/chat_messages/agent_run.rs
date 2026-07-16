@@ -2666,17 +2666,34 @@ pub(crate) async fn spawn_agent_run(
     if let Some(plan) = &orchestration_plan {
         emit_orchestration_plan_meta_step(&run_pool, &tx_for_brain, run_id, plan, "pre_run").await;
     }
-    let council_outcome = maybe_convene_council(
-        &state,
-        &run_pool,
-        &tx_for_brain,
-        params.session_id,
-        run_id,
-        &params.content,
-        deliberate,
-        orchestration_plan.as_ref().map(|p| p.council_figures),
-    )
-    .await;
+    // I due panel a monte girano in PARALLELO (fase 2 del paradigma): non
+    // condividono dati — le sintesi vengono riconciliate solo a valle da
+    // select_pre_run_advisory — quindi la serializzazione era solo
+    // implementativa (fino a ~300+300s di pre-step nel caso peggiore). La
+    // pressione sub-run e' governata dal semaforo di processo del fan-out
+    // (FanoutGovernor, mig 0603). Le emissioni meta-step restano sequenziali
+    // DOPO la join: ordine deterministico degli step.
+    let (council_outcome, multi_provider_block) = tokio::join!(
+        maybe_convene_council(
+            &state,
+            &run_pool,
+            &tx_for_brain,
+            params.session_id,
+            run_id,
+            &params.content,
+            deliberate,
+            orchestration_plan.as_ref().map(|p| p.council_figures),
+        ),
+        maybe_convene_multi_provider_panel(
+            &state,
+            params.session_id,
+            &params.content,
+            deliberate,
+            orchestration_plan
+                .as_ref()
+                .map(|p| p.multi_provider_providers),
+        )
+    );
     if let Some(ref outcome) = council_outcome {
         emit_council_of_competencies_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }
@@ -2684,16 +2701,6 @@ pub(crate) async fn spawn_agent_run(
         .as_ref()
         .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
         .filter(|b| !b.is_empty());
-    let multi_provider_block = maybe_convene_multi_provider_panel(
-        &state,
-        params.session_id,
-        &params.content,
-        deliberate,
-        orchestration_plan
-            .as_ref()
-            .map(|p| p.multi_provider_providers),
-    )
-    .await;
     if let Some(outcome) = &multi_provider_block {
         emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
     }

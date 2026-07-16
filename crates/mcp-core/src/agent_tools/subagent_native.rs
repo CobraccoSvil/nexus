@@ -1877,6 +1877,53 @@ async fn fanout_max_parallel(db: &sqlx::PgPool) -> usize {
         .max(1)
 }
 
+/// Setting DB (regola G) del tetto di sub-run concorrenti dell'INTERO processo
+/// (mig 0603). Serve da quando i panel girano in parallelo (`tokio::join!` di
+/// consiglio + multi-provider): ogni fan-out ha il suo semaforo locale, quindi
+/// K panel insieme = K x permits senza un tetto globale — questo lo mette.
+const KEY_FANOUT_PROCESS_MAX_PARALLEL: &str = "orchestrator.fanout_process_max_parallel";
+/// Default se la riga manca: 2 panel pieni (2 x 6) come i due panel pre-run.
+const DEFAULT_FANOUT_PROCESS_MAX_PARALLEL: usize = 12;
+
+/// Semaforo di PROCESSO dei fan-out top-level. Dimensionato UNA volta al primo
+/// uso (riavvio del servizio per applicare una modifica del setting: un semaforo
+/// non e' ridimensionabile a caldo senza reintrodurre stati transitori).
+static PROCESS_FANOUT_SEM: tokio::sync::OnceCell<std::sync::Arc<tokio::sync::Semaphore>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn process_fanout_semaphore(db: &sqlx::PgPool) -> std::sync::Arc<tokio::sync::Semaphore> {
+    PROCESS_FANOUT_SEM
+        .get_or_init(|| async {
+            let permits = crate::settings::get_setting(db, KEY_FANOUT_PROCESS_MAX_PARALLEL)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_FANOUT_PROCESS_MAX_PARALLEL)
+                .max(1);
+            std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
+        })
+        .await
+        .clone()
+}
+
+/// Ambito del fan-out rispetto al governo della concorrenza, DICHIARATO dal
+/// call site (regola M: segnale esplicito, non inferito dal ctx — il ctx del
+/// consiglio ha `parent_run_id` valorizzato pur essendo del coordinatore).
+///
+/// - `TopLevel`: convocazione del COORDINATORE (consiglio, review panel,
+///   multi-provider, debate). Acquisisce ANCHE il semaforo di processo.
+/// - `Nested`: fan-out dentro un sub-run. SOLO semaforo locale: un membro
+///   padre che tenesse un permesso di processo mentre il figlio ne attende un
+///   altro dallo stesso semaforo creerebbe hold-and-wait (deadlock di classe);
+///   la concorrenza dei nested resta bounded dal semaforo locale + depth guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FanoutScope {
+    TopLevel,
+    Nested,
+}
+
 /// PUNTO UNICO (regola L) del FAN-OUT di sub-run: esegue `n` sub-run
 /// CONCORRENTI, ognuno nel PROPRIO task tokio, con un tetto di parallelismo.
 ///
@@ -1900,21 +1947,43 @@ async fn fanout_max_parallel(db: &sqlx::PgPool) -> usize {
 /// `JoinError` (panic dentro un sub-run) e' catturato e tradotto in `Value`
 /// d'errore: dentro il vecchio `FuturesUnordered` un panic avrebbe abbattuto
 /// l'INTERO fan-out in silenzio.
-async fn spawn_fanout<F, Fut>(db: &sqlx::PgPool, n: usize, make: F) -> Vec<Value>
+async fn spawn_fanout<F, Fut>(db: &sqlx::PgPool, n: usize, scope: FanoutScope, make: F) -> Vec<Value>
 where
     F: Fn(usize) -> Fut,
     Fut: std::future::Future<Output = Value> + Send + 'static,
 {
     let permits = fanout_max_parallel(db).await;
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let local = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let process = match scope {
+        FanoutScope::TopLevel => Some(process_fanout_semaphore(db).await),
+        FanoutScope::Nested => None,
+    };
+    spawn_fanout_with(local, process, n, make).await
+}
+
+/// Corpo del fan-out con semafori ESPLICITI (testabile senza stato globale).
+/// Ordine di acquisizione FISSO e uniforme: LOCALE -> PROCESSO. Il grafo delle
+/// attese resta aciclico: chi tiene un permesso di processo non attende mai un
+/// semaforo locale altrui (ogni fan-out ha il proprio), quindi niente cicli.
+async fn spawn_fanout_with<F, Fut>(
+    local: std::sync::Arc<tokio::sync::Semaphore>,
+    process: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    n: usize,
+    make: F,
+) -> Vec<Value>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Value> + Send + 'static,
+{
     let mut handles = Vec::with_capacity(n);
     for i in 0..n {
         let fut = make(i);
-        let sem = sem.clone();
+        let local = local.clone();
+        let process = process.clone();
         handles.push(tokio::spawn(async move {
-            // Il permesso vive quanto il sub-run; si libera al drop (fine del
-            // task), non a fine "ondata".
-            let _permit = match sem.acquire_owned().await {
+            // I permessi vivono quanto il sub-run; si liberano al drop (fine
+            // del task), non a fine "ondata".
+            let _local_permit = match local.acquire_owned().await {
                 Ok(p) => p,
                 // Semaforo chiuso: non succede (mai `close()`), ma non si
                 // inventa un esito -> errore strutturato.
@@ -1926,6 +1995,20 @@ where
                         "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
                     })
                 }
+            };
+            let _process_permit = match process {
+                Some(sem) => match sem.acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        return json!({
+                            "error": format!("fanout: semaforo di processo chiuso: {e}"),
+                            "error_code": "fanout_semaphore_closed",
+                            "status": "prepare_failed",
+                            "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                        })
+                    }
+                },
+                None => None,
             };
             fut.await
         }));
@@ -1979,7 +2062,7 @@ pub(crate) async fn convene_council(
     let owned_kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
     let results = {
         let kinds_for_make = owned_kinds.clone();
-        spawn_fanout(&ctx.core.db, kinds_for_make.len(), |i| {
+        spawn_fanout(&ctx.core.db, kinds_for_make.len(), FanoutScope::TopLevel, |i| {
             let ctx = ctx.clone();
             let task = task.to_string();
             let expected = expected.to_string();
@@ -2026,7 +2109,7 @@ pub(crate) async fn convene_review_panel(
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
-    let results = spawn_fanout(&ctx.core.db, n, |_| {
+    let results = spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, |_| {
         let ctx = ctx.clone();
         let task = task.to_string();
         let expected = expected.to_string();
@@ -2103,7 +2186,7 @@ pub(crate) async fn convene_multi_provider_panel(
     let results = {
         let cands_for_make = cands.clone();
         let kind = cfg.kind.clone();
-        spawn_fanout(&ctx.core.db, cands_for_make.len(), |i| {
+        spawn_fanout(&ctx.core.db, cands_for_make.len(), FanoutScope::TopLevel, |i| {
             let ctx = ctx.clone();
             let task = task.to_string();
             let expected = expected.to_string();
@@ -4223,7 +4306,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("settings");
-        let out = spawn_fanout(&pool, 3, |i| async move {
+        // Scope Nested: il test resta ermetico (non tocca il semaforo di
+        // processo globale OnceCell, condiviso tra i test).
+        let out = spawn_fanout(&pool, 3, FanoutScope::Nested, |i| async move {
             if i == 1 {
                 panic!("sub-run esploso (simulato)");
             }
@@ -4237,6 +4322,81 @@ mod tests {
         );
         assert_eq!(out[0]["outcome"]["success"], json!(true));
         assert_eq!(out[2]["outcome"]["success"], json!(true));
+    }
+
+    /// GOVERNOR (mig 0603): due fan-out top-level CONCORRENTI condividono il
+    /// semaforo di processo — la concorrenza TOTALE non supera mai il suo tetto,
+    /// anche se i semafori locali permetterebbero di piu'. Semafori ESPLICITI
+    /// via `spawn_fanout_with`: niente stato globale nel test (regola F).
+    #[tokio::test]
+    async fn fanout_process_semaphore_limita_la_concorrenza_totale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let process = Arc::new(tokio::sync::Semaphore::new(4));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let make = |in_flight: Arc<AtomicUsize>, peak: Arc<AtomicUsize>| {
+            move |_i: usize| {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    json!({ "ok": true })
+                }
+            }
+        };
+        // Due panel da 6 con semafori locali larghi (6): senza il semaforo di
+        // processo la concorrenza arriverebbe a 12.
+        let (a, b) = tokio::join!(
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(6)),
+                Some(process.clone()),
+                6,
+                make(in_flight.clone(), peak.clone()),
+            ),
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(6)),
+                Some(process.clone()),
+                6,
+                make(in_flight.clone(), peak.clone()),
+            ),
+        );
+        assert_eq!(a.len(), 6);
+        assert_eq!(b.len(), 6);
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "picco {} oltre il tetto di processo 4",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    /// GOVERNOR: un fan-out `Nested` NON tocca il semaforo di processo — anche
+    /// con il processo SATURO (zero permessi) i nested completano. E' la
+    /// proprieta' anti-deadlock: un figlio non attende mai un permesso tenuto
+    /// dal proprio padre.
+    #[tokio::test]
+    async fn fanout_nested_non_attende_il_semaforo_di_processo() {
+        use std::sync::Arc;
+        let process = Arc::new(tokio::sync::Semaphore::new(1));
+        // Satura il processo: un top-level fittizio tiene l'unico permesso.
+        let _held = process.clone().acquire_owned().await.expect("permesso");
+        // Il nested (process=None) deve completare comunque, entro un timeout
+        // stretto: se per errore acquisisse il semaforo saturo, appenderebbe.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(2)),
+                None,
+                3,
+                |i| async move { json!({ "i": i }) },
+            ),
+        )
+        .await
+        .expect("il nested non deve attendere il semaforo di processo");
+        assert_eq!(out.len(), 3);
     }
 
     /// Il tetto di concorrenza viene dal DB (regola G) e clampa a >=1.
