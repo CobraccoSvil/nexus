@@ -18,6 +18,7 @@ import { ActivityStreamView } from "./activity-stream";
 import { ActivityCostFooter } from "./activity-cost-footer";
 import { ActivityHistoryRow } from "./activity-history-row";
 import { InlineTruncated, formatStepInput } from "./step-detail";
+import { usageBadgeView } from "./usage-badge-logic";
 import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -247,16 +248,18 @@ function groupMessages(messages: ChatMessage[]): GroupedItem[] {
   return result;
 }
 
+/// Token e modello di un messaggio, dai SOLI campi strutturati (regola M).
+///
+/// Prima esisteva un fallback che li estraeva dalla PROSA del messaggio con due
+/// regex (`/(\d[\d\s]*)\s*token totali/` e `/\(([^/]+\/[^)]+)\)/`). Era rotto due
+/// volte: la prima regex non ammette il separatore delle migliaia italiano, quindi
+/// su "20.665 token totali" catturava `665`; e la stringa che cercava era prodotta
+/// dal badge accanto, per cui un cambio di etichetta lo spegneva in silenzio.
+/// I token sono un dato del DB: si leggono dal campo, non si rileggono da come
+/// sono stati stampati.
 function getRunInfo(msg: ChatMessage): { tokens: number; model: string } {
-  if (msg.totalTokens && msg.totalTokens > 0) {
-    const model = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : msg.model ?? "";
-    return { tokens: msg.totalTokens, model };
-  }
-  const tokenMatch = /(\d[\d\s]*)\s*token totali/.exec(msg.content ?? "");
-  const tokens = tokenMatch ? parseInt(tokenMatch[1].replace(/\s/g, ""), 10) : 0;
-  const modelMatch = /\(([^/]+\/[^)]+)\)/.exec(msg.content ?? "");
-  const model = modelMatch ? modelMatch[1] : "";
-  return { tokens, model };
+  const model = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : msg.model ?? "";
+  return { tokens: msg.totalTokens ?? 0, model };
 }
 
 function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeColors }) {
@@ -1469,7 +1472,7 @@ export function MessageList({
               const runId = message.runId;
               const runMeta = metaStepsMap?.get(runId) ?? [];
               const runSteps = agentStepsMap?.get(runId) ?? [];
-              const runTraces = traces ? tracesForRun(traces, runId) : [];
+              const runTraces = traces ? tracesForRun(traces, runId, runMeta) : [];
               const hasRunData = runMeta.length > 0 || runSteps.length > 0 || runTraces.length > 0;
               if (!hasRunData) return null;
               const isLastAssistantRun = message.id === lastAssistantRunMessageId;
@@ -1558,33 +1561,19 @@ export function MessageList({
                 color: tc.textMuted,
                 flexWrap: "wrap",
               }}>
-                {message.provider && message.model && (
-                  <span style={{ fontWeight: 600 }}>
-                    {message.provider}/{message.model}
-                  </span>
-                )}
                 {(() => {
-                  const total = message.totalTokens ?? 0;
-                  const lastIn = message.promptTokens ?? 0;
-                  const lastOut = message.completionTokens ?? 0;
-                  // total e' cumulativo sull'intero run (tutte le iterazioni),
-                  // mentre in/out sono dell'ULTIMA chiamata: senza etichetta
-                  // "212K (47K in / 332 out)" sembra incongruente (47K+332 != 212K).
-                  const cumulative = total > lastIn + lastOut + 50;
+                  // Etichette dal punto unico (usage-badge-logic): fisse, mai
+                  // dedotte da confronti di grandezze.
+                  const v = usageBadgeView(message);
                   return (
                     <>
-                      <span>{total.toLocaleString("it-IT")} token{cumulative ? " totali" : ""}</span>
-                      {lastIn > 0 && (
-                        <span>({cumulative ? "ultima chiamata: " : ""}{lastIn.toLocaleString("it-IT")} in / {lastOut.toLocaleString("it-IT")} out)</span>
-                      )}
+                      {v.modelLabel && <span style={{ fontWeight: 600 }}>{v.modelLabel}</span>}
+                      {v.tokensLabel && <span>{v.tokensLabel}</span>}
+                      {v.breakdownLabel && <span>({v.breakdownLabel})</span>}
+                      {v.costLabel && <span style={{ color: tc.warning }}>{v.costLabel}</span>}
                     </>
                   );
                 })()}
-                {(message.totalCost ?? 0) > 0 && (
-                  <span style={{ color: tc.warning }}>
-                    ${message.totalCost!.toFixed(4)} {message.currency ?? "USD"}
-                  </span>
-                )}
               </div>
             )}
           </div>

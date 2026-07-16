@@ -1401,7 +1401,7 @@ export function ChatPanel({
               stream={composeActivityStream(
                 metaStepsMap.get(agentRun.runId) ?? [],
                 agentStepsMap.get(agentRun.runId) ?? [],
-                tracesForRun(traces, agentRun.runId),
+                tracesForRun(traces, agentRun.runId, metaStepsMap.get(agentRun.runId) ?? []),
                 foldThreshold,
               )}
               runStatus={agentRun.status}

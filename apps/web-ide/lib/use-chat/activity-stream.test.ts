@@ -16,6 +16,7 @@ import {
   foldConsecutiveOkTools,
   aggregateTokensByProvider,
   tracesForRun,
+  subagentRunIds,
   capStreamToRecent,
   type ActivityEvent,
   type ToolEvent,
@@ -606,6 +607,46 @@ test("tracesForRun filtra per runId", () => {
   const traces = [trace("a", 1, "google", "gemini"), trace("b", 1, "openai", "gpt")];
   assert.equal(tracesForRun(traces, "a").length, 1);
   assert.equal(tracesForRun(traces, "a")[0].provider, "google");
+});
+
+test("subagentRunIds legge il campo strutturato subagent_run_id (e correlationId)", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta("executor_call", { provider: "mistral" }),
+    meta("subagent_started", { subagent_run_id: "sub-1" }),
+    meta("subagent_progress", { subagent_run_id: "sub-1" }),
+    meta("subagent_completed", { subagent_run_id: "sub-1", cost_usd: 0.03 }),
+    { ...meta("subagent_started", {}), correlationId: "sub-2" },
+  ];
+  assert.deepEqual(subagentRunIds(metaSteps).sort(), ["sub-1", "sub-2"]);
+  // Nessun sub-run dichiarato -> nessun id (non deve inventare correlazioni).
+  assert.deepEqual(subagentRunIds([meta("executor_call", {})]), []);
+});
+
+test("tracesForRun include le trace dei sub-run dichiarati dai meta-step", () => {
+  beforeEach();
+  // Il subagente e' un run a se': le sue trace stanno sotto il PROPRIO run_id.
+  // Filtrando per il solo run del padre sparivano dal footer costo-per-provider,
+  // insieme ai provider usati SOLO dal figlio.
+  const traces = [
+    trace("padre", 1, "mistral", "mistral-large-2512", { inputTokens: 100, outputTokens: 20 }),
+    trace("sub-1", 1, "groq", "gpt-oss-120b", { inputTokens: 300, outputTokens: 50 }),
+    trace("altro-run", 1, "openai", "gpt", { inputTokens: 999, outputTokens: 999 }),
+  ];
+  const metaSteps: MetaStepEntry[] = [meta("subagent_completed", { subagent_run_id: "sub-1" })];
+
+  const soloPadre = tracesForRun(traces, "padre");
+  assert.equal(soloPadre.length, 1, "senza meta-step resta il comportamento per-run");
+
+  const conFigli = tracesForRun(traces, "padre", metaSteps);
+  assert.equal(conFigli.length, 2);
+  // Il run NON correlato resta fuori: si includono solo i sub-run dichiarati.
+  assert.equal(conFigli.some((t) => t.runId === "altro-run"), false);
+
+  const buckets = aggregateTokensByProvider(conFigli);
+  const groq = buckets.find((b) => b.provider === "groq");
+  assert.equal(groq?.inputTokens, 300, "i token del subagente sono contabilizzati");
+  assert.equal(groq?.outputTokens, 50);
 });
 
 test("stream vuoto: nessun segnale -> empty true", () => {

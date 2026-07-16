@@ -2,12 +2,24 @@ import { API_BASE, fetchJson } from "./_shared";
 
 // ── Model Catalog ──────────────────────────────────────────────────────────
 
+/**
+ * Specchio ESATTO del wire di `/api/models` (punto unico, regola L): il
+ * serializzatore autoritativo e' `crates/mcp-core/src/models.rs::ModelCatalogEntry`,
+ * annotato `#[serde(rename_all = "camelCase")]` -> i campi arrivano in camelCase
+ * con il suffisso `Tokens` sui costi (`inputCostPerMillionTokens`).
+ *
+ * Ogni consumatore di `/api/models` deve usare QUESTO tipo: le copie locali
+ * divergono in silenzio dal wire e i campi mancanti diventano `undefined`, che
+ * un `?? 0` a valle trasforma in "costo zero" invece che in un errore visibile
+ * (regola G: niente magic fallback). E' esattamente il difetto che azzerava il
+ * footer costo-per-provider del nastro attivita'.
+ */
 export interface ModelCatalogEntry {
   provider: string;
   model: string;
   displayName: string;
-  inputCostPerMillion: number;
-  outputCostPerMillion: number;
+  inputCostPerMillionTokens: number;
+  outputCostPerMillionTokens: number;
   currency: string;
   performanceTier: "light" | "medium" | "high" | "heavy" | "frontier";
   speedTier: "fast" | "medium" | "slow";
@@ -28,21 +40,11 @@ export async function getModels(provider?: string): Promise<{ models: ModelCatal
 
 // ── Model Catalog (per dropdown billing) ───────────────────────────────────
 
-export interface ModelCatalogItem {
-  provider: string;
-  model: string;
-  displayName: string;
-  inputCostPerMillionTokens: number;
-  outputCostPerMillionTokens: number;
-  currency: string;
-  performanceTier: string;
-  speedTier: string;
-  contextWindow: number;
-  isFeatured: boolean;
-  isEnabled: boolean;
-}
+/** Alias storico: `/api/models` ha UN solo wire, quindi un solo tipo (regola L).
+ *  Mantenuto per i call site che lo importano con questo nome. */
+export type ModelCatalogItem = ModelCatalogEntry;
 
-export async function listModelCatalog(): Promise<{ models: ModelCatalogItem[] }> {
+export async function listModelCatalog(): Promise<{ models: ModelCatalogEntry[] }> {
   return fetchJson(`${API_BASE}/api/models`);
 }
 

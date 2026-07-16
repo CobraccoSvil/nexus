@@ -659,16 +659,19 @@ function EventBody({
             )}
           </div>
           {(event.phase === "completed" || event.phase === "failed") && event.summary && (
+            // Il sommario del subagente e' Markdown (lo scrive un modello:
+            // heading, liste, **bold**, `code`). Reso con MarkdownBlock come
+            // ogni altro testo di modello nel nastro (ThoughtBlock, reflection):
+            // in chiaro mostrava "## Analisi" e "**bold**" verbatim.
             <div
               style={{
                 marginTop: 3,
                 fontSize: 12,
                 color: tc.textMuted,
-                whiteSpace: "pre-wrap",
                 overflowWrap: "anywhere",
               }}
             >
-              {event.summary}
+              <MarkdownBlock content={event.summary} />
             </div>
           )}
         </div>

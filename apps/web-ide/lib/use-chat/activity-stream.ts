@@ -1047,9 +1047,41 @@ export function foldConsecutiveOkTools(
   return out;
 }
 
-/** Filtra le trace di un singolo run (le trace in useChat sono per-sessione). */
-export function tracesForRun(traces: AITraceEvent[], runId: string): AITraceEvent[] {
-  return traces.filter((t) => t.runId === runId);
+/**
+ * Id dei sub-run generati da un run, letti dai suoi meta-step.
+ *
+ * Fonte: il campo STRUTTURATO `subagent_run_id` del payload (regola M), con
+ * `correlationId` come gemello per i meta-step che portano solo quello — la
+ * stessa coppia usata da `buildRawTimeline` per correlare gli eventi subagente.
+ */
+export function subagentRunIds(metaSteps: MetaStepEntry[]): string[] {
+  const ids = new Set<string>();
+  for (const m of metaSteps) {
+    if (!m.kind.startsWith("subagent")) continue;
+    const id = asString(m.payload?.subagent_run_id) ?? m.correlationId ?? undefined;
+    if (id) ids.add(id);
+  }
+  return Array.from(ids);
+}
+
+/**
+ * Trace di un run (le trace in useChat sono per-sessione), INCLUSE quelle dei
+ * suoi sub-run.
+ *
+ * Un subagente e' un run a se': le sue trace sono persistite sotto il PROPRIO
+ * `run_id` (nexus_agent_traces), non sotto quello del padre. Filtrando per il
+ * solo `runId` del padre, i token e il costo dei subagenti sparivano dal footer
+ * costo-per-provider — il lavoro del figlio era narrato nel nastro ma non
+ * contabilizzato, e provider usati SOLO dal figlio non comparivano affatto.
+ * I sub-run sono dichiarati dai meta-step del padre (`subagentRunIds`).
+ */
+export function tracesForRun(
+  traces: AITraceEvent[],
+  runId: string,
+  metaSteps: MetaStepEntry[] = [],
+): AITraceEvent[] {
+  const ids = new Set<string>([runId, ...subagentRunIds(metaSteps)]);
+  return traces.filter((t) => ids.has(t.runId));
 }
 
 // ── Cap live (anti-verbosita') ──────────────────────────────────────────────

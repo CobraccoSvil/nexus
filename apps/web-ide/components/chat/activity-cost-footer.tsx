@@ -25,12 +25,17 @@ import type { AITraceEvent } from "../../lib/api/agent";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
-/** Costo USD di un bucket dato il catalogo prezzi (0 se entry assente). */
+/** Costo USD di un bucket dato il catalogo prezzi (0 se entry assente).
+ *
+ *  I nomi dei campi seguono il wire di `/api/models` (camelCase, punto unico
+ *  `lib/api/models.ts`): sono obbligatori, quindi NIENTE `?? 0` a valle. Il
+ *  fallback a zero e' ammesso in UN solo caso esplicito — il modello non e' nel
+ *  catalog — e non puo' piu' mascherare un campo letto col nome sbagliato. */
 function bucketCost(bucket: ProviderTokenBucket, catalog: ModelPricingEntry[]): number {
   const entry = catalog.find((e) => e.provider === bucket.provider && e.model === bucket.model);
   if (!entry) return 0;
-  const inCost = (entry.input_cost_per_million_tokens ?? 0) * (bucket.inputTokens / 1_000_000);
-  const outCost = (entry.output_cost_per_million_tokens ?? 0) * (bucket.outputTokens / 1_000_000);
+  const inCost = entry.inputCostPerMillionTokens * (bucket.inputTokens / 1_000_000);
+  const outCost = entry.outputCostPerMillionTokens * (bucket.outputTokens / 1_000_000);
   return inCost + outCost;
 }
 
@@ -110,12 +115,12 @@ export function ActivityCostFooter({
             >
               {b.provider}
             </span>
-            <b style={{ color }}>${costs[i].toFixed(2)}</b>
+            <b style={{ color }}>${costs[i].toFixed(4)}</b>
           </span>
         );
       })}
       <span style={{ marginLeft: "auto" }}>
-        <b style={{ color: tc.text }}>${totalCost.toFixed(2)}</b>
+        <b style={{ color: tc.text }}>${totalCost.toFixed(4)}</b>
       </span>
     </div>
   );

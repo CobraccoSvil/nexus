@@ -128,11 +128,9 @@ export function ProviderIcon({
   const border = rgba(tint, 0.5);
 
   const tipParts: string[] = [`${label}${model ? ` / ${model}` : ""}`];
-  if (entry?.input_cost_per_million_tokens != null) {
-    tipParts.push(`in $${entry.input_cost_per_million_tokens.toFixed(2)}/M`);
-  }
-  if (entry?.output_cost_per_million_tokens != null) {
-    tipParts.push(`out $${entry.output_cost_per_million_tokens.toFixed(2)}/M`);
+  if (entry) {
+    tipParts.push(`in $${entry.inputCostPerMillionTokens.toFixed(2)}/M`);
+    tipParts.push(`out $${entry.outputCostPerMillionTokens.toFixed(2)}/M`);
   }
   const initial = (label || "?").charAt(0).toUpperCase();
 
