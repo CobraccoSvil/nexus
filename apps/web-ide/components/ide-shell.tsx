@@ -83,7 +83,7 @@ import { StatusBar } from "./shell/status-bar";
 import { FirstAnalysisOverlay } from "./shell/first-analysis-overlay";
 import { ShellOverlays } from "./shell/shell-overlays";
 import { BottomPanelHeader } from "./shell/bottom-panel-header";
-import { RightViewTabs } from "./shell/panel-tabs";
+import { RightColumn } from "./shell/right-column";
 import { ChatHeadPopover } from "./chat/chat-head-popover";
 import {
   activityBarWidth as activityBarWidthFor,
@@ -103,18 +103,6 @@ const EditorArea = dynamic(() => import("./editor/editor-area.lazy"), {
   loading: () => <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }} />,
   ssr: false,
 });
-
-const SqlQueryPanel = dynamic(
-  () => import("./sql/sql-query-panel").then((m) => m.SqlQueryPanel),
-  {
-    loading: () => (
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>
-        Caricamento pannello SQL…
-      </div>
-    ),
-    ssr: false,
-  },
-);
 
 const SidebarManager = dynamic(() => import("./sidebar/sidebar-manager.lazy"), {
   loading: () => <div style={{ width: 300 }} />,
@@ -1565,36 +1553,26 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               />
             )}
           </div>
-          <div
-            style={{
-              minWidth: 0,
-              minHeight: 0,
-              height: "100%",
-              overflow: "hidden",
-              display: "grid",
-              gridTemplateRows: "26px minmax(0, 1fr)",
-            }}
-          >
-            <RightViewTabs
-              rightView={rightView}
-              setRightView={setRightView}
-              tc={tc}
-            />
-            {rightView === "editor" ? (
-              editorPanel
-            ) : (
-              <SqlQueryPanel project={activeProject} />
-            )}
-          </div>
+          <RightColumn
+            rightView={rightView}
+            setRightView={setRightView}
+            tc={tc}
+            project={activeProject}
+            editor={editorPanel}
+          />
         </div>
       );
     }
 
     if (layoutMode === "editor-center") {
       return (
-        <div style={{ minHeight: 0, height: "100%" }}>
-          {editorPanel}
-        </div>
+        <RightColumn
+          rightView={rightView}
+          setRightView={setRightView}
+          tc={tc}
+          project={activeProject}
+          editor={editorPanel}
+        />
       );
     }
 
@@ -1631,9 +1609,13 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             />
           )}
         </div>
-        <div style={{ minWidth: 0, minHeight: 0, height: "100%", overflow: "hidden" }}>
-          {editorPanel}
-        </div>
+        <RightColumn
+          rightView={rightView}
+          setRightView={setRightView}
+          tc={tc}
+          project={activeProject}
+          editor={editorPanel}
+        />
       </div>
     );
   };
