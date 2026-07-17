@@ -1113,8 +1113,27 @@ fn verdict_from_error_class(ec: &str, ok_fallback: &str) -> ToolProbeVerdict {
 /// Logica:
 /// - error_class provider-wide -> ProviderWide (non punire il modello).
 /// - error_class model-specific / forbidden / not_found -> ToolFailed.
+/// - stop_reason=error senza error_class -> Transient (vedi sotto).
 /// - presenza di un `tool_use_blocks` con name == nexus_probe_tool -> Success.
-/// - altrimenti (stop_reason=error, malformed, nessuna tool call) -> ToolFailed.
+/// - altrimenti (malformed, nessuna tool call) -> ToolFailed.
+///
+/// # Il ramo `stop_reason=error` e' irraggiungibile, e resta
+///
+/// Il produttore del turno d'errore valorizza SEMPRE `error_class` (dal segnale
+/// strutturato o dal catch-all del classificatore), quindi il caso 1 intercetta
+/// tutto e al caso 2 non arriva niente: lo prova
+/// `turno_errore_ha_sempre_error_class_*` su sei errori reali, corpo opaco incluso.
+///
+/// Resta lo stesso, perche' e' morto per via dell'INVARIANTE e non per aver perso
+/// lo scopo: un guard non si toglie perche' non ha mai suonato. Togliendolo, il
+/// giorno in cui l'invariante cadesse quel turno finirebbe al caso 4 e diventerebbe
+/// `ToolFailed` — cioe' il degrado di `supports_tool_use` per un blip del confine
+/// gateway/provider, che e' l'incidente Gemini da cui il ramo e' nato. Un ramo
+/// irraggiungibile e prudente vale piu' di una caduta raggiungibile e dannosa.
+///
+/// Sparira' da se' il giorno in cui il turno sara' TIPIZZATO e `error_class` non
+/// potra' essere vuota per costruzione. Oggi il turno e' un `Value`, e quel
+/// cambiamento non e' gratuito.
 pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerdict {
     // 1. error_class autorevole dal brain.
     let ec = response
@@ -1126,13 +1145,9 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
         return verdict_from_error_class(ec, "unexpected_ok_with_error_class");
     }
 
-    // 2. stop_reason=error senza error_class: INCONCLUSIVO, non tool-failure.
-    //    Prima questo ramo marciava verso il degrado di supports_tool_use anche
-    //    quando l'errore era un blip generico al confine gateway/provider
-    //    (incidente Gemini: tool-probe e chat-probe accoppiati, entrambi
-    //    error_kind='error', NON dipendenti dai tool). Senza un error_class
-    //    model-specific riconosciuto non possiamo attribuire il guasto al
-    //    modello: Transient, stato invariato, ritento al round successivo.
+    // 2. stop_reason=error senza error_class: Transient, stato invariato — mai una
+    //    tool-failure. Irraggiungibile oggi, e resta apposta: il perche' sta nella
+    //    doc della funzione, ed e' l'incidente Gemini.
     let stop_reason = response
         .get("stop_reason")
         .and_then(|v| v.as_str())
