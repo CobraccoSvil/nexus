@@ -177,6 +177,10 @@ export function ChatHeadPopover({
               top: coord.top,
               left: coord.left,
               width: LARGHEZZA_PANNELLO,
+              // Senza questo, `width` non comprende padding e bordo: il pannello
+              // misurava 326px contro i 300 su cui calcolo `left`, e sfondava il
+              // bordo destro di 18px (misurato).
+              boxSizing: "border-box",
               maxWidth: `calc(100vw - ${MARGINE_BORDO * 2}px)`,
               maxHeight: "70vh",
               overflowY: "auto",
