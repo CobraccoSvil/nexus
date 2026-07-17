@@ -232,6 +232,11 @@ fn predicate_fail_reason(
     if let Some(motivo) = multi_step_fail_reason(turn, predicate) {
         return Some(motivo);
     }
+    // Lo stato finale del profilo `latent_state`: il verificatore vive nel suo
+    // modulo, qui c'e' solo la delega (regola L).
+    if let Some(motivo) = crate::probe_latent_state::motivo_fallimento(turn, predicate) {
+        return Some(motivo);
+    }
     match predicate.get("max_latency_ms").and_then(Value::as_i64) {
         Some(cap) if latency_ms > cap => Some(format!("latency:{latency_ms}>{cap}")),
         _ => None,
@@ -903,7 +908,7 @@ const K_FORBIDS_REPEAT: &str = "forbids_repeat_of_failed";
 /// rimandato identica una chiamata gia' fallita.
 const F_REPEATED_FAILED: &str = "repeated_failed";
 
-const CHIAVI_PREDICATO: [&str; 9] = [
+const CHIAVI_PREDICATO: [&str; 10] = [
     // verificate da `predicate_fail_reason`
     "min_tool_calls",
     "min_content_chars",
@@ -916,6 +921,8 @@ const CHIAVI_PREDICATO: [&str; 9] = [
     K_MIN_CHAINED,
     K_REQUIRES_RECOVERY,
     K_FORBIDS_REPEAT,
+    // verificata da `probe_latent_state` (latent_state)
+    crate::probe_latent_state::K_REQUIRES_FINAL_STATE,
 ];
 
 /// La prima chiave del predicato che nessuno sa verificare. `None` = il predicato
@@ -953,6 +960,18 @@ fn predicato_coerente_col_kind(profile: &ProbeProfile) -> Result<(), String> {
             ));
         }
     }
+    // Stessa ragione per lo stato latente: su un altro kind non ci sarebbe nessuna
+    // misura da leggere, il predicato sarebbe muto e `frontier` diventerebbe gratis.
+    let k_stato = crate::probe_latent_state::K_REQUIRES_FINAL_STATE;
+    if profile.kind != crate::probe_latent_state::KIND_LATENT_STATE
+        && profile.pass_predicate.get(k_stato).is_some()
+    {
+        return Err(format!(
+            "predicato '{k_stato}' richiede il kind '{}', ma il profilo e' '{}'",
+            crate::probe_latent_state::KIND_LATENT_STATE,
+            profile.kind
+        ));
+    }
     Ok(())
 }
 
@@ -982,6 +1001,14 @@ fn seme_fresco() -> u64 {
         // cadere nello stesso tick su Windows (granularita' ~100ns).
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407)
+}
+
+/// I kind in cui OGNI token del compito nasce dal seme. Solo li' il seme e' la
+/// PREMESSA del verdetto e va registrato in `ai_model_probe_evidence.seed`: sugli
+/// altri profili non c'e' niente da rigiocare, e un verdetto che non sai rigiocare
+/// non e' contestabile, quindi e' un'opinione (regola O).
+fn kind_deriva_dal_seme(kind: &str) -> bool {
+    mondo_del_kind(kind).is_some() || kind == crate::probe_latent_state::KIND_LATENT_STATE
 }
 
 /// Il mondo che serve a un kind, se e' uno dei due multi-step.
@@ -1119,6 +1146,39 @@ impl ProbeCtx<'_> {
             latency_ms,
         )
     }
+
+    /// UN tentativo di `latent_state`: costruisce l'istanza fresca dal seme, la manda,
+    /// consegna i FATTI al predicato. Come per il multi-step, ogni uscita anticipata
+    /// e' un inconclusivo e mai una bocciatura: il modello risponde di cio' che fa,
+    /// non dei nostri cap ne' dei provider caduti.
+    async fn latent_state_attempt(&self, attempt: i32, seme: u64) -> (AttemptOutcome, i64) {
+        let started = std::time::Instant::now();
+        let parametri = crate::probe_latent_state::ParametriGiro {
+            provider: self.provider,
+            model: self.model,
+            profile_key: &self.profile.profile_key,
+            attempt,
+            seme,
+            payload: &self.profile.payload,
+        };
+        let esito = tokio::time::timeout(
+            Duration::from_secs(self.params.timeout_s),
+            crate::probe_latent_state::tentativo(self, parametri),
+        )
+        .await;
+        let latency_ms = started.elapsed().as_millis() as i64;
+        match esito {
+            Ok(Ok(turno)) => (
+                evaluate_attempt(&turno, &self.profile.pass_predicate, latency_ms),
+                latency_ms,
+            ),
+            Ok(Err(motivo)) => esito_inconclusivo(motivo, latency_ms),
+            Err(_elapsed) => esito_inconclusivo(
+                format!("probe_timeout:{}s", self.params.timeout_s),
+                latency_ms,
+            ),
+        }
+    }
 }
 
 /// Un esito che NON e' attribuibile al modello: il suo stato resta invariato.
@@ -1190,6 +1250,14 @@ async fn build_profile_request(
             ))
         }
         "long_context" => Ok(build_long_context_request(profile)),
+        // `latent_state` (frontier): niente tool — il compito e' leggere, non agire.
+        // I messaggi li costruisce `latent_state_attempt`, che conosce il seme e
+        // quindi i codici: il registro e' un'ISTANZA fresca, non un testo fisso.
+        crate::probe_latent_state::KIND_LATENT_STATE => Ok((
+            "[]".to_string(),
+            String::new(),
+            crate::probe_latent_state::system_text(),
+        )),
         // I due multi-step: qui si costruisce solo la cornice (tool + system).
         // L'istruzione la completa `multi_step_attempt`, che conosce il seed e
         // quindi l'handle di partenza; il resto della conversazione lo costruisce
@@ -1317,6 +1385,11 @@ impl ProbeCtx<'_> {
         if let Some(kind) = mondo_del_kind(&self.profile.kind) {
             return self.multi_step_attempt(kind, attempt, seme).await;
         }
+        // `latent_state` sta in un turno solo, ma il suo compito e' un'istanza fresca
+        // che nasce dal seme: non puo' venire da `build_profile_request`.
+        if self.profile.kind == crate::probe_latent_state::KIND_LATENT_STATE {
+            return self.latent_state_attempt(attempt, seme).await;
+        }
         let (tools_json, messages_json, system_text) = self.request;
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
@@ -1413,7 +1486,7 @@ async fn run_profile_attempts(
             &outcome,
             // Il seme e' la premessa del verdetto, e vale solo dove ogni token ne
             // deriva: sugli altri profili non c'e' niente da rigiocare.
-            mondo_del_kind(&ctx.profile.kind).map(|_| seme as i64),
+            kind_deriva_dal_seme(&ctx.profile.kind).then_some(seme as i64),
         )
         .await
         {
@@ -2228,6 +2301,24 @@ mod tests {
         );
     }
 
+    /// Stessa trappola per lo stato latente: `requires_final_state` su un kind che non
+    /// produce misure non verificherebbe NIENTE e regalerebbe `frontier`, che e' il
+    /// vertice. Il refuso va rifiutato prima che il profilo giri.
+    #[test]
+    fn requires_final_state_su_un_kind_qualunque_e_un_errore() {
+        let k = crate::probe_latent_state::K_REQUIRES_FINAL_STATE;
+        let e = predicato_coerente_col_kind(&profilo("chat", json!({ k: true })));
+        assert!(
+            e.is_err() && e.unwrap_err().contains("latent_state"),
+            "requires_final_state su kind 'chat' e' muto: va rifiutato"
+        );
+        assert!(predicato_coerente_col_kind(&profilo(
+            crate::probe_latent_state::KIND_LATENT_STATE,
+            json!({ k: true })
+        ))
+        .is_ok());
+    }
+
     /// I predicati dei profili VERI del DB devono essere tutti coperti: e' il
     /// controllo che impedisce a un profilo aggiunto dall'admin di girare a vuoto.
     #[test]
@@ -2255,6 +2346,12 @@ mod tests {
                 "long_context",
                 json!({"max_latency_ms": 180000, "hold_min_passes": 2,
                        "requires_needle": true, "promote_min_passes": 3}),
+            ),
+            // `agentic_latent_state` (mig 0611): il predicato e' quello della riga.
+            (
+                crate::probe_latent_state::KIND_LATENT_STATE,
+                json!({"requires_final_state": true, "promote_min_passes": 4,
+                       "hold_min_passes": 3, "max_latency_ms": 120000}),
             ),
         ] {
             assert!(

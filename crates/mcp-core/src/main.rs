@@ -89,6 +89,7 @@ mod project_files;
 mod project_git;
 mod probe_agentic_loop;
 mod probe_chain_measure;
+mod probe_latent_state;
 mod probe_world;
 mod project_workspace;
 mod projects;

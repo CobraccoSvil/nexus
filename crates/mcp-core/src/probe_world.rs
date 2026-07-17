@@ -94,6 +94,28 @@ impl TokenSeed {
         format!("H-{}", self.token(&format!("esca:{k}"), 10))
     }
 
+    /// Il codice di un fascicolo del profilo `latent_state`. Prefisso diverso dagli
+    /// handle perche' vive in un altro mondo: li' e' un bersaglio da indirizzare, qui
+    /// e' un'entita' di cui seguire lo stato. Stessa fonte (SHA-256 del seme), quindi
+    /// stesse garanzie: ~47 bit, non inventabile, fresco a ogni tentativo.
+    pub(crate) fn codice(&self, k: usize) -> String {
+        format!("F-{}", self.token(&format!("stato:{k}"), 10))
+    }
+
+    /// Una frazione deterministica in [0,1) per l'etichetta `label`.
+    ///
+    /// Stessa fonte dei token e nessun generatore nuovo (regola L): `latent_state` la
+    /// usa per decidere DOVE, dentro la sua zona, cade un aggiornamento. La posizione
+    /// e' parte dell'istanza — RULER e BABILong misurano il degrado per posizione, e
+    /// una posizione fissa misurerebbe quella invece della capacita'.
+    pub(crate) fn frazione(&self, label: &str) -> f64 {
+        let n = self
+            .token(label, 6)
+            .bytes()
+            .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
+        f64::from(n % 10_000) / 10_000.0
+    }
+
     /// Il token che vive UNICAMENTE dentro un messaggio d'errore. E' cio' che rende
     /// verificabile "il recupero e' informato dall'errore" senza chiedere il parere
     /// di un LLM: se la chiamata dopo lo contiene, il modello ha LETTO l'errore —
