@@ -410,6 +410,62 @@ il codebase.
 | Parse automation_mode | `crates/mcp-core/src/orchestrator/mod.rs` (`AutomationMode::try_parse`) |
 | Parse supervisor_mode | `SupervisorMode` FromStr in `agent_types.rs` / `nexus-agent-graph` state |
 
+## O. Lo strumento di misura raggiunge il suo oggetto come la produzione
+
+Regola autoritativa per test, script diagnostici e gate: **la misura deve arrivare
+al suo oggetto per la STESSA strada della produzione**. Uno strumento che
+ri-costruisce l'input a mano, ri-scrive la query o risolve il percorso a modo suo
+non misura il sistema: misura una sua imitazione, e quando le due divergono non
+fallisce — mente con la faccia seria.
+
+E' la regola L applicata agli strumenti. Oggi test e script sono trattati come se
+non fossero codice: sono invece la parte di codice che decide **se ti fidi**.
+
+### Il pattern, e perche' non si vede
+
+Sempre lo stesso: lo strumento e il sistema usano fonti diverse per la stessa
+domanda. Entrambi funzionano, su cose diverse. Casi REALI di questo repo:
+
+| Strumento | Come raggiungeva l'oggetto | Cosa non poteva vedere |
+|---|---|---|
+| `xtask quality-scan --root` | risolveva il path dalla CWD | misurava un albero, dichiarava l'altro (fix `2ae08818`) |
+| 3 test di `error_class_from_gateway` | chiamavano la funzione a mano | che in produzione non era MAI raggiunta (codice morto con test verdi) |
+| `classify_deterministica_da_status_e_codice` | passava il codice a mano | che l'estrattore quel codice non lo produceva mai (groq 413) |
+| `read_turn_signals` + i suoi test | inventavano `turn['result']` | che il produttore scrive `content`: 0 per costruzione |
+| helper di test `run()` | fissava `inconclusive: 0` | il ramo del silenzio, mai esercitato |
+| script diagnostico | ricopiava `SQL_CLAIM` a mano | leggeva la suite dalla tabella sbagliata: "0 candidati" contro 29 |
+| `rg -rn` | `-r` e' `--replace`, non "recursive" | output falsato per un'intera sessione |
+
+### Cosa e' richiesto
+
+1. **Un test attraversa il produttore.** Se in produzione un valore nasce da una
+   funzione nota (`agent_turn_value_from_gw`, `ProviderHttpError::from_response`,
+   `GatewayHttpError::from_response`, `catalog_select!`), il test parte da LI'.
+   Costruire a mano l'input equivale a fissare l'assunto che si vuole verificare:
+   codice e test condividono l'errore e restano verdi per sempre.
+2. **Un test arriva alla CONSEGUENZA, non alla stringa.** Asserire che una funzione
+   ritorni `"model_not_found"` non prova niente se nessun consumatore conosce quella
+   parola (accaduto: cadeva nel catch-all `Transient`). Si asserisce il verdetto.
+3. **La diagnostica chiama il codice, non lo imita.** Uno script che ricopia una
+   query o una regola di produzione e' un punto unico violato: la copia divergera'.
+   Chi diagnostica pone la domanda al sistema; se non c'e' un modo per porla, si
+   aggiunge (un `explain`), non si riscrive la query.
+4. **Un numero senza la sua premessa e' un'opinione.** Ogni strumento dichiara DA
+   DOVE guarda: quale albero, quale fonte, quale seed. `0` non e' un risultato;
+   `0 (suite letta da ai_price_catalog)` lo e' — e si vede subito che e' sbagliato.
+5. **Ogni fix ha il suo test di mutazione.** Si rompe apposta il codice appena
+   corretto e si verifica che il test ROSSEGGI, col valore del difetto reale. Un
+   test che non fallisce quando reintroduci il bug non copre il bug: copre se
+   stesso.
+
+### Conseguenza pratica
+
+Prima di fidarti di un verde o di un numero, chiediti: *questo strumento tocca il
+sistema dove lo tocca la produzione?* Se il test costruisce l'input, se lo script
+riscrive la query, se il gate risolve il path da solo — non stai misurando il
+sistema. Un PR che aggiunge un test che fabbrica un input gia' prodotto altrove e'
+rifiutato come una toppa (regola H).
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo locale: **Windows nativo**, repo Git in `D:\IDEAI`. Shell:

@@ -1113,8 +1113,27 @@ fn verdict_from_error_class(ec: &str, ok_fallback: &str) -> ToolProbeVerdict {
 /// Logica:
 /// - error_class provider-wide -> ProviderWide (non punire il modello).
 /// - error_class model-specific / forbidden / not_found -> ToolFailed.
+/// - stop_reason=error senza error_class -> Transient (vedi sotto).
 /// - presenza di un `tool_use_blocks` con name == nexus_probe_tool -> Success.
-/// - altrimenti (stop_reason=error, malformed, nessuna tool call) -> ToolFailed.
+/// - altrimenti (malformed, nessuna tool call) -> ToolFailed.
+///
+/// # Il ramo `stop_reason=error` e' irraggiungibile, e resta
+///
+/// Il produttore del turno d'errore valorizza SEMPRE `error_class` (dal segnale
+/// strutturato o dal catch-all del classificatore), quindi il caso 1 intercetta
+/// tutto e al caso 2 non arriva niente: lo prova
+/// `turno_errore_ha_sempre_error_class_*` su sei errori reali, corpo opaco incluso.
+///
+/// Resta lo stesso, perche' e' morto per via dell'INVARIANTE e non per aver perso
+/// lo scopo: un guard non si toglie perche' non ha mai suonato. Togliendolo, il
+/// giorno in cui l'invariante cadesse quel turno finirebbe al caso 4 e diventerebbe
+/// `ToolFailed` — cioe' il degrado di `supports_tool_use` per un blip del confine
+/// gateway/provider, che e' l'incidente Gemini da cui il ramo e' nato. Un ramo
+/// irraggiungibile e prudente vale piu' di una caduta raggiungibile e dannosa.
+///
+/// Sparira' da se' il giorno in cui il turno sara' TIPIZZATO e `error_class` non
+/// potra' essere vuota per costruzione. Oggi il turno e' un `Value`, e quel
+/// cambiamento non e' gratuito.
 pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerdict {
     // 1. error_class autorevole dal brain.
     let ec = response
@@ -1126,13 +1145,9 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
         return verdict_from_error_class(ec, "unexpected_ok_with_error_class");
     }
 
-    // 2. stop_reason=error senza error_class: INCONCLUSIVO, non tool-failure.
-    //    Prima questo ramo marciava verso il degrado di supports_tool_use anche
-    //    quando l'errore era un blip generico al confine gateway/provider
-    //    (incidente Gemini: tool-probe e chat-probe accoppiati, entrambi
-    //    error_kind='error', NON dipendenti dai tool). Senza un error_class
-    //    model-specific riconosciuto non possiamo attribuire il guasto al
-    //    modello: Transient, stato invariato, ritento al round successivo.
+    // 2. stop_reason=error senza error_class: Transient, stato invariato — mai una
+    //    tool-failure. Irraggiungibile oggi, e resta apposta: il perche' sta nella
+    //    doc della funzione, ed e' l'incidente Gemini.
     let stop_reason = response
         .get("stop_reason")
         .and_then(|v| v.as_str())
@@ -1769,38 +1784,119 @@ mod tests {
         }
     }
 
+    /// Il turno d'ERRORE per la STESSA strada della produzione (regola O): il
+    /// gateway risponde col suo 500 aggregato (corpo REALE, `code=PROVIDER_ERROR`
+    /// + `details.primary_cause` + `details.failures[].status`), l'errore arriva
+    /// TIPIZZATO da `GatewayHttpError::from_response` e diventa un turno via
+    /// `error_agent_turn_from_error` — lo stesso punto a cui delega il ramo `Err`
+    /// di `generate_agent_turn`.
+    ///
+    /// Nessun campo del turno e' scritto qui: `stop_reason`, `error_class` e
+    /// `tool_use_blocks` li decide il produttore. Un test che li fabbricasse
+    /// fisserebbe l'assunto che deve verificare.
+    fn turno_da_errore_gateway(body: &str) -> serde_json::Value {
+        let err: anyhow::Error = crate::nexus_gateway::GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body.to_string(),
+        )
+        .into();
+        crate::orchestrator::neural_client::error_agent_turn_from_error(
+            "mistral",
+            "mistral-medium-3.5",
+            &err,
+        )
+    }
+
+    /// Corpo REALE del 500 aggregato del gateway (`routes.rs`: `primary_cause` =
+    /// classe del PRIMO fallimento, `failures[]` con lo status del provider).
+    fn corpo_gateway(primary_cause: &str, class: &str, status: u16) -> String {
+        serde_json::json!({
+            "error": format!("tutti i provider hanno fallito -> mistral (mistral HTTP {status})"),
+            "code": "PROVIDER_ERROR",
+            "details": {
+                "primary_cause": primary_cause,
+                "failures": [{ "provider": "mistral", "class": class, "status": status }],
+            },
+        })
+        .to_string()
+    }
+
+    /// CONTRATTO DEL PRODUTTORE (regola O). Il ramo `stop_reason == "error"` di
+    /// `evaluate_tool_probe` e' raggiungibile solo da un turno che abbia
+    /// `stop_reason="error"` e `error_class` VUOTO. Questo test prova sul
+    /// produttore reale che quel turno non esiste: `error_agent_turn_from_error`
+    /// scrive SEMPRE un `error_class` non vuoto (dal segnale strutturato quando
+    /// c'e', altrimenti dal catch-all "error" del classificatore testuale).
+    ///
+    /// Finche' l'asserzione regge, `Transient("stop_reason_error")` e' un verdetto
+    /// che nessuna esecuzione puo' produrre. Il vecchio test lo dava per vivo
+    /// perche' fabbricava il turno a mano OMETTENDO error_class: una forma che
+    /// nessun produttore emette.
     #[test]
-    fn tool_probe_transient_su_stop_reason_error() {
-        // stop_reason='error' senza error_class model-specific riconosciuto:
-        // INCONCLUSIVO, NON tool-failure. Prima era ToolFailed -> degradava
-        // supports_tool_use anche su un blip generico (incidente Gemini: il
-        // tool-probe e il chat-probe fallivano accoppiati con error_kind='error',
-        // a riprova che NON dipendeva dai tool).
-        let v = serde_json::json!({ "stop_reason": "error", "tool_use_blocks": [] });
-        assert!(matches!(
-            evaluate_tool_probe(&v),
-            ToolProbeVerdict::Transient(ref k) if k == "stop_reason_error"
-        ));
+    fn turno_errore_ha_sempre_error_class_quindi_stop_reason_error_e_irraggiungibile() {
+        let casi = [
+            corpo_gateway("billing", "billing", 402),
+            corpo_gateway("client_error", "client_error", 403),
+            corpo_gateway("client_error", "client_error", 404),
+            corpo_gateway("transient", "transient", 429),
+            corpo_gateway("unknown", "unknown", 418),
+            "corpo non-JSON del tutto opaco".to_string(),
+        ];
+        for body in casi {
+            let turn = turno_da_errore_gateway(&body);
+            assert_eq!(
+                turn["stop_reason"], "error",
+                "il turno d'errore ha sempre stop_reason=error; turno: {turn}"
+            );
+            let ec = turn["error_class"].as_str().unwrap_or("");
+            assert!(
+                !ec.is_empty(),
+                "il produttore non emette MAI un turno d'errore senza error_class: \
+                 se questa assert cade, il ramo stop_reason_error diventa vivo e va \
+                 ri-testato sul verdetto reale; turno: {turn}"
+            );
+            // Conseguenza: il verdetto passa SEMPRE per error_class, mai per il
+            // ramo stop_reason.
+            assert!(
+                !matches!(
+                    evaluate_tool_probe(&turn),
+                    ToolProbeVerdict::Transient(ref k) if k == "stop_reason_error"
+                ),
+                "verdetto dal ramo stop_reason su un turno che ha error_class={ec}"
+            );
+        }
     }
 
     #[test]
     fn tool_probe_transient_su_error_class_generico() {
-        // error_class 'error' nel tool-probe -> Transient (non ToolFailed):
-        // non degrada la tool-capability.
-        let v = serde_json::json!({ "error_class": "error", "tool_use_blocks": [] });
+        // Un fallimento che il gateway NON sa classificare (`primary_cause`
+        // "unknown": e' l'unwrap_or di routes.rs quando la chain non registra
+        // failures) -> nessun segnale strutturato -> il classificatore testuale
+        // cade sul catch-all "error" -> Transient, NON ToolFailed: non degrada la
+        // tool-capability su un blip opaco.
+        let turn = turno_da_errore_gateway(&corpo_gateway("unknown", "unknown", 418));
+        assert_eq!(
+            turn["error_class"], "error",
+            "atteso il catch-all del classificatore testuale; turno: {turn}"
+        );
         assert!(matches!(
-            evaluate_tool_probe(&v),
+            evaluate_tool_probe(&turn),
             ToolProbeVerdict::Transient(ref k) if k == "error"
         ));
     }
 
     #[test]
     fn tool_probe_model_specific_restano_tool_failed() {
-        // not_found (unificato a "invalid_model") resta ToolFailed (degrada): solo i
-        // transient sono inconclusivi.
-        let v = serde_json::json!({ "error_class": "not_found", "tool_use_blocks": [] });
+        // 404 del provider: il modello non esiste. Il gateway lo dichiara come
+        // client_error + status 404; `not_found` (unificato a "invalid_model")
+        // resta ToolFailed (degrada): solo i transient sono inconclusivi.
+        let turn = turno_da_errore_gateway(&corpo_gateway("client_error", "client_error", 404));
+        assert_eq!(
+            turn["error_class"], "not_found",
+            "il 404 va disambiguato dallo status strutturato; turno: {turn}"
+        );
         assert!(matches!(
-            evaluate_tool_probe(&v),
+            evaluate_tool_probe(&turn),
             ToolProbeVerdict::ToolFailed(ref k) if k == "invalid_model"
         ));
     }
@@ -1837,48 +1933,104 @@ mod tests {
 
     // --- FIX 1: tool-probe verdict ------------------------------------------
 
+    /// Il turno di SUCCESSO per la STESSA strada della produzione (regola O):
+    /// dalla `GwResponse` che il gateway restituisce davvero, via
+    /// `agent_turn_value_from_gw` — l'UNICO produttore del turno non-errore.
+    /// `stop_reason` e la forma dei `tool_use_blocks` li decide il produttore.
+    fn turno_da_risposta_gateway(
+        content: &str,
+        tool_calls: Option<Vec<crate::nexus_gateway::GwToolCall>>,
+    ) -> serde_json::Value {
+        let resp = crate::nexus_gateway::GwResponse {
+            content: content.to_string(),
+            tool_calls,
+            usage: crate::nexus_gateway::GwUsage {
+                input_tokens: 49,
+                output_tokens: 2,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+            },
+            model_used: "mistral-medium-3.5".to_string(),
+            provider_used: "mistral".to_string(),
+            latency_ms: 505,
+            finish_reason: "stop".to_string(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+            citations: None,
+        };
+        crate::orchestrator::neural_client::agent_turn_value_from_gw(
+            "mistral",
+            "mistral-medium-3.5",
+            &resp,
+        )
+    }
+
     #[test]
     fn tool_probe_success_su_tool_call_valida() {
-        // Il modello ha chiamato nexus_probe_tool -> Success.
-        let v = serde_json::json!({
-            "stop_reason": "tool_use",
-            "tool_use_blocks": [{ "name": TOOL_PROBE_TOOL_NAME, "input": {"ok": true} }]
-        });
-        assert_eq!(evaluate_tool_probe(&v), ToolProbeVerdict::Success);
+        // Il modello ha chiamato il tool forzato: il gateway riporta la tool-call
+        // e il produttore la trasforma nel blocco che il probe legge -> Success.
+        let turn = turno_da_risposta_gateway(
+            "procedo",
+            Some(vec![crate::nexus_gateway::GwToolCall {
+                id: "call_1".to_string(),
+                kind: "function".to_string(),
+                function: crate::nexus_gateway::GwToolFunctionCall {
+                    name: TOOL_PROBE_TOOL_NAME.to_string(),
+                    arguments: r#"{"ok":true}"#.to_string(),
+                },
+                thought_signature: None,
+            }]),
+        );
+        assert_eq!(
+            evaluate_tool_probe(&turn),
+            ToolProbeVerdict::Success,
+            "turno prodotto dal gateway: {turn}"
+        );
     }
 
     #[test]
     fn tool_probe_fail_su_nessuna_tool_call() {
         // Il modello ha risposto in chat senza chiamare il tool forzato
-        // (tipico hollow_no_tools / output-vuoto sul tool-forcing).
-        let v = serde_json::json!({
-            "stop_reason": "end_turn",
-            "content": "Certo, procedo.",
-            "tool_use_blocks": []
-        });
-        assert!(matches!(
-            evaluate_tool_probe(&v),
-            ToolProbeVerdict::ToolFailed(ref k) if k.contains("no_tool_call")
-        ));
+        // (tipico hollow_no_tools / output-vuoto sul tool-forcing). Il produttore
+        // mette stop_reason=end_turn: il kind del verdetto lo riflette.
+        let turn = turno_da_risposta_gateway("Certo, procedo.", None);
+        assert!(
+            matches!(
+                evaluate_tool_probe(&turn),
+                ToolProbeVerdict::ToolFailed(ref k) if k == "no_tool_call:end_turn"
+            ),
+            "turno prodotto dal gateway: {turn}"
+        );
     }
 
     #[test]
     fn tool_probe_fail_su_forbidden_model_specific() {
-        // 403 forbidden (es. alias Mistral -> Labs 403) e' model-specific:
-        // il tool-probe lo conta come ToolFailed, NON provider-wide.
-        let v = serde_json::json!({ "error_class": "forbidden", "tool_use_blocks": [] });
+        // 403 forbidden (es. alias Mistral -> Labs 403) e' model-specific: il
+        // gateway lo dichiara come client_error + status 403, il tool-probe lo
+        // conta come ToolFailed, NON provider-wide.
+        let turn = turno_da_errore_gateway(&corpo_gateway("client_error", "client_error", 403));
+        assert_eq!(
+            turn["error_class"], "forbidden",
+            "il 403 va disambiguato dallo status strutturato; turno: {turn}"
+        );
         assert!(matches!(
-            evaluate_tool_probe(&v),
+            evaluate_tool_probe(&turn),
             ToolProbeVerdict::ToolFailed(ref k) if k == "model_forbidden"
         ));
     }
 
     #[test]
     fn tool_probe_providerwide_su_billing() {
-        // billing_error e' colpa del provider: non punisce il modello.
-        let v = serde_json::json!({ "error_class": "billing_error", "tool_use_blocks": [] });
+        // billing_error e' colpa del provider: non punisce il modello. La causa
+        // arriva dichiarata dal gateway (`primary_cause="billing"`), mai dalla prosa.
+        let turn = turno_da_errore_gateway(&corpo_gateway("billing", "billing", 402));
+        assert_eq!(
+            turn["error_class"], "billing_error",
+            "il billing e' dichiarato dal gateway alla fonte; turno: {turn}"
+        );
         assert!(matches!(
-            evaluate_tool_probe(&v),
+            evaluate_tool_probe(&turn),
             ToolProbeVerdict::ProviderWide(ref k) if k == "credit_balance_too_low"
         ));
     }

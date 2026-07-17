@@ -10,11 +10,16 @@
 //!   - `audit-settings [--report|--gate|--json FILE|--no-db]`: censimento
 //!     configurazioni `settings` (DB live + migrazioni vs lettori vs UI).
 //!     Punto unico (regola L), gate ratchet vs audit-settings-baseline.json.
+//!   - `battery-explain [modello]`: chi e' eleggibile ADESSO per la batteria di
+//!     qualificazione e PERCHE'. Compone la domanda con `nexus-model-eligibility`,
+//!     lo stesso crate da cui mcp-core compone il claim: la diagnosi non puo'
+//!     rispondere su una regola diversa da quella che gira (regola O).
 //!
 //! Uscita non-zero se trova violazioni. Progettato per essere eseguito in CI
 //! senza dipendenze native pesanti.
 
 mod audit_settings;
+mod battery_explain;
 mod quality_scan;
 
 use std::process::Command;
@@ -39,11 +44,18 @@ fn main() -> Result<()> {
             let code = quality_scan::run(&args[2..])?;
             std::process::exit(code);
         }
+        "battery-explain" => {
+            let code = battery_explain::run(&args[2..])?;
+            std::process::exit(code);
+        }
         _ => {
             eprintln!("xtask — task runner interno");
             eprintln!("  lint-commits <base> <head>    Controlli redazionali sui commit");
             eprintln!("  audit-settings [flags]        Censimento settings DB/codice/UI");
             eprintln!("  quality-scan [--gate|--update] Gate ratchet qualita codice Rust");
+            eprintln!(
+                "  battery-explain [modello]     Eleggibilita' batteria: chi e perche' (DB live)"
+            );
             Ok(())
         }
     }

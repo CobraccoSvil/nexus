@@ -321,6 +321,47 @@ else
   echo "OK model-name-opaco: il nome del modello si splitta solo nel punto unico"
 fi
 
+# ── regola O: la diagnostica chiama il codice, non lo imita ──────────────────
+# Uno script che RICOPIA una query di produzione e' un punto unico violato: la
+# copia divergera' in silenzio. Accaduto il 2026-07-17: uno script diagnostico
+# aveva ricopiato SQL_CLAIM leggendo la suite dalla tabella sbagliata e diceva
+# "0 candidati" mentre erano 29. Un numero sbagliato con la faccia seria vale meno
+# di nessun numero.
+#
+# Il pattern copre le colonne E le tabelle dell'eleggibilita': con le sole due
+# colonne di partenza, uno script che ricopiava la regola guardando lo stato di
+# qualificazione o la tabella dei profili passava indisturbato — cioe' proprio
+# l'errore accaduto, che stava nella scelta della TABELLA della suite.
+sql_ricopiato="$(grep -rIlE "qualification_suite_version|qualification_backoff_until|qualification_expires_at|qualification_state|ai_model_probe_profile"   --include=*.py --include=*.sh --include=*.ps1 --include=*.js --include=*.ts   scripts/ tools/ 2>/dev/null | grep -v "check-single-source.sh" || true)"
+if [[ -n "$sql_ricopiato" ]]; then
+  echo "!! diagnostica-non-imita: uno script ricopia la query del claim della batteria:" >&2
+  echo "$sql_ricopiato" >&2
+  echo "   La copia divergera' dal codice e mentira'. Chiedi al sistema invece di" >&2
+  echo "   riscrivere la domanda (regola O). La strada esiste:" >&2
+  echo "     cargo xtask battery-explain            chi e' eleggibile ADESSO" >&2
+  echo "     cargo xtask battery-explain <modello>  perche' si', perche' no" >&2
+  fail=1
+else
+  echo "OK diagnostica-non-imita: nessuno script ricopia la query del claim"
+fi
+
+# ── regola O: un test attraversa il produttore ───────────────────────────────
+# Il Value del turno agentico nasce SOLO da agent_turn_value_from_gw. Un test che
+# lo fabbrica a mano fissa l'assunto che dovrebbe verificare: e' l'incidente
+# turn['result'] (chiave che nessuno scriveva -> content_chars 0 per costruzione,
+# test verdi, modelli sani bocciati). Chi ha bisogno di un turno finto parte dal
+# produttore, o dichiara perche' non puo'.
+turno_a_mano="$(grep -rIn "tool_use_blocks\"\s*:" --include=*.rs crates/ 2>/dev/null   | grep -v "neural_client.rs"   | grep -v "probe_agentic_loop.rs"   | grep -v "model_qualification.rs"   || true)"
+if [[ -n "$turno_a_mano" ]]; then
+  echo "!! turno-dal-produttore: un turno agentico e' costruito a mano fuori dai punti noti:" >&2
+  echo "$turno_a_mano" >&2
+  echo "   Il Value del turno nasce da agent_turn_value_from_gw: un test che lo" >&2
+  echo "   fabbrica condivide l'errore col codice e resta verde per sempre (regola O)." >&2
+  fail=1
+else
+  echo "OK turno-dal-produttore: il turno agentico non si fabbrica a mano"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -1,0 +1,12 @@
+[package]
+name = "nexus-model-eligibility"
+edition.workspace = true
+version.workspace = true
+
+# Nessuna dipendenza, per costruzione: questo crate COMPONE la regola
+# dell'eleggibilita' (stringhe SQL + logica pura), non la esegue. Chi la esegue
+# porta il suo sqlx: mcp-core per il claim di produzione, xtask per l'explain.
+[dependencies]
+
+[lints]
+workspace = true

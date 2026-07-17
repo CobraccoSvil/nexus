@@ -22,18 +22,19 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 
-use crate::orchestrator::Orchestrator;
+/// Chiavi settings (mig 0591/0593, regola G), lock stantio e REGOLA di
+/// eleggibilita': il punto unico e' il crate `nexus-model-eligibility` (regola L).
+/// Vivono la' perche' l'explain diagnostico (`xtask battery-explain`) deve
+/// interrogare la STESSA regola che questo worker esegue, invece di ricopiarla
+/// (regola O): una copia divergerebbe in silenzio.
+use nexus_model_eligibility::{
+    KEY_BACKOFF_HOURS, KEY_MAX_PER_ROUND, KEY_ROUND_ENABLED, KEY_TTL_DAYS, STALE_PROBING_MINUTES,
+};
 
-/// Chiavi settings (mig 0591/0593, regola G).
-const KEY_ROUND_ENABLED: &str = "agent.model_qualification.round_enabled";
-const KEY_MAX_PER_ROUND: &str = "agent.model_qualification.max_models_per_round";
-const KEY_TTL_DAYS: &str = "agent.model_qualification.requalify_ttl_days";
-const KEY_BACKOFF_HOURS: &str = "agent.model_qualification.backoff_hours";
+use crate::orchestrator::Orchestrator;
 
 /// Cap del backoff esponenziale (7 giorni): oltre non ha senso attendere di piu'.
 const BACKOFF_CAP_HOURS: i64 = 168;
-/// Lock `probing` stantio: oltre questa eta' il claim e' di un worker morto.
-const STALE_PROBING_MINUTES: i64 = 15;
 
 /// Capability MISURATE dalla suite v1 (P0 chat + P2 agentic): vengono SOLO dai
 /// `grants` dei profili superati. Le altre (es. `reasoning`, `vision`) non sono
@@ -228,10 +229,54 @@ fn predicate_fail_reason(
     if needle_missing(turn, predicate) {
         return Some("needle_not_found".to_string());
     }
+    if let Some(motivo) = multi_step_fail_reason(turn, predicate) {
+        return Some(motivo);
+    }
     match predicate.get("max_latency_ms").and_then(Value::as_i64) {
         Some(cap) if latency_ms > cap => Some(format!("latency:{latency_ms}>{cap}")),
         _ => None,
     }
+}
+
+/// I predicati dei profili multi-step, confrontati coi FATTI che il loop ha
+/// misurato (`probe_chain_measure::AttemptMeasures`, che il giro appende al turno
+/// sotto `measures`).
+///
+/// Le tre chiavi erano nel DB da sempre e nessuno le leggeva: `predicate_fail_reason`
+/// tace su cio' che non conosce e ritorna "superato". Finche' i kind non
+/// esistevano il profilo non partiva e il buco non faceva danno; ora che il loop
+/// c'e', queste righe sono l'unica cosa che impedisce a `high` e `heavy` di essere
+/// gratis per chiunque.
+fn multi_step_fail_reason(turn: &Value, predicate: &Value) -> Option<String> {
+    let fatto_i64 = |k: &str| turn.pointer(&format!("/measures/{k}")).and_then(Value::as_i64);
+    let fatto_bool = |k: &str| {
+        turn.pointer(&format!("/measures/{k}"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    if let Some(min) = predicate.get(K_MIN_CHAINED).and_then(Value::as_i64) {
+        // `chained_links` sono gli anelli CONSUMATI (un token nostro riportato in
+        // una chiamata successiva), non le chiamate emesse: tre `list_files` di fila
+        // fanno 0.
+        let anelli = fatto_i64("chained_links").unwrap_or(0);
+        if anelli < min {
+            return Some(format!("no_chain:{anelli}<{min}"));
+        }
+    }
+    if predicate.get(K_REQUIRES_RECOVERY).and_then(Value::as_bool) == Some(true)
+        && !fatto_bool("recovered")
+    {
+        // Non ha portato il token che viveva solo nel messaggio d'errore: qualunque
+        // cosa abbia fatto, non l'ha letto.
+        return Some("no_recovery".to_string());
+    }
+    if predicate.get(K_FORBIDS_REPEAT).and_then(Value::as_bool) == Some(true)
+        && fatto_bool(F_REPEATED_FAILED)
+    {
+        return Some(F_REPEATED_FAILED.to_string());
+    }
+    None
 }
 
 /// FRONTIER (`long_context`): il modello deve aver RITROVATO il fatto piantato a
@@ -433,11 +478,14 @@ pub(crate) fn derive_tier_prior(
 /// del modello). Overlap = pareggio: la riclassificazione ha bisogno di evidenza,
 /// la conservazione no.
 ///
-/// `current` = il tier gia' acquisito (per l'isteresi). `None` -> nessuna banda
-/// certificata: il chiamante ricade sul prior.
+/// `current_measured` = la banda gia' GUADAGNATA dalla batteria (solo se
+/// `tier_source='measured'`), per l'isteresi. `current_catalog` = il tier scritto
+/// nel catalogo da QUALUNQUE fonte, che serve al guard anti-declassamento.
+/// `None` -> nessuna banda certificata: il chiamante ricade sul prior.
 pub(crate) fn derive_tier_measured(
     runs: &[(ProfileRun, Option<String>)],
-    current: Option<&str>,
+    current_measured: Option<&str>,
+    current_catalog: Option<&str>,
     hold_min: u32,
 ) -> Option<String> {
     use nexus_agent_graph::decisions::tiers::tier_rank;
@@ -446,19 +494,137 @@ pub(crate) fn derive_tier_measured(
         let Some(banda) = certifies.as_deref() else {
             continue; // il profilo non certifica un tier (es. tool_smoke)
         };
-        let acquisita = current.is_some_and(|c| tier_rank(banda) <= tier_rank(c));
-        // Soglia asimmetrica: piu' bassa per CONSERVARE una banda gia' acquisita,
-        // piu' alta per conquistarne una nuova.
-        let soglia = if acquisita {
-            hold_min.min(run.promote_min)
-        } else {
-            run.promote_min
-        };
-        if run.passes >= soglia && migliore.is_none_or(|m| tier_rank(banda) > tier_rank(m)) {
+        if run.passes >= soglia_banda(run, banda, current_measured, hold_min)
+            && !scala_rotta_sotto(runs, banda)
+            && migliore.is_none_or(|m| tier_rank(banda) > tier_rank(m))
+        {
             migliore = Some(banda);
         }
     }
-    migliore.map(str::to_string)
+    // IL SILENZIO NON DECLASSA. Se la banda certificata e' piu' bassa di quella
+    // che il catalogo ha gia', si scende SOLO fino alla piu' alta che nessuno ha
+    // negato — non fino a `migliore`. Senza questo, un parco intero crolla a
+    // `medium` appena la batteria smette di poter certificare le bande alte: le
+    // misure che mancano verrebbero lette come bocciature. E' misurato: al
+    // 2026-07-17, con `agentic_chain`/`agentic_recovery` non implementati, 14
+    // modelli su 29 sarebbero scesi di fascia — a partire da grok-4.5 (indice
+    // 45.7, il migliore del parco), che nessun profilo ha mai contestato.
+    match (migliore, current_catalog) {
+        (Some(m), Some(c)) if tier_rank(m) < tier_rank(c) => {
+            match banda_piu_alta_non_negata(runs, c) {
+                // Nessuno ha contestato la banda che il modello ha gia': non si
+                // declassa. E non si riscrive nemmeno `c` come `measured`, che
+                // sarebbe un riciclo del prior — l'indice esterno si farebbe
+                // certificare dalla batteria senza aver superato un solo probe, e
+                // `measured` batte `synced`: l'autocorrezione dell'indice si
+                // congelerebbe per sempre.
+                Some(p) if p == c => None,
+                // La banda del catalogo E' stata negata: si scende, ma solo fino
+                // alla prima che nessuno ha contestato. `p >= m` per costruzione
+                // (`m` e' certificato, quindi non e' negato).
+                Some(p) => Some(p.to_string()),
+                // `c` non appartiene alla scala (refuso, valore legacy): non e' un
+                // gradino da cui scendere. Vale la banda certificata.
+                None => Some(m.to_string()),
+            }
+        }
+        (m, _) => m.map(str::to_string),
+    }
+}
+
+/// I pass necessari perche' `banda` valga, con l'isteresi.
+///
+/// Asimmetrica per costruzione: conservare costa meno che conquistare, e il gap fra
+/// le due soglie E' l'isteresi (senza, un modello oscillerebbe di fascia a ogni
+/// riqualifica e destabilizzerebbe il routing).
+///
+/// La soglia bassa spetta solo a chi la banda l'ha GUADAGNATA dalla batteria
+/// (`current_measured`), mai a un prior dell'indice: leggendo il tier del catalogo
+/// senza guardarne la fonte, un modello con synced=heavy si teneva heavy con 2/4
+/// invece di 3/4 — l'indice esterno si autocertificava con la nostra clemenza.
+fn soglia_banda(
+    run: &ProfileRun,
+    banda: &str,
+    current_measured: Option<&str>,
+    hold_min: u32,
+) -> u32 {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let acquisita = current_measured.is_some_and(|c| tier_rank(banda) <= tier_rank(c));
+    if acquisita {
+        hold_min.min(run.promote_min)
+    } else {
+        run.promote_min
+    }
+}
+
+/// `true` se sotto `banda` c'e' un gradino NEGATO: allora `banda` non vale, perche'
+/// la scala dev'essere una scala.
+///
+/// `agentic_longctx` certifica `frontier` (il vertice) ed e' l'unico profilo alto
+/// implementato: senza questo, un modello che fallisce la catena e il recupero ma
+/// ritrova l'ago si prende `frontier`, scavalcando i gradini che non ha salito.
+/// Il test e' la NON-NEGAZIONE, non la certificazione positiva: pretendere che tutte
+/// le bande inferiori passino congelerebbe quelle alte ogni volta che la rete cade
+/// su un anello intermedio.
+fn scala_rotta_sotto(runs: &[(ProfileRun, Option<String>)], banda: &str) -> bool {
+    bande_inferiori(banda)
+        .iter()
+        .any(|b| banda_negata(runs, b))
+}
+
+/// `true` se il giro NEGA `banda` con evidenza attribuibile al MODELLO: il profilo
+/// che la certifica e' girato, e' rimasto sotto la sua soglia e ha almeno un
+/// fallimento CONCLUSIVO.
+///
+/// Un profilo mai girato, non costruibile (kind non implementato) o solo
+/// inconclusivo NON e' una negazione: e' silenzio. La distinzione e' tutta qui —
+/// "non l'ho provato" e "l'ha fallito" sono cose opposte, e trattarle uguale
+/// declassa i modelli per i difetti della batteria invece che per i loro.
+fn banda_negata(runs: &[(ProfileRun, Option<String>)], banda: &str) -> bool {
+    runs.iter().any(|(r, b)| {
+        b.as_deref() == Some(banda) && !r.passed() && r.conclusive_fails > 0
+    })
+}
+
+/// Le bande sotto `banda` nella scala canonica (punto unico `PERFORMANCE_TIERS`,
+/// regola L: la scala non si riscrive a mano).
+fn bande_inferiori(banda: &str) -> Vec<&'static str> {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let r = tier_rank(banda);
+    nexus_types::tiers::PERFORMANCE_TIERS
+        .iter()
+        .copied()
+        .filter(|b| tier_rank(b) < r)
+        .collect()
+}
+
+/// La banda del vocabolario canonico che corrisponde a `t`. `None` = valore fuori
+/// scala (refuso, tier legacy): il chiamante non lo tratta come un gradino.
+fn banda_canonica(t: &str) -> Option<&'static str> {
+    nexus_types::tiers::PERFORMANCE_TIERS
+        .iter()
+        .copied()
+        .find(|b| b.eq_ignore_ascii_case(t.trim()))
+}
+
+/// Scendendo da `tetto`, la prima banda che il giro non ha negato. E' il pavimento
+/// del declassamento: si perde un gradino per volta, e solo dove c'e' una bocciatura
+/// vera. `None` = `tetto` non e' una banda della scala.
+fn banda_piu_alta_non_negata(
+    runs: &[(ProfileRun, Option<String>)],
+    tetto: &str,
+) -> Option<&'static str> {
+    let mut scesa = banda_canonica(tetto)?;
+    loop {
+        if !banda_negata(runs, scesa) {
+            return Some(scesa);
+        }
+        match bande_inferiori(scesa).last() {
+            Some(b) => scesa = b,
+            // Negata anche la banda piu' bassa: non si scende sotto la scala.
+            None => return Some(scesa),
+        }
+    }
 }
 
 /// Verdetto NEGATIVO della batteria, se c'e'. Distingue le due cause, che non
@@ -545,11 +711,15 @@ async fn setting_i64(db: &PgPool, key: &str, default: i64) -> i64 {
 
 /// Carica i profili ENABLED della batteria, ordinati per `ord`.
 async fn load_profiles(db: &PgPool) -> Vec<ProbeProfile> {
-    let rows = sqlx::query(
-        "SELECT profile_key, suite_version, kind, is_blocking, certifies_tier, \
-                applies_when, grants, payload, pass_predicate \
-           FROM ai_model_probe_profile WHERE enabled = TRUE ORDER BY ord",
-    )
+    // La FONTE dei profili (tabella + filtro enabled) e' condivisa con l'explain:
+    // la premessa "quale suite e' corrente" e' esattamente cio' che lo script
+    // diagnostico del 2026-07-17 aveva sbagliato leggendola dal catalogo.
+    let rows = sqlx::query(concat!(
+        "SELECT profile_key, suite_version, kind, is_blocking, certifies_tier, ",
+        "applies_when, grants, payload, pass_predicate ",
+        nexus_model_eligibility::profile_source!(),
+        " ORDER BY ord"
+    ))
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -705,10 +875,302 @@ fn build_long_context_request(profile: &ProbeProfile) -> (String, String, String
     )
 }
 
+/// Le chiavi che un `pass_predicate` puo' contenere. VOCABOLARIO CHIUSO (regola N):
+/// tutto cio' che sta qui e' verificato da qualcuno, e cio' che non sta qui e' un
+/// errore — non un vincolo da ignorare.
+///
+/// La differenza non e' formale. `predicate_fail_reason` legge le chiavi che
+/// conosce e tace sulle altre, con default permissivi: un predicato
+/// `{"min_chained_calls": 3}` su un profilo che non sa contare gli anelli non
+/// verifica NIENTE e ritorna `None`, cioe' "superato". Il profilo gira, promuove
+/// tutti e sembra funzionare: `high` diventerebbe gratis per chiunque, in silenzio.
+/// E' il difetto peggiore possibile qui, perche' un test che non misura e'
+/// indistinguibile da un test che passa.
+/// Le tre chiavi dei profili multi-step. Sono nominate in tre punti — il
+/// vocabolario, la lista di cio' che richiede un kind multi-turno, e il
+/// verificatore — e devono essere LA STESSA parola: un refuso in uno dei tre
+/// renderebbe il predicato muto, cioe' un pass regalato (regola N).
+/// I due kind multi-step. Nominati dal dispatch, dal guard del predicato e dalla
+/// scelta del mondo: se una delle tre copie divergesse, un profilo girerebbe col
+/// mondo sbagliato o col predicato muto (regola N).
+const KIND_TOOL_CHAIN: &str = "tool_chain";
+const KIND_TOOL_RECOVERY: &str = "tool_recovery";
+
+const K_MIN_CHAINED: &str = "min_chained_calls";
+const K_REQUIRES_RECOVERY: &str = "requires_recovery";
+const K_FORBIDS_REPEAT: &str = "forbids_repeat_of_failed";
+/// Il FATTO misurato dal loop (non la chiave del predicato): il modello ha
+/// rimandato identica una chiamata gia' fallita.
+const F_REPEATED_FAILED: &str = "repeated_failed";
+
+const CHIAVI_PREDICATO: [&str; 9] = [
+    // verificate da `predicate_fail_reason`
+    "min_tool_calls",
+    "min_content_chars",
+    "requires_needle",
+    "max_latency_ms",
+    // lette da `profile_params` (isteresi delle bande)
+    "hold_min_passes",
+    "promote_min_passes",
+    // verificate dal loop agentico (tool_chain / tool_recovery)
+    K_MIN_CHAINED,
+    K_REQUIRES_RECOVERY,
+    K_FORBIDS_REPEAT,
+];
+
+/// La prima chiave del predicato che nessuno sa verificare. `None` = il predicato
+/// e' interamente coperto.
+fn chiave_predicato_ignota(predicate: &Value) -> Option<String> {
+    predicate
+        .as_object()?
+        .keys()
+        .find(|k| !CHIAVI_PREDICATO.contains(&k.as_str()))
+        .cloned()
+}
+
+/// I predicati che solo il loop multi-turno sa verificare. Su un profilo
+/// single-turn sarebbero muti (nessun anello da contare, nessun errore iniettato):
+/// il profilo promuoverebbe senza misurare cio' che dichiara di misurare.
+const PREDICATI_MULTI_TURNO: [&str; 3] = [K_MIN_CHAINED, K_REQUIRES_RECOVERY, K_FORBIDS_REPEAT];
+
+/// `Err` se il profilo chiede una verifica che il suo kind non puo' fare. Il
+/// controllo e' incrociato apposta: le due meta' del contratto (kind e predicato)
+/// vivono in righe diverse del DB e possono divergere per un refuso dell'admin.
+fn predicato_coerente_col_kind(profile: &ProbeProfile) -> Result<(), String> {
+    if let Some(k) = chiave_predicato_ignota(&profile.pass_predicate) {
+        return Err(format!("predicato sconosciuto: {k}"));
+    }
+    let multi_turno = matches!(profile.kind.as_str(), KIND_TOOL_CHAIN | KIND_TOOL_RECOVERY);
+    if !multi_turno {
+        if let Some(k) = profile
+            .pass_predicate
+            .as_object()
+            .and_then(|o| o.keys().find(|k| PREDICATI_MULTI_TURNO.contains(&k.as_str())))
+        {
+            return Err(format!(
+                "predicato '{k}' richiede un kind multi-turno, ma il profilo e' '{}'",
+                profile.kind
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Un seme fresco per il tentativo.
+///
+/// Fresco: due giri dello stesso modello vedono handle diversi, quindi il test non
+/// e' memorizzabile (il needle fisso `NX7K2P9QW4` insegna il contrario — costante in
+/// chiaro nel repo, nel DB e nei log, mandata a 8 provider: GPT-4-base recita il
+/// GUID di BIG-bench).
+///
+/// Registrato: finisce in `ai_model_probe_evidence.seed`, e da li' il giro si rigioca
+/// bit a bit. Un verdetto che non sai rigiocare non e' contestabile, quindi e'
+/// un'opinione (regola O: un numero senza la sua premessa).
+///
+/// Il seme varia per ISTANZA, mai i PARAMETRI della banda (profondita' della catena,
+/// tipo di guasto): stesso parametro = stessa difficolta', seme diverso = istanza mai
+/// vista. E' la risposta della letteratura alla tensione freschezza/stabilita' (survey
+/// contaminazione arXiv 2406.04244: i benchmark dinamici "mancano della garanzia di
+/// risultati consistenti fra valutazioni successive").
+fn seme_fresco() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        // Il nanosecondo da solo non basta: due tentativi ravvicinati possono
+        // cadere nello stesso tick su Windows (granularita' ~100ns).
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
+/// Il mondo che serve a un kind, se e' uno dei due multi-step.
+fn mondo_del_kind(kind: &str) -> Option<crate::probe_world::WorldKind> {
+    match kind {
+        KIND_TOOL_CHAIN => Some(crate::probe_world::WorldKind::Catena),
+        KIND_TOOL_RECOVERY => Some(crate::probe_world::WorldKind::Recupero),
+        _ => None,
+    }
+}
+
+/// L'istruzione del giro: nomina il SOLO bersaglio noto (l'handle di partenza) e
+/// dice cosa cercare.
+///
+/// Non nomina i tool — quale usare lo decide il modello — e non dice "concatena tre
+/// chiamate": chiederlo esplicitamente misurerebbe l'obbedienza al nostro prompt
+/// invece della capacita' di capire che, per arrivare in fondo, bisogna seguire i
+/// riferimenti.
+fn istruzione_catena(handle: &str) -> String {
+    format!(
+        "Parti dalla risorsa {handle}. Ogni risorsa che leggi contiene i riferimenti \
+         a quelle successive: segui la voce marcata 'current' finche' non arrivi \
+         all'ultima. Rispondi con il riferimento finale."
+    )
+}
+
+/// Il recupero non si annuncia: se il prompt dicesse "quando fallisce, leggi
+/// l'errore", misureremmo l'obbedienza. Dice solo il compito.
+fn istruzione_recupero(handle: &str) -> String {
+    format!("Leggi la risorsa {handle} e riportane il contenuto.")
+}
+
+impl ProbeCtx<'_> {
+    /// Un turno del loop. Gli errori del provider tornano DENTRO il Value (il
+    /// produttore non li propaga come `Err`): il loop li legge da `error_class` e
+    /// chiude inconclusivo.
+    async fn turno_del_loop(&self, messages_json: &str) -> Value {
+        let (tools_json, _, system_text) = self.request;
+        match self
+            .orchestrator
+            .neural
+            .generate_agent_turn_with_thinking(
+                self.provider,
+                self.model,
+                messages_json,
+                tools_json,
+                self.params.max_tokens,
+                system_text,
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            // Errore LOCALE (bridge non configurato, json invalido): non e' colpa
+            // del modello, e il loop lo trattera' come inconclusivo.
+            Err(e) => json!({ "error_class": "bridge_error", "stop_reason": "error",
+                              "error": e.to_string(), "tool_use_blocks": [] }),
+        }
+    }
+
+    /// Il mondo del tentativo e l'istruzione che lo apre. `Err` col motivo se il
+    /// mondo non e' costruibile: e' colpa nostra, e il chiamante chiude inconclusivo.
+    fn prepara_mondo(
+        &self,
+        kind: crate::probe_world::WorldKind,
+        attempt: i32,
+        seme: u64,
+    ) -> Result<(crate::probe_world::ScriptedWorld, String), String> {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
+        let seed = TokenSeed {
+            provider: self.provider.to_string(),
+            model: self.model.to_string(),
+            profile_key: self.profile.profile_key.clone(),
+            attempt,
+            // Fresco a ogni tentativo e REGISTRATO nell'evidenza (mig 0610): il giro
+            // si rigioca identico da quella riga.
+            seed: seme,
+        };
+        // L'anello di partenza e' l'UNICO che la richiesta nomina: gli altri il
+        // modello deve guadagnarseli seguendo la catena.
+        let handle0 = seed.handle(0);
+        let istruzione = match kind {
+            WorldKind::Catena => istruzione_catena(&handle0),
+            WorldKind::Recupero => istruzione_recupero(&handle0),
+        };
+        let (_, _, system_text) = self.request;
+        // L'INVARIANTE del needle, qui come guard: nessun token A VALLE puo' essere
+        // gia' visibile nella richiesta, o la catena e' scorciatoiabile.
+        let mondo = ScriptedWorld::new(kind, seed, &[&istruzione, system_text])?;
+        Ok((mondo, istruzione))
+    }
+
+    /// UN tentativo multi-step: prepara il mondo, gira il loop, consegna i FATTI al
+    /// predicato. Ogni uscita anticipata e' un inconclusivo, mai una bocciatura:
+    /// il modello risponde di cio' che fa, non dei nostri cap ne' dei provider caduti.
+    async fn multi_step_attempt(
+        &self,
+        kind: crate::probe_world::WorldKind,
+        attempt: i32,
+        seme: u64,
+    ) -> (AttemptOutcome, i64) {
+        let started = std::time::Instant::now();
+        let ms = || started.elapsed().as_millis() as i64;
+
+        let (mut mondo, istruzione) = match self.prepara_mondo(kind, attempt, seme) {
+            Ok(v) => v,
+            Err(motivo) => return esito_inconclusivo(format!("mondo_non_costruibile:{motivo}"), ms()),
+        };
+        let max_turns = self
+            .profile
+            .payload
+            .get("max_turns")
+            .and_then(Value::as_i64)
+            .unwrap_or(6) as usize;
+
+        let esito = tokio::time::timeout(
+            Duration::from_secs(self.params.timeout_s),
+            crate::probe_agentic_loop::run_loop(self, kind, &mut mondo, &istruzione, max_turns),
+        )
+        .await;
+        let latency_ms = ms();
+
+        let Ok(out) = esito else {
+            return esito_inconclusivo(
+                format!("probe_timeout:{}s", self.params.timeout_s),
+                latency_ms,
+            );
+        };
+        if let Some(motivo) = out.inconclusive {
+            return esito_inconclusivo(motivo, latency_ms);
+        }
+        let turno = turno_dai_fatti(&out.measures);
+        (
+            evaluate_attempt(&turno, &self.profile.pass_predicate, latency_ms),
+            latency_ms,
+        )
+    }
+}
+
+/// Un esito che NON e' attribuibile al modello: il suo stato resta invariato.
+/// Esiste come funzione sola perche' era una chiusura dentro `multi_step_attempt`,
+/// e un esito che il chiamante deve poter produrre da quattro punti diversi non e'
+/// un dettaglio di quella funzione.
+fn esito_inconclusivo(reason: String, ms: i64) -> (AttemptOutcome, i64) {
+    (
+        AttemptOutcome {
+            pass: false,
+            inconclusive: true,
+            reason,
+            error_class: None,
+            tool_call_count: 0,
+            content_chars: 0,
+            stop_reason: String::new(),
+        },
+        ms,
+    )
+}
+
+/// I fatti misurati, nella forma che il predicato sa leggere. Il turno e' sintetico
+/// apposta: il verdetto guarda `measures`, MAI la prosa del modello (regola M).
+fn turno_dai_fatti(m: &crate::probe_chain_measure::AttemptMeasures) -> Value {
+    json!({
+        "content": "",
+        "stop_reason": "end_turn",
+        "tool_use_blocks": [],
+        "measures": {
+            "chained_links": m.chained_links,
+            "recovered": m.recovered,
+            F_REPEATED_FAILED: m.repeated_failed,
+            "bad_tool_syntax": m.bad_tool_syntax,
+        }
+    })
+}
+
+impl crate::probe_agentic_loop::TurnSource for ProbeCtx<'_> {
+    async fn turn(&self, messages_json: &str) -> Value {
+        self.turno_del_loop(messages_json).await
+    }
+}
+
 async fn build_profile_request(
     db: &PgPool,
     profile: &ProbeProfile,
 ) -> Result<(String, String, String), String> {
+    // PRIMA di costruire la richiesta: se il predicato chiede una verifica che
+    // nessuno sa fare, il profilo NON e' costruibile. Fallire qui produce un giro
+    // inconclusivo (colpa nostra, stato del modello invariato); tacere
+    // produrrebbe una promozione gratuita.
+    predicato_coerente_col_kind(profile)?;
     match profile.kind.as_str() {
         "chat" => Ok((
             "[]".to_string(),
@@ -728,12 +1190,25 @@ async fn build_profile_request(
             ))
         }
         "long_context" => Ok(build_long_context_request(profile)),
+        // I due multi-step: qui si costruisce solo la cornice (tool + system).
+        // L'istruzione la completa `multi_step_attempt`, che conosce il seed e
+        // quindi l'handle di partenza; il resto della conversazione lo costruisce
+        // il loop, turno per turno, con le risposte del mondo finto.
+        KIND_TOOL_CHAIN | KIND_TOOL_RECOVERY => {
+            let tools = resolve_probe_tools(profile)?;
+            let system = resolve_probe_system(db, profile).await?;
+            Ok((tools.to_string(), String::new(), system))
+        }
         other => Err(format!("kind profilo non implementato: {other}")),
     }
 }
 
 /// Registra un tentativo in `ai_model_probe_evidence` e ritorna l'id.
 #[allow(clippy::too_many_arguments)]
+/// Registra un tentativo. Il `seme` e' la PREMESSA del verdetto: senza, un
+/// fallimento contestato non si rigioca e quindi non si contesta (regola O). Vale
+/// solo per i profili multi-step, che dal seme derivano ogni token; per gli altri
+/// e' `None`.
 async fn insert_evidence(
     db: &PgPool,
     provider: &str,
@@ -742,6 +1217,7 @@ async fn insert_evidence(
     attempt: i32,
     latency_ms: i64,
     outcome: &AttemptOutcome,
+    seme: Option<i64>,
 ) -> Option<i64> {
     let verdict = if outcome.inconclusive {
         "inconclusive"
@@ -753,8 +1229,8 @@ async fn insert_evidence(
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO ai_model_probe_evidence \
          (provider, model, profile_key, suite_version, attempt, latency_ms, error_class, \
-          tool_call_count, content_chars, stop_reason, verdict, verdict_reason) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+          tool_call_count, content_chars, stop_reason, verdict, verdict_reason, seed) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
     )
     .bind(provider)
     .bind(model)
@@ -768,6 +1244,7 @@ async fn insert_evidence(
     .bind(&outcome.stop_reason)
     .bind(verdict)
     .bind(&outcome.reason)
+    .bind(seme)
     .fetch_one(db)
     .await
     .map_err(|e| {
@@ -831,7 +1308,15 @@ impl ProbeCtx<'_> {
     async fn single_attempt(
         &self,
         thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+        attempt: i32,
+        seme: u64,
     ) -> (AttemptOutcome, i64) {
+        // I due kind multi-step non stanno in un turno solo: hanno bisogno del
+        // loop, del mondo finto e del taint tracking. E' l'unico punto in cui il
+        // giro si biforca.
+        if let Some(kind) = mondo_del_kind(&self.profile.kind) {
+            return self.multi_step_attempt(kind, attempt, seme).await;
+        }
         let (tools_json, messages_json, system_text) = self.request;
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
@@ -909,7 +1394,12 @@ async fn run_profile_attempts(
         first_fail_reason: None,
     };
     for attempt in 1..=ctx.params.repeat {
-        let (mut outcome, latency_ms) = ctx.single_attempt(thinking.clone()).await;
+        // Un seme per TENTATIVO: i 4 tentativi campionano istanze diverse invece di
+        // ripetere la stessa (FLenQA misura che una posizione fissa e' la peggiore:
+        // ripetere 4 volte lo stesso caso fa passare i borderline per fortuna).
+        let seme = seme_fresco();
+        let (mut outcome, latency_ms) =
+            ctx.single_attempt(thinking.clone(), attempt as i32, seme).await;
         if !label.is_empty() {
             outcome.reason = format!("{label}{}", outcome.reason);
         }
@@ -921,6 +1411,9 @@ async fn run_profile_attempts(
             attempt as i32,
             latency_ms,
             &outcome,
+            // Il seme e' la premessa del verdetto, e vale solo dove ogni token ne
+            // deriva: sugli altri profili non c'e' niente da rigiocare.
+            mondo_del_kind(&ctx.profile.kind).map(|_| seme as i64),
         )
         .await
         {
@@ -1064,10 +1557,31 @@ async fn attach_measured_tier(
             (r.clone(), banda)
         })
         .collect();
-    // Il tier ATTUALE serve all'isteresi: conservare una banda gia' acquisita
-    // costa meno che conquistarne una nuova.
-    let current: Option<String> = sqlx::query_scalar(
-        "SELECT performance_tier FROM ai_price_catalog \
+    let (tier_catalogo, banda_guadagnata) = tier_corrente(db, provider, model).await;
+    derived.measured_tier = derive_tier_measured(
+        &con_bande,
+        banda_guadagnata.as_deref(),
+        tier_catalogo.as_deref(),
+        hold_min_passes(profiles),
+    );
+}
+
+/// Il tier del modello nel catalogo, in DUE valori che non vanno confusi:
+///   - `.0` il tier scritto da QUALUNQUE fonte: e' il pavimento del declassamento,
+///     da li' si scende un gradino alla volta e solo dove c'e' una bocciatura vera;
+///   - `.1` la banda GUADAGNATA dalla batteria (solo `tier_source='measured'`):
+///     l'unica che ha diritto all'isteresi.
+///
+/// Leggendo il solo `performance_tier` — come faceva prima — un prior dell'indice
+/// esterno si teneva la sua fascia con la soglia di conservazione: si autocertificava
+/// con una clemenza pensata per chi la banda l'aveva dimostrata.
+async fn tier_corrente(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> (Option<String>, Option<String>) {
+    let riga: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT performance_tier, tier_source FROM ai_price_catalog \
           WHERE provider = $1 AND model = $2 LIMIT 1",
     )
     .bind(provider)
@@ -1075,10 +1589,13 @@ async fn attach_measured_tier(
     .fetch_optional(db)
     .await
     .ok()
-    .flatten()
     .flatten();
-    derived.measured_tier =
-        derive_tier_measured(&con_bande, current.as_deref(), hold_min_passes(profiles));
+    let (tier, fonte) = riga.unwrap_or((None, None));
+    let guadagnata = match fonte.as_deref() {
+        Some("measured") => tier.clone(),
+        _ => None,
+    };
+    (tier, guadagnata)
 }
 
 /// Esegue la batteria su UN modello candidato (gia' claimato `probing`).
@@ -1337,7 +1854,8 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
     if !enabled {
         return 0;
     }
-    let max_per_round = setting_i64(db, KEY_MAX_PER_ROUND, 4).await;
+    let max_per_round =
+        setting_i64(db, KEY_MAX_PER_ROUND, nexus_model_eligibility::DEFAULT_MAX_PER_ROUND).await;
     let ttl_days = setting_i64(db, KEY_TTL_DAYS, 30).await;
     let backoff_hours = setting_i64(db, KEY_BACKOFF_HOURS, 24).await;
 
@@ -1350,7 +1868,9 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
         return 0;
     }
     let cfg = RoundConfig {
-        suite_version: profiles.iter().map(|p| p.suite_version).max().unwrap_or(1),
+        suite_version: nexus_model_eligibility::current_suite_version(
+            profiles.iter().map(|p| p.suite_version),
+        ),
         ttl_days,
         backoff_hours,
     };
@@ -1379,61 +1899,20 @@ struct RoundConfig {
     backoff_hours: i64,
 }
 
-/// Claim CAS. I candidati GIA' qualified (scaduti o con suite vecchia) sono
-/// ri-provati IN SHADOW: lo state resta 'qualified' (il pool non si svuota durante
-/// la ri-qualificazione); il lock del claim e' qualification_started_at (stantio
-/// oltre STALE_PROBING_MINUTES = worker morto, riclaimabile).
-/// I candidati del giro. Il filtro sul COOLDOWN sta QUI, non solo a valle:
-/// `qualify_claimed` controlla `is_provider_in_cooldown` col commento "non
-/// sprecare il giro", ma a quel punto il giro e' gia' speso — il claim ha
-/// consumato uno dei `max_per_round` posti per un modello che verra' scartato
-/// in 10 millisecondi.
+/// I candidati del giro, reclamati col CAS di `nexus_model_eligibility::sql_claim`.
 ///
-/// Misurato il 2026-07-16, dopo il fix del panic: due giri consecutivi hanno
-/// reclamato 8 modelli, TUTTI di openai/anthropic (in cooldown per
-/// `credit_balance_too_low`), e li hanno buttati tutti. Non e' sfortuna: quei
-/// due provider sono 76 modelli su 116 e l'ORDER BY per scadenza li pesca
-/// quasi sempre. A 4 per giro ogni 30 minuti servivano ~9 ore per smaltirli
-/// prima di toccare i 34 modelli misurabili — cioe' il "tier dai fatti" non
-/// avrebbe misurato nulla per un'intera giornata, con la batteria che girava
-/// e sembrava sana.
-///
-/// Il filtro usa `nexus_provider_health.billing_cooldown_until` (la fonte
-/// PERSISTENTE del cooldown lungo, ADR 0020/0030). Il cooldown breve vive in
-/// memoria e non e' interrogabile da SQL: per quello resta il check a valle,
-/// che da rete di sicurezza torna a essere cio' che deve essere — un caso raro,
-/// non la norma.
-const SQL_CLAIM: &str = "UPDATE ai_price_catalog c SET \
-     qualification_state = CASE WHEN c.qualification_state = 'qualified' \
-                                THEN 'qualified' ELSE 'probing' END, \
-     qualification_started_at = NOW() \
- FROM ( \
-     SELECT provider, model FROM ai_price_catalog p \
-      WHERE is_enabled = TRUE AND supports_tool_use = TRUE \
-        AND (qualification_backoff_until IS NULL OR qualification_backoff_until < NOW()) \
-        AND (qualification_started_at IS NULL \
-             OR qualification_started_at < NOW() - make_interval(mins => $2::int)) \
-        AND (qualification_state IN ('unqualified','quarantined','probing') \
-             OR (qualification_state = 'qualified' \
-                 AND (qualification_expires_at < NOW() \
-                      OR qualification_suite_version < $3))) \
-        AND NOT EXISTS (SELECT 1 FROM nexus_provider_health h \
-                         WHERE h.provider = p.provider \
-                           AND h.billing_cooldown_until > NOW()) \
-      ORDER BY (qualification_state = 'unqualified') DESC, \
-               qualification_expires_at ASC NULLS FIRST \
-      LIMIT $1 \
-      FOR UPDATE SKIP LOCKED \
- ) cand \
- WHERE c.provider = cand.provider AND c.model = cand.model \
- RETURNING c.provider, c.model, c.capabilities";
-
+/// La REGOLA (chi e' eleggibile: catalog abilitato, tool use dichiarato, backoff
+/// scaduto, lock libero, da rimisurare, provider senza cooldown) vive nel crate
+/// come punto unico, insieme al perche' di ogni condizione. Non e' cortesia
+/// architetturale: `xtask battery-explain` compone la SUA query dalle stesse
+/// condizioni, quindi la diagnosi risponde sempre sulla regola che gira davvero
+/// qui (regola O). Una copia — cioe' com'era prima — divergeva in silenzio.
 async fn claim_candidates(
     db: &PgPool,
     max_per_round: i64,
     suite_version: i32,
 ) -> Vec<(String, String, Value)> {
-    sqlx::query_as(SQL_CLAIM)
+    sqlx::query_as(&nexus_model_eligibility::sql_claim())
         .bind(max_per_round)
         .bind(STALE_PROBING_MINUTES as i32)
         .bind(suite_version)
@@ -1694,6 +2173,189 @@ mod tests {
     /// rispondono 'ok' alla richiesta identica del probe) e, con
     /// enforce_routing_gate acceso, li ESCLUDEVA dal routing 4 per giro.
     ///
+    // ── Il vocabolario CHIUSO dei predicati ─────────────────────────────────
+
+    fn profilo(kind: &str, predicate: Value) -> ProbeProfile {
+        ProbeProfile {
+            profile_key: format!("test_{kind}"),
+            suite_version: 2,
+            kind: kind.to_string(),
+            is_blocking: false,
+            applies_when: None,
+            grants: vec![],
+            payload: json!({}),
+            pass_predicate: predicate,
+            certifies_tier: None,
+        }
+    }
+
+    /// IL FAIL-APERTO, che e' il difetto peggiore: un predicato che nessuno
+    /// verifica non e' un vincolo, e `predicate_fail_reason` con i suoi default
+    /// permissivi ritorna `None` = "superato". Un profilo che non misura niente e
+    /// promuove tutti e' indistinguibile da un profilo che funziona.
+    #[test]
+    fn un_predicato_sconosciuto_e_un_errore_non_un_vincolo_ignorato() {
+        // La prova del fail-aperto: oggi il verificatore TACE su una chiave ignota
+        // e dichiara il tentativo superato.
+        let sig = read_turn_signals(&json!({"content": "x", "tool_use_blocks": []}));
+        assert_eq!(
+            predicate_fail_reason(&json!({}), &json!({"min_unicorni": 3}), &sig, 10),
+            None,
+            "il verificatore non conosce 'min_unicorni' e lo ignora: senza il \
+             vocabolario chiuso, quel profilo promuoverebbe chiunque"
+        );
+        // Per questo il profilo dev'essere rifiutato PRIMA di girare.
+        assert_eq!(
+            predicato_coerente_col_kind(&profilo("chat", json!({"min_unicorni": 3}))),
+            Err("predicato sconosciuto: min_unicorni".to_string())
+        );
+    }
+
+    /// Le due meta' del contratto stanno in colonne diverse del DB e possono
+    /// divergere: un predicato di catena su un profilo single-turn sarebbe muto
+    /// (nessun anello da contare), quindi promuoverebbe senza misurare.
+    #[test]
+    fn un_predicato_di_catena_su_un_profilo_single_turn_e_un_errore() {
+        let e = predicato_coerente_col_kind(&profilo("chat", json!({"min_chained_calls": 3})));
+        assert!(
+            e.is_err() && e.unwrap_err().contains("multi-turno"),
+            "min_chained_calls su kind 'chat' non e' verificabile: va rifiutato"
+        );
+        // Sul kind giusto, invece, e' legittimo.
+        assert!(
+            predicato_coerente_col_kind(&profilo("tool_chain", json!({"min_chained_calls": 3})))
+                .is_ok()
+        );
+    }
+
+    /// I predicati dei profili VERI del DB devono essere tutti coperti: e' il
+    /// controllo che impedisce a un profilo aggiunto dall'admin di girare a vuoto.
+    #[test]
+    fn il_vocabolario_copre_i_predicati_dei_profili_reali() {
+        for (kind, pred) in [
+            ("chat", json!({"min_content_chars": 1})),
+            ("tool_minimal", json!({"min_tool_calls": 1})),
+            (
+                "tool_realistic",
+                json!({"max_latency_ms": 60000, "min_tool_calls": 1,
+                       "hold_min_passes": 2, "promote_min_passes": 3}),
+            ),
+            (
+                "tool_chain",
+                json!({"max_latency_ms": 120000, "hold_min_passes": 2,
+                       "min_chained_calls": 3, "promote_min_passes": 3}),
+            ),
+            (
+                "tool_recovery",
+                json!({"max_latency_ms": 120000, "hold_min_passes": 2,
+                       "requires_recovery": true, "promote_min_passes": 3,
+                       "forbids_repeat_of_failed": true}),
+            ),
+            (
+                "long_context",
+                json!({"max_latency_ms": 180000, "hold_min_passes": 2,
+                       "requires_needle": true, "promote_min_passes": 3}),
+            ),
+        ] {
+            assert!(
+                predicato_coerente_col_kind(&profilo(kind, pred)).is_ok(),
+                "il profilo '{kind}' del DB deve essere accettato dal vocabolario"
+            );
+        }
+    }
+
+    // ── I predicati multi-step, agganciati ai fatti del loop ────────────────
+
+    /// Un turno multi-step come il loop lo consegna: i fatti stanno sotto
+    /// `measures`, ed e' li' che il predicato li legge.
+    fn turno_con_misure(chained: i64, recovered: bool, repeated: bool) -> Value {
+        json!({
+            "content": "", "stop_reason": "end_turn", "tool_use_blocks": [],
+            "measures": {
+                "chained_links": chained,
+                "recovered": recovered,
+                "repeated_failed": repeated,
+                "bad_tool_syntax": false
+            }
+        })
+    }
+
+    /// `min_chained_calls: 3` boccia chi ha concatenato meno di 3 anelli, e i
+    /// "3 anelli" sono token nostri riportati — non chiamate emesse.
+    #[test]
+    fn il_predicato_della_catena_boccia_chi_non_concatena() {
+        let pred = json!({ "min_chained_calls": 3 });
+        let sig = read_turn_signals(&turno_con_misure(0, false, false));
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, false, false), &pred, &sig, 10),
+            Some("no_chain:0<3".to_string()),
+            "zero anelli: il profilo non certifica high"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(2, false, false), &pred, &sig, 10),
+            Some("no_chain:2<3".to_string()),
+            "due anelli su tre: sotto soglia"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(3, false, false), &pred, &sig, 10),
+            None,
+            "tre anelli: superato"
+        );
+    }
+
+    /// `requires_recovery` chiede il FATTO, non le buone intenzioni: senza il token
+    /// dell'errore non c'e' recupero, per quanto bella sia la prosa.
+    #[test]
+    fn il_predicato_del_recupero_chiede_il_token_non_le_scuse() {
+        let pred = json!({ "requires_recovery": true });
+        let sig = read_turn_signals(&turno_con_misure(0, false, false));
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, false, false), &pred, &sig, 10),
+            Some("no_recovery".to_string())
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, true, false), &pred, &sig, 10),
+            None
+        );
+    }
+
+    /// `forbids_repeat_of_failed` boccia chi rimanda identica una chiamata gia'
+    /// fallita. Vale solo dove il guasto e' PERMANENTE: su uno transitorio ritentare
+    /// e' la mossa giusta, ed e' quella che il nostro stesso prompt ordina.
+    #[test]
+    fn il_predicato_della_ripetizione_boccia_chi_insiste_identico() {
+        let pred = json!({ "forbids_repeat_of_failed": true });
+        let sig = read_turn_signals(&turno_con_misure(0, true, true));
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, true, true), &pred, &sig, 10),
+            Some("repeated_failed".to_string()),
+            "ha recuperato ma insistendo identico prima: il profilo lo dice"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, true, false), &pred, &sig, 10),
+            None
+        );
+    }
+
+    /// LA REGRESSIONE CHE CONTA: un turno SENZA `measures` (single-turn) non deve
+    /// superare un predicato di catena per silenzio. Prima dell'aggancio,
+    /// `min_chained_calls` non veniva letto da nessuno e il profilo prometteva
+    /// `high` a chiunque rispondesse.
+    #[test]
+    fn un_turno_senza_misure_non_supera_un_predicato_di_catena() {
+        let turno = json!({ "content": "ok", "stop_reason": "end_turn", "tool_use_blocks": [] });
+        let sig = read_turn_signals(&turno);
+        assert_eq!(
+            predicate_fail_reason(&turno, &json!({ "min_chained_calls": 3 }), &sig, 10),
+            Some("no_chain:0<3".to_string()),
+            "nessuna misura = nessun anello provato: mai un pass per assenza di dati"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno, &json!({ "requires_recovery": true }), &sig, 10),
+            Some("no_recovery".to_string())
+        );
+    }
+
     /// I test preesistenti non lo vedevano perche' inventavano il JSON con la
     /// stessa chiave sbagliata del codice: codice e test condividevano l'errore.
     #[test]
@@ -1850,7 +2512,13 @@ mod tests {
         assert_eq!(derive_tier_prior(None, &soglie()), None);
     }
 
+    /// Un giro in cui i tentativi non superati sono BOCCIATURE vere: il modello ha
+    /// risposto e non ha fatto il lavoro. E' l'unico caso che nega una banda.
     fn run(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
+        run_conclusive(key, passes, promote_min)
+    }
+
+    fn run_conclusive(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
         ProfileRun {
             profile_key: key.to_string(),
             grants: vec![],
@@ -1858,6 +2526,26 @@ mod tests {
             passes,
             conclusive_fails: 4 - passes,
             inconclusive: 0,
+            promote_min,
+            first_fail_reason: None,
+        }
+    }
+
+    /// Un giro in cui i tentativi non superati sono INCONCLUSIVI: rate limit,
+    /// timeout, provider giu', profilo non costruibile. Il modello non e' stato
+    /// misurato, quindi non ha negato niente.
+    ///
+    /// Questo helper esiste perche' `run()` fissava `inconclusive: 0` e il ramo
+    /// del silenzio non era esercitato da nessun test: il doc prometteva "si
+    /// retrocede solo con fallimenti CONCLUSIVI" e il codice non li leggeva.
+    fn run_inconclusive(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
+        ProfileRun {
+            profile_key: key.to_string(),
+            grants: vec![],
+            is_blocking: false,
+            passes,
+            conclusive_fails: 0,
+            inconclusive: 4 - passes,
             promote_min,
             first_fail_reason: None,
         }
@@ -1873,7 +2561,7 @@ mod tests {
             (run("agentic_chain", 3, 3), Some("high".to_string())),
             (run("agentic_recovery", 1, 3), Some("heavy".to_string())), // NON superata
         ];
-        assert_eq!(derive_tier_measured(&runs, None, 2), Some("high".to_string()),
+        assert_eq!(derive_tier_measured(&runs, None, None, 2), Some("high".to_string()),
             "3/4 su agentic_chain promuove a high; agentic_recovery con 1/4 non certifica heavy");
     }
 
@@ -1884,7 +2572,7 @@ mod tests {
             (run("tool_smoke", 4, 3), None),
             (run("chat_smoke", 4, 3), Some("light".to_string())),
         ];
-        assert_eq!(derive_tier_measured(&runs, None, 2), Some("light".to_string()));
+        assert_eq!(derive_tier_measured(&runs, None, None, 2), Some("light".to_string()));
     }
 
     /// L'ISTERESI: la soglia per CONSERVARE una banda gia' acquisita e' piu'
@@ -1895,12 +2583,102 @@ mod tests {
         // 2 pass su 4: sotto promote_min (3) ma sopra hold_min (2).
         let runs = vec![(run("agentic_recovery", 2, 3), Some("heavy".to_string()))];
         // Chi e' GIA' heavy la mantiene (2 >= hold_min).
-        assert_eq!(derive_tier_measured(&runs, Some("heavy"), 2), Some("heavy".to_string()),
+        assert_eq!(derive_tier_measured(&runs, Some("heavy"), Some("heavy"), 2), Some("heavy".to_string()),
             "banda acquisita: si conserva con hold_min, la conservazione non ha              bisogno di evidenza nuova");
         // Chi e' medium NON la conquista (2 < promote_min): serve piu' evidenza
         // per salire che per restare.
-        assert_eq!(derive_tier_measured(&runs, Some("medium"), 2), None,
+        assert_eq!(derive_tier_measured(&runs, Some("medium"), Some("medium"), 2), None,
             "banda NUOVA: serve promote_min. Il gap fra le due soglie E' l'isteresi");
+    }
+
+    // ── Il silenzio non declassa ────────────────────────────────────────────
+    //
+    // Il doc di `derive_tier_measured` prometteva da sempre "si retrocede solo
+    // sotto hold_min E con fallimenti CONCLUSIVI", ma il codice non leggeva mai
+    // `conclusive_fails`: nessun test poteva accorgersene perche' l'helper `run()`
+    // fissava `inconclusive: 0`. Questi test esercitano il ramo che mancava.
+
+    /// LA REGRESSIONE MISURATA (2026-07-17): con `agentic_chain` e
+    /// `agentic_recovery` non implementati, i loro profili chiudono INCONCLUSIVI.
+    /// Un modello che passa solo `agentic_real` avrebbe preso `measured=medium`, e
+    /// siccome `measured` batte `synced` sarebbe stato declassato da frontier: e'
+    /// il caso di x-ai/grok-4.5 (indice 45.7, il migliore del parco), che nessun
+    /// profilo ha mai contestato. 14 modelli su 29 sarebbero scesi cosi'.
+    #[test]
+    fn una_banda_mai_provata_non_declassa_chi_ce_l_ha_gia() {
+        let runs = vec![
+            (run_conclusive("chat_smoke", 1, 1), Some("light".to_string())),
+            (run_conclusive("agentic_real", 3, 3), Some("medium".to_string())),
+            // I due kind non implementati: il profilo non e' costruibile -> nessun
+            // pass, nessuna bocciatura. SILENZIO.
+            (run_inconclusive("agentic_chain", 0, 3), Some("high".to_string())),
+            (run_inconclusive("agentic_recovery", 0, 3), Some("heavy".to_string())),
+            (run_inconclusive("agentic_longctx", 0, 3), Some("frontier".to_string())),
+        ];
+        assert_eq!(
+            derive_tier_measured(&runs, None, Some("frontier"), 2),
+            None,
+            "nessuna banda alta e' stata NEGATA: non si scrive un measured che \
+             declassa. 'non l'ho provato' non e' 'l'ha fallito'"
+        );
+    }
+
+    /// Il contrario: se il modello ha DAVVERO fallito la banda che aveva, si
+    /// scende. Ma di UN gradino, fino alla piu' alta non contestata — non fino
+    /// alla piu' alta certificata.
+    #[test]
+    fn una_negazione_conclusiva_declassa_di_un_gradino_solo() {
+        let runs = vec![
+            (run_conclusive("agentic_real", 3, 3), Some("medium".to_string())),
+            // heavy NEGATO con evidenza: il modello ha risposto e ha sbagliato.
+            (run_conclusive("agentic_recovery", 0, 3), Some("heavy".to_string())),
+            // high: mai provato (silenzio).
+            (run_inconclusive("agentic_chain", 0, 3), Some("high".to_string())),
+        ];
+        assert_eq!(
+            derive_tier_measured(&runs, Some("heavy"), Some("heavy"), 2),
+            Some("high".to_string()),
+            "heavy e' stato negato -> si scende, ma a high, che nessuno ha \
+             contestato. Scendere a medium punirebbe il modello per i due profili \
+             che non abbiamo saputo eseguire"
+        );
+    }
+
+    /// LA SCALA E' UNA SCALA: `agentic_longctx` certifica `frontier` (il vertice)
+    /// ed e' l'unico profilo alto implementato. Senza il guard, un modello che
+    /// fallisce la catena ma ritrova l'ago si prende il tier piu' alto di tutti,
+    /// scavalcando i gradini che non ha salito.
+    #[test]
+    fn frontier_non_scavalca_una_banda_inferiore_negata() {
+        let runs = vec![
+            (run_conclusive("agentic_real", 3, 3), Some("medium".to_string())),
+            (run_conclusive("agentic_chain", 0, 3), Some("high".to_string())), // NEGATA
+            (run_conclusive("agentic_longctx", 4, 3), Some("frontier".to_string())),
+        ];
+        assert_eq!(
+            derive_tier_measured(&runs, None, None, 2),
+            Some("medium".to_string()),
+            "ha trovato l'ago ma non sa concatenare due tool: frontier scavalcherebbe \
+             high, che ha fallito davanti a noi"
+        );
+    }
+
+    /// L'isteresi protegge una banda GUADAGNATA, non un prior dell'indice esterno:
+    /// il `tier_source` distingue le due cose. Senza, un synced=heavy si teneva
+    /// heavy con la soglia bassa — l'indice si autocertificava con la nostra
+    /// clemenza — e un giro tutto inconclusivo avrebbe riciclato il prior in
+    /// `measured` con zero probe superati.
+    #[test]
+    fn un_prior_synced_non_gode_dell_isteresi_ne_diventa_measured_a_vuoto() {
+        let runs = vec![(run_conclusive("agentic_recovery", 2, 3), Some("heavy".to_string()))];
+        // Il catalogo dice heavy, ma NON l'ha guadagnato la batteria (synced):
+        // 2/4 non basta a conquistarlo (serve promote_min=3).
+        assert_eq!(
+            derive_tier_measured(&runs, None, Some("heavy"), 2),
+            None,
+            "il prior dell'indice non ha diritto alla soglia di conservazione: \
+             quella spetta a chi la banda l'ha dimostrata"
+        );
     }
     /// IL CERCHIO SI CHIUDE: la batteria SCRIVE il tier misurato, e la curatela
     /// dell'admin vince sempre.
@@ -2159,5 +2937,78 @@ mod tests {
         let pred = json!({"min_content_chars": 1});
         let turn = json!({ "content": "ok", "stop_reason": "end_turn" });
         assert!(evaluate_attempt(&turn, &pred, 100).pass);
+    }
+
+    /// REGRESSIONE del giro muto del 2026-07-17: 32 tentativi su 32 inconclusive con
+    /// "mondo_non_costruibile", perche' il guard vietava l'handle di partenza che
+    /// l'istruzione DEVE nominare.
+    ///
+    /// Questo test raggiunge il mondo per la STESSA strada della produzione (regola O):
+    /// l'istruzione la costruisce `istruzione_catena`/`istruzione_recupero`, gli stessi
+    /// produttori che chiama `multi_step_attempt`. I 17 test che c'erano prima
+    /// passavano tutti una richiesta VUOTA (`&[]`) o un token a valle: nessuno costruiva
+    /// il mondo come lo costruisce chi lo usa davvero, e per questo 39 test verdi
+    /// certificavano un motore che non poteva partire.
+    #[test]
+    fn il_mondo_si_costruisce_con_l_istruzione_vera() {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
+
+        for (kind, profilo) in [
+            (WorldKind::Catena, "agentic_chain"),
+            (WorldKind::Recupero, "agentic_recovery"),
+        ] {
+            let seed = TokenSeed {
+                provider: "mistral".into(),
+                model: "mistral-medium-2604".into(),
+                profile_key: profilo.into(),
+                attempt: 1,
+                seed: 42,
+            };
+            // Esattamente cio' che fa `multi_step_attempt`: handle0 -> istruzione.
+            let handle0 = seed.handle(0);
+            let istruzione = match kind {
+                WorldKind::Catena => istruzione_catena(&handle0),
+                WorldKind::Recupero => istruzione_recupero(&handle0),
+            };
+            assert!(
+                istruzione.contains(&handle0),
+                "{profilo}: l'istruzione deve nominare l'anello di partenza, o il \
+                 modello non ha da dove cominciare"
+            );
+
+            let mondo = ScriptedWorld::new(kind, seed.clone(), &[&istruzione, "system"]);
+            assert!(
+                mondo.is_ok(),
+                "{profilo}: il mondo deve costruirsi con l'istruzione VERA, non solo \
+                 con una richiesta vuota. Motivo del rifiuto: {:?}",
+                mondo.err()
+            );
+        }
+    }
+
+    /// L'altra meta' dell'invariante, che il fix NON deve aver spento: un token a
+    /// valle nella richiesta rende la catena scorciatoiabile, e il mondo si rifiuta.
+    #[test]
+    fn un_handle_a_valle_nell_istruzione_resta_vietato() {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
+
+        let seed = TokenSeed {
+            provider: "mistral".into(),
+            model: "mistral-medium-2604".into(),
+            profile_key: "agentic_chain".into(),
+            attempt: 1,
+            seed: 42,
+        };
+        let trapelato = seed.handle(3);
+        let istruzione = format!("{} (e la risposta e' {trapelato})", istruzione_catena(&seed.handle(0)));
+        assert!(
+            ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&istruzione]).is_err(),
+            "un anello a valle visibile nella richiesta deve impedire il giro"
+        );
+        assert!(
+            ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&format!("esca {}", seed.esca(0))])
+                .is_err(),
+            "un'esca viaggia solo nelle risposte: nella richiesta deve impedire il giro"
+        );
     }
 }
