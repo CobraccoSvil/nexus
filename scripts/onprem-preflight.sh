@@ -23,7 +23,9 @@ echo "════════════════════════�
 echo ""
 
 # ── 1. CLI tool richiesti dallo smoke test ─────────────────────────────────
-for tool in docker curl python3 pg_isready; do
+# node sostituisce python3: onprem-smoke.sh parsa il JSON con node (jq non e'
+# garantito sull'ambiente), e nel repo non esiste piu' codice Python.
+for tool in docker curl node pg_isready; do
   if command -v "$tool" &>/dev/null; then
     ok "$tool disponibile ($(command -v $tool))"
   else

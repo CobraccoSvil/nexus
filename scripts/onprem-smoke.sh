@@ -65,7 +65,7 @@ wait_for "vLLM" "$VLLM_URL/health"
 # 3. vLLM modelli disponibili
 MODELS=$(curl -sf "$VLLM_URL/v1/models" 2>/dev/null)
 if echo "$MODELS" | grep -q '"id"'; then
-  MODEL_ID=$(echo "$MODELS" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo "unknown")
+  MODEL_ID=$(echo "$MODELS" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.data[0].id)" 2>/dev/null || echo "unknown")
   green "vLLM modello attivo: $MODEL_ID"
 else
   red "vLLM: nessun modello trovato"
@@ -107,7 +107,7 @@ if [ -n "${NEXUS_TEST_TOKEN:-}" ]; then
 
   if echo "$RESPONSE" | grep -q '"content"'; then
     green "Call LLM end-to-end: risposta ricevuta"
-    PROVIDER=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('provider_used','?'))" 2>/dev/null || echo "?")
+    PROVIDER=$(echo "$RESPONSE" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.provider_used ?? '?')" 2>/dev/null || echo "?")
     if [ "$PROVIDER" = "vllm" ]; then
       green "Provider usato: vllm (corretto)"
     else

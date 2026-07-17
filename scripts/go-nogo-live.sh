@@ -44,7 +44,6 @@ echo "── Performance probe (single-call latency) ──"
 for endpoint in \
   "http://localhost:4000/health" \
   "http://localhost:4060/health" \
-  "http://localhost:8001/health" \
   "http://localhost:3000/api/health" \
   "http://localhost:4010/health"
 do

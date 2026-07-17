@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/dup-report.sh — Punto unico di misura della duplicazione del codice.
 #
-# Esegue jscpd su TS/JS/Rust/Python (config in jscpd.json) e applica il gate
+# Esegue jscpd su TS/JS/Rust (config in jscpd.json) e applica il gate
 # "ratchet": il numero di cloni puo' solo SCENDERE rispetto a .dup-baseline.json.
 # Quando una wave riduce il debito, si riallinea la baseline al ribasso con
 # --update-baseline. Vedi ADR 0026 e regola L del CLAUDE.md.
@@ -42,7 +42,7 @@ echo -e "${YELLOW}==> dup-report: esecuzione jscpd${NC}"
 # allineati. Gli "ignore" del config valgono comunque entro questi root.
 pnpm exec jscpd --silent --reporters json --output "$OUT_DIR" \
     --min-lines 15 --min-tokens 100 \
-    --ignore "**/generated/**,**/_pb2.py,**/_pb2_grpc.py,**/*_pb2.py,**/*_pb2_grpc.py,**/*.pb.rs,**/*.backup*,**/tests/**,**/__tests__/**,**/test_*.py,**/*_test.py,**/*.test.ts,**/*.test.tsx,**/*.test.js,**/*.test.jsx,**/*.spec.ts,**/*.spec.tsx,**/*.spec.js,**/*.spec.jsx,**/e2e/**,**/profiles/*.yaml,**/profiles/*.yml,**/fixtures/**,**/mocks/**,**/__mocks__/**,**/*.example.*,**/examples/**,docs/**" \
+    --ignore "**/generated/**,**/*.pb.rs,**/*.backup*,**/tests/**,**/__tests__/**,**/*.test.ts,**/*.test.tsx,**/*.test.js,**/*.test.jsx,**/*.spec.ts,**/*.spec.tsx,**/*.spec.js,**/*.spec.jsx,**/e2e/**,**/profiles/*.yaml,**/profiles/*.yml,**/fixtures/**,**/mocks/**,**/__mocks__/**,**/*.example.*,**/examples/**,docs/**" \
     apps packages crates || true
 
 if [[ ! -f "$REPORT_JSON" ]]; then

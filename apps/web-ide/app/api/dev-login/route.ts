@@ -3,10 +3,10 @@ import crypto from 'crypto';
 
 // Route SOLO per sviluppo locale — imposta il cookie JWT senza OAuth.
 // NOTA: il vecchio dev_login_server.py (localhost:9999) e' stato RIMOSSO
-// (migrazione zero-Python). La fetch a :9999 sotto e' best-effort e fallisce
-// in modo silenzioso: la generazione del JWT e del cookie funziona comunque.
-// Se serve l'inserimento esplicito della sessione in Postgres in dev, va
-// reimplementato lato Node/Rust (mai un nuovo server Python).
+// (migrazione zero-Python) e con esso l'inserimento della riga in `sessions`:
+// il dev-login si regge sul solo cookie JWT, che e' il percorso gia' in uso.
+// Se servisse di nuovo la riga esplicita in Postgres, va reimplementata lato
+// Node/Rust (mai un nuovo server Python).
 export async function GET(request: Request) {
   if (process.env.NODE_ENV === 'production') {
     return NextResponse.json({ error: 'Not available in production' }, { status: 403 });
@@ -37,19 +37,6 @@ export async function GET(request: Request) {
     const payload = Buffer.from(JSON.stringify({ sub: userId, role, exp })).toString('base64url');
     const sig     = crypto.createHmac('sha256', jwtSecret).update(`${header}.${payload}`).digest('base64url');
     const token   = `${header}.${payload}.${sig}`;
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-
-    // Best-effort: tentativo di inserimento sessione in Postgres tramite l'ex
-    // dev_login_server (localhost:9999), ora RIMOSSO. La chiamata fallisce in
-    // modo silenzioso e non e' piu' necessaria al funzionamento del dev-login.
-    try {
-      await fetch(
-        `http://localhost:9999/insert-session?user_id=${encodeURIComponent(userId)}&hash=${encodeURIComponent(tokenHash)}`,
-        { signal: AbortSignal.timeout(3000) }
-      );
-    } catch {
-      // non critico: il server :9999 non esiste piu' (migrazione zero-Python)
-    }
 
     // Redirect a /ide — hardcoded su localhost:3000 per dev
     const response = NextResponse.redirect('http://localhost:3000/ide');

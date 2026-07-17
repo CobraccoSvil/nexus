@@ -25,9 +25,9 @@ assert_single() {
   local label="$1" pattern="$2" allowed="$3"; shift 3
   local dirs=("$@"); [[ ${#dirs[@]} -eq 0 ]] && dirs=(crates apps packages)
   local hits bad=""
-  hits="$(grep -rEl --include='*.rs' --include='*.py' --include='*.ts' --include='*.tsx' \
+  hits="$(grep -rEl --include='*.rs' --include='*.ts' --include='*.tsx' \
     --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.next \
-    --exclude-dir=.turbo --exclude-dir=dist --exclude-dir=__pycache__ \
+    --exclude-dir=.turbo --exclude-dir=dist \
     -e "$pattern" "${dirs[@]}" 2>/dev/null || true)"
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue

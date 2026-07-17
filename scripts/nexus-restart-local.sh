@@ -76,6 +76,6 @@ setsid nohup env NODE_ENV=production DATABASE_URL="$DATABASE_URL" POSTGRES_URL="
 sleep 4
 
 log "Porte in ascolto"
-ss -tlnp 2>/dev/null | grep -E ':3000|:4000|:4010|:4020|:4030|:4040|:4060|:8001|:50051|:4055' || true
+ss -tlnp 2>/dev/null | grep -E ':3000|:4000|:4010|:4020|:4030|:4040|:4060|:50051|:4055' || true
 
 log "Fine. Log: /tmp/nexus-*.log"

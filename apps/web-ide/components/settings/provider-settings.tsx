@@ -366,7 +366,7 @@ export function ProviderSettings({
                       );
                     }
 
-                    // Fonte primaria: stato gateway. Fallback: test brain.
+                    // Fonte primaria: stato gateway. Fallback: test manuale.
                     const gwProvider = gatewayProviders?.find((p) => p.name === providerName);
                     const result = testResults[providerName];
                     const isTesting = result === "testing...";
@@ -377,9 +377,8 @@ export function ProviderSettings({
                     // ricade sul test manuale (o resta neutro), evitando il falso
                     // "Errore" su un provider che si autentica correttamente.
                     const useGwState = gwProvider != null && gwProvider.healthy !== null;
-                    // L'endpoint /providers/:name/health ritorna status "ok"; il test
-                    // brain storico usava "ready". Accettiamo entrambi come successo.
-                    const okResult = !!result && (result.startsWith("ready") || result.startsWith("ok"));
+                    // L'endpoint /providers/:name/health di mcp-core ritorna status "ok".
+                    const okResult = !!result && result.startsWith("ok");
                     const isReady = useGwState ? gwProvider.healthy : okResult;
                     const isDisabledResult = !useGwState && result === "disabled";
                     const isError = useGwState
@@ -436,7 +435,7 @@ export function ProviderSettings({
                         {isError && (
                           <button
                             onClick={() => onReloadProvider(providerName)}
-                            title="Ricarica chiave dal DB, azzera il cooldown (utile dopo billing recharge) e ri-testa il provider"
+                            title="Azzera il cooldown (utile dopo billing recharge) e ri-testa il provider"
                             style={{
                               padding: "3px 8px",
                               borderRadius: 6,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 echo "=== Health endpoint ==="
-for p in 3000 4000 4010 4020 4030 4040 4050 4055 4060 8001; do
+for p in 3000 4000 4010 4020 4030 4040 4050 4055 4060; do
   code=$(curl -sS -o /dev/null -m 5 -w "%{http_code}" "http://localhost:$p/health" 2>/dev/null || echo 000)
   printf "  :%-5s /health  %s\n" "$p" "$code"
 done

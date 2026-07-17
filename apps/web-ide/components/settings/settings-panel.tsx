@@ -85,31 +85,11 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     }
   }, []);
 
-  // AZZERA il cooldown lato mcp-core (utile dopo billing recharge/rate_limit
-  // risolto), poi ri-testa il provider. La chiamata a /reload-settings ora e'
-  // un no-op lato mcp-core (il brain Python che ricaricava le chiavi non esiste
-  // piu'): resta innocua e non rompe il flusso.
-  const handleReloadProvider = useCallback(async (provider: string) => {
-    try {
-      await fetch(`${NEURAL_BASE}/reload-settings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-    } catch {
-      // ignora errori di reload, prova comunque il reset cooldown e il test
-    }
-    // Best-effort: il reset-cooldown e' no-op se non c'e' cooldown attivo
-    // (idempotente lato Rust). Cosi' dopo billing recharge l'utente puo'
-    // riattivare il provider senza passare dall'API.
-    try {
-      const { resetProviderCooldown } = await import("../../lib/api-client");
-      await resetProviderCooldown(provider);
-    } catch {
-      // ignora: il provider potrebbe non essere registrato nei cooldown
-    }
-    await handleTestProvider(provider);
-  }, [handleTestProvider]);
+  // Non esiste piu' un "reload": il brain Python che ricaricava le chiavi e'
+  // stato rimosso e mcp-core legge le settings dal DB con cache TTL (regola G).
+  // Il pulsante Ricarica fa esattamente cio' che serve dopo un billing recharge
+  // — azzera il cooldown e ri-testa — cioe' handleTestProvider (regola L: un
+  // solo punto, niente wrapper che ripete il reset gia' fatto li' dentro).
 
   const loadGatewayProviders = useCallback(async () => {
     try {
@@ -172,21 +152,10 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
         return next;
       });
       await fetchSettings();
-      // Se si salva una API key, ricarica il brain e ri-testa
+      // Se si salva una API key, ri-testa il provider (azzerando il cooldown).
       if (key.endsWith("_api_key")) {
         const providerName = key.replace("_api_key", "");
-        void handleReloadProvider(providerName);
-      }
-      // Se si salva la configurazione DNS, invoca /reload-settings su mcp-core
-      // (no-op dopo l'eliminazione del brain, ma innocuo).
-      if (key === "network_dns_servers") {
-        try {
-          await fetch(`${NEURAL_BASE}/reload-settings`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: "{}",
-          });
-        } catch { /* ignore */ }
+        void handleTestProvider(providerName);
       }
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Save failed");
@@ -340,7 +309,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     onSave: handleSave,
     onSaveImmediate: handleSaveImmediate,
     onTestProvider: handleTestProvider,
-    onReloadProvider: handleReloadProvider,
+    onReloadProvider: handleTestProvider,
     onOpenBrowse: (currentValue: string) => {
       setIsBrowsingRoot(true);
       if (!browseData) {
