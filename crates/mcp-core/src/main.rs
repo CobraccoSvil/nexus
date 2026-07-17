@@ -87,6 +87,7 @@ mod learned_instructions;
 mod project_db_routes;
 mod project_files;
 mod project_git;
+mod probe_chain_measure;
 mod probe_world;
 mod project_workspace;
 mod projects;
