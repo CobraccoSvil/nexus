@@ -208,43 +208,43 @@ export function ChatHeadPopover({
 
             <div>
               <div style={titoloSezione}>Sessione</div>
-              {sessions.length === 0 ? (
-                <div style={{ fontSize: 12, color: tc.textMuted }}>Nessuna chat aperta.</div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 2, maxHeight: 180, overflowY: "auto" }}>
-                  {sessions.map((s) => {
-                    const attiva = s.id === activeSessionId;
-                    return (
-                      <button
-                        key={s.id}
-                        type="button"
-                        onClick={() => {
-                          onSelectSession(s.id);
-                          setOpen(false);
-                        }}
-                        title={s.title}
-                        style={{
-                          textAlign: "left",
-                          padding: "6px 8px",
-                          borderRadius: 6,
-                          border: `1px solid ${attiva ? tc.accent : "transparent"}`,
-                          background: attiva ? tc.accentBg : "transparent",
-                          color: attiva ? tc.accent : tc.text,
-                          cursor: "pointer",
-                          fontSize: 12,
-                          fontWeight: attiva ? 600 : 400,
-                          fontFamily: "inherit",
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        }}
-                      >
-                        {s.title}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
+              {/* Tendina come quella del profilo: l'elenco a pulsanti cresceva
+                  con le sessioni e sbilanciava il pannello. `boxSizing` non e'
+                  decorativo qui: con width 100% il padding si sommerebbe e il
+                  select sfonderebbe il pannello. */}
+              <select
+                value={activeSessionId ?? ""}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  if (id) onSelectSession(id);
+                }}
+                disabled={sessions.length === 0}
+                title="Seleziona sessione chat"
+                aria-label="Seleziona sessione chat"
+                style={{
+                  width: "100%",
+                  minWidth: 0,
+                  boxSizing: "border-box",
+                  background: tc.bgInput,
+                  border: `1px solid ${tc.border}`,
+                  borderRadius: 6,
+                  padding: "4px 6px",
+                  fontSize: 12,
+                  fontFamily: "inherit",
+                  color: sessions.length === 0 ? tc.textMuted : tc.text,
+                  cursor: sessions.length === 0 ? "not-allowed" : "pointer",
+                }}
+              >
+                {sessions.length === 0 ? (
+                  <option value="">Nessuna chat</option>
+                ) : (
+                  sessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.title}
+                    </option>
+                  ))
+                )}
+              </select>
             </div>
 
             <div>
