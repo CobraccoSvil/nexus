@@ -2386,12 +2386,11 @@ async fn fetch_provider_models(
     orchestrator: Option<&Orchestrator>,
     provider: &str,
 ) -> anyhow::Result<Vec<crate::nexus_gateway::GwModelMeta>> {
-    let gateway = orchestrator
-        .and_then(|orch| orch.nexus_gateway.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Nexus Gateway non disponibile: autodiscovery modelli impossibile")
-        })?;
-    gateway.list_models(provider).await
+    // L'orchestrator puo' mancare (chiamata fuori dal server); il suo gateway no.
+    let orch = orchestrator.ok_or_else(|| {
+        anyhow::anyhow!("orchestrator non disponibile: autodiscovery modelli impossibile")
+    })?;
+    orch.nexus_gateway.list_models(provider).await
 }
 
 #[cfg(test)]

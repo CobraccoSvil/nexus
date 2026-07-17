@@ -293,31 +293,28 @@ pub struct ClassifierFields {
 /// `routing.action_oriented_min_agentic_score` (regola G, mig 0387).
 ///
 /// PUNTO UNICO (regola L) condiviso dai rami Shadow e PRIMARY-Rust di
-/// `spawn_agent_run`: prima ciascuno re-implementava questa sequenza. Senza
-/// gateway o su fallback del classifier i campi del giudizio restano neutri
-/// (`None`/`false`); la soglia DB e' comunque risolta (fallback al default
-/// tecnico `DEFAULT_ACTION_ORIENTED_MIN_SCORE` se la chiave manca). Indipendente
-/// dal flag `routing.classifier_engine`: usa SEMPRE il classifier rust (sia per
-/// lo shadow-replay sia per il primario nativo, che e' il motore Rust stesso).
+/// `spawn_agent_run`: prima ciascuno re-implementava questa sequenza. Su
+/// fallback del classifier i campi del giudizio restano neutri (`None`/`false`);
+/// la soglia DB e' comunque risolta (fallback al default tecnico
+/// `DEFAULT_ACTION_ORIENTED_MIN_SCORE` se la chiave manca).
+///
+/// Il `gateway` non e' piu' `Option`: era il residuo di quando l'orchestrator
+/// poteva nascere senza: quel ramo produceva `classifier_resolved=false` in
+/// silenzio, che a valle spegneva il dimensionamento senza dire perche'.
 pub(crate) async fn resolve_classifier_fields(
     db: &PgPool,
-    gateway: Option<&NexusGatewayClient>,
+    gateway: &NexusGatewayClient,
     classifier_input: &str,
 ) -> ClassifierFields {
-    let (requires_tools, agentic_score, authorizes_changes, classifier_resolved) = match gateway {
-        Some(gw) => {
-            let ai = crate::intent_classifier::classify(db, gw, classifier_input).await;
-            // classifier_resolved = il classifier ha prodotto un giudizio (NON un
-            // fallback di sistema). Parita' col `_classifier_resolved` del brain.
-            (
-                Some(ai.requires_tools),
-                Some(ai.agentic_score),
-                Some(ai.authorizes_changes),
-                !ai.fallback_used,
-            )
-        }
-        None => (None, None, None, false),
-    };
+    let ai = crate::intent_classifier::classify(db, gateway, classifier_input).await;
+    // classifier_resolved = il classifier ha prodotto un giudizio (NON un
+    // fallback di sistema).
+    let (requires_tools, agentic_score, authorizes_changes, classifier_resolved) = (
+        Some(ai.requires_tools),
+        Some(ai.agentic_score),
+        Some(ai.authorizes_changes),
+        !ai.fallback_used,
+    );
     // Soglia DB action_oriented_min_agentic_score (regola G, mig 0387).
     let action_oriented_min_score =
         nexus_auth::get_setting(db, "routing.action_oriented_min_agentic_score")

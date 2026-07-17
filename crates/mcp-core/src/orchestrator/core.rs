@@ -21,9 +21,15 @@ use super::*;
 type LlmExecution = (String, String, serde_json::Value, UsageNumbers, f64, String);
 
 impl Orchestrator {
+    /// Il gateway e' un parametro OBBLIGATORIO: senza non si puo' chiamare alcun
+    /// LLM. Era iniettato da un `with_gateway` opzionale, chiamato solo se una
+    /// probe all'avvio trovava il gateway gia' sano — e chi perdeva quella corsa
+    /// restava senza gateway per sempre. Ora la firma non lo consente.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         neural: NeuralCoreClient,
         template_cache: crate::prompt_templates::TemplateCache,
+        nexus_gateway: NexusGatewayClient,
         routing_matrix: crate::routing_matrix::RoutingMatrixCache,
         routing_thresholds: crate::routing_config::RoutingThresholdsCache,
         intent_capability: crate::routing_config::IntentCapabilityCache,
@@ -32,7 +38,7 @@ impl Orchestrator {
         Self {
             neural,
             template_cache,
-            nexus_gateway: None,
+            nexus_gateway,
             routing_matrix,
             routing_thresholds,
             intent_capability,
@@ -40,92 +46,42 @@ impl Orchestrator {
         }
     }
 
-    pub fn with_gateway(mut self, gw: NexusGatewayClient) -> Self {
-        self.nexus_gateway = Some(gw);
-        self
-    }
-
     pub async fn neural_healthy(&self) -> bool {
         self.neural.is_healthy().await
     }
 
-    /// Classifier intent che usa le soglie da DB (mig 0111) e delega al punto
-    /// unico di scelta motore [`select_classifier_engine`] (regola L, flag mig
-    /// 0458): `python` -> endpoint brain `/classify-intent-agentic` (path vivo
-    /// INVARIATO), `rust` -> `intent_classifier::classify` in-process. Se la
-    /// cache `routing_thresholds` non e' disponibile, fallback ai default.
+    /// Classifica l'intent restituendo solo `(intent, confidence)`.
+    ///
+    /// Delega a [`Self::classify_intent_full`] (punto unico, regola L): prima le
+    /// due funzioni ripetevano la stessa scelta di motore, e una modifica a una
+    /// sola avrebbe fatto divergere in silenzio i due chiamanti.
     async fn classify_intent_with_db_thresholds(
         &self,
         db: &PgPool,
         message: &str,
     ) -> (&'static str, f32) {
-        // Path RUST in-process quando il flag DB lo dice E il gateway e'
-        // disponibile (senza gateway non si puo' chiamare l'LLM: si resta sul
-        // path Python, comportamento stabile).
-        if let (ClassifierEngine::Rust, Some(gw)) = (
-            select_classifier_engine(db).await,
-            self.nexus_gateway.as_ref(),
-        ) {
-            let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
-            return (classified.intent, classified.confidence);
-        }
-        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
-            Ok(t) => (
-                t.llm_classifier_min_confidence,
-                t.llm_classifier_timeout_seconds,
-            ),
-            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
-        };
-        classify_intent_async_with_threshold(message, min_conf, timeout_s).await
+        let classified = self.classify_intent_full(db, message).await;
+        (classified.intent, classified.confidence)
     }
 
     /// Variante "full" che ritorna `ClassifiedIntent` con candidati + flag
     /// ambiguita'. Usata da `spawn_agent_run` per decidere se chiedere
     /// disambiguazione all'utente (best practice NLU).
+    ///
+    /// Il motore e' UNO: `intent_classifier::classify` in-process via gateway.
+    /// Non c'e' piu' una scelta rust-vs-python (`routing.classifier_engine`,
+    /// mig 0458/0460) ne' un ripiego sull'endpoint brain `/classify-intent-agentic`:
+    /// il brain e' stato eliminato (mig 0462/0532), quindi quel ramo non
+    /// classificava piu' nulla — restituiva l'intent neutro e spegneva in
+    /// silenzio il dimensionamento. Un'alternativa che non puo' funzionare non e'
+    /// un fallback: e' un buco in cui cadere.
+    ///
+    /// Se il gateway non risponde, `classify_intent_full_rust` lo DICHIARA
+    /// (`fallback_used=true` -> `classifier_resolved=false`) e i consumatori a
+    /// valle sanno di non potersi fidare della classe.
     pub async fn classify_intent_full(&self, db: &PgPool, message: &str) -> ClassifiedIntent {
-        // Punto unico di scelta motore (regola L, flag mig 0458): `rust` ->
-        // classificatore in-process; `python` (default) -> endpoint brain. Il
-        // path rust richiede il gateway; senza, si resta sul path Python.
-        //
-        // La scelta si DICE (regola M). Il ramo python oggi non puo' risolvere
-        // nulla — il brain e' stato rimosso (mig 0462/0532) — quindi finirci
-        // per una condizione tacita (gateway assente col motore su 'rust')
-        // significa nessuna classificazione, nessun dimensionamento e nessuna
-        // traccia del perche'. Il 2026-07-16 e' costato a due sessioni una
-        // diagnosi sbagliata: i log non dicevano nemmeno quale ramo girasse.
-        let engine = select_classifier_engine(db).await;
-        let gateway = self.nexus_gateway.as_ref();
-        match (engine, gateway) {
-            (ClassifierEngine::Rust, Some(gw)) => {
-                tracing::debug!(ramo = "rust", "classifier: motore in-process (gateway presente)");
-                let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
-                return classified;
-            }
-            (ClassifierEngine::Rust, None) => tracing::warn!(
-                ramo = "python",
-                motivo = "gateway_assente_con_motore_rust",
-                "classifier: il setting chiede il motore 'rust' ma il gateway non e' \
-                 configurato -> si ripiega sul ramo python, che senza brain (rimosso, \
-                 mig 0462/0532) non classifica: il dimensionamento restera' legacy"
-            ),
-            (ClassifierEngine::Python, _) => tracing::debug!(
-                ramo = "python",
-                "classifier: motore 'python' da settings (routing.classifier_engine)"
-            ),
-        }
-        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
-            Ok(t) => (
-                t.llm_classifier_min_confidence,
-                t.llm_classifier_timeout_seconds,
-            ),
-            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
-        };
-
-        // Solo interpretazione semantica LLM: niente piu' pre-check ne' fallback
-        // keyword/deterministico. Quando l'LLM non e' disponibile, la funzione
-        // ritorna l'intent di sistema neutro `agentic_default`, che attiva lato
-        // agente il _LAZY_MINIMAL_TOOLKIT (l'LLM dell'agente interpreta da se').
-        classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await
+        let (classified, _ai) = classify_intent_full_rust(db, &self.nexus_gateway, message).await;
+        classified
     }
 
     /// Routing slot-first (Livello 4 NLU): se il classifier ha estratto slot
@@ -1458,191 +1414,7 @@ impl Orchestrator {
         ))
     }
 
-    /// Esecuzione LLM via Brain gRPC legacy (PATH B): itera i provider candidati,
-    /// salta quelli non sani / rate-limited / falliti, e ritorna il primo che
-    /// completa. Estratta da `run` per contenerne lunghezza e complessita':
-    /// logica di fallback, billing e logging invariati.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_via_neural(
-        &self,
-        db: &PgPool,
-        matrix: &crate::routing_matrix::RoutingMatrix,
-        input: &OrchestratorRequest,
-        routing: &RoutingConfig,
-        intent: &str,
-        forced_provider: Option<&str>,
-        forced_model: Option<&str>,
-        suggested_provider: Option<&str>,
-        suggested_model: Option<&str>,
-        composed_prompt: &str,
-        prompt_corrections: &[Value],
-        token_budget: u32,
-        run_id: Uuid,
-        user_id: Uuid,
-        project_uuid: Uuid,
-    ) -> anyhow::Result<LlmExecution> {
-        let mut selected_provider: Option<String> = None;
-        let mut selected_model: Option<String> = None;
-        let mut completion: Option<serde_json::Value> = None;
-        let mut usage: Option<UsageNumbers> = None;
-        let mut usage_cost: Option<(f64, f64, f64, String)> = None;
-        let mut skip_reasons = Vec::new();
 
-        // In modalità dinamico la scelta del catalogo è autoritativa
-        let provider_candidates = if let Some(provider) = forced_provider {
-            vec![provider.to_string()]
-        } else if routing.behavior_mode == "dinamico" {
-            if let Some(p) = suggested_provider {
-                vec![p.to_string()]
-            } else {
-                routing.candidates(intent, suggested_provider)
-            }
-        } else {
-            routing.candidates(intent, suggested_provider)
-        };
-        for provider in provider_candidates {
-            let health = match self.neural.provider_health(&provider).await {
-                Ok(health) => health,
-                Err(error) => {
-                    skip_reasons.push(format!("{provider}:health_check_failed:{error}"));
-                    continue;
-                }
-            };
-
-            let status = health["status"].as_str().unwrap_or("unknown");
-            if !matches!(status, "ready" | "ok") {
-                let reason = health["reason"]
-                    .as_str()
-                    .or_else(|| health["skipReasons"].get(0).and_then(Value::as_str))
-                    .unwrap_or(status);
-                skip_reasons.push(format!("{provider}:skipped:{reason}"));
-                continue;
-            }
-
-            let model = if forced_provider == Some(provider.as_str()) {
-                forced_model.map(str::to_string).unwrap_or_else(|| {
-                    routing.resolve_model(matrix, &provider, Some(provider.as_str()), None)
-                })
-            } else if routing.behavior_mode == "dinamico"
-                && suggested_provider == Some(provider.as_str())
-                && suggested_model.is_some()
-            {
-                // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
-                // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
-                suggested_model.map(str::to_string).unwrap_or_default()
-            } else {
-                routing.resolve_model(matrix, &provider, suggested_provider, suggested_model)
-            };
-            let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
-            let estimated_completion_tokens = token_budget as i32 - prompt_tokens;
-            let reservation = match billing::reserve_usage(
-                db,
-                user_id,
-                project_uuid,
-                &provider,
-                &model,
-                prompt_tokens,
-                estimated_completion_tokens.max(0),
-                json!({
-                    "intent": intent,
-                    "profile_id": input.profile_id,
-                    "corrections_count": prompt_corrections.len(),
-                    "request_message_id": input.request_message_id,
-                    "automation_mode": input.automation_mode.as_str(),
-                    "provider_override": forced_provider,
-                    "model_override": forced_model,
-                    "attachments_count": input.attachments.len(),
-                }),
-            )
-            .await
-            {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    skip_reasons.push(format!("{provider}:billing_rejected:{error}"));
-                    continue;
-                }
-            };
-
-            let provider_completion = match self
-                .neural
-                .generate_completion(&provider, &model, composed_prompt)
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    billing::release_usage(db, &reservation, "provider_error").await;
-                    let error_msg = error.to_string();
-                    // Distingui rate limit da altri errori
-                    if error_msg.contains("429")
-                        || error_msg.to_lowercase().contains("rate_limit")
-                        || error_msg.to_lowercase().contains("quota")
-                        || error_msg.to_lowercase().contains("too_many_requests")
-                    {
-                        skip_reasons.push(format!("{provider}:rate_limited:{error_msg}"));
-                        tracing::warn!(
-                            "Provider {provider} è rate-limited, provo il prossimo candidato"
-                        );
-                    } else {
-                        skip_reasons.push(format!("{provider}:execution_error:{error_msg}"));
-                    }
-                    continue;
-                }
-            };
-
-            if completion_has_error(&provider_completion) {
-                billing::release_usage(db, &reservation, "provider_failed").await;
-                let error = provider_completion["metadata"]["error"]
-                    .as_str()
-                    .unwrap_or("generation_failed");
-                // Distingui rate limit da altri errori anche nella risposta
-                if error.contains("429")
-                    || error.to_lowercase().contains("rate_limit")
-                    || error.to_lowercase().contains("quota")
-                    || error.to_lowercase().contains("too_many_requests")
-                {
-                    skip_reasons.push(format!("{provider}:rate_limited:{error}"));
-                    tracing::warn!(
-                        "Provider {provider} segnala rate limit nella risposta, provo il prossimo"
-                    );
-                } else {
-                    skip_reasons.push(format!("{provider}:failed:{error}"));
-                }
-                continue;
-            }
-
-            let usage_numbers = billing::extract_usage_numbers(
-                &provider_completion,
-                prompt_tokens,
-                estimated_completion_tokens,
-            );
-            let finalized_cost =
-                billing::finalize_usage(db, &reservation, run_id, &usage_numbers).await?;
-
-            selected_provider = Some(provider);
-            selected_model = Some(model);
-            completion = Some(provider_completion);
-            usage = Some(usage_numbers);
-            usage_cost = Some(finalized_cost);
-            break;
-        }
-
-        let provider = selected_provider.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No AI provider available for intent '{intent}'. Skip reasons: {}",
-                skip_reasons.join(", ")
-            )
-        })?;
-        let model = selected_model
-            .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
-        let completion = completion.ok_or_else(|| anyhow::anyhow!("No completion generated"))?;
-        let usage = usage.unwrap_or(UsageNumbers {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        });
-        let (_, _, cost, cur) = usage_cost.unwrap_or((0.0, 0.0, 0.0, "EUR".to_string()));
-        Ok((provider, model, completion, usage, cost, cur))
-    }
 
     pub async fn run(
         &self,
@@ -1738,49 +1510,30 @@ impl Orchestrator {
         .await;
 
         // ── Step 4: LLM Execution ─────────────────────────────────────────────────
-        // PATH A: Nexus Gateway (routing, DLP, rate limiting, fallback automatico)
-        // PATH B: Brain gRPC diretto (legacy, usato se il gateway non è disponibile)
-        let (provider, model, completion, usage, total_cost, currency) =
-            if let Some(gw) = &self.nexus_gateway {
-                self.execute_via_gateway(
-                    db,
-                    gw,
-                    matrix,
-                    &input,
-                    &routing,
-                    &intent,
-                    forced_provider.as_deref(),
-                    forced_model.as_deref(),
-                    suggested_provider.as_deref(),
-                    suggested_model.as_deref(),
-                    &composed_prompt,
-                    token_budget,
-                    prompt_corrections.len(),
-                    run_id,
-                    user_id,
-                    project_uuid,
-                )
-                .await?
-            } else {
-                self.execute_via_neural(
-                    db,
-                    matrix,
-                    &input,
-                    &routing,
-                    &intent,
-                    forced_provider.as_deref(),
-                    forced_model.as_deref(),
-                    suggested_provider.as_deref(),
-                    suggested_model.as_deref(),
-                    &composed_prompt,
-                    &prompt_corrections,
-                    token_budget,
-                    run_id,
-                    user_id,
-                    project_uuid,
-                )
-                .await?
-            };
+        // Un solo path: il Nexus Gateway (routing, DLP, rate limiting, fallback
+        // automatico). Il "PATH B" storico era il brain gRPC, usato quando il
+        // gateway risultava assente: il brain non esiste piu' e il gateway ora e'
+        // obbligatorio per costruzione, quindi l'alternativa non c'e'.
+        let (provider, model, completion, usage, total_cost, currency) = self
+            .execute_via_gateway(
+                db,
+                &self.nexus_gateway,
+                matrix,
+                &input,
+                &routing,
+                &intent,
+                forced_provider.as_deref(),
+                forced_model.as_deref(),
+                suggested_provider.as_deref(),
+                suggested_model.as_deref(),
+                &composed_prompt,
+                token_budget,
+                prompt_corrections.len(),
+                run_id,
+                user_id,
+                project_uuid,
+            )
+            .await?;
 
         // Step 5: Build audit record
         let audit = OrchestratorAudit {

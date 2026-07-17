@@ -2684,10 +2684,7 @@ pub(super) async fn refine_with_nexus(
     root: &std::path::Path,
     suggestions: &mut [Value],
 ) {
-    let gw = match &state.orchestrator.nexus_gateway {
-        Some(g) => g,
-        None => return,
-    };
+    let gw = &state.orchestrator.nexus_gateway;
 
     let prompt = costruisci_prompt_classificazione(root, suggestions);
     let req = costruisci_gw_request(prompt, project_id, user_id);

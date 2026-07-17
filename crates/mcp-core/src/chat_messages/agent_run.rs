@@ -2927,7 +2927,7 @@ pub(crate) async fn spawn_agent_run(
                 // motore primario instradato globalmente.
                 let primary_classifier = crate::native_engine::resolve_classifier_fields(
                     &db_clone,
-                    state_for_finalize.orchestrator.nexus_gateway.as_ref(),
+                    &state_for_finalize.orchestrator.nexus_gateway,
                     &classifier_input_for_shadow,
                 )
                 .await;
@@ -4439,7 +4439,7 @@ pub(crate) async fn spawn_agent_run(
                 // action_oriented_for_intent).
                 let shadow_classifier = crate::native_engine::resolve_classifier_fields(
                     &shadow_state.db,
-                    shadow_state.orchestrator.nexus_gateway.as_ref(),
+                    &shadow_state.orchestrator.nexus_gateway,
                     &classifier_input_for_shadow,
                 )
                 .await;

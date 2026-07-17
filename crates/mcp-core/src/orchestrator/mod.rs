@@ -156,7 +156,18 @@ pub struct OrchestratorResult {
 pub struct Orchestrator {
     pub(crate) neural: NeuralCoreClient,
     pub(crate) template_cache: crate::prompt_templates::TemplateCache,
-    pub(crate) nexus_gateway: Option<NexusGatewayClient>,
+    /// Client del Nexus Gateway. NON e' `Option`: senza gateway non esiste alcun
+    /// modo di chiamare un LLM (il brain Python e' stato rimosso), quindi un
+    /// orchestrator senza gateway non e' uno stato valido — e il tipo lo rende
+    /// impossibile.
+    ///
+    /// Prima era `Option`, valorizzata all'avvio solo se una probe `is_healthy()`
+    /// rispondeva in quell'istante: il 2026-07-16 il gateway ha finito di nascere
+    /// 1,4s DOPO la probe e mcp-core e' rimasto senza gateway per tutta la vita
+    /// del processo, con il classificatore fermo in fallback. La disponibilita'
+    /// di un servizio e' uno stato che cambia: si scopre quando lo si chiama, non
+    /// la si congela all'avvio (regola M).
+    pub(crate) nexus_gateway: NexusGatewayClient,
     /// Cache della matrice di routing letta da DB (nexus_routing_matrix).
     /// Refresh background ogni 60s. Sostituisce i model name hardcoded
     /// che erano sparsi in `route_model_with_mode` e `default_model_for_provider`.

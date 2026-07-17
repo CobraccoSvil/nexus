@@ -738,23 +738,28 @@ async fn build_orchestrator(
     let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
     let gw_url = format!("http://127.0.0.1:{gw_port}");
     let nexus_gw = nexus_gateway::NexusGatewayClient::from_db(db).await;
-    let orchestrator = {
-        let base = Orchestrator::new(
-            neural_client,
-            template_cache,
-            caches.routing_matrix,
-            caches.thresholds,
-            caches.intent,
-            caches.slots.clone(),
-        );
-        if nexus_gw.is_healthy().await {
-            tracing::info!("Nexus Gateway disponibile su {gw_url} — PATH A attivo");
-            base.with_gateway(nexus_gw)
-        } else {
-            tracing::warn!("Nexus Gateway non raggiungibile su {gw_url} — uso PATH B (Brain gRPC)");
-            base
-        }
-    };
+    // Il gateway si INIETTA sempre: la sua disponibilita' non si decide qui.
+    //
+    // Prima una probe `is_healthy()` all'avvio sceglieva fra PATH A (gateway) e
+    // PATH B (brain gRPC), e l'esito restava congelato per tutta la vita del
+    // processo. Il 2026-07-16 mcp-core ha sondato il gateway 1,4s prima che
+    // questo finisse di avviarsi: risultato, nessun gateway fino al riavvio
+    // successivo, classificatore sempre in fallback e dimensionamento spento —
+    // con il gateway che nel frattempo rispondeva 200. Il PATH B non esiste piu'
+    // (il brain e' stato eliminato), quindi non c'e' nulla da scegliere: se il
+    // gateway e' giu', lo dice la singola chiamata che fallisce, e al tentativo
+    // dopo puo' essere di nuovo su (regola M: lo stato si osserva quando serve,
+    // non si deduce una volta per sempre).
+    let orchestrator = Orchestrator::new(
+        neural_client,
+        template_cache,
+        nexus_gw,
+        caches.routing_matrix,
+        caches.thresholds,
+        caches.intent,
+        caches.slots.clone(),
+    );
+    tracing::info!("Nexus Gateway: client configurato su {gw_url}");
     (orchestrator, caches.port_registry)
 }
 
