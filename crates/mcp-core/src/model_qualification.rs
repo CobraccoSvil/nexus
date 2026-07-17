@@ -74,6 +74,15 @@ pub(crate) struct AttemptOutcome {
     pub tool_call_count: i64,
     pub content_chars: i64,
     pub stop_reason: String,
+    /// I FATTI dietro il verdetto, quando ne esistono che nessuna colonna dedicata
+    /// registra (le `measures` dei profili multi-step: `recovered`, `chained_links`,
+    /// `repeated_failed`, `bad_tool_syntax`). Finisce nella colonna `derived` di
+    /// `ai_model_probe_evidence` (mig 0591), che restava scritta da NESSUNO: un
+    /// verdetto `no_recovery`/`no_chain` senza questi fatti non e' contestabile
+    /// (regola O), ed e' precisamente cio' che ha reso invisibile la vera causa dei
+    /// 93 fail del 2026-07-17 (il modello si arrende, non un bug di misura).
+    /// `None` per i profili single-turn, che hanno gia' i loro segnali in colonna.
+    pub derived: Option<Value>,
 }
 
 // Qui viveva `error_class_from_gateway`, il ponte structured->error_class del
@@ -141,6 +150,9 @@ impl TurnSignals {
             tool_call_count: self.tool_call_count,
             content_chars: self.content_chars,
             stop_reason: self.stop_reason,
+            // Lo riempie `evaluate_attempt` dal turno (unico posto che vede le
+            // `measures`): qui il segnale grezzo non le conosce.
+            derived: None,
         }
     }
 }
@@ -1140,9 +1152,8 @@ impl ProbeCtx<'_> {
         if let Some(motivo) = out.inconclusive {
             return esito_inconclusivo(motivo, latency_ms);
         }
-        let turno = turno_dai_fatti(&out.measures);
         (
-            evaluate_attempt(&turno, &self.profile.pass_predicate, latency_ms),
+            verdetto_dai_fatti(&out.measures, &self.profile.pass_predicate, latency_ms),
             latency_ms,
         )
     }
@@ -1181,23 +1192,31 @@ impl ProbeCtx<'_> {
     }
 }
 
-/// Un esito che NON e' attribuibile al modello: il suo stato resta invariato.
-/// Esiste come funzione sola perche' era una chiusura dentro `multi_step_attempt`,
-/// e un esito che il chiamante deve poter produrre da quattro punti diversi non e'
-/// un dettaglio di quella funzione.
+/// L'`AttemptOutcome` di un esito NON attribuibile al modello (transient, cap
+/// nostro, timeout): pass/fail entrambi falsi, nessun segnale del modello. Punto
+/// unico del literal (regola L): lo costruivano a mano sia `esito_inconclusivo`
+/// che il ramo timeout di `single_attempt`, e i due literal identici erano una
+/// duplicazione (un campo in piu' a entrambi li faceva superare la soglia del
+/// detector) — ora esiste in un solo posto.
+fn outcome_inconclusivo(reason: String) -> AttemptOutcome {
+    AttemptOutcome {
+        pass: false,
+        inconclusive: true,
+        reason,
+        error_class: None,
+        tool_call_count: 0,
+        content_chars: 0,
+        stop_reason: String::new(),
+        derived: None,
+    }
+}
+
+/// Un esito inconclusivo con la latenza gia' misurata. Esiste come funzione sola
+/// perche' era una chiusura dentro `multi_step_attempt`, e un esito che il
+/// chiamante deve poter produrre da quattro punti diversi non e' un dettaglio di
+/// quella funzione.
 fn esito_inconclusivo(reason: String, ms: i64) -> (AttemptOutcome, i64) {
-    (
-        AttemptOutcome {
-            pass: false,
-            inconclusive: true,
-            reason,
-            error_class: None,
-            tool_call_count: 0,
-            content_chars: 0,
-            stop_reason: String::new(),
-        },
-        ms,
-    )
+    (outcome_inconclusivo(reason), ms)
 }
 
 /// I fatti misurati, nella forma che il predicato sa leggere. Il turno e' sintetico
@@ -1214,6 +1233,24 @@ fn turno_dai_fatti(m: &crate::probe_chain_measure::AttemptMeasures) -> Value {
             "bad_tool_syntax": m.bad_tool_syntax,
         }
     })
+}
+
+/// Dai FATTI del loop al VERDETTO, per la STESSA strada che percorre la produzione
+/// (regola L: un solo punto per il passaggio misura->verdetto dei profili
+/// multi-step; regola O: il test del giro completo delega QUI, non ricostruisce la
+/// sequenza a mano). Aggancia le `measures` alla colonna diagnostica `derived`:
+/// senza, un verdetto `no_recovery`/`no_chain` non porta con se' i fatti che l'hanno
+/// deciso e non e' contestabile — ed e' esattamente cio' che ha reso invisibile la
+/// causa dei 93 fail del 2026-07-17 (il modello si arrende, non un bug di misura).
+fn verdetto_dai_fatti(
+    m: &crate::probe_chain_measure::AttemptMeasures,
+    predicate: &Value,
+    latency_ms: i64,
+) -> AttemptOutcome {
+    let turno = turno_dai_fatti(m);
+    let mut out = evaluate_attempt(&turno, predicate, latency_ms);
+    out.derived = turno.get("measures").cloned();
+    out
 }
 
 impl crate::probe_agentic_loop::TurnSource for ProbeCtx<'_> {
@@ -1297,8 +1334,8 @@ async fn insert_evidence(
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO ai_model_probe_evidence \
          (provider, model, profile_key, suite_version, attempt, latency_ms, error_class, \
-          tool_call_count, content_chars, stop_reason, verdict, verdict_reason, seed) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
+          tool_call_count, content_chars, stop_reason, verdict, verdict_reason, seed, derived) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id",
     )
     .bind(provider)
     .bind(model)
@@ -1313,6 +1350,10 @@ async fn insert_evidence(
     .bind(verdict)
     .bind(&outcome.reason)
     .bind(seme)
+    // I FATTI dietro il verdetto (regola O): la colonna `derived` (mig 0591) restava
+    // NULL per costruzione — nessun writer la toccava — quindi un `no_recovery` non
+    // portava con se' il fatto che l'aveva deciso e non era diagnosticabile.
+    .bind(&outcome.derived)
     .fetch_one(db)
     .await
     .map_err(|e| {
@@ -1418,15 +1459,9 @@ impl ProbeCtx<'_> {
                     latency_ms,
                 )
             }
-            Err(_elapsed) => AttemptOutcome {
-                pass: false,
-                inconclusive: true,
-                reason: format!("probe_timeout:{}s", self.params.timeout_s),
-                error_class: None,
-                tool_call_count: 0,
-                content_chars: 0,
-                stop_reason: String::new(),
-            },
+            Err(_elapsed) => {
+                outcome_inconclusivo(format!("probe_timeout:{}s", self.params.timeout_s))
+            }
         };
         (outcome, latency_ms)
     }
@@ -3106,6 +3141,135 @@ mod tests {
             ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&format!("esca {}", seed.esca(0))])
                 .is_err(),
             "un'esca viaggia solo nelle risposte: nella richiesta deve impedire il giro"
+        );
+    }
+
+    // ── Il GIRO COMPLETO del recupero (regola O) ─────────────────────
+    //
+    // Il test isolato `il_modello_che_legge_l_errore_recupera` (probe_agentic_loop)
+    // si ferma a `out.measures.recovered`: prova la MECCANICA del loop, non che la
+    // misura arrivi al VERDETTO. Questi due test attraversano la stessa catena della
+    // produzione — `multi_step_attempt` fa esattamente `run_loop` -> `turno_dai_fatti`
+    // -> `evaluate_attempt` col predicato REALE del profilo — e asseriscono la
+    // conseguenza (verdict='pass'/'no_recovery'), non un fatto intermedio. Partono
+    // dai produttori veri (il turno nasce da `agent_turn_value_from_gw`, i fatti da
+    // `run_loop`): nessun `measures`/`derived` fabbricato a mano.
+
+    /// Un modello finto per il mondo Recupero. `riporta_il_token` = legge l'errore e
+    /// porta il `current_epoch` (recupera); altrimenti al secondo turno risponde con
+    /// SOLO testo e nessuna tool-call — cio' che fa un modello che si ARRENDE, e che
+    /// fa chiudere il loop (probe_agentic_loop: `blocchi.is_empty() -> break`). E' la
+    /// forma reale del `no_recovery` osservato in produzione, non un ramo inventato.
+    struct RecuperoScritto {
+        turni_emessi: std::cell::RefCell<usize>,
+        riporta_il_token: bool,
+    }
+    impl crate::probe_agentic_loop::TurnSource for RecuperoScritto {
+        async fn turn(&self, messages_json: &str) -> Value {
+            use crate::nexus_gateway::{GwResponse, GwToolCall, GwToolFunctionCall, GwUsage};
+            let produci = |chiamate: &[(String, String)]| -> Value {
+                let tc: Vec<GwToolCall> = chiamate
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, a))| GwToolCall {
+                        id: format!("c{i}"),
+                        kind: "function".into(),
+                        function: GwToolFunctionCall { name: n.clone(), arguments: a.clone() },
+                        thought_signature: None,
+                    })
+                    .collect();
+                let resp = GwResponse {
+                    content: if chiamate.is_empty() { "non riesco a leggere la risorsa".into() } else { String::new() },
+                    tool_calls: (!tc.is_empty()).then_some(tc),
+                    usage: GwUsage::default(),
+                    model_used: "m".into(),
+                    provider_used: "p".into(),
+                    latency_ms: 1,
+                    finish_reason: if chiamate.is_empty() { "stop".into() } else { "tool_calls".into() },
+                    privacy_rerouted: None,
+                    reasoning: None,
+                    thinking_signature: None,
+                    citations: None,
+                };
+                crate::orchestrator::neural_client::agent_turn_value_from_gw("p", "m", &resp)
+            };
+            let mut n = self.turni_emessi.borrow_mut();
+            let turno = *n;
+            *n += 1;
+            // Il token dell'errore il modello non lo conosce in anticipo: lo LEGGE
+            // dalla conversazione, dal campo `current_epoch`, come farebbe uno vero.
+            let token = messages_json.split("current_epoch").nth(1).and_then(|coda| {
+                coda.find("E-").map(|i| {
+                    coda[i..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .collect::<String>()
+                })
+            });
+            match (turno, self.riporta_il_token, &token) {
+                (0, _, _) => produci(&[("read_file".into(), r#"{"path":"start"}"#.into())]),
+                (_, true, Some(t)) => produci(&[("read_file".into(), format!(r#"{{"path":"{t}"}}"#))]),
+                // Si arrende: nessuna tool-call, il loop si chiude.
+                _ => produci(&[]),
+            }
+        }
+    }
+
+    async fn giro_completo_recupero(riporta_il_token: bool) -> AttemptOutcome {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
+        // Il predicato REALE del profilo `agentic_recovery` (mig 0599/0610), non un
+        // predicato di comodo: e' cio' che gira in produzione.
+        let predicate = json!({
+            "max_latency_ms": 120000, "hold_min_passes": 3, "requires_recovery": true,
+            "promote_min_passes": 4, "forbids_repeat_of_failed": true
+        });
+        let seed = TokenSeed {
+            provider: "p".into(),
+            model: "m".into(),
+            profile_key: "agentic_recovery".into(),
+            attempt: 1,
+            seed: 7,
+        };
+        let mut mondo = ScriptedWorld::new(WorldKind::Recupero, seed, &[]).unwrap();
+        let modello = RecuperoScritto { turni_emessi: std::cell::RefCell::new(0), riporta_il_token };
+        // La STESSA catena di `multi_step_attempt`: loop -> `verdetto_dai_fatti`
+        // (che fa `turno_dai_fatti` -> `evaluate_attempt` -> `derived`). Il test
+        // delega al punto unico, non ricostruisce la sequenza a mano (regola O).
+        let out = crate::probe_agentic_loop::run_loop(&modello, WorldKind::Recupero, &mut mondo, "istr", 6).await;
+        assert!(out.inconclusive.is_none(), "il modello ha risposto: e' un verdetto vero, non un inconclusivo");
+        verdetto_dai_fatti(&out.measures, &predicate, 42)
+    }
+
+    /// Chi RIPORTA il token dell'errore ottiene verdict='pass'. Il test isolato si
+    /// fermava a `measures.recovered=true`; qui la misura arriva al verdetto.
+    #[tokio::test]
+    async fn il_giro_completo_promuove_chi_riporta_il_token_dell_errore() {
+        let out = giro_completo_recupero(true).await;
+        assert!(out.pass, "recupero riuscito deve dare pass, non '{}'", out.reason);
+        assert_eq!(out.reason, "ok");
+        // `derived` porta i FATTI dietro il verdetto (regola O: un verdetto senza i
+        // suoi fatti non e' contestabile). Prima era una colonna morta (mig 0591).
+        assert_eq!(
+            out.derived.as_ref().and_then(|d| d.pointer("/recovered")).and_then(Value::as_bool),
+            Some(true),
+            "il verdetto deve portare con se' il fatto che l'ha deciso"
+        );
+    }
+
+    /// Chi si ARRENDE dopo l'errore (nessuna tool-call al secondo turno, il loop si
+    /// chiude) ottiene verdict='no_recovery'. E' la forma ESATTA dei 93 fail
+    /// osservati in produzione al 2026-07-17: non un bug di misura, un modello che
+    /// non riporta il token. Se `turno_dai_fatti` smettesse di portare `recovered`,
+    /// entrambi i giri darebbero no_recovery e questo test lo vedrebbe.
+    #[tokio::test]
+    async fn il_giro_completo_boccia_chi_non_riporta_il_token() {
+        let out = giro_completo_recupero(false).await;
+        assert!(!out.pass);
+        assert_eq!(out.reason, "no_recovery");
+        assert_eq!(
+            out.derived.as_ref().and_then(|d| d.pointer("/recovered")).and_then(Value::as_bool),
+            Some(false),
+            "il fail 'no_recovery' deve mostrare recovered=false, cosi' e' diagnosticabile"
         );
     }
 }
