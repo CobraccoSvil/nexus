@@ -951,6 +951,34 @@ fn predicato_coerente_col_kind(profile: &ProbeProfile) -> Result<(), String> {
     Ok(())
 }
 
+/// Un seme fresco per il tentativo.
+///
+/// Fresco: due giri dello stesso modello vedono handle diversi, quindi il test non
+/// e' memorizzabile (il needle fisso `NX7K2P9QW4` insegna il contrario — costante in
+/// chiaro nel repo, nel DB e nei log, mandata a 8 provider: GPT-4-base recita il
+/// GUID di BIG-bench).
+///
+/// Registrato: finisce in `ai_model_probe_evidence.seed`, e da li' il giro si rigioca
+/// bit a bit. Un verdetto che non sai rigiocare non e' contestabile, quindi e'
+/// un'opinione (regola O: un numero senza la sua premessa).
+///
+/// Il seme varia per ISTANZA, mai i PARAMETRI della banda (profondita' della catena,
+/// tipo di guasto): stesso parametro = stessa difficolta', seme diverso = istanza mai
+/// vista. E' la risposta della letteratura alla tensione freschezza/stabilita' (survey
+/// contaminazione arXiv 2406.04244: i benchmark dinamici "mancano della garanzia di
+/// risultati consistenti fra valutazioni successive").
+fn seme_fresco() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        // Il nanosecondo da solo non basta: due tentativi ravvicinati possono
+        // cadere nello stesso tick su Windows (granularita' ~100ns).
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+}
+
 /// Il mondo che serve a un kind, se e' uno dei due multi-step.
 fn mondo_del_kind(kind: &str) -> Option<crate::probe_world::WorldKind> {
     match kind {
@@ -1015,6 +1043,7 @@ impl ProbeCtx<'_> {
         &self,
         kind: crate::probe_world::WorldKind,
         attempt: i32,
+        seme: u64,
     ) -> (AttemptOutcome, i64) {
         use crate::probe_world::{ScriptedWorld, TokenSeed};
         let started = std::time::Instant::now();
@@ -1038,11 +1067,9 @@ impl ProbeCtx<'_> {
             model: self.model.to_string(),
             profile_key: self.profile.profile_key.clone(),
             attempt,
-            // LIMITE DICHIARATO: senza la colonna `seed` in `ai_model_probe_evidence`
-            // (mig 0610) il seme e' fisso. I token restano diversi fra tentativi e
-            // fra modelli, ma un giro contestato non e' ancora rigiocabile da una
-            // riga di evidenza.
-            seed: 0,
+            // Fresco a ogni tentativo e REGISTRATO nell'evidenza (mig 0610): il giro
+            // si rigioca identico da quella riga.
+            seed: seme,
         };
         let handle0 = seed.handle(0);
         let istruzione = match kind {
@@ -1152,6 +1179,10 @@ async fn build_profile_request(
 
 /// Registra un tentativo in `ai_model_probe_evidence` e ritorna l'id.
 #[allow(clippy::too_many_arguments)]
+/// Registra un tentativo. Il `seme` e' la PREMESSA del verdetto: senza, un
+/// fallimento contestato non si rigioca e quindi non si contesta (regola O). Vale
+/// solo per i profili multi-step, che dal seme derivano ogni token; per gli altri
+/// e' `None`.
 async fn insert_evidence(
     db: &PgPool,
     provider: &str,
@@ -1160,6 +1191,7 @@ async fn insert_evidence(
     attempt: i32,
     latency_ms: i64,
     outcome: &AttemptOutcome,
+    seme: Option<i64>,
 ) -> Option<i64> {
     let verdict = if outcome.inconclusive {
         "inconclusive"
@@ -1171,8 +1203,8 @@ async fn insert_evidence(
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO ai_model_probe_evidence \
          (provider, model, profile_key, suite_version, attempt, latency_ms, error_class, \
-          tool_call_count, content_chars, stop_reason, verdict, verdict_reason) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
+          tool_call_count, content_chars, stop_reason, verdict, verdict_reason, seed) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id",
     )
     .bind(provider)
     .bind(model)
@@ -1186,6 +1218,7 @@ async fn insert_evidence(
     .bind(&outcome.stop_reason)
     .bind(verdict)
     .bind(&outcome.reason)
+    .bind(seme)
     .fetch_one(db)
     .await
     .map_err(|e| {
@@ -1250,12 +1283,13 @@ impl ProbeCtx<'_> {
         &self,
         thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
         attempt: i32,
+        seme: u64,
     ) -> (AttemptOutcome, i64) {
         // I due kind multi-step non stanno in un turno solo: hanno bisogno del
         // loop, del mondo finto e del taint tracking. E' l'unico punto in cui il
         // giro si biforca.
         if let Some(kind) = mondo_del_kind(&self.profile.kind) {
-            return self.multi_step_attempt(kind, attempt).await;
+            return self.multi_step_attempt(kind, attempt, seme).await;
         }
         let (tools_json, messages_json, system_text) = self.request;
         let started = std::time::Instant::now();
@@ -1334,7 +1368,12 @@ async fn run_profile_attempts(
         first_fail_reason: None,
     };
     for attempt in 1..=ctx.params.repeat {
-        let (mut outcome, latency_ms) = ctx.single_attempt(thinking.clone(), attempt as i32).await;
+        // Un seme per TENTATIVO: i 4 tentativi campionano istanze diverse invece di
+        // ripetere la stessa (FLenQA misura che una posizione fissa e' la peggiore:
+        // ripetere 4 volte lo stesso caso fa passare i borderline per fortuna).
+        let seme = seme_fresco();
+        let (mut outcome, latency_ms) =
+            ctx.single_attempt(thinking.clone(), attempt as i32, seme).await;
         if !label.is_empty() {
             outcome.reason = format!("{label}{}", outcome.reason);
         }
@@ -1346,6 +1385,9 @@ async fn run_profile_attempts(
             attempt as i32,
             latency_ms,
             &outcome,
+            // Il seme e' la premessa del verdetto, e vale solo dove ogni token ne
+            // deriva: sugli altri profili non c'e' niente da rigiocare.
+            mondo_del_kind(&ctx.profile.kind).map(|_| seme as i64),
         )
         .await
         {
