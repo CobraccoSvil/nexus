@@ -274,6 +274,9 @@ function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeC
       style={{
         alignSelf: "flex-start",
         maxWidth: "96%",
+        // Come il bubble dei messaggi: il 96% non comprende il bordo, che si
+        // sommerebbe sfondando la lista.
+        boxSizing: "border-box",
         border: `1px solid ${tc.border}`,
         borderRadius: 8,
         background: tc.bgCard,
@@ -1248,6 +1251,11 @@ export function MessageList({
               opacity: isDeleted ? 0.6 : 1,
               alignSelf: isUser ? "flex-end" : "flex-start",
               maxWidth: "96%",
+              // Il 96% vale sul content box: senza questo, padding (20) e bordo
+              // (2) si sommavano e il bubble arrivava a 442px contro i 438
+              // disponibili, facendo scrollare in orizzontale tutta la lista
+              // messaggi per 4px (misurato).
+              boxSizing: "border-box",
               minWidth: "auto",
               wordBreak: "break-word",
               overflowWrap: "anywhere",

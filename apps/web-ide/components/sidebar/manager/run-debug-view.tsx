@@ -266,7 +266,10 @@ export function RunDebugView({
 
   return (
     <>
-      <div className="flex-row px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between" }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
+      {/* flex-row-wrap, non flex-row: in sidebar stretta titolo e comandi non
+          ci stanno in riga e, non potendo andare a capo, sfondavano il
+          contenitore (misurati 4px) che rispondeva con uno scroll orizzontale. */}
+      <div className="flex-row-wrap px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between", gap: 6 }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
         <span style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, textTransform: "uppercase", letterSpacing: 1 }}>Script &amp; Comandi</span>
         {!editing && !suggestions && (
           <div className="flex-row" style={{ gap: 4, alignItems: "center" }}>

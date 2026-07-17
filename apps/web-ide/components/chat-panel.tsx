@@ -1202,6 +1202,9 @@ export function ChatPanel({
                 background: tc.accentBg,
                 alignSelf: "flex-end",
                 maxWidth: "96%",
+                // Il 96% non comprende padding e bordo: senza questo il preview
+                // sfonda la lista come faceva il bubble dei messaggi.
+                boxSizing: "border-box",
                 minWidth: "30%",
               }}
             >
