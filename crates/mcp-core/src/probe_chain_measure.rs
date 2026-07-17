@@ -168,9 +168,13 @@ pub(crate) fn ha_recuperato(traccia: &[TracedCall], token_errore: Option<&str>, 
 /// no si boccia il comportamento corretto, e per giunta quello che il nostro stesso
 /// prompt di sistema ordina ("se un'operazione fallisce, riprova").
 pub(crate) fn ha_ripetuto_la_fallita(traccia: &[TracedCall], firme_fallite: &[String]) -> bool {
-    traccia
-        .iter()
-        .any(|c| firme_fallite.contains(&firma(&c.nome, &c.input)))
+    // Una firma fallita e' NELLA traccia per definizione: e' la chiamata che ha
+    // fallito. Ripetere significa che compare PIU' di una volta — contare la prima
+    // occorrenza accuserebbe di ripetizione chiunque sbagli anche una sola volta,
+    // cioe' proprio il modello che poi si corregge.
+    firme_fallite.iter().any(|f| {
+        traccia.iter().filter(|c| &firma(&c.nome, &c.input) == f).count() > 1
+    })
 }
 
 /// Le misure di un tentativo, dalla traccia. PURA.
@@ -308,8 +312,19 @@ mod tests {
         let a = firma("read_file", &json!({ "path": "x", "mode": "r" }));
         let b = firma("read_file", &json!({ "mode": "r", "path": "x" }));
         assert_eq!(a, b);
-        let traccia = vec![call(2, "read_file", json!({ "mode": "r", "path": "x" }))];
+        // La chiamata fallita (turno 1) e la sua ripetizione (turno 2), scritte con
+        // le chiavi in ordine diverso: e' la stessa chiamata.
+        let traccia = vec![
+            call(1, "read_file", json!({ "path": "x", "mode": "r" })),
+            call(2, "read_file", json!({ "mode": "r", "path": "x" })),
+        ];
         assert!(ha_ripetuto_la_fallita(&traccia, &[a]));
+        // Chi sbaglia UNA volta e poi cambia azione non ha ripetuto.
+        let corretto = vec![
+            call(1, "read_file", json!({ "path": "x", "mode": "r" })),
+            call(2, "read_file", json!({ "epoch": "E-ZZZ" })),
+        ];
+        assert!(!ha_ripetuto_la_fallita(&corretto, &[b]));
     }
 
     /// Argomenti malformati sono un fatto SEPARATO: senza, un modello che non sa
