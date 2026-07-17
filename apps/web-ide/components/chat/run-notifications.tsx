@@ -11,7 +11,8 @@
 //
 // Stile: inline + useThemeColors, niente Tailwind, niente emoji nei sorgenti.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
 import { useThemeColors } from "../../lib/theme";
 import { providerBaseColor } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
@@ -198,18 +199,12 @@ export function RunNotifications({
     if (!blocking) autoOpenedRef.current = false;
   }, [blocking]);
 
-  // Chiudi al click fuori dal pannello (non blocca il resto della chat).
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (panelRef.current?.contains(target)) return;
-      if (bellRef.current?.contains(target)) return;
-      setOpen(false);
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [open]);
+  // Chiudi al click fuori dal pannello (non blocca il resto della chat). Le zone
+  // sono due — pannello e campanello — ed e' il caso per cui il punto unico
+  // accetta piu' ref. Delegando, il pannello guadagna anche la chiusura con
+  // Escape, che prima non aveva.
+  const chiudiPannello = useCallback(() => setOpen(false), []);
+  useDismissOnOutside(open, [panelRef, bellRef], chiudiPannello);
 
   if (notifications.length === 0) return null;
 

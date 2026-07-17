@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
+import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
 import type { useThemeColors } from "../../lib/theme";
 import type { UserProjectDetails, UserProjectSummary, WorkbenchLayoutMode } from "../../lib/api-client";
 import { ProjectSwitcher } from "../project-switcher";
@@ -33,23 +34,8 @@ function ProviderStatusIndicator({
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
+  const chiudi = useCallback(() => setOpen(false), []);
+  useDismissOnOutside(open, containerRef, chiudi);
 
   const names = sortProviderNames(Object.keys(providerStatus));
   if (names.length === 0) return null;

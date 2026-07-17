@@ -8,10 +8,11 @@ type ElementRef = RefObject<HTMLElement | null>;
  * Chiude un elemento a comparsa (popover, menu, dropdown) quando l'utente clicca
  * fuori dalle sue zone o preme Escape.
  *
- * Punto unico (regola L / ADR 0026): la stessa coppia di listener era ripetuta
- * identica in top-bar.tsx, user-header.tsx, run-notifications.tsx,
- * project-explorer.tsx e AdminModal.tsx. I call site storici non sono ancora
- * stati fatti convergere qui: vedi il task di consolidamento.
+ * Punto unico (regola L / ADR 0026) dei call site che facevano entrambe le cose:
+ * chat-head-popover, top-bar, user-header, run-notifications e il menu
+ * contestuale di project-explorer. Non e' il punto unico di OGNI chiusura: chi
+ * ha solo Escape e delega il clic al backdrop (AdminModal) non passa di qui —
+ * l'hook gli aggiungerebbe un listener che non gli serve.
  *
  * Accetta piu' ref perche' un pannello reso via ModalPortal NON e' discendente
  * del suo trigger nel DOM: controllando il solo contenitore, ogni clic dentro il
