@@ -2,9 +2,33 @@
 # Legge i PID salvati e termina ogni processo con il suo albero (/T): i figli
 # eventualmente spawnati da mcp-core (dev-server di progetto) non restano orfani a
 # tenere le porte. NON tocca i database (servizi Windows separati).
+#
+# Ogni kill passa da Stop-NexusProcessTree (lib\nexus-process.ps1), che VERIFICA
+# che il processo sia davvero morto invece di dichiararlo. Un processo che
+# sopravvive NON viene piu' annunciato come "fermato": l'errore e' esplicito e lo
+# script esce !=0, cosi' i chiamanti (dev-build.ps1) non compilano contro .exe
+# ancora lockati (os error 5). Vedi lib\nexus-process.ps1 per il razionale.
 $ErrorActionPreference = 'Stop'
 $RUNTIME = 'D:\IDEAI-runtime'
 $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
+
+. (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
+
+# Processi sopravvissuti al kill: raccolti qui e riportati insieme in coda, cosi'
+# un fallimento non impedisce di tentare gli altri servizi.
+$survivors = @()
+
+function Invoke-Kill([int]$processId, [string]$label, [string]$how) {
+  $res = Stop-NexusProcessTree -ProcessId $processId -Label $label -KillTree
+  if ($res.AlreadyStopped) { return }
+  if ($res.Stopped) {
+    Write-Host ("fermato{0} {1,-16} pid {2}" -f $how, $label, $processId) -ForegroundColor Yellow
+  }
+  else {
+    Write-Host $res.Message -ForegroundColor Red
+    $script:survivors += $res
+  }
+}
 
 # 1) Ferma i PID registrati nel pidfile (albero /T), se presente. `@($procs)` tollera
 # sia un array sia un oggetto singolo (pidfile serializzato a un elemento).
@@ -12,16 +36,15 @@ if (Test-Path $PIDFILE) {
   try {
     $procs = Get-Content $PIDFILE -Raw | ConvertFrom-Json
     foreach ($p in @($procs)) {
-      if ($p.pid -and (Get-Process -Id $p.pid -ErrorAction SilentlyContinue)) {
-        # taskkill via cmd /c: in PS 5.1 il redirect di stderr di un exe nativo genera
-        # un NativeCommandError; dentro cmd lo stderr non risale a PowerShell.
-        cmd /c "taskkill /PID $($p.pid) /T /F >nul 2>nul"
-        Write-Host ("fermato {0,-16} pid {1}" -f $p.id, $p.pid) -ForegroundColor Yellow
-      }
+      if ($p.pid) { Invoke-Kill ([int]$p.pid) ([string]$p.id) '' }
     }
   }
   catch { Write-Warning "pidfile illeggibile ($($_.Exception.Message)); procedo col fallback per nome." }
-  Remove-Item $PIDFILE -Force -ErrorAction SilentlyContinue
+  # Il pidfile va via solo se NESSUN processo e' sopravvissuto: cancellarlo mentre
+  # qualcosa e' ancora vivo perde l'unica traccia del PID (orfano non rintracciabile)
+  # e fa credere a dev-start.ps1 che lo stack sia giu'.
+  if ($survivors.Count -eq 0) { Remove-Item $PIDFILE -Force -ErrorAction SilentlyContinue }
+  else { Write-Warning "$PIDFILE NON rimosso: contiene processi ancora vivi." }
 }
 
 # 2) SEMPRE fallback per nome dei processi noti ancora vivi. Il pidfile puo' essere
@@ -33,8 +56,7 @@ $names = 'mcp-core', 'nexus-gateway', 'admin-service',
 'doc-service', 'plugin-service', 'qdrant', 'GarnetServer'
 foreach ($n in $names) {
   Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
-    cmd /c "taskkill /PID $($_.Id) /T /F >nul 2>nul"
-    Write-Host ("fermato (per nome) {0,-16} pid {1}" -f $n, $_.Id) -ForegroundColor Yellow
+    Invoke-Kill $_.Id $n ' (per nome)'
   }
 }
 
@@ -48,16 +70,14 @@ Get-NetTCPConnection -LocalPort $webPort -State Listen -ErrorAction SilentlyCont
 Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
   $op = Get-Process -Id $_ -ErrorAction SilentlyContinue
   if ($op -and $op.ProcessName -eq 'node') {
-    cmd /c "taskkill /PID $($op.Id) /T /F >nul 2>nul"
-    Start-Sleep -Milliseconds 500
-    if (Get-Process -Id $op.Id -ErrorAction SilentlyContinue) {
-      # Sopravvive al kill: orfano a integrita' piu' alta (avviato da shell elevata).
-      # Un dev-stop non-admin non puo' terminarlo -> avvisa invece di fallire muto.
-      Write-Warning ("web-ide pid {0} occupa ancora :{1} dopo il kill: processo probabilmente ELEVATO. Rilancia questo script da una PowerShell come amministratore." -f $op.Id, $webPort)
-    }
-    else {
-      Write-Host ("fermato (per porta :{0}) web-ide pid {1}" -f $webPort, $op.Id) -ForegroundColor Yellow
-    }
+    Invoke-Kill $op.Id 'web-ide' (" (per porta :{0})" -f $webPort)
   }
 }
+
+if ($survivors.Count -gt 0) {
+  Write-Host ''
+  [Console]::Error.WriteLine("Stack NON fermato: $($survivors.Count) processo/i sopravvissuto/i al kill (vedi sopra). Non compilare: gli eseguibili sono lockati.")
+  exit 1
+}
 Write-Host 'Stack fermato.' -ForegroundColor Cyan
+exit 0

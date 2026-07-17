@@ -10,6 +10,9 @@ param([switch]$Rust, [switch]$Web, [switch]$NoRestart)
 $ErrorActionPreference = 'Stop'
 $ROOT = 'D:\IDEAI'
 
+# Kill + verifica del fatto: punto unico condiviso con dev-service.ps1/dev-stop.ps1.
+. (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
+
 # Auto-elevazione: stop/start dei servizi Windows richiede admin.
 if (-not $NoRestart) {
   $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
@@ -50,23 +53,39 @@ function Stop-ServiceTree($name) {
   } catch { }
   Stop-Service $name -Force -ErrorAction Continue
   Start-Sleep -Milliseconds 800
-  # taskkill via cmd /c con redirect INTERNO: in PS 5.1 con ErrorActionPreference=Stop
-  # un '2>$null' su exe nativo genera comunque un ErrorRecord (NativeCommandError) e
-  # quindi un throw su "processo non trovato". Dentro cmd lo stderr non risale a PS.
-  if ($procId -ne 0 -and (Get-Process -Id $procId -ErrorAction SilentlyContinue)) {
-    cmd /c "taskkill /PID $procId /T /F >nul 2>nul"
+  # Kill + VERIFICA via Stop-NexusProcessTree: un processo sopravvissuto tiene
+  # lockato il proprio .exe e la `cargo build` piu' sotto fallirebbe con un opaco
+  # `os error 5`. Meglio dirlo qui, con il motivo. Ritorna i sopravvissuti al
+  # chiamante, che decide (qui: build annullata).
+  $alive = @()
+  if ($procId -ne 0) {
+    $res = Stop-NexusProcessTree -ProcessId $procId -Label $name -KillTree
+    if (-not $res.Stopped) { $alive += $res.Message }
   }
-  foreach ($k in $kids) { if ($k) { cmd /c "taskkill /PID $k /T /F >nul 2>nul" } }
+  foreach ($k in $kids) {
+    if ($k) {
+      $res = Stop-NexusProcessTree -ProcessId ([int]$k) -Label "$name (figlio)" -KillTree
+      if (-not $res.Stopped) { $alive += $res.Message }
+    }
+  }
+  return $alive
 }
 
 $doRust = $Rust -or (-not $Rust -and -not $Web)
 $doWeb  = $Web  -or (-not $Rust -and -not $Web)
 $rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-doc','nexus-plugin'
 
-# 1. STOP (solo se gestiamo i servizi) — kill-tree per non lasciare orfani
+# 1. STOP (solo se gestiamo i servizi) — kill-tree per non lasciare orfani.
+# Se qualcosa sopravvive si INTERROMPE qui: proseguire vorrebbe dire compilare
+# contro eseguibili lockati (os error 5) e poi riavviare servizi mai fermati.
 if (-not $NoRestart) {
-  if ($doRust) { foreach ($s in $rustSvc) { Stop-ServiceTree $s } }
-  if ($doWeb)  { Stop-ServiceTree 'nexus-web-ide' }
+  $survivors = @()
+  if ($doRust) { foreach ($s in $rustSvc) { $survivors += Stop-ServiceTree $s } }
+  if ($doWeb)  { $survivors += Stop-ServiceTree 'nexus-web-ide' }
+  if ($survivors.Count -gt 0) {
+    $survivors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+    throw "$($survivors.Count) processo/i non terminato/i (vedi sopra): build annullata."
+  }
   Start-Sleep -Seconds 2
 }
 
