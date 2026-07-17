@@ -1903,7 +1903,6 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           activePanelTab={activePanelTab}
           activeProject={activeProject}
           onSelectTab={(tab) => setActivePanelTab(tab)}
-          onHide={() => setBottomPanelVisible(false)}
         />
         <div style={{ minHeight: 0, overflow: "hidden" }}>
           <BottomPanelManager

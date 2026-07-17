@@ -14,14 +14,12 @@ export function BottomPanelHeader({
   activePanelTab,
   activeProject,
   onSelectTab,
-  onHide,
 }: {
   tc: ReturnType<typeof useThemeColors>;
   isMobileViewport: boolean;
   activePanelTab: PanelTab;
   activeProject: UserProjectDetails | null;
   onSelectTab: (tab: PanelTab) => void;
-  onHide: () => void;
 }) {
   const scorrevoleRef = useRef<HTMLDivElement>(null);
   const [scorribile, setScorribile] = useState({ sinistra: false, destra: false });
@@ -128,18 +126,15 @@ export function BottomPanelHeader({
         </div>
       )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingRight: 12, paddingLeft: 8, flexShrink: 0 }}>
-        {activeProject && <QuotaBadge projectId={activeProject.id} />}
-        <button
-          type="button"
-          onClick={onHide}
-          title="Nascondi panel"
-          aria-label="Nascondi panel"
-          style={iconButton(tc)}
-        >
-          ✕
-        </button>
-      </div>
+      {/* La visibilita' del pannello inferiore la governano i pulsanti di layout
+          nell'header dell'IDE (punto unico, regola L): qui non c'e' un secondo
+          comando di chiusura. Un ✕ in fondo alle linguette suggeriva anche la cosa
+          sbagliata — sembrava chiudere la linguetta attiva, non il pannello. */}
+      {activeProject && (
+        <div style={{ display: "flex", alignItems: "center", paddingRight: 12, paddingLeft: 8, flexShrink: 0 }}>
+          <QuotaBadge projectId={activeProject.id} />
+        </div>
+      )}
     </div>
   );
 }
