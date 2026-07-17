@@ -303,13 +303,7 @@ impl NeuralCoreClient {
                 // `e.to_string()` e la classe veniva ri-dedotta con una regex sul
                 // Display: il segnale moriva qui. Ora si legge il codice strutturato e
                 // il testo resta solo per display/log.
-                let structured = structured_error_class(&e);
-                Ok(error_agent_turn_value_with_class(
-                    provider,
-                    model,
-                    &e.to_string(),
-                    structured,
-                ))
+                Ok(error_agent_turn_from_error(provider, model, &e))
             }
         }
     }
@@ -581,6 +575,26 @@ fn first_failure_status(details: &Value) -> Option<i64> {
         .first()?
         .get("status")?
         .as_i64()
+}
+
+/// PUNTO UNICO (regola L) del turno d'ERRORE per il path neural: dall'errore
+/// TIPIZZATO del gateway al `Value` che i consumatori leggono davvero
+/// (`evaluate_tool_probe`, `evaluate_attempt`).
+///
+/// Esiste come funzione a se' per la regola O: il ramo `Err` di
+/// `generate_agent_turn_with_thinking` delega QUI, quindi un test che parte da
+/// questa funzione raggiunge il suo oggetto per la STESSA strada della
+/// produzione — estrazione del segnale strutturato inclusa. Prima il ramo `Err`
+/// era codice inline dentro un metodo `async` che richiede un gateway vivo:
+/// irraggiungibile da un test, che quindi fabbricava il turno a mano e fissava
+/// l'assunto che avrebbe dovuto verificare.
+pub(crate) fn error_agent_turn_from_error(
+    provider: &str,
+    model: &str,
+    err: &anyhow::Error,
+) -> Value {
+    let structured = structured_error_class(err);
+    error_agent_turn_value_with_class(provider, model, &err.to_string(), structured)
 }
 
 /// Come [`error_agent_turn_value`] ma con la classe gia' derivata da un segnale

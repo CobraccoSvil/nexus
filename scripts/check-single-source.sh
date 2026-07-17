@@ -344,7 +344,7 @@ fi
 # turn['result'] (chiave che nessuno scriveva -> content_chars 0 per costruzione,
 # test verdi, modelli sani bocciati). Chi ha bisogno di un turno finto parte dal
 # produttore, o dichiara perche' non puo'.
-turno_a_mano="$(grep -rIn "tool_use_blocks\"\s*:" --include=*.rs crates/ 2>/dev/null   | grep -v "neural_client.rs"   | grep -v "probe_agentic_loop.rs"   | grep -v "model_qualification.rs"   | grep -v "model_health_probe.rs"   || true)"
+turno_a_mano="$(grep -rIn "tool_use_blocks\"\s*:" --include=*.rs crates/ 2>/dev/null   | grep -v "neural_client.rs"   | grep -v "probe_agentic_loop.rs"   | grep -v "model_qualification.rs"   || true)"
 if [[ -n "$turno_a_mano" ]]; then
   echo "!! turno-dal-produttore: un turno agentico e' costruito a mano fuori dai punti noti:" >&2
   echo "$turno_a_mano" >&2
