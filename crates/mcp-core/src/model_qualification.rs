@@ -826,10 +826,83 @@ fn build_long_context_request(profile: &ProbeProfile) -> (String, String, String
     )
 }
 
+/// Le chiavi che un `pass_predicate` puo' contenere. VOCABOLARIO CHIUSO (regola N):
+/// tutto cio' che sta qui e' verificato da qualcuno, e cio' che non sta qui e' un
+/// errore — non un vincolo da ignorare.
+///
+/// La differenza non e' formale. `predicate_fail_reason` legge le chiavi che
+/// conosce e tace sulle altre, con default permissivi: un predicato
+/// `{"min_chained_calls": 3}` su un profilo che non sa contare gli anelli non
+/// verifica NIENTE e ritorna `None`, cioe' "superato". Il profilo gira, promuove
+/// tutti e sembra funzionare: `high` diventerebbe gratis per chiunque, in silenzio.
+/// E' il difetto peggiore possibile qui, perche' un test che non misura e'
+/// indistinguibile da un test che passa.
+const CHIAVI_PREDICATO: [&str; 9] = [
+    // verificate da `predicate_fail_reason`
+    "min_tool_calls",
+    "min_content_chars",
+    "requires_needle",
+    "max_latency_ms",
+    // lette da `profile_params` (isteresi delle bande)
+    "hold_min_passes",
+    "promote_min_passes",
+    // verificate dal loop agentico (tool_chain / tool_recovery)
+    "min_chained_calls",
+    "requires_recovery",
+    "forbids_repeat_of_failed",
+];
+
+/// La prima chiave del predicato che nessuno sa verificare. `None` = il predicato
+/// e' interamente coperto.
+fn chiave_predicato_ignota(predicate: &Value) -> Option<String> {
+    predicate
+        .as_object()?
+        .keys()
+        .find(|k| !CHIAVI_PREDICATO.contains(&k.as_str()))
+        .cloned()
+}
+
+/// I predicati che solo il loop multi-turno sa verificare. Su un profilo
+/// single-turn sarebbero muti (nessun anello da contare, nessun errore iniettato):
+/// il profilo promuoverebbe senza misurare cio' che dichiara di misurare.
+const PREDICATI_MULTI_TURNO: [&str; 3] = [
+    "min_chained_calls",
+    "requires_recovery",
+    "forbids_repeat_of_failed",
+];
+
+/// `Err` se il profilo chiede una verifica che il suo kind non puo' fare. Il
+/// controllo e' incrociato apposta: le due meta' del contratto (kind e predicato)
+/// vivono in righe diverse del DB e possono divergere per un refuso dell'admin.
+fn predicato_coerente_col_kind(profile: &ProbeProfile) -> Result<(), String> {
+    if let Some(k) = chiave_predicato_ignota(&profile.pass_predicate) {
+        return Err(format!("predicato sconosciuto: {k}"));
+    }
+    let multi_turno = matches!(profile.kind.as_str(), "tool_chain" | "tool_recovery");
+    if !multi_turno {
+        if let Some(k) = profile
+            .pass_predicate
+            .as_object()
+            .and_then(|o| o.keys().find(|k| PREDICATI_MULTI_TURNO.contains(&k.as_str())))
+        {
+            return Err(format!(
+                "predicato '{k}' richiede un kind multi-turno, ma il profilo e' '{}'",
+                profile.kind
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn build_profile_request(
     db: &PgPool,
     profile: &ProbeProfile,
 ) -> Result<(String, String, String), String> {
+    // PRIMA di costruire la richiesta: se il predicato chiede una verifica che
+    // nessuno sa fare, il profilo NON e' costruibile. Fallire qui produce un giro
+    // inconclusivo (colpa nostra, stato del modello invariato); tacere
+    // produrrebbe una promozione gratuita.
+    predicato_coerente_col_kind(profile)?;
     match profile.kind.as_str() {
         "chat" => Ok((
             "[]".to_string(),
@@ -1839,6 +1912,97 @@ mod tests {
     /// rispondono 'ok' alla richiesta identica del probe) e, con
     /// enforce_routing_gate acceso, li ESCLUDEVA dal routing 4 per giro.
     ///
+    // ── Il vocabolario CHIUSO dei predicati ─────────────────────────────────
+
+    fn profilo(kind: &str, predicate: Value) -> ProbeProfile {
+        ProbeProfile {
+            profile_key: format!("test_{kind}"),
+            suite_version: 2,
+            kind: kind.to_string(),
+            is_blocking: false,
+            applies_when: None,
+            grants: vec![],
+            payload: json!({}),
+            pass_predicate: predicate,
+            certifies_tier: None,
+        }
+    }
+
+    /// IL FAIL-APERTO, che e' il difetto peggiore: un predicato che nessuno
+    /// verifica non e' un vincolo, e `predicate_fail_reason` con i suoi default
+    /// permissivi ritorna `None` = "superato". Un profilo che non misura niente e
+    /// promuove tutti e' indistinguibile da un profilo che funziona.
+    #[test]
+    fn un_predicato_sconosciuto_e_un_errore_non_un_vincolo_ignorato() {
+        // La prova del fail-aperto: oggi il verificatore TACE su una chiave ignota
+        // e dichiara il tentativo superato.
+        let sig = read_turn_signals(&json!({"content": "x", "tool_use_blocks": []}));
+        assert_eq!(
+            predicate_fail_reason(&json!({}), &json!({"min_unicorni": 3}), &sig, 10),
+            None,
+            "il verificatore non conosce 'min_unicorni' e lo ignora: senza il \
+             vocabolario chiuso, quel profilo promuoverebbe chiunque"
+        );
+        // Per questo il profilo dev'essere rifiutato PRIMA di girare.
+        assert_eq!(
+            predicato_coerente_col_kind(&profilo("chat", json!({"min_unicorni": 3}))),
+            Err("predicato sconosciuto: min_unicorni".to_string())
+        );
+    }
+
+    /// Le due meta' del contratto stanno in colonne diverse del DB e possono
+    /// divergere: un predicato di catena su un profilo single-turn sarebbe muto
+    /// (nessun anello da contare), quindi promuoverebbe senza misurare.
+    #[test]
+    fn un_predicato_di_catena_su_un_profilo_single_turn_e_un_errore() {
+        let e = predicato_coerente_col_kind(&profilo("chat", json!({"min_chained_calls": 3})));
+        assert!(
+            e.is_err() && e.unwrap_err().contains("multi-turno"),
+            "min_chained_calls su kind 'chat' non e' verificabile: va rifiutato"
+        );
+        // Sul kind giusto, invece, e' legittimo.
+        assert!(
+            predicato_coerente_col_kind(&profilo("tool_chain", json!({"min_chained_calls": 3})))
+                .is_ok()
+        );
+    }
+
+    /// I predicati dei profili VERI del DB devono essere tutti coperti: e' il
+    /// controllo che impedisce a un profilo aggiunto dall'admin di girare a vuoto.
+    #[test]
+    fn il_vocabolario_copre_i_predicati_dei_profili_reali() {
+        for (kind, pred) in [
+            ("chat", json!({"min_content_chars": 1})),
+            ("tool_minimal", json!({"min_tool_calls": 1})),
+            (
+                "tool_realistic",
+                json!({"max_latency_ms": 60000, "min_tool_calls": 1,
+                       "hold_min_passes": 2, "promote_min_passes": 3}),
+            ),
+            (
+                "tool_chain",
+                json!({"max_latency_ms": 120000, "hold_min_passes": 2,
+                       "min_chained_calls": 3, "promote_min_passes": 3}),
+            ),
+            (
+                "tool_recovery",
+                json!({"max_latency_ms": 120000, "hold_min_passes": 2,
+                       "requires_recovery": true, "promote_min_passes": 3,
+                       "forbids_repeat_of_failed": true}),
+            ),
+            (
+                "long_context",
+                json!({"max_latency_ms": 180000, "hold_min_passes": 2,
+                       "requires_needle": true, "promote_min_passes": 3}),
+            ),
+        ] {
+            assert!(
+                predicato_coerente_col_kind(&profilo(kind, pred)).is_ok(),
+                "il profilo '{kind}' del DB deve essere accettato dal vocabolario"
+            );
+        }
+    }
+
     /// I test preesistenti non lo vedevano perche' inventavano il JSON con la
     /// stessa chiave sbagliata del codice: codice e test condividevano l'errore.
     #[test]
