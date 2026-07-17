@@ -663,7 +663,12 @@ fn error_agent_turn_value_with_class(
     }
 }
 
-fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
+/// Il turno d'errore quando NON c'e' un segnale strutturato e la classe va dedotta
+/// dal testo. `pub(crate)` come cucitura per i test: chi deve esercitare un turno
+/// d'errore parte DA QUI invece di fabbricarne uno a mano (regola O). Vale lo stesso
+/// motivo di [`error_agent_turn_from_error`]: un ramo che nessun test puo'
+/// raggiungere se lo costruisce da se', e cosi' fissa l'assunto che dovrebbe provare.
+pub(crate) fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
     let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
     error_agent_turn_value_inner(provider, model, raw_error, class)
 }
