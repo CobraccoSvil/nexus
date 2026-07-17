@@ -271,9 +271,9 @@ fn multi_step_fail_reason(turn: &Value, predicate: &Value) -> Option<String> {
         return Some("no_recovery".to_string());
     }
     if predicate.get(K_FORBIDS_REPEAT).and_then(Value::as_bool) == Some(true)
-        && fatto_bool("repeated_failed")
+        && fatto_bool(F_REPEATED_FAILED)
     {
-        return Some("repeated_failed".to_string());
+        return Some(F_REPEATED_FAILED.to_string());
     }
     None
 }
@@ -885,9 +885,18 @@ fn build_long_context_request(profile: &ProbeProfile) -> (String, String, String
 /// vocabolario, la lista di cio' che richiede un kind multi-turno, e il
 /// verificatore — e devono essere LA STESSA parola: un refuso in uno dei tre
 /// renderebbe il predicato muto, cioe' un pass regalato (regola N).
+/// I due kind multi-step. Nominati dal dispatch, dal guard del predicato e dalla
+/// scelta del mondo: se una delle tre copie divergesse, un profilo girerebbe col
+/// mondo sbagliato o col predicato muto (regola N).
+const KIND_TOOL_CHAIN: &str = "tool_chain";
+const KIND_TOOL_RECOVERY: &str = "tool_recovery";
+
 const K_MIN_CHAINED: &str = "min_chained_calls";
 const K_REQUIRES_RECOVERY: &str = "requires_recovery";
 const K_FORBIDS_REPEAT: &str = "forbids_repeat_of_failed";
+/// Il FATTO misurato dal loop (non la chiave del predicato): il modello ha
+/// rimandato identica una chiamata gia' fallita.
+const F_REPEATED_FAILED: &str = "repeated_failed";
 
 const CHIAVI_PREDICATO: [&str; 9] = [
     // verificate da `predicate_fail_reason`
@@ -926,7 +935,7 @@ fn predicato_coerente_col_kind(profile: &ProbeProfile) -> Result<(), String> {
     if let Some(k) = chiave_predicato_ignota(&profile.pass_predicate) {
         return Err(format!("predicato sconosciuto: {k}"));
     }
-    let multi_turno = matches!(profile.kind.as_str(), "tool_chain" | "tool_recovery");
+    let multi_turno = matches!(profile.kind.as_str(), KIND_TOOL_CHAIN | KIND_TOOL_RECOVERY);
     if !multi_turno {
         if let Some(k) = profile
             .pass_predicate
@@ -942,7 +951,165 @@ fn predicato_coerente_col_kind(profile: &ProbeProfile) -> Result<(), String> {
     Ok(())
 }
 
+/// Il mondo che serve a un kind, se e' uno dei due multi-step.
+fn mondo_del_kind(kind: &str) -> Option<crate::probe_world::WorldKind> {
+    match kind {
+        KIND_TOOL_CHAIN => Some(crate::probe_world::WorldKind::Catena),
+        KIND_TOOL_RECOVERY => Some(crate::probe_world::WorldKind::Recupero),
+        _ => None,
+    }
+}
+
+/// L'istruzione del giro: nomina il SOLO bersaglio noto (l'handle di partenza) e
+/// dice cosa cercare.
+///
+/// Non nomina i tool — quale usare lo decide il modello — e non dice "concatena tre
+/// chiamate": chiederlo esplicitamente misurerebbe l'obbedienza al nostro prompt
+/// invece della capacita' di capire che, per arrivare in fondo, bisogna seguire i
+/// riferimenti.
+fn istruzione_catena(handle: &str) -> String {
+    format!(
+        "Parti dalla risorsa {handle}. Ogni risorsa che leggi contiene i riferimenti \
+         a quelle successive: segui la voce marcata 'current' finche' non arrivi \
+         all'ultima. Rispondi con il riferimento finale."
+    )
+}
+
+/// Il recupero non si annuncia: se il prompt dicesse "quando fallisce, leggi
+/// l'errore", misureremmo l'obbedienza. Dice solo il compito.
+fn istruzione_recupero(handle: &str) -> String {
+    format!("Leggi la risorsa {handle} e riportane il contenuto.")
+}
+
+impl ProbeCtx<'_> {
+    /// Un turno del loop. Gli errori del provider tornano DENTRO il Value (il
+    /// produttore non li propaga come `Err`): il loop li legge da `error_class` e
+    /// chiude inconclusivo.
+    async fn turno_del_loop(&self, messages_json: &str) -> Value {
+        let (tools_json, _, system_text) = self.request;
+        match self
+            .orchestrator
+            .neural
+            .generate_agent_turn_with_thinking(
+                self.provider,
+                self.model,
+                messages_json,
+                tools_json,
+                self.params.max_tokens,
+                system_text,
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            // Errore LOCALE (bridge non configurato, json invalido): non e' colpa
+            // del modello, e il loop lo trattera' come inconclusivo.
+            Err(e) => json!({ "error_class": "bridge_error", "stop_reason": "error",
+                              "error": e.to_string(), "tool_use_blocks": [] }),
+        }
+    }
+
+    /// UN tentativo multi-step: costruisce il mondo, gira il loop, e consegna un
+    /// turno sintetico coi FATTI sotto `measures` — dove il predicato li legge.
+    async fn multi_step_attempt(
+        &self,
+        kind: crate::probe_world::WorldKind,
+        attempt: i32,
+    ) -> (AttemptOutcome, i64) {
+        use crate::probe_world::{ScriptedWorld, TokenSeed};
+        let started = std::time::Instant::now();
+        let inconclusivo = |reason: String, ms: i64| {
+            (
+                AttemptOutcome {
+                    pass: false,
+                    inconclusive: true,
+                    reason,
+                    error_class: None,
+                    tool_call_count: 0,
+                    content_chars: 0,
+                    stop_reason: String::new(),
+                },
+                ms,
+            )
+        };
+
+        let seed = TokenSeed {
+            provider: self.provider.to_string(),
+            model: self.model.to_string(),
+            profile_key: self.profile.profile_key.clone(),
+            attempt,
+            // LIMITE DICHIARATO: senza la colonna `seed` in `ai_model_probe_evidence`
+            // (mig 0610) il seme e' fisso. I token restano diversi fra tentativi e
+            // fra modelli, ma un giro contestato non e' ancora rigiocabile da una
+            // riga di evidenza.
+            seed: 0,
+        };
+        let handle0 = seed.handle(0);
+        let istruzione = match kind {
+            crate::probe_world::WorldKind::Catena => istruzione_catena(&handle0),
+            crate::probe_world::WorldKind::Recupero => istruzione_recupero(&handle0),
+        };
+        let (_, _, system_text) = self.request;
+        // L'INVARIANTE del needle, qui come guard: nessun token puo' essere gia'
+        // visibile nella richiesta, o la catena e' scorciatoiabile.
+        let mut mondo = match ScriptedWorld::new(kind, seed, &[&istruzione, system_text]) {
+            Ok(m) => m,
+            Err(motivo) => {
+                return inconclusivo(
+                    format!("mondo_non_costruibile:{motivo}"),
+                    started.elapsed().as_millis() as i64,
+                )
+            }
+        };
+        let max_turns = self
+            .profile
+            .payload
+            .get("max_turns")
+            .and_then(Value::as_i64)
+            .unwrap_or(6) as usize;
+
+        let esito = tokio::time::timeout(
+            Duration::from_secs(self.params.timeout_s),
+            crate::probe_agentic_loop::run_loop(self, kind, &mut mondo, &istruzione, max_turns),
+        )
+        .await;
+        let latency_ms = started.elapsed().as_millis() as i64;
+
+        let Ok(out) = esito else {
+            return inconclusivo(format!("probe_timeout:{}s", self.params.timeout_s), latency_ms);
+        };
+        // Giro non attribuibile al modello (nostro cap, provider caduto): mai una
+        // bocciatura.
+        if let Some(motivo) = out.inconclusive {
+            return inconclusivo(motivo, latency_ms);
+        }
+        let m = &out.measures;
+        let turno = json!({
+            "content": "",
+            "stop_reason": "end_turn",
+            "tool_use_blocks": [],
+            "measures": {
+                "chained_links": m.chained_links,
+                "recovered": m.recovered,
+                F_REPEATED_FAILED: m.repeated_failed,
+                "bad_tool_syntax": m.bad_tool_syntax,
+            }
+        });
+        (
+            evaluate_attempt(&turno, &self.profile.pass_predicate, latency_ms),
+            latency_ms,
+        )
+    }
+}
+
+impl crate::probe_agentic_loop::TurnSource for ProbeCtx<'_> {
+    async fn turn(&self, messages_json: &str) -> Value {
+        self.turno_del_loop(messages_json).await
+    }
+}
+
 async fn build_profile_request(
+
     db: &PgPool,
     profile: &ProbeProfile,
 ) -> Result<(String, String, String), String> {
@@ -970,6 +1137,15 @@ async fn build_profile_request(
             ))
         }
         "long_context" => Ok(build_long_context_request(profile)),
+        // I due multi-step: qui si costruisce solo la cornice (tool + system).
+        // L'istruzione la completa `multi_step_attempt`, che conosce il seed e
+        // quindi l'handle di partenza; il resto della conversazione lo costruisce
+        // il loop, turno per turno, con le risposte del mondo finto.
+        KIND_TOOL_CHAIN | KIND_TOOL_RECOVERY => {
+            let tools = resolve_probe_tools(profile)?;
+            let system = resolve_probe_system(db, profile).await?;
+            Ok((tools.to_string(), String::new(), system))
+        }
         other => Err(format!("kind profilo non implementato: {other}")),
     }
 }
@@ -1073,7 +1249,14 @@ impl ProbeCtx<'_> {
     async fn single_attempt(
         &self,
         thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+        attempt: i32,
     ) -> (AttemptOutcome, i64) {
+        // I due kind multi-step non stanno in un turno solo: hanno bisogno del
+        // loop, del mondo finto e del taint tracking. E' l'unico punto in cui il
+        // giro si biforca.
+        if let Some(kind) = mondo_del_kind(&self.profile.kind) {
+            return self.multi_step_attempt(kind, attempt).await;
+        }
         let (tools_json, messages_json, system_text) = self.request;
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
@@ -1151,7 +1334,7 @@ async fn run_profile_attempts(
         first_fail_reason: None,
     };
     for attempt in 1..=ctx.params.repeat {
-        let (mut outcome, latency_ms) = ctx.single_attempt(thinking.clone()).await;
+        let (mut outcome, latency_ms) = ctx.single_attempt(thinking.clone(), attempt as i32).await;
         if !label.is_empty() {
             outcome.reason = format!("{label}{}", outcome.reason);
         }
