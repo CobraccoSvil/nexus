@@ -322,9 +322,18 @@ impl ScriptedWorld {
             self.token_errore = Some(tok.clone());
             // Il dato c'e', l'azione no: l'handle e' scaduto e l'errore dice quale
             // sia quello valido. Ripetere identico non puo' funzionare; leggere si'.
+            //
+            // `retryable: true`, NON false: l'errore porta `current_epoch` (l'invito
+            // implicito a riprovare col token fresco) e vietare il retry nello stesso
+            // messaggio era auto-contraddittorio — un modello allineato leggeva
+            // `retryable:false`, obbediva e si arrendeva, e il test lo bocciava per
+            // aver fatto cio' che gli si diceva (0/30 conclusivi, tutti no_recovery).
+            // Ora l'header e il dato concordano: riprova, ed ecco con cosa. Il test
+            // resta di CAPACITA' (l'istruzione non annuncia il recupero: il modello
+            // deve capire da se' di riusare current_epoch), non di obbedienza.
             return WorldReply::errore(
                 "E_HANDLE_STALE",
-                json!({ "current_epoch": tok, "retryable": false }),
+                json!({ "current_epoch": tok, "retryable": true }),
             );
         }
         match self.token_errore.as_deref() {
