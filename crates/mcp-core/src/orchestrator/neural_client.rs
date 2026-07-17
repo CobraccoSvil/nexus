@@ -23,8 +23,9 @@
 //!   ancora servito dal brain: il .docx viene ora assemblato interamente in
 //!   Rust (ZIP + OOXML), senza round-trip di rete (verso zero-Python).
 //!
-//! Restano sul gRPC al brain solo gli RPC batch/model-sync non toccati da questo
-//! refactoring.
+//! Al brain non resta NULLA: il servizio e' stato eliminato e il proto rimosso.
+//! Questo tipo e' ormai una facciata zero-sized che tiene in piedi le firme
+//! storiche dei call site — non un client di rete.
 
 use serde_json::{json, Value};
 

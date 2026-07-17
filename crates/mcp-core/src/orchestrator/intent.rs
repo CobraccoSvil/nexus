@@ -124,8 +124,10 @@ pub struct ClassifiedIntent {
     pub candidates: Vec<IntentCandidate>,
     pub is_ambiguous: bool,
     /// Slot canonici (action_verb, target_type, framework, scope) estratti
-    /// dal classifier LLM. Vuoto se il classifier keyword fallback e' stato
-    /// usato. Quando `slots.is_complete()` E `slots.confidence >= 0.60`, il
+    /// dal classifier LLM. Vuoto quando il classifier non ha risolto (fallback
+    /// di sistema): il "classifier keyword fallback" che li lasciava vuoti non
+    /// esiste piu' da quando l'interpretazione e' solo semantica.
+    /// Quando `slots.is_complete()` E `slots.confidence >= 0.60`, il
     /// router prova prima la `nexus_routing_slots_matrix` (mig 0133), e
     /// cade sul routing classico (intent, behavior_mode) se non c'e' match.
     pub slots: crate::routing_slots::ActionSlots,

@@ -280,6 +280,7 @@ condividere codice (fragile base class).
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
 | Pool DB metadati per-progetto (registry, elenco progetti, directory routing, cache pool) | crate `nexus-project-pools` (separazione sempre attiva, flag rimosso mig 0527); `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
+| Completion testuale via gateway per i crate FUORI da mcp-core (admin-service, worker di nexus-orchestrator) | `nexus-types/src/gateway_client.rs` (`gateway_text_complete`). Dentro mcp-core resta `nexus_gateway::NexusGatewayClient`. ADR 0041 |
 | Aggregazione problemi ripetitivi (pannello Problemi) | `mcp-core/src/project_workspace/problem_aggregation.rs` (`problem_group_key`, `aggregate_problems`); `get_project_problems` delega |
 | Dimensionamento dei panel multi-agente (quante figure/revisori/provider/avvocati) | `nexus-agent-graph/src/decisions/orchestration_sizing.rs` (`resolve_orchestration_plan`; i cap storici restano backstop). ADR 0040 |
 | Tesi contrapposte (assegnazione posizioni + selezione opzione) | `nexus-agent-graph/src/decisions/debate_panel.rs` (`plan_debate`, `compose_debate_synthesis`). ADR 0040 |

@@ -81,16 +81,15 @@
 //!    portare il classifier completo come debito residuo: senza, i turni shadow
 //!    SENZA `intent_hint` non hanno l'intent reale del primario.
 //!
-//! ## Stato (PRIMARIO, instradato globalmente)
+//! ## Stato: unico motore
 //!
-//! `select_engine` ritorna `rust` sulla riga jolly `*`=rust (regola G, tabella
-//! `nexus_orchestrator_engine`): il motore nativo Rust e' il PRIMARIO in
-//! produzione e questo path e' quello effettivamente eseguito per i nuovi run.
-//! `Engine::Python` resta solo come rollback per-scope esplicito (INERTE: il
-//! servizio brain e' stato rimosso, mig 0462/0532) e valore storico dei run
-//! `agent_runs.engine='python'`; il default difensivo (riga DB assente / DB down
-//! / valore non riconosciuto) e' `Engine::Rust`. L'instradamento e' un dato nel
-//! DB, non codice.
+//! Questo path esegue OGNI run agentico. Non c'e' piu' un instradamento da
+//! decidere: `select_engine` e la tabella `nexus_orchestrator_engine`
+//! sceglievano fra `Engine::{Rust, Python, Shadow}`, ma il brain Python e' stato
+//! rimosso (mig 0462/0532) e con lui gli altri due rami — Shadow incluso, il cui
+//! PRIMARIO era proprio Python. Enum, selettore e tabella sono spariti (mig
+//! 0609). `agent_runs.engine` resta valorizzato per il recovery, e i run storici
+//! conservano il valore che avevano davvero.
 
 use std::sync::Arc;
 
