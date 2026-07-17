@@ -433,11 +433,14 @@ pub(crate) fn derive_tier_prior(
 /// del modello). Overlap = pareggio: la riclassificazione ha bisogno di evidenza,
 /// la conservazione no.
 ///
-/// `current` = il tier gia' acquisito (per l'isteresi). `None` -> nessuna banda
-/// certificata: il chiamante ricade sul prior.
+/// `current_measured` = la banda gia' GUADAGNATA dalla batteria (solo se
+/// `tier_source='measured'`), per l'isteresi. `current_catalog` = il tier scritto
+/// nel catalogo da QUALUNQUE fonte, che serve al guard anti-declassamento.
+/// `None` -> nessuna banda certificata: il chiamante ricade sul prior.
 pub(crate) fn derive_tier_measured(
     runs: &[(ProfileRun, Option<String>)],
-    current: Option<&str>,
+    current_measured: Option<&str>,
+    current_catalog: Option<&str>,
     hold_min: u32,
 ) -> Option<String> {
     use nexus_agent_graph::decisions::tiers::tier_rank;
@@ -446,19 +449,137 @@ pub(crate) fn derive_tier_measured(
         let Some(banda) = certifies.as_deref() else {
             continue; // il profilo non certifica un tier (es. tool_smoke)
         };
-        let acquisita = current.is_some_and(|c| tier_rank(banda) <= tier_rank(c));
-        // Soglia asimmetrica: piu' bassa per CONSERVARE una banda gia' acquisita,
-        // piu' alta per conquistarne una nuova.
-        let soglia = if acquisita {
-            hold_min.min(run.promote_min)
-        } else {
-            run.promote_min
-        };
-        if run.passes >= soglia && migliore.is_none_or(|m| tier_rank(banda) > tier_rank(m)) {
+        if run.passes >= soglia_banda(run, banda, current_measured, hold_min)
+            && !scala_rotta_sotto(runs, banda)
+            && migliore.is_none_or(|m| tier_rank(banda) > tier_rank(m))
+        {
             migliore = Some(banda);
         }
     }
-    migliore.map(str::to_string)
+    // IL SILENZIO NON DECLASSA. Se la banda certificata e' piu' bassa di quella
+    // che il catalogo ha gia', si scende SOLO fino alla piu' alta che nessuno ha
+    // negato — non fino a `migliore`. Senza questo, un parco intero crolla a
+    // `medium` appena la batteria smette di poter certificare le bande alte: le
+    // misure che mancano verrebbero lette come bocciature. E' misurato: al
+    // 2026-07-17, con `agentic_chain`/`agentic_recovery` non implementati, 14
+    // modelli su 29 sarebbero scesi di fascia — a partire da grok-4.5 (indice
+    // 45.7, il migliore del parco), che nessun profilo ha mai contestato.
+    match (migliore, current_catalog) {
+        (Some(m), Some(c)) if tier_rank(m) < tier_rank(c) => {
+            match banda_piu_alta_non_negata(runs, c) {
+                // Nessuno ha contestato la banda che il modello ha gia': non si
+                // declassa. E non si riscrive nemmeno `c` come `measured`, che
+                // sarebbe un riciclo del prior — l'indice esterno si farebbe
+                // certificare dalla batteria senza aver superato un solo probe, e
+                // `measured` batte `synced`: l'autocorrezione dell'indice si
+                // congelerebbe per sempre.
+                Some(p) if p == c => None,
+                // La banda del catalogo E' stata negata: si scende, ma solo fino
+                // alla prima che nessuno ha contestato. `p >= m` per costruzione
+                // (`m` e' certificato, quindi non e' negato).
+                Some(p) => Some(p.to_string()),
+                // `c` non appartiene alla scala (refuso, valore legacy): non e' un
+                // gradino da cui scendere. Vale la banda certificata.
+                None => Some(m.to_string()),
+            }
+        }
+        (m, _) => m.map(str::to_string),
+    }
+}
+
+/// I pass necessari perche' `banda` valga, con l'isteresi.
+///
+/// Asimmetrica per costruzione: conservare costa meno che conquistare, e il gap fra
+/// le due soglie E' l'isteresi (senza, un modello oscillerebbe di fascia a ogni
+/// riqualifica e destabilizzerebbe il routing).
+///
+/// La soglia bassa spetta solo a chi la banda l'ha GUADAGNATA dalla batteria
+/// (`current_measured`), mai a un prior dell'indice: leggendo il tier del catalogo
+/// senza guardarne la fonte, un modello con synced=heavy si teneva heavy con 2/4
+/// invece di 3/4 — l'indice esterno si autocertificava con la nostra clemenza.
+fn soglia_banda(
+    run: &ProfileRun,
+    banda: &str,
+    current_measured: Option<&str>,
+    hold_min: u32,
+) -> u32 {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let acquisita = current_measured.is_some_and(|c| tier_rank(banda) <= tier_rank(c));
+    if acquisita {
+        hold_min.min(run.promote_min)
+    } else {
+        run.promote_min
+    }
+}
+
+/// `true` se sotto `banda` c'e' un gradino NEGATO: allora `banda` non vale, perche'
+/// la scala dev'essere una scala.
+///
+/// `agentic_longctx` certifica `frontier` (il vertice) ed e' l'unico profilo alto
+/// implementato: senza questo, un modello che fallisce la catena e il recupero ma
+/// ritrova l'ago si prende `frontier`, scavalcando i gradini che non ha salito.
+/// Il test e' la NON-NEGAZIONE, non la certificazione positiva: pretendere che tutte
+/// le bande inferiori passino congelerebbe quelle alte ogni volta che la rete cade
+/// su un anello intermedio.
+fn scala_rotta_sotto(runs: &[(ProfileRun, Option<String>)], banda: &str) -> bool {
+    bande_inferiori(banda)
+        .iter()
+        .any(|b| banda_negata(runs, b))
+}
+
+/// `true` se il giro NEGA `banda` con evidenza attribuibile al MODELLO: il profilo
+/// che la certifica e' girato, e' rimasto sotto la sua soglia e ha almeno un
+/// fallimento CONCLUSIVO.
+///
+/// Un profilo mai girato, non costruibile (kind non implementato) o solo
+/// inconclusivo NON e' una negazione: e' silenzio. La distinzione e' tutta qui —
+/// "non l'ho provato" e "l'ha fallito" sono cose opposte, e trattarle uguale
+/// declassa i modelli per i difetti della batteria invece che per i loro.
+fn banda_negata(runs: &[(ProfileRun, Option<String>)], banda: &str) -> bool {
+    runs.iter().any(|(r, b)| {
+        b.as_deref() == Some(banda) && !r.passed() && r.conclusive_fails > 0
+    })
+}
+
+/// Le bande sotto `banda` nella scala canonica (punto unico `PERFORMANCE_TIERS`,
+/// regola L: la scala non si riscrive a mano).
+fn bande_inferiori(banda: &str) -> Vec<&'static str> {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let r = tier_rank(banda);
+    nexus_types::tiers::PERFORMANCE_TIERS
+        .iter()
+        .copied()
+        .filter(|b| tier_rank(b) < r)
+        .collect()
+}
+
+/// La banda del vocabolario canonico che corrisponde a `t`. `None` = valore fuori
+/// scala (refuso, tier legacy): il chiamante non lo tratta come un gradino.
+fn banda_canonica(t: &str) -> Option<&'static str> {
+    nexus_types::tiers::PERFORMANCE_TIERS
+        .iter()
+        .copied()
+        .find(|b| b.eq_ignore_ascii_case(t.trim()))
+}
+
+/// Scendendo da `tetto`, la prima banda che il giro non ha negato. E' il pavimento
+/// del declassamento: si perde un gradino per volta, e solo dove c'e' una bocciatura
+/// vera. `None` = `tetto` non e' una banda della scala.
+fn banda_piu_alta_non_negata(
+    runs: &[(ProfileRun, Option<String>)],
+    tetto: &str,
+) -> Option<&'static str> {
+    let mut scesa = banda_canonica(tetto)?;
+    loop {
+        if !banda_negata(runs, scesa) {
+            return Some(scesa);
+        }
+        match bande_inferiori(scesa).last() {
+            Some(b) => scesa = b,
+            // Negata anche la banda piu' bassa: non si scende sotto la scala.
+            None => return Some(scesa),
+        }
+    }
 }
 
 /// Verdetto NEGATIVO della batteria, se c'e'. Distingue le due cause, che non
@@ -1064,10 +1185,31 @@ async fn attach_measured_tier(
             (r.clone(), banda)
         })
         .collect();
-    // Il tier ATTUALE serve all'isteresi: conservare una banda gia' acquisita
-    // costa meno che conquistarne una nuova.
-    let current: Option<String> = sqlx::query_scalar(
-        "SELECT performance_tier FROM ai_price_catalog \
+    let (tier_catalogo, banda_guadagnata) = tier_corrente(db, provider, model).await;
+    derived.measured_tier = derive_tier_measured(
+        &con_bande,
+        banda_guadagnata.as_deref(),
+        tier_catalogo.as_deref(),
+        hold_min_passes(profiles),
+    );
+}
+
+/// Il tier del modello nel catalogo, in DUE valori che non vanno confusi:
+///   - `.0` il tier scritto da QUALUNQUE fonte: e' il pavimento del declassamento,
+///     da li' si scende un gradino alla volta e solo dove c'e' una bocciatura vera;
+///   - `.1` la banda GUADAGNATA dalla batteria (solo `tier_source='measured'`):
+///     l'unica che ha diritto all'isteresi.
+///
+/// Leggendo il solo `performance_tier` — come faceva prima — un prior dell'indice
+/// esterno si teneva la sua fascia con la soglia di conservazione: si autocertificava
+/// con una clemenza pensata per chi la banda l'aveva dimostrata.
+async fn tier_corrente(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> (Option<String>, Option<String>) {
+    let riga: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT performance_tier, tier_source FROM ai_price_catalog \
           WHERE provider = $1 AND model = $2 LIMIT 1",
     )
     .bind(provider)
@@ -1075,10 +1217,13 @@ async fn attach_measured_tier(
     .fetch_optional(db)
     .await
     .ok()
-    .flatten()
     .flatten();
-    derived.measured_tier =
-        derive_tier_measured(&con_bande, current.as_deref(), hold_min_passes(profiles));
+    let (tier, fonte) = riga.unwrap_or((None, None));
+    let guadagnata = match fonte.as_deref() {
+        Some("measured") => tier.clone(),
+        _ => None,
+    };
+    (tier, guadagnata)
 }
 
 /// Esegue la batteria su UN modello candidato (gia' claimato `probing`).
@@ -1850,7 +1995,13 @@ mod tests {
         assert_eq!(derive_tier_prior(None, &soglie()), None);
     }
 
+    /// Un giro in cui i tentativi non superati sono BOCCIATURE vere: il modello ha
+    /// risposto e non ha fatto il lavoro. E' l'unico caso che nega una banda.
     fn run(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
+        run_conclusive(key, passes, promote_min)
+    }
+
+    fn run_conclusive(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
         ProfileRun {
             profile_key: key.to_string(),
             grants: vec![],
@@ -1858,6 +2009,26 @@ mod tests {
             passes,
             conclusive_fails: 4 - passes,
             inconclusive: 0,
+            promote_min,
+            first_fail_reason: None,
+        }
+    }
+
+    /// Un giro in cui i tentativi non superati sono INCONCLUSIVI: rate limit,
+    /// timeout, provider giu', profilo non costruibile. Il modello non e' stato
+    /// misurato, quindi non ha negato niente.
+    ///
+    /// Questo helper esiste perche' `run()` fissava `inconclusive: 0` e il ramo
+    /// del silenzio non era esercitato da nessun test: il doc prometteva "si
+    /// retrocede solo con fallimenti CONCLUSIVI" e il codice non li leggeva.
+    fn run_inconclusive(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
+        ProfileRun {
+            profile_key: key.to_string(),
+            grants: vec![],
+            is_blocking: false,
+            passes,
+            conclusive_fails: 0,
+            inconclusive: 4 - passes,
             promote_min,
             first_fail_reason: None,
         }
@@ -1873,7 +2044,7 @@ mod tests {
             (run("agentic_chain", 3, 3), Some("high".to_string())),
             (run("agentic_recovery", 1, 3), Some("heavy".to_string())), // NON superata
         ];
-        assert_eq!(derive_tier_measured(&runs, None, 2), Some("high".to_string()),
+        assert_eq!(derive_tier_measured(&runs, None, None, 2), Some("high".to_string()),
             "3/4 su agentic_chain promuove a high; agentic_recovery con 1/4 non certifica heavy");
     }
 
@@ -1884,7 +2055,7 @@ mod tests {
             (run("tool_smoke", 4, 3), None),
             (run("chat_smoke", 4, 3), Some("light".to_string())),
         ];
-        assert_eq!(derive_tier_measured(&runs, None, 2), Some("light".to_string()));
+        assert_eq!(derive_tier_measured(&runs, None, None, 2), Some("light".to_string()));
     }
 
     /// L'ISTERESI: la soglia per CONSERVARE una banda gia' acquisita e' piu'
@@ -1895,12 +2066,102 @@ mod tests {
         // 2 pass su 4: sotto promote_min (3) ma sopra hold_min (2).
         let runs = vec![(run("agentic_recovery", 2, 3), Some("heavy".to_string()))];
         // Chi e' GIA' heavy la mantiene (2 >= hold_min).
-        assert_eq!(derive_tier_measured(&runs, Some("heavy"), 2), Some("heavy".to_string()),
+        assert_eq!(derive_tier_measured(&runs, Some("heavy"), Some("heavy"), 2), Some("heavy".to_string()),
             "banda acquisita: si conserva con hold_min, la conservazione non ha              bisogno di evidenza nuova");
         // Chi e' medium NON la conquista (2 < promote_min): serve piu' evidenza
         // per salire che per restare.
-        assert_eq!(derive_tier_measured(&runs, Some("medium"), 2), None,
+        assert_eq!(derive_tier_measured(&runs, Some("medium"), Some("medium"), 2), None,
             "banda NUOVA: serve promote_min. Il gap fra le due soglie E' l'isteresi");
+    }
+
+    // ── Il silenzio non declassa ────────────────────────────────────────────
+    //
+    // Il doc di `derive_tier_measured` prometteva da sempre "si retrocede solo
+    // sotto hold_min E con fallimenti CONCLUSIVI", ma il codice non leggeva mai
+    // `conclusive_fails`: nessun test poteva accorgersene perche' l'helper `run()`
+    // fissava `inconclusive: 0`. Questi test esercitano il ramo che mancava.
+
+    /// LA REGRESSIONE MISURATA (2026-07-17): con `agentic_chain` e
+    /// `agentic_recovery` non implementati, i loro profili chiudono INCONCLUSIVI.
+    /// Un modello che passa solo `agentic_real` avrebbe preso `measured=medium`, e
+    /// siccome `measured` batte `synced` sarebbe stato declassato da frontier: e'
+    /// il caso di x-ai/grok-4.5 (indice 45.7, il migliore del parco), che nessun
+    /// profilo ha mai contestato. 14 modelli su 29 sarebbero scesi cosi'.
+    #[test]
+    fn una_banda_mai_provata_non_declassa_chi_ce_l_ha_gia() {
+        let runs = vec![
+            (run_conclusive("chat_smoke", 1, 1), Some("light".to_string())),
+            (run_conclusive("agentic_real", 3, 3), Some("medium".to_string())),
+            // I due kind non implementati: il profilo non e' costruibile -> nessun
+            // pass, nessuna bocciatura. SILENZIO.
+            (run_inconclusive("agentic_chain", 0, 3), Some("high".to_string())),
+            (run_inconclusive("agentic_recovery", 0, 3), Some("heavy".to_string())),
+            (run_inconclusive("agentic_longctx", 0, 3), Some("frontier".to_string())),
+        ];
+        assert_eq!(
+            derive_tier_measured(&runs, None, Some("frontier"), 2),
+            None,
+            "nessuna banda alta e' stata NEGATA: non si scrive un measured che \
+             declassa. 'non l'ho provato' non e' 'l'ha fallito'"
+        );
+    }
+
+    /// Il contrario: se il modello ha DAVVERO fallito la banda che aveva, si
+    /// scende. Ma di UN gradino, fino alla piu' alta non contestata — non fino
+    /// alla piu' alta certificata.
+    #[test]
+    fn una_negazione_conclusiva_declassa_di_un_gradino_solo() {
+        let runs = vec![
+            (run_conclusive("agentic_real", 3, 3), Some("medium".to_string())),
+            // heavy NEGATO con evidenza: il modello ha risposto e ha sbagliato.
+            (run_conclusive("agentic_recovery", 0, 3), Some("heavy".to_string())),
+            // high: mai provato (silenzio).
+            (run_inconclusive("agentic_chain", 0, 3), Some("high".to_string())),
+        ];
+        assert_eq!(
+            derive_tier_measured(&runs, Some("heavy"), Some("heavy"), 2),
+            Some("high".to_string()),
+            "heavy e' stato negato -> si scende, ma a high, che nessuno ha \
+             contestato. Scendere a medium punirebbe il modello per i due profili \
+             che non abbiamo saputo eseguire"
+        );
+    }
+
+    /// LA SCALA E' UNA SCALA: `agentic_longctx` certifica `frontier` (il vertice)
+    /// ed e' l'unico profilo alto implementato. Senza il guard, un modello che
+    /// fallisce la catena ma ritrova l'ago si prende il tier piu' alto di tutti,
+    /// scavalcando i gradini che non ha salito.
+    #[test]
+    fn frontier_non_scavalca_una_banda_inferiore_negata() {
+        let runs = vec![
+            (run_conclusive("agentic_real", 3, 3), Some("medium".to_string())),
+            (run_conclusive("agentic_chain", 0, 3), Some("high".to_string())), // NEGATA
+            (run_conclusive("agentic_longctx", 4, 3), Some("frontier".to_string())),
+        ];
+        assert_eq!(
+            derive_tier_measured(&runs, None, None, 2),
+            Some("medium".to_string()),
+            "ha trovato l'ago ma non sa concatenare due tool: frontier scavalcherebbe \
+             high, che ha fallito davanti a noi"
+        );
+    }
+
+    /// L'isteresi protegge una banda GUADAGNATA, non un prior dell'indice esterno:
+    /// il `tier_source` distingue le due cose. Senza, un synced=heavy si teneva
+    /// heavy con la soglia bassa — l'indice si autocertificava con la nostra
+    /// clemenza — e un giro tutto inconclusivo avrebbe riciclato il prior in
+    /// `measured` con zero probe superati.
+    #[test]
+    fn un_prior_synced_non_gode_dell_isteresi_ne_diventa_measured_a_vuoto() {
+        let runs = vec![(run_conclusive("agentic_recovery", 2, 3), Some("heavy".to_string()))];
+        // Il catalogo dice heavy, ma NON l'ha guadagnato la batteria (synced):
+        // 2/4 non basta a conquistarlo (serve promote_min=3).
+        assert_eq!(
+            derive_tier_measured(&runs, None, Some("heavy"), 2),
+            None,
+            "il prior dell'indice non ha diritto alla soglia di conservazione: \
+             quella spetta a chi la banda l'ha dimostrata"
+        );
     }
     /// IL CERCHIO SI CHIUDE: la batteria SCRIVE il tier misurato, e la curatela
     /// dell'admin vince sempre.
