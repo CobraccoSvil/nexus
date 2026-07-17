@@ -1662,6 +1662,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         bottomPanelVisible={bottomPanelVisible}
         isFullscreen={isFullscreen}
         providerStatus={providerStatus}
+        // In editor-center il pannello unico e' voluto, non subito: niente avviso.
+        fixedPanelHidden={rightPanelCollapsed && layoutMode !== "editor-center"}
         onTogglePrimarySidebar={() => setPrimarySidebarVisible((current) => !current)}
         onToggleBottomPanel={() => setBottomPanelVisible((current) => !current)}
         onCycleLayoutMode={cycleLayoutMode}

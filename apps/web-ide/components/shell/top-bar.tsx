@@ -199,6 +199,7 @@ export function TopBar({
   onSelectProject,
   onRegisterProject,
   onRefreshProjects,
+  fixedPanelHidden = false,
 }: {
   tc: ReturnType<typeof useThemeColors>;
   isMobileViewport: boolean;
@@ -210,6 +211,10 @@ export function TopBar({
   bottomPanelVisible: boolean;
   isFullscreen: boolean;
   providerStatus: ProviderStatusMap;
+  /** Il pannello a larghezza fissa (editor/SQL) e' a 0px perche' lo spazio non
+   *  basta per due colonne. Senza dirlo, sparisce in silenzio e nessun tasto
+   *  sembra riportarlo: il layout promette due pannelli e ne mostra uno. */
+  fixedPanelHidden?: boolean;
   onTogglePrimarySidebar: () => void;
   onToggleBottomPanel: () => void;
   onCycleLayoutMode: () => void;
@@ -274,12 +279,53 @@ export function TopBar({
       <button
         type="button"
         onClick={onCycleLayoutMode}
-        title={`Cambia layout (${layoutMode})`}
+        title={
+          fixedPanelHidden
+            ? `Cambia layout (${layoutMode}) — l'editor e' nascosto: lo spazio non basta per due pannelli`
+            : `Cambia layout (${layoutMode})`
+        }
         aria-label={`Cambia layout (${layoutMode})`}
         style={iconButton(tc)}
       >
         ⧉
       </button>
+      {/* Avviso, non automatismo: il pannello sparito si spiega e offre la sua
+          via d'uscita. Ciclare il layout non lo riporta (lo spazio resta quello),
+          quindi senza questo l'unico rimedio - chiudere la sidebar - non e'
+          deducibile da nessun tasto. Con la sidebar gia' chiusa resta solo
+          allargare la finestra, e lo dice. */}
+      {fixedPanelHidden && (
+        <button
+          type="button"
+          onClick={primarySidebarVisible ? onTogglePrimarySidebar : undefined}
+          disabled={!primarySidebarVisible}
+          title={
+            primarySidebarVisible
+              ? "Editor nascosto: lo spazio non basta per due pannelli. Clicca per chiudere la sidebar e farlo tornare."
+              : "Editor nascosto: lo spazio non basta per due pannelli. Allarga la finestra per farlo tornare."
+          }
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            height: 30,
+            padding: "0 8px",
+            borderRadius: 7,
+            border: `1px solid ${tc.warning}`,
+            background: "transparent",
+            color: tc.warning,
+            cursor: primarySidebarVisible ? "pointer" : "default",
+            fontSize: 11,
+            fontWeight: 600,
+            fontFamily: "inherit",
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+          }}
+        >
+          <span aria-hidden="true">◫</span>
+          {!isNarrowViewport && <span>Editor nascosto</span>}
+        </button>
+      )}
       <button
         type="button"
         onClick={onToggleFullscreen}
