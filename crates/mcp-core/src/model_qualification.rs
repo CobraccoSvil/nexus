@@ -2950,4 +2950,77 @@ mod tests {
         let turn = json!({ "content": "ok", "stop_reason": "end_turn" });
         assert!(evaluate_attempt(&turn, &pred, 100).pass);
     }
+
+    /// REGRESSIONE del giro muto del 2026-07-17: 32 tentativi su 32 inconclusive con
+    /// "mondo_non_costruibile", perche' il guard vietava l'handle di partenza che
+    /// l'istruzione DEVE nominare.
+    ///
+    /// Questo test raggiunge il mondo per la STESSA strada della produzione (regola O):
+    /// l'istruzione la costruisce `istruzione_catena`/`istruzione_recupero`, gli stessi
+    /// produttori che chiama `multi_step_attempt`. I 17 test che c'erano prima
+    /// passavano tutti una richiesta VUOTA (`&[]`) o un token a valle: nessuno costruiva
+    /// il mondo come lo costruisce chi lo usa davvero, e per questo 39 test verdi
+    /// certificavano un motore che non poteva partire.
+    #[test]
+    fn il_mondo_si_costruisce_con_l_istruzione_vera() {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
+
+        for (kind, profilo) in [
+            (WorldKind::Catena, "agentic_chain"),
+            (WorldKind::Recupero, "agentic_recovery"),
+        ] {
+            let seed = TokenSeed {
+                provider: "mistral".into(),
+                model: "mistral-medium-2604".into(),
+                profile_key: profilo.into(),
+                attempt: 1,
+                seed: 42,
+            };
+            // Esattamente cio' che fa `multi_step_attempt`: handle0 -> istruzione.
+            let handle0 = seed.handle(0);
+            let istruzione = match kind {
+                WorldKind::Catena => istruzione_catena(&handle0),
+                WorldKind::Recupero => istruzione_recupero(&handle0),
+            };
+            assert!(
+                istruzione.contains(&handle0),
+                "{profilo}: l'istruzione deve nominare l'anello di partenza, o il \
+                 modello non ha da dove cominciare"
+            );
+
+            let mondo = ScriptedWorld::new(kind, seed.clone(), &[&istruzione, "system"]);
+            assert!(
+                mondo.is_ok(),
+                "{profilo}: il mondo deve costruirsi con l'istruzione VERA, non solo \
+                 con una richiesta vuota. Motivo del rifiuto: {:?}",
+                mondo.err()
+            );
+        }
+    }
+
+    /// L'altra meta' dell'invariante, che il fix NON deve aver spento: un token a
+    /// valle nella richiesta rende la catena scorciatoiabile, e il mondo si rifiuta.
+    #[test]
+    fn un_handle_a_valle_nell_istruzione_resta_vietato() {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
+
+        let seed = TokenSeed {
+            provider: "mistral".into(),
+            model: "mistral-medium-2604".into(),
+            profile_key: "agentic_chain".into(),
+            attempt: 1,
+            seed: 42,
+        };
+        let trapelato = seed.handle(3);
+        let istruzione = format!("{} (e la risposta e' {trapelato})", istruzione_catena(&seed.handle(0)));
+        assert!(
+            ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&istruzione]).is_err(),
+            "un anello a valle visibile nella richiesta deve impedire il giro"
+        );
+        assert!(
+            ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&format!("esca {}", seed.esca(0))])
+                .is_err(),
+            "un'esca viaggia solo nelle risposte: nella richiesta deve impedire il giro"
+        );
+    }
 }

@@ -166,11 +166,19 @@ pub(crate) struct ScriptedWorld {
 }
 
 impl ScriptedWorld {
-    /// Costruisce il mondo. `Err` se un token comparirebbe gia' nella richiesta
-    /// iniziale: `long_context` affida la stessa regola a un COMMENTO ("il needle non
-    /// compare MAI nel system prompt"), qui e' un invariante che costa tre `contains`
-    /// e trasforma una promessa in un guard. Un token gia' visibile renderebbe la
-    /// catena scorciatoiabile e il test misurerebbe la nostra ingenuita'.
+    /// Costruisce il mondo. `Err` se un token che va GUADAGNATO comparirebbe gia'
+    /// nella richiesta iniziale: `long_context` affida la stessa regola a un COMMENTO
+    /// ("il needle non compare MAI nel system prompt"), qui e' un invariante che costa
+    /// due `contains` e trasforma una promessa in un guard. Un token a valle gia'
+    /// visibile renderebbe la catena scorciatoiabile e il test misurerebbe la nostra
+    /// ingenuita' invece del modello.
+    ///
+    /// `handle(0)` e' l'ECCEZIONE, e non e' un'indulgenza: e' l'anello di partenza, e
+    /// la richiesta DEVE nominarlo o il modello non ha da dove cominciare (lo dice
+    /// `handle_iniziale`). Vietarlo insieme agli altri e' costato 32 giri su 32
+    /// inconclusive: il guard rifiutava esattamente cio' che il progetto impone.
+    /// Il mondo sa da se' qual e' il suo ingresso e non chiede al chiamante di
+    /// dichiararlo: nessun accordo da tenere allineato, quindi nessuno da rompere.
     pub(crate) fn new(
         kind: WorldKind,
         seed: TokenSeed,
@@ -184,11 +192,19 @@ impl ScriptedWorld {
             guasto_scattato: false,
             token_errore: None,
         };
+        let nella_richiesta =
+            |tok: &str| richiesta_iniziale.iter().any(|t| t.contains(tok));
         for k in 0..8 {
-            for tok in [mondo.seed.handle(k), mondo.seed.esca(k)] {
-                if richiesta_iniziale.iter().any(|t| t.contains(&tok)) {
-                    return Err(format!("token {tok} gia' presente nella richiesta"));
-                }
+            // Gli handle a valle si guadagnano seguendo la catena; le esche viaggiano
+            // solo nelle risposte, quindi nessuna e' ammessa nella richiesta.
+            if k > 0 && nella_richiesta(&mondo.seed.handle(k)) {
+                return Err(format!(
+                    "token a valle {} gia' presente nella richiesta",
+                    mondo.seed.handle(k)
+                ));
+            }
+            if nella_richiesta(&mondo.seed.esca(k)) {
+                return Err(format!("esca {} gia' presente nella richiesta", mondo.seed.esca(k)));
             }
         }
         Ok(mondo)
