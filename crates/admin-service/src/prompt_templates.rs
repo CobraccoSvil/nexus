@@ -14,66 +14,21 @@ use std::collections::HashSet;
 
 use crate::AppState;
 
-/// Token di servizio per autenticarsi al Nexus Gateway. Segreto (non porta/modello,
-/// quindi ammesso in env come negli altri call site del gateway, es.
-/// `NexusGatewayClient::from_db` in mcp-core). Fallback al token dev interno.
-fn gateway_service_token() -> String {
-    std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string())
-}
-
-/// Esegue una completion testuale via Nexus Gateway (`POST /v1/complete`).
+/// Esegue una completion testuale via Nexus Gateway per gli handler admin.
 ///
-/// PUNTO UNICO (regola L) della chiamata al gateway per gli handler admin: prima
-/// le tre call site facevano POST diretti a `{brain_url}/generate` (brain Python
-/// eliminato). Risolve l'URL del gateway dal DB (`settings.nexus_gateway_port`,
-/// regola G: niente porta hardcoded) e instrada `{provider, model, prompt}` come
-/// richiesta `LlmRequest` del gateway: il `provider` diventa `pin_provider` per
-/// eseguire ESATTAMENTE il provider+modello gia' risolto a monte (niente secondo
-/// routing divergente, regola G). Ritorna il testo generato (`LlmResponse.content`).
+/// Delega al PUNTO UNICO cross-crate `nexus_types::gateway_client`
+/// (regola L): la stessa chiamata serve anche ai worker di nexus-orchestrator,
+/// e due copie divergerebbero. Qui resta solo l'adattamento del tipo d'errore
+/// (`String` -> `anyhow`) atteso dai chiamanti di questo modulo.
 async fn gateway_generate(
     db: &PgPool,
-    client: &nexus_http::NexusClient,
     provider: &str,
     model: &str,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
-    let gw_url = format!("http://127.0.0.1:{gw_port}");
-    let token = gateway_service_token();
-
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{ "role": "user", "content": prompt }],
-        "pin_provider": provider,
-        "metadata": {
-            "tenant_id": "nexus",
-            "user_id": "admin-service",
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "feature": "admin",
-        },
-    });
-
-    let resp = client
-        .post(&format!("{gw_url}/v1/complete"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&body)
-        .send()
+    nexus_types::gateway_client::gateway_text_complete(db, provider, model, prompt, "admin", None)
         .await
-        .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Nexus Gateway {status}: {text}");
-    }
-
-    let result: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("Nexus Gateway response parse: {e}"))?;
-
-    Ok(result["content"].as_str().unwrap_or("").to_string())
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 // TemplateCache e get_template_or_default: punto unico in nexus-types
@@ -541,9 +496,8 @@ Rispondi SOLO con il nuovo testo del prompt, senza preamboli."#,
 
     // Completion LLM via Nexus Gateway (brain Python eliminato): punto unico
     // gateway_generate, URL risolto dal DB (regola G).
-    let client = nexus_http::NexusClient::with_timeout(60);
 
-    let suggestion = gateway_generate(&state.db, &client, provider, model, &meta_prompt)
+    let suggestion = gateway_generate(&state.db, provider, model, &meta_prompt)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
         .trim()
@@ -587,7 +541,7 @@ Rispondi con SOLO un array JSON valido, senza commenti, senza markdown:
         tools_list = tools_list,
     );
 
-    if let Ok(tools_text) = gateway_generate(&state.db, &client, provider, model, &tools_prompt).await {
+    if let Ok(tools_text) = gateway_generate(&state.db, provider, model, &tools_prompt).await {
         // Estrai array JSON dalla risposta (puo avere testo prima/dopo)
         let cleaned = extract_json_array(&tools_text);
         if let Ok(tools) = serde_json::from_str::<Vec<SuggestedTool>>(&cleaned) {
@@ -839,7 +793,6 @@ async fn run_batch_assign_tools_job(
 
     // Completion LLM via Nexus Gateway (brain Python eliminato): punto unico
     // gateway_generate, URL risolto dal DB (regola G).
-    let client = nexus_http::NexusClient::with_timeout(30);
 
     // Lista compatta token-saver (stesso formato di mcp-core): `server::tool` senza descrizioni lunghe.
     let mut tool_lines: Vec<String> = Vec::new();
@@ -910,7 +863,7 @@ Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
 [{{"tool_name":"read_file","tool_server":"nexus_builtin"}},{{"tool_name":"browser.navigate","tool_server":"Nexus Browser Bridge (localci)","usage_context":"navigazione E2E"}}]"#,
         );
 
-        match gateway_generate(&state.db, &client, &admin_provider, &admin_model, &prompt).await {
+        match gateway_generate(&state.db, &admin_provider, &admin_model, &prompt).await {
             Ok(content_text) => {
                 let content_str = if content_text.is_empty() { "[]" } else { content_text.as_str() };
                 let json_str = extract_json_array(content_str);

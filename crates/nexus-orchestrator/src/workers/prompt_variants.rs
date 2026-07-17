@@ -12,11 +12,17 @@
 //!    `schema_type` e `placeholder_vars` dalla riga baseline (fix del bug per
 //!    cui venivano scritti valori hardcoded uguali per ogni prompt).
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use tracing::{error, info};
 
-/// Modalita' della chiamata `POST /agent/prompt-revise` del brain.
+/// Esito canonico di una revisione andata a buon fine. E' il valore che
+/// `PromptOptimizerWorker` e `GuidelineAlignmentWorker` verificano prima di
+/// usare il risultato: sta qui, una volta sola, invece di essere una stringa
+/// ripetuta nei call site (regola L/N).
+pub const REVISE_STATUS_COMPLETED: &str = "completed";
+
+/// Modalita' della valutazione richiesta al modello.
 #[derive(Debug, Clone, Copy)]
 pub enum ReviseMode {
     /// Solo valutazione di conformita' (nessuna riscrittura del template).
@@ -26,16 +32,23 @@ pub enum ReviseMode {
 }
 
 impl ReviseMode {
-    fn as_str(self) -> &'static str {
+    /// Istruzione che la modalita' impone al modello. Sta sull'enum: aggiungere
+    /// una modalita' obbliga il compilatore a dichiararne l'istruzione.
+    const fn instruction(self) -> &'static str {
         match self {
-            ReviseMode::Evaluate => "evaluate",
-            ReviseMode::EvaluateAndRevise => "evaluate_and_revise",
+            ReviseMode::Evaluate => {
+                "NON riscrivere il template: valuta soltanto. Lascia `revised_template` a null."
+            }
+            ReviseMode::EvaluateAndRevise => {
+                "Riscrivi il template correggendo i problemi trovati, conservandone scopo, \
+                 placeholder e struttura. Metti la versione riscritta in `revised_template`."
+            }
         }
     }
 }
 
-/// Origine dei segnali passati al brain: il loop guideline-driven o quello
-/// reflection-driven. Determina come il brain pesa i criteri di valutazione.
+/// Origine dei segnali: il loop guideline-driven o quello reflection-driven.
+/// Determina come il modello pesa i criteri di valutazione.
 #[derive(Debug, Clone, Copy)]
 pub enum SignalKind {
     Guideline,
@@ -43,17 +56,29 @@ pub enum SignalKind {
 }
 
 impl SignalKind {
-    fn as_str(self) -> &'static str {
+    /// Come il modello deve pesare i criteri, data l'origine dei segnali.
+    const fn weighting(self) -> &'static str {
         match self {
-            SignalKind::Guideline => "guideline",
-            SignalKind::Reflection => "reflection",
+            SignalKind::Guideline => {
+                "I segnali vengono dalle linee guida di progetto: pesa la conformita' alle direttive."
+            }
+            SignalKind::Reflection => {
+                "I segnali vengono dalla reflection sui run reali: pesa l'efficacia osservata sul campo."
+            }
         }
     }
 }
 
-/// Esito strutturato di `POST /agent/prompt-revise` (contratto brain).
+/// Esito strutturato della valutazione di un prompt.
+///
+/// I campi valutativi (`overall_score`, `dimensions`, `issues`,
+/// `revised_template`, `rationale`) vengono dal modello; `status`, `model_used`
+/// e `duration_ms` li valorizza [`call_prompt_revise`] coi fatti misurati.
 #[derive(Debug, Deserialize)]
 pub struct PromptReviseResult {
+    /// Esito della chiamata, non un giudizio del modello: vedi
+    /// [`REVISE_STATUS_COMPLETED`]. `default` perche' non arriva dal JSON.
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub overall_score: f64,
@@ -90,42 +115,74 @@ impl PromptReviseResult {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct PromptReviseSignals<'a> {
-    kind: &'a str,
-    weaknesses: &'a [String],
-    metrics: serde_json::Value,
+/// Purpose da cui si risolve il modello, VIA TIER (mig 0346). Il nome del
+/// modello non compare mai qui (regola G).
+const PROMPT_REVISE_PURPOSE: &str = "prompt_conformance_check";
+
+/// Rende leggibili al modello le debolezze osservate. Una lista vuota si
+/// DICHIARA: un blocco vuoto lascerebbe il modello a indovinare se i segnali
+/// mancano o se non sono stati raccolti.
+fn format_weaknesses(weaknesses: &[String]) -> String {
+    if weaknesses.is_empty() {
+        return "(nessuna debolezza segnalata)".to_string();
+    }
+    weaknesses
+        .iter()
+        .map(|w| format!("- {w}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-#[derive(Debug, Serialize)]
-struct PromptReviseRequest<'a> {
-    current_template: &'a str,
-    prompt_key: &'a str,
-    mode: &'a str,
-    signals: PromptReviseSignals<'a>,
-}
-
-/// Risolve l'URL base del brain dal DB (settings.brain_rest_url, regola G:
-/// niente env hardcoded, unica fonte di verita'). `Err` se non configurato.
-async fn brain_base_url(pool: &PgPool) -> Result<String, String> {
-    nexus_auth::get_setting(pool, "brain_rest_url")
-        .await
-        .map(|v| v.trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            "settings.brain_rest_url non configurato: impossibile raggiungere /agent/prompt-revise"
-                .to_string()
-        })
-}
-
-/// Punto unico (regola L) per chiamare il conformance/revision check del brain.
+/// Costruisce il prompt della valutazione/revisione.
 ///
-/// `weaknesses`/`metrics` sono i segnali (vuoti per il loop guideline). La
-/// scelta del modello e' responsabilita' del brain (routing tier-only, purpose
-/// `prompt_conformance_check`): nessun modello/URL hardcoded qui.
+/// Questo blocco e' un call site FUORI CHAT (worker schedulato): nessuna
+/// modalita' UI viene ereditata, quindi il contratto di output va dichiarato
+/// per intero qui (regola D).
+fn build_revise_prompt(
+    prompt_key: &str,
+    current_template: &str,
+    mode: ReviseMode,
+    kind: SignalKind,
+    weaknesses: &[String],
+    metrics: &serde_json::Value,
+) -> String {
+    let weaknesses_block = format_weaknesses(weaknesses);
+    let revise_clause = mode.instruction();
+    let kind_clause = kind.weighting();
+
+    format!(
+        "Sei un revisore di prompt di sistema. Valuta il prompt qui sotto e rispondi \
+         ESCLUSIVAMENTE con un oggetto JSON, senza testo attorno.\n\n\
+         CHIAVE PROMPT: {prompt_key}\n\
+         {kind_clause}\n\
+         {revise_clause}\n\n\
+         SEGNALI / DEBOLEZZE OSSERVATE:\n{weaknesses_block}\n\n\
+         METRICHE:\n{metrics}\n\n\
+         TEMPLATE ATTUALE:\n---\n{current_template}\n---\n\n\
+         FORMATO DELLA RISPOSTA:\n\
+         {{\"overall_score\": <0-100>, \
+         \"dimensions\": {{\"chiarezza\": <0-100>, \"completezza\": <0-100>, \
+         \"specificita\": <0-100>, \"robustezza\": <0-100>}}, \
+         \"issues\": [{{\"severity\": \"alta|media|bassa\", \"description\": \"<problema concreto>\"}}], \
+         \"revised_template\": <stringa o null>, \"rationale\": \"<perche' questo punteggio>\"}}"
+    )
+}
+
+/// Punto unico (regola L) della valutazione/revisione di un prompt.
 ///
-/// Ritorna `None` se l'URL non e' configurato, la chiamata HTTP fallisce o la
-/// risposta non e' valida (errore loggato, mai panico).
+/// `weaknesses`/`metrics` sono i segnali (vuoti per il loop guideline). Il
+/// modello si risolve VIA TIER dal purpose `prompt_conformance_check` e la
+/// chiamata passa dal gateway Rust: nessun modello, URL o porta hardcoded qui.
+///
+/// Storicamente questa era una POST al brain Python (`/agent/prompt-revise`),
+/// che decideva il modello e produceva il JSON. Il brain e' stato eliminato: la
+/// valutazione la fa ora direttamente il modello via gateway, e il contratto di
+/// output e' imposto dal prompt e verificato al parse. Un modello che non
+/// rispetta il formato produce `None` (variante scartata), mai un punteggio
+/// inventato.
+///
+/// Ritorna `None` se il modello non e' risolvibile, la chiamata fallisce o la
+/// risposta non e' il JSON atteso (errore loggato, mai panico).
 pub async fn call_prompt_revise(
     pool: &PgPool,
     prompt_key: &str,
@@ -135,56 +192,74 @@ pub async fn call_prompt_revise(
     weaknesses: &[String],
     metrics: serde_json::Value,
 ) -> Option<PromptReviseResult> {
-    let base = match brain_base_url(pool).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("prompt_revise: {e}");
-            return None;
-        }
-    };
+    let started = std::time::Instant::now();
 
-    let request = PromptReviseRequest {
-        current_template,
-        prompt_key,
-        mode: mode.as_str(),
-        signals: PromptReviseSignals {
-            kind: kind.as_str(),
-            weaknesses,
-            metrics,
-        },
-    };
+    let (provider, model) =
+        match nexus_types::routing_client::resolve_purpose_via_http(pool, PROMPT_REVISE_PURPOSE)
+            .await
+        {
+            Ok(pm) => pm,
+            Err(e) => {
+                error!(
+                    "prompt_revise: modello non risolvibile per il purpose \
+                     '{PROMPT_REVISE_PURPOSE}' (prompt '{prompt_key}'): {e}"
+                );
+                return None;
+            }
+        };
 
-    let client = nexus_http::build_client();
-    let response = match client
-        .post(format!("{base}/agent/prompt-revise"))
-        .json(&request)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
+    let prompt = build_revise_prompt(prompt_key, current_template, mode, kind, weaknesses, &metrics);
+
+    let content = match nexus_types::gateway_client::gateway_text_complete(
+        pool,
+        &provider,
+        &model,
+        &prompt,
+        PROMPT_REVISE_PURPOSE,
+        None,
+    )
+    .await
     {
-        Ok(r) => r,
+        Ok(c) => c,
         Err(e) => {
-            error!("prompt_revise: errore HTTP brain /agent/prompt-revise: {e}");
+            error!("prompt_revise: chiamata al gateway fallita per '{prompt_key}': {e}");
             return None;
         }
     };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
+    parse_revise_response(&content, prompt_key, &provider, &model, started)
+}
+
+/// Estrae il giudizio dalla risposta e vi innesta i fatti tecnici misurati.
+///
+/// `status`, `model_used` e `duration_ms` NON vengono dal modello (regola M):
+/// la chiamata e' arrivata fin qui e il JSON e' conforme, quindi l'esito e'
+/// `completed` — il valore che i chiamanti verificano. Chiederlo al modello
+/// significherebbe fargli decidere se se stesso e' riuscito.
+fn parse_revise_response(
+    content: &str,
+    prompt_key: &str,
+    provider: &str,
+    model: &str,
+    started: std::time::Instant,
+) -> Option<PromptReviseResult> {
+    let Some(parsed) = nexus_types::llm_json::extract_json_block(content) else {
         error!(
-            "prompt_revise: brain /agent/prompt-revise error {} per '{}': {}",
-            status,
-            prompt_key,
-            &body_text[..body_text.len().min(200)]
+            "prompt_revise: il modello {provider}/{model} non ha risposto col JSON richiesto \
+             per '{prompt_key}' — variante scartata"
         );
         return None;
-    }
+    };
 
-    match response.json::<PromptReviseResult>().await {
-        Ok(result) => Some(result),
+    match serde_json::from_value::<PromptReviseResult>(parsed) {
+        Ok(mut result) => {
+            result.status = REVISE_STATUS_COMPLETED.to_string();
+            result.model_used = Some(format!("{provider}/{model}"));
+            result.duration_ms = Some(started.elapsed().as_millis() as i64);
+            Some(result)
+        }
         Err(e) => {
-            error!("prompt_revise: parse risposta brain per '{prompt_key}': {e}");
+            error!("prompt_revise: JSON non conforme al contratto per '{prompt_key}': {e}");
             None
         }
     }

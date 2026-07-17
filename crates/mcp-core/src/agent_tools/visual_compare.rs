@@ -44,7 +44,32 @@ const DEFAULT_VIEWPORT_HEIGHT: u32 = 800;
 const DEFAULT_WAIT_MS: u64 = 1500;
 const DEFAULT_SCREENSHOT_TIMEOUT_SECS: u64 = 45;
 /// Timeout HTTP verso il brain per il confronto vision (cold start possibile).
-const VISION_HTTP_TIMEOUT_SECS: u64 = 90;
+/// Purpose del confronto visivo: il modello si risolve VIA TIER da qui (mig
+/// 0214), mai per nome (regola G).
+const VISUAL_COMPARE_PURPOSE: &str = "visual_compare";
+
+/// Tetto di output della risposta vision. Il confronto restituisce un JSON
+/// breve (punteggio + elenco differenze), non prosa.
+const VISION_MAX_TOKENS: u32 = 1500;
+
+/// Quanto della risposta grezza si allega quando il modello non rispetta il
+/// formato: abbastanza per capire cosa ha risposto, non tanto da inondare il
+/// contesto dell'agente.
+const RAW_ANSWER_EXCERPT_CHARS: usize = 400;
+
+/// Contratto di risposta imposto al modello. La prima immagine e' lo screenshot
+/// reale, la seconda il riferimento: l'ordine e' quello dei blocchi inviati.
+const VISUAL_COMPARE_PROMPT: &str = concat!(
+    "Confronta due immagini di una interfaccia: la PRIMA e' lo screenshot reale, ",
+    "la SECONDA e' il riferimento atteso.\n\n",
+    "Rispondi ESCLUSIVAMENTE con un oggetto JSON, senza testo attorno, in questo formato:\n",
+    "{\"similarity_score\": <numero 0-100>, \"differences\": [{\"area\": \"<zona dell'interfaccia>\", ",
+    "\"expected\": \"<cosa mostra il riferimento>\", \"actual\": \"<cosa mostra lo screenshot>\", ",
+    "\"severity\": \"alta|media|bassa\"}]}\n\n",
+    "similarity_score: 100 = identiche, 0 = completamente diverse. Elenca solo differenze ",
+    "VISIBILI e concrete (layout, colori, testo, elementi mancanti o in piu'). ",
+    "Se non ci sono differenze rilevanti, usa un array vuoto.",
+);
 /// Subdir sotto la project_root dove salvare gli screenshot del tool.
 const SCREENSHOT_SUBDIR: &str = ".nexus/visual_compare";
 
@@ -143,20 +168,20 @@ pub(super) async fn tool_nexus_visual_compare(ctx: &AgentToolContext, input: &Va
         .to_string();
     };
 
-    // 7) Confronto vision via brain.
+    // 7) Confronto vision via gateway LLM (Rust nativo).
     let shot_b64 = B64.encode(&shot);
     let ref_b64 = B64.encode(&reference.bytes);
     let compare =
-        compare_via_brain(&ctx.db, &shot_b64, "image/png", &ref_b64, &reference.mime).await;
+        compare_via_gateway(&ctx.db, &shot_b64, "image/png", &ref_b64, &reference.mime).await;
 
     match compare {
         Ok(v) => json!({
-            "similarity_score": v.get("similarity_score").cloned().unwrap_or(Value::Null),
-            "differences": v.get("differences").cloned().unwrap_or(json!([])),
+            "similarity_score": v.similarity_score,
+            "differences": v.differences,
             "screenshot_path": screenshot_path,
             "reference_source": reference.source,
-            "model_used": v.get("model_used").cloned().unwrap_or(Value::Null),
-            "parse_error": v.get("parse_error").cloned().unwrap_or(Value::Null),
+            "model_used": v.model_used,
+            "parse_error": v.parse_error,
         })
         .to_string(),
         Err(e) => json!({
@@ -472,65 +497,93 @@ async fn save_screenshot(root: &Path, bytes: &[u8]) -> Result<String, String> {
     Ok(clean_rel)
 }
 
-/// POST al brain `/vision/compare` con le due immagini base64.
-async fn compare_via_brain(
+/// Esito del confronto visivo.
+///
+/// E' un TIPO e non un `Value` anonimo: prima la funzione impacchettava un JSON
+/// e il chiamante lo ri-estraeva con le stesse chiavi scritte a mano una
+/// seconda volta. Ogni nome di campo compare ora una volta sola, nel `json!`
+/// finale del tool (regola L).
+struct VisualComparison {
+    /// `Null` quando il modello non ha prodotto un punteggio: assente e zero
+    /// non sono la stessa cosa.
+    similarity_score: Value,
+    differences: Value,
+    model_used: String,
+    /// Valorizzato SOLO se la risposta non era nel formato richiesto.
+    parse_error: Option<String>,
+}
+
+impl VisualComparison {
+    fn from_model(model_used: &str, parsed: &Value) -> Self {
+        Self {
+            similarity_score: parsed.get("similarity_score").cloned().unwrap_or(Value::Null),
+            differences: parsed.get("differences").cloned().unwrap_or_else(|| json!([])),
+            model_used: model_used.to_string(),
+            parse_error: None,
+        }
+    }
+
+    /// Il modello ha risposto, ma non nel formato imposto: nessun punteggio
+    /// inventato, si dichiara il fatto e si allega la risposta grezza troncata.
+    fn unparsable(model_used: &str, raw: &str) -> Self {
+        Self {
+            similarity_score: Value::Null,
+            differences: json!([]),
+            model_used: model_used.to_string(),
+            parse_error: Some(format!(
+                "il modello non ha risposto col JSON richiesto; risposta grezza: {}",
+                raw.chars().take(RAW_ANSWER_EXCERPT_CHARS).collect::<String>()
+            )),
+        }
+    }
+}
+
+/// Confronta le due immagini con una chiamata multimodale al gateway LLM.
+///
+/// Gemella di `vision_tools::nexus_describe_image_attachment`: stesso punto
+/// unico [`gateway_vision_complete`] (regola L), stesso modo di risolvere il
+/// modello (VIA TIER dal purpose, regola G — nessun nome modello qui).
+///
+/// Il brain Python esponeva `/vision/compare` e restituiva gia' il JSON. Ora il
+/// confronto lo fa il modello vision: il prompt impone il formato, e la risposta
+/// viene estratta col punto unico `llm_json::extract_json_block`. Un modello che
+/// non rispetta il formato produce `parse_error`, non un punteggio inventato.
+async fn compare_via_gateway(
     db: &sqlx::PgPool,
     screenshot_b64: &str,
     screenshot_mime: &str,
     reference_b64: &str,
     reference_mime: &str,
-) -> Result<Value, String> {
-    let brain_url = resolve_brain_url(db).await;
-    let endpoint = format!("{}/vision/compare", brain_url.trim_end_matches('/'));
-    let payload = json!({
-        "screenshot_base64": screenshot_b64,
-        "screenshot_mime": screenshot_mime,
-        "reference_base64": reference_b64,
-        "reference_mime": reference_mime,
-    });
+) -> Result<VisualComparison, String> {
+    let (provider, model) =
+        crate::internal_routing::resolve_purpose_model_db(db, VISUAL_COMPARE_PURPOSE)
+            .await
+            .into_model(VISUAL_COMPARE_PURPOSE)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(VISION_HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("impossibile costruire client HTTP: {e}"))?;
+    let shot_uri = format!("data:{screenshot_mime};base64,{screenshot_b64}");
+    let ref_uri = format!("data:{reference_mime};base64,{reference_b64}");
+    let content_blocks = json!([
+        { "type": "text", "text": VISUAL_COMPARE_PROMPT },
+        { "type": "image_url", "image_url": { "url": shot_uri } },
+        { "type": "image_url", "image_url": { "url": ref_uri } },
+    ]);
 
-    let response = client
-        .post(&endpoint)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "chiamata vision compare fallita verso {endpoint}: {e}. Verifica che il brain \
-                 sia attivo e che nexus_purpose_model.visual_compare sia configurato (mig 0214)."
-            )
-        })?;
+    let result = nexus_agent_tools::gateway_client::gateway_vision_complete(
+        db,
+        &provider,
+        &model,
+        content_blocks,
+        VISION_MAX_TOKENS,
+        VISUAL_COMPARE_PURPOSE,
+    )
+    .await?;
 
-    let status = response.status();
-    let body_text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "vision compare ha risposto HTTP {}: {}",
-            status.as_u16(),
-            body_text
-        ));
-    }
-    serde_json::from_str::<Value>(&body_text)
-        .map_err(|e| format!("risposta vision compare non e' JSON valido: {e}; body={body_text}"))
-}
-
-/// Resolve URL brain: prima settings.brain_rest_url, poi env var, poi default
-/// locale. Allineato a vision_tools::resolve_brain_url.
-async fn resolve_brain_url(db: &sqlx::PgPool) -> String {
-    if let Ok(Some(v)) = settings::get_setting(db, "brain_rest_url").await {
-        let trimmed = v.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    std::env::var("BRAIN_REST_URL")
-        .or_else(|_| std::env::var("NEURAL_CORE_REST_URL"))
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string())
+    // Il punteggio non si inventa: se il modello non ha risposto nel formato
+    // richiesto lo si DICHIARA (parse_error) e il chiamante lo rigira all'agente.
+    let Some(parsed) = nexus_types::llm_json::extract_json_block(&result.content) else {
+        return Ok(VisualComparison::unparsable(&result.model_used, &result.content));
+    };
+    Ok(VisualComparison::from_model(&result.model_used, &parsed))
 }
 
 #[cfg(test)]
