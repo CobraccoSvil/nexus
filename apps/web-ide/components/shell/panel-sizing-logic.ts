@@ -115,3 +115,35 @@ export function clampRightWidth(
   const { min, max } = rightSidebarBounds(viewportWidth, availableWidth);
   return Math.max(min, Math.min(max, width));
 }
+
+// La testata della chat (profilo, sessione, azioni) sta in riga nell'header, o si
+// raccoglie nel popover a comparsa (l'hamburger)?
+//
+// NON e' una soglia fissa in px, e per una ragione precisa: la larghezza naturale
+// della riga dipende dal nome del profilo selezionato e dal titolo della sessione
+// attiva (troncato, ma fino a ~210px), che variano con i dati e con la lingua del
+// progetto (en/es/it). Una costante calibrata su un titolo corto direbbe "ci sta"
+// mentre un titolo lungo sfonda, e viceversa. Percio' il chiamante MISURA sul DOM
+// vivo la larghezza naturale della riga renderizzata (scrollWidth, non vincolata) e
+// lo spazio disponibile (clientWidth dell'host), e passa i due numeri qui (regola O:
+// la decisione nasce dalla misura del rendering vero, non da una stima). Questo
+// modulo resta il punto unico (regola L) della REGOLA di confronto.
+//
+// La banda morta CHAT_HEAD_REENTRY_GUARD da' isteresi: senza, a cavallo del confine
+// un pixel di ResizeObserver farebbe oscillare riga<->popover a ogni frame.
+export const CHAT_HEAD_REENTRY_GUARD = 12;
+
+export function chatHeadFitsInline(
+  availableWidth: number,
+  naturalWidth: number,
+  currentlyInline: boolean,
+): boolean {
+  // Non ancora misurato: parti dalla riga (default ottimista). Il primo
+  // ResizeObserver, in useLayoutEffect, corregge prima del paint.
+  if (naturalWidth <= 0 || availableWidth <= 0) return true;
+  // In riga si resta finche' la riga non sfonda davvero lo spazio disponibile.
+  if (currentlyInline) return naturalWidth <= availableWidth;
+  // Gia' raccolta nel popover: si torna in riga solo con un margine, per non
+  // ri-collassare al primo pixel guadagnato.
+  return naturalWidth + CHAT_HEAD_REENTRY_GUARD <= availableWidth;
+}

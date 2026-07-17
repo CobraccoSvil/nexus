@@ -84,7 +84,7 @@ import { FirstAnalysisOverlay } from "./shell/first-analysis-overlay";
 import { ShellOverlays } from "./shell/shell-overlays";
 import { BottomPanelHeader } from "./shell/bottom-panel-header";
 import { RightColumn } from "./shell/right-column";
-import { ChatHeadPopover } from "./chat/chat-head-popover";
+import { ChatHead } from "./chat/chat-head";
 import {
   activityBarWidth as activityBarWidthFor,
   clampLeftWidth,
@@ -1346,11 +1346,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         >
           AI Workspace
         </div>
-        {/* Tutta la testata (profilo, sessioni, azioni) vive nel pannello a
-            comparsa. In riga non ci stava: il gruppo delle sessioni era l'unico
-            cedevole e a colonna stretta finiva a larghezza ZERO, rendendo le chat
-            irraggiungibili. Il trigger tronca con ellissi e non puo' sfondare. */}
-        <ChatHeadPopover
+        {/* Testata della chat: distesa in riga quando i controlli ci stanno,
+            raccolta nel popover (l'hamburger) quando non ci stanno. ChatHead
+            misura sul DOM vivo e sceglie; il popover non e' piu' mostrato sempre. */}
+        <ChatHead
           tc={tc}
           profiles={profilesMgr.profiles}
           selectedProfileId={selectedProfileId}
