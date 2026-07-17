@@ -228,10 +228,54 @@ fn predicate_fail_reason(
     if needle_missing(turn, predicate) {
         return Some("needle_not_found".to_string());
     }
+    if let Some(motivo) = multi_step_fail_reason(turn, predicate) {
+        return Some(motivo);
+    }
     match predicate.get("max_latency_ms").and_then(Value::as_i64) {
         Some(cap) if latency_ms > cap => Some(format!("latency:{latency_ms}>{cap}")),
         _ => None,
     }
+}
+
+/// I predicati dei profili multi-step, confrontati coi FATTI che il loop ha
+/// misurato (`probe_chain_measure::AttemptMeasures`, che il giro appende al turno
+/// sotto `measures`).
+///
+/// Le tre chiavi erano nel DB da sempre e nessuno le leggeva: `predicate_fail_reason`
+/// tace su cio' che non conosce e ritorna "superato". Finche' i kind non
+/// esistevano il profilo non partiva e il buco non faceva danno; ora che il loop
+/// c'e', queste righe sono l'unica cosa che impedisce a `high` e `heavy` di essere
+/// gratis per chiunque.
+fn multi_step_fail_reason(turn: &Value, predicate: &Value) -> Option<String> {
+    let fatto_i64 = |k: &str| turn.pointer(&format!("/measures/{k}")).and_then(Value::as_i64);
+    let fatto_bool = |k: &str| {
+        turn.pointer(&format!("/measures/{k}"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+
+    if let Some(min) = predicate.get(K_MIN_CHAINED).and_then(Value::as_i64) {
+        // `chained_links` sono gli anelli CONSUMATI (un token nostro riportato in
+        // una chiamata successiva), non le chiamate emesse: tre `list_files` di fila
+        // fanno 0.
+        let anelli = fatto_i64("chained_links").unwrap_or(0);
+        if anelli < min {
+            return Some(format!("no_chain:{anelli}<{min}"));
+        }
+    }
+    if predicate.get(K_REQUIRES_RECOVERY).and_then(Value::as_bool) == Some(true)
+        && !fatto_bool("recovered")
+    {
+        // Non ha portato il token che viveva solo nel messaggio d'errore: qualunque
+        // cosa abbia fatto, non l'ha letto.
+        return Some("no_recovery".to_string());
+    }
+    if predicate.get(K_FORBIDS_REPEAT).and_then(Value::as_bool) == Some(true)
+        && fatto_bool("repeated_failed")
+    {
+        return Some("repeated_failed".to_string());
+    }
+    None
 }
 
 /// FRONTIER (`long_context`): il modello deve aver RITROVATO il fatto piantato a
@@ -837,6 +881,14 @@ fn build_long_context_request(profile: &ProbeProfile) -> (String, String, String
 /// tutti e sembra funzionare: `high` diventerebbe gratis per chiunque, in silenzio.
 /// E' il difetto peggiore possibile qui, perche' un test che non misura e'
 /// indistinguibile da un test che passa.
+/// Le tre chiavi dei profili multi-step. Sono nominate in tre punti — il
+/// vocabolario, la lista di cio' che richiede un kind multi-turno, e il
+/// verificatore — e devono essere LA STESSA parola: un refuso in uno dei tre
+/// renderebbe il predicato muto, cioe' un pass regalato (regola N).
+const K_MIN_CHAINED: &str = "min_chained_calls";
+const K_REQUIRES_RECOVERY: &str = "requires_recovery";
+const K_FORBIDS_REPEAT: &str = "forbids_repeat_of_failed";
+
 const CHIAVI_PREDICATO: [&str; 9] = [
     // verificate da `predicate_fail_reason`
     "min_tool_calls",
@@ -847,9 +899,9 @@ const CHIAVI_PREDICATO: [&str; 9] = [
     "hold_min_passes",
     "promote_min_passes",
     // verificate dal loop agentico (tool_chain / tool_recovery)
-    "min_chained_calls",
-    "requires_recovery",
-    "forbids_repeat_of_failed",
+    K_MIN_CHAINED,
+    K_REQUIRES_RECOVERY,
+    K_FORBIDS_REPEAT,
 ];
 
 /// La prima chiave del predicato che nessuno sa verificare. `None` = il predicato
@@ -865,11 +917,7 @@ fn chiave_predicato_ignota(predicate: &Value) -> Option<String> {
 /// I predicati che solo il loop multi-turno sa verificare. Su un profilo
 /// single-turn sarebbero muti (nessun anello da contare, nessun errore iniettato):
 /// il profilo promuoverebbe senza misurare cio' che dichiara di misurare.
-const PREDICATI_MULTI_TURNO: [&str; 3] = [
-    "min_chained_calls",
-    "requires_recovery",
-    "forbids_repeat_of_failed",
-];
+const PREDICATI_MULTI_TURNO: [&str; 3] = [K_MIN_CHAINED, K_REQUIRES_RECOVERY, K_FORBIDS_REPEAT];
 
 /// `Err` se il profilo chiede una verifica che il suo kind non puo' fare. Il
 /// controllo e' incrociato apposta: le due meta' del contratto (kind e predicato)
@@ -2001,6 +2049,98 @@ mod tests {
                 "il profilo '{kind}' del DB deve essere accettato dal vocabolario"
             );
         }
+    }
+
+    // ── I predicati multi-step, agganciati ai fatti del loop ────────────────
+
+    /// Un turno multi-step come il loop lo consegna: i fatti stanno sotto
+    /// `measures`, ed e' li' che il predicato li legge.
+    fn turno_con_misure(chained: i64, recovered: bool, repeated: bool) -> Value {
+        json!({
+            "content": "", "stop_reason": "end_turn", "tool_use_blocks": [],
+            "measures": {
+                "chained_links": chained,
+                "recovered": recovered,
+                "repeated_failed": repeated,
+                "bad_tool_syntax": false
+            }
+        })
+    }
+
+    /// `min_chained_calls: 3` boccia chi ha concatenato meno di 3 anelli, e i
+    /// "3 anelli" sono token nostri riportati — non chiamate emesse.
+    #[test]
+    fn il_predicato_della_catena_boccia_chi_non_concatena() {
+        let pred = json!({ "min_chained_calls": 3 });
+        let sig = read_turn_signals(&turno_con_misure(0, false, false));
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, false, false), &pred, &sig, 10),
+            Some("no_chain:0<3".to_string()),
+            "zero anelli: il profilo non certifica high"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(2, false, false), &pred, &sig, 10),
+            Some("no_chain:2<3".to_string()),
+            "due anelli su tre: sotto soglia"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(3, false, false), &pred, &sig, 10),
+            None,
+            "tre anelli: superato"
+        );
+    }
+
+    /// `requires_recovery` chiede il FATTO, non le buone intenzioni: senza il token
+    /// dell'errore non c'e' recupero, per quanto bella sia la prosa.
+    #[test]
+    fn il_predicato_del_recupero_chiede_il_token_non_le_scuse() {
+        let pred = json!({ "requires_recovery": true });
+        let sig = read_turn_signals(&turno_con_misure(0, false, false));
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, false, false), &pred, &sig, 10),
+            Some("no_recovery".to_string())
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, true, false), &pred, &sig, 10),
+            None
+        );
+    }
+
+    /// `forbids_repeat_of_failed` boccia chi rimanda identica una chiamata gia'
+    /// fallita. Vale solo dove il guasto e' PERMANENTE: su uno transitorio ritentare
+    /// e' la mossa giusta, ed e' quella che il nostro stesso prompt ordina.
+    #[test]
+    fn il_predicato_della_ripetizione_boccia_chi_insiste_identico() {
+        let pred = json!({ "forbids_repeat_of_failed": true });
+        let sig = read_turn_signals(&turno_con_misure(0, true, true));
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, true, true), &pred, &sig, 10),
+            Some("repeated_failed".to_string()),
+            "ha recuperato ma insistendo identico prima: il profilo lo dice"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno_con_misure(0, true, false), &pred, &sig, 10),
+            None
+        );
+    }
+
+    /// LA REGRESSIONE CHE CONTA: un turno SENZA `measures` (single-turn) non deve
+    /// superare un predicato di catena per silenzio. Prima dell'aggancio,
+    /// `min_chained_calls` non veniva letto da nessuno e il profilo prometteva
+    /// `high` a chiunque rispondesse.
+    #[test]
+    fn un_turno_senza_misure_non_supera_un_predicato_di_catena() {
+        let turno = json!({ "content": "ok", "stop_reason": "end_turn", "tool_use_blocks": [] });
+        let sig = read_turn_signals(&turno);
+        assert_eq!(
+            predicate_fail_reason(&turno, &json!({ "min_chained_calls": 3 }), &sig, 10),
+            Some("no_chain:0<3".to_string()),
+            "nessuna misura = nessun anello provato: mai un pass per assenza di dati"
+        );
+        assert_eq!(
+            predicate_fail_reason(&turno, &json!({ "requires_recovery": true }), &sig, 10),
+            Some("no_recovery".to_string())
+        );
     }
 
     /// I test preesistenti non lo vedevano perche' inventavano il JSON con la
