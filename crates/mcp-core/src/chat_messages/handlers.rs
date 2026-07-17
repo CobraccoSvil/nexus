@@ -993,7 +993,6 @@ async fn try_resume_interrupted_run(
     let automation_r = automation_mode;
     let supervisor_r = prev_supervisor;
     let template_cache_r = state.template_cache.clone();
-    let routing_thresholds_for_resume = state.orchestrator.routing_thresholds.clone();
     let user_role_r = claims.role.clone();
 
     let _ = (
@@ -1024,7 +1023,7 @@ async fn try_resume_interrupted_run(
         // ON e il run ripreso ripartiva senza contesto conversazionale.
         let resume_history = build_recent_conversation_history(&proj_pool, session_id_r, 8).await;
 
-        let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
+        let tools_for_resume = crate::agent_turn_setup::build_tools_json_for_agent(
             &db_clone2,
             user_id,
             project_id_r,
@@ -1034,29 +1033,70 @@ async fn try_resume_interrupted_run(
         )
         .await;
 
-        // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
-        let sse_silence_resume: u64 = match routing_thresholds_for_resume.current_async().await {
-            Ok(t) => t.sse_heartbeat_max_silence_secs,
-            Err(_) => 120,
+        // Il resume gira sul motore NATIVO, come ogni altro run.
+        //
+        // Qui si chiamava `run_via_brain` SENZA alcun controllo del motore: era
+        // l'unico call site non gated da `select_engine`, quindi dal giorno della
+        // rimozione del brain ogni "riprendi" dell'utente e' finito su un
+        // servizio inesistente. Non era una configurazione esotica: e' il flusso
+        // normale di chi scrive "continua" in chat.
+        let native_input = crate::native_engine::NativeRunInput {
+            run_id: new_run_id,
+            session_id: session_id_r,
+            provider: provider_r.clone(),
+            model: model_r.clone(),
+            system_text: String::new(),
+            initial_msg: resume_prompt,
+            conversation_history: resume_history,
+            tools_json: tools_for_resume,
+            // Resume di un run interrotto: nessuna disambiguazione da risolvere.
+            intent_hint: None,
+            // Il classifier non ha girato per questo turno: i campi restano
+            // neutri e `classifier_resolved=false` lo DICHIARA, cosi' il
+            // RouterNode decide invece di fidarsi di valori inventati.
+            requires_tools: None,
+            agentic_score: None,
+            authorizes_changes: None,
+            classifier_resolved: false,
+            action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
+            automation_mode: automation_r.as_str().to_string(),
+            supervisor_mode: crate::native_engine::graph_supervisor_mode(supervisor_r),
+            step_tx: tx,
+            parent_run_id: None,
+            subagent_depth: None,
+            working_root: None,
+            // I panel a monte hanno gia' deliberato sul run originale: il resume
+            // riprende il lavoro, non riapre la deliberazione.
+            pre_run_advisory_synthesis: None,
+            pre_run_advisory_source: None,
+            advisory_gate: None,
         };
-
-        let mut result = crate::brain_agent_client::run_via_brain(
-            new_run_id,
-            session_id_r,
-            provider_r,
-            model_r,
-            String::new(),
-            resume_prompt,
-            tx,
-            resume_history,
-            tools_for_resume,
-            sse_silence_resume,
-            true, // emit_final_event: caller singolo-shot, nessun retry loop
-            automation_r.as_str().to_string(),
-            None, // intent_hint: resume di conferma, nessuna disambiguazione risolta
-            db_clone2.clone(),
+        let mut result = match crate::chat_messages::agent_run::run_via_native(
+            &state_for_task,
+            &native_input,
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => {
+                let steps_pool =
+                    crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
+                crate::chat_messages::agent_run::native_outcome_to_run_result(
+                    &steps_pool,
+                    new_run_id,
+                    outcome,
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::error!(run_id = %new_run_id, error = %e, "resume: motore nativo fallito");
+                crate::chat_messages::agent_run::native_engine_failure_result(
+                    new_run_id,
+                    &provider_r,
+                    &model_r,
+                    format!("Il resume non e' riuscito: {e}"),
+                )
+            }
+        };
         channels2.remove(&new_run_id);
 
         // Riconciliazione costo/token dal ledger (punto unico,

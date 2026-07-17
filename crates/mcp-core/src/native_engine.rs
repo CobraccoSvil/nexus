@@ -2616,7 +2616,7 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         // fonte del primario Python, il quale lo riceve dal payload
         // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
         // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
-        // costante `PRIMARY_BEHAVIOR_MODE` (`brain_agent_client.rs`): la riusiamo
+        // costante `PRIMARY_BEHAVIOR_MODE` (`agent_turn_setup.rs`): la riusiamo
         // qui (punto unico, regola L) cosi' lo shadow confronta un grafo col mode
         // IDENTICO. Conta sul serio dal momento in cui il planner e' eleggibile
         // (`plan_phase_enabled=true`, mig 0426/0439): `PlannerConfig::is_eligible`
@@ -2624,7 +2624,7 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         // "bilanciata"). Il valore-vero-dal-turno (derivarlo dall'automation_mode/
         // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
         // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
-        behavior_mode: Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE.to_string()),
+        behavior_mode: Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE.to_string()),
         // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
         // stato cosi' il grafo applica i guard di annidamento (UnderstandingNode skip
         // del fan-out explore se depth>=1). `None` per il run principale -> stato
@@ -3402,7 +3402,7 @@ mod tests {
         // Python (la costante del client brain), non None.
         assert_eq!(
             state.behavior_mode.as_deref(),
-            Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE),
+            Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE),
             "behavior_mode = fonte primario (bilanciata), per parita' con lo shadow"
         );
 
@@ -4465,7 +4465,7 @@ mod tests {
         // sufficiente, il planner Rust e' eleggibile (accoppiamento debito 1+2).
         assert!(
             cfg.is_eligible(
-                Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE),
+                Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE),
                 Some("code"),
                 1000
             ),

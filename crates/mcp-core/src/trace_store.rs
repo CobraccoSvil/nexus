@@ -8,7 +8,7 @@
 //! dopo aver pulito lo storage il pannello tracce divergeva dal rendering live.
 //!
 //! Punto unico (regola L): l'INSERT vive qui; i call site (oggi
-//! `brain_agent_client`) delegano a [`persist_trace`], niente query SQL
+//! `agent_turn_setup`) delegano a [`persist_trace`], niente query SQL
 //! duplicate. Il getter [`get_session_traces`] raggruppa per `run_id`, stessa
 //! shape di `chat_agent::get_session_meta_steps` (`{ runs: { runId: [...] } }`).
 

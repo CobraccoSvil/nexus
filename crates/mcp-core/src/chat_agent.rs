@@ -723,70 +723,41 @@ pub async fn confirm_agent_run(
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let engine: String = run
-        .try_get::<Option<String>, _>("engine")
+    // Resume nativo in BACKGROUND: la POST risponde subito con `running` cosi' il
+    // client non va in timeout HTTP mentre il grafo riprende dal checkpoint.
+    // Finalizzazione + is_final SSE dentro `confirm_native_run`.
+    //
+    // Qui si leggeva `agent_runs.engine` e, se non era 'rust', si mandava la
+    // conferma al brain Python. La colonna e' NULLABLE e i run legacy hanno NULL
+    // (mig 0451): per quelle righe la conferma HITL finiva su un servizio rimosso
+    // e l'utente vedeva "Brain non raggiungibile". Il motore e' uno solo: il
+    // valore della colonna non decide piu' nulla.
+    let session_id: Uuid = run.get::<Uuid, _>("session_id");
+    let provider: String = run.try_get("provider").unwrap_or_default();
+    let model: String = run.try_get("model").unwrap_or_default();
+    let automation_mode: String = run
+        .try_get::<Option<String>, _>("automation_mode")
         .ok()
         .flatten()
         .unwrap_or_default();
-
-    if engine.eq_ignore_ascii_case("rust") {
-        // Resume nativo in BACKGROUND (parita' col path brain e collo spawn
-        // primario in agent_run.rs): la POST risponde subito con `running` cosi'
-        // il client non va in timeout HTTP mentre il grafo riprende dal checkpoint.
-        // Finalizzazione + is_final SSE dentro `confirm_native_run`.
-        let session_id: Uuid = run.get::<Uuid, _>("session_id");
-        let provider: String = run.try_get("provider").unwrap_or_default();
-        let model: String = run.try_get("model").unwrap_or_default();
-        let automation_mode: String = run
-            .try_get::<Option<String>, _>("automation_mode")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let state_bg = state.clone();
-        let resume_message_bg = resume_message.clone();
-        tokio::spawn(async move {
-            let _ = crate::chat_messages::confirm_native_run(
-                &state_bg,
-                run_id,
-                session_id,
-                provider,
-                model,
-                automation_mode,
-                &resume_message_bg,
-            )
-            .await;
-        });
-        Ok(Json(json!({
-            "runId": run_id.to_string(),
-            "status": "running",
-        })))
-    } else {
-        // Resume LEGACY sul brain Python (engine='python' o NULL). Il brain
-        // mantiene lo state del thread ed e' l'unica sorgente del loop per quei run.
-        match crate::brain_agent_client::resume_run(run_id, true, Some(resume_message)).await {
-            Ok(()) => Ok(Json(json!({
-                "runId": run_id.to_string(),
-                "status": "running",
-            }))),
-            Err(e) => {
-                tracing::error!(
-                    "confirm_agent_run: brain resume_run fallito run_id={} err={}",
-                    run_id,
-                    e
-                );
-                // Riporta il run a awaiting_confirmation per non lasciarlo appeso.
-                let _ =
-                    sqlx::query("UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1")
-                        .bind(run_id)
-                        .execute(&run_pool)
-                        .await;
-                Err(api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Brain non raggiungibile per approve: {e}"),
-                ))
-            }
-        }
-    }
+    let state_bg = state.clone();
+    let resume_message_bg = resume_message.clone();
+    tokio::spawn(async move {
+        let _ = crate::chat_messages::confirm_native_run(
+            &state_bg,
+            run_id,
+            session_id,
+            provider,
+            model,
+            automation_mode,
+            &resume_message_bg,
+        )
+        .await;
+    });
+    Ok(Json(json!({
+        "runId": run_id.to_string(),
+        "status": "running",
+    })))
 }
 
 /// POST /api/chat/agent-runs/:run_id/cancel -- interrompe un run in corso.

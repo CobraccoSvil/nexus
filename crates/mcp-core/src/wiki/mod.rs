@@ -116,7 +116,7 @@ impl WikiAiServices for AppStateWikiAi {
         let error_class = error_class.map(str::to_string);
         let message = message.to_string();
         Box::pin(async move {
-            crate::brain_agent_client::handle_provider_llm_failure(
+            crate::agent_turn_setup::handle_provider_llm_failure(
                 &provider,
                 error_class.as_deref(),
                 &message,

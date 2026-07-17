@@ -3,7 +3,7 @@
 //! Estratto da `agent_loop.rs` durante la Fase 4 del refactor Nexus: il loop
 //! vero e proprio e' ora nel brain LangGraph (Python), ma questi tipi (step,
 //! run result, eventi broadcast, helper DB, ecc.) sono ancora consumati dal
-//! ponte `brain_agent_client` e dall'SSE del frontend.
+//! ponte `agent_turn_setup` e dall'SSE del frontend.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -151,7 +151,7 @@ pub enum AgentRunStatus {
     ProviderUnavailable,
     // ── Esiti terminali canonici (macchina a stati deterministica, ADR terminazione) ──
     // Emessi dal punto unico `outcome_node` del brain via `nexus_run_outcome` e mappati
-    // qui da `derive_status` (brain_agent_client.rs). Mutuamente esclusivi: un run d'azione
+    // qui da `derive_status` (agent_turn_setup.rs). Mutuamente esclusivi: un run d'azione
     // termina SEMPRE in uno di questi tre, mai in una domanda di disambiguazione.
     /// Il task e' completato E verificato: final_gate passato (o non applicabile),
     /// almeno un'azione produttiva applicata, risposta finale non vuota.
@@ -344,7 +344,7 @@ pub struct AgentRunResult {
     pub hollow_no_tools: bool,
     /// Sottotipo specifico dell'hollow_completion per la diagnostica QW2:
     /// "EMPTY_ANSWER" | "NO_TOOLS" | "EMPTY_ANSWER+NO_TOOLS" | "".
-    /// Vuoto se hollow_completion=false. Propagato dal caller (brain_agent_client)
+    /// Vuoto se hollow_completion=false. Propagato dal caller (agent_turn_setup)
     /// al persistente (chat_messages/agent_run) per il log in
     /// `nexus_provider_empty_responses` (mig 0291). Il kind lessicale "RESIGNED"
     /// e' stato rimosso (ADR 0018 fase 3): la rinuncia e' dichiarata dal modello

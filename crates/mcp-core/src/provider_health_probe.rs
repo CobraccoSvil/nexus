@@ -571,7 +571,7 @@ fn kind_from_error_class(ec: &str) -> String {
 }
 
 /// Classifica un messaggio di errore in una categoria nota. Mirror della
-/// logica di `brain_agent_client.rs::classify_provider_error`.
+/// logica di `agent_turn_setup.rs::classify_provider_error`.
 /// Estrae il content testuale dalla response gRPC del brain.
 /// Usato per intercettare "[Error: ...]" che il brain ritorna in caso di
 /// exception (vedi brain/providers/anthropic_provider.py:211 e simili).

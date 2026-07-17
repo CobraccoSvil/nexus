@@ -3,7 +3,7 @@
 //! Implementa `EventSink::emit` (sincrono, infallibile, best-effort) pubblicando
 //! l'evento sul canale SSE concreto della chat: il `broadcast::Sender<AgentStepEvent>`
 //! registrato in `state.agent_channels` per il run (lo STESSO canale che
-//! `brain_agent_client::run_via_brain` usa per ritrasmettere gli eventi del brain,
+//! `agent_turn_setup::run_via_brain` usa per ritrasmettere gli eventi del brain,
 //! regola L: nessuna seconda forma di evento). Nessun gate `mode`: lo shadow usa il
 //! sink no-op iniettato nel ctx (`NullEventSink`), l'unica fonte di verita' verso
 //! l'utente resta il run primario. Il run a cui gli eventi appartengono e' fissato
@@ -63,7 +63,7 @@ pub struct SseEventSinkAdapter {
     /// Run a cui gli eventi emessi appartengono (campo `run_id` degli eventi SSE).
     run_id: Uuid,
     /// Contatore monotono per-run dello `step_index` (parita' col path Python
-    /// `brain_agent_client::run_via_brain`, dove ogni `tool_use` incrementa
+    /// `agent_turn_setup::run_via_brain`, dove ogni `tool_use` incrementa
     /// l'indice). Senza questo ogni step usava `step_index: 0` e il frontend
     /// (upsert per `stepIndex`) sovrascriveva lo step precedente mostrandone uno
     /// solo: il progresso live spariva. `fetch_add(1)` ritorna il valore PRIMA
@@ -87,7 +87,7 @@ pub struct SseEventSinkAdapter {
     /// (`executor_call` successivo / `EndTurn` / `Done`).
     pending_trace: Mutex<Option<PendingTrace>>,
     /// Contatore monotono per-run del `seq` delle tracce (indice progressivo nel
-    /// run, parita' col `trace_seq` di `brain_agent_client::run_via_brain`).
+    /// run, parita' col `trace_seq` di `agent_turn_setup::run_via_brain`).
     next_trace_seq: AtomicI64,
 }
 
@@ -253,7 +253,7 @@ impl SseEventSinkAdapter {
 
 impl EventSink for SseEventSinkAdapter {
     /// Traduce un [`SseEvent`] del grafo nell'[`AgentStepEvent`] del canale chat,
-    /// 1:1 con i mapping di `brain_agent_client::run_via_brain`:
+    /// 1:1 con i mapping di `agent_turn_setup::run_via_brain`:
     /// - `ThinkingDelta`  -> `thinking_delta` (blocco "Ragionamento")
     /// - `MetaStep`       -> `meta_step` (plan/routing/clarify/fallback/usage_snapshot/...)
     /// - `Usage`          -> `meta_step` kind=`usage_snapshot` (barra contesto/TokenUsageBar)

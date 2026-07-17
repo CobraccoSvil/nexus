@@ -15,7 +15,7 @@ mod agent_tools;
 mod agent_types;
 mod auth;
 mod billing;
-mod brain_agent_client;
+mod agent_turn_setup;
 pub use nexus_build_graph as build_graph;
 mod cache;
 mod capability;
