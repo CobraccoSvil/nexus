@@ -85,7 +85,13 @@ import { FirstAnalysisOverlay } from "./shell/first-analysis-overlay";
 import { ShellOverlays } from "./shell/shell-overlays";
 import { BottomPanelHeader } from "./shell/bottom-panel-header";
 import { RightViewTabs } from "./shell/panel-tabs";
-import { rightSidebarBounds } from "./shell/panel-sizing-logic";
+import {
+  activityBarWidth as activityBarWidthFor,
+  clampLeftWidth,
+  leftSidebarBounds,
+  mainAreaAvailableWidth,
+  rightSidebarBounds,
+} from "./shell/panel-sizing-logic";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -310,18 +316,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
 
   const isNarrowViewport = viewportWidth < 1280;
   const isMobileViewport = viewportWidth < 980;
-  const activityBarWidth = isMobileViewport ? 46 : 52;
   const activityButtonSize = isMobileViewport ? 32 : 36;
-  const leftSidebarMinWidth = isMobileViewport ? 160 : isNarrowViewport ? 190 : 220;
-  const leftSidebarMaxWidth = Math.max(
-    leftSidebarMinWidth,
-    Math.min(520, Math.floor(viewportWidth * 0.46)),
+  // Larghezze orizzontali: punto unico in panel-sizing-logic (regola L).
+  const activityBarWidth = activityBarWidthFor(viewportWidth);
+  const { min: leftSidebarMinWidth, max: leftSidebarMaxWidth } = leftSidebarBounds(viewportWidth);
+  const effectiveLeftWidth = clampLeftWidth(leftWidth, viewportWidth);
+  // I vincoli del pannello a larghezza fissa dipendono dallo spazio che resta
+  // DAVVERO, non dal solo viewport: la chrome lo consuma prima. Il tetto e' piu'
+  // generoso sotto la soglia narrow/mobile; sotto lo spazio per due pannelli, la
+  // colonna fissa cede tutto e ne resta uno solo.
+  const availableMainWidth = mainAreaAvailableWidth(viewportWidth, leftWidth, primarySidebarVisible);
+  const { min: rightSidebarMinWidth, max: rightSidebarMaxWidth } = rightSidebarBounds(
+    viewportWidth,
+    availableMainWidth,
   );
-  // Vincoli pannello destro: punto unico in panel-sizing-logic (regola L). Il
-  // tetto e' piu' generoso sotto la soglia narrow/mobile.
-  const { min: rightSidebarMinWidth, max: rightSidebarMaxWidth } = rightSidebarBounds(viewportWidth);
-  const effectiveLeftWidth = Math.max(leftSidebarMinWidth, Math.min(leftSidebarMaxWidth, leftWidth));
   const effectiveRightWidth = Math.max(rightSidebarMinWidth, Math.min(rightSidebarMaxWidth, rightWidth));
+  // Niente spazio per due colonne: il divisorio non avrebbe nulla da trascinare.
+  const rightPanelCollapsed = rightSidebarMaxWidth === 0;
 
   // Bottom panel: altezza proporzionale al viewport (min 120, max 50% dello spazio disponibile)
   const bottomPanelMinHeight = isMobileViewport ? 120 : 160;
@@ -572,7 +583,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     [allOpenTabs],
   );
   const currentBranch = activeProject?.currentBranch || gitState?.currentBranch || "n/a";
-  const showSecondaryAi = layoutMode === "editor-center" && secondarySidebarVisible;
+  // Col pannello singolo la secondary non ci sta: renderla a 0px la mostrerebbe
+  // come "aperta" senza che si veda nulla.
+  const showSecondaryAi =
+    layoutMode === "editor-center" && secondarySidebarVisible && !rightPanelCollapsed;
   const activeGroup =
     editorGroups.find((group) => group.id === activeEditorGroupId) ?? editorGroups[0];
   const activeEditorTab =
@@ -1627,22 +1641,25 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         >
           <div style={{ minWidth: 0, minHeight: 0, height: "100%", display: "flex", overflow: "hidden", borderRight: `1px solid ${tc.border}`, position: "relative" }}>
             {renderAiWorkspace()}
-            <div
-              {...resizeRight}
-              style={{
-                position: "absolute",
-                top: 0,
-                right: -3,
-                bottom: 0,
-                width: 6,
-                cursor: "col-resize",
-                background: "transparent",
-                zIndex: 10,
-                transition: "background 0.15s",
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
-            />
+            {/* Col pannello singolo il divisorio non ha nulla da trascinare. */}
+            {!rightPanelCollapsed && (
+              <div
+                {...resizeRight}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  right: -3,
+                  bottom: 0,
+                  width: 6,
+                  cursor: "col-resize",
+                  background: "transparent",
+                  zIndex: 10,
+                  transition: "background 0.15s",
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
+              />
+            )}
           </div>
           <div
             style={{
@@ -1689,23 +1706,26 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       >
         <div style={{ minWidth: 0, minHeight: 0, height: "100%", display: "flex", overflow: "hidden", borderRight: `1px solid ${tc.border}`, position: "relative" }}>
           {renderAiWorkspace()}
-          {/* Resize handle sovrapposto al bordo destro del pannello AI */}
-          <div
-            {...resizeRight}
-            style={{
-              position: "absolute",
-              top: 0,
-              right: -3,
-              bottom: 0,
-              width: 6,
-              cursor: "col-resize",
-              background: "transparent",
-              zIndex: 10,
-              transition: "background 0.15s",
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
-          />
+          {/* Resize handle sovrapposto al bordo destro del pannello AI: sparisce
+              col pannello singolo, dove non avrebbe nulla da trascinare. */}
+          {!rightPanelCollapsed && (
+            <div
+              {...resizeRight}
+              style={{
+                position: "absolute",
+                top: 0,
+                right: -3,
+                bottom: 0,
+                width: 6,
+                cursor: "col-resize",
+                background: "transparent",
+                zIndex: 10,
+                transition: "background 0.15s",
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
+            />
+          )}
         </div>
         <div style={{ minWidth: 0, minHeight: 0, height: "100%", overflow: "hidden" }}>
           {editorPanel}
