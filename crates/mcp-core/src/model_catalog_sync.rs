@@ -7,7 +7,8 @@
 //! inesistenti lato provider, sprecando token e degradando l'UX.
 //!
 //! Flusso ogni N ore (settings `catalog_sync.interval_hours`, default 6):
-//!   1. Lista provider da `catalog_sync.providers` (CSV)
+//!   1. Lista provider DEDOTTA dal `nexus_provider_registry` (is_active +
+//!      configurato) via [`providers_da_sincronizzare`] — niente CSV hardcoded
 //!   2. Per ogni provider: GET {gateway}/v1/models/{provider} (via UNICA per
 //!      la discovery — il gateway incapsula l'auth di ogni provider, Vertex
 //!      Service Account incluso). Poi confronta con catalog: INSERT nuovi
@@ -957,9 +958,6 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         return Ok(SyncStats::default());
     }
 
-    let providers_csv = get_setting(db, "catalog_sync.providers")
-        .await?
-        .unwrap_or_else(|| "anthropic,openai,mistral,deepseek,google".to_string());
     let disable_missing = get_setting(db, "catalog_sync.disable_missing")
         .await?
         .map(|v| v == "true" || v == "1")
@@ -969,12 +967,14 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
 
+    // PEZZO 1 (regola G+L): la lista dei provider da sincronizzare NON e' piu' un
+    // CSV hardcoded (setting `catalog_sync.providers`, rimosso dalla mig 0613) ma
+    // e' DEDOTTA dal `nexus_provider_registry` (unica fonte). Un provider nuovo,
+    // attivo e configurato entra nella discovery da solo, senza toccare liste.
+    let providers = providers_da_sincronizzare(db).await?;
+
     let mut stats = SyncStats::default();
-    for provider_raw in providers_csv.split(',') {
-        let provider = provider_raw.trim();
-        if provider.is_empty() {
-            continue;
-        }
+    for provider in &providers {
         sync_one_provider_into_stats(
             db,
             provider,
@@ -986,6 +986,85 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         .await;
     }
     Ok(stats)
+}
+
+/// Riga del `nexus_provider_registry` con i campi che servono a dedurre se un
+/// provider va sincronizzato (PEZZO 1): nome + activation + le chiavi settings da
+/// cui leggere lo stato di configurazione.
+#[derive(sqlx::FromRow)]
+struct ProviderRegistryRow {
+    name: String,
+    activation: Option<String>,
+    key_setting: Option<String>,
+    enabled_setting: Option<String>,
+    base_url_setting: Option<String>,
+}
+
+/// PUNTO UNICO (regola G+L) dei provider da sincronizzare: dedotti dal
+/// `nexus_provider_registry` (unica fonte di verita'), NON da una lista CSV
+/// hardcoded. Prima il setting `catalog_sync.providers` duplicava cio' che il
+/// registry gia' sa, e un provider `is_active` + configurato ma fuori dal CSV
+/// (openrouter/groq/perplexity) restava fuori dalla discovery live pur essendo
+/// identico ai 5 nel CSV. Rimosso il CSV (mig 0613), un nuovo provider nel
+/// registry entra nella discovery da solo.
+///
+/// Un provider entra se `is_active = true` E [`provider_is_configured`].
+async fn providers_da_sincronizzare(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<ProviderRegistryRow> = sqlx::query_as::<_, ProviderRegistryRow>(
+        "SELECT name, activation, key_setting, enabled_setting, base_url_setting \
+         FROM nexus_provider_registry WHERE is_active = true ORDER BY sort_order, name",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut out = Vec::new();
+    for r in rows {
+        if provider_is_configured(db, &r).await? {
+            out.push(r.name);
+        }
+    }
+    Ok(out)
+}
+
+/// "Configurato" di un provider del registry (PEZZO 1). Due sole forme di
+/// attivazione:
+///   - activation contenente 'api_key' (incl. 'api_key_or_vertex'): richiede
+///     `enabled_setting` = 'true'/'1' E `key_setting` valorizzato nei settings;
+///   - activation = 'base_url' (vllm): richiede `base_url_setting` valorizzato.
+/// Ogni altra activation (o assente) -> non configurato (escluso pulito, niente
+/// panico). Un errore di lettura settings PROPAGA (regola M): un provider non
+/// deve sparire dalla sync per un DB che sbatte — meglio far fallire il tick.
+async fn provider_is_configured(db: &PgPool, r: &ProviderRegistryRow) -> anyhow::Result<bool> {
+    Ok(match r.activation.as_deref() {
+        Some(a) if a.contains("api_key") => {
+            setting_is_true(db, r.enabled_setting.as_deref()).await?
+                && setting_is_valued(db, r.key_setting.as_deref()).await?
+        }
+        Some("base_url") => setting_is_valued(db, r.base_url_setting.as_deref()).await?,
+        _ => false,
+    })
+}
+
+/// True se il setting `key` esiste e vale 'true'/'1'. Chiave `None`/assente -> false.
+async fn setting_is_true(db: &PgPool, key: Option<&str>) -> anyhow::Result<bool> {
+    match key {
+        Some(k) => Ok(get_setting(db, k)
+            .await?
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)),
+        None => Ok(false),
+    }
+}
+
+/// True se il setting `key` esiste ed e' valorizzato (non vuoto). Chiave
+/// `None`/assente -> false.
+async fn setting_is_valued(db: &PgPool, key: Option<&str>) -> anyhow::Result<bool> {
+    match key {
+        Some(k) => Ok(get_setting(db, k)
+            .await?
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)),
+        None => Ok(false),
+    }
 }
 
 /// Esegue `sync_provider` per un provider e accumula l'esito in `stats`
@@ -1202,7 +1281,14 @@ async fn process_discovered_chat_model(
 ) {
     match catalog_entry {
         None => {
+            // PEZZO 2 (regola L): la policy governa anche l'INSERT, non solo
+            // l'enable. Un provider con policy restrittiva inserisce SOLO i suoi
+            // allowed; un provider SENZA riga policy (`unwrap_or(true)`) inserisce
+            // tutti (comportamento invariato per i 5 provider che ce l'hanno gia').
+            // Punto unico: si riusa `model_passes_selection_policy` — la stessa SQL
+            // del reconcile e dell'enable — invece di duplicare il filtro.
             if insert_new_disabled
+                && model_passes_selection_policy(db, provider, api_model).await
                 && insert_new_chat_model(db, orchestrator, provider, api_model, declared_window)
                     .await
             {
@@ -3110,5 +3196,150 @@ mod tests {
             (Some("heavy"), Some("synced")),
             "l'indice conferma 'heavy': il tier resta, ma ora la fonte DICE che              e' stato sincronizzato invece di tacere"
         );
+    }
+
+    // ── PEZZO 1: i provider da sincronizzare sono DEDOTTI dal registry ──
+
+    /// Crea `nexus_provider_registry` + `settings` per i test PEZZO 1.
+    async fn crea_registry_e_settings(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_provider_registry ( \
+                 name TEXT PRIMARY KEY, \
+                 activation TEXT, \
+                 key_setting TEXT, \
+                 enabled_setting TEXT, \
+                 base_url_setting TEXT, \
+                 is_active BOOLEAN NOT NULL DEFAULT true, \
+                 sort_order INT NOT NULL DEFAULT 0 )",
+        )
+        .execute(pool)
+        .await
+        .expect("registry table");
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(pool)
+            .await
+            .expect("settings table");
+    }
+
+    /// PEZZO 1 (regola G+L, test via il produttore reale — regola O): la lista
+    /// dei provider da sincronizzare esce da `providers_da_sincronizzare` che
+    /// interroga il registry vero, NON da un CSV. openrouter (attivo+configurato,
+    /// identico ai 5 storici) DEVE entrare: era proprio il caso che il CSV
+    /// hardcoded lasciava fuori.
+    #[sqlx::test]
+    async fn pezzo1_providers_dedotti_dal_registry(pool: sqlx::PgPool) {
+        crea_registry_e_settings(&pool).await;
+        sqlx::query(
+            "INSERT INTO nexus_provider_registry \
+                 (name, activation, key_setting, enabled_setting, base_url_setting, is_active, sort_order) VALUES \
+              ('openai',     'api_key',           'openai_key',     'openai_en',     NULL,            true, 1), \
+              ('google',     'api_key_or_vertex', 'google_key',     'google_en',     NULL,            true, 2), \
+              ('openrouter', 'api_key',           'openrouter_key', 'openrouter_en', NULL,            true, 3), \
+              ('spento',     'api_key',           'spento_key',     'spento_en',     NULL,            true, 4), \
+              ('senza_key',  'api_key',           'senza_key_key',  'senza_key_en',  NULL,            true, 5), \
+              ('vllm_ok',    'base_url',          NULL,             NULL,            'vllm_ok_url',    true, 6), \
+              ('vllm_vuoto', 'base_url',          NULL,             NULL,            'vllm_vuoto_url', true, 7), \
+              ('inattivo',   'api_key',           'inattivo_key',   'inattivo_en',   NULL,            false,8)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed registry");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES \
+              ('openai_en','true'),('openai_key','sk-1'), \
+              ('google_en','true'),('google_key','g-1'), \
+              ('openrouter_en','true'),('openrouter_key','or-1'), \
+              ('spento_en','false'),('spento_key','sk-2'), \
+              ('senza_key_en','true'),('senza_key_key',''), \
+              ('vllm_ok_url','http://127.0.0.1:8000/v1'), \
+              ('vllm_vuoto_url',''), \
+              ('inattivo_en','true'),('inattivo_key','sk-3')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed settings");
+
+        let got = providers_da_sincronizzare(&pool).await.expect("query");
+
+        assert_eq!(
+            got,
+            vec![
+                "openai".to_string(),
+                "google".to_string(),
+                "openrouter".to_string(),
+                "vllm_ok".to_string(),
+            ],
+            "entrano SOLO gli attivi+configurati, ordinati per sort_order: \
+             'spento' (enabled=false) e 'senza_key' (key vuota) fuori; \
+             'vllm_vuoto' (base_url vuoto) fuori; 'inattivo' (is_active=false) fuori; \
+             openrouter — identico ai 5 storici — NON resta piu' fuori"
+        );
+    }
+
+    // ── PEZZO 2: la policy governa anche l'INSERT, non solo l'enable ──
+
+    /// PEZZO 2 (regola L; test via il produttore reale — regola O): il ramo di
+    /// INSERT di `process_discovered_chat_model` (il nodo di produzione toccato)
+    /// consulta `model_passes_selection_policy` PRIMA di inserire. Un provider
+    /// CON policy restrittiva inserisce solo gli allowed; uno SENZA riga policy
+    /// inserisce tutti (unwrap_or(true), invariato per i 5 provider storici).
+    #[sqlx::test]
+    async fn pezzo2_policy_governa_insert(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Colonne + UNIQUE che l'INSERT reale di `insert_new_chat_model` usa ma
+        // che lo specchio di test non ha (display_name/currency/effective_from,
+        // ON CONFLICT (provider, model)).
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog \
+               ADD COLUMN display_name TEXT, \
+               ADD COLUMN currency TEXT, \
+               ADD COLUMN effective_from TIMESTAMPTZ, \
+               ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto', \
+               ADD CONSTRAINT ux_apc UNIQUE (provider, model)",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne insert");
+        sqlx::query(
+            "CREATE TABLE nexus_model_selection_policy ( \
+                 provider TEXT PRIMARY KEY, \
+                 allowed_patterns TEXT[] NOT NULL DEFAULT '{}', \
+                 denied_patterns TEXT[] NOT NULL DEFAULT '{}', \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now() )",
+        )
+        .execute(&pool)
+        .await
+        .expect("policy table");
+        sqlx::query(
+            "INSERT INTO nexus_model_selection_policy (provider, allowed_patterns, denied_patterns) \
+             VALUES ('provA', ARRAY['^good-']::text[], ARRAY[]::text[])",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed policy");
+
+        let mut delta = ModelSyncDelta::default();
+        // ramo None (modello nuovo), orchestrator=None -> niente probe.
+        process_discovered_chat_model(&pool, None, "provA", "good-1", true, None, None, &mut delta)
+            .await;
+        process_discovered_chat_model(&pool, None, "provA", "bad-1", true, None, None, &mut delta)
+            .await;
+        process_discovered_chat_model(
+            &pool, None, "provB", "qualsiasi-1", true, None, None, &mut delta,
+        )
+        .await;
+
+        let models: Vec<String> =
+            sqlx::query_scalar("SELECT provider || '/' || model FROM ai_price_catalog ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .expect("catalog");
+        assert_eq!(
+            models,
+            vec!["provA/good-1".to_string(), "provB/qualsiasi-1".to_string()],
+            "provA con policy inserisce SOLO 'good-1' (bad-1 filtrato PRIMA \
+             dell'insert); provB senza policy inserisce comunque (unwrap_or(true))"
+        );
+        assert_eq!(delta.inserted, 2, "due soli insert: good-1 e qualsiasi-1");
     }
 }
