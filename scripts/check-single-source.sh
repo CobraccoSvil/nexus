@@ -327,12 +327,19 @@ fi
 # aveva ricopiato SQL_CLAIM leggendo la suite dalla tabella sbagliata e diceva
 # "0 candidati" mentre erano 29. Un numero sbagliato con la faccia seria vale meno
 # di nessun numero.
-sql_ricopiato="$(grep -rIlE "qualification_suite_version|qualification_backoff_until"   --include=*.py --include=*.sh --include=*.ps1 --include=*.js --include=*.ts   scripts/ tools/ 2>/dev/null | grep -v "check-single-source.sh" || true)"
+#
+# Il pattern copre le colonne E le tabelle dell'eleggibilita': con le sole due
+# colonne di partenza, uno script che ricopiava la regola guardando lo stato di
+# qualificazione o la tabella dei profili passava indisturbato — cioe' proprio
+# l'errore accaduto, che stava nella scelta della TABELLA della suite.
+sql_ricopiato="$(grep -rIlE "qualification_suite_version|qualification_backoff_until|qualification_expires_at|qualification_state|ai_model_probe_profile"   --include=*.py --include=*.sh --include=*.ps1 --include=*.js --include=*.ts   scripts/ tools/ 2>/dev/null | grep -v "check-single-source.sh" || true)"
 if [[ -n "$sql_ricopiato" ]]; then
   echo "!! diagnostica-non-imita: uno script ricopia la query del claim della batteria:" >&2
   echo "$sql_ricopiato" >&2
   echo "   La copia divergera' dal codice e mentira'. Chiedi al sistema invece di" >&2
-  echo "   riscrivere la domanda (regola O)." >&2
+  echo "   riscrivere la domanda (regola O). La strada esiste:" >&2
+  echo "     cargo xtask battery-explain            chi e' eleggibile ADESSO" >&2
+  echo "     cargo xtask battery-explain <modello>  perche' si', perche' no" >&2
   fail=1
 else
   echo "OK diagnostica-non-imita: nessuno script ricopia la query del claim"
