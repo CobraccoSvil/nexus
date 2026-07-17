@@ -22,18 +22,19 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 
-use crate::orchestrator::Orchestrator;
+/// Chiavi settings (mig 0591/0593, regola G), lock stantio e REGOLA di
+/// eleggibilita': il punto unico e' il crate `nexus-model-eligibility` (regola L).
+/// Vivono la' perche' l'explain diagnostico (`xtask battery-explain`) deve
+/// interrogare la STESSA regola che questo worker esegue, invece di ricopiarla
+/// (regola O): una copia divergerebbe in silenzio.
+use nexus_model_eligibility::{
+    KEY_BACKOFF_HOURS, KEY_MAX_PER_ROUND, KEY_ROUND_ENABLED, KEY_TTL_DAYS, STALE_PROBING_MINUTES,
+};
 
-/// Chiavi settings (mig 0591/0593, regola G).
-const KEY_ROUND_ENABLED: &str = "agent.model_qualification.round_enabled";
-const KEY_MAX_PER_ROUND: &str = "agent.model_qualification.max_models_per_round";
-const KEY_TTL_DAYS: &str = "agent.model_qualification.requalify_ttl_days";
-const KEY_BACKOFF_HOURS: &str = "agent.model_qualification.backoff_hours";
+use crate::orchestrator::Orchestrator;
 
 /// Cap del backoff esponenziale (7 giorni): oltre non ha senso attendere di piu'.
 const BACKOFF_CAP_HOURS: i64 = 168;
-/// Lock `probing` stantio: oltre questa eta' il claim e' di un worker morto.
-const STALE_PROBING_MINUTES: i64 = 15;
 
 /// Capability MISURATE dalla suite v1 (P0 chat + P2 agentic): vengono SOLO dai
 /// `grants` dei profili superati. Le altre (es. `reasoning`, `vision`) non sono
@@ -710,11 +711,15 @@ async fn setting_i64(db: &PgPool, key: &str, default: i64) -> i64 {
 
 /// Carica i profili ENABLED della batteria, ordinati per `ord`.
 async fn load_profiles(db: &PgPool) -> Vec<ProbeProfile> {
-    let rows = sqlx::query(
-        "SELECT profile_key, suite_version, kind, is_blocking, certifies_tier, \
-                applies_when, grants, payload, pass_predicate \
-           FROM ai_model_probe_profile WHERE enabled = TRUE ORDER BY ord",
-    )
+    // La FONTE dei profili (tabella + filtro enabled) e' condivisa con l'explain:
+    // la premessa "quale suite e' corrente" e' esattamente cio' che lo script
+    // diagnostico del 2026-07-17 aveva sbagliato leggendola dal catalogo.
+    let rows = sqlx::query(concat!(
+        "SELECT profile_key, suite_version, kind, is_blocking, certifies_tier, ",
+        "applies_when, grants, payload, pass_predicate ",
+        nexus_model_eligibility::profile_source!(),
+        " ORDER BY ord"
+    ))
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -1849,7 +1854,8 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
     if !enabled {
         return 0;
     }
-    let max_per_round = setting_i64(db, KEY_MAX_PER_ROUND, 4).await;
+    let max_per_round =
+        setting_i64(db, KEY_MAX_PER_ROUND, nexus_model_eligibility::DEFAULT_MAX_PER_ROUND).await;
     let ttl_days = setting_i64(db, KEY_TTL_DAYS, 30).await;
     let backoff_hours = setting_i64(db, KEY_BACKOFF_HOURS, 24).await;
 
@@ -1862,7 +1868,9 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
         return 0;
     }
     let cfg = RoundConfig {
-        suite_version: profiles.iter().map(|p| p.suite_version).max().unwrap_or(1),
+        suite_version: nexus_model_eligibility::current_suite_version(
+            profiles.iter().map(|p| p.suite_version),
+        ),
         ttl_days,
         backoff_hours,
     };
@@ -1891,61 +1899,20 @@ struct RoundConfig {
     backoff_hours: i64,
 }
 
-/// Claim CAS. I candidati GIA' qualified (scaduti o con suite vecchia) sono
-/// ri-provati IN SHADOW: lo state resta 'qualified' (il pool non si svuota durante
-/// la ri-qualificazione); il lock del claim e' qualification_started_at (stantio
-/// oltre STALE_PROBING_MINUTES = worker morto, riclaimabile).
-/// I candidati del giro. Il filtro sul COOLDOWN sta QUI, non solo a valle:
-/// `qualify_claimed` controlla `is_provider_in_cooldown` col commento "non
-/// sprecare il giro", ma a quel punto il giro e' gia' speso — il claim ha
-/// consumato uno dei `max_per_round` posti per un modello che verra' scartato
-/// in 10 millisecondi.
+/// I candidati del giro, reclamati col CAS di `nexus_model_eligibility::sql_claim`.
 ///
-/// Misurato il 2026-07-16, dopo il fix del panic: due giri consecutivi hanno
-/// reclamato 8 modelli, TUTTI di openai/anthropic (in cooldown per
-/// `credit_balance_too_low`), e li hanno buttati tutti. Non e' sfortuna: quei
-/// due provider sono 76 modelli su 116 e l'ORDER BY per scadenza li pesca
-/// quasi sempre. A 4 per giro ogni 30 minuti servivano ~9 ore per smaltirli
-/// prima di toccare i 34 modelli misurabili — cioe' il "tier dai fatti" non
-/// avrebbe misurato nulla per un'intera giornata, con la batteria che girava
-/// e sembrava sana.
-///
-/// Il filtro usa `nexus_provider_health.billing_cooldown_until` (la fonte
-/// PERSISTENTE del cooldown lungo, ADR 0020/0030). Il cooldown breve vive in
-/// memoria e non e' interrogabile da SQL: per quello resta il check a valle,
-/// che da rete di sicurezza torna a essere cio' che deve essere — un caso raro,
-/// non la norma.
-const SQL_CLAIM: &str = "UPDATE ai_price_catalog c SET \
-     qualification_state = CASE WHEN c.qualification_state = 'qualified' \
-                                THEN 'qualified' ELSE 'probing' END, \
-     qualification_started_at = NOW() \
- FROM ( \
-     SELECT provider, model FROM ai_price_catalog p \
-      WHERE is_enabled = TRUE AND supports_tool_use = TRUE \
-        AND (qualification_backoff_until IS NULL OR qualification_backoff_until < NOW()) \
-        AND (qualification_started_at IS NULL \
-             OR qualification_started_at < NOW() - make_interval(mins => $2::int)) \
-        AND (qualification_state IN ('unqualified','quarantined','probing') \
-             OR (qualification_state = 'qualified' \
-                 AND (qualification_expires_at < NOW() \
-                      OR qualification_suite_version < $3))) \
-        AND NOT EXISTS (SELECT 1 FROM nexus_provider_health h \
-                         WHERE h.provider = p.provider \
-                           AND h.billing_cooldown_until > NOW()) \
-      ORDER BY (qualification_state = 'unqualified') DESC, \
-               qualification_expires_at ASC NULLS FIRST \
-      LIMIT $1 \
-      FOR UPDATE SKIP LOCKED \
- ) cand \
- WHERE c.provider = cand.provider AND c.model = cand.model \
- RETURNING c.provider, c.model, c.capabilities";
-
+/// La REGOLA (chi e' eleggibile: catalog abilitato, tool use dichiarato, backoff
+/// scaduto, lock libero, da rimisurare, provider senza cooldown) vive nel crate
+/// come punto unico, insieme al perche' di ogni condizione. Non e' cortesia
+/// architetturale: `xtask battery-explain` compone la SUA query dalle stesse
+/// condizioni, quindi la diagnosi risponde sempre sulla regola che gira davvero
+/// qui (regola O). Una copia — cioe' com'era prima — divergeva in silenzio.
 async fn claim_candidates(
     db: &PgPool,
     max_per_round: i64,
     suite_version: i32,
 ) -> Vec<(String, String, Value)> {
-    sqlx::query_as(SQL_CLAIM)
+    sqlx::query_as(&nexus_model_eligibility::sql_claim())
         .bind(max_per_round)
         .bind(STALE_PROBING_MINUTES as i32)
         .bind(suite_version)

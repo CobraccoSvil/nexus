@@ -1976,6 +1976,7 @@ dependencies = [
  "nexus-graph",
  "nexus-http",
  "nexus-mcp-client",
+ "nexus-model-eligibility",
  "nexus-orchestrator",
  "nexus-pricing",
  "nexus-project-db",
@@ -2372,6 +2373,10 @@ dependencies = [
  "tokio",
  "uuid",
 ]
+
+[[package]]
+name = "nexus-model-eligibility"
+version = "0.1.0"
 
 [[package]]
 name = "nexus-orchestrator"
@@ -5680,6 +5685,8 @@ dependencies = [
  "anyhow",
  "dotenvy",
  "mcp-quality",
+ "nexus-auth",
+ "nexus-model-eligibility",
  "regex",
  "serde",
  "serde_json",

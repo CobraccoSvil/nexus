@@ -34,6 +34,7 @@ mcp-db = { path = "../mcp-db" }
 mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }
 nexus-pricing = { path = "../nexus-pricing" }
+nexus-model-eligibility = { path = "../nexus-model-eligibility" }
 nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
 nexus-cache = { path = "../nexus-cache" }
