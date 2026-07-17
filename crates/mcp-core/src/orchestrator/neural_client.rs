@@ -51,12 +51,16 @@ impl std::fmt::Debug for NeuralCoreClient {
 }
 
 impl NeuralCoreClient {
-    /// Costruisce il client. Non apre piu' alcun canale gRPC (il brain non e' nel
-    /// percorso): l'`url` e' accettato per compatibilita' di firma coi call site
-    /// che ancora leggono `settings.neural_core_url`, ma e' ignorato. Resta
-    /// `async`/`Result` per non toccare i ~5 call site esistenti.
-    pub async fn connect(_url: &str) -> anyhow::Result<Self> {
-        Ok(Self)
+    /// Costruisce il client.
+    ///
+    /// Prima era `connect(url) -> Result`: accettava un URL, lo IGNORAVA e non
+    /// falliva mai. Attorno a quella firma erano cresciuti un setting
+    /// (`neural_core_url`), una env var (`NEURAL_CORE_URL`), tre punti che li
+    /// leggevano e un retry-loop da 60 tentativi che ritentava una funzione
+    /// infallibile. Una firma che mente si porta dietro del lavoro inutile: ora
+    /// dice il vero, e quel lavoro non ha piu' motivo di esistere.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Variante per i test unit. Identica a `connect` ora che non c'e' piu' un

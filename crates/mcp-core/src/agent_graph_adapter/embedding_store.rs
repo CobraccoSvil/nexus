@@ -56,11 +56,9 @@ impl EmbeddingStore for PgEmbeddingStore {
             return Ok(Vec::new());
         }
 
-        // Punto unico embedder ONNX MiniLM-384d in-process (regola L). connect("")
-        // non apre canali (client zero-sized); model "" -> label MiniLM di default.
-        let neural = NeuralCoreClient::connect("")
-            .await
-            .map_err(|e| PortError::Tool(format!("embed: neural client: {e}")))?;
+        // Punto unico embedder ONNX MiniLM-384d in-process (regola L). Il client
+        // e' zero-sized e non apre canali; model "" -> label MiniLM di default.
+        let neural = NeuralCoreClient::new();
 
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for text in &texts {

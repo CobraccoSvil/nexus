@@ -258,47 +258,33 @@ pub async fn update_setting(
         crate::dlp::invalidate_dlp_cache();
     }
 
-    // Propaga impostazioni di connessione come variabili d'ambiente di processo
-    // (effetto immediato per tutti i nuovi client nexus-http, no riavvio)
-    match key.as_str() {
-        "nexus_external_proxy" => {
-            if body.value.is_empty() {
-                std::env::remove_var("NEXUS_PROXY");
-            } else {
-                std::env::set_var("NEXUS_PROXY", &body.value);
-            }
-            // Notifica il Neural Core di ricaricare le impostazioni
-            let neural_url = std::env::var("NEURAL_CORE_REST_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-            let client = nexus_http::build_client();
-            let _ = client
-                .post(format!("{}/reload-settings", neural_url))
-                .json(&serde_json::json!({}))
-                .send()
-                .await;
+    // Propaga il proxy come variabile d'ambiente di processo (effetto immediato
+    // per tutti i nuovi client nexus-http, senza riavvio).
+    //
+    // Qui partiva anche un POST `{NEURAL_CORE_REST_URL}/reload-settings` per
+    // avvisare il brain Python di rileggere la configurazione — su
+    // `nexus_external_proxy` e su `network_dns_servers`. Il brain e' stato
+    // rimosso: quella notifica non arrivava a nessuno (e l'URL veniva da una env
+    // var con fallback hardcoded a 127.0.0.1:8001, regola G). Il DNS override
+    // era una prerogativa del brain: senza brain non c'e' piu' nessuno da
+    // notificare.
+    if key.as_str() == "nexus_external_proxy" {
+        if body.value.is_empty() {
+            std::env::remove_var("NEXUS_PROXY");
+        } else {
+            std::env::set_var("NEXUS_PROXY", &body.value);
         }
-        "network_dns_servers" => {
-            // Notifica il Neural Core di ricaricare le impostazioni (applica DNS override)
-            let neural_url = std::env::var("NEURAL_CORE_REST_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-            let client = nexus_http::build_client();
-            let _ = client
-                .post(format!("{}/reload-settings", neural_url))
-                .json(&serde_json::json!({}))
-                .send()
-                .await;
-        }
-        _ => {}
     }
 
     Ok(Json(serde_json::json!({ "status": "ok", "key": key })))
 }
 
-/// Effetti collaterali di una scrittura in blocco: cache DLP e chiavi API.
+/// Effetti collaterali di una scrittura in blocco: invalidazione della cache DLP.
 ///
 /// Estratti da `bulk_update`, che altrimenti mescola la scrittura, gli effetti
-/// e la costruzione della risposta in una funzione sola.
-fn apply_bulk_side_effects(body: &BulkUpdateRequest, all_ok: bool) {
+/// e la costruzione della risposta in una funzione sola. Prendeva anche `all_ok`
+/// per non notificare il brain su una scrittura parziale: il brain non c'e' piu'.
+fn apply_bulk_side_effects(body: &BulkUpdateRequest) {
     // Se sono state cambiate chiavi DLP, invalida la cache in-process.
     let has_dlp_key = body.settings.iter().any(|e| {
         matches!(
@@ -310,30 +296,12 @@ fn apply_bulk_side_effects(body: &BulkUpdateRequest, all_ok: bool) {
         crate::dlp::invalidate_dlp_cache();
     }
 
-    // Se e' stata salvata almeno una API key, ricarica le chiavi nel brain.
-    let has_api_key = body.settings.iter().any(|e| e.key.ends_with("_api_key"));
-    if !has_api_key || !all_ok {
-        return;
-    }
-    // Il brain REST server e' su NEURAL_CORE_URL (porta 8001) o su /neural se
-    // proxied; per il reload interno usiamo l'URL diretto.
-    let brain_url = std::env::var("NEURAL_CORE_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-        match client
-            .post(format!("{brain_url}/reload-settings"))
-            .json(&serde_json::json!({"mcp_core_url": "http://localhost:4000"}))
-            .send()
-            .await
-        {
-            Ok(r) => tracing::info!("Brain reload-settings: {}", r.status()),
-            Err(e) => tracing::warn!("Brain reload-settings failed: {e}"),
-        }
-    });
+    // Al salvataggio di una `*_api_key` partiva anche un POST
+    // `{NEURAL_CORE_REST_URL}/reload-settings` per far rileggere le chiavi al
+    // brain Python, che le teneva in memoria. Il brain e' stato rimosso: quella
+    // chiamata non arrivava a nessuno e logava "Brain reload-settings failed" a
+    // ogni salvataggio di chiave. Chi consuma le API key oggi (gateway, provider)
+    // le legge dal DB, quindi non c'e' nessuna cache remota da invalidare.
 }
 
 /// PUT /api/admin/settings — aggiorna piu' impostazioni in un colpo.
@@ -377,7 +345,7 @@ pub async fn bulk_update(
         }
     }
 
-    apply_bulk_side_effects(&body, errors.is_empty());
+    apply_bulk_side_effects(&body);
 
     if errors.is_empty() {
         return (

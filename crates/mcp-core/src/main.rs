@@ -602,39 +602,6 @@ async fn wiki_bootstrap_recompute_links(state_links: AppState) {
     }
 }
 
-/// Connette il Neural Core con retry a backoff crescente (2s -> cap 10s, fino a
-/// `MAX_ATTEMPTS` tentativi, ~9 minuti). Resilienza all'avvio (regola H): il brain
-/// puo' avere cold start lento o hang transitori; ci arrendiamo solo dopo molti
-/// tentativi. Estratta da `main` (comportamento invariato): ritorna il client o un
-/// errore che `main` propaga con `?`.
-async fn connect_neural_core_with_retry(neural_core_url: &str) -> anyhow::Result<NeuralCoreClient> {
-    let mut attempts = 0u32;
-    const MAX_ATTEMPTS: u32 = 60;
-    loop {
-        match NeuralCoreClient::connect(neural_core_url).await {
-            Ok(c) => {
-                if attempts > 0 {
-                    tracing::info!("Neural Core connesso dopo {attempts} tentativi");
-                }
-                return Ok(c);
-            }
-            Err(e) => {
-                attempts += 1;
-                if attempts >= MAX_ATTEMPTS {
-                    anyhow::bail!(
-                        "Failed to connect to Neural Core after {attempts} attempts: {e}"
-                    );
-                }
-                let backoff = std::cmp::min(2 + attempts as u64, 10);
-                tracing::warn!(
-                    "Neural Core not ready (attempt {attempts}/{MAX_ATTEMPTS}): {e} — retry in {backoff}s"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            }
-        }
-    }
-}
-
 /// Cache di routing e registro porte inizializzate all'avvio, raggruppate per
 /// non moltiplicare i valori di ritorno di `init_routing_and_port_caches`
 /// (regola: helper <=6 parametri, niente tuple lunghe illeggibili).
@@ -1543,8 +1510,6 @@ async fn main() -> anyhow::Result<()> {
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let neural_core_url =
-        std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
     // Riconciliazione META dei processi 'running'/'starting' stale (vedi
     // `reconcile_stale_processes`). Il reap dei run orfani e' in `build_app_state`,
@@ -1554,7 +1519,9 @@ async fn main() -> anyhow::Result<()> {
     // Redis + esposizione a provider_cooldown + restore cooldown billing.
     let redis = init_redis_and_cooldowns(&db, &redis_url).await?;
 
-    let neural_client = connect_neural_core_with_retry(&neural_core_url).await?;
+    // Client zero-sized: delega all'embedder ONNX in-process e al gateway. Non
+    // apre canali, quindi non c'e' nulla da connettere ne' da ritentare.
+    let neural_client = NeuralCoreClient::new();
     let template_cache = prompt_templates::TemplateCache::new();
 
     // Cache di routing/porte + singleton build graph (vedi `init_routing_and_port_caches`).

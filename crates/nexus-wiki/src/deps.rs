@@ -44,7 +44,7 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
     ) -> BoxFuture<'_, Result<(String, String), String>>;
 
     /// Notifica un fallimento LLM strutturato per applicare cooldown provider
-    /// (punto unico `brain_agent_client::handle_provider_llm_failure`).
+    /// (punto unico `agent_turn_setup::handle_provider_llm_failure`).
     fn notify_provider_llm_failure(
         &self,
         provider: &str,

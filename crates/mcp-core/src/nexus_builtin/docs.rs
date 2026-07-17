@@ -53,18 +53,6 @@ fn doc_content_is_empty(content: &Value) -> bool {
     }
 }
 
-/// Risolve l'URL del Neural Core: setting DB `neural_core_url`, poi env var
-/// `NEURAL_CORE_URL`, infine default locale. Punto unico (regola L) condiviso
-/// dai due call site che embeddano testo (KB context e ricerca documenti).
-async fn neural_core_url(db: &PgPool) -> String {
-    crate::auth::get_setting(db, "neural_core_url")
-        .await
-        .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
-        })
-}
-
 /// Risolve il project id target dagli argomenti: prova il parse dell'UUID, poi
 /// il lookup per nome (ILIKE), con fallback sul `project_id` del run corrente.
 /// Estratto da `handle_doc_generate` per ridurne lunghezza e complessita.
@@ -130,19 +118,12 @@ async fn append_kb_project_context(
     project_name: &str,
     doc_type: &str,
 ) {
-    let neural_url_kb = neural_core_url(db).await;
     let kb_query = format!(
         "Architettura, funzionalita', requisiti e componenti principali del progetto {} \
          per documento di tipo {}",
         project_name, doc_type
     );
-    let neural_kb = match crate::orchestrator::NeuralCoreClient::connect(&neural_url_kb).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("nexus_doc_generate: connessione neural core per KB fallita: {e}");
-            return;
-        }
-    };
+    let neural_kb = crate::orchestrator::NeuralCoreClient::new();
     let vector = match neural_kb.embed_text("", &kb_query).await {
         Ok(v) => v,
         Err(e) => {
@@ -940,12 +921,7 @@ pub(super) async fn handle_doc_search(db: &PgPool, project_id: Uuid, args: &Valu
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
 
     // Embed query
-    let neural_url = neural_core_url(db).await;
-
-    let neural = match crate::orchestrator::NeuralCoreClient::connect(&neural_url).await {
-        Ok(c) => c,
-        Err(e) => return format!("[Errore] Connessione Neural Core: {e}"),
-    };
+    let neural = crate::orchestrator::NeuralCoreClient::new();
 
     let vector = match neural.embed_text("", &query).await {
         Ok(v) => v,
