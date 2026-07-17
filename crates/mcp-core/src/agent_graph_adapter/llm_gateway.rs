@@ -472,7 +472,14 @@ pub(crate) fn tools_to_openai_schema(tools: &[Value]) -> Value {
 /// il formato del gateway e la porta `LlmResponse`. Valori ignoti -> passthrough
 /// (robustezza: niente magic, una stringa sconosciuta cade poi sul default
 /// `end_turn` del punto unico executor, come oggi).
-fn normalize_gw_finish_reason(finish: &str) -> String {
+///
+/// `pub(crate)` perche' anche il path NEURALE ha bisogno dello stesso vocabolario:
+/// `agent_turn_value_from_gw` (neural_client) espone il `finish_reason` normalizzato
+/// nel Value del turno. Chiamare QUI e' l'unico modo di non riscrivere la mappa
+/// altrove: il loop multi-step deve poter distinguere "troncato dal nostro cap"
+/// (`max_tokens`) da "ha smesso di chiamare tool" (`end_turn`), e quella distinzione
+/// nasce dal `finish_reason` del gateway, non da un'euristica.
+pub(crate) fn normalize_gw_finish_reason(finish: &str) -> String {
     match finish {
         "tool_calls" => "tool_use".to_string(),
         "length" => "max_tokens".to_string(),

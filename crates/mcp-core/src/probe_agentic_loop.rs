@@ -75,7 +75,13 @@ pub(crate) async fn run_loop(
             };
         }
         // Troncato dal NOSTRO cap di token: misurerebbe il nostro budget, non lui.
-        if turn.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+        // Si legge `finish_reason` (il segnale del gateway, normalizzato al
+        // vocabolario della porta), NON `stop_reason`: quest'ultimo il produttore lo
+        // DERIVA dalla presenza di tool-call e vale solo "tool_use"/"end_turn" — non
+        // puo' valere "max_tokens" per costruzione. Finche' il controllo guardava li'
+        // era inerte, e un modello troncato dal nostro cap veniva letto come "ha
+        // smesso di chiamare tool": una bocciatura al posto di un inconcludente.
+        if turn.get("finish_reason").and_then(Value::as_str) == Some("max_tokens") {
             return LoopOutcome {
                 measures: misura(&traccia, &emessi, token_errore.as_deref(), turno_errore, &firme_fallite),
                 inconclusive: Some("truncated_max_tokens".to_string()),
@@ -97,7 +103,7 @@ pub(crate) async fn run_loop(
 
         // L'assistant va riappeso PRIMA dei tool_result, o la conversazione e'
         // incoerente e il provider la rifiuta.
-        messaggi.push(assistant_da_blocchi(&blocchi, turn.get("content").and_then(Value::as_str)));
+        messaggi.push(assistant_dal_turno(&turn));
 
         let mut stato = StatoGiro {
             traccia: &mut traccia,
@@ -165,40 +171,43 @@ fn esegui_blocchi(blocchi: &[Value], turno: usize, mondo: &mut ScriptedWorld, s:
     }
 }
 
-/// Il messaggio assistant da riappendere, ricostruito dai blocchi.
+/// Il messaggio assistant da riappendere: RIECHEGGIATO dal turno, non ricostruito.
 ///
-/// LIMITE DICHIARATO: il Value del turno espone `tool_use_blocks` ma non i
-/// `tool_calls` originali del filo, quindi la `thought_signature` per-call di
-/// Gemini 3 non sopravvive al giro e quel provider puo' rifiutare il secondo turno
-/// (400 INVALID_ARGUMENT). Si vedra' come `provider:invalid_request` concentrato su
-/// google — inconclusivo, non una bocciatura del modello. Il fix e' propagare
-/// `tool_calls` nel produttore: e' additivo e va fatto, ma non qui.
-fn assistant_da_blocchi(blocchi: &[Value], contenuto: Option<&str>) -> Value {
-    let calls: Vec<Value> = blocchi
-        .iter()
-        .map(|b| {
-            json!({
-                "id": b.get("id").and_then(Value::as_str).unwrap_or("call"),
-                "type": "function",
-                "function": {
-                    "name": b.get("name").and_then(Value::as_str).unwrap_or_default(),
-                    "arguments": b.get("input").cloned().unwrap_or(json!({})).to_string(),
-                }
-            })
-        })
-        .collect();
-    json!({
+/// Il produttore (`agent_turn_value_from_gw`) espone gia' le `tool_calls` nella forma
+/// esatta che il gateway riaccetta in richiesta, con la `thought_signature` per-call
+/// che Gemini 3 esige di ritorno sulla stessa `functionCall` (HTTP 400
+/// INVALID_ARGUMENT se manca). Qui non si ricostruisce nulla: ricostruire dai
+/// `tool_use_blocks` sarebbe una SECONDA versione di "com'e' fatto un turno
+/// assistant" (regola L) e perderebbe per costruzione cio' che i blocchi non
+/// portano — la firma, e gli `arguments` letterali del modello.
+fn assistant_dal_turno(turn: &Value) -> Value {
+    let mut msg = json!({
         "role": "assistant",
-        "content": contenuto.unwrap_or(""),
-        "tool_calls": calls,
-    })
+        "content": turn.get("content").and_then(Value::as_str).unwrap_or(""),
+    });
+    // Verbatim: cio' che il produttore ha messo, esattamente com'e'. `tool_calls`
+    // porta dentro di se' la firma per-call; le altre due sono per-messaggio
+    // (Anthropic / DeepSeek). Assenti -> omesse, come le vuole il contratto.
+    for campo in ["tool_calls", "thinking_signature", "reasoning"] {
+        if let Some(v) = turn.get(campo) {
+            msg[campo] = v.clone();
+        }
+    }
+    msg
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nexus_gateway::{GwResponse, GwToolCall, GwToolFunctionCall, GwUsage};
+    use crate::orchestrator::neural_client::agent_turn_value_from_gw;
     use crate::probe_world::TokenSeed;
     use std::cell::RefCell;
+
+    /// Il provider che esige la firma di ritorno, e un modello della sua famiglia:
+    /// qui non sono configurazione (regola G), sono la SCENA dell'incidente.
+    const PROVIDER: &str = "google";
+    const MODELLO: &str = "gemini-3-pro-preview";
 
     fn seme(profilo: &str) -> TokenSeed {
         TokenSeed {
@@ -210,13 +219,59 @@ mod tests {
         }
     }
 
+    /// Il turno come lo costruisce la PRODUZIONE: una [`GwResponse`] del gateway fatta
+    /// passare per `agent_turn_value_from_gw`, l'UNICO produttore di questo Value.
+    ///
+    /// Fabbricare il turno a mano (`json!({"tool_use_blocks": ...})`) fisserebbe
+    /// l'assunto che vogliamo verificare: codice e test condividerebbero l'errore e
+    /// resterebbero verdi per sempre — e' cosi' che la chiave inventata `turn["result"]`
+    /// e' sopravvissuta (regola O).
+    fn turno_dal_gateway(
+        content: &str,
+        chiamate: &[(String, String)],
+        finish_reason: &str,
+        firma: Option<&str>,
+    ) -> Value {
+        let tool_calls: Vec<GwToolCall> = chiamate
+            .iter()
+            .enumerate()
+            .map(|(i, (nome, arguments))| GwToolCall {
+                id: format!("c{i}"),
+                kind: "function".to_string(),
+                function: GwToolFunctionCall {
+                    name: nome.clone(),
+                    arguments: arguments.clone(),
+                },
+                // La firma per-call che Gemini 3 emette su OGNI functionCall.
+                thought_signature: firma.map(str::to_string),
+            })
+            .collect();
+        let resp = GwResponse {
+            content: content.to_string(),
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            usage: GwUsage::default(),
+            model_used: MODELLO.to_string(),
+            provider_used: PROVIDER.to_string(),
+            latency_ms: 12,
+            finish_reason: finish_reason.to_string(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+            citations: None,
+        };
+        agent_turn_value_from_gw(PROVIDER, MODELLO, &resp)
+    }
+
     /// Un modello finto che gioca una sceneggiatura: a ogni turno emette le
     /// tool-call che gli diciamo. Serve a provare la MECCANICA del giro senza rete.
+    /// Il TURNO pero' non se lo inventa: lo fa produrre al produttore vero.
     struct ModelloScritto {
         /// Per ogni turno: le chiamate (nome, input). Vuoto = smette.
         copione: RefCell<Vec<Vec<(String, Value)>>>,
         /// L'ultima conversazione vista: per verificare che il giro sia coerente.
         vista: RefCell<String>,
+        /// La firma di pensiero che il provider appiccica a ogni tool-call.
+        firma: Option<String>,
     }
 
     impl ModelloScritto {
@@ -229,6 +284,15 @@ mod tests {
                         .collect(),
                 ),
                 vista: RefCell::new(String::new()),
+                firma: None,
+            }
+        }
+
+        /// Come [`ModelloScritto::new`], ma il modello firma il proprio pensiero.
+        fn con_firma(copione: Vec<Vec<(&str, Value)>>, firma: &str) -> Self {
+            Self {
+                firma: Some(firma.to_string()),
+                ..Self::new(copione)
             }
         }
     }
@@ -257,26 +321,26 @@ mod tests {
             *self.vista.borrow_mut() = messages_json.to_string();
             let mut c = self.copione.borrow_mut();
             if c.is_empty() {
-                return json!({ "content": "fatto", "tool_use_blocks": [], "stop_reason": "end_turn" });
+                return turno_dal_gateway("fatto", &[], "stop", None);
             }
             let passo = c.remove(0);
             let letto = token_dalla_conversazione(messages_json);
-            let blocchi: Vec<Value> = passo
+            let chiamate: Vec<(String, String)> = passo
                 .iter()
-                .enumerate()
-                .map(|(i, (n, inp))| {
+                .map(|(n, inp)| {
                     // Il copione dice "leggi": il modello finto prende il token dalla
                     // conversazione, come farebbe uno vero.
-                    let inp = match (inp.to_string().contains(LEGGI), &letto) {
-                        (true, Some(t)) => {
-                            serde_json::from_str(&inp.to_string().replace(LEGGI, t)).unwrap_or(json!({}))
-                        }
-                        _ => inp.clone(),
+                    let grezzo = inp.to_string();
+                    let arguments = match (grezzo.contains(LEGGI), &letto) {
+                        (true, Some(t)) => grezzo.replace(LEGGI, t),
+                        _ => grezzo,
                     };
-                    json!({ "id": format!("c{i}"), "name": n, "input": inp })
+                    (n.clone(), arguments)
                 })
                 .collect();
-            json!({ "content": "", "tool_use_blocks": blocchi, "stop_reason": "tool_use" })
+            // "tool_calls" e' il vocabolario WIRE del gateway per "ha chiamato un
+            // tool"; e' il produttore a tradurlo.
+            turno_dal_gateway("", &chiamate, "tool_calls", self.firma.as_deref())
         }
     }
 
@@ -350,12 +414,18 @@ mod tests {
     }
 
     /// Il troncamento dal NOSTRO cap non e' colpa del modello.
+    ///
+    /// Il turno viene dal produttore con `finish_reason="length"` — cio' che il
+    /// gateway dice DAVVERO quando il cap taglia la risposta. Prima questo test
+    /// fabbricava `stop_reason:"max_tokens"`, un valore che il produttore non puo'
+    /// emettere (lo DERIVA dalle tool-call: solo "tool_use"/"end_turn"): il test era
+    /// verde e il controllo nel loop non poteva scattare mai.
     #[tokio::test]
     async fn il_troncamento_e_inconclusivo_non_una_bocciatura() {
         struct Troncato;
         impl TurnSource for Troncato {
             async fn turn(&self, _m: &str) -> Value {
-                json!({ "content": "", "tool_use_blocks": [], "stop_reason": "max_tokens" })
+                turno_dal_gateway("", &[], "length", None)
             }
         }
         let mut mondo = ScriptedWorld::new(WorldKind::Catena, seme("agentic_chain"), &[]).unwrap();
@@ -406,12 +476,94 @@ mod tests {
         struct Infinito;
         impl TurnSource for Infinito {
             async fn turn(&self, _m: &str) -> Value {
-                json!({ "content": "", "stop_reason": "tool_use",
-                        "tool_use_blocks": [{ "id": "c", "name": "list_files", "input": {"path": "/"} }] })
+                turno_dal_gateway(
+                    "",
+                    &[("list_files".to_string(), json!({"path": "/"}).to_string())],
+                    "tool_calls",
+                    None,
+                )
             }
         }
         let mut mondo = ScriptedWorld::new(WorldKind::Catena, seme("agentic_chain"), &[]).unwrap();
         let out = run_loop(&Infinito, WorldKind::Catena, &mut mondo, "x", 3).await;
         assert_eq!(out.turni, 3, "si ferma al cap, non gira per sempre");
+    }
+
+    /// Una firma opaca come quelle che Gemini 3 emette per-call.
+    const FIRMA: &str = "CtcBAVSoXO9dGRkm0Xq2hVLZ4bWnNr1sQqYd8vTgJhPzKcM3Fx";
+
+    /// L'assistant che il loop rimanda indietro, letto DOVE conta: sul wire.
+    /// `gw_message_from_value` e' l'ultimo cancello prima del gateway, quindi e' lui
+    /// a dire cosa parte davvero (regola O: si asserisce la conseguenza).
+    fn assistant_sul_wire(vista: &str) -> crate::nexus_gateway::GwMessage {
+        let conversazione: Vec<Value> = serde_json::from_str(vista).unwrap();
+        let assistant = conversazione
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("il giro deve riappendere l'assistant prima dei tool_result")
+            .clone();
+        crate::orchestrator::neural_client::gw_message_from_value(assistant)
+    }
+
+    /// LA FIRMA DI PENSIERO SOPRAVVIVE AL SECONDO TURNO (Gemini 3).
+    ///
+    /// Gemini 3 esige che la `thought_signature` torni indietro VERBATIM sulla stessa
+    /// `functionCall`, pena HTTP 400 INVALID_ARGUMENT: se si perde, google fallisce
+    /// ogni profilo multi-step per un difetto NOSTRO e viene declassato a torto.
+    ///
+    /// Il giro parte dalla `GwResponse` del gateway (produttore reale) e arriva al
+    /// `GwMessage` che parte: entrambi gli estremi sono codice di produzione.
+    #[tokio::test]
+    async fn la_firma_di_pensiero_di_gemini_sopravvive_al_giro() {
+        let mut mondo = ScriptedWorld::new(WorldKind::Catena, seme("agentic_chain"), &[]).unwrap();
+        let s = seme("agentic_chain");
+        let m = ModelloScritto::con_firma(
+            vec![
+                vec![("read_file", json!({ "path": s.handle(0) }))],
+                vec![("read_file", json!({ "path": s.handle(1) }))],
+            ],
+            FIRMA,
+        );
+        run_loop(&m, WorldKind::Catena, &mut mondo, "istruzione", 6).await;
+
+        let msg = assistant_sul_wire(&m.vista.borrow());
+        let calls = msg
+            .tool_calls
+            .expect("l'assistant deve ripartire con le sue tool_calls, o la coppia tool_use/tool_result si rompe");
+        assert_eq!(
+            calls[0].thought_signature.as_deref(),
+            Some(FIRMA),
+            "la firma di pensiero deve tornare indietro verbatim: senza, google \
+             rifiuta il secondo turno con 400 INVALID_ARGUMENT e la batteria \
+             declassa il modello per un difetto nostro"
+        );
+        assert_eq!(calls[0].kind, "function", "il discriminante OpenAI resta");
+    }
+
+    /// Gli `arguments` tornano LETTERALI, non ri-serializzati.
+    ///
+    /// La firma di Gemini copre la functionCall: ricostruirla ri-serializzando
+    /// l'input parsato la riscrive (spaziatura, ordine, forma dei numeri) e la firma
+    /// non combacia piu'. Qui il modello emette `arguments` spaziati: se tornano
+    /// compattati, qualcuno li ha ricostruiti invece di riecheggiarli.
+    #[test]
+    fn gli_arguments_tornano_letterali_non_ricostruiti() {
+        let spaziati = r#"{"path": "alfa", "peso": 1.0}"#.to_string();
+        let turno = turno_dal_gateway(
+            "",
+            &[("read_file".to_string(), spaziati.clone())],
+            "tool_calls",
+            Some(FIRMA),
+        );
+        let msg = crate::orchestrator::neural_client::gw_message_from_value(assistant_dal_turno(
+            &turno,
+        ));
+        let calls = msg.tool_calls.expect("tool_calls sul wire");
+        assert_eq!(
+            calls[0].function.arguments, spaziati,
+            "gli arguments devono ripartire byte per byte come il modello li ha \
+             emessi: ri-serializzarli invaliderebbe la firma che li copre"
+        );
+        assert_eq!(calls[0].thought_signature.as_deref(), Some(FIRMA));
     }
 }

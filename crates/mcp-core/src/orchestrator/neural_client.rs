@@ -484,6 +484,30 @@ fn tool_blocks_from_gw(resp: &GwResponse) -> (Vec<Value>, Vec<Value>) {
 /// usage, error:null, error_class:null}`. `stop_reason` = "tool_use" se ci sono
 /// tool-call, altrimenti "end_turn" (come il brain, che NON propaga il
 /// finish_reason grezzo qui ma lo deriva dalla presenza di tool-call).
+///
+/// # Cio' che deve sopravvivere al giro di andata e ritorno
+///
+/// `tool_use_blocks` e' una forma COMODA (`{id, name, input}` gia' parsato) ma
+/// LOSSY: non e' il turno che il provider vuole indietro. Chi rimanda la
+/// conversazione al turno successivo (il loop multi-step di
+/// [`crate::probe_agentic_loop`]) deve poter riprodurre l'assistant VERBATIM, e
+/// tre cose non passavano da qui:
+///
+/// - `tool_calls`: le tool-call ORIGINALI, con la `thought_signature` per-call che
+///   Gemini 3 esige di ritorno sulla stessa `functionCall` (HTTP 400
+///   INVALID_ARGUMENT se manca). Ricostruirle dai blocchi le normalizza (gli
+///   `arguments` verrebbero ri-serializzati) e la firma non c'e' proprio piu';
+/// - `finish_reason` (normalizzato al vocabolario della porta dal punto unico
+///   [`crate::agent_graph_adapter::llm_gateway::normalize_gw_finish_reason`]): senza
+///   di esso "troncato dal cap" e "ha smesso di chiamare tool" sono indistinguibili,
+///   perche' `stop_reason` qui e' DERIVATO dalla presenza di tool-call e non puo'
+///   valere `max_tokens` per costruzione;
+/// - `thinking_signature` (Anthropic, per-messaggio) e `reasoning` (DeepSeek): stesso
+///   vincolo di round-trip, gia' onorato dal path del grafo (`map_gw_response`).
+///
+/// I campi sono ADDITIVI e omessi quando assenti: `stop_reason`, `tool_use_blocks` e
+/// `assistant_content` non cambiano forma, quindi i consumatori esistenti
+/// (`read_turn_signals`, `evaluate_tool_probe`) non vedono differenza.
 pub(crate) fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
     let used_provider = if resp.provider_used.is_empty() {
         provider
@@ -511,17 +535,44 @@ pub(crate) fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwRes
         "tool_use"
     };
 
-    json!({
+    let mut turn = json!({
         "provider": used_provider,
         "model": used_model,
         "content": resp.content,
         "stop_reason": stop_reason,
+        // Vocabolario della porta dal punto unico (regola L): "length" -> "max_tokens".
+        "finish_reason": crate::agent_graph_adapter::llm_gateway::normalize_gw_finish_reason(
+            &resp.finish_reason,
+        ),
         "tool_use_blocks": tool_use_blocks,
         "assistant_content": assistant_content,
         "usage": usage_value_from_gw(resp),
         "error": Value::Null,
         "error_class": Value::Null,
-    })
+    });
+    aggiungi_campi_di_round_trip(&mut turn, resp);
+    turn
+}
+
+/// I campi che il turno deve portare con se' per poter essere RIMANDATO INDIETRO
+/// identico: le tool-call verbatim (con la firma per-call di Gemini 3) e le firme
+/// per-messaggio. Additivi: assenti dal Value quando il provider non li emette, cosi'
+/// un turno testuale resta esattamente com'era.
+fn aggiungi_campi_di_round_trip(turn: &mut Value, resp: &GwResponse) {
+    // VERBATIM: la forma serializzata di `GwToolCall` E' quella che il gateway
+    // riaccetta in richiesta (`Serialize`+`Deserialize`, contratto bidirezionale).
+    // Ri-costruirla a mano dai blocchi la normalizzerebbe.
+    if let Some(tool_calls) = &resp.tool_calls {
+        if let Ok(v) = serde_json::to_value(tool_calls) {
+            turn["tool_calls"] = v;
+        }
+    }
+    if let Some(sig) = &resp.thinking_signature {
+        turn["thinking_signature"] = json!(sig);
+    }
+    if let Some(reasoning) = &resp.reasoning {
+        turn["reasoning"] = json!(reasoning);
+    }
 }
 
 /// Forma `Value` d'errore di `generate_agent_turn`, paritetica al ramo `except`
@@ -640,7 +691,15 @@ fn error_agent_turn_value_inner(
 /// in `GwMessage`. I call site passano sempre `{role, content}` testuali; i campi
 /// tool sono preservati se presenti (robustezza, retrocompatibile col contratto
 /// gateway). `role`/`content` mancanti -> default difensivi.
-fn gw_message_from_value(v: Value) -> GwMessage {
+///
+/// E' l'ULTIMO cancello prima del wire: cio' che non viene letto qui non parte, per
+/// quanto correttamente il chiamante l'abbia messo nel messaggio. `tool_calls` passa
+/// per `GwToolCall`, che porta con se' la `thought_signature` per-call (Gemini 3).
+///
+/// `pub(crate)` perche' un round-trip si prova solo arrivando fin qui: asserire che
+/// la firma sia nel messaggio dimostra che l'abbiamo scritta, non che parte davvero
+/// (regola O: si asserisce la conseguenza, non la stringa).
+pub(crate) fn gw_message_from_value(v: Value) -> GwMessage {
     let role = v
         .get("role")
         .and_then(Value::as_str)
@@ -661,13 +720,20 @@ fn gw_message_from_value(v: Value) -> GwMessage {
         .get("reasoning")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Round-trip firma thinking Anthropic: era inchiodata a `None`, quindi la firma
+    // moriva QUI anche quando il chiamante la portava. Speculare al `reasoning`
+    // DeepSeek sopra; il server la inoltra solo ad Anthropic.
+    let thinking_signature = v
+        .get("thinking_signature")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     GwMessage {
         role,
         content,
         tool_calls,
         tool_call_id,
         reasoning,
-        thinking_signature: None,
+        thinking_signature,
     }
 }
 
