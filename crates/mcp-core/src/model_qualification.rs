@@ -1037,31 +1037,15 @@ impl ProbeCtx<'_> {
         }
     }
 
-    /// UN tentativo multi-step: costruisce il mondo, gira il loop, e consegna un
-    /// turno sintetico coi FATTI sotto `measures` — dove il predicato li legge.
-    async fn multi_step_attempt(
+    /// Il mondo del tentativo e l'istruzione che lo apre. `Err` col motivo se il
+    /// mondo non e' costruibile: e' colpa nostra, e il chiamante chiude inconclusivo.
+    fn prepara_mondo(
         &self,
         kind: crate::probe_world::WorldKind,
         attempt: i32,
         seme: u64,
-    ) -> (AttemptOutcome, i64) {
-        use crate::probe_world::{ScriptedWorld, TokenSeed};
-        let started = std::time::Instant::now();
-        let inconclusivo = |reason: String, ms: i64| {
-            (
-                AttemptOutcome {
-                    pass: false,
-                    inconclusive: true,
-                    reason,
-                    error_class: None,
-                    tool_call_count: 0,
-                    content_chars: 0,
-                    stop_reason: String::new(),
-                },
-                ms,
-            )
-        };
-
+    ) -> Result<(crate::probe_world::ScriptedWorld, String), String> {
+        use crate::probe_world::{ScriptedWorld, TokenSeed, WorldKind};
         let seed = TokenSeed {
             provider: self.provider.to_string(),
             model: self.model.to_string(),
@@ -1071,22 +1055,35 @@ impl ProbeCtx<'_> {
             // si rigioca identico da quella riga.
             seed: seme,
         };
+        // L'anello di partenza e' l'UNICO che la richiesta nomina: gli altri il
+        // modello deve guadagnarseli seguendo la catena.
         let handle0 = seed.handle(0);
         let istruzione = match kind {
-            crate::probe_world::WorldKind::Catena => istruzione_catena(&handle0),
-            crate::probe_world::WorldKind::Recupero => istruzione_recupero(&handle0),
+            WorldKind::Catena => istruzione_catena(&handle0),
+            WorldKind::Recupero => istruzione_recupero(&handle0),
         };
         let (_, _, system_text) = self.request;
-        // L'INVARIANTE del needle, qui come guard: nessun token puo' essere gia'
-        // visibile nella richiesta, o la catena e' scorciatoiabile.
-        let mut mondo = match ScriptedWorld::new(kind, seed, &[&istruzione, system_text]) {
-            Ok(m) => m,
-            Err(motivo) => {
-                return inconclusivo(
-                    format!("mondo_non_costruibile:{motivo}"),
-                    started.elapsed().as_millis() as i64,
-                )
-            }
+        // L'INVARIANTE del needle, qui come guard: nessun token A VALLE puo' essere
+        // gia' visibile nella richiesta, o la catena e' scorciatoiabile.
+        let mondo = ScriptedWorld::new(kind, seed, &[&istruzione, system_text])?;
+        Ok((mondo, istruzione))
+    }
+
+    /// UN tentativo multi-step: prepara il mondo, gira il loop, consegna i FATTI al
+    /// predicato. Ogni uscita anticipata e' un inconclusivo, mai una bocciatura:
+    /// il modello risponde di cio' che fa, non dei nostri cap ne' dei provider caduti.
+    async fn multi_step_attempt(
+        &self,
+        kind: crate::probe_world::WorldKind,
+        attempt: i32,
+        seme: u64,
+    ) -> (AttemptOutcome, i64) {
+        let started = std::time::Instant::now();
+        let ms = || started.elapsed().as_millis() as i64;
+
+        let (mut mondo, istruzione) = match self.prepara_mondo(kind, attempt, seme) {
+            Ok(v) => v,
+            Err(motivo) => return esito_inconclusivo(format!("mondo_non_costruibile:{motivo}"), ms()),
         };
         let max_turns = self
             .profile
@@ -1100,33 +1097,58 @@ impl ProbeCtx<'_> {
             crate::probe_agentic_loop::run_loop(self, kind, &mut mondo, &istruzione, max_turns),
         )
         .await;
-        let latency_ms = started.elapsed().as_millis() as i64;
+        let latency_ms = ms();
 
         let Ok(out) = esito else {
-            return inconclusivo(format!("probe_timeout:{}s", self.params.timeout_s), latency_ms);
+            return esito_inconclusivo(
+                format!("probe_timeout:{}s", self.params.timeout_s),
+                latency_ms,
+            );
         };
-        // Giro non attribuibile al modello (nostro cap, provider caduto): mai una
-        // bocciatura.
         if let Some(motivo) = out.inconclusive {
-            return inconclusivo(motivo, latency_ms);
+            return esito_inconclusivo(motivo, latency_ms);
         }
-        let m = &out.measures;
-        let turno = json!({
-            "content": "",
-            "stop_reason": "end_turn",
-            "tool_use_blocks": [],
-            "measures": {
-                "chained_links": m.chained_links,
-                "recovered": m.recovered,
-                F_REPEATED_FAILED: m.repeated_failed,
-                "bad_tool_syntax": m.bad_tool_syntax,
-            }
-        });
+        let turno = turno_dai_fatti(&out.measures);
         (
             evaluate_attempt(&turno, &self.profile.pass_predicate, latency_ms),
             latency_ms,
         )
     }
+}
+
+/// Un esito che NON e' attribuibile al modello: il suo stato resta invariato.
+/// Esiste come funzione sola perche' era una chiusura dentro `multi_step_attempt`,
+/// e un esito che il chiamante deve poter produrre da quattro punti diversi non e'
+/// un dettaglio di quella funzione.
+fn esito_inconclusivo(reason: String, ms: i64) -> (AttemptOutcome, i64) {
+    (
+        AttemptOutcome {
+            pass: false,
+            inconclusive: true,
+            reason,
+            error_class: None,
+            tool_call_count: 0,
+            content_chars: 0,
+            stop_reason: String::new(),
+        },
+        ms,
+    )
+}
+
+/// I fatti misurati, nella forma che il predicato sa leggere. Il turno e' sintetico
+/// apposta: il verdetto guarda `measures`, MAI la prosa del modello (regola M).
+fn turno_dai_fatti(m: &crate::probe_chain_measure::AttemptMeasures) -> Value {
+    json!({
+        "content": "",
+        "stop_reason": "end_turn",
+        "tool_use_blocks": [],
+        "measures": {
+            "chained_links": m.chained_links,
+            "recovered": m.recovered,
+            F_REPEATED_FAILED: m.repeated_failed,
+            "bad_tool_syntax": m.bad_tool_syntax,
+        }
+    })
 }
 
 impl crate::probe_agentic_loop::TurnSource for ProbeCtx<'_> {
@@ -1136,7 +1158,6 @@ impl crate::probe_agentic_loop::TurnSource for ProbeCtx<'_> {
 }
 
 async fn build_profile_request(
-
     db: &PgPool,
     profile: &ProbeProfile,
 ) -> Result<(String, String, String), String> {
