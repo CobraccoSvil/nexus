@@ -38,7 +38,11 @@ $doRust = $Rust -or (-not $Rust -and -not $Web)
 $doWeb = $Web -or (-not $Rust -and -not $Web)
 
 # 1. STOP (i binari lockati non sono ricompilabili mentre girano)
+# L'esito di dev-stop.ps1 va CONTROLLATO: se un processo e' sopravvissuto (tipico
+# con servizi avviati da shell elevata) il suo .exe resta lockato e `cargo build`
+# fallisce con un opaco `os error 5`. Meglio fermarsi qui, dove il motivo e' scritto.
 & "$PSScriptRoot\dev-stop.ps1"
+if ($LASTEXITCODE -ne 0) { throw 'dev-stop.ps1 non ha fermato tutto lo stack (vedi sopra): build annullata, gli eseguibili sono ancora lockati.' }
 Start-Sleep -Seconds 2
 
 # 2. BUILD
