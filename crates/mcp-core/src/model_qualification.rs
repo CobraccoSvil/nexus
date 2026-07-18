@@ -3198,13 +3198,16 @@ mod tests {
             *n += 1;
             // Il token dell'errore il modello non lo conosce in anticipo: lo LEGGE
             // dalla conversazione, dal campo `current_epoch`, come farebbe uno vero.
-            let token = messages_json.split("current_epoch").nth(1).and_then(|coda| {
-                coda.find("E-").map(|i| {
-                    coda[i..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                        .collect::<String>()
-                })
+            // TUTTE le occorrenze del nome campo, non solo la prima: il `message`
+            // dell'errore lo nomina in prosa prima del campo (stesso fix del
+            // gemello in probe_agentic_loop).
+            let token = messages_json.split("current_epoch").skip(1).find_map(|coda| {
+                let i = coda.find("E-")?;
+                let tok: String = coda[i..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                (tok.len() > 3).then_some(tok)
             });
             match (turno, self.riporta_il_token, &token) {
                 (0, _, _) => produci(&[("read_file".into(), r#"{"path":"start"}"#.into())]),

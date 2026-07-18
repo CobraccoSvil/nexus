@@ -187,6 +187,17 @@ pub(crate) struct ScriptedWorld {
     token_errore: Option<String>,
 }
 
+/// Il rimedio che l'errore di recupero DICHIARA: nomina il campo esatto
+/// (`current_epoch`) e l'azione (riprova includendolo negli argomenti), come
+/// fanno le API vere (un 409 con "retry with ..."). E' il contratto di
+/// risolvibilita' del test: senza, la mappatura token->argomenti non e'
+/// derivabile da nessun canale osservabile e il test misura un pavimento
+/// (0/30 conclusivi, misurato DUE volte). Il rimedio sta nell'ERRORE, che il
+/// modello deve leggere: l'istruzione del task continua a non annunciare il
+/// guasto, quindi resta un test di capacita', non di obbedienza.
+const RIMEDIO_STALE: &str = "The handle epoch is stale. Retry the same call, \
+     including the value of 'current_epoch' below in the arguments.";
+
 impl ScriptedWorld {
     /// Costruisce il mondo. `Err` se un token che va GUADAGNATO comparirebbe gia'
     /// nella richiesta iniziale: `long_context` affida la stessa regola a un COMMENTO
@@ -323,17 +334,27 @@ impl ScriptedWorld {
             // Il dato c'e', l'azione no: l'handle e' scaduto e l'errore dice quale
             // sia quello valido. Ripetere identico non puo' funzionare; leggere si'.
             //
-            // `retryable: true`, NON false: l'errore porta `current_epoch` (l'invito
-            // implicito a riprovare col token fresco) e vietare il retry nello stesso
-            // messaggio era auto-contraddittorio — un modello allineato leggeva
-            // `retryable:false`, obbediva e si arrendeva, e il test lo bocciava per
-            // aver fatto cio' che gli si diceva (0/30 conclusivi, tutti no_recovery).
-            // Ora l'header e il dato concordano: riprova, ed ecco con cosa. Il test
-            // resta di CAPACITA' (l'istruzione non annuncia il recupero: il modello
-            // deve capire da se' di riusare current_epoch), non di obbedienza.
+            // L'errore DICE COSA FARE (`message` esplicito). Storia delle tarature,
+            // perche' non si regredisca:
+            //   1. `retryable:false` + niente message -> 0/30: auto-contraddittorio
+            //      (il token invitava, l'header vietava; i modelli obbedivano).
+            //   2. `retryable:true` + niente message -> ancora 0 conclusivi su glm-5,
+            //      minimax-m2, deepseek-r1: la mappatura "current_epoch -> mettilo
+            //      negli argomenti" non e' derivabile da NESSUN canale osservabile.
+            //      Uno 0% unanime e' un pavimento da design, non una misura (il
+            //      principio di raggiungibilita' di BFCL V3; ToolMaze misura floor
+            //      effect sotto il 20% sui fault impliciti-permanenti).
+            //   3. Ora: message che nomina il campo e l'azione, come fanno le API
+            //      vere (409 con "retry with..."). Resta un test di CAPACITA', non
+            //      di obbedienza: il rimedio sta NELL'ERRORE (che il modello deve
+            //      leggere e applicare), mai nell'ISTRUZIONE del task, che continua
+            //      a non annunciare il guasto. Sui benchmark pubblicati i frontier
+            //      passano il recupero informato al 40-60% (ToolMaze): se qui
+            //      saturasse al 100%, il gradino successivo e' spostare il rimedio
+            //      nello SCHEMA del tool (livello 2), non togliere il message.
             return WorldReply::errore(
                 "E_HANDLE_STALE",
-                json!({ "current_epoch": tok, "retryable": true }),
+                json!({ "message": RIMEDIO_STALE, "current_epoch": tok, "retryable": true }),
             );
         }
         match self.token_errore.as_deref() {
@@ -474,6 +495,17 @@ mod tests {
         assert!(r.text.contains("E_HANDLE_STALE"));
         let tok = w.token_errore_emesso().expect("il guasto ha piantato il token").to_string();
         assert!(r.text.contains(&tok), "il token vive dentro il messaggio d'errore");
+        // CONTRATTO DI RISOLVIBILITA' (dal floor effect 0/30 misurato due volte):
+        // l'errore deve DIRE COSA FARE, nominando il campo esatto che porta il
+        // token. Senza, la mappatura "token -> argomenti del retry" non e'
+        // derivabile da nessun canale osservabile e il test misura un pavimento,
+        // non i modelli. Il rimedio sta nell'errore, mai nell'istruzione del task.
+        let v: Value = serde_json::from_str(&r.text).expect("l'errore e' JSON");
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("current_epoch") && msg.to_lowercase().contains("retry"),
+            "il message deve nominare il campo del token e l'azione: {msg}"
+        );
     }
 
     /// Il RECUPERO VERO: la chiamata dopo porta il token che SOLO l'errore conteneva.

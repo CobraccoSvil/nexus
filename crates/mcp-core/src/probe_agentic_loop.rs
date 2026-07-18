@@ -304,16 +304,25 @@ mod tests {
     const LEGGI: &str = "@TOKEN_LETTO@";
 
     /// Il token che l'errore ha piantato in `current_epoch`: e' cio' che un modello
-    /// che ha LETTO l'errore avrebbe sotto gli occhi. Si legge dal campo, non a
-    /// tentoni nel testo — anche il modello finto rispetta la regola.
+    /// che ha LETTO l'errore avrebbe sotto gli occhi. Si scandiscono TUTTE le
+    /// occorrenze del nome campo, non solo la prima: da quando il `message`
+    /// dell'errore nomina 'current_epoch' in prosa (com'e' giusto: l'errore dice
+    /// cosa fare), la prima occorrenza puo' essere la menzione e non il campo.
+    /// Il vecchio `nth(1)` era un tentoni travestito: si e' rotto esattamente
+    /// quando l'errore e' diventato piu' realistico.
     fn token_dalla_conversazione(messages_json: &str) -> Option<String> {
-        let coda = messages_json.split("current_epoch").nth(1)?;
-        let i = coda.find("E-")?;
-        let tok: String = coda[i..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        (tok.len() > 3).then_some(tok)
+        for coda in messages_json.split("current_epoch").skip(1) {
+            if let Some(i) = coda.find("E-") {
+                let tok: String = coda[i..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if tok.len() > 3 {
+                    return Some(tok);
+                }
+            }
+        }
+        None
     }
 
     impl TurnSource for ModelloScritto {
