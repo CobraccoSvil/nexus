@@ -198,9 +198,9 @@ use crate::routing::signals::{
 use crate::runtime::ports::RecoveryMove;
 use crate::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, EmbeddingStore, EscalationPort,
-    LlmMessage, LlmRequest, MetaStepStore, ModelUpscalePort, NextActionsDeriver, OffloadKind,
-    RunControlStore, ScaleMove, ScaleTier, SizingOverrides, SseEvent, StallBudgetPort,
-    SummaryStore, TokenCounter,
+    LlmMessage, LlmRequest, LlmResponse, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
+    OffloadKind, PortError, RunControlStore, ScaleMove, ScaleTier, SizingOverrides, SseEvent,
+    StallBudgetPort, SummaryStore, TokenCounter,
 };
 use crate::runtime::AgentNodeCtx;
 use crate::state::{
@@ -674,6 +674,80 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Granularita' con cui lo Stop utente diventa visibile MENTRE una chiamata al
+/// modello e' in volo. Non e' una soglia di business (regola G): e' il passo di
+/// poll del segnale di cancellazione DB. 2s bilancia reattivita' (lo Stop si
+/// riflette entro ~2s) e carico DB (una SELECT booleana per chiamata attiva ogni
+/// 2s). Iniettato (mai letto qui) cosi' i test lo stringono a millisecondi.
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// PUNTO UNICO (regola L) della cancellazione COOPERATIVA di una chiamata al
+/// modello. Corre `complete_fut` (la chiamata al gateway) contro un poll
+/// periodico di [`RunControlStore::is_superseded`] (il segnale DB scritto dallo
+/// Stop utente `user_cancel` o dal supersede last-wins).
+///
+/// Perche' esiste: il gate di TESTA dell'executor legge la cancellazione SOLO a
+/// inizio iterazione (`head_gate`), mai durante la chiamata. Senza questa corsa,
+/// uno Stop arrivato mentre la chiamata e' in volo non viene visto finche' la
+/// chiamata non rientra (fino a 90-150s sotto carico), e se il modello poi
+/// conclude il run finalizza 'completed' ignorando lo Stop (incidente 18/07, run
+/// 53dac032: Stop a +2min, chiuso 'completed'). Qui, appena il DB segnala la
+/// cancellazione, la corsa ritorna `None` e `complete_fut` viene DROPPATO
+/// (reqwest annulla la richiesta HTTP in volo).
+///
+/// `biased`: a parita' di prontezza la CHIAMATA vince, cosi' una risposta gia'
+/// arrivata non viene persa per un poll concomitante. Fail-open (regola di
+/// sicurezza, coerente con [`RunControlStore::is_superseded`]): un errore di
+/// lettura del segnale NON cancella (il run prosegue; il gate di testa
+/// ricontrollera'), mai un abort per un guasto infrastrutturale.
+///
+/// Ritorna `Some(esito)` se la chiamata e' rientrata (successo o errore del
+/// gateway); `None` se lo Stop e' stato rilevato durante la chiamata (il
+/// chiamante chiude il run `Superseded` senza attendere che la chiamata rientri).
+async fn complete_or_cancel(
+    complete_fut: impl std::future::Future<Output = Result<LlmResponse, PortError>>,
+    run_control: &dyn RunControlStore,
+    run_id: &str,
+    poll_interval: std::time::Duration,
+) -> Option<Result<LlmResponse, PortError>> {
+    tokio::select! {
+        biased;
+        r = complete_fut => Some(r),
+        _ = poll_until_superseded(run_control, run_id, poll_interval) => None,
+    }
+}
+
+/// Attende finche' il segnale di cancellazione DB (`is_superseded`) non e' vero,
+/// pollandolo ogni `interval`. Completa SOLO alla cancellazione: usato come ramo
+/// perdente del `select!` di [`complete_or_cancel`] (se la chiamata rientra prima,
+/// questo future viene droppato). Fail-open: un errore di lettura non e' una
+/// cancellazione (il run prosegue).
+async fn poll_until_superseded(
+    run_control: &dyn RunControlStore,
+    run_id: &str,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        if run_control.is_superseded(run_id).await.unwrap_or(false) {
+            return;
+        }
+    }
+}
+
+/// Delta di uscita cooperativa per un run superato/cancellato: `stop_reason =
+/// Superseded`, nient'altro. PUNTO UNICO (regola L) condiviso dal gate di TESTA
+/// (Stop visto a inizio iterazione) e dalla cancellazione DURANTE la chiamata
+/// ([`complete_or_cancel`]), cosi' i due percorsi chiudono il run in modo
+/// identico e il delta non e' costruito inline in due punti.
+fn superseded_delta() -> OpaqueDelta {
+    StateDelta {
+        stop_reason: Some(Some(StopReason::Superseded)),
+        ..Default::default()
+    }
+    .into_opaque()
+}
+
 /// Nodo executor. Le porte I/O (`RunControlStore`, `AgentStepStore`,
 /// `MetaStepStore`) sono CAMPI del nodo (come `ToolDispatchNode`); LLM e
 /// EventSink arrivano dal `AgentNodeCtx`. La config DB-driven (incluso
@@ -1033,11 +1107,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                     thread = %run_id,
                     "run superato/cancellato, uscita cooperativa (no chiamata modello)"
                 );
-                return Ok(StateDelta {
-                    stop_reason: Some(Some(StopReason::Superseded)),
-                    ..Default::default()
-                }
-                .into_opaque());
+                return Ok(superseded_delta());
             }
             HeadGate::DeclaredDone => {
                 return Ok(self.close_declared_done(state, iters_in));
@@ -3511,7 +3581,30 @@ della finestra {effective_window} del modello {provider}/{model}"
         // forcing (che e' il retry interno malformed del Python, NON l'errore
         // provider, gia' gestito da generate_agent_turn_sync) e la cascade-detect.
         let mut gateway_errored = false;
-        let mut resp = match ctx.llm.complete(req).await {
+        // Cancellazione COOPERATIVA (regola L, punto unico complete_or_cancel):
+        // uno Stop arrivato DURANTE questa chiamata la interrompe subito e chiude
+        // il run 'superseded', senza attendere che rientri (fino a 90-150s sotto
+        // carico). Il gate di testa la vede solo a inizio iterazione: qui colmiamo
+        // la finestra in cui la chiamata e' in volo.
+        let complete_result = match complete_or_cancel(
+            ctx.llm.complete(req),
+            self.run_control.as_ref(),
+            &run_id,
+            CANCEL_POLL_INTERVAL,
+        )
+        .await
+        {
+            None => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    thread = %run_id,
+                    "Stop rilevato durante la chiamata al modello: interruzione cooperativa"
+                );
+                return Ok(superseded_delta());
+            }
+            Some(r) => r,
+        };
+        let mut resp = match complete_result {
             Ok(r) => r,
             Err(err) => {
                 // FAILOVER cross-provider sul provider caduto/indisponibile (regola H

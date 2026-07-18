@@ -13,6 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   composeActivityStream,
+  figureVerdictDisplay,
   foldConsecutiveOkTools,
   aggregateTokensByProvider,
   tracesForRun,
@@ -355,6 +356,97 @@ test("consiglio competenze propaga il parere advisory completo di ogni figura", 
   assert.equal(report.advisory.risks?.length, 1);
   assert.equal(report.advisory.risks?.[0]?.severity, "alta");
   assert.deepEqual(report.advisory.recommendations, ["Aggiungere audit log"]);
+});
+
+test("etichetta figura distingue veto e cause tecniche, mai un opaco n/d", () => {
+  // Regola O: si parte dai figure_reports (shape del backend) e si attraversa il
+  // produttore reale (composeActivityStream -> readFigureReports), poi il punto
+  // unico figureVerdictDisplay. Scenario del run reale 2026-07-18 04:42: un
+  // block con evidenza (NON declassato) + quattro astensioni tecniche distinte.
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_synthesis_present",
+        activated: true,
+        figure_count: 6,
+        figure_reports: [
+          {
+            kind: "provider_analyst",
+            status: "advisory_ok",
+            detail_code: "advisory_ok",
+            detail_message: "Parere advisory valido",
+            advisory_verdict: "block",
+            advisory: {
+              verdict: "block",
+              risks: [{ severity: "alta", description: "manca request_port" }],
+            },
+          },
+          {
+            kind: "project_manager",
+            status: "run_timeout",
+            detail_code: "run_timeout",
+            detail_message: "Sub-agent in timeout",
+          },
+          {
+            kind: "sysadmin",
+            status: "run_failed",
+            detail_code: "billing_error",
+            detail_message: "Sub-run terminato senza esito positivo",
+          },
+          {
+            kind: "software_architect",
+            status: "completed_no_advisory",
+            detail_code: "no_advisory",
+            detail_message: "Sub-run completato senza chiamare advisory_verdict",
+          },
+          {
+            kind: "security_engineer",
+            status: "invalid_advisory",
+            detail_code: "invalid_advisory",
+            detail_message: "Parere advisory presente ma verdetto non valido",
+            advisory_verdict: "reject",
+            advisory: { verdict: "reject" },
+          },
+        ],
+      },
+      "Consiglio delle Competenze",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+    );
+  assert.ok(event, "evento Consiglio atteso");
+  const reports = event.figureReports;
+  assert.equal(reports?.length, 5);
+
+  const byKind = new Map(reports!.map((r) => [r.kind, figureVerdictDisplay(r)]));
+
+  // Il veto con evidenza NON e' un'astensione: e' "blocca", tono block.
+  assert.deepEqual(byKind.get("provider_analyst"), { tone: "block", label: "blocca" });
+  // Le cause tecniche hanno etichette PROPRIE e distinte, non un unico "n/d".
+  assert.deepEqual(byKind.get("project_manager"), { tone: "technical", label: "tempo scaduto" });
+  assert.deepEqual(byKind.get("sysadmin"), { tone: "technical", label: "errore" });
+  assert.deepEqual(byKind.get("software_architect"), {
+    tone: "technical",
+    label: "nessun parere",
+  });
+  assert.deepEqual(byKind.get("security_engineer"), {
+    tone: "invalid",
+    label: "parere non valido",
+  });
+
+  // Nessuna figura di questo scenario cade sull'opaco "n/d": il difetto era
+  // proprio questo collasso. Il veto in particolare non deve mai sembrare muto.
+  for (const d of byKind.values()) {
+    assert.notEqual(d.label, "n/d");
+  }
 });
 
 test("consiglio competenze degradato espone segnale strutturato", () => {

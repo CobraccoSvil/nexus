@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::routing::config::RoutingConfig;
-use crate::runtime::ports::{LlmResponse, LlmUsage, SseEvent};
+use crate::runtime::ports::{LlmResponse, LlmUsage, PortError, SseEvent};
 use crate::runtime::test_doubles::{
     NullEventSink, RecordingEventSink, StubAgentStepStore, StubBillingCooldownPort,
     StubEmbeddingStore, StubEscalationPort, StubLlmGateway, StubMetaStepStore,
@@ -5628,4 +5628,51 @@ mod multi_turn_wire {
         assert_eq!(wire[1].content, json!("risposta"));
         assert!(wire[1].tool_calls.is_none() && wire[1].tool_call_id.is_none());
     }
+}
+
+// ── complete_or_cancel: cancellazione COOPERATIVA durante la chiamata ──────────
+// A livello TOP del modulo `tests` (super = `executor`): qui `use super::*`
+// (in testa al file) porta in scope l'helper privato `complete_or_cancel`.
+
+/// Il cuore del fix "Stop -> completed" (incidente 18/07): con lo Stop gia'
+/// segnalato nel DB, una chiamata LENTA (qui 300ms, in produzione 90-150s sotto
+/// carico) deve essere ABORTITA dalla corsa PRIMA di rientrare. Senza il fix il
+/// gate la vedrebbe solo a fine chiamata: la mutazione (helper che non cancella)
+/// lascia rientrare la chiamata -> `Completed` -> questo assert ROSSEGGIA.
+#[tokio::test]
+async fn complete_or_cancel_interrompe_chiamata_lenta() {
+    let rc = StubRunControlStore {
+        superseded: true,
+        ..Default::default()
+    };
+    let slow = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        Ok::<_, PortError>(LlmResponse::default())
+    };
+    let out = complete_or_cancel(slow, &rc, "run1", std::time::Duration::from_millis(5)).await;
+    assert!(out.is_none(), "lo Stop deve abortire la chiamata lenta (None)");
+}
+
+/// Nessuno Stop: la chiamata che rientra con successo e' onorata (nessun falso
+/// abort su un run che procede normalmente).
+#[tokio::test]
+async fn complete_or_cancel_onora_la_risposta_senza_stop() {
+    let rc = StubRunControlStore::default(); // superseded=false
+    let ok = async { Ok(LlmResponse::default()) };
+    let out = complete_or_cancel(ok, &rc, "run1", std::time::Duration::from_millis(50)).await;
+    assert!(matches!(out, Some(Ok(_))));
+}
+
+/// Fail-open: un errore di lettura del segnale di cancellazione NON abortisce la
+/// chiamata (coerente con `is_superseded`): il run prosegue, mai un abort per un
+/// guasto DB.
+#[tokio::test]
+async fn complete_or_cancel_fail_open_non_abortisce() {
+    let rc = StubRunControlStore {
+        fail_is_superseded: true,
+        ..Default::default()
+    };
+    let ok = async { Ok(LlmResponse::default()) };
+    let out = complete_or_cancel(ok, &rc, "run1", std::time::Duration::from_millis(5)).await;
+    assert!(matches!(out, Some(Ok(_))));
 }

@@ -1715,6 +1715,42 @@ pub(crate) fn reconcile_run_cost_from_ledger(
     true
 }
 
+/// PUNTO UNICO (regola L) della riconciliazione STOP -> stato finale del run.
+///
+/// Un run per cui e' stata richiesta la cancellazione (`cancellation_requested IS
+/// NOT NULL`, scritto dallo Stop utente `user_cancel` o dal supersede last-wins)
+/// NON deve chiudersi 'completed'. Il gate di TESTA dell'executor legge la
+/// cancellazione solo a INIZIO iterazione (`executor.rs`, `head_gate` ->
+/// `StopReason::Superseded`), MAI durante la chiamata LLM: se lo Stop arriva
+/// mentre l'ultima chiamata e' in volo e il modello poi conclude (task_complete/
+/// end_turn), il run finalizza 'completed' senza ripassare dal gate. Questa
+/// riconciliazione chiude la finestra dal lato della persistenza: l'UPDATE e'
+/// ATOMICO (la condizione `cancellation_requested IS NOT NULL` e' valutata dal DB
+/// al momento della scrittura), quindi coglie anche una cancellazione arrivata
+/// DOPO la finalizzazione ma prima di questa chiamata (nessuna race read-modify).
+///
+/// Tocca SOLO il ramo 'completed': un esito 'failed'/'cancelled' resta invariato
+/// (un fallimento tecnico e' informativo, non va mascherato da 'cancelled', e un
+/// 'cancelled' e' gia' corretto). Best-effort: un guasto DB non deve far fallire
+/// la chiusura del run (l'esito 'completed' resta, degradazione onesta).
+async fn enforce_user_cancellation_status(pool: &PgPool, run_id: Uuid) {
+    let res = sqlx::query(
+        "UPDATE agent_runs SET status = 'cancelled' \
+         WHERE id = $1 AND cancellation_requested IS NOT NULL AND status = 'completed'",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "enforce_user_cancellation_status fallito (best-effort): lo Stop \
+             potrebbe non riflettersi nello stato finale"
+        );
+    }
+}
+
 /// Costruisce un [`AgentRunResult`] FAILED ONESTO per il fallimento del motore
 /// nativo PRIMARIO (regola H: nessun fallback mascherato al brain). Converge sullo
 /// stesso finalizzatore del path normale (regola L) impostando `native_result`:
@@ -3440,6 +3476,9 @@ pub(crate) async fn spawn_agent_run(
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&run_pool)
             .await;
+            // Stop utente arrivato durante l'ultima chiamata LLM: riconcilia
+            // 'completed' -> 'cancelled' (punto unico, regola L).
+            enforce_user_cancellation_status(&run_pool, run_id).await;
 
             // ── Terminatore dello stream: SOLO per gli stati TERMINALI ─────────
             // Emesso DOPO l'INSERT chat_messages e l'UPDATE agent_runs: quando il
@@ -3972,6 +4011,7 @@ pub(crate) async fn confirm_native_run(
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&cn_pool)
             .await;
+            enforce_user_cancellation_status(&cn_pool, run_id).await;
             result.status
         }
         Err(e) => {
@@ -4338,6 +4378,7 @@ pub(crate) async fn resume_fanin(
             .bind(result.messages_json.as_deref())
             .execute(&cn_pool)
             .await;
+            enforce_user_cancellation_status(&cn_pool, parent_run_id).await;
             result.status
         }
         Err(e) => {
@@ -7308,5 +7349,80 @@ mod tests_native_mapping {
             .as_deref()
             .unwrap_or_default()
             .contains("non e' riuscito"));
+    }
+}
+
+#[cfg(test)]
+mod tests_enforce_cancellation {
+    use super::*;
+
+    async fn create_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID PRIMARY KEY, \
+                 status TEXT NOT NULL, \
+                 cancellation_requested TIMESTAMPTZ \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create agent_runs");
+    }
+
+    async fn insert(pool: &sqlx::PgPool, status: &str, cancelled: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        let sql = if cancelled {
+            "INSERT INTO agent_runs (id, status, cancellation_requested) VALUES ($1, $2, NOW())"
+        } else {
+            "INSERT INTO agent_runs (id, status) VALUES ($1, $2)"
+        };
+        sqlx::query(sql)
+            .bind(id)
+            .bind(status)
+            .execute(pool)
+            .await
+            .expect("insert");
+        id
+    }
+
+    async fn status_of(pool: &sqlx::PgPool, id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("status")
+    }
+
+    /// Il caso di campo (run 53dac032, 18/07): Stop premuto durante l'ultima
+    /// chiamata LLM, il modello conclude -> finalizzato 'completed' con
+    /// `cancellation_requested` valorizzato. La riconciliazione lo porta a
+    /// 'cancelled', cosi' lo Stop utente si riflette nello stato finale.
+    #[sqlx::test]
+    async fn completed_con_cancellazione_diventa_cancelled(pool: sqlx::PgPool) {
+        create_table(&pool).await;
+        let id = insert(&pool, "completed", true).await;
+        enforce_user_cancellation_status(&pool, id).await;
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+    }
+
+    /// Senza cancellazione un 'completed' resta 'completed': nessun falso Stop su
+    /// un run terminato normalmente.
+    #[sqlx::test]
+    async fn completed_senza_cancellazione_resta_completed(pool: sqlx::PgPool) {
+        create_table(&pool).await;
+        let id = insert(&pool, "completed", false).await;
+        enforce_user_cancellation_status(&pool, id).await;
+        assert_eq!(status_of(&pool, id).await, "completed");
+    }
+
+    /// Un 'failed' con cancellazione NON viene mascherato da 'cancelled': il
+    /// fallimento tecnico resta informativo (la riconciliazione tocca solo
+    /// 'completed').
+    #[sqlx::test]
+    async fn failed_con_cancellazione_resta_failed(pool: sqlx::PgPool) {
+        create_table(&pool).await;
+        let id = insert(&pool, "failed", true).await;
+        enforce_user_cancellation_status(&pool, id).await;
+        assert_eq!(status_of(&pool, id).await, "failed");
     }
 }
