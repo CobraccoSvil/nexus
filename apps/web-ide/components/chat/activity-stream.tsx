@@ -26,7 +26,11 @@ import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 import { InlineTruncated, formatStepInput, humanizeToolResult } from "./step-detail";
 import { ProviderIcon } from "./provider-icon";
-import { capStreamToRecent, switchCauseLabel } from "../../lib/use-chat/activity-stream";
+import {
+  capStreamToRecent,
+  figureVerdictDisplay,
+  switchCauseLabel,
+} from "../../lib/use-chat/activity-stream";
 import type {
   ActivityStream,
   ActivitySegment,
@@ -37,6 +41,7 @@ import type {
   FoldThreshold,
   FigureAdvisory,
   FigureAdvisoryReport,
+  FigureVerdictTone,
 } from "../../lib/use-chat/activity-stream";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -872,21 +877,21 @@ function EventBody({
   }
 }
 
-/** Verdetto strutturato della figura -> colore + etichetta umana (identificatori
- *  canonici backend, regola N: proceed|proceed_with_changes|block). */
-function verdictMeta(
-  v: string | undefined,
-  tc: ThemeColors,
-): { color: string; label: string } {
-  switch (v) {
+/** Tono del parere (deciso dal punto unico `figureVerdictDisplay` sul segnale
+ *  strutturato `status`) -> colore della palette. La DECISIONE su cosa mostrare
+ *  vive in lib (testata); qui resta solo la presentazione. */
+function verdictToneColor(tone: FigureVerdictTone, tc: ThemeColors): string {
+  switch (tone) {
     case "proceed":
-      return { color: "#22c55e", label: "procede" };
-    case "proceed_with_changes":
-      return { color: "#f59e0b", label: "procede con modifiche" };
+      return "#22c55e";
+    case "changes":
+    case "invalid":
+      return "#f59e0b";
     case "block":
-      return { color: tc.error, label: "blocca" };
+      return tc.error;
     default:
-      return { color: tc.textMuted, label: v ?? "n/d" };
+      // technical (timeout/errore/nessun parere/non avviata) e unknown: neutro.
+      return tc.textMuted;
   }
 }
 
@@ -983,8 +988,8 @@ function FigureReportRow({
 }) {
   const [open, setOpen] = useState(false);
   const advisory = report.advisory;
-  const verdict = advisory?.verdict ?? report.advisory_verdict;
-  const vm = verdictMeta(verdict, tc);
+  const vd = figureVerdictDisplay(report);
+  const vm = { color: verdictToneColor(vd.tone, tc), label: vd.label };
   const failed = report.status !== "advisory_ok";
   const hasBody =
     !!advisory &&

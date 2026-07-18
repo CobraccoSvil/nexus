@@ -372,6 +372,68 @@ function readFigureReports(
   return out.length > 0 ? out : undefined;
 }
 
+/** Tono visivo del parere di una figura; il componente lo mappa a un colore
+ *  concreto (la palette resta presentazione, la decisione resta qui). */
+export type FigureVerdictTone =
+  | "proceed"
+  | "changes"
+  | "block"
+  | "invalid"
+  | "technical"
+  | "unknown";
+
+/** Etichetta + tono del parere di UNA figura, pronti per il tag del display. */
+export interface FigureVerdictDisplay {
+  tone: FigureVerdictTone;
+  label: string;
+}
+
+/** Etichetta di un parere `advisory_ok` dal verdetto canonico (regola N:
+ *  proceed | proceed_with_changes | block). `advisory_ok` GARANTISCE alla fonte
+ *  un verdetto canonico: se manca e' un'incoerenza del backend, non un'astensione
+ *  tecnica, e resta "n/d" (tono unknown) senza fingere un parere. */
+function advisoryOkDisplay(verdict: string | undefined): FigureVerdictDisplay {
+  switch (verdict) {
+    case "proceed":
+      return { tone: "proceed", label: "procede" };
+    case "proceed_with_changes":
+      return { tone: "changes", label: "procede con modifiche" };
+    case "block":
+      return { tone: "block", label: "blocca" };
+    default:
+      return { tone: "unknown", label: "n/d" };
+  }
+}
+
+/** Etichetta + tono del parere di UNA figura del consiglio a partire dal SEGNALE
+ *  STRUTTURATO `report.status` (enum backend), MAI dalla prosa (regola M).
+ *  Distingue un parere ESPRESSO (procede / con modifiche / blocca) da
+ *  un'astensione TECNICA con causa nota (tempo scaduto, errore, nessun parere,
+ *  non avviata) e da un parere INVALIDO. Cosi' il display non collassa cause
+ *  diverse in un opaco "n/d": una figura in timeout dice "tempo scaduto", una che
+ *  veta dice "blocca", e le due non si confondono. Un `block` con evidenza NON e'
+ *  declassato: arriva qui come `advisory_ok` con `advisory.verdict = "block"`.
+ *  Punto unico (regola L) letto sia dai report di figura sia da quelli di
+ *  provider del panel multi-provider. */
+export function figureVerdictDisplay(report: FigureAdvisoryReport): FigureVerdictDisplay {
+  switch (report.status) {
+    case "advisory_ok":
+      return advisoryOkDisplay(report.advisory?.verdict ?? report.advisory_verdict);
+    case "run_timeout":
+      return { tone: "technical", label: "tempo scaduto" };
+    case "run_failed":
+      return { tone: "technical", label: "errore" };
+    case "prepare_failed":
+      return { tone: "technical", label: "non avviata" };
+    case "completed_no_advisory":
+      return { tone: "technical", label: "nessun parere" };
+    case "invalid_advisory":
+      return { tone: "invalid", label: "parere non valido" };
+    default:
+      return { tone: "unknown", label: "n/d" };
+  }
+}
+
 function readCouncilFigureTasks(
   payload: Record<string, unknown>,
 ): CouncilFigureTask[] | undefined {
