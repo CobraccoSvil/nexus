@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+nexus-cache = { path = "../nexus-cache" }
 jsonwebtoken.workspace = true
 rand.workspace = true
 serde.workspace = true

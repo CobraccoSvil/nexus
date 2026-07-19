@@ -2243,6 +2243,7 @@ dependencies = [
  "anyhow",
  "axum",
  "jsonwebtoken",
+ "nexus-cache",
  "rand 0.8.5",
  "serde",
  "sha2",

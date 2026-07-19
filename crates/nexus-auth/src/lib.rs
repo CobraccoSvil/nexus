@@ -6,7 +6,11 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use nexus_cache::TtlCache;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,12 +31,103 @@ pub struct Claims {
 // in `read_setting_raw`; tutte le viste (Result/Option, raw/trim, bool/int)
 // delegano qui. Niente query `SELECT ... FROM settings` duplicate nei crate.
 
-/// Query unica della tabella `settings`. Punto di verita' della lettura.
+/// TTL della cache dei settings.
+///
+/// 60s non e' un numero scelto qui: e' la finestra che il repo ha gia' dichiarato
+/// per la configurazione calda (la routing matrix promette "UPDATE in DB ->
+/// pickup entro 60s, niente redeploy"). Questa cache estende quel contratto a
+/// tutte le chiavi, invece di lasciarlo alle cache artigianali che i singoli
+/// lettori si erano gia' costruiti quando il traffico faceva male.
+///
+/// Perche' e' una costante e non una riga di `settings` (regola G): leggerla dal
+/// DB richiederebbe la lettura che questo TTL governa. E' l'unico parametro del
+/// sistema che non puo' stare nella tabella che configura.
+const SETTINGS_TTL: Duration = Duration::from_secs(60);
+
+/// Cache delle letture di `settings`.
+///
+/// Il TTL e' per-istanza e non globale perche' un test possa costruirne una da
+/// 20ms e chiamare la STESSA funzione della produzione col solo parametro
+/// cambiato, invece di dormire un minuto o di verificare uno strumento
+/// introdotto dalla patch stessa (regola O).
+pub(crate) struct SettingsCache {
+    cache: TtlCache<(String, String), Option<String>>,
+}
+
+impl SettingsCache {
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self {
+            cache: TtlCache::new(ttl),
+        }
+    }
+
+    /// Lettura con cache. `Ok(None)` (chiave assente) E' un fatto sulla
+    /// configurazione e viene memorizzato: senza, ogni default applicato dai
+    /// chiamanti resterebbe un round-trip, cioe' esattamente il traffico da
+    /// togliere.
+    pub(crate) async fn read(
+        &self,
+        db: &PgPool,
+        key: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let ck = (pool_identity(db), key.to_string());
+        if let Some(cached) = self.cache.get(&ck) {
+            return Ok(cached);
+        }
+        // L'ERRORE NON ENTRA IN CACHE, deliberatamente: `get_setting` lo ingoia
+        // ritornando None, e memorizzarlo trasformerebbe un blip transitorio del
+        // DB in una configurazione sbagliata che persiste per tutto il TTL.
+        let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(db)
+            .await?;
+        self.cache.insert(ck, value.clone());
+        Ok(value)
+    }
+
+    pub(crate) fn invalidate(&self, db: &PgPool, key: &str) {
+        self.cache.invalidate(&(pool_identity(db), key.to_string()));
+    }
+}
+
+static SETTINGS_CACHE: LazyLock<SettingsCache> = LazyLock::new(|| SettingsCache::new(SETTINGS_TTL));
+
+/// Identita' del pool: due pool verso lo STESSO database condividono la cache,
+/// due pool verso database diversi non si vedono mai.
+///
+/// Senza questo, una lettura fatta col pool di un progetto (`<slug>_nexus`)
+/// servirebbe il valore del meta, o viceversa: la chiave `settings.key` e' la
+/// stessa in entrambi i database, ma il valore no.
+fn pool_identity(db: &PgPool) -> String {
+    let o = db.connect_options();
+    format!(
+        "{}@{}:{}/{}",
+        o.get_username(),
+        o.get_host(),
+        o.get_port(),
+        o.get_database().unwrap_or(""),
+    )
+}
+
+/// Invalida la voce di cache di una chiave.
+///
+/// Serve ai percorsi che scrivono `settings` con una query propria (upsert con
+/// categoria, REPLACE mirati): senza, la loro scrittura resterebbe invisibile
+/// alle letture per tutto il TTL. Chi puo' passare da `update_setting_value` non
+/// ha bisogno di chiamarla: quella invalida gia'.
+///
+/// NON copre le scritture fatte da un ALTRO PROCESSO (admin-service ha il suo
+/// pool, e `psql` non ha cache): quelle si propagano entro il TTL, che e' il
+/// contratto gia' in vigore per la configurazione calda.
+pub fn invalidate_setting_cache(db: &PgPool, key: &str) {
+    SETTINGS_CACHE.invalidate(db, key);
+}
+
+/// Query unica della tabella `settings`. Punto di verita' della lettura, e unico
+/// posto dove vive la cache: un chiamante che debba RICORDARSI di cachare e' un
+/// chiamante che prima o poi se lo dimentica (regola L).
 async fn read_setting_raw(db: &PgPool, key: &str) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
+    SETTINGS_CACHE.read(db, key).await
 }
 
 /// Legge una setting propagando l'errore DB (regola H: non ingoiare). Valore
@@ -131,6 +226,11 @@ pub async fn update_setting_value(
     if result.rows_affected() == 0 {
         return Err(SettingWriteError::UnknownKey(key.to_string()));
     }
+    // Invalidazione accanto alla scrittura: chi aggiorna dal punto unico vede il
+    // proprio valore SUBITO, non entro il TTL. Senza questa riga un PUT admin
+    // seguito da una rilettura mostrerebbe ancora il vecchio valore, e sembrerebbe
+    // che la scrittura non abbia funzionato.
+    SETTINGS_CACHE.invalidate(db, key);
     Ok(())
 }
 
@@ -325,6 +425,179 @@ pub async fn require_admin<S: Clone + Send + Sync + 'static>(
             tracing::warn!("require_admin: token validation failed: {:?}, path={}", e, req.uri());
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_settings_cache {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    /// Schema allineato a `db/migrations/0002_settings.sql`: `update_setting_value`
+    /// scrive anche `updated_at`, quindi una tabella di prova ridotta non
+    /// eserciterebbe la stessa query della produzione (regola O).
+    async fn crea_settings(pool: &PgPool) {
+        sqlx::query(
+            "CREATE TABLE settings ( \
+                 key TEXT PRIMARY KEY, \
+                 value TEXT NOT NULL DEFAULT '', \
+                 category TEXT NOT NULL DEFAULT 'general', \
+                 description TEXT NOT NULL DEFAULT '', \
+                 is_secret BOOLEAN NOT NULL DEFAULT FALSE, \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
+        )
+        .execute(pool)
+        .await
+        .expect("create table settings");
+    }
+
+    async fn semina(pool: &PgPool, key: &str, value: &str) {
+        sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2)")
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await
+            .expect("insert setting");
+    }
+
+    /// Pool verso una porta senza listener: ogni query fallisce, nessuna rete.
+    fn pool_morto(dsn: &str) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy(dsn)
+            .expect("connect_lazy non tocca la rete: se fallisce e' la DSN")
+    }
+
+    /// La prova che il round-trip e' davvero risparmiato non passa da un
+    /// contatore introdotto da questa patch (se sbagliassi l'incremento, il test
+    /// resterebbe verde con la cache rotta): passa da un pool CHIUSO, che non
+    /// puo' servire query. Se la seconda lettura riesce, viene dalla cache.
+    #[sqlx::test]
+    async fn la_seconda_lettura_non_tocca_il_db(pool: PgPool) {
+        crea_settings(&pool).await;
+        semina(&pool, "test.cache.hit", "v1").await;
+
+        let v1 = get_setting_checked(&pool, "test.cache.hit")
+            .await
+            .expect("prima lettura");
+        pool.close().await;
+        let v2 = get_setting_checked(&pool, "test.cache.hit")
+            .await
+            .expect("la seconda lettura deve venire dalla cache, non dal pool chiuso");
+
+        assert_eq!(v1, v2);
+        assert_eq!(v2.as_deref(), Some("v1"));
+    }
+
+    /// Il difetto piu' costoso che una cache di settings possa avere: servire a
+    /// un database il valore di un altro. La chiave `settings.key` e' la stessa
+    /// nel meta e in ogni `<slug>_nexus`, il valore no.
+    #[sqlx::test]
+    async fn un_altro_database_non_e_servito_dalla_cache_del_primo(pool: PgPool) {
+        crea_settings(&pool).await;
+        semina(&pool, "test.iso.key", "valore_del_db_vero").await;
+        get_setting_checked(&pool, "test.iso.key")
+            .await
+            .expect("popola la cache");
+
+        // Secondo pool costruito dalle STESSE connect options del primo, con il
+        // solo `database` cambiato: stesso utente, stesso host, stessa porta.
+        // E' l'unica forma che prova davvero l'isolamento - un pool con utente o
+        // porta diversi resterebbe distinto anche senza il database nella chiave,
+        // e il test passerebbe pur essendo il difetto presente.
+        let altro_db = sqlx::postgres::PgConnectOptions::clone(&pool.connect_options())
+            .database("un_altro_database_che_non_esiste");
+        let altro = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy_with(altro_db);
+
+        assert!(
+            get_setting_checked(&altro, "test.iso.key").await.is_err(),
+            "un pool verso un ALTRO database non va servito dalla cache del primo"
+        );
+    }
+
+    /// Chi scrive dal punto unico vede il proprio valore subito, non entro il TTL.
+    #[sqlx::test]
+    async fn la_scrittura_dal_punto_unico_invalida(pool: PgPool) {
+        crea_settings(&pool).await;
+        semina(&pool, "test.inval.key", "vecchio").await;
+        assert_eq!(
+            get_setting_checked(&pool, "test.inval.key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("vecchio"),
+            "popola la cache"
+        );
+
+        update_setting_value(&pool, "test.inval.key", "nuovo")
+            .await
+            .expect("update");
+
+        assert_eq!(
+            get_setting_checked(&pool, "test.inval.key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("nuovo"),
+            "la scrittura dal punto unico ha effetto SUBITO"
+        );
+    }
+
+    /// Un blip del DB non deve inchiodare una configurazione sbagliata per tutto
+    /// il TTL: l'errore non entra in cache.
+    #[tokio::test]
+    async fn un_errore_di_lettura_non_viene_memorizzato() {
+        let morto = pool_morto("postgres://nobody:nopass@127.0.0.1:1/inesistente");
+
+        assert!(
+            get_setting_checked(&morto, "test.errore.non.cachato")
+                .await
+                .is_err(),
+            "prima lettura: il DB e' irraggiungibile"
+        );
+        assert!(
+            get_setting_checked(&morto, "test.errore.non.cachato")
+                .await
+                .is_err(),
+            "anche la seconda deve interrogare il DB, non servire un errore memorizzato"
+        );
+    }
+
+    /// La scadenza, in millisecondi invece che in un minuto: il TTL e'
+    /// per-istanza proprio per poter esercitare la stessa `read` della
+    /// produzione senza dormire (regola O, e niente test lenti).
+    #[sqlx::test]
+    async fn la_voce_scade_e_rilegge(pool: PgPool) {
+        crea_settings(&pool).await;
+        semina(&pool, "test.ttl.key", "primo").await;
+
+        let breve = SettingsCache::new(Duration::from_millis(20));
+        assert_eq!(
+            breve.read(&pool, "test.ttl.key").await.unwrap().as_deref(),
+            Some("primo")
+        );
+
+        sqlx::query("UPDATE settings SET value = 'secondo' WHERE key = 'test.ttl.key'")
+            .execute(&pool)
+            .await
+            .expect("update fuori dal punto unico");
+        // Entro il TTL la cache serve ancora il vecchio valore: e' il contratto.
+        assert_eq!(
+            breve.read(&pool, "test.ttl.key").await.unwrap().as_deref(),
+            Some("primo"),
+            "entro il TTL vale la copia"
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            breve.read(&pool, "test.ttl.key").await.unwrap().as_deref(),
+            Some("secondo"),
+            "scaduto il TTL la lettura torna al DB"
+        );
     }
 }
 

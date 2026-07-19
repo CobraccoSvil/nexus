@@ -1247,6 +1247,9 @@ async fn upsert_setting_value(
     .bind(description)
     .execute(db)
     .await;
+    // Upsert con query propria: invalida esplicitamente, altrimenti la lettura
+    // resta stantia fino alla scadenza della cache dei settings.
+    nexus_auth::invalidate_setting_cache(db, key);
 }
 
 fn sanitize_collection_suffix(raw: &str) -> String {
