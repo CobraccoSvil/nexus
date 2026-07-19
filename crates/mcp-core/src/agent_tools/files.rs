@@ -151,8 +151,8 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
 /// (DB-driven, regola G; 0/assente = nessun cap). PUNTO UNICO della lettura
 /// (regola L): serve sia al guard di `read_file` sia alla ricerca in-process,
 /// che senza cap leggerebbe in RAM file di qualunque dimensione.
-async fn fs_read_max_bytes(ctx: &AgentToolContext) -> u64 {
-    crate::settings::get_setting(&ctx.db, "agent.fs.read_max_bytes")
+async fn fs_read_max_bytes(db: &sqlx::PgPool) -> u64 {
+    crate::settings::get_setting(db, "agent.fs.read_max_bytes")
         .await
         .ok()
         .flatten()
@@ -165,7 +165,7 @@ async fn read_max_bytes_guard(
     target: &Path,
     path_str: &str,
 ) -> Option<String> {
-    let read_max_bytes: u64 = fs_read_max_bytes(ctx).await;
+    let read_max_bytes: u64 = fs_read_max_bytes(&ctx.db).await;
     if read_max_bytes == 0 {
         return None;
     }
@@ -802,7 +802,7 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         ctx.root_path.clone()
     };
 
-    let max_file_bytes = fs_read_max_bytes(ctx).await;
+    let max_file_bytes = fs_read_max_bytes(&ctx.db).await;
     let stdout = match run_grep_or_fallback(pattern, &search_path, max_file_bytes).await {
         Ok(s) => s,
         Err(msg) => return msg,
@@ -1928,23 +1928,32 @@ mod tests {
         dir
     }
 
+    /// Righe dell'output senza il prefisso della tempdir: le asserzioni devono
+    /// guardare i path RELATIVI, altrimenti un TMPDIR che contiene "target" o
+    /// "dist" (o un suffisso random di tempfile che lo contiene) le fa fallire
+    /// per l'ambiente invece che per il difetto.
+    fn relativo(out: &str, dir: &tempfile::TempDir) -> String {
+        out.replace(&dir.path().to_string_lossy().to_string(), "")
+    }
+
     #[test]
     fn ricerca_salta_gli_alberi_di_build_e_i_dotdir() {
         let dir = albero_di_ricerca(0);
         // Cap alto: qui si misura solo quali DIRECTORY vengono percorse.
         let out = super::search_in_files_rust(dir.path(), "AGO_NEL_PAGLIAIO", 1_000_000);
+        let rel = relativo(&out, &dir);
 
-        assert!(out.contains("src"), "il sorgente va trovato: {out}");
+        assert!(rel.contains("src"), "il sorgente va trovato: {rel}");
         // Mutazione che rende rosso: rimettere `name.starts_with('.')` al posto
         // di `is_skipped_dir` -> questi tre alberi tornano nei risultati.
         assert!(
-            !out.contains("node_modules"),
-            "node_modules non va percorso: {out}"
+            !rel.contains("node_modules"),
+            "node_modules non va percorso: {rel}"
         );
-        assert!(!out.contains("target"), "target non va percorso: {out}");
-        assert!(!out.contains("dist"), "dist non va percorso: {out}");
+        assert!(!rel.contains("target"), "target non va percorso: {rel}");
+        assert!(!rel.contains("dist"), "dist non va percorso: {rel}");
         // Comportamento storico preservato dalla delega: i dotdir restano fuori.
-        assert!(!out.contains(".git"), "i dotdir restano esclusi: {out}");
+        assert!(!rel.contains(".git"), "i dotdir restano esclusi: {rel}");
     }
 
     #[test]
@@ -1962,6 +1971,29 @@ mod tests {
             out.contains("f.txt"),
             "i file sotto il cap restano cercabili: {out}"
         );
+    }
+
+    /// Il cap non e' un numero scritto nella ricerca: viene dalla governance.
+    /// Senza questo test nulla proverebbe QUALE chiave viene letta - un refuso
+    /// nel nome farebbe cadere ogni lettura sul default, in silenzio.
+    #[sqlx::test]
+    async fn il_cap_viene_dalla_chiave_di_governance(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create table settings");
+
+        // Chiave assente: default dichiarato (2 MB), lo stesso di read_file.
+        assert_eq!(super::fs_read_max_bytes(&pool).await, 2_097_152);
+
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('agent.fs.read_max_bytes', '4096')")
+            .execute(&pool)
+            .await
+            .expect("insert setting");
+
+        // Mutazione che rende rosso: cambiare il nome della chiave letta in
+        // fs_read_max_bytes -> torna il default e questa asserzione cade.
+        assert_eq!(super::fs_read_max_bytes(&pool).await, 4096);
     }
 
     #[test]
