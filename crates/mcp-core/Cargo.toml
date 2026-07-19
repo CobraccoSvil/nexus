@@ -18,6 +18,9 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Solo con la feature `tokio-console` (vedi [features]): richiede anche
+# --cfg tokio_unstable al momento della compilazione.
+console-subscriber = { version = "0.4", optional = true }
 uuid.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
@@ -85,6 +88,19 @@ default = ["onnx"]
 # onnx: abilita OnnxMiniLmEmbedder (384-dim) in nexus-orchestrator per semantic tool search
 # Richiede CPU con AVX2 per libonnxruntime (Haswell e successivi) a runtime.
 onnx = ["nexus-orchestrator/onnx"]
+
+# tokio-console: apre il server di diagnostica del runtime (porta 6669) per
+# ispezionare le task vive con la CLI `tokio-console`. Serve a una domanda sola,
+# che nessun altro strumento risponde: QUALE task non viene pollata.
+#
+# Non e' attiva per default e non deve esserlo: la strumentazione ha un costo per
+# ogni task creata, e la build richiede comunque `--cfg tokio_unstable`, che
+# invalida la cache di compilazione. Vedi il commento in `init_infrastructure`
+# per il comando esatto.
+#
+# Prima di ricorrere a questa: `runtime_health` (sentinella del ritardo di
+# risveglio) e i WARN `sqlx::pool::acquire` sono gia' nei log e costano zero.
+tokio-console = ["dep:console-subscriber"]
 
 # libc: usata in sandbox.rs::build_sandboxed_command per leggere uid/gid
 # del processo host (cosi' i container Docker non scrivono file root-owned

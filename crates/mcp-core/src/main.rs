@@ -1428,15 +1428,60 @@ async fn run_boot_recovery(state: &AppState) {
 /// catalog tool globale, pool DB e NexusBridge. Ritorna il pool DB e la porta HTTP
 /// risolta dal DB (regola G). Estratta da `main` (ordine e comportamento invariati);
 /// se il DB e' irraggiungibile propaga l'errore che `main` gestisce con `?`.
-async fn init_infrastructure() -> anyhow::Result<(PgPool, u16)> {
-    dotenvy::dotenv().ok();
-
+/// Inizializza il logging. Senza la feature `tokio-console` e' la sola coppia
+/// EnvFilter + fmt di sempre.
+#[cfg(not(feature = "tokio-console"))]
+fn init_tracing() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+/// Variante con il server di diagnostica del runtime in ascolto (porta 6669).
+///
+/// Il filtro sta sul layer di FORMATTAZIONE, non sul registry: da globale
+/// scarterebbe gli eventi `tokio=trace`/`runtime=trace` su cui si regge la
+/// console, che resterebbe vuota senza dire perche' (l'errore classico di questa
+/// integrazione). Cosi' i log restano quelli di sempre e la console vede tutto.
+///
+/// Build ed uso, da PowerShell nella radice del repo:
+///
+/// ```text
+/// $env:RUSTFLAGS = "--cfg tokio_unstable"
+/// $env:CARGO_TARGET_DIR = "target-console"   # non invalida la cache normale
+/// cargo build -p mcp-core --features tokio-console
+/// # avviare il binario prodotto al posto del servizio, poi:
+/// tokio-console http://127.0.0.1:6669
+/// ```
+///
+/// Il target dir separato non e' un vezzo: `--cfg tokio_unstable` cambia la
+/// configurazione di compilazione di tokio, quindi ricompila l'intero albero e
+/// senza la separazione butterebbe via anche la cache delle build normali.
+#[cfg(feature = "tokio-console")]
+fn init_tracing() {
+    use tracing_subscriber::Layer;
+
+    tracing_subscriber::registry()
+        .with(console_subscriber::spawn())
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::EnvFilter::new(
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+            )),
+        )
+        .init();
+
+    tracing::info!(
+        "tokio-console attivo su 127.0.0.1:6669 (build di diagnostica, non di esercizio)"
+    );
+}
+
+async fn init_infrastructure() -> anyhow::Result<(PgPool, u16)> {
+    dotenvy::dotenv().ok();
+
+    init_tracing();
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable".to_string()
