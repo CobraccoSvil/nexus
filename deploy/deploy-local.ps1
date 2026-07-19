@@ -6,6 +6,14 @@
 #   .\deploy-local.ps1 -Rust       solo Rust
 #   .\deploy-local.ps1 -Web        solo web-ide
 #   .\deploy-local.ps1 -NoRestart  build senza toccare i servizi (NON serve admin)
+#
+# Due ambienti, rilevati automaticamente (vedi $serviziInstallati piu' sotto):
+# servizi WinSW installati -> stop/start via Stop-Service; nessun servizio
+# applicativo -> stack a PROCESSI, si delega a dev-stop.ps1 / dev-start.ps1.
+#
+# MIGRAZIONI DB: questo script NON le applica. Le esegue mcp-core all'avvio, per
+# questo il riavvio non e' opzionale quando il commit ne porta di nuove: con
+# -NoRestart i binari sono aggiornati ma lo schema resta indietro.
 param([switch]$Rust, [switch]$Web, [switch]$NoRestart)
 $ErrorActionPreference = 'Stop'
 $ROOT = 'D:\IDEAI'
@@ -75,16 +83,42 @@ $doRust = $Rust -or (-not $Rust -and -not $Web)
 $doWeb  = $Web  -or (-not $Rust -and -not $Web)
 $rustSvc = 'nexus-mcp-core','nexus-gateway','nexus-admin','nexus-doc','nexus-plugin'
 
+# MODALITA' DELL'AMBIENTE: servizi WinSW installati, oppure stack a PROCESSI?
+# Non e' un dettaglio cosmetico: `Stop-ServiceTree` risolve il PID SOLO via
+# Win32_Service, quindi senza servizi installati $procId resta 0, non ferma
+# nulla, e i 5 "Impossibile trovare un servizio" sembrano innocui mentre sono
+# LA CAUSA del `cargo build ... os error 5` due schermate piu' sotto (i binari
+# restano lockati dai processi vivi). Incidente 2026-07-19.
+# In modalita' processi si DELEGA a dev-stop.ps1/dev-start.ps1 invece di
+# duplicare qui la loro logica (regola L): sanno gia' leggere i manifest WinSW
+# come fonte unica di eseguibile/env, ruotano i log e tengono il file dei PID.
+$serviziInstallati = @(Get-Service -Name $rustSvc -ErrorAction SilentlyContinue).Count -gt 0
+if (-not $NoRestart -and -not $serviziInstallati) {
+  Write-Host '== ambiente a PROCESSI (nessun servizio WinSW installato): delego a dev-stop/dev-start ==' -ForegroundColor Yellow
+  Write-Host '   nota: dev-stop/dev-start governano lo stack INTERO (anche qdrant/garnet/web-ide),' -ForegroundColor DarkYellow
+  Write-Host '   non solo i binari selezionati da -Rust/-Web.' -ForegroundColor DarkYellow
+}
+
 # 1. STOP (solo se gestiamo i servizi) — kill-tree per non lasciare orfani.
 # Se qualcosa sopravvive si INTERROMPE qui: proseguire vorrebbe dire compilare
 # contro eseguibili lockati (os error 5) e poi riavviare servizi mai fermati.
 if (-not $NoRestart) {
-  $survivors = @()
-  if ($doRust) { foreach ($s in $rustSvc) { $survivors += Stop-ServiceTree $s } }
-  if ($doWeb)  { $survivors += Stop-ServiceTree 'nexus-web-ide' }
-  if ($survivors.Count -gt 0) {
-    $survivors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-    throw "$($survivors.Count) processo/i non terminato/i (vedi sopra): build annullata."
+  if (-not $serviziInstallati) {
+    # dev-stop.ps1 esce 1 se qualcosa sopravvive al kill (tipicamente: processi
+    # elevati e shell non elevata). Proseguire vorrebbe dire compilare contro
+    # eseguibili lockati: si interrompe qui, come nel ramo servizi.
+    & (Join-Path $PSScriptRoot 'dev-stop.ps1')
+    if ($LASTEXITCODE -ne 0) {
+      throw 'dev-stop.ps1 non ha fermato tutto (vedi sopra): build annullata, gli eseguibili sono lockati.'
+    }
+  } else {
+    $survivors = @()
+    if ($doRust) { foreach ($s in $rustSvc) { $survivors += Stop-ServiceTree $s } }
+    if ($doWeb)  { $survivors += Stop-ServiceTree 'nexus-web-ide' }
+    if ($survivors.Count -gt 0) {
+      $survivors | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+      throw "$($survivors.Count) processo/i non terminato/i (vedi sopra): build annullata."
+    }
   }
   Start-Sleep -Seconds 2
 }
@@ -107,9 +141,22 @@ if ($doWeb) {
 
 # 3. START
 if (-not $NoRestart) {
-  if ($doRust) { Start-Service nexus-mcp-core -ErrorAction Continue; Start-Sleep -Seconds 5; foreach ($s in $rustSvc | Where-Object { $_ -ne 'nexus-mcp-core' }) { Start-Service $s -ErrorAction Continue } }
-  if ($doWeb)  { Start-Service nexus-web-ide -ErrorAction Continue }
-  Write-Host '== servizi riavviati ==' -ForegroundColor Green
-  Get-Service nexus-* | Format-Table Name, Status -AutoSize
+  if (-not $serviziInstallati) {
+    # Senza questo ramo il deploy finiva con lo stack GIU': Start-Service falliva
+    # sui servizi inesistenti e nessuno riavviava i processi (incidente
+    # 2026-07-19). dev-start.ps1 rispetta l'ordine (mcp-core prima, +5s) e ruota
+    # i log; NON richiede admin.
+    & (Join-Path $PSScriptRoot 'dev-start.ps1')
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host 'dev-start.ps1 non ha avviato lo stack: i binari sono aggiornati ma i servizi sono GIU.' -ForegroundColor Red
+    } else {
+      Write-Host '== stack riavviato (processi) ==' -ForegroundColor Green
+    }
+  } else {
+    if ($doRust) { Start-Service nexus-mcp-core -ErrorAction Continue; Start-Sleep -Seconds 5; foreach ($s in $rustSvc | Where-Object { $_ -ne 'nexus-mcp-core' }) { Start-Service $s -ErrorAction Continue } }
+    if ($doWeb)  { Start-Service nexus-web-ide -ErrorAction Continue }
+    Write-Host '== servizi riavviati ==' -ForegroundColor Green
+    Get-Service nexus-* | Format-Table Name, Status -AutoSize
+  }
 }
 Set-Location $ROOT
