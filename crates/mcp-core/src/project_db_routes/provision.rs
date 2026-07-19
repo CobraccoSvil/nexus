@@ -552,9 +552,9 @@ async fn project_meta_pool_core(
                 .ok_or_else(|| "DB metadati non risolvibile dopo il provisioning".to_string())?
         }
     };
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(std::time::Duration::from_secs(5))
+    // Tetto e attesa dal punto unico (regola L): lo stesso DB `<slug>_nexus`
+    // veniva aperto anche da nexus-project-pools, con un tetto diverso.
+    let pool = nexus_project_pools::sizing::project_pool_options()
         .connect(&url)
         .await
         .map_err(|e| format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}"))?;

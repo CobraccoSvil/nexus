@@ -362,6 +362,35 @@ else
   echo "OK turno-dal-produttore: il turno agentico non si fabbrica a mano"
 fi
 
+# ── sizing dei pool verso il DB per-progetto ─────────────────────────────────
+# Lo stesso DB <slug>_nexus veniva aperto con due tetti decisi in due punti che
+# si ignoravano: 5 sul percorso caldo di mcp-core, 3 in nexus-project-pools. Una
+# patch applicata all'uno era un no-op sull'altro. Ora il tetto vive solo in
+# nexus_project_pools::sizing. Il guard e' ristretto alle due strade del DB di
+# progetto: i pool verso il cluster admin o verso DB definiti dall'utente
+# (provisioning, cleanup, connessioni utente) restano legittimi e non sono qui.
+pool_sizing_hits="$(grep -rEn '\.max_connections\(' \
+  crates/nexus-project-pools/src \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v '^crates/nexus-project-pools/src/sizing.rs:' \
+  || true)"
+if ! grep -q 'sizing::project_pool_options' \
+  crates/mcp-core/src/project_db_routes/provision.rs 2>/dev/null; then
+  pool_sizing_hits="${pool_sizing_hits}
+crates/mcp-core/src/project_db_routes/provision.rs: non delega piu' a sizing::project_pool_options"
+fi
+if [[ -n "${pool_sizing_hits// /}" ]]; then
+  echo "!! project-pool-sizing: il tetto del pool per-progetto e' deciso fuori dal punto unico:" >&2
+  echo "$pool_sizing_hits" >&2
+  echo "   Usa nexus_project_pools::sizing::project_pool_options()." >&2
+  echo "   Due sizing per lo stesso DB significa che chi ne cambia uno crede di" >&2
+  echo "   aver cambiato il comportamento, e non ha cambiato nulla." >&2
+  fail=1
+else
+  echo "OK project-pool-sizing: un solo tetto per il DB per-progetto"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
