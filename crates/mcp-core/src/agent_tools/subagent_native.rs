@@ -3446,6 +3446,11 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
+        // Il tetto REALE di questa figura (lo stesso del `tokio::time::timeout`
+        // esterno qui sotto) entra nel motore: senza, il gate a tempo dell'executor
+        // userebbe il setting globale `agent.run_time_budget_s` (0 per policy) e
+        // resterebbe inerte, lasciando la figura morire muta allo scadere.
+        run_time_budget_s: Some(timeout_s.max(0) as u64),
         // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso o
         // background) -> scrive sulla root del progetto, comportamento invariato.
         // `Some(worktree)` (ramo ISOLATO, valorizzato dal batch parallelo di

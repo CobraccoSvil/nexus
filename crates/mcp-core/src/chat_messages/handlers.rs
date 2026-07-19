@@ -1064,6 +1064,7 @@ async fn try_resume_interrupted_run(
             step_tx: tx,
             parent_run_id: None,
             subagent_depth: None,
+            run_time_budget_s: None,
             working_root: None,
             // I panel a monte hanno gia' deliberato sul run originale: il resume
             // riprende il lavoro, non riapre la deliberazione.

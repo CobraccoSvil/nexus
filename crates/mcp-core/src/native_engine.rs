@@ -237,6 +237,17 @@ pub struct NativeRunInput {
     /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
     /// (`UnderstandingNode`, `subagent_depth >= 1 -> skip`) e per l'anti-ricorsione.
     pub subagent_depth: Option<i64>,
+    /// Budget in secondi del run CORRENTE, quando il chiamante lo conosce meglio
+    /// del setting globale. `None` (run principale) -> vale `agent.run_time_budget_s`
+    /// letto da `load_executor_config` (regola G). `Some(s)` (SUB-RUN/figura) -> e'
+    /// il `timeout_s` gia' risolto in `prepare_subagent_run`, cioe' il tetto REALE
+    /// applicato dal `tokio::time::timeout` esterno.
+    ///
+    /// Perche' serve: senza questo canale il motore della figura non conosce il
+    /// proprio tetto (il setting globale e' `0` per policy, mig 0604/0607), quindi
+    /// ogni gate a tempo dell'executor e' codice morto e la figura scade MUTA —
+    /// uccisa dall'esterno senza mai poter dichiarare il proprio parere.
+    pub run_time_budget_s: Option<u64>,
     /// Override della root di lavoro per un SUB-RUN ISOLATO (FASE 2 orchestrazione:
     /// git worktree effimero). Threadato fino al `ToolRunnerExecutorAdapter` ->
     /// `build_ctx_with_root`, che quando presente sovrascrive `root_path` e imposta
@@ -1144,6 +1155,20 @@ async fn advisory_gate_timeout(db: &PgPool) -> u64 {
     configured.min(deadline_s as u64)
 }
 
+/// Budget di tempo EFFETTIVO del run: l'override del chiamante vince sul setting
+/// globale letto dal DB. PUNTO UNICO (regola L) della precedenza, cosi' non vive
+/// inline in mezzo alla costruzione della config.
+///
+/// Perche' esiste: `agent.run_time_budget_s` e' `0` per policy (mig 0604/0607),
+/// quindi per un SUB-RUN il valore dal DB e' inservibile — il tetto reale della
+/// figura e' il `timeout_s` risolto in `prepare_subagent_run` e applicato dal
+/// `tokio::time::timeout` esterno. Senza questa precedenza il gate a tempo
+/// dell'executor resta codice morto per le figure e nessun sollecito di chiusura
+/// puo' scattare: la figura muore muta.
+fn effective_run_time_budget_s(from_db: u64, from_caller: Option<u64>) -> u64 {
+    from_caller.unwrap_or(from_db)
+}
+
 async fn load_executor_config(
     db: &PgPool,
     provider: &str,
@@ -1198,6 +1223,12 @@ async fn load_executor_config(
         run_time_budget_s: setting_i64(db, "agent.run_time_budget_s", d.run_time_budget_s as i64)
             .await
             .max(0) as u64,
+        // Soglia del turno di grazia a tempo (mig 0614): percentuale del budget
+        // oltre cui un canale di ruolo ancora muto viene SOLLECITATO a chiudere,
+        // invece di morire n/d allo scadere. 0 = disabilitato.
+        time_grace_pct: setting_i64(db, "agent.time_grace_pct", d.time_grace_pct as i64)
+            .await
+            .clamp(0, 100) as u64,
         max_consecutive_text_only_turns: setting_i64(
             db,
             "agent.max_consecutive_text_only_turns",
@@ -2139,7 +2170,16 @@ async fn build_native_engine(
         }
     }
 
-    let exec_cfg = load_executor_config(&db, &input.provider, &input.model, context_window).await;
+    let mut exec_cfg =
+        load_executor_config(&db, &input.provider, &input.model, context_window).await;
+    // Budget del run CORRENTE. `load_executor_config` resta il punto unico DB-driven
+    // (regola G) e legge il setting GLOBALE `agent.run_time_budget_s`; qui vince il
+    // tetto che il chiamante conosce meglio: per un SUB-RUN e' il `timeout_s` della
+    // figura, l'unico orologio che la governa davvero (il `tokio::time::timeout`
+    // esterno). Senza questo override il gate a tempo dell'executor resta codice
+    // morto per le figure e il sollecito di chiusura non scatterebbe mai.
+    exec_cfg.run_time_budget_s =
+        effective_run_time_budget_s(exec_cfg.run_time_budget_s, input.run_time_budget_s);
 
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
@@ -3364,6 +3404,7 @@ mod tests {
             // Run principale di test: nessun annidamento sub-agente.
             parent_run_id: None,
             subagent_depth: None,
+            run_time_budget_s: None,
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,
             pre_run_advisory_synthesis: None,
@@ -5090,5 +5131,24 @@ mod tests {
             0,
             "kill-switch OFF: nessun comando eseguito"
         );
+    }
+
+    /// Il caso REALE che rende utile la precedenza: `agent.run_time_budget_s` e' `0`
+    /// per policy (mig 0604/0607), quindi per una FIGURA il valore dal DB e'
+    /// inservibile. Se vincesse il DB, il gate a tempo dell'executor resterebbe
+    /// codice morto e la figura morirebbe muta allo scadere, senza mai ricevere il
+    /// sollecito di chiusura. Mutazione: far vincere `from_db` -> questo assert
+    /// rosseggia con `0`, cioe' col valore esatto del difetto.
+    #[test]
+    fn budget_della_figura_vince_sul_setting_globale_a_zero() {
+        assert_eq!(effective_run_time_budget_s(0, Some(300)), 300);
+    }
+
+    /// Run principale (nessun override): comanda il setting globale, comportamento
+    /// invariato.
+    #[test]
+    fn senza_override_vale_il_setting_globale() {
+        assert_eq!(effective_run_time_budget_s(900, None), 900);
+        assert_eq!(effective_run_time_budget_s(0, None), 0);
     }
 }

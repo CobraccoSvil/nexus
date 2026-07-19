@@ -2967,6 +2967,7 @@ pub(crate) async fn spawn_agent_run(
                     // `dispatch_subagent` (subagent_native) popola questi campi.
                     parent_run_id: None,
                     subagent_depth: None,
+                    run_time_budget_s: None,
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
                     working_root: None,
@@ -3947,6 +3948,7 @@ pub(crate) async fn confirm_native_run(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
         pre_run_advisory_synthesis: None,
@@ -4332,6 +4334,7 @@ pub(crate) async fn resume_fanin(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
         pre_run_advisory_synthesis: None,

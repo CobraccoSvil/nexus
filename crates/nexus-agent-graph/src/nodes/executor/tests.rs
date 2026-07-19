@@ -5676,3 +5676,130 @@ async fn complete_or_cancel_fail_open_non_abortisce() {
     let out = complete_or_cancel(ok, &rc, "run1", std::time::Duration::from_millis(5)).await;
     assert!(matches!(out, Some(Ok(_))));
 }
+
+// ── sollecito di chiusura a TEMPO (turno di grazia prima del kill) ─────────────
+
+/// Epoch di avvio tale che risultino `elapsed_s` secondi trascorsi.
+fn started_epoch_fa(elapsed_s: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs() as i64;
+    now - elapsed_s
+}
+
+/// Stato di una FIGURA del consiglio senza parere (advisory_verdict fra i tool,
+/// `advisory_verdict` non ancora dichiarato), con `elapsed_s` secondi trascorsi.
+fn figura_muta_da(elapsed_s: i64) -> AgentState {
+    AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("analizza l'auth")],
+        iterations: Some(5),
+        run_started_at_epoch_s: Some(started_epoch_fa(elapsed_s)),
+        tools_json: Some(vec![
+            json!({"name": "read_file"}),
+            json!({"name": "advisory_verdict"}),
+        ]),
+        ..Default::default()
+    }
+}
+
+/// Il cuore del fix: col budget quasi esaurito, una figura ancora muta viene
+/// SOLLECITATA a chiudere invece di essere uccisa allo scadere. Prima moriva n/d
+/// ("tempo scaduto") portandosi via il lavoro gia' svolto: il timer esterno
+/// droppava il future senza mai concederle un turno per dichiarare il parere.
+#[tokio::test]
+async fn figura_sotto_deadline_riceve_sollecito_invece_di_morire_muta() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_time_budget_s: 100,
+        time_grace_pct: 70,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = figura_muta_da(80); // 80% del budget: oltre la soglia del 70%
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    // NON chiude: turno di grazia (self-loop G1Escalated), nessuna chiusura d'autorita'.
+    assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    assert!(
+        !out.meta_steps.iter().any(|m| m.kind == "anti_runaway"),
+        "la figura non deve morire muta: riceve il sollecito"
+    );
+    // Flag una-tantum + streak azzerato (senza, il re-entry richiuderebbe subito).
+    assert_eq!(
+        out.extra.get("advisory_grace_used").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(out.consecutive_text_only_turns, Some(0));
+    // La direttiva raggiunge davvero il modello come messaggio.
+    assert!(
+        out.messages
+            .iter()
+            .rev()
+            .take(2)
+            .any(|m| format!("{m:?}").contains("advisory_verdict")),
+        "il sollecito deve chiedere esplicitamente di chiamare advisory_verdict"
+    );
+}
+
+/// Sotto la soglia il sollecito NON scatta: il run prosegue normalmente e
+/// interroga il modello (nessun turno sprecato quando c'e' ancora tempo).
+#[tokio::test]
+async fn sopra_il_budget_ma_sotto_la_soglia_nessun_sollecito() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_time_budget_s: 100,
+        time_grace_pct: 70,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("risposta"));
+    let ctx = ctx_with(llm.clone(), false);
+    let state = figura_muta_da(50); // 50% del budget: sotto la soglia
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert_ne!(
+        out.extra.get("advisory_grace_used").and_then(Value::as_bool),
+        Some(true),
+        "sotto soglia non si sollecita"
+    );
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "sotto soglia il turno prosegue e interroga il modello"
+    );
+}
+
+/// Con la grazia GIA' concessa e il budget esaurito, il ramo di chiusura resta
+/// quello di prima: si chiude d'autorita' con reason `time_budget` (il sollecito
+/// e' una-tantum, non un modo per vivere per sempre).
+#[tokio::test]
+async fn grazia_gia_concessa_a_budget_esaurito_chiude_time_budget() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        run_time_budget_s: 100,
+        time_grace_pct: 70,
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = figura_muta_da(120); // budget esaurito
+    state
+        .extra
+        .insert("advisory_grace_used".into(), json!(true));
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    assert!(
+        out.meta_steps
+            .iter()
+            .any(|m| m.kind == "anti_runaway" || format!("{m:?}").contains("time_budget")),
+        "a budget esaurito, con la grazia gia' usata, si chiude"
+    );
+    assert!(llm.seen.lock().unwrap().is_empty(), "nessuna chiamata al modello");
+}
