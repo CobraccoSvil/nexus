@@ -361,6 +361,19 @@ pub struct ExecutorConfig {
     /// reason canonico `time_budget` (regola M/N), come il cap di spesa. NON si
     /// resetta all'escalation. Regola G: DB-driven, mai hardcoded.
     pub run_time_budget_s: u64,
+    /// Percentuale di [`Self::run_time_budget_s`] oltre cui (`>=`) un run con un
+    /// CANALE DI RUOLO ancora muto (figura del consiglio senza `advisory_verdict`,
+    /// avvocato senza `debate_position`) riceve UN turno di grazia per dichiarare
+    /// col proprio canale, invece di essere ucciso muto allo scadere
+    /// (`agent.time_grace_pct`, default 70 = al 70% del budget). `0` = disabilitato
+    /// -> comportamento bit-identico (si chiude solo a budget esaurito).
+    ///
+    /// Perche' una PERCENTUALE e non un tempo fisso: il residuo che serve per
+    /// chiudere e' proporzionale al budget (una figura da 300s ha bisogno di piu'
+    /// margine di una da 60s). Il valore giusto dipende dalla latenza reale delle
+    /// chiamate: se una singola chiamata dura quanto il residuo, il turno di grazia
+    /// non fa in tempo e va abbassata (regola G: si tara dal DB, non nel codice).
+    pub time_grace_pct: u64,
     /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
     /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
     /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
@@ -622,6 +635,9 @@ impl Default for ExecutorConfig {
             // 0 = disabilitato (bit-identico): la deadline di run e' attivata
             // dal setting DB agent.run_time_budget_s (mig 0604).
             run_time_budget_s: 0,
+            // Turno di grazia al 70% del budget: il default vive nel DB (mig 0614),
+            // qui e' solo la rete di sicurezza documentata del costruttore.
+            time_grace_pct: 70,
             max_consecutive_text_only_turns: 3,
             // 3.4 default OFF -> comportamento bit-identico (chiusura backstop).
             provider_no_progress_switch_enabled: false,
@@ -1525,6 +1541,21 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(started);
                 let elapsed_s = now_s.saturating_sub(started).max(0) as u64;
+                // SOLLECITO DI CHIUSURA prima del kill (interattivo, regola H): col
+                // budget quasi esaurito e il canale di ruolo ancora muto, invece di
+                // uccidere si CHIEDE alla figura di chiudere col parere che ha. Cosi'
+                // una figura che scade non muore n/d: dichiara un parere reale, magari
+                // parziale, che il consiglio puo' comporre. Punto unico riusato
+                // (regola L): lo stesso `maybe_advisory_grace_delta` del backstop
+                // text-only, gia' one-shot e gia' con gli azzeramenti dei detector.
+                // `None` (non e' un ruolo / grazia gia' concessa) -> si prosegue al
+                // ramo di chiusura sotto, bit-identico.
+                if let Some(delta) = self
+                    .maybe_time_grace_delta(state, iters_in, ctx, mode, elapsed_s)
+                    .await
+                {
+                    return Ok(delta);
+                }
                 if elapsed_s >= self.cfg.run_time_budget_s {
                     let time_text = format!(
                         "Raggiunta la deadline del run ({elapsed_s}s trascorsi, budget {}s). \
@@ -6692,6 +6723,34 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
     /// ([`ADVISORY_GRACE_USED_KEY`]) per non ciclare. `None` -> il chiamante procede
     /// col `close_runaway` (bit-identico per i run senza canale di ruolo / grazia
     /// gia' concessa).
+    /// SOLLECITO DI CHIUSURA a tempo: quando il budget del run e' oltre la soglia
+    /// [`ExecutorConfig::time_grace_pct`], invece di lasciar morire muto un canale
+    /// di ruolo ancora aperto gli concede il turno di grazia per dichiarare.
+    ///
+    /// `None` (il chiamante prosegue, comportamento invariato) se: il sollecito e'
+    /// disabilitato (`time_grace_pct == 0`), la soglia non e' raggiunta, oppure non
+    /// c'e' un canale di ruolo da sollecitare / la grazia e' gia' stata concessa
+    /// (decide il punto unico [`Self::maybe_advisory_grace_delta`], che qui viene
+    /// solo INNESCATO su un secondo criterio — il tempo invece dei turni a vuoto).
+    async fn maybe_time_grace_delta(
+        &self,
+        state: &AgentState,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+        elapsed_s: u64,
+    ) -> Option<OpaqueDelta> {
+        if self.cfg.time_grace_pct == 0 {
+            return None;
+        }
+        let soglia_s = self.cfg.run_time_budget_s * self.cfg.time_grace_pct / 100;
+        if elapsed_s < soglia_s {
+            return None;
+        }
+        self.maybe_advisory_grace_delta(state, iters_in, ctx, mode)
+            .await
+    }
+
     async fn maybe_advisory_grace_delta(
         &self,
         state: &AgentState,
