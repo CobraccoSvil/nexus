@@ -147,17 +147,25 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
 /// `agent.fs.read_max_bytes` (DB-driven, regola G; 0/assente = nessun cap)
 /// ritorna `Some(messaggio_errore)` che invita a `read_file_lines`. Estratto da
 /// `tool_read_file`.
+/// Cap-byte per le letture su file dei tool fs, da `agent.fs.read_max_bytes`
+/// (DB-driven, regola G; 0/assente = nessun cap). PUNTO UNICO della lettura
+/// (regola L): serve sia al guard di `read_file` sia alla ricerca in-process,
+/// che senza cap leggerebbe in RAM file di qualunque dimensione.
+async fn fs_read_max_bytes(ctx: &AgentToolContext) -> u64 {
+    crate::settings::get_setting(&ctx.db, "agent.fs.read_max_bytes")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2_097_152)
+}
+
 async fn read_max_bytes_guard(
     ctx: &AgentToolContext,
     target: &Path,
     path_str: &str,
 ) -> Option<String> {
-    let read_max_bytes: u64 = crate::settings::get_setting(&ctx.db, "agent.fs.read_max_bytes")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(2_097_152);
+    let read_max_bytes: u64 = fs_read_max_bytes(ctx).await;
     if read_max_bytes == 0 {
         return None;
     }
@@ -794,7 +802,8 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         ctx.root_path.clone()
     };
 
-    let stdout = match run_grep_or_fallback(pattern, &search_path).await {
+    let max_file_bytes = fs_read_max_bytes(ctx).await;
+    let stdout = match run_grep_or_fallback(pattern, &search_path, max_file_bytes).await {
         Ok(s) => s,
         Err(msg) => return msg,
     };
@@ -808,7 +817,22 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
 /// che produce lo STESSO formato cosi' il post-processing a valle resta unico
 /// (regola L). `Err(msg)` solo quando grep gira ma emette un errore reale
 /// (stdout vuoto + stderr non vuoto), da propagare al chiamante.
-async fn run_grep_or_fallback(pattern: &str, search_path: &Path) -> Result<String, String> {
+///
+/// Il fallback e' I/O SINCRONO su tutto l'albero, quindi gira in
+/// `spawn_blocking`: su un worker tokio terrebbe fermo il thread per l'intera
+/// scansione, e con esso i timer di ogni altro task servito da quel worker.
+///
+/// Le esclusioni (`is_skipped_dir`) valgono SOLO per il fallback: il ramo grep
+/// non riceve `--exclude-dir` di proposito. `--exclude-dir` si applica anche
+/// all'operando da riga di comando, quindi filtrare qui renderebbe muta una
+/// ricerca esplicita dentro un albero escluso (`path='target'` -> zero righe).
+/// Nel fallback il rischio non c'e': il filtro guarda i nomi delle entry
+/// visitate, mai la root da cui si parte.
+async fn run_grep_or_fallback(
+    pattern: &str,
+    search_path: &Path,
+    max_file_bytes: u64,
+) -> Result<String, String> {
     let output = Command::new("grep")
         .arg("-rn")
         .arg("--include=*")
@@ -829,8 +853,22 @@ async fn run_grep_or_fallback(pattern: &str, search_path: &Path) -> Result<Strin
             }
             Ok(stdout)
         }
-        // grep assente (tipico Windows nativo): ricerca in-process, best-effort.
-        Err(_) => Ok(search_in_files_rust(search_path, pattern)),
+        // grep assente (tipico Windows nativo): ricerca in-process, best-effort,
+        // su un thread di blocking (mai su un worker del runtime).
+        Err(_) => {
+            let root = search_path.to_path_buf();
+            let pat = pattern.to_string();
+            match tokio::task::spawn_blocking(move || {
+                search_in_files_rust(&root, &pat, max_file_bytes)
+            })
+            .await
+            {
+                Ok(stdout) => Ok(stdout),
+                // Panic nella scansione: esito STRUTTURATO al chiamante (regola
+                // M), mai un unwrap che porterebbe giu' il tool runner.
+                Err(e) => Err(format!("[search error: scansione interrotta: {e}]")),
+            }
+        }
     }
 }
 
@@ -901,7 +939,31 @@ fn compile_line_matcher(pattern: &str) -> impl Fn(&str) -> bool {
 ///   e, se il pattern non e' una regex valida, ricerca letterale con `contains`.
 ///
 /// Formato riga identico a `grep -rn`: "<path_assoluto>:<lineno>:<contenuto>".
-fn search_in_files_rust(root: &std::path::Path, pattern: &str) -> String {
+/// Cosa fare di una entry incontrata dalla scansione.
+enum ScanEntry {
+    /// Nome escluso, tipo illeggibile, o symlink/altro (non seguiti: cicli).
+    Ignora,
+    Directory(std::path::PathBuf),
+    File(std::path::PathBuf),
+}
+
+/// Classifica una entry della DFS. Le esclusioni delegano al PUNTO UNICO
+/// `nexus_tool_kit::is_skipped_dir` (regola L): copre i dotfile/dotdir
+/// (comportamento storico di questo walk) E gli alberi di build - node_modules,
+/// target, dist, build - che prima venivano percorsi per intero, su una root di
+/// sviluppo decine di GB letti da un thread solo.
+fn classify_scan_entry(entry: &std::fs::DirEntry) -> ScanEntry {
+    if nexus_tool_kit::is_skipped_dir(&entry.file_name().to_string_lossy()) {
+        return ScanEntry::Ignora;
+    }
+    match entry.file_type() {
+        Ok(ft) if ft.is_dir() => ScanEntry::Directory(entry.path()),
+        Ok(ft) if ft.is_file() => ScanEntry::File(entry.path()),
+        _ => ScanEntry::Ignora,
+    }
+}
+
+fn search_in_files_rust(root: &std::path::Path, pattern: &str, max_file_bytes: u64) -> String {
     let matches = compile_line_matcher(pattern);
 
     // Budget difensivo per non camminare all'infinito su alberi enormi: ben oltre
@@ -921,29 +983,20 @@ fn search_in_files_rust(root: &std::path::Path, pattern: &str) -> String {
             Err(_) => continue, // permessi/inesistente: best-effort, salta
         };
         for entry in rd.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') {
-                continue; // salta dotfile/dotdir (allineato a tool_list_files)
-            }
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
+            let path = match classify_scan_entry(&entry) {
+                ScanEntry::Ignora => continue,
+                ScanEntry::Directory(p) => {
+                    stack.push(p);
+                    continue;
+                }
+                ScanEntry::File(p) => p,
             };
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue; // symlink/altro: non seguiamo (evita cicli)
-            }
             files_visited += 1;
             if files_visited > MAX_FILES_VISITED || total_matches >= MAX_TOTAL_MATCHES {
                 return out;
             }
             let remaining = MAX_TOTAL_MATCHES - total_matches;
-            total_matches += append_file_matches(&path, &matches, remaining, &mut out);
+            total_matches += append_file_matches(&path, &matches, remaining, max_file_bytes, &mut out);
         }
     }
     out
@@ -957,11 +1010,23 @@ fn append_file_matches(
     path: &Path,
     matches: &impl Fn(&str) -> bool,
     remaining: usize,
+    max_file_bytes: u64,
     out: &mut String,
 ) -> usize {
     const MAX_MATCHES_PER_FILE: usize = 50;
     const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
+    // Cap PRIMA della lettura, come fa `read_file` (read_max_bytes_guard): il
+    // sniff binario guarda i primi 8 KB, ma senza questo controllo un .rlib o un
+    // pack git da centinaia di MB sarebbe gia' stato letto INTERO in RAM per
+    // scoprirlo. 0 = nessun cap (setting disattivato).
+    if max_file_bytes > 0 {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > max_file_bytes => return 0,
+            Ok(_) => {}
+            Err(_) => return 0,
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(_) => return 0,
@@ -1837,6 +1902,97 @@ mod tests {
         assert!(!is_critical_config("src/components/Login.tsx"));
         assert!(!is_critical_config("README.md"));
         assert!(!is_critical_config("environment.ts")); // contiene "env" ma non e' .env
+    }
+
+    // ── Ricerca in-process (fallback senza grep, ramo vivo su Windows nativo) ──
+    //
+    // Coprono i due difetti chiusi qui: l'albero di build percorso per intero e
+    // la lettura senza cap. NON coprono il fatto che `max_file_bytes` in
+    // produzione arrivi da `fs_read_max_bytes` (servirebbe un ctx col DB):
+    // quel collegamento e' garantito dalla firma, che non ha default.
+
+    /// Albero di prova: la stessa riga cercabile in un sorgente, dentro un
+    /// albero di build, in un dotdir e in un file grande.
+    fn albero_di_ricerca(grande_bytes: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = dir.path();
+        for sub in ["src", "node_modules/pkg", "target/debug", "dist", ".git"] {
+            std::fs::create_dir_all(r.join(sub)).expect("mkdir");
+            std::fs::write(r.join(sub).join("f.txt"), "AGO_NEL_PAGLIAIO\n").expect("write");
+        }
+        std::fs::write(
+            r.join("src/grande.txt"),
+            format!("{}\nAGO_NEL_PAGLIAIO\n", "x".repeat(grande_bytes)),
+        )
+        .expect("write grande");
+        dir
+    }
+
+    #[test]
+    fn ricerca_salta_gli_alberi_di_build_e_i_dotdir() {
+        let dir = albero_di_ricerca(0);
+        // Cap alto: qui si misura solo quali DIRECTORY vengono percorse.
+        let out = super::search_in_files_rust(dir.path(), "AGO_NEL_PAGLIAIO", 1_000_000);
+
+        assert!(out.contains("src"), "il sorgente va trovato: {out}");
+        // Mutazione che rende rosso: rimettere `name.starts_with('.')` al posto
+        // di `is_skipped_dir` -> questi tre alberi tornano nei risultati.
+        assert!(
+            !out.contains("node_modules"),
+            "node_modules non va percorso: {out}"
+        );
+        assert!(!out.contains("target"), "target non va percorso: {out}");
+        assert!(!out.contains("dist"), "dist non va percorso: {out}");
+        // Comportamento storico preservato dalla delega: i dotdir restano fuori.
+        assert!(!out.contains(".git"), "i dotdir restano esclusi: {out}");
+    }
+
+    #[test]
+    fn ricerca_salta_i_file_oltre_il_cap_senza_leggerli() {
+        let dir = albero_di_ricerca(4096);
+        let out = super::search_in_files_rust(dir.path(), "AGO_NEL_PAGLIAIO", 1024);
+
+        // Mutazione che rende rosso: togliere il controllo su `metadata()` in
+        // append_file_matches -> il file da 4 KB viene letto e il match appare.
+        assert!(
+            !out.contains("grande.txt"),
+            "il file oltre il cap non va nemmeno letto: {out}"
+        );
+        assert!(
+            out.contains("f.txt"),
+            "i file sotto il cap restano cercabili: {out}"
+        );
+    }
+
+    #[test]
+    fn una_ricerca_esplicita_dentro_un_albero_escluso_funziona() {
+        let dir = albero_di_ricerca(0);
+        // Chi cerca DENTRO node_modules deve trovare: la skip-list filtra i nomi
+        // delle entry visitate, mai la root da cui si parte. E' anche il motivo
+        // per cui il ramo grep non riceve `--exclude-dir`, che invece filtra
+        // pure l'operando da riga di comando.
+        let out = super::search_in_files_rust(
+            &dir.path().join("node_modules"),
+            "AGO_NEL_PAGLIAIO",
+            1_000_000,
+        );
+
+        assert!(
+            out.contains("f.txt"),
+            "la root della ricerca non va filtrata: {out}"
+        );
+    }
+
+    #[test]
+    fn cap_a_zero_disattiva_il_limite_di_dimensione() {
+        let dir = albero_di_ricerca(4096);
+        // 0 = setting disattivato: stessa semantica di agent.fs.read_max_bytes.
+        let out = super::search_in_files_rust(dir.path(), "AGO_NEL_PAGLIAIO", 0);
+
+        assert!(
+            out.contains("grande.txt"),
+            "con cap 0 il file grande torna cercabile: {out}"
+        );
     }
 
     fn make_file(num_lines: usize) -> String {
