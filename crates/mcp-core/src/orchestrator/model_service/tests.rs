@@ -468,6 +468,116 @@ async fn sotto_il_pavimento_si_fallisce_onestamente(pool: PgPool) {
     assert!(!matches!(err, NoModelReason::InvalidRequest(_)), "{err:?}");
 }
 
+// ── La scala RELATIVA: tier_from_leader e l'ancora ──────────────────────────
+
+/// Le percentuali del seed (mig 0615).
+fn bande_default() -> RelativeBands {
+    RelativeBands {
+        frontier_pct: 0.85,
+        heavy_pct: 0.65,
+        high_pct: 0.45,
+        medium_pct: 0.20,
+    }
+}
+
+/// La banda dalle vecchie soglie ASSOLUTE (45/35/25/10, mig 0600, rimosse con
+/// la 0614): vive SOLO qui, come termine di paragone del test di
+/// comportamento-preservazione.
+fn banda_assoluta(idx: f64) -> &'static str {
+    if idx >= 45.0 {
+        "frontier"
+    } else if idx >= 35.0 {
+        "heavy"
+    } else if idx >= 25.0 {
+        "high"
+    } else if idx >= 10.0 {
+        "medium"
+    } else {
+        "light"
+    }
+}
+
+/// La tabella di `tier_from_leader`: bordi inclusivi, leader = frontier per
+/// definizione, ancora non positiva = scala indefinita (tutto light).
+#[test]
+fn tier_from_leader_a_tabella() {
+    let b = bande_default();
+    for (value, leader, atteso) in [
+        (100.0, 100.0, "frontier"), // il leader e' il 100% di se stesso
+        (85.0, 100.0, "frontier"),  // bordo inclusivo
+        (84.9, 100.0, "heavy"),
+        (65.0, 100.0, "heavy"),
+        (64.9, 100.0, "high"),
+        (45.0, 100.0, "high"),
+        (44.9, 100.0, "medium"),
+        (20.0, 100.0, "medium"),
+        (19.9, 100.0, "light"),
+        (0.0, 100.0, "light"),
+        (120.0, 100.0, "frontier"), // sopra il leader (ancora in deadband)
+        (54.0, 54.0, "frontier"),   // scala ancorata al parco reale
+        (10.0, 0.0, "light"),       // ancora non positiva: scala indefinita
+    ] {
+        assert_eq!(
+            tier_from_leader(value, leader, &b),
+            atteso,
+            "value={value} leader={leader}"
+        );
+    }
+}
+
+/// COMPORTAMENTO-PRESERVAZIONE della Fase A: ad ancora 54.0 (il leader reale,
+/// openai/gpt-5.6-sol) le bande relative riproducono le vecchie soglie assolute
+/// 45/35/25/10 OVUNQUE tranne che nelle tre finestre di bordo dichiarate, dove
+/// le soglie relative (45.9 / 35.1 / 24.3 / 10.8) scavalcano le assolute.
+/// Quantificato sul DB vivo (2026-07-19): 5 modelli su 79 cambiano banda.
+#[test]
+fn ad_ancora_54_la_scala_relativa_preserva_le_bande_assolute() {
+    let b = bande_default();
+    let dentro_le_finestre_di_bordo = |idx: f64| {
+        (45.0..45.9).contains(&idx)   // frontier assoluta, heavy relativa
+            || (35.0..35.1).contains(&idx) // heavy assoluta, high relativa
+            || (24.3..25.0).contains(&idx) // medium assoluta, high relativa
+            || (10.0..10.8).contains(&idx) // medium assoluta, light relativa
+    };
+    let mut idx = 0.0f64;
+    while idx < 60.0 {
+        if !dentro_le_finestre_di_bordo(idx) {
+            assert_eq!(
+                tier_from_leader(idx, 54.0, &b),
+                banda_assoluta(idx),
+                "indice {idx}: fuori dai bordi dichiarati la banda NON cambia"
+            );
+        }
+        idx += 0.05;
+    }
+    // I 5 modelli REALI che cambiano banda (query sul catalogo vivo, 19/07):
+    // sono tutti dentro le finestre di bordo, e il cambio e' DICHIARATO.
+    for (idx, relativa) in [
+        (45.7, "heavy"), // x-ai/grok-4.5: era frontier
+        (45.6, "heavy"), // openai/gpt-5.6-luna: era frontier
+        (24.6, "high"),  // claude-sonnet-4-5: era medium (la relativa lo ALZA)
+        (10.6, "light"), // mistral/devstral-2512: era medium
+    ] {
+        assert_eq!(tier_from_leader(idx, 54.0, &b), relativa, "indice {idx}");
+    }
+}
+
+/// La DEADBAND dell'ancora: entro il 3% la scala non si muove (anti-flapping),
+/// oltre si ri-ancora e la scrittura va persistita. Un'ancora assente o non
+/// positiva si fissa subito.
+#[test]
+fn l_ancora_si_muove_solo_oltre_la_deadband() {
+    // Entro la deadband: l'ancora resta quella, niente scrittura.
+    assert_eq!(resolve_anchor(Some(54.0), 55.0, 0.03), (54.0, false));
+    assert_eq!(resolve_anchor(Some(54.0), 52.5, 0.03), (54.0, false));
+    // Oltre (in entrambe le direzioni): nuova ancora, da persistere.
+    assert_eq!(resolve_anchor(Some(54.0), 60.0, 0.03), (60.0, true));
+    assert_eq!(resolve_anchor(Some(54.0), 44.4, 0.03), (44.4, true));
+    // Nessuna ancora precedente (o un fossile non positivo): si fissa subito.
+    assert_eq!(resolve_anchor(None, 54.0, 0.03), (54.0, true));
+    assert_eq!(resolve_anchor(Some(0.0), 54.0, 0.03), (54.0, true));
+}
+
 // ── Scrittura del tier: la precedenza delle fonti ───────────────────────────
 
 /// La tabella di verita' dell'autorita', per intero. E' la regola che prima

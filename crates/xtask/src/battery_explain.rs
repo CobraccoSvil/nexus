@@ -69,12 +69,55 @@ async fn esegui(database_url: String, modello: Option<String>) -> Result<i32> {
         .with_context(|| format!("connessione a {}", dichiara_db(&database_url)))?;
     let premessa = leggi_premessa(&pool, &database_url).await?;
     stampa_premessa(&premessa);
+    stampa_scala_relativa(&pool).await;
     match modello {
         Some(m) => stampa_modello(&pool, &premessa, &m).await?,
         None => stampa_eleggibili(&pool, &premessa).await?,
     }
     pool.close().await;
     Ok(0)
+}
+
+/// La SCALA RELATIVA dei tier (mig 0615/0615): ancore, percentuali e pesi dello
+/// score, letti GREZZI dal DB (regola O: si mostra cio' che c'e', non un parse
+/// nostro). Senza questa premessa, uno score o una banda relativa sono numeri
+/// opachi che non si possono contestare.
+async fn stampa_scala_relativa(pool: &PgPool) {
+    println!();
+    println!("scala relativa (mig #0615/#0616 — banda = % del leader):");
+    println!(
+        "  percentuali    frontier {} | heavy {} | high {} | medium {}",
+        setting_dichiarato(pool, "catalog.tier_relative.frontier_pct").await,
+        setting_dichiarato(pool, "catalog.tier_relative.heavy_pct").await,
+        setting_dichiarato(pool, "catalog.tier_relative.high_pct").await,
+        setting_dichiarato(pool, "catalog.tier_relative.medium_pct").await,
+    );
+    println!(
+        "  ancora prior   {} (modello {}, al {})  [tier synced dall'agentic_index]",
+        setting_dichiarato(pool, "catalog.tier_relative.anchor").await,
+        setting_dichiarato(pool, "catalog.tier_relative.anchor_model").await,
+        setting_dichiarato(pool, "catalog.tier_relative.anchor_at").await,
+    );
+    println!(
+        "  ancora measured {} (modello {}, al {})  [bande dallo score della batteria]",
+        setting_dichiarato(pool, "catalog.measured_band.anchor").await,
+        setting_dichiarato(pool, "catalog.measured_band.anchor_model").await,
+        setting_dichiarato(pool, "catalog.measured_band.anchor_at").await,
+    );
+    println!(
+        "  bande measured deadband {} | demote_margin {} | min_population {}",
+        setting_dichiarato(pool, "catalog.measured_band.anchor_deadband_pct").await,
+        setting_dichiarato(pool, "catalog.measured_band.demote_margin").await,
+        setting_dichiarato(pool, "catalog.measured_band.min_population").await,
+    );
+    println!(
+        "  pesi score     chain {} | recovery {} | real {} | latent {} | longctx {}",
+        setting_dichiarato(pool, "catalog.measured_score.w_chain").await,
+        setting_dichiarato(pool, "catalog.measured_score.w_recovery").await,
+        setting_dichiarato(pool, "catalog.measured_score.w_real").await,
+        setting_dichiarato(pool, "catalog.measured_score.w_latent").await,
+        setting_dichiarato(pool, "catalog.measured_score.w_longctx").await,
+    );
 }
 
 /// La suite corrente viene dai PROFILI, con la query del crate: e' la premessa
@@ -232,6 +275,14 @@ fn stampa_verdetto(r: &PgRow) {
         campo(r, "qualification_backoff_until"),
         campo(r, "qualification_started_at")
     );
+    println!(
+        "    tier: {} (fonte: {}) | score misurato: {} (suite: {}, al: {})",
+        campo(r, "performance_tier"),
+        campo(r, "tier_source"),
+        campo_f64(r, "measured_score"),
+        campo_int(r, "measured_score_suite"),
+        campo(r, "measured_score_at")
+    );
     for (c, ok) in &esiti {
         if *ok {
             println!("    [ok] {}", c.name);
@@ -253,6 +304,13 @@ fn campo_int(r: &PgRow, nome: &str) -> String {
         .ok()
         .flatten()
         .map_or_else(|| "-".into(), |n| n.to_string())
+}
+
+fn campo_f64(r: &PgRow, nome: &str) -> String {
+    r.try_get::<Option<f64>, _>(nome)
+        .ok()
+        .flatten()
+        .map_or_else(|| "-".into(), |n| format!("{n:.2}"))
 }
 
 #[cfg(test)]

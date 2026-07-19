@@ -916,5 +916,153 @@ fn fonti_sovrascrivibili(nuova: TierSource) -> Vec<String> {
     fonti
 }
 
+// ── La scala RELATIVA dei tier: il piu' forte trovato E' frontier ───────────
+
+/// Le bande della scala relativa, come PERCENTUALI del leader (mig 0615,
+/// settings `catalog.tier_relative.*_pct`). Un solo set di percentuali per
+/// entrambe le ancore (l'indice esterno e lo score misurato): la SCALA e' una,
+/// cambiano solo le ancore.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RelativeBands {
+    pub frontier_pct: f64,
+    pub heavy_pct: f64,
+    pub high_pct: f64,
+    pub medium_pct: f64,
+}
+
+impl RelativeBands {
+    /// Le soglie in ordine DISCENDENTE, ciascuna con la sua banda: l'UNICA
+    /// tabella percentuale->banda (i nomi compaiono qui e basta).
+    fn soglie_discendenti(&self) -> [(f64, &'static str); 4] {
+        [
+            (self.frontier_pct, "frontier"),
+            (self.heavy_pct, "heavy"),
+            (self.high_pct, "high"),
+            (self.medium_pct, "medium"),
+        ]
+    }
+
+    /// La percentuale che apre `banda`. `light` non ha soglia: e' il pavimento.
+    /// `None` = valore fuori dalla scala canonica.
+    pub fn pct_of(&self, banda: &str) -> Option<f64> {
+        let b = banda.trim().to_ascii_lowercase();
+        if b == "light" {
+            return Some(0.0);
+        }
+        self.soglie_discendenti()
+            .iter()
+            .find(|(_, nome)| *nome == b)
+            .map(|(pct, _)| *pct)
+    }
+}
+
+/// PUNTO UNICO (regola L) della banda dalla scala RELATIVA. PURA.
+///
+/// Il piu' forte trovato E' frontier e tutti si misurano su di lui: le asticelle
+/// ASSOLUTE hanno prodotto due fallimenti opposti, entrambi misurati (recovery
+/// irraggiungibile da tutti = banda heavy VUOTA; chain saturata da un 8B = high
+/// regalata). La scala relativa misura il NOSTRO parco, non il mondo.
+///
+/// `leader` e' l'ANCORA (il massimo del parco, con deadband anti-flapping via
+/// [`resolve_anchor`]): un'ancora non positiva rende la scala indefinita e
+/// qualunque valore finisce `light` — il chiamante non deve arrivarci (guarda
+/// il massimo del parco prima di chiamare).
+pub fn tier_from_leader(value: f64, leader: f64, bands: &RelativeBands) -> &'static str {
+    if leader <= 0.0 {
+        return "light";
+    }
+    let frazione = value / leader;
+    bands
+        .soglie_discendenti()
+        .iter()
+        .find(|(soglia, _)| frazione >= *soglia)
+        .map_or("light", |(_, banda)| *banda)
+}
+
+/// L'ancora EFFETTIVA della scala, con la deadband anti-flapping. PURA, e
+/// condivisa dalle DUE ancore (indice e score): un solo punto (regola L).
+///
+/// Ritorna `(ancora_da_usare, va_persistita)`: se il nuovo massimo scarta dal
+/// valore corrente meno di `deadband_pct` (relativo), l'ancora NON si muove —
+/// senza, ogni oscillazione dell'indice o dello score ri-scalerebbe l'intero
+/// parco a ogni giro.
+pub fn resolve_anchor(attuale: Option<f64>, nuovo_max: f64, deadband_pct: f64) -> (f64, bool) {
+    match attuale {
+        Some(a) if a > 0.0 && ((nuovo_max - a).abs() / a) <= deadband_pct => (a, false),
+        _ => (nuovo_max, true),
+    }
+}
+
+/// Le percentuali della scala relativa dal DB (regola G, mig 0615). `None` =
+/// chiavi mancanti: la scala non e' configurata e NESSUNA banda viene derivata
+/// (fail-visibile, mai un default hardcoded).
+pub async fn relative_bands(db: &PgPool) -> Option<RelativeBands> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM settings WHERE key LIKE 'catalog.tier_relative.%'",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "relative_bands: lettura settings fallita"))
+    .ok()?;
+    let map: std::collections::HashMap<_, _> = rows.into_iter().collect();
+    let num = |k: &str| -> Option<f64> { map.get(k)?.trim().parse().ok() };
+    Some(RelativeBands {
+        frontier_pct: num("catalog.tier_relative.frontier_pct")?,
+        heavy_pct: num("catalog.tier_relative.heavy_pct")?,
+        high_pct: num("catalog.tier_relative.high_pct")?,
+        medium_pct: num("catalog.tier_relative.medium_pct")?,
+    })
+}
+
+/// PERSISTE un'ancora (valore + modello leader + istante) sotto `prefisso`
+/// (`catalog.tier_relative` o `catalog.measured_band`). Delega al punto unico
+/// di scrittura settings (`update_setting_value`, nexus-auth): le chiavi NASCONO
+/// in migrazione (0614/0615), qui si aggiornano soltanto — una chiave assente e'
+/// un WARN visibile, mai un INSERT di ripiego.
+pub async fn persist_anchor(db: &PgPool, prefisso: &str, valore: f64, leader_model: &str) {
+    let scritture = [
+        (format!("{prefisso}.anchor"), valore.to_string()),
+        (format!("{prefisso}.anchor_model"), leader_model.to_string()),
+        (format!("{prefisso}.anchor_at"), chrono::Utc::now().to_rfc3339()),
+    ];
+    for (key, value) in scritture {
+        if let Err(e) = nexus_auth::update_setting_value(db, &key, &value).await {
+            tracing::warn!(key = %key, error = %e, "persist_anchor: scrittura ancora fallita");
+        }
+    }
+}
+
+/// Scrive lo SCORE MISURATO di un modello (mig 0616). Gemello di [`apply_tier`]
+/// e come lui UNICO writer delle sue colonne (guard `tier-write` esteso a
+/// `measured_score`): la batteria lo chiama dentro la transazione del verdetto
+/// (score e stato atterrano insieme o niente).
+///
+/// `suite` e' OBBLIGATORIA: score di suite diverse non sono confrontabili, e il
+/// leader measured si calcola solo fra righe alla suite corrente.
+pub async fn apply_measured_score<'e, E>(
+    exec: E,
+    provider: &str,
+    model: &str,
+    score: f64,
+    suite: i32,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let res = sqlx::query(
+        "UPDATE ai_price_catalog \
+            SET measured_score = $3, measured_score_at = NOW(), \
+                measured_score_suite = $4, updated_at = NOW() \
+          WHERE provider = $1 AND model = $2",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(score)
+    .bind(suite)
+    .execute(exec)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests;

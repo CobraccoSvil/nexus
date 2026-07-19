@@ -1733,17 +1733,53 @@ async fn realign_existing_model(db: &PgPool, provider: &str, api_model: &str) ->
 /// WHERE scritta a mano in questa funzione e un CASE scritto a mano nella
 /// batteria: due formulazioni della stessa cosa, allineate solo dalla diligenza.
 pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32 {
-    let Some(thresholds) = tier_prior_thresholds(db).await else {
-        return 0; // prior disabilitato dal flag DB (o soglie mancanti)
+    let Some(bands) = tier_prior_bands(db).await else {
+        return 0; // prior disabilitato dal flag DB (o percentuali mancanti)
     };
-    // L'indice STANTIO viene scartato QUI (non nella funzione pura): la fonte e'
-    // undocumented e puo' sparire senza preavviso — un indice vecchio non deve
-    // passare per fresco.
-    let max_age_h = crate::settings::get_setting(db, "catalog.agentic_index_sync.max_age_hours")
+    // Il path per-modello (discovery, sync LiteLLM) legge l'ANCORA PERSISTITA
+    // (mig 0615): il massimo del parco lo ricalcola solo il giro set-based
+    // `refresh_tiers_from_index`, che la aggiorna con la deadband.
+    let Some(leader) = read_anchor(db, "catalog.tier_relative.anchor").await else {
+        tracing::debug!(
+            provider = %provider, model = %api_model,
+            "refresh_tier_prior: ancora della scala relativa non ancora fissata \
+             (catalog.tier_relative.anchor vuota): tier invariato fino al primo \
+             giro di refresh_tiers_from_index"
+        );
+        return 0;
+    };
+    refresh_tier_prior_con_leader(db, provider, api_model, leader, &bands).await
+}
+
+/// Un setting NUMERICO, se presente e parsabile. Punto unico del pattern
+/// lettura+parse di questo modulo (il default, dove esiste, resta al chiamante).
+async fn setting_num<T: std::str::FromStr>(db: &PgPool, key: &str) -> Option<T> {
+    crate::settings::get_setting(db, key)
         .await
         .ok()
         .flatten()
-        .and_then(|v| v.trim().parse::<i64>().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// L'ancora persistita sotto `key`, se e' un numero positivo. Vuota o assente =
+/// scala non ancora ancorata.
+async fn read_anchor(db: &PgPool, key: &str) -> Option<f64> {
+    setting_num::<f64>(db, key).await.filter(|v| *v > 0.0)
+}
+
+/// Il corpo del refresh di UN modello, col leader gia' risolto dal chiamante.
+async fn refresh_tier_prior_con_leader(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    leader: f64,
+    bands: &crate::orchestrator::model_service::RelativeBands,
+) -> u32 {
+    // L'indice STANTIO viene scartato QUI (non nella funzione pura): la fonte e'
+    // undocumented e puo' sparire senza preavviso — un indice vecchio non deve
+    // passare per fresco.
+    let max_age_h = setting_num::<i64>(db, "catalog.agentic_index_sync.max_age_hours")
+        .await
         .unwrap_or(168);
     let agentic_index: Option<Option<f64>> = sqlx::query_scalar(
         "SELECT CASE WHEN agentic_index_at IS NULL \
@@ -1775,7 +1811,7 @@ pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &
     // OpenRouter non lista quei nomi, e non e' una lacuna temporanea. Restano
     // routabili col tier che hanno finche' la batteria non scrive 'measured'.
     let Some(derived) =
-        crate::model_qualification::derive_tier_prior(agentic_index.flatten(), &thresholds)
+        crate::model_qualification::derive_tier_prior(agentic_index.flatten(), leader, bands)
     else {
         tracing::debug!(
             provider = %provider, model = %api_model,
@@ -1820,11 +1856,24 @@ pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &
 /// inerte. Se l'indice e' la BASE della classificazione, deve raggiungere
 /// tutti.
 ///
-/// Regola L: non ri-deriva nulla. Enumera le righe candidate e delega al punto
-/// unico `refresh_tier_prior`, che rilegge la riga e applica le soglie — cosi'
-/// le bande restano definite in un solo posto (`tier_from_agentic_index`)
-/// invece di essere riscritte come `CASE` in questa query.
+/// Regola L: non ri-deriva nulla. Calcola il LEADER una volta (il massimo
+/// `agentic_index` fresco fra le righe enabled — il cooldown transitorio di un
+/// provider NON esclude dal leader: il parco e' il parco), lo ancora con la
+/// deadband (mig 0615) e poi enumera le righe candidate delegando al punto
+/// unico `refresh_tier_prior_con_leader`, che rilegge la riga e applica la
+/// scala — cosi' le bande restano definite in un solo posto
+/// (`tier_from_leader`) invece di essere riscritte come `CASE` in questa query.
 pub(crate) async fn refresh_tiers_from_index(db: &PgPool) -> u32 {
+    let Some(bands) = tier_prior_bands(db).await else {
+        return 0; // prior disabilitato dal flag DB (o percentuali mancanti)
+    };
+    let Some(leader) = leader_riancorato(db).await else {
+        tracing::debug!(
+            "refresh_tiers_from_index: nessun indice fresco su righe enabled e \
+             nessuna ancora persistita: la scala relativa non ha un leader"
+        );
+        return 0;
+    };
     let candidati: Vec<(String, String)> = sqlx::query_as(
         "SELECT provider, model FROM ai_price_catalog \
           WHERE agentic_index IS NOT NULL \
@@ -1839,9 +1888,64 @@ pub(crate) async fn refresh_tiers_from_index(db: &PgPool) -> u32 {
 
     let mut cambiati = 0;
     for (provider, model) in candidati {
-        cambiati += refresh_tier_prior(db, &provider, &model).await;
+        cambiati += refresh_tier_prior_con_leader(db, &provider, &model, leader, &bands).await;
     }
     cambiati
+}
+
+/// Il leader della scala del prior, RI-ANCORATO: massimo indice fresco fra le
+/// righe enabled, passato per la deadband contro l'ancora persistita
+/// (`catalog.tier_relative.anchor`) e persistito se lo scarto la supera.
+/// `None` = ne' un massimo fresco ne' un'ancora precedente: la scala non parte.
+async fn leader_riancorato(db: &PgPool) -> Option<f64> {
+    use crate::orchestrator::model_service::{persist_anchor, resolve_anchor};
+    let max_age_h = setting_num::<i64>(db, "catalog.agentic_index_sync.max_age_hours")
+        .await
+        .unwrap_or(168);
+    let fresco: Option<(String, f64)> = sqlx::query_as(
+        "SELECT provider || '/' || model, agentic_index FROM ai_price_catalog \
+          WHERE is_enabled AND agentic_index IS NOT NULL \
+            AND agentic_index_at >= now() - make_interval(hours => $1::int) \
+          ORDER BY agentic_index DESC LIMIT 1",
+    )
+    .bind(max_age_h as i32)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "leader_riancorato: lettura del massimo fallita"))
+    .ok()
+    .flatten();
+    let ancora_attuale = read_anchor(db, "catalog.tier_relative.anchor").await;
+    let Some((leader_model, nuovo_max)) = fresco else {
+        // Parco senza indice fresco: si resta sull'ancora che c'e' (le righe
+        // stantie verranno comunque saltate dal check per-riga).
+        return ancora_attuale;
+    };
+    let Some(deadband) = read_deadband(db).await else {
+        return ancora_attuale.or(Some(nuovo_max)); // senza deadband non si persiste
+    };
+    let (ancora, persisti) = resolve_anchor(ancora_attuale, nuovo_max, deadband);
+    if persisti {
+        tracing::info!(
+            ancora = ancora, leader = %leader_model,
+            "scala relativa: nuova ancora del tier prior (deadband superata)"
+        );
+        persist_anchor(db, "catalog.tier_relative", ancora, &leader_model).await;
+    }
+    Some(ancora)
+}
+
+/// La deadband dell'ancora (mig 0615). Assente = WARN visibile, nessun
+/// aggiornamento dell'ancora (regola G: la chiave nasce in migrazione, non da
+/// un default nel codice).
+async fn read_deadband(db: &PgPool) -> Option<f64> {
+    let v = setting_num::<f64>(db, "catalog.tier_relative.anchor_deadband_pct").await;
+    if v.is_none() {
+        tracing::warn!(
+            "catalog.tier_relative.anchor_deadband_pct assente o non numerica \
+             (applicare la migrazione #0615): l'ancora della scala relativa non si aggiorna"
+        );
+    }
+    v
 }
 
 /// Normalizza un id modello per il confronto fra cataloghi diversi (il nostro e
@@ -2038,35 +2142,26 @@ pub async fn sync_agentic_index(db: &PgPool) -> Result<u64, String> {
     Ok(aggiornati)
 }
 
-/// Le soglie del tier `synced` dal DB (regola G, mig 0600/0608). `None` =
-/// prior disabilitato dal flag O soglie mancanti (fail-visibile, niente
-/// default hardcoded): restano solo `manual` e `measured`, e un modello mai
-/// misurato ha tier NULL.
-pub(crate) async fn tier_prior_thresholds(
+/// La scala del tier `synced` dal DB (regola G, mig 0615: le soglie ASSOLUTE
+/// della 0600 sono state sostituite dalle percentuali relative al leader).
+/// `None` = prior disabilitato dal flag O percentuali mancanti (fail-visibile,
+/// niente default hardcoded): restano solo `manual` e `measured`, e un modello
+/// mai misurato ha tier NULL. Le percentuali le carica il punto unico
+/// `model_service::relative_bands` (regola L: la stessa scala serve anche alle
+/// bande measured).
+pub(crate) async fn tier_prior_bands(
     db: &PgPool,
-) -> Option<crate::model_qualification::TierPriorThresholds> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT key, value FROM settings WHERE key LIKE 'catalog.tier_prior.%'",
-    )
-    .fetch_all(db)
-    .await
-    .ok()?;
-    let map: std::collections::HashMap<_, _> = rows.into_iter().collect();
-    let on = map
-        .get("catalog.tier_prior.enabled")
+) -> Option<crate::orchestrator::model_service::RelativeBands> {
+    let on = crate::settings::get_setting(db, "catalog.tier_prior.enabled")
+        .await
+        .ok()
+        .flatten()
         .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
         .unwrap_or(false);
     if !on {
         return None;
     }
-    let num = |k: &str| -> Option<f64> { map.get(k)?.trim().parse().ok() };
-    let thresholds = crate::model_qualification::TierPriorThresholds {
-        agentic_index_frontier_min: num("catalog.tier_prior.agentic_index_frontier_min")?,
-        agentic_index_heavy_min: num("catalog.tier_prior.agentic_index_heavy_min")?,
-        agentic_index_high_min: num("catalog.tier_prior.agentic_index_high_min")?,
-        agentic_index_medium_min: num("catalog.tier_prior.agentic_index_medium_min")?,
-    };
-    Some(thresholds)
+    crate::orchestrator::model_service::relative_bands(db).await
 }
 
 /// Riallinea `context_window` di un modello GIA' nel catalog al valore
@@ -3011,7 +3106,7 @@ mod tests {
         .await
         .expect("settings");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_prior.agentic_index_frontier_min', '45'),              ('catalog.tier_prior.agentic_index_heavy_min', '35'),              ('catalog.tier_prior.agentic_index_high_min', '25'),              ('catalog.tier_prior.agentic_index_medium_min', '10'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
         )
         .execute(&pool)
         .await
@@ -3026,9 +3121,9 @@ mod tests {
         .await
         .expect("seed");
 
-        // DIAGNOSI: le soglie si caricano davvero?
-        let t = tier_prior_thresholds(&pool).await;
-        assert!(t.is_some(), "tier_prior_thresholds ha ritornato None: il prior non parte");
+        // DIAGNOSI: la scala si carica davvero?
+        let t = tier_prior_bands(&pool).await;
+        assert!(t.is_some(), "tier_prior_bands ha ritornato None: il prior non parte");
         refresh_tier_prior(&pool, "mistral", "mistral-large-2512").await;
 
         let (tier, src): (Option<String>, Option<String>) = sqlx::query_as(
@@ -3065,7 +3160,7 @@ mod tests {
             .await
             .expect("settings");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_prior.agentic_index_frontier_min', '45'),              ('catalog.tier_prior.agentic_index_heavy_min', '35'),              ('catalog.tier_prior.agentic_index_high_min', '25'),              ('catalog.tier_prior.agentic_index_medium_min', '10'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
         )
         .execute(&pool)
         .await
@@ -3111,12 +3206,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("colonne");
-        sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            .execute(&pool)
-            .await
-            .expect("settings");
+        // Lo schema REALE dei settings (con updated_at): il giro set-based
+        // PERSISTE l'ancora via update_setting_value, e uno schema finto senza
+        // quella colonna nasconderebbe la scrittura (regola O).
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_prior.agentic_index_frontier_min', '45'),              ('catalog.tier_prior.agentic_index_heavy_min', '35'),              ('catalog.tier_prior.agentic_index_high_min', '25'),              ('catalog.tier_prior.agentic_index_medium_min', '10'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, \
+             value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
         )
         .execute(&pool)
         .await
@@ -3140,13 +3241,24 @@ mod tests {
         assert_eq!(
             righe,
             vec![
-                // Il fossile del nome ('medium') corretto dall'indice: 44.4 -> heavy.
                 ("gia-misurato".into(), Some("frontier".into()), Some("measured".into())),
-                ("opus-fossile".into(), Some("heavy".into()), Some("synced".into())),
+                // SEMANTICA RELATIVA (mig 0615): 44.4 e' il massimo fresco del
+                // parco enabled -> il giro RI-ANCORA (54 -> 44.4, scarto 17.8% >
+                // deadband 3%) e il leader del parco E' frontier per definizione.
+                ("opus-fossile".into(), Some("frontier".into()), Some("synced".into())),
                 ("senza-indice".into(), Some("heavy".into()), None),
             ],
-            "l'indice riclassifica il fossile; NON tocca chi la batteria ha gia'              misurato (measured vince), ne' azzera chi l'indice non copre"
+            "l'indice riclassifica il fossile sul leader del PARCO; NON tocca chi              la batteria ha gia' misurato (measured vince), ne' azzera chi              l'indice non copre"
         );
+        // L'ancora e' stata PERSISTITA dal punto unico (update_setting_value):
+        // il prossimo giro per-modello leggera' 44.4, non il 54 di ieri.
+        let ancora: (String,) = sqlx::query_as(
+            "SELECT value FROM settings WHERE key = 'catalog.tier_relative.anchor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("ancora");
+        assert_eq!(ancora.0, "44.4", "l'ancora segue il massimo del parco oltre la deadband");
     }
 
     /// Quando l'indice CONFERMA il tier gia' presente, la PROVENIENZA deve
@@ -3169,7 +3281,7 @@ mod tests {
             .await
             .expect("settings");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_prior.agentic_index_frontier_min', '45'),              ('catalog.tier_prior.agentic_index_heavy_min', '35'),              ('catalog.tier_prior.agentic_index_high_min', '25'),              ('catalog.tier_prior.agentic_index_medium_min', '10'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
         )
         .execute(&pool)
         .await

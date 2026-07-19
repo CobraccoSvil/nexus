@@ -255,9 +255,17 @@ else
   echo "OK model-selection: nessun call site scavalca il servizio unico"
 fi
 
+# Scala relativa dei tier (2026-07-19, mig 0614): la banda dal leader si
+# calcola in UN solo posto. Il prior dell'indice e le bande measured della
+# batteria delegano entrambi a tier_from_leader: due copie della scala
+# divergerebbero in silenzio come le due formulazioni della precedenza fonti.
+assert_single "tier_from_leader" 'fn tier_from_leader\(' 'crates/mcp-core/src/orchestrator/model_service.rs' crates
+
 # Scrittura del tier (2026-07-16): performance_tier + tier_source si scrivono
 # SOLO da model_service::apply_tier, che conosce la precedenza delle fonti
-# (manual > measured > synced > fonte ignota).
+# (manual > measured > synced > fonte ignota). Esteso il 2026-07-19 (mig 0615):
+# anche measured_score si scrive solo dal gemello apply_measured_score, nello
+# stesso modulo — lo score e' confrontabile solo se lo scrive una mano sola.
 #
 # Perche' un guard e non la sola buona volonta': la regola e' gia' stata scritta
 # due volte, in due linguaggi diversi e lontani — una WHERE in
@@ -271,7 +279,7 @@ fi
 # Ammessi: il servizio stesso, i test, e le migrazioni (immutabili, gia'
 # applicate: una migrazione SQL non puo' chiamare Rust).
 tier_writers="$(grep -rEn \
-  "(UPDATE|SET)[^\"']*\b(performance_tier|tier_source) *=" \
+  "(UPDATE|SET)[^\"']*\b(performance_tier|tier_source|measured_score) *=" \
   crates apps \
   --include='*.rs' --include='*.ts' --include='*.tsx' \
   2>/dev/null \

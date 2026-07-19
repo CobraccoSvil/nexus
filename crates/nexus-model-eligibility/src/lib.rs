@@ -228,11 +228,16 @@ pub fn sql_explain_model() -> String {
         .collect();
     // I timestamp escono come testo: l'explain li STAMPA e basta, e il casting
     // qui gli risparmia un binding di tipi data solo per rileggerli.
+    // Tier, fonte e SCORE MISURATO (mig 0615) escono insieme allo stato: senza,
+    // la scala relativa e' un numero opaco che l'explain non sa mostrare.
     format!(
         "SELECT p.provider, p.model, p.qualification_state, p.qualification_suite_version, \
                 p.qualification_expires_at::text AS qualification_expires_at, \
                 p.qualification_backoff_until::text AS qualification_backoff_until, \
-                p.qualification_started_at::text AS qualification_started_at, {colonne} \
+                p.qualification_started_at::text AS qualification_started_at, \
+                p.performance_tier, p.tier_source, \
+                p.measured_score, p.measured_score_suite, \
+                p.measured_score_at::text AS measured_score_at, {colonne} \
            FROM ai_price_catalog p \
           WHERE p.model = {EXPLAIN_MODEL_PARAM} \
              OR p.provider || '/' || p.model = {EXPLAIN_MODEL_PARAM} \

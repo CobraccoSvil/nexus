@@ -329,10 +329,36 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
     }
 }
 
+/// Il bersaglio della catena nella formula dello score (piano "scala relativa",
+/// mig 0616): `s_chain = media di min(chained_links/LINKS_TARGET, 1)`. E' una
+/// costante della FORMULA (5 anelli = catena piena), non un tuning di routing:
+/// cambiarla cambia il significato degli score gia' persistiti, quindi il posto
+/// giusto per una revisione e' un bump di suite, non un setting.
+const LINKS_TARGET: f64 = 5.0;
+
+/// Somme CONTINUE sui tentativi CONCLUSIVI di un profilo (mig 0616): alimentano
+/// [`derive_measured_score`] senza rileggere l'evidence. Restano a zero sui
+/// profili single-turn (che non producono `measures`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct SommeConclusive {
+    /// Somma di `min(chained_links/LINKS_TARGET, 1)` per tentativo conclusivo:
+    /// CONTINUA (separa links-3 da links-5), gia' clampata per-tentativo.
+    pub chain_frac: f64,
+    /// Tentativi conclusivi col FATTO `recovered` (ha letto l'errore).
+    pub recovered: u32,
+    /// Tentativi conclusivi col fatto `repeated_failed` (malus).
+    pub repeated: u32,
+    /// Tentativi conclusivi col fatto `bad_tool_syntax` (malus).
+    pub bad_syntax: u32,
+}
+
 /// Esito aggregato di UN profilo eseguito (`repeat` tentativi).
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileRun {
     pub profile_key: String,
+    /// Il `kind` del profilo: e' la chiave con cui lo score aggancia ogni run
+    /// alla sua componente (chain/recovery/real/latent/longctx).
+    pub kind: String,
     pub grants: Vec<String>,
     pub is_blocking: bool,
     pub passes: u32,
@@ -341,11 +367,18 @@ pub(crate) struct ProfileRun {
     /// Pass minimi per promuovere (dal `pass_predicate`, default = repeat).
     pub promote_min: u32,
     pub first_fail_reason: Option<String>,
+    pub somme: SommeConclusive,
 }
 
 impl ProfileRun {
     fn passed(&self) -> bool {
         self.passes >= self.promote_min
+    }
+
+    /// I tentativi CONCLUSIVI del run: il denominatore di ogni componente dello
+    /// score (gli inconclusivi stanno fuori da numeratore E denominatore).
+    fn conclusivi(&self) -> u32 {
+        self.passes + self.conclusive_fails
     }
 }
 
@@ -372,6 +405,11 @@ pub(crate) struct Derived {
     /// con isteresi. `None` = nessuna banda certificata -> il catalog tiene il suo
     /// tier `synced` e non viene toccato.
     pub measured_tier: Option<String>,
+    /// Lo SCORE MISURATO 0-100 (mig 0616, [`derive_measured_score`]). `None` =
+    /// giro non Qualified, pesi non configurati, o una componente applicabile
+    /// senza tentativi conclusivi (il silenzio non punteggia): score e bande
+    /// restano invariati.
+    pub measured_score: Option<f64>,
 }
 
 /// Esito AGGREGATO di una configurazione della thinking_matrix (fase 5).
@@ -423,43 +461,18 @@ pub(crate) fn derive_thinking_policy(
     }
 }
 
-/// Le soglie del tier `synced`, dal DB (regola G, mig 0600; il prezzo e' uscito
-/// dalla classificazione con la mig 0608).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TierPriorThresholds {
-    /// Soglie sull'`agentic_index`. ASSOLUTE su un indice VERSIONATO (AA v4.1 ha
-    /// cambiato 3 benchmark su 9 rispetto a v4.0): per questo stanno nel DB e
-    /// vanno riviste a ogni cambio di metodologia.
-    pub agentic_index_frontier_min: f64,
-    pub agentic_index_heavy_min: f64,
-    pub agentic_index_high_min: f64,
-    pub agentic_index_medium_min: f64,
-}
-
-/// TIER `synced` DALLA CLASSIFICAZIONE ESTERNA. PURA.
+/// TIER `synced` DALLA CLASSIFICAZIONE ESTERNA, sulla scala RELATIVA (mig 0615).
 ///
 /// E' il SEME onesto in attesa della misura, non una verita': appena la
 /// batteria certifica una banda, `measured` lo sostituisce. L'agentic_index
 /// MISURA la capacita' agentica (Agents 34% + Coding 24% dell'Intelligence
 /// Index, su harness con tool): e' il nostro uso esatto — a differenza del NOME
 /// (il token `mini` copre intelligence 6.8-50.2) e del PREZZO (posizionamento
-/// commerciale: gpt-5.4-mini a >$2 diventava 'heavy' con agentic 30.2, e
-/// claude-opus-4-8 a 47.2 veniva DECLASSATO da frontier). Entrambi sono usciti
-/// dalla classificazione: il nome con la mig 0599, il prezzo con la 0608.
-fn tier_from_agentic_index(idx: f64, t: &TierPriorThresholds) -> &'static str {
-    if idx >= t.agentic_index_frontier_min {
-        "frontier"
-    } else if idx >= t.agentic_index_heavy_min {
-        "heavy"
-    } else if idx >= t.agentic_index_high_min {
-        "high"
-    } else if idx >= t.agentic_index_medium_min {
-        "medium"
-    } else {
-        "light"
-    }
-}
-
+/// commerciale). Le soglie ASSOLUTE sono uscite con la mig 0615: erano fossili
+/// dell'indice di un giorno preciso, e a ogni rilascio forte andavano riviste a
+/// mano. Ora la banda e' `tier_from_leader` (punto unico, regola L): il piu'
+/// forte del parco e' l'ancora e tutti si misurano su di lui.
+///
 /// `None` = indice assente o stantio (il chiamante lo azzera oltre
 /// `max_age_hours`: la fonte e' undocumented e puo' sparire — un indice vecchio
 /// non deve passare per fresco). Il tier resta NULL e il sistema DICE che non lo
@@ -469,9 +482,11 @@ fn tier_from_agentic_index(idx: f64, t: &TierPriorThresholds) -> &'static str {
 /// banda `measured` al primo giro utile.
 pub(crate) fn derive_tier_prior(
     agentic_index: Option<f64>,
-    t: &TierPriorThresholds,
+    leader: f64,
+    bands: &crate::orchestrator::model_service::RelativeBands,
 ) -> Option<&'static str> {
-    agentic_index.map(|idx| tier_from_agentic_index(idx, t))
+    agentic_index
+        .map(|idx| crate::orchestrator::model_service::tier_from_leader(idx, leader, bands))
 }
 
 /// TIER MISURATO (`measured`): la banda PIU' ALTA certificata dalla batteria.
@@ -661,6 +676,7 @@ fn blocking_verdict(runs: &[ProfileRun]) -> Option<Derived> {
                 ),
                 thinking: None,
                 measured_tier: None,
+                measured_score: None,
             });
         }
     }
@@ -672,6 +688,7 @@ fn blocking_verdict(runs: &[ProfileRun]) -> Option<Derived> {
             reason: "inconclusive_round".into(),
             thinking: None,
             measured_tier: None,
+                measured_score: None,
         })
 }
 
@@ -711,6 +728,145 @@ pub(crate) fn derive_capabilities(declared: &[String], runs: &[ProfileRun]) -> D
         // `derive_tier_measured` e la deposita qui — un solo punto che decide il
         // tier (regola L), separato da quello che decide le capability.
         measured_tier: None,
+                measured_score: None,
+    }
+}
+
+// ── Lo SCORE MISURATO (mig 0616): la batteria in un numero 0-100 ────────────
+
+/// I pesi della formula, dal DB (settings `catalog.measured_score.*`, regola G).
+/// `w_recovery` = 30 e' deliberato: un gemello del leader senza recovery resta
+/// FUORI da frontier senza dipendere dal malus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MeasuredScoreWeights {
+    pub chain: f64,
+    pub recovery: f64,
+    pub real: f64,
+    pub latent: f64,
+    pub longctx: f64,
+}
+
+/// Come una componente estrae la sua frazione [0,1] dal run.
+#[derive(Clone, Copy)]
+enum ModoComponente {
+    /// `media di min(chained_links/LINKS_TARGET, 1)`: CONTINUA, separa
+    /// links-3 da links-5 (la somma clampata la accumula `tally`).
+    CatenaContinua,
+    /// Il rate del FATTO `recovered` sui conclusivi: la capacita' di leggere
+    /// l'errore, distinta dalla disciplina (che il pass/fail gia' giudica).
+    RateRecupero,
+    /// Il pass rate conclusivo del profilo.
+    RatePass,
+}
+
+/// Le 5 componenti della formula: (kind del profilo, peso, modo). L'ordine non
+/// conta (somma), la CHIAVE e' il kind — la stessa parola del dispatch (regola N).
+fn componenti_score(w: &MeasuredScoreWeights) -> [(&'static str, f64, ModoComponente); 5] {
+    [
+        (KIND_TOOL_CHAIN, w.chain, ModoComponente::CatenaContinua),
+        (KIND_TOOL_RECOVERY, w.recovery, ModoComponente::RateRecupero),
+        (KIND_TOOL_REALISTIC, w.real, ModoComponente::RatePass),
+        (crate::probe_latent_state::KIND_LATENT_STATE, w.latent, ModoComponente::RatePass),
+        (KIND_LONG_CONTEXT, w.longctx, ModoComponente::RatePass),
+    ]
+}
+
+/// Aggregato dei run di un `kind`: (tentativi conclusivi, pass, somme).
+fn aggrega_kind(runs: &[ProfileRun], kind: &str) -> (u32, u32, SommeConclusive) {
+    let mut tot = (0u32, 0u32, SommeConclusive::default());
+    for r in runs.iter().filter(|r| r.kind == kind) {
+        tot.0 += r.conclusivi();
+        tot.1 += r.passes;
+        tot.2.chain_frac += r.somme.chain_frac;
+        tot.2.recovered += r.somme.recovered;
+        tot.2.repeated += r.somme.repeated;
+        tot.2.bad_syntax += r.somme.bad_syntax;
+    }
+    tot
+}
+
+/// Il malus della formula: `-5*repeated_rate -5*bad_syntax_rate`, cap -5
+/// totale. I rate sono sui tentativi CONCLUSIVI dei profili multi-step (gli
+/// unici che misurano quei fatti).
+fn malus_conclusivo(runs: &[ProfileRun]) -> f64 {
+    let (mut conclusivi, mut repeated, mut bad) = (0u32, 0u32, 0u32);
+    for kind in [KIND_TOOL_CHAIN, KIND_TOOL_RECOVERY] {
+        let (n, _, somme) = aggrega_kind(runs, kind);
+        conclusivi += n;
+        repeated += somme.repeated;
+        bad += somme.bad_syntax;
+    }
+    if conclusivi == 0 {
+        return 0.0;
+    }
+    let n = f64::from(conclusivi);
+    (5.0 * f64::from(repeated) / n + 5.0 * f64::from(bad) / n).min(5.0)
+}
+
+/// PUNTO UNICO PURO (regola L) dello SCORE MISURATO 0-100: media pesata delle
+/// 5 componenti sui tentativi CONCLUSIVI (gli inconclusivi fuori da numeratore
+/// E denominatore), meno il malus.
+///
+/// `kinds_applicabili` = i kind dei profili che questo giro POTEVA correre
+/// (enabled + `applies_when` soddisfatto). Una componente NON applicabile per
+/// struttura (o assente dalla suite) vale 0 punti SENZA rinormalizzare:
+/// rinormalizzare premierebbe chi non puo' correre le prove alte.
+///
+/// `None` = una componente APPLICABILE e' rimasta senza tentativi conclusivi:
+/// il silenzio non punteggia (regola H — score e bande restano invariati), mai
+/// uno score parziale spacciato per intero.
+pub(crate) fn derive_measured_score(
+    runs: &[ProfileRun],
+    kinds_applicabili: &[&str],
+    w: &MeasuredScoreWeights,
+) -> Option<f64> {
+    let mut score = 0.0;
+    for (kind, peso, modo) in componenti_score(w) {
+        if !kinds_applicabili.contains(&kind) {
+            continue; // 0 punti, dichiarati: niente rinormalizzazione
+        }
+        let (conclusivi, passes, somme) = aggrega_kind(runs, kind);
+        if conclusivi == 0 {
+            return None; // il silenzio non punteggia
+        }
+        let n = f64::from(conclusivi);
+        let frazione = match modo {
+            ModoComponente::CatenaContinua => somme.chain_frac / n,
+            ModoComponente::RateRecupero => f64::from(somme.recovered) / n,
+            ModoComponente::RatePass => f64::from(passes) / n,
+        };
+        score += peso * frazione;
+    }
+    Some((score - malus_conclusivo(runs)).clamp(0.0, 100.0))
+}
+
+/// La banda MEASURED di uno score sulla scala relativa, con l'isteresi di
+/// demozione (mig 0616): si SALE superando la soglia della banda nuova, si
+/// SCENDE solo sotto `soglia della banda attuale - demote_margin` (punti score).
+/// `attuale` = la banda gia' GUADAGNATA dalla batteria (`tier_source =
+/// 'measured'`), l'unica con diritto all'isteresi — mai un prior.
+pub(crate) fn banda_measured(
+    score: f64,
+    attuale: Option<&str>,
+    ancora: f64,
+    bands: &crate::orchestrator::model_service::RelativeBands,
+    demote_margin: f64,
+) -> &'static str {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    let candidata = crate::orchestrator::model_service::tier_from_leader(score, ancora, bands);
+    let Some(acquisita) = attuale.and_then(banda_canonica) else {
+        return candidata;
+    };
+    if tier_rank(candidata) >= tier_rank(acquisita) {
+        return candidata;
+    }
+    let Some(pct) = bands.pct_of(acquisita) else {
+        return candidata;
+    };
+    if score >= ancora * pct - demote_margin {
+        acquisita // dentro il margine: la banda guadagnata si conserva
+    } else {
+        candidata
     }
 }
 
@@ -912,6 +1068,11 @@ fn build_long_context_request(profile: &ProbeProfile) -> (String, String, String
 /// mondo sbagliato o col predicato muto (regola N).
 const KIND_TOOL_CHAIN: &str = "tool_chain";
 const KIND_TOOL_RECOVERY: &str = "tool_recovery";
+/// Gli altri due kind che alimentano lo score (mig 0616). Nominati qui e non
+/// inline perche' la componente dello score e il dispatch della richiesta
+/// devono essere LA STESSA parola (regola N).
+const KIND_TOOL_REALISTIC: &str = "tool_realistic";
+const KIND_LONG_CONTEXT: &str = "long_context";
 
 const K_MIN_CHAINED: &str = "min_chained_calls";
 const K_REQUIRES_RECOVERY: &str = "requires_recovery";
@@ -919,6 +1080,12 @@ const K_FORBIDS_REPEAT: &str = "forbids_repeat_of_failed";
 /// Il FATTO misurato dal loop (non la chiave del predicato): il modello ha
 /// rimandato identica una chiamata gia' fallita.
 const F_REPEATED_FAILED: &str = "repeated_failed";
+/// Gli altri fatti delle `measures` multi-step: nominati UNA volta, perche' il
+/// produttore (`turno_dai_fatti`) e i lettori (`tally`, predicati) devono usare
+/// la stessa parola (regola N).
+const F_CHAINED_LINKS: &str = "chained_links";
+const F_RECOVERED: &str = "recovered";
+const F_BAD_TOOL_SYNTAX: &str = "bad_tool_syntax";
 
 const CHIAVI_PREDICATO: [&str; 10] = [
     // verificate da `predicate_fail_reason`
@@ -1227,10 +1394,10 @@ fn turno_dai_fatti(m: &crate::probe_chain_measure::AttemptMeasures) -> Value {
         "stop_reason": "end_turn",
         "tool_use_blocks": [],
         "measures": {
-            "chained_links": m.chained_links,
-            "recovered": m.recovered,
+            F_CHAINED_LINKS: m.chained_links,
+            F_RECOVERED: m.recovered,
             F_REPEATED_FAILED: m.repeated_failed,
-            "bad_tool_syntax": m.bad_tool_syntax,
+            F_BAD_TOOL_SYNTAX: m.bad_tool_syntax,
         }
     })
 }
@@ -1277,7 +1444,7 @@ async fn build_profile_request(
             "Sei in una verifica di raggiungibilita'. Rispondi in modo conciso.".to_string(),
         )),
         "tool_minimal" => Ok(crate::model_health_probe::build_tool_probe_request()),
-        "tool_realistic" | "thinking_matrix" => {
+        KIND_TOOL_REALISTIC | "thinking_matrix" => {
             let tools = resolve_probe_tools(profile)?;
             let system = resolve_probe_system(db, profile).await?;
             Ok((
@@ -1286,7 +1453,7 @@ async fn build_profile_request(
                 system,
             ))
         }
-        "long_context" => Ok(build_long_context_request(profile)),
+        KIND_LONG_CONTEXT => Ok(build_long_context_request(profile)),
         // `latent_state` (frontier): niente tool — il compito e' leggere, non agire.
         // I messaggi li costruisce `latent_state_attempt`, che conosce il seme e
         // quindi i codici: il registro e' un'ISTANZA fresca, non un testo fisso.
@@ -1474,12 +1641,31 @@ impl ProfileRun {
     fn tally(&mut self, outcome: &AttemptOutcome) {
         if outcome.inconclusive {
             self.inconclusive += 1;
-        } else if outcome.pass {
+            return; // niente somme: il silenzio non entra nello score
+        }
+        if outcome.pass {
             self.passes += 1;
         } else {
             self.conclusive_fails += 1;
             if self.first_fail_reason.is_none() {
                 self.first_fail_reason = Some(outcome.reason.clone());
+            }
+        }
+        // Le somme continue, dai FATTI del tentativo (le `measures` che
+        // `verdetto_dai_fatti` aggancia a `derived`): sui conclusivi soltanto,
+        // e solo dove esistono (i single-turn non ne hanno).
+        let Some(m) = outcome.derived.as_ref() else {
+            return;
+        };
+        let links = m.get(F_CHAINED_LINKS).and_then(Value::as_f64).unwrap_or(0.0);
+        self.somme.chain_frac += (links / LINKS_TARGET).clamp(0.0, 1.0);
+        for (fatto, conto) in [
+            (F_RECOVERED, &mut self.somme.recovered),
+            (F_REPEATED_FAILED, &mut self.somme.repeated),
+            (F_BAD_TOOL_SYNTAX, &mut self.somme.bad_syntax),
+        ] {
+            if m.get(fatto).and_then(Value::as_bool) == Some(true) {
+                *conto += 1;
             }
         }
     }
@@ -1493,6 +1679,7 @@ async fn run_profile_attempts(
 ) -> ProfileRun {
     let mut run = ProfileRun {
         profile_key: ctx.profile.profile_key.clone(),
+        kind: ctx.profile.kind.clone(),
         grants: ctx.profile.grants.clone(),
         is_blocking: ctx.profile.is_blocking,
         passes: 0,
@@ -1500,6 +1687,7 @@ async fn run_profile_attempts(
         inconclusive: 0,
         promote_min: ctx.params.promote_min,
         first_fail_reason: None,
+        somme: SommeConclusive::default(),
     };
     for attempt in 1..=ctx.params.repeat {
         // Un seme per TENTATIVO: i 4 tentativi campionano istanze diverse invece di
@@ -1586,6 +1774,7 @@ fn unbuildable_run(
     );
     ProfileRun {
         profile_key: profile.profile_key.clone(),
+        kind: profile.kind.clone(),
         grants: profile.grants.clone(),
         is_blocking: profile.is_blocking,
         passes: 0,
@@ -1593,6 +1782,7 @@ fn unbuildable_run(
         inconclusive: params.repeat,
         promote_min: params.promote_min,
         first_fail_reason: None,
+        somme: SommeConclusive::default(),
     }
 }
 
@@ -1672,6 +1862,55 @@ async fn attach_measured_tier(
         tier_catalogo.as_deref(),
         hold_min_passes(profiles),
     );
+}
+
+/// LO SCORE MISURATO (mig 0616). Solo su un esito QUALIFIED, come il tier: una
+/// squalifica o un giro inconclusivo non misurano nulla. Pesi dal DB (regola G):
+/// chiavi assenti = nessuno score, con un WARN che dice quale migrazione manca.
+async fn attach_measured_score(
+    derived: &mut Derived,
+    runs: &[ProfileRun],
+    profiles: &[ProbeProfile],
+    declared: &[String],
+    db: &PgPool,
+) {
+    if derived.state != DerivedState::Qualified {
+        return;
+    }
+    let Some(w) = measured_score_weights(db).await else {
+        tracing::warn!(
+            "measured_score: pesi 'catalog.measured_score.*' assenti o non numerici \
+             (applicare la migrazione #0616): score non calcolato"
+        );
+        return;
+    };
+    let kinds: Vec<&str> = profiles
+        .iter()
+        .filter(|p| profile_applies(p, declared))
+        .map(|p| p.kind.as_str())
+        .collect();
+    derived.measured_score = derive_measured_score(runs, &kinds, &w);
+}
+
+/// I pesi della formula dal DB. `None` = una chiave manca o non e' un numero:
+/// fail-visibile, mai un default hardcoded (regola G).
+async fn measured_score_weights(db: &PgPool) -> Option<MeasuredScoreWeights> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM settings WHERE key LIKE 'catalog.measured_score.%'",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "measured_score_weights: lettura fallita"))
+    .ok()?;
+    let map: std::collections::HashMap<_, _> = rows.into_iter().collect();
+    let num = |k: &str| -> Option<f64> { map.get(k)?.trim().parse().ok() };
+    Some(MeasuredScoreWeights {
+        chain: num("catalog.measured_score.w_chain")?,
+        recovery: num("catalog.measured_score.w_recovery")?,
+        real: num("catalog.measured_score.w_real")?,
+        latent: num("catalog.measured_score.w_latent")?,
+        longctx: num("catalog.measured_score.w_longctx")?,
+    })
 }
 
 /// Il tier del modello nel catalogo, in DUE valori che non vanno confusi:
@@ -1755,6 +1994,7 @@ async fn qualify_one(
     let mut derived = derive_capabilities(declared, &runs);
     derived.thinking = thinking_derived;
     attach_measured_tier(&mut derived, &runs, profiles, db, provider, model).await;
+    attach_measured_score(&mut derived, &runs, profiles, declared, db).await;
     (derived, last_evidence)
 }
 
@@ -1869,21 +2109,27 @@ impl DerivedWrite<'_> {
             .bind(uses_thinking)
             .execute(&mut *tx)
             .await?;
-        // `None` = nessuna banda certificata da questo giro: il tier resta
-        // quello che c'e' (regola H: un giro che non dimostra nulla non declassa
-        // nessuno).
-        if let Some(tier) = self.derived.measured_tier.as_deref() {
-            crate::orchestrator::model_service::apply_tier(
-                &mut *tx,
-                self.provider,
-                self.model,
-                tier,
-                crate::orchestrator::model_service::TierSource::Measured,
-            )
-            .await?;
-        }
+        self.scrivi_tier_e_score(&mut tx).await?;
         tx.commit().await?;
         Ok(res)
+    }
+
+    /// Tier e SCORE misurati, dentro la transazione del verdetto. `None` su
+    /// entrambi = giro che non dimostra nulla: le colonne restano quelle di
+    /// ieri (regola H: il silenzio non declassa e non punteggia).
+    async fn scrivi_tier_e_score(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), sqlx::Error> {
+        use crate::orchestrator::model_service::{apply_measured_score, apply_tier, TierSource};
+        if let Some(tier) = self.derived.measured_tier.as_deref() {
+            apply_tier(&mut **tx, self.provider, self.model, tier, TierSource::Measured).await?;
+        }
+        if let Some(score) = self.derived.measured_score {
+            apply_measured_score(&mut **tx, self.provider, self.model, score, self.profiles_suite)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn disqualified(&self) -> WriteResult {
@@ -1997,7 +2243,148 @@ pub(crate) async fn run_qualification_round(orchestrator: &Orchestrator, db: &Pg
             done += 1;
         }
     }
+    // Ri-ancoraggio bande measured (mig 0616): a fine giro, idempotente.
+    riancora_bande_measured(db, cfg.suite_version).await;
     done
+}
+
+/// La configurazione delle bande measured (settings `catalog.measured_band.*`,
+/// mig 0616). `None` = chiavi assenti: il pass non parte (fail-visibile).
+struct MeasuredBandConfig {
+    deadband_pct: f64,
+    demote_margin: f64,
+    min_population: usize,
+}
+
+async fn measured_band_config(db: &PgPool) -> Option<MeasuredBandConfig> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM settings WHERE key LIKE 'catalog.measured_band.%'",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "measured_band_config: lettura fallita"))
+    .ok()?;
+    let map: std::collections::HashMap<_, _> = rows.into_iter().collect();
+    let num = |k: &str| -> Option<f64> { map.get(k)?.trim().parse().ok() };
+    Some(MeasuredBandConfig {
+        deadband_pct: num("catalog.measured_band.anchor_deadband_pct")?,
+        demote_margin: num("catalog.measured_band.demote_margin")?,
+        min_population: num("catalog.measured_band.min_population")? as usize,
+    })
+}
+
+/// RI-ANCORA le bande measured sull'ultimo parco di score (mig 0616).
+///
+/// SEMANTICA NUOVA, dichiarata: il tier di un modello puo' muoversi SENZA che
+/// quel modello sia stato ri-provato — si e' mosso il leader, e la scala e'
+/// relativa al parco. Il leader si calcola SOLO fra righe alla suite corrente
+/// (score di suite diverse non sono confrontabili); sotto `min_population`
+/// modelli misurati le bande NON si applicano (senza questa soglia il primo
+/// misurato di ogni suite sarebbe frontier per definizione) e il tier resta
+/// `synced`. La precedenza delle fonti resta di [`apply_tier`]: la curatela
+/// `manual` non si tocca.
+async fn riancora_bande_measured(db: &PgPool, suite: i32) {
+    let Some(bands) = crate::orchestrator::model_service::relative_bands(db).await else {
+        tracing::warn!(
+            "riancora_bande_measured: percentuali 'catalog.tier_relative.*' assenti \
+             (applicare la migrazione #0615): bande measured non applicate"
+        );
+        return;
+    };
+    let Some(cfg) = measured_band_config(db).await else {
+        tracing::warn!(
+            "riancora_bande_measured: config 'catalog.measured_band.*' assente \
+             (applicare la migrazione #0616): bande measured non applicate"
+        );
+        return;
+    };
+    let righe = leggi_score_suite(db, suite).await;
+    if righe.len() < cfg.min_population {
+        tracing::debug!(
+            misurati = righe.len(),
+            min_population = cfg.min_population,
+            suite = suite,
+            "riancora_bande_measured: popolazione sotto soglia, bande non applicate \
+             (il tier resta synced)"
+        );
+        return;
+    }
+    let Some(ancora) = ancora_measured_aggiornata(db, &righe, &cfg).await else {
+        return;
+    };
+    applica_bande_measured(db, &righe, ancora, &bands, cfg.demote_margin).await;
+}
+
+/// Una riga misurata a suite corrente: (provider, model, score, tier, fonte).
+type RigaMisurata = (String, String, f64, Option<String>, Option<String>);
+
+/// Le righe con uno score alla suite corrente: il PERIMETRO del ri-ancoraggio
+/// (score di suite diverse non sono confrontabili).
+async fn leggi_score_suite(db: &PgPool, suite: i32) -> Vec<RigaMisurata> {
+    sqlx::query_as(
+        "SELECT provider, model, measured_score, performance_tier, tier_source \
+           FROM ai_price_catalog \
+          WHERE measured_score IS NOT NULL AND measured_score_suite = $1",
+    )
+    .bind(suite)
+    .fetch_all(db)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "riancora_bande_measured: lettura score fallita"))
+    .unwrap_or_default()
+}
+
+/// L'ancora measured effettiva: il massimo score del perimetro, passato per la
+/// deadband contro l'ancora persistita (e persistito se lo scarto la supera).
+async fn ancora_measured_aggiornata(
+    db: &PgPool,
+    righe: &[RigaMisurata],
+    cfg: &MeasuredBandConfig,
+) -> Option<f64> {
+    use crate::orchestrator::model_service::{persist_anchor, resolve_anchor};
+    let leader = righe
+        .iter()
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|r| (format!("{}/{}", r.0, r.1), r.2))?;
+    let attuale = leggi_ancora_measured(db).await;
+    let (ancora, persisti) = resolve_anchor(attuale, leader.1, cfg.deadband_pct);
+    if persisti {
+        tracing::info!(ancora = ancora, leader = %leader.0,
+            "scala relativa: nuova ancora delle bande measured (deadband superata)");
+        persist_anchor(db, "catalog.measured_band", ancora, &leader.0).await;
+    }
+    Some(ancora)
+}
+
+/// Applica la banda relativa a ogni riga del perimetro. La precedenza delle
+/// fonti resta di `apply_tier`: la curatela `manual` non si tocca.
+async fn applica_bande_measured(
+    db: &PgPool,
+    righe: &[RigaMisurata],
+    ancora: f64,
+    bands: &crate::orchestrator::model_service::RelativeBands,
+    demote_margin: f64,
+) {
+    use crate::orchestrator::model_service::{apply_tier, TierSource};
+    for (provider, model, score, tier, source) in righe {
+        let acquisita = (source.as_deref() == Some("measured"))
+            .then_some(tier.as_deref())
+            .flatten();
+        let banda = banda_measured(*score, acquisita, ancora, bands, demote_margin);
+        if let Err(e) = apply_tier(db, provider, model, banda, TierSource::Measured).await {
+            tracing::warn!(provider = %provider, model = %model, error = %e,
+                "riancora_bande_measured: apply_tier fallita");
+        }
+    }
+}
+
+/// L'ancora measured persistita, se numerica e positiva.
+async fn leggi_ancora_measured(db: &PgPool) -> Option<f64> {
+    crate::settings::get_setting(db, "catalog.measured_band.anchor")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
 }
 
 /// I parametri del giro, letti una volta dal DB (regola G).
@@ -2042,6 +2429,7 @@ async fn mark_provider_cooldown(db: &PgPool, provider: &str, model: &str, cfg: &
         thinking: None,
         // Un giro non attribuibile al modello non misura nessuna banda.
         measured_tier: None,
+                measured_score: None,
     };
     apply_derived(
         db,
@@ -2121,6 +2509,7 @@ mod tests {
     ) -> ProfileRun {
         ProfileRun {
             profile_key: key.into(),
+            kind: "test".into(),
             grants: grants.iter().map(|s| s.to_string()).collect(),
             is_blocking: blocking,
             passes,
@@ -2128,6 +2517,7 @@ mod tests {
             inconclusive,
             promote_min,
             first_fail_reason: first_fail.map(str::to_owned),
+            somme: SommeConclusive::default(),
         }
     }
 
@@ -2600,19 +2990,25 @@ mod tests {
         let inc = profile_run("m", &[], false, 1, 0, 1, 2, None);
         assert_eq!(ConfigOutcome::from_run(&inc), ConfigOutcome::Inconclusive);
     }
-    fn soglie() -> TierPriorThresholds {
-        // Le soglie dell'indice dal seed (mig 0600).
-        TierPriorThresholds {
-            agentic_index_frontier_min: 45.0,
-            agentic_index_heavy_min: 35.0,
-            agentic_index_high_min: 25.0,
-            agentic_index_medium_min: 10.0,
+    fn bande() -> crate::orchestrator::model_service::RelativeBands {
+        // La scala relativa dal seed (mig 0615).
+        crate::orchestrator::model_service::RelativeBands {
+            frontier_pct: 0.85,
+            heavy_pct: 0.65,
+            high_pct: 0.45,
+            medium_pct: 0.20,
         }
     }
 
+    /// L'ANCORA del parco reale al 2026-07-19 (openai/gpt-5.6-sol, indice 54.0):
+    /// e' il valore con cui la scala relativa riproduce quasi esattamente le
+    /// vecchie soglie assolute 45/35/25/10 (45.9/35.1/24.3/10.8).
+    const ANCORA_54: f64 = 54.0;
+
     /// L'agentic_index e' l'UNICO seme del tier `synced` (mig 0608): MISURA la
     /// capacita' agentica, mentre il prezzo era il posizionamento commerciale
-    /// del fornitore e il nome un aggettivo di marketing.
+    /// del fornitore e il nome un aggettivo di marketing. Dalla mig 0615 la
+    /// banda e' RELATIVA al leader (`tier_from_leader`, punto unico).
     ///
     /// I due casi REALI che il prezzo sbagliava (misurati sul parco il 16/07):
     /// gpt-5.4-mini costa da heavy (>$2) ma vale 30.2 -> e' 'high', non 'heavy';
@@ -2620,16 +3016,20 @@ mod tests {
     #[test]
     fn l_agentic_index_e_il_solo_seme_del_tier() {
         // gpt-5.4-mini: un MINI caro non e' heavy, l'indice dice la verita'.
-        assert_eq!(derive_tier_prior(Some(30.2), &soglie()), Some("high"));
+        assert_eq!(derive_tier_prior(Some(30.2), ANCORA_54, &bande()), Some("high"));
         // claude-opus-4-8: 47.2 -> frontier (il prezzo lo faceva scendere a heavy).
-        assert_eq!(derive_tier_prior(Some(47.2), &soglie()), Some("frontier"));
-        // gpt-5.6-sol: il migliore del parco.
-        assert_eq!(derive_tier_prior(Some(54.0), &soglie()), Some("frontier"));
+        assert_eq!(derive_tier_prior(Some(47.2), ANCORA_54, &bande()), Some("frontier"));
+        // gpt-5.6-sol: il leader e' il 100% di se stesso.
+        assert_eq!(derive_tier_prior(Some(54.0), ANCORA_54, &bande()), Some("frontier"));
         // mistral-large-2512: vale poco -> light, qualunque cosa costi.
-        assert_eq!(derive_tier_prior(Some(5.5), &soglie()), Some("light"));
-        // Le soglie intermedie.
-        assert_eq!(derive_tier_prior(Some(35.0), &soglie()), Some("heavy"));
-        assert_eq!(derive_tier_prior(Some(10.0), &soglie()), Some("medium"));
+        assert_eq!(derive_tier_prior(Some(5.5), ANCORA_54, &bande()), Some("light"));
+        // I BORDI DICHIARATI della scala relativa: 35.0 sta in [35.0, 35.1) e
+        // 10.0 in [10.0, 10.8), le due finestre in cui le soglie relative
+        // (65%/20% di 54) sono PIU' ALTE delle vecchie assolute. Erano 'heavy'
+        // e 'medium'; ora 'high' e 'light'. E' la tolleranza sui bordi del
+        // cambio di scala, quantificata sul DB vivo: 5 modelli su 79.
+        assert_eq!(derive_tier_prior(Some(35.0), ANCORA_54, &bande()), Some("high"));
+        assert_eq!(derive_tier_prior(Some(10.0), ANCORA_54, &bande()), Some("light"));
     }
 
     /// Senza indice il prior TACE: meglio NULL che una bugia. E' la differenza
@@ -2641,7 +3041,7 @@ mod tests {
     /// gli dara' una banda `measured` al primo giro.
     #[test]
     fn senza_indice_il_prior_tace() {
-        assert_eq!(derive_tier_prior(None, &soglie()), None);
+        assert_eq!(derive_tier_prior(None, ANCORA_54, &bande()), None);
     }
 
     /// Un giro in cui i tentativi non superati sono BOCCIATURE vere: il modello ha
@@ -2653,6 +3053,7 @@ mod tests {
     fn run_conclusive(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
         ProfileRun {
             profile_key: key.to_string(),
+            kind: "test".into(),
             grants: vec![],
             is_blocking: false,
             passes,
@@ -2660,6 +3061,7 @@ mod tests {
             inconclusive: 0,
             promote_min,
             first_fail_reason: None,
+            somme: SommeConclusive::default(),
         }
     }
 
@@ -2673,6 +3075,7 @@ mod tests {
     fn run_inconclusive(key: &str, passes: u32, promote_min: u32) -> ProfileRun {
         ProfileRun {
             profile_key: key.to_string(),
+            kind: "test".into(),
             grants: vec![],
             is_blocking: false,
             passes,
@@ -2680,6 +3083,7 @@ mod tests {
             inconclusive: 4 - passes,
             promote_min,
             first_fail_reason: None,
+            somme: SommeConclusive::default(),
         }
     }
 
@@ -2812,6 +3216,287 @@ mod tests {
              quella spetta a chi la banda l'ha dimostrata"
         );
     }
+    // ── Lo SCORE MISURATO: la simulazione del piano sul giro reale ──────────
+
+    fn pesi() -> MeasuredScoreWeights {
+        // I pesi del seed (mig 0616).
+        MeasuredScoreWeights { chain: 25.0, recovery: 30.0, real: 15.0, latent: 15.0, longctx: 15.0 }
+    }
+
+    /// I kind che la suite 4 reale poteva correre: long_context NON c'e'
+    /// (profilo disabilitato), quindi vale 0 punti per tutti, senza
+    /// rinormalizzare.
+    fn kinds_suite_4() -> Vec<&'static str> {
+        vec![
+            "chat",
+            "tool_minimal",
+            KIND_TOOL_REALISTIC,
+            KIND_TOOL_CHAIN,
+            KIND_TOOL_RECOVERY,
+            crate::probe_latent_state::KIND_LATENT_STATE,
+        ]
+    }
+
+    fn fatti(links: usize, rec: bool, rep: bool, bad: bool) -> crate::probe_chain_measure::AttemptMeasures {
+        crate::probe_chain_measure::AttemptMeasures {
+            chained_links: links,
+            recovered: rec,
+            repeated_failed: rep,
+            bad_tool_syntax: bad,
+        }
+    }
+
+    /// Un run multi-step costruito per la STESSA strada della produzione
+    /// (regola O): misure -> `verdetto_dai_fatti` (il predicato REALE del
+    /// profilo, mig 0610) -> `tally`. Niente pass/fail fabbricati: li decide il
+    /// verificatore vero, e le somme continue le accumula il produttore vero.
+    fn run_dai_fatti(
+        kind: &str,
+        predicato: &Value,
+        misure: &[crate::probe_chain_measure::AttemptMeasures],
+    ) -> ProfileRun {
+        let mut run = ProfileRun {
+            profile_key: kind.to_string(),
+            kind: kind.to_string(),
+            grants: vec![],
+            is_blocking: false,
+            passes: 0,
+            conclusive_fails: 0,
+            inconclusive: 0,
+            promote_min: 3,
+            first_fail_reason: None,
+            somme: SommeConclusive::default(),
+        };
+        for m in misure {
+            run.tally(&verdetto_dai_fatti(m, predicato, 1_000));
+        }
+        run
+    }
+
+    /// Un run single-turn coi CONTEGGI del giro reale (i verdetti verbatim da
+    /// `ai_model_probe_evidence`; il percorso turno->verdetto dei single-turn e'
+    /// gia' coperto dai test dei rispettivi probe).
+    fn run_conteggi(kind: &str, passes: u32, fails: u32) -> ProfileRun {
+        ProfileRun {
+            profile_key: kind.to_string(),
+            kind: kind.to_string(),
+            grants: vec![],
+            is_blocking: false,
+            passes,
+            conclusive_fails: fails,
+            inconclusive: 0,
+            promote_min: 3,
+            first_fail_reason: None,
+            somme: SommeConclusive::default(),
+        }
+    }
+
+    /// I predicati REALI dei due profili multi-step (mig 0610, suite 4).
+    fn predicato_catena() -> Value {
+        json!({ "max_latency_ms": 120000, "hold_min_passes": 2,
+                "min_chained_calls": 3, "promote_min_passes": 3 })
+    }
+    fn predicato_recupero() -> Value {
+        json!({ "max_latency_ms": 120000, "hold_min_passes": 3,
+                "requires_recovery": true, "promote_min_passes": 4,
+                "forbids_repeat_of_failed": true })
+    }
+
+    /// minimax-m2.1, l'ultimo giro reale (evidence 18/07, suite 4): catena piena
+    /// 5,5,5,5; recupero SEMPRE letto (recovered 4/4) ma 2 tentativi bocciati
+    /// per ripetizione; real 3/3; latent 2/4 (empty_completion).
+    fn giro_minimax() -> Vec<ProfileRun> {
+        vec![
+            run_dai_fatti(KIND_TOOL_CHAIN, &predicato_catena(), &[
+                fatti(5, false, false, false), fatti(5, false, false, false),
+                fatti(5, false, false, false), fatti(5, false, false, false),
+            ]),
+            run_dai_fatti(KIND_TOOL_RECOVERY, &predicato_recupero(), &[
+                fatti(2, true, true, true), fatti(1, true, false, false),
+                fatti(0, true, true, true), fatti(0, true, false, true),
+            ]),
+            run_conteggi(KIND_TOOL_REALISTIC, 3, 0),
+            run_conteggi(crate::probe_latent_state::KIND_LATENT_STATE, 2, 2),
+        ]
+    }
+
+    /// LA SIMULAZIONE DEL PIANO, coi ProfileRun dell'ULTIMO GIRO REALE
+    /// (ai_model_probe_evidence, 17-18/07, suite 4) fatti passare dai produttori
+    /// veri. UNICO input non preso dall'evidence, dichiarato: la catena di
+    /// ministral-8b (vintage pre-0610, senza misure) e' simulata a 2 anelli su 5
+    /// come nel piano.
+    ///
+    /// I valori ASSOLUTI del piano (85 / 67.5 / 65 / 65) assumevano componenti
+    /// idealizzate; la formula ESATTA sui fatti reali produce i numeri sotto —
+    /// ministral coincide (32.5) — e TUTTE le conclusioni del piano reggono:
+    /// leader frontier, kimi/qwen/grok heavy, ministral MEDIUM (non piu' high),
+    /// banda high VUOTA.
+    #[test]
+    fn la_simulazione_del_piano_sul_giro_reale() {
+        let w = pesi();
+        let kinds = kinds_suite_4();
+        // kimi-k2.5: catena 5,4,3,5 (un tentativo con sintassi rotta), UN
+        // recupero letto su 4, real 3/3, latent 4/4.
+        let kimi = vec![
+            run_dai_fatti(KIND_TOOL_CHAIN, &predicato_catena(), &[
+                fatti(5, false, false, false), fatti(4, false, false, true),
+                fatti(3, false, false, false), fatti(5, false, false, false),
+            ]),
+            run_dai_fatti(KIND_TOOL_RECOVERY, &predicato_recupero(), &[
+                fatti(0, true, false, false), fatti(0, false, false, false),
+                fatti(0, false, false, false), fatti(0, false, false, false),
+            ]),
+            run_conteggi(KIND_TOOL_REALISTIC, 3, 0),
+            run_conteggi(crate::probe_latent_state::KIND_LATENT_STATE, 4, 0),
+        ];
+        // qwen3-235b: catena 5,5,4,5; recupero MAI letto (e una ripetizione).
+        let qwen = vec![
+            run_dai_fatti(KIND_TOOL_CHAIN, &predicato_catena(), &[
+                fatti(5, false, false, false), fatti(5, false, false, false),
+                fatti(4, false, false, false), fatti(5, false, false, false),
+            ]),
+            run_dai_fatti(KIND_TOOL_RECOVERY, &predicato_recupero(), &[
+                fatti(0, false, false, false), fatti(0, false, false, false),
+                fatti(0, false, false, false), fatti(0, false, true, false),
+            ]),
+            run_conteggi(KIND_TOOL_REALISTIC, 3, 0),
+            run_conteggi(crate::probe_latent_state::KIND_LATENT_STATE, 4, 0),
+        ];
+        // grok-4.5: catena piena, recupero MAI letto e ripetuto IDENTICO 4/4
+        // (il pattern sospetto del piano): recovery 0 + malus repeated.
+        let grok = vec![
+            run_dai_fatti(KIND_TOOL_CHAIN, &predicato_catena(), &[
+                fatti(5, false, false, false), fatti(5, false, false, false),
+                fatti(5, false, false, false), fatti(5, false, false, false),
+            ]),
+            run_dai_fatti(KIND_TOOL_RECOVERY, &predicato_recupero(), &[
+                fatti(0, false, true, false), fatti(0, false, true, false),
+                fatti(0, false, true, true), fatti(0, false, true, true),
+            ]),
+            run_conteggi(KIND_TOOL_REALISTIC, 3, 0),
+            run_conteggi(crate::probe_latent_state::KIND_LATENT_STATE, 4, 0),
+        ];
+        // ministral-8b: catena a 2 anelli (dichiarato sopra), niente recupero,
+        // real 3/3, latent 2/4. Il caso di separazione del piano.
+        let ministral = vec![
+            run_dai_fatti(KIND_TOOL_CHAIN, &predicato_catena(), &[
+                fatti(2, false, false, false), fatti(2, false, false, false),
+                fatti(2, false, false, false), fatti(2, false, false, false),
+            ]),
+            run_dai_fatti(KIND_TOOL_RECOVERY, &predicato_recupero(), &[
+                fatti(0, false, false, false), fatti(0, false, false, false),
+                fatti(0, false, false, false), fatti(0, false, false, false),
+            ]),
+            run_conteggi(KIND_TOOL_REALISTIC, 3, 0),
+            run_conteggi(crate::probe_latent_state::KIND_LATENT_STATE, 2, 2),
+        ];
+
+        let punteggio = |runs: &[ProfileRun]| {
+            derive_measured_score(runs, &kinds, &w).expect("giro completo: lo score c'e'")
+        };
+        let vicino = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let s_minimax = punteggio(&giro_minimax());
+        let s_kimi = punteggio(&kimi);
+        let s_qwen = punteggio(&qwen);
+        let s_grok = punteggio(&grok);
+        let s_ministral = punteggio(&ministral);
+        // La formula esatta sui fatti reali. minimax: 25 + 30 + 15 + 7.5 -
+        // malus(2/8 repeated + 3/8 bad = 3.125) = 74.375. ministral: 25*0.4 +
+        // 0 + 15 + 7.5 = 32.5, il numero del piano.
+        assert!(vicino(s_minimax, 74.375), "minimax: {s_minimax}");
+        assert!(vicino(s_kimi, 58.125), "kimi: {s_kimi}");
+        assert!(vicino(s_qwen, 53.125), "qwen: {s_qwen}");
+        assert!(vicino(s_grok, 51.25), "grok: {s_grok}");
+        assert!(vicino(s_ministral, 32.5), "ministral: {s_ministral}");
+        // grok sotto kimi NONOSTANTE catena piena e latent pieno: il recovery
+        // (peso 30) e il malus repeated lo pagano. E' il razionale di w_recovery.
+        assert!(s_grok < s_kimi, "recovery 0 + malus deve costare: {s_grok} vs {s_kimi}");
+
+        // LE BANDE RELATIVE al leader misurato (74.375): il criterio di
+        // successo che la scala assoluta fallisce — ministral si separa.
+        let ancora = s_minimax;
+        let banda = |s: f64| banda_measured(s, None, ancora, &bande(), 3.0);
+        assert_eq!(banda(s_minimax), "frontier", "il leader e' il 100% di se stesso");
+        assert_eq!(banda(s_kimi), "heavy");
+        assert_eq!(banda(s_qwen), "heavy");
+        assert_eq!(banda(s_grok), "heavy");
+        assert_eq!(banda(s_ministral), "medium", "ministral-8b NON e' piu' high");
+        // La banda high resta VUOTA in questo parco di 5: accettabile e
+        // dichiarato (il routing degrada gia' via TierPolicy).
+        for s in [s_minimax, s_kimi, s_qwen, s_grok, s_ministral] {
+            assert_ne!(banda(s), "high", "score {s}");
+        }
+    }
+
+    /// Il razionale di w_recovery=30: un GEMELLO del leader che non legge mai
+    /// l'errore resta fuori da frontier SENZA dipendere dal malus.
+    #[test]
+    fn un_gemello_del_leader_senza_recovery_non_e_frontier() {
+        let w = pesi();
+        let kinds = kinds_suite_4();
+        let mut gemello = giro_minimax();
+        // Stesso giro, ma il recupero non viene MAI letto (recovered=false):
+        // stessi fatti di ripetizione/sintassi, quindi lo stesso malus.
+        gemello[1] = run_dai_fatti(KIND_TOOL_RECOVERY, &predicato_recupero(), &[
+            fatti(2, false, true, true), fatti(1, false, false, false),
+            fatti(0, false, true, true), fatti(0, false, false, true),
+        ]);
+        let leader = derive_measured_score(&giro_minimax(), &kinds, &w).expect("leader");
+        let s = derive_measured_score(&gemello, &kinds, &w).expect("gemello");
+        assert!((s - (leader - 30.0)).abs() < 1e-9, "perde ESATTAMENTE il peso recovery: {s}");
+        assert_ne!(
+            banda_measured(s, None, leader, &bande(), 3.0),
+            "frontier",
+            "senza recovery non si e' il migliore, nemmeno col malus azzerato: \
+             {s} / {leader} = {:.3}",
+            s / leader
+        );
+    }
+
+    /// IL SILENZIO NON PUNTEGGIA: una componente APPLICABILE senza tentativi
+    /// conclusivi (provider giu', profilo non costruibile) azzera lo SCORE del
+    /// giro, non il punteggio della componente — score e bande restano invariati.
+    #[test]
+    fn una_componente_applicabile_ma_muta_annulla_lo_score() {
+        let w = pesi();
+        let kinds = kinds_suite_4();
+        let mut giro = giro_minimax();
+        // Il recupero e' girato ma SOLO inconclusivo: 4 tentativi, zero conclusivi.
+        giro[1] = ProfileRun {
+            profile_key: KIND_TOOL_RECOVERY.into(),
+            kind: KIND_TOOL_RECOVERY.into(),
+            grants: vec![],
+            is_blocking: false,
+            passes: 0,
+            conclusive_fails: 0,
+            inconclusive: 4,
+            promote_min: 4,
+            first_fail_reason: None,
+            somme: SommeConclusive::default(),
+        };
+        assert_eq!(derive_measured_score(&giro, &kinds, &w), None);
+        // Ma una componente NON applicabile (long_context fuori suite) NON
+        // annulla: vale 0 punti e il resto punteggia (gia' provato sopra).
+    }
+
+    /// Il MARGINE DI DEMOZIONE (catalog.measured_band.demote_margin): si sale
+    /// superando la soglia, si scende solo sotto soglia - margine. L'isteresi
+    /// spetta SOLO alla banda guadagnata dalla batteria, mai a un prior.
+    #[test]
+    fn il_margine_di_demozione_protegge_la_banda_guadagnata() {
+        let b = bande();
+        // Ancora 100: soglia heavy = 65. A 63 (dentro il margine di 3) chi E'
+        // heavy resta heavy; a 61.9 scende — e di UNA banda, a high.
+        assert_eq!(banda_measured(63.0, Some("heavy"), 100.0, &b, 3.0), "heavy");
+        assert_eq!(banda_measured(61.9, Some("heavy"), 100.0, &b, 3.0), "high");
+        // Salire non ha margine: superata la soglia, si sale.
+        assert_eq!(banda_measured(86.0, Some("heavy"), 100.0, &b, 3.0), "frontier");
+        // Un prior (nessuna banda measured) non gode dell'isteresi.
+        assert_eq!(banda_measured(63.0, None, 100.0, &b, 3.0), "high");
+        // Una banda fuori scala (refuso) non e' un gradino da difendere.
+        assert_eq!(banda_measured(63.0, Some("boh"), 100.0, &b, 3.0), "high");
+    }
+
     /// IL CERCHIO SI CHIUDE: la batteria SCRIVE il tier misurato, e la curatela
     /// dell'admin vince sempre.
     ///
@@ -2840,6 +3525,7 @@ mod tests {
             reason: "suite_passed".into(),
             thinking: None,
             measured_tier: Some("heavy".to_string()),
+            measured_score: None,
         };
         for model in ["stimato", "curato"] {
             apply_derived(&pool, "p", model, 2, &derived, None, 30, 24).await;
@@ -2893,6 +3579,7 @@ mod tests {
             reason: "suite_passed".into(),
             thinking: None,
             measured_tier: None,
+                measured_score: None,
         };
         apply_derived(&pool, "p", "m", 2, &derived, None, 30, 24).await;
         let r: (Option<String>, Option<String>) = sqlx::query_as(
@@ -2907,6 +3594,184 @@ mod tests {
             "nessuna banda certificata: il tier resta il prior, non viene azzerato"
         );
     }
+    /// Colonne e settings dello score (mig 0616) sopra lo schema di test.
+    async fn colonne_e_settings_score(pool: &PgPool) {
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog \
+               ADD COLUMN tier_source TEXT, \
+               ADD COLUMN measured_score DOUBLE PRECISION, \
+               ADD COLUMN measured_score_at TIMESTAMPTZ, \
+               ADD COLUMN measured_score_suite INT",
+        )
+        .execute(pool)
+        .await
+        .expect("colonne score");
+        // Lo schema REALE dei settings (updated_at compresa): il pass PERSISTE
+        // l'ancora via update_setting_value (regola O: la strada vera).
+        sqlx::query(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        .execute(pool)
+        .await
+        .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES \
+             ('catalog.tier_relative.frontier_pct', '0.85'), \
+             ('catalog.tier_relative.heavy_pct', '0.65'), \
+             ('catalog.tier_relative.high_pct', '0.45'), \
+             ('catalog.tier_relative.medium_pct', '0.20'), \
+             ('catalog.measured_band.anchor', ''), \
+             ('catalog.measured_band.anchor_model', ''), \
+             ('catalog.measured_band.anchor_at', ''), \
+             ('catalog.measured_band.anchor_deadband_pct', '0.03'), \
+             ('catalog.measured_band.demote_margin', '3'), \
+             ('catalog.measured_band.min_population', '3')",
+        )
+        .execute(pool)
+        .await
+        .expect("seed settings");
+    }
+
+    /// MIN_POPULATION: sotto 3 modelli misurati a suite corrente le bande
+    /// measured NON si applicano (il tier resta synced). Obbligatoria: senza,
+    /// il primo misurato di OGNI suite sarebbe frontier per definizione (e' il
+    /// 100% di se stesso). Il test attraversa il pass VERO
+    /// (`riancora_bande_measured`), non una sua imitazione.
+    #[sqlx::test]
+    async fn sotto_min_population_le_bande_measured_non_si_applicano(pool: PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        colonne_e_settings_score(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite) \
+             VALUES ('p', 'primo', 'heavy', 'synced', 80.0, 5)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        riancora_bande_measured(&pool, 5).await;
+
+        let (tier, src): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='primo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(
+            (tier.as_deref(), src.as_deref()),
+            (Some("heavy"), Some("synced")),
+            "UN solo misurato: se qui compare frontier/measured, min_population \
+             e' saltata e il primo misurato di ogni suite si autoproclama leader"
+        );
+        let ancora: (String,) = sqlx::query_as(
+            "SELECT value FROM settings WHERE key = 'catalog.measured_band.anchor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("ancora");
+        assert_eq!(ancora.0, "", "sotto soglia nemmeno l'ancora si fissa");
+
+        // Al terzo misurato la popolazione basta: il pass si applica, l'ancora
+        // si fissa sul leader e le bande sono RELATIVE a lui.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, performance_tier, tier_source, measured_score, measured_score_suite) \
+             VALUES ('p', 'secondo', 'medium', 'synced', 60.0, 5), \
+                    ('p', 'terzo',   'medium', 'synced', 40.0, 5), \
+                    ('p', 'fuori-suite', 'medium', 'synced', 99.0, 4)",
+        )
+        .execute(&pool)
+        .await
+        .expect("altri");
+        riancora_bande_measured(&pool, 5).await;
+        let righe: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT model, performance_tier, tier_source FROM ai_price_catalog ORDER BY model",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("righe");
+        assert_eq!(
+            righe,
+            vec![
+                // 99.0 ma di SUITE VECCHIA: fuori dal leader e fuori dal pass.
+                ("fuori-suite".into(), Some("medium".into()), Some("synced".into())),
+                ("primo".into(), Some("frontier".into()), Some("measured".into())),
+                ("secondo".into(), Some("heavy".into()), Some("measured".into())),
+                ("terzo".into(), Some("high".into()), Some("measured".into())),
+            ],
+            "a popolazione raggiunta il leader (80) e' frontier, 60/80=75% e' \
+             heavy, 40/80=50% e' high; la suite vecchia resta fuori"
+        );
+        let ancora: (String,) = sqlx::query_as(
+            "SELECT value FROM settings WHERE key = 'catalog.measured_band.anchor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("ancora");
+        assert_eq!(ancora.0, "80", "l'ancora e' il leader misurato a suite corrente");
+    }
+
+    /// Lo SCORE atterra nella stessa transazione del verdetto (DerivedWrite::
+    /// qualified), e un giro senza score NON tocca le colonne di ieri.
+    #[sqlx::test]
+    async fn il_verdetto_scrive_lo_score_e_il_silenzio_non_lo_azzera(pool: PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog \
+               ADD COLUMN tier_source TEXT, \
+               ADD COLUMN capability_locked BOOLEAN NOT NULL DEFAULT false, \
+               ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto', \
+               ADD COLUMN qualified_at TIMESTAMPTZ, \
+               ADD COLUMN qualification_suite_version INT, \
+               ADD COLUMN qualification_reason TEXT, \
+               ADD COLUMN qualification_evidence_id BIGINT, \
+               ADD COLUMN qualification_started_at TIMESTAMPTZ, \
+               ADD COLUMN qualification_attempts INT NOT NULL DEFAULT 0, \
+               ADD COLUMN qualification_backoff_until TIMESTAMPTZ, \
+               ADD COLUMN measured_score DOUBLE PRECISION, \
+               ADD COLUMN measured_score_at TIMESTAMPTZ, \
+               ADD COLUMN measured_score_suite INT",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query("INSERT INTO ai_price_catalog (provider, model) VALUES ('p', 'm')")
+            .execute(&pool)
+            .await
+            .expect("seed");
+
+        let con_score = Derived {
+            state: DerivedState::Qualified,
+            qualified_capabilities: vec!["chat".into()],
+            reason: "suite_passed".into(),
+            thinking: None,
+            measured_tier: None,
+            measured_score: Some(74.375),
+        };
+        apply_derived(&pool, "p", "m", 5, &con_score, None, 30, 24).await;
+        let riga: (Option<f64>, Option<i32>) = sqlx::query_as(
+            "SELECT measured_score, measured_score_suite FROM ai_price_catalog WHERE model='m'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(riga, (Some(74.375), Some(5)), "score e suite atterrano col verdetto");
+
+        // Il giro successivo NON produce score (pesi assenti, componente muta):
+        // le colonne restano quelle di ieri, mai azzerate.
+        let senza_score = Derived { measured_score: None, ..con_score };
+        apply_derived(&pool, "p", "m", 5, &senza_score, None, 30, 24).await;
+        let riga: (Option<f64>, Option<i32>) = sqlx::query_as(
+            "SELECT measured_score, measured_score_suite FROM ai_price_catalog WHERE model='m'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(riga, (Some(74.375), Some(5)), "il silenzio non azzera lo score");
+    }
+
     /// La SELECT deve CHIEDERE tutto cio' che il mapper LEGGE: `certifies_tier`
     /// (mig 0599) era letto ma non selezionato, e `Row::get` panicava dentro il
     /// task tokio del worker. Il servizio restava `health: ok` mentre la batteria
