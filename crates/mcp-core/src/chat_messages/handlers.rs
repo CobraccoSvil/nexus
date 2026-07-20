@@ -18,9 +18,20 @@ pub async fn list_chat_messages(
         r#"
         SELECT cm.id, cm.session_id, cm.project_id, cm.role, cm.content, cm.metadata,
                cm.request_message_id, cm.deleted_at, cm.created_at,
-               ar.status AS run_status
+               ar.id AS run_id, ar.status AS run_status
         FROM chat_messages cm
-        LEFT JOIN agent_runs ar ON ar.run_message_id = cm.id
+        -- Ancora del run: `agent_runs.run_message_id` punta al messaggio UTENTE
+        -- che ha innescato il run, mai alla risposta. Agganciare l'assistant
+        -- passa quindi dal suo `request_message_id` (il messaggio utente a cui
+        -- risponde); per lo user vale l'id stesso. Con il JOIN su `cm.id` secco
+        -- l'assistant non riceveva NE' `run_id` NE' `run_status`: dopo un
+        -- reload `message.runId` era undefined, e message-list.tsx apre con
+        -- `if (!message.runId) return null` -- l'intero nastro attivita'
+        -- spariva, Consiglio delle Competenze incluso, pur essendo tutto nel DB
+        -- (difetto osservato il 20/07: "la sezione consiglio scompare quando si
+        -- aggiorna"). Nessun messaggio utente ha `request_message_id`, quindi
+        -- il COALESCE non altera l'aggancio gia' funzionante su quel lato.
+        LEFT JOIN agent_runs ar ON ar.run_message_id = COALESCE(cm.request_message_id, cm.id)
         WHERE cm.session_id = $1
         ORDER BY cm.created_at ASC
         "#,
