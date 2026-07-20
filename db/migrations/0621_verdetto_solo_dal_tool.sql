@@ -1,4 +1,4 @@
--- 0620_verdetto_solo_dal_tool.sql
+-- 0621_verdetto_solo_dal_tool.sql
 -- Toglie l'ESCA dal prompt delle figure del consiglio: il punto (5) di
 -- <output_format> chiedeva "verdetto: proceed | proceed_with_changes | block"
 -- DENTRO il final_answer, cioe' in prosa. Un modello che obbedisce a quella
