@@ -993,24 +993,35 @@ pub fn resolve_anchor(attuale: Option<f64>, nuovo_max: f64, deadband_pct: f64) -
     }
 }
 
-/// Le percentuali della scala relativa dal DB (regola G, mig 0615). `None` =
-/// chiavi mancanti: la scala non e' configurata e NESSUNA banda viene derivata
-/// (fail-visibile, mai un default hardcoded).
-pub async fn relative_bands(db: &PgPool) -> Option<RelativeBands> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT key, value FROM settings WHERE key LIKE 'catalog.tier_relative.%'",
-    )
-    .fetch_all(db)
-    .await
-    .map_err(|e| tracing::warn!(error = %e, "relative_bands: lettura settings fallita"))
-    .ok()?;
+/// Le percentuali della scala relativa dal DB (regola G, mig 0615), sotto
+/// `prefisso` — lo stesso vocabolario di [`persist_anchor`]:
+/// `catalog.tier_relative` per il prior esterno, `catalog.measured_band` per le
+/// bande della batteria. `None` = chiavi mancanti: la scala non e' configurata e
+/// NESSUNA banda viene derivata (fail-visibile, mai un default hardcoded).
+///
+/// PERCHE' PER-ANCORA e non un set condiviso (mig 0617): le due scale misurano
+/// grandezze diverse e si distribuiscono in modo diverso. Con le percentuali in
+/// comune, l'85% ha dato 6 frontier su ~80 nel prior (sano) e 15 su 35 nel
+/// measured (il 43% del parco: una banda che tiene quasi meta' dei modelli non
+/// e' il vertice). Stringere il valore condiviso avrebbe curato il measured
+/// ammalando il prior — una toppa. Ogni ancora ha le sue soglie.
+pub async fn relative_bands(db: &PgPool, prefisso: &str) -> Option<RelativeBands> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM settings WHERE key LIKE $1")
+            .bind(format!("{prefisso}.%"))
+            .fetch_all(db)
+            .await
+            .map_err(|e| tracing::warn!(error = %e, prefisso, "relative_bands: lettura settings fallita"))
+            .ok()?;
     let map: std::collections::HashMap<_, _> = rows.into_iter().collect();
-    let num = |k: &str| -> Option<f64> { map.get(k)?.trim().parse().ok() };
+    let num = |suffisso: &str| -> Option<f64> {
+        map.get(&format!("{prefisso}.{suffisso}"))?.trim().parse().ok()
+    };
     Some(RelativeBands {
-        frontier_pct: num("catalog.tier_relative.frontier_pct")?,
-        heavy_pct: num("catalog.tier_relative.heavy_pct")?,
-        high_pct: num("catalog.tier_relative.high_pct")?,
-        medium_pct: num("catalog.tier_relative.medium_pct")?,
+        frontier_pct: num("frontier_pct")?,
+        heavy_pct: num("heavy_pct")?,
+        high_pct: num("high_pct")?,
+        medium_pct: num("medium_pct")?,
     })
 }
 

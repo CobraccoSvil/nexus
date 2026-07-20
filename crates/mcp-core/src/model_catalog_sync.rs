@@ -2161,7 +2161,7 @@ pub(crate) async fn tier_prior_bands(
     if !on {
         return None;
     }
-    crate::orchestrator::model_service::relative_bands(db).await
+    crate::orchestrator::model_service::relative_bands(db, "catalog.tier_relative").await
 }
 
 /// Riallinea `context_window` di un modello GIA' nel catalog al valore

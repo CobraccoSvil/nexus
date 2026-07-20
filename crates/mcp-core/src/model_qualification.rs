@@ -2284,10 +2284,10 @@ async fn measured_band_config(db: &PgPool) -> Option<MeasuredBandConfig> {
 /// `synced`. La precedenza delle fonti resta di [`apply_tier`]: la curatela
 /// `manual` non si tocca.
 async fn riancora_bande_measured(db: &PgPool, suite: i32) {
-    let Some(bands) = crate::orchestrator::model_service::relative_bands(db).await else {
+    let Some(bands) = crate::orchestrator::model_service::relative_bands(db, "catalog.measured_band").await else {
         tracing::warn!(
-            "riancora_bande_measured: percentuali 'catalog.tier_relative.*' assenti \
-             (applicare la migrazione #0615): bande measured non applicate"
+            "riancora_bande_measured: percentuali 'catalog.measured_band.*_pct' assenti \
+             (applicare la migrazione #0617): bande measured non applicate"
         );
         return;
     };
@@ -3617,10 +3617,10 @@ mod tests {
         .expect("settings");
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES \
-             ('catalog.tier_relative.frontier_pct', '0.85'), \
-             ('catalog.tier_relative.heavy_pct', '0.65'), \
-             ('catalog.tier_relative.high_pct', '0.45'), \
-             ('catalog.tier_relative.medium_pct', '0.20'), \
+             ('catalog.measured_band.frontier_pct', '0.92'), \
+             ('catalog.measured_band.heavy_pct', '0.65'), \
+             ('catalog.measured_band.high_pct', '0.45'), \
+             ('catalog.measured_band.medium_pct', '0.20'), \
              ('catalog.measured_band.anchor', ''), \
              ('catalog.measured_band.anchor_model', ''), \
              ('catalog.measured_band.anchor_at', ''), \
