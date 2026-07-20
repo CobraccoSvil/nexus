@@ -1245,11 +1245,21 @@ oppure riprova piu' tardi."
             .get("outcome_declaration_forced")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // Turno dichiarativo pendente: quello dell'ESITO (ADR 0034) oppure quello
+        // di RUOLO (turno di grazia forzante). In entrambi i casi i gate di
+        // chiusura pre-LLM non devono corto-circuitare il turno prima che il
+        // modello riceva la richiesta di dichiarare (incidente gia' documentato
+        // sul gemello: vedi il commento a `!declaration_pending` piu' sotto).
         let declaration_pending = state
             .extra
             .get("force_outcome_declaration")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || state
+                .extra
+                .get("force_role_declaration")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let declaration_closed = state
             .extra
             .get("outcome_declaration_closed")
@@ -2980,6 +2990,39 @@ servizio del tuo scopo (o riavvialo) ed ESEGUI il prossimo step.",
             }
         }
 
+        // ── Turno DICHIARATIVO DI RUOLO: catalogo = solo il tool del canale ──────
+        // Gemello del blocco sopra per i canali di ruolo (advisory_verdict /
+        // debate_position). Richiesto dal turno di grazia: la sola direttiva in
+        // prosa aveva efficacia misurata 1/5 — lo stesso tipo di segnale che il
+        // modello muto sta gia' ignorando. Con il catalogo ridotto a UN tool,
+        // tool_choice=required equivale a forzare QUEL tool su ogni dialetto:
+        // l'obbligo del quorum diventa un vincolo di macchina.
+        let declaring_role_turn = state
+            .extra
+            .get("force_role_declaration")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if declaring_role_turn {
+            if let Some(chan) = pending_role_channel(state) {
+                let only: Vec<Value> = state
+                    .tools_json
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| t.get("name").and_then(Value::as_str) == Some(chan.tool))
+                    .collect();
+                if !only.is_empty() {
+                    tools_json = only;
+                    force_action_hard = true;
+                    tracing::warn!(
+                        target: "nexus_agent_graph::executor",
+                        tool = chan.tool,
+                        "turno dichiarativo di RUOLO: catalogo ridotto al canale + tool choice forzata"
+                    );
+                }
+            }
+        }
+
         // ── Risoluzione provider/model: sticky > override > routing (py:2460-2521) ─
         // Mutabili: l'auto-escalation nel signature-loop (py:3262-3263) li riassegna
         // al modello promosso prima del calcolo eff/sticky del delta finale.
@@ -4434,7 +4477,7 @@ modello piu' capace.",
         // marcato `forced_close_unverified` (stesso segnale autoritativo di
         // 9ece276) -> il finalizzatore mappa FailedDiagnosed e produce il recap
         // deterministico, mai un 'completed' muto.
-        let empty_forced_reply = (forced_text_turn || declaring_turn)
+        let empty_forced_reply = (forced_text_turn || declaring_turn || declaring_role_turn)
             && matches!(stop_reason_enum, StopReason::EndTurn | StopReason::Stop)
             && pending_tool_uses.is_empty()
             && final_result.trim().is_empty();
@@ -4447,6 +4490,36 @@ modello piu' capace.",
                     target: "nexus_agent_graph::executor",
                     forced_text = forced_text_turn,
                     "risposta VUOTA al turno forzato -> retry col turno dichiarativo (ADR 0034)"
+                );
+                return Ok(d);
+            }
+        }
+
+        // ── CHIUSURA VOLONTARIA con canale di ruolo MUTO ──────────────────────
+        // Terzo call site del turno di grazia (gli altri due: budget a tempo,
+        // backstop text-only). Il caso reale che mancava: la figura fa il lavoro,
+        // scrive la diagnosi IN PROSA e chiude con end_turn senza mai chiamare il
+        // proprio tool — 14 dei 24 run muti storici, incluso il run 10:03 del
+        // 20/07 (qwen3: analisi corretta, parere mai dichiarato, quorum saltato).
+        // La prosa NON va persa: e' il resoconto del modello, la grazia le si
+        // accoda (`preserving`). One-shot come gli altri call site: al secondo
+        // end_turn muto si chiude come oggi, nessun loop.
+        if matches!(stop_reason_enum, StopReason::EndTurn | StopReason::Stop)
+            && pending_tool_uses.is_empty()
+        {
+            if let Some(d) = self
+                .maybe_advisory_grace_delta_preserving(
+                    state,
+                    Some(assistant_msg.clone()),
+                    iters_in,
+                    ctx,
+                    mode,
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "nexus_agent_graph::executor",
+                    "chiusura volontaria con canale di ruolo muto -> turno di grazia FORZANTE"
                 );
                 return Ok(d);
             }
@@ -4752,6 +4825,12 @@ modello piu' capace.",
             // true: la testa dell'executor chiude col summary se la dichiarazione
             // c'e'; i rami di chiusura non ri-forzano (una tantum).
             extra_out.remove("force_outcome_declaration");
+        }
+        if declaring_role_turn {
+            // Finestra di RUOLO consumata (gemella della precedente): una sola,
+            // che il modello abbia dichiarato o no — l'anti-loop resta il
+            // one-shot di ADVISORY_GRACE_USED_KEY.
+            extra_out.remove("force_role_declaration");
         }
         delta.extra = Some(extra_out);
         if loop_forced_close {
@@ -6797,6 +6876,23 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
+        self.maybe_advisory_grace_delta_preserving(state, None, iters_in, ctx, mode)
+            .await
+    }
+
+    /// Come [`Self::maybe_advisory_grace_delta`], ma puo' PRESERVARE il messaggio
+    /// assistant del turno corrente (`preserve`): sul call site della chiusura
+    /// volontaria la prosa diagnostica del modello e' il suo resoconto e non va
+    /// buttata — la grazia le si accoda. Nei call site pre-LLM `preserve` e'
+    /// `None` e il comportamento e' bit-identico allo storico.
+    async fn maybe_advisory_grace_delta_preserving(
+        &self,
+        state: &AgentState,
+        preserve: Option<Message>,
+        iters_in: i64,
+        ctx: &AgentNodeCtx,
+        mode: crate::runtime::ports::ExecMode,
+    ) -> Option<OpaqueDelta> {
         let directive = pending_role_channel_grace(state)?;
         if state
             .extra
@@ -6808,6 +6904,13 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         }
         let mut extra_out = state.extra.clone();
         extra_out.insert(ADVISORY_GRACE_USED_KEY.to_string(), json!(true));
+        // La grazia non e' piu' solo prosa: il turno successivo diventa un TURNO
+        // DICHIARATIVO DI RUOLO (catalogo ridotto al solo tool del canale +
+        // tool_choice=required, stesso meccanismo di ADR 0034 per task_complete).
+        // Misurato il perche': la sola direttiva testuale aveva efficacia 1/5 —
+        // e' lo stesso tipo di segnale che il modello muto sta gia' ignorando.
+        // L'obbligo del quorum diventa un vincolo di macchina, non una preghiera.
+        extra_out.insert("force_role_declaration".to_string(), json!(true));
         // Finestra pulita sui detector di ripetizione (come i rami nudge fissi).
         extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
         self.emit_phase(
@@ -6823,9 +6926,16 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
             iters = iters_in,
             "ruolo senza verdetto al backstop runaway -> turno di grazia sul canale proprio"
         );
+        // La prosa del turno corrente (chiusura volontaria) precede la direttiva:
+        // e' il resoconto del modello e resta in conversazione.
+        let mut msgs = Vec::with_capacity(2);
+        if let Some(m) = preserve {
+            msgs.push(m);
+        }
+        msgs.push(human_msg(directive.trim()));
         Some(
             StateDelta {
-                messages: Some(vec![human_msg(directive.trim())]),
+                messages: Some(msgs),
                 // Azzera lo streak solo-testo: al re-entry il blocco text-only NON
                 // ri-scatta prima di chiamare l'LLM, cosi' il turno di grazia raggiunge
                 // davvero il modello (che puo' emettere advisory_verdict). Senza
@@ -7140,14 +7250,34 @@ fn has_tool(state: &AgentState, tool: &str) -> bool {
 /// Ordine dei rami: un kind ha UN solo canale di ruolo (le whitelist di 0546 e
 /// 0605 sono disgiunte), quindi non c'e' ambiguita' reale; l'advisory resta
 /// primo per continuita' col comportamento storico.
-fn pending_role_channel_grace(state: &AgentState) -> Option<&'static str> {
+/// Canale di ruolo ancora muto: il TOOL da esigere e la direttiva per il modello.
+struct RoleChannel {
+    tool: &'static str,
+    directive: &'static str,
+}
+
+/// PUNTO UNICO del riconoscimento "questo ruolo deve chiudere col proprio canale
+/// e non l'ha ancora fatto". Ritorna il canale completo (tool + direttiva): il
+/// turno di grazia usa la direttiva, il turno dichiarativo di ruolo usa il nome
+/// del tool per ridurre il catalogo e FORZARE la dichiarazione.
+fn pending_role_channel(state: &AgentState) -> Option<RoleChannel> {
     if state.advisory_verdict.is_none() && has_tool(state, "advisory_verdict") {
-        return Some(ADVISORY_GRACE_DIRECTIVE);
+        return Some(RoleChannel {
+            tool: "advisory_verdict",
+            directive: ADVISORY_GRACE_DIRECTIVE,
+        });
     }
     if state.debate_position.is_none() && has_tool(state, "debate_position") {
-        return Some(DEBATE_GRACE_DIRECTIVE);
+        return Some(RoleChannel {
+            tool: "debate_position",
+            directive: DEBATE_GRACE_DIRECTIVE,
+        });
     }
     None
+}
+
+fn pending_role_channel_grace(state: &AgentState) -> Option<&'static str> {
+    pending_role_channel(state).map(|c| c.directive)
 }
 
 /// Costruisce il messaggio-nudge di recovery applicando il turno di grazia di

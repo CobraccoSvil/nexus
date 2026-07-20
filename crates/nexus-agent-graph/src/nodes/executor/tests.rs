@@ -5746,10 +5746,15 @@ async fn figura_sotto_deadline_riceve_sollecito_invece_di_morire_muta() {
     );
 }
 
-/// Sotto la soglia il sollecito NON scatta: il run prosegue normalmente e
-/// interroga il modello (nessun turno sprecato quando c'e' ancora tempo).
+/// Sotto la soglia di TEMPO il sollecito pre-LLM non scatta: il modello viene
+/// interrogato normalmente (nessun turno sprecato quando c'e' ancora tempo).
+/// MA se a quel turno il modello CHIUDE MUTO (end_turn di sola prosa, il caso
+/// reale del run 10:03 del 20/07), il terzo call site della grazia lo
+/// intercetta POST-LLM: la chiusura volontaria senza parere non e' piu' una
+/// chiusura n/d. Questo test fissava il comportamento pre-fix (chiusura muta
+/// ammessa); ora fissa quello nuovo.
 #[tokio::test]
-async fn sopra_il_budget_ma_sotto_la_soglia_nessun_sollecito() {
+async fn sotto_soglia_il_modello_viene_interrogato_ma_la_chiusura_muta_no() {
     let rc = Arc::new(StubRunControlStore::default());
     let cfg = ExecutorConfig {
         run_time_budget_s: 100,
@@ -5763,10 +5768,31 @@ async fn sopra_il_budget_ma_sotto_la_soglia_nessun_sollecito() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
 
-    assert_ne!(
+    // Il sollecito e' arrivato DOPO l'interrogazione (post-LLM), non al suo
+    // posto: il modello e' stato chiamato davvero.
+    assert!(
+        !llm.seen.lock().unwrap().is_empty(),
+        "sotto soglia il modello va interrogato, non sostituito dal sollecito"
+    );
+    assert_eq!(
         out.extra.get("advisory_grace_used").and_then(Value::as_bool),
         Some(true),
-        "sotto soglia non si sollecita"
+        "la chiusura MUTA post-LLM riceve il turno di grazia"
+    );
+    // Il turno successivo e' dichiarativo di ruolo: catalogo ridotto + forcing.
+    assert_eq!(
+        out.extra
+            .get("force_role_declaration")
+            .and_then(Value::as_bool),
+        Some(true),
+        "la grazia arma il turno dichiarativo di ruolo"
+    );
+    // La prosa del modello NON e' andata persa: precede la direttiva.
+    assert!(
+        out.messages
+            .iter()
+            .any(|m| format!("{m:?}").contains("risposta")),
+        "il resoconto in prosa del modello resta in conversazione"
     );
     assert!(
         !llm.seen.lock().unwrap().is_empty(),
@@ -5859,5 +5885,70 @@ fn solo_le_cause_deterministiche_contano_per_il_tetto() {
         deterministic_gateway_cause(&PortError::Llm("boom".to_string()), &[]),
         None,
         "un errore generico non tipizzato non entra nel tetto"
+    );
+}
+
+/// T2 del piano: il turno dichiarativo di RUOLO arriva al wire con il catalogo
+/// ridotto al solo tool del canale e il forcing attivo. Con UN solo tool,
+/// tool_choice=required equivale a forzare QUEL tool su ogni dialetto.
+#[tokio::test]
+async fn il_turno_di_ruolo_forza_il_tool_sul_wire() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let cfg = ExecutorConfig {
+        // Stile che supporta il forcing (in produzione: openrouter/openai ->
+        // openai_required via capability). Senza stile il forcing e' spento e
+        // il turno di ruolo degraderebbe a sola riduzione del catalogo.
+        tool_choice_style: Some("openai_required".to_string()),
+        ..cfg_resolved()
+    };
+    let (n, _m, _s) = node(cfg, rc);
+    let llm = Arc::new(StubLlmGateway::with_text("ancora prosa"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = figura_muta_da(10);
+    state
+        .extra
+        .insert("force_role_declaration".to_string(), json!(true));
+
+    let _ = n.run(&state, &ctx).await.expect("run");
+
+    let req = llm.seen.lock().unwrap().last().cloned().expect("request");
+    let tools = req.tools.clone().unwrap_or_default();
+    // Mutazione che rende rosso: togliere la riduzione del catalogo nel blocco
+    // `declaring_role_turn` -> qui compare anche read_file.
+    assert_eq!(tools.len(), 1, "catalogo ridotto al solo canale: {tools:?}");
+    assert_eq!(
+        tools[0].get("name").and_then(Value::as_str),
+        Some("advisory_verdict")
+    );
+    // Mutazione che rende rosso: togliere `force_action_hard = true` -> None.
+    assert_eq!(
+        req.force_tool_choice,
+        Some(true),
+        "il tool_choice deve essere forzato"
+    );
+}
+
+/// T4 del piano: la grazia e' one-shot. Un secondo end_turn muto DOPO la grazia
+/// consumata chiude come oggi — nessun loop di solleciti.
+#[tokio::test]
+async fn la_grazia_sulla_chiusura_volontaria_e_one_shot() {
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = Arc::new(StubLlmGateway::with_text("chiudo senza dichiarare"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut state = figura_muta_da(10);
+    state
+        .extra
+        .insert("advisory_grace_used".to_string(), json!(true));
+
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+
+    // Mutazione che rende rosso: togliere il check ADVISORY_GRACE_USED_KEY in
+    // maybe_advisory_grace_delta_preserving -> secondo rientro invece di chiudere.
+    assert_eq!(
+        out.stop_reason,
+        Some(StopReason::EndTurn),
+        "grazia gia' consumata: la chiusura volontaria resta una chiusura"
     );
 }

@@ -135,11 +135,15 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert");
+        // Scrittura DIRETTA (fuori dal punto unico): la lettura e' cache-ata,
+        // il test dichiara l'invalidazione come farebbe una sessione esterna.
+        nexus_auth::invalidate_setting_cache(&pool, "runtime.starvation_alert_ms");
         assert_eq!(threshold_ms(&pool).await, 750, "il DB governa (regola G)");
         sqlx::query("UPDATE settings SET value = '0' WHERE key = 'runtime.starvation_alert_ms'")
             .execute(&pool)
             .await
             .expect("update");
+        nexus_auth::invalidate_setting_cache(&pool, "runtime.starvation_alert_ms");
         assert_eq!(
             threshold_ms(&pool).await,
             DEFAULT_STARVATION_ALERT_MS,
