@@ -1558,8 +1558,24 @@ async fn init_redis_and_cooldowns(
     Ok(redis)
 }
 
-#[tokio::main(worker_threads = 32)]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Builder esplicito al posto di #[tokio::main]: serve `thread_stack_size`.
+    // Tre crash STATUS_STACK_OVERFLOW (0xc00000fd, faulting __chkstk) in un
+    // giorno sui tokio-rt-worker durante run agentici con payload JSON grossi:
+    // lo stack default dei worker (2 MB) e' tarato su frame da build RELEASE,
+    // ma lo stack dev gira in DEBUG dove i frame Rust sono 10-20x piu' grandi
+    // — l'equivalente release di 2 MB debug e' ~200 KB. Gli 8 MB riallineano
+    // il margine debug a quello che release ha gia'; una ricorsione INFINITA
+    // esploderebbe comunque (piu' tardi), quindi nessun bug viene mascherato.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(32)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Orchestratore d'avvio: ogni fase e' un helper di modulo coeso (init infra,
     // riconciliazione processi, redis+cooldown, cache routing, orchestrator,
     // AppState+boot-recovery, worker background, HTTP). L'ordine di inizializzazione
