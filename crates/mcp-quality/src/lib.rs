@@ -1,4 +1,4 @@
-// safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
+﻿// safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
 // applicate a pattern literal hardcoded, compilati UNA volta in static
 // `LazyLock<Regex>` (C3, docs/tech-debt-rust.md): `analyze_source` e' chiamata
 // in loop per-file dagli scan di progetto e ricompilare le regex ad ogni file
@@ -428,6 +428,22 @@ fn check_complexity(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
     findings
 }
 
+/// `true` se la riga NON conta come codice per la metrica di lunghezza:
+/// vuota, commento di riga (`//`, incluse le doc `///` e `//!`), commento
+/// Python/shell (`#`, MA NON l'attributo Rust `#[...]`), o riga di un blocco
+/// `/* ... */` (apertura, continuazione in stile `* ...`, chiusura). Il
+/// deref Rust (`*count += 1`) non viene scartato: il filtro su `*` richiede
+/// lo spazio o la chiusura del blocco.
+fn non_code_line(trimmed: &str) -> bool {
+    trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("* ")
+        || trimmed == "*"
+        || trimmed.starts_with("*/")
+}
+
 fn check_long_functions(lines: &[&str]) -> Vec<QualityFinding> {
     let mut findings = Vec::new();
     let mut i = 0;
@@ -447,13 +463,22 @@ fn check_long_functions(lines: &[&str]) -> Vec<QualityFinding> {
                     } else if ch == '}' && found {
                         depth -= 1;
                         if depth == 0 {
-                            let length = j - start + 1;
+                            // La soglia misura il CODICE: commenti e righe
+                            // vuote non contano (una funzione ben documentata
+                            // non e' piu' "lunga" di una identica senza doc).
+                            let length = lines[start..=j]
+                                .iter()
+                                .filter(|l| !non_code_line(l.trim()))
+                                .count();
                             if length > 50 {
                                 findings.push(QualityFinding {
                                     category: "maintainability".into(),
                                     severity: if length > 100 { "high" } else { "medium" }.into(),
                                     title: format!("Long function `{}`", name),
-                                    detail: format!("{} lines (threshold: 50)", length),
+                                    detail: format!(
+                                        "{} code lines (threshold: 50; commenti e righe vuote esclusi)",
+                                        length
+                                    ),
                                     line: Some(start + 1),
                                     suggested_comment: None,
                                 });
@@ -1321,6 +1346,56 @@ fn check_duplicate_blocks_detailed(lines: &[&str]) -> Vec<QualityFinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La soglia delle funzioni lunghe misura il CODICE: una funzione con 40
+    /// righe di codice e 30 di commenti/righe vuote (70 totali) NON e' lunga.
+    /// Era il difetto: il conteggio `j - start + 1` includeva i commenti, e una
+    /// funzione ben documentata veniva punita rispetto alla gemella senza doc.
+    #[test]
+    fn i_commenti_non_contano_nella_lunghezza() {
+        let mut corpo = String::from("fn documentata() {\n");
+        for i in 0..40 {
+            corpo.push_str(&format!("    // commento di riga {i}\n"));
+            corpo.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        corpo.push_str("}\n");
+        // 40 codice + 40 commenti + firma + graffa = 82 righe totali, 42 di codice.
+        let findings = check_long_functions(&corpo.lines().collect::<Vec<_>>());
+        assert!(
+            findings.is_empty(),
+            "42 righe di CODICE sotto soglia 50: i commenti non devono contare. \
+             Trovato: {findings:?}"
+        );
+    }
+
+    /// Contro-caso (mutazione: se il filtro sparisce o scarta troppo, uno dei
+    /// due test rosseggia): 55 righe di codice restano una funzione lunga,
+    /// anche senza alcun commento.
+    #[test]
+    fn il_codice_oltre_soglia_resta_segnalato() {
+        let mut corpo = String::from("fn lunga() {\n");
+        for i in 0..55 {
+            corpo.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        corpo.push_str("}\n");
+        let findings = check_long_functions(&corpo.lines().collect::<Vec<_>>());
+        assert_eq!(findings.len(), 1, "55 righe di codice: lunga. {findings:?}");
+        assert!(findings[0].detail.contains("code lines"));
+    }
+
+    /// Il deref Rust (`*conteggio`) e l'attributo (`#[derive]`) sono CODICE:
+    /// il filtro dei commenti non li deve scartare.
+    #[test]
+    fn deref_e_attributi_sono_codice() {
+        assert!(!non_code_line("*count += 1;"));
+        assert!(!non_code_line("#[derive(Debug)]"));
+        assert!(non_code_line("// commento"));
+        assert!(non_code_line("/// doc"));
+        assert!(non_code_line("# commento python"));
+        assert!(non_code_line("* continuazione di blocco"));
+        assert!(non_code_line("*/"));
+        assert!(non_code_line(""));
+    }
 
     #[test]
     fn test_basic_analysis() {
