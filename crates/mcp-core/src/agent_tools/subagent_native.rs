@@ -1,4 +1,4 @@
-//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
+﻿//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
 //!
 //! Verso zero-Python: prima `dispatch_subagent` (in `nexus-agent-tools`) chiamava
 //! l'endpoint REST `POST /agent/subagent-run` del brain Python, che eseguiva un
@@ -160,7 +160,7 @@ struct SubagentDefinition {
 }
 
 async fn fetch_definition(
-    ctx: &AgentToolContext,
+    db: &sqlx::PgPool,
     kind: &str,
 ) -> Result<Option<SubagentDefinition>, String> {
     let row = sqlx::query(
@@ -168,7 +168,7 @@ async fn fetch_definition(
          FROM nexus_subagent_definitions WHERE kind = $1 LIMIT 1",
     )
     .bind(kind)
-    .fetch_optional(&*ctx.core.db)
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("query definition: {e}"))?;
     let Some(row) = row else {
@@ -2120,6 +2120,11 @@ pub(crate) async fn convene_council(
     // col proprio timer (difetto D3). Il progresso UI viene emesso appena il
     // singolo sub-run rientra, senza attendere gli altri.
     let owned_kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
+    // Provider DISTINTI decisi PRIMA del fan-out (sequenziale, quindi
+    // accumulabile): in parallelo ogni figura sceglieva da sola e il piu'
+    // economico eleggibile era lo stesso per tutte -- due figure sullo stesso
+    // provider+modello non sono due pareri. `None` = percorso storico.
+    let assignments = council_assignments(ctx, &owned_kinds).await;
     let results = {
         let kinds_for_make = owned_kinds.clone();
         spawn_fanout(&ctx.core.db, kinds_for_make.len(), FanoutScope::TopLevel, |i| {
@@ -2127,18 +2132,12 @@ pub(crate) async fn convene_council(
             let task = task.to_string();
             let expected = expected.to_string();
             let kind = kinds_for_make[i].clone();
-            async move { run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await }
+            let pin = assignments[i].clone();
+            async move { run_council_figure(&ctx, &kind, &task, &expected, pin).await }
         })
         .await
     };
-    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(owned_kinds.len());
-    for (kind, result) in owned_kinds.iter().zip(results.into_iter()) {
-        let report = classify_council_figure_result(kind, &result);
-        if let Some(ref tx) = progress_tx {
-            let _ = tx.send(report.clone()).await;
-        }
-        pairs.push((report, result));
-    }
+    let pairs = classify_and_stream_reports(&owned_kinds, results, progress_tx.as_ref()).await;
     let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
     let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     // Roster esplicito = figure CONVOCATE (regola M): una figura in timeout/errore
@@ -3110,7 +3109,7 @@ async fn prepare_subagent_run(
     }
 
     // ── Guard 2: definition del kind ──────────────────────────────────────────
-    let definition = match fetch_definition(ctx, kind).await {
+    let definition = match fetch_definition(db, kind).await {
         Ok(Some(d)) => d,
         Ok(None) => {
             return Err(prepare_reject(
@@ -3760,7 +3759,7 @@ async fn resolve_worker_model(
     // padre da escludere (astensione da auto-certificazione).
     if kind == "review" {
         let exclude: Vec<String> = parent_provider(db, anchor).await.into_iter().collect();
-        return resolve_review_model(db, purpose, kind, &exclude).await;
+        return resolve_model_excluding(db, purpose, kind, &exclude).await;
     }
 
     // Ramo WORKER: se l'utente ha pinnato un provider sulla chat, prova a risolvere
@@ -3808,12 +3807,17 @@ async fn resolve_worker_model(
     }
 }
 
-/// Risoluzione del modello per un sub-run di `kind == "review"`: ESCLUDE il
-/// provider del padre (`exclude`), con fallback SENZA esclusione + WARN se il pool
-/// si svuota (unico provider capable). Estratto da `resolve_worker_model` per
-/// tenere il ramo review distinto dal ramo pin-worker (leggibilita'); la logica
-/// del vincolo giudice != worker e' invariata.
-async fn resolve_review_model(
+/// Risoluzione del modello di un sub-run con ESCLUSIONE di provider, e fallback
+/// SENZA esclusione + WARN se il pool si svuota (unico provider capable).
+///
+/// Punto unico (regola L) per due vincoli della stessa natura:
+///   - review: giudice != worker (esclude il provider del padre);
+///   - consiglio: figure su provider DISTINTI (esclude i provider gia'
+///     assegnati alle figure precedenti, vedi `resolve_council_assignments`).
+/// In entrambi i casi l'esclusione e' una PREFERENZA forte, non un vincolo che
+/// lascia il posto vuoto: meglio un duplicato dichiarato (WARN) che una figura
+/// in meno.
+async fn resolve_model_excluding(
     db: &sqlx::PgPool,
     purpose: &str,
     kind: &str,
@@ -3871,6 +3875,113 @@ async fn parent_provider(db: &sqlx::PgPool, anchor: Uuid) -> Option<String> {
 /// `agent_runs`. `None` se la sessione non ha pin, il valore e' NULL/vuoto, o la
 /// query fallisce (fail-open: nessun pin -> routing worker standard). Il pin e'
 /// SOLO il provider: il modello si deriva sempre dal tier via catalog (regola G).
+/// Classifica l'esito di ogni figura e lo emette sul canale di progresso UI
+/// appena disponibile (estratto da `convene_council`, comportamento invariato).
+async fn classify_and_stream_reports(
+    kinds: &[String],
+    results: Vec<Value>,
+    progress_tx: Option<&tokio::sync::mpsc::Sender<FigureAdvisoryReport>>,
+) -> Vec<(FigureAdvisoryReport, Value)> {
+    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(kinds.len());
+    for (kind, result) in kinds.iter().zip(results.into_iter()) {
+        let report = classify_council_figure_result(kind, &result);
+        if let Some(tx) = progress_tx {
+            let _ = tx.send(report.clone()).await;
+        }
+        pairs.push((report, result));
+    }
+    pairs
+}
+
+/// Risolve il pool del progetto e delega a [`resolve_council_assignments`]
+/// (che resta parametrica sui pool per i test, regola O).
+async fn council_assignments(
+    ctx: &AgentToolContext,
+    kinds: &[String],
+) -> Vec<Option<(String, String)>> {
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
+    resolve_council_assignments(&ctx.core.db, &proj_pool, ctx.core.session_id, kinds).await
+}
+
+/// Esegue UNA figura del Consiglio: pinnata sul provider pre-assegnato
+/// ([`resolve_council_assignments`]) quando c'e', percorso storico altrimenti.
+async fn run_council_figure(
+    ctx: &AgentToolContext,
+    kind: &str,
+    task: &str,
+    expected: &str,
+    pin: Option<(String, String)>,
+) -> Value {
+    match pin {
+        Some((provider, model)) => {
+            run_single_subagent_with_model_pin(ctx, kind, task, "", expected, &provider, &model)
+                .await
+        }
+        None => run_single_subagent(ctx, kind, task, "", expected, None, false).await,
+    }
+}
+
+/// Pre-assegna alle figure del Consiglio provider DISTINTI (preferenza forte).
+///
+/// Difetto misurato il 20/07: `software_architect` e `security_engineer`
+/// (stesso purpose tier) hanno ricevuto lo STESSO provider e lo STESSO modello
+/// (openrouter/qwen3-235b), perche' ogni figura risolveva il proprio modello in
+/// parallelo e in isolamento -- il piu' economico eleggibile e' uguale per
+/// tutte. Due pareri dello stesso modello non sono due pareri: la diversita'
+/// che il Consiglio promette va decisa PRIMA del fan-out, quando l'assegnazione
+/// e' ancora sequenziale.
+///
+/// Regole:
+///   - ogni figura risolve col SUO purpose (nessun purpose condiviso imposto),
+///     escludendo i provider gia' assegnati alle figure precedenti;
+///   - pool esaurito -> la figura tiene il provider duplicato (WARN dentro
+///     `resolve_model_excluding`): meglio un parere in piu' che una figura in
+///     meno;
+///   - pin di sessione presente -> nessuna pre-assegnazione (il pin si propaga
+///     ai subagenti per scelta deliberata; la diversita' non si applica);
+///   - ogni esito non risolvibile -> `None`: la figura segue il percorso
+///     storico (`resolve_worker_model` dentro il prepare), che produce i suoi
+///     rifiuti strutturati.
+async fn resolve_council_assignments(
+    db: &sqlx::PgPool,
+    proj_pool: &sqlx::PgPool,
+    session_id: Option<Uuid>,
+    kinds: &[String],
+) -> Vec<Option<(String, String)>> {
+    let nessuna: Vec<Option<(String, String)>> = vec![None; kinds.len()];
+    let Some(session_id) = session_id else {
+        return nessuna;
+    };
+    if session_pinned_provider(proj_pool, session_id).await.is_some() {
+        return nessuna;
+    }
+    let mut exclude: Vec<String> = Vec::new();
+    let mut out: Vec<Option<(String, String)>> = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let Ok(Some(definition)) = fetch_definition(db, kind).await else {
+            out.push(None);
+            continue;
+        };
+        let purpose = resolve_worker_model_purpose(db, kind, &definition).await;
+        if purpose.trim().is_empty() {
+            out.push(None);
+            continue;
+        }
+        let (provider, model) = resolve_model_excluding(db, &purpose, kind, &exclude).await;
+        if provider.is_empty() || model.is_empty() {
+            out.push(None);
+            continue;
+        }
+        let pl = provider.to_lowercase();
+        if !exclude.contains(&pl) {
+            exclude.push(pl);
+        }
+        out.push(Some((provider, model)));
+    }
+    out
+}
+
 async fn session_pinned_provider(proj_pool: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
     let pinned: Option<String> =
         sqlx::query_scalar("SELECT preferred_provider FROM chat_sessions WHERE id = $1")
@@ -5544,6 +5655,115 @@ mod tests {
         let (provider, _model) =
             resolve_worker_model(&pool, &pool, "implement", &def, parent, Uuid::new_v4()).await;
         assert_eq!(provider, "alpha", "kind non-review: nessuna esclusione");
+    }
+
+    // ── DIVERSITA' PROVIDER FRA LE FIGURE DEL CONSIGLIO ───────────────────────
+    //
+    // Difetto 20/07: due figure con lo stesso purpose tier risolvevano in
+    // parallelo e in isolamento -> stesso provider E stesso modello
+    // (openrouter/qwen3-235b su software_architect + security_engineer).
+    // `resolve_council_assignments` decide PRIMA del fan-out, in sequenza.
+
+    /// Tabella `nexus_subagent_definitions` per i kind delle figure (il DB dei
+    /// test e' bare). Tutte sul MEDESIMO purpose: e' il caso del difetto.
+    async fn seed_figure_definitions(pool: &sqlx::PgPool, kinds: &[&str], purpose: &str) {
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_definitions ( \
+                 kind TEXT PRIMARY KEY, \
+                 prompt_key TEXT NOT NULL, \
+                 tool_whitelist TEXT[] NOT NULL DEFAULT '{}', \
+                 model_purpose TEXT, \
+                 timeout_s INTEGER NOT NULL DEFAULT 0, \
+                 is_enabled BOOLEAN NOT NULL DEFAULT true \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_subagent_definitions");
+        for kind in kinds {
+            sqlx::query(
+                "INSERT INTO nexus_subagent_definitions (kind, prompt_key, model_purpose) \
+                 VALUES ($1, 'p', $2)",
+            )
+            .bind(kind)
+            .bind(purpose)
+            .execute(pool)
+            .await
+            .expect("definition");
+        }
+    }
+
+    /// Due figure, due provider capable -> assegnazioni DISTINTE: la seconda
+    /// figura esclude il provider gia' dato alla prima.
+    #[sqlx::test]
+    async fn figure_del_consiglio_su_provider_distinti(pool: sqlx::PgPool) {
+        let (_parent, _def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
+            .await;
+        let kinds = vec![
+            "software_architect".to_string(),
+            "security_engineer".to_string(),
+        ];
+        let out = resolve_council_assignments(&pool, &pool, Some(Uuid::new_v4()), &kinds).await;
+        let providers: Vec<String> = out
+            .iter()
+            .map(|o| o.as_ref().expect("figura assegnata").0.clone())
+            .collect();
+        assert_ne!(
+            providers[0], providers[1],
+            "due figure devono girare su provider DISTINTI: {providers:?} \
+             (era il difetto: entrambe sul piu' economico eleggibile)"
+        );
+    }
+
+    /// Pool monoprovider: la seconda figura tiene il DUPLICATO invece di saltare
+    /// (preferenza forte, non hard filter: meglio un parere in piu' che una
+    /// figura in meno).
+    #[sqlx::test]
+    async fn consiglio_monoprovider_duplica_invece_di_perdere_figure(pool: sqlx::PgPool) {
+        let (_parent, _def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
+        seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
+            .await;
+        let kinds = vec![
+            "software_architect".to_string(),
+            "security_engineer".to_string(),
+        ];
+        let out = resolve_council_assignments(&pool, &pool, Some(Uuid::new_v4()), &kinds).await;
+        let providers: Vec<String> = out
+            .iter()
+            .map(|o| o.as_ref().expect("figura assegnata").0.clone())
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["alpha".to_string(), "alpha".to_string()],
+            "unico provider capable -> entrambe su alpha, nessuna figura persa"
+        );
+    }
+
+    /// Pin di sessione presente -> NESSUNA pre-assegnazione: il pin si propaga
+    /// ai subagenti per scelta deliberata e la diversita' non si applica.
+    #[sqlx::test]
+    async fn pin_di_sessione_disattiva_la_diversita(pool: sqlx::PgPool) {
+        let (_parent, _def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
+            .await;
+        let session = Uuid::new_v4();
+        sqlx::query("INSERT INTO chat_sessions (id, preferred_provider) VALUES ($1, 'alpha')")
+            .bind(session)
+            .execute(&pool)
+            .await
+            .expect("pin");
+        let kinds = vec![
+            "software_architect".to_string(),
+            "security_engineer".to_string(),
+        ];
+        let out = resolve_council_assignments(&pool, &pool, Some(session), &kinds).await;
+        assert!(
+            out.iter().all(Option::is_none),
+            "col pin di sessione le figure seguono il percorso storico: {out:?}"
+        );
     }
 
     // ── PROPAGAZIONE PIN PROVIDER AI SUB-AGENTI WORKER ────────────────────────
