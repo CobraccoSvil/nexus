@@ -34,6 +34,7 @@ pub use nodes::{
     build_error_files, clarifying_branch, count_build_errors, error_file_matches_touched,
     plan_reuse_decision, ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, ClarifyingBranch,
     DecisionCategory, FinalGateConfig, FinalGateNode, GateOutcome, LearnerConfig, LearnerNode,
+    ReviewGateConfig, ReviewGateNode,
     LlmDecision, OnFailure, PlanReuse, PlannerConfig, PlannerNode, QdrantPayload, ReflectionConfig,
     ReflectionData, ReflectionNode, RouterNode, TodoRunnerConfig, TodoRunnerNode,
     ToolDispatchConfig, ToolDispatchNode, ToolResultOutcome, UnderstandingConfig,
@@ -45,6 +46,6 @@ pub use runtime::{
 };
 pub use shadow::{compute_diff, persist_node_diff, DiffCollector, NodeDiff};
 pub use state::{
-    AgentState, AutomationMode, FinalGateVerdict, Message, MetaStep, StateDelta, StopReason,
+    AgentState, AutomationMode, FinalGateVerdict, Message, MetaStep, ReviewGateVerdict, StateDelta, StopReason,
     SupervisorMode, TaskComplexity,
 };

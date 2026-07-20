@@ -305,11 +305,19 @@ pub fn route_after_todo_runner(state: &AgentState, cfg: &RoutingConfig) -> NodeT
     NodeTarget::Executor
 }
 
+/// Predicato UNICO del "gate rimanda in correzione" (regola L): un gate di
+/// chiusura (final_gate, review_gate) che vuole restituire il turno
+/// all'executor lo dichiara con `stop_reason = ToolUse` nel proprio delta; gli
+/// edge decidono da qui, non ognuno con la propria copia del confronto.
+pub fn gate_rimanda_in_correzione(state: &AgentState) -> bool {
+    state.stop_reason == Some(StopReason::ToolUse)
+}
+
 /// Dopo il final_gate: re-executor se il gate ha rimandato all'executor
 /// (stop_reason tool_use), altrimenti chiusura (learner).
 /// Porting 1:1 di `route_after_final_gate` (final_gate.py:549-551).
 pub fn route_after_final_gate(state: &AgentState) -> NodeTarget {
-    if state.stop_reason == Some(StopReason::ToolUse) {
+    if gate_rimanda_in_correzione(state) {
         NodeTarget::Executor
     } else {
         NodeTarget::Learner

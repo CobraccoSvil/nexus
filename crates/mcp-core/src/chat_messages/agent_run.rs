@@ -1459,6 +1459,26 @@ pub(crate) async fn native_outcome_to_run_result(
     // "completato" mentre lo status era failed_diagnosed (run e91d4892). Non si
     // applica alle dichiarazioni oneste (blocked/needs_input/partial: il modello
     // stesso ha gia' descritto l'incompletezza nel summary).
+    // Review adversariale bocciata (ReviewGate): il titolo onesto viene PRIMA
+    // dei rami del final_gate -- l'utente leggeva "TASK COMPLETATO" con la nota
+    // della review appesa sotto, cioe' un successo, su un run failed_diagnosed.
+    let final_answer = if outcome.review_panel_rejected {
+        final_answer.map(|ans| {
+            let nota = outcome
+                .review_panel_last
+                .as_ref()
+                .map(render_review_panel_note)
+                .unwrap_or_else(|| {
+                    "**Review adversariale automatica: NON superata.**".to_string()
+                });
+            format!(
+                "{nota}\n\n---\n_Resoconto dell'agente (auto-valutazione, NON \
+                 confermata dalla review):_\n{ans}"
+            )
+        })
+    } else {
+        final_answer
+    };
     let final_answer = match (
         final_answer,
         outcome.final_gate_passed,
@@ -2697,7 +2717,7 @@ pub(crate) async fn spawn_agent_run(
         )
         .await;
         resolve_orchestration_plan_for(
-            &state,
+            &state.db,
             sizing_complexity,
             sizing_scope_system_wide,
             false,
@@ -2967,6 +2987,8 @@ pub(crate) async fn spawn_agent_run(
                     // `dispatch_subagent` (subagent_native) popola questi campi.
                     parent_run_id: None,
                     subagent_depth: None,
+                    sizing_complexity,
+                    sizing_scope_system_wide,
                     run_time_budget_s: None,
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
@@ -2976,7 +2998,7 @@ pub(crate) async fn spawn_agent_run(
                     advisory_gate: advisory_gate_for_run.clone(),
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
-                    Ok(mut outcome) => {
+                    Ok(outcome) => {
                         // Niente leak: si logga la LUNGHEZZA della risposta, non il
                         // contenuto (regola F). provider/model EFFETTIVI post cascade.
                         tracing::info!(
@@ -3004,22 +3026,12 @@ pub(crate) async fn spawn_agent_run(
                                 session_id_cp,
                             )
                             .await;
-                        // Rinforzo PROGRAMMATICO della review adversariale a valle
-                        // (regola H): la direttiva <revisione_finale> (mig 0571) e'
-                        // LLM-driven e puo' essere saltata. Qui, se il run ha
-                        // MODIFICATO codice e NON ha gia' fatto una review, il panel
-                        // viene convocato dal codice e il verdetto riconciliato nel
-                        // resoconto. No-op se disabilitato o non pertinente.
-                        maybe_convene_review_panel(
-                            &state_for_finalize,
-                            &steps_pool,
-                            session_id_cp,
-                            run_id,
-                            &mut outcome,
-                            sizing_complexity,
-                            sizing_scope_system_wide,
-                        )
-                        .await;
+                        // La review adversariale programmatica ora vive DENTRO il
+                        // grafo (nodo ReviewGate, prima della chiusura): su
+                        // bocciatura rimanda in correzione invece di annotare un
+                        // run gia' morto. Qui resta solo il mapping dell'esito
+                        // (native_outcome_to_run_result legge review_panel_rejected
+                        // e extra.review_panel_last dal medesimo stato).
                         native_result =
                             Some(native_outcome_to_run_result(&steps_pool, run_id, outcome).await);
                         native_steps_persisted = true;
@@ -3948,6 +3960,8 @@ pub(crate) async fn confirm_native_run(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        sizing_complexity: None,
+        sizing_scope_system_wide: false,
         run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
@@ -4334,6 +4348,8 @@ pub(crate) async fn resume_fanin(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        sizing_complexity: None,
+        sizing_scope_system_wide: false,
         run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
@@ -4511,8 +4527,8 @@ fn select_pre_run_advisory(
 /// reali dalla review). `None` = sizing spento o segnali non risolti ->
 /// comportamento legacy coi cap storici (fail-safe, mai un piano dimensionato
 /// su un fallback del classificatore).
-async fn resolve_orchestration_plan_for(
-    state: &AppState,
+pub(crate) async fn resolve_orchestration_plan_for(
+    db: &PgPool,
     complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
     scope_system_wide: bool,
     decision_detected: bool,
@@ -4521,19 +4537,19 @@ async fn resolve_orchestration_plan_for(
 ) -> Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan> {
     use nexus_agent_graph::decisions::orchestration_sizing as sizing;
     let cfg =
-        crate::agent_tools::subagent_native::read_orchestration_sizing_config(&state.db).await;
+        crate::agent_tools::subagent_native::read_orchestration_sizing_config(db).await;
     if !cfg.enabled {
         return None;
     }
     let complexity = complexity?;
     let demand =
-        crate::agent_tools::subagent_native::read_sizing_profile(&state.db, complexity).await?;
+        crate::agent_tools::subagent_native::read_sizing_profile(db, complexity).await?;
     let backstops =
-        crate::agent_tools::subagent_native::read_orchestration_backstops(&state.db).await;
-    let unit = crate::agent_tools::subagent_native::read_panel_unit_estimate(&state.db).await;
+        crate::agent_tools::subagent_native::read_orchestration_backstops(db).await;
+    let unit = crate::agent_tools::subagent_native::read_panel_unit_estimate(db).await;
     // Budget di costo del run: la STESSA chiave anti-runaway dell'executor
     // (`agent.run_cost_budget_usd`, 0 = off). Nessuna seconda fonte di verita'.
-    let cost_budget = nexus_auth::get_setting(&state.db, "agent.run_cost_budget_usd")
+    let cost_budget = nexus_auth::get_setting(db, "agent.run_cost_budget_usd")
         .await
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|b| *b > 0.0);
@@ -4851,7 +4867,7 @@ async fn debate_advocate_target(
     // propri nel ledger, quindi un'aggregazione per-run del padre li perderebbe.
     let spent = crate::agent_tools::subagent_native::cumulative_cost(run_pool, run_id).await;
     let plan = resolve_orchestration_plan_for(
-        state,
+        &state.db,
         complexity,
         scope_system_wide,
         true, // decision_detected: il consiglio l'ha dichiarata
@@ -5212,7 +5228,7 @@ async fn maybe_convene_council(
 
 /// `true` se il path e' un file di CODICE (una modifica a codice merita review;
 /// config/markdown/asset no). Estensione case-insensitive.
-fn is_code_file(path: &str) -> bool {
+pub(crate) fn is_code_file(path: &str) -> bool {
     const CODE_EXT: &[&str] = &[
         "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java", "rb", "php", "cs", "cpp",
         "cc", "c", "h", "hpp", "vue", "svelte", "sql", "kt", "swift",
@@ -5227,7 +5243,7 @@ fn is_code_file(path: &str) -> bool {
 /// CODICE modificati + se un panel di review e' GIA' stato prodotto. Il tool reale
 /// e' annidato in `agent_steps.tool_input` (`{tool_name, tool_input:{path}}`); la
 /// presenza di un panel si legge dal `panel_verdict` nel tool_result del fan-in.
-async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
+pub(crate) async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
     use sqlx::Row;
     const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
     let rows = sqlx::query(
@@ -5262,33 +5278,34 @@ async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool)
     (modified, reviewed)
 }
 
-/// Un verdetto di panel programmatico e' un RIFIUTO strutturato (il run non e'
-/// un successo, regola M) SOLO per Fail/NeedsChanges. Inconclusive (quorum non
-/// raggiunto) e' un limite infrastrutturale, non un difetto del codice; Pass e'
-/// un'approvazione. Punto unico (regola L): produttore del flag e test partono
-/// da qui (regola O), non da un bool costruito a mano.
-fn review_verdict_rejects(v: nexus_agent_graph::decisions::PanelVerdict) -> bool {
-    use nexus_agent_graph::decisions::PanelVerdict;
-    matches!(v, PanelVerdict::Fail | PanelVerdict::NeedsChanges)
-}
-
-/// Nota onesta (regola M) da anteporre/aggiungere al resoconto quando la review
-/// programmatica NON approva. Findings limitati per non gonfiare.
-fn render_review_panel_note(panel: &nexus_agent_graph::decisions::PanelOutcome) -> String {
-    use nexus_agent_graph::decisions::PanelVerdict;
-    let label = match panel.verdict {
-        PanelVerdict::Fail => "NON superata (difetti bloccanti)",
-        PanelVerdict::NeedsChanges => "richiede modifiche",
-        PanelVerdict::Inconclusive => "non conclusiva (quorum non raggiunto)",
-        PanelVerdict::Pass => "superata",
+/// Nota onesta (regola M) da anteporre al resoconto quando la review NON
+/// approva. Il `Value` e' `PanelOutcome::to_value` trasportato dallo stato del
+/// grafo (`extra.review_panel_last`): stessi campi strutturati, vocabolario di
+/// `PanelVerdict::as_str`. Findings limitati per non gonfiare.
+fn render_review_panel_note(panel: &serde_json::Value) -> String {
+    let label = match panel.get("verdict").and_then(|v| v.as_str()).unwrap_or("") {
+        "fail" => "NON superata (difetti bloccanti)",
+        "needs_changes" => "richiede modifiche",
+        "inconclusive" => "non conclusiva (quorum non raggiunto)",
+        "pass" => "superata",
+        _ => "esito non disponibile",
     };
+    let valid = panel.get("valid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = panel
+        .get("total_reviews")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let mut s = format!(
-        "**Review adversariale automatica: {label}** ({}/{} voti validi). Un panel di \
-         revisori indipendenti ha esaminato le modifiche di questo run.",
-        panel.valid, panel.total_reviews
+        "**Review adversariale automatica: {label}** ({valid}/{total} voti validi). Un panel di \
+         revisori indipendenti ha esaminato le modifiche di questo run."
     );
+    let vuoto = Vec::new();
+    let findings = panel
+        .get("findings")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&vuoto);
     let mut shown = 0;
-    for f in &panel.findings {
+    for f in findings {
         if shown >= 8 {
             break;
         }
@@ -5303,149 +5320,6 @@ fn render_review_panel_note(panel: &nexus_agent_graph::decisions::PanelOutcome) 
     }
     s.push_str("\n\nControlla e correggi i punti sopra prima di considerare il task concluso.");
     s
-}
-
-/// RINFORZO PROGRAMMATICO della review adversariale a valle (regola H): la
-/// direttiva `<revisione_finale>` (mig 0571) e' LLM-driven e puo' essere saltata.
-/// Se il run ha DICHIARATO done, ha MODIFICATO codice e NON ha gia' fatto una
-/// review, convoca il panel dal codice (`convene_review_panel`) e riconcilia il
-/// verdetto nel resoconto (nota onesta se non approva; simmetrico alla nota
-/// final_gate). Gate DB-driven `orchestrator.review_panel_autoconvene_enabled`
-/// (mig 0572). No-op fuori dai casi pertinenti: non altera il flusso.
-async fn maybe_convene_review_panel(
-    state: &AppState,
-    steps_pool: &PgPool,
-    session_id: Uuid,
-    run_id: Uuid,
-    outcome: &mut crate::native_engine::NativeRunOutcome,
-    sizing_complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
-    sizing_scope_system_wide: bool,
-) {
-    // Solo su un run CHIUSO come done: rivedere un lavoro dichiarato incompleto
-    // (blocked/partial/needs_input) o non completato e' rumore.
-    if !outcome.completed {
-        return;
-    }
-    let declared = outcome
-        .declared_outcome
-        .as_ref()
-        .and_then(|v| v.get("outcome"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if matches!(declared, "blocked" | "partial" | "needs_input") {
-        return;
-    }
-    if !nexus_auth::get_bool_setting(&state.db, "orchestrator.review_panel_autoconvene_enabled")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(true)
-    {
-        return;
-    }
-    let (modified, already_reviewed) = review_gate_signals(steps_pool, run_id).await;
-    if modified.is_empty() || already_reviewed {
-        return;
-    }
-    let deps = build_tool_runner_deps(state);
-    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
-    let ctx = match svc.build_ctx(session_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(run_id = %run_id, "review panel: build_ctx fallita: {e}");
-            return;
-        }
-    };
-    let policy = nexus_agent_graph::decisions::QuorumPolicy {
-        min_valid_verdicts: nexus_auth::get_setting(&state.db, "orchestrator.review_quorum_min_valid")
-            .await
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1),
-        fail_on_high_severity: nexus_auth::get_bool_setting(
-            &state.db,
-            "orchestrator.review_fail_on_high_severity",
-        )
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(true),
-    };
-    let reviewers_backstop = nexus_auth::get_setting(&state.db, "orchestrator.review_panel_size")
-        .await
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(2)
-        .max(1);
-    // Re-risoluzione del piano coi budget RESIDUI reali (stesso punto unico del
-    // pre-run, regola L): il costo gia' speso dal run stringe la review a valle.
-    // `outcome.total_cost` e' il cumulativo del run (asimmetria documentata in
-    // NativeRunOutcome). Sizing spento/non risolto -> backstop storico.
-    let review_time_remaining = crate::agent_tools::subagent_native::run_time_remaining_s(
-        &state.db, steps_pool, run_id,
-    )
-    .await;
-    let reviewers = match resolve_orchestration_plan_for(
-        state,
-        sizing_complexity,
-        sizing_scope_system_wide,
-        false,
-        outcome.total_cost,
-        review_time_remaining,
-    )
-    .await
-    {
-        Some(plan) => {
-            if plan.review_panel_size == 0 {
-                tracing::info!(
-                    run_id = %run_id,
-                    sized_by = plan.sized_by.as_str(),
-                    "review panel: azzerato dal dimensionamento (budget residuo insufficiente)"
-                );
-                return;
-            }
-            plan.review_panel_size
-        }
-        None => reviewers_backstop,
-    };
-    let files_line = modified
-        .iter()
-        .map(|f| format!("- {f}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let task = format!(
-        "Rivedi le modifiche al codice appena applicate dal run corrente. File modificati:\n\
-         {files_line}\n\nLeggi questi file, verifica correttezza, sicurezza, edge case e \
-         regressioni, e dichiara il verdetto con review_verdict."
-    );
-    tracing::info!(
-        run_id = %run_id,
-        reviewers,
-        files = modified.len(),
-        "review panel: convocazione programmatica (rinforzo <revisione_finale>)"
-    );
-    let Some(panel) =
-        crate::agent_tools::subagent_native::convene_review_panel(&ctx, &task, reviewers, &policy)
-            .await
-    else {
-        return; // nessun verdetto valido: best-effort, niente nota
-    };
-    if !panel.verdict.is_approved() {
-        let note = render_review_panel_note(&panel);
-        let base = outcome.final_answer.clone().unwrap_or_default();
-        outcome.final_answer = Some(if base.trim().is_empty() {
-            note
-        } else {
-            format!("{base}\n\n---\n{note}")
-        });
-        // La review non e' piu' solo una voce: su Fail/NeedsChanges il run NON
-        // chiude "completed" — classify_status (punto unico) mappa
-        // FailedDiagnosed dal segnale strutturato. La nota resta il display; il
-        // flag governa l'esito. La correzione AUTOMATICA (re-loop come il
-        // final_gate) richiede un ingresso di ri-apertura nel motore (il resume
-        // di un run a `End` corto-circuita, nexus-graph/engine.rs): task
-        // separato — questo fix chiude intanto il "finge successo".
-        outcome.review_panel_rejected = review_verdict_rejects(panel.verdict);
-    }
 }
 
 async fn maybe_convene_multi_provider_panel(
@@ -7028,6 +6902,7 @@ mod tests_native_mapping {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_last: None,
             pending_actions: Vec::new(),
         }
     }

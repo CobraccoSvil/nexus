@@ -63,5 +63,6 @@ pub mod embedding_store;
 
 // --- 3 impl FASE 2c: LlmGateway / ToolExecutor / CriteriaRunner ---
 pub mod criteria_runner;
+pub mod review_panel;
 pub mod llm_gateway;
 pub mod tool_executor;

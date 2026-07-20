@@ -538,6 +538,53 @@ pub trait CriteriaRunner: Send + Sync {
     ) -> Result<Vec<CriterionResult>, PortError>;
 }
 
+/// Richiesta di convocazione del panel di review adversariale (ReviewGate).
+/// Il grafo passa solo cio' che sa; il concreto (mcp-core) risolve settings,
+/// sizing e sub-run.
+#[derive(Debug, Clone)]
+pub struct ReviewPanelRequest {
+    /// Run per cui la review giudica (= thread del grafo).
+    pub run_id: String,
+    /// Costo cumulativo gia' speso dal run (stringe il sizing del panel).
+    pub cost_spent_usd: f64,
+    /// Ciclo di review corrente (1-based): al secondo giro il concreto sa che
+    /// e' una RI-review dopo correzione.
+    pub cycle: i64,
+}
+
+/// Perche' il panel NON e' stato convocato (segnale strutturato, regola M:
+/// il nodo decide sul motivo, mai su una stringa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSkipReason {
+    /// `orchestrator.review_panel_autoconvene_enabled` = false.
+    AutoconveneDisabled,
+    /// Il run non ha modificato codice: niente da rivedere.
+    NoCodeChanges,
+    /// Una review e' gia' avvenuta in questo run (direttiva LLM onorata).
+    AlreadyReviewed,
+    /// Il dimensionamento ha azzerato il panel (budget residuo insufficiente).
+    SizedToZero,
+    /// Panel convocato ma nessun verdetto valido raccolto.
+    NoValidVerdict,
+}
+
+/// Esito della porta: panel saltato (con motivo) o convocato (col verdetto
+/// composto dal punto unico `decisions::compose_panel_verdict`).
+#[derive(Debug, Clone)]
+pub enum ReviewPanelReport {
+    Skipped(ReviewSkipReason),
+    Convened(crate::decisions::PanelOutcome),
+}
+
+/// Porta del panel di review adversariale (gemello di [`CriteriaRunner`] per il
+/// ReviewGate). Il concreto in mcp-core convoca i sub-run revisori
+/// (`convene_review_panel`) e compone il verdetto; il nodo decide SOLO sul
+/// [`ReviewPanelReport`]. In shadow/replay il concreto non viene chiamato.
+#[async_trait]
+pub trait ReviewPanelPort: Send + Sync {
+    async fn review(&self, req: ReviewPanelRequest) -> Result<ReviewPanelReport, PortError>;
+}
+
 /// Esito di UN run del verifier da persistere su `nexus_agent_verifier_runs`
 /// (`verifier_node._persist_verifier_run`, `verifier_node.py:584-601`). Forma
 /// minimale: i campi della INSERT (`run_id`/`todo_id`/`cycle`/`criteria_results`/

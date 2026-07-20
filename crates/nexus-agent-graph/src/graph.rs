@@ -120,6 +120,9 @@ pub struct AgentGraphNodes {
     pub verifier: Arc<AgentGraphNode>,
     /// Verifica E2E pre-chiusura.
     pub final_gate: Arc<AgentGraphNode>,
+    /// Review adversariale come gate di chiusura (rimando in correzione su
+    /// bocciatura, gemello del final_gate).
+    pub review_gate: Arc<AgentGraphNode>,
     /// Self-reflection (gate sampling).
     pub reflection: Arc<AgentGraphNode>,
     /// Chiusura del run (learning/persistenza).
@@ -143,9 +146,11 @@ pub fn node_target_to_node_id(target: NodeTarget) -> NodeId {
         NodeTarget::ScaleControl => NodeId::ScaleControl,
         // Self-loop G1 nativo nel motore (no nodo passthrough, regola H).
         NodeTarget::G1Continue => NodeId::Executor,
-        // graph.py: il target "learner" delle route_after_* va al nodo reflection
-        // (reflection -> learner -> END). Punto di chiusura del run.
-        NodeTarget::Learner => NodeId::Reflection,
+        // graph.py: il target "learner" delle route_after_* chiudeva su
+        // reflection; ora la chiusura ONESTA passa PRIMA dal ReviewGate
+        // (review_gate -> reflection -> learner -> END), che su bocciatura
+        // rimanda in correzione invece di lasciar chiudere un lavoro bocciato.
+        NodeTarget::Learner => NodeId::ReviewGate,
     }
 }
 
@@ -237,6 +242,21 @@ fn build_edges(
     // (rientro-applicazione, PR-B3). INERTE oggi: nessun detector emette ScaleReason,
     // quindi il nodo non e' mai raggiunto.
     edges.insert(NodeId::ScaleControl, Edge::Static(NodeId::Executor));
+    // review_gate -> executor (bocciatura rimandata in correzione, stesso
+    // predicato del final_gate: punto unico gate_rimanda_in_correzione) oppure
+    // -> reflection (chiusura). ATTENZIONE: il ramo di chiusura punta a
+    // NodeId::Reflection ESPLICITO, mai via node_target_to_node_id(Learner) --
+    // quella mappatura ora porta QUI e creerebbe un self-loop infinito.
+    edges.insert(
+        NodeId::ReviewGate,
+        Edge::conditional(|state: &AgentState| {
+            if crate::routing::gate_rimanda_in_correzione(state) {
+                NodeId::Executor
+            } else {
+                NodeId::Reflection
+            }
+        }),
+    );
     // reflection -> learner -> END (chiusura del run).
     edges.insert(NodeId::Reflection, Edge::Static(NodeId::Learner));
     edges.insert(NodeId::Learner, Edge::End);
@@ -342,6 +362,7 @@ fn build_node_map(nodes: AgentGraphNodes) -> HashMap<NodeId, Arc<AgentGraphNode>
     map.insert(NodeId::Supervisor, nodes.supervisor);
     map.insert(NodeId::Verifier, nodes.verifier);
     map.insert(NodeId::FinalGate, nodes.final_gate);
+    map.insert(NodeId::ReviewGate, nodes.review_gate);
     map.insert(NodeId::Reflection, nodes.reflection);
     map.insert(NodeId::Learner, nodes.learner);
     map
@@ -411,7 +432,7 @@ mod tests {
         StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubTodoStore,
         StubVerifierRunStore,
     };
-    use crate::runtime::StubMetaReasonerPort;
+    use crate::runtime::{StubMetaReasonerPort, StubReviewPanelPort};
     use crate::state::{AutomationMode, Message, MessageContent, StateDelta, StopReason, ToolUse};
 
     // ── Checkpointer in-memory (zero DB nel test) ─────────────────────────────
@@ -712,6 +733,14 @@ mod tests {
                 stub_criteria(),
                 meta_steps.clone(),
             )),
+            review_gate: Arc::new(crate::nodes::review_gate::ReviewGateNode::new(
+                crate::nodes::review_gate::ReviewGateConfig {
+                    enabled: false, // fixture: gate inerte nei test topologici
+                    max_cycles: 1,
+                },
+                Arc::new(StubReviewPanelPort),
+                meta_steps.clone(),
+            )),
             reflection: Arc::new(ReflectionNode::new(ReflectionConfig::default())),
             learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
         }
@@ -761,15 +790,17 @@ mod tests {
 
     #[test]
     fn mapping_g1continue_e_learner_strutturale() {
-        // Le due differenze strutturali volute (regola H): g1_continue -> executor
-        // (self-loop nativo), learner -> reflection (graph.py rimappa).
+        // Le differenze strutturali volute (regola H): g1_continue -> executor
+        // (self-loop nativo); learner -> REVIEW_GATE (la chiusura onesta passa
+        // dalla review adversariale prima di reflection: su bocciatura il gate
+        // rimanda in correzione invece di lasciar chiudere un lavoro bocciato).
         assert_eq!(
             node_target_to_node_id(NodeTarget::G1Continue),
             NodeId::Executor
         );
         assert_eq!(
             node_target_to_node_id(NodeTarget::Learner),
-            NodeId::Reflection
+            NodeId::ReviewGate
         );
         // Gli altri sono 1:1.
         assert_eq!(
@@ -842,6 +873,42 @@ mod tests {
         assert_eq!(edge.resolve(&AgentState::default()), NodeId::Executor);
     }
 
+    /// REGRESSIONE (il difetto chiesto due volte: "se non superata dovrebbe
+    /// tentare di sistemare"): la chiusura onesta passa dal ReviewGate, e il suo
+    /// edge rimanda all'Executor su bocciatura o prosegue su Reflection.
+    ///
+    /// TRAPPOLA LETALE coperta: la mappatura `NodeTarget::Learner` ora punta a
+    /// ReviewGate; se l'edge del ReviewGate usasse `node_target_to_node_id`
+    /// (invece di Reflection ESPLICITO) il nodo ricircolerebbe su se stesso
+    /// all'infinito. Il test asserisce entrambe le direzioni sul GRAFO REALE.
+    #[test]
+    fn review_gate_rimanda_o_chiude_senza_ricircolare() {
+        use crate::state::StopReason;
+        let edges = build_edges(
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+        );
+        // La chiusura onesta (target Learner) entra nel ReviewGate.
+        assert_eq!(
+            node_target_to_node_id(crate::routing::NodeTarget::Learner),
+            NodeId::ReviewGate,
+            "la chiusura deve passare dal gate della review"
+        );
+        let edge = edges.get(&NodeId::ReviewGate).expect("edge review_gate");
+        // Bocciatura rimandata (stop_reason ToolUse dal delta del nodo) -> Executor.
+        let rimandato = AgentState {
+            stop_reason: Some(StopReason::ToolUse),
+            ..Default::default()
+        };
+        assert_eq!(edge.resolve(&rimandato), NodeId::Executor);
+        // Chiusura (approvato/non applicabile/cap) -> Reflection, MAI ReviewGate.
+        let chiude = AgentState::default();
+        let next = edge.resolve(&chiude);
+        assert_eq!(next, NodeId::Reflection, "chiusura su Reflection");
+        assert_ne!(next, NodeId::ReviewGate, "mai un self-loop del gate");
+    }
+
     #[test]
     fn topologia_copre_ogni_nodo_non_terminale() {
         let edges = build_edges(
@@ -863,6 +930,7 @@ mod tests {
             NodeId::Supervisor,
             NodeId::Verifier,
             NodeId::FinalGate,
+            NodeId::ReviewGate,
             NodeId::Reflection,
             NodeId::Learner,
         ] {

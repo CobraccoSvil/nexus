@@ -187,7 +187,7 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub closure_verdict: Option<Option<Value>>,
-    /// Vedi `AgentState::review_verdict`.
+    /// Vedi `AgentState::review_gate_verdict`.
     #[serde(
         default,
         deserialize_with = "double_option",
@@ -691,6 +691,20 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub final_gate_verdict: Option<Option<crate::state::FinalGateVerdict>>,
+    /// Vedi `AgentState::review_gate_cycle`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_gate_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::review_gate_verdict`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_gate_verdict: Option<Option<crate::state::ReviewGateVerdict>>,
     /// Vedi `AgentState::final_gate_passed`.
     #[serde(
         default,

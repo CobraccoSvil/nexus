@@ -14,6 +14,7 @@
 pub mod clarify_or_expand;
 pub mod executor;
 pub mod final_gate;
+pub mod review_gate;
 pub mod learner;
 pub mod planner;
 pub mod reflection;
@@ -30,6 +31,7 @@ pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
+pub use review_gate::{ReviewGateConfig, ReviewGateNode};
 pub use final_gate::{
     build_error_files, count_build_errors, error_file_matches_touched, FinalGateConfig,
     FinalGateNode, FINAL_GATE_ESCALATION_KEY,

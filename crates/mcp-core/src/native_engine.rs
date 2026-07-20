@@ -116,7 +116,7 @@ use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
     ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict, LearnerConfig,
-    LearnerNode, Message,
+    LearnerNode, Message, ReviewGateConfig, ReviewGateNode, ReviewGateVerdict,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
     UnderstandingNode, SupervisorMode,
@@ -271,6 +271,12 @@ pub struct NativeRunInput {
     /// scrittura.
     pub advisory_gate:
         Option<tokio::sync::watch::Receiver<nexus_agent_graph::nodes::AdvisoryGateState>>,
+    /// Dimensionamento del turno (dal classifier): il ReviewGate lo usa per
+    /// stringere il panel coi budget residui (stesso punto unico del pre-run).
+    /// `None` nei percorsi senza classifier (sub-run, resume): vale il backstop.
+    pub sizing_complexity:
+        Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    pub sizing_scope_system_wide: bool,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -490,15 +496,18 @@ pub struct NativeRunOutcome {
     ///
     /// Letto dal finalizzatore: mai `Completed` con una bocciatura pendente.
     pub final_gate_failed_pending: bool,
-    /// `true` quando la review adversariale convocata PROGRAMMATICAMENTE a valle
-    /// (`maybe_convene_review_panel`) NON ha approvato (Fail/NeedsChanges) su
-    /// codice modificato: segnale STRUTTURATO (regola M) che il run non e' un
-    /// successo pulito. Letto da `classify_status` (punto unico, regola L) per
-    /// mappare FailedDiagnosed invece di Completed — la review ora ha potere
-    /// sull'esito, non solo una nota nel resoconto (run 20/07 10:03:30: verdetto
-    /// Fail 2/2, run rimasto `completed`). `Inconclusive` (quorum non raggiunto)
-    /// NON e' un rifiuto: limite infra, non difetto del codice -> resta `false`.
+    /// `true` quando la review adversariale del ReviewGate (nodo del grafo,
+    /// prima della chiusura) NON ha approvato (Fail/NeedsChanges) su codice
+    /// modificato: segnale STRUTTURATO (regola M) che il run non e' un successo
+    /// pulito. Letto da `classify_status` (punto unico, regola L) per mappare
+    /// FailedDiagnosed invece di Completed. `Inconclusive` (quorum non
+    /// raggiunto) NON e' un rifiuto: limite infra, non difetto del codice ->
+    /// resta `false`.
     pub review_panel_rejected: bool,
+    /// Esito dell'ultimo panel (`PanelOutcome::to_value`, trasportato dal
+    /// ReviewGate in `extra.review_panel_last`): alimenta la nota onesta nel
+    /// resoconto. `None` = panel mai convocato.
+    pub review_panel_last: Option<serde_json::Value>,
     /// Azioni in attesa di conferma utente (HITL modalita' Conferma), serializzate
     /// dal grafo in `extra.hitl_pending_actions`. Vuoto se nessuna sospensione HITL.
     pub pending_actions: Vec<serde_json::Value>,
@@ -935,6 +944,16 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
 /// `None`/vuoto il criterio corrispondente NON si aggiunge (non blocca, niente
 /// toppa). `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
+/// Config del ReviewGate (gemella del loader del final_gate). Le chiavi sono
+/// quelle della review programmatica gia' esistenti + il cap dei rimandi
+/// (mig 0624). Regola G: tutto dal DB, il default e' solo safe-default.
+async fn load_review_gate_config(db: &PgPool) -> ReviewGateConfig {
+    ReviewGateConfig {
+        enabled: setting_bool(db, "orchestrator.review_panel_autoconvene_enabled", true).await,
+        max_cycles: setting_i64(db, "orchestrator.review_max_correction_cycles", 1).await,
+    }
+}
+
 async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
     let d = FinalGateConfig::default();
     // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
@@ -2127,6 +2146,18 @@ async fn build_native_engine(
     ));
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
+    // Porta del panel di review (ReviewGate). Nel ruolo shadow il nodo passa
+    // in Replay e non chiama la porta; il concreto resta comunque innocuo.
+    let review_panel: Arc<dyn nexus_agent_graph::runtime::ports::ReviewPanelPort> =
+        Arc::new(crate::agent_graph_adapter::review_panel::ReviewPanelAdapter::new(
+            db.clone(),
+            run_db.clone(),
+            deps.tool_runner_deps.clone(),
+            input.session_id,
+            input.sizing_complexity,
+            input.sizing_scope_system_wide,
+        ));
+
     // ── Config dei nodi (DB-driven, regola G piena) ──────────────────────────
     // DEBITO 2 chiuso (TODO Fase 5): le config dei nodi che il brain Python legge
     // da `orchestrator_config.get()` (`orchestrator_config.py`) vengono ora LETTE
@@ -2137,6 +2168,7 @@ async fn build_native_engine(
     // lo shadow (run_shadow): entrambi passano di qui (punto unico).
     let planner_cfg = load_planner_config(&db).await;
     let mut final_gate_cfg = load_final_gate_config(&db).await;
+    let review_gate_cfg = load_review_gate_config(&db).await;
     let verifier_cfg = load_verifier_config(&db).await;
 
     // ── Catena di verifica per-AMBIENTE (ADR 0036) ───────────────────────────
@@ -2351,6 +2383,11 @@ async fn build_native_engine(
             final_gate_cfg,
             routing_cfg.clone(),
             criteria,
+            meta_steps.clone(),
+        )),
+        review_gate: Arc::new(ReviewGateNode::new(
+            review_gate_cfg,
+            review_panel,
             meta_steps.clone(),
         )),
         reflection: Arc::new(ReflectionNode::new(reflection_cfg)),
@@ -3085,9 +3122,22 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
-        // La review programmatica gira DOPO run_engine (nel finalizzatore): qui
-        // nasce false, maybe_convene_review_panel lo alza su bocciatura.
-        review_panel_rejected: false,
+        // Esito della review adversariale dal SEGNALE del ReviewGate (regola M),
+        // match esaustivo: un ramo nuovo del nodo non compila finche' non
+        // dichiara cosa significa qui. `PendingCorrection` a fine run e' vero
+        // per costruzione: la review aveva bocciato e la ri-review non e'
+        // avvenuta (run morto prima di rientrare).
+        review_panel_rejected: match state.review_gate_verdict {
+            Some(ReviewGateVerdict::PendingCorrection | ReviewGateVerdict::RejectedFinal) => true,
+            Some(
+                ReviewGateVerdict::Approved
+                | ReviewGateVerdict::NotApplicable
+                | ReviewGateVerdict::Inconclusive
+                | ReviewGateVerdict::Unavailable,
+            )
+            | None => false,
+        },
+        review_panel_last: state.extra.get("review_panel_last").cloned(),
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
         // Bocciatura del gate rimasta pendente a fine run: letta dal SEGNALE del
@@ -3433,6 +3483,8 @@ mod tests {
             // Run principale di test: nessun annidamento sub-agente.
             parent_run_id: None,
             subagent_depth: None,
+            sizing_complexity: None,
+            sizing_scope_system_wide: false,
             run_time_budget_s: None,
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,
@@ -4799,6 +4851,7 @@ mod tests {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_last: None,
             pending_actions: Vec::new(),
         }
     }

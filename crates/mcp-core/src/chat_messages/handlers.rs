@@ -1075,6 +1075,8 @@ async fn try_resume_interrupted_run(
             step_tx: tx,
             parent_run_id: None,
             subagent_depth: None,
+            sizing_complexity: None,
+            sizing_scope_system_wide: false,
             run_time_budget_s: None,
             working_root: None,
             // I panel a monte hanno gia' deliberato sul run originale: il resume

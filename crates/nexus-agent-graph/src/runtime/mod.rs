@@ -54,6 +54,22 @@ impl EventSink for NullEventSink {
 /// un "magic fallback" mascherante (regola G): un DB-down / provider indisponibile
 /// nell'impl CONCRETA ritorna `Err(PortError::ProviderUnavailable)`, mai `Ok(None)`.
 /// Questo stub e' inerte per COSTRUZIONE (non consulta nulla), non maschera guasti.
+/// Porta del panel di review INERTE (sempre `Skipped(AutoconveneDisabled)`):
+/// per fixture topologiche/test dove il gate non deve convocare nulla.
+pub struct StubReviewPanelPort;
+
+#[async_trait]
+impl crate::runtime::ports::ReviewPanelPort for StubReviewPanelPort {
+    async fn review(
+        &self,
+        _req: crate::runtime::ports::ReviewPanelRequest,
+    ) -> Result<crate::runtime::ports::ReviewPanelReport, PortError> {
+        Ok(crate::runtime::ports::ReviewPanelReport::Skipped(
+            crate::runtime::ports::ReviewSkipReason::AutoconveneDisabled,
+        ))
+    }
+}
+
 pub struct StubMetaReasonerPort;
 
 #[async_trait]

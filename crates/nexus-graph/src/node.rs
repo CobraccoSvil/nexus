@@ -53,6 +53,11 @@ pub enum NodeId {
     Supervisor,
     Verifier,
     FinalGate,
+    /// Gate della review adversariale (gemello del FinalGate): interposto sul
+    /// funnel di chiusura onesta, su bocciatura rimanda in correzione
+    /// all'Executor invece di lasciare che il run arrivi a End con un verdetto
+    /// Fail pendente (il resume di un run a End e' un no-op per costruzione).
+    ReviewGate,
     Reflection,
     Learner,
 }
@@ -76,6 +81,7 @@ impl NodeId {
             NodeId::Supervisor => "supervisor",
             NodeId::Verifier => "verifier",
             NodeId::FinalGate => "final_gate",
+            NodeId::ReviewGate => "review_gate",
             NodeId::Reflection => "reflection",
             NodeId::Learner => "learner",
         }
@@ -99,6 +105,7 @@ impl NodeId {
             "supervisor" => NodeId::Supervisor,
             "verifier" => NodeId::Verifier,
             "final_gate" => NodeId::FinalGate,
+            "review_gate" => NodeId::ReviewGate,
             "reflection" => NodeId::Reflection,
             "learner" => NodeId::Learner,
             _ => return None,

@@ -96,7 +96,7 @@ pub struct LegacyChatRequest {
 // esterni (routes/public.rs, chat_attachments.rs) non cambiano.
 // ---------------------------------------------------------------------------
 
-mod agent_run;
+pub(crate) mod agent_run;
 mod auto_compact;
 mod context;
 mod handlers;

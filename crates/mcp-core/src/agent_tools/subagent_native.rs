@@ -3450,6 +3450,8 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         step_tx: sub_tx,
         parent_run_id: Some(anchor),
         subagent_depth: Some(current_depth),
+        sizing_complexity: None,
+        sizing_scope_system_wide: false,
         // Il tetto REALE di questa figura (lo stesso del `tokio::time::timeout`
         // esterno qui sotto) entra nel motore: senza, il gate a tempo dell'executor
         // userebbe il setting globale `agent.run_time_budget_s` (0 per policy) e
@@ -4657,6 +4659,7 @@ mod tests {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_last: None,
             pending_actions: Vec::new(),
         }
     }
@@ -6071,6 +6074,7 @@ mod tests {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_last: None,
             pending_actions: Vec::new(),
         };
         let keys = |v: &Value| -> BTreeSet<String> {

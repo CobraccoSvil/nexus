@@ -63,6 +63,33 @@ pub enum FinalGateVerdict {
     /// caso in cui l'esito "verifica fallita e non ripetuta" e' VERO.
     FailedPendingCorrection,
 }
+
+/// ESITO dell'ultimo passaggio dal ReviewGate (gemello di [`FinalGateVerdict`],
+/// regola M: l'esito e' un campo proprio, mai dedotto dal contatore
+/// `review_cycle`). Lo scrive OGNI ramo del nodo; i consumatori fanno `match`
+/// esaustivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewGateVerdict {
+    /// Il panel ha approvato (Pass): il run chiude con review superata.
+    Approved,
+    /// Il gate non si applicava (disabilitato, nessun codice modificato,
+    /// dichiarazione non-done, run gia' bocciato dal final_gate, panel
+    /// azzerato dal dimensionamento): nessun giudizio emesso.
+    NotApplicable,
+    /// Panel convocato ma quorum non raggiunto: limite infrastrutturale, non un
+    /// difetto del codice (mai trattato come rifiuto).
+    Inconclusive,
+    /// La convocazione e' fallita a monte (ctx non costruibile, porta in
+    /// errore): il giudizio non e' stato possibile.
+    Unavailable,
+    /// Bocciatura con correzione RIMANDATA all'executor: la ri-review era
+    /// prevista. Se il run muore prima di rientrare nel gate, la bocciatura
+    /// resta VERA (nessuna ri-verifica avvenuta).
+    PendingCorrection,
+    /// Bocciatura DEFINITIVA: cap dei rimandi raggiunto, il run chiude bocciato.
+    RejectedFinal,
+}
 pub use message::{ContentBlock, Message, MessageContent, ToolUse};
 
 /// Modalita' supervisore worker (UI: off / su anomalia / ogni N step / continuo).
@@ -481,6 +508,18 @@ pub struct AgentState {
     ///
     /// `None` = il gate non e' mai entrato in questo run.
     pub final_gate_verdict: Option<FinalGateVerdict>,
+    /// Ciclo del ReviewGate (CONTATORE dei rimandi in correzione della review
+    /// adversariale; gemello di `final_gate_cycle`; `review_gate_*` e non
+    /// `review_*`: `review_verdict` e' gia' il CANALE DI RUOLO del revisore, mai riusato quello: il
+    /// residuo di un contatore altrui e' gia' stato causa di un falso
+    /// `FailedDiagnosed`, vedi doc di `final_gate_verdict`).
+    #[serde(default)]
+    pub review_gate_cycle: Option<i64>,
+    /// ESITO dell'ultimo passaggio dal ReviewGate (regola M): il segnale che il
+    /// finalizzatore legge per `review_panel_rejected`. `None` = nodo mai
+    /// raggiunto (motore vecchio o run chiuso per altra via).
+    #[serde(default)]
+    pub review_gate_verdict: Option<ReviewGateVerdict>,
     /// `true` quando il final gate ha PASSATO la verifica E2E (esito canonico
     /// CompletedVerified lato mcp-core). Settato solo sul ramo PASSED del
     /// `final_gate_node`; il ramo forced_close/cap NON lo imposta (resta

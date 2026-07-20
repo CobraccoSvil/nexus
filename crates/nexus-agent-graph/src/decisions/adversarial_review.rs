@@ -65,6 +65,17 @@ impl PanelVerdict {
     pub fn is_approved(self) -> bool {
         matches!(self, Self::Pass)
     }
+
+    /// Un verdetto di panel e' un RIFIUTO strutturato (il run non e' un
+    /// successo, regola M) SOLO per Fail/NeedsChanges. `Inconclusive` (quorum
+    /// non raggiunto) e' un limite infrastrutturale, non un difetto del codice;
+    /// `Pass` e' un'approvazione. Punto unico (regola L): il ReviewGate del
+    /// grafo e il finalizzatore mcp-core decidono ENTRAMBI da qui (era
+    /// `review_verdict_rejects` privata in agent_run.rs, irraggiungibile dal
+    /// motore).
+    pub fn rejects(self) -> bool {
+        matches!(self, Self::Fail | Self::NeedsChanges)
+    }
 }
 
 /// Policy del quorum (DB-driven, regola G): caricata dal chiamante e passata qui.
