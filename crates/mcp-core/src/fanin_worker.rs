@@ -278,7 +278,13 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
     let mut requeued = 0u64;
     for project_id in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+            match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(project_id = %project_id, error = %e, "fan-in backstop: DB progetto non disponibile, progetto saltato per questo giro");
+                    continue;
+                }
+            };
         requeued +=
             backstop_project(&state.db, &proj_pool, orphan_timeout_s as i64, no_progress).await;
     }
@@ -460,7 +466,22 @@ async fn process_queue_row(state: &AppState, row: QueueRow) {
     } = row;
 
     // Pool del progetto (separazione DB): agent_runs e' migrata per-progetto.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // Se il DB del progetto non e' disponibile la riga resta in coda e viene
+    // ritentata al prossimo giro (niente fallback al meta-DB).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mcp_core::fanin_worker",
+                    parent_run_id = %parent_run_id,
+                    project_id = %project_id,
+                    error = %e,
+                    "fan-in: DB progetto non disponibile, riga saltata per questo giro"
+                );
+                return;
+            }
+        };
 
     // CAS: transizione atomica awaiting_subagents -> running. RETURNING id ->
     // vince UN solo consumer/giro (idempotenza del resume, regola H: e' il CAS a

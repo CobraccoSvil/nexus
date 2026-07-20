@@ -61,7 +61,9 @@ pub(crate) async fn load_session_context(
 ) -> Result<SessionContext, ApiError> {
     // La sessione chat vive nel DB del progetto (risolto da session_id via la
     // directory di routing); ensure_project_access resta sul meta-DB (globale).
-    let chat_pool = crate::project_db_routes::project_data_pool_by_session(state, session_id).await;
+    // DB progetto non disponibile -> 503 strutturato (regola M), mai meta-DB.
+    let chat_pool =
+        crate::project_db_routes::project_data_pool_by_session(state, session_id).await?;
     let row = sqlx::query(
         r#"
         SELECT id, project_id, user_id
@@ -101,22 +103,34 @@ pub(crate) async fn load_session_context(
 }
 
 pub(crate) async fn update_user_active_project(state: &AppState, user_id: Uuid, project_id: Uuid) {
-    // Separazione DB: project_open_sessions e' migrata, instrada sul pool del progetto.
-    let data_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO project_open_sessions (
-            id, user_id, project_id, last_opened_at, created_at, updated_at
-        )
-        VALUES (gen_random_uuid(), $1, $2, NOW(), NOW(), NOW())
-        ON CONFLICT (user_id, project_id)
-        DO UPDATE SET last_opened_at = NOW(), updated_at = NOW()
-        "#,
-    )
-    .bind(user_id)
-    .bind(project_id)
-    .execute(&data_pool)
-    .await;
+    // Separazione DB: project_open_sessions e' migrata, instrada sul pool del
+    // progetto. Best-effort: DB progetto non disponibile -> WARN e si salta
+    // l'aggiornamento (mai scriverlo sul meta, regola M).
+    match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+        Ok(data_pool) => {
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO project_open_sessions (
+                    id, user_id, project_id, last_opened_at, created_at, updated_at
+                )
+                VALUES (gen_random_uuid(), $1, $2, NOW(), NOW(), NOW())
+                ON CONFLICT (user_id, project_id)
+                DO UPDATE SET last_opened_at = NOW(), updated_at = NOW()
+                "#,
+            )
+            .bind(user_id)
+            .bind(project_id)
+            .execute(&data_pool)
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "update_user_active_project: DB progetto non disponibile, last_opened_at non aggiornato"
+            );
+        }
+    }
 
     // Avvia indicizzazione semantica in background se non ancora eseguita.
     crate::projects::indexing::spawn_code_index_if_needed(state, project_id).await;
@@ -137,11 +151,12 @@ pub async fn list_chat_sessions(
     let project_id = parse_project_id(project_id_raw)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
-    // Cutover separazione DB (regola L): i dati chat vivono nel DB del progetto
-    // quando il flag e' on; project_data_pool e' il punto unico (flag off ->
-    // ritorna il meta-DB, comportamento storico). ensure_project_access sopra
-    // resta sul meta-DB (membership globale).
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, project_id).await;
+    // Separazione DB (regola L): i dati chat vivono nel DB del progetto;
+    // project_data_pool e' il punto unico. DB non disponibile (es. progetto in
+    // provisioning) -> 503 strutturato, MAI lista vuota dal meta (incidente
+    // 2026-07-20: il client scambiava il fallback per "nessuna sessione").
+    // ensure_project_access sopra resta sul meta-DB (membership globale).
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, project_id).await?;
 
     let rows = sqlx::query(
         r#"
@@ -240,9 +255,10 @@ pub async fn create_chat_session(
     let project_id = parse_project_id(&body.project_id)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
-    // Cutover separazione DB: la sessione chat si scrive nel DB del progetto
-    // (flag off -> meta-DB). project_id in scope dal body.
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, project_id).await;
+    // Separazione DB: la sessione chat si scrive nel DB del progetto. DB non
+    // disponibile -> 503 (regola M): l'INSERT sul meta creava una sessione
+    // "fantasma" che spariva dalla UI appena il DB del progetto tornava su.
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, project_id).await?;
 
     let session_id = Uuid::new_v4();
     let title = body
@@ -345,7 +361,7 @@ pub async fn update_chat_session(
         .as_deref()
         .and_then(normalize_session_pin);
 
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await;
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await?;
     sqlx::query(
         r#"
         UPDATE chat_sessions SET
@@ -385,7 +401,7 @@ pub async fn delete_chat_session(
 
     let ctx = load_session_context(&state, session_id, user_id).await?;
 
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await;
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, ctx.project_id).await?;
     // Soft-delete messages
     sqlx::query(
         "UPDATE chat_messages SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
@@ -471,8 +487,22 @@ impl CompactError {
 /// duplicata sugli stessi tool mutativi. `None` se il worklog e' vuoto o
 /// disabilitato (il riassunto procede senza la sezione strutturale).
 async fn structured_work_state(db: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
-    // Worklog di sessione nel DB del progetto (risolto da session_id via routing).
-    let pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    // Worklog di sessione nel DB del progetto (risolto da session_id via
+    // routing). Best-effort: DB non disponibile -> il riassunto procede senza
+    // la sezione strutturale (WARN), mai una lettura vuota dal meta.
+    let pool = match crate::project_db_routes::project_data_pool_by_session_from(db, session_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "structured_work_state: DB progetto non disponibile, sezione worklog omessa"
+            );
+            return None;
+        }
+    };
     let block = crate::session_worklog::fetch_rendered_block(db, &pool, session_id).await?;
     Some(format!(
         "\n\n## Stato lavori (worklog di sessione, punto unico — non perdere questi fatti)\n{block}"
@@ -489,9 +519,12 @@ pub(crate) async fn compact_session_core(
     // Necessario perche' dopo una compattazione l'utente continua a chattare
     // accumulando nuovi token che devono poter essere a loro volta compattati.
 
-    // Cutover separazione DB: i dati chat della compattazione vivono nel DB del
-    // progetto (flag off -> meta-DB). project_id e' in scope.
-    let chat_pool = crate::project_db_routes::project_data_pool(state, project_id).await;
+    // Separazione DB: i dati chat della compattazione vivono nel DB del
+    // progetto. DB non disponibile -> errore con lo status del punto unico
+    // (503), propagato sia all'endpoint manuale sia all'auto-compact.
+    let chat_pool = crate::project_db_routes::project_data_pool(state, project_id)
+        .await
+        .map_err(|e| CompactError::new(e.status_code(), e.to_string()))?;
 
     // Load non-deleted messages
     let rows = sqlx::query(
@@ -841,7 +874,7 @@ pub(crate) async fn compact_session_core(
     // alla compattazione successiva (non piu' solo nel testo libero del summary).
     if !distilled_decisions.is_empty() {
         // Worklog nel DB del progetto (separazione DB): riuso il chat_pool gia'
-        // risolto in questa funzione (flag off -> meta).
+        // risolto in questa funzione.
         let _ = crate::session_worklog::ingest_decisions(
             &state.db,
             &chat_pool,
@@ -896,9 +929,9 @@ pub async fn list_project_memories(
     let project_id = Uuid::parse_str(&project_id_str)
         .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "project id non valido"))?;
 
-    // prompt_corrections e chat_sessions sono entrambe migrate: il JOIN e' valido
-    // sul pool del progetto (separazione DB, flag OFF -> meta).
-    let mem_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // prompt_corrections e chat_sessions sono entrambe migrate: il JOIN e'
+    // valido sul pool del progetto. DB non disponibile -> 503 strutturato.
+    let mem_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let rows = sqlx::query(
         r#"
         SELECT
@@ -952,7 +985,8 @@ pub async fn toggle_project_memory(
     // nel DB del progetto -> pool via directory di routing (fallback ricerca). La
     // sync Qdrant piu' sotto resta su &state.db (config collection globale).
     let cpool =
-        crate::project_db_routes::project_data_pool_by_correction_from(&state.db, memory_id).await;
+        crate::project_db_routes::project_data_pool_by_correction_from(&state.db, memory_id)
+            .await?;
 
     // Flip the active flag
     let new_active: bool = sqlx::query_scalar(

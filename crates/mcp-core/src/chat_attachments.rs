@@ -292,6 +292,20 @@ pub async fn persist_message_attachments(
         return Vec::new();
     }
 
+    // chat_message_attachments e' migrata: INSERT e COUNT vanno sul pool del
+    // progetto, risolto UNA volta per il batch. Se il DB del progetto non e'
+    // disponibile si salta l'intero batch PRIMA di scrivere file su disco
+    // (niente orfani), senza fallback al meta (mig 0527).
+    let Some(attach_pool) = crate::project_db_routes::project_data_pool_or_warn(
+        db,
+        project_id,
+        "persist_message_attachments (batch saltato prima di scrivere su disco)",
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
     let mut saved = Vec::with_capacity(attachments.len());
 
     for attachment in attachments {
@@ -429,7 +443,7 @@ pub async fn persist_message_attachments(
         .bind(&kind)
         .bind(&content_hash)
         .bind(created_at)
-        .execute(&crate::project_db_routes::project_data_pool_from(db, project_id).await)
+        .execute(&attach_pool)
         .await;
 
         if let Err(e) = insert {
@@ -453,8 +467,8 @@ pub async fn persist_message_attachments(
                 .bind(project_id)
                 .bind(&content_hash)
                 // chat_message_attachments e' migrata: conta sul pool del progetto
-                // (coerente con l'INSERT sopra). Flag OFF -> meta.
-                .fetch_one(&crate::project_db_routes::project_data_pool_from(db, project_id).await)
+                // (coerente con l'INSERT sopra).
+                .fetch_one(&attach_pool)
                 .await
                 .unwrap_or(0);
                 if shared == 0 {
@@ -830,21 +844,32 @@ pub async fn index_attachments_to_kb(
             continue;
         }
 
-        // Aggiorna allegato con kb_note_id + indexed_at.
+        // Aggiorna allegato con kb_note_id + indexed_at. Best-effort come
+        // l'UPDATE stesso (esito gia' ignorato): il doc wiki e' gia' creato,
+        // se il DB del progetto non e' disponibile si salta solo la marcatura.
         // separazione DB: chat_message_attachments e' migrata sul pool di progetto.
-        let attach_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, record.project_id).await;
-        let _ = sqlx::query(
-            r#"
-            UPDATE chat_message_attachments
-            SET kb_note_id = $1, indexed_at = NOW()
-            WHERE id = $2
-            "#,
-        )
-        .bind(note_id)
-        .bind(record.id)
-        .execute(&attach_pool)
-        .await;
+        match crate::project_db_routes::project_data_pool_from(&state.db, record.project_id).await {
+            Ok(attach_pool) => {
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE chat_message_attachments
+                    SET kb_note_id = $1, indexed_at = NOW()
+                    WHERE id = $2
+                    "#,
+                )
+                .bind(note_id)
+                .bind(record.id)
+                .execute(&attach_pool)
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attachment_id = %record.id,
+                    error = %e,
+                    "marcatura kb_note_id allegato: DB progetto non disponibile, salto"
+                );
+            }
+        }
 
         // Emit SSE per aggiornare il pannello KB.
         let _ = nexus_events::dispatcher::emit(

@@ -259,8 +259,8 @@ pub(crate) fn enrich_attachments_with_ids(
 ///
 /// Separazione DB: `chat_message_attachments` e' migrata nel DB del progetto. Il
 /// chiamante DEVE passare un pool GIA' instradato al progetto (risolto via
-/// `project_data_pool_by_message_from` o affine) — NON il meta-DB, che a flag ON
-/// non contiene piu' queste righe e ritornerebbe vuoto.
+/// `project_data_pool_by_message_from` o affine) — NON il meta-DB, che non
+/// contiene piu' queste righe e ritornerebbe vuoto.
 pub(crate) async fn enrich_attachments_with_ids_from_db(
     pool: &PgPool,
     atts: Vec<ChatAttachment>,
@@ -367,9 +367,10 @@ pub(crate) async fn insert_message_with_client_id(
 ) -> Result<ClientIdInsert, ApiError> {
     let message_id = Uuid::new_v4();
     // Cutover separazione DB (route-at-helper): il messaggio si scrive nel DB del
-    // progetto via registry globale. `db` e' il pool meta-DB per la risoluzione;
-    // flag off -> ritorna il meta-DB (comportamento storico).
-    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // progetto via registry globale. `db` e' il pool meta-DB per la risoluzione.
+    // Niente fallback al meta (mig 0527): DB progetto non disponibile -> errore
+    // propagato al chiamante, MAI scrivere il messaggio sul DB sbagliato.
+    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     let insert_result = sqlx::query(
         r#"
         INSERT INTO chat_messages (
@@ -458,7 +459,7 @@ pub(crate) async fn load_message_by_id(
     message_id: Uuid,
 ) -> Result<sqlx::postgres::PgRow, ApiError> {
     // Legge dal DB del progetto dove il messaggio e' stato scritto (route-at-helper).
-    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     sqlx::query(
         r#"
         SELECT

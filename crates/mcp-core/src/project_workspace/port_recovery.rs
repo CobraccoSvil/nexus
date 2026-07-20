@@ -331,7 +331,21 @@ pub async fn port_occupant(port: u16) -> Option<(u32, String)> {
 /// mai killato per liberare una porta (e' il servizio legittimo); uno non
 /// tracciato e' un orfano/avvio manuale.
 pub async fn is_tracked_pid(db: &PgPool, project_id: Uuid, pid: u32) -> bool {
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // DB progetto non disponibile -> fail-safe: consideriamo il PID TRACCIATO
+    // (true), cosi' il chiamante non killa un occupante che non puo' verificare.
+    // Lo stesso principio fail-closed di windows_service_unit_still_exists.
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                pid,
+                error = %e,
+                "is_tracked_pid: DB progetto non disponibile, considero il PID tracciato (fail-safe)"
+            );
+            return true;
+        }
+    };
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM agent_processes WHERE project_id = $1 AND pid = $2 \
          AND status IN ('running','starting')",
@@ -433,8 +447,19 @@ pub async fn scan_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<(u16, u32
         .saturating_sub(1);
 
     // Routing separazione DB: `agent_processes` e' una tabella migrata, va letta
-    // sul pool del progetto (a flag OFF ritorna il meta-pool, comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // sul pool del progetto. Non disponibile -> nessun orfano candidato (fail-safe:
+    // senza l'elenco dei tracciati ogni listener sembrerebbe orfano da killare).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "scan_bucket_orphans: DB progetto non disponibile, nessun orfano candidato"
+            );
+            return Vec::new();
+        }
+    };
     let tracked: std::collections::HashSet<i64> = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT pid FROM agent_processes WHERE project_id = $1 \
          AND status IN ('running','starting')",

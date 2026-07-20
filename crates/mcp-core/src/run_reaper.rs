@@ -48,13 +48,19 @@ pub async fn stale_seconds_from_settings(db: &PgPool) -> i64 {
 /// Ritorna gli id dei run reapati, cosi' il chiamante puo' sbloccare gli
 /// EventSource ancora in ascolto (emissione `is_final` sul broadcast channel).
 /// Il reaper itera i progetti (punto unico `list_all_project_ids`) per girare la
-/// chiusura sul DB di ciascuno (separazione DB): a flag off
-/// `project_data_pool_from` ritorna il meta-DB e la prima iterazione reapa
-/// tutto, le successive trovano vuoto; a flag on ogni pool e' gia' scoped.
+/// chiusura sul DB di ciascuno (separazione DB, sempre attiva da mig 0527): ogni
+/// pool e' scoped al progetto; un progetto col DB non disponibile viene saltato
+/// con WARN per questo giro (niente fallback al meta-DB).
 pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid> {
     let mut all_reaped = Vec::new();
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "run_reaper: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let reaped = mark_stale_on_pool(&pool, stale_seconds).await;
         if reaped.is_empty() {
             continue;
@@ -130,7 +136,13 @@ pub async fn reap_orphaned_runs_at_boot(db: &PgPool) -> Vec<uuid::Uuid> {
     }
     let mut all_reaped = Vec::new();
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "run_reaper boot: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let reaped: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
             r#"
             UPDATE agent_runs

@@ -65,8 +65,9 @@ async fn fetch_owned_run_row(
 ) -> Result<(sqlx::postgres::PgRow, sqlx::PgPool), ApiError> {
     // Separazione DB: endpoint keyed solo dal run_id. agent_runs (+ eventuale JOIN
     // chat_sessions) vive nel DB del progetto -> pool via directory di routing
-    // (fallback ricerca). A flag OFF -> meta-DB.
-    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(db, run_id).await;
+    // (fallback ricerca). Niente fallback al meta (mig 0527): DB progetto non
+    // disponibile -> 503 propagato al client.
+    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(db, run_id).await?;
     let run_row = sqlx::query(sql)
         .bind(run_id)
         .fetch_optional(&run_pool)
@@ -116,12 +117,28 @@ pub async fn agent_stream(
     // Fix: replay degli step gia' persistiti + final_answer come primo blob
     // di eventi, POI continua col live broadcast.
     let mut replay_events: Vec<Event> = Vec::new();
-    if let Some(rid) = run_id {
-        // Separazione DB: agent_steps/agent_runs sono tabelle migrate, instradate
-        // sul pool del progetto risolto via session_id (flag OFF -> meta-DB).
-        let proj_pool =
-            crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id)
-                .await;
+    // Separazione DB: agent_steps/agent_runs sono tabelle migrate, instradate
+    // sul pool del progetto risolto via session_id. Il replay e' best-effort:
+    // se il DB del progetto non e' disponibile si salta il replay (WARN) e lo
+    // stream prosegue col solo live broadcast, senza fallback al meta (mig 0527).
+    let replay_pool = if run_id.is_some() {
+        match crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id)
+            .await
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "agent_stream: DB progetto non disponibile, salto il replay degli step"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let (Some(rid), Some(proj_pool)) = (run_id, replay_pool) {
         // Replay step dal DB
         if let Ok(rows) = sqlx::query(
             "SELECT step_index, tool_name, tool_input, tool_result, status, created_at
@@ -308,10 +325,10 @@ pub async fn get_active_run_for_session(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
     // Separazione DB: agent_runs/agent_steps sono tabelle migrate -> pool del
-    // progetto risolto dalla sessione (flag OFF -> meta-DB). Sul meta le tabelle
-    // sono vuote a flag ON: leggerle li' faceva sparire il run attivo al refresh.
+    // progetto risolto dalla sessione. Sul meta le tabelle sono vuote: leggerle
+    // li' faceva sparire il run attivo al refresh. Niente fallback (mig 0527).
     let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
     let run_row = sqlx::query(&format!(
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at
@@ -481,7 +498,7 @@ pub async fn get_session_worklog(
     // Worklog nel DB del progetto (separazione DB): pool risolto dalla sessione.
     let wpool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
-            .await;
+            .await?;
     let block = crate::session_worklog::fetch_rendered_block(&state.db, &wpool, context.session_id)
         .await
         .unwrap_or_default();
@@ -504,8 +521,9 @@ pub async fn get_agent_run_next_actions(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
     // Separazione DB: nexus_agent_meta_steps + agent_runs vivono nel DB del
-    // progetto -> pool risolto dal run (flag OFF -> meta-DB).
-    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(&state.db, run_id).await;
+    // progetto -> pool risolto dal run. Niente fallback al meta (mig 0527).
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_run_from(&state.db, run_id).await?;
     // Ownership verificata via join su agent_runs.user_id: nessun leak cross-utente.
     let row = sqlx::query(
         "SELECT m.payload
@@ -552,10 +570,10 @@ pub async fn get_session_meta_steps(
     // run, cioe' il caso d'uso del refresh. I meta_step tornano in ordine
     // cronologico per la ricostruzione fedele della timeline.
     // Separazione DB: nexus_agent_meta_steps + agent_runs vivono nel DB del
-    // progetto -> pool risolto dalla sessione. Sul meta le tabelle sono vuote a
-    // flag ON: la timeline narrativa spariva al reload della chat.
+    // progetto -> pool risolto dalla sessione. Sul meta le tabelle sono vuote:
+    // la timeline narrativa spariva al reload della chat. Niente fallback (mig 0527).
     let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
     let rows = sqlx::query(
         "SELECT m.run_id, m.kind, m.title, m.payload, m.correlation_id, m.created_at
          FROM nexus_agent_meta_steps m
@@ -623,7 +641,7 @@ pub async fn get_session_traces(
     // Separazione DB: nexus_agent_traces vive nel DB del progetto (scritta dal
     // motore nativo sul run_db) -> pool risolto dalla sessione.
     let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
     // Punto unico (regola L): ownership + raggruppamento per run nel trace_store,
     // speculare a get_session_meta_steps.
     let runs = crate::trace_store::get_session_traces(&run_pool, session_id, user_id)

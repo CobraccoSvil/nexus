@@ -595,7 +595,17 @@ async fn check_container_quotas(
 ) -> Option<String> {
     // Separazione DB: agent_processes (conteggi container/RAM) vive nel DB
     // del progetto; le quote restano nel meta. Punto unico project_db_routes.
-    let run_pool = crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
+    // Fail-closed: quota non verificabile -> avvio bloccato con messaggio
+    // esplicito (lo spawn fallirebbe comunque sullo stesso DB).
+    let run_pool =
+        match crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Some(format!(
+                    "[Errore: DB del progetto non disponibile, quote container non verificabili: {e}]"
+                ))
+            }
+        };
     if let Err(reason) =
         crate::security::quotas::check_can_start_container(&ctx.db, &run_pool, ctx.project_id).await
     {
@@ -852,7 +862,20 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
 /// sul pool del progetto corrente (separazione DB per-progetto).
 async fn restart_work_dir(ctx: &AgentToolContext, process_id: Uuid) -> String {
     let fallback = || ctx.root_path.to_string_lossy().to_string();
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Stessa degradazione della query fallita qui sotto: si ricade
+                // su root_path (fallback di business, non un altro DB).
+                tracing::warn!(
+                    project_id = %ctx.project_id,
+                    error = %e,
+                    "restart_work_dir: DB progetto non disponibile, uso root_path"
+                );
+                return fallback();
+            }
+        };
     let row = sqlx::query("SELECT working_dir FROM agent_processes WHERE id = $1")
         .bind(process_id)
         .fetch_optional(&proj_pool)

@@ -22,9 +22,11 @@
 //! La separazione DB per-progetto e' SEMPRE attiva: il cutover e' chiuso (le
 //! tabelle meta `zz_decommissioned_*` sono droppate, mig 0525) e il flag
 //! storico `db.project_separation.enabled` e' stato rimosso (mig 0527). Le
-//! funzioni instradano sempre al DB `<slug>_nexus` del progetto; l'unica via
-//! che ritorna il pool meta e' la resilienza (registry non inizializzato o DB
-//! non provisionato), mai un ramo di configurazione.
+//! funzioni instradano sempre al DB `<slug>_nexus` del progetto e NON ritornano
+//! MAI il pool meta: registry non inizializzato o DB non provisionato/aperto ->
+//! errore tipizzato. Lo stesso contratto vale dal 2026-07-20 anche per
+//! `mcp-core::project_db_routes` (`ProjectDbError`): il vecchio fallback
+//! "resiliente" al meta leggeva liste vuote e scriveva sul DB sbagliato.
 
 pub mod sizing;
 

@@ -484,7 +484,13 @@ async fn restore_billing_cooldowns_from_redis(mut conn: redis::aio::MultiplexedC
 async fn mark_stale_project_processes_failed(db_recover: sqlx::PgPool) {
     use sqlx::Row;
     for pid in project_db_routes::list_all_project_ids(&db_recover).await {
-        let pool = project_db_routes::project_data_pool_from(&db_recover, pid).await;
+        let pool = match project_db_routes::project_data_pool_from(&db_recover, pid).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %pid, error = %e, "boot-recovery processi stale: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let stale = sqlx::query(
             "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
         )
@@ -737,11 +743,12 @@ async fn build_orchestrator(
 /// Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio
 /// precedente (PID non piu' vivo -> status=failed; PID vivo -> resta running e si
 /// rilancia il monitoring OS-specifico). Estratta da `main` (comportamento
-/// invariato). NOTA (separazione DB): `agent_processes` e' MIGRATA al DB per-progetto.
-/// Questo blocco opera sul META (storico / progetti NON migrati); a flag ON il meta
-/// e' quasi vuoto -> no-op benigno. La riconciliazione dei processi per-progetto a
-/// flag ON e' gestita dal blocco NUOVO (mark-only) DOPO init_global_pools, che itera
-/// list_all_project_ids + project_data_pool_from. NON duplicare qui.
+/// invariato). NOTA (separazione DB, sempre attiva da mig 0527): `agent_processes`
+/// e' MIGRATA al DB per-progetto. Questo blocco opera sul META (solo righe
+/// storiche pre-migrazione): il meta e' quasi vuoto -> no-op benigno. La
+/// riconciliazione dei processi per-progetto e' gestita dal blocco mark-only DOPO
+/// init_global_pools, che itera list_all_project_ids + project_data_pool_from.
+/// NON duplicare qui.
 async fn reconcile_stale_processes(db: &sqlx::PgPool) {
     use sqlx::Row;
     let stale =
@@ -1416,8 +1423,10 @@ async fn build_app_state(
 /// 'awaiting_confirmation' resumibile) + mark-only dei processi per-progetto stale
 /// (tokio::spawn, non blocca l'avvio; il re-attach dei processi vivi resta al
 /// watchdog periodico). Il registry pool DEVE essere gia' inizializzato, altrimenti
-/// `project_data_pool_from` ricade sul meta-DB lasciando i run per-progetto zombie
-/// (causa radice del bug "chat cieca sul run dopo restart"). Estratta da `build_app_state`.
+/// `project_data_pool_from` ritorna un errore tipizzato (`ProjectDbError`) e il
+/// progetto viene SALTATO con WARN per quel giro — niente piu' fallback silenzioso
+/// al meta-DB, che lasciava i run per-progetto zombie (causa radice del bug
+/// "chat cieca sul run dopo restart"). Estratta da `build_app_state`.
 async fn run_boot_recovery(state: &AppState) {
     let _ = run_reaper::reap_orphaned_runs_at_boot(&state.db).await;
     let db_recover = state.db.clone();
@@ -1625,8 +1634,8 @@ async fn probe_tool_runner_grpc(state: &AppState) -> bool {
 
 /// Somma i conteggi dashboard (run ultimi 30 giorni, job attivi) su tutti i DB
 /// per-progetto e restituisce lo stato del job `shadow_db_validation` piu' recente
-/// cross-progetto. Estratta da `dashboard` (comportamento invariato): a flag OFF
-/// gli helper `project_db_routes` ritornano il meta -> stessa semantica di prima.
+/// cross-progetto. Estratta da `dashboard`. Best-effort: un progetto col DB non
+/// disponibile viene saltato con WARN (niente fallback al meta, mig 0527).
 async fn aggregate_project_dashboard_stats(
     db: &PgPool,
 ) -> (i64, i64, Option<(chrono::DateTime<chrono::Utc>, String)>) {
@@ -1634,7 +1643,13 @@ async fn aggregate_project_dashboard_stats(
     let mut active_jobs: i64 = 0;
     let mut latest_shadow: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
     for project_id in project_db_routes::list_all_project_ids(db).await {
-        let pool = project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "dashboard stats: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
 
         total_runs += sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '30 days'",

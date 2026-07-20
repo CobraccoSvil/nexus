@@ -229,7 +229,7 @@ async fn scan_and_distill(state: &AppState, settings: &DistillerSettings) -> Res
     // Progetti con >= min_new_signals nuovi eventi error/failed_attempt oltre il
     // cursore (trigger worklog-driven; i wiki_docs sono evidenza aggiuntiva).
     //
-    // Separazione DB (flag ON): nexus_session_worklog_events e' per-progetto,
+    // Separazione DB: nexus_session_worklog_events e' per-progetto,
     // nexus_project_distill_state (cursore) vive nel meta. Il JOIN originale e'
     // cross-DB e non eseguibile su un solo pool: si spezza. Itera i progetti,
     // per ognuno leggi il cursore dal meta e conta i segnali sul pool del
@@ -245,8 +245,20 @@ async fn scan_and_distill(state: &AppState, settings: &DistillerSettings) -> Res
         .context("SELECT cursore distill (discovery)")?
         .flatten();
 
+        // Worker: un DB-progetto non disponibile si salta per questo giro (WARN),
+        // gli altri progetti restano candidabili.
         let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+            match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        %project_id,
+                        error = %e,
+                        "learned_instructions: DB progetto non disponibile, salto il progetto"
+                    );
+                    continue;
+                }
+            };
         let cnt: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM nexus_session_worklog_events \
              WHERE kind IN ('error', 'failed_attempt') \
@@ -314,8 +326,9 @@ async fn distill_project(
         .and_then(|r| r.try_get("last_wiki_cursor").ok());
 
     // Separazione DB: nexus_session_worklog_events e' una tabella per-progetto,
-    // instrada sul pool del progetto (a flag OFF ritorna il meta-DB).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // instrada sul pool del progetto. Niente fallback al meta (mig 0527): errore
+    // propagato, il chiamante logga e passa al progetto successivo.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     // Evidenza worklog (segnali deterministici di cosa va storto ripetutamente).
     let wl_rows = sqlx::query(

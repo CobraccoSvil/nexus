@@ -1026,9 +1026,11 @@ pub(crate) async fn upsert_open_session(
     let active_files_json = serde_json::to_value(active_file_paths)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // separazione DB: project_open_sessions e' migrata, instrada la scrittura sul pool del progetto
+    // separazione DB: project_open_sessions e' migrata, instrada la scrittura sul
+    // pool del progetto; DB non disponibile -> errore tipizzato al chiamante
+    // (503/404 via From<ProjectDbError>, niente fallback al meta-DB)
     let project_pool =
-        crate::project_db_routes::project_data_pool_from(db, context.project_id).await;
+        crate::project_db_routes::project_data_pool_from(db, context.project_id).await?;
 
     sqlx::query(
         r#"

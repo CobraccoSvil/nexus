@@ -186,27 +186,44 @@ pub async fn index_attachment(
 
     // Separazione DB: chat_message_attachments e' una tabella migrata. La risolviamo
     // sul pool del progetto (per project_id se presente, altrimenti per session_id);
-    // a flag-OFF / non risolvibile l'helper ritorna il meta-pool (comportamento storico).
+    // senza ne' project_id ne' session_id resta il meta (comportamento storico per
+    // allegati senza scope). Il marcatore indexed_at e' best-effort (l'indice
+    // Qdrant e' gia' scritto): DB progetto non disponibile -> update saltato con
+    // WARN, niente fallback al meta-DB (la riga sul meta non esiste).
     let attach_pool = if let Some(pid) = project_id {
-        crate::project_db_routes::project_data_pool_from(db, pid).await
+        match crate::project_db_routes::project_data_pool_from(db, pid).await {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                tracing::warn!(project_id = %pid, error = %e, "rag.index_attachment: DB progetto non disponibile, marcatore indexed_at saltato");
+                None
+            }
+        }
     } else if let Some(sid) = session_id {
-        crate::project_db_routes::project_data_pool_by_session_from(db, sid).await
+        match crate::project_db_routes::project_data_pool_by_session_from(db, sid).await {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                tracing::warn!(session_id = %sid, error = %e, "rag.index_attachment: DB progetto non disponibile, marcatore indexed_at saltato");
+                None
+            }
+        }
     } else {
-        db.clone()
+        Some(db.clone())
     };
-    if let Err(e) = sqlx::query(
-        "UPDATE chat_message_attachments SET indexed_at = NOW(), chunk_count = $2 WHERE id = $1",
-    )
-    .bind(attachment_id)
-    .bind(n as i32)
-    .execute(&attach_pool)
-    .await
-    {
-        tracing::warn!(
-            "rag.index_attachment: update indexed_at fallito id={} err={}",
-            attachment_id,
-            e
-        );
+    if let Some(attach_pool) = attach_pool {
+        if let Err(e) = sqlx::query(
+            "UPDATE chat_message_attachments SET indexed_at = NOW(), chunk_count = $2 WHERE id = $1",
+        )
+        .bind(attachment_id)
+        .bind(n as i32)
+        .execute(&attach_pool)
+        .await
+        {
+            tracing::warn!(
+                "rag.index_attachment: update indexed_at fallito id={} err={}",
+                attachment_id,
+                e
+            );
+        }
     }
     tracing::info!(
         "rag.index_attachment: id={} chunks={} indicizzati",

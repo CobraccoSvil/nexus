@@ -344,8 +344,20 @@ async fn control_windows(
 ) -> ServiceActionOutcome {
     use sqlx::query_as;
 
-    // agent_processes e' migrata -> pool del progetto (flag OFF -> meta-pool).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(ctx.db, ctx.project_id).await;
+    // agent_processes e' migrata -> pool del progetto. DB progetto non
+    // disponibile: nessuna azione (noop con motivazione), mai il meta come ripiego.
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(ctx.db, ctx.project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %ctx.project_id,
+                    error = %e,
+                    "control_windows: DB progetto non disponibile, nessuna azione sul servizio"
+                );
+                return ServiceActionOutcome::noop(format!("DB progetto non disponibile: {e}"));
+            }
+        };
 
     // STOP: taskkill dei soli processi running di questa label. `acted` = true se
     // e solo se abbiamo davvero killato almeno un pid vivo.

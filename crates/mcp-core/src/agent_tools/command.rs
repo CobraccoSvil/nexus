@@ -65,8 +65,19 @@ fn record_playwright_job(
     let pid = ctx.project_id;
     tokio::spawn(async move {
         // Separazione DB per-progetto: `jobs` e' tabella migrata, instrada il
-        // write sul pool del progetto (a flag OFF ritorna il meta-DB).
-        let proj_pool = crate::project_db_routes::project_data_pool_from(&db, pid).await;
+        // write sul pool del progetto. Fire-and-forget: DB non disponibile ->
+        // registrazione saltata con WARN, mai fallback al meta.
+        let proj_pool = match crate::project_db_routes::project_data_pool_from(&db, pid).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %pid,
+                    error = %e,
+                    "record_playwright_job: DB progetto non disponibile, salto"
+                );
+                return;
+            }
+        };
         let _ = sqlx::query(
             "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)",
         )

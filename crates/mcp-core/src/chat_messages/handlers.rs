@@ -9,10 +9,10 @@ pub async fn list_chat_messages(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
     let context = load_session_context(&state, session_id, user_id).await?;
-    // Cutover separazione DB: messaggi + agent_runs ora nel DB del progetto (il
-    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool e' il
-    // punto unico (flag off -> meta-DB, comportamento storico).
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await;
+    // Separazione DB: messaggi + agent_runs vivono nel DB del progetto (il
+    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool
+    // e' il punto unico; DB non disponibile -> 503 strutturato (regola M).
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await?;
 
     let rows = sqlx::query(
         r#"
@@ -193,10 +193,11 @@ pub async fn send_chat_message(
     let context = load_session_context(&state, session_id, user_id).await?;
     // Separazione DB: chat_sessions/agent_runs migrate nel DB del progetto.
     // Risolvo una volta il pool del progetto per sessione e lo riuso per tutte
-    // le scritture di questo handler (flag off -> meta-DB, comportamento storico).
+    // le scritture di questo handler. DB non disponibile -> 503: scrivere il
+    // messaggio sul meta lo farebbe "sparire" alla riapertura del DB progetto.
     let session_pool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
-            .await;
+            .await?;
 
     let content = body.content.trim();
     if content.is_empty() {
@@ -1019,9 +1020,27 @@ async fn try_resume_interrupted_run(
         // Separazione DB: chat_messages/agent_runs sono migrate -> pool del
         // progetto risolto UNA volta e riusato per history, UPDATE, INSERT,
         // finalize e worklog. db_clone2 resta il meta SOLO per template,
-        // ledger e catalogo tool (domini di piattaforma).
-        let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
+        // ledger e catalogo tool (domini di piattaforma). Senza il DB del
+        // progetto il resume non puo' ne' leggere la history ne' finalizzare
+        // il run: si abortisce il task con ERROR (regola M), mai sul meta.
+        let proj_pool = match crate::project_db_routes::project_data_pool_from(
+            &db_clone2,
+            project_id_r,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    run_id = %new_run_id,
+                    project_id = %project_id_r,
+                    error = %e,
+                    "resume: DB progetto non disponibile, task di resume abortito"
+                );
+                channels2.remove(&new_run_id);
+                return;
+            }
+        };
         let resume_tpl = crate::prompt_templates::get_template_or_default(
             &db_clone2,
             &template_cache_r,
@@ -1092,14 +1111,31 @@ async fn try_resume_interrupted_run(
         .await
         {
             Ok(outcome) => {
-                let steps_pool =
-                    crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
-                crate::chat_messages::agent_run::native_outcome_to_run_result(
-                    &steps_pool,
-                    new_run_id,
-                    outcome,
-                )
-                .await
+                match crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r)
+                    .await
+                {
+                    Ok(steps_pool) => {
+                        crate::chat_messages::agent_run::native_outcome_to_run_result(
+                            &steps_pool,
+                            new_run_id,
+                            outcome,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            run_id = %new_run_id,
+                            error = %e,
+                            "resume: DB progetto non disponibile al finalize"
+                        );
+                        crate::chat_messages::agent_run::native_engine_failure_result(
+                            new_run_id,
+                            &provider_r,
+                            &model_r,
+                            format!("DB del progetto non disponibile al finalize: {e}"),
+                        )
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(run_id = %new_run_id, error = %e, "resume: motore nativo fallito");
@@ -1280,9 +1316,9 @@ pub async fn resend_chat_message(
     // nel DB del progetto. Risolvo una volta il pool del progetto a partire dal
     // message_id (Path param) e lo riuso per tutte le SELECT su queste tabelle. Il
     // JOIN chat_messages+chat_sessions e' su un solo pool perche' entrambe vivono
-    // nello stesso <slug>_nexus (flag off -> meta-DB, comportamento storico).
+    // nello stesso <slug>_nexus. DB non disponibile -> 503 strutturato.
     let msg_pool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -1705,7 +1741,7 @@ pub async fn delete_chat_message(
     // Separazione DB: endpoint keyed solo dal message_id. chat_messages/chat_sessions
     // vivono nel DB del progetto -> pool via directory di routing (fallback ricerca).
     let mpool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -1763,9 +1799,9 @@ pub async fn feedback_error(
     // Separazione DB: endpoint keyed solo dal message_id. Risolvo il pool del
     // progetto dalla directory di routing (fallback ricerca + auto-registrazione);
     // chat_messages/chat_sessions/ai_response_feedback/prompt_corrections vivono
-    // li'. A flag OFF -> meta-DB. ensure_project_access resta sul meta (globale).
+    // li'. ensure_project_access resta sul meta (globale).
     let mpool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -2070,9 +2106,9 @@ pub async fn feedback_positive(
         .unwrap_or("");
 
     // Separazione DB: endpoint keyed solo dal message_id -> pool del progetto via
-    // directory di routing (fallback ricerca). A flag OFF -> meta-DB.
+    // directory di routing (fallback ricerca). DB non disponibile -> 503.
     let mpool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -2271,7 +2307,7 @@ pub async fn legacy_chat(
     // volta per ricerca E creazione. Sul meta la ricerca rispondeva sempre
     // vuoto e ogni chiamata legacy creava una NUOVA sessione.
     let session_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let existing_session = sqlx::query_scalar::<_, Uuid>(
         r#"
         SELECT id

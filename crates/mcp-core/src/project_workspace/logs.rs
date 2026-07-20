@@ -11,8 +11,9 @@ pub async fn get_project_problems(
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
     // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel
-    // pool del progetto. A flag OFF project_data_pool_from ritorna il meta-DB.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // pool del progetto. DB progetto non disponibile -> errore tipizzato (503/404).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     // Aggregazione fonti nell'ordine canonico (preserva l'ordine di inserimento a
     // parita' di chiave di sort): quality -> security -> jobs -> diag -> runtime.
@@ -734,9 +735,10 @@ pub async fn get_output_channels(
     // Self-healing in Rust: marca come 'stopped' nel DB i processi con status='running'
     // ma PID inesistente (residui di chat AI precedenti, restart Nexus, kill esterni).
     // Routing separazione DB (regola E): `agent_processes` e' tabella MIGRATA,
-    // vive nel pool del progetto. A flag OFF ritorna il meta-DB. Lo riuso sotto
-    // per la sanazione UPDATE (stesso project_id).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // vive nel pool del progetto (errore tipizzato se non disponibile). Lo riuso
+    // sotto per la sanazione UPDATE (stesso project_id).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let agent_rows_raw = fetch_agent_process_rows(&proj_pool, project_id).await;
 
     // Canali svc:* su Windows: nessun systemd, i servizi di progetto sono le righe
@@ -910,8 +912,9 @@ pub async fn get_output_events(
 
     // Routing separazione DB (regola E): `jobs` e `agent_processes` sono tabelle
     // MIGRATE (vivono nel pool del progetto); `git_operations` NON e' migrata e
-    // resta sul meta-pool. A flag OFF project_data_pool_from ritorna il meta-DB.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // resta sul meta-pool. DB progetto non disponibile -> errore tipizzato (503/404).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     let events = match channel.as_str() {
         "Git" => git_channel_events(&state.db, project_id, limit).await?,
@@ -1262,7 +1265,8 @@ pub async fn get_playwright_runs(
 
     // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
     // del progetto. La query `projects` piu' sotto resta sul meta-pool (non migrata).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let rows = sqlx::query(
         r#"
         SELECT id, kind, status, input, created_at, updated_at, progress
@@ -1343,8 +1347,9 @@ pub async fn get_playwright_run_detail(
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
     // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
-    // del progetto. A flag OFF project_data_pool_from ritorna il meta-DB.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // del progetto. DB progetto non disponibile -> errore tipizzato (503/404).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let row = sqlx::query(
         r#"
         SELECT id, status, input, created_at, updated_at, progress, output_log
@@ -1478,7 +1483,8 @@ pub async fn stream_playwright_run(
 
     // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
     // del progetto. Riuso il pool sotto per il fallback row_opt (stesso progetto).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     // Verifica che il job appartenga al progetto
     ensure_playwright_run_exists(&proj_pool, run_id, project_id).await?;
@@ -1638,8 +1644,9 @@ pub async fn clear_playwright_runs(
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
     // Routing separazione DB (regola E): `jobs` e' tabella MIGRATA, vive nel pool
-    // del progetto. A flag OFF project_data_pool_from ritorna il meta-DB.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // del progetto. DB progetto non disponibile -> errore tipizzato (503/404).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let result =
         sqlx::query(r#"DELETE FROM jobs WHERE project_id = $1 AND kind ILIKE '%playwright%'"#)
             .bind(project_id)

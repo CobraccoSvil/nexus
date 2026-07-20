@@ -69,9 +69,12 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
 pub trait ProjectPoolResolver: std::fmt::Debug + Send + Sync {
     /// Pool del DB del dominio run/chat per `project_id`: il DB `<slug>_nexus`
     /// del progetto. La separazione e' sempre attiva (flag rimosso, mig 0527):
-    /// l'unica via che ritorna il meta e' la resilienza dell'impl (registry non
-    /// inizializzato o provisioning fallito), mai un ramo di configurazione.
-    fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, PgPool>;
+    /// se il registry non e' inizializzato o il provisioning fallisce l'impl
+    /// ritorna `Err` (errore appiattito a stringa per il contratto cross-crate),
+    /// MAI il meta-DB — una query del dominio migrato sul meta leggerebbe
+    /// tabelle vuote o scriverebbe sul DB sbagliato. Il chiamante salta il
+    /// progetto per quel giro.
+    fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, Result<PgPool, String>>;
 }
 
 /// Contesto dei servizi usati dal wiki (sottoinsieme di AppState).
@@ -91,12 +94,14 @@ pub struct WikiDeps {
 impl WikiDeps {
     /// Pool del dominio run/chat per `project_id`: via il risolutore iniettato,
     /// che instrada sul DB `<slug>_nexus` del progetto. Punto unico (regola L)
-    /// di routing per i worker cross-progetto. Senza risolutore (solo test)
-    /// ritorna il meta-DB: vedi la nota sul campo [`Self::project_pool`].
-    pub async fn run_pool(&self, project_id: uuid::Uuid) -> PgPool {
+    /// di routing per i worker cross-progetto. DB del progetto non disponibile
+    /// -> `Err`: il chiamante salta il progetto per quel giro (niente fallback
+    /// al meta-DB). Senza risolutore (solo test) ritorna il meta-DB: vedi la
+    /// nota sul campo [`Self::project_pool`].
+    pub async fn run_pool(&self, project_id: uuid::Uuid) -> Result<PgPool, String> {
         match &self.project_pool {
             Some(r) => r.project_pool(project_id).await,
-            None => self.db.clone(),
+            None => Ok(self.db.clone()),
         }
     }
 

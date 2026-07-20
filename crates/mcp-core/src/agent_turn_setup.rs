@@ -958,8 +958,22 @@ struct EndTurnOutputs<'a> {
 /// lo stream. `IS NULL`: marca una volta sola. Separazione DB: agent_runs vive
 /// sul pool del progetto (risolto da session_id).
 async fn mark_generation_ended(db: &PgPool, session_id: Uuid, run_id: Uuid) {
-    let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    let run_pool = match crate::project_db_routes::project_data_pool_by_session_from(db, session_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            // Best-effort dichiarato: la marca si salta con WARN, niente
+            // fallback al meta (le tabelle run sul meta sono vuote).
+            tracing::warn!(
+                session_id = %session_id,
+                run_id = %run_id,
+                error = %e,
+                "mark_generation_ended: DB progetto non disponibile, salto"
+            );
+            return;
+        }
+    };
     let _ = sqlx::query(
         "UPDATE agent_runs SET generation_ended_at = NOW() \
          WHERE id = $1 AND generation_ended_at IS NULL",
@@ -1094,17 +1108,30 @@ async fn persist_and_emit_turn_trace(ctx: &EndTurnCtx<'_>, out: &mut EndTurnOutp
     // meta -> risolvi by_session (directory O(1)), trace_store NON ri-risolve
     // (convenzione: pool gia' risolto).
     if let Ok(payload) = serde_json::to_value(&trace) {
-        let trace_pool =
-            crate::project_db_routes::project_data_pool_by_session_from(ctx.db, ctx.session_id)
+        match crate::project_db_routes::project_data_pool_by_session_from(ctx.db, ctx.session_id)
+            .await
+        {
+            Ok(trace_pool) => {
+                crate::trace_store::persist_trace(
+                    &trace_pool,
+                    ctx.session_id,
+                    ctx.run_id,
+                    *out.trace_seq,
+                    &payload,
+                )
                 .await;
-        crate::trace_store::persist_trace(
-            &trace_pool,
-            ctx.session_id,
-            ctx.run_id,
-            *out.trace_seq,
-            &payload,
-        )
-        .await;
+            }
+            Err(e) => {
+                // Persist best-effort: la traccia non si salva ma l'emissione
+                // LIVE qui sotto avviene comunque (il pannello live funziona,
+                // il refresh non rivedra' questo turno).
+                tracing::warn!(
+                    session_id = %ctx.session_id,
+                    error = %e,
+                    "persist_and_emit_turn_trace: DB progetto non disponibile, traccia non persistita"
+                );
+            }
+        }
     }
     *out.trace_seq += 1;
     // Emissione LIVE: lo STESSO evento che il frontend mostra nel pannello tracce

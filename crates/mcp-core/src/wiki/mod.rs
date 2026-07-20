@@ -130,10 +130,12 @@ impl WikiAiServices for AppStateWikiAi {
 /// instrada sul pool di `<slug>_nexus` e vi aggiunge il layer che il crate
 /// read-only `nexus-project-pools` non puo' offrire: provisioning al primo
 /// accesso, migrazioni `db/migrations/project` sotto lock per-progetto e cache
-/// pool condivisa con AppState. Ritorna il meta solo per resilienza (registry
-/// non inizializzato o provisioning fallito), mai per configurazione: il flag
-/// separazione e' stato rimosso (mig 0527). Tiene solo il meta pool (i worker
-/// girano in background, senza AppState vivo).
+/// pool condivisa con AppState. Registry non inizializzato o provisioning
+/// fallito -> `Err` (l'errore tipizzato `ProjectDbError` appiattito a stringa
+/// per il contratto cross-crate), MAI il meta: il flag separazione e' stato
+/// rimosso (mig 0527) e il fallback silenzioso con esso — il worker salta il
+/// progetto per quel giro. Tiene solo il meta pool (i worker girano in
+/// background, senza AppState vivo).
 #[derive(Clone)]
 pub(crate) struct AppStateProjectPool {
     meta: sqlx::PgPool,
@@ -146,10 +148,15 @@ impl std::fmt::Debug for AppStateProjectPool {
 }
 
 impl nexus_wiki::ProjectPoolResolver for AppStateProjectPool {
-    fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, sqlx::PgPool> {
+    fn project_pool(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> BoxFuture<'_, Result<sqlx::PgPool, String>> {
         let meta = self.meta.clone();
         Box::pin(async move {
-            crate::project_db_routes::project_data_pool_from(&meta, project_id).await
+            crate::project_db_routes::project_data_pool_from(&meta, project_id)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 }
