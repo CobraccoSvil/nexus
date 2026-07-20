@@ -1368,13 +1368,22 @@ dell'utente.";
             delta.review_verdict = Some(None);
         }
 
-        // Consiglio a monte: parere di una FIGURA — stessa semantica dell'esito
-        // dichiarato (l'ultimo prevale; un parere seguito da altri tool era
-        // intermedio e viene azzerato).
+        // Consiglio a monte: parere di una FIGURA. A DIFFERENZA del gemello
+        // `declared_outcome` (ADR 0034), il parere NON viene invalidato dal lavoro
+        // successivo: e' un CONTRIBUTO consultivo, non lo stato del run. Un esito
+        // dichiarato a meta' e poi superato dal lavoro falsava davvero lo status
+        // finale; leggere un file dopo aver formulato un giudizio non rende quel
+        // giudizio falso. Solo una dichiarazione SUCCESSIVA lo sostituisce
+        // (l'ultima prevale).
+        //
+        // La semantica ereditata cancellava pareri gia' validi e acquisiti: la
+        // figura veniva poi classificata `CompletedNoAdvisory` e non contava per
+        // il quorum. Misurato: 7 casi su 355 sub-run del consiglio, piu' il run
+        // del 20/07 in cui `program_manager` ha dichiarato TRE volte senza che
+        // nulla restasse (e ha ricevuto il turno di grazia, che scatta solo se il
+        // canale e' muto, mentre aveva appena parlato due volte).
         if let Some(last) = advisory_verdicts.last() {
             delta.advisory_verdict = Some(Some(last.clone()));
-        } else if state.advisory_verdict.is_some() {
-            delta.advisory_verdict = Some(None);
         }
 
         // Dibattito: posizione di un AVVOCATO — stessa semantica dei gemelli
@@ -2849,6 +2858,64 @@ mod tests {
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Dichiarazione stantia azzerata; il contatore done resta cumulativo.
         assert!(out.declared_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn parere_consultivo_sopravvive_al_lavoro_successivo() {
+        // A DIFFERENZA di `declared_outcome` (test sopra): il parere di una figura
+        // e' un CONTRIBUTO, non lo stato del run. Sequenza reale del 20/07 che
+        // questo test riproduce: `functional_analyst` dichiara alle 06:12:25, poi
+        // legge cinque file alle 06:12:35, e finiva `CompletedNoAdvisory` col
+        // parere buttato — sotto quorum per un voto che il sistema aveva ricevuto.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
+        st.advisory_verdict = Some(json!({"verdict": "proceed", "summary": "gia' dichiarato"}));
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        // Mutazione che rende rosso: rimettere il ramo
+        // `else if state.advisory_verdict.is_some() { delta.advisory_verdict = Some(None) }`.
+        assert!(
+            out.advisory_verdict.is_some(),
+            "il parere non va cancellato da un tool successivo"
+        );
+        assert_eq!(
+            out.advisory_verdict.as_ref().expect("parere")["verdict"],
+            json!("proceed")
+        );
+    }
+
+    #[tokio::test]
+    async fn una_nuova_dichiarazione_sostituisce_la_precedente() {
+        // L'unica cosa che cambia un parere e' un altro parere: la figura che si
+        // ricrede resta libera di farlo, e vale l'ULTIMA dichiarazione.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool(
+            "c1",
+            "advisory_verdict",
+            json!({
+                "verdict": "block",
+                "summary": "ho trovato un difetto",
+                "risks": [{"description": "segreto in chiaro nel repo", "severity": "alta"}]
+            }),
+        )]);
+        st.advisory_verdict = Some(json!({"verdict": "proceed", "summary": "parere precedente"}));
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        assert_eq!(
+            out.advisory_verdict.as_ref().expect("parere")["verdict"],
+            json!("block"),
+            "l'ultima dichiarazione prevale"
+        );
     }
 
     // ── (5) errore infrastruttura -> tool_result d'errore, niente NodeError ──────
