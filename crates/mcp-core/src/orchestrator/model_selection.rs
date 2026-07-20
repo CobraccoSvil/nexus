@@ -1,4 +1,4 @@
-//! Punto unico (regola L) dei sotto-componenti CONDIVISI della selezione di un
+﻿//! Punto unico (regola L) dei sotto-componenti CONDIVISI della selezione di un
 //! modello dal `ai_price_catalog`.
 //!
 //! FASE 1 del consolidamento del selettore modello (vedi ADR 0030): questo
@@ -460,12 +460,28 @@ fn push_order_by(sql: &mut String, filter: &EligibilityFilter<'_>, order_by: &st
     sql.push_str(&format!(" LIMIT {limit}"));
 }
 
+/// `min_distinct_providers` governa la CONDIZIONE DI USCITA dalla tier-chain.
+///
+/// Con `0` o `1` vale la regola storica: si esce al primo tier che restituisce
+/// righe, e i candidati restano omogenei di fascia.
+///
+/// Con `>= 2` la domanda cambia natura: il chiamante non chiede "dei modelli",
+/// chiede "modelli su N provider DISTINTI" (fan-out multi-provider). La
+/// non-vuotezza smette di essere una risposta: un tier con dieci modelli di un
+/// solo provider non soddisfa la richiesta, e uscire li' significa dichiarare
+/// "provider insufficienti" senza aver mai guardato i tier successivi, che erano
+/// gia' autorizzati dalla catena. E' il difetto osservato il 20/07: 6 provider
+/// sani abilitati, panel degradato con `got=1 min=2`. In quel caso si accumula
+/// scendendo la catena fino a raggiungere la soglia, e l'omogeneita' di fascia
+/// diventa una preferenza (i tier migliori restano in testa) invece di un
+/// vincolo che fa fallire il panel.
 pub(super) async fn select_models_tierchain(
     db: &PgPool,
     filter: &EligibilityFilter<'_>,
     tier_chain: &[&str],
     order_by: &str,
     limit: i64,
+    min_distinct_providers: usize,
 ) -> Result<Vec<(String, String, Option<String>)>, String> {
     let excluded: Vec<String> = if filter.apply_cooldown {
         excluded_providers_lower(filter.exclude_providers)
@@ -502,6 +518,10 @@ pub(super) async fn select_models_tierchain(
         requested_is_media: filter.capability.map(is_media_capability).unwrap_or(false),
     };
 
+    // Usato solo quando il chiamante chiede diversita' di provider (>= 2).
+    let mut accumulate: Vec<(String, String, Option<String>)> = Vec::new();
+    let tier_totali = tiers.len();
+
     for tier in tiers {
         let sql = build_tierchain_sql(filter, &shape, tier, order_by, limit);
         let mut q = sqlx::query_as::<_, (String, String, Option<String>)>(&sql).bind(&excluded);
@@ -522,9 +542,47 @@ pub(super) async fn select_models_tierchain(
             .fetch_all(db)
             .await
             .map_err(|e| format!("select_models_tierchain: query fallita: {e}"))?;
-        if !rows.is_empty() {
-            return Ok(rows);
+
+        if min_distinct_providers <= 1 {
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+            continue;
         }
+
+        // Fan-out: si accumula scendendo, saltando le coppie gia' viste (i tier
+        // della catena possono sovrapporsi). L'ordine di visita e' quello della
+        // catena, quindi i tier migliori restano in testa al risultato.
+        for row in rows {
+            if accumulate.iter().any(|(p, m, _)| p == &row.0 && m == &row.1) {
+                continue;
+            }
+            accumulate.push(row);
+        }
+        let distinti: std::collections::HashSet<&str> =
+            accumulate.iter().map(|(p, _, _)| p.as_str()).collect();
+        if distinti.len() >= min_distinct_providers {
+            return Ok(accumulate);
+        }
+    }
+
+    // Catena esaurita senza raggiungere la soglia: si restituisce comunque cio'
+    // che si e' trovato. Chi ha chiesto la diversita' e' l'unico che sa cosa
+    // farne (il panel degrada con `got`/`min` STRUTTURATI, regola M); qui un
+    // Vec vuoto al posto di un candidato solo cancellerebbe quell'informazione.
+    if !accumulate.is_empty() {
+        tracing::info!(
+            trovati = accumulate.len(),
+            provider_distinti = accumulate
+                .iter()
+                .map(|(p, _, _)| p.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            richiesti = min_distinct_providers,
+            tier_esplorati = tier_totali,
+            "tier-chain: diversita' provider non raggiunta a catena esaurita"
+        );
+        return Ok(accumulate);
     }
     if filter.require_qualified {
         // Pool VUOTO col gate acceso: il sintomo giusto e' "il gate non ha
@@ -713,6 +771,7 @@ mod tests {
             &["heavy"],
             "input_cost_per_million_tokens ASC",
             1,
+            1,
         )
         .await
         .expect("ok");
@@ -763,6 +822,7 @@ mod tests {
             &["heavy"],
             "input_cost_per_million_tokens ASC",
             1,
+            1,
         )
         .await
         .expect("ok");
@@ -786,6 +846,7 @@ mod tests {
             &["heavy"],
             "input_cost_per_million_tokens ASC",
             1,
+            1,
         )
         .await
         .expect("ok");
@@ -808,6 +869,7 @@ mod tests {
             &f_absent,
             &["heavy"],
             "input_cost_per_million_tokens ASC",
+            1,
             1,
         )
         .await
@@ -849,6 +911,7 @@ mod tests {
             &f,
             &["heavy"],
             "input_cost_per_million_tokens ASC",
+            1,
             1,
         )
         .await
@@ -899,6 +962,7 @@ mod tests {
             &["medium"],
             "input_cost_per_million_tokens ASC",
             1,
+            1,
         )
         .await
         .expect("ok");
@@ -941,6 +1005,7 @@ mod tests {
             &["heavy"],
             "input_cost_per_million_tokens ASC",
             1,
+            1,
         )
         .await
         .expect("ok");
@@ -979,6 +1044,7 @@ mod tests {
             &f,
             &["heavy", "medium"],
             "input_cost_per_million_tokens ASC",
+            1,
             1,
         )
         .await
@@ -1023,6 +1089,7 @@ mod tests {
             &f,
             &["medium"],
             "is_featured DESC, input_cost_per_million_tokens ASC",
+            1,
             1,
         )
         .await
@@ -1069,6 +1136,7 @@ mod tests {
             &["medium"],
             "input_cost_per_million_tokens ASC",
             5,
+            1,
         )
         .await
         .expect("ok");
@@ -1115,6 +1183,7 @@ mod tests {
             &["light"],
             "is_featured DESC, input_cost_per_million_tokens ASC",
             5,
+            1,
         )
         .await
         .expect("ok");
@@ -1212,6 +1281,7 @@ mod tests {
             &[],
             "input_cost_per_million_tokens ASC",
             10,
+            1,
         )
         .await
         .expect("ok");
@@ -1227,6 +1297,7 @@ mod tests {
             &[],
             "input_cost_per_million_tokens ASC",
             10,
+            1,
         )
         .await
         .expect("ok");
@@ -1249,7 +1320,7 @@ mod tests {
         .expect("insert");
         let mut f = gate_filter(true, false);
         f.capability = Some("reasoning");
-        let out = select_models_tierchain(&pool, &f, &[], "input_cost_per_million_tokens ASC", 10)
+        let out = select_models_tierchain(&pool, &f, &[], "input_cost_per_million_tokens ASC", 10, 1)
             .await
             .expect("ok");
         assert_eq!(
@@ -1260,7 +1331,7 @@ mod tests {
         // Gate spento: si crede al dichiarato (comportamento storico).
         let mut f = gate_filter(false, false);
         f.capability = Some("reasoning");
-        let out = select_models_tierchain(&pool, &f, &[], "input_cost_per_million_tokens ASC", 10)
+        let out = select_models_tierchain(&pool, &f, &[], "input_cost_per_million_tokens ASC", 10, 1)
             .await
             .expect("ok");
         assert_eq!(out.len(), 2);
@@ -1287,6 +1358,7 @@ mod tests {
             &[],
             "input_cost_per_million_tokens ASC",
             10,
+            1,
         )
         .await
         .expect("ok");

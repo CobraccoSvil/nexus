@@ -2195,10 +2195,15 @@ pub(crate) async fn convene_multi_provider_panel(
     if !cfg.enabled {
         return None;
     }
+    // Tetto e soglia arrivano ENTRAMBI alla selezione: `max_providers` e' quanti
+    // se ne vorrebbero, `min_providers` sotto quanti il panel non ha senso. Con
+    // la sola prima la tier-chain usciva al primo tier non vuoto e il quorum
+    // veniva giudicato su un pool mai cercato davvero.
     let candidates = match crate::internal_routing::resolve_purpose_provider_candidates_db(
         &ctx.core.db,
         &cfg.purpose,
         cfg.max_providers,
+        cfg.min_providers,
     )
     .await
     {

@@ -593,6 +593,9 @@ pub async fn classify(db: &PgPool, gateway: &NexusGatewayClient, message: &str) 
         db,
         CLASSIFIER_PURPOSE,
         limit,
+        // Il classificatore prova i candidati in cascata finche' uno risponde:
+        // gli basta il primo, non chiede diversita' di provider.
+        1,
     )
     .await
     {

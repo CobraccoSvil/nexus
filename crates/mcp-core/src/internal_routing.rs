@@ -403,10 +403,19 @@ pub async fn resolve_purpose_model_db_pinned(
 /// catalog e gli stessi filtri/cooldown del routing live. E' il punto unico per
 /// fan-out multi-provider: i chiamanti non interrogano `ai_price_catalog` a mano e
 /// non hardcodano provider/modelli.
+///
+/// `limit` e' il TETTO (quanti se ne vorrebbero), `min_providers` la SOGLIA sotto
+/// la quale il fan-out non ha senso. Sono due cose diverse e vanno dette
+/// entrambe alla selezione: passare solo il tetto significava chiedere "fino a N
+/// candidati" e scoprire soltanto a valle che venivano tutti dallo stesso
+/// provider, con la tier-chain ormai abbandonata. Il 20/07 questo produceva
+/// "provider distinti insufficienti (got=1 min=2)" con SEI provider abilitati e
+/// sani, e i tier successivi -- gia' autorizzati dalla catena -- mai interrogati.
 pub async fn resolve_purpose_provider_candidates_db(
     db: &PgPool,
     purpose: &str,
     limit: usize,
+    min_providers: usize,
 ) -> Result<Vec<PurposeProviderCandidate>, PurposeResolution> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -457,7 +466,7 @@ pub async fn resolve_purpose_provider_candidates_db(
     // Pool piu' ampio del limite per deduplicare per provider senza una query
     // dedicata fuori dal servizio.
     let pool_limit = (limit.saturating_mul(4)).max(limit) as i64;
-    let rows = match select_models(db, &req, pool_limit).await {
+    let rows = match select_models(db, &req, pool_limit, min_providers).await {
         Ok(v) => v,
         // Pool vuoto: per il fan-out non e' un errore da propagare (il chiamante
         // convoca chi c'e'), salvo il catalog irraggiungibile.
@@ -545,7 +554,9 @@ where
     Fut: std::future::Future<Output = AttemptOutcome<T>>,
 {
     let limit = purpose_failover_candidate_limit(db, purpose).await;
-    let candidates = match resolve_purpose_provider_candidates_db(db, purpose, limit).await {
+    // Failover in cascata: si prova un candidato alla volta finche' uno risponde,
+    // quindi nessuna richiesta di diversita' (basta il primo che funziona).
+    let candidates = match resolve_purpose_provider_candidates_db(db, purpose, limit, 1).await {
         Ok(c) if !c.is_empty() => c,
         Ok(_) => return Err(PurposeFailoverError::NoCandidate(PurposeResolution::NotFound)),
         Err(res) => return Err(PurposeFailoverError::NoCandidate(res)),
@@ -1101,7 +1112,7 @@ mod tests {
             .expect("catalog");
         }
         let candidates =
-            resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3)
+            resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3, 1)
                 .await
                 .expect("candidati");
         assert_eq!(candidates.len(), 3, "max 3 provider distinti");
@@ -1153,7 +1164,7 @@ mod tests {
             .await
             .expect("catalog");
         }
-        let candidates = resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3)
+        let candidates = resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3, 1)
             .await
             .expect("candidati");
         let providers: Vec<_> = candidates.iter().map(|c| c.provider.as_str()).collect();
@@ -1167,6 +1178,95 @@ mod tests {
         assert!(
             candidates.iter().all(|c| c.tier.as_deref() == Some("high")),
             "i pareri devono restare omogenei di fascia: {candidates:?}"
+        );
+    }
+
+    /// REGRESSIONE (difetto osservato il 20/07): il tier richiesto NON e' vuoto,
+    /// ma tutti i suoi modelli appartengono a UN SOLO provider. La tier-chain
+    /// usciva al primo tier non vuoto -- la non-vuotezza come criterio -- e il
+    /// panel dichiarava "provider distinti insufficienti (got=1 min=2)" mentre
+    /// SEI provider erano abilitati e sani e i tier successivi, gia' autorizzati
+    /// dalla catena, non erano mai stati interrogati.
+    ///
+    /// Il tetto (`limit`) e la soglia (`min_providers`) sono due domande diverse:
+    /// qui si verifica che la seconda arrivi fino alla selezione e faccia
+    /// proseguire la catena.
+    #[sqlx::test]
+    async fn fanout_scende_finche_i_provider_distinti_bastano(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model (
+                 purpose TEXT PRIMARY KEY,
+                 tier TEXT,
+                 required_capability TEXT,
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("nexus_purpose_model");
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use)
+             VALUES ('multi_provider_advisory', 'medium', 'reasoning', true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+
+        // Il tier richiesto e' POPOLATO ma monoprovider: due modelli, stesso
+        // openrouter. Gli altri provider sani stanno un gradino sopra.
+        for (provider, model, tier, cost) in [
+            ("openrouter", "qwen3-235b", "medium", 0.2),
+            ("openrouter", "glm-5.2", "medium", 0.3),
+            ("deepseek", "deepseek-v4-pro", "high", 0.5),
+            ("google", "gemini-high", "high", 1.0),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy,
+                    performance_tier, capabilities, input_cost_per_million_tokens)
+                 VALUES ($1, $2, true, true, 'none', $3, '[\"reasoning\"]'::jsonb, $4)",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(tier)
+            .bind(cost)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+
+        // Soglia 2 (il valore reale di `orchestrator.multi_provider_min_providers`).
+        let candidates = resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3, 2)
+            .await
+            .expect("candidati");
+        let distinti: std::collections::HashSet<&str> =
+            candidates.iter().map(|c| c.provider.as_str()).collect();
+        assert!(
+            distinti.len() >= 2,
+            "con provider sani un gradino sopra il fan-out deve raggiungere la \
+             soglia invece di degradare: trovati {distinti:?} da {candidates:?}"
+        );
+        assert!(
+            distinti.contains("openrouter"),
+            "il tier richiesto resta in TESTA: la diversita' si aggiunge, non \
+             sostituisce la preferenza di fascia. Trovati {distinti:?}"
+        );
+
+        // MUTAZIONE / contro-caso: con soglia 1 vale la regola storica -- si esce
+        // al primo tier non vuoto e si resta monoprovider. E' il comportamento
+        // che produceva il degrado, e deve restare intatto per chi non chiede
+        // diversita' (failover in cascata, classificatore).
+        let soglia_uno = resolve_purpose_provider_candidates_db(&pool, "multi_provider_advisory", 3, 1)
+            .await
+            .expect("candidati");
+        let distinti_uno: std::collections::HashSet<&str> =
+            soglia_uno.iter().map(|c| c.provider.as_str()).collect();
+        assert_eq!(
+            distinti_uno.len(),
+            1,
+            "senza richiesta di diversita' la catena esce al primo tier non \
+             vuoto: {soglia_uno:?}"
         );
     }
 

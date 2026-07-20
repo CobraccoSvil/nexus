@@ -395,7 +395,7 @@ pub(crate) async fn agentic_failover_candidates(
         .min_context_window(min_context_window)
         .min_tier(&floor)
         .exclude(exclude);
-    match crate::orchestrator::model_service::select_models(db, &req, FAILOVER_CANDIDATE_POOL)
+    match crate::orchestrator::model_service::select_models(db, &req, FAILOVER_CANDIDATE_POOL, 1)
         .await
         .map(|v| {
             v.into_iter()

@@ -557,7 +557,7 @@ async fn diagnose_empty(
         let mut senza_gate = filter_for(req, gate);
         senza_gate.require_qualified = false;
         senza_gate.exclude_preview = false;
-        if let Ok(v) = select_models_tierchain(db, &senza_gate, chain, &req.rank.to_sql(), 1).await {
+        if let Ok(v) = select_models_tierchain(db, &senza_gate, chain, &req.rank.to_sql(), 1, 1).await {
             if !v.is_empty() {
                 return NoModelReason::GateEmpty {
                     requested_tier: req.tier.to_string(),
@@ -611,7 +611,7 @@ async fn select_model_governed(
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
     let rows =
-        select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), GOVERNED_CANDIDATE_POOL)
+        select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), GOVERNED_CANDIDATE_POOL, 1)
             .await
             .map_err(NoModelReason::CatalogUnavailable)?;
     if rows.is_empty() {
@@ -652,25 +652,38 @@ async fn select_model_governed(
     Ok(choice_from(req, provider, model, effective_tier))
 }
 
-/// Come [`select_model`] ma ritorna fino a `limit` candidati, dello STESSO tier
-/// (il corto-circuito della tier-chain sceglie il primo tier con candidati:
-/// i risultati restano omogenei di fascia, mai un misto heavy+light).
+/// Come [`select_model`] ma ritorna fino a `limit` candidati.
 ///
 /// Serve ai fan-out multi-provider: il consiglio chiede N provider DISTINTI, e
 /// deduplica a valle. E' il caso che ha PIU' bisogno della degradazione, non
 /// meno: chiede piu' provider proprio nel tier che ne ha di meno.
+///
+/// `min_distinct_providers` e' proprio quella richiesta, resa esplicita fino al
+/// punto di selezione. Prima si fermava a "dammi fino a N candidati" e la
+/// diversita' veniva controllata SOLO a valle, quando la tier-chain era gia'
+/// stata abbandonata al primo tier non vuoto: con `1` si esce come sempre
+/// (candidati omogenei di fascia), con `>= 2` la catena prosegue finche' i
+/// provider distinti bastano. Vedi [`select_models_tierchain`].
 pub async fn select_models(
     db: &PgPool,
     req: &ModelRequest<'_>,
     limit: i64,
+    min_distinct_providers: usize,
 ) -> Result<Vec<ModelChoice>, NoModelReason> {
     let gate = qualification_gate(db).await;
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows = select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), limit)
-        .await
-        .map_err(NoModelReason::CatalogUnavailable)?;
+    let rows = select_models_tierchain(
+        db,
+        &filter,
+        &chain,
+        &req.rank.to_sql(),
+        limit,
+        min_distinct_providers,
+    )
+    .await
+    .map_err(NoModelReason::CatalogUnavailable)?;
     if rows.is_empty() {
         return Err(diagnose_empty(db, req, &chain, gate).await);
     }
@@ -691,7 +704,7 @@ async fn select_model_with_gate(
     validate(req)?;
     let chain = chain_for(req);
     let filter = filter_for(req, gate);
-    let rows = select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), 1)
+    let rows = select_models_tierchain(db, &filter, &chain, &req.rank.to_sql(), 1, 1)
         .await
         .map_err(NoModelReason::CatalogUnavailable)?;
     let Some((provider, model, effective_tier)) = rows.into_iter().next() else {
