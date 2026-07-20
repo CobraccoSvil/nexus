@@ -604,6 +604,9 @@ pub fn is_skipped_dir(name: &str) -> bool {
         || name == "target"
         || name == "dist"
         || name == "build"
+        || name == "coverage"
+        || name == "__pycache__"
+        || name == "venv"
 }
 
 // ── Rust toolchain ────────────────────────────────────────────────────────
