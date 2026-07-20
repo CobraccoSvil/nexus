@@ -282,12 +282,11 @@ async fn oauth_encryption_key(db: &PgPool) -> anyhow::Result<String> {
     let secret: String = (0..64)
         .map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>()))
         .collect();
-    sqlx::query(
-        "UPDATE settings SET value = $1, updated_at = NOW() WHERE key = 'oauth_data_encryption_key'",
-    )
-    .bind(&secret)
-    .execute(db)
-    .await?;
+    // Scrittura dal punto unico, che invalida la cache delle letture. Con un
+    // UPDATE inline la `get_setting` qui sopra continuerebbe a vedere il valore
+    // assente per tutto il TTL: la chiamata successiva genererebbe un SECONDO
+    // segreto, e quanto cifrato col primo diventerebbe indecifrabile.
+    nexus_auth::update_setting_value(db, "oauth_data_encryption_key", &secret).await?;
     Ok(secret)
 }
 

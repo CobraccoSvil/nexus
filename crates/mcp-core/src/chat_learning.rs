@@ -197,6 +197,10 @@ async fn upsert_project_routing_setting(
     .execute(db)
     .await
     .map_err(internal_err)?;
+    // Questa scrittura ha una query propria (upsert con categoria) e quindi non
+    // passa dal punto unico che invalida: senza, la lettura continuerebbe a
+    // servire il vecchio valore per tutto il TTL della cache dei settings.
+    nexus_auth::invalidate_setting_cache(db, project_key);
     Ok(())
 }
 

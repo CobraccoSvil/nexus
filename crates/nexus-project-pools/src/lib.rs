@@ -26,6 +26,8 @@
 //! che ritorna il pool meta e' la resilienza (registry non inizializzato o DB
 //! non provisionato), mai un ramo di configurazione.
 
+pub mod sizing;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -120,9 +122,7 @@ pub async fn project_data_pool(
     let url = resolve_meta_db_url(meta, project_id)
         .await?
         .ok_or(ProjectPoolError::NotProvisioned(project_id))?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(3)
-        .acquire_timeout(Duration::from_secs(5))
+    let pool = sizing::project_pool_options()
         .connect(&url)
         .await
         .map_err(|e| ProjectPoolError::Connect {

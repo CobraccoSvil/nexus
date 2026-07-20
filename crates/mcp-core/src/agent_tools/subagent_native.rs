@@ -3473,11 +3473,31 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // per created_at). L'await del handle garantisce che nessuna INSERT del ponte
     // segua quella di chiusura (race chiusa alla radice, regola H).
     let run_fut = crate::native_engine::run_native(&deps, &native_input);
+    // L'istante da cui il budget decorre, in Rust. Serve al ramo di scadenza:
+    // `completed_at` sulla riga del sub-run e' il NOW() del server Postgres,
+    // scritto DOPO stop_bridge + fetch_ledger_totals + mark_run, cioe' misura la
+    // CHIUSURA e non lo scatto. Finche' i due erano indistinguibili, un ritardo
+    // nella scrittura (pool esaurito) somigliava a un timer che scatta tardi:
+    // due cause opposte con la stessa faccia.
+    let t_budget_start = std::time::Instant::now();
     let outcome: anyhow::Result<NativeRunOutcome> =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await
         {
             Ok(res) => res,
             Err(_) => {
+                // Misurato PRIMA di ogni await successivo: da qui in poi qualunque
+                // attesa (il ponte, il ledger, una connessione dal pool) sposta
+                // solo la scrittura, non lo scatto.
+                let scatto_ms = t_budget_start.elapsed().as_millis() as u64;
+                let ritardo_ms = ritardo_scatto_ms(scatto_ms, timeout_s);
+                tracing::warn!(
+                    sub_run_id = %subagent_run_id,
+                    kind = %kind,
+                    timeout_s,
+                    scatto_ms,
+                    ritardo_ms,
+                    "sub-run scaduto: ritardo dello scatto rispetto al budget"
+                );
                 stop_bridge(bridge).await;
                 // Il timeout marca comunque la riga TERMINALE (status='timeout'):
                 // deve passare per l'enqueue fan-in come gli altri rami (senza,
@@ -3914,6 +3934,17 @@ async fn insert_subagent_run(
 
 /// Ferma il ponte narrazione e ATTENDE che sia davvero finito (vedi commento
 /// sul timeout in `run_single_subagent`: chiude la race abort/INSERT-in-volo).
+/// Quanto lo scatto del timeout ha ecceduto il budget, in millisecondi.
+///
+/// Un valore vicino a zero dice che il timer e' stato puntuale e che un eventuale
+/// ritardo osservato a valle (su `completed_at`) sta nella scrittura, non nello
+/// scatto. Un valore grande dice il contrario: sono due diagnosi opposte, e senza
+/// questa misura si distinguono solo per congettura.
+fn ritardo_scatto_ms(scatto_ms: u64, timeout_s: i64) -> u64 {
+    let budget_ms = (timeout_s.max(0) as u64).saturating_mul(1_000);
+    scatto_ms.saturating_sub(budget_ms)
+}
+
 async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
     if let Some(b) = bridge {
         b.abort();
@@ -4455,6 +4486,25 @@ mod tests {
     const T_EDIT: &str = "edit_file";
     const T_RUN: &str = "run_command";
     const FIX_PATH: &str = "src/a.rs";
+
+    /// La misura che distingue "il timer e' scattato tardi" da "la scrittura di
+    /// chiusura e' arrivata tardi": nell'incidente del 19/07 le due cause erano
+    /// indistinguibili perche' l'unico timestamp disponibile era quello della
+    /// scrittura, e il ritardo era in realta' l'attesa di una connessione.
+    #[test]
+    fn il_ritardo_dello_scatto_e_l_eccesso_sul_budget() {
+        // Timer puntuale: nessun ritardo da segnalare.
+        assert_eq!(ritardo_scatto_ms(300_000, 300), 0);
+        assert_eq!(ritardo_scatto_ms(300_120, 300), 120);
+        // Il caso dell'incidente, se lo scatto fosse davvero tardato.
+        assert_eq!(ritardo_scatto_ms(427_000, 300), 127_000);
+        // Scatto anticipato (clock non monotono altrove): mai negativo.
+        assert_eq!(ritardo_scatto_ms(299_000, 300), 0);
+        // Budget non valorizzato: l'intero tempo trascorso e' l'eccesso, e non
+        // si moltiplica un negativo.
+        assert_eq!(ritardo_scatto_ms(5_000, 0), 5_000);
+        assert_eq!(ritardo_scatto_ms(5_000, -7), 5_000);
+    }
 
     #[test]
     fn err_ha_marker_errore() {
