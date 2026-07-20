@@ -3227,8 +3227,13 @@ mod tests {
     // ── Lo SCORE MISURATO: la simulazione del piano sul giro reale ──────────
 
     fn pesi() -> MeasuredScoreWeights {
-        // I pesi del seed (mig 0616).
-        MeasuredScoreWeights { chain: 25.0, recovery: 30.0, real: 15.0, latent: 15.0, longctx: 15.0 }
+        // I pesi VERI della produzione (mig 0620), non quelli del seed: un test
+        // che simula "il giro reale" con pesi che nessuno usa piu' misurerebbe
+        // una formula immaginaria (regola O). chain 12 perche' e' diventata
+        // commodity, recovery 45 perche' e' il solo che apre il ventaglio,
+        // longctx 0 perche' il profilo e' spento e un peso che nessuno puo'
+        // prendere comprime la scala invece di ordinarla.
+        MeasuredScoreWeights { chain: 12.0, recovery: 45.0, real: 18.0, latent: 25.0, longctx: 0.0 }
     }
 
     /// I kind che la suite 4 reale poteva correre: long_context NON c'e'
@@ -3408,17 +3413,17 @@ mod tests {
         let s_qwen = punteggio(&qwen);
         let s_grok = punteggio(&grok);
         let s_ministral = punteggio(&ministral);
-        // La formula esatta sui fatti reali, con LINKS_TARGET = 7 (mig 0618).
-        // Ogni punteggio scende di 25*(somma links)/4 * (1/5 - 1/7) rispetto al
-        // bersaglio a 5: e' la catena che smette di dare il pieno a chi si ferma
-        // dove finivano i turni. minimax (5,5,5,5): 74.375 - 50/7. kimi (5,4,3,5):
-        // 58.125 - 170/28. qwen (5,5,4,5): 53.125 - 190/28. grok (5,5,5,5):
-        // 51.25 - 50/7. ministral (2,2,2,2): 32.5 - 80/28.
-        assert!(vicino(s_minimax, 74.375 - 50.0 / 7.0), "minimax: {s_minimax}");
-        assert!(vicino(s_kimi, 58.125 - 170.0 / 28.0), "kimi: {s_kimi}");
-        assert!(vicino(s_qwen, 53.125 - 190.0 / 28.0), "qwen: {s_qwen}");
-        assert!(vicino(s_grok, 51.25 - 50.0 / 7.0), "grok: {s_grok}");
-        assert!(vicino(s_ministral, 32.5 - 80.0 / 28.0), "ministral: {s_ministral}");
+        // La formula esatta sui fatti reali, coi pesi della mig 0620
+        // (chain 12, recovery 45, real 18, latent 25, longctx 0) e
+        // LINKS_TARGET = 7 (mig 0618). Ogni addendo e' scritto come
+        // peso * frazione-osservata, cosi' il numero si legge invece di essere
+        // copiato dall'output: catena (somma links)/(4*7), recupero e latent per
+        // rate, malus -5 su repeated e bad_syntax sugli 8 tentativi multi-step.
+        assert!(vicino(s_minimax, 12.0 * 5.0 / 7.0 + 45.0 + 18.0 + 25.0 * 0.5 - 3.125), "minimax: {s_minimax}");
+        assert!(vicino(s_kimi, 12.0 * 17.0 / 28.0 + 45.0 * 0.25 + 18.0 + 25.0 - 0.625), "kimi: {s_kimi}");
+        assert!(vicino(s_qwen, 12.0 * 19.0 / 28.0 + 18.0 + 25.0 - 0.625), "qwen: {s_qwen}");
+        assert!(vicino(s_grok, 12.0 * 5.0 / 7.0 + 18.0 + 25.0 - 3.75), "grok: {s_grok}");
+        assert!(vicino(s_ministral, 12.0 * 2.0 / 7.0 + 18.0 + 25.0 * 0.5), "ministral: {s_ministral}");
         // grok sotto kimi NONOSTANTE catena piena e latent pieno: il recovery
         // (peso 30) e il malus repeated lo pagano. E' il razionale di w_recovery.
         assert!(s_grok < s_kimi, "recovery 0 + malus deve costare: {s_grok} vs {s_kimi}");
@@ -3429,18 +3434,31 @@ mod tests {
         let banda = |s: f64| banda_measured(s, None, ancora, &bande(), 3.0);
         assert_eq!(banda(s_minimax), "frontier", "il leader e' il 100% di se stesso");
         assert_eq!(banda(s_kimi), "heavy");
-        assert_eq!(banda(s_qwen), "heavy");
-        assert_eq!(banda(s_grok), "heavy");
+        // qwen e grok scendono a HIGH con i pesi della 0620: la catena non li
+        // porta piu' in alto (12 punti invece di 25) e il recupero, che nessuno
+        // dei due passa, ora ne pesa 45. Prima erano indistinguibili da kimi.
+        assert_eq!(banda(s_qwen), "high");
+        assert_eq!(banda(s_grok), "high");
         assert_eq!(banda(s_ministral), "medium", "ministral-8b NON e' piu' high");
-        // La banda high resta VUOTA in questo parco di 5: accettabile e
-        // dichiarato (il routing degrada gia' via TierPolicy).
-        for s in [s_minimax, s_kimi, s_qwen, s_grok, s_ministral] {
-            assert_ne!(banda(s), "high", "score {s}");
-        }
+        // QUI IL TEST E' STATO CAPOVOLTO, ed e' la misura del progresso: coi
+        // pesi vecchi la banda high restava VUOTA (il ciclo asseriva che nessuno
+        // la toccasse) perche' la catena da 25 punti spingeva qwen e grok su
+        // heavy insieme a kimi. Con la 0620 i cinque modelli occupano QUATTRO
+        // bande su cinque: una scala che usa i suoi gradini invece di
+        // accatastare tutti in cima.
+        let bande_usate: std::collections::BTreeSet<_> =
+            [s_minimax, s_kimi, s_qwen, s_grok, s_ministral].iter().map(|s| banda(*s)).collect();
+        assert!(
+            bande_usate.contains("high"),
+            "la banda high deve essere popolata: e' il gradino che la de-pesatura ha restituito"
+        );
+        assert!(bande_usate.len() >= 4, "bande distinte usate: {bande_usate:?}");
     }
 
-    /// Il razionale di w_recovery=30: un GEMELLO del leader che non legge mai
-    /// l'errore resta fuori da frontier SENZA dipendere dal malus.
+    /// Il razionale di w_recovery=45 (mig 0620, prima 30): un GEMELLO del leader
+    /// che non legge mai l'errore resta fuori da frontier SENZA dipendere dal
+    /// malus. Il peso e' salito perche' il recupero e' rimasto il solo criterio
+    /// che apre davvero il ventaglio, mentre la catena e' diventata commodity.
     #[test]
     fn un_gemello_del_leader_senza_recovery_non_e_frontier() {
         let w = pesi();
@@ -3454,7 +3472,7 @@ mod tests {
         ]);
         let leader = derive_measured_score(&giro_minimax(), &kinds, &w).expect("leader");
         let s = derive_measured_score(&gemello, &kinds, &w).expect("gemello");
-        assert!((s - (leader - 30.0)).abs() < 1e-9, "perde ESATTAMENTE il peso recovery: {s}");
+        assert!((s - (leader - 45.0)).abs() < 1e-9, "perde ESATTAMENTE il peso recovery: {s}");
         assert_ne!(
             banda_measured(s, None, leader, &bande(), 3.0),
             "frontier",
