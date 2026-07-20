@@ -118,17 +118,12 @@ const FILES_TOUCHED_CAP: usize = 50;
 /// solo se `true`; `files_touched` solo se array non vuoto di stringhe non vuote
 /// (cap [`FILES_TOUCHED_CAP`]). Le chiavi sono inserite in ordine d'inserimento
 /// (preserve_order del workspace).
-pub fn normalize_declared_outcome(tool_input: &Value) -> Option<Value> {
-    let obj = tool_input.as_object()?;
-    let outcome = obj
-        .get("outcome")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    if !VALID_OUTCOMES.contains(&outcome.as_str()) {
-        return None;
-    }
+pub fn normalize_declared_outcome(tool_input: &Value) -> Result<Value, DeclarationRejected> {
+    const TOOL: &str = "task_complete";
+    let obj = tool_input
+        .as_object()
+        .ok_or(DeclarationRejected::InputNonOggetto { tool: TOOL })?;
+    let outcome = campo_enum(obj, "outcome", VALID_OUTCOMES, TOOL)?;
     let summary = obj
         .get("summary")
         .and_then(Value::as_str)
@@ -174,7 +169,7 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Option<Value> {
             out.insert("files_touched".to_string(), Value::Array(files));
         }
     }
-    Some(Value::Object(out))
+    Ok(Value::Object(out))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -994,11 +989,24 @@ mod tests {
 
     #[test]
     fn normalize_outcome_invalido() {
+        // Il rifiuto porta la RAGIONE: outcome fuori enum con il valore ricevuto
+        // e lo slice ammesso (caso reale: "success" dichiarato identico 3 volte
+        // perche' il modello non sapeva cosa correggere).
+        let err = normalize_declared_outcome(&json!({"outcome": "fatto"}))
+            .expect_err("outcome fuori enum va rifiutato");
         assert_eq!(
-            normalize_declared_outcome(&json!({"outcome": "fatto"})),
-            None
+            err,
+            DeclarationRejected::ValoreFuoriEnum {
+                tool: "task_complete",
+                campo: "outcome",
+                ricevuto: "\"fatto\"".to_string(),
+                ammessi: VALID_OUTCOMES,
+            }
         );
-        assert_eq!(normalize_declared_outcome(&json!([1, 2])), None);
+        assert!(
+            normalize_declared_outcome(&json!([1, 2])).is_err(),
+            "input non-oggetto va rifiutato"
+        );
     }
 
     #[test]

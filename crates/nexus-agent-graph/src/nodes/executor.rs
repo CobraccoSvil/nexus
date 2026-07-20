@@ -5597,7 +5597,7 @@ con un tool call.",
                     "summary": question,
                     "next_step": question,
                 }))
-                .unwrap_or_else(|| json!({"outcome": "needs_input", "summary": question}));
+                .unwrap_or_else(|_| json!({"outcome": "needs_input", "summary": question}));
                 self.emit_phase(
                     ctx,
                     mode,
@@ -5642,7 +5642,7 @@ al mio controllo e va risolta prima di continuare."
                     "summary": summary,
                     "blocker": blocker,
                 }))
-                .unwrap_or_else(|| json!({"outcome": "blocked", "summary": summary}));
+                .unwrap_or_else(|_| json!({"outcome": "blocked", "summary": summary}));
                 self.emit_phase(
                     ctx,
                     mode,
