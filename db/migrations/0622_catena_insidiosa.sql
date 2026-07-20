@@ -1,4 +1,4 @@
--- 0621 - La catena torna a discriminare: insidiosa, non piu' lunga
+-- 0622 - La catena torna a discriminare: insidiosa, non piu' lunga
 --
 -- La 0618 aveva alzato il soffitto (turni 6 -> 8, bersaglio 5 -> 7 anelli) per
 -- de-saturare `agentic_chain`. Misurato dopo il giro a suite 6/7: la componente si

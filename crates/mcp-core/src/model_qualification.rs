@@ -340,10 +340,10 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
 /// punteggio pieno. Quel 5 non era la bravura dei modelli, era il soffitto di
 /// `max_turns: 6` — con 6 turni non se ne possono concatenare di piu'.
 ///
-/// 7 -> 6 (mig 0621), e stavolta il bersaglio SCENDE. A 7 la componente si e'
+/// 7 -> 6 (mig 0622), e stavolta il bersaglio SCENDE. A 7 la componente si e'
 /// risaturata (79% dei tentativi a 7 anelli, ministral-8b compreso): il soffitto
 /// si era spostato, non rimosso, perche' seguire riferimenti concatenati non e'
-/// piu' una capacita' rara. La 0621 non allunga la catena, la rende insidiosa —
+/// piu' una capacita' rara. La 0622 non allunga la catena, la rende insidiosa —
 /// il criterio di selezione sta nel primo messaggio e a un anello la pista si
 /// interrompe. Rientrare COSTA UN TURNO, quindi con gli stessi 8 turni la
 /// traiettoria perfetta vale 6 anelli e non piu' 7.
@@ -3435,7 +3435,7 @@ mod tests {
         let s_ministral = punteggio(&ministral);
         // La formula esatta sui fatti reali, coi pesi della mig 0620
         // (chain 12, recovery 45, real 18, latent 25, longctx 0) e
-        // LINKS_TARGET = 6 (mig 0621). Ogni addendo e' scritto come
+        // LINKS_TARGET = 6 (mig 0622). Ogni addendo e' scritto come
         // peso * frazione-osservata, cosi' il numero si legge invece di essere
         // copiato dall'output: catena (somma links)/(4*6), recupero e latent per
         // rate, malus -5 su repeated e bad_syntax sugli 8 tentativi multi-step.
@@ -4381,7 +4381,7 @@ mod tests {
     /// needle, `run_loop`, `verdetto_dai_fatti` col predicato REALE del profilo.
     async fn giro_completo_catena(strategia: Strategia, seme: u64) -> (AttemptOutcome, usize) {
         use crate::probe_world::{ScriptedWorld, WorldKind};
-        // Il predicato del profilo `agentic_chain` dopo la mig 0621: 4 anelli.
+        // Il predicato del profilo `agentic_chain` dopo la mig 0622: 4 anelli.
         // 4 > 3 = l'anello cieco piu' lontano, quindi passare IMPLICA essere
         // rientrati sulla pista — non c'e' altra strada per superare quel numero.
         let predicate = json!({
