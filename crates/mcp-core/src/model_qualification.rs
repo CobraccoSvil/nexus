@@ -331,10 +331,18 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
 
 /// Il bersaglio della catena nella formula dello score (piano "scala relativa",
 /// mig 0616): `s_chain = media di min(chained_links/LINKS_TARGET, 1)`. E' una
-/// costante della FORMULA (5 anelli = catena piena), non un tuning di routing:
-/// cambiarla cambia il significato degli score gia' persistiti, quindi il posto
-/// giusto per una revisione e' un bump di suite, non un setting.
-const LINKS_TARGET: f64 = 5.0;
+/// costante della FORMULA (catena piena), non un tuning di routing: cambiarla
+/// cambia il significato degli score gia' persistiti, quindi il posto giusto per
+/// una revisione e' un bump di suite, non un setting.
+///
+/// 5 -> 7 (mig 0618). A 5 la componente era SATURA e non separava piu' nessuno:
+/// 120 tentativi su 156 (il 77%) toccavano esattamente 5 anelli e prendevano il
+/// punteggio pieno. Quel 5 non era la bravura dei modelli, era il soffitto di
+/// `max_turns: 6` — con 6 turni non se ne possono concatenare di piu'. Alzati
+/// insieme i turni a 8 (il massimo che `TURNI_MAX` concede), 7 anelli tornano
+/// raggiungibili e la componente torna a distinguere: chi si ferma a 5 prende il
+/// 71%, chi arriva a 7 il pieno.
+const LINKS_TARGET: f64 = 7.0;
 
 /// Somme CONTINUE sui tentativi CONCLUSIVI di un profilo (mig 0616): alimentano
 /// [`derive_measured_score`] senza rileggere l'evidence. Restano a zero sui
@@ -3400,14 +3408,17 @@ mod tests {
         let s_qwen = punteggio(&qwen);
         let s_grok = punteggio(&grok);
         let s_ministral = punteggio(&ministral);
-        // La formula esatta sui fatti reali. minimax: 25 + 30 + 15 + 7.5 -
-        // malus(2/8 repeated + 3/8 bad = 3.125) = 74.375. ministral: 25*0.4 +
-        // 0 + 15 + 7.5 = 32.5, il numero del piano.
-        assert!(vicino(s_minimax, 74.375), "minimax: {s_minimax}");
-        assert!(vicino(s_kimi, 58.125), "kimi: {s_kimi}");
-        assert!(vicino(s_qwen, 53.125), "qwen: {s_qwen}");
-        assert!(vicino(s_grok, 51.25), "grok: {s_grok}");
-        assert!(vicino(s_ministral, 32.5), "ministral: {s_ministral}");
+        // La formula esatta sui fatti reali, con LINKS_TARGET = 7 (mig 0618).
+        // Ogni punteggio scende di 25*(somma links)/4 * (1/5 - 1/7) rispetto al
+        // bersaglio a 5: e' la catena che smette di dare il pieno a chi si ferma
+        // dove finivano i turni. minimax (5,5,5,5): 74.375 - 50/7. kimi (5,4,3,5):
+        // 58.125 - 170/28. qwen (5,5,4,5): 53.125 - 190/28. grok (5,5,5,5):
+        // 51.25 - 50/7. ministral (2,2,2,2): 32.5 - 80/28.
+        assert!(vicino(s_minimax, 74.375 - 50.0 / 7.0), "minimax: {s_minimax}");
+        assert!(vicino(s_kimi, 58.125 - 170.0 / 28.0), "kimi: {s_kimi}");
+        assert!(vicino(s_qwen, 53.125 - 190.0 / 28.0), "qwen: {s_qwen}");
+        assert!(vicino(s_grok, 51.25 - 50.0 / 7.0), "grok: {s_grok}");
+        assert!(vicino(s_ministral, 32.5 - 80.0 / 28.0), "ministral: {s_ministral}");
         // grok sotto kimi NONOSTANTE catena piena e latent pieno: il recovery
         // (peso 30) e il malus repeated lo pagano. E' il razionale di w_recovery.
         assert!(s_grok < s_kimi, "recovery 0 + malus deve costare: {s_grok} vs {s_kimi}");
