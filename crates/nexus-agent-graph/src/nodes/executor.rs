@@ -1,4 +1,4 @@
-//! `ExecutorNode` — porta il CUORE del grafo, `executor_node`
+﻿//! `ExecutorNode` — porta il CUORE del grafo, `executor_node`
 //! (`brain/agents/nodes/__init__.py:1648-3513`).
 //!
 //! E' la META' del loop agentico che CHIAMA il modello: dato lo stato (history +
@@ -840,6 +840,36 @@ pub struct ExecutorNode {
     /// [`Self::with_context_offload`]. Gata dai flag `cfg.compress_offload_enabled`
     /// / `cfg.rolling_summary_offload_enabled`.
     offload: Option<Arc<dyn ContextOffload>>,
+}
+
+
+/// Payload STRUTTURATO del cambio provider (punto unico dei tre emettitori:
+/// failover in cascata, signature_loop, no_progress). Le chiavi sono il
+/// contratto wire con la card "CAMBIO PROVIDER" del frontend; `from_model` e'
+/// il modello CADUTO -- senza, la card mostrava "Mistral / ?" (il frontend
+/// ripiega su prev.model, assente sul primo segmento).
+fn switch_payload(
+    from_provider: &str,
+    from_model: &str,
+    to_provider: &str,
+    to_model: &str,
+    reason: &str,
+    cooldown: Option<bool>,
+    cause: Option<&str>,
+) -> Value {
+    let mut p = serde_json::Map::new();
+    p.insert("from_provider".into(), from_provider.into());
+    p.insert("from_model".into(), from_model.into());
+    p.insert("to_provider".into(), to_provider.into());
+    p.insert("to_model".into(), to_model.into());
+    p.insert("reason".into(), reason.into());
+    if let Some(c) = cooldown {
+        p.insert("cooldown".into(), c.into());
+    }
+    if let Some(c) = cause {
+        p.insert("cause".into(), c.into());
+    }
+    Value::Object(p)
 }
 
 impl ExecutorNode {
@@ -3840,21 +3870,15 @@ passo a {}/{}",
                                 mode,
                                 "escalation",
                                 title,
-                                json!({
-                                    "from_provider": provider,
-                                    "to_provider": pick.provider,
-                                    "to_model": pick.model,
-                                    "reason": "provider_failover",
-                                    // Causa STRUTTURATA (ADR 0037 arricchimento B),
-                                    // vocabolario chiuso ProviderFailureCause: il
-                                    // frontend mappa l'etichetta umana senza
-                                    // euristiche. `cooldown` resta bool per
-                                    // retro-compatibilita' ed e' true SOLO quando
-                                    // lo switch e' davvero da indisponibilita'
-                                    // temporale (cooldown/credito).
-                                    "cooldown": pu.cause.is_cooldown_like(),
-                                    "cause": pu.cause.as_str(),
-                                }),
+switch_payload(
+                                    &provider,
+                                    &model,
+                                    &pick.provider,
+                                    &pick.model,
+                                    "provider_failover",
+                                    Some(pu.cause.is_cooldown_like()),
+                                    Some(pu.cause.as_str()),
+                                ),
                             )
                             .await;
                             let esc_nudge = human_msg(match pu.cause {
@@ -4186,12 +4210,15 @@ riassumi lo stato."
                             "Passo a {}/{} (tool call ripetuta identica)",
                             pick.provider, pick.model
                         ),
-                        json!({
-                            "from_provider": provider,
-                            "to_provider": pick.provider,
-                            "to_model": pick.model,
-                            "reason": "signature_loop",
-                        }),
+                        switch_payload(
+                            &provider,
+                            &model,
+                            &pick.provider,
+                            &pick.model,
+                            "signature_loop",
+                            None,
+                            None,
+                        ),
                     )
                     .await;
                     // Ri-esegue lo STESSO turno col provider/model promosso
@@ -5260,14 +5287,15 @@ impl ExecutorNode {
                 "{provider} non avanza (solo testo): passo a {}/{}",
                 pick.provider, pick.model
             ),
-            json!({
-                "from_provider": provider,
-                "to_provider": pick.provider,
-                "to_model": pick.model,
-                "reason": "provider_no_progress",
-                "cooldown": false,
-                "cause": "no_progress",
-            }),
+            switch_payload(
+                &provider,
+                &model,
+                &pick.provider,
+                &pick.model,
+                "provider_no_progress",
+                Some(false),
+                Some("no_progress"),
+            ),
         )
         .await;
         let esc_nudge = human_msg(

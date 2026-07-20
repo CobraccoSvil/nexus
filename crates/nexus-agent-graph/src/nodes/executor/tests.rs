@@ -1725,7 +1725,7 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
         "mistral-large-2411",
         "medium",
     ));
-    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let (n, meta, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
 (in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
@@ -1774,6 +1774,31 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
     // failover_provider e' stato interrogato escludendo il provider caduto.
     let seen = esc.failover_seen.lock().unwrap();
     assert_eq!(seen.last().unwrap(), &vec!["anthropic".to_string()]);
+    // REGRESSIONE (card "Mistral / ?" del 20/07): il meta-step dello switch
+    // deve portare ANCHE il modello caduto (`from_model`), non solo il
+    // provider -- il frontend ripiega su prev.model, che sul primo segmento
+    // non esiste, e la card mostrava "?". Payload dal PRODUTTORE reale
+    // (regola O): questo test attraversa l'emissione vera dell'executor.
+    let steps = meta.meta_steps.lock().unwrap();
+    let switch = steps
+        .iter()
+        .find(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("reason"))
+                .and_then(Value::as_str)
+                == Some("provider_failover")
+        })
+        .expect("meta-step provider_failover emesso");
+    let payload = switch.get("payload").expect("payload presente");
+    assert_eq!(
+        payload.get("from_model").and_then(Value::as_str),
+        Some("claude-x"),
+        "il modello caduto deve viaggiare nel payload: {payload}"
+    );
+    assert_eq!(
+        payload.get("from_provider").and_then(Value::as_str),
+        Some("anthropic")
+    );
 }
 
 #[tokio::test]
