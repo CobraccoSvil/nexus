@@ -1359,41 +1359,13 @@ dell'utente.";
             delta.declared_outcome = Some(None);
         }
 
-        // Fase B (ultracode): verdetto del REVISORE — stessa semantica ADR 0034
-        // dell'esito dichiarato (l'ultimo prevale; se il run prosegue con altri
-        // tool dopo un verdetto, quel verdetto era intermedio e viene azzerato).
-        if let Some(last) = review_verdicts.last() {
-            delta.review_verdict = Some(Some(last.clone()));
-        } else if state.review_verdict.is_some() {
-            delta.review_verdict = Some(None);
-        }
-
-        // Consiglio a monte: parere di una FIGURA. A DIFFERENZA del gemello
-        // `declared_outcome` (ADR 0034), il parere NON viene invalidato dal lavoro
-        // successivo: e' un CONTRIBUTO consultivo, non lo stato del run. Un esito
-        // dichiarato a meta' e poi superato dal lavoro falsava davvero lo status
-        // finale; leggere un file dopo aver formulato un giudizio non rende quel
-        // giudizio falso. Solo una dichiarazione SUCCESSIVA lo sostituisce
-        // (l'ultima prevale).
-        //
-        // La semantica ereditata cancellava pareri gia' validi e acquisiti: la
-        // figura veniva poi classificata `CompletedNoAdvisory` e non contava per
-        // il quorum. Misurato: 7 casi su 355 sub-run del consiglio, piu' il run
-        // del 20/07 in cui `program_manager` ha dichiarato TRE volte senza che
-        // nulla restasse (e ha ricevuto il turno di grazia, che scatta solo se il
-        // canale e' muto, mentre aveva appena parlato due volte).
-        if let Some(last) = advisory_verdicts.last() {
-            delta.advisory_verdict = Some(Some(last.clone()));
-        }
-
-        // Dibattito: posizione di un AVVOCATO — stessa semantica dei gemelli
-        // (l'ultima prevale; una posizione seguita da altri tool era intermedia
-        // e viene azzerata).
-        if let Some(last) = debate_positions.last() {
-            delta.debate_position = Some(Some(last.clone()));
-        } else if state.debate_position.is_some() {
-            delta.debate_position = Some(None);
-        }
+        // Canali di RUOLO (punto unico `set_role_channel`): l'ultima dichiarazione
+        // prevale, ma un turno che non dichiara NON li azzera — al contrario di
+        // `declared_outcome` sopra, che e' lo STATO del run e che il lavoro
+        // successivo puo' davvero smentire.
+        set_role_channel(&mut delta.review_verdict, review_verdicts.last());
+        set_role_channel(&mut delta.advisory_verdict, advisory_verdicts.last());
+        set_role_channel(&mut delta.debate_position, debate_positions.last());
 
         // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).
         if infra_error {
@@ -1494,6 +1466,36 @@ impl ToolDispatchNode {
 /// anthropic_content), SENZA `raw_content` (rimosso: non arriva al modello).
 /// `exit_code` e' incluso solo se presente (tool-comando), 1:1 col Python che
 /// aggiunge la chiave solo `if result.exit_code is not None`.
+/// Scrive nel delta un canale di RUOLO: parere della figura del consiglio,
+/// verdetto del revisore, posizione dell'avvocato del dibattito.
+///
+/// PUNTO UNICO (regola L) della loro semantica, che e' l'OPPOSTO di quella di
+/// `declared_outcome` (ADR 0034): un canale di ruolo e' un CONTRIBUTO gia'
+/// consegnato su un oggetto ESTERNO al run — la richiesta da valutare, il diff da
+/// revisionare, l'opzione da difendere — non un'asserzione sullo stato del run.
+/// Proseguire con altri tool non lo smentisce, quindi il turno successivo non lo
+/// azzera: solo una nuova dichiarazione lo sostituisce.
+///
+/// Perche' l'azzeramento faceva danno: l'unico consumatore legge lo stato FINALE,
+/// quindi cancellare a meta' non "corregge" nulla — fabbrica un'ASTENSIONE
+/// indistinguibile dal ruolo che non ha mai parlato. `classify_council_figure_result`
+/// (mcp-core), `extract_vote` (decisions/adversarial_review.rs) ed `extract_position`
+/// (decisions/debate_panel.rs) la contano come voto mancante, e sotto quorum il
+/// panel esce `inconclusive`. Nel caso del revisore e' peggio: con zero review
+/// `compose_panel_verdict` non emette alcuna nota, quindi un `fail` con findings
+/// gravi diventa silenzio totale invece che prudenza.
+///
+/// Regola M: il segnale e' la presenza di una dichiarazione ACCETTATA dal
+/// normalizzatore, mai la prosa del turno.
+fn set_role_channel(target: &mut Option<Option<Value>>, declared: Option<&Value>) {
+    if let Some(last) = declared {
+        *target = Some(Some(last.clone()));
+    }
+    // Nessun ramo `else`: l'assenza di dichiarazione in QUESTO turno non ritratta
+    // quella dei turni precedenti. Leggere quel silenzio come ritrattazione
+    // sarebbe inferenza, non segnale.
+}
+
 fn tool_result_to_block(r: &ToolResultBlock) -> Value {
     let mut m = Map::new();
     m.insert("type".to_string(), json!("tool_result"));
@@ -2915,6 +2917,37 @@ mod tests {
             out.advisory_verdict.as_ref().expect("parere")["verdict"],
             json!("block"),
             "l'ultima dichiarazione prevale"
+        );
+    }
+
+    #[tokio::test]
+    async fn anche_verdetto_revisore_e_posizione_avvocato_sopravvivono() {
+        // Stessa classe del parere: sono contributi su un oggetto ESTERNO al run.
+        // Per il revisore l'azzeramento era il piu' insidioso: con zero review
+        // `compose_panel_verdict` non emette alcuna nota, quindi un `fail` con
+        // findings gravi non diventava prudenza, diventava silenzio.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
+        st.review_verdict = Some(json!({"verdict": "fail", "summary": "difetto grave"}));
+        st.debate_position = Some(json!({"stance": "oppose", "summary": "cedo la tesi"}));
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        // Mutazione che rende rosso: rimettere il ramo `else if ... = Some(None)`
+        // su uno dei due canali in `set_role_channel`.
+        assert_eq!(
+            out.review_verdict.as_ref().expect("verdetto")["verdict"],
+            json!("fail"),
+            "il verdetto del revisore non va cancellato dal lavoro successivo"
+        );
+        assert_eq!(
+            out.debate_position.as_ref().expect("posizione")["stance"],
+            json!("oppose"),
+            "l'oppose e' il segnale piu' prezioso del dibattito: non va perso"
         );
     }
 
