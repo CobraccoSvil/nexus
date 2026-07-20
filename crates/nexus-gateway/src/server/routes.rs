@@ -1,4 +1,4 @@
-//! Handler HTTP del gateway e pipeline di routing.
+﻿//! Handler HTTP del gateway e pipeline di routing.
 //!
 //! Porting delle route di `server.ts`. La pipeline `/v1/complete` (e `/v1/stream`)
 //! replica il flusso di `LLMGateway`:
@@ -562,6 +562,28 @@ async fn run_fallback(
         "primary_cause": primary_cause,
         "failures": failures.iter().map(ProviderFailure::to_json).collect::<Vec<_>>(),
     });
+    // Lo STATUS verso il chiamante riflette la classe (regola M al confine):
+    // se OGNI provider ha rifiutato con un errore client deterministico, la
+    // stessa richiesta non andra' mai bene e ritentarla e' inutile -> 400.
+    // Prima era sempre 500: un 400 del provider usciva dal gateway come
+    // "errore server, riprovabile", e i chiamanti fuori dal motore agentico
+    // (worker, wiki, probe: decidono su `is_success`/5xx, non leggono
+    // `details`) erano autorizzati a insistere su richieste gia' condannate
+    // (misurato il 20/07: burst di 400 mistral rilanciati come 500).
+    // Il motore agentico non cambia: decide su `code` + `primary_cause`
+    // (classify_gateway_error), non sullo status. Ogni altra composizione
+    // (transiente, cooldown, billing, mista) resta 500: ritentare puo' avere
+    // senso, e il contratto coi client esistenti non si muove.
+    let all_deterministic =
+        !failures.is_empty() && failures.iter().all(|f| f.class == "client_error");
+    if all_deterministic {
+        return Err(PipelineError {
+            status: StatusCode::BAD_REQUEST,
+            code: "PROVIDER_ERROR".to_string(),
+            message: format!("tutti i provider hanno fallito -> {human}"),
+            details: Some(Box::new(details)),
+        });
+    }
     Err(PipelineError::provider_with_details(
         format!("tutti i provider hanno fallito -> {human}"),
         details,
@@ -2782,6 +2804,12 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code, "PROVIDER_ERROR");
+        // Cascata TUTTA deterministica -> lo status verso il chiamante e' 400,
+        // non 500: ritentare la stessa richiesta e' inutile e i chiamanti fuori
+        // dal motore (decidono su 4xx/5xx, non leggono details) non devono piu'
+        // essere invitati a insistere (burst mistral del 20/07, otto 400
+        // rilanciati come 500).
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
         let details = err.details.expect("details strutturati presenti");
         assert_eq!(details["primary_cause"], "client_error");
         let f = &details["failures"][0];
@@ -2789,6 +2817,39 @@ mod tests {
         assert_eq!(f["class"], "client_error");
         assert_eq!(f["status"], 400);
         assert_eq!(f["code"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn cascata_mista_resta_500_riprovabile() {
+        // CONTRO-CASO del 400 deterministico: basta UN fallimento non-client
+        // nella cascata (qui billing) e l'aggregato resta 500 -- un retry o un
+        // failover piu' tardi possono avere senso, e il contratto storico coi
+        // client non si muove. Mutazione: se la condizione all_deterministic
+        // degenerasse in "il primo e' client_error", questo test rosseggia.
+        let a = FakeProvider::new("deepseek", Behaviour::ErrClient);
+        let b: Arc<dyn LlmProvider> = FakeProvider::new("mistral", Behaviour::ErrBilling);
+        let resolved = vec![
+            ResolvedProvider {
+                provider: a,
+                model: "deepseek-chat".into(),
+            },
+            ResolvedProvider {
+                provider: b,
+                model: "mistral-small-latest".into(),
+            },
+        ];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, "PROVIDER_ERROR");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let details = err.details.expect("details presenti");
+        // La classe per-provider resta integra nei details (regola M).
+        assert_eq!(details["failures"][0]["class"], "client_error");
+        assert_eq!(details["failures"][1]["class"], "billing");
     }
 
     #[tokio::test]
