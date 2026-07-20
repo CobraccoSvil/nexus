@@ -39,7 +39,8 @@ SET idle_in_transaction_session_timeout = 0;
 SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
-SELECT pg_catalog.set_config('search_path', '', false);
+-- set_config('search_path','',...) RIMOSSO (vedi 0001_chat.sql: rompeva
+-- l'INSERT di registrazione del migrator nella stessa transazione).
 SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;

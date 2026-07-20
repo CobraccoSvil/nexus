@@ -421,6 +421,23 @@ if [[ -z "${dup:-}" ]]; then
   echo "OK migrazioni-numero-unico: nessun numero di migrazione duplicato"
 fi
 
+# ── migrazioni-search-path ───────────────────────────────────────────────────
+# sqlx esegue la migrazione e l'INSERT di registrazione in _sqlx_migrations
+# nella STESSA transazione: una migrazione che manipola il search_path (residuo
+# del preambolo pg_dump: set_config('search_path','',...) o SET search_path)
+# fa fallire quell'INSERT non qualificato con "relazione non esiste" e nessun
+# DB vergine puo' piu' essere migrato (incidente vendita-immobile 20/07).
+sp_hits="$(grep -rniE "set_config\('search_path'|SET search_path" db/migrations --include='*.sql' 2>/dev/null | grep -vE ':[0-9]+:\s*--' || true)"
+if [[ -n "$sp_hits" ]]; then
+  echo "!! migrazioni-search-path: manipolazione del search_path in una migrazione:" >&2
+  echo "$sp_hits" | sed 's/^/     /' >&2
+  echo "   Rompe l'INSERT di registrazione del migrator sqlx (stessa transazione)." >&2
+  echo "   Rimuovi la riga: gli oggetti vanno qualificati con lo schema esplicito." >&2
+  fail=1
+else
+  echo "OK migrazioni-search-path: nessuna migrazione manipola il search_path"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
