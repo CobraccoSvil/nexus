@@ -107,7 +107,7 @@ use crate::decisions::tool_dispatch::{
     append_reminder_block, apply_run_notes, current_context_token_estimate, estimate_context_chars,
     estimate_tool_result_size_bytes, extract_returned_bytes, normalize_advisory_verdict,
     normalize_debate_position, normalize_declared_outcome, normalize_review_verdict,
-    ContextMessage,
+    ContextMessage, DeclarationRejected,
 };
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
@@ -690,79 +690,40 @@ impl ToolDispatchNode {
         // ── review_verdict (brain-only, Fase B ultracode) ─────────────────────
         if name == REVIEW_VERDICT_TOOL_NAME {
             let decl = normalize_review_verdict(&input);
-            let verdict = decl
-                .as_ref()
-                .and_then(|d| d.get("verdict").cloned())
-                .unwrap_or(Value::Null);
-            let acknowledged = decl.is_some();
-            if let Some(d) = decl {
+            if let Ok(d) = &decl {
                 collector
                     .review_verdicts
                     .lock()
                     .expect("lock review verdicts")
-                    .push(d);
+                    .push(d.clone());
             }
-            return ToolResultBlock {
-                tool_use_id,
-                content: Value::String(py_dumps(
-                    &json!({"acknowledged": acknowledged, "verdict": verdict}),
-                )),
-                is_error: !acknowledged,
-                exit_code: None,
-                raw_content: None,
-            };
+            return declarative_tool_result(tool_use_id, "verdict", decl.as_ref());
         }
 
         // ── advisory_verdict (brain-only, consiglio di figure a monte) ────────
         if name == ADVISORY_VERDICT_TOOL_NAME {
             let decl = normalize_advisory_verdict(&input);
-            let verdict = decl
-                .as_ref()
-                .and_then(|d| d.get("verdict").cloned())
-                .unwrap_or(Value::Null);
-            let acknowledged = decl.is_some();
-            if let Some(d) = decl {
+            if let Ok(d) = &decl {
                 collector
                     .advisory_verdicts
                     .lock()
                     .expect("lock advisory verdicts")
-                    .push(d);
+                    .push(d.clone());
             }
-            return ToolResultBlock {
-                tool_use_id,
-                content: Value::String(py_dumps(
-                    &json!({"acknowledged": acknowledged, "verdict": verdict}),
-                )),
-                is_error: !acknowledged,
-                exit_code: None,
-                raw_content: None,
-            };
+            return declarative_tool_result(tool_use_id, "verdict", decl.as_ref());
         }
 
         // ── debate_position (brain-only, avvocato del dibattito) ──────────────
         if name == DEBATE_POSITION_TOOL_NAME {
             let decl = normalize_debate_position(&input);
-            let stance = decl
-                .as_ref()
-                .and_then(|d| d.get("stance").cloned())
-                .unwrap_or(Value::Null);
-            let acknowledged = decl.is_some();
-            if let Some(d) = decl {
+            if let Ok(d) = &decl {
                 collector
                     .debate_positions
                     .lock()
                     .expect("lock debate positions")
-                    .push(d);
+                    .push(d.clone());
             }
-            return ToolResultBlock {
-                tool_use_id,
-                content: Value::String(py_dumps(
-                    &json!({"acknowledged": acknowledged, "stance": stance}),
-                )),
-                is_error: !acknowledged,
-                exit_code: None,
-                raw_content: None,
-            };
+            return declarative_tool_result(tool_use_id, "stance", decl.as_ref());
         }
 
         // ── tool generico via ToolExecutor ────────────────────────────────────
@@ -1359,32 +1320,13 @@ dell'utente.";
             delta.declared_outcome = Some(None);
         }
 
-        // Fase B (ultracode): verdetto del REVISORE — stessa semantica ADR 0034
-        // dell'esito dichiarato (l'ultimo prevale; se il run prosegue con altri
-        // tool dopo un verdetto, quel verdetto era intermedio e viene azzerato).
-        if let Some(last) = review_verdicts.last() {
-            delta.review_verdict = Some(Some(last.clone()));
-        } else if state.review_verdict.is_some() {
-            delta.review_verdict = Some(None);
-        }
-
-        // Consiglio a monte: parere di una FIGURA — stessa semantica dell'esito
-        // dichiarato (l'ultimo prevale; un parere seguito da altri tool era
-        // intermedio e viene azzerato).
-        if let Some(last) = advisory_verdicts.last() {
-            delta.advisory_verdict = Some(Some(last.clone()));
-        } else if state.advisory_verdict.is_some() {
-            delta.advisory_verdict = Some(None);
-        }
-
-        // Dibattito: posizione di un AVVOCATO — stessa semantica dei gemelli
-        // (l'ultima prevale; una posizione seguita da altri tool era intermedia
-        // e viene azzerata).
-        if let Some(last) = debate_positions.last() {
-            delta.debate_position = Some(Some(last.clone()));
-        } else if state.debate_position.is_some() {
-            delta.debate_position = Some(None);
-        }
+        // Canali di RUOLO (punto unico `set_role_channel`): l'ultima dichiarazione
+        // prevale, ma un turno che non dichiara NON li azzera — al contrario di
+        // `declared_outcome` sopra, che e' lo STATO del run e che il lavoro
+        // successivo puo' davvero smentire.
+        set_role_channel(&mut delta.review_verdict, review_verdicts.last());
+        set_role_channel(&mut delta.advisory_verdict, advisory_verdicts.last());
+        set_role_channel(&mut delta.debate_position, debate_positions.last());
 
         // WAVE 2.2: errore infrastruttura tool (mcp-core NON scala i provider).
         if infra_error {
@@ -1485,6 +1427,79 @@ impl ToolDispatchNode {
 /// anthropic_content), SENZA `raw_content` (rimosso: non arriva al modello).
 /// `exit_code` e' incluso solo se presente (tool-comando), 1:1 col Python che
 /// aggiunge la chiave solo `if result.exit_code is not None`.
+/// Costruisce il `tool_result` di un canale dichiarativo di RUOLO.
+///
+/// PUNTO UNICO (regola L) della forma `{"acknowledged": bool, <chiave>: ...}`, e
+/// del fatto che un rifiuto porti con se' la RAGIONE: prima i tre canali
+/// ripetevano la stessa costruzione e il modello riceveva solo
+/// `{"acknowledged": false, "verdict": null}`, senza sapere cosa correggere.
+///
+/// `task_complete` resta ESCLUSO di proposito: e' l'unico con parita' Python
+/// verificata da un golden test che confronta i blocks, e un campo `reason` in
+/// piu' la romperebbe. La partizione "tre canali di ruolo + lo stato del run" e'
+/// la stessa di [`set_role_channel`] — non e' una coincidenza, e' la stessa
+/// distinzione fra contributo e stato.
+///
+/// Regola M: per il CODICE il segnale resta `is_error`; `reason` e' prosa per il
+/// modello e nessun ramo del programma deve parsarla.
+fn declarative_tool_result(
+    tool_use_id: String,
+    payload_key: &'static str,
+    decl: Result<&Value, &DeclarationRejected>,
+) -> ToolResultBlock {
+    let mut content = serde_json::Map::new();
+    content.insert("acknowledged".to_string(), Value::Bool(decl.is_ok()));
+    match decl {
+        Ok(d) => {
+            content.insert(
+                payload_key.to_string(),
+                d.get(payload_key).cloned().unwrap_or(Value::Null),
+            );
+        }
+        Err(r) => {
+            content.insert(payload_key.to_string(), Value::Null);
+            content.insert("reason".to_string(), Value::String(r.explain()));
+        }
+    }
+    ToolResultBlock {
+        tool_use_id,
+        content: Value::String(py_dumps(&Value::Object(content))),
+        is_error: decl.is_err(),
+        exit_code: None,
+        raw_content: None,
+    }
+}
+
+/// Scrive nel delta un canale di RUOLO: parere della figura del consiglio,
+/// verdetto del revisore, posizione dell'avvocato del dibattito.
+///
+/// PUNTO UNICO (regola L) della loro semantica, che e' l'OPPOSTO di quella di
+/// `declared_outcome` (ADR 0034): un canale di ruolo e' un CONTRIBUTO gia'
+/// consegnato su un oggetto ESTERNO al run — la richiesta da valutare, il diff da
+/// revisionare, l'opzione da difendere — non un'asserzione sullo stato del run.
+/// Proseguire con altri tool non lo smentisce, quindi il turno successivo non lo
+/// azzera: solo una nuova dichiarazione lo sostituisce.
+///
+/// Perche' l'azzeramento faceva danno: l'unico consumatore legge lo stato FINALE,
+/// quindi cancellare a meta' non "corregge" nulla — fabbrica un'ASTENSIONE
+/// indistinguibile dal ruolo che non ha mai parlato. `classify_council_figure_result`
+/// (mcp-core), `extract_vote` (decisions/adversarial_review.rs) ed `extract_position`
+/// (decisions/debate_panel.rs) la contano come voto mancante, e sotto quorum il
+/// panel esce `inconclusive`. Nel caso del revisore e' peggio: con zero review
+/// `compose_panel_verdict` non emette alcuna nota, quindi un `fail` con findings
+/// gravi diventa silenzio totale invece che prudenza.
+///
+/// Regola M: il segnale e' la presenza di una dichiarazione ACCETTATA dal
+/// normalizzatore, mai la prosa del turno.
+fn set_role_channel(target: &mut Option<Option<Value>>, declared: Option<&Value>) {
+    if let Some(last) = declared {
+        *target = Some(Some(last.clone()));
+    }
+    // Nessun ramo `else`: l'assenza di dichiarazione in QUESTO turno non ritratta
+    // quella dei turni precedenti. Leggere quel silenzio come ritrattazione
+    // sarebbe inferenza, non segnale.
+}
+
 fn tool_result_to_block(r: &ToolResultBlock) -> Value {
     let mut m = Map::new();
     m.insert("type".to_string(), json!("tool_result"));
@@ -2849,6 +2864,163 @@ mod tests {
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Dichiarazione stantia azzerata; il contatore done resta cumulativo.
         assert!(out.declared_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn parere_consultivo_sopravvive_al_lavoro_successivo() {
+        // A DIFFERENZA di `declared_outcome` (test sopra): il parere di una figura
+        // e' un CONTRIBUTO, non lo stato del run. Sequenza reale del 20/07 che
+        // questo test riproduce: `functional_analyst` dichiara alle 06:12:25, poi
+        // legge cinque file alle 06:12:35, e finiva `CompletedNoAdvisory` col
+        // parere buttato — sotto quorum per un voto che il sistema aveva ricevuto.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
+        st.advisory_verdict = Some(json!({"verdict": "proceed", "summary": "gia' dichiarato"}));
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        // Mutazione che rende rosso: rimettere il ramo
+        // `else if state.advisory_verdict.is_some() { delta.advisory_verdict = Some(None) }`.
+        assert!(
+            out.advisory_verdict.is_some(),
+            "il parere non va cancellato da un tool successivo"
+        );
+        assert_eq!(
+            out.advisory_verdict.as_ref().expect("parere")["verdict"],
+            json!("proceed")
+        );
+    }
+
+    #[tokio::test]
+    async fn una_nuova_dichiarazione_sostituisce_la_precedente() {
+        // L'unica cosa che cambia un parere e' un altro parere: la figura che si
+        // ricrede resta libera di farlo, e vale l'ULTIMA dichiarazione.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool(
+            "c1",
+            "advisory_verdict",
+            json!({
+                "verdict": "block",
+                "summary": "ho trovato un difetto",
+                "risks": [{"description": "segreto in chiaro nel repo", "severity": "alta"}]
+            }),
+        )]);
+        st.advisory_verdict = Some(json!({"verdict": "proceed", "summary": "parere precedente"}));
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        assert_eq!(
+            out.advisory_verdict.as_ref().expect("parere")["verdict"],
+            json!("block"),
+            "l'ultima dichiarazione prevale"
+        );
+    }
+
+    #[tokio::test]
+    async fn anche_verdetto_revisore_e_posizione_avvocato_sopravvivono() {
+        // Stessa classe del parere: sono contributi su un oggetto ESTERNO al run.
+        // Per il revisore l'azzeramento era il piu' insidioso: con zero review
+        // `compose_panel_verdict` non emette alcuna nota, quindi un `fail` con
+        // findings gravi non diventava prudenza, diventava silenzio.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
+        st.review_verdict = Some(json!({"verdict": "fail", "summary": "difetto grave"}));
+        st.debate_position = Some(json!({"stance": "oppose", "summary": "cedo la tesi"}));
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        // Mutazione che rende rosso: rimettere il ramo `else if ... = Some(None)`
+        // su uno dei due canali in `set_role_channel`.
+        assert_eq!(
+            out.review_verdict.as_ref().expect("verdetto")["verdict"],
+            json!("fail"),
+            "il verdetto del revisore non va cancellato dal lavoro successivo"
+        );
+        assert_eq!(
+            out.debate_position.as_ref().expect("posizione")["stance"],
+            json!("oppose"),
+            "l'oppose e' il segnale piu' prezioso del dibattito: non va perso"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_parere_rifiutato_dice_al_modello_come_correggerlo() {
+        // Prima il modello riceveva solo {"acknowledged": false, "verdict": null}:
+        // non sapendo COSA fosse sbagliato riprovava alla cieca. Il test arriva al
+        // contenuto del tool_result, cioe' a cio' che il modello legge davvero.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let st = state_with_pending(vec![pending_tool(
+            "c1",
+            "advisory_verdict",
+            json!({"verdict": "proceed_with_caution", "summary": "quasi giusto"}),
+        )]);
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        let content = blocks[0]["content"].as_str().expect("content");
+
+        assert!(
+            blocks[0]["is_error"].as_bool().unwrap_or(false),
+            "il rifiuto resta un segnale strutturato per il codice"
+        );
+        // Mutazione che rende rosso: togliere l'inserimento di "reason" in
+        // `declarative_tool_result`, o riportare normalize_* a `Option` (che
+        // perde la ragione alla fonte).
+        assert!(
+            content.contains("proceed_with_caution"),
+            "il messaggio deve citare il valore rifiutato: {content}"
+        );
+        for ammesso in ["proceed", "proceed_with_changes", "block"] {
+            assert!(
+                content.contains(ammesso),
+                "il messaggio deve elencare i valori ammessi, manca {ammesso}: {content}"
+            );
+        }
+        // Il parere non e' stato acquisito: il canale resta muto.
+        assert!(out.advisory_verdict.is_none());
+    }
+
+    #[tokio::test]
+    async fn un_veto_senza_evidenza_spiega_cosa_manca() {
+        // Regola non ovvia: `block` esige almeno un rischio con descrizione. Se il
+        // rifiuto non lo dice, il modello rilegge l'enum, lo trova corretto, e
+        // ripete lo stesso errore.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let st = state_with_pending(vec![pending_tool(
+            "c1",
+            "advisory_verdict",
+            json!({"verdict": "block", "summary": "non si puo' fare"}),
+        )]);
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        let content = blocks[0]["content"].as_str().expect("content");
+
+        assert!(blocks[0]["is_error"].as_bool().unwrap_or(false));
+        assert!(
+            content.contains("risks"),
+            "il messaggio deve nominare la lista mancante: {content}"
+        );
     }
 
     // ── (5) errore infrastruttura -> tool_result d'errore, niente NodeError ──────

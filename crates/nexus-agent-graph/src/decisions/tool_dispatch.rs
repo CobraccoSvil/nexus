@@ -286,17 +286,12 @@ const FINDINGS_CAP: usize = 50;
 /// incluso solo se non vuoto dopo la sanificazione: ogni finding richiede
 /// `file` e `description` non vuoti, `severity` fuori enum ricade su `media`,
 /// `line` e' incluso solo se intero positivo. Cap [`FINDINGS_CAP`].
-pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
-    let obj = tool_input.as_object()?;
-    let verdict = obj
-        .get("verdict")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    if !VALID_REVIEW_VERDICTS.contains(&verdict.as_str()) {
-        return None;
-    }
+pub fn normalize_review_verdict(tool_input: &Value) -> Result<Value, DeclarationRejected> {
+    const TOOL: &str = "review_verdict";
+    let obj = tool_input
+        .as_object()
+        .ok_or(DeclarationRejected::InputNonOggetto { tool: TOOL })?;
+    let verdict = campo_enum(obj, "verdict", VALID_REVIEW_VERDICTS, TOOL)?;
     let summary = obj
         .get("summary")
         .and_then(Value::as_str)
@@ -337,7 +332,12 @@ pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
     // Verdetto negativo senza evidenza: rifiutato alla fonte (regola M — il
     // coordinatore non deve mai dover "credere" a un fail senza findings).
     if verdict != "pass" && findings.is_empty() {
-        return None;
+        return Err(DeclarationRejected::EvidenzaMancante {
+            tool: TOOL,
+            campo: "verdict",
+            valore: "diverso da pass",
+            lista: "findings",
+        });
     }
     let mut out = serde_json::Map::new();
     out.insert("verdict".to_string(), Value::String(verdict));
@@ -345,7 +345,7 @@ pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
     if !findings.is_empty() {
         out.insert("findings".to_string(), Value::Array(findings));
     }
-    Some(Value::Object(out))
+    Ok(Value::Object(out))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -354,6 +354,141 @@ pub fn normalize_review_verdict(tool_input: &Value) -> Option<Value> {
 
 /// Verdetti validi dichiarabili via `advisory_verdict` (segnale ENUM, regola M:
 /// mai dedotto dalla prosa del parere).
+/// Ragione MACCHINA per cui una dichiarazione di ruolo e' stata rifiutata.
+///
+/// Vive accanto alle regole che la producono (regola L): il chiamante non
+/// potrebbe ri-derivarla senza duplicare la validazione, e una copia divergerebbe
+/// al primo cambio di regola. Prima il rifiuto era un `None`, e il modello
+/// riceveva solo `{"acknowledged": false, "verdict": null}`: senza sapere COSA
+/// fosse sbagliato riprovava alla cieca, o rinunciava.
+///
+/// Il testo prodotto da [`Self::explain`] e' per il MODELLO, che e' un
+/// consumatore legittimo di prosa. Nessun ramo del programma deve parsarlo: per
+/// il codice il segnale resta `is_error` sul tool_result (regola M).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeclarationRejected {
+    /// L'input non e' un oggetto JSON.
+    InputNonOggetto { tool: &'static str },
+    /// Campo enum con un valore fuori dai valori ammessi. `ammessi` e' lo STESSO
+    /// slice che il validatore controlla, cosi' il messaggio non puo' divergere
+    /// dalla regola.
+    ValoreFuoriEnum {
+        tool: &'static str,
+        campo: &'static str,
+        ricevuto: String,
+        ammessi: &'static [&'static str],
+    },
+    /// Campo obbligatorio assente o vuoto dopo il trim.
+    CampoObbligatorioVuoto {
+        tool: &'static str,
+        campo: &'static str,
+        perche: &'static str,
+    },
+    /// Giudizio negativo senza evidenza: un veto che il coordinatore dovrebbe
+    /// solo "credere" non e' componibile (regola M).
+    EvidenzaMancante {
+        tool: &'static str,
+        campo: &'static str,
+        valore: &'static str,
+        lista: &'static str,
+    },
+}
+
+/// Quanto dell'input rifiutato viene rimandato al modello. L'input non e'
+/// vincolato e il messaggio rientra nel suo contesto a ogni tentativo.
+const RICEVUTO_MAX: usize = 40;
+
+impl DeclarationRejected {
+    /// Estrae il valore di un campo per il messaggio, distinguendo il tipo
+    /// sbagliato dalla stringa vuota: `as_str()` su `{"verdict": {...}}` da'
+    /// `None`, e dire "vale ''" mentirebbe sul tipo.
+    pub fn valore_ricevuto(obj: &serde_json::Map<String, Value>, campo: &str) -> String {
+        match obj.get(campo) {
+            None => "(assente)".to_string(),
+            Some(Value::String(s)) => {
+                let t = s.trim();
+                let mut v: String = t.chars().take(RICEVUTO_MAX).collect();
+                if t.chars().count() > RICEVUTO_MAX {
+                    v.push_str("...");
+                }
+                format!("\"{v}\"")
+            }
+            Some(altro) => format!("(tipo {}, atteso una stringa)", tipo_json(altro)),
+        }
+    }
+
+    /// Messaggio per il MODELLO: cosa e' stato rifiutato e come correggerlo.
+    pub fn explain(&self) -> String {
+        match self {
+            Self::InputNonOggetto { tool } => {
+                format!("{tool}: l'input deve essere un oggetto JSON con i campi documentati.")
+            }
+            Self::ValoreFuoriEnum {
+                tool,
+                campo,
+                ricevuto,
+                ammessi,
+            } => format!(
+                "{tool}: il campo '{campo}' vale {ricevuto}, che non e' un valore ammesso. \
+                 Richiama il tool con '{campo}' uguale a uno di: {}.",
+                ammessi.join(" | ")
+            ),
+            Self::CampoObbligatorioVuoto { tool, campo, perche } => format!(
+                "{tool}: il campo '{campo}' e' obbligatorio e non puo' essere vuoto ({perche}). \
+                 Richiama il tool valorizzandolo."
+            ),
+            Self::EvidenzaMancante {
+                tool,
+                campo,
+                valore,
+                lista,
+            } => format!(
+                "{tool}: con '{campo}' = '{valore}' serve almeno una voce in '{lista}' con una \
+                 descrizione non vuota: un giudizio negativo senza evidenza non e' componibile. \
+                 Richiama il tool aggiungendo l'evidenza, oppure scegli un '{campo}' diverso."
+            ),
+        }
+    }
+}
+
+/// Legge un campo enum normalizzato (trim + minuscolo) e lo valida contro i
+/// valori ammessi. Punto unico (regola L) della coppia lettura+rifiuto, che i tre
+/// canali di ruolo ripetevano identica: cosi' il messaggio d'errore non puo'
+/// divergere dallo slice che la regola controlla davvero.
+fn campo_enum(
+    obj: &serde_json::Map<String, Value>,
+    campo: &'static str,
+    ammessi: &'static [&'static str],
+    tool: &'static str,
+) -> Result<String, DeclarationRejected> {
+    let valore = obj
+        .get(campo)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if !ammessi.contains(&valore.as_str()) {
+        return Err(DeclarationRejected::ValoreFuoriEnum {
+            tool,
+            campo,
+            ricevuto: DeclarationRejected::valore_ricevuto(obj, campo),
+            ammessi,
+        });
+    }
+    Ok(valore)
+}
+
+fn tipo_json(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "booleano",
+        Value::Number(_) => "numero",
+        Value::String(_) => "stringa",
+        Value::Array(_) => "lista",
+        Value::Object(_) => "oggetto",
+    }
+}
+
 pub const VALID_ADVISORY_VERDICTS: &[&str] = &["proceed", "proceed_with_changes", "block"];
 
 /// Cap sul numero di elementi (requirements/risks/recommendations) per parere
@@ -372,17 +507,12 @@ const ADVISORY_LIST_CAP: usize = 30;
 /// `description` non vuota, `severity` fuori enum ricade su `media`, `area`
 /// inclusa solo se non vuota. La forma dell'output e' quella letta dal punto unico
 /// [`super::advisory_panel::compose_advisory_synthesis`] nel campo `advisory`.
-pub fn normalize_advisory_verdict(tool_input: &Value) -> Option<Value> {
-    let obj = tool_input.as_object()?;
-    let verdict = obj
-        .get("verdict")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    if !VALID_ADVISORY_VERDICTS.contains(&verdict.as_str()) {
-        return None;
-    }
+pub fn normalize_advisory_verdict(tool_input: &Value) -> Result<Value, DeclarationRejected> {
+    const TOOL: &str = "advisory_verdict";
+    let obj = tool_input
+        .as_object()
+        .ok_or(DeclarationRejected::InputNonOggetto { tool: TOOL })?;
+    let verdict = campo_enum(obj, "verdict", VALID_ADVISORY_VERDICTS, TOOL)?;
     let summary = obj
         .get("summary")
         .and_then(Value::as_str)
@@ -395,7 +525,12 @@ pub fn normalize_advisory_verdict(tool_input: &Value) -> Option<Value> {
     // Veto senza evidenza: rifiutato alla fonte (regola M — il coordinatore non
     // deve mai dover "credere" a un block senza rischi con descrizione).
     if verdict == "block" && risks.is_empty() {
-        return None;
+        return Err(DeclarationRejected::EvidenzaMancante {
+            tool: TOOL,
+            campo: "verdict",
+            valore: "block",
+            lista: "risks",
+        });
     }
     let mut out = serde_json::Map::new();
     out.insert("verdict".to_string(), Value::String(verdict));
@@ -412,7 +547,7 @@ pub fn normalize_advisory_verdict(tool_input: &Value) -> Option<Value> {
     if let Some(cd) = normalize_contested_decision(obj.get("contested_decision")) {
         out.insert("contested_decision".to_string(), cd);
     }
-    Some(Value::Object(out))
+    Ok(Value::Object(out))
 }
 
 /// Minimo di opzioni perche' una decisione sia CONTESA: una sola alternativa non
@@ -490,8 +625,11 @@ pub const VALID_DEBATE_STANCES: &[&str] = &[
 /// L'output mantiene sempre `assigned_position`, `stance`, `summary`; le liste
 /// solo se non vuote. La forma e' quella letta da
 /// [`super::debate_panel::compose_debate_synthesis`] nel campo `debate`.
-pub fn normalize_debate_position(tool_input: &Value) -> Option<Value> {
-    let obj = tool_input.as_object()?;
+pub fn normalize_debate_position(tool_input: &Value) -> Result<Value, DeclarationRejected> {
+    const TOOL: &str = "debate_position";
+    let obj = tool_input
+        .as_object()
+        .ok_or(DeclarationRejected::InputNonOggetto { tool: TOOL })?;
     let assigned = obj
         .get("assigned_position")
         .and_then(Value::as_str)
@@ -499,17 +637,13 @@ pub fn normalize_debate_position(tool_input: &Value) -> Option<Value> {
         .trim()
         .to_string();
     if assigned.is_empty() {
-        return None;
+        return Err(DeclarationRejected::CampoObbligatorioVuoto {
+            tool: TOOL,
+            campo: "assigned_position",
+            perche: "deve ripetere alla lettera la posizione che ti e' stata assegnata",
+        });
     }
-    let stance = obj
-        .get("stance")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_lowercase();
-    if !VALID_DEBATE_STANCES.contains(&stance.as_str()) {
-        return None;
-    }
+    let stance = campo_enum(obj, "stance", VALID_DEBATE_STANCES, TOOL)?;
     let summary = obj
         .get("summary")
         .and_then(Value::as_str)
@@ -521,7 +655,12 @@ pub fn normalize_debate_position(tool_input: &Value) -> Option<Value> {
     // Resa senza evidenza: rifiutata alla fonte (regola M). Un `oppose` squalifica
     // l'opzione anche in minoranza: deve portare prove, non solo una conclusione.
     if stance == super::debate_panel::Stance::Oppose.as_str() && risks.is_empty() {
-        return None;
+        return Err(DeclarationRejected::EvidenzaMancante {
+            tool: TOOL,
+            campo: "stance",
+            valore: "oppose",
+            lista: "risks",
+        });
     }
     let mut out = serde_json::Map::new();
     out.insert("assigned_position".to_string(), Value::String(assigned));
@@ -533,7 +672,7 @@ pub fn normalize_debate_position(tool_input: &Value) -> Option<Value> {
     if !risks.is_empty() {
         out.insert("risks".to_string(), Value::Array(risks));
     }
-    Some(Value::Object(out))
+    Ok(Value::Object(out))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -933,12 +1072,12 @@ mod tests {
     #[test]
     fn normalize_review_verdict_invalidi() {
         // verdict fuori enum -> None.
-        assert!(normalize_review_verdict(&json!({"verdict": "boh", "summary": "x"})).is_none());
+        assert!(normalize_review_verdict(&json!({"verdict": "boh", "summary": "x"})).is_err());
         // input non-oggetto -> None.
-        assert!(normalize_review_verdict(&json!("fail")).is_none());
+        assert!(normalize_review_verdict(&json!("fail")).is_err());
         // fail SENZA findings validi -> None (verdetto negativo senza evidenza).
         assert!(
-            normalize_review_verdict(&json!({"verdict": "fail", "summary": "brutto"})).is_none()
+            normalize_review_verdict(&json!({"verdict": "fail", "summary": "brutto"})).is_err()
         );
         // fail con findings tutti invalidi (file/description vuoti) -> None.
         assert!(normalize_review_verdict(&json!({
@@ -946,7 +1085,7 @@ mod tests {
             "summary": "brutto",
             "findings": [{"file": "", "description": "x"}, {"file": "a.rs", "description": ""}]
         }))
-        .is_none());
+        .is_err());
     }
 
     #[test]
@@ -998,12 +1137,12 @@ mod tests {
     #[test]
     fn normalize_advisory_verdict_invalidi() {
         // verdict fuori enum -> None.
-        assert!(normalize_advisory_verdict(&json!({"verdict": "boh", "summary": "x"})).is_none());
+        assert!(normalize_advisory_verdict(&json!({"verdict": "boh", "summary": "x"})).is_err());
         // input non-oggetto -> None.
-        assert!(normalize_advisory_verdict(&json!("block")).is_none());
+        assert!(normalize_advisory_verdict(&json!("block")).is_err());
         // block SENZA rischi -> None (veto senza evidenza rifiutato alla fonte).
         assert!(
-            normalize_advisory_verdict(&json!({"verdict": "block", "summary": "no"})).is_none()
+            normalize_advisory_verdict(&json!({"verdict": "block", "summary": "no"})).is_err()
         );
         // block con rischi tutti invalidi (description vuota) -> None.
         assert!(normalize_advisory_verdict(&json!({
@@ -1011,7 +1150,7 @@ mod tests {
             "summary": "no",
             "risks": [{"severity": "alta", "description": ""}]
         }))
-        .is_none());
+        .is_err());
     }
 
     #[test]
