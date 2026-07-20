@@ -87,6 +87,18 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
 
   // ── Bootstrap ───────────────────────────────────────────────────────────────
   useEffect(() => {
+    // Reset PRIMA del fetch: al cambio progetto il pannello non deve mai
+    // mostrare (ne' rendere operabili) le chat del progetto precedente. Senza
+    // questo reset, un fetch fallito sul progetto nuovo (es. DB in provisioning)
+    // lasciava visibile la chat del progetto vecchio: un messaggio digitato li'
+    // finiva su una sessione di un ALTRO progetto (incidente vendita-immobile
+    // 20/07). Vale anche per il ramo "default": stato vuoto, non stantio.
+    setAllSessions([]);
+    setOpenTabs([]);
+    setActiveTabIdState(null);
+    setAgentActivity(new Map());
+    setCtxRatioState(new Map());
+    setError(null);
     if (!projectId || projectId === "default") return;
     let cancelled = false;
     setIsLoading(true);
