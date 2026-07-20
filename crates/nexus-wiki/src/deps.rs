@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use nexus_types::purpose::PurposeUnresolved;
 use nexus_types::TemplateCache;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -30,18 +31,19 @@ pub trait WikiAiServices: std::fmt::Debug + Send + Sync {
     ) -> BoxFuture<'_, anyhow::Result<Value>>;
 
     /// Risolve il purpose model interno (es. "wiki_title_gen") in
-    /// `(provider, model)`. Err con messaggio diagnostico se non risolvibile.
+    /// `(provider, model)`. Err TIPIZZATO ([`PurposeUnresolved`], regola M):
+    /// chi decide (es. interrompere un batch) legge la variante, mai il testo.
     fn resolve_purpose_model(
         &self,
         purpose: &str,
-    ) -> BoxFuture<'_, Result<(String, String), String>>;
+    ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>>;
 
     /// Variante che esclude provider gia' falliti (failover intra-purpose).
     fn resolve_purpose_model_excluding(
         &self,
         purpose: &str,
         exclude_providers: &[String],
-    ) -> BoxFuture<'_, Result<(String, String), String>>;
+    ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>>;
 
     /// Notifica un fallimento LLM strutturato per applicare cooldown provider
     /// (punto unico `agent_turn_setup::handle_provider_llm_failure`).

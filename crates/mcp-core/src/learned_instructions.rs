@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::auth::Claims;
-use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
+use crate::internal_routing::{resolve_purpose_model, PurposeUnresolved};
 use crate::AppState;
 
 const PURPOSE: &str = "learned_instructions_distill";
@@ -280,8 +280,10 @@ async fn scan_and_distill(state: &AppState, settings: &DistillerSettings) -> Res
             }
             Err(e) => {
                 tracing::warn!(%project_id, error = %e, "learned_instructions: distillazione progetto fallita");
-                // Purpose non configurato: inutile insistere sugli altri progetti.
-                if e.to_string().contains("purpose") {
+                // Purpose non risolvibile (non configurato, tier senza modelli,
+                // routing matrix giu'): condizione GLOBALE, identica per ogni
+                // progetto — inutile insistere sugli altri.
+                if PurposeUnresolved::in_chain(&e) {
                     break;
                 }
             }
@@ -415,21 +417,12 @@ async fn distill_project(
         .flatten()
         .unwrap_or_else(|| project_id.to_string());
 
-    // Risolve provider/modello dal PUNTO UNICO (regola G/L).
-    let (provider, model) = match resolve_purpose_model(state, PURPOSE).await {
-        PurposeResolution::Resolved {
-            provider, model, ..
-        } => (provider, model),
-        PurposeResolution::NoCapableModel { tier } => {
-            anyhow::bail!("nessun modello del tier '{tier}' per purpose {PURPOSE}")
-        }
-        PurposeResolution::NotFound => {
-            anyhow::bail!("purpose {PURPOSE} non configurato (applicare mig 0412)")
-        }
-        PurposeResolution::MatrixUnavailable(e) => {
-            anyhow::bail!("routing matrix non disponibile: {e}")
-        }
-    };
+    // Risolve provider/modello dal PUNTO UNICO (regola G/L). L'errore resta
+    // tipizzato (PurposeUnresolved) lungo la catena anyhow, cosi' che
+    // scan_and_distill decida sulla variante e non sul testo (regola M).
+    let (provider, model) = resolve_purpose_model(state, PURPOSE)
+        .await
+        .try_model(PURPOSE)?;
 
     // Prompt da template DB (regola D), placeholder sostituiti.
     let template = nexus_types::get_template_or_default(

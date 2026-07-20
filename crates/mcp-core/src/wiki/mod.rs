@@ -30,6 +30,7 @@ pub mod search;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use nexus_types::purpose::PurposeUnresolved;
 use serde_json::Value;
 
 /// Impl mcp-core dei servizi AI del wiki: embedding/completion via
@@ -79,12 +80,12 @@ impl WikiAiServices for AppStateWikiAi {
     fn resolve_purpose_model(
         &self,
         purpose: &str,
-    ) -> BoxFuture<'_, Result<(String, String), String>> {
+    ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>> {
         let purpose = purpose.to_string();
         Box::pin(async move {
             crate::internal_routing::resolve_purpose_model(&self.state, &purpose)
                 .await
-                .into_model(&purpose)
+                .try_model(&purpose)
         })
     }
 
@@ -92,7 +93,7 @@ impl WikiAiServices for AppStateWikiAi {
         &self,
         purpose: &str,
         exclude_providers: &[String],
-    ) -> BoxFuture<'_, Result<(String, String), String>> {
+    ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>> {
         let purpose = purpose.to_string();
         let exclude = exclude_providers.to_vec();
         Box::pin(async move {
@@ -102,7 +103,7 @@ impl WikiAiServices for AppStateWikiAi {
                 &exclude,
             )
             .await
-            .into_model(&purpose)
+            .try_model(&purpose)
         })
     }
 
