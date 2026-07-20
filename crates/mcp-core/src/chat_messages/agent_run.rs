@@ -5262,6 +5262,16 @@ async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool)
     (modified, reviewed)
 }
 
+/// Un verdetto di panel programmatico e' un RIFIUTO strutturato (il run non e'
+/// un successo, regola M) SOLO per Fail/NeedsChanges. Inconclusive (quorum non
+/// raggiunto) e' un limite infrastrutturale, non un difetto del codice; Pass e'
+/// un'approvazione. Punto unico (regola L): produttore del flag e test partono
+/// da qui (regola O), non da un bool costruito a mano.
+fn review_verdict_rejects(v: nexus_agent_graph::decisions::PanelVerdict) -> bool {
+    use nexus_agent_graph::decisions::PanelVerdict;
+    matches!(v, PanelVerdict::Fail | PanelVerdict::NeedsChanges)
+}
+
 /// Nota onesta (regola M) da anteporre/aggiungere al resoconto quando la review
 /// programmatica NON approva. Findings limitati per non gonfiare.
 fn render_review_panel_note(panel: &nexus_agent_graph::decisions::PanelOutcome) -> String {
@@ -5427,6 +5437,14 @@ async fn maybe_convene_review_panel(
         } else {
             format!("{base}\n\n---\n{note}")
         });
+        // La review non e' piu' solo una voce: su Fail/NeedsChanges il run NON
+        // chiude "completed" — classify_status (punto unico) mappa
+        // FailedDiagnosed dal segnale strutturato. La nota resta il display; il
+        // flag governa l'esito. La correzione AUTOMATICA (re-loop come il
+        // final_gate) richiede un ingresso di ri-apertura nel motore (il resume
+        // di un run a `End` corto-circuita, nexus-graph/engine.rs): task
+        // separato — questo fix chiude intanto il "finge successo".
+        outcome.review_panel_rejected = review_verdict_rejects(panel.verdict);
     }
 }
 
@@ -7009,6 +7027,7 @@ mod tests_native_mapping {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            review_panel_rejected: false,
             pending_actions: Vec::new(),
         }
     }

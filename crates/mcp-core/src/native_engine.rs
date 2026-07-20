@@ -490,6 +490,15 @@ pub struct NativeRunOutcome {
     ///
     /// Letto dal finalizzatore: mai `Completed` con una bocciatura pendente.
     pub final_gate_failed_pending: bool,
+    /// `true` quando la review adversariale convocata PROGRAMMATICAMENTE a valle
+    /// (`maybe_convene_review_panel`) NON ha approvato (Fail/NeedsChanges) su
+    /// codice modificato: segnale STRUTTURATO (regola M) che il run non e' un
+    /// successo pulito. Letto da `classify_status` (punto unico, regola L) per
+    /// mappare FailedDiagnosed invece di Completed — la review ora ha potere
+    /// sull'esito, non solo una nota nel resoconto (run 20/07 10:03:30: verdetto
+    /// Fail 2/2, run rimasto `completed`). `Inconclusive` (quorum non raggiunto)
+    /// NON e' un rifiuto: limite infra, non difetto del codice -> resta `false`.
+    pub review_panel_rejected: bool,
     /// Azioni in attesa di conferma utente (HITL modalita' Conferma), serializzate
     /// dal grafo in `extra.hitl_pending_actions`. Vuoto se nessuna sospensione HITL.
     pub pending_actions: Vec<serde_json::Value>,
@@ -610,6 +619,13 @@ impl NativeRunOutcome {
             // "completed" su un task la cui verifica e' fallita. Difesa in
             // profondita' rispetto a `forced_close`: il cap del final_gate NON
             // imposta forced_close_unverified.
+            AgentRunStatus::FailedDiagnosed
+        } else if self.review_panel_rejected {
+            // Review adversariale programmatica NON approvata (Fail/NeedsChanges)
+            // su codice modificato: il verdetto STRUTTURATO del panel (regola M)
+            // prevale sulla dichiarazione "done" ottimista del modello. Mai
+            // "completed" su un lavoro che un panel indipendente ha bocciato con
+            // difetti bloccanti. Stessa classe di `final_gate_passed == false`.
             AgentRunStatus::FailedDiagnosed
         } else if self.final_gate_failed_pending {
             // L'ULTIMO verdetto del final_gate e' una BOCCIATURA di ciclo
@@ -3069,6 +3085,9 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
+        // La review programmatica gira DOPO run_engine (nel finalizzatore): qui
+        // nasce false, maybe_convene_review_panel lo alza su bocciatura.
+        review_panel_rejected: false,
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
         // Bocciatura del gate rimasta pendente a fine run: letta dal SEGNALE del
@@ -4638,11 +4657,14 @@ mod tests {
         create_settings_table(&pool).await;
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
         set_setting(&pool, "agent.context.tokenizer", "cl100k_base").await;
+        // Scrittura diretta: lettura cache-ata, il test invalida esplicitamente.
+        nexus_auth::invalidate_setting_cache(&pool, "agent.context.tokenizer");
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Cl100k);
         sqlx::query("UPDATE settings SET value = 'chars' WHERE key = 'agent.context.tokenizer'")
             .execute(&pool)
             .await
             .expect("update setting");
+        nexus_auth::invalidate_setting_cache(&pool, "agent.context.tokenizer");
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
     }
 
@@ -4776,6 +4798,7 @@ mod tests {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            review_panel_rejected: false,
             pending_actions: Vec::new(),
         }
     }
@@ -4783,6 +4806,21 @@ mod tests {
     #[test]
     fn classify_status_completed_pulito() {
         assert_eq!(base_outcome().classify_status(), AgentRunStatus::Completed);
+    }
+
+    /// Un run bocciato dalla review adversariale programmatica non e' un
+    /// successo: il verdetto strutturato del panel prevale sul "done" ottimista
+    /// del modello (run reale 20/07 10:03:30: Fail 2/2, restava `completed` con
+    /// i difetti bloccanti sepolti in una nota del resoconto).
+    #[test]
+    fn classify_status_review_bocciata_non_e_completed() {
+        let o = NativeRunOutcome {
+            review_panel_rejected: true,
+            ..base_outcome()
+        };
+        // Mutazione che rende rosso: togliere il ramo `review_panel_rejected`
+        // da classify_status -> torna Completed, cioe' il difetto originale.
+        assert_eq!(o.classify_status(), AgentRunStatus::FailedDiagnosed);
     }
 
     #[test]

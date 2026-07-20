@@ -1990,6 +1990,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert setting");
+        // Scrittura diretta: la lettura passa dalla cache dei settings, il test
+        // invalida come farebbe una sessione esterna (o lo scadere del TTL).
+        nexus_auth::invalidate_setting_cache(&pool, "agent.fs.read_max_bytes");
 
         // Mutazione che rende rosso: cambiare il nome della chiave letta in
         // fs_read_max_bytes -> torna il default e questa asserzione cade.

@@ -4540,6 +4540,7 @@ mod tests {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            review_panel_rejected: false,
             pending_actions: Vec::new(),
         }
     }
@@ -4795,11 +4796,14 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert");
+        // Scrittura diretta: lettura cache-ata, il test invalida esplicitamente.
+        nexus_auth::invalidate_setting_cache(&pool, "orchestrator.subagent_fanout_max_parallel");
         assert_eq!(fanout_max_parallel(&pool).await, 2, "il DB governa (regola G)");
         sqlx::query("UPDATE settings SET value = '0' WHERE key = 'orchestrator.subagent_fanout_max_parallel'")
             .execute(&pool)
             .await
             .expect("update");
+        nexus_auth::invalidate_setting_cache(&pool, "orchestrator.subagent_fanout_max_parallel");
         assert_eq!(
             fanout_max_parallel(&pool).await,
             DEFAULT_FANOUT_MAX_PARALLEL,
@@ -5841,6 +5845,7 @@ mod tests {
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            review_panel_rejected: false,
             pending_actions: Vec::new(),
         };
         let keys = |v: &Value| -> BTreeSet<String> {
