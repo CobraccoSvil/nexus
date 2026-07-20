@@ -1418,6 +1418,57 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           boxSizing: "border-box",
         }}
       >
+        {/* Stati del bootstrap sessioni (useMultiChat): prima il pannello
+            renderizzava null sia durante il caricamento sia su errore, e un
+            bootstrap fallito (es. progetto appena creato col DB in
+            provisioning) lasciava un vuoto senza rimedio fino al reload. */}
+        {!multiChat.activeTabId && multiChat.isLoading ? (
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: tc.textMuted,
+              fontSize: 13,
+            }}
+          >
+            Caricamento chat...
+          </div>
+        ) : null}
+        {!multiChat.activeTabId && !multiChat.isLoading && multiChat.error ? (
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 10,
+              color: tc.textMuted,
+              fontSize: 13,
+              textAlign: "center",
+              padding: 16,
+            }}
+          >
+            <div>Impossibile caricare le chat del progetto: {multiChat.error}</div>
+            <button
+              type="button"
+              onClick={() => multiChat.retryBootstrap()}
+              style={{
+                borderRadius: 6,
+                border: `1px solid ${tc.border}`,
+                background: tc.bgCard,
+                color: tc.text,
+                padding: "6px 14px",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              Riprova
+            </button>
+          </div>
+        ) : null}
         {multiChat.activeTabId ? (
           <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", width: "100%" }}>
             <ChatPanel

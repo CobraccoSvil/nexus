@@ -11,6 +11,7 @@ import {
   type ChatSessionSummary,
 } from "./api-client";
 import { useProjectStore } from "./project-dispatcher/store";
+import { reconcileSessionTabs } from "./use-multi-chat/reconcile";
 
 const TABS_KEY = (pid: string) => `ideai:openTabs:${pid}`;
 const ACTIVE_KEY = (pid: string) => `ideai:activeTab:${pid}`;
@@ -67,6 +68,9 @@ export interface UseMultiChatReturn {
   setAgentActive: (sessionId: string, active: boolean) => void;
   setCtxRatio: (sessionId: string, ratio: number | null) => void;
   refreshSessions: () => Promise<void>;
+  /** Rilancia il bootstrap del progetto corrente (per il bottone Riprova
+   *  quando il caricamento sessioni e' fallito). */
+  retryBootstrap: () => void;
 }
 
 export function useMultiChat(projectId: string): UseMultiChatReturn {
@@ -77,8 +81,27 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
   const [ctxRatio, setCtxRatioState] = useState<CtxRatioMap>(new Map());
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [bootstrapNonce, setBootstrapNonce] = useState(0);
   const openTabsRef = useRef<string[]>([]);
   openTabsRef.current = openTabs;
+
+  // Reset SINCRONO al cambio progetto (pattern React "adjust state when a prop
+  // changes"): senza questo, sessioni e tab del progetto precedente restavano
+  // in vista finche' il bootstrap del nuovo non completava — e PER SEMPRE se
+  // falliva (es. progetto appena creato col DB per-progetto in provisioning).
+  // ChatPanel arrivava cosi' a una coppia incoerente (progetto nuovo, sessione
+  // del vecchio) col composer muto: isReady=false in useChat -> send senza POST.
+  const [bootProjectId, setBootProjectId] = useState(projectId);
+  if (bootProjectId !== projectId) {
+    setBootProjectId(projectId);
+    setAllSessions([]);
+    setOpenTabs([]);
+    setActiveTabIdState(null);
+    setAgentActivity(new Map());
+    setCtxRatioState(new Map());
+    setError(null);
+    setIsLoading(Boolean(projectId && projectId !== "default"));
+  }
 
   const persist = useCallback(
     (tabs: string[], active: string | null) => savePersisted(projectId, tabs, active),
@@ -93,9 +116,31 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
 
     (async () => {
       try {
-        const data = await getChatSessions(projectId);
+        // GET con breve retry: un progetto appena creato puo' avere il DB
+        // per-progetto ancora in provisioning e la prima fetch puo' fallire.
+        // Con un tentativo unico il pannello restava congelato (nessun retry,
+        // errore mai renderizzato) fino al reload manuale della pagina.
+        let sessions: ChatSessionSummary[] | null = null;
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < 3 && !cancelled; attempt += 1) {
+          if (attempt > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+            if (cancelled) break;
+          }
+          try {
+            const data = await getChatSessions(projectId);
+            sessions = data.sessions;
+            break;
+          } catch (e) {
+            lastError = e;
+          }
+        }
         if (cancelled) return;
-        let sessions = data.sessions;
+        if (sessions === null) {
+          throw lastError instanceof Error
+            ? lastError
+            : new Error("Errore caricamento sessioni");
+        }
 
         // If no sessions exist, create the first one
         if (sessions.length === 0) {
@@ -114,18 +159,14 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
         }
 
         setAllSessions(sessions);
-        const sessionIds = new Set(sessions.map((s) => s.id));
         const persisted = loadPersisted(projectId);
-
-        // Reconcile: remove stale tab IDs
-        let tabs = persisted.tabs.filter((id) => sessionIds.has(id));
-        let active = persisted.active && sessionIds.has(persisted.active)
-          ? persisted.active : null;
-
-        // Ensure at least one tab is open
-        if (tabs.length === 0) tabs = [sessions[0].id];
-        if (!active) active = tabs[tabs.length - 1];
-
+        // Punto unico di riconciliazione (regola L): scarta tab stantie,
+        // garantisce una tab aperta e un'attiva coerente.
+        const { tabs, active } = reconcileSessionTabs(
+          sessions.map((s) => s.id),
+          persisted.tabs,
+          persisted.active,
+        );
         setOpenTabs(tabs);
         setActiveTabIdState(active);
         persist(tabs, active);
@@ -137,7 +178,11 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
     })();
 
     return () => { cancelled = true; };
-  }, [projectId, persist]);
+  }, [projectId, persist, bootstrapNonce]);
+
+  const retryBootstrap = useCallback(() => {
+    setBootstrapNonce((n) => n + 1);
+  }, []);
 
   // ── Refresh ─────────────────────────────────────────────────────────────────
   const refreshSessions = useCallback(async () => {
@@ -179,26 +224,39 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
 
   // ── CRUD ────────────────────────────────────────────────────────────────────
   const newSession = useCallback(async () => {
-    const count = allSessions.length + 1;
-    const created = await createChatSession(projectId, `Chat ${count}`);
-    const s = created.session;
-    const summary: ChatSessionSummary = {
-      id: s.id,
-      projectId,
-      title: s.title,
-      status: s.status,
-      messageCount: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    setAllSessions((prev) => [summary, ...prev]);
-    setOpenTabs((prev) => {
-      const next = [...prev, s.id];
-      persist(next, s.id);
-      return next;
-    });
-    setActiveTabIdState(s.id);
-  }, [allSessions.length, projectId, persist]);
+    try {
+      const count = allSessions.length + 1;
+      const created = await createChatSession(projectId, `Chat ${count}`);
+      const s = created.session;
+      const summary: ChatSessionSummary = {
+        id: s.id,
+        projectId,
+        title: s.title,
+        status: s.status,
+        messageCount: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      setAllSessions((prev) => [summary, ...prev]);
+      setOpenTabs((prev) => {
+        const next = [...prev, s.id];
+        persist(next, s.id);
+        return next;
+      });
+      setActiveTabIdState(s.id);
+    } catch (e) {
+      // Feedback esplicito: prima l'errore era silenzioso (void senza catch nel
+      // chiamante) e la chat "sembrava non creata" senza alcuna indicazione.
+      useProjectStore.getState().pushToast(
+        "error",
+        e instanceof Error ? `Creazione chat fallita: ${e.message}` : "Creazione chat fallita",
+      );
+      // Riconciliazione: se la POST e' riuscita lato server ma la risposta si
+      // e' persa (rete), il refetch la fa comunque comparire nella lista invece
+      // di lasciarla orfana sul DB fino al reload della pagina.
+      void refreshSessions().catch(() => {});
+    }
+  }, [allSessions.length, projectId, persist, refreshSessions]);
 
   const renameSession = useCallback(async (id: string, title: string) => {
     await renameChatSession(id, title);
@@ -315,5 +373,6 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
     setAgentActive,
     setCtxRatio,
     refreshSessions,
+    retryBootstrap,
   };
 }
