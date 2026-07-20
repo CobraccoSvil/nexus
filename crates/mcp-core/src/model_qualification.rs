@@ -338,11 +338,21 @@ pub(crate) fn evaluate_attempt(turn: &Value, predicate: &Value, latency_ms: i64)
 /// 5 -> 7 (mig 0618). A 5 la componente era SATURA e non separava piu' nessuno:
 /// 120 tentativi su 156 (il 77%) toccavano esattamente 5 anelli e prendevano il
 /// punteggio pieno. Quel 5 non era la bravura dei modelli, era il soffitto di
-/// `max_turns: 6` — con 6 turni non se ne possono concatenare di piu'. Alzati
-/// insieme i turni a 8 (il massimo che `TURNI_MAX` concede), 7 anelli tornano
-/// raggiungibili e la componente torna a distinguere: chi si ferma a 5 prende il
-/// 71%, chi arriva a 7 il pieno.
-const LINKS_TARGET: f64 = 7.0;
+/// `max_turns: 6` — con 6 turni non se ne possono concatenare di piu'.
+///
+/// 7 -> 6 (mig 0621), e stavolta il bersaglio SCENDE. A 7 la componente si e'
+/// risaturata (79% dei tentativi a 7 anelli, ministral-8b compreso): il soffitto
+/// si era spostato, non rimosso, perche' seguire riferimenti concatenati non e'
+/// piu' una capacita' rara. La 0621 non allunga la catena, la rende insidiosa —
+/// il criterio di selezione sta nel primo messaggio e a un anello la pista si
+/// interrompe. Rientrare COSTA UN TURNO, quindi con gli stessi 8 turni la
+/// traiettoria perfetta vale 6 anelli e non piu' 7.
+///
+/// Il bersaglio e' esattamente il tetto della traiettoria intesa, provato dal
+/// golden agent (`la_traiettoria_intesa_arriva_in_fondo`, probe_agentic_loop).
+/// Lasciarlo a 7 avrebbe costruito il difetto opposto e altrettanto disonesto:
+/// un pieno che NESSUNO puo' prendere, cioe' di nuovo la misura del nostro tetto.
+const LINKS_TARGET: f64 = 6.0;
 
 /// Somme CONTINUE sui tentativi CONCLUSIVI di un profilo (mig 0616): alimentano
 /// [`derive_measured_score`] senza rileggere l'evidence. Restano a zero sui
@@ -1207,18 +1217,28 @@ fn mondo_del_kind(kind: &str) -> Option<crate::probe_world::WorldKind> {
     }
 }
 
-/// L'istruzione del giro: nomina il SOLO bersaglio noto (l'handle di partenza) e
-/// dice cosa cercare.
+/// L'istruzione del giro: nomina il SOLO bersaglio noto (l'handle di partenza), il
+/// CUSTODE che seleziona la voce da seguire, e nient'altro.
 ///
 /// Non nomina i tool — quale usare lo decide il modello — e non dice "concatena tre
 /// chiamate": chiederlo esplicitamente misurerebbe l'obbedienza al nostro prompt
 /// invece della capacita' di capire che, per arrivare in fondo, bisogna seguire i
 /// riferimenti.
-fn istruzione_catena(handle: &str) -> String {
+///
+/// Il custode e' l'UNICO posto in cui il criterio compare: sparita la vecchia
+/// formula "segui la voce marcata 'current'", che metteva la risposta dentro ogni
+/// tool_result e rendeva vincente una ricerca di stringa. Qui il criterio va tenuto
+/// a mente per tutto il giro.
+///
+/// Cio' che l'istruzione NON dice: che a un certo punto la pista si interrompe. Un
+/// ostacolo annunciato misurerebbe l'obbedienza; questo va scoperto leggendo
+/// l'errore, esattamente come il guasto del profilo di recupero.
+fn istruzione_catena(handle: &str, custode: &str) -> String {
     format!(
-        "Parti dalla risorsa {handle}. Ogni risorsa che leggi contiene i riferimenti \
-         a quelle successive: segui la voce marcata 'current' finche' non arrivi \
-         all'ultima. Rispondi con il riferimento finale."
+        "Parti dalla risorsa {handle}. Ogni risorsa che leggi elenca delle voci, \
+         ciascuna con un campo 'owner': prosegui attraverso la voce affidata al \
+         custode {custode}, e continua finche' la pista non si esaurisce. Rispondi \
+         con il riferimento finale."
     )
 }
 
@@ -1278,7 +1298,7 @@ impl ProbeCtx<'_> {
         // modello deve guadagnarseli seguendo la catena.
         let handle0 = seed.handle(0);
         let istruzione = match kind {
-            WorldKind::Catena => istruzione_catena(&handle0),
+            WorldKind::Catena => istruzione_catena(&handle0, &seed.custode()),
             WorldKind::Recupero => istruzione_recupero(&handle0),
         };
         let (_, _, system_text) = self.request;
@@ -3415,15 +3435,21 @@ mod tests {
         let s_ministral = punteggio(&ministral);
         // La formula esatta sui fatti reali, coi pesi della mig 0620
         // (chain 12, recovery 45, real 18, latent 25, longctx 0) e
-        // LINKS_TARGET = 7 (mig 0618). Ogni addendo e' scritto come
+        // LINKS_TARGET = 6 (mig 0621). Ogni addendo e' scritto come
         // peso * frazione-osservata, cosi' il numero si legge invece di essere
-        // copiato dall'output: catena (somma links)/(4*7), recupero e latent per
+        // copiato dall'output: catena (somma links)/(4*6), recupero e latent per
         // rate, malus -5 su repeated e bad_syntax sugli 8 tentativi multi-step.
-        assert!(vicino(s_minimax, 12.0 * 5.0 / 7.0 + 45.0 + 18.0 + 25.0 * 0.5 - 3.125), "minimax: {s_minimax}");
-        assert!(vicino(s_kimi, 12.0 * 17.0 / 28.0 + 45.0 * 0.25 + 18.0 + 25.0 - 0.625), "kimi: {s_kimi}");
-        assert!(vicino(s_qwen, 12.0 * 19.0 / 28.0 + 18.0 + 25.0 - 0.625), "qwen: {s_qwen}");
-        assert!(vicino(s_grok, 12.0 * 5.0 / 7.0 + 18.0 + 25.0 - 3.75), "grok: {s_grok}");
-        assert!(vicino(s_ministral, 12.0 * 2.0 / 7.0 + 18.0 + 25.0 * 0.5), "ministral: {s_ministral}");
+        //
+        // Il denominatore scende da 28 a 24 col bersaglio: questi tentativi sono
+        // della suite 4 e i loro anelli valgono un po' di piu' rapportati a una
+        // catena piu' corta. E' precisamente il motivo per cui il cambio di
+        // bersaglio pretende un bump di suite — i punteggi non sono confrontabili
+        // fra materiali diversi, e questa riga lo rende visibile.
+        assert!(vicino(s_minimax, 12.0 * 20.0 / 24.0 + 45.0 + 18.0 + 25.0 * 0.5 - 3.125), "minimax: {s_minimax}");
+        assert!(vicino(s_kimi, 12.0 * 17.0 / 24.0 + 45.0 * 0.25 + 18.0 + 25.0 - 0.625), "kimi: {s_kimi}");
+        assert!(vicino(s_qwen, 12.0 * 19.0 / 24.0 + 18.0 + 25.0 - 0.625), "qwen: {s_qwen}");
+        assert!(vicino(s_grok, 12.0 * 20.0 / 24.0 + 18.0 + 25.0 - 3.75), "grok: {s_grok}");
+        assert!(vicino(s_ministral, 12.0 * 8.0 / 24.0 + 18.0 + 25.0 * 0.5), "ministral: {s_ministral}");
         // grok sotto kimi NONOSTANTE catena piena e latent pieno: il recovery
         // (peso 30) e il malus repeated lo pagano. E' il razionale di w_recovery.
         assert!(s_grok < s_kimi, "recovery 0 + malus deve costare: {s_grok} vs {s_kimi}");
@@ -3993,7 +4019,7 @@ mod tests {
             // Esattamente cio' che fa `multi_step_attempt`: handle0 -> istruzione.
             let handle0 = seed.handle(0);
             let istruzione = match kind {
-                WorldKind::Catena => istruzione_catena(&handle0),
+                WorldKind::Catena => istruzione_catena(&handle0, &seed.custode()),
                 WorldKind::Recupero => istruzione_recupero(&handle0),
             };
             assert!(
@@ -4026,7 +4052,10 @@ mod tests {
             seed: 42,
         };
         let trapelato = seed.handle(3);
-        let istruzione = format!("{} (e la risposta e' {trapelato})", istruzione_catena(&seed.handle(0)));
+        let istruzione = format!(
+            "{} (e la risposta e' {trapelato})",
+            istruzione_catena(&seed.handle(0), &seed.custode())
+        );
         assert!(
             ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&istruzione]).is_err(),
             "un anello a valle visibile nella richiesta deve impedire il giro"
@@ -4058,35 +4087,44 @@ mod tests {
         turni_emessi: std::cell::RefCell<usize>,
         riporta_il_token: bool,
     }
+
+    /// Il turno come lo produce la PRODUZIONE: una [`GwResponse`] del gateway fatta
+    /// passare per `agent_turn_value_from_gw`, l'UNICO produttore di questo Value.
+    /// Fabbricarlo a mano fisserebbe l'assunto da verificare (regola O).
+    ///
+    /// Punto unico dei modelli finti di questo modulo: prima ogni agente scriptato si
+    /// portava dietro la propria copia della costruzione, e una copia diverge.
+    fn turno_prodotto(chiamate: &[(String, String)]) -> Value {
+        use crate::nexus_gateway::{GwResponse, GwToolCall, GwToolFunctionCall, GwUsage};
+        let tc: Vec<GwToolCall> = chiamate
+            .iter()
+            .enumerate()
+            .map(|(i, (n, a))| GwToolCall {
+                id: format!("c{i}"),
+                kind: "function".into(),
+                function: GwToolFunctionCall { name: n.clone(), arguments: a.clone() },
+                thought_signature: None,
+            })
+            .collect();
+        let resp = GwResponse {
+            content: if chiamate.is_empty() { "non riesco a proseguire".into() } else { String::new() },
+            tool_calls: (!tc.is_empty()).then_some(tc),
+            usage: GwUsage::default(),
+            model_used: "m".into(),
+            provider_used: "p".into(),
+            latency_ms: 1,
+            finish_reason: if chiamate.is_empty() { "stop".into() } else { "tool_calls".into() },
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+            citations: None,
+        };
+        crate::orchestrator::neural_client::agent_turn_value_from_gw("p", "m", &resp)
+    }
+
     impl crate::probe_agentic_loop::TurnSource for RecuperoScritto {
         async fn turn(&self, messages_json: &str) -> Value {
-            use crate::nexus_gateway::{GwResponse, GwToolCall, GwToolFunctionCall, GwUsage};
-            let produci = |chiamate: &[(String, String)]| -> Value {
-                let tc: Vec<GwToolCall> = chiamate
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (n, a))| GwToolCall {
-                        id: format!("c{i}"),
-                        kind: "function".into(),
-                        function: GwToolFunctionCall { name: n.clone(), arguments: a.clone() },
-                        thought_signature: None,
-                    })
-                    .collect();
-                let resp = GwResponse {
-                    content: if chiamate.is_empty() { "non riesco a leggere la risorsa".into() } else { String::new() },
-                    tool_calls: (!tc.is_empty()).then_some(tc),
-                    usage: GwUsage::default(),
-                    model_used: "m".into(),
-                    provider_used: "p".into(),
-                    latency_ms: 1,
-                    finish_reason: if chiamate.is_empty() { "stop".into() } else { "tool_calls".into() },
-                    privacy_rerouted: None,
-                    reasoning: None,
-                    thinking_signature: None,
-                    citations: None,
-                };
-                crate::orchestrator::neural_client::agent_turn_value_from_gw("p", "m", &resp)
-            };
+            let produci = turno_prodotto;
             let mut n = self.turni_emessi.borrow_mut();
             let turno = *n;
             *n += 1;
@@ -4168,5 +4206,309 @@ mod tests {
             Some(false),
             "il fail 'no_recovery' deve mostrare recovered=false, cosi' e' diagnosticabile"
         );
+    }
+
+    // ── LA CATENA: raggiungibilita' e difficolta', PROVATE (regola O) ─────
+    //
+    // Un mondo piu' difficile e' un'ipotesi finche' non si misura da due lati
+    // opposti, e sono i due modi in cui questa batteria ha gia' sbagliato:
+    //
+    //   RAGGIUNGIBILITA' - esiste una traiettoria che passa? Il profilo di recupero
+    //     e' stato a 0 pass su 30 modelli DUE volte perche' nessuno l'aveva mai
+    //     percorso in codice. Un test che nessuno passa non e' severo, e' rotto.
+    //   DIFFICOLTA' - le strategie da una riga falliscono? Senza questo lato, la
+    //     catena e' saturata due volte (100% di pass) e ce ne siamo accorti solo
+    //     leggendo l'istogramma degli anelli in produzione.
+    //
+    // I quattro agenti qui sotto sono scriptati e NON-LLM: differiscono solo per la
+    // regola di scelta della prossima voce, quindi il delta fra i loro esiti misura
+    // il MONDO e nient'altro. Attraversano la strada della produzione — istruzione da
+    // `istruzione_catena`, mondo da `ScriptedWorld::new` col guard del needle, giro da
+    // `run_loop`, verdetto da `verdetto_dai_fatti` col predicato reale — perche' un
+    // agente d'oro che chiamasse il mondo a mano proverebbe solo che sappiamo
+    // scrivere un copione.
+
+    /// La regola con cui un agente sceglie la voce da seguire. E' l'UNICA cosa che
+    /// cambia fra i quattro: tutto il resto e' identico per costruzione.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Strategia {
+        /// LA TRAIETTORIA INTESA: segui la voce del custode nominato nel compito e,
+        /// quando la pista si chiude, torna all'elenco precedente e prendi la voce
+        /// che avevi scartato. Nient'altro: nessuna conoscenza privilegiata del
+        /// seme, nessun token passato di nascosto.
+        Oro,
+        /// La scorciatoia che il ridisegno doveva uccidere: cerca l'etichetta
+        /// 'current' e prendi quel ref.
+        CercaCurrent,
+        /// L'altra scorciatoia da una riga: prendi sempre il primo ref dell'elenco.
+        PrimoRef,
+        /// Legge davvero il custode, ma non si adatta: sul ramo chiuso insiste.
+        /// E' il caso piu' severo per noi — isola l'ADATTAMENTO da tutto il resto.
+        SenzaRitorno,
+    }
+
+    struct AgenteScritto {
+        strategia: Strategia,
+    }
+
+    /// Il primo token con un dato prefisso dentro un testo.
+    fn token_con_prefisso(testo: &str, prefisso: &str) -> Option<String> {
+        let i = testo.find(prefisso)?;
+        Some(
+            testo[i..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect(),
+        )
+    }
+
+    /// Il contenuto del primo messaggio utente: l'istruzione del compito, dove vive
+    /// il custode. Un agente vero ce l'ha sotto gli occhi allo stesso modo.
+    fn istruzione_dalla_conversazione(msgs: &[Value]) -> String {
+        msgs.iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// I tool_result visti finora, in ordine.
+    fn risultati_tool(msgs: &[Value]) -> Vec<String> {
+        msgs.iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|m| m.get("content").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    /// Il `ref` della voce affidata al custode (`affidata=true`) o dell'altra.
+    fn ref_per_custode(elenco: &Value, custode: &str, affidata: bool) -> Option<String> {
+        elenco["entries"]
+            .as_array()?
+            .iter()
+            .find(|v| (v["owner"].as_str() == Some(custode)) == affidata)
+            .and_then(|v| v["ref"].as_str().map(str::to_string))
+    }
+
+    /// L'ultimo tool_result che sia un ELENCO di voci: e' l'elenco a cui l'errore
+    /// del ramo chiuso dice di tornare.
+    fn ultimo_elenco(risultati: &[String]) -> Option<Value> {
+        risultati
+            .iter()
+            .rev()
+            .filter_map(|t| serde_json::from_str::<Value>(t).ok())
+            .find(|v| v["entries"].is_array())
+    }
+
+    /// La vecchia strategia vincente, conservata come misura: la voce marcata
+    /// 'current'. Se il mondo la espone ancora, questo agente passa — ed e'
+    /// esattamente cio' che il test di simmetria non deve permettere.
+    fn ref_marcato_current(elenco: &Value) -> Option<String> {
+        elenco["entries"]
+            .as_array()?
+            .iter()
+            .find(|v| v.as_object().is_some_and(|o| o.values().any(|x| x == "current")))
+            .and_then(|v| v["ref"].as_str().map(str::to_string))
+    }
+
+    impl AgenteScritto {
+        /// Il bersaglio del prossimo turno, deciso SOLO da cio' che e' nella
+        /// conversazione. `None` = non so proseguire, e il giro si chiude.
+        fn prossimo_bersaglio(&self, messages_json: &str) -> Option<String> {
+            let msgs: Vec<Value> = serde_json::from_str(messages_json).ok()?;
+            let istruzione = istruzione_dalla_conversazione(&msgs);
+            let custode = token_con_prefisso(&istruzione, "C-")?;
+            let risultati = risultati_tool(&msgs);
+            let Some(ultimo) = risultati.last() else {
+                // Primo turno: l'unico bersaglio noto e' quello del compito.
+                return token_con_prefisso(&istruzione, "H-");
+            };
+            // Il CODICE dell'errore, non la sua prosa: `E_BRANCH_CLOSED` e' un
+            // identificatore macchina stabile, il `message` e' per gli umani
+            // (regola M, lo stesso criterio che il gateway applica ai provider).
+            if ultimo.contains("E_BRANCH_CLOSED") {
+                return self.dopo_il_ramo_chiuso(&risultati, &custode);
+            }
+            self.dall_elenco(&serde_json::from_str::<Value>(ultimo).ok()?, &custode)
+        }
+
+        fn dall_elenco(&self, elenco: &Value, custode: &str) -> Option<String> {
+            match self.strategia {
+                Strategia::Oro | Strategia::SenzaRitorno => {
+                    ref_per_custode(elenco, custode, true)
+                }
+                Strategia::PrimoRef => elenco["entries"][0]["ref"].as_str().map(str::to_string),
+                Strategia::CercaCurrent => ref_marcato_current(elenco),
+            }
+        }
+
+        /// Cosa si fa quando la pista si chiude. E' l'unico bivio che separa
+        /// l'adattamento dalla sua assenza.
+        fn dopo_il_ramo_chiuso(&self, risultati: &[String], custode: &str) -> Option<String> {
+            let elenco = ultimo_elenco(risultati)?;
+            match self.strategia {
+                // L'errore lo dichiara: torna all'elenco, prendi la voce scartata.
+                Strategia::Oro => ref_per_custode(&elenco, custode, false),
+                // Non si adatta: ripresenta la stessa voce, che resta chiusa.
+                _ => ref_per_custode(&elenco, custode, true),
+            }
+        }
+    }
+
+    impl crate::probe_agentic_loop::TurnSource for AgenteScritto {
+        async fn turn(&self, messages_json: &str) -> Value {
+            match self.prossimo_bersaglio(messages_json) {
+                Some(b) => turno_prodotto(&[(
+                    "read_file".into(),
+                    json!({ "path": b }).to_string(),
+                )]),
+                None => turno_prodotto(&[]),
+            }
+        }
+    }
+
+    fn seme_catena(seme: u64) -> crate::probe_world::TokenSeed {
+        crate::probe_world::TokenSeed {
+            provider: "p".into(),
+            model: "m".into(),
+            profile_key: "agentic_chain".into(),
+            attempt: 1,
+            seed: seme,
+        }
+    }
+
+    /// Un giro completo di `agentic_chain`, per la STESSA strada di
+    /// `multi_step_attempt`: istruzione dal produttore vero, mondo col guard del
+    /// needle, `run_loop`, `verdetto_dai_fatti` col predicato REALE del profilo.
+    async fn giro_completo_catena(strategia: Strategia, seme: u64) -> (AttemptOutcome, usize) {
+        use crate::probe_world::{ScriptedWorld, WorldKind};
+        // Il predicato del profilo `agentic_chain` dopo la mig 0621: 4 anelli.
+        // 4 > 3 = l'anello cieco piu' lontano, quindi passare IMPLICA essere
+        // rientrati sulla pista — non c'e' altra strada per superare quel numero.
+        let predicate = json!({
+            "max_latency_ms": 120000, "hold_min_passes": 2,
+            "min_chained_calls": 4, "promote_min_passes": 3
+        });
+        let seed = seme_catena(seme);
+        let istruzione = istruzione_catena(&seed.handle(0), &seed.custode());
+        let mondo = ScriptedWorld::new(WorldKind::Catena, seed.clone(), &[&istruzione, "system"]);
+        let mut mondo = mondo.expect("il mondo si costruisce con l'istruzione vera");
+        let agente = AgenteScritto { strategia };
+        // `max_turns: 8`, cio' che il profilo dichiara nel payload (mig 0618).
+        let out = crate::probe_agentic_loop::run_loop(
+            &agente,
+            WorldKind::Catena,
+            &mut mondo,
+            &istruzione,
+            8,
+        )
+        .await;
+        assert!(
+            out.inconclusive.is_none(),
+            "il giro dev'essere attribuibile all'agente, non ai nostri cap: {:?}",
+            out.inconclusive
+        );
+        (verdetto_dai_fatti(&out.measures, &predicate, 42), out.measures.chained_links)
+    }
+
+    /// I semi su cui si prova il mondo. Ne servono piu' d'uno perche' il seme decide
+    /// DOVE la pista si interrompe e in che ORDINE stanno le voci: un solo seme
+    /// misurerebbe un'istanza, non il design.
+    const SEMI: [u64; 6] = [7, 42, 99, 1234, 5, 20260720];
+
+    /// PROVA DI RAGGIUNGIBILITA'. La traiettoria intesa, scritta come codice, deve
+    /// PASSARE — e arrivare al tetto di 6 anelli che `LINKS_TARGET` dichiara.
+    ///
+    /// Se questo test rosseggia, il mondo e' irrisolvibile e va ritarato: non e' il
+    /// modello a essere debole, e' il test a essere rotto. E' la lezione dei due
+    /// 0/30 sul profilo di recupero, resa eseguibile.
+    #[tokio::test]
+    async fn la_traiettoria_intesa_arriva_in_fondo() {
+        for seme in SEMI {
+            let (out, anelli) = giro_completo_catena(Strategia::Oro, seme).await;
+            assert!(
+                out.pass,
+                "seme {seme}: la traiettoria intesa DEVE passare, invece '{}' ({anelli} anelli)",
+                out.reason
+            );
+            assert_eq!(
+                anelli, 6,
+                "seme {seme}: la traiettoria perfetta vale esattamente 6 anelli con 8 \
+                 turni (il rientro dalla pista chiusa ne costa uno). Se questo numero \
+                 scende, LINKS_TARGET sta misurando un pieno irraggiungibile; se sale, \
+                 l'interruzione non sta piu' costando nulla"
+            );
+        }
+    }
+
+    /// PROVA DI DIFFICOLTA' (simmetria). Le tre strategie da una riga NON devono
+    /// passare. Senza questo lato non avremmo provato di aver alzato la difficolta':
+    /// avremmo solo cambiato le stringhe.
+    ///
+    /// I tre casi isolano tre cose diverse, ed e' il punto:
+    ///   - 'cerca current'  -> l'etichetta non c'e' piu': la vecchia strategia e' morta
+    ///   - 'primo ref'      -> l'ordine e' del seme: la posizione non e' un criterio
+    ///   - 'senza ritorno'  -> legge il custode DAVVERO, e non basta: manca solo
+    ///                         l'adattamento, e si ferma esattamente all'anello cieco
+    #[tokio::test]
+    async fn le_strategie_da_una_riga_non_passano_piu() {
+        for seme in SEMI {
+            for strategia in [Strategia::CercaCurrent, Strategia::PrimoRef, Strategia::SenzaRitorno] {
+                let (out, anelli) = giro_completo_catena(strategia, seme).await;
+                assert!(
+                    !out.pass,
+                    "seme {seme}: la strategia {strategia:?} NON deve passare, invece \
+                     ha chiuso {anelli} anelli con verdetto '{}'",
+                    out.reason
+                );
+                // La CONSEGUENZA col suo numero, non un booleano: il motivo dice
+                // quanti anelli ha chiuso e quanti ne servivano, cosi' un rosso e'
+                // gia' una diagnosi (regola O).
+                assert_eq!(
+                    out.reason,
+                    format!("no_chain:{anelli}<4"),
+                    "seme {seme}, {strategia:?}"
+                );
+            }
+        }
+    }
+
+    /// Il DELTA che il mondo produce, letto anello per anello: e' la misura del
+    /// design, non del singolo agente.
+    ///
+    /// 'cerca current' si ferma a ZERO (l'etichetta e' sparita, non sa dove andare
+    /// dopo il primo elenco); 'senza ritorno' si ferma ESATTAMENTE sull'anello
+    /// cieco, che e' il costo puro del non-adattamento; l'oro arriva a 6. Tre
+    /// numeri diversi dallo stesso mondo, e la distanza fra il secondo e il terzo
+    /// e' cio' che il profilo misura davvero.
+    ///
+    /// PERCHE' NON BASTA IL TEST SOPRA, misurato e non supposto: rimettendo
+    /// l'etichetta `state: "current"` negli elenchi (la mutazione che reintroduce
+    /// il difetto), `le_strategie_da_una_riga_non_passano_piu` resta VERDE — chi
+    /// segue l'etichetta arriva comunque solo all'anello cieco, e 3 < 4 e' ancora
+    /// un fail. Il pass/fail da solo non vede la regressione: la vede questo, che
+    /// guarda gli anelli. Un test che non rosseggia quando reintroduci il bug non
+    /// copre il bug, copre se stesso.
+    #[tokio::test]
+    async fn i_tre_agenti_si_fermano_dove_il_design_dice() {
+        for seme in SEMI {
+            let cieco = seme_catena(seme).anello_cieco();
+            let (_, anelli_current) = giro_completo_catena(Strategia::CercaCurrent, seme).await;
+            let (_, anelli_fermo) = giro_completo_catena(Strategia::SenzaRitorno, seme).await;
+            let (_, anelli_oro) = giro_completo_catena(Strategia::Oro, seme).await;
+            assert_eq!(
+                anelli_current, 0,
+                "seme {seme}: senza l'etichetta 'current' la vecchia strategia non \
+                 supera nemmeno il primo elenco"
+            );
+            assert_eq!(
+                anelli_fermo, cieco,
+                "seme {seme}: chi non si adatta si ferma sull'anello cieco, ne' prima \
+                 ne' dopo. Se arrivasse oltre, la pista non si sarebbe interrotta"
+            );
+            assert!(
+                anelli_oro > anelli_fermo,
+                "seme {seme}: l'adattamento deve VALERE anelli ({anelli_oro} vs {anelli_fermo})"
+            );
+        }
     }
 }

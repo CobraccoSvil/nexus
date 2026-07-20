@@ -26,6 +26,33 @@
 //! contraddire il valore plausibile in memoria parametrica) e la forma del Gorilla
 //! File System, dove "the errors are not exceptions but return values".
 //!
+//! # Perche' la catena e' fatta cosi' (suite 8)
+//!
+//! Un test che tutti passano non e' severo, e' rotto — ma vale anche il contrario:
+//! un test che nessuno passa misura un pavimento. Questa catena e' stata satura DUE
+//! volte (100% di pass, e il 79% dei tentativi esattamente al soffitto dei turni),
+//! e le due volte la causa era la stessa: la voce buona portava un'etichetta
+//! (`state: "current"`) e la strategia vincente era cercare quella parola. Alzare i
+//! turni ha spostato il soffitto senza toccare la causa — anche i modelli piccoli
+//! arrivavano in fondo, perche' seguire riferimenti concatenati non e' piu' una
+//! capacita' rara.
+//!
+//! Due meccanismi la rendono di nuovo discriminante, e nessuno dei due la allunga:
+//!
+//! 1. IL CRITERIO NON E' NELLA RISPOSTA. Le voci di ogni elenco sono simmetriche e
+//!    si distinguono solo per il custode (`owner`); il custode giusto e' nominato una
+//!    volta sola, nel primo messaggio. Non c'e' parola da cercare: c'e' un vincolo da
+//!    ricordare per otto turni.
+//! 2. LA PISTA SI INTERROMPE. A un anello deciso dal seme la voce corretta porta a un
+//!    ramo chiuso, e l'errore dice di tornare all'elenco precedente e prendere la voce
+//!    scartata. Chi ha appena imparato il criterio deve sospenderlo perche' il mondo
+//!    gliel'ha detto. E' adattamento, ed e' cio' che manca ai modelli deboli.
+//!
+//! Il rimedio dell'interruzione e' DICHIARATO nell'errore: e' il vincolo di
+//! raggiungibilita' di BFCL V3, imparato pagando 0/30 conclusivi due volte sul
+//! profilo di recupero. Il compito resta di capacita' e non di obbedienza: nulla
+//! di tutto cio' e' annunciato nell'istruzione.
+//!
 //! # Determinismo e freschezza insieme
 //!
 //! Ogni token nasce da SHA-256 di (provider, model, profile_key, attempt, anello):
@@ -94,6 +121,45 @@ impl TokenSeed {
         format!("H-{}", self.token(&format!("esca:{k}"), 10))
     }
 
+    /// Il CUSTODE della pista: il criterio di selezione della catena. Vive
+    /// UNICAMENTE nell'istruzione iniziale, e ogni voce di ogni elenco dichiara il
+    /// proprio `owner`: la voce da seguire e' quella affidata a questo custode.
+    ///
+    /// E' il perno del ridisegno (suite 8). Prima la voce buona era marcata
+    /// `state: "current"`, e la strategia vincente era una sola riga — cerca la
+    /// stringa "current", prendi quel `ref`. Nessuna lettura, nessuna memoria:
+    /// misurato, il 79% dei tentativi arrivava al soffitto, inclusi i modelli
+    /// piccoli. Qui il criterio non e' nella risposta, e' nel PRIMO messaggio: per
+    /// applicarlo al settimo elenco bisogna ancora ricordarselo. Prefisso `C-`,
+    /// distinto da `H-`/`E-`/`F-`, perche' un custode non e' un bersaglio da
+    /// indirizzare: e' una proprieta' da confrontare.
+    pub(crate) fn custode(&self) -> String {
+        format!("C-{}", self.token("custode", 8))
+    }
+
+    /// Il custode ESTRANEO dell'anello `k`: chi tiene la voce che non va seguita.
+    /// Cambia a ogni anello, cosi' che "evita quel valore li'" non diventi una
+    /// scorciatoia dopo il primo errore: l'unico invariante e' il custode giusto.
+    pub(crate) fn custode_estraneo(&self, k: usize) -> String {
+        format!("C-{}", self.token(&format!("estraneo:{k}"), 8))
+    }
+
+    /// A quale anello la pista si interrompe. Fra il secondo e il terzo: abbastanza
+    /// avanti perche' la catena sia avviata, abbastanza presto perche' restino turni
+    /// per rientrare. Deriva dal seme come tutto il resto — fresco a ogni tentativo,
+    /// rigiocabile dall'evidenza.
+    ///
+    /// Il PASS del profilo chiede piu' anelli di quanti la pista ne conceda prima
+    /// dell'interruzione (`min_chained_calls: 4` > 3): passare IMPLICA essere
+    /// rientrati, e l'unica strada per rientrare e' tornare all'elenco precedente.
+    pub(crate) fn anello_cieco(&self) -> usize {
+        if self.frazione("cieco") < 0.5 {
+            2
+        } else {
+            3
+        }
+    }
+
     /// Il codice di un fascicolo del profilo `latent_state`. Prefisso diverso dagli
     /// handle perche' vive in un altro mondo: li' e' un bersaglio da indirizzare, qui
     /// e' un'entita' di cui seguire lo stato. Stessa fonte (SHA-256 del seme), quindi
@@ -147,6 +213,26 @@ impl WorldReply {
         Self { text: text.into(), is_error: false, planted }
     }
 
+    /// Un errore che DICHIARA il proprio rimedio: `message` dice cosa fare,
+    /// `retryable` se un altro tentativo possa riuscire. E' la forma delle API vere
+    /// (un 409 con "retry with ...") ed e' il contratto di risolvibilita' di questo
+    /// mondo — un ostacolo il cui rimedio non e' derivabile da nessun canale
+    /// osservabile misura un pavimento, non i modelli (0/30 conclusivi, due volte).
+    ///
+    /// Un solo posto sa come si scrive un ostacolo parlante, cosi' i tre che
+    /// esistono non possono divergere (regola L). `retryable` e' `true` ogni volta
+    /// che un'altra mossa PUO' riuscire: dichiarare `false` mentre si pretende una
+    /// seconda mossa e' la contraddizione che azzero' il profilo di recupero.
+    fn errore_parlante(codice: &str, rimedio: &str, ritentabile: bool, extra: Value) -> Self {
+        let mut corpo = json!({ "message": rimedio, "retryable": ritentabile });
+        if let Some(o) = extra.as_object() {
+            for (k, v) in o {
+                corpo[k] = v.clone();
+            }
+        }
+        Self::errore(codice, corpo)
+    }
+
     /// Errore-come-valore-di-ritorno (Gorilla File System): il modello lo riceve
     /// come un normale tool_result, non come un'eccezione di trasporto.
     fn errore(codice: &str, extra: Value) -> Self {
@@ -177,6 +263,15 @@ pub(crate) struct ScriptedWorld {
     seed: TokenSeed,
     /// Gli handle che il mondo ha gia' consegnato, in ordine di anello.
     emessi: Vec<String>,
+    /// L'anello piu' avanti che il mondo abbia consegnato. Prima questo numero si
+    /// leggeva da `emessi.len()` dopo un `resize` con stringhe vuote per tenere
+    /// allineati gli indici: un contatore travestito da lista, che lasciava un ""
+    /// in testa a `emessi`. Ora il contatore e' esplicito e `emessi` e' solo cio'
+    /// che dice di essere.
+    frontiera: usize,
+    /// La pista si e' gia' interrotta? L'interruzione e' FIRST-TOUCH come il guasto
+    /// del recupero: al primo contatto con l'anello cieco, sempre.
+    ramo_cieco_annunciato: bool,
     /// Quante volte ogni tool e' stato chiamato: serve al trigger del guasto
     /// (`nth_call`), che e' dichiarativo e deterministico — mai probabilistico.
     chiamate: Vec<String>,
@@ -197,6 +292,26 @@ pub(crate) struct ScriptedWorld {
 /// guasto, quindi resta un test di capacita', non di obbedienza.
 const RIMEDIO_STALE: &str = "The handle epoch is stale. Retry the same call, \
      including the value of 'current_epoch' below in the arguments.";
+
+/// Cosa DICHIARA l'errore del ramo cieco. E' la lezione del recupero applicata alla
+/// catena, e non e' negoziabile: un ostacolo il cui rimedio non e' derivabile da un
+/// canale osservabile non e' un test severo, e' un pavimento (0/30 conclusivi,
+/// misurato due volte prima che l'errore del recupero dicesse cosa fare).
+///
+/// Qui tutto cio' che serve e' gia' nella conversazione: l'elenco che ha prodotto
+/// questo handle e' un tool_result precedente, e conteneva DUE voci. L'errore nomina
+/// l'azione ("torna a quell'elenco, chiama l'altra voce") senza nominare il valore:
+/// il ref giusto va ripescato leggendo indietro, che e' esattamente la capacita' in
+/// esame. Dirlo per esteso lo regalerebbe; tacerlo lo renderebbe indovinello.
+const RIMEDIO_RAMO_CIECO: &str = "This branch is closed and will not reopen. Go back \
+     to the listing that gave you this reference and call the OTHER entry of that \
+     same listing - the one you did not choose. The trail continues from there.";
+
+/// Cosa dichiara l'errore di chi segue la voce sbagliata: NOMINA il criterio
+/// (confronta `owner` col custode del compito) e non il valore. Il custode e' nel
+/// primo messaggio: il rimedio e' derivabile, ma va ricordato.
+const RIMEDIO_CUSTODE: &str = "That entry is not held by the custodian named in your \
+     task. Compare the 'owner' field of each entry with the custodian you were given.";
 
 impl ScriptedWorld {
     /// Costruisce il mondo. `Err` se un token che va GUADAGNATO comparirebbe gia'
@@ -221,6 +336,8 @@ impl ScriptedWorld {
             kind,
             seed,
             emessi: Vec::new(),
+            frontiera: 0,
+            ramo_cieco_annunciato: false,
             chiamate: Vec::new(),
             guasto_scattato: false,
             token_errore: None,
@@ -271,23 +388,19 @@ impl ScriptedWorld {
         }
     }
 
-    /// La catena: chi indirizza l'anello k riceve l'anello k+1. Il match sul token
-    /// PRECEDE qualunque considerazione sul nome del tool: `run_command` con
-    /// `cat H-XXX` deve valere quanto `read_file` con `path: H-XXX` — il modello e'
-    /// libero di scegliere lo strumento, e bocciare una preferenza di stile fra
-    /// `cat` e `read_file` misurerebbe noi.
+    /// La catena: chi indirizza l'anello k riceve l'anello k+1 — TRANNE all'anello
+    /// cieco, dove la pista si interrompe e va ripresa dall'elenco precedente.
+    ///
+    /// Il match sul token PRECEDE qualunque considerazione sul nome del tool: un
+    /// `run_command` che passa l'handle dentro `cat` vale quanto un `read_file` che
+    /// lo passa in `path` — il modello e' libero di scegliere lo strumento, e
+    /// bocciare una preferenza di stile fra i due misurerebbe noi.
     fn risposta_catena(&mut self, pagliaio: &str) -> WorldReply {
-        // Dall'anello piu' avanti all'indietro: un modello che ripresenta un handle
-        // vecchio non guadagna un anello nuovo.
-        for k in (0..=self.emessi.len()).rev() {
-            if pagliaio.contains(&self.seed.handle(k)) {
-                return self.pianta_prossimo(k);
-            }
+        if let Some(k) = self.anello_indirizzato(pagliaio) {
+            return self.dalla_pista(k);
         }
-        if pagliaio.contains(&self.seed.esca(0)) || pagliaio.contains(&self.seed.esca(1)) {
-            // Ha abboccato al distrattore: non e' un errore di trasporto, e' una
-            // risorsa che non esiste. Nessun anello.
-            return WorldReply::errore("E_HANDLE_UNKNOWN", json!({}));
+        if let Some(k) = self.voce_estranea_indirizzata(pagliaio) {
+            return self.dalla_voce_estranea(k);
         }
         // Nessun handle: il modello ha inventato un bersaglio (tipicamente un path
         // plausibile dal pre-training).
@@ -297,29 +410,91 @@ impl ScriptedWorld {
         )
     }
 
+    /// Chi indirizza un anello della pista avanza — TRANNE sull'anello cieco, dove
+    /// la pista finisce, e finisce per SEMPRE: ripresentare lo stesso handle non la
+    /// riapre.
+    ///
+    /// L'anello resta CONTATO: il modello ci e' arrivato seguendo il criterio, ed e'
+    /// stato il mondo a chiudergli la strada. Toglierglielo punirebbe la mossa
+    /// giusta e renderebbe indistinguibile chi segue il criterio da chi tira a
+    /// indovinare, cioe' esattamente la separazione che questo profilo esiste per
+    /// misurare.
+    fn dalla_pista(&mut self, k: usize) -> WorldReply {
+        if k != self.seed.anello_cieco() {
+            return self.pianta_prossimo(k);
+        }
+        self.ramo_cieco_annunciato = true;
+        WorldReply::errore_parlante("E_BRANCH_CLOSED", RIMEDIO_RAMO_CIECO, true, json!({}))
+    }
+
+    /// Chi indirizza la voce di un ALTRO custode ha sbagliato criterio — TRANNE
+    /// dopo l'interruzione e sul suo anello, dove quella voce e' la via di rientro.
+    ///
+    /// E' LA DEVIAZIONE, il punto in cui una regola appena imparata va sospesa
+    /// perche' il mondo l'ha detto: seguire il criterio non basta piu', bisogna aver
+    /// letto l'errore e ricordarsi l'elenco di due turni prima. Fuori da li' la
+    /// voce estranea resta sbagliata, o "prendi sempre l'altra" diventerebbe una
+    /// strategia valida ovunque.
+    fn dalla_voce_estranea(&mut self, k: usize) -> WorldReply {
+        if self.ramo_cieco_annunciato && k == self.seed.anello_cieco() {
+            return self.pianta_prossimo(k);
+        }
+        // `retryable: true`: la mossa giusta esiste ed e' a portata di mano (l'altra
+        // voce dello stesso elenco). Dichiarare `false` qui sarebbe l'errore che
+        // azzero' il profilo di recupero — vietare cio' che si pretende — con
+        // l'aggravante che un modello obbediente si arrenderebbe al primo passo
+        // falso invece di correggere il tiro.
+        WorldReply::errore_parlante("E_OWNER_MISMATCH", RIMEDIO_CUSTODE, true, json!({}))
+    }
+
+    /// L'anello della pista che la chiamata indirizza, il piu' avanti se ne nomina
+    /// piu' d'uno: ripresentare un handle vecchio non guadagna un anello nuovo.
+    fn anello_indirizzato(&self, pagliaio: &str) -> Option<usize> {
+        (0..=self.frontiera).rev().find(|k| pagliaio.contains(&self.seed.handle(*k)))
+    }
+
+    /// L'anello di cui la chiamata indirizza la voce ESTRANEA (quella di un altro
+    /// custode). Cercata su tutti gli anelli consegnati, non solo sui primi due:
+    /// il distrattore vive a ogni passo, e riconoscerlo solo all'inizio faceva
+    /// passare per "bersaglio inventato" un abbaglio dell'ottavo elenco.
+    fn voce_estranea_indirizzata(&self, pagliaio: &str) -> Option<usize> {
+        (0..=self.frontiera).rev().find(|k| pagliaio.contains(&self.seed.esca(*k)))
+    }
+
     /// Consegna l'anello k+1 a chi ha indirizzato il k.
     fn pianta_prossimo(&mut self, k: usize) -> WorldReply {
         let prossimo = self.seed.handle(k + 1);
-        let esca = self.seed.esca(k + 1);
-        if self.emessi.len() <= k {
-            self.emessi.resize(k + 1, String::new());
-        }
         if !self.emessi.contains(&prossimo) {
             self.emessi.push(prossimo.clone());
         }
-        // Il distrattore viaggia INSIEME al vero, nella stessa risposta e nella
-        // stessa forma: chi abbina per somiglianza sbaglia, chi legge discrimina.
-        WorldReply::ok(
-            json!({
-                "entries": [
-                    { "ref": prossimo, "state": "current" },
-                    { "ref": esca, "state": "superseded" }
-                ],
-                "note": "usa la voce current"
-            })
-            .to_string(),
-            Some(prossimo),
-        )
+        self.frontiera = self.frontiera.max(k + 1);
+        let testo = self.elenco(k + 1);
+        WorldReply::ok(testo, Some(prossimo))
+    }
+
+    /// L'elenco dell'anello `k`: due voci della stessa forma, distinte SOLO dal
+    /// custode a cui sono affidate.
+    ///
+    /// Cos'e' sparito, e perche': il campo `state` (`current`/`superseded`) e la
+    /// nota "usa la voce current". Erano un'etichetta che tradiva il distrattore, e
+    /// rendevano vincente una strategia di una riga sola. Ora le due voci sono
+    /// simmetriche per forma e per etichetta: l'unica differenza e' un valore da
+    /// confrontare con un criterio che sta nel primo messaggio.
+    ///
+    /// L'ORDINE viene dal seme, non e' fisso: chi prende sempre il primo `ref`
+    /// sbaglia in circa meta' degli anelli, quindi non arriva in fondo. Con la voce
+    /// buona sempre in testa avremmo lasciato in piedi una seconda scorciatoia di
+    /// una riga, appena tolta la prima.
+    fn elenco(&self, k: usize) -> String {
+        let vera = json!({ "ref": self.seed.handle(k), "owner": self.seed.custode() });
+        let estranea =
+            json!({ "ref": self.seed.esca(k), "owner": self.seed.custode_estraneo(k) });
+        let entries = if self.seed.frazione(&format!("ordine:{k}")) < 0.5 {
+            json!([vera, estranea])
+        } else {
+            json!([estranea, vera])
+        };
+        json!({ "entries": entries }).to_string()
     }
 
     /// Il recupero: il primo contatto col tool bersaglio fallisce, SEMPRE, e l'errore
@@ -352,9 +527,11 @@ impl ScriptedWorld {
             //      passano il recupero informato al 40-60% (ToolMaze): se qui
             //      saturasse al 100%, il gradino successivo e' spostare il rimedio
             //      nello SCHEMA del tool (livello 2), non togliere il message.
-            return WorldReply::errore(
+            return WorldReply::errore_parlante(
                 "E_HANDLE_STALE",
-                json!({ "message": RIMEDIO_STALE, "current_epoch": tok, "retryable": true }),
+                RIMEDIO_STALE,
+                true,
+                json!({ "current_epoch": tok }),
             );
         }
         match self.token_errore.as_deref() {
@@ -471,17 +648,157 @@ mod tests {
         assert!(r.planted.is_some(), "chi indirizza l'anello 0 riceve l'anello 1");
     }
 
-    /// L'esca non apre nulla, e non e' un errore di trasporto: e' una risorsa che
-    /// non esiste.
+    /// La voce di un ALTRO custode non apre nulla, e non e' un errore di trasporto:
+    /// e' il criterio del compito che non e' stato rispettato. L'errore lo NOMINA
+    /// (confronta `owner`) senza dire quale sia il valore giusto: il custode e' nel
+    /// primo messaggio, e ricordarselo e' meta' del test.
     #[test]
-    fn chi_abbocca_all_esca_non_avanza() {
+    fn chi_segue_la_voce_di_un_altro_custode_non_avanza() {
         let mut w = ScriptedWorld::new(WorldKind::Catena, seme(), &[]).unwrap();
         let h0 = w.handle_iniziale();
-        w.answer("read_file", &json!({ "path": h0 })); // anello 1 consegnato (con esca)
-        let esca = seme().esca(1);
-        let r = w.answer("read_file", &json!({ "path": esca }));
+        w.answer("read_file", &json!({ "path": h0 })); // anello 1 consegnato
+        let r = w.answer("read_file", &json!({ "path": seme().esca(1) }));
         assert!(r.is_error);
-        assert!(r.text.contains("E_HANDLE_UNKNOWN"));
+        assert!(r.text.contains("E_OWNER_MISMATCH"));
+        assert!(r.planted.is_none());
+        assert!(r.text.contains("owner"), "l'errore nomina il criterio, non il valore");
+        assert!(
+            !r.text.contains(&seme().custode()),
+            "e NON regala il custode: sta nell'istruzione, va ricordato"
+        );
+    }
+
+    /// L'ETICHETTA NON C'E' PIU'. E' la regressione da cui nasce tutto il ridisegno:
+    /// finche' l'elenco marcava la voce buona con `state: "current"`, la strategia
+    /// vincente era cercare quella parola — e infatti passavano tutti, piccoli
+    /// inclusi. Le due voci ora sono simmetriche per forma E per etichetta.
+    #[test]
+    fn l_elenco_non_contiene_nessuna_etichetta_che_tradisca_la_voce_buona() {
+        let mut w = ScriptedWorld::new(WorldKind::Catena, seme(), &[]).unwrap();
+        let h0 = w.handle_iniziale();
+        let r = w.answer("read_file", &json!({ "path": h0 }));
+        for parola in ["current", "superseded", "state", "note", "valid", "latest"] {
+            assert!(
+                !r.text.contains(parola),
+                "l'elenco non deve contenere '{parola}': e' un'etichetta che tradisce \
+                 il distrattore e rende vincente una ricerca di stringa. {}",
+                r.text
+            );
+        }
+        let v: Value = serde_json::from_str(&r.text).expect("l'elenco e' JSON");
+        let voci = v["entries"].as_array().expect("due voci").clone();
+        assert_eq!(voci.len(), 2);
+        // Le uniche chiavi sono le stesse per entrambe: si distinguono per VALORE.
+        for voce in &voci {
+            let chiavi: std::collections::BTreeSet<&str> =
+                voce.as_object().expect("oggetto").keys().map(String::as_str).collect();
+            assert_eq!(
+                chiavi,
+                ["owner", "ref"].into_iter().collect(),
+                "stessa forma per entrambe: si distinguono per VALORE, non per campi"
+            );
+        }
+        assert_ne!(voci[0]["owner"], voci[1]["owner"], "custodi diversi");
+    }
+
+    /// L'ORDINE delle voci non e' fisso. Senza questo, tolta la scorciatoia
+    /// "cerca current" ne restava un'altra da una riga sola: "prendi il primo ref".
+    /// Su una manciata di anelli le due posizioni devono comparire entrambe.
+    #[test]
+    fn la_voce_buona_non_sta_sempre_in_testa() {
+        let mut posizioni = std::collections::BTreeSet::new();
+        for attempt in 1..12 {
+            let mut s = seme();
+            s.attempt = attempt;
+            let mut w = ScriptedWorld::new(WorldKind::Catena, s.clone(), &[]).unwrap();
+            let r = w.answer("read_file", &json!({ "path": s.handle(0) }));
+            let v: Value = serde_json::from_str(&r.text).expect("l'elenco e' JSON");
+            let prima = v["entries"][0]["ref"].as_str().unwrap_or_default().to_string();
+            posizioni.insert(prima == s.handle(1));
+        }
+        assert_eq!(
+            posizioni.len(),
+            2,
+            "la voce buona deve comparire sia in testa sia in coda: se stesse sempre \
+             per prima, 'prendi il primo ref' sarebbe la nuova scorciatoia"
+        );
+    }
+
+    /// LA PISTA SI INTERROMPE, e l'errore DICE COSA FARE. E' il vincolo di
+    /// raggiungibilita' pagato 0/30 due volte sul profilo di recupero: un ostacolo
+    /// il cui rimedio non e' derivabile non e' severo, e' un pavimento.
+    #[test]
+    fn il_ramo_cieco_dichiara_il_proprio_rimedio() {
+        let s = seme();
+        let mut w = ScriptedWorld::new(WorldKind::Catena, s.clone(), &[]).unwrap();
+        for k in 0..s.anello_cieco() {
+            let r = w.answer("read_file", &json!({ "path": s.handle(k) }));
+            assert!(!r.is_error, "prima dell'interruzione la pista scorre: anello {k}");
+        }
+        let r = w.answer("read_file", &json!({ "path": s.handle(s.anello_cieco()) }));
+        assert!(r.is_error);
+        assert!(r.text.contains("E_BRANCH_CLOSED"));
+        assert!(r.planted.is_none(), "un ramo chiuso non consegna anelli");
+        let v: Value = serde_json::from_str(&r.text).expect("l'errore e' JSON");
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("OTHER entry") && msg.contains("listing"),
+            "il rimedio va DICHIARATO: torna all'elenco, prendi l'altra voce. {msg}"
+        );
+        assert!(
+            !msg.contains(&s.esca(s.anello_cieco())),
+            "ma il ref giusto NON si regala: va ripescato leggendo indietro"
+        );
+    }
+
+    /// LA DEVIAZIONE: dopo l'interruzione la voce scartata diventa la via di
+    /// rientro, e la catena riprende. Senza questo il ramo cieco sarebbe un muro e
+    /// il profilo misurerebbe un pavimento invece dei modelli.
+    #[test]
+    fn dopo_l_interruzione_la_voce_scartata_riporta_sulla_pista() {
+        let s = seme();
+        let d = s.anello_cieco();
+        let mut w = ScriptedWorld::new(WorldKind::Catena, s.clone(), &[]).unwrap();
+        for k in 0..=d {
+            w.answer("read_file", &json!({ "path": s.handle(k) }));
+        }
+        let r = w.answer("read_file", &json!({ "path": s.esca(d) }));
+        assert!(!r.is_error, "la voce scartata e' la via di rientro: {}", r.text);
+        assert_eq!(r.planted.as_deref(), Some(s.handle(d + 1).as_str()));
+        // E la pista prosegue normale da li' in poi.
+        let dopo = w.answer("read_file", &json!({ "path": s.handle(d + 1) }));
+        assert!(!dopo.is_error, "oltre la deviazione la catena e' di nuovo lineare");
+    }
+
+    /// La deviazione si apre SOLO dopo l'interruzione e SOLO sul suo anello: prima,
+    /// la stessa voce e' un errore di criterio. Senza questo asse, "prendi sempre
+    /// l'altra voce" diventerebbe una strategia valida ovunque.
+    #[test]
+    fn la_deviazione_non_e_aperta_prima_dell_interruzione() {
+        let s = seme();
+        let d = s.anello_cieco();
+        let mut w = ScriptedWorld::new(WorldKind::Catena, s.clone(), &[]).unwrap();
+        for k in 0..d {
+            w.answer("read_file", &json!({ "path": s.handle(k) }));
+        }
+        // Siamo ARRIVATI all'anello cieco ma non l'abbiamo ancora toccato.
+        let r = w.answer("read_file", &json!({ "path": s.esca(d) }));
+        assert!(r.is_error, "senza l'interruzione la voce estranea resta sbagliata");
+        assert!(r.text.contains("E_OWNER_MISMATCH"));
+    }
+
+    /// Ripresentare l'handle del ramo chiuso non lo riapre: l'interruzione e'
+    /// permanente e dichiarata tale. Chi insiste registra `repeated_failed`.
+    #[test]
+    fn insistere_sul_ramo_chiuso_non_lo_riapre() {
+        let s = seme();
+        let d = s.anello_cieco();
+        let mut w = ScriptedWorld::new(WorldKind::Catena, s.clone(), &[]).unwrap();
+        for k in 0..=d {
+            w.answer("read_file", &json!({ "path": s.handle(k) }));
+        }
+        let r = w.answer("read_file", &json!({ "path": s.handle(d) }));
+        assert!(r.is_error && r.text.contains("E_BRANCH_CLOSED"));
         assert!(r.planted.is_none());
     }
 
