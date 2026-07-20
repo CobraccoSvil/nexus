@@ -946,7 +946,7 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
 /// Config del ReviewGate (gemella del loader del final_gate). Le chiavi sono
 /// quelle della review programmatica gia' esistenti + il cap dei rimandi
-/// (mig 0624). Regola G: tutto dal DB, il default e' solo safe-default.
+/// (mig 0625). Regola G: tutto dal DB, il default e' solo safe-default.
 async fn load_review_gate_config(db: &PgPool) -> ReviewGateConfig {
     ReviewGateConfig {
         enabled: setting_bool(db, "orchestrator.review_panel_autoconvene_enabled", true).await,

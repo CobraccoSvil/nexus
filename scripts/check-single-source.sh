@@ -399,6 +399,28 @@ else
   echo "OK project-pool-sizing: un solo tetto per il DB per-progetto"
 fi
 
+# ── migrazioni-numero-unico ──────────────────────────────────────────────────
+# Il numero di versione di una migrazione e' un punto unico per definizione:
+# due file con lo stesso prefisso numerico e nomi diversi passano il merge di
+# git senza conflitto, e mcp-core rifiuta di AVVIARSI ("migration N was
+# previously applied but has been modified"). TRE collisioni in due giorni
+# (0620, 0622, 0624): sessioni parallele che scelgono lo stesso numero libero.
+# Vale per db/migrations e per db/migrations/project (numerazioni separate).
+for dir in db/migrations db/migrations/project; do
+  [[ -d "$dir" ]] || continue
+  dup="$(ls "$dir" 2>/dev/null | grep -E '^[0-9]+_.*\.sql$' | sed -E 's/^([0-9]+)_.*/\1/' | sort | uniq -d)"
+  if [[ -n "$dup" ]]; then
+    echo "!! migrazioni-numero-unico: numeri DUPLICATI in $dir:" >&2
+    for n in $dup; do ls "$dir" | grep -E "^${n}_" | sed 's/^/     /' >&2; done
+    echo "   Due migrazioni con lo stesso numero: il servizio non si avvia." >&2
+    echo "   Rinumera la piu' recente al primo numero libero." >&2
+    fail=1
+  fi
+done
+if [[ -z "${dup:-}" ]]; then
+  echo "OK migrazioni-numero-unico: nessun numero di migrazione duplicato"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
