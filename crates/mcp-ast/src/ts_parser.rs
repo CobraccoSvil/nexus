@@ -86,6 +86,15 @@ fn is_type_kind(sk: &SymbolKind) -> bool {
     )
 }
 
+/// Tetto di ricorsione sull'AST. Un bundle minificato produce alberi left-deep
+/// di migliaia di nodi (`a||b||c||...`): senza guard la discesa sfonda i 2 MiB
+/// di stack del worker — in build debug bastano ~2k livelli — e su Windows uno
+/// stack overflow abbatte l'intero processo, non il thread. 512 livelli coprono
+/// qualunque sorgente scritto a mano; oltre, l'indice esce PARZIALE e il
+/// chiamante ha gia' il fallback regex.
+const MAX_WALK_DEPTH: usize = 512;
+
+#[allow(clippy::too_many_arguments)]
 fn walk(
     node: Node,
     src: &[u8],
@@ -93,7 +102,13 @@ fn walk(
     calls: &mut Vec<CallInfo>,
     callers: &mut Vec<String>,
     in_type: bool,
+    depth: usize,
+    truncated: &mut bool,
 ) {
+    if depth >= MAX_WALK_DEPTH {
+        *truncated = true;
+        return;
+    }
     let kind = node.kind();
     let mut pushed_caller = false;
     let mut child_in_type = in_type;
@@ -139,7 +154,16 @@ fn walk(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, src, symbols, calls, callers, child_in_type);
+        walk(
+            child,
+            src,
+            symbols,
+            calls,
+            callers,
+            child_in_type,
+            depth + 1,
+            truncated,
+        );
     }
 
     if pushed_caller {
@@ -159,7 +183,24 @@ pub fn index_with_treesitter(file_path: &str, language: &str, source: &str) -> O
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut calls: Vec<CallInfo> = Vec::new();
     let mut callers: Vec<String> = Vec::new();
-    walk(tree.root_node(), src, &mut symbols, &mut calls, &mut callers, false);
+    let mut truncated = false;
+    walk(
+        tree.root_node(),
+        src,
+        &mut symbols,
+        &mut calls,
+        &mut callers,
+        false,
+        0,
+        &mut truncated,
+    );
+    if truncated {
+        // Indice PARZIALE, dichiarato: meglio di un processo abbattuto.
+        tracing::warn!(
+            max_depth = MAX_WALK_DEPTH,
+            "ts_parser: AST oltre il tetto di profondita', indice troncato"
+        );
+    }
 
     Some(AstIndex {
         file_path: file_path.to_string(),
@@ -170,4 +211,24 @@ pub fn index_with_treesitter(file_path: &str, language: &str, source: &str) -> O
         line_count: source.lines().count(),
         precise: true,
     })
+}
+
+#[cfg(test)]
+mod tests_walk_guard {
+    use super::*;
+
+    /// Un'espressione left-deep da migliaia di livelli (la forma dei bundle
+    /// minificati) non deve piu' abbattere il processo: la discesa si ferma al
+    /// tetto e l'indice esce parziale. Prima di questo guard, lo stesso input
+    /// era uno stack overflow: su Windows moriva l'INTERO servizio.
+    ///
+    /// Mutazione che rende rosso (crash del test runner): rimuovere il check
+    /// `depth >= MAX_WALK_DEPTH` in `walk`.
+    #[test]
+    fn un_ast_left_deep_non_sfonda_lo_stack() {
+        let profondo = format!("const x = {};", vec!["1"; 60_000].join("||"));
+        let idx = index_with_treesitter("bundle.min.js", "javascript", &profondo);
+        // L'indice puo' essere parziale, ma la chiamata TORNA.
+        assert!(idx.is_some(), "il parser deve sopravvivere all'input profondo");
+    }
 }

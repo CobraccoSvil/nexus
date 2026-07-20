@@ -1229,6 +1229,16 @@ async fn load_executor_config(
         time_grace_pct: setting_i64(db, "agent.time_grace_pct", d.time_grace_pct as i64)
             .await
             .clamp(0, 100) as u64,
+        // Tetto sui turni consecutivi falliti al gateway con causa deterministica
+        // (mig 0619): oltre, si chiude con esito onesto invece di ritentare la
+        // stessa chiamata fino al budget. 0 = disabilitato.
+        gateway_deterministic_streak_max: setting_i64(
+            db,
+            "agent.gateway_deterministic_streak_max",
+            d.gateway_deterministic_streak_max as i64,
+        )
+        .await
+        .max(0) as u64,
         max_consecutive_text_only_turns: setting_i64(
             db,
             "agent.max_consecutive_text_only_turns",

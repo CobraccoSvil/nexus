@@ -374,6 +374,21 @@ pub struct ExecutorConfig {
     /// chiamate: se una singola chiamata dura quanto il residuo, il turno di grazia
     /// non fa in tempo e va abbassata (regola G: si tara dal DB, non nel codice).
     pub time_grace_pct: u64,
+    /// Turni CONSECUTIVI falliti al gateway sulla STESSA coppia provider/model
+    /// con causa DETERMINISTICA (risposta degenere `empty_completion`,
+    /// `client_error` fuori dalla whitelist di recupero) oltre cui (`>=`) il run
+    /// chiude con esito onesto invece di ritentare
+    /// (`agent.gateway_deterministic_streak_max`, default 3; `0` = disabilitato).
+    ///
+    /// Senza questo tetto, quando il failover cross-provider non scatta (cap
+    /// escalation raggiunto, nessun sostituto sano, causa non recuperabile) il
+    /// turno d'errore sintetico lascia provider e model sticky INVARIATI: il
+    /// giro dopo rifa' la stessa chiamata e riceve la stessa risposta, fino al
+    /// budget. Misurato sul run 2abb30db del 20/07: retry deterministici a
+    /// oltranza (~7s l'uno su empty, ~500ms su 400), invisibili al DB perche'
+    /// i retry intra-iterazione non emettono meta-step. Le cause TRANSITORIE
+    /// (cooldown, transient) restano fuori: possono risolversi da sole.
+    pub gateway_deterministic_streak_max: u64,
     /// Turni solo-testo CONSECUTIVI oltre cui (`>=`) il run chiude deterministicamente
     /// (`agent.max_consecutive_text_only_turns`, default 3): fast-fail sul modello che
     /// DESCRIVE senza AGIRE (pattern gemini che ignora `force_tool_choice`). Un turno
@@ -638,6 +653,7 @@ impl Default for ExecutorConfig {
             // Turno di grazia al 70% del budget: il default vive nel DB (mig 0614),
             // qui e' solo la rete di sicurezza documentata del costruttore.
             time_grace_pct: 70,
+            gateway_deterministic_streak_max: 3,
             max_consecutive_text_only_turns: 3,
             // 3.4 default OFF -> comportamento bit-identico (chiusura backstop).
             provider_no_progress_switch_enabled: false,
@@ -3612,6 +3628,9 @@ della finestra {effective_window} del modello {provider}/{model}"
         // forcing (che e' il retry interno malformed del Python, NON l'errore
         // provider, gia' gestito da generate_agent_turn_sync) e la cascade-detect.
         let mut gateway_errored = false;
+        // Streak dei fallimenti gateway deterministici (sotto soglia): va
+        // persistito nel delta finale; su turno riuscito viene rimosso.
+        let mut det_streak_val: Option<Value> = None;
         // Cancellazione COOPERATIVA (regola L, punto unico complete_or_cancel):
         // uno Stop arrivato DURANTE questa chiamata la interrompe subito e chiude
         // il run 'superseded', senza attendere che rientri (fino a 90-150s sotto
@@ -3871,6 +3890,15 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                         "provider caduto ma nessun provider sano disponibile: chiusura Error"
                     );
                     }
+                }
+                // TETTO sui fallimenti DETERMINISTICI (punto unico
+                // deterministic_streak_gate): oltre la soglia si chiude con
+                // esito onesto invece di consumare il budget in retry invisibili.
+                match deterministic_streak_gate(state, &self.cfg, &err, &provider, &model, iters_in)
+                {
+                    DetGate::Close(delta) => return Ok(delta),
+                    DetGate::Under(v) => det_streak_val = Some(v),
+                    DetGate::NonDeterministico => {}
                 }
                 // try/except onnicomprensivo Python: result="[Errore provider ...]",
                 // stop_reason="error" (NON NodeError: il run prosegue al routing).
@@ -4700,6 +4728,17 @@ modello piu' capace.",
         // iteration_budget, ...).
         let mut extra_out = state.extra.clone();
         extra_out.insert("auto_escalations".to_string(), json!(escalations));
+        match &det_streak_val {
+            // Fallimento deterministico sotto soglia: lo streak sopravvive al turno.
+            Some(v) => {
+                extra_out.insert(GW_DET_STREAK_KEY.to_string(), v.clone());
+            }
+            // Turno senza fallimento deterministico: reset esplicito (oltre alla
+            // contiguita', che gia' lo invaliderebbe).
+            None => {
+                extra_out.remove(GW_DET_STREAK_KEY);
+            }
+        }
         if signature_loop_promoted {
             // Grazia post-escalation: il floor parte dal prefisso persistito
             // corrente, cosi' l'assistant del promosso (appeso da questo delta)
@@ -5597,7 +5636,7 @@ con un tool call.",
                     "summary": question,
                     "next_step": question,
                 }))
-                .unwrap_or_else(|| json!({"outcome": "needs_input", "summary": question}));
+                .unwrap_or_else(|_| json!({"outcome": "needs_input", "summary": question}));
                 self.emit_phase(
                     ctx,
                     mode,
@@ -5642,7 +5681,7 @@ al mio controllo e va risolta prima di continuare."
                     "summary": summary,
                     "blocker": blocker,
                 }))
-                .unwrap_or_else(|| json!({"outcome": "blocked", "summary": summary}));
+                .unwrap_or_else(|_| json!({"outcome": "blocked", "summary": summary}));
                 self.emit_phase(
                     ctx,
                     mode,
@@ -6886,6 +6925,153 @@ pub(crate) fn action_str(a: Action) -> &'static str {
 /// `stop_reason=="error"` + substring nell'errore. Qui usiamo lo `stop_reason`
 /// normalizzato `error` come segnale (il dettaglio dell'errore vive nel gateway
 /// concreto, che puo' arricchire `stop_reason`). Conservativo: vero solo su error.
+/// Chiave in `state.extra` dello streak di fallimenti gateway deterministici.
+const GW_DET_STREAK_KEY: &str = "gw_det_streak";
+
+/// Nome-causa se il fallimento del gateway e' DETERMINISTICO — cioe' rifarebbe
+/// la stessa richiesta e otterrebbe la stessa risposta — altrimenti `None`.
+///
+/// Deterministici: `EmptyCompletion` (risposta degenere ripetibile) e
+/// `ClientError` NON recuperabile (fuori dalla whitelist DB: il 4xx si ripete
+/// identico). Transitori (fuori): cooldown, billing, transient — possono
+/// risolversi da soli e un tetto li chiuderebbe ingiustamente.
+fn deterministic_gateway_cause(
+    err: &crate::runtime::ports::PortError,
+    recoverable_codes: &[String],
+) -> Option<&'static str> {
+    use crate::runtime::ports::{PortError, ProviderFailureCause as Cause};
+    let PortError::ProviderUnavailable(pu) = err else {
+        return None;
+    };
+    match pu.cause {
+        Cause::EmptyCompletion => Some("empty_completion"),
+        Cause::ClientError if !pu.allows_cross_provider_failover(recoverable_codes) => {
+            Some("client_error_non_recuperabile")
+        }
+        _ => None,
+    }
+}
+
+/// Aggiorna lo streak dei fallimenti deterministici: stessa (provider, model,
+/// causa) su iterazioni CONTIGUE -> count+1, altrimenti riparte da 1. La
+/// contiguita' (`last_iter + 1 == iters_in`) rende il reset implicito: un turno
+/// riuscito consuma un'iterazione senza toccare lo streak, e il fallimento
+/// successivo non risulta piu' contiguo. Ritorna `(count, valore da persistere)`.
+fn next_deterministic_streak(
+    prev: Option<&Value>,
+    provider: &str,
+    model: &str,
+    cause: &str,
+    iters_in: i64,
+) -> (u64, Value) {
+    let contiguo = prev.is_some_and(|p| {
+        p.get("provider").and_then(Value::as_str) == Some(provider)
+            && p.get("model").and_then(Value::as_str) == Some(model)
+            && p.get("cause").and_then(Value::as_str) == Some(cause)
+            && p.get("last_iter").and_then(Value::as_i64) == Some(iters_in - 1)
+    });
+    let count = if contiguo {
+        prev.and_then(|p| p.get("count").and_then(Value::as_u64))
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    let val = json!({
+        "provider": provider,
+        "model": model,
+        "cause": cause,
+        "count": count,
+        "last_iter": iters_in,
+    });
+    (count, val)
+}
+
+/// Esito del gate sui fallimenti gateway deterministici.
+enum DetGate {
+    /// Causa non deterministica (o errore non tipizzato): il tetto non si applica.
+    NonDeterministico,
+    /// Sotto soglia: lo streak aggiornato va persistito nel delta del turno.
+    Under(Value),
+    /// Soglia raggiunta: chiusura onesta, il delta e' pronto.
+    Close(OpaqueDelta),
+}
+
+/// Gate del tetto sui fallimenti deterministici (stessa coppia provider/model,
+/// stessa causa, iterazioni CONTIGUE): rifare la stessa chiamata produrrebbe la
+/// stessa risposta, quindi oltre `gateway_deterministic_streak_max` si chiude
+/// con esito onesto invece di ritentare fino al budget (mig 0619).
+fn deterministic_streak_gate(
+    state: &AgentState,
+    cfg: &ExecutorConfig,
+    err: &crate::runtime::ports::PortError,
+    provider: &str,
+    model: &str,
+    iters_in: i64,
+) -> DetGate {
+    let Some(cause) = deterministic_gateway_cause(err, &cfg.recoverable_client_error_codes) else {
+        return DetGate::NonDeterministico;
+    };
+    let (streak, streak_val) = next_deterministic_streak(
+        state.extra.get(GW_DET_STREAK_KEY),
+        provider,
+        model,
+        cause,
+        iters_in,
+    );
+    let soglia = cfg.gateway_deterministic_streak_max;
+    if soglia > 0 && streak >= soglia {
+        return DetGate::Close(deterministic_close_delta(
+            state, provider, model, cause, streak, streak_val, iters_in,
+        ));
+    }
+    DetGate::Under(streak_val)
+}
+
+/// Delta di CHIUSURA per fallimento gateway deterministico oltre soglia:
+/// messaggio onesto, `stop_reason=Error` ed `error_class` strutturato (stessa
+/// forma del gemello context_overflow). Estratto dal ramo err dell'executor.
+fn deterministic_close_delta(
+    state: &AgentState,
+    provider: &str,
+    model: &str,
+    cause: &str,
+    streak: u64,
+    streak_val: Value,
+    iters_in: i64,
+) -> OpaqueDelta {
+    let text = format!(
+        "[Errore provider {provider}/{model}: {streak} turni consecutivi falliti con causa \
+         deterministica '{cause}'. Ritentare produrrebbe lo stesso esito: chiudo il run.]"
+    );
+    tracing::warn!(
+        target: "nexus_agent_graph::executor",
+        provider = %provider,
+        model = %model,
+        cause,
+        streak,
+        "fallimento gateway deterministico oltre soglia: chiusura onesta"
+    );
+    let mut extra = state.extra.clone();
+    extra.insert("error_class".to_string(), json!("gateway_deterministic"));
+    extra.insert(GW_DET_STREAK_KEY.to_string(), streak_val);
+    StateDelta {
+        messages: Some(vec![Message::Ai {
+            content: MessageContent::text(text.clone()),
+            tool_calls: vec![],
+            reasoning: None,
+            thinking_signature: None,
+        }]),
+        result: Some(Some(text)),
+        pending_tool_uses: Some(Some(vec![])),
+        stop_reason: Some(Some(StopReason::Error)),
+        iterations: Some(Some(iters_in + 1)),
+        extra: Some(extra),
+        ..Default::default()
+    }
+    .into_opaque()
+}
+
 fn is_forcing_failure(resp: &crate::runtime::ports::LlmResponse) -> bool {
     resp.stop_reason.as_deref() == Some("error")
 }

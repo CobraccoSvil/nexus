@@ -28,7 +28,13 @@ impl WorkspaceTargetError {
         match self {
             Self::EmptyPath => "Il percorso relativo e' obbligatorio",
             Self::InvalidChars => "Il percorso contiene caratteri non validi",
-            Self::OutsideRoot => "Percorso non autorizzato",
+            // Il rimedio nel messaggio: chi lo riceve e' quasi sempre un modello,
+            // e "non autorizzato" senza rimedio produce retry alla cieca (48
+            // occorrenze censite, tutte da tool agente).
+            Self::OutsideRoot => {
+                "Percorso fuori dalla root del progetto: usa un path RELATIVO alla \
+                 project root, senza '..' e senza assoluti esterni"
+            }
         }
     }
 }

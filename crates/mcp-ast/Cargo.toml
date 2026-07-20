@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 regex.workspace = true
 serde.workspace = true
+tracing.workspace = true
 # W1-bis code-wiki: parser AST veri (tree-sitter) per simboli e call-graph
 # precisi. Language-agnostic per grammatica; i linguaggi senza grammatica
 # ricadono sul parser regex/generic (fallback ibrido).

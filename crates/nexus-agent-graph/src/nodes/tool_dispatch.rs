@@ -664,27 +664,14 @@ impl ToolDispatchNode {
                 .expect("lock tc ids")
                 .push(tool_use_id.clone());
             let decl = normalize_declared_outcome(&input);
-            let outcome = decl
-                .as_ref()
-                .and_then(|d| d.get("outcome").cloned())
-                .unwrap_or(Value::Null);
-            let acknowledged = decl.is_some();
-            if let Some(d) = decl {
+            if let Ok(d) = &decl {
                 collector
                     .declared_outcomes
                     .lock()
                     .expect("lock outcomes")
-                    .push(d);
+                    .push(d.clone());
             }
-            return ToolResultBlock {
-                tool_use_id,
-                content: Value::String(py_dumps(
-                    &json!({"acknowledged": acknowledged, "outcome": outcome}),
-                )),
-                is_error: !acknowledged,
-                exit_code: None,
-                raw_content: None,
-            };
+            return declarative_tool_result(tool_use_id, "outcome", decl.as_ref());
         }
 
         // ── review_verdict (brain-only, Fase B ultracode) ─────────────────────
@@ -1434,11 +1421,11 @@ impl ToolDispatchNode {
 /// ripetevano la stessa costruzione e il modello riceveva solo
 /// `{"acknowledged": false, "verdict": null}`, senza sapere cosa correggere.
 ///
-/// `task_complete` resta ESCLUSO di proposito: e' l'unico con parita' Python
-/// verificata da un golden test che confronta i blocks, e un campo `reason` in
-/// piu' la romperebbe. La partizione "tre canali di ruolo + lo stato del run" e'
-/// la stessa di [`set_role_channel`] — non e' una coincidenza, e' la stessa
-/// distinzione fra contributo e stato.
+/// Copre anche `task_complete`: l'esclusione originaria proteggeva la parita'
+/// col golden Python, ma il golden file non esiste nel repo e il generatore e'
+/// stato rimosso col brain (`load_golden` salta sempre) — il vincolo era un
+/// fossile. Il reperto che ha motivato l'estensione: 16 rifiuti muti su 132,
+/// con retry alla cieca provati ("success" dichiarato identico 3 volte).
 ///
 /// Regola M: per il CODICE il segnale resta `is_error`; `reason` e' prosa per il
 /// modello e nessun ramo del programma deve parsarla.
@@ -2994,6 +2981,39 @@ mod tests {
         }
         // Il parere non e' stato acquisito: il canale resta muto.
         assert!(out.advisory_verdict.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_complete_rifiutato_elenca_gli_outcome_ammessi() {
+        // Caso reale: un modello ha dichiarato outcome="success" (fuori enum)
+        // tre volte identiche, perche' riceveva solo acknowledged=false senza
+        // sapere che i valori ammessi sono done|blocked|needs_input|partial.
+        let (n, _steps, _rc) = node(
+            ToolDispatchConfig::default(),
+            Arc::new(MapToolExecutor::new()),
+        );
+        let ctx = ctx_with(false, CancellationToken::new());
+        let st = state_with_pending(vec![pending_tool(
+            "c1",
+            "task_complete",
+            json!({"outcome": "success", "summary": "fatto tutto"}),
+        )]);
+
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        let blocks = blocks_of(out.messages.last().expect("msg"));
+        let content = blocks[0]["content"].as_str().expect("content");
+
+        assert!(blocks[0]["is_error"].as_bool().unwrap_or(false));
+        // Mutazione che rende rosso: riportare il call site alla vecchia forma
+        // {"acknowledged": false, "outcome": null} senza reason.
+        assert!(
+            content.contains("success"),
+            "il valore rifiutato va citato: {content}"
+        );
+        for ammesso in ["done", "blocked", "needs_input", "partial"] {
+            assert!(content.contains(ammesso), "manca {ammesso}: {content}");
+        }
+        assert!(out.declared_outcome.is_none(), "la dichiarazione non e' acquisita");
     }
 
     #[tokio::test]

@@ -5803,3 +5803,61 @@ async fn grazia_gia_concessa_a_budget_esaurito_chiude_time_budget() {
     );
     assert!(llm.seen.lock().unwrap().is_empty(), "nessuna chiamata al modello");
 }
+
+// ── Tetto sui fallimenti gateway deterministici (mig 0619) ────────────────────
+
+#[test]
+fn streak_deterministico_cresce_solo_su_iterazioni_contigue() {
+    use crate::nodes::executor::next_deterministic_streak;
+
+    // Primo fallimento: count 1.
+    let (c1, v1) = next_deterministic_streak(None, "openrouter", "glm", "empty_completion", 4);
+    assert_eq!(c1, 1);
+
+    // Stesso (provider, model, causa), iterazione contigua: count 2.
+    let (c2, v2) =
+        next_deterministic_streak(Some(&v1), "openrouter", "glm", "empty_completion", 5);
+    assert_eq!(c2, 2);
+
+    // Un turno RIUSCITO in mezzo consuma l'iterazione 6: il fallimento a 7 non
+    // e' piu' contiguo -> lo streak riparte. E' il reset implicito che evita di
+    // chiudere un run per errori sporadici non consecutivi.
+    let (c3, _) = next_deterministic_streak(Some(&v2), "openrouter", "glm", "empty_completion", 7);
+    assert_eq!(c3, 1, "un successo in mezzo azzera la catena");
+
+    // Cambio di modello (failover riuscito): tupla diversa -> riparte.
+    let (c4, _) = next_deterministic_streak(Some(&v2), "mistral", "large", "empty_completion", 6);
+    assert_eq!(c4, 1, "il failover cambia la coppia e azzera la catena");
+}
+
+#[test]
+fn solo_le_cause_deterministiche_contano_per_il_tetto() {
+    use crate::nodes::executor::deterministic_gateway_cause;
+    use crate::runtime::ports::{
+        PortError, ProviderFailureCause, ProviderUnavailableInfo,
+    };
+
+    let mk = |cause| {
+        PortError::ProviderUnavailable(ProviderUnavailableInfo::new(cause, "x".to_string()))
+    };
+    // Deterministica: rifare la chiamata da' la stessa risposta.
+    assert_eq!(
+        deterministic_gateway_cause(&mk(ProviderFailureCause::EmptyCompletion), &[]),
+        Some("empty_completion")
+    );
+    // Transitorie: FUORI dal tetto (possono risolversi da sole). Mutazione che
+    // rende rosso: includere Cooldown nel match dell'helper.
+    assert_eq!(
+        deterministic_gateway_cause(&mk(ProviderFailureCause::Cooldown), &[]),
+        None
+    );
+    assert_eq!(
+        deterministic_gateway_cause(&mk(ProviderFailureCause::Billing), &[]),
+        None
+    );
+    assert_eq!(
+        deterministic_gateway_cause(&PortError::Llm("boom".to_string()), &[]),
+        None,
+        "un errore generico non tipizzato non entra nel tetto"
+    );
+}
