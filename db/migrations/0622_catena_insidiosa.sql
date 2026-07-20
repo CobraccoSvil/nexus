@@ -1,0 +1,91 @@
+-- 0622 - La catena torna a discriminare: insidiosa, non piu' lunga
+--
+-- La 0618 aveva alzato il soffitto (turni 6 -> 8, bersaglio 5 -> 7 anelli) per
+-- de-saturare `agentic_chain`. Misurato dopo il giro a suite 6/7: la componente si
+-- e' RISATURATA. Il 79% dei tentativi si ferma a 7 anelli esatti — di nuovo il
+-- soffitto dei turni, non la bravura — e 11 modelli su 18 hanno una media di 7,0
+-- anelli, ministral-8b e mistral-small INCLUSI, cioe' i piccoli.
+--
+-- La conclusione e' un fatto, non un'opinione: seguire riferimenti concatenati non
+-- e' piu' una capacita' rara, e' commodity. Allungare ancora misurerebbe la
+-- resistenza, non la capacita' — e sarebbe la quarta volta che spostiamo il
+-- problema invece di toccarlo.
+--
+-- LA CAUSA, che ne' la 0618 ne' la 0616 avevano guardato: il mondo rispondeva
+--
+--   {"entries":[{"ref":A,"state":"current"},{"ref":B,"state":"superseded"}],
+--    "note":"usa la voce current"}
+--
+-- e la strategia vincente era UNA RIGA: cerca la stringa "current", prendi quel
+-- ref. Nessuna lettura, nessuna memoria, nessun ragionamento. Il distrattore aveva
+-- la stessa FORMA del bersaglio ma un'etichetta che lo tradiva: misuravamo la
+-- capacita' di trovare una parola.
+--
+-- IL RIDISEGNO (codice: probe_world.rs, suite 8). Due meccanismi, nessuno dei quali
+-- allunga la catena:
+--
+--   1. IL CRITERIO NON E' PIU' NELLA RISPOSTA. Sparita l'etichetta `state` e la
+--      nota. Le due voci di ogni elenco sono simmetriche per forma E per campi:
+--      si distinguono solo per `owner`, e il custode giusto e' nominato UNA volta,
+--      nell'istruzione iniziale. Applicarlo al settimo elenco richiede ancora di
+--      ricordarselo. In piu' l'ORDINE delle voci viene dal seme: 'prendi il primo
+--      ref' non e' la scorciatoia di riserva.
+--   2. LA PISTA SI INTERROMPE. A un anello deciso dal seme (il 2o o il 3o) la voce
+--      corretta porta a un ramo chiuso; l'errore DICHIARA il rimedio (torna
+--      all'elenco precedente, prendi la voce che avevi scartato) senza regalare il
+--      ref, che va ripescato leggendo indietro. Chi ha appena imparato il criterio
+--      deve sospenderlo perche' il mondo gliel'ha detto: e' adattamento, ed e' cio'
+--      che manca ai modelli deboli.
+--
+-- Il rimedio e' DICHIARATO per un motivo pagato caro: `agentic_recovery` e' stato a
+-- 0 pass su 30 modelli DUE volte, perche' l'ostacolo non era derivabile da nessun
+-- canale osservabile. Un test che nessuno passa non e' severo, e' rotto (principio
+-- di raggiungibilita' di BFCL V3; ToolMaze misura floor effect sotto il 20%).
+-- L'istruzione del compito continua a NON annunciare l'interruzione: resta un test
+-- di capacita', non di obbedienza.
+--
+-- LE DUE LEVE DI QUESTA MIGRAZIONE (i turni NON si toccano: restano 8):
+--   min_chained_calls 5 -> 4   Non e' uno sconto, e' il numero che rende il PASS
+--                              una prova di rientro: l'anello cieco piu' lontano e'
+--                              il 3o, quindi superare 3 anelli IMPLICA essere
+--                              tornati indietro e ripartiti. Con 5 avremmo chiesto
+--                              la traiettoria perfetta meno uno, su un mondo dove
+--                              un solo turno sprecato costa un anello.
+--   LINKS_TARGET 7 -> 6        (codice, non setting: cambia il significato degli
+--                              score gia' persistiti, per questo va col bump di
+--                              suite). Rientrare COSTA UN TURNO, quindi con gli
+--                              stessi 8 turni la traiettoria perfetta vale 6 anelli
+--                              e non piu' 7. Lasciarlo a 7 avrebbe costruito il
+--                              difetto opposto e altrettanto disonesto: un pieno
+--                              che nessuno puo' prendere.
+--
+-- PROVATO PRIMA DI CONSEGNARE, da due lati opposti (regola O, test in
+-- model_qualification.rs, giro completo dalla produzione: `istruzione_catena` ->
+-- `ScriptedWorld::new` -> `run_loop` -> `verdetto_dai_fatti`):
+--   raggiungibilita' - un golden agent scriptato NON-LLM che segue la traiettoria
+--                      intesa passa su tutti i semi provati, con 6 anelli esatti
+--                      (`la_traiettoria_intesa_arriva_in_fondo`)
+--   difficolta'      - tre agenti da una riga ('cerca current' -> 0 anelli,
+--                      'primo ref', 'segui il custode ma non tornare mai indietro'
+--                      -> si ferma esatto sull'anello cieco) falliscono tutti
+--                      (`le_strategie_da_una_riga_non_passano_piu`,
+--                       `i_tre_agenti_si_fermano_dove_il_design_dice`)
+--
+-- COSTO DICHIARATO: nessun turno in piu' (il costo per tentativo non cambia), ma il
+-- bump di suite fa rigirare la batteria su tutto il parco eleggibile.
+--
+-- SUITE 8, obbligatoria: cambia il MATERIALE del test (il mondo, il criterio di
+-- selezione, la soglia di pass, il bersaglio dello score), quindi i punteggi vecchi
+-- non sono confrontabili coi nuovi — e il leader delle bande measured si calcola
+-- solo fra righe della suite corrente. E' il pattern di tau2-bench, gia' adottato
+-- alla 0616, alla 0618 e alla 0620.
+
+-- (1) Il PASS diventa una prova di rientro: 4 > 3 = l'anello cieco piu' lontano.
+UPDATE ai_model_probe_profile
+   SET pass_predicate = pass_predicate || '{"min_chained_calls": 4}'::jsonb
+ WHERE profile_key = 'agentic_chain';
+
+-- (2) Il bump che rende i nuovi punteggi comparabili solo fra loro.
+UPDATE ai_model_probe_profile
+   SET suite_version = 8
+ WHERE enabled;

@@ -353,24 +353,34 @@ mod tests {
         }
     }
 
-    /// UN MODELLO CHE CONCATENA: segue gli handle e chiude 3 anelli.
+    /// UN MODELLO CHE CONCATENA: segue gli handle fino a dove la pista glielo
+    /// concede, e ogni token riportato e' un anello.
+    ///
+    /// Il copione si ferma PRIMA dell'anello cieco (`anello_cieco()`, deciso dal
+    /// seme): qui si prova la MECCANICA del giro — il mondo consegna, il modello
+    /// riporta, il taint tracking conta — non la capacita' di rientrare da una pista
+    /// chiusa, che ha i suoi test dedicati sul giro completo (model_qualification:
+    /// `la_traiettoria_intesa_arriva_in_fondo`). Il limite si legge dal seme invece
+    /// di essere scritto a mano: se domani l'interruzione si sposta, questo test
+    /// segue il mondo invece di rompersi.
     #[tokio::test]
     async fn un_modello_che_segue_gli_handle_chiude_la_catena() {
         let mut mondo = ScriptedWorld::new(WorldKind::Catena, seme("agentic_chain"), &[]).unwrap();
         let s = seme("agentic_chain");
-        let copione = vec![
-            // Il primo handle e' nell'istruzione: usarlo NON prova dipendenza (il
-            // modello lo copia). Gli anelli si contano dai token che il mondo ha
-            // consegnato in risposta, quindi 3 anelli chiedono 4 chiamate.
-            vec![("read_file", json!({ "path": s.handle(0) }))],
-            vec![("read_file", json!({ "path": s.handle(1) }))],
-            vec![("read_file", json!({ "path": s.handle(2) }))],
-            vec![("read_file", json!({ "path": s.handle(3) }))],
-        ];
+        let ultimo = s.anello_cieco() - 1;
+        // Il primo handle e' nell'istruzione: usarlo NON prova dipendenza (il
+        // modello lo copia). Gli anelli si contano dai token che il mondo ha
+        // consegnato in risposta, quindi N anelli chiedono N+1 chiamate.
+        let copione: Vec<Vec<(&str, Value)>> = (0..=ultimo)
+            .map(|k| vec![("read_file", json!({ "path": s.handle(k) }))])
+            .collect();
         let m = ModelloScritto::new(copione);
         let out = run_loop(&m, WorldKind::Catena, &mut mondo, "istruzione", 6).await;
         assert!(out.inconclusive.is_none());
-        assert_eq!(out.measures.chained_links, 3, "tre token consegnati dal mondo e riportati");
+        assert_eq!(
+            out.measures.chained_links, ultimo,
+            "tanti anelli quanti token il mondo ha consegnato e il modello ha riportato"
+        );
     }
 
     /// UN MODELLO CHE NON CONCATENA: chiama a caso. Il giro finisce senza anelli, e
