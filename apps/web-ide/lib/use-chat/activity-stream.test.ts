@@ -21,6 +21,7 @@ import {
   capStreamToRecent,
   type ActivityEvent,
   type ToolEvent,
+  type ReviewGateEvent,
 } from "./activity-stream.ts";
 import type { MetaStepEntry } from "./types.ts";
 import type { AgentStep, AITraceEvent } from "../api/agent.ts";
@@ -792,6 +793,49 @@ test("unwrap: step SSE con toolName presente non viene alterato", () => {
   assert.ok(tool);
   assert.equal(tool.name, "edit_file");
   assert.deepEqual(tool.input, { path: "a.ts", content: "x" });
+});
+
+// ── ReviewGate nel nastro (kind=review_gate, nodo review_gate.rs) ───────────
+
+test("review_gate: il rimando in correzione compare nel nastro col titolo del backend", () => {
+  beforeEach();
+  // Payload del ramo boccia() non-definitivo di review_gate.rs (phase=failed).
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "review_gate",
+      { cycle: 1, max_cycles: 1, findings: 3, phase: "failed", verdict: "needs_changes" },
+      "Review NON superata: rimando in correzione (1/1)",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const ev = s.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is ReviewGateEvent => e.type === "review_gate");
+  assert.ok(ev, "l'evento review_gate NON deve essere scartato dal parser");
+  assert.equal(ev.title, "Review NON superata: rimando in correzione (1/1)");
+  assert.equal(ev.phase, "failed");
+  assert.equal(ev.verdict, "needs_changes");
+  assert.equal(ev.cycle, 1);
+  assert.equal(ev.maxCycles, 1);
+});
+
+test("review_gate: la chiusura approvata porta il verdetto pass", () => {
+  beforeEach();
+  // Payload del ramo close_not_rejected() (phase=closed).
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "review_gate",
+      { cycle: 2, phase: "closed", valid: 2, total: 2, verdict: "pass" },
+      "Review adversariale: pass (2/2 voti validi)",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const ev = s.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is ReviewGateEvent => e.type === "review_gate");
+  assert.ok(ev);
+  assert.equal(ev.verdict, "pass");
+  assert.equal(ev.title, "Review adversariale: pass (2/2 voti validi)");
 });
 
 // ── Stamping provider/model per riga (icona provider) ───────────────────────

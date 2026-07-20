@@ -118,6 +118,22 @@ export interface ContextOverflowEvent extends EventProvenance {
   detail?: string;
 }
 
+/** Esito del ReviewGate del grafo (kind=review_gate, nodo review_gate.rs):
+ *  rimando in correzione, chiusura bocciata al cap, o verdetto di chiusura
+ *  (pass/inconclusive). Il `title` e' gia' composto dal backend; phase e
+ *  verdict sono i segnali strutturati del payload (regola M). */
+export interface ReviewGateEvent extends EventProvenance {
+  type: "review_gate";
+  /** fase strutturata: closed | failed | rejected_final. */
+  phase?: string;
+  /** verdetto del panel: pass | fail | needs_changes | inconclusive. */
+  verdict?: string;
+  cycle?: number;
+  maxCycles?: number;
+  /** titolo leggibile del meta-step (composto dal backend). */
+  title: string;
+}
+
 /** Sequenza di tool consecutivi tutti ok, compressa oltre soglia densita'.
  *  I ToolEvent originali sono CONSERVATI in `tools` (non scartati) cosi' il
  *  renderer puo' espandere la riga collassata e mostrare i singoli tool (ognuno
@@ -258,6 +274,7 @@ export type ActivityEvent =
   | ToolEvent
   | SwitchEvent
   | VerifyEvent
+  | ReviewGateEvent
   | ContextOverflowEvent
   | FoldedToolsEvent
   | SubagentEvent
@@ -756,6 +773,18 @@ export function composeActivityStream(
             phase: asString(p.phase),
             cycle: asNumber(p.cycle),
             maxCycles: asNumber(p.max_cycles),
+          });
+          break;
+        }
+        case "review_gate": {
+          const seg = ensureSegment(undefined, undefined);
+          seg.events.push({
+            type: "review_gate",
+            phase: asString(p.phase),
+            verdict: asString(p.verdict),
+            cycle: asNumber(p.cycle),
+            maxCycles: asNumber(p.max_cycles),
+            title: m.title,
           });
           break;
         }

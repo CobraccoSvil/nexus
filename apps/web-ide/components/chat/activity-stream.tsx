@@ -65,6 +65,7 @@ const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
   tool: "◆", // rombo pieno
   switch: "▲", // triangolo su (mai reso qui: la banda ha il suo header)
   verify: "✓", // check
+  review_gate: "▣", // quadrato con riquadro (review adversariale)
   context_overflow: "!",
   folded_tools: "…", // ellissi
   subagent: "◈", // rombo con centro (attivita' delegata)
@@ -80,6 +81,7 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
   tool: "Tool",
   switch: "Cambio provider",
   verify: "Verifica",
+  review_gate: "Review",
   context_overflow: "Contesto",
   folded_tools: "Passi",
   subagent: "Subagente",
@@ -93,6 +95,8 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
 const SUBAGENT_ACCENT = "#8b5cf6";
 const COUNCIL_ACCENT = "#0ea5e9";
 const MULTI_PROVIDER_ACCENT = "#6366f1";
+/** Accent del ReviewGate (rosa: gate adversariale, distinto dal verde verify). */
+const REVIEW_GATE_ACCENT = "#f43f5e";
 
 const FINAL_GATE_PHASES: Record<string, string> = {
   start: "avviata",
@@ -618,6 +622,24 @@ function EventBody({
           )}
         </div>
       );
+    case "review_gate": {
+      // Colore dal verdetto STRUTTURATO del panel (regola M), mai dal titolo.
+      const verdictColor =
+        event.verdict === "pass"
+          ? "#22c55e"
+          : event.verdict === "inconclusive" || event.verdict === undefined
+            ? tc.textMuted
+            : tc.error;
+      return (
+        <div style={rowStyle}>
+          <span className="nx-as-kind-label" style={kindLabelStyle(REVIEW_GATE_ACCENT)}>
+            {EVENT_KIND_LABEL.review_gate}
+          </span>
+          <span style={{ fontSize: 12.5, color: tc.text }}>{event.title}</span>
+          {event.verdict && <span style={tagStyle(verdictColor)}>{event.verdict}</span>}
+        </div>
+      );
+    }
     case "context_overflow":
       return (
         <div style={rowStyle}>

@@ -170,6 +170,9 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   strategy_shift: { icon: "↷", label: "Cambio strategia", accent: "#8b5cf6", defaultOpen: true },
   loop_break: { icon: "◼", label: "Interruzione", accent: "#ef4444", defaultOpen: true },
   final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: true },
+  // ReviewGate del grafo (review_gate.rs): rimando in correzione su bocciatura,
+  // chiusura bocciata al cap, o verdetto di chiusura (pass/inconclusive).
+  review_gate: { icon: "▣", label: "Review", accent: "#f43f5e", defaultOpen: true },
   declaration_request: { icon: "…", label: "Richiesta esito", accent: "#f59e0b", defaultOpen: false },
   outcome_declared: { icon: "◆", label: "Esito dichiarato", accent: "#22c55e", defaultOpen: true },
   // Narrazione del sub-agente sul run padre (ponte subagent_native.rs, mig
@@ -192,7 +195,13 @@ const DEFAULT_DESC: KindDescriptor = {
  *  card: `usage_snapshot` (token del turno, consumato dalla barra contesto) ed
  *  `end_turn` (chiusura turno). Senza questo filtro comparivano come card
  *  "Step" senza titolo. Punto unico: usato da MessageMetaSteps (regola L). */
-export const HIDDEN_META_KINDS: ReadonlySet<string> = new Set(["usage_snapshot", "end_turn"]);
+export const HIDDEN_META_KINDS: ReadonlySet<string> = new Set([
+  "usage_snapshot",
+  "end_turn",
+  // Contabilita' tecnica dello stall-recovery (meta-reasoner): title vuoto,
+  // payload solo session_id — non e' una decisione da mostrare come card.
+  "stall_budget",
+]);
 
 /** Traduzioni delle chiavi di payload piu' comuni per la resa tabellare dei
  *  meta-step senza renderer dedicato. Le chiavi ignote degradano a
@@ -214,6 +223,10 @@ const PAYLOAD_KEY_LABELS: Record<string, string> = {
   strategy: "Strategia",
   tools_count: "Tool disponibili",
   intent: "Intent",
+  verdict: "Verdetto",
+  findings: "Findings",
+  valid: "Voti validi",
+  total: "Review totali",
 };
 
 /** Valori del payload in forma leggibile: booleani "si'"/"no", primitivi as-is,
