@@ -20,6 +20,7 @@
 
 import { useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { withAlpha } from "../../lib/color";
 import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { PlanChecklist } from "./agent-meta-step-card";
 import { toolLabel } from "./tool-labels";
@@ -29,6 +30,7 @@ import { ProviderIcon } from "./provider-icon";
 import {
   capStreamToRecent,
   figureVerdictDisplay,
+  runScopedAnchorId,
   switchCauseLabel,
 } from "../../lib/use-chat/activity-stream";
 import type {
@@ -46,16 +48,8 @@ import type {
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
-/** Converte hex (#RRGGBB) + alpha in rgba. */
-function withAlpha(hex: string, alpha: number): string {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
-  if (!m) return hex;
-  const v = m[1];
-  const r = parseInt(v.slice(0, 2), 16);
-  const g = parseInt(v.slice(2, 4), 16);
-  const b = parseInt(v.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-}
+// `withAlpha` e' consolidata in lib/color (regola L): era duplicata qui e in
+// run-notifications.tsx.
 
 // Glifi monospaziati per tipo evento (coerenti col mockup v3). Non-emoji.
 const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
@@ -200,12 +194,13 @@ function ThoughtBlock({ text, tc }: { text: string; tc: ThemeColors }) {
  *  umana della causa strutturata quando nota (punto unico switchCauseLabel,
  *  regola L/M): un rifiuto 4xx o un'esclusione di policy non vanno raccontati
  *  come cooldown ne' come codice grezzo `provider_failover`. */
-function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
+function SwitchBand({ sw, tc, domId }: { sw: SwitchEvent; tc: ThemeColors; domId?: string }) {
   const fromColor = providerBaseColor(sw.fromProvider);
   const toColor = providerBaseColor(sw.toProvider);
   const causeLabel = switchCauseLabel(sw.cause);
   return (
     <div
+      id={domId}
       style={{
         margin: "6px 10px 6px 22px",
         borderRadius: 10,
@@ -214,6 +209,7 @@ function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
         background: `linear-gradient(90deg, ${withAlpha(fromColor, 0.16)}, ${withAlpha(toColor, 0.24)})`,
         border: `1px solid ${withAlpha(toColor, 0.45)}`,
         minWidth: 0,
+        scrollMarginTop: 12,
       }}
     >
       <div
@@ -277,17 +273,25 @@ function EventRow({
   event,
   segColor,
   tc,
+  runId,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
   tc: ThemeColors;
+  /** run del nastro: scopa l'id DOM dell'evento per il deep-link (undefined nel
+   *  percorso storico, che non e' bersaglio della campanella). */
+  runId?: string;
 }) {
+  const domId =
+    runId && event.anchorId ? runScopedAnchorId(runId, event.anchorId) : undefined;
   return (
     <div
+      id={domId}
       style={{
         position: "relative",
         padding: "7px 34px 7px 42px",
         minWidth: 0,
+        scrollMarginTop: 12,
       }}
     >
       {/* Spina neutra */}
@@ -996,8 +1000,10 @@ function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeCol
 }
 
 /** Riga espandibile per il parere di UNA figura del consiglio. Il testo completo
- *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione. */
-function FigureReportRow({
+ *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione.
+ *  Esportata (regola L): il centro notifiche del run la RIUSA per mostrare i
+ *  pareri di Consiglio/multi-provider, invece di ricomporli. */
+export function FigureReportRow({
   report,
   tc,
   titleByProvider = false,
@@ -1121,16 +1127,43 @@ function metaStyle(tc: ThemeColors): React.CSSProperties {
 }
 
 /** Un segmento: eventuale banda switch in testa, poi la spina di eventi. */
-function SegmentView({ segment, tc }: { segment: ActivitySegment; tc: ThemeColors }) {
+function SegmentView({
+  segment,
+  tc,
+  runId,
+}: {
+  segment: ActivitySegment;
+  tc: ThemeColors;
+  runId?: string;
+}) {
   const segColor = providerBaseColor(segment.provider);
+  // Id DOM del SEGMENTO (fallback per l'evento cappato). Applicato alla banda
+  // switch se il segmento la ha, altrimenti al placeholder "N passi precedenti":
+  // mutuamente esclusivi per non emettere due nodi con lo stesso id.
+  const segDomId =
+    runId && segment.anchorId ? runScopedAnchorId(runId, segment.anchorId) : undefined;
+  const hasSwitchBand = segment.openedBySwitch && !!segment.switch;
   return (
     <div style={{ minWidth: 0 }}>
-      {segment.openedBySwitch && segment.switch && <SwitchBand sw={segment.switch} tc={tc} />}
+      {hasSwitchBand && segment.switch && (
+        <SwitchBand sw={segment.switch} tc={tc} domId={segDomId} />
+      )}
       <div style={{ position: "relative", padding: "4px 10px 8px 0", minWidth: 0 }}>
         {segment.cappedCount ? (
           // Passi di questo provider compressi dal cap live: il provider resta
-          // visibile (non sparisce), il dettaglio e' nello storico.
-          <div style={{ fontSize: 11, color: tc.textMuted, fontStyle: "italic", padding: "2px 0" }}>
+          // visibile (non sparisce), il dettaglio e' nello storico. Se il
+          // segmento non ha banda switch, questo placeholder porta l'ancora di
+          // segmento (bersaglio del fallback deep-link).
+          <div
+            id={hasSwitchBand ? undefined : segDomId}
+            style={{
+              fontSize: 11,
+              color: tc.textMuted,
+              fontStyle: "italic",
+              padding: "2px 0",
+              scrollMarginTop: 12,
+            }}
+          >
             ·{" "}
             {segment.cappedCount === 1
               ? "1 passo precedente"
@@ -1139,7 +1172,7 @@ function SegmentView({ segment, tc }: { segment: ActivitySegment; tc: ThemeColor
         ) : null}
         {segment.events.map((ev, i) =>
           ev.type === "switch" ? null : (
-            <EventRow key={`ev-${i}`} event={ev} segColor={segColor} tc={tc} />
+            <EventRow key={`ev-${i}`} event={ev} segColor={segColor} tc={tc} runId={runId} />
           ),
         )}
       </div>
@@ -1161,11 +1194,15 @@ export function ActivityStreamView({
   stream,
   tc,
   liveCap,
+  runId,
 }: {
   stream: ActivityStream;
   tc: ThemeColors;
   foldThreshold?: FoldThreshold;
   liveCap?: number;
+  /** run del nastro: scopa gli id DOM per il deep-link della campanella. Passato
+   *  solo dal nastro LIVE (AgentStepsPanel); lo storico lo omette. */
+  runId?: string;
 }) {
   const [showAll, setShowAll] = useState(false);
   if (stream.empty) return null;
@@ -1180,6 +1217,7 @@ export function ActivityStreamView({
   return (
     <div
       data-testid="activity-stream"
+      data-run-id={runId}
       style={{
         marginTop: 6,
         border: `1px solid ${tc.border}`,
@@ -1217,7 +1255,7 @@ export function ActivityStreamView({
         </button>
       )}
       {renderStream.segments.map((seg, i) => (
-        <SegmentView key={`seg-${i}`} segment={seg} tc={tc} />
+        <SegmentView key={`seg-${i}`} segment={seg} tc={tc} runId={runId} />
       ))}
     </div>
   );

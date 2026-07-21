@@ -34,7 +34,7 @@ export interface AITraceEvent {
   cacheReadTokens?: number;
 }
 
-interface AgentPendingAction {
+export interface AgentPendingAction {
   index: number;
   toolName: string;
   toolInput: Record<string, unknown>;

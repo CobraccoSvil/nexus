@@ -19,6 +19,8 @@ import {
   tracesForRun,
   subagentRunIds,
   capStreamToRecent,
+  activityLocalAnchorId,
+  segmentAnchorId,
   type ActivityEvent,
   type ToolEvent,
   type ReviewGateEvent,
@@ -1230,4 +1232,44 @@ test("il pin allo start (model_purpose) e l'escalation del figlio restano per-ev
   assert.equal(subs[1].provider, "anthropic", "il progress conserva il provider corrente");
   assert.equal(subs[2].provider, "anthropic");
   assert.equal(subs[2].model, "claude-sonnet");
+});
+
+// ── Ancoraggio deep-link (regola O) ─────────────────────────────────────────
+// L'ancora del deep-link (campanella -> riga del nastro) e' assegnata da
+// composeActivityStream: la verifichiamo sul PRODUTTORE reale, mai su uno stream
+// costruito a mano (fabbricare un anchorId fossilizzerebbe un valore che il
+// produttore non emette). Test di mutazione: se l'assegnazione si rompe, gli
+// anchorId diventano undefined e gli assert falliscono.
+
+test("anchoring: composeActivityStream assegna l'ancora canonica a segmenti ed eventi", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta("routing", { intent: "code_fix", provider: "deepseek", model: "deepseek-chat" }),
+    meta("executor_call", { iteration: 1, provider: "deepseek", model: "deepseek-chat" }),
+    meta("escalation", {
+      from_provider: "deepseek",
+      to_provider: "google",
+      to_model: "gemini-2.5-flash",
+      reason: "x",
+      cause: "cooldown",
+    }),
+    meta("executor_call", { iteration: 3, provider: "google", model: "gemini-2.5-flash" }),
+  ];
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  assert.ok(stream.segments.length >= 2, "escalation apre un secondo segmento");
+
+  let eventsChecked = 0;
+  for (let si = 0; si < stream.segments.length; si++) {
+    const seg = stream.segments[si];
+    assert.equal(seg.anchorId, segmentAnchorId(si), `ancora del segmento ${si}`);
+    for (let ei = 0; ei < seg.events.length; ei++) {
+      const ev = seg.events[ei];
+      if (ev.type === "switch") continue;
+      assert.equal(ev.anchorId, activityLocalAnchorId(si, ei), `ancora evento ${si}/${ei}`);
+      eventsChecked += 1;
+    }
+  }
+  // Guardia: il loop deve aver esercitato davvero il ramo evento (altrimenti il
+  // test passerebbe a vuoto senza verificare nulla).
+  assert.ok(eventsChecked >= 1, "almeno un evento non-switch con ancora verificato");
 });

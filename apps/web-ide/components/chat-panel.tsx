@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   useCallback,
@@ -375,6 +376,21 @@ export function ChatPanel({
   // scatta mentre l'agente sta lavorando (emette meta_step), e (b) mostrare
   // l'attivita' corrente (titolo dell'ultimo meta_step).
   const liveMetaSteps = (agentRun?.runId ? metaStepsMap.get(agentRun.runId) : undefined) ?? [];
+  // Refinement P13: compone il nastro del run LIVE UNA sola volta (stesso
+  // foldThreshold del pannello). La STESSA istanza alimenta sia la campanella
+  // (deriva notifiche + anchorId) sia il renderer del nastro (AgentStepsPanel):
+  // gli anchorId del deep-link coincidono per costruzione, non per determinismo.
+  const liveRunId = agentRun?.runId;
+  const liveActivityStream = useMemo(() => {
+    if (!activityStreamEnabled || !liveRunId) return null;
+    const meta = metaStepsMap.get(liveRunId) ?? [];
+    return composeActivityStream(
+      meta,
+      agentStepsMap.get(liveRunId) ?? [],
+      tracesForRun(traces, liveRunId, meta),
+      foldThreshold,
+    );
+  }, [activityStreamEnabled, liveRunId, metaStepsMap, agentStepsMap, traces, foldThreshold]);
   const lastMetaStep = liveMetaSteps.length > 0 ? liveMetaSteps[liveMetaSteps.length - 1] : null;
   const lastMetaStepAt = lastMetaStep ? new Date(lastMetaStep.createdAt).getTime() : 0;
   const lastAgentStepAt = agentSteps.length > 0
@@ -1277,6 +1293,7 @@ export function ChatPanel({
               traces={traces}
               activityStreamEnabled={activityStreamEnabled}
               foldThreshold={foldThreshold}
+              mainRunStream={liveActivityStream ?? undefined}
             />
           )}
 
@@ -1416,14 +1433,9 @@ export function ChatPanel({
         // (cambio provider, step fallito, attesa conferma). Auto-apertura solo
         // per eventi bloccanti.
         const runNotifications =
-          activityStreamEnabled && agentRun?.runId ? (
+          activityStreamEnabled && agentRun?.runId && liveActivityStream ? (
             <RunNotifications
-              stream={composeActivityStream(
-                metaStepsMap.get(agentRun.runId) ?? [],
-                agentStepsMap.get(agentRun.runId) ?? [],
-                tracesForRun(traces, agentRun.runId, metaStepsMap.get(agentRun.runId) ?? []),
-                foldThreshold,
-              )}
+              stream={liveActivityStream}
               runStatus={agentRun.status}
               runId={agentRun.runId}
               pendingActions={agentRun.pendingActions}

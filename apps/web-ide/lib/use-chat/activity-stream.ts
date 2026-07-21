@@ -38,6 +38,11 @@ export type ToolOutcome = "ok" | "err" | "running";
 export interface EventProvenance {
   provider?: string;
   model?: string;
+  /** Ancora strutturale dell'evento nel nastro (posizione canonica segmento/
+   *  evento), assegnata UNA volta a fine composeActivityStream. Consumata dal
+   *  renderer (id DOM) e dalla campanella (deep-link). Formato definito dagli
+   *  helper esportati activityLocalAnchorId/runScopedAnchorId (regola L). */
+  anchorId?: string;
 }
 
 export interface RoutingEvent extends EventProvenance {
@@ -297,6 +302,12 @@ export interface ActivitySegment {
    *  > 0 -> il renderer mostra "N passi precedenti" cosi' il provider non sparisce
    *  del tutto dalla vista live (i suoi step sono nello storico, visibili al refresh). */
   cappedCount?: number;
+  /** Ancora strutturale del SEGMENTO (posizione canonica), assegnata a fine
+   *  composeActivityStream su OGNI segmento. Il renderer la stampa sulla banda
+   *  "Cambio provider" e sul placeholder "N passi precedenti"; la campanella la
+   *  usa come fallback quando l'evento puntato e' stato cappato dalla vista live
+   *  (il segmento resta sempre nel DOM, l'evento no). */
+  anchorId?: string;
 }
 
 export interface ActivityStream {
@@ -1001,7 +1012,48 @@ export function composeActivityStream(
     }
   }
 
+  // ── Ancoraggio (regola L) ──────────────────────────────────────────────────
+  // ULTIMO passo, dopo il folding: assegna l'ancora canonica UNA sola volta su
+  // ogni segmento e ogni evento (posizione strutturale, mai dedotta dal testo,
+  // regola M). L'id STORATO qui e' letto identico dal renderer (attributo DOM) e
+  // dalla campanella (deep-link), quindi le due letture coincidono per
+  // costruzione. Sopravvive a `capStreamToRecent` (spread dei segmenti + stessi
+  // ref evento): l'ancora resta il valore pre-cap, mai l'indice del render.
+  for (let si = 0; si < segments.length; si++) {
+    const seg = segments[si];
+    seg.anchorId = segmentAnchorId(si);
+    for (let ei = 0; ei < seg.events.length; ei++) {
+      const ev = seg.events[ei];
+      // Gli switch vivono in `seg.switch` (banda a livello segmento), non negli
+      // `events` resi come riga: la loro ancora e' quella del segmento.
+      if (ev.type === "switch") continue;
+      ev.anchorId = activityLocalAnchorId(si, ei);
+    }
+  }
+
   return { segments, empty: segments.length === 0 };
+}
+
+// ── Ancoraggio: formato canonico degli id (regola L, punto unico) ────────────
+// Il TEMPLATE degli id vive SOLO qui: renderer e campanella li leggono da questi
+// helper, mai ricodificano la stringa altrove. `activityLocalAnchorId`/
+// `segmentAnchorId` sono le ancore LOCALI storate sugli oggetti; `runScopedAnchorId`
+// le combina col runId al confine DOM (in cronologia coesistono piu' nastri, gli
+// id vanno scopati per run per non colpire il turno sbagliato).
+
+/** Ancora locale di UN evento: posizione canonica (segmento, evento). */
+export function activityLocalAnchorId(segIndex: number, evIndex: number): string {
+  return `seg${segIndex}-ev${evIndex}`;
+}
+
+/** Ancora locale di UN segmento (banda switch / placeholder passi cappati). */
+export function segmentAnchorId(segIndex: number): string {
+  return `seg${segIndex}`;
+}
+
+/** Id DOM completo: ancora locale scopata per run. */
+export function runScopedAnchorId(runId: string, local: string): string {
+  return `nx-as-${runId}-${local}`;
 }
 
 /** true se il segmento ha gia' ESEGUITO lavoro (tool/folded), non solo eventi
@@ -1234,6 +1286,9 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
     // gli step di un provider intermedio (es. deepseek) sparivano, riapparendo
     // solo al refresh (che non cappa).
     if (hasVisibleEvent || cappedInSeg > 0 || seg.openedBySwitch) {
+      // Lo spread `...seg` preserva `anchorId` del segmento; `keptEvents` sono i
+      // ref evento ORIGINALI, quindi conservano il proprio `anchorId` (canonico,
+      // pre-cap): il deep-link della campanella resta valido dopo il cap.
       cappedSegments.push({
         ...seg,
         events: keptEvents,

@@ -9,6 +9,7 @@ import { toolLabel } from "./tool-labels";
 import {
   composeActivityStream,
   tracesForRun,
+  type ActivityStream,
   type FoldThreshold,
 } from "../../lib/use-chat/activity-stream";
 import { ActivityStreamView } from "./activity-stream";
@@ -182,6 +183,11 @@ export interface AgentStepsPanelProps {
   // Soglia densita' del collasso tool (derivata dalla larghezza @container).
   foldThreshold?: FoldThreshold;
   isConfirming?: boolean;
+  // Refinement P13: nastro del run PRINCIPALE gia' composto una volta in
+  // chat-panel (useMemo) e condiviso con la campanella. Passandolo qui, renderer
+  // e campanella usano la STESSA istanza -> gli anchorId del deep-link coincidono
+  // per costruzione. Per i sub-run (tab) il pannello compone comunque localmente.
+  mainRunStream?: ActivityStream;
 }
 
 /** P5: Blocco collassabile per gli step piu' vecchi */
@@ -741,6 +747,7 @@ export function AgentStepsPanel({
   activityStreamEnabled = false,
   traces,
   foldThreshold = 3,
+  mainRunStream,
 }: AgentStepsPanelProps) {
   const [activeTab, setActiveTab] = useState<string>(agentRun.runId);
   // Lista "Decisioni del turno" collassata: durante un run la sequenza esplode a
@@ -812,14 +819,23 @@ export function AgentStepsPanel({
       {activityStreamEnabled && activeRunData ? (
         <div style={{ marginBottom: 8 }} data-testid="agent-activity-stream-live">
           <ActivityStreamView
-            stream={composeActivityStream(
-              metaSteps ?? [],
-              activeRunData.steps,
-              traces ? tracesForRun(traces, activeRunData.run.runId, metaSteps ?? []) : [],
-              foldThreshold ?? 3,
-            )}
+            stream={
+              // Refinement P13: per il run PRINCIPALE riusa la STESSA istanza
+              // gia' composta in chat-panel (e derivata dalla campanella), cosi'
+              // gli anchorId coincidono per costruzione. I sub-run (tab) compongono
+              // localmente (la campanella non li bersaglia).
+              mainRunStream && activeRunData.run.runId === agentRun.runId
+                ? mainRunStream
+                : composeActivityStream(
+                    metaSteps ?? [],
+                    activeRunData.steps,
+                    traces ? tracesForRun(traces, activeRunData.run.runId, metaSteps ?? []) : [],
+                    foldThreshold ?? 3,
+                  )
+            }
             tc={tc}
             liveCap={7}
+            runId={activeRunData.run.runId}
           />
         </div>
       ) : (
