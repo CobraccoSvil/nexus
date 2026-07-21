@@ -93,6 +93,18 @@ pub struct Todo {
     /// retrocompat (golden/checkpoint pre-esistenti non hanno il campo).
     #[serde(default)]
     pub write_scope: Vec<String>,
+    /// Testo del todo (`nexus_agent_todos.content`). TRASPORTATO per la
+    /// presentazione (il meta-step "plan" del nastro lo pubblica in chat), NON
+    /// usato dallo scheduling DAG (che ordina per dipendenze/seq): stesso spirito
+    /// di `seq`/`write_scope`, campo portato non decisionale. Senza, il piano nel
+    /// nastro appariva come righe vuote "[ ] -" (content=null nel payload).
+    /// `#[serde(default)]` per retrocompat golden/checkpoint pre-esistenti.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Priorita' del todo (`nexus_agent_todos.priority`), trasportata per il
+    /// meta-step di presentazione; non usata dallo scheduling.
+    #[serde(default)]
+    pub priority: Option<String>,
 }
 
 /// Config del DAG parallelo (PARAMETRO esplicito, no lettura DB: regola G).
@@ -242,6 +254,8 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             seq: None,
             write_scope: Vec::new(),
+            content: None,
+            priority: None,
         }
     }
 

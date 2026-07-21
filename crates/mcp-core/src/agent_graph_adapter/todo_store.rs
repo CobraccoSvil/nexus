@@ -69,9 +69,12 @@ impl TodoStore for PgTodoStore {
     async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
             .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}")))?;
-        let rows = sqlx::query_as::<_, (String, Option<i64>, String, Vec<String>, Vec<String>)>(
+        let rows = sqlx::query_as::<
+            _,
+            (String, Option<i64>, String, Vec<String>, Vec<String>, Option<String>, Option<String>),
+        >(
             "SELECT id::text, seq::bigint, status, depends_on::text[] AS depends_on, \
-                    write_scope::text[] AS write_scope \
+                    write_scope::text[] AS write_scope, content, priority \
              FROM nexus_agent_todos \
              WHERE run_id = $1 \
              ORDER BY seq ASC",
@@ -82,11 +85,15 @@ impl TodoStore for PgTodoStore {
         .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}")))?;
         Ok(rows
             .into_iter()
-            .map(|(id, seq, status, depends_on, write_scope)| Todo {
+            .map(|(id, seq, status, depends_on, write_scope, content, priority)| Todo {
                 id,
                 status: status_from_db(&status),
                 depends_on,
                 seq,
+                // Testo/priorita' del todo: trasportati per il meta-step "plan"
+                // (presentazione nel nastro), non usati dallo scheduling DAG.
+                content,
+                priority,
                 // PR5 (mig project 0006): scope di scrittura dichiarato dal todo,
                 // letto dalla colonna `write_scope` (TEXT[] NOT NULL DEFAULT '{}').
                 // Retrocompat: i todo senza scope hanno '{}' -> Vec vuoto -> il
