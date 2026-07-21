@@ -175,6 +175,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReviewGateNode {
             return Ok(Self::pass_through());
         }
 
+        // GUARD ANTI-LOOP: se il run e' GIA' stato bocciato in modo DEFINITIVO
+        // (RejectedFinal = cycle > max_cycles gia' raggiunto), NON ri-convocare il
+        // panel. Senza, ogni re-ingresso nel funnel di chiusura (ondate
+        // todo-isolation, rientri) ri-convocava i 2 revisori, incrementava
+        // `review_gate_cycle` e ri-bocciava -> loop "(4/3), (5/3), ... (N/3)" visto
+        // in UI, che brucia token (panel avversario a ogni giro). Il commento di
+        // modulo ("DEFINITIVA -> il run chiude bocciato, mai un loop") era l'INTENTO;
+        // questo guard lo rende vero: il verdetto resta RejectedFinal, si esce senza
+        // nuova spesa.
+        if state.review_gate_verdict == Some(ReviewGateVerdict::RejectedFinal) {
+            return Ok(Self::pass_through());
+        }
+
         let cycle = state.review_gate_cycle.unwrap_or(0) + 1;
         let max_cycles = self.cfg.max_cycles.max(0);
 
@@ -533,6 +546,35 @@ mod tests {
             !crate::routing::gate_rimanda_in_correzione(&s),
             "al cap NON si rimanda: il run deve chiudere (bocciato), mai un loop"
         );
+    }
+
+    /// Anti-loop: un run GIA' bocciato in modo definitivo (RejectedFinal) NON
+    /// ri-convoca il panel a un nuovo ingresso. Senza il guard, `run` convocherebbe
+    /// di nuovo i revisori e incrementerebbe `review_gate_cycle` (4/3, 5/3, ...) ->
+    /// il loop visto in UI. Test di mutazione: rimuovendo il guard, il cycle passa
+    /// da 5 a 6 e questo assert rosseggia.
+    #[tokio::test]
+    async fn gia_rejected_final_non_riconvoca() {
+        // Panel che boccerebbe SE convocato: il guard deve impedire la convocazione.
+        let node = nodo(1, ReviewPanelReport::Convened(panel_bocciato()));
+        let gia_definitivo = AgentState {
+            review_gate_verdict: Some(ReviewGateVerdict::RejectedFinal),
+            review_gate_cycle: Some(5),
+            ..stato_done()
+        };
+        let delta = node
+            .run(&gia_definitivo, &ctx_with(false))
+            .await
+            .expect("nodo ok");
+        let s = apply(gia_definitivo, delta);
+        // pass_through: verdetto e cycle INVARIATI (nessuna ri-review, nessuna spesa).
+        assert_eq!(s.review_gate_verdict, Some(ReviewGateVerdict::RejectedFinal));
+        assert_eq!(
+            s.review_gate_cycle,
+            Some(5),
+            "il cycle NON incrementa: nessuna ri-convocazione del panel"
+        );
+        assert!(!crate::routing::gate_rimanda_in_correzione(&s));
     }
 
     /// Approvazione: nessun rimando, verdetto Approved, il run chiude pulito.

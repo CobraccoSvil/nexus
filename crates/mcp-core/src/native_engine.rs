@@ -1167,6 +1167,21 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
             d.fs_mutator_tools,
         )
         .await,
+        // Rete di sicurezza della plan-phase (regola G): senza questo cablaggio
+        // `RoutingConfig.verifier_enabled` restava al default `false`, quindi il
+        // gate `route_after_executor` (`plan_phase_active && verifier_enabled ->
+        // Verifier`) era CODICE MORTO e i todo del piano non venivano MAI avanzati
+        // a `completed` (il Verifier e' l'unico nodo che li avanza in esecuzione
+        // inline). `orchestrator.verifier_enabled=true` era gia' letto per il NODO
+        // Verifier (cosa fa) ma non per il ROUTING (se ci si arriva). NB: NON
+        // cablare qui `dag_parallel_enabled`: l'Executor non ha ancora il dispatch
+        // DAG (executor.rs placeholder), abilitarlo lascerebbe i todo orfani.
+        verifier_enabled: setting_bool(
+            db,
+            "orchestrator.verifier_enabled",
+            d.verifier_enabled,
+        )
+        .await,
         ..RoutingConfig::default()
     }
 }
