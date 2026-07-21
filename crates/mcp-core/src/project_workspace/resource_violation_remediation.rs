@@ -110,6 +110,19 @@ pub(crate) fn build_remediation_content(
 /// lo consente, avvia UN solo run di riparazione che le copre tutte. Chiusura:
 /// a fine run re-lint dei file coinvolti -> resolved / ri-open / failed.
 pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) {
+    // Boot-grace (punto unico dell'osservazione servizi, regola L): dopo un
+    // restart di mcp-core il re-lint rivede le violazioni note e questo worker
+    // risvegliava la chat entro pochi minuti dal deploy ("la chat riparte da
+    // sola a ogni ricompilazione": risvegli 19:48/19:53 attorno al restart
+    // 19:50 del 20/07). Il gemello service_observer_remediation aveva gia' la
+    // guardia; qui mancava.
+    if super::service_observer_remediation::within_boot_grace(state).await {
+        tracing::info!(
+            project_id = %project_id,
+            "resource_violation_remediation: boot-grace attivo, giro saltato"
+        );
+        return;
+    }
     // Solo regole con auto_remediate=true nel catalogo (le altre restano
     // visibili nel pannello, azionabili a mano col pulsante chat).
     let enabled_flag =
@@ -200,19 +213,26 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     .await
     .unwrap_or(0);
 
-    // Cap tentativi per firma su 24h CROSS-ROW (immune al re-open): si valuta
-    // sulla firma piu' "consumata" del batch.
+    // Cap tentativi su 24h CROSS-ROW, contato PER FILE e non per firma puntuale
+    // (regola M): la firma include il VALUE (porta/URL) e un rimedio parziale che
+    // sposta la porta genera una firma NUOVA a ogni giro -> il cap non convergeva
+    // mai (provato sul progetto vendita-immobile: 07:25 e 07:30, due run su
+    // frontend/vite.config.ts con firme diverse). La remediation e' by-edit sul
+    // FILE: se quel file ha gia' consumato i tentativi, altri run identici non
+    // aggiungono nulla, comunque si sia spostato il valore.
     let mut max_sig_attempts: i64 = 0;
     for v in &violations {
-        if v.signature.is_empty() {
+        let Some(fp) = v.file_path.as_deref().filter(|p| !p.is_empty()) else {
             continue;
-        }
+        };
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM service_diagnoses \
-              WHERE error_signature_hash = $1 AND triggered_run_id IS NOT NULL \
+              WHERE project_id = $1 AND signal_kind = 'policy_violation' \
+                AND file_path = $2 AND triggered_run_id IS NOT NULL \
                 AND ts > NOW() - INTERVAL '24 hours'",
         )
-        .bind(&v.signature)
+        .bind(project_id)
+        .bind(fp)
         .fetch_one(&state.db)
         .await
         .unwrap_or(0);
