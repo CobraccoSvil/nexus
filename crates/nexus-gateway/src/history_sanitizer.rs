@@ -253,14 +253,6 @@ fn collect_tool_call_ids(messages: &[LlmMessage]) -> HashSet<String> {
         .collect()
 }
 
-fn collect_tool_result_ids(messages: &[LlmMessage]) -> HashSet<String> {
-    messages
-        .iter()
-        .filter(|m| m.role == "tool")
-        .filter_map(|m| m.tool_call_id.clone())
-        .collect()
-}
-
 fn synthetic_tool_message(tool_call_id: &str, name: &str) -> LlmMessage {
     LlmMessage {
         role: "tool".to_string(),
