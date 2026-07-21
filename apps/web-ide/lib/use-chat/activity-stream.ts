@@ -293,6 +293,10 @@ export interface ActivitySegment {
   openedBySwitch: boolean;
   /** dati dello switch che ha aperto il segmento (per la banda). */
   switch?: SwitchEvent;
+  /** Eventi non-switch di QUESTO segmento nascosti dal cap live (`capStreamToRecent`).
+   *  > 0 -> il renderer mostra "N passi precedenti" cosi' il provider non sparisce
+   *  del tutto dalla vista live (i suoi step sono nello storico, visibili al refresh). */
+  cappedCount?: number;
 }
 
 export interface ActivityStream {
@@ -1210,6 +1214,7 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
   const cappedSegments: ActivitySegment[] = [];
   for (const seg of stream.segments) {
     const keptEvents: ActivityEvent[] = [];
+    let cappedInSeg = 0;
     for (const ev of seg.events) {
       if (ev.type === "switch") {
         // le bande switch vivono nel campo `seg.switch`, non negli events resi;
@@ -1218,13 +1223,22 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
         continue;
       }
       if (globalIndex >= keepFromGlobalIndex) keptEvents.push(ev);
+      else cappedInSeg += 1;
       globalIndex += 1;
     }
     const hasVisibleEvent = keptEvents.some((e) => e.type !== "switch");
-    // Un segmento resta se: e' aperto da switch (banda sempre visibile) OPPURE
-    // ha almeno un evento non nascosto.
-    if (seg.openedBySwitch || hasVisibleEvent) {
-      cappedSegments.push({ ...seg, events: keptEvents });
+    // Un segmento resta se ha eventi visibili OPPURE ne ha di nascosti dal cap:
+    // cosi' NESSUN provider che ha lavorato sparisce dalla vista live. Se ha solo
+    // eventi cappati, il renderer mostra "N passi precedenti" (il dettaglio e'
+    // nello storico). Prima il segmento veniva DROPPATO se non openedBySwitch ->
+    // gli step di un provider intermedio (es. deepseek) sparivano, riapparendo
+    // solo al refresh (che non cappa).
+    if (hasVisibleEvent || cappedInSeg > 0 || seg.openedBySwitch) {
+      cappedSegments.push({
+        ...seg,
+        events: keptEvents,
+        cappedCount: cappedInSeg > 0 ? cappedInSeg : undefined,
+      });
     }
   }
 

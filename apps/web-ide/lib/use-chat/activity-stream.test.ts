@@ -978,6 +978,40 @@ test("cap: le bande switch restano SEMPRE visibili anche se cappate", () => {
   assert.equal(switchSeg.switch?.toProvider, "anthropic");
 });
 
+test("cap: un provider con soli eventi cappati resta visibile col conteggio, non sparisce", () => {
+  beforeEach();
+  // deepseek fa 2 step, poi switch a mistral che ne fa 3: il cap stretto nasconde
+  // TUTTI gli step di deepseek. Reclamo utente: "non si vedono piu' gli step di
+  // deepseek, dopo il refresh ricompaiono". deepseek NON deve sparire dalla vista
+  // live: resta col conteggio dei passi compressi.
+  // Ordine di creazione INTERLACCIATO: l'associazione step->segmento e' per
+  // createdAt, quindi gli step di deepseek vanno creati tra il suo executor_call
+  // e l'escalation, altrimenti finirebbero tutti nell'ultimo segmento.
+  const m0 = meta("executor_call", { iteration: 0, provider: "deepseek", model: "v4" });
+  const sd0 = step("run", "failed", 0, { toolResult: "e" });
+  const sd1 = step("run", "failed", 1, { toolResult: "e" });
+  const mEsc = meta("escalation", {
+    from_provider: "deepseek",
+    to_provider: "mistral",
+    to_model: "small",
+    reason: "loop",
+  });
+  const mM = meta("executor_call", { iteration: 10, provider: "mistral", model: "small" });
+  const sm0 = step("run", "failed", 10, { toolResult: "e" });
+  const sm1 = step("run", "failed", 11, { toolResult: "e" });
+  const sm2 = step("run", "failed", 12, { toolResult: "e" });
+  const s = composeActivityStream([m0, mEsc, mM], [sd0, sd1, sm0, sm1, sm2], [], 3);
+  const capped = capStreamToRecent(s, 2); // tiene solo gli ultimi 2 (mistral)
+  const deepseekSeg = capped.stream.segments.find((seg) => seg.provider === "deepseek");
+  assert.ok(deepseekSeg, "il segmento deepseek NON deve sparire dalla vista live");
+  assert.equal(deepseekSeg.cappedCount, 2, "mostra i 2 passi compressi di deepseek");
+  assert.equal(
+    deepseekSeg.events.filter((e) => e.type !== "switch").length,
+    0,
+    "gli eventi di deepseek sono cappati (dettaglio nello storico)",
+  );
+});
+
 // ── 8. Narrazione sub-agente (subagent_started/progress/completed) ──────────
 
 test("i meta-step subagent_* diventano eventi 'subagent' con fase strutturata", () => {

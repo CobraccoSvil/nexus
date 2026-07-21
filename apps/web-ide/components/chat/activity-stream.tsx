@@ -1127,6 +1127,16 @@ function SegmentView({ segment, tc }: { segment: ActivitySegment; tc: ThemeColor
     <div style={{ minWidth: 0 }}>
       {segment.openedBySwitch && segment.switch && <SwitchBand sw={segment.switch} tc={tc} />}
       <div style={{ position: "relative", padding: "4px 10px 8px 0", minWidth: 0 }}>
+        {segment.cappedCount ? (
+          // Passi di questo provider compressi dal cap live: il provider resta
+          // visibile (non sparisce), il dettaglio e' nello storico.
+          <div style={{ fontSize: 11, color: tc.textMuted, fontStyle: "italic", padding: "2px 0" }}>
+            ·{" "}
+            {segment.cappedCount === 1
+              ? "1 passo precedente"
+              : `${segment.cappedCount} passi precedenti`}
+          </div>
+        ) : null}
         {segment.events.map((ev, i) =>
           ev.type === "switch" ? null : (
             <EventRow key={`ev-${i}`} event={ev} segColor={segColor} tc={tc} />
