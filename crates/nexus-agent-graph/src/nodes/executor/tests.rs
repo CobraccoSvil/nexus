@@ -5977,3 +5977,35 @@ async fn la_grazia_sulla_chiusura_volontaria_e_one_shot() {
         "grazia gia' consumata: la chiusura volontaria resta una chiusura"
     );
 }
+
+// ── compact_provider_error: il blob JSON del gateway non arriva in chat ──────
+
+#[test]
+fn errore_provider_compresso_senza_blob_json() {
+    // Input REALE (run 1db02ed3, 21/07): l'errore del gateway incorpora il
+    // body JSON del provider; nel resoconto in chat arrivava intero.
+    let raw = r#"provider non disponibile: Nexus Gateway 400 Bad Request: {"error":"tutti i provider hanno fallito -> mistral (mistral HTTP 400: {\"object\":\"error\",\"message\":\"Unexpected role 'tool' after role 'user'\"})","code":"PROVIDER_ERROR"}"#;
+    let out = super::compact_provider_error(raw);
+    // Mutazione che rende rosso: usare {err} invece di {err_short} al call
+    // site, o rimuovere il taglio alla prima '{' in compact_provider_error.
+    assert!(!out.contains('{'), "il payload JSON non deve comparire: {out}");
+    assert_eq!(out, "provider non disponibile: Nexus Gateway 400 Bad Request");
+}
+
+#[test]
+fn errore_provider_senza_json_resta_intatto_e_lungo_viene_troncato() {
+    assert_eq!(
+        super::compact_provider_error("timeout di rete verso il gateway"),
+        "timeout di rete verso il gateway"
+    );
+    let lungo = "x".repeat(400);
+    let out = super::compact_provider_error(&lungo);
+    assert!(out.len() <= 203, "tetto caratteri: {}", out.len());
+    assert!(out.ends_with("..."));
+    // Solo payload tecnico -> frase di ripiego onesta, mai stringa vuota.
+    let solo_json = r#"{"error":"x"}"#;
+    assert_eq!(
+        super::compact_provider_error(solo_json),
+        "richiesta rifiutata dal provider (dettaglio tecnico nei log del run)"
+    );
+}

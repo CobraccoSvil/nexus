@@ -3978,11 +3978,16 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                 // Riepilogo del lavoro svolto PRIMA dell'interruzione: anche se il
                 // provider e' caduto (es. cooldown), l'utente deve sapere cosa e'
                 // stato fatto, non solo l'errore. Punto unico summarize_actions_in_history.
+                // L'errore va compresso alla sintesi umana (compact_provider_error):
+                // il testo completo — che incorpora il body JSON del gateway —
+                // resta nel log qui sopra; incollato nel resoconto in chat
+                // arrivava all'utente come blob illeggibile.
+                let err_short = compact_provider_error(&err.to_string());
                 let err_text = match crate::routing::signals::summarize_actions_in_history(&messages) {
                     Some(w) => format!(
-                        "[Errore provider {provider}: {err}]\n\nInterrotto dopo {iters_in} iterazioni. Lavoro svolto finora: {w}."
+                        "[Errore provider {provider}: {err_short}]\n\nInterrotto dopo {iters_in} iterazioni. Lavoro svolto finora: {w}."
                     ),
-                    None => format!("[Errore provider {provider}: {err}]"),
+                    None => format!("[Errore provider {provider}: {err_short}]"),
                 };
                 // provider_used/model_used None: nessuna cascade -> eff = richiesto
                 // (cascade_did_fallback=false -> sticky invariato, == Python).
@@ -7208,6 +7213,33 @@ fn deterministic_close_delta(
         ..Default::default()
     }
     .into_opaque()
+}
+
+/// Sintesi UMANA di un errore provider per il messaggio sintetico in chat.
+/// Il testo completo dell'errore incorpora spesso il body JSON del gateway
+/// (es. `Nexus Gateway 400 Bad Request: {"error":...}`): quello resta nei log
+/// (tracing) e nelle trace; nel resoconto mostrato all'utente va solo la parte
+/// leggibile. Tronca alla prima `{` (inizio del payload tecnico) e a un tetto
+/// di caratteri. Il MARKER `[Errore provider` del chiamante non cambia: la
+/// detection dell'esito-certo in mcp-core (is_provider_error_answer) resta valida.
+pub(crate) fn compact_provider_error(err: &str) -> String {
+    let cut = err.find('{').unwrap_or(err.len());
+    let head = err[..cut].trim().trim_end_matches(':').trim_end();
+    const MAX: usize = 200;
+    let mut s = head.to_string();
+    if s.len() > MAX {
+        let mut end = MAX;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push_str("...");
+    }
+    if s.is_empty() {
+        "richiesta rifiutata dal provider (dettaglio tecnico nei log del run)".to_string()
+    } else {
+        s
+    }
 }
 
 fn is_forcing_failure(resp: &crate::runtime::ports::LlmResponse) -> bool {
