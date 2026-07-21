@@ -26,7 +26,8 @@ import {
   hasBlocking,
   type RunNotification,
 } from "./run-notifications-model";
-import type { ActivityStream } from "../../lib/use-chat/activity-stream";
+import { FigureReportRow } from "./activity-stream";
+import type { ActivityStream, FigureAdvisoryReport } from "../../lib/use-chat/activity-stream";
 import type { AgentPendingAction } from "../../lib/api/agent";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -66,6 +67,32 @@ export function RunNotifications({
   // Voci "Passo fallito" espanse (indice nella lista renderizzata): mostrano
   // input strutturato + estratto errore umanizzato (delega a step-detail-logic).
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
+
+  // Stato letto/non-letto (P8): high-water del numero di notifiche gia' viste,
+  // calcolato SOLO sul sottoinsieme MONOTONO (append-only) del nastro. Le voci
+  // di stato run (attesa conferma / sub-agent) sono transitorie — vengono rimosse
+  // al riprendere del run — quindi le ESCLUDIAMO: incluse nel conteggio,
+  // corromperebbero l'high-water mascherando un evento nuovo dopo un blocco.
+  const monotoneCount = useMemo(
+    () => notifications.filter((n) => n.kind !== "run_status").length,
+    [notifications],
+  );
+  const [seen, setSeen] = useState(0);
+  const seenRunRef = useRef<string | undefined>(undefined);
+  // Il conteggio e' per-run: al cambio run l'high-water riparte da zero (le
+  // notifiche del run precedente non sono piu' pertinenti).
+  useEffect(() => {
+    if (seenRunRef.current !== runId) {
+      seenRunRef.current = runId;
+      setSeen(0);
+    }
+  }, [runId]);
+  // Aprendo il pannello tutte le voci correnti diventano "lette"; se ne arrivano
+  // altre mentre e' aperto, restano lette in tempo reale (le stai guardando).
+  useEffect(() => {
+    if (open) setSeen(monotoneCount);
+  }, [open, monotoneCount]);
+  const unread = Math.max(0, monotoneCount - seen);
   const panelRef = useRef<HTMLDivElement>(null);
   const bellRef = useRef<HTMLButtonElement>(null);
   // Traccia se abbiamo gia' auto-aperto per l'attuale ondata di blocco, cosi'
@@ -127,10 +154,35 @@ export function RunNotifications({
     [stream],
   );
 
+  // Risale ai pareri strutturati di una notifica Consiglio/multi-provider (via il
+  // riferimento posizionale) per l'espansione: riusa il renderer FigureReportRow
+  // (regola L) invece di ricomporre i pareri. `titleByProvider` distingue il
+  // panel multi-provider (righe per provider) dal consiglio (righe per figura).
+  const reportsFor = useCallback(
+    (
+      n: RunNotification,
+    ): { reports: FigureAdvisoryReport[]; titleByProvider: boolean } | undefined => {
+      if (!n.source || n.source.evIndex == null) return undefined;
+      const ev = stream.segments[n.source.segIndex]?.events[n.source.evIndex];
+      if (!ev) return undefined;
+      if (ev.type === "council_of_competencies" && ev.figureReports && ev.figureReports.length > 0) {
+        return { reports: ev.figureReports, titleByProvider: false };
+      }
+      if (ev.type === "multi_provider_panel" && ev.providerReports && ev.providerReports.length > 0) {
+        return { reports: ev.providerReports, titleByProvider: true };
+      }
+      return undefined;
+    },
+    [stream],
+  );
+
   if (notifications.length === 0) return null;
 
   const count = notifications.length;
-  const badgeColor = blocking ? "#8b5cf6" : notifications[0]?.color ?? tc.error;
+  // Segnale "nuove" (P8): se ci sono voci non lette la campanella vira
+  // sull'accent, senza rubare il focus (l'auto-apertura resta ai soli blocchi).
+  const bellHighlight = blocking ? "#8b5cf6" : unread > 0 ? tc.accent : undefined;
+  const badgeColor = bellHighlight ?? notifications[0]?.color ?? tc.error;
 
   const monoBoxStyle: React.CSSProperties = {
     fontFamily: "var(--font-mono)",
@@ -162,16 +214,16 @@ export function RunNotifications({
         type="button"
         onClick={() => setOpen((v) => !v)}
         title="Centro notifiche del run"
-        aria-label={`Notifiche del run (${count})`}
+        aria-label={`Notifiche del run (${count}${unread > 0 ? `, ${unread} nuove` : ""})`}
         aria-expanded={open}
         style={{
           position: "relative",
           width: 28,
           height: 28,
           borderRadius: 8,
-          border: `1px solid ${blocking ? "#8b5cf6" : tc.border}`,
-          background: blocking ? "#8b5cf611" : tc.bgCard,
-          color: blocking ? "#8b5cf6" : tc.textSecondary,
+          border: `1px solid ${bellHighlight ?? tc.border}`,
+          background: blocking ? "#8b5cf611" : unread > 0 ? withAlpha(tc.accent, 0.08) : tc.bgCard,
+          color: bellHighlight ?? tc.textSecondary,
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
@@ -274,8 +326,14 @@ export function RunNotifications({
             // conosciamo il run: le voci di stato senza riga restano statiche.
             const clickable = !!runId && !!n.anchorId;
             const toolEv = toolEventFor(n);
-            const hasBody = !!toolEv && (!!toolEv.input || !!toolEv.result);
-            const filePath = filePathFromToolInput(toolEv?.input) ?? toolEv?.target;
+            const reports = reportsFor(n);
+            const hasBody =
+              (!!toolEv && (!!toolEv.input || !!toolEv.result)) ||
+              (!!reports && reports.reports.length > 0);
+            const filePath =
+              n.kind === "tool_error"
+                ? filePathFromToolInput(toolEv?.input) ?? toolEv?.target
+                : undefined;
             const isExpanded = expanded.has(i);
 
             const activate = () => {
@@ -377,8 +435,9 @@ export function RunNotifications({
                   </div>
                 </div>
 
-                {/* Controlli del passo fallito: espansione dettagli + apri file. */}
-                {n.kind === "tool_error" && (hasBody || filePath) && (
+                {/* Controlli: espansione dettagli (passo fallito o pareri
+                    Consiglio/panel) + apri file del passo fallito. */}
+                {(hasBody || filePath) && (
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                     {hasBody && (
                       <button
@@ -406,7 +465,7 @@ export function RunNotifications({
                   </div>
                 )}
 
-                {n.kind === "tool_error" && isExpanded && toolEv && (
+                {isExpanded && toolEv && (toolEv.input || toolEv.result) && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                     {toolEv.input && (
                       <div style={monoBoxStyle}>{formatStepInput(toolEv.input)}</div>
@@ -417,6 +476,29 @@ export function RunNotifications({
                       </div>
                     )}
                   </div>
+                )}
+
+                {isExpanded && reports && (
+                  <ul
+                    style={{
+                      margin: 0,
+                      padding: "0 0 0 2px",
+                      listStyle: "none",
+                      maxHeight: 200,
+                      overflowY: "auto",
+                      fontSize: 11,
+                      color: tc.textSecondary,
+                    }}
+                  >
+                    {reports.reports.map((r, ri) => (
+                      <FigureReportRow
+                        key={`${r.kind}-${ri}`}
+                        report={r}
+                        tc={tc}
+                        titleByProvider={reports.titleByProvider}
+                      />
+                    ))}
+                  </ul>
                 )}
               </div>
             );

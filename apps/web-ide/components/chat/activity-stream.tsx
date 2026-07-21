@@ -1000,8 +1000,10 @@ function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeCol
 }
 
 /** Riga espandibile per il parere di UNA figura del consiglio. Il testo completo
- *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione. */
-function FigureReportRow({
+ *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione.
+ *  Esportata (regola L): il centro notifiche del run la RIUSA per mostrare i
+ *  pareri di Consiglio/multi-provider, invece di ricomporli. */
+export function FigureReportRow({
   report,
   tc,
   titleByProvider = false,
