@@ -22,7 +22,9 @@ use nexus_events::event::ProjectEvent;
 use uuid::Uuid;
 
 use crate::agent_types::SupervisorMode;
-use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams, SpawnOutcome};
+use crate::chat_messages::{
+    insert_message, session_has_active_run, spawn_agent_run, SpawnAgentParams, SpawnOutcome,
+};
 use crate::AppState;
 
 /// Riga di violazione aperta (subset di service_diagnoses).
@@ -299,6 +301,21 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         );
         return;
     };
+
+    // Un run e' GIA' attivo sulla sessione (tipico: la creazione dell'app che sta
+    // SCRIVENDO il codice con una porta hardcoded -> apre la violazione): NON
+    // spawnare la riparazione, la supererebbe via supersede (last-wins) uccidendo
+    // il run in corso mentre progrediva (incidente ricreazione vendita-immobile:
+    // il run di creazione cancellato da `superseded_by_new_run` a meta' lavoro).
+    // Gemello del guard di process_resume:377 e service_observer_remediation:151;
+    // qui MANCAVA. La violazione resta aperta e la riparazione ritenta a sessione
+    // libera. proj_pool: agent_runs e' tabella per-progetto (separazione DB).
+    if session_has_active_run(&proj_pool, session).await {
+        tracing::debug!(
+            "resource_remediation: run gia' attivo sulla sessione {session}, riparazione rimandata a sessione libera"
+        );
+        return;
+    }
 
     // Template fuori-chat (regola D) + contesto porte.
     let template = crate::prompt_templates::get_template_or_default(
