@@ -513,8 +513,7 @@ pub async fn extract_triples_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<E
         let (provider, model) = state
             .ai
             .resolve_purpose_model_excluding("wiki_triple_extract", &exclude_providers)
-            .await
-            .map_err(|m| anyhow!(m))?;
+            .await?;
 
         tracing::info!(
             doc_id = %doc.id,

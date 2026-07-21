@@ -28,6 +28,7 @@
 
 use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
+use nexus_types::purpose::PurposeUnresolved;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
@@ -292,8 +293,10 @@ async fn scan_and_enrich(state: &WikiDeps, settings: &CodeDocsEnricherSettings) 
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(doc_id = %doc_id, error = %e, "wiki.code_docs: arricchimento fallito");
-                // Purpose non configurato -> inutile insistere su tutto il batch.
-                if e.to_string().contains("purpose non configurato") {
+                // Purpose non risolvibile (non configurato, tier senza modelli,
+                // matrix giu'): condizione globale -> inutile insistere sul
+                // batch. Decisione sul TIPO lungo la catena anyhow (regola M).
+                if PurposeUnresolved::in_chain(&e) {
                     break;
                 }
             }
@@ -343,12 +346,9 @@ async fn enrich_code_doc(
     }
 
     // Risolve provider+model dal PUNTO UNICO (regola L): routing tier-only.
-    // I messaggi diagnostici (tier mancante, purpose non configurato, matrix
-    // non disponibile) arrivano dall'impl WikiAiServices in mcp-core.
-    let (provider, model) = match state.ai.resolve_purpose_model(PURPOSE).await {
-        Ok(pm) => pm,
-        Err(e) => anyhow::bail!("{e}"),
-    };
+    // L'errore resta tipizzato (PurposeUnresolved) lungo la catena anyhow,
+    // cosi' il chiamante decide sulla variante e non sul testo (regola M).
+    let (provider, model) = state.ai.resolve_purpose_model(PURPOSE).await?;
 
     let snippet: String = content.chars().take(settings.max_source_chars).collect();
     let prompt = build_prompt(relative_path, &snippet);

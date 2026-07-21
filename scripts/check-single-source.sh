@@ -421,6 +421,16 @@ if [[ -z "${dup:-}" ]]; then
   echo "OK migrazioni-numero-unico: nessun numero di migrazione duplicato"
 fi
 
+# ── purpose-esito-tipizzato (2026-07-20) ─────────────────────────────────────
+# Regola M: l'esito della risoluzione purpose→modello si decide sul TIPO
+# (nexus_types::purpose::PurposeUnresolved, downcast/match sulla variante),
+# mai col parsing del testo del messaggio. Due incidenti reali:
+# learned_instructions interrompeva il batch su contains("purpose") (falsi
+# positivi su qualunque errore che citasse la parola) e code_docs_enricher
+# cercava "purpose non configurato", sottostringa MAI prodotta dal punto unico
+# (il messaggio reale ha il nome del purpose in mezzo): break morto in silenzio.
+assert_single "purpose classificato dal testo" '\.contains\("purpose' 'crates/nexus-types/src/purpose.rs' crates
+
 # ── migrazioni-search-path ───────────────────────────────────────────────────
 # sqlx esegue la migrazione e l'INSERT di registrazione in _sqlx_migrations
 # nella STESSA transazione: una migrazione che manipola il search_path (residuo

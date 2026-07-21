@@ -212,27 +212,40 @@ pub struct PurposeProviderCandidate {
     pub tier: Option<String>,
 }
 
+/// Errore TIPIZZATO della risoluzione (regola M). Vive in `nexus-types` cosi'
+/// che anche i crate a valle dei port (es. `nexus-wiki`) decidano sulla
+/// variante — mai sul testo. Re-export per i call site interni.
+pub use nexus_types::purpose::PurposeUnresolved;
+
 impl PurposeResolution {
-    /// Riduce l'esito a `(provider, model)` oppure a un messaggio d'errore
-    /// leggibile (tier-only: nessun fallback). Helper per i call site che vogliono
-    /// solo il modello risolto e mappano l'errore nel proprio tipo. Evita di
-    /// duplicare il match a 4 rami in ogni chiamante (regola L).
-    pub fn into_model(self, purpose: &str) -> Result<(String, String), String> {
+    /// Riduce l'esito a `(provider, model)` oppure all'errore tipizzato
+    /// [`PurposeUnresolved`]. E' il punto unico del match a 4 rami (regola L):
+    /// i call site che devono solo mostrare il messaggio usano [`into_model`],
+    /// quelli che devono decidere sulla classe dell'esito usano questo.
+    pub fn try_model(self, purpose: &str) -> Result<(String, String), PurposeUnresolved> {
         match self {
             PurposeResolution::Resolved {
                 provider, model, ..
             } => Ok((provider, model)),
-            PurposeResolution::NoCapableModel { tier } => Err(format!(
-                "nessun modello del tier '{tier}' disponibile per purpose '{purpose}' \
-                 (capability mancante o provider in cooldown)"
-            )),
-            PurposeResolution::NotFound => Err(format!(
-                "purpose '{purpose}' non configurato o privo di tier in nexus_purpose_model"
-            )),
-            PurposeResolution::MatrixUnavailable(e) => {
-                Err(format!("routing non disponibile per '{purpose}': {e}"))
-            }
+            PurposeResolution::NoCapableModel { tier } => Err(PurposeUnresolved::NoCapableModel {
+                purpose: purpose.to_string(),
+                tier,
+            }),
+            PurposeResolution::NotFound => Err(PurposeUnresolved::NotFound {
+                purpose: purpose.to_string(),
+            }),
+            PurposeResolution::MatrixUnavailable(e) => Err(PurposeUnresolved::MatrixUnavailable {
+                purpose: purpose.to_string(),
+                message: e,
+            }),
         }
+    }
+
+    /// Come [`try_model`] ma appiattito a messaggio leggibile, per i call site
+    /// che mappano l'errore nel proprio tipo solo per display/log (regola M:
+    /// il testo umano non decide niente).
+    pub fn into_model(self, purpose: &str) -> Result<(String, String), String> {
+        self.try_model(purpose).map_err(|e| e.to_string())
     }
 }
 
@@ -1294,5 +1307,64 @@ mod tests {
         assert_eq!(purpose_floor(&pool, "medium").await, "medium");
         assert_eq!(purpose_floor(&pool, "heavy").await, "medium");
         assert_eq!(purpose_floor(&pool, "frontier").await, "medium");
+    }
+
+    #[test]
+    fn try_model_mappa_ogni_esito_nella_variante_tipizzata() {
+        let ok = PurposeResolution::Resolved {
+            provider: "p".into(),
+            model: "m".into(),
+            rationale: "tier".into(),
+        }
+        .try_model("x");
+        assert_eq!(ok.unwrap(), ("p".into(), "m".into()));
+
+        assert!(matches!(
+            PurposeResolution::NotFound.try_model("x"),
+            Err(PurposeUnresolved::NotFound { .. })
+        ));
+        assert!(matches!(
+            PurposeResolution::NoCapableModel { tier: "light".into() }.try_model("x"),
+            Err(PurposeUnresolved::NoCapableModel { .. })
+        ));
+        assert!(matches!(
+            PurposeResolution::MatrixUnavailable("db down".into()).try_model("x"),
+            Err(PurposeUnresolved::MatrixUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn try_model_resta_decidibile_lungo_la_catena_anyhow() {
+        // Stessa strada dei call site (es. learned_instructions::distill_project):
+        // try_model + `?` (From::from) dentro un Result anyhow. Il punto di
+        // decisione a valle riconosce la variante col downcast (regola M).
+        let e: anyhow::Error = PurposeResolution::NotFound
+            .try_model("learned_instructions_distill")
+            .map_err(anyhow::Error::from)
+            .unwrap_err();
+        assert!(PurposeUnresolved::in_chain(&e));
+    }
+
+    #[test]
+    fn into_model_conserva_i_messaggi_storici() {
+        // into_model delega a try_model (regola L): i call site che mostrano il
+        // messaggio non devono vedere cambiare l'output.
+        assert_eq!(
+            PurposeResolution::NotFound.into_model("doc_gen").unwrap_err(),
+            "purpose 'doc_gen' non configurato o privo di tier in nexus_purpose_model"
+        );
+        assert_eq!(
+            PurposeResolution::NoCapableModel { tier: "light".into() }
+                .into_model("doc_gen")
+                .unwrap_err(),
+            "nessun modello del tier 'light' disponibile per purpose 'doc_gen' \
+             (capability mancante o provider in cooldown)"
+        );
+        assert_eq!(
+            PurposeResolution::MatrixUnavailable("db down".into())
+                .into_model("doc_gen")
+                .unwrap_err(),
+            "routing non disponibile per 'doc_gen': db down"
+        );
     }
 }
