@@ -2491,6 +2491,60 @@ async fn final_gate_nonconvergence_promuove_e_consuma_flag() {
 }
 
 #[tokio::test]
+async fn escalation_nonconvergenza_payload_porta_from_model() {
+    // REGRESSIONE (card "Mistral / ?"): il ramo di escalation per non-convergenza
+    // del final_gate (maybe_escalate_nonconvergence) era il 4o emettitore di card
+    // "CAMBIO PROVIDER" che bypassava il punto unico switch_payload OMETTENDO
+    // from_provider/from_model -> il pill "Da" degradava a "?" (il frontend ripiega
+    // su prev.model, assente sul 1o segmento). Payload dal PRODUTTORE reale (regola
+    // O): il test attraversa n.run, NON costruisce il payload a mano. Coppia
+    // corrente = scenario utente (mistral/mistral-small-latest).
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::with_chain_tier(
+        &["claude-piu-capace"],
+        "heavy",
+    ));
+    let (n, meta, _s) = node_esc(cfg_resolved(), rc, esc);
+    let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
+    let ctx = ctx_with(llm.clone(), false);
+    let mut extra = serde_json::Map::new();
+    extra.insert(crate::nodes::FINAL_GATE_ESCALATION_KEY.into(), json!(true));
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("crea x")],
+        stop_reason: Some(StopReason::ToolUse),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        // Coppia corrente NOTA: cio' che DEVE finire in from_provider/from_model.
+        provider_used: Some("mistral".into()),
+        model_used: Some("mistral-small-latest".into()),
+        extra,
+        ..Default::default()
+    };
+    let _ = n.run(&state, &ctx).await.expect("run");
+
+    let steps = meta.meta_steps.lock().unwrap();
+    let switch = steps
+        .iter()
+        .find(|m| {
+            m.get("payload")
+                .and_then(|p| p.get("reason"))
+                .and_then(Value::as_str)
+                == Some("final_gate_nonconvergence")
+        })
+        .expect("meta-step final_gate_nonconvergence emesso");
+    let payload = switch.get("payload").expect("payload presente");
+    assert_eq!(
+        payload.get("from_model").and_then(Value::as_str),
+        Some("mistral-small-latest"),
+        "il modello corrente deve viaggiare nel payload -> niente pill '?': {payload}"
+    );
+    assert_eq!(
+        payload.get("from_provider").and_then(Value::as_str),
+        Some("mistral")
+    );
+}
+
+#[tokio::test]
 async fn final_gate_nonconvergence_senza_candidato_chiude() {
     // Flag presente ma catena escalation VUOTA (porta default): maybe_escalate
     // ritorna None -> chiusura FailedDiagnosed via il PUNTO UNICO close_runaway

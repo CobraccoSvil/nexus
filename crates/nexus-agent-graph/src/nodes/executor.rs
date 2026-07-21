@@ -5500,11 +5500,10 @@ una tool call, non descrivere.",
                 "Passo a {}/{} (non-convergenza sul budget del turno)",
                 pick.provider, pick.model
             ),
-            json!({
-                "to_provider": pick.provider,
-                "to_model": pick.model,
-                "reason": reason,
-            }),
+            // Punto unico del payload switch (regola L): senza from_provider/from_model
+            // la card "CAMBIO PROVIDER" mostrava "Da: <provider> / ?". La coppia
+            // corrente e' gia' in scope da escalation_current_pair (:5464).
+            stall_switch_payload(&cur_provider, &cur_model, &pick.provider, &pick.model, reason),
         )
         .await;
         let esc_nudge = human_msg(
@@ -5724,11 +5723,9 @@ azioni concrete e mirate verso il completamento.",
                     mode,
                     "escalation",
                     format!("Passo a {}/{} (meta-reasoner)", pick.provider, pick.model),
-                    json!({
-                        "to_provider": pick.provider,
-                        "to_model": pick.model,
-                        "reason": "stall_recovery",
-                    }),
+                    // Punto unico del payload switch (regola L): come sopra, from_* dalla
+                    // coppia corrente (:5700) per non mostrare "Da: <provider> / ?".
+                    stall_switch_payload(&cur_provider, &cur_model, &pick.provider, &pick.model, "stall_recovery"),
                 )
                 .await;
                 let esc_nudge = human_msg(
