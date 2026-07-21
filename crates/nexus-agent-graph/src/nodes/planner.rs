@@ -1856,6 +1856,8 @@ mod tests {
             depends_on: vec![],
             seq: Some(seq),
             write_scope: Vec::new(),
+            content: None,
+            priority: None,
         }
     }
 
