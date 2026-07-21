@@ -249,6 +249,46 @@ impl PurposeResolution {
     }
 }
 
+/// Nome canonico (regola N) del purpose dei run di rimedio automatico
+/// (service_observer_remediation, resource_violation_remediation). Mig 0626.
+pub const PURPOSE_AUTO_REMEDIATION: &str = "auto_remediation";
+
+/// Riduce un esito di risoluzione a una coppia di override `(provider, model)`
+/// per un run agentico. PUNTO UNICO (regola L) del match usato dai siti di
+/// remediation; regola M: la decisione e' sulla VARIANTE tipizzata (`try_model`
+/// -> `PurposeUnresolved`), il testo serve solo al log. Su qualunque fallimento
+/// -> `(None, None)`: il chiamante procede col routing di default (regola G:
+/// niente fallback hardcoded; il rimedio non si blocca). INVARIANTE: mai lo
+/// stato misto `(Some, None)` — lo slot-routing di spawn_agent_run e' attivo
+/// solo con ENTRAMBI None, e un ibrido lo disabiliterebbe lasciando l'altro
+/// campo al routing.
+pub(crate) fn reduce_purpose_to_override(
+    res: PurposeResolution,
+    purpose: &str,
+) -> (Option<String>, Option<String>) {
+    match res.try_model(purpose) {
+        Ok((provider, model)) => (Some(provider), Some(model)),
+        Err(unresolved) => {
+            tracing::warn!(
+                purpose = %purpose,
+                motivo = %unresolved,
+                "purpose non risolvibile: il rimedio procede col routing di default"
+            );
+            (None, None)
+        }
+    }
+}
+
+/// Override `(provider, model)` per un run agentico dal purpose tier-aware,
+/// degradando al routing di default se non risolvibile. Entry di produzione
+/// dei siti di remediation che dispongono di `AppState`.
+pub async fn purpose_override_or_default(
+    state: &AppState,
+    purpose: &str,
+) -> (Option<String>, Option<String>) {
+    reduce_purpose_to_override(resolve_purpose_model(state, purpose).await, purpose)
+}
+
 /// CORE decisionale (PUNTO UNICO, regola L) della risoluzione purpose→modello.
 /// TIER-ONLY: il modello e' scelto ESCLUSIVAMENTE dal routing per tier
 /// (`best_model_for_tier`: miglior modello del catalog per tier+capability,
@@ -1366,5 +1406,100 @@ mod tests {
                 .unwrap_err(),
             "routing non disponibile per 'doc_gen': db down"
         );
+    }
+
+    // ── reduce_purpose_to_override: override dei run di rimedio (mig 0626) ──
+    //
+    // Regola O: i test attraversano il PRODUTTORE reale della risoluzione
+    // (resolve_purpose_model_db -> resolve_purpose_core -> select_model, lo
+    // STESSO core dell'adapter AppState usato in produzione; il delta non
+    // coperto e' il solo adapter cache di 2 righe) composto col MEDESIMO
+    // reducer dei call site. La CONSEGUENZA asserita e' la coppia Some/Some
+    // (che disabilita lo slot-routing) o None/None (routing di default), mai
+    // la stringa del modello.
+
+    async fn crea_tabella_purpose(pool: &sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("nexus_purpose_model");
+    }
+
+    #[sqlx::test]
+    async fn auto_remediation_risolto_valorizza_entrambi_gli_override(pool: sqlx::PgPool) {
+        crea_tabella_purpose(&pool).await;
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'heavy', NULL, true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+              performance_tier, input_cost_per_million_tokens) \
+             VALUES ('deepseek', 'ds-heavy', true, true, 'none', 'heavy', 0.5)",
+        )
+        .execute(&pool)
+        .await
+        .expect("catalog");
+        let (p, m) = reduce_purpose_to_override(
+            resolve_purpose_model_db(&pool, PURPOSE_AUTO_REMEDIATION).await,
+            PURPOSE_AUTO_REMEDIATION,
+        );
+        // Mutazione che rende rosso: reducer che ritorna (Some, None) o
+        // (None, None) su Resolved -> override monco/assente, slot-routing
+        // riattivato a meta' (lo stato ibrido che l'invariante vieta).
+        assert!(
+            p.is_some() && m.is_some(),
+            "override valorizzato su ENTRAMBI i campi: p={p:?} m={m:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn auto_remediation_senza_tier_degrada_al_routing_di_default(pool: sqlx::PgPool) {
+        crea_tabella_purpose(&pool).await;
+        // Purpose presente ma tier NULL -> NotFound (tier-only). Il rimedio NON
+        // si blocca: (None, None) = routing di default, comportamento odierno.
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', NULL, NULL, true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        let (p, m) = reduce_purpose_to_override(
+            resolve_purpose_model_db(&pool, PURPOSE_AUTO_REMEDIATION).await,
+            PURPOSE_AUTO_REMEDIATION,
+        );
+        assert_eq!((p, m), (None, None), "NotFound -> degrado onesto");
+    }
+
+    #[sqlx::test]
+    async fn auto_remediation_catalog_vuoto_degrada_al_routing_di_default(pool: sqlx::PgPool) {
+        crea_tabella_purpose(&pool).await;
+        // Tier valorizzato ma NESSUN modello capace nel catalog -> NoCapableModel
+        // -> (None, None). Stessa strada del produttore, ramo diverso.
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('auto_remediation', 'heavy', NULL, true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        let (p, m) = reduce_purpose_to_override(
+            resolve_purpose_model_db(&pool, PURPOSE_AUTO_REMEDIATION).await,
+            PURPOSE_AUTO_REMEDIATION,
+        );
+        assert_eq!((p, m), (None, None), "NoCapableModel -> degrado onesto");
     }
 }

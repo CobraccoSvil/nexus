@@ -349,6 +349,15 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     )
     .await;
 
+    // Modello del rimedio dal purpose tier-aware 'auto_remediation' (mig 0626,
+    // regola G): vedi service_observer_remediation, stesso punto unico.
+    // Se non risolvibile -> (None, None): routing di default, rimedio mai bloccato.
+    let (provider_override, model_override) = crate::internal_routing::purpose_override_or_default(
+        state,
+        crate::internal_routing::PURPOSE_AUTO_REMEDIATION,
+    )
+    .await;
+
     let params = SpawnAgentParams {
         user_id: owner,
         session_id: session,
@@ -362,8 +371,8 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
-        provider_override: None,
-        model_override: None,
+        provider_override,
+        model_override,
         profile_provider: None,
         profile_model: None,
         attachments: Vec::new(),

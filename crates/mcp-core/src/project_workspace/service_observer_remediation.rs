@@ -189,6 +189,16 @@ pub(crate) async fn maybe_trigger_debugger(
     )
     .await;
 
+    // Modello del rimedio dal purpose tier-aware 'auto_remediation' (mig 0626,
+    // regola G): un run di debug affidato al default piccolo del routing
+    // fallisce e brucia i tentativi. Se il purpose non e' risolvibile ->
+    // (None, None): decide il routing di default, il rimedio non si blocca.
+    let (provider_override, model_override) = crate::internal_routing::purpose_override_or_default(
+        state,
+        crate::internal_routing::PURPOSE_AUTO_REMEDIATION,
+    )
+    .await;
+
     let params = SpawnAgentParams {
         user_id: owner,
         session_id: session,
@@ -204,8 +214,8 @@ pub(crate) async fn maybe_trigger_debugger(
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
-        provider_override: None,
-        model_override: None,
+        provider_override,
+        model_override,
         profile_provider: None,
         profile_model: None,
         attachments: Vec::new(),
