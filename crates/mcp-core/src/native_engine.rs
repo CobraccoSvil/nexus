@@ -277,6 +277,14 @@ pub struct NativeRunInput {
     pub sizing_complexity:
         Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
     pub sizing_scope_system_wide: bool,
+    /// Intent del CLASSIFIER del turno (mcp-core `intent_classifier`), propagato
+    /// nello stato come `user_intent` cosi' il RouterNode del grafo lo USA invece
+    /// del fallback stub `agentic_default` (la classificazione LLM del grafo non
+    /// e' ancora portata). `None` nei percorsi senza classifier (sub-run, resume)
+    /// -> il router applica il neutro (comportamento invariato). Sblocca
+    /// `is_eligible` (intent reale in `plan_intents`, es. `scaffold_app`) e da' al
+    /// gate d'orchestrazione un segnale d'intento vero, non il catch-all.
+    pub classifier_intent: Option<String>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
@@ -2614,7 +2622,16 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
             // user_intent: l'intent del primario se noto (intent_hint), altrimenti
             // None (l'intent vive nel routing, non e' richiesto dal grafo per
             // action_oriented).
-            (intent_hint.map(str::to_string), Some(action_oriented))
+            // user_intent = intent del classifier del turno (propagato dal call
+            // site) cosi' il RouterNode lo preserva invece del neutro; fallback
+            // all'intent_hint (disambiguazione risolta) se il classifier manca.
+            (
+                input
+                    .classifier_intent
+                    .clone()
+                    .or_else(|| intent_hint.map(str::to_string)),
+                Some(action_oriented),
+            )
         } else if role.is_shadow() {
             // Fallback grossolano SOLO shadow (classifier non disponibile): deriva
             // dall'intent_hint con la mappa deterministica. Quando manca anche
@@ -3526,6 +3543,7 @@ mod tests {
             subagent_depth: None,
             sizing_complexity: None,
             sizing_scope_system_wide: false,
+            classifier_intent: None,
             run_time_budget_s: None,
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,

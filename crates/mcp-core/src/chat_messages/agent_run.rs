@@ -3061,6 +3061,7 @@ pub(crate) async fn spawn_agent_run(
                     subagent_depth: None,
                     sizing_complexity,
                     sizing_scope_system_wide,
+                    classifier_intent: Some(classified_intent_for_loop.to_string()),
                     run_time_budget_s: None,
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
@@ -4081,6 +4082,7 @@ pub(crate) async fn confirm_native_run(
         subagent_depth: None,
         sizing_complexity: None,
         sizing_scope_system_wide: false,
+        classifier_intent: None,
         run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
@@ -4472,6 +4474,7 @@ pub(crate) async fn resume_fanin(
         subagent_depth: None,
         sizing_complexity: None,
         sizing_scope_system_wide: false,
+        classifier_intent: None,
         run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
