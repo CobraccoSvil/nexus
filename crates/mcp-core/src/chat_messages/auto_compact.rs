@@ -26,7 +26,20 @@ pub(crate) async fn maybe_auto_compact(
 
     // chat_messages e' migrata al DB per-progetto: risolvi il pool una volta e
     // usalo per le query su chat_messages (le metriche di compattazione).
-    let chat_pool = crate::project_db_routes::project_data_pool(state, project_id).await;
+    // Best-effort (contratto della funzione): DB progetto non disponibile ->
+    // WARN e si rimanda il compact, il turno prosegue.
+    let chat_pool = match crate::project_db_routes::project_data_pool(state, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                project_id = %project_id,
+                error = %e,
+                "auto-compact: DB progetto non disponibile, salto il giro"
+            );
+            return;
+        }
+    };
 
     // Conteggio messaggi user/assistant compattabili: evita il compact su
     // sessioni troppo corte (sarebbe un no-op).

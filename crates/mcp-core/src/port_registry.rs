@@ -507,9 +507,20 @@ async fn windows_service_unit_still_exists(db: &PgPool, project_id: Uuid, unit: 
         Err(_) => return true,    // META transitorio: preserva la riserva
     };
     let slug = crate::project_workspace::services::project_service_slug(&name);
-    // agent_processes e' tabella migrata: instrada sul pool del progetto (flag OFF
-    // -> meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // agent_processes e' tabella migrata: instrada sul pool del progetto. Pool
+    // PROGETTO non disponibile = transitorio: fail-closed, preserva la riserva
+    // (stessa postura del ramo Err della query sotto).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "windows_service_unit_still_exists: DB progetto non disponibile, preservo la riserva"
+            );
+            return true;
+        }
+    };
     match sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT label FROM agent_processes WHERE project_id = $1 AND kind = 'service'",
     )

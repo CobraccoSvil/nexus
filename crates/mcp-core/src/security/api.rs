@@ -137,8 +137,10 @@ pub async fn get_project_quota(
             .unwrap_or(0);
 
     // Routing separazione DB: agent_processes e' una tabella migrata, instradata
-    // sul pool del progetto (a flag OFF/non risolvibile ricade sul meta-DB).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // sul pool del progetto; DB non disponibile -> errore tipizzato al client
+    // (503/404 via From<ProjectDbError>, niente fallback al meta-DB).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let containers_used: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_processes \
          WHERE project_id = $1 AND status IN ('running', 'starting') AND sandboxed = true",

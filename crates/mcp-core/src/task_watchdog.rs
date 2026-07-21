@@ -578,9 +578,9 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         );
     }
 
-    // Agent processes bloccati. Separazione DB: agent_processes vive nel DB del
-    // progetto a flag ON -> iteriamo i progetti e marchiamo sul pool di ciascuno
-    // (a flag OFF tutti i pool sono il meta).
+    // Agent processes bloccati. Separazione DB (sempre attiva, mig 0527):
+    // agent_processes vive nel DB del progetto -> iteriamo i progetti e marchiamo
+    // sul pool di ciascuno; un progetto col DB non disponibile viene saltato.
     //
     // Distinzione per `kind` (fix definitivo, regola H):
     //  - `kind <> 'service'`: processi one-shot (build/comando). Un blocco oltre
@@ -593,7 +593,13 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     //    degli agent_runs qui sotto (updated_at), non l'eta' assoluta.
     let mut stale_processes: Vec<uuid::Uuid> = Vec::new();
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "task_watchdog: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
 
         // (a) One-shot bloccati: reap per eta' assoluta.
         let mut ids = sqlx::query_scalar::<_, uuid::Uuid>(

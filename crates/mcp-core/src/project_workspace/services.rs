@@ -423,8 +423,19 @@ pub(super) async fn list_services_windows(
     slug: &str,
 ) -> Vec<serde_json::Value> {
     // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
-    // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // sul pool del progetto. DB progetto non disponibile -> lista vuota con WARN
+    // (display best-effort; niente fallback al meta: li' la tabella e' vuota).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "list_services_windows: DB progetto non disponibile, elenco servizi vuoto"
+            );
+            return Vec::new();
+        }
+    };
     let rows: Vec<(
         String,
         String,
@@ -848,9 +859,11 @@ async fn control_project_service_windows(
         .to_string();
 
     // Separazione DB per-progetto: agent_processes e' migrata, instrada le query
-    // di questo handler sul pool del progetto (flag OFF -> meta-pool). Risolto una
-    // volta sola e riusato dalle 3 query sotto (stesso project_id).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // di questo handler sul pool del progetto (errore tipizzato 503/404 se non
+    // disponibile). Risolto una volta sola e riusato dalle 3 query sotto (stesso
+    // project_id).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     // STOP esplicito: taskkill dei soli processi running di QUESTA label (lo
     // stop richiesto dall'utente non deve toccare gli altri servizi). Per
@@ -1344,8 +1357,10 @@ pub async fn cleanup_project_ports(
     {
         // Windows: pid vivi dei servizi del progetto (agent_processes) + tutti i
         // discendenti risalendo l'albero processi Win32 (windows_process_parents).
+        // DB progetto non disponibile -> propaga (503): con protected_pids vuoto
+        // il reset ucciderebbe i servizi legittimi del progetto.
         let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
         let svc_pids: Vec<(Option<i32>,)> = sqlx::query_as(
             "SELECT pid FROM agent_processes \
              WHERE project_id = $1 AND kind = 'service' \
@@ -1712,10 +1727,13 @@ pub(super) async fn detect_project_ports(
     // 1. PID dai processi agent — include sia 'running' che altri status purché il processo sia ancora vivo.
     // Lo status nel DB può essere 'failed' dopo un riavvio di mcp-core anche se il processo gira ancora.
     // Separazione DB per-progetto: agent_processes e' migrata, instrada sul pool
-    // del progetto (flag OFF -> meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // del progetto. DB progetto non disponibile -> WARN e nessun PID da
+    // agent_processes (restano le fonti systemd/cwd, che non passano dal DB).
     let agent_pids: Vec<i32> =
-        sqlx::query("SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL")
+        match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(proj_pool) => sqlx::query(
+                "SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL",
+            )
             .bind(project_id)
             .fetch_all(&proj_pool)
             .await
@@ -1724,7 +1742,16 @@ pub(super) async fn detect_project_ports(
             .filter_map(|row| row.try_get::<i32, _>("pid").ok())
             // Verifica che il processo sia ancora vivo (punto unico cross-platform).
             .filter(|pid| crate::process_util::process_alive(*pid as u32))
-            .collect();
+            .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "detect_project_ports: DB progetto non disponibile, salto agent_processes"
+                );
+                Vec::new()
+            }
+        };
 
     // 2a. MainPID dei servizi systemd --user `{slug}-*.service` + mappa pid→short_name
     let (systemd_pids, mut pid_to_service) = systemd_main_pids_by_service(slug).await;
@@ -1884,7 +1911,18 @@ async fn detect_project_ports_windows(
     use std::collections::{HashMap, HashSet};
 
     // 1. pid dei servizi vivi del progetto (agent_processes migrata -> pool progetto).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    //    DB progetto non disponibile -> nessuna porta rilevabile (WARN, best-effort).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "detect_project_ports_windows: DB progetto non disponibile, nessuna porta rilevata"
+            );
+            return Vec::new();
+        }
+    };
     let svc_rows: Vec<(Option<i32>, String)> = sqlx::query_as(
         "SELECT pid, label FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' \
@@ -2862,22 +2900,35 @@ pub async fn delete_port_allocation(
                 // su Windows -> la "x" del pannello non liberava la porta.
                 crate::process_util::kill_pid(pid).await;
                 killed_pid = Some(pid);
-                // Marca agent_processes come stopped (riconciliazione).
+                // Marca agent_processes come stopped (riconciliazione best-effort:
+                // il kill e' gia' avvenuto, un DB progetto non disponibile degrada
+                // con WARN senza far fallire la richiesta).
                 // Separazione DB per-progetto: agent_processes e' migrata, instrada
-                // sul pool del progetto (flag OFF -> meta-pool, behavior-preserving).
-                let proj_pool =
-                    crate::project_db_routes::project_data_pool_from(&state.db, _project_id).await;
-                let upd = sqlx::query(
-                    "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
-                     WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
-                )
-                .bind(pid as i32)
-                .bind(_project_id)
-                .execute(&proj_pool)
-                .await
-                .map(|r| r.rows_affected())
-                .unwrap_or(0);
-                marked_stopped = upd > 0;
+                // sul pool del progetto.
+                match crate::project_db_routes::project_data_pool_from(&state.db, _project_id)
+                    .await
+                {
+                    Ok(proj_pool) => {
+                        let upd = sqlx::query(
+                            "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
+                             WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
+                        )
+                        .bind(pid as i32)
+                        .bind(_project_id)
+                        .execute(&proj_pool)
+                        .await
+                        .map(|r| r.rows_affected())
+                        .unwrap_or(0);
+                        marked_stopped = upd > 0;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            project_id = %_project_id,
+                            error = %e,
+                            "delete_port_allocation: DB progetto non disponibile, salto la riconciliazione agent_processes"
+                        );
+                    }
+                }
             }
         }
     }
@@ -2947,7 +2998,17 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
     //    irraggiungibile degrada con WARN senza azzerare gli altri.
     let mut pid_rows: Vec<(Option<i32>, uuid::Uuid)> = Vec::new();
     for proj in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        let pool = match crate::project_db_routes::project_data_pool_from(db, proj).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %proj,
+                    error = %e,
+                    "detect_all_port_bindings: DB progetto non disponibile, salto il progetto"
+                );
+                continue;
+            }
+        };
         match sqlx::query_as::<_, (Option<i32>, uuid::Uuid)>(
             "SELECT pid, project_id FROM agent_processes \
              WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
@@ -3082,7 +3143,15 @@ async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortB
     // Problemi con detail "processo 'lsass'/'svchost'/'postgres' terminato".
     let mut pid_to_project: HashMap<u32, uuid::Uuid> = HashMap::new();
     for proj in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        let Some(pool) = crate::project_db_routes::project_data_pool_or_warn(
+            db,
+            proj,
+            "detect_all_port_bindings_windows",
+        )
+        .await
+        else {
+            continue;
+        };
         let rows: Vec<(Option<i32>, uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
             sqlx::query_as(
                 "SELECT pid, project_id, started_at FROM agent_processes \

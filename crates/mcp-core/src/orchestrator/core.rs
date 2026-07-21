@@ -1556,26 +1556,36 @@ impl Orchestrator {
             .and_then(|value| Uuid::parse_str(value).ok());
         let profile_uuid = Uuid::parse_str(&input.profile_id).ok();
         // orchestrator_runs e' migrata: vive nel DB del progetto (separazione DB).
-        // A flag OFF / project_id non parsabile ricade sul meta-DB.
+        // project_id non parsabile (id legacy non-UUID) -> meta-DB (comportamento
+        // storico); DB progetto non disponibile -> insert saltato con WARN
+        // (l'audit e' best-effort, vedi `.ok()` sotto — niente fallback al meta).
         let orch_pool = match Uuid::parse_str(&input.project_id) {
-            Ok(pid) => crate::project_db_routes::project_data_pool_from(db, pid).await,
-            Err(_) => db.clone(),
+            Ok(pid) => match crate::project_db_routes::project_data_pool_from(db, pid).await {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    tracing::warn!(project_id = %pid, error = %e, "orchestrator audit: DB progetto non disponibile, insert orchestrator_runs saltato");
+                    None
+                }
+            },
+            Err(_) => Some(db.clone()),
         };
-        sqlx::query(
-            r#"
-            INSERT INTO orchestrator_runs (id, project_id, user_id, session_id, profile_id, status, audit_json)
-            VALUES ($1, $2::uuid, $3, $4, $5, 'completed', $6)
-            "#,
-        )
-        .bind(run_id)
-        .bind(&input.project_id)
-        .bind(user_id)
-        .bind(session_uuid)
-        .bind(profile_uuid)
-        .bind(&audit_json)
-        .execute(&orch_pool)
-        .await
-        .ok(); // Non-fatal: log but don't fail the request
+        if let Some(orch_pool) = orch_pool {
+            sqlx::query(
+                r#"
+                INSERT INTO orchestrator_runs (id, project_id, user_id, session_id, profile_id, status, audit_json)
+                VALUES ($1, $2::uuid, $3, $4, $5, 'completed', $6)
+                "#,
+            )
+            .bind(run_id)
+            .bind(&input.project_id)
+            .bind(user_id)
+            .bind(session_uuid)
+            .bind(profile_uuid)
+            .bind(&audit_json)
+            .execute(&orch_pool)
+            .await
+            .ok(); // Non-fatal: log but don't fail the request
+        }
 
         let payload = json!({
             "run_id": run_id.to_string(),
@@ -1689,20 +1699,27 @@ impl Orchestrator {
             // prompt_corrections e' migrata: la tabella vive nel DB del progetto
             // (separazione DB). settings/project_learning_config sopra restano su
             // meta (globale/non migrata); la ricerca Qdrant e' multi-tenant per
-            // payload. A flag OFF il pool ritorna il meta-DB.
-            let cpool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-            let _ = sqlx::query(
-                r#"
-                UPDATE prompt_corrections
-                SET retrieved_count = retrieved_count + 1,
-                    last_retrieved_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = ANY($1)
-                "#,
-            )
-            .bind(&correction_ids)
-            .execute(&cpool)
-            .await;
+            // payload. Il bump dei contatori e' telemetria best-effort: DB progetto
+            // non disponibile -> update saltato con WARN (niente fallback al meta).
+            match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+                Ok(cpool) => {
+                    let _ = sqlx::query(
+                        r#"
+                        UPDATE prompt_corrections
+                        SET retrieved_count = retrieved_count + 1,
+                            last_retrieved_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = ANY($1)
+                        "#,
+                    )
+                    .bind(&correction_ids)
+                    .execute(&cpool)
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(project_id = %project_id, error = %e, "prompt_corrections: DB progetto non disponibile, bump retrieved_count saltato");
+                }
+            }
         }
 
         Ok(corrections)

@@ -200,7 +200,10 @@ export interface PrecheckResult {
 export async function getChatSessions(projectId: string): Promise<{ sessions: ChatSessionSummary[] }> {
   const url = new URL(`${API_BASE}/api/chat/sessions`, typeof window !== "undefined" ? window.location.origin : "http://localhost");
   url.searchParams.set("projectId", projectId);
-  return fetchJson(url.toString());
+  // GET idempotente + backend che ora risponde 503 strutturato quando il DB del
+  // progetto e' in provisioning (mai piu' lista vuota dal meta): il retry con
+  // backoff assorbe il transitorio invece di mostrare subito l'errore.
+  return fetchJsonWithRetry(url.toString());
 }
 
 export async function createChatSession(

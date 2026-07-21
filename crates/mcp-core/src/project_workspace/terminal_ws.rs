@@ -185,9 +185,17 @@ fn verify_terminal_token(
 /// Canonicalizza un path se esiste sul filesystem, altrimenti normalizza
 /// senza I/O. Evita falsi negativi quando `canonicalize` fallisce (es. symlink
 /// gia risolti a monte da create_terminal_session).
+///
+/// Il risultato passa dal punto unico `path_for_storage` (regola L): su
+/// Windows `canonicalize` produce la forma verbatim `\\?\D:\...`, e usarla
+/// come cwd della shell fa mostrare a PowerShell il prompt provider-qualified
+/// `PS Microsoft.PowerShell.Core\FileSystem::\\?\D:\...>` al posto del path.
 fn canonicalize_lenient(raw: &str) -> PathBuf {
     let path = Path::new(raw);
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    match std::fs::canonicalize(path) {
+        Ok(canon) => PathBuf::from(nexus_types::workspace_paths::path_for_storage(&canon)),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// Confronto a tempo costante (no early-exit) per evitare timing attack sulla
@@ -754,6 +762,23 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonicalize_lenient_mai_verbatim() {
+        // Regressione prompt terminale: su Windows `canonicalize` produce la
+        // forma verbatim (\\?\D:\...) e PowerShell avviato con quella cwd
+        // mostra il prompt provider-qualified. Il percorso reale (una dir
+        // esistente canonicalizzata) non deve MAI uscire in forma verbatim.
+        let dir = std::env::temp_dir();
+        let out = canonicalize_lenient(&dir.to_string_lossy());
+        assert!(
+            !out.to_string_lossy().starts_with(r"\\?\"),
+            "cwd verbatim: {out:?}"
+        );
+        // Path inesistente: no-op senza I/O, invariato.
+        let missing = canonicalize_lenient("relative/inesistente");
+        assert_eq!(missing, PathBuf::from("relative/inesistente"));
+    }
 
     fn make_token(secret: &str, claims_json: &serde_json::Value) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims_json).unwrap());

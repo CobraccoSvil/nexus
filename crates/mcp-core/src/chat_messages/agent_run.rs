@@ -784,7 +784,7 @@ async fn run_narrative_llm(
 /// allegati piu' recenti.
 async fn build_session_attachments_block(
     // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
-    // chiamante via project_data_pool_by_session_from. A flag OFF e' il meta.
+    // chiamante via project_data_pool_by_session_from.
     db: &PgPool,
     content: &str,
     session_id: Uuid,
@@ -853,7 +853,7 @@ async fn build_session_attachments_block(
 
 pub(crate) async fn build_initial_msg_with_attachments(
     // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
-    // chiamante via project_data_pool_by_session_from. A flag OFF e' il meta.
+    // chiamante via project_data_pool_by_session_from.
     db: &PgPool,
     content: &str,
     attachments: &[crate::orchestrator::ChatAttachment],
@@ -1137,10 +1137,24 @@ pub(crate) async fn supersede_active_runs(
         "Superato da un nuovo run."
     };
     // Pool del progetto risolto dalla sessione (separazione DB): tabella
-    // agent_runs migrata -> instrada la UPDATE sul DB del progetto (flag off ->
-    // meta). Riusato sotto per l'ingest del worklog dei run superati.
-    let wpool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+    // agent_runs migrata -> instrada la UPDATE sul DB del progetto. Riusato
+    // sotto per l'ingest del worklog dei run superati. DB non disponibile ->
+    // niente da superare LI' (i run vivono su quel DB): WARN e lista vuota.
+    let wpool = match crate::project_db_routes::project_data_pool_by_session_from(
+        &state.db, session_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "supersede_active_runs: DB progetto non disponibile, nessun run superato"
+            );
+            return Vec::new();
+        }
+    };
     let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
         // Cancella TUTTI i run attivi/sospesi-vivi della sessione (punto unico
         // ACTIVE_RUN_STATUSES): il force-stop deve liberare anche un padre sospeso
@@ -1196,7 +1210,7 @@ pub(crate) async fn supersede_active_runs(
             "superseduto (interrotto da un nuovo messaggio)"
         };
         // Worklog nel DB del progetto (separazione DB): riuso il pool per-progetto
-        // gia' risolto sopra dalla sessione (flag off -> meta).
+        // gia' risolto sopra dalla sessione.
         for cid in &cancelled_ids {
             if let Err(e) =
                 crate::session_worklog::ingest_from_db_steps(&state.db, &wpool, *cid, label).await
@@ -1999,13 +2013,27 @@ pub(crate) async fn spawn_agent_run(
     // 'chat' (prompt_len=1), vanificando la scelta dell'utente.
     let mut resolved_intent_hint: Option<String> = None;
     // Separazione DB: chat_messages e' migrata -> pool del progetto risolto UNA
-    // volta e riusato per le letture conversazionali di questo spawn (metadata
-    // di disambiguazione, count messaggi, history, hint auto-referenziale).
-    // Sul meta rispondevano sempre vuoto a flag ON: disambiguazione in loop,
-    // routing mai calibrato, history vuota anche per il motore nativo.
-    let msgs_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, params.session_id)
-            .await;
+    // volta e riusato per TUTTE le letture/scritture per-progetto di questo
+    // spawn (disambiguazione, history, INSERT run, allegati, worklog). DB non
+    // disponibile -> NotStarted onesto (regola M), mai il meta: sul meta le
+    // letture rispondono vuoto e le scritture producono run/messaggi fantasma.
+    let msgs_pool = match crate::project_db_routes::project_data_pool_by_session_from(
+        &state.db,
+        params.session_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %params.session_id,
+                error = %e,
+                "spawn_agent_run: DB progetto non disponibile, run non avviato"
+            );
+            state.agent_channels.remove(&run_id);
+            return SpawnOutcome::NotStarted;
+        }
+    };
     if let Some(chosen) =
         resolve_disambiguation_reply(&msgs_pool, params.session_id, &params.content).await
     {
@@ -2248,9 +2276,8 @@ pub(crate) async fn spawn_agent_run(
         );
         // Persist run come "failed" con errore strutturato.
         // Pool del progetto (separazione DB): tabella agent_runs migrata ->
-        // instrada l'INSERT sul DB del progetto (flag off -> meta).
-        let run_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, params.project_id).await;
+        // riusa msgs_pool (stesso DB <slug>_nexus, risolto una volta sopra).
+        let run_pool = msgs_pool.clone();
         let _ = sqlx::query(
             r#"INSERT INTO agent_runs
                (id, session_id, project_id, user_id, run_message_id, status,
@@ -2308,10 +2335,9 @@ pub(crate) async fn spawn_agent_run(
         supersede_active_runs(state, params.session_id, "superseded_by_new_run").await;
 
     // Persist initial run in DB
-    // Pool del progetto (separazione DB): tabella agent_runs migrata -> instrada
-    // l'INSERT sul DB del progetto (flag off -> meta).
-    let run_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, params.project_id).await;
+    // Pool del progetto (separazione DB): tabella agent_runs migrata -> riusa
+    // msgs_pool (stesso DB <slug>_nexus, risolto una volta a inizio spawn).
+    let run_pool = msgs_pool.clone();
     let _ = sqlx::query(
         r#"INSERT INTO agent_runs
            (id, session_id, project_id, user_id, run_message_id, status,
@@ -2673,14 +2699,11 @@ pub(crate) async fn spawn_agent_run(
     // (funzione dedicata) per non gonfiare ulteriormente spawn_agent_run, che e'
     // gia' enorme: una closure complessa inline qui faceva degenerare il typeck
     // del compilatore (ICE).
-    // chat_message_attachments vive nel DB del progetto (separazione DB): risolvo
-    // il pool per-progetto dalla sessione e lo passo alle query interne, coerente
-    // con il worklog piu' sotto. A flag OFF l'helper ritorna il meta.
-    let att_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, params.session_id)
-            .await;
+    // chat_message_attachments vive nel DB del progetto (separazione DB): riusa
+    // msgs_pool (stesso DB, risolto una volta a inizio spawn), coerente con il
+    // worklog piu' sotto.
     let initial_msg = build_initial_msg_with_attachments(
-        &att_pool,
+        &msgs_pool,
         &params.content,
         &params.attachments,
         params.user_message_id,
@@ -2796,15 +2819,10 @@ pub(crate) async fn spawn_agent_run(
         // Nota arricchita dal worklog (mig 0411): sintesi del lavoro gia'
         // svolto dal run interrotto + puntatore al blocco <session_worklog>.
         // L'ingest e' gia' avvenuto SINCRONO dentro supersede_active_runs.
-        // Worklog nel DB del progetto (separazione DB): risolvo il pool dalla sessione.
-        let wpool = crate::project_db_routes::project_data_pool_by_session_from(
-            &state.db,
-            params.session_id,
-        )
-        .await;
+        // Worklog nel DB del progetto (separazione DB): riusa msgs_pool.
         let worklog_note = crate::session_worklog::supersede_summary(
             &state.db,
-            &wpool,
+            &msgs_pool,
             params.session_id,
             &superseded_runs,
         )
@@ -2925,13 +2943,23 @@ pub(crate) async fn spawn_agent_run(
             // vuoto — e restavano armabili con un UPDATE di "rollback" all'aria di
             // innocuo. `agent_runs.engine` resta valorizzato per il recovery, ora
             // con l'unico valore possibile.
-            let run_pool =
-                crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await;
-            let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
-                .bind(run_id)
-                .bind(ENGINE_NATIVE)
-                .execute(&run_pool)
-                .await;
+            match crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await
+            {
+                Ok(run_pool) => {
+                    let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
+                        .bind(run_id)
+                        .bind(ENGINE_NATIVE)
+                        .execute(&run_pool)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "run task: DB progetto non disponibile, colonna engine non aggiornata"
+                    );
+                }
+            }
             // `native_steps_persisted` evita la re-INSERT degli step (il grafo li
             // ha gia' persistiti) nel finalizzatore, che resta uno solo (regola L).
             // Nessun inizializzatore: ogni ramo del blocco sotto li assegna, e il
@@ -3017,23 +3045,41 @@ pub(crate) async fn spawn_agent_run(
                         // Python): il finalizzatore sotto opera su questo result.
                         // Separazione DB: agent_steps vive nel DB del progetto
                         // (PgAgentStepStore scrive sul run_db) -> la rilettura per
-                        // costruire result.steps DEVE usare lo stesso pool, non il
-                        // meta (dove la tabella e' vuota a flag ON: il worklog
-                        // perderebbe tutti i fatti del run).
-                        let steps_pool =
-                            crate::project_db_routes::project_data_pool_by_session_from(
-                                &db_clone,
-                                session_id_cp,
-                            )
-                            .await;
+                        // costruire result.steps DEVE usare lo stesso pool, mai il
+                        // meta (tabella vuota: il worklog perderebbe i fatti del run).
                         // La review adversariale programmatica ora vive DENTRO il
                         // grafo (nodo ReviewGate, prima della chiusura): su
                         // bocciatura rimanda in correzione invece di annotare un
                         // run gia' morto. Qui resta solo il mapping dell'esito
                         // (native_outcome_to_run_result legge review_panel_rejected
-                        // e extra.review_panel_last dal medesimo stato).
-                        native_result =
-                            Some(native_outcome_to_run_result(&steps_pool, run_id, outcome).await);
+                        // e extra.review_panel_last dal medesimo stato). Se il DB
+                        // del progetto non e' disponibile al finalize, l'esito e'
+                        // un FAILED diagnosticato (regola M), mai il meta.
+                        native_result = match crate::project_db_routes::project_data_pool_by_session_from(
+                            &db_clone,
+                            session_id_cp,
+                        )
+                        .await
+                        {
+                            Ok(steps_pool) => Some(
+                                native_outcome_to_run_result(&steps_pool, run_id, outcome).await,
+                            ),
+                            Err(e) => {
+                                tracing::error!(
+                                    run_id = %run_id,
+                                    error = %e,
+                                    "motore nativo: DB progetto non disponibile al finalize"
+                                );
+                                Some(native_engine_failure_result(
+                                    run_id,
+                                    &provider_clone,
+                                    &model_clone,
+                                    format!(
+                                        "DB del progetto non disponibile al finalize del run: {e}"
+                                    ),
+                                ))
+                            }
+                        };
                         native_steps_persisted = true;
                     }
                     Err(e) => {
@@ -3375,18 +3421,31 @@ pub(crate) async fn spawn_agent_run(
                         obj.insert("reasoning".to_string(), json!(reasoning));
                     }
                 }
-                let _ = sqlx::query(
-                r#"INSERT INTO chat_messages
-                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
-                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
-            )
-            .bind(session_id_cp)
-            .bind(project_id_cp)
-            .bind(&effective_answer)
-            .bind(meta)
-            .bind(user_message_id)
-            .execute(&crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await)
-            .await;
+                match crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp)
+                    .await
+                {
+                    Ok(msg_pool) => {
+                        let _ = sqlx::query(
+                            r#"INSERT INTO chat_messages
+                               (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
+                               VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
+                        )
+                        .bind(session_id_cp)
+                        .bind(project_id_cp)
+                        .bind(&effective_answer)
+                        .bind(meta)
+                        .bind(user_message_id)
+                        .execute(&msg_pool)
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            run_id = %run_id,
+                            error = %e,
+                            "finalize: DB progetto non disponibile, messaggio assistant non persistito"
+                        );
+                    }
+                }
 
                 spawn_embed_conversation_turn(
                     neural_for_embed.clone(),
@@ -3801,9 +3860,25 @@ pub(crate) async fn spawn_agent_run(
             // Pool del progetto (separazione DB): agent_runs (e chat_messages sotto)
             // migrate -> instrada le scritture del panic-handler sul DB del progetto.
             // Risolto una volta dal clone del meta (panic_db) + panic_project_id
-            // catturati (flag off -> meta); riusato per l'INSERT chat_messages sotto.
-            let panic_pool =
-                crate::project_db_routes::project_data_pool_from(&panic_db, panic_project_id).await;
+            // catturati; riusato per l'INSERT chat_messages sotto. DB non
+            // disponibile -> il panic-handler NON deve panicare a sua volta:
+            // ERROR e uscita (il run_reaper chiudera' il run stale).
+            let panic_pool = match crate::project_db_routes::project_data_pool_from(
+                &panic_db,
+                panic_project_id,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        run_id = %panic_run_id,
+                        error = %e,
+                        "panic-handler: DB progetto non disponibile, run non marcato failed"
+                    );
+                    return;
+                }
+            };
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status='failed', completed_at=NOW(), \
                  final_answer=$2 WHERE id=$1",
@@ -3978,9 +4053,10 @@ pub(crate) async fn confirm_native_run(
 
     // Pool del progetto risolto dalla sessione (separazione DB): agent_runs
     // migrata -> instrada le UPDATE di finalize (esito Ok/Err) sul DB del
-    // progetto. Risolto una volta, riusato in entrambi i rami (flag off -> meta).
-    let cn_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+    // progetto. Risolto una volta, riusato in entrambi i rami.
+    let cn_pool = crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let status = match outcome {
         Ok(outcome) => {
             // Mapping unico esito->AgentRunResult (regola L), poi finalize essenziale.
@@ -4276,7 +4352,9 @@ pub(crate) async fn resume_fanin(
     // Pool del progetto (separazione DB): agent_runs / nexus_subagent_runs sono
     // migrate. Risolto UNA volta, riusato per lettura provider/model, risultati
     // dei figli e UPDATE di finalize.
-    let cn_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let cn_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // provider/model del run originale dal DB (il worker ha solo gli id): servono
     // a popolare ctx + porte I/O del resume (il grafo riparte comunque dal

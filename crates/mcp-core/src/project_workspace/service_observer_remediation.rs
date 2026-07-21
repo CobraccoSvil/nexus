@@ -99,8 +99,20 @@ pub(crate) async fn maybe_trigger_debugger(
     };
 
     // Pool dati del progetto (separazione DB): chat_sessions e' migrata, va letta
-    // sul DB del progetto. A flag OFF ritorna il meta-pool (comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // sul DB del progetto. Non disponibile -> niente auto-debug per questo giro
+    // (trigger best-effort, WARN + return).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "service_observer: DB progetto non disponibile, skip auto-debug"
+                );
+                return;
+            }
+        };
 
     // Sessione chat esistente del progetto (non ne creiamo: l'auto-debug e'
     // opt-in e ha senso solo dove l'utente vede la conversazione).
@@ -237,10 +249,24 @@ pub(crate) async fn maybe_trigger_debugger(
             tokio::spawn(async move {
                 // Pool dati del progetto (separazione DB): agent_runs e' migrata.
                 // project_id e' in scope (catturato dalla closure), quindi instradiamo
-                // sul DB del progetto. A flag OFF ritorna il meta-pool.
-                let proj_pool =
-                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id)
-                        .await;
+                // sul DB del progetto. Non disponibile -> il task best-effort termina
+                // con WARN (niente attesa/riavvio per questo trigger).
+                let proj_pool = match crate::project_db_routes::project_data_pool_from(
+                    &state_cl.db,
+                    project_id,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %e,
+                            "service_observer: DB progetto non disponibile, salto attesa e riavvio post-debug"
+                        );
+                        return;
+                    }
+                };
                 // Attende la fine del run debugger (max ~5 min), poi riavvia.
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;

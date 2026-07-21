@@ -103,8 +103,22 @@ pub(crate) async fn clear_session_preferred_provider_after_privacy(
     db: &sqlx::PgPool,
     session_id: uuid::Uuid,
 ) {
-    // separazione DB: chat_sessions e' una tabella migrata, instrada sul pool del progetto
-    let pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    // separazione DB: chat_sessions e' una tabella migrata, instrada sul pool del
+    // progetto. Best-effort (contratto della funzione, esito gia' ignorato):
+    // DB progetto non disponibile -> WARN e si salta l'azzeramento.
+    let pool = match crate::project_db_routes::project_data_pool_by_session_from(db, session_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "azzeramento preferred_provider post-privacy: DB progetto non disponibile, salto"
+            );
+            return;
+        }
+    };
     let _ = sqlx::query(
         "UPDATE chat_sessions \
          SET preferred_provider = NULL, preferred_model = NULL, privacy_rerouted_at = NOW() \

@@ -831,10 +831,10 @@ pub async fn get_session_usage(
     let requester = claims_user_id(&claims)?;
 
     // Separazione DB per-progetto: chat_sessions e chat_messages sono tabelle
-    // migrate; instrada le letture sul pool del progetto risolto dalla sessione
-    // (a flag OFF ritorna il meta-pool, comportamento storico).
+    // migrate; instrada le letture sul pool del progetto risolto dalla sessione.
+    // Niente fallback al meta (mig 0527): DB progetto non disponibile -> 503.
     let session_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
 
     // Verify the session belongs to the requesting user (or user is admin)
     if claims.role != "admin" {

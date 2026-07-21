@@ -759,7 +759,22 @@ async fn run_batch_isolated(
     let root = ctx.core.root_path.clone();
     let project_id = ctx.core.project_id;
     let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await;
+        match crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                // DB progetto non disponibile: impossibile prenotare le row
+                // sub-run dell'isolamento. Stesso trattamento di head_commit
+                // fallito: degrada al ramo sequenziale (i singoli sub-run
+                // produrranno i loro rifiuti strutturati se il DB resta giu').
+                tracing::warn!(
+                    target: "mcp_core::subagent_native",
+                    project_id = %project_id,
+                    error = %e,
+                    "isolamento: DB progetto non disponibile, degrado a sequenziale"
+                );
+                return run_batch_sequential(ctx, parsed, max_parallel).await;
+            }
+        };
 
     // (0) LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in worktree.rs):
     //     serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
@@ -3081,9 +3096,13 @@ async fn prepare_subagent_run(
         }
     };
     // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
-    // del progetto. Risolvo una volta il pool per_progetto e lo riuso per la catena
-    // depth/costo, l'INSERT e le mark_run (a flag OFF ritorna il meta-DB).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // del progetto. Risolvo una volta il pool per-progetto e lo riuso per la catena
+    // depth/costo, l'INSERT e le mark_run. DB non disponibile -> rifiuto
+    // strutturato del prepare (regola M: il codice macchina, non la prosa).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => return Err(prepare_reject(e.error_code(), e.to_string())),
+    };
 
     // ── Guard 1: settings (enabled / whitelist / depth / cost) ────────────────
     let settings = match read_subagent_settings(ctx).await {
@@ -3901,8 +3920,25 @@ async fn council_assignments(
     ctx: &AgentToolContext,
     kinds: &[String],
 ) -> Vec<Option<(String, String)>> {
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(
+        &ctx.core.db,
+        ctx.core.project_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            // Pre-assegnazione best-effort: senza DB progetto non si legge il
+            // pin di sessione -> nessuna pre-assegnazione, ogni figura segue il
+            // percorso storico (None), che produce i suoi rifiuti strutturati.
+            tracing::warn!(
+                project_id = %ctx.core.project_id,
+                error = %e,
+                "council_assignments: DB progetto non disponibile, nessuna pre-assegnazione"
+            );
+            return vec![None; kinds.len()];
+        }
+    };
     resolve_council_assignments(&ctx.core.db, &proj_pool, ctx.core.session_id, kinds).await
 }
 
@@ -4480,6 +4516,16 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
 
 /// `nexus_subagent_poll` — stato di una sub-run da `nexus_subagent_runs` (DB-only,
 /// niente brain). Il main lo usa per i kind background.
+/// Pool del progetto per i tool sub-agent (poll/resume), o messaggio d'errore
+/// gia' formattato col marker del tool (il contratto dei tool_result e' la
+/// stringa). Punto unico locale del pattern (regola L): i due tool condividono
+/// identica risoluzione e identico esito di indisponibilita'.
+async fn subagent_tool_pool(ctx: &AgentToolContext, tool: &str) -> Result<sqlx::PgPool, String> {
+    crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id)
+        .await
+        .map_err(|e| format!("\u{274C} [{tool}] DB progetto non disponibile: {e}"))
+}
+
 pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
     let run_id = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -4490,8 +4536,10 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
     };
     // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run e' nel DB
     // del progetto corrente (stesso project_id che lo ha dispatchato).
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
+    let proj_pool = match subagent_tool_pool(ctx, "nexus_subagent_poll").await {
+        Ok(p) => p,
+        Err(msg) => return msg,
+    };
     let row = sqlx::query(
         "SELECT id::text, status, kind, final_summary, artifacts, iterations,
                 tokens_prompt, tokens_completion, cost_usd, depth, source, is_background,
@@ -4552,8 +4600,10 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 
     // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run da riprendere
     // e' nel DB del progetto corrente (stesso project_id che lo ha dispatchato).
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
+    let proj_pool = match subagent_tool_pool(ctx, "nexus_subagent_resume").await {
+        Ok(p) => p,
+        Err(msg) => return msg,
+    };
     let row = sqlx::query(
         "SELECT kind, task_description, context_blob, expected_format, status, depth, parent_run_id
          FROM nexus_subagent_runs WHERE id = $1",

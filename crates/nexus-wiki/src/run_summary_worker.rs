@@ -169,7 +169,13 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &RunSummarySettings) -> Res
         if remaining == 0 {
             break;
         }
-        let run_pool = state.run_pool(project_id).await;
+        let run_pool = match state.run_pool(project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "wiki.run_summary: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let rows = sqlx::query(
             r#"
             SELECT ar.id, ar.session_id, ar.status, ar.provider, ar.model,

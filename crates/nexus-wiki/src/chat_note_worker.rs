@@ -204,7 +204,13 @@ async fn scan_and_ingest(state: &WikiDeps, settings: &ChatNoteSettings) -> Resul
         if remaining == 0 {
             break;
         }
-        let run_pool = state.run_pool(project_id).await;
+        let run_pool = match state.run_pool(project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "wiki.chat_note: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         // Messaggi user pending per QUESTO progetto (no JOIN projects: il
         // project_id viene dall'iterazione, e il pool ha solo i suoi).
         let rows = sqlx::query(

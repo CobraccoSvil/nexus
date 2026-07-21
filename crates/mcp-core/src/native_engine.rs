@@ -1994,13 +1994,14 @@ async fn build_native_engine(
     // ── Pool del dominio run (separazione DB per-progetto, punto unico regola L) ─
     // Tutte le porte che PERSISTONO dati per-progetto del run (agent_runs,
     // agent_steps, nexus_agent_*, nexus_graph_checkpoints, nexus_agent_traces,
-    // todos/plans) girano su QUESTO pool: il DB del progetto (`<slug>_nexus`) a
-    // flag separazione ON, il meta-DB a flag OFF / sessione non mappata
-    // (comportamento storico). Risolto UNA volta dal session_id via la directory
-    // di routing. Le porte che leggono SOLO config/catalogo GLOBALI (settings,
-    // ai_price_catalog, nexus_prompt_templates, routing matrix) restano su `db`.
+    // todos/plans) girano su QUESTO pool: il DB del progetto (`<slug>_nexus`).
+    // Risolto UNA volta dal session_id via la directory di routing; se il DB del
+    // progetto non e' disponibile il run NON parte (errore tipizzato propagato,
+    // niente fallback al meta-DB). Le porte che leggono SOLO config/catalogo
+    // GLOBALI (settings, ai_price_catalog, nexus_prompt_templates, routing
+    // matrix) restano su `db`.
     let run_db =
-        crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id).await?;
 
     // Fase C3 Part B: disponibilita' dell'isolamento fisico (worktree git) per
     // questo run, calcolata UNA volta qui e passata al ctx (i nodi puri non fanno
@@ -3032,27 +3033,40 @@ async fn run_engine(
             // FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della
             // sessione. Il pool e' quello del DOMINIO RUN (agent_runs/meta_steps
             // migrati al DB progetto), risolto col PUNTO UNICO per-sessione.
-            // Fail-open: guasto DB -> conteggio 0 (asse mai attivo, invariato).
+            // Fail-open: DB progetto non disponibile -> detector saltato con WARN
+            // (asse mai attivo, invariato); niente fallback al meta-DB.
             if !role.is_shadow() {
-                let run_db = crate::project_db_routes::project_data_pool_by_session_from(
+                match crate::project_db_routes::project_data_pool_by_session_from(
                     &deps.db,
                     input.session_id,
                 )
-                .await;
-                let clarify_history = PgClarifyHistoryStore::new(run_db);
-                let (sig, repeat_count) = clarify_history
-                    .latest_signature_and_repeat_count(input.session_id)
-                    .await;
-                if repeat_count > 0 {
-                    tracing::info!(
-                        target: "mcp_core::native_engine",
-                        session_id = %input.session_id,
-                        repeated_clarify_count = repeat_count,
-                        signature = sig.as_deref().unwrap_or(""),
-                        "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
-                    );
+                .await
+                {
+                    Ok(run_db) => {
+                        let clarify_history = PgClarifyHistoryStore::new(run_db);
+                        let (sig, repeat_count) = clarify_history
+                            .latest_signature_and_repeat_count(input.session_id)
+                            .await;
+                        if repeat_count > 0 {
+                            tracing::info!(
+                                target: "mcp_core::native_engine",
+                                session_id = %input.session_id,
+                                repeated_clarify_count = repeat_count,
+                                signature = sig.as_deref().unwrap_or(""),
+                                "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
+                            );
+                        }
+                        init_state.repeated_clarify_count = Some(repeat_count);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mcp_core::native_engine",
+                            session_id = %input.session_id,
+                            error = %e,
+                            "detector clarify cross-run: DB progetto non disponibile, detector saltato"
+                        );
+                    }
                 }
-                init_state.repeated_clarify_count = Some(repeat_count);
             }
 
             let init = Some(init_state);
@@ -3403,7 +3417,7 @@ pub async fn run_shadow(
     // meta (dove la proiezione uscirebbe vuota: 0 tool calls, completed=false).
     let primary_pool =
         crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
-            .await;
+            .await?;
     let primary = primary_canonical(&primary_pool, primary_run_id).await?;
     let shadow = shadow_canonical(shadow_state, completed);
 

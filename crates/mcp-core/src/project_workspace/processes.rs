@@ -30,8 +30,10 @@ pub async fn clear_finished_processes(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
-    // Separazione DB: agent_processes e' tabella migrata, instrada sul pool del progetto
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // Separazione DB: agent_processes e' tabella migrata, instrada sul pool del
+    // progetto (errore tipizzato 503/404 se non disponibile).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let result = sqlx::query(
         "DELETE FROM agent_processes WHERE project_id = $1 AND status IN ('stopped', 'failed')",
     )
@@ -78,8 +80,17 @@ pub async fn stream_agent_process_logs(
     {
         return (StatusCode::FORBIDDEN, "Accesso negato").into_response();
     }
-    // Separazione DB: agent_processes e' tabella migrata, instrada sul pool del progetto
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // Separazione DB: agent_processes e' tabella migrata, instrada sul pool del
+    // progetto. Handler non-Result (Response): converto l'errore tipizzato nella
+    // risposta strutturata (503/404) senza ripiegare sul meta.
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                let (status, body): (StatusCode, Json<Value>) = e.into();
+                return (status, body).into_response();
+            }
+        };
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM agent_processes WHERE id=$1 AND project_id=$2)",
     )

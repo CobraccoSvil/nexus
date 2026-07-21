@@ -917,6 +917,17 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     tracing::info!(command = %command_str, root = %root.display(), "run_playwright_tests: avvio comando");
 
     // ── 7. Esegui con env BASE_URL ────────────────────────────────────────────
+    // Separazione DB per-progetto: la tabella `jobs` e' migrata. Il pool del
+    // progetto va risolto PRIMA di spawnare il processo: se il DB progetto non
+    // e' disponibile il run non parte (nessun child orfano non monitorato).
+    // Riusato per INSERT, UPDATE live nel task stdout e UPDATE finale.
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                return format!("[run_playwright_tests] DB del progetto non disponibile: {e}")
+            }
+        };
     let mut child = match spawn_playwright_child(
         &command_str,
         root,
@@ -928,10 +939,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     };
 
     // ── Live monitoring: INSERT iniziale + broadcast channel ─────────────────
-    // Separazione DB per-progetto: la tabella `jobs` e' migrata. Risolvo una
-    // sola volta il pool del progetto (per ctx.project_id in scope) e lo riuso
-    // per INSERT, UPDATE live nel task stdout e UPDATE finale.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&ctx.db, ctx.project_id).await;
+    // (pool del progetto gia' risolto sopra, prima dello spawn)
     let job_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \

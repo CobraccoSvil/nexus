@@ -55,8 +55,10 @@ pub async fn get_workbench_state(
         .unwrap_or_else(|| json!({}));
 
     // Separazione DB per-progetto: project_open_sessions e' una tabella migrata,
-    // instradiamo la lettura sul pool del progetto (project_id gia' in scope).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // instradiamo la lettura sul pool del progetto (project_id gia' in scope;
+    // errore tipizzato 503/404 se non disponibile).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let session = sqlx::query(
         r#"
         SELECT active_file_paths, terminal_cwd, updated_at

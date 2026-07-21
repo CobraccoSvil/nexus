@@ -586,31 +586,108 @@ async fn resolve_meta_db_url(
         .map_err(|e| e.to_string())
 }
 
-/// Punto unico (regola L) per il pool DOVE risiedono i dati per-progetto di un
-/// dominio gia' migrato: il DB metadati del progetto (`<slug>_nexus`). La
-/// separazione e' SEMPRE attiva (cutover chiuso, flag rimosso mig 0527); i
-/// call-site dei domini migrati usano QUESTO, mai `state.db` diretto.
-/// Fallback sicuro al meta-DB SOLO come resilienza se il pool del progetto non
-/// si apre (es. DB non ancora provisionato): l'app non si rompe.
-async fn project_data_pool_core(
-    meta: &sqlx::PgPool,
-    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
-    project_id: Uuid,
-) -> sqlx::PgPool {
-    match project_meta_pool_core(meta, cache, project_id).await {
-        Ok(pool) => (*pool).clone(),
-        Err(e) => {
-            tracing::warn!(
-                project_id = %project_id,
-                error = %e,
-                "project_data_pool: apertura DB metadati progetto fallita, fallback al meta-DB"
-            );
-            meta.clone()
+/// Errore tipizzato (regola M) della risoluzione del pool per-progetto dentro
+/// mcp-core. Niente fallback al meta-DB: a separazione sempre attiva (cutover
+/// chiuso, flag rimosso mig 0527) una query del dominio migrato sul meta legge
+/// tabelle vuote/decommissionate o, peggio, SCRIVE sul DB sbagliato (incidente
+/// 2026-07-20: "Chat 1" inserita sul meta durante il provisioning del
+/// DB-progetto e "sparita" dalla UI al primo accesso riuscito). I call site
+/// decidono la degradazione sul variante, mai sul testo.
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectDbError {
+    /// Il DB `<slug>_nexus` del progetto non e' utilizzabile ADESSO:
+    /// provisioning fallito/in corso, connect fallita o migrazioni fallite.
+    /// Condizione transitoria: gli handler HTTP rispondono 503 (retry lato
+    /// client), i worker saltano il progetto per questo giro.
+    #[error("DB del progetto {project_id} non disponibile: {message}")]
+    Unavailable { project_id: Uuid, message: String },
+
+    /// Il registry globale dei pool (`init_global_pools`) non e' inizializzato:
+    /// accade solo se un helper viene invocato prima del bootstrap di main.
+    #[error("registry dei pool per-progetto non inizializzato")]
+    RegistryNotReady,
+
+    /// L'entita' non esiste in ALCUN DB-progetto raggiungibile (ricerca
+    /// by-id esaurita con tutti i progetti interrogati).
+    #[error("{entity_kind} {entity_id} non trovata in alcun DB progetto")]
+    EntityNotFound {
+        entity_kind: &'static str,
+        entity_id: Uuid,
+    },
+
+    /// Ricerca by-id NON conclusiva: l'entita' non e' stata trovata ma almeno
+    /// un DB-progetto era irraggiungibile, quindi "non trovata" non e'
+    /// dimostrato. Si tratta come indisponibilita' (503), mai come 404.
+    #[error(
+        "{entity_kind} {entity_id} non risolvibile: {unreachable} DB progetto irraggiungibili durante la ricerca"
+    )]
+    SearchInconclusive {
+        entity_kind: &'static str,
+        entity_id: Uuid,
+        unreachable: usize,
+    },
+}
+
+impl ProjectDbError {
+    /// Status HTTP coerente col variante: 404 solo quando il "non trovato" e'
+    /// dimostrato su tutti i DB-progetto, 503 per ogni indisponibilita'.
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            ProjectDbError::EntityNotFound { .. } => StatusCode::NOT_FOUND,
+            ProjectDbError::Unavailable { .. }
+            | ProjectDbError::RegistryNotReady
+            | ProjectDbError::SearchInconclusive { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// Codice macchina stabile per il client (regola M/N): il frontend decide
+    /// su questo, mai sul testo del messaggio.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            ProjectDbError::EntityNotFound { .. } => "entity_not_found",
+            ProjectDbError::Unavailable { .. }
+            | ProjectDbError::RegistryNotReady
+            | ProjectDbError::SearchInconclusive { .. } => "project_db_unavailable",
         }
     }
 }
 
-pub async fn project_data_pool(state: &AppState, project_id: Uuid) -> sqlx::PgPool {
+/// Conversione per gli handler axum: `?` su un `ApiResult` produce la risposta
+/// strutturata (status + `{error, code}`) senza boilerplate ai call site.
+impl From<ProjectDbError> for (StatusCode, Json<Value>) {
+    fn from(e: ProjectDbError) -> Self {
+        (
+            e.status_code(),
+            Json(json!({ "error": e.to_string(), "code": e.error_code() })),
+        )
+    }
+}
+
+/// Punto unico (regola L) per il pool DOVE risiedono i dati per-progetto di un
+/// dominio gia' migrato: il DB metadati del progetto (`<slug>_nexus`). La
+/// separazione e' SEMPRE attiva (cutover chiuso, flag rimosso mig 0527); i
+/// call-site dei domini migrati usano QUESTO, mai `state.db` diretto.
+/// NIENTE fallback al meta-DB (regola M): se il DB del progetto non si apre
+/// l'esito e' un errore tipizzato che il chiamante gestisce esplicitamente —
+/// il fallback silenzioso leggeva liste vuote e SCRIVEVA sul DB sbagliato.
+async fn project_data_pool_core(
+    meta: &sqlx::PgPool,
+    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
+    project_id: Uuid,
+) -> Result<sqlx::PgPool, ProjectDbError> {
+    match project_meta_pool_core(meta, cache, project_id).await {
+        Ok(pool) => Ok((*pool).clone()),
+        Err(message) => Err(ProjectDbError::Unavailable {
+            project_id,
+            message,
+        }),
+    }
+}
+
+pub async fn project_data_pool(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<sqlx::PgPool, ProjectDbError> {
     project_data_pool_core(&state.db, &state.project_meta_pools, project_id).await
 }
 
@@ -639,13 +716,17 @@ pub async fn register_entity_routing(
     nexus_project_pools::register_entity_routing(meta, entity_kind, entity_id, project_id).await
 }
 
-pub async fn project_data_pool_by_session(state: &AppState, session_id: Uuid) -> sqlx::PgPool {
+pub async fn project_data_pool_by_session(
+    state: &AppState,
+    session_id: Uuid,
+) -> Result<sqlx::PgPool, ProjectDbError> {
     // Self-healing (regola L, stesso punto unico del by-id): directory O(1); se
     // la sessione NON e' mappata (creata prima della registrazione, o INSERT in
-    // directory fallito) NON si degrada al meta — a flag ON le tabelle chat sul
-    // meta sono VUOTE e la sessione "sparisce" dalla UI (fetch 404/lista vuota
-    // -> il client svuota la chat, incidente 2026-07-02). Si CERCA la sessione
-    // nei DB-progetto e si auto-registra la mappa per le chiamate successive.
+    // directory fallito) NON si degrada al meta — a separazione attiva le
+    // tabelle chat sul meta sono vuote/decommissionate e la sessione "sparisce"
+    // dalla UI (fetch 404/lista vuota -> il client svuota la chat, incidente
+    // 2026-07-02). Si CERCA la sessione nei DB-progetto e si auto-registra la
+    // mappa per le chiamate successive.
     project_data_pool_by_search_from(&state.db, "session", "chat_sessions", session_id).await
 }
 
@@ -668,22 +749,51 @@ pub fn init_global_pools(cache: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx:
 
 /// Pool dove risiedono i dati per-progetto, per gli helper che hanno il pool
 /// meta-DB (`meta`) e il `project_id` ma non `&AppState`. Usa la cache globale;
-/// se il registry non e' inizializzato ricade su `meta` (sicuro).
-pub async fn project_data_pool_from(meta: &sqlx::PgPool, project_id: Uuid) -> sqlx::PgPool {
+/// registry non inizializzato -> `Err(RegistryNotReady)` (regola M): il vecchio
+/// "ricade su meta, sicuro" era il fallback silenzioso che scriveva sul DB
+/// sbagliato quando un helper partiva prima del bootstrap.
+pub async fn project_data_pool_from(
+    meta: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Result<sqlx::PgPool, ProjectDbError> {
     match GLOBAL_PROJECT_POOL_CACHE.get() {
         Some(cache) => project_data_pool_core(meta, cache, project_id).await,
-        None => meta.clone(),
+        None => Err(ProjectDbError::RegistryNotReady),
+    }
+}
+
+/// Variante per worker e task best-effort (punto unico del pattern, regola L):
+/// pool del progetto o `None` con WARN gia' emesso. La DECISIONE di degradare
+/// (continue nel loop, return, metrica omessa) resta al call site; qui si
+/// centralizza solo la coppia risoluzione+log, cosi' il degrado esplicito non
+/// gonfia ogni funzione chiamante. MAI usare dove l'errore va propagato.
+pub async fn project_data_pool_or_warn(
+    meta: &sqlx::PgPool,
+    project_id: Uuid,
+    context: &'static str,
+) -> Option<sqlx::PgPool> {
+    match project_data_pool_from(meta, project_id).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                context,
+                "DB progetto non disponibile, operazione saltata"
+            );
+            None
+        }
     }
 }
 
 /// Pool del progetto risolto dal `session_id` (directory di routing).
 /// Self-healing come [`project_data_pool_by_session`]: sessione non mappata ->
 /// ricerca nei DB-progetto + auto-registrazione, MAI fallback silenzioso al
-/// meta (a flag ON le tabelle chat sono vuote e la sessione "sparisce").
+/// meta (le tabelle chat sul meta sono vuote e la sessione "sparisce").
 pub async fn project_data_pool_by_session_from(
     meta: &sqlx::PgPool,
     session_id: Uuid,
-) -> sqlx::PgPool {
+) -> Result<sqlx::PgPool, ProjectDbError> {
     project_data_pool_by_search_from(meta, "session", "chat_sessions", session_id).await
 }
 
@@ -697,19 +807,21 @@ pub async fn list_all_project_ids(meta: &sqlx::PgPool) -> Vec<Uuid> {
 }
 
 /// Risolve il pool del progetto per un'entita' keyed solo dall'id: prima la
-/// directory di routing (O(1)); se assente e flag ON, CERCA l'entita' iterando i
+/// directory di routing (O(1)); se assente, CERCA l'entita' iterando i
 /// DB-progetto (`SELECT 1 FROM <table> WHERE id=$1`) e, trovatala, AUTO-REGISTRA
 /// la mappa in directory cosi' le chiamate successive sono O(1) (self-healing).
-/// Fallback sicuro al meta-DB se non trovata. Copre gli endpoint by-id anche per
-/// le entita' non registrate alla creazione (regola L, punto unico del by-id).
+/// Esaurita la ricerca l'esito e' tipizzato (regola M): `EntityNotFound` se
+/// TUTTI i progetti erano interrogabili, `SearchInconclusive` (503, mai 404) se
+/// almeno un DB-progetto era irraggiungibile — il vecchio fallback al meta
+/// produceva a valle un errore SQL non strutturato o una lettura vuota.
 async fn project_data_pool_by_search_from(
     meta: &sqlx::PgPool,
-    entity_kind: &str,
+    entity_kind: &'static str,
     table: &str,
     entity_id: Uuid,
-) -> sqlx::PgPool {
+) -> Result<sqlx::PgPool, ProjectDbError> {
     let Some(cache) = GLOBAL_PROJECT_POOL_CACHE.get() else {
-        return meta.clone();
+        return Err(ProjectDbError::RegistryNotReady);
     };
     // Fast-path: directory.
     if let Some(pid) = resolve_project_for_entity(meta, entity_kind, entity_id).await {
@@ -718,8 +830,22 @@ async fn project_data_pool_by_search_from(
     // Fallback: cerca l'entita' nei DB-progetto. `table` e' un identificatore
     // costante interno (mai input utente): nessuna SQL-injection.
     let sql = format!("SELECT 1 FROM {table} WHERE id = $1 LIMIT 1");
+    let mut unreachable = 0usize;
     for pid in list_all_project_ids(meta).await {
-        let pool = project_data_pool_core(meta, cache, pid).await;
+        let pool = match project_data_pool_core(meta, cache, pid).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %pid,
+                    entity_kind,
+                    entity_id = %entity_id,
+                    error = %e,
+                    "routing by-id: DB-progetto irraggiungibile durante la ricerca, progetto saltato"
+                );
+                unreachable += 1;
+                continue;
+            }
+        };
         let found = sqlx::query_scalar::<_, i32>(&sql)
             .bind(entity_id)
             .fetch_optional(&pool)
@@ -729,20 +855,39 @@ async fn project_data_pool_by_search_from(
             .is_some();
         if found {
             register_entity_routing(meta, entity_kind, entity_id, pid).await;
-            return pool;
+            return Ok(pool);
         }
     }
-    // Dalla 0507 le tabelle del dominio chat/run NON esistono piu' nel meta:
-    // questo fallback produce a valle un errore SQL esplicito ("relation does
-    // not exist"), non piu' un silenzioso "0 righe". Livello error: un'entita'
-    // introvabile in ogni DB-progetto e' sempre un'anomalia da diagnosticare
-    // (id inesistente, directory di routing incompleta o DB-progetto down).
+    Err(search_exhausted_outcome(entity_kind, entity_id, unreachable))
+}
+
+/// Verdetto (e logging) della ricerca by-id esaurita: "non trovata" e'
+/// dimostrato SOLO se ogni DB-progetto era interrogabile; con almeno un DB
+/// irraggiungibile (es. in provisioning) l'esito e' `SearchInconclusive`
+/// (503, mai un 404 bugiardo).
+fn search_exhausted_outcome(
+    entity_kind: &'static str,
+    entity_id: Uuid,
+    unreachable: usize,
+) -> ProjectDbError {
+    if unreachable > 0 {
+        return ProjectDbError::SearchInconclusive {
+            entity_kind,
+            entity_id,
+            unreachable,
+        };
+    }
+    // Livello error: un'entita' introvabile in ogni DB-progetto e' sempre
+    // un'anomalia da diagnosticare (id inesistente o directory incompleta).
     tracing::error!(
         entity_kind,
         entity_id = %entity_id,
-        "routing by-id: entita' non trovata in nessun DB-progetto, fallback al meta-DB (dominio decommissionato dalla 0507: la query a valle fallira' in modo esplicito)"
+        "routing by-id: entita' non trovata in nessun DB-progetto"
     );
-    meta.clone()
+    ProjectDbError::EntityNotFound {
+        entity_kind,
+        entity_id,
+    }
 }
 
 /// Pool del progetto risolto dal `message_id` (directory + fallback ricerca). Per
@@ -750,13 +895,16 @@ async fn project_data_pool_by_search_from(
 pub async fn project_data_pool_by_message_from(
     meta: &sqlx::PgPool,
     message_id: Uuid,
-) -> sqlx::PgPool {
+) -> Result<sqlx::PgPool, ProjectDbError> {
     project_data_pool_by_search_from(meta, "message", "chat_messages", message_id).await
 }
 
 /// Pool del progetto risolto dal `run_id` (directory + fallback ricerca). Per gli
 /// endpoint keyed solo dal run (confirm/cancel run).
-pub async fn project_data_pool_by_run_from(meta: &sqlx::PgPool, run_id: Uuid) -> sqlx::PgPool {
+pub async fn project_data_pool_by_run_from(
+    meta: &sqlx::PgPool,
+    run_id: Uuid,
+) -> Result<sqlx::PgPool, ProjectDbError> {
     project_data_pool_by_search_from(meta, "run", "agent_runs", run_id).await
 }
 
@@ -766,7 +914,7 @@ pub async fn project_data_pool_by_run_from(meta: &sqlx::PgPool, run_id: Uuid) ->
 pub async fn project_data_pool_by_correction_from(
     meta: &sqlx::PgPool,
     correction_id: Uuid,
-) -> sqlx::PgPool {
+) -> Result<sqlx::PgPool, ProjectDbError> {
     project_data_pool_by_search_from(meta, "correction", "prompt_corrections", correction_id).await
 }
 
@@ -776,7 +924,7 @@ pub async fn project_data_pool_by_correction_from(
 pub async fn project_data_pool_by_feedback_from(
     meta: &sqlx::PgPool,
     feedback_id: Uuid,
-) -> sqlx::PgPool {
+) -> Result<sqlx::PgPool, ProjectDbError> {
     project_data_pool_by_search_from(meta, "feedback", "ai_response_feedback", feedback_id).await
 }
 
@@ -874,5 +1022,82 @@ mod tests {
             derive_project_db_name(Some("---"), pid(), DbRole::App),
             "____app"
         );
+    }
+
+    /// Regressione del fallback silenzioso al meta-DB (incidente 2026-07-20:
+    /// GET /api/chat/sessions rispondeva lista vuota dal meta e l'auto-create
+    /// "Chat 1" scriveva la sessione sul DB sbagliato mentre il DB del progetto
+    /// era in provisioning). Il test attraversa il PRODUTTORE reale (regola O):
+    /// `project_data_pool_core` -> `project_meta_pool_core` ->
+    /// `resolve_meta_db_url` con un pool lazy verso un endpoint irraggiungibile
+    /// — lo scenario "DB giu'" vero, non un input fabbricato. L'esito DEVE
+    /// essere `Err(Unavailable)`: reintrodurre `meta.clone()` sul ramo Err
+    /// (la mutazione che ha causato l'incidente) fa tornare Ok e il test
+    /// fallisce.
+    #[tokio::test]
+    async fn db_progetto_non_raggiungibile_errore_tipizzato_mai_meta() {
+        let meta = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://nexus:nope@127.0.0.1:9/meta_irraggiungibile")
+            .expect("connect_lazy non contatta il server: l'URL basta che sia ben formata");
+        let cache: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>> =
+            nexus_cache::TtlCache::new(std::time::Duration::from_secs(60));
+        let ghost = Uuid::new_v4();
+        match project_data_pool_core(&meta, &cache, ghost).await {
+            Err(ProjectDbError::Unavailable { project_id, .. }) => {
+                assert_eq!(project_id, ghost);
+            }
+            Ok(_) => panic!(
+                "DB del progetto non raggiungibile deve dare Err(Unavailable): \
+                 un Ok qui significa che il fallback silenzioso al meta e' tornato"
+            ),
+            Err(e) => panic!("variante inattesa per DB irraggiungibile: {e}"),
+        }
+    }
+
+    /// Il contratto wire dell'errore (regola M/N): status e codice macchina
+    /// sono cio' su cui decide il frontend, non il testo. 404 SOLO quando il
+    /// "non trovato" e' dimostrato su tutti i DB-progetto; ogni
+    /// indisponibilita' (incluso il "non trovato" NON dimostrato di
+    /// SearchInconclusive) e' 503 con codice `project_db_unavailable`.
+    #[test]
+    fn project_db_error_status_e_codici_stabili() {
+        let pid = Uuid::new_v4();
+        let unavailable = ProjectDbError::Unavailable {
+            project_id: pid,
+            message: "connect fallita".into(),
+        };
+        assert_eq!(
+            unavailable.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(unavailable.error_code(), "project_db_unavailable");
+
+        assert_eq!(
+            ProjectDbError::RegistryNotReady.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let inconclusive = ProjectDbError::SearchInconclusive {
+            entity_kind: "session",
+            entity_id: pid,
+            unreachable: 1,
+        };
+        assert_eq!(inconclusive.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(inconclusive.error_code(), "project_db_unavailable");
+
+        let not_found = ProjectDbError::EntityNotFound {
+            entity_kind: "session",
+            entity_id: pid,
+        };
+        assert_eq!(not_found.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(not_found.error_code(), "entity_not_found");
+
+        // La conversione per gli handler axum trasporta ENTRAMBI i campi
+        // strutturati nel body: `error` (testo per display) e `code` (macchina).
+        let (status, body): (StatusCode, Json<Value>) = unavailable.into();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["code"], "project_db_unavailable");
+        assert!(body.0["error"].as_str().is_some_and(|s| !s.is_empty()));
     }
 }

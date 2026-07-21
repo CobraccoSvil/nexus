@@ -69,22 +69,28 @@ pub async fn list_user_projects(
         let created_at = row.get::<chrono::DateTime<chrono::Utc>, _>("created_at");
 
         // last_opened_at vive nel DB per-progetto (project_open_sessions migrata):
-        // risolvo il pool del progetto e leggo il valore. A flag OFF l'helper
-        // ritorna il meta-DB (comportamento storico preservato).
-        let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-        let last_opened_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            r#"
-            SELECT updated_at FROM project_open_sessions
-            WHERE project_id = $1 AND user_id = $2
-            "#,
-        )
-        .bind(project_id)
-        .bind(user_id)
-        .fetch_optional(&proj_pool)
-        .await
-        .ok()
-        .flatten();
+        // risolvo il pool del progetto e leggo il valore. Lettura best-effort: se
+        // il DB del progetto non e' disponibile la lista NON salta, il progetto
+        // resta visibile con last_opened_at assente (niente fallback al meta-DB).
+        let last_opened_at: Option<chrono::DateTime<chrono::Utc>> =
+            match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+                Ok(proj_pool) => sqlx::query_scalar(
+                    r#"
+                    SELECT updated_at FROM project_open_sessions
+                    WHERE project_id = $1 AND user_id = $2
+                    "#,
+                )
+                .bind(project_id)
+                .bind(user_id)
+                .fetch_optional(&proj_pool)
+                .await
+                .ok()
+                .flatten(),
+                Err(e) => {
+                    tracing::warn!(project_id = %project_id, error = %e, "lista progetti: DB progetto non disponibile, last_opened_at omesso");
+                    None
+                }
+            };
 
         let sort_key = last_opened_at.unwrap_or(created_at);
         let name = row.get::<String, _>("name");
@@ -512,20 +518,28 @@ pub async fn delete_project(
     // dentro node_modules/.vite e race con il rm_dir_all sotto, lasciando residui
     // su disco anche dopo che il DB e' stato pulito dal CASCADE.
     // Separazione DB: agent_processes e' una tabella migrata, instradiamo la
-    // lettura sul pool del progetto (a flag OFF ritorna il meta-DB, comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
-    let running_pids: Vec<i32> = sqlx::query_scalar(
-        r#"
-        SELECT pid FROM agent_processes
-        WHERE project_id = $1
-          AND status IN ('running', 'starting')
-          AND pid IS NOT NULL
-        "#,
-    )
-    .bind(project_id)
-    .fetch_all(&proj_pool)
-    .await
-    .unwrap_or_default();
+    // lettura sul pool del progetto. Best-effort: se il DB del progetto non e'
+    // disponibile (progetto rotto/mai provisionato) il delete deve comunque
+    // procedere — si salta solo il kill dei figli tracciati, con WARN.
+    let running_pids: Vec<i32> =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(proj_pool) => sqlx::query_scalar(
+                r#"
+                SELECT pid FROM agent_processes
+                WHERE project_id = $1
+                  AND status IN ('running', 'starting')
+                  AND pid IS NOT NULL
+                "#,
+            )
+            .bind(project_id)
+            .fetch_all(&proj_pool)
+            .await
+            .unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "delete_project: DB progetto non disponibile, kill dei figli tracciati saltato");
+                Vec::new()
+            }
+        };
 
     // Terminazione dei figli tracciati: punto unico process_util::kill_pid
     // (Unix: SIGTERM->SIGKILL; Windows: taskkill /T /F sull'albero). Sostituisce
