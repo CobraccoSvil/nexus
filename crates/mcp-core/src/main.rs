@@ -1073,6 +1073,11 @@ fn spawn_infra_watchdogs(state: &AppState) {
     process_resume::spawn_process_resume_worker(state.clone());
     fanin_worker::spawn_fanin_worker(state.clone());
     crate::project_workspace::monitor_seed::spawn_monitor_seed_worker(state.clone());
+    // One-shot: chiude le diagnosi 'diagnosing' orfane di run di rimedio morti
+    // col processo precedente (la chiusura normale vive in un task in-memory).
+    crate::project_workspace::resource_violation_remediation::spawn_stale_diagnosing_reaper(
+        state.clone(),
+    );
 }
 
 /// Avvia i worker catalogo/telemetria/retention: catalog_sync (ai_price_catalog dal

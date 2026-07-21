@@ -464,6 +464,67 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     }
 }
 
+/// Reaper one-shot all'avvio: chiude le diagnosi rimaste `diagnosing` da un
+/// run di rimedio MORTO. La chiusura normale (attesa fine run -> re-lint in
+/// `close_after_remediation`) vive in un task IN MEMORIA: se mcp-core viene
+/// riavviato/crasha con un run di rimedio in volo, il task sparisce e la
+/// diagnosi resta `diagnosing` per sempre (zombie osservati sul progetto
+/// vendita-immobile, ferme al 20/07 dopo il crash). Il criterio e' il segnale
+/// strutturato dello stato del run (regola M: `is_active_run_status`, punto
+/// unico), mai l'eta' della riga; la chiusura passa dallo STESSO punto unico
+/// del flusso normale (`close_after_remediation` -> re-lint reale, regola L/O).
+pub(crate) fn spawn_stale_diagnosing_reaper(state: AppState) {
+    tokio::spawn(async move {
+        // Breve attesa: lascia stabilizzare pool e registry dopo il boot.
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        reap_stale_diagnosing(&state).await;
+    });
+}
+
+async fn reap_stale_diagnosing(state: &AppState) {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT project_id, triggered_run_id FROM service_diagnoses \
+          WHERE signal_kind = 'policy_violation' AND status = 'diagnosing' \
+            AND triggered_run_id IS NOT NULL",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (project_id, run_id) in rows {
+        if remediation_run_is_active(state, project_id, run_id).await {
+            continue; // il task di chiusura del run corrente se ne occupera'
+        }
+        tracing::info!(project_id = %project_id, run_id = %run_id,
+            "diagnosing_reaper: run di rimedio terminato/assente, chiudo via re-lint");
+        close_after_remediation(state, project_id, run_id).await;
+    }
+}
+
+/// True se il run di rimedio e' ancora ATTIVO sul pool del progetto (segnale
+/// strutturato `is_active_run_status`, regola M). DB progetto non disponibile
+/// -> true prudente (non chiudere: al prossimo boot si rivaluta).
+async fn remediation_run_is_active(state: &AppState, project_id: Uuid, run_id: Uuid) -> bool {
+    let runs_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e,
+                    "diagnosing_reaper: DB progetto non disponibile, salto");
+                return true;
+            }
+        };
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(&runs_pool)
+            .await
+            .ok()
+            .flatten();
+    status
+        .as_deref()
+        .is_some_and(crate::agent_types::is_active_run_status)
+}
+
 /// Re-lint post-run: per ogni diagnosi `diagnosing` di questo run, verifica se
 /// la violazione e' sparita dai sorgenti -> resolved; altrimenti ri-open (il
 /// cap tentativi al prossimo giro decide l'eventuale failed_remediation).
