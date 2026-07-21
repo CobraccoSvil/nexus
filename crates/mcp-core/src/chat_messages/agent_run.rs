@@ -1485,9 +1485,12 @@ pub(crate) async fn native_outcome_to_run_result(
                 .unwrap_or_else(|| {
                     "**Review adversariale automatica: NON superata.**".to_string()
                 });
-            format!(
-                "{nota}\n\n---\n_Resoconto dell'agente (auto-valutazione, NON \
-                 confermata dalla review):_\n{ans}"
+            compose_unconfirmed_report(
+                &nota,
+                "NON confermata dalla review",
+                &provider,
+                &model,
+                &ans,
             )
         })
     } else {
@@ -1498,31 +1501,30 @@ pub(crate) async fn native_outcome_to_run_result(
         outcome.final_gate_passed,
         outcome.final_gate_unverified,
     ) {
-        (Some(ans), Some(false), _) => Some(format!(
-            "**Verifica automatica non superata** (limite tentativi raggiunto): i \
-             criteri di verifica del progetto non sono passati; il task NON e' \
-             confermato completo. Controlla i criteri falliti nella timeline \
-             \"Decisioni del turno\" e riverifica il flusso reale prima di \
-             considerarlo concluso.\n\n---\n_Resoconto dell'agente (auto-valutazione, \
-             non confermata dalla verifica):_\n{ans}"
+        (Some(ans), Some(false), _) => Some(compose_unconfirmed_report(
+            NOTE_GATE_NON_SUPERATA,
+            "non confermata dalla verifica",
+            &provider,
+            &model,
+            &ans,
         )),
         // Bocciatura del gate in sospeso (run morto prima della ri-verifica, es.
         // provider esauriti): l'ultima verifica ESEGUITA era fallita e le
         // correzioni successive non sono mai state ri-verificate (run a5db0985).
-        (Some(ans), _, _) if outcome.final_gate_failed_pending => Some(format!(
-            "**Verifica automatica fallita e non ripetuta**: l'ultima verifica dei \
-             criteri del progetto era FALLITA e il run si e' chiuso prima di poter \
-             ri-verificare le correzioni. Il task NON risulta verificato e puo' \
-             contenere regressioni: controlla i criteri falliti nella timeline \
-             \"Decisioni del turno\" e riesegui la verifica prima di considerarlo \
-             concluso.\n\n---\n_Resoconto dell'agente (auto-valutazione, non \
-             confermata dalla verifica):_\n{ans}"
+        (Some(ans), _, _) if outcome.final_gate_failed_pending => Some(compose_unconfirmed_report(
+            NOTE_GATE_FALLITA_PENDING,
+            "non confermata dalla verifica",
+            &provider,
+            &model,
+            &ans,
         )),
         // Lavoro svolto ma verifica tecnica NON eseguita (profilo di verifica
         // dell'ambiente assente): annotazione onesta (regola M), non un fallimento.
+        // Forma DIVERSA (nota DOPO, nessun degrado ad auto-valutazione): il lavoro
+        // e' riuscito, manca solo la conferma tecnica. Resta fuori dal punto unico.
         (Some(ans), _, Some(true)) => Some(format!(
-            "{ans}\n\n---\n**Verifica tecnica non eseguita**: per questo progetto non \
-             e' disponibile un profilo di verifica (comandi di build/test), quindi \
+            "{ans}\n\n---\n\n**Verifica tecnica non eseguita**: per questo progetto \
+             non e' disponibile un profilo di verifica (comandi di build/test), quindi \
              l'esito NON e' stato confermato da un comando reale. Definisci i comandi \
              di verifica del progetto oppure ricontrolla manualmente prima di \
              considerarlo concluso."
@@ -1589,6 +1591,46 @@ pub(crate) async fn native_outcome_to_run_result(
         // trace panel): prima il run nativo lasciava la colonna NULL.
         messages_json: outcome.messages_json,
     }
+}
+
+/// Nota di esito del final_gate NON superato al cap. Contratto riconosciuto a
+/// valle (regola M): il prefisso `**Verifica automatica non superata**` e'
+/// matchato da `is_report_hollow`/canonical_run_status e da un test. Invariato.
+const NOTE_GATE_NON_SUPERATA: &str = "**Verifica automatica non superata** \
+(limite tentativi raggiunto): i criteri di verifica del progetto non sono \
+passati; il task NON e' confermato completo. Controlla i criteri falliti nella \
+timeline \"Decisioni del turno\" e riverifica il flusso reale prima di \
+considerarlo concluso.";
+
+/// Nota di esito del gate bocciato e mai ri-verificato (run chiuso prima della
+/// ri-verifica). Contratto (regola M): prefisso invariato.
+const NOTE_GATE_FALLITA_PENDING: &str = "**Verifica automatica fallita e non \
+ripetuta**: l'ultima verifica dei criteri del progetto era FALLITA e il run si \
+e' chiuso prima di poter ri-verificare le correzioni. Il task NON risulta \
+verificato e puo' contenere regressioni: controlla i criteri falliti nella \
+timeline \"Decisioni del turno\" e riesegui la verifica prima di considerarlo \
+concluso.";
+
+/// Punto unico (regola L) del resoconto "auto-valutazione NON confermata": i tre
+/// casi (review bocciata / gate non superato / gate fallito-non-ripetuto)
+/// condividono la STESSA forma e differiscono solo per `note` e `qualifica`.
+/// Compone: nota di esito, header col PROVENIENZA (provider/model che ha
+/// generato il testo) e corpo, con spaziatura markdown ariosa. Le note passate
+/// sono un contratto a valle (regola M): non vengono alterate.
+fn compose_unconfirmed_report(
+    note: &str,
+    qualifica: &str,
+    provider: &str,
+    model: &str,
+    ans: &str,
+) -> String {
+    let prov = (!provider.is_empty() && !model.is_empty())
+        .then(|| format!("{provider}/{model} · "))
+        .unwrap_or_default();
+    format!(
+        "{note}\n\n---\n\n_Resoconto dell'agente ({prov}auto-valutazione, \
+         {qualifica}):_\n\n{ans}"
+    )
 }
 
 /// Riconosce il messaggio di errore provider sintetizzato dall'executor del
@@ -5765,6 +5807,37 @@ pub(crate) async fn run_shadow_for_state(
 }
 
 #[cfg(test)]
+mod tests_compose_report {
+    use super::{compose_unconfirmed_report, NOTE_GATE_NON_SUPERATA};
+
+    #[test]
+    fn provenienza_inclusa_e_nota_preservata() {
+        let out = compose_unconfirmed_report(
+            NOTE_GATE_NON_SUPERATA,
+            "non confermata dalla verifica",
+            "mistral",
+            "mistral-small-latest",
+            "Ho fatto X.",
+        );
+        // Contratto a valle (regola M): il prefisso nota resta il primo carattere.
+        assert!(out.starts_with("**Verifica automatica non superata**"), "{out}");
+        // Provenienza inclusa nell'header del resoconto.
+        assert!(out.contains("mistral/mistral-small-latest · auto-valutazione"), "{out}");
+        // Corpo presente, separato dall'header.
+        assert!(out.contains("\n\nHo fatto X."), "{out}");
+        assert!(out.contains("Resoconto dell'agente"), "{out}");
+    }
+
+    #[test]
+    fn provenienza_omessa_se_provider_o_model_vuoti() {
+        // Senza provider/model noti: header senza provenienza (niente "·" spurio).
+        let out = compose_unconfirmed_report("**Nota.**", "non confermata", "", "", "corpo");
+        assert!(out.contains("_Resoconto dell'agente (auto-valutazione,"), "{out}");
+        assert!(!out.contains(" · "), "nessun separatore provenienza vuoto: {out}");
+    }
+}
+
+#[cfg(test)]
 mod tests_review_gate {
     use super::{is_code_file, select_pre_run_advisory};
     use serde_json::json;
@@ -7105,6 +7178,11 @@ mod tests_native_mapping {
             "la prosa del modello resta presente (subordinata): {ans}"
         );
         assert!(ans.contains("Resoconto dell'agente"));
+        // Provenienza: il resoconto dice QUALE provider/modello l'ha generato.
+        assert!(
+            ans.contains("anthropic/claude-x"),
+            "il resoconto deve riportare provider/modello: {ans}"
+        );
 
         // gate PASSATO -> Completed, nessuna annotazione.
         let mut o = outcome_base();
