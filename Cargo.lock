@@ -2575,6 +2575,7 @@ dependencies = [
  "nexus-build-graph",
  "nexus-http",
  "nexus-project-pools",
+ "nexus-tool-kit",
  "nexus-types",
  "notify",
  "once_cell",
