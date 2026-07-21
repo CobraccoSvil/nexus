@@ -930,6 +930,22 @@ export function ChatPanel({
     [messages, resend, profileId, activeFiles, scrollToBottom],
   );
 
+  // Riattivazione di una chat sospesa dal riavvio del backend: invia un messaggio
+  // SINTETICO (nascosto nella UI) con resume=true. Il backend continua l'ultimo run
+  // `interrupted` dallo stato salvato (messages_json), NON riparte da zero. Nessun
+  // auto-riavvio: parte solo dal click sul pulsante "Riattiva" del banner.
+  const handleResume = useCallback(() => {
+    void (async () => {
+      await send("Riprendi l'elaborazione interrotta", {
+        profileId,
+        activeFiles,
+        synthetic: true,
+        resume: true,
+      });
+      setTimeout(scrollToBottom, 40);
+    })();
+  }, [send, profileId, activeFiles, scrollToBottom]);
+
   const handleDelete = useCallback(
     (messageId: string) => {
       void (async () => {
@@ -1166,6 +1182,7 @@ export function ChatPanel({
             t={t as (key: string) => string}
             onCopy={copyMessage}
             onResend={handleResend}
+            onResume={handleResume}
             onDelete={handleDelete}
             onFeedback={handleFeedback}
             onFeedbackPositive={feedbackPositive}

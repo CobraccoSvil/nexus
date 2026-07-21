@@ -1072,6 +1072,10 @@ export interface MessageListProps {
   t: (key: string) => string;
   onCopy: (messageId: string, content: string) => Promise<boolean> | boolean;
   onResend: (messageId: string) => void;
+  /** Riattivazione di una chat sospesa dal riavvio del backend: continua l'ultimo
+   *  run `interrupted` dallo stato salvato (invia un messaggio sintetico con
+   *  resume=true). Assente => il banner "Riattiva" non compare. */
+  onResume?: () => void;
   onDelete: (messageId: string) => void;
   onFeedback: (messageId: string, content: string) => void;
   /** Feedback positivo: conferma esplicita che la risposta e' corretta (Q-learning reward=1.0). */
@@ -1149,6 +1153,7 @@ export function MessageList({
   t,
   onCopy,
   onResend,
+  onResume,
   onDelete,
   onFeedback,
   onFeedbackPositive,
@@ -1462,6 +1467,54 @@ export function MessageList({
               ) && (
                 <div style={{ marginTop: 6 }}>
                   <RunStatusBadge status={message.runStatus} tc={tc} />
+                </div>
+              )}
+
+            {/* Avviso "chat sospesa" + Riattiva: un run interrotto dal riavvio del
+                backend conserva lo stato (agent_runs.messages_json) ed e'
+                RIPRISTINABILE, ma resta un vicolo cieco nella UI (solo testo
+                passivo). Mostriamo un banner azionabile SOLO sull'ultimo run
+                interrotto (l'unico che il resume backend riprende) e SOLO se il
+                chiamante ha fornito onResume. Nessun auto-riavvio: l'utente decide
+                (scelta "sempre col pulsante"). */}
+            {!isUser &&
+              message.runStatus === "interrupted" &&
+              message.id === lastAssistantRunMessageId &&
+              onResume && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    border: `1px solid #f59e0b55`,
+                    background: "#f59e0b14",
+                    fontSize: 12,
+                  }}
+                >
+                  <span style={{ color: tc.text }}>
+                    Chat sospesa dal riavvio del backend. Il lavoro e&apos; stato salvato.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onResume()}
+                    style={{
+                      marginLeft: "auto",
+                      fontWeight: 600,
+                      fontSize: 12,
+                      color: "#fff",
+                      background: "#f59e0b",
+                      border: "none",
+                      borderRadius: 6,
+                      padding: "4px 12px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Riattiva
+                  </button>
                 </div>
               )}
 

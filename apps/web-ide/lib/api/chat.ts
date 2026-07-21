@@ -132,6 +132,10 @@ export interface SendChatMessageOptions {
   /** Se true, marca il messaggio come auto-generato dal sistema (es. auto-continuazione).
       Il backend lo persiste in metadata.synthetic; la UI lo nasconde. */
   synthetic?: boolean;
+  /** Se true, segnala una RIATTIVAZIONE strutturata (pulsante "Riattiva" del banner
+      chat-sospesa): il backend continua l'ultimo run `interrupted` dallo stato
+      salvato, indipendente dal contenuto (regola N, non la stringa "riprendi"). */
+  resume?: boolean;
   /** Hint strutturale sul tipo di agente (es. "debugger" dai pannelli error-fix).
       Il backend lo mappa su agent_type_hint -> nexus_agent_type_hint, attiva
       agent_type_forced e SALTA la disambiguazione d'intent (A/B). Non dedotto dal
@@ -322,6 +326,7 @@ export async function sendChatMessage(
       // inviare. Il backend usa questo hint per pruning lato suo.
       messageWindowSize: options.messageWindowSize ?? 30,
       synthetic: options.synthetic ?? false,
+      resume: options.resume ?? false,
       // Hint strutturale (es. "debugger" dai pannelli error-fix): se assente si
       // invia undefined (omesso dal JSON) e il backend classifica l'intent come
       // di consueto. Vedi SendChatMessageOptions.agentTypeHint.

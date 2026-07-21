@@ -674,6 +674,7 @@ pub async fn send_chat_message(
         &session_pool,
         content,
         automation_mode,
+        body.resume,
         user_id,
         user_message_id,
         &user_message,
@@ -892,6 +893,7 @@ async fn try_resume_interrupted_run(
     session_pool: &PgPool,
     content: &str,
     automation_mode: AutomationMode,
+    force_resume: bool,
     user_id: Uuid,
     user_message_id: Uuid,
     user_message: &ChatMessageView,
@@ -901,7 +903,10 @@ async fn try_resume_interrupted_run(
         return None;
     }
 
-    let is_resume_request = {
+    // `force_resume` (regola N): segnale STRUTTURATO dal pulsante "Riattiva" del
+    // banner chat-sospesa, indipendente dal testo. La stringa magica ("riprendi"/
+    // "continua") resta come scorciatoia digitabile ma non e' piu' l'unico canale.
+    let is_resume_request = force_resume || {
         let lower = content.trim().to_lowercase();
         lower == "riprendi"
             || lower == "continua"

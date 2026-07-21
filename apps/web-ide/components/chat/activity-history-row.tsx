@@ -54,6 +54,39 @@ function statusTone(runStatus: string | undefined): "ok" | "err" | "neutral" {
   return "neutral";
 }
 
+/** Etichetta leggibile dello stato del turno storico. Senza, il badge mostrava
+ *  SOLO un glifo (•/✓/✗): per un run `interrupted` (o comunque senza query ne'
+ *  costo) la riga compatta diventava illeggibile — solo un pallino grigio + il
+ *  trail provider, nessun testo. Allineata al vocabolario di RunStatusBadge. */
+function statusLabel(runStatus: string | undefined): string {
+  switch (runStatus) {
+    case "completed":
+    case "completed_verified":
+      return "completato";
+    case "completed_unverified":
+      return "completato (non verificato)";
+    case "failed":
+    case "failed_diagnosed":
+      return "fallito";
+    case "timed_out":
+      return "timeout";
+    case "loop_aborted":
+      return "interrotto (loop)";
+    case "interrupted":
+      return "interrotto (riavvio)";
+    case "cancelled":
+      return "annullato";
+    case "provider_unavailable":
+      return "provider non disponibile";
+    case "blocked_needs_input":
+      return "serve input";
+    case "running":
+      return "in corso";
+    default:
+      return runStatus ?? "turno";
+  }
+}
+
 /** Trail dei provider toccati nel turno (uno per segmento, in ordine, senza
  *  doppioni consecutivi). */
 function providerTrail(stream: ActivityStream): string[] {
@@ -152,9 +185,11 @@ export function ActivityHistoryRow({
             borderRadius: 6,
             padding: "1px 7px",
             flexShrink: 0,
+            whiteSpace: "nowrap",
           }}
         >
           {toneGlyph}
+          <span>{statusLabel(runStatus)}</span>
         </span>
         {/* Testo del turno (cede per primo) */}
         {query && (

@@ -46,6 +46,12 @@ pub struct SendChatMessageRequest {
     /// nel DB e usato per triggerare l'agent run.
     #[serde(default)]
     pub synthetic: bool,
+    /// Segnale STRUTTURATO di RIATTIVAZIONE (regola N: identificatore esplicito,
+    /// non la stringa magica "riprendi"): il pulsante "Riattiva" del banner "chat
+    /// sospesa" lo imposta a true per continuare l'ultimo run `interrupted` dallo
+    /// stato salvato (`messages_json`), a prescindere dal `content`. Default false.
+    #[serde(default)]
+    pub resume: bool,
     /// Chiave di idempotenza generata dal client (mig progetto 0008): un retry
     /// di rete della stessa POST porta lo stesso UUID e il backend, se il
     /// messaggio risulta gia' persistito nella sessione, fa replay della
