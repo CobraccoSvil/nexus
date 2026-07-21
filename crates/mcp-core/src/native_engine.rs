@@ -2742,6 +2742,21 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .map(|d| d.as_secs() as i64),
+        // Segnali del classifier del TURNO nello stato del grafo (regola O: la
+        // misura deve raggiungere il suo oggetto). Sono gia' RISOLTI al call site
+        // (`agent_run.rs`: `sizing_complexity` = classe del classifier del turno,
+        // `agentic_score` = punteggio 0..1) ma finora `..Default::default()` li
+        // scartava -> il grafo primario nativo girava CIECO: `is_complex`
+        // (UnderstandingNode) sempre false e il GATE ORCHESTRAZIONE del planner
+        // (`orchestration_gate`, consulta il MetaReasoner con `task_complexity`/
+        // `agentic_score`) decideva su valori a ZERO -> RunInline -> plan-phase
+        // SALTATA anche per "crea un'app". Seminandoli il reasoner vede la
+        // complessita' reale e la plan-phase si attiva sui task complessi. Sub-run
+        // e resume NON risolvono il classifier (input a `None`) -> restano `None`,
+        // comportamento INVARIATO. `agentic_score` di stato e' f64 (il campo del
+        // classifier e' f32): cast diretto, nessuna perdita significativa.
+        task_complexity: input.sizing_complexity.map(Into::into),
+        agentic_score: input.agentic_score.map(|s| s as f64),
         ..Default::default()
     }
 }
