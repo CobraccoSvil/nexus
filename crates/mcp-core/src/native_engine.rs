@@ -862,13 +862,27 @@ pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> Superv
 /// Costruisce la [`PlannerConfig`] DB-driven (regola G), 1:1 con le chiavi
 /// `orchestrator.*` lette dal brain (`orchestrator_config.py`). I campi che il
 /// brain NON popola da `orchestrator_config` restano al loro `Default`:
-/// - `planner_system_text`: prompt RISOLTO A MONTE dal registry (regola G) — non
-///   ancora portato nella cablatura nativa, resta vuoto (`prompt_missing` -> skip,
-///   parita' col safe-default);
+/// - `planner_system_text`: prompt del planner RISOLTO dal registry (regola G/L):
+///   chiave da `orchestrator.planner_prompt_key` (default `agent.planner.base`),
+///   testo via il punto unico `get_template_or_default`. Prima restava vuoto
+///   (`prompt_missing` -> skip): innocuo finche' la plan-phase non si attivava mai,
+///   diventato bloccante quando i segnali del classifier (task_complexity/
+///   agentic_score) propagati nello stato hanno reso il planner eleggibile davvero.
 /// - `turn_focus_enabled`: viene dalla CONTINUITY config (`agent.context.turn_focus_enabled`),
 ///   non da `orchestrator_config` — TODO wiring continuity (default true).
 async fn load_planner_config(db: &PgPool) -> PlannerConfig {
     let d = PlannerConfig::default();
+    // Prompt del planner risolto dal registry (vedi nota sopra): chiave -> testo.
+    // Senza questo il planner, quando eleggibile, salta con "prompt non trovato".
+    let planner_prompt_key = nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
+        .await
+        .unwrap_or_else(|| d.planner_prompt_key.clone());
+    let planner_system_text = crate::prompt_templates::get_template_or_default(
+        db,
+        &crate::prompt_templates::TemplateCache::new(),
+        &planner_prompt_key,
+    )
+    .await;
     PlannerConfig {
         plan_phase_enabled: setting_bool(
             db,
@@ -889,9 +903,7 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
             d.plan_min_token_budget,
         )
         .await,
-        planner_prompt_key: nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
-            .await
-            .unwrap_or(d.planner_prompt_key),
+        planner_prompt_key,
         clarifying_questions_enabled: setting_bool(
             db,
             "orchestrator.clarifying_questions_enabled",
@@ -927,7 +939,7 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
         )
         .await,
         // Risolti a monte / da altra fonte (vedi doc della funzione): default.
-        planner_system_text: d.planner_system_text,
+        planner_system_text,
         turn_focus_enabled: d.turn_focus_enabled,
     }
 }
