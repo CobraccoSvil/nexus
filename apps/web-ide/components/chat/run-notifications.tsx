@@ -13,148 +13,22 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
+import { useScrollToAnchor } from "../../hooks/use-scroll-to-anchor";
 import { useThemeColors } from "../../lib/theme";
-import { providerBaseColor } from "./provider-badge";
-import { toolLabel } from "./tool-labels";
+import { withAlpha } from "../../lib/color";
+import {
+  deriveRunNotifications,
+  hasBlocking,
+  type RunNotification,
+} from "./run-notifications-model";
 import type { ActivityStream } from "../../lib/use-chat/activity-stream";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
-export type RunNotificationTone = "info" | "warn" | "block";
-
-export interface RunNotification {
-  tone: RunNotificationTone;
-  title: string;
-  detail?: string;
-  color: string;
-}
-
-/** Stati del run che richiedono l'attenzione bloccante dell'utente. */
-const BLOCKING_STATUSES: ReadonlySet<string> = new Set([
-  "awaiting_confirmation",
-  "blocked_needs_input",
-]);
-
-/** Deriva le notifiche salienti dal nastro + stato run (segnali strutturati). */
-export function deriveRunNotifications(
-  stream: ActivityStream,
-  runStatus: string | undefined,
-  tc: ThemeColors,
-): RunNotification[] {
-  const out: RunNotification[] = [];
-
-  for (const seg of stream.segments) {
-    // Cambio provider = evento saliente.
-    if (seg.openedBySwitch && seg.switch) {
-      out.push({
-        tone: "warn",
-        title: "Cambio provider",
-        detail: `${seg.switch.fromProvider ?? "?"} -> ${seg.switch.toProvider}${
-          seg.switch.reason ? ` (${seg.switch.reason})` : ""
-        }`,
-        color: providerBaseColor(seg.switch.toProvider),
-      });
-    }
-    // Step fallito = evento saliente.
-    for (const ev of seg.events) {
-      if (ev.type === "tool" && ev.outcome === "err") {
-        out.push({
-          tone: "warn",
-          title: "Passo fallito",
-          detail: `${toolLabel(ev.name)}${typeof ev.exitCode === "number" ? ` (exit ${ev.exitCode})` : ""}`,
-          color: tc.error,
-        });
-      }
-      if (ev.type === "context_overflow") {
-        out.push({
-          tone: "warn",
-          title: "Contesto oltre il limite",
-          detail: ev.detail,
-          color: tc.error,
-        });
-      }
-      if (ev.type === "council_of_competencies") {
-        const failedFigures = ev.figureReports?.filter((r) => r.status !== "advisory_ok") ?? [];
-        const figureDetail =
-          ev.phase === "convening"
-            ? typeof ev.completedCount === "number" &&
-              typeof ev.figureCount === "number" &&
-              ev.figureCount > 0
-              ? `${ev.completedCount}/${ev.figureCount} figure completate`
-              : "Convocazione figure in corso"
-            : ev.degraded && failedFigures.length > 0
-              ? failedFigures.map((r) => `${r.kind}: ${r.detail_message}`).join(" · ")
-              : undefined;
-        out.push({
-          tone: ev.phase === "convening" ? "info" : ev.degraded ? "warn" : "info",
-          title: "Consiglio delle Competenze",
-          detail:
-            figureDetail ??
-            (ev.degraded
-              ? ev.degradationReason ??
-                "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
-              : "Attivato dall'analisi agentica/deterministica della richiesta."),
-          color: ev.degraded ? "#f59e0b" : "#0ea5e9",
-        });
-      }
-      if (ev.type === "multi_provider_panel") {
-        out.push({
-          tone: ev.degraded ? "warn" : "info",
-          title: ev.productName,
-          detail: ev.degraded
-            ? ev.degradationReason ??
-              "Provider distinti insufficienti: panel multi-provider non convocato."
-            : typeof ev.providerCount === "number" && ev.providerCount > 0
-              ? `${ev.providerCount} provider distinti hanno analizzato la richiesta.`
-              : "Analisi parallela su provider/modelli distinti.",
-          color: ev.degraded ? "#f59e0b" : "#6366f1",
-        });
-      }
-    }
-  }
-
-  if (runStatus && BLOCKING_STATUSES.has(runStatus)) {
-    out.push({
-      tone: "block",
-      title:
-        runStatus === "awaiting_confirmation" ? "Attesa conferma" : "Attesa input",
-      detail: "Il run e' in pausa e richiede la tua azione.",
-      color: "#8b5cf6",
-    });
-  }
-
-  // Fan-in async: il run e' sospeso in attesa dei sub-agent in background.
-  // NON e' bloccante per l'utente (non deve agire, solo attendere): tono "info"
-  // e FUORI da BLOCKING_STATUSES cosi' NON auto-apre il pannello rubando il
-  // focus. Il conteggio, se noto, arriva dall'evento awaiting_subagents del
-  // nastro (segnale strutturato, regola M).
-  if (runStatus === "awaiting_subagents") {
-    let count: number | undefined;
-    for (const seg of stream.segments) {
-      for (const ev of seg.events) {
-        if (ev.type === "awaiting_subagents" && typeof ev.count === "number") {
-          count = ev.count;
-        }
-      }
-    }
-    out.push({
-      tone: "info",
-      title: "In attesa dei sub-agent",
-      detail:
-        typeof count === "number" && count > 0
-          ? `${count} sub-agent in background, il run riprende al loro completamento.`
-          : "Il run riprende al completamento dei sub-agent in background.",
-      color: "#8b5cf6",
-    });
-  }
-
-  return out;
-}
-
-/** true se tra le notifiche c'e' almeno un evento bloccante. */
-function hasBlocking(notifications: RunNotification[]): boolean {
-  return notifications.some((n) => n.tone === "block");
-}
+// Il modello dati (tipi + deriveRunNotifications + hasBlocking + BLOCKING_STATUSES)
+// vive nel modulo PURO ./run-notifications-model (regola L: modello vs vista,
+// regola O: testabile con `node --test` senza JSX). Qui resta la sola vista.
+export type { RunNotification } from "./run-notifications-model";
 
 export function RunNotifications({
   stream,
@@ -205,6 +79,19 @@ export function RunNotifications({
   // Escape, che prima non aveva.
   const chiudiPannello = useCallback(() => setOpen(false), []);
   useDismissOnOutside(open, [panelRef, bellRef], chiudiPannello);
+
+  // Deep-link: click su una voce -> scroll + flash sulla riga esatta del nastro
+  // del run corrente (punto unico use-scroll-to-anchor, regola L). Solo le voci
+  // con un'ancora sono cliccabili; le voci di stato senza riga restano statiche.
+  const scrollToAnchor = useScrollToAnchor();
+  const handleNotificationClick = useCallback(
+    (n: RunNotification) => {
+      if (!runId || !n.anchorId) return;
+      scrollToAnchor(runId, n.anchorId, n.segmentAnchorId, tc.accent);
+      setOpen(false);
+    },
+    [runId, scrollToAnchor, tc.accent],
+  );
 
   if (notifications.length === 0) return null;
 
@@ -326,49 +213,74 @@ export function RunNotifications({
               x
             </button>
           </div>
-          {notifications.map((n, i) => (
-            <div
-              key={`notif-${i}`}
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 8,
-                padding: "5px 6px",
-                borderRadius: 8,
-                background: withAlpha(n.color, 0.08),
-                border: `1px solid ${withAlpha(n.color, 0.3)}`,
-                minWidth: 0,
-              }}
-            >
-              <span
-                aria-hidden
+          {notifications.map((n, i) => {
+            // Cliccabile solo se la voce ha un'ancora nel nastro e conosciamo il
+            // run: le voci di stato senza riga (attesa conferma, sub-agent)
+            // restano statiche (degrado pulito).
+            const clickable = !!runId && !!n.anchorId;
+            const boxStyle: React.CSSProperties = {
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 8,
+              padding: "5px 6px",
+              borderRadius: 8,
+              background: withAlpha(n.color, 0.08),
+              border: `1px solid ${withAlpha(n.color, 0.3)}`,
+              minWidth: 0,
+            };
+            const inner = (
+              <>
+                <span
+                  aria-hidden
+                  style={{
+                    width: 8,
+                    height: 8,
+                    borderRadius: "50%",
+                    background: n.color,
+                    marginTop: 5,
+                    flexShrink: 0,
+                  }}
+                />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: tc.text }}>{n.title}</div>
+                  {n.detail && (
+                    <div
+                      style={{
+                        fontSize: 11,
+                        color: tc.textMuted,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {n.detail}
+                    </div>
+                  )}
+                </div>
+              </>
+            );
+            return clickable ? (
+              <button
+                key={`notif-${i}`}
+                type="button"
+                onClick={() => handleNotificationClick(n)}
+                title="Vai al punto nel nastro"
                 style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  background: n.color,
-                  marginTop: 5,
-                  flexShrink: 0,
+                  ...boxStyle,
+                  width: "100%",
+                  textAlign: "left",
+                  font: "inherit",
+                  cursor: "pointer",
                 }}
-              />
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 11.5, fontWeight: 600, color: tc.text }}>{n.title}</div>
-                {n.detail && (
-                  <div
-                    style={{
-                      fontSize: 11,
-                      color: tc.textMuted,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {n.detail}
-                  </div>
-                )}
+              >
+                {inner}
+              </button>
+            ) : (
+              <div key={`notif-${i}`} style={boxStyle}>
+                {inner}
               </div>
-            </div>
-          ))}
+            );
+          })}
 
           {showHitlActions && (
             <div
@@ -450,14 +362,4 @@ export function RunNotifications({
       )}
     </div>
   );
-}
-
-function withAlpha(hex: string, alpha: number): string {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
-  if (!m) return hex;
-  const v = m[1];
-  const r = parseInt(v.slice(0, 2), 16);
-  const g = parseInt(v.slice(2, 4), 16);
-  const b = parseInt(v.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
 }
