@@ -62,6 +62,23 @@ impl TaskComplexity {
     }
 }
 
+/// Conversione al vocabolario di STATO del grafo (`state::TaskComplexity`). Due
+/// enum gemelli Low/Medium/High vivono in moduli diversi (dimensionamento vs
+/// stato del run); questa e' l'UNICA conversione (regola L), consumata da
+/// mcp-core per seminare `AgentState::task_complexity` dal dimensionamento del
+/// classifier del turno. Senza questo seme il grafo primario nativo gira CIECO
+/// alla complessita' (`is_complex` sempre false, gate orchestrazione del planner
+/// che decide su segnali a zero).
+impl From<TaskComplexity> for crate::state::TaskComplexity {
+    fn from(c: TaskComplexity) -> Self {
+        match c {
+            TaskComplexity::Low => crate::state::TaskComplexity::Low,
+            TaskComplexity::Medium => crate::state::TaskComplexity::Medium,
+            TaskComplexity::High => crate::state::TaskComplexity::High,
+        }
+    }
+}
+
 /// Panel dimensionabili, in vocabolario canonico (regola N). Il CSV
 /// `orchestrator.sizing.panel_priority` si parsa SOLO qui.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

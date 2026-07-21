@@ -1624,9 +1624,11 @@ fn compose_unconfirmed_report(
     model: &str,
     ans: &str,
 ) -> String {
-    let prov = (!provider.is_empty() && !model.is_empty())
-        .then(|| format!("{provider}/{model} · "))
-        .unwrap_or_default();
+    let prov = if !provider.is_empty() && !model.is_empty() {
+        format!("{provider}/{model} · ")
+    } else {
+        String::new()
+    };
     format!(
         "{note}\n\n---\n\n_Resoconto dell'agente ({prov}auto-valutazione, \
          {qualifica}):_\n\n{ans}"
