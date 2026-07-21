@@ -34,6 +34,11 @@ pub struct SanitizeReport {
     pub stripped_trailing_assistant: usize,
     pub removed_orphan_tool_results: usize,
     pub injected_synthetic_tool_results: usize,
+    /// tool result RIPOSIZIONATI: erano nella history ma non immediatamente
+    /// dopo la loro tool_call (es. un messaggio user iniettato tra assistant e
+    /// tool dal ReviewGate/correzione). Il formato OpenAI-compat (Mistral 400
+    /// "Unexpected role 'tool' after role 'user'") esige l'adiacenza.
+    pub reordered_tool_results: usize,
 }
 
 /// Placeholder per tool-result sintetico quando manca la risposta (history troncata).
@@ -136,9 +141,14 @@ fn strip_provider_specific_fields(
     }
 }
 
-/// Riconcilia tool_use <-> tool_result: rimuove result orfani, inietta sintetici
-/// per call senza risposta (parita' concettuale con `reconcile_function_call_response_pairs`
-/// Google, ma sul contratto canonico LlmMessage).
+/// Riconcilia tool_use <-> tool_result RICOSTRUENDO la sequenza: ogni tool
+/// result viene posizionato SUBITO DOPO l'assistant che contiene la sua call
+/// (nell'ordine delle call), i result orfani sono rimossi e le call senza
+/// risposta ricevono un sintetico INLINE (non in fondo). Cosi' l'invariante del
+/// formato OpenAI/Anthropic/Google `assistant(tool_calls) -> tool(results)` vale
+/// SEMPRE, anche se un messaggio user era stato iniettato in mezzo (ReviewGate,
+/// correzione post-final_gate): era la causa del Mistral 400
+/// "Unexpected role 'tool' after role 'user'".
 fn reconcile_tool_pairing(
     messages: &mut Vec<LlmMessage>,
     mode: SanitizeMode,
@@ -153,55 +163,84 @@ fn reconcile_tool_pairing(
         return;
     }
 
-    // Rimuovi tool-result il cui id non corrisponde a nessuna call.
-    messages.retain(|m| {
-        if m.role != "tool" {
-            return true;
-        }
-        let Some(id) = m.tool_call_id.as_deref() else {
-            report.removed_orphan_tool_results += 1;
-            return false;
-        };
-        if call_ids.contains(id) {
-            true
-        } else {
-            report.removed_orphan_tool_results += 1;
-            false
-        }
-    });
+    // 1. Conta le posizioni ILLEGALI nella history originale (telemetria): sono
+    //    esattamente i tool result che il rebuild sposta.
+    report.reordered_tool_results += misplaced_tool_count(messages, &call_ids);
 
-    let answered = collect_tool_result_ids(messages);
-    let missing: Vec<(String, String)> = messages
+    // 2. Estrai i tool result: id valido -> mappa (primo vince), orfani scartati.
+    //    `kept` conserva l'ordine di tutti i NON-tool.
+    let mut tool_by_id: HashMap<String, LlmMessage> = HashMap::new();
+    let mut kept: Vec<LlmMessage> = Vec::with_capacity(messages.len());
+    for m in messages.drain(..) {
+        if m.role == "tool" {
+            match m.tool_call_id.as_deref() {
+                Some(id) if call_ids.contains(id) => {
+                    tool_by_id.entry(id.to_string()).or_insert(m);
+                }
+                _ => report.removed_orphan_tool_results += 1,
+            }
+        } else {
+            kept.push(m);
+        }
+    }
+
+    // 3. Soglia injection: la Standard guarda il totale mancante (storico).
+    let missing_count = kept
         .iter()
         .filter(|m| m.role == "assistant")
-        .flat_map(|m| {
-            m.tool_calls
-                .as_ref()
-                .into_iter()
-                .flat_map(|calls| calls.iter())
-        })
-        .filter(|tc| !answered.contains(&tc.id))
-        .map(|tc| (tc.id.clone(), tc.function.name.clone()))
-        .collect();
-
-    if missing.is_empty() {
-        return;
-    }
-
-    // In Standard mode: inietta sintetici solo se <= 2 mancanti (history parziale).
-    // In Aggressive: inietta sempre (post client_error).
+        .flat_map(|m| m.tool_calls.as_ref().into_iter().flatten())
+        .filter(|tc| !tool_by_id.contains_key(&tc.id))
+        .count();
     let inject = match mode {
         SanitizeMode::Aggressive => true,
-        SanitizeMode::Standard => missing.len() <= 2,
+        SanitizeMode::Standard => missing_count <= 2,
     };
-    if !inject {
-        return;
+
+    // 4. Ricostruisci: dopo ogni assistant con tool_calls, i result nell'ordine
+    //    delle call; sintetico INLINE per le mancanti (se consentito).
+    let mut out: Vec<LlmMessage> = Vec::with_capacity(kept.len() + tool_by_id.len());
+    for m in kept {
+        let calls = if m.role == "assistant" {
+            m.tool_calls.clone()
+        } else {
+            None
+        };
+        out.push(m);
+        let Some(calls) = calls else { continue };
+        for tc in &calls {
+            if let Some(t) = tool_by_id.remove(&tc.id) {
+                out.push(t);
+            } else if inject {
+                out.push(synthetic_tool_message(&tc.id, &tc.function.name));
+                report.injected_synthetic_tool_results += 1;
+            }
+        }
     }
 
-    for (id, name) in missing {
-        messages.push(synthetic_tool_message(&id, &name));
-        report.injected_synthetic_tool_results += 1;
-    }
+    *messages = out;
+}
+
+/// True se `prev` puo' legittimamente precedere un messaggio `tool` nel formato
+/// OpenAI-compat: un altro tool result o l'assistant che ha emesso le call.
+fn valid_tool_predecessor(prev: &LlmMessage) -> bool {
+    prev.role == "tool" || (prev.role == "assistant" && prev.tool_calls.is_some())
+}
+
+/// Numero di tool result (con id valido) in posizione ILLEGALE: il predecessore
+/// non e' un predecessore valido per un tool. Sono quelli che il rebuild sposta.
+fn misplaced_tool_count(messages: &[LlmMessage], call_ids: &HashSet<String>) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| {
+            m.role == "tool"
+                && m.tool_call_id.as_deref().is_some_and(|id| call_ids.contains(id))
+                && !i
+                    .checked_sub(1)
+                    .map(|p| valid_tool_predecessor(&messages[p]))
+                    .unwrap_or(false)
+        })
+        .count()
 }
 
 fn collect_tool_call_ids(messages: &[LlmMessage]) -> HashSet<String> {
@@ -390,6 +429,60 @@ mod tests {
         let r = sanitize_history(&mut msgs, "anthropic", SanitizeMode::Aggressive);
         assert_eq!(r.injected_synthetic_tool_results, 1);
         assert!(msgs.iter().any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_x")));
+    }
+
+    fn user(text: &str) -> LlmMessage {
+        LlmMessage {
+            role: "user".to_string(),
+            content: MessageContent::Text(text.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn tool_result_dopo_user_viene_riposizionato_dopo_la_call() {
+        // Scenario incidente run 1db02ed3 (Mistral 400 "Unexpected role 'tool'
+        // after role 'user'"): un messaggio user (nota del ReviewGate/correzione)
+        // era finito TRA l'assistant con la call e il suo tool result.
+        let mut msgs = vec![
+            user("fai qualcosa"),
+            assistant_with_tools("c1", "read_file"),
+            user("NOTA: correggi anche X"),
+            tool_result("c1"),
+        ];
+        let r = sanitize_history(&mut msgs, "mistral", SanitizeMode::Standard);
+        assert_eq!(r.reordered_tool_results, 1, "il tool era in posizione illegale");
+        // Invariante OpenAI ristabilita: ogni tool segue l'assistant o un tool.
+        for i in 0..msgs.len() {
+            if msgs[i].role == "tool" {
+                assert!(
+                    i > 0 && valid_tool_predecessor(&msgs[i - 1]),
+                    "tool a {i} preceduto da {}",
+                    msgs[i - 1].role
+                );
+            }
+        }
+        // Il tool result e' subito dopo il suo assistant; la nota user resta in coda.
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+    }
+
+    #[test]
+    fn tool_result_gia_adiacente_non_conta_come_riposizionato() {
+        let mut msgs = vec![
+            user("vai"),
+            assistant_with_tools("c1", "read_file"),
+            tool_result("c1"),
+        ];
+        let r = sanitize_history(&mut msgs, "mistral", SanitizeMode::Standard);
+        assert_eq!(r.reordered_tool_results, 0, "gia' in ordine: nessuno spostamento");
+        assert_eq!(r.removed_orphan_tool_results, 0);
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool"]);
     }
 
     #[test]
