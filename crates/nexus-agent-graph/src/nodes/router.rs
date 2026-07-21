@@ -155,18 +155,35 @@ impl GraphNode<AgentState, AgentNodeCtx> for RouterNode {
             None => Some(Some(true)), // fallback NEUTRO conservativo (Python degradato)
         };
 
-        // Fallback NEUTRO definito (NON un magic fallback nascosto): identico al
-        // ramo "classifier non disponibile" del Python (__init__.py:673-707).
-        // action_oriented = true e' il default conservativo documentato la'
-        // (i guard anti-descrittivi restano attivi, il toolkit minimal lascia
-        // l'agente libero di interpretare).
-        tracing::warn!(
-            target: "nexus_agent_graph::router",
-            "router: classificazione LLM non ancora portata (PR successivo) -> intent neutro '{}'",
-            NEUTRAL_INTENT
-        );
+        // Intent RISOLTO A MONTE dal classifier mcp-core (`intent_classifier`),
+        // propagato nello stato iniziale (native_engine: user_intent = classifier
+        // del turno). Quando lo stato lo porta gia', il RouterNode lo PRESERVA
+        // (stesso pattern di action_oriented sopra, regola L) invece di forzare il
+        // neutro: cosi' `is_eligible` vede l'intent vero (es. scaffold_app) e il
+        // gate d'orchestrazione riceve un segnale d'intento reale. Il fallback
+        // NEUTRO `agentic_default` (identico al ramo "classifier non disponibile"
+        // del Python, __init__.py:673-707) resta solo quando NESSUN intent e'
+        // risolto (sub-run/resume): comportamento invariato.
+        let user_intent_delta = match state.user_intent.as_deref().map(str::trim) {
+            Some(intent) if !intent.is_empty() => {
+                tracing::info!(
+                    target: "nexus_agent_graph::router",
+                    intent,
+                    "router: intent dal classifier mcp-core -> preservo (no fallback neutro)"
+                );
+                None // "non toccare": preserva l'intent gia' nello stato
+            }
+            _ => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::router",
+                    "router: nessun intent risolto a monte -> intent neutro '{}'",
+                    NEUTRAL_INTENT
+                );
+                Some(Some(NEUTRAL_INTENT.to_string()))
+            }
+        };
         Ok(StateDelta {
-            user_intent: Some(Some(NEUTRAL_INTENT.to_string())),
+            user_intent: user_intent_delta,
             intent_confidence: Some(Some(0.5)),
             action_oriented: action_oriented_delta,
             token_budget: Some(Some(token_budget)),

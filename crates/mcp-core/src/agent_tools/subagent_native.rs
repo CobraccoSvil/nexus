@@ -3471,6 +3471,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         subagent_depth: Some(current_depth),
         sizing_complexity: None,
         sizing_scope_system_wide: false,
+        classifier_intent: None,
         // Il tetto REALE di questa figura (lo stesso del `tokio::time::timeout`
         // esterno qui sotto) entra nel motore: senza, il gate a tempo dell'executor
         // userebbe il setting globale `agent.run_time_budget_s` (0 per policy) e
