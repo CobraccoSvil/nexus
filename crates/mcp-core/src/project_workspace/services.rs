@@ -1941,9 +1941,11 @@ async fn detect_project_ports_windows(
             }
         }
     }
-    if svc_pid_label.is_empty() {
-        return Vec::new();
-    }
+    // NB: `svc_pid_label` vuoto NON e' piu' un'uscita anticipata. Il pass 2 sulle
+    // allocazioni (sotto) e' una fonte AUTONOMA basata sul segnale strutturato
+    // "porta allocata + in LISTEN" (regola M): con tutti i servizi `failed` ma la
+    // porta ancora tenuta da un processo orfano/figlio, il pannello deve mostrarla
+    // lo stesso. L'early-return precedente la faceva sparire.
 
     // 2. Mappa figlio->genitore (Win32_Process) per risalire dal pid in ascolto
     //    (node/vite) fino al pid del servizio (npm/pnpm).
@@ -2007,9 +2009,17 @@ async fn detect_project_ports_windows(
 /// del progetto ricava le porte LIVE aggiuntive del pass 2 di
 /// `detect_project_ports_windows`. Una porta e' live sse: (a) e' realmente in
 /// LISTEN (`listening_ports`, segnale strutturato — regola M), (b) non gia' emessa
-/// dal pass 1 (`already_seen`), (c) appartiene a un servizio VIVO (`running_labels`),
-/// con match via il PUNTO UNICO `similar_service_labels`. Ritorna (porta, servizio)
-/// deduplicato per porta.
+/// dal pass 1 (`already_seen`), (c) e' nel range Nexus.
+///
+/// Il LABEL preferisce un servizio VIVO con nome simile (`running_labels`, punto
+/// unico `similar_service_labels`), ma NON e' piu' un requisito: se nessun
+/// servizio vivo combacia (il servizio e' `failed`/`stopped` in agent_processes
+/// mentre il suo processo tiene ancora la porta — orfano, o il pid registrato e'
+/// il wrapper morto mentre il figlio vive) si usa il LABEL DELL'ALLOCAZIONE.
+/// La porta in ascolto e' la prova strutturale che il progetto sta servendo li'
+/// (regola M): scartarla perche' lo stato registrato dice "failed" faceva sparire
+/// dal pannello Porte servizi realmente attivi (incidente vendita-immobile
+/// 21/07: frontend in LISTEN su 39804, "failed" in agent_processes, invisibile).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn allocations_to_live_ports(
     running_labels: &std::collections::HashSet<String>,
@@ -2056,9 +2066,12 @@ pub(super) fn allocations_to_live_ports(
                 })
                 .then_with(|| sa.cmp(sb))
         });
-        if let Some(service) = candidates.first() {
-            out.push((port, (*service).clone()));
-        }
+        // Label del servizio vivo se c'e', altrimenti il label dell'allocazione.
+        let service = candidates
+            .first()
+            .map(|s| (*s).clone())
+            .unwrap_or_else(|| label.clone());
+        out.push((port, service));
     }
     out
 }
@@ -3349,7 +3362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocations_to_live_ports_emette_solo_servizi_vivi_in_ascolto() {
+    fn allocations_to_live_ports_emette_ogni_porta_allocata_in_ascolto() {
         use std::collections::HashSet;
         let running: HashSet<String> = ["frontend".to_string(), "backend".to_string()]
             .into_iter()
@@ -3358,14 +3371,35 @@ mod tests {
         // 31792 gia' emessa dal pass 1 (albero processi risolto)
         let already_seen: HashSet<u16> = [31792u16].into_iter().collect();
         let allocs = vec![
-            (31840i32, "frontend-dev".to_string()), // servizio vivo (frontend ~ frontend-dev) + in ascolto -> emesso
+            (31840i32, "frontend-dev".to_string()), // servizio vivo (frontend ~ frontend-dev) -> label del servizio
             (31792, "backend".to_string()),         // gia' vista dal pass 1 -> saltata
-            (31900, "worker".to_string()),          // in ascolto ma servizio NON vivo -> saltata
-            (31999, "frontend".to_string()),        // servizio vivo ma NON in ascolto -> saltata
+            (31900, "worker".to_string()),          // in ascolto, servizio NON vivo -> label dell'allocazione
+            (31999, "frontend".to_string()),        // NON in ascolto -> saltata (nessun listener)
             (70000, "frontend".to_string()),        // fuori range u16 -> saltata
         ];
         let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
-        assert_eq!(out, vec![(31840u16, "frontend".to_string())]);
+        assert_eq!(
+            out,
+            vec![
+                (31840u16, "frontend".to_string()),
+                (31900u16, "worker".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn allocations_to_live_ports_mostra_porta_di_servizio_failed_in_ascolto() {
+        use std::collections::HashSet;
+        // Scenario incidente vendita-immobile 21/07: il frontend e' `failed` in
+        // agent_processes (running_labels ha solo "backend"), ma il suo processo
+        // node tiene ancora la porta 39804 in LISTEN. Deve comparire nel pannello
+        // Porte, col label dell'ALLOCAZIONE, invece di sparire.
+        let running: HashSet<String> = ["backend".to_string()].into_iter().collect();
+        let listening: HashSet<u16> = [39804u16].into_iter().collect();
+        let already_seen: HashSet<u16> = HashSet::new();
+        let allocs = vec![(39804i32, "frontend".to_string())];
+        let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
+        assert_eq!(out, vec![(39804u16, "frontend".to_string())]);
     }
 
     #[test]
