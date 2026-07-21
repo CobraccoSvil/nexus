@@ -30,7 +30,7 @@
 
 use nexus_types::get_template_or_default;
 use crate::deps::WikiDeps;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use std::collections::HashSet;
@@ -358,12 +358,9 @@ pub async fn generate_title_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<Ti
         return Ok(report);
     }
 
-    // Risolvi modello dal PUNTO UNICO tier-only (regola L/G).
-    let (provider, model) = state
-        .ai
-        .resolve_purpose_model("wiki_title_gen")
-        .await
-        .map_err(|m| anyhow!(m))?;
+    // Risolvi modello dal PUNTO UNICO tier-only (regola L/G). L'errore
+    // PurposeUnresolved resta tipizzato nella catena anyhow (regola M).
+    let (provider, model) = state.ai.resolve_purpose_model("wiki_title_gen").await?;
 
     let prompt = render_prompt(state, &doc, settings.max_words).await?;
 
