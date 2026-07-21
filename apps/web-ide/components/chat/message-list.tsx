@@ -482,6 +482,13 @@ function SystemWakeupBanner({
         border: `1px solid ${accent}55`,
         background: `${accent}12`,
         minWidth: 0,
+        // flex-shrink:0 (fix "riga coperta"): la card e' un flex item della colonna
+        // messaggi scrollabile (flex-direction:column, overflow:auto). Col default
+        // flex-shrink:1 il flexbox la COMPRIMEVA a ~0 quando il contenuto totale
+        // eccedeva l'altezza (invece di lasciar scrollare), e con overflow:hidden
+        // restava una fascia illeggibile coperta dal messaggio successivo. Con
+        // flex-shrink:0 mantiene l'altezza del contenuto e la colonna scrolla.
+        flexShrink: 0,
         overflow: "hidden",
       }}
     >
