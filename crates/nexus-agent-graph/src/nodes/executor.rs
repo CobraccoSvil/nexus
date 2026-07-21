@@ -872,6 +872,30 @@ fn switch_payload(
     Value::Object(p)
 }
 
+/// Payload di un cambio provider da STALLO (g1_cap / exploration /
+/// repeated_action): la coppia corrente arriva come `Option` da
+/// `escalation_current_pair` (None -> stringa vuota, il frontend ripiega su
+/// prev.model). Wrapper dei tre emettitori sul punto unico `switch_payload`
+/// (regola L): senza, ricostruivano il payload a mano OMETTENDO `from_model`
+/// -> la card mostrava "Mistral / ?".
+fn stall_switch_payload(
+    cur_provider: &Option<String>,
+    cur_model: &Option<String>,
+    to_provider: &str,
+    to_model: &str,
+    reason: &str,
+) -> Value {
+    switch_payload(
+        cur_provider.as_deref().unwrap_or(""),
+        cur_model.as_deref().unwrap_or(""),
+        to_provider,
+        to_model,
+        reason,
+        None,
+        None,
+    )
+}
+
 impl ExecutorNode {
     /// Costruisce il nodo con la config DB-driven gia' risolta e le porte I/O.
     #[allow(clippy::too_many_arguments)]
@@ -1937,11 +1961,13 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
                         "Passo a {}/{} (il modello descrive senza agire)",
                         pick.provider, pick.model
                     ),
-                    json!({
-                        "to_provider": pick.provider,
-                        "to_model": pick.model,
-                        "reason": "g1_cap",
-                    }),
+                    stall_switch_payload(
+                        &g1_cur_provider,
+                        &g1_cur_model,
+                        &pick.provider,
+                        &pick.model,
+                        "g1_cap",
+                    ),
                 )
                 .await;
                 let esc_nudge = human_msg(
@@ -2241,11 +2267,13 @@ la richiesta in modo piu' specifico.",
                             "Passo a {}/{} (esplorazione senza risultato)",
                             pick.provider, pick.model
                         ),
-                        json!({
-                            "to_provider": pick.provider,
-                            "to_model": pick.model,
-                            "reason": "exploration",
-                        }),
+                        stall_switch_payload(
+                            &expl_cur_provider,
+                            &expl_cur_model,
+                            &pick.provider,
+                            &pick.model,
+                            "exploration",
+                        ),
                     )
                     .await;
                     let esc_nudge = human_msg(
@@ -2713,11 +2741,13 @@ indicalo esplicitamente."
                                 "Passo a {}/{} (stallo su '{label}')",
                                 pick.provider, pick.model
                             ),
-                            json!({
-                                "to_provider": pick.provider,
-                                "to_model": pick.model,
-                                "reason": "repeated_action",
-                            }),
+                            stall_switch_payload(
+                                &ra_cur_provider,
+                                &ra_cur_model,
+                                &pick.provider,
+                                &pick.model,
+                                "repeated_action",
+                            ),
                         )
                         .await;
                         let esc_nudge = human_msg(

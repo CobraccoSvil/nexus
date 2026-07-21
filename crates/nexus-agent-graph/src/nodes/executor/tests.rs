@@ -535,7 +535,7 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
         &["claude-piu-capace"],
         "heavy",
     ));
-    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let (n, meta, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
     let ctx = ctx_with(llm.clone(), false);
     let messages = edit_fallito_x2();
@@ -552,6 +552,26 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
     assert_eq!(out.stop_reason, Some(StopReason::G1Escalated));
+    // Il meta-step "escalation" porta il modello CADUTO (from_*), non solo il
+    // to_* (bug della card "Mistral / ?": il payload costruito a mano ometteva
+    // from_model, il frontend ripiegava su prev.model assente sul 1o segmento).
+    // La coppia corrente = risoluzione del turno (qui il routing anthropic/claude-x).
+    let metas = meta.meta_steps.lock().unwrap();
+    let esc_payload = metas
+        .iter()
+        .find(|m| m.get("kind").and_then(Value::as_str) == Some("escalation"))
+        .and_then(|m| m.get("payload"))
+        .expect("meta-step escalation presente");
+    assert_eq!(
+        esc_payload.get("from_provider").and_then(Value::as_str),
+        Some("anthropic")
+    );
+    assert_eq!(
+        esc_payload.get("from_model").and_then(Value::as_str),
+        Some("claude-x")
+    );
+    assert_eq!(esc_payload.get("reason").and_then(Value::as_str), Some("repeated_action"));
+    drop(metas);
     assert_eq!(out.sticky_provider.as_deref(), Some("anthropic"));
     assert_eq!(out.sticky_model.as_deref(), Some("claude-piu-capace"));
     // FIX-A: current_tier scritto col performance_tier del modello promosso.
