@@ -691,6 +691,7 @@ async fn reenable_candidate(db: &PgPool, cand: &ReprobeCandidate, provider: &str
     let _ = sqlx::query(
         "UPDATE ai_price_catalog \
             SET is_enabled = true, \
+                last_probe_healthy_at = NOW(), \
                 effective_from = NOW(), \
                 auto_disabled_at = NULL, \
                 auto_disabled_reason = NULL, \

@@ -2435,6 +2435,7 @@ async fn write_probe_healthy_flags(
     let sql = format!(
         "UPDATE ai_price_catalog \
          SET is_enabled = ($8 AND NOT {price_unknown}), \
+             last_probe_healthy_at = CASE WHEN ($8 AND NOT {price_unknown}) THEN NOW() ELSE last_probe_healthy_at END, \
              auto_disabled_at = CASE WHEN ($8 AND NOT {price_unknown}) THEN NULL ELSE NOW() END, \
              auto_disabled_reason = CASE \
                  WHEN ($8 AND NOT {price_unknown}) THEN NULL \
