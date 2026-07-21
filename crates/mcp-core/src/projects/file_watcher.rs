@@ -311,17 +311,9 @@ fn is_code_file(path: &Path) -> bool {
 }
 
 fn is_in_excluded_dir(path: &Path, root: &Path) -> bool {
-    let relative = match path.strip_prefix(root) {
-        Ok(r) => r,
-        Err(_) => path,
-    };
-    for component in relative.components() {
-        let name = component.as_os_str().to_string_lossy();
-        if nexus_tool_kit::is_skipped_dir(&name) {
-            return true;
-        }
-    }
-    false
+    // Delega al punto unico path-based (regola L): confronto per COMPONENTE
+    // relativo al root, condiviso col wiki watcher e il reingest.
+    nexus_tool_kit::is_in_skipped_dir(path, root)
 }
 
 #[cfg(test)]
