@@ -423,9 +423,15 @@ export function BottomPanelManager({
         {clearBar("ports", ports.length > 0)}
         <div style={{ padding: 12, overflow: "auto", flex: 1, minHeight: 0 }}>
           {ports.length === 0 ? (
-            <div style={{ color: tc.textMuted }}>Nessuna porta rilevata per il progetto.</div>
+            <div style={{ color: tc.textMuted }}>Nessuna porta attiva o registrata per il progetto.</div>
           ) : (
-            ports.map((port, index) => (
+            ports.map((port, index) => {
+              // Vista unificata (regola L): una porta puo' essere in ascolto
+              // (live) e/o registrata (allocated). Il badge lo dice a colpo
+              // d'occhio invece di due liste separate. `live !== false`: le voci
+              // storiche senza il campo restano trattate come attive.
+              const isLive = port.live !== false;
+              return (
               <div key={`${port.port ?? "port"}-${index}`} style={tileStyle(tc)}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span style={{
@@ -439,10 +445,35 @@ export function BottomPanelManager({
                   }}>
                     {port.port}
                   </span>
+                  <span style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 4,
+                    flexShrink: 0,
+                    fontSize: 10,
+                    fontWeight: 600,
+                    color: isLive ? "#22c55e" : tc.textMuted,
+                  }}
+                  title={isLive ? "In ascolto ora" : "Registrata ma nessun processo in ascolto"}
+                  >
+                    <span style={{
+                      width: 6, height: 6, borderRadius: "50%", flexShrink: 0,
+                      background: isLive ? "#22c55e" : tc.textMuted,
+                    }} />
+                    {isLive ? "attiva" : "ferma"}
+                  </span>
+                  {port.allocated && (
+                    <span style={{
+                      fontSize: 9, color: tc.textMuted, borderRadius: 2, padding: "0 4px",
+                      background: tc.accentBg, flexShrink: 0,
+                    }} title={`Porta registrata (${port.allocation_mode ?? "auto"})`}>
+                      {port.allocation_mode === "manual" ? "manuale" : "riservata"}
+                    </span>
+                  )}
                   <span style={{ color: tc.text, fontWeight: 500, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {port.label || `Porta ${port.port}`}
                   </span>
-                  {onKillPort && typeof port.port === "number" && (() => {
+                  {onKillPort && isLive && typeof port.port === "number" && (() => {
                     // Narrowing manuale: la callback gira async, TS non
                     // propaga il type guard del rendering condizionale.
                     const portNum: number = port.port;
@@ -496,10 +527,13 @@ export function BottomPanelManager({
                     {port.url}
                   </a>
                 ) : (
-                  <div style={{ color: tc.textMuted, fontSize: 11 }}>Nessun URL disponibile</div>
+                  <div style={{ color: tc.textMuted, fontSize: 11 }}>
+                    {isLive ? "Nessun URL disponibile" : "Servizio non in ascolto"}
+                  </div>
                 )}
               </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>

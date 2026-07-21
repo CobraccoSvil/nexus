@@ -1569,7 +1569,101 @@ pub async fn get_project_ports(
         .collect();
     assign_service_from_allocations(&mut ports, &alloc_label_by_port);
 
+    // VISTA UNIFICATA (regola L): il pannello Porte mostra TUTTE le porte del
+    // progetto — quelle realmente in ascolto (probe live sopra) E quelle
+    // registrate ma ferme (registro allocazioni, fonte autoritativa di "cosa
+    // appartiene al progetto"). Ogni voce porta `live` (in ascolto ora) e
+    // `allocated` (nel registro): il frontend le distingue con un badge
+    // attivo/fermo invece di due liste separate (endpoint /port-allocations
+    // resta per la CRUD). Sostituisce il "FIX 3b" che nascondeva le riserve.
+    let allocations = state.port_registry.ports_for_project(&project_id).await;
+    let alloc_view: Vec<(i64, String, String)> = allocations
+        .iter()
+        .map(|a| (a.port as i64, a.label.clone(), a.allocation_mode.clone()))
+        .collect();
+    let ports = merge_ports_view(ports, &alloc_view);
+
     Ok(Json(json!({ "ports": ports })))
+}
+
+/// Pura (regola L / regola O, testabile su ogni piattaforma): fonde le porte
+/// LIVE (probe, `live=true`, con pid/url) con il REGISTRO delle allocazioni
+/// (`allocs` = (port, label, mode)) in un'unica vista ordinata per porta.
+///
+/// Contratto di ogni voce:
+///   - `allocated`: la porta e' nel registro del progetto;
+///   - `live`: la porta e' realmente in ascolto ORA;
+///   - `allocation_mode`: dal registro (null se non allocata);
+///   - `url`/`pid`/`state`: presenti SOLO se live (una porta ferma non ha un
+///     endpoint raggiungibile — il pannello Servizi non deve linkarla).
+///
+/// Tre casi: allocata+live (arricchisce la voce live), allocata-ferma (voce
+/// nuova senza url), live-non-allocata (rara: resta, `allocated=false`).
+pub(super) fn merge_ports_view(
+    live: Vec<serde_json::Value>,
+    allocs: &[(i64, String, String)],
+) -> Vec<serde_json::Value> {
+    let mut live_by_port = index_live_by_port(live);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut emitted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    // 1. Ogni allocazione: arricchisce la voce live se c'e', altrimenti voce ferma.
+    for (port, label, mode) in allocs {
+        if !emitted.insert(*port) {
+            continue;
+        }
+        match live_by_port.remove(port) {
+            Some(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("allocated".to_string(), json!(true));
+                    obj.insert("allocation_mode".to_string(), json!(mode));
+                }
+                out.push(v);
+            }
+            None => out.push(stopped_port_entry(*port, label, mode)),
+        }
+    }
+
+    // 2. Porte live non allocate (rare): restano, allocated=false.
+    for (port, v) in live_by_port {
+        if emitted.insert(port) {
+            out.push(v);
+        }
+    }
+
+    // Ordine stabile per porta: la UI non deve lampeggiare tra i polling.
+    out.sort_by_key(|v| v.get("port").and_then(serde_json::Value::as_i64).unwrap_or(0));
+    out
+}
+
+/// Indicizza le voci live per porta, marcandole `live=true`/`allocated=false`
+/// (l'allocazione viene poi impostata dal merge se la porta e' nel registro).
+fn index_live_by_port(
+    live: Vec<serde_json::Value>,
+) -> std::collections::HashMap<i64, serde_json::Value> {
+    let mut map = std::collections::HashMap::new();
+    for mut v in live {
+        if let Some(port) = v.get("port").and_then(serde_json::Value::as_i64) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.entry("live").or_insert(json!(true));
+                obj.insert("allocated".to_string(), json!(false));
+            }
+            map.insert(port, v);
+        }
+    }
+    map
+}
+
+/// Voce di una porta REGISTRATA ma non in ascolto (nessun url linkabile).
+fn stopped_port_entry(port: i64, label: &str, mode: &str) -> serde_json::Value {
+    json!({
+        "port": port,
+        "label": label,
+        "service": label,
+        "allocated": true,
+        "allocation_mode": mode,
+        "live": false,
+    })
 }
 
 /// MainPID dei servizi systemd `--user` `{slug}-*.service` vivi, con la mappa
@@ -3385,6 +3479,61 @@ mod tests {
                 (31900u16, "worker".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn merge_ports_view_fonde_registro_e_live() {
+        // Live: 39826 (backend, in ascolto con pid/url). Registro: 39826 backend
+        // (auto) + 39804 frontend (auto, FERMO, non nel probe).
+        let live = vec![json!({
+            "port": 39826, "label": "backend", "service": "backend",
+            "pid": 26648, "state": "LISTEN", "url": "http://localhost:39826", "live": true
+        })];
+        let allocs = vec![
+            (39826i64, "backend".to_string(), "auto".to_string()),
+            (39804i64, "frontend".to_string(), "auto".to_string()),
+        ];
+        let out = merge_ports_view(live, &allocs);
+        assert_eq!(out.len(), 2);
+        // Ordinato per porta: 39804 (ferma) prima, 39826 (live) dopo.
+        let ferma = &out[0];
+        assert_eq!(ferma["port"], 39804);
+        assert_eq!(ferma["allocated"], true);
+        assert_eq!(ferma["live"], false);
+        assert!(ferma.get("url").is_none(), "porta ferma: nessun url linkabile");
+        let viva = &out[1];
+        assert_eq!(viva["port"], 39826);
+        assert_eq!(viva["allocated"], true);
+        assert_eq!(viva["live"], true);
+        assert_eq!(viva["allocation_mode"], "auto");
+        assert_eq!(viva["url"], "http://localhost:39826");
+    }
+
+    #[test]
+    fn merge_ports_view_porta_live_non_allocata_resta() {
+        // Un listener su una porta NON nel registro (raro): resta, allocated=false.
+        let live = vec![json!({
+            "port": 35500, "label": "extra", "service": "extra",
+            "url": "http://localhost:35500", "live": true
+        })];
+        let out = merge_ports_view(live, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["port"], 35500);
+        assert_eq!(out[0]["allocated"], false);
+        assert_eq!(out[0]["live"], true);
+    }
+
+    #[test]
+    fn merge_ports_view_dedup_porta_allocata_due_volte() {
+        // Una porta duplicata nel registro non produce due voci.
+        let allocs = vec![
+            (39804i64, "frontend".to_string(), "auto".to_string()),
+            (39804i64, "frontend-old".to_string(), "manual".to_string()),
+        ];
+        let out = merge_ports_view(vec![], &allocs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["port"], 39804);
+        assert_eq!(out[0]["label"], "frontend");
     }
 
     #[test]
