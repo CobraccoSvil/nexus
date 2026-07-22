@@ -23,13 +23,42 @@ pub struct PgTodoStore {
     /// Pool meta-DB per le letture di `settings` (config GLOBALE, regola G: non
     /// per-progetto). A flag OFF coincide con `db`.
     meta: PgPool,
+    /// Canali per l'evento live `TodoUpdated` (checklist del piano in chat).
+    /// `None` = store senza eventi (letture, test): la scrittura funziona
+    /// comunque, semplicemente non viene annunciata.
+    events: Option<(nexus_events::ProjectChannels, Uuid)>,
 }
 
 impl PgTodoStore {
     /// Costruisce lo store: `db` = pool del dominio run (todos/plans), `meta` =
-    /// pool meta-DB per la config globale (`settings`).
+    /// pool meta-DB per la config globale (`settings`). Senza canali: nessun
+    /// evento live (va bene per i percorsi di sola lettura e per i test).
     pub fn new(db: PgPool, meta: PgPool) -> Self {
-        Self { db, meta }
+        Self {
+            db,
+            meta,
+            events: None,
+        }
+    }
+
+    /// Variante che ANNUNCIA i cambi di stato dei todo (`TodoUpdated`), cosi' la
+    /// checklist del piano in chat spunta le voci mentre il lavoro procede.
+    ///
+    /// Serve perche' sotto todo-isolation lo stato dei todo lo scrive QUESTO
+    /// adapter (via `TodoRunner`), non il tool `todos` ne' la UI: erano i due soli
+    /// punti che emettevano l'evento, quindi la checklist restava ferma su `[ ]`
+    /// per tutto il run anche a todo completati.
+    pub fn with_events(
+        db: PgPool,
+        meta: PgPool,
+        channels: nexus_events::ProjectChannels,
+        project_id: Uuid,
+    ) -> Self {
+        Self {
+            db,
+            meta,
+            events: Some((channels, project_id)),
+        }
     }
 }
 
@@ -141,25 +170,51 @@ impl TodoStore for PgTodoStore {
             Err(_) => return Ok(()),
         };
         let status_str = status_to_db(status);
-        let res = sqlx::query(
+        // `RETURNING` dei due campi che servono all'evento live: sono gia' nella
+        // riga che stiamo scrivendo, quindi non costa una query in piu'.
+        let res = sqlx::query_as::<_, (Option<String>, Option<i32>)>(
             "UPDATE nexus_agent_todos \
              SET status = $1, updated_at = NOW(), \
                  verify_failures = CASE WHEN $1 = 'blocked' \
                                         THEN verify_failures + 1 \
                                         ELSE verify_failures END \
-             WHERE id = $2",
+             WHERE id = $2 \
+             RETURNING run_id::text, seq::int",
         )
         .bind(status_str)
         .bind(todo_uuid)
-        .execute(&self.db)
+        .fetch_optional(&self.db)
         .await;
-        if let Err(e) = res {
-            tracing::warn!(
-                todo_id = %todo_id,
-                status = %status_str,
-                error = %e,
-                "todo_store: mark_status fallito (best-effort)"
-            );
+        match res {
+            Err(e) => {
+                tracing::warn!(
+                    todo_id = %todo_id,
+                    status = %status_str,
+                    error = %e,
+                    "todo_store: mark_status fallito (best-effort)"
+                );
+            }
+            // Nessuna riga aggiornata (todo inesistente): niente da annunciare.
+            Ok(None) => {}
+            Ok(Some((run_id, seq))) => {
+                // ANNUNCIO del cambio di stato: e' quello che fa spuntare la voce
+                // nella checklist del piano in chat mentre il lavoro procede.
+                // Sotto todo-isolation questo adapter e' l'UNICO a scrivere lo
+                // stato, quindi senza questa emissione la checklist restava ferma
+                // su `[ ]` per tutto il run, anche a todo completati.
+                if let Some((channels, project_id)) = &self.events {
+                    nexus_events::dispatcher::emit(
+                        channels,
+                        *project_id,
+                        nexus_events::event::ProjectEvent::TodoUpdated {
+                            run_id: run_id.unwrap_or_default(),
+                            todo_id: todo_id.to_string(),
+                            seq,
+                            status: status_str.to_string(),
+                        },
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -461,6 +516,47 @@ mod tests {
                 .expect("riga");
         assert_eq!(status, "blocked");
         assert_eq!(vf, 1, "blocked incrementa verify_failures");
+    }
+
+    /// Il cambio di stato dev'essere ANNUNCIATO, non solo scritto: e' l'evento
+    /// che fa spuntare la voce nella checklist del piano in chat. Sotto
+    /// todo-isolation questo adapter e' l'unico a scrivere lo stato, quindi senza
+    /// emissione la checklist resta ferma su `[ ]` per tutto il run anche a todo
+    /// completati (segnalato dall'utente il 2026-07-22).
+    #[sqlx::test]
+    async fn mark_status_annuncia_il_cambio(pool: PgPool) {
+        create_schema(&pool).await;
+        let run_id = Uuid::new_v4();
+        let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
+        let channels: nexus_events::ProjectChannels =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        let project_id = Uuid::new_v4();
+        let store =
+            PgTodoStore::with_events(pool.clone(), pool.clone(), channels.clone(), project_id);
+
+        store
+            .mark_status(&t.to_string(), TodoStatus::Completed, ExecMode::Real)
+            .await
+            .expect("ok");
+
+        assert!(
+            channels.contains_key(&project_id),
+            "il cambio di stato deve essere emesso sul canale del progetto"
+        );
+
+        // Lo store SENZA canali resta valido: scrive e basta (percorsi di sola
+        // lettura e test non devono essere costretti a fornire i canali).
+        let muto = PgTodoStore::new(pool.clone(), pool.clone());
+        muto.mark_status(&t.to_string(), TodoStatus::Blocked, ExecMode::Real)
+            .await
+            .expect("ok anche senza canali");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM nexus_agent_todos WHERE id = $1")
+                .bind(t)
+                .fetch_one(&pool)
+                .await
+                .expect("riga");
+        assert_eq!(status, "blocked");
     }
 
     #[sqlx::test]
