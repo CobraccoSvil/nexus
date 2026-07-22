@@ -364,14 +364,17 @@ fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line:
 /// tracking ripristinabile (mig 0349) leggendo lo stato PRIMA della scrittura,
 /// cosi' un revert riporta il file allo stato attuale. Il record e' best-effort
 /// (warn ma non blocca: l'agente non puo' restare bloccato per un bug della
-/// tabella di audit). Ritorna se il file esisteva gia'. Estratto da
-/// `tool_write_file`.
+/// tabella di audit). Estratto da `tool_write_file`.
+///
+/// Ritorna `(esisteva_gia, contenuto_invariato)`: il secondo e' `true` quando il
+/// nuovo contenuto coincide byte per byte con quello gia' su disco, cioe' quando
+/// la scrittura NON cambia nulla.
 async fn prepare_write_and_track(
     ctx: &AgentToolContext,
     target: &Path,
     path_str: &str,
     content: &str,
-) -> Result<bool, String> {
+) -> Result<(bool, bool), String> {
     // Crea directory intermedie se necessario
     if let Some(parent) = target.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -384,6 +387,13 @@ async fn prepare_write_and_track(
     } else {
         None
     };
+    // Il contenuto nuovo e' IDENTICO a quello gia' su disco? E' l'unico segnale
+    // che distingue una scrittura che fa progredire il lavoro da una che gira a
+    // vuoto. Va restituito all'agente: senza, un modello puo' riscrivere lo
+    // stesso file decine di volte credendo di avanzare (incidente 2026-07-22:
+    // 28 operazioni sullo stesso file, dimensione che oscillava avanti e
+    // indietro, sub-run ucciso dal timeout senza mai convergere).
+    let unchanged = before_for_track.as_deref() == Some(content);
     if let Err(e) = crate::file_mutations::record_mutation(
         &ctx.db,
         ctx.project_id,
@@ -401,7 +411,7 @@ async fn prepare_write_and_track(
             "file_mutations::record_mutation fallita (write_file): {e}"
         );
     }
-    Ok(existed_before)
+    Ok((existed_before, unchanged))
 }
 
 /// Preambolo di `write_file`: permesso di scrittura, path presente e non
@@ -461,12 +471,21 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         Err(e) => return format!("[Errore: {e}]"),
     };
 
-    let existed_before = match prepare_write_and_track(ctx, &target, path_str, content).await {
-        Ok(existed) => existed,
-        Err(msg) => return msg,
-    };
+    let (existed_before, unchanged) =
+        match prepare_write_and_track(ctx, &target, path_str, content).await {
+            Ok(esito) => esito,
+            Err(msg) => return msg,
+        };
     match tokio::fs::write(&target, content).await {
-        Ok(()) => on_write_success(ctx, &target, path_str, content, existed_before, bg_warning),
+        Ok(()) => on_write_success(
+            ctx,
+            &target,
+            path_str,
+            content,
+            existed_before,
+            unchanged,
+            bg_warning,
+        ),
         Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
     }
 }
@@ -480,6 +499,7 @@ fn on_write_success(
     path_str: &str,
     content: &str,
     existed_before: bool,
+    unchanged: bool,
     bg_warning: Option<String>,
 ) -> String {
     // Dispatcher: notifica Explorer/Editor in tempo reale
@@ -499,7 +519,7 @@ fn on_write_success(
     let autocommit_op = if existed_before { "modify" } else { "create" };
     spawn_autocommit_snapshot(ctx, autocommit_op, path_str);
     spawn_write_reindex(ctx, target, path_str, content);
-    build_write_success_message(path_str, content.len(), bg_warning)
+    build_write_success_message(path_str, content.len(), unchanged, bg_warning)
 }
 
 /// Avvia in background lo snapshot di auto-commit per sessione su branch
@@ -586,12 +606,26 @@ fn spawn_write_reindex(ctx: &AgentToolContext, target: &Path, path_str: &str, co
 fn build_write_success_message(
     path_str: &str,
     byte_len: usize,
+    unchanged: bool,
     bg_warning: Option<String>,
 ) -> String {
     let mut msg = format!(
         "File '{}' scritto con successo ({} byte)",
         path_str, byte_len
     );
+    // Segnale di NON-CONVERGENZA. La scrittura e' riuscita (quindi nessun
+    // rilevatore di errori la nota) ma non ha cambiato NULLA: se il modello
+    // ripete, sta girando a vuoto. Detto esplicitamente perche' l'esito
+    // strutturato "successo" da solo e' indistinguibile da un progresso reale.
+    if unchanged {
+        msg.push_str(
+            "\n\nATTENZIONE: il contenuto scritto e' IDENTICO a quello gia' \
+             presente nel file: questa operazione NON ha modificato nulla. Se \
+             stai cercando di correggere qualcosa, cambia approccio invece di \
+             riscrivere lo stesso contenuto: leggi il file, individua la \
+             differenza reale, oppure verifica se il problema e' altrove.",
+        );
+    }
     if let Some(w) = bg_warning {
         msg = format!("{}\n\n{}", msg, w);
     }
@@ -1643,12 +1677,25 @@ async fn apply_edit_and_persist(
             // Auto-commit per sessione (vedi tool_write_file).
             spawn_autocommit_snapshot(ctx, "modify", path_str);
             spawn_edit_reindex(ctx, target);
-            let base = format!(
+            let mut base = format!(
                 "File '{}' modificato con successo ({} byte → {} byte)",
                 path_str,
                 apply.content_lf.len(),
                 new_content.len()
             );
+            // Stesso segnale di non-convergenza di `write_file`: una sostituzione
+            // puo' riuscire lasciando il file IDENTICO (old_string e new_string
+            // equivalenti, o edit che annulla il precedente). L'esito
+            // strutturato direbbe "successo" e il modello continuerebbe a
+            // ritentare credendo di avanzare.
+            if apply.raw_content == new_content {
+                base.push_str(
+                    "\n\nATTENZIONE: dopo la sostituzione il file e' IDENTICO a \
+                     prima: questa modifica NON ha cambiato nulla. Non ripetere \
+                     lo stesso edit; rileggi il file e verifica se il punto da \
+                     correggere e' un altro.",
+                );
+            }
             match apply.bg_warning {
                 Some(w) => format!("{}\n\n{}", base, w),
                 None => base,
@@ -1884,6 +1931,7 @@ pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> Strin
 mod tests {
     use super::build_old_string_ambiguous_message;
     use super::build_old_string_not_found_message;
+    use super::build_write_success_message;
     use super::is_critical_config;
     use super::occurrence_start_lines;
 
@@ -2134,6 +2182,27 @@ mod tests {
         assert_eq!(capped, vec![1]);
         // needle vuoto -> nessun hit (niente loop).
         assert!(occurrence_start_lines(content, "", 5).is_empty());
+    }
+
+    #[test]
+    fn scrittura_che_non_cambia_nulla_lo_dichiara() {
+        // Successo SILENZIOSO: il tool riesce, quindi nessun rilevatore di errori
+        // lo nota, ma il file resta identico. E' il caso che alimenta la
+        // non-convergenza (incidente 2026-07-22: 28 operazioni sullo stesso file,
+        // sub-run ucciso dal timeout senza mai avanzare). Il messaggio deve dirlo
+        // esplicitamente, perche' dall'esito strutturato "ok" il modello non puo'
+        // distinguere questo da un progresso reale.
+        let noop = build_write_success_message("src/a.rs", 120, true, None);
+        assert!(noop.contains("IDENTICO"), "manca il segnale di no-op: {noop}");
+        assert!(noop.contains("NON ha modificato nulla"), "{noop}");
+
+        // Scrittura che cambia davvero: nessun falso allarme.
+        let reale = build_write_success_message("src/a.rs", 120, false, None);
+        assert!(
+            !reale.contains("IDENTICO"),
+            "falso allarme su una scrittura reale: {reale}"
+        );
+        assert!(reale.contains("scritto con successo"));
     }
 
     #[test]
