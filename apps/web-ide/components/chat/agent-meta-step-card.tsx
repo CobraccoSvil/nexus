@@ -347,8 +347,23 @@ export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
         const status = (t.id ? overrides[t.id] : undefined) ?? t.status ?? "pending";
         return (
           <li key={t.id ?? i} style={{ lineHeight: 1.4, display: "flex", alignItems: "flex-start", gap: 6 }}>
-            <span style={{ fontFamily: "var(--font-mono)", opacity: 0.7 }}>{MARK[status] ?? MARK.pending}</span>
-            <span>
+            {/* Il marker e' un flex item: senza flexShrink:0 + nowrap, in un
+                pannello stretto viene compresso e "[ ]" si spezza sullo spazio
+                interno, mandando "]" a capo (checklist illeggibile). */}
+            <span
+              style={{
+                fontFamily: "var(--font-mono)",
+                opacity: 0.7,
+                flex: "0 0 auto",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {MARK[status] ?? MARK.pending}
+            </span>
+            {/* minWidth:0 : un flex item non si restringe sotto il proprio
+                contenuto minimo, quindi senza questo un path lungo sfonderebbe
+                la colonna invece di andare a capo. */}
+            <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
               {t.content ?? "—"}
               {t.priority && t.priority !== "normal" ? <span style={{ opacity: 0.6 }}> ({t.priority})</span> : null}
             </span>
