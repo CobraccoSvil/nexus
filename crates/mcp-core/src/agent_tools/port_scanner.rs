@@ -350,6 +350,26 @@ fn port_in_bucket(port: u32) -> bool {
     (NEXUS_PORT_MIN..NEXUS_PORT_MAX).contains(&port)
 }
 
+/// PUNTO UNICO del criterio "quali porte di questo file vanno verificate contro
+/// le allocazioni del progetto", funzione PURA (testabile senza DB).
+///
+/// Nei `.env*` vale per QUALUNQUE porta non riservata: il file e' il posto
+/// canonico dove DICHIARARE la porta (percio' `scan_content` non lo tratta come
+/// hardcode vietato), ma il numero deve comunque venire da `request_port`.
+/// Altrove il criterio resta il bucket Nexus.
+///
+/// Perche' serve la distinzione: un `PORT=3000` nel `.env` non e' nel bucket,
+/// quindi il controllo sul range non lo vedeva, e il file era saltato del tutto
+/// dallo scan -- passava da entrambe le verifiche (incidente 2026-07-22, con in
+/// piu' la sfortuna che 3000 e' la porta della UI di Nexus).
+fn ports_needing_allocation(path: &str, content: &str) -> Vec<PortFinding> {
+    if should_skip_path(path) {
+        collect_ports(content, |p| p >= 1024)
+    } else {
+        collect_ports(content, port_in_bucket)
+    }
+}
+
 pub fn scan_content(path: &str, content: &str) -> PortScanOutcome {
     if should_skip_path(path) {
         return PortScanOutcome::Allowed;
@@ -372,7 +392,11 @@ pub fn scan_content(path: &str, content: &str) -> PortScanOutcome {
 /// `None`. NON tocca le porte fuori-bucket (gestite da `scan_content`).
 fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
     let mut msg = format!(
-        "[Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e host nel range Nexus (20000-39999) ma NON allocate a questo progetto.]\n\nDettaglio:\n",
+        "[Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e NON allocate a questo progetto.]\n\n\
+         La porta non si sceglie a mano: chiedila a `request_port(label=\"...\")`, che ne \
+         alloca una libera, la registra ed evita le collisioni con gli altri progetti e \
+         con i servizi di Nexus. Poi scrivi ESATTAMENTE il numero che ti restituisce.\n\n\
+         Dettaglio:\n",
         path,
         findings.len()
     );
@@ -488,10 +512,17 @@ async fn unallocated_bucket_findings(
     path: &str,
     content: &str,
 ) -> Option<Vec<PortFinding>> {
-    if should_skip_path(path) {
-        return None;
-    }
-    let bucket_ports = collect_ports(content, port_in_bucket);
+    // I `.env*` restano il posto CANONICO dove dichiarare la porta -- per questo
+    // `scan_content` non li tratta come hardcode vietato. Ma "posto canonico" non
+    // vuol dire "numero libero": la porta scritta li' dev'essere quella ALLOCATA
+    // via `request_port`. Senza questo controllo il file sfuggiva a ENTRAMBE le
+    // verifiche e il modello ci scriveva un numero scelto a mano (incidente
+    // 2026-07-22: `PORT=3000` -- fuori bucket, quindi invisibile al controllo sul
+    // range, e per giunta la porta della UI di Nexus).
+    //
+    // Nei `.env` contano quindi TUTTE le porte non riservate, non solo quelle del
+    // bucket; altrove resta il criterio del bucket.
+    let bucket_ports = ports_needing_allocation(path, content);
     if bucket_ports.is_empty() {
         return None;
     }
@@ -655,6 +686,33 @@ mod tests {
     fn allow_in_bucket() {
         let res = scan_content("src/server.js", "app.listen(25432)\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
+    }
+
+    #[test]
+    fn env_file_la_porta_va_comunque_allocata() {
+        // Il .env resta il posto CANONICO dove dichiarare la porta: non e'
+        // hardcode vietato, quindi lo scan lo lascia passare...
+        assert!(matches!(
+            scan_content(".env", "PORT=3000\nDB_PATH=./data/app.db\n"),
+            PortScanOutcome::Allowed
+        ));
+        // ...ma il numero entra nella verifica di allocazione. Prima il file era
+        // saltato del tutto e una porta fuori bucket (3000, per giunta quella
+        // della UI di Nexus) sfuggiva a ENTRAMBI i controlli.
+        let da_verificare = ports_needing_allocation(".env", "PORT=3000\n");
+        assert_eq!(da_verificare.len(), 1, "la porta del .env va verificata");
+        assert_eq!(da_verificare[0].port, 3000);
+
+        // Fuori dai .env il criterio resta il bucket: 3000 non ci rientra e viene
+        // gia' gestita come hardcode da `scan_content`.
+        assert!(ports_needing_allocation("src/server.js", "PORT=3000\n").is_empty());
+
+        // Le forme che leggono la porta dall'ambiente non sono candidate: e'
+        // esattamente il modo corretto di scrivere il file.
+        assert!(ports_needing_allocation(".env", "PORT=${BACKEND_PORT}\n").is_empty());
+
+        // Le riservate (<1024) non passano dall'allocatore di progetto.
+        assert!(ports_needing_allocation(".env", "PORT=443\n").is_empty());
     }
 
     #[test]
