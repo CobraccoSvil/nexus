@@ -274,6 +274,7 @@ function EventRow({
   segColor,
   tc,
   runId,
+  continuaSubagente,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
@@ -281,6 +282,9 @@ function EventRow({
   /** run del nastro: scopa l'id DOM dell'evento per il deep-link (undefined nel
    *  percorso storico, che non e' bersaglio della campanella). */
   runId?: string;
+  /** La riga precedente e' dello stesso sub-run: si aggrega sotto l'intestazione
+   *  gia' mostrata, invece di ripeterla. */
+  continuaSubagente?: boolean;
 }) {
   const domId =
     runId && event.anchorId ? runScopedAnchorId(runId, event.anchorId) : undefined;
@@ -376,7 +380,12 @@ function EventRow({
           </span>
         )
       )}
-      <EventBody event={event} segColor={segColor} tc={tc} />
+      <EventBody
+        event={event}
+        segColor={segColor}
+        tc={tc}
+        continuaSubagente={continuaSubagente}
+      />
     </div>
   );
 }
@@ -569,10 +578,14 @@ function EventBody({
   event,
   segColor,
   tc,
+  continuaSubagente,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
   tc: ThemeColors;
+  /** La riga precedente e' dello STESSO sub-run: l'intestazione e' gia' a
+   *  schermo poche righe sopra, qui si mostra solo il contenuto. */
+  continuaSubagente?: boolean;
 }) {
   switch (event.type) {
     case "routing":
@@ -667,10 +680,15 @@ function EventBody({
       return (
         <div style={{ minWidth: 0 }}>
           <div style={rowStyle}>
-            <span className="nx-as-kind-label" style={kindLabelStyle(accent)}>
-              {EVENT_KIND_LABEL.subagent}
-            </span>
-            {shortId && (
+            {/* Intestazione mostrata solo sulla PRIMA riga del sub-run: le
+                successive si aggregano sotto, cosi' a colpo d'occhio si legge
+                cosa sta facendo invece di una colonna di etichette uguali. */}
+            {!continuaSubagente && (
+              <span className="nx-as-kind-label" style={kindLabelStyle(accent)}>
+                {EVENT_KIND_LABEL.subagent}
+              </span>
+            )}
+            {!continuaSubagente && shortId && (
               <span
                 style={{
                   fontFamily: "var(--font-mono)",
@@ -1170,11 +1188,35 @@ function SegmentView({
               : `${segment.cappedCount} passi precedenti`}
           </div>
         ) : null}
-        {segment.events.map((ev, i) =>
-          ev.type === "switch" ? null : (
-            <EventRow key={`ev-${i}`} event={ev} segColor={segColor} tc={tc} runId={runId} />
-          ),
-        )}
+        {segment.events.map((ev, i) => {
+          if (ev.type === "switch") return null;
+          // Righe CONSECUTIVE dello stesso sub-run: l'intestazione
+          // ("SUBAGENTE #id") si mostra una volta sola e le successive si
+          // aggregano sotto. Ripeterla a ogni tool rendeva il nastro un elenco
+          // di etichette identiche, in cui il contenuto vero (il tool eseguito)
+          // era la parte meno visibile.
+          // Il confronto e' con la precedente riga VISIBILE: gli eventi "switch"
+          // non producono una riga, quindi non spezzano la continuita'.
+          const precedente = segment.events
+            .slice(0, i)
+            .reverse()
+            .find((e) => e.type !== "switch");
+          const continuaSubagente =
+            ev.type === "subagent" &&
+            precedente?.type === "subagent" &&
+            !!ev.subagentRunId &&
+            precedente.subagentRunId === ev.subagentRunId;
+          return (
+            <EventRow
+              key={`ev-${i}`}
+              event={ev}
+              segColor={segColor}
+              tc={tc}
+              runId={runId}
+              continuaSubagente={continuaSubagente}
+            />
+          );
+        })}
       </div>
     </div>
   );
