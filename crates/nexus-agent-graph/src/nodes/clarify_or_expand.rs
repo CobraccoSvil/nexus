@@ -820,7 +820,7 @@ mod tests {
     #[async_trait]
     impl LlmGateway for FailingLlm {
         async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
-            Err(PortError::Llm("simulato".to_string()))
+            Err(PortError::Llm("simulato".to_string().into()))
         }
     }
 
@@ -861,7 +861,7 @@ mod tests {
             _call: ToolCall,
             _mode: ExecMode,
         ) -> Result<ToolOutcome, PortError> {
-            Err(PortError::Tool("simulato".to_string()))
+            Err(PortError::Tool("simulato".to_string().into()))
         }
     }
 

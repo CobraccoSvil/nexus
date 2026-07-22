@@ -53,6 +53,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{ExecMode, PortError, ToolCall, ToolExecutor, ToolOutcome};
+use nexus_types::error_presentation::{
+    render_user_error, ErrorDomain, ErrorFacts, RenderedError,
+};
 
 use crate::agent_tools::execute_agent_tool;
 use crate::tool_runner_server::{
@@ -157,7 +160,11 @@ impl ToolRunnerExecutorAdapter {
         // un guasto INFRASTRUTTURALE coerente (ToolRunner non operativo qui),
         // mai un side-effect silenzioso.
         let deps = self.deps.as_ref().ok_or_else(|| {
-            PortError::Tool("ToolExecutor Replay-only: esecuzione Real non disponibile".to_string())
+            PortError::Tool(
+                "ToolExecutor Replay-only: esecuzione Real non disponibile"
+                    .to_string()
+                    .into(),
+            )
         })?;
         // Ctx col PUNTO UNICO del server gRPC (stesso root/permessi/reindex). Un
         // fallimento qui (sessione non risolvibile, DB down) e' INFRASTRUTTURALE:
@@ -171,7 +178,13 @@ impl ToolRunnerExecutorAdapter {
         let mut ctx = svc
             .build_ctx_with_root(self.session_id, self.working_root.as_deref())
             .await
-            .map_err(|status| PortError::Tool(format!("build_ctx fallita: {status}")))?;
+            // Il `Display` di `tonic::Status` stampa la struttura INTERA —
+            // `status: Unavailable, message: "...", details: [], metadata:
+            // MetadataMap { headers: {...} }` — ed e' il testo che l'utente
+            // trovava nel tool_result del nastro attivita'. I segnali che
+            // servono sono due e sono strutturati: `code()` e `message()`
+            // (regola M). Il resto resta nel detail.
+            .map_err(|status| PortError::Tool(rendered_from_status(&status)))?;
         // Inietta la narrazione del run invocante (run_id + canale SSE del run
         // del grafo): i tool a lunga durata (dispatch_subagents) la usano per
         // emettere meta-step sul run padre mentre lavorano. Solo path Real.
@@ -235,12 +248,35 @@ async fn replay_tool_result(
     .bind(offset)
     .fetch_optional(db)
     .await
-    .map_err(|e| PortError::Tool(format!("replay lettura agent_steps: {e}")))?;
+    .map_err(|e| {
+        PortError::Tool(render_user_error(&ErrorFacts::opaque(
+            ErrorDomain::Db,
+            format!("replay lettura agent_steps: {e}"),
+        )))
+    })?;
 
     match row {
         Some((tool_result,)) => Ok(tool_result.unwrap_or_default()),
         None => Err(PortError::ReplayMissing(format!("{tool_name}:#{offset}"))),
     }
+}
+
+/// Traduce un [`tonic::Status`] nei suoi due segnali strutturati.
+///
+/// `code()` e' un enum (`Unavailable`, `DeadlineExceeded`, ...) e `message()` la
+/// riga scritta da chi ha costruito lo Status: sono le sole due cose che
+/// servono. Il `Display` dell'intero Status — che stampa anche `details: []` e
+/// `metadata: MetadataMap { headers: {...} }` — scende nel `detail`, dove serve
+/// a chi diagnostica e non a chi legge la chat.
+fn rendered_from_status(status: &tonic::Status) -> RenderedError {
+    render_user_error(
+        &ErrorFacts::opaque(ErrorDomain::Tool, format!("{status:?}"))
+            .with_code(format!("{:?}", status.code()))
+            // `message()` e' la frase scritta da chi ha costruito lo Status:
+            // testo, non struttura. `{status:?}` — che porta `details: []` e
+            // `MetadataMap { headers: {...} }` — resta nel detail.
+            .with_upstream(status.message()),
+    )
 }
 
 #[async_trait]

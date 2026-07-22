@@ -128,12 +128,12 @@ impl SummaryStore for PgSummaryStore {
             // Run shadow read-only: niente chiamata LLM (gate shadow). Il nodo
             // degrada = salta il summary, non diverge dal replay.
             return Err(PortError::Llm(
-                "rolling_summary: no-op in Replay (run shadow read-only)".to_string(),
+                "rolling_summary: no-op in Replay (run shadow read-only)".to_string().into(),
             ));
         }
         if text.trim().is_empty() {
             return Err(PortError::Llm(
-                "rolling_summary: prefisso vuoto, niente da riassumere".to_string(),
+                "rolling_summary: prefisso vuoto, niente da riassumere".to_string().into(),
             ));
         }
 
@@ -145,14 +145,14 @@ impl SummaryStore for PgSummaryStore {
             );
             return Err(PortError::Llm(
                 "rolling_summary: modello non risolto (agent.context.rolling_summary_model)"
-                    .to_string(),
+                    .to_string().into(),
             ));
         };
 
         // 2. Client gateway dalla porta nel DB (regola G). Manca -> degrada.
         let Some(gw) = self.gateway_client().await else {
             return Err(PortError::Llm(
-                "rolling_summary: porta gateway non risolta".to_string(),
+                "rolling_summary: porta gateway non risolta".to_string().into(),
             ));
         };
 
@@ -197,18 +197,18 @@ impl SummaryStore for PgSummaryStore {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "rolling_summary: chiamata gateway fallita");
-                return Err(PortError::Llm(format!("rolling_summary: {e}")));
+                return Err(PortError::Llm(format!("rolling_summary: {e}").into()));
             }
             Err(_) => {
                 tracing::warn!("rolling_summary: chiamata gateway in timeout");
-                return Err(PortError::Llm("rolling_summary: timeout".to_string()));
+                return Err(PortError::Llm("rolling_summary: timeout".to_string().into()));
             }
         };
 
         let summary = resp.content.trim();
         if summary.is_empty() {
             return Err(PortError::Llm(
-                "rolling_summary: risposta vuota dal modello".to_string(),
+                "rolling_summary: risposta vuota dal modello".to_string().into(),
             ));
         }
         tracing::info!(

@@ -56,42 +56,35 @@ function inferActionLabel(input: RequestInfo | URL, init?: RequestInit): string 
   return `Operazione (${method})`;
 }
 
-// Mappa frammenti tecnici noti → messaggio umano italiano.
-// Aggiungere qui nuovi casi quando emergono.
-const ERROR_PATTERNS: Array<{ test: RegExp; human: string }> = [
-  { test: /ResourceExhausted|Received message larger than max|message larger than/i, human: "Il provider AI ha rifiutato un payload troppo grande, prova con meno contesto" },
-  { test: /Unauthenticated|invalid api key|401/i, human: "Credenziali del provider AI non valide" },
-  { test: /DeadlineExceeded|timed? ?out|timeout/i, human: "Il provider AI non ha risposto in tempo" },
-  { test: /Unavailable|connection refused|ECONNREFUSED|503/i, human: "Servizio momentaneamente non disponibile" },
-  { test: /rate ?limit|429|quota/i, human: "Limite di richieste raggiunto, riprova tra poco" },
-  { test: /not ?found|404/i, human: "Risorsa non trovata" },
-  { test: /forbidden|403/i, human: "Operazione non permessa" },
-];
-
+/// Il messaggio da mostrare in una notifica, o `undefined` per far mostrare al
+/// chiamante solo "<label> fallita".
+///
+/// Qui viveva una tabella di sette regex (`ERROR_PATTERNS`) che deduceva la
+/// CLASSE dell'errore cercando "429", "timeout", "MetadataMap" nel testo, piu'
+/// un `looksTechnical` che sopprimeva tutto cio' che somigliava al `Debug` di
+/// una struttura. Entrambi violavano la regola M — lo stato tecnico si legge dai
+/// segnali strutturati alla fonte, non dalla prosa — e sbagliavano in entrambi i
+/// versi: un "429" comparso per caso nel body faceva dire "limite di richieste",
+/// e un errore vero ma dall'aria tecnica spariva del tutto.
+///
+/// Ora la frase leggibile arriva dal backend, dal punto unico
+/// `nexus-types::error_presentation`, dove status e codice erano ancora vivi.
+/// Qui resta una sola decisione, e non e' una classificazione: se il testo e' una
+/// STRUTTURA (JSON, HTML) invece che prosa, non e' un messaggio e non va in una
+/// notifica.
 function humanizeError(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
 
-  // Pagina HTML / proxy error → generico
+  // Pagina HTML / proxy error: non e' un messaggio.
   if (/^\s*</.test(trimmed) || /<html/i.test(trimmed)) {
     return "Il server non ha risposto correttamente";
   }
+  // Payload JSON: e' un dato, non una frase.
+  if (/^[[{]/.test(trimmed)) return undefined;
 
-  // Pattern noti
-  for (const { test, human } of ERROR_PATTERNS) {
-    if (test.test(trimmed)) return human;
-  }
-
-  // Contiene roba tecnica grezza (gRPC status, MetadataMap, JSON, stack trace) → sopprimi
-  const looksTechnical =
-    /MetadataMap|status:\s*\w+|details:\s*\[|grpc[\s_-]?status|stack:|\bat\s+\w+\s*\(/i.test(trimmed) ||
-    /^[[{]/.test(trimmed);
-  if (looksTechnical) {
-    return undefined; // il chiamante mostrerà solo "<label> fallita"
-  }
-
-  // Testo leggibile: prima riga, max 160 char
+  // Testo leggibile: prima riga, max 160 char (layout, non traduzione).
   const line = trimmed.replace(/\r\n/g, "\n").split("\n").find((l) => l.trim().length > 0)?.trim();
   if (!line) return undefined;
   return line.length > 160 ? `${line.slice(0, 157)}...` : line;

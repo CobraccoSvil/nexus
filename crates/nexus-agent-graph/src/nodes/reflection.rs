@@ -819,7 +819,7 @@ mod tests {
     #[async_trait]
     impl LlmGateway for FailingLlm {
         async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
-            Err(PortError::Llm("simulato".to_string()))
+            Err(PortError::Llm("simulato".to_string().into()))
         }
     }
 

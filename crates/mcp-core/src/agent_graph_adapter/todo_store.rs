@@ -97,7 +97,7 @@ impl TodoStore for PgTodoStore {
     /// confronto `depends_on` (id come stringa) nelle funzioni pure.
     async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}").into()))?;
         let rows = sqlx::query_as::<
             _,
             (String, Option<i64>, String, Vec<String>, Vec<String>, Option<String>, Option<String>),
@@ -111,7 +111,7 @@ impl TodoStore for PgTodoStore {
         .bind(run_uuid)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}").into()))?;
         Ok(rows
             .into_iter()
             .map(|(id, seq, status, depends_on, write_scope, content, priority)| Todo {
@@ -138,14 +138,14 @@ impl TodoStore for PgTodoStore {
     /// riuso intent/mode-aware). `None` = nessun piano (prima pianificazione).
     async fn fetch_plan(&self, run_id: &str) -> Result<Option<PlanRow>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("fetch_plan: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("fetch_plan: run_id non UUID: {e}").into()))?;
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT user_intent, behavior_mode FROM nexus_agent_plans WHERE run_id = $1",
         )
         .bind(run_uuid)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("fetch_plan: query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("fetch_plan: query fallita: {e}").into()))?;
         Ok(row.map(|(user_intent, behavior_mode)| PlanRow {
             user_intent,
             behavior_mode,
@@ -304,14 +304,14 @@ impl TodoStore for PgTodoStore {
         // Content dei todo non e' in `Todo` (forma minimale del grafo): lo leggo
         // per il render leggibile. Mappa id::text -> content.
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("build_reminder_text: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("build_reminder_text: run_id non UUID: {e}").into()))?;
         let content_rows = sqlx::query_as::<_, (String, String)>(
             "SELECT id::text, content FROM nexus_agent_todos WHERE run_id = $1",
         )
         .bind(run_uuid)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("build_reminder_text: content query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("build_reminder_text: content query fallita: {e}").into()))?;
         let content_of = |id: &str| -> String {
             content_rows
                 .iter()

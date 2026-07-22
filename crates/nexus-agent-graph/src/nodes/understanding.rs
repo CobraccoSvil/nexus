@@ -529,7 +529,7 @@ mod tests {
             _call: ToolCall,
             _mode: ExecMode,
         ) -> Result<ToolOutcome, PortError> {
-            Err(PortError::Tool("simulato".to_string()))
+            Err(PortError::Tool("simulato".to_string().into()))
         }
     }
 
@@ -751,7 +751,7 @@ mod tests {
                 _mode: ExecMode,
             ) -> Result<ToolOutcome, PortError> {
                 if call.name == "nexus_search_semantic" {
-                    return Err(PortError::Tool("grounding giu".to_string()));
+                    return Err(PortError::Tool("grounding giu".to_string().into()));
                 }
                 Ok(ToolOutcome {
                     tool_call_id: call.id,

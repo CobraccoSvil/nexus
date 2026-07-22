@@ -448,6 +448,46 @@ else
   echo "OK migrazioni-search-path: nessuna migrazione manipola il search_path"
 fi
 
+# ── error-presentation (2026-07-22) ──────────────────────────────────────────
+# Un errore si RENDE leggibile in un solo posto
+# (nexus-types/src/error_presentation.rs), partendo dai segnali strutturati.
+# Il difetto storico: mancava il punto unico della PRESENTAZIONE (esisteva solo
+# quello della classificazione), quindi ogni superficie usava il Display degli
+# errori tipizzati -- che per contratto porta il body grezzo -- e da li' sono
+# nate quattro funzioni gemelle che tagliavano CARATTERI invece di tradurre
+# (compact_provider_error alla prima graffa, humanize_ai_error sulla prima riga,
+# format_compact_error a 300 char, humanizeTraceText a regex). Erano cieche a
+# ogni Debug senza graffa: il MetadataMap di tonic e la catena
+# io(ConnectionRefused, os_error=10061) arrivavano intatti in chat.
+#
+# Due divieti, entrambi sintomi dello stesso errore di progetto:
+# 1) nuove funzioni di compattazione testuale fuori dal modulo autoritativo;
+# 2) regex che riconoscono un errore dalla FORMA del suo Debug (regola M).
+ep_hits="$(grep -rnE "fn (compact_|humanize_|format_compact_)[a-z_]*error" crates --include='*.rs' 2>/dev/null \
+  | grep -v 'crates/nexus-types/src/error_presentation.rs' || true)"
+if [[ -n "$ep_hits" ]]; then
+  echo "!! error-presentation: una resa d'errore fuori dal punto unico:" >&2
+  echo "$ep_hits" | sed 's/^/     /' >&2
+  echo "   Il messaggio si costruisce da ErrorFacts via render_user_error" >&2
+  echo "   (crates/nexus-types/src/error_presentation.rs), non tagliando caratteri." >&2
+  fail=1
+else
+  echo "OK error-presentation: nessuna resa d'errore duplicata nei crate"
+fi
+
+ep_regex="$(grep -rnE "MetadataMap|grpc[_ -]?status|details:\\\\s\*\\\\\[" crates apps --include='*.rs' --include='*.ts' --include='*.tsx' 2>/dev/null \
+  | grep -vE 'crates/nexus-types/src/error_presentation.rs|/(node_modules|\.next)/|scripts/' \
+  | grep -vE ':[0-9]+:\s*(//|\*|#)' || true)"
+if [[ -n "$ep_regex" ]]; then
+  echo "!! error-presentation: si riconosce un errore dalla FORMA del suo Debug:" >&2
+  echo "$ep_regex" | sed 's/^/     /' >&2
+  echo "   Regola M: lo stato tecnico si legge da status/code/enum alla fonte," >&2
+  echo "   non da una regex sul testo gia' appiattito." >&2
+  fail=1
+else
+  echo "OK error-presentation: nessun riconoscimento d'errore dal testo"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

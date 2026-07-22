@@ -273,7 +273,7 @@ pub mod test_doubles {
                         ProviderUnavailableInfo::new(cause, msg.clone()),
                     ));
                 }
-                return Err(PortError::Llm(msg.clone()));
+                return Err(PortError::Llm(msg.clone().into()));
             }
             Ok(self.canned.clone())
         }
@@ -485,7 +485,7 @@ pub mod test_doubles {
     impl RunControlStore for StubRunControlStore {
         async fn is_superseded(&self, _run_id: &str) -> Result<bool, PortError> {
             if self.fail_is_superseded {
-                return Err(PortError::Llm("stub: is_superseded fail".to_string()));
+                return Err(PortError::Llm("stub: is_superseded fail".to_string().into()));
             }
             Ok(self.superseded)
         }
@@ -613,10 +613,10 @@ pub mod test_doubles {
             // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta.
             // Ritorna PortError cosi' il chiamante degrada a troncamento non-RAG.
             if mode != ExecMode::Real {
-                return Err(PortError::Tool("shadow: offload no-op".to_string()));
+                return Err(PortError::Tool("shadow: offload no-op".to_string().into()));
             }
             if self.fail {
-                return Err(PortError::Tool("stub: offload fail".to_string()));
+                return Err(PortError::Tool("stub: offload fail".to_string().into()));
             }
             let mut g = self.offloaded.lock().expect("lock offloaded");
             g.push(payload);
@@ -660,11 +660,11 @@ pub mod test_doubles {
             mode: ExecMode,
         ) -> Result<Vec<Vec<f32>>, PortError> {
             if mode != ExecMode::Real {
-                return Err(PortError::Tool("shadow: embed no-op".to_string()));
+                return Err(PortError::Tool("shadow: embed no-op".to_string().into()));
             }
             if self.vectors.is_empty() {
                 return Err(PortError::Tool(
-                    "stub: nessun vettore configurato".to_string(),
+                    "stub: nessun vettore configurato".to_string().into(),
                 ));
             }
             {
@@ -716,7 +716,7 @@ pub mod test_doubles {
         async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError> {
             // Gate shadow: in Replay NON si riassume (no-op), come l'impl concreta.
             if mode != ExecMode::Real {
-                return Err(PortError::Llm("shadow: summarize no-op".to_string()));
+                return Err(PortError::Llm("shadow: summarize no-op".to_string().into()));
             }
             self.summarize_seen
                 .lock()
@@ -726,7 +726,7 @@ pub mod test_doubles {
                 Some(s) => Ok(s.clone()),
                 // Nessun riassunto configurato: degrado best-effort (history invariata).
                 None => Err(PortError::Llm(
-                    "stub: nessun summary configurato".to_string(),
+                    "stub: nessun summary configurato".to_string().into(),
                 )),
             }
         }
@@ -826,7 +826,7 @@ pub mod test_doubles {
                 model.map(str::to_string),
             ));
             if self.fail {
-                return Err(PortError::Llm("stub: escalation_inputs fail".to_string()));
+                return Err(PortError::Llm("stub: escalation_inputs fail".to_string().into()));
             }
             // Nuovo contratto agentico: insieme UNIFICATO di candidati (intra +
             // cross) con tier + telemetria. Il provider della catena intra e' quello
@@ -869,7 +869,7 @@ pub mod test_doubles {
                 .expect("lock failover_seen")
                 .push(exclude.to_vec());
             if self.fail {
-                return Err(PortError::Llm("stub: failover_provider fail".to_string()));
+                return Err(PortError::Llm("stub: failover_provider fail".to_string().into()));
             }
             Ok(self.failover.as_ref().map(|(p, m)| CrossProviderCandidate {
                 provider: p.clone(),
@@ -926,7 +926,7 @@ pub mod test_doubles {
                 .expect("lock seen")
                 .push(cleaned_text.to_string());
             if self.fail {
-                return Err(PortError::Llm("stub: derive fail".to_string()));
+                return Err(PortError::Llm("stub: derive fail".to_string().into()));
             }
             Ok(self.choices.clone())
         }
@@ -957,7 +957,7 @@ pub mod test_doubles {
     impl BillingCooldownPort for StubBillingCooldownPort {
         async fn billing_exhausted_providers(&self) -> Result<Vec<String>, PortError> {
             if self.fail {
-                return Err(PortError::Llm("stub: billing snapshot fail".to_string()));
+                return Err(PortError::Llm("stub: billing snapshot fail".to_string().into()));
             }
             Ok(self.exhausted.clone())
         }

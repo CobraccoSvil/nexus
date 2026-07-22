@@ -152,7 +152,7 @@ impl ReviewPanelAdapter {
 impl ReviewPanelPort for ReviewPanelAdapter {
     async fn review(&self, req: ReviewPanelRequest) -> Result<ReviewPanelReport, PortError> {
         let run_id = Uuid::parse_str(&req.run_id)
-            .map_err(|e| PortError::Tool(format!("run_id non valido: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("run_id non valido: {e}").into()))?;
 
         let modified = match self.gate_skips(run_id, req.cycle).await {
             Ok(files) => files,
@@ -163,7 +163,7 @@ impl ReviewPanelPort for ReviewPanelAdapter {
         let ctx = svc
             .build_ctx(self.session_id)
             .await
-            .map_err(|e| PortError::Tool(format!("build_ctx fallita: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("build_ctx fallita: {e}").into()))?;
 
         let policy = self.quorum_policy().await;
         let reviewers = match self.panel_size(run_id, &req).await {

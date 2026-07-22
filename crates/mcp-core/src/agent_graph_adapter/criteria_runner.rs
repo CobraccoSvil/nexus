@@ -737,7 +737,7 @@ task_complete (outcome + summary)"
         .bind(&mutator_names)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("outputs_exist lettura agent_steps: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("outputs_exist lettura agent_steps: {e}").into()))?;
 
         let mut paths: Vec<String> = Vec::new();
         for (tool_name, tool_input) in &rows {

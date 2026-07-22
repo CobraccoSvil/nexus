@@ -36,6 +36,9 @@ use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError};
 use nexus_agent_graph::state::ToolUse;
+use nexus_types::error_presentation::{
+    render_user_error, ErrorDomain, ErrorFacts, HasErrorFacts, RenderedError,
+};
 
 use crate::nexus_gateway::{
     GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall, GwToolFunctionCall,
@@ -124,7 +127,7 @@ fn purpose_for_empty_model(req: &LlmRequest) -> Result<Option<String>, PortError
             "richiesta LLM senza modello ne' purpose: il chiamante deve risolvere \
              provider/modello a monte (routing matrix) o indicare un purpose \
              (nexus_purpose_model, regola G)"
-                .to_string(),
+                .to_string().into(),
         )),
     }
 }
@@ -141,7 +144,7 @@ impl LlmGateway for GatewayLlmAdapter {
                 crate::internal_routing::resolve_purpose_model_db(&self.db, &purpose)
                     .await
                     .into_model(&purpose)
-                    .map_err(PortError::Llm)?;
+                    .map_err(|msg| PortError::Llm(msg.into()))?;
             tracing::debug!(
                 purpose = %purpose,
                 provider = %provider,
@@ -255,7 +258,12 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
         .chain()
         .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())
     else {
-        return PortError::Llm(err.to_string());
+        // Ramo di degrado: e' qui che finisce OGNI errore non-HTTP, cioe' tutto
+        // il trasporto. Restituiva `err.to_string()`, e siccome a monte
+        // l'errore era un `anyhow!` costruito sulla riga diagnostica dei log,
+        // quella riga diventava il messaggio in chat. Ora l'errore di trasporto
+        // e' TIPIZZATO (`GatewayTransportError`) e porta la sua frase.
+        return PortError::Llm(rendered_from_error(err));
     };
     match http.code.as_deref() {
         Some("PROVIDER_ERROR") => {
@@ -283,13 +291,43 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 Some("empty_completion") => ProviderFailureCause::EmptyCompletion,
                 _ => ProviderFailureCause::Unknown,
             };
-            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(cause, err.to_string()))
+            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
+                cause,
+                rendered_from_error(err).message,
+            ))
         }
-        Some("POLICY_TIER_EXCLUDED") => PortError::ProviderUnavailable(
-            ProviderUnavailableInfo::new(ProviderFailureCause::PolicyTierExcluded, err.to_string()),
-        ),
-        _ => PortError::Llm(err.to_string()),
+        Some("POLICY_TIER_EXCLUDED") => {
+            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
+                ProviderFailureCause::PolicyTierExcluded,
+                rendered_from_error(err).message,
+            ))
+        }
+        _ => PortError::Llm(rendered_from_error(err)),
     }
+}
+
+/// Il [`RenderedError`] di un errore che arriva dal client gateway.
+///
+/// PUNTO DI RACCORDO fra i produttori tipizzati (regola M) e il punto unico di
+/// presentazione (regola L): cerca nella catena il primo errore che sa dichiarare
+/// i propri fatti e delega la frase a `render_user_error`. Nessuna ispezione del
+/// testo: se nessuno dei tipi noti e' presente, i fatti sono onestamente opachi e
+/// il messaggio resta generico, ma il dettaglio tecnico finisce dove va — nel
+/// campo `detail`, non nella bolla di chat.
+fn rendered_from_error(err: &anyhow::Error) -> RenderedError {
+    if let Some(t) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayTransportError>())
+    {
+        return t.rendered();
+    }
+    if let Some(h) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())
+    {
+        return h.rendered();
+    }
+    render_user_error(&ErrorFacts::opaque(ErrorDomain::Gateway, err.to_string()))
 }
 
 /// Mappa una [`LlmRequest`] (porta) nel [`GwRequest`] del client gateway.
@@ -639,7 +677,7 @@ async fn load_replay_steps(
     .bind(primary_run_id)
     .fetch_all(db)
     .await
-    .map_err(|e| PortError::Llm(format!("replay caricamento agent_steps: {e}")))?;
+    .map_err(|e| PortError::Llm(format!("replay caricamento agent_steps: {e}").into()))?;
 
     Ok(rows
         .into_iter()
@@ -667,7 +705,7 @@ async fn load_primary_final_answer(
             .bind(primary_run_id)
             .fetch_optional(db)
             .await
-            .map_err(|e| PortError::Llm(format!("replay lettura final_answer: {e}")))?;
+            .map_err(|e| PortError::Llm(format!("replay lettura final_answer: {e}").into()))?;
     Ok(row.and_then(|(fa,)| fa))
 }
 

@@ -120,7 +120,7 @@ pub async fn test_plugin(
         }
         Err(error) => {
             let raw_error = error.to_string();
-            let mut msg = format_compact_error(&raw_error);
+            let mut msg = crate::plugins::plugin_error_message(&raw_error);
             if resolution.plugin_slug.eq_ignore_ascii_case("figma-http")
                 && raw_error.contains("HTTP 401")
             {

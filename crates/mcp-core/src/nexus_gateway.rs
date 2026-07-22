@@ -1,4 +1,5 @@
 use anyhow::Result;
+use nexus_types::error_presentation::{ErrorDomain, ErrorFacts, HasErrorFacts, TransportFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -315,6 +316,98 @@ fn transport_error_detail(e: &reqwest::Error) -> String {
     format!("{e} [kind={}] <- {}", kinds.join("+"), chain.join(" <- "))
 }
 
+/// I segnali STRUTTURATI del fallimento di trasporto, dai predicati tipizzati di
+/// reqwest e dal primo `io::Error` della catena (regola M).
+///
+/// Gemello strutturato di [`transport_error_detail`]: quello produce la riga
+/// diagnostica per i log, questo i FATTI da cui nasce la frase per l'utente. La
+/// stessa catena serve due canali diversi, e nessuno dei due deriva dall'altro
+/// leggendone il testo.
+fn transport_facts(e: &reqwest::Error, target: &str) -> TransportFacts {
+    let mut io_kind = None;
+    let mut os_error = None;
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            io_kind = Some(format!("{:?}", io.kind()));
+            os_error = io.raw_os_error();
+            break;
+        }
+        src = std::error::Error::source(s);
+    }
+    TransportFacts {
+        is_connect: e.is_connect(),
+        is_timeout: e.is_timeout(),
+        io_kind,
+        os_error,
+        target: Some(target.to_string()),
+    }
+}
+
+/// Errore di TRASPORTO verso il gateway, tipizzato (regole L+M).
+///
+/// Qui viveva `anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e))`:
+/// una stringa opaca che a valle nessuno poteva piu' interrogare. Il ramo di
+/// classificazione (`classify_gateway_error`) cercava solo `GatewayHttpError`,
+/// non lo trovava, e ripiegava su `err.to_string()` — cioe' la riga diagnostica
+/// nata per i log finiva TALE E QUALE nella bolla di chat:
+/// "error sending request for url (...) [kind=connect] <- io(ConnectionRefused,
+/// os_error=10061)".
+///
+/// Ora l'errore porta i suoi fatti. `Display` da' la frase umana, `detail` (nei
+/// fatti) conserva la catena INTATTA per i log: il segnale diagnostico non si
+/// perde, cambia canale.
+#[derive(Debug)]
+pub struct GatewayTransportError {
+    facts: ErrorFacts,
+}
+
+impl GatewayTransportError {
+    pub fn from_reqwest(e: &reqwest::Error, target: &str) -> Self {
+        let mut facts = ErrorFacts::opaque(ErrorDomain::Transport, transport_error_detail(e));
+        facts.transport = Some(transport_facts(e, target));
+        Self { facts }
+    }
+}
+
+impl HasErrorFacts for GatewayTransportError {
+    fn error_facts(&self) -> ErrorFacts {
+        self.facts.clone()
+    }
+}
+
+impl std::fmt::Display for GatewayTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.rendered().message)
+    }
+}
+
+impl std::error::Error for GatewayTransportError {}
+
+/// I fatti di un errore HTTP del gateway: `code` e `details` sono gia' estratti
+/// dal body al punto di costruzione, e il body integrale scende a `detail`.
+impl HasErrorFacts for GatewayHttpError {
+    fn error_facts(&self) -> ErrorFacts {
+        let class = self
+            .details
+            .as_ref()
+            .and_then(|d| d.get("primary_cause"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        ErrorFacts {
+            domain: ErrorDomain::Gateway,
+            http_status: Some(self.status),
+            code: self.code.clone(),
+            class,
+            provider: None,
+            model: None,
+            transport: None,
+            upstream_message: None,
+            detail: self.body.clone(),
+        }
+    }
+}
+
 /// Budget HTTP mcp-core -> gateway per `/v1/complete`, dal punto unico
 /// (`nexus_auth::llm_timeouts`, regola L).
 ///
@@ -392,9 +485,7 @@ impl NexusGatewayClient {
             .json(&req)
             .send()
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e))
-            })?;
+            .map_err(|e| anyhow::Error::new(GatewayTransportError::from_reqwest(&e, &self.base_url)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -437,7 +528,7 @@ impl NexusGatewayClient {
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e)))?;
+            .map_err(|e| anyhow::Error::new(GatewayTransportError::from_reqwest(&e, &self.base_url)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -610,6 +701,57 @@ mod tests {
         assert!(
             dettaglio.len() > display_solo.len(),
             "il dettaglio non aggiunge nulla al Display: {dettaglio}"
+        );
+    }
+
+    /// LA REGRESSIONE, dal produttore vero (regola O): un fallimento reqwest
+    /// REALE verso una porta chiusa, non un errore fabbricato a mano.
+    ///
+    /// E' il testo che l'utente ha visto in chat. Il test non asserisce una
+    /// stringa intermedia ma la CONSEGUENZA: cosa esce dal `Display`, cioe' cio'
+    /// che ogni `format!("{e}")` a valle produrra'.
+    ///
+    /// Mutazione che rende rosso: far tornare `Display` a stampare
+    /// `self.facts.detail`, o ricostruire l'errore con `anyhow!("...{}",
+    /// transport_error_detail(&e))`.
+    #[tokio::test]
+    async fn l_errore_di_trasporto_si_presenta_da_solo_in_modo_leggibile() {
+        let c = reqwest::Client::new();
+        let e = c
+            .post("http://127.0.0.1:59999/v1/complete")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("porta chiusa: deve fallire");
+
+        let err = GatewayTransportError::from_reqwest(&e, "127.0.0.1:59999");
+        let mostrato = err.to_string();
+
+        assert!(
+            !mostrato.contains("os_error") && !mostrato.contains("kind="),
+            "gergo di sistema nel messaggio mostrato: {mostrato}"
+        );
+        assert!(
+            !mostrato.contains("error sending request"),
+            "il Display di reqwest e' arrivato all'utente: {mostrato}"
+        );
+        assert!(
+            mostrato.contains("127.0.0.1:59999"),
+            "il messaggio non dice CHI non risponde: {mostrato}"
+        );
+
+        // Il segnale diagnostico non si perde: cambia canale.
+        let facts = err.error_facts();
+        assert!(
+            facts.detail.contains("kind=") && facts.detail.contains("<-"),
+            "la catena diagnostica deve restare INTATTA nel detail: {}",
+            facts.detail
+        );
+        let t = facts.transport.expect("i fatti di trasporto");
+        assert!(t.is_connect, "porta chiusa: reqwest lo dichiara con is_connect");
+        assert!(
+            t.os_error.is_some(),
+            "il codice OS e' il segnale piu' specifico e va estratto"
         );
     }
 }

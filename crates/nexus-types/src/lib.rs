@@ -16,6 +16,7 @@ pub use fs_browse::{
 pub mod admin_dto;
 pub mod code_files;
 pub mod documents_dto;
+pub mod error_presentation;
 pub mod gateway_client;
 pub mod git_exec;
 pub mod llm_json;

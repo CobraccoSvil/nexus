@@ -1724,7 +1724,22 @@ async fn fallback_assistant_after_run_turn_error(
         session_id,
         project_id,
         "assistant",
-        &format!("Operazione non completata: {}", humanize_ai_error(err_text)),
+        // Il testo tecnico NON entra nel corpo del messaggio: e' gia' in
+        // `fallback_metadata["error"]`, da cui il pannello diagnostico lo legge.
+        // Qui viveva `humanize_ai_error`, che decideva la frase cercando "429" o
+        // "timeout" DENTRO il testo (regola M) e, quando non li trovava, ci
+        // incollava la prima riga troncata a 220 caratteri — cioe' il blob
+        // mozzato che si leggeva in chat.
+        &format!(
+            "Operazione non completata: {}",
+            nexus_types::error_presentation::render_user_error(
+                &nexus_types::error_presentation::ErrorFacts::opaque(
+                    nexus_types::error_presentation::ErrorDomain::Gateway,
+                    err_text,
+                ),
+            )
+            .message
+        ),
         fallback_metadata,
         Some(user_message_id),
     )
