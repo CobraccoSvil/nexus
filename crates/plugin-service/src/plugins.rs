@@ -919,15 +919,41 @@ async fn resolve_install_release(
 }
 
 // Upsert della tool policy iniziale dell'instance dai default del catalog.
-// L'errore e' ignorato come nell'originale (best-effort, non blocca l'install).
-async fn seed_default_tool_policy(db: &PgPool, plugin_instance_id: Uuid, catalog: &CatalogConfig, user_id: Uuid) {
+//
+// NON e' best-effort, e non puo' esserlo. Il gate che decide se un tool del
+// plugin puo' essere chiamato (`mcp_connectors.rs`) legge questa riga con
+// `if let Ok(Some(policy_row))`: riga assente significa gate SALTATO, cioe'
+// tutti i tool permessi. Un INSERT fallito in silenzio non lasciava quindi il
+// plugin "senza preferenze", lo lasciava senza controlli.
+//
+// L'errore ora fa fallire l'installazione: meglio un plugin non installato che
+// un plugin installato senza gate.
+async fn seed_default_tool_policy(
+    db: &PgPool,
+    plugin_instance_id: Uuid,
+    catalog: &CatalogConfig,
+    user_id: Uuid,
+) -> Result<(), (StatusCode, Json<Value>)> {
     let pm = catalog.default_tool_policy.get("mode").and_then(Value::as_str).unwrap_or("allowlist").to_string();
     let pt = catalog.default_tool_policy.get("tools").cloned().unwrap_or(json!([]));
     let pb = catalog.default_tool_policy.get("blockedTools").cloned().unwrap_or(json!([]));
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO plugin_instance_tool_policies (plugin_instance_id, mode, tools, blocked_tools, updated_by_user_id) VALUES ($1,$2,$3,$4,$5)
          ON CONFLICT (plugin_instance_id) DO UPDATE SET mode=EXCLUDED.mode, tools=EXCLUDED.tools, blocked_tools=EXCLUDED.blocked_tools, updated_by_user_id=EXCLUDED.updated_by_user_id, updated_at=NOW()"
-    ).bind(plugin_instance_id).bind(&pm).bind(&pt).bind(&pb).bind(user_id).execute(db).await;
+    ).bind(plugin_instance_id).bind(&pm).bind(&pt).bind(&pb).bind(user_id).execute(db).await
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                %plugin_instance_id,
+                "seed della tool policy fallito: installazione annullata, il plugin \
+                 resterebbe senza gate sui tool"
+            );
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy tool non scrivibile, installazione annullata: {e}"),
+            )
+        })?;
+    Ok(())
 }
 
 // Per transport stdio con allowlist di comandi non vuota, verifica che il
@@ -1050,7 +1076,7 @@ pub async fn install_plugin(
     .fetch_one(&state.db).await.map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let plugin_instance_id: Uuid = pi_row.try_get("id").unwrap_or(Uuid::nil());
 
-    seed_default_tool_policy(&state.db, plugin_instance_id, &catalog, user_id).await;
+    seed_default_tool_policy(&state.db, plugin_instance_id, &catalog, user_id).await?;
 
     let mcp_server_id = insert_mcp_server(
         &state.db, plugin_instance_id, user_id, project_id, &catalog, &scope, &instance_name, &config, runtime_command,
