@@ -1,5 +1,7 @@
 use anyhow::Result;
-use nexus_types::error_presentation::{ErrorDomain, ErrorFacts, HasErrorFacts, TransportFacts};
+use nexus_types::error_presentation::{
+    render_user_error, ErrorDomain, ErrorFacts, HasErrorFacts, RenderedError, TransportFacts,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -244,6 +246,15 @@ pub struct GatewayHttpError {
     pub code: Option<String>,
     /// Blocco `details` del body (failures classificate, tier, ammessi).
     pub details: Option<Value>,
+    /// La FRASE gia' resa dal gateway (`user_message`), quando la risposta la
+    /// porta. Il gateway l'ha scritta mentre provider, modello e status del
+    /// fornitore erano ancora vivi: qui quei fatti non esistono piu', quindi
+    /// questa frase si TRASPORTA, non si ri-deriva.
+    pub user_message: Option<String>,
+    /// L'identificatore canonico della classe deciso dal gateway (`user_code`).
+    /// Piu' specifico di quello che si puo' dedurre da questo lato del confine
+    /// (dove tutto e' "errore del gateway").
+    pub user_code: Option<String>,
     /// Body grezzo: solo display/log, mai per decidere.
     pub body: String,
 }
@@ -251,17 +262,25 @@ pub struct GatewayHttpError {
 impl GatewayHttpError {
     pub fn from_response(status: reqwest::StatusCode, body: String) -> Self {
         let parsed: Option<Value> = serde_json::from_str(&body).ok();
-        let code = parsed
-            .as_ref()
-            .and_then(|v| v.get("code"))
-            .and_then(|c| c.as_str())
-            .map(str::to_string);
+        let stringa = |chiave: &str| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(chiave))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        };
         let details = parsed.as_ref().and_then(|v| v.get("details")).cloned();
+        // La resa si rilegge dal punto unico che la scrive dall'altro lato: cosi'
+        // un rename delle chiavi non puo' rompere il solo trasporto lasciando
+        // verdi i test dei due estremi.
+        let rendered = parsed.as_ref().and_then(RenderedError::from_wire);
         Self {
             status: status.as_u16(),
             status_text: status.to_string(),
-            code,
+            code: stringa("code"),
             details,
+            user_message: rendered.as_ref().map(|r| r.message.clone()),
+            user_code: rendered.as_ref().map(|r| r.code.clone()),
             body,
         }
     }
@@ -399,6 +418,12 @@ impl std::error::Error for GatewayTransportError {}
 
 /// I fatti di un errore HTTP del gateway: `code` e `details` sono gia' estratti
 /// dal body al punto di costruzione, e il body integrale scende a `detail`.
+///
+/// `upstream_message` e' la frase che il gateway ha gia' reso. Qui cablava
+/// `None`, e non poteva essere altrimenti: da questo lato del confine i fatti
+/// del fornitore — quale provider, quale modello, quale status — non esistono
+/// piu', quindi il messaggio poteva solo dire "il servizio AI interno ha
+/// risposto con un errore". Ora la frase viaggia col suo errore.
 impl HasErrorFacts for GatewayHttpError {
     fn error_facts(&self) -> ErrorFacts {
         let class = self
@@ -407,7 +432,7 @@ impl HasErrorFacts for GatewayHttpError {
             .and_then(|d| d.get("primary_cause"))
             .and_then(|c| c.as_str())
             .map(str::to_string);
-        ErrorFacts {
+        let mut facts = ErrorFacts {
             domain: ErrorDomain::Gateway,
             http_status: Some(self.status),
             code: self.code.clone(),
@@ -417,8 +442,41 @@ impl HasErrorFacts for GatewayHttpError {
             transport: None,
             upstream_message: None,
             detail: self.body.clone(),
+        };
+        if let Some(m) = &self.user_message {
+            facts = facts.with_upstream(m.clone());
         }
+        facts
     }
+}
+
+/// Il [`RenderedError`] di un errore che arriva dal client gateway.
+///
+/// PUNTO DI RACCORDO (regola L) fra i produttori tipizzati di questo modulo e il
+/// punto unico di presentazione: cerca nella catena il primo errore che sa
+/// dichiarare i propri fatti e delega la frase a `render_user_error`. Nessuna
+/// ispezione del testo: se nessuno dei tipi noti e' presente, i fatti sono
+/// onestamente opachi e il messaggio resta generico, ma il dettaglio tecnico
+/// finisce dove va — in `detail`, non nella bolla di chat.
+///
+/// Vive QUI, accanto ai due tipi di cui fa il downcast, e non nell'adapter del
+/// motore: la stessa domanda ("che frase mostro per questo errore?") se la pone
+/// anche il confine HTTP della chat, e due copie divergerebbero.
+pub fn rendered_from_error(err: &anyhow::Error) -> RenderedError {
+    if let Some(t) = err.chain().find_map(|c| c.downcast_ref::<GatewayTransportError>()) {
+        return t.rendered();
+    }
+    if let Some(h) = err.chain().find_map(|c| c.downcast_ref::<GatewayHttpError>()) {
+        let mut rendered = h.rendered();
+        // Il verdetto del gateway VINCE su quello locale: e' stato deciso dove
+        // status e codice del fornitore erano ancora leggibili. Da qui, ogni
+        // errore del gateway sarebbe indistinguibile da ogni altro.
+        if let Some(code) = h.user_code.clone().filter(|c| !c.trim().is_empty()) {
+            rendered.code = code;
+        }
+        return rendered;
+    }
+    render_user_error(&ErrorFacts::opaque(ErrorDomain::Gateway, err.to_string()))
 }
 
 /// Budget HTTP mcp-core -> gateway per `/v1/complete`, dal punto unico
@@ -788,5 +846,81 @@ mod tests {
             t.os_error.is_some(),
             "il codice OS e' il segnale piu' specifico e va estratto"
         );
+    }
+
+    /// La frase del gateway ATTRAVERSA il confine HTTP.
+    ///
+    /// Il body non e' scritto a mano: lo compone `write_into`, cioe' lo stesso
+    /// produttore che lo scrive nel gateway (regola O). Se un giorno le chiavi
+    /// cambiassero nome, questo test non resterebbe verde per costruzione.
+    ///
+    /// La CONSEGUENZA che si asserisce: da questo lato del confine i fatti del
+    /// fornitore non esistono piu' (nessun provider, nessun modello, nessuno
+    /// status del provider), quindi senza trasporto il messaggio sarebbe il
+    /// generico "il servizio AI interno ha risposto con un errore" — vero e
+    /// inutile.
+    #[test]
+    fn la_frase_del_gateway_arriva_intera_dopo_il_confine_http() {
+        let reso = nexus_types::error_presentation::render_user_error(
+            &ErrorFacts::opaque(
+                ErrorDomain::Provider,
+                "tutti i provider hanno fallito -> mistral (mistral HTTP 429: {\"error\":{}})",
+            )
+            .with_provider("mistral")
+            .with_status(429)
+            .with_code("rate_limit_exceeded"),
+        );
+        let mut body = serde_json::json!({
+            "error": "tutti i provider hanno fallito -> mistral (...)",
+            "code": "PROVIDER_ERROR",
+            "details": { "primary_cause": "transient" },
+        });
+        reso.write_into(&mut body);
+
+        let err: anyhow::Error =
+            GatewayHttpError::from_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body.to_string())
+                .into();
+        let rendered = rendered_from_error(&err);
+
+        assert!(
+            rendered.message.contains("mistral"),
+            "la frase del gateway non e' stata trasportata: {}",
+            rendered.message
+        );
+        assert!(
+            !rendered.message.contains('{'),
+            "il body grezzo e' rientrato nella frase: {}",
+            rendered.message
+        );
+        // Il codice del gateway VINCE: da qui ogni errore sarebbe indistinguibile
+        // ("gateway_all_providers_failed") e il frontend non potrebbe proporre
+        // l'azione giusta.
+        assert_eq!(rendered.code, "provider_rate_limited");
+        assert!(
+            rendered.detail.contains("HTTP 429"),
+            "il tecnico integrale non deve perdersi: {}",
+            rendered.detail
+        );
+    }
+
+    /// Gateway che NON porta la resa (versione vecchia, o errore emesso da un
+    /// path non ancora migrato): nessuna frase inventata, nessuna deduzione dal
+    /// testo. Il messaggio resta generico e il body integrale finisce in detail.
+    #[test]
+    fn senza_resa_trasportata_si_ripiega_onestamente() {
+        let body = r#"{"error":"boom {\"raw\":1}","code":"PROVIDER_ERROR"}"#;
+        let err: anyhow::Error = GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body.to_string(),
+        )
+        .into();
+        let rendered = rendered_from_error(&err);
+        assert_eq!(rendered.code, "gateway_all_providers_failed");
+        assert!(
+            !rendered.message.contains('{'),
+            "il blob non deve mai entrare nella frase: {}",
+            rendered.message
+        );
+        assert!(rendered.detail.contains("boom"), "il tecnico resta intero");
     }
 }

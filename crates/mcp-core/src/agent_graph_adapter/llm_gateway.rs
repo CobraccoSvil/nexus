@@ -36,13 +36,11 @@ use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError};
 use nexus_agent_graph::state::ToolUse;
-use nexus_types::error_presentation::{
-    render_user_error, ErrorDomain, ErrorFacts, HasErrorFacts, RenderedError,
-};
-
+// La resa di un errore del gateway vive accanto ai tipi che la sanno produrre
+// (`crate::nexus_gateway`): qui si delega, non si ri-decide.
 use crate::nexus_gateway::{
-    GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall, GwToolFunctionCall,
-    NexusGatewayClient,
+    rendered_from_error, GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall,
+    GwToolFunctionCall, NexusGatewayClient,
 };
 
 /// Adapter [`LlmGateway`] -> [`NexusGatewayClient`].
@@ -306,29 +304,6 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
     }
 }
 
-/// Il [`RenderedError`] di un errore che arriva dal client gateway.
-///
-/// PUNTO DI RACCORDO fra i produttori tipizzati (regola M) e il punto unico di
-/// presentazione (regola L): cerca nella catena il primo errore che sa dichiarare
-/// i propri fatti e delega la frase a `render_user_error`. Nessuna ispezione del
-/// testo: se nessuno dei tipi noti e' presente, i fatti sono onestamente opachi e
-/// il messaggio resta generico, ma il dettaglio tecnico finisce dove va — nel
-/// campo `detail`, non nella bolla di chat.
-fn rendered_from_error(err: &anyhow::Error) -> RenderedError {
-    if let Some(t) = err
-        .chain()
-        .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayTransportError>())
-    {
-        return t.rendered();
-    }
-    if let Some(h) = err
-        .chain()
-        .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())
-    {
-        return h.rendered();
-    }
-    render_user_error(&ErrorFacts::opaque(ErrorDomain::Gateway, err.to_string()))
-}
 
 /// Mappa una [`LlmRequest`] (porta) nel [`GwRequest`] del client gateway.
 ///

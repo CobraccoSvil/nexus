@@ -53,6 +53,7 @@ use super::billing::{
     QuotaEstimate, QuotaExceeded,
 };
 use nexus_pricing::UsageUnit;
+use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts};
 use super::bootstrap::{build_http_client, build_runtime, GatewayConfig};
 use nexus_auth::llm_timeouts::LlmTimeouts;
 use super::AppState;
@@ -64,6 +65,14 @@ use super::AppState;
 /// risposta, accanto a `error`/`code`. Il chiamante (motore agentico) decide
 /// dalla struttura — classe del fallimento per-provider, tier rilevato,
 /// provider ammessi — mai dal testo umano di `message`.
+///
+/// `facts`: gli stessi segnali, nella forma che il PUNTO UNICO di presentazione
+/// (`nexus_types::error_presentation`) sa tradurre in una frase. Nasce QUI e non
+/// a valle perche' qui provider, modello, status e codice del provider esistono
+/// ancora: dopo il confine HTTP resta solo `message`, che per contratto porta i
+/// body grezzi ("mistral HTTP 429: {\"error\":{...}}") — ed e' il testo che
+/// l'utente si e' visto in chat finche' nessuno ha reso leggibile l'errore alla
+/// fonte.
 #[derive(Debug)]
 struct PipelineError {
     status: StatusCode,
@@ -72,14 +81,34 @@ struct PipelineError {
     // Boxed: tiene la Err-variant dei Result della pipeline sotto la soglia
     // clippy `result_large_err` (il details e' raro, il Result e' ovunque).
     details: Option<Box<Value>>,
+    // Boxed per la stessa ragione di `details`: ErrorFacts e' largo e questo
+    // Result attraversa l'intera pipeline.
+    facts: Box<ErrorFacts>,
+}
+
+/// I fatti di un errore APPLICATIVO del gateway (guardie, quota, risoluzione
+/// provider): dominio Gateway, codice del gateway, e la frase scritta a mano dal
+/// codice come `upstream_message`.
+///
+/// La distinzione con [`provider_facts_from_error`] non e' formale: li' il testo
+/// e' il body di un fornitore esterno (mai una frase), qui e' una riga scritta da
+/// noi per un umano, quindi puo' essere concatenata al messaggio.
+fn gateway_facts(code: &str, message: &str) -> Box<ErrorFacts> {
+    Box::new(
+        ErrorFacts::opaque(ErrorDomain::Gateway, message)
+            .with_code(code)
+            .with_upstream(message),
+    )
 }
 
 impl PipelineError {
     fn blocked(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::FORBIDDEN,
             code: "TIER_BLOCKED".to_string(),
-            message: message.into(),
+            facts: gateway_facts("TIER_BLOCKED", &message),
+            message,
             details: None,
         }
     }
@@ -94,10 +123,12 @@ impl PipelineError {
         allowed: &[String],
         message: impl Into<String>,
     ) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::FORBIDDEN,
             code: "POLICY_TIER_EXCLUDED".to_string(),
-            message: message.into(),
+            facts: gateway_facts("POLICY_TIER_EXCLUDED", &message),
+            message,
             details: Some(Box::new(json!({
                 "provider": provider,
                 "detected_tier": detected_tier,
@@ -106,38 +137,151 @@ impl PipelineError {
         }
     }
     fn quota(scope: &str, reason: &str) -> Self {
+        let message = format!("quota_exceeded:{scope}:{reason}");
         Self {
             status: StatusCode::FORBIDDEN,
             code: "QUOTA_EXCEEDED".to_string(),
-            message: format!("quota_exceeded:{scope}:{reason}"),
+            // `message` e' un identificatore macchina (`quota_exceeded:scope:reason`),
+            // non una frase: come upstream verrebbe letto da un umano come gergo.
+            // Il motivo leggibile e' il solo `reason`.
+            facts: Box::new(
+                ErrorFacts::opaque(ErrorDomain::Gateway, &message)
+                    .with_code("QUOTA_EXCEEDED")
+                    .with_upstream(reason),
+            ),
+            message,
             details: None,
         }
     }
+    /// Errore applicativo del gateway sul percorso dei provider (quota check
+    /// fallito, nessun provider capace, alias non risolvibile): il testo e'
+    /// scritto da noi, non e' il body di un fornitore.
     fn provider(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "PROVIDER_ERROR".to_string(),
-            message: message.into(),
+            facts: gateway_facts("PROVIDER_ERROR", &message),
+            message,
             details: None,
         }
     }
     /// Variante di [`Self::provider`] col dettaglio strutturato dei fallimenti
-    /// per-provider (`details.failures` + `details.primary_cause`).
-    fn provider_with_details(message: impl Into<String>, details: Value) -> Self {
+    /// per-provider (`details.failures` + `details.primary_cause`) e i FATTI del
+    /// fallimento primario, che sono l'unica cosa da cui puo' nascere una frase
+    /// che nomini il fornitore e il motivo.
+    fn provider_with_details(message: impl Into<String>, details: Value, facts: ErrorFacts) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "PROVIDER_ERROR".to_string(),
             message: message.into(),
             details: Some(Box::new(details)),
+            facts: Box::new(facts),
+        }
+    }
+    /// Fallimento di una chiamata a UN provider quando l'errore tipizzato e'
+    /// ancora nella catena (media-gen, stream SSE): i fatti si estraggono dal
+    /// [`ProviderHttpError`], non dal suo `Display`.
+    fn provider_call_failed(provider: &str, model: &str, err: &anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "PROVIDER_ERROR".to_string(),
+            message: err.to_string(),
+            details: None,
+            facts: Box::new(provider_facts_from_error(err, provider, Some(model))),
         }
     }
     fn invalid_request(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_REQUEST".to_string(),
-            message: message.into(),
+            facts: gateway_facts("INVALID_REQUEST", &message),
+            message,
             details: None,
         }
+    }
+    /// Budget END-TO-END della richiesta esaurito (504). Il codice sul wire e'
+    /// minuscolo per ragioni storiche: e' quello su cui il motore agentico
+    /// decide gia' oggi, e cambiarlo romperebbe il failover.
+    fn request_budget_exceeded() -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "request_budget_exceeded".to_string(),
+            message: "request budget exceeded".to_string(),
+            details: None,
+            facts: Box::new(
+                ErrorFacts::opaque(ErrorDomain::Gateway, "request budget exceeded")
+                    .with_code("request_budget_exceeded")
+                    .with_status(StatusCode::GATEWAY_TIMEOUT.as_u16()),
+            ),
+        }
+    }
+
+    /// PUNTO UNICO (regola L) del corpo d'errore del gateway.
+    ///
+    /// `error`/`code`/`details` restano INVARIATI: li leggono gia' mcp-core
+    /// (`nexus_gateway.rs`), l'adapter del motore e il neural client. Le tre
+    /// chiavi additive portano la RESA: `user_message` e' la frase,
+    /// `user_code` l'identificatore su cui il frontend sceglie icona e azione
+    /// (mai il testo, regola M), `user_detail` il tecnico integrale.
+    ///
+    /// Si chiama `user_detail` e non `detail` perche' `details` esiste gia' su
+    /// questo stesso oggetto con significato opposto: due chiavi a un carattere
+    /// di distanza sono la trappola che qui ha gia' prodotto il bug dei costi a
+    /// $0.00.
+    fn to_body(&self) -> Value {
+        let mut body = json!({ "error": self.message, "code": self.code });
+        // Il NOME delle tre chiavi vive nel punto unico insieme al suo lettore
+        // (`RenderedError::from_wire`, usato da mcp-core): scriverle qui a mano
+        // le renderebbe rinominabili da un solo lato.
+        render_user_error(&self.facts).write_into(&mut body);
+        if let Some(details) = &self.details {
+            body["details"] = (**details).clone();
+        }
+        body
+    }
+}
+
+/// Corpo del 504 di budget esaurito: il punto unico ([`PipelineError::to_body`])
+/// piu' le due chiavi TOP-LEVEL storiche che i chiamanti cercano gia'
+/// (`primary_cause` per il failover del motore, `budget_seconds` per la
+/// diagnosi). Funzione e non codice inline nel handler perche' il handler
+/// richiede un `AppState` con DB: cosi' il test attraversa il produttore vero
+/// invece di ricomporre il body a modo suo (regola O).
+fn request_budget_exceeded_body(budget_seconds: u64) -> (StatusCode, Value) {
+    let err = PipelineError::request_budget_exceeded();
+    let mut body = err.to_body();
+    body["primary_cause"] = json!("request_budget_exceeded");
+    body["budget_seconds"] = json!(budget_seconds);
+    (err.status, body)
+}
+
+/// I fatti STRUTTURATI di un fallimento provider a partire dall'errore anyhow
+/// che lo trasporta (punto unico nel gateway, regola L+M): status e codice dal
+/// [`ProviderHttpError`] della catena, classe dal classificatore, `error.message`
+/// del provider come frase upstream, body integrale in `detail`.
+fn provider_facts_from_error(err: &anyhow::Error, provider: &str, model: Option<&str>) -> ErrorFacts {
+    let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
+    let class = match classify_provider_error(err) {
+        ProviderErrorKind::Billing => "billing",
+        ProviderErrorKind::ClientError => "client_error",
+        ProviderErrorKind::ContextTooLong => "context_too_long",
+        ProviderErrorKind::Transient => "transient",
+    };
+    ErrorFacts {
+        domain: ErrorDomain::Provider,
+        http_status: http.map(|h| h.status),
+        code: http.and_then(|h| h.code.clone()),
+        class: Some(class.to_string()),
+        provider: Some(provider.to_string()),
+        model: model.map(str::to_string),
+        transport: None,
+        // `error.message` del contratto d'errore del provider: e' l'unico pezzo
+        // di testo che sia davvero una frase (dice COSA e' invalido). Il body
+        // integrale resta in `detail`.
+        upstream_message: http.and_then(|h| h.structured_message()),
+        detail: err.to_string(),
     }
 }
 
@@ -165,11 +309,7 @@ fn validate_logical_model(model: &str) -> Result<(), PipelineError> {
 
 impl IntoResponse for PipelineError {
     fn into_response(self) -> Response {
-        let mut body = json!({ "error": self.message, "code": self.code });
-        if let Some(details) = self.details {
-            body["details"] = *details;
-        }
-        (self.status, Json(body)).into_response()
+        (self.status, Json(self.to_body())).into_response()
     }
 }
 
@@ -577,10 +717,12 @@ async fn run_fallback(
                 // lungo invece di riprovare a ogni iterazione.
                 failures.push(ProviderFailure {
                     provider: name.to_string(),
+                    model: Some(rp.model.clone()),
                     class: "cooldown_billing",
                     status: None,
                     code: None,
                     message: format!("cooldown billing, {secs}s rimanenti"),
+                    upstream: None,
                 });
                 continue;
             }
@@ -608,10 +750,12 @@ async fn run_fallback(
             } else {
                 failures.push(ProviderFailure {
                     provider: name.to_string(),
+                    model: Some(rp.model.clone()),
                     class: "cooldown",
                     status: None,
                     code: None,
                     message: format!("in cooldown, {secs}s rimanenti"),
+                    upstream: None,
                 });
                 continue;
             }
@@ -639,7 +783,7 @@ async fn run_fallback(
                 cooldown.clear(name);
                 return Ok(resp);
             }
-            Err(f) => failures.push(f.into_provider_failure(name)),
+            Err(f) => failures.push(f.into_provider_failure(name, &rp.model)),
         }
     }
 
@@ -671,18 +815,27 @@ async fn run_fallback(
     // senso, e il contratto coi client esistenti non si muove.
     let all_deterministic =
         !failures.is_empty() && failures.iter().all(|f| f.class == "client_error");
+    // La FRASE nasce dal PRIMO fallimento, con dominio Provider: e' l'unico
+    // punto in cui provider, modello, status e codice esistono ancora. A valle
+    // resterebbe solo l'aggregato "tutti i provider hanno fallito -> mistral
+    // (mistral HTTP 429: {...})", da cui nessuno puo' piu' ricavare CHI ha
+    // fallito e PERCHE' senza una regex sulla prosa (regola M).
+    let message = format!("tutti i provider hanno fallito -> {human}");
+    let facts = match failures.first() {
+        Some(f) => f.facts(&message),
+        // Chain vuota (nessun provider risolto): niente da nominare.
+        None => ErrorFacts::opaque(ErrorDomain::Gateway, &message).with_code("PROVIDER_ERROR"),
+    };
     if all_deterministic {
         return Err(PipelineError {
             status: StatusCode::BAD_REQUEST,
             code: "PROVIDER_ERROR".to_string(),
-            message: format!("tutti i provider hanno fallito -> {human}"),
+            message,
             details: Some(Box::new(details)),
+            facts: Box::new(facts),
         });
     }
-    Err(PipelineError::provider_with_details(
-        format!("tutti i provider hanno fallito -> {human}"),
-        details,
-    ))
+    Err(PipelineError::provider_with_details(message, details, facts))
 }
 
 /// Fallimento di UN provider della chain, in forma STRUTTURATA (regola M).
@@ -694,21 +847,51 @@ async fn run_fallback(
 /// `status`/`code` arrivano dal [`ProviderHttpError`] quando disponibili.
 struct ProviderFailure {
     provider: String,
+    /// Modello REALE tentato su questo provider (l'alias e' gia' risolto). Senza,
+    /// il messaggio puo' dire "mistral ha rifiutato" ma non QUALE modello, che e'
+    /// la prima cosa da cambiare quando un modello viene deprecato.
+    model: Option<String>,
     class: &'static str,
     status: Option<u16>,
     code: Option<String>,
     message: String,
+    /// `error.message` del provider, quando il body lo espone: una frase, non il
+    /// body. Alimenta la resa; NON entra in `to_json` (i `details` restano il
+    /// canale delle decisioni macchina, regola M).
+    upstream: Option<String>,
 }
 
 impl ProviderFailure {
     fn to_json(&self) -> Value {
         json!({
             "provider": self.provider,
+            "model": self.model,
             "class": self.class,
             "status": self.status,
             "code": self.code,
             "message": self.message,
         })
+    }
+
+    /// I fatti da cui nasce la frase per l'utente. `detail` arriva da fuori: e'
+    /// il testo tecnico AGGREGATO di tutta la cascata, non solo di questo
+    /// fallimento — chi debugga vuole sapere anche cosa hanno fatto gli altri.
+    fn facts(&self, detail: &str) -> ErrorFacts {
+        let mut facts = ErrorFacts {
+            domain: ErrorDomain::Provider,
+            http_status: self.status,
+            code: self.code.clone(),
+            class: Some(self.class.to_string()),
+            provider: Some(self.provider.clone()),
+            model: self.model.clone(),
+            transport: None,
+            upstream_message: None,
+            detail: detail.to_string(),
+        };
+        if let Some(u) = &self.upstream {
+            facts = facts.with_upstream(u.clone());
+        }
+        facts
     }
 }
 
@@ -720,6 +903,11 @@ struct CallFailure {
     status: Option<u16>,
     code: Option<String>,
     message: String,
+    /// `error.message` del body del provider (`structured_message`). Esisteva
+    /// gia' come segnale, ma finiva in UN solo campo di tracing: la frase che
+    /// dice COSA e' invalido moriva nei log mentre all'utente arrivava il body
+    /// grezzo. Ora viaggia fino alla resa.
+    upstream: Option<String>,
 }
 
 impl CallFailure {
@@ -735,6 +923,7 @@ impl CallFailure {
             status: http.map(|h| h.status),
             code: http.and_then(|h| h.code.clone()),
             message: err.to_string(),
+            upstream: http.and_then(|h| h.structured_message()),
         }
     }
 
@@ -751,6 +940,7 @@ impl CallFailure {
             message: format!(
                 "risposta degenere: nessun testo ne' tool-call (finish_reason={finish_reason})"
             ),
+            upstream: None,
         }
     }
 
@@ -769,16 +959,19 @@ impl CallFailure {
                 "nessuna risposta entro il cap per-tentativo ({}s)",
                 per_attempt.as_secs()
             ),
+            upstream: None,
         }
     }
 
-    fn into_provider_failure(self, provider: &str) -> ProviderFailure {
+    fn into_provider_failure(self, provider: &str, model: &str) -> ProviderFailure {
         ProviderFailure {
             provider: provider.to_string(),
+            model: Some(model.to_string()),
             class: self.class,
             status: self.status,
             code: self.code,
             message: self.message,
+            upstream: self.upstream,
         }
     }
 }
@@ -1138,11 +1331,10 @@ pub async fn complete(
     Json(body): Json<LlmRequest>,
 ) -> Response {
     if body.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "messages required" })),
-        )
-            .into_response();
+        // Delega al corpo d'errore unico: anche una guardia d'ingresso deve
+        // uscire con la stessa forma del resto della pipeline, o il frontend
+        // trova `user_message` a volte si' e a volte no.
+        return PipelineError::invalid_request("messages required").into_response();
     }
     // DEADLINE END-TO-END (retry e chain inclusi). Senza di essa una singola
     // completion poteva correre quanto il TRASPORTO concedeva (300s) — cioe'
@@ -1169,18 +1361,8 @@ pub async fn complete(
                 feature = %body.metadata.feature,
                 "gateway: budget della richiesta esaurito -> 504, il motore fara' failover"
             );
-            // 504 con codice STRUTTURATO (regola M): il chiamante decide sul
-            // codice, non sul testo.
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({
-                    "error": "request budget exceeded",
-                    "code": "request_budget_exceeded",
-                    "primary_cause": "request_budget_exceeded",
-                    "budget_seconds": budget.as_secs(),
-                })),
-            )
-                .into_response()
+            let (status, body) = request_budget_exceeded_body(budget.as_secs());
+            (status, Json(body)).into_response()
         }
     }
 }
@@ -1197,11 +1379,7 @@ pub async fn stream(
     Json(body): Json<LlmRequest>,
 ) -> Response {
     if body.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "messages required" })),
-        )
-            .into_response();
+        return PipelineError::invalid_request("messages required").into_response();
     }
     // Stessa guardia del path non-streaming (punto unico validate_logical_model):
     // un modello vuoto non deve mai aprire uno stream verso i provider.
@@ -1240,15 +1418,12 @@ async fn build_sse_stream(
             match pinned {
                 Ok(rp) => vec![rp],
                 Err(e) => {
-                    // Parita' col body JSON del path non-streaming: `code` (e
-                    // `details` se presenti) accanto al testo, cosi' il
-                    // consumer SSE decide dalla struttura (regola M).
-                    let mut payload = json!({ "error": e.message, "code": e.code });
-                    if let Some(d) = e.details {
-                        payload["details"] = *d;
-                    }
+                    // Parita' col body JSON del path non-streaming: stesso punto
+                    // unico, quindi `code`, `details` E la resa leggibile. Qui
+                    // il body era ricostruito a mano ed e' rimasto indietro ogni
+                    // volta che il non-streaming e' cambiato.
                     let _ = tx
-                        .send(Ok(Event::default().data(payload.to_string())))
+                        .send(Ok(Event::default().data(e.to_body().to_string())))
                         .await;
                     let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                     return;
@@ -1257,20 +1432,22 @@ async fn build_sse_stream(
         } else {
             let decision = runtime.policy.decide(tier, &body.metadata.feature, &HashMap::new());
             if decision.blocked {
-                let code = if decision.dlp_blocked {
-                    "POLICY_TIER_EXCLUDED"
+                let reason = decision.reason.clone().unwrap_or_default();
+                let mut err = if decision.dlp_blocked {
+                    PipelineError::policy_tier_excluded(None, tier, &decision.providers, reason)
                 } else {
-                    "TIER_BLOCKED"
+                    PipelineError::blocked(reason)
                 };
+                // `TIER_BLOCKED` non porta details dal suo costruttore, ma il
+                // path SSE li ha sempre emessi: il consumer legge detected_tier
+                // e allowed_providers.
+                err.details.get_or_insert_with(|| {
+                    Box::new(
+                        json!({ "detected_tier": tier, "allowed_providers": decision.providers }),
+                    )
+                });
                 let _ = tx
-                    .send(Ok(Event::default().data(
-                        json!({
-                            "error": decision.reason.unwrap_or_default(),
-                            "code": code,
-                            "details": { "detected_tier": tier, "allowed_providers": decision.providers },
-                        })
-                        .to_string(),
-                    )))
+                    .send(Ok(Event::default().data(err.to_body().to_string())))
                     .await;
                 let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                 return;
@@ -1379,8 +1556,16 @@ async fn build_sse_stream(
                         state.cooldown.mark_transient(name, Some(msg.clone()))
                     }
                 }
+                // Stesso corpo del path non-streaming: qui usciva il solo
+                // `err.to_string()`, cioe' il body grezzo del provider — la
+                // sorgente esatta dei blob letti in chat, sul canale che nessuno
+                // guardava perche' lo streaming e' l'eccezione.
                 let _ = tx
-                    .send(Ok(Event::default().data(json!({ "error": msg }).to_string())))
+                    .send(Ok(Event::default().data(
+                        PipelineError::provider_call_failed(name, &req.model, &err)
+                            .to_body()
+                            .to_string(),
+                    )))
                     .await;
             }
         }
@@ -1469,7 +1654,9 @@ async fn run_generate_image(
     let resp = provider
         .generate_image(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))?;
+        // I fatti dal ProviderHttpError, non il suo Display: qui usciva il body
+        // grezzo del provider come unico testo disponibile.
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
 
     // Consumo: le immagini prodotte si CONTANO sulla risposta, quindi la
     // quantita' e' misurata, non stimata.
@@ -1634,7 +1821,7 @@ async fn run_generate_video(
     let resp = provider
         .generate_video(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))?;
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
 
     // Consumo: la risposta NON riporta la durata prodotta, quindi al massimo si
     // registra quella richiesta. Se il chiamante non l'ha indicata (il default e'
@@ -1802,7 +1989,7 @@ async fn run_transcribe_audio(
     let resp = provider
         .transcribe_audio(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))?;
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
 
     // Consumo: la trascrizione si paga al secondo di audio, ma la durata non e'
     // nota da nessuna delle due parti — la richiesta porta i byte codificati (da
@@ -1966,7 +2153,7 @@ async fn run_text_to_speech(
     let resp = provider
         .text_to_speech(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))?;
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
 
     // Consumo: il TTS si paga al carattere di input, e l'input lo conosciamo
     // esattamente. `chars()` e non `len()`: i byte UTF-8 non sono caratteri, e
@@ -3018,6 +3205,212 @@ mod tests {
         assert_eq!(f["class"], "client_error");
         assert_eq!(f["status"], 400);
         assert_eq!(f["code"], "invalid_request_error");
+    }
+
+    // ── Resa dell'errore al confine HTTP (le tre chiavi user_*) ──────────────
+
+    /// Provider che fallisce con un body d'errore REALE, costruito
+    /// dall'estrattore di PRODUZIONE ([`ProviderHttpError::from_response`]).
+    ///
+    /// Il [`FakeProvider`] scrive `code` a mano nella struct: comodo, ma un test
+    /// che parte da li' fissa l'assunto che vuole verificare (regola O). Qui il
+    /// codice strutturato e la frase upstream nascono dal body, come sul campo:
+    /// se domani l'estrattore smettesse di trovare `error.code`, il test se ne
+    /// accorge invece di restare verde.
+    struct RealBodyProvider {
+        name: String,
+        status: u16,
+        body: String,
+    }
+
+    impl RealBodyProvider {
+        fn new(name: &str, status: u16, body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                status,
+                body: body.to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RealBodyProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+        fn max_context_tokens(&self) -> u32 {
+            1000
+        }
+        fn tier_compatibility(&self) -> &[u8] {
+            &[0, 1, 2]
+        }
+        async fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+            Err(
+                ProviderHttpError::from_response(&self.name, self.status, self.body.clone())
+                    .into(),
+            )
+        }
+        async fn stream(&self, _req: &LlmRequest) -> anyhow::Result<crate::provider::ChunkStream> {
+            anyhow::bail!("non usato")
+        }
+        async fn healthcheck(&self) -> bool {
+            true
+        }
+    }
+
+    /// Body 429 REALE di un provider OpenAI-compat (Mistral), con `error.code`
+    /// macchina e `error.message` leggibile accanto a campi di contorno.
+    const BODY_429: &str = r#"{"error":{"message":"Requests rate limit exceeded","type":"invalid_request_error","code":"rate_limit_exceeded","param":null},"request_id":"1f0c9e"}"#;
+
+    #[tokio::test]
+    async fn il_corpo_derrore_porta_la_frase_e_conserva_il_contratto_storico() {
+        // LA CONSEGUENZA: dal body grezzo del provider, lungo la catena vera
+        // (complete -> CallFailure -> ProviderFailure -> PipelineError -> JSON),
+        // deve uscire un corpo in cui `user_message` e' una FRASE che nomina
+        // provider, modello e motivo — e in cui il blob e' confinato in
+        // `user_detail`. Prima esisteva solo `error`, che il blob lo portava
+        // dentro.
+        let p = RealBodyProvider::new("mistral", 429, BODY_429);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "mistral-small-latest".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let body = err.to_body();
+
+        let user = body["user_message"].as_str().expect("user_message presente");
+        assert!(
+            !user.contains('{') && !user.contains("request_id"),
+            "il blob e' rientrato nella frase: {user}"
+        );
+        assert!(
+            user.contains("mistral") && user.contains("mistral-small-latest"),
+            "la frase non nomina provider e modello: {user}"
+        );
+        // `error.message` del provider: esisteva gia' come segnale
+        // (`structured_message`) ma finiva solo in un campo di tracing.
+        assert!(
+            user.contains("Requests rate limit exceeded"),
+            "la frase del provider si perde per strada: {user}"
+        );
+        // Il codice macchina del provider, non lo status: e' su questo che il
+        // frontend sceglie icona e azione (mai sul testo, regola M).
+        assert_eq!(body["user_code"], "provider_rate_limited");
+        let detail = body["user_detail"].as_str().expect("user_detail presente");
+        assert!(
+            detail.contains("429") && detail.contains("request_id"),
+            "il tecnico integrale non deve perdersi: {detail}"
+        );
+
+        // Contratto storico INVARIATO: `error`, `code` e `details` sono letti da
+        // mcp-core (nexus_gateway.rs), dall'adapter del motore e dal neural client.
+        assert_eq!(body["code"], "PROVIDER_ERROR");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("tutti i provider hanno fallito"));
+        assert_eq!(body["details"]["primary_cause"], "transient");
+        assert_eq!(body["details"]["failures"][0]["status"], 429);
+        // Il modello tentato viaggia anche nei details: senza, un modello
+        // deprecato resta invisibile a chi legge la struttura.
+        assert_eq!(
+            body["details"]["failures"][0]["model"],
+            "mistral-small-latest"
+        );
+    }
+
+    #[tokio::test]
+    async fn ogni_corpo_derrore_del_gateway_ha_le_tre_chiavi() {
+        // L'INVARIANTE del confine: se anche UNA superficie risponde senza
+        // `user_message`, il frontend torna a doversela cavare col testo tecnico
+        // — cioe' a classificare per sottostringa. Qui si fissa che non accada,
+        // guardia d'ingresso e 504 di budget inclusi.
+        let p = RealBodyProvider::new("mistral", 429, BODY_429);
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let cascata = run_fallback(
+            &[ResolvedProvider {
+                provider: p,
+                model: "mistral-small-latest".into(),
+            }],
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        let (_, budget_body) = request_budget_exceeded_body(240);
+        let corpi = [
+            PipelineError::invalid_request("messages required").to_body(),
+            PipelineError::quota("project", "monthly_limit").to_body(),
+            PipelineError::blocked("contenuto riservato").to_body(),
+            PipelineError::policy_tier_excluded(Some("openai"), 3, &["ollama".into()], "escluso")
+                .to_body(),
+            PipelineError::provider("nessun provider sano supporta la trascrizione audio")
+                .to_body(),
+            cascata.to_body(),
+            budget_body.clone(),
+        ];
+        for body in corpi {
+            let user = body["user_message"].as_str().unwrap_or_default();
+            assert!(!user.is_empty(), "corpo senza user_message: {body}");
+            assert!(
+                !user.contains('{'),
+                "una struttura e' finita nella frase: {user}"
+            );
+            assert!(
+                !body["user_code"].as_str().unwrap_or_default().is_empty(),
+                "corpo senza user_code: {body}"
+            );
+            assert!(body["error"].is_string(), "`error` storico perso: {body}");
+        }
+
+        // Il 504 conserva le due chiavi TOP-LEVEL su cui il motore agentico
+        // decide gia' il failover: aggiungere la resa non doveva spostarle.
+        assert_eq!(budget_body["code"], "request_budget_exceeded");
+        assert_eq!(budget_body["primary_cause"], "request_budget_exceeded");
+        assert_eq!(budget_body["budget_seconds"], 240);
+        assert_eq!(budget_body["user_code"], "gateway_timeout");
+    }
+
+    #[test]
+    fn il_fallimento_di_una_singola_chiamata_provider_nomina_chi_e_perche() {
+        // Path media/SSE: nessuna cascata, un solo provider. I fatti si estraggono
+        // dal ProviderHttpError ancora nella catena anyhow — non dal suo Display,
+        // che e' il blob.
+        let err: anyhow::Error =
+            ProviderHttpError::from_response("openai", 402, r#"{"error":{"message":"Your credit balance is too low","type":"insufficient_quota"}}"#.to_string())
+                .into();
+        let body = PipelineError::provider_call_failed("openai", "gpt-image-1", &err).to_body();
+        assert_eq!(body["user_code"], "provider_quota");
+        let user = body["user_message"].as_str().unwrap();
+        assert!(
+            user.contains("openai") && user.contains("gpt-image-1") && !user.contains('{'),
+            "frase inutilizzabile: {user}"
+        );
+        assert!(user.contains("credit balance"), "la frase del provider si perde: {user}");
     }
 
     #[tokio::test]

@@ -50,3 +50,8 @@ nexus-auth = { path = "../nexus-auth" }
 nexus-pricing = { path = "../nexus-pricing" }
 # Punto unico del secret scanner su stringa (redazione prompt/output, regola L).
 nexus-tool-kit = { path = "../nexus-tool-kit" }
+# Punto unico della PRESENTAZIONE degli errori (error_presentation): il gateway
+# e' l'ultimo posto dove status, codice strutturato, provider e modello sono
+# ancora VIVI, quindi e' qui che la frase per l'utente deve nascere. Nessun ciclo:
+# nexus-gateway non e' dipendenza di nexus-types (ne' di alcun altro crate).
+nexus-types = { path = "../nexus-types" }

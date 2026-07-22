@@ -218,6 +218,40 @@ impl RenderedError {
             format!("{} | detail: {}", self.message, self.detail)
         }
     }
+
+    /// Aggiunge la resa a un oggetto JSON gia' esistente, con le TRE chiavi
+    /// additive del contratto: `user_message` (la frase), `user_code`
+    /// (l'identificatore su cui il client sceglie icona e azione, mai il testo)
+    /// e `user_detail` (il tecnico integrale).
+    ///
+    /// PUNTO UNICO (regola L) del NOME di quelle chiavi: scrittura qui, lettura
+    /// in [`RenderedError::from_wire`]. Se vivessero in posti diversi — il
+    /// gateway che scrive, mcp-core che legge — un rename lascerebbe verdi
+    /// entrambi i lati e romperebbe solo il trasporto, cioe' l'unica cosa che
+    /// nessuno dei due test guarda.
+    ///
+    /// Si chiama `user_detail` e non `detail` perche' sulle risposte del gateway
+    /// convive gia' `details` con significato opposto (i fallimenti per-provider
+    /// su cui decide il motore): due chiavi a un carattere di distanza sono la
+    /// trappola che in questo repo ha gia' prodotto il bug dei costi a $0.00.
+    pub fn write_into(&self, target: &mut serde_json::Value) {
+        target["user_message"] = serde_json::Value::String(self.message.clone());
+        target["user_code"] = serde_json::Value::String(self.code.clone());
+        target["user_detail"] = serde_json::Value::String(self.detail.clone());
+    }
+
+    /// La resa trasportata da un payload JSON, se c'e'. `None` quando il
+    /// produttore non la porta (servizio vecchio, endpoint non ancora migrato):
+    /// il chiamante ripiega onestamente, senza dedurre nulla dal testo.
+    pub fn from_wire(payload: &serde_json::Value) -> Option<Self> {
+        let stringa = |chiave: &str| payload.get(chiave).and_then(|v| v.as_str());
+        let message = stringa("user_message").filter(|s| !s.trim().is_empty())?;
+        Some(Self {
+            code: stringa("user_code").unwrap_or("unspecified").to_string(),
+            message: message.to_string(),
+            detail: stringa("user_detail").unwrap_or_default().to_string(),
+        })
+    }
 }
 
 /// Chi produce errori sa estrarre i propri segnali strutturati.
@@ -362,6 +396,14 @@ fn render_provider_code(code: &str, chi: &str) -> Option<(&'static str, String)>
             "provider_model_unknown",
             format!("{chi} non riconosce il modello richiesto."),
         ),
+        // Codice emesso dal gateway stesso (`CallFailure::attempt_timeout`) sul
+        // tentativo scaduto. Senza questo ramo cadrebbe sulla classe
+        // "transient", che dice "sospeso dopo un errore recente": un provider
+        // che sta ancora pensando non e' un provider sospeso.
+        "attempt_timeout" => (
+            "provider_timeout",
+            format!("{chi} non ha risposto entro il tempo concesso al tentativo."),
+        ),
         _ => return None,
     };
     Some(esito)
@@ -441,6 +483,23 @@ fn render_gateway(facts: &ErrorFacts) -> (&'static str, String) {
         Some("POLICY_TIER_EXCLUDED") | Some("TIER_BLOCKED") => (
             "policy_excluded",
             "Le policy di riservatezza escludono i fornitori disponibili per questo contenuto."
+                .to_string(),
+        ),
+        Some("QUOTA_EXCEEDED") => (
+            "quota_exceeded",
+            "La quota configurata per questo ambito e' esaurita.".to_string(),
+        ),
+        Some("INVALID_REQUEST") => (
+            "invalid_request",
+            "La richiesta inviata al servizio AI non e' valida.".to_string(),
+        ),
+        // Literal MINUSCOLO: e' il valore storico sul wire (`code` del 504 di
+        // budget), non un identificatore nuovo. Il gateway lo emette cosi' e il
+        // motore agentico ci decide sopra il failover: normalizzarlo qui
+        // significherebbe non riconoscerlo mai.
+        Some("request_budget_exceeded") => (
+            "gateway_timeout",
+            "Il servizio AI non ha completato la richiesta entro il tempo massimo consentito."
                 .to_string(),
         ),
         _ => match facts.http_status {
@@ -674,5 +733,37 @@ mod tests {
     fn i_log_conservano_il_dettaglio() {
         let r = render_user_error(&ErrorFacts::opaque(ErrorDomain::Gateway, "boom os_error=1"));
         assert!(r.log_line().contains("boom os_error=1"));
+    }
+
+    /// Il TRASPORTO: cio' che un lato scrive, l'altro lo rilegge identico.
+    ///
+    /// Il round-trip passa dai due produttori veri (`write_into`/`from_wire`),
+    /// non da un letterale ricopiato: e' l'unico modo perche' un rename delle
+    /// chiavi faccia ROSSEGGIARE qualcosa invece di rompere in silenzio il solo
+    /// pezzo che nessuno osserva.
+    #[test]
+    fn la_resa_sopravvive_al_confine_json() {
+        let originale = render_user_error(
+            &ErrorFacts::opaque(ErrorDomain::Provider, "{\"error\":{\"code\":\"x\"}}")
+                .with_provider("mistral")
+                .with_status(429),
+        );
+        let mut body = serde_json::json!({ "error": "testo tecnico", "code": "PROVIDER_ERROR" });
+        originale.write_into(&mut body);
+        // I campi storici non vengono toccati: le tre chiavi sono ADDITIVE.
+        assert_eq!(body["error"], "testo tecnico");
+        assert_eq!(body["code"], "PROVIDER_ERROR");
+
+        let riletto = RenderedError::from_wire(&body).expect("la resa attraversa il confine");
+        assert_eq!(riletto.message, originale.message);
+        assert_eq!(riletto.code, originale.code);
+        assert_eq!(riletto.detail, originale.detail);
+
+        // Nessuna resa trasportata -> None, mai una frase inventata.
+        assert!(RenderedError::from_wire(&serde_json::json!({ "error": "solo tecnico" })).is_none());
+        assert!(
+            RenderedError::from_wire(&serde_json::json!({ "user_message": "   " })).is_none(),
+            "una frase vuota non e' una resa"
+        );
     }
 }

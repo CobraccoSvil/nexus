@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { useProjectStore } from "../lib/project-dispatcher";
+import { readRenderedError } from "../lib/api/error-render";
 
 type FeedbackTone = "success" | "error" | "info";
 
@@ -68,7 +69,10 @@ function inferActionLabel(input: RequestInfo | URL, init?: RequestInit): string 
 /// e un errore vero ma dall'aria tecnica spariva del tutto.
 ///
 /// Ora la frase leggibile arriva dal backend, dal punto unico
-/// `nexus-types::error_presentation`, dove status e codice erano ancora vivi.
+/// `nexus-types::error_presentation`, dove status e codice erano ancora vivi, e
+/// viene letta da `readRenderedError` PRIMA di arrivare qui. Questa funzione e'
+/// il RIPIEGO per cio' che quella resa non ce l'ha: risposte di proxy, HTML di
+/// un server intermedio, endpoint non ancora migrati.
 /// Qui resta una sola decisione, e non e' una classificazione: se il testo e' una
 /// STRUTTURA (JSON, HTML) invece che prosa, non e' un messaggio e non va in una
 /// notifica.
@@ -96,6 +100,10 @@ async function parseResponseError(response: Response): Promise<string | undefine
     const contentType = clone.headers.get("content-type")?.toLowerCase() ?? "";
     if (contentType.includes("application/json")) {
       const payload = await clone.json().catch(() => null);
+      // La frase gia' resa dal backend vince su qualunque cosa si possa dedurre
+      // da questo lato: e' stata scritta dove status e codice erano leggibili.
+      const rendered = readRenderedError(payload);
+      if (rendered) return rendered.message;
       if (payload && typeof payload === "object") {
         const maybeError =
           typeof (payload as { error?: unknown }).error === "string"

@@ -38,7 +38,17 @@ pub(crate) async fn run_turn(
             },
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+        // E' QUI che la resa moriva: la catena anyhow contiene ancora
+        // GatewayHttpError / GatewayTransportError — cioe' status, codice e la
+        // frase gia' scritta dal gateway — e `e.to_string()` li appiattiva tutti
+        // in una riga tecnica. Da questo punto in poi nessuno poteva piu'
+        // ricostruire nulla se non con una regex sulla prosa (regola M).
+        .map_err(|e| {
+            nexus_types::api_error_rendered(
+                StatusCode::BAD_REQUEST,
+                &crate::nexus_gateway::rendered_from_error(&e),
+            )
+        })?;
 
     let payload = &orchestrator_output.payload;
     let raw_content = payload["completion"]["content"]

@@ -2374,6 +2374,7 @@ dependencies = [
  "nexus-cache",
  "nexus-pricing",
  "nexus-tool-kit",
+ "nexus-types",
  "regex",
  "reqwest",
  "serde",

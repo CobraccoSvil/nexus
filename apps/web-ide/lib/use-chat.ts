@@ -1159,7 +1159,12 @@ export function useChat(
             setAgentRun(null);
             setAgentSteps([]);
             setIsLoading(false);
-            setError(formatChatError(new Error(finalRun.finalAnswer ?? "Run fallito dopo conferma."), "Conferma fallita."));
+            // `finalAnswer` NON e' un errore JS: e' l'esito che il run ha
+            // dichiarato, gia' prosa. Farlo passare da formatChatError significava
+            // fabbricare un Error attorno a un testo per poi troncarlo — e da
+            // quando la frase si legge da un CAMPO (mai dal testo), quel testo
+            // verrebbe scartato del tutto e l'utente perderebbe il motivo vero.
+            setError(finalRun.finalAnswer?.trim() || "Conferma fallita: il run e' terminato con errore.");
           } catch {
             setAgentRun(null);
             setAgentSteps([]);
