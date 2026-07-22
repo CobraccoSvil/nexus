@@ -53,6 +53,12 @@ db/backups/
 apps/web-ide/tsconfig.tsbuildinfo
 brain/nexus_memory/
 .claude/projects/
+# Worktree effimeri degli agenti: nascono e muoiono col task. Uno di essi
+# (agent-a31cffeec933339c1) era finito in git con 88 file -- backup Postgres,
+# learning.db, CSV di test -- e alla sua rimozione ha lasciato altrettante
+# cancellazioni da committare. Ignorarli chiude il caso alla radice: un albero
+# temporaneo non e' contenuto del repo.
+.claude/worktrees/
 .cursor/
 check_tables.txt
 devnull
