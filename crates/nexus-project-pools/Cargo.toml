@@ -5,14 +5,13 @@ version.workspace = true
 
 [dependencies]
 nexus-auth = { path = "../nexus-auth" }
-nexus-cache = { path = "../nexus-cache" }
 sqlx.workspace = true
 thiserror = "1.0"
+# Lock per-progetto sull'APERTURA del pool: senza, due task che non trovano il
+# pool in registro ne aprono uno ciascuno verso lo stesso database.
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
 
 [lints]
 workspace = true

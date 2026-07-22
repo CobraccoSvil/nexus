@@ -399,6 +399,54 @@ else
   echo "OK project-pool-sizing: un solo tetto per il DB per-progetto"
 fi
 
+# ── registro dei pool per-progetto ───────────────────────────────────────────
+# Il guard qui sopra era VERDE il 2026-07-22, mentre il cluster app era saturo:
+# copriva il tetto per pool, e il tetto era rispettato: a crescere era il NUMERO
+# dei pool. mcp-core teneva la propria cache (TtlCache 600s) e nexus-project-pools
+# un'altra (300s), entrambe nello stesso processo, entrambe verso <slug>_nexus:
+# 15 connessioni su un solo database, tre pool. Misurare la cosa sbagliata e'
+# peggio che non misurare, perche' il verde diventa una prova a discarico
+# (regola O: lo strumento non raggiungeva il suo oggetto).
+#
+# Ora il registro e' uno solo: nexus_project_pools::pool_or_open. Questo check
+# fallisce se ricompare una mappa da progetto a pool fuori di li'.
+pool_registry_hits="$(grep -rEn '(TtlCache|HashMap|DashMap|BTreeMap)<\s*Uuid\s*,[^>]*PgPool' \
+  crates \
+  --include='*.rs' \
+  --exclude-dir=target \
+  2>/dev/null \
+  | grep -v '^crates/nexus-project-pools/src/lib.rs:' \
+  || true)"
+if [[ -n "${pool_registry_hits// /}" ]]; then
+  echo "!! project-pool-registry: un secondo registro di pool per-progetto:" >&2
+  echo "$pool_registry_hits" >&2
+  echo "   Usa nexus_project_pools::pool_or_open() / cached_pool()." >&2
+  echo "   Il tetto per pool non governa quanti pool esistono: due registri" >&2
+  echo "   verso lo stesso database raddoppiano le connessioni, e il ruolo" >&2
+  echo "   Postgres si esaurisce per TUTTI i progetti insieme." >&2
+  fail=1
+else
+  echo "OK project-pool-registry: un solo registro di pool per-progetto"
+fi
+
+# ── ciclo di vita dei pool per-progetto ──────────────────────────────────────
+# Un pool NON e' un dato che scade: e' una risorsa. Con un TTL, alla scadenza
+# `get` risponde None SENZA rimuovere la entry, il chiamante ne apre uno nuovo e
+# il vecchio resta vivo finche' l'ultima PgPool clonata (che un run tiene per
+# tutta la sua durata) non viene droppata. E' cosi' che lo stesso database si
+# ritrovava con due e tre pool.
+if grep -qE 'TtlCache' crates/nexus-project-pools/src/lib.rs 2>/dev/null \
+  && grep -qE 'TtlCache::new' crates/nexus-project-pools/src/lib.rs 2>/dev/null; then
+  echo "!! project-pool-lifetime: il registro dei pool e' tornato a scadenza TTL:" >&2
+  echo "   crates/nexus-project-pools/src/lib.rs" >&2
+  echo "   Alla scadenza il pool viene RIAPERTO e il precedente sopravvive nelle" >&2
+  echo "   clone in uso: il numero di pool cresce da solo. L'invalidazione di un" >&2
+  echo "   pool e' esplicita (forget_pool), mai temporale." >&2
+  fail=1
+else
+  echo "OK project-pool-lifetime: il registro dei pool non scade a tempo"
+fi
+
 # ── migrazioni-numero-unico ──────────────────────────────────────────────────
 # Il numero di versione di una migrazione e' un punto unico per definizione:
 # due file con lo stesso prefisso numerico e nomi diversi passano il merge di

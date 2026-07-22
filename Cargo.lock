@@ -2501,7 +2501,6 @@ name = "nexus-project-pools"
 version = "0.1.0"
 dependencies = [
  "nexus-auth",
- "nexus-cache",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",

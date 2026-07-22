@@ -16,24 +16,26 @@
 //! I mattoni comuni ai due contratti — lettura del registry
 //! `project_database_config`, elenco progetti, directory `nexus_data_routing`
 //! — vivono SOLO qui: `mcp-core::project_db_routes` delega a queste funzioni e
-//! vi aggiunge il layer provisioning+migrazione (lock per-progetto) e la
-//! propria cache pool condivisa con AppState.
+//! vi aggiunge il layer provisioning+migrazione (lock per-progetto).
+//!
+//! Anche il REGISTRO dei pool vive solo qui (`pool_or_open`): i due contratti
+//! differiscono su COME si apre un pool, non su quanti ne esistono. Finche' ne
+//! avevano uno per uno, lo stesso `<slug>_nexus` veniva aperto due volte dallo
+//! stesso processo — vedi il commento su `POOLS`.
 //!
 //! La separazione DB per-progetto e' SEMPRE attiva: il cutover e' chiuso (le
 //! tabelle meta `zz_decommissioned_*` sono droppate, mig 0525) e il flag
 //! storico `db.project_separation.enabled` e' stato rimosso (mig 0527). Le
 //! funzioni instradano sempre al DB `<slug>_nexus` del progetto e NON ritornano
-//! MAI il pool meta: registry non inizializzato o DB non provisionato/aperto ->
-//! errore tipizzato. Lo stesso contratto vale dal 2026-07-20 anche per
+//! MAI il pool meta: DB non provisionato o non apribile -> errore tipizzato.
+//! Lo stesso contratto vale dal 2026-07-20 anche per
 //! `mcp-core::project_db_routes` (`ProjectDbError`): il vecchio fallback
 //! "resiliente" al meta leggeva liste vuote e scriveva sul DB sbagliato.
 
 pub mod sizing;
 
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
-use nexus_cache::TtlCache;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -60,12 +62,95 @@ pub enum ProjectPoolError {
     SessionNotFound(Uuid),
 }
 
-static POOLS: OnceLock<TtlCache<Uuid, PgPool>> = OnceLock::new();
+// ── Registro dei pool per-progetto (punto unico, regola L) ───────────────────
+// UN pool per database, per tutta la vita del processo.
+//
+// Qui c'era una `TtlCache` (300s), e mcp-core ne aveva una seconda (600s) per lo
+// stesso DB: due strade verso `<slug>_nexus`, ognuna col proprio registro. Il TTL
+// era il difetto piu' grave dei due, perche' un pool NON e' un dato che scade —
+// e' una risorsa con un ciclo di vita. `TtlCache::get` alla scadenza risponde
+// `None` senza rimuovere la entry: il chiamante apriva un pool NUOVO, e il
+// vecchio restava vivo finche' l'ultima `PgPool` clonata (che un run tiene per
+// tutta la sua durata) non veniva droppata. A crescere non era il singolo pool ma
+// il LORO NUMERO, che il tetto per-pool non governa.
+//
+// Misurato il 2026-07-22 sul cluster app: 50 connessioni per il ruolo `nexus_app`
+// su un `rolconnlimit` di 50, TUTTE idle — 15 su un solo database (tre pool), 10
+// su altri due (due pool ciascuno). Da li' in poi qualunque apertura di pool
+// falliva e il sistema era fermo per intero, non un singolo run.
+//
+// Il registro non scade: l'unica invalidazione e' esplicita (`forget_pool`, sul
+// re-provisioning che cambia la URL del DB).
+static POOLS: OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, Arc<PgPool>>>> =
+    OnceLock::new();
 
-fn pool_cache() -> &'static TtlCache<Uuid, PgPool> {
-    // TTL 5 min: alla scadenza il pool viene riaperto; l'ultima clone droppata
-    // chiude le connessioni. I servizi separati sono a basso QPS, va bene.
-    POOLS.get_or_init(|| TtlCache::new(Duration::from_secs(300)))
+/// Lock per-progetto che serializza l'APERTURA. Senza, due task che non trovano
+/// il pool in registro aprono entrambi il proprio: e' il fenomeno osservato come
+/// coppie di connessioni nate nello stesso istante sullo stesso database.
+static OPEN_LOCKS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
+
+fn pools() -> &'static std::sync::Mutex<std::collections::HashMap<Uuid, Arc<PgPool>>> {
+    POOLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Pool gia' aperto per il progetto, se c'e'. Non ne apre mai uno.
+pub fn cached_pool(project_id: Uuid) -> Option<Arc<PgPool>> {
+    pools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&project_id)
+        .cloned()
+}
+
+fn open_lock(project_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    OPEN_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(project_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Punto unico dell'apertura di un pool per-progetto: restituisce quello gia'
+/// registrato oppure lo apre UNA volta con `open`, sotto lock per-progetto.
+///
+/// `open` e' fornito dal chiamante perche' le due strade hanno contratti diversi
+/// — questo crate risolve e basta, `mcp-core` provisiona e migra prima — ma il
+/// REGISTRO e' uno solo: chi arriva secondo, da qualunque strada, ritrova il pool
+/// del primo invece di aprirne un altro verso lo stesso database.
+pub async fn pool_or_open<F, Fut, E>(project_id: Uuid, open: F) -> Result<Arc<PgPool>, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<PgPool, E>>,
+{
+    if let Some(pool) = cached_pool(project_id) {
+        return Ok(pool);
+    }
+    let lock = open_lock(project_id);
+    let _guard = lock.lock().await;
+    // Doppio controllo: chi attendeva il lock ritrova il pool aperto dal primo.
+    if let Some(pool) = cached_pool(project_id) {
+        return Ok(pool);
+    }
+    let pool = Arc::new(open().await?);
+    pools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(project_id, Arc::clone(&pool));
+    Ok(pool)
+}
+
+/// Dimentica il pool di un progetto (re-provisioning: la URL del DB e' cambiata,
+/// il pool registrato punta al database sbagliato). Le connessioni si chiudono
+/// quando l'ultima clone in uso viene droppata.
+pub fn forget_pool(project_id: Uuid) {
+    pools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&project_id);
 }
 
 /// Elenco dei `project_id` (tabella globale `projects`, sempre sul meta).
@@ -111,28 +196,28 @@ pub async fn resolve_meta_db_url(
 /// `<slug>_nexus` del progetto (separazione sempre attiva). READ-ONLY: nessun
 /// provisioning; DB non registrato -> `Err(NotProvisioned)`.
 ///
-/// Niente lock di provisioning: due task concorrenti possono aprire due pool
-/// per lo stesso progetto; uno rimpiazza l'altro in cache e il perdente si
-/// chiude alla drop dell'ultima clone. Accettabile per servizi a basso QPS.
+/// Un solo pool per database (`pool_or_open`): due task concorrenti non ne
+/// aprono piu' uno ciascuno, e chi arriva dopo — anche dall'altra strada, quella
+/// di `mcp-core` che provisiona — ritrova questo.
 pub async fn project_data_pool(
     meta: &PgPool,
     project_id: Uuid,
 ) -> Result<PgPool, ProjectPoolError> {
-    if let Some(pool) = pool_cache().get(&project_id) {
-        return Ok(pool);
+    if let Some(pool) = cached_pool(project_id) {
+        return Ok((*pool).clone());
     }
     let url = resolve_meta_db_url(meta, project_id)
         .await?
         .ok_or(ProjectPoolError::NotProvisioned(project_id))?;
-    let pool = sizing::project_pool_options()
-        .connect(&url)
-        .await
-        .map_err(|e| ProjectPoolError::Connect {
-            project_id,
-            message: e.to_string(),
-        })?;
-    pool_cache().insert(project_id, pool.clone());
-    Ok(pool)
+    let pool = pool_or_open(project_id, || async {
+        sizing::project_pool_options().connect(&url).await
+    })
+    .await
+    .map_err(|e: sqlx::Error| ProjectPoolError::Connect {
+        project_id,
+        message: e.to_string(),
+    })?;
+    Ok((*pool).clone())
 }
 
 /// `project_id` di un'entita' dalla directory di routing (`nexus_data_routing`

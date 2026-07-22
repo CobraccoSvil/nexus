@@ -513,13 +513,31 @@ static PROVISION_LOCKS: once_cell::sync::Lazy<
     std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Progetti il cui schema e' gia' stato garantito in QUESTO processo.
+///
+/// Il pool sta nel registro unico (`nexus_project_pools`), che non sa nulla di
+/// migrazioni: puo' averlo aperto la strada read-only. Lo schema va quindi
+/// garantito qui, una volta per processo — non a ogni risoluzione, che e' il
+/// percorso caldo.
+static SCHEMA_ENSURED: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn schema_ensured(project_id: Uuid) -> bool {
+    SCHEMA_ENSURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&project_id)
+}
+
 async fn project_meta_pool_core(
     meta: &sqlx::PgPool,
-    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     project_id: Uuid,
 ) -> Result<std::sync::Arc<sqlx::PgPool>, String> {
-    if let Some(pool) = cache.get(&project_id) {
-        return Ok(pool);
+    // Percorso caldo: pool gia' nel registro unico E schema gia' garantito.
+    if schema_ensured(project_id) {
+        if let Some(pool) = nexus_project_pools::cached_pool(project_id) {
+            return Ok(pool);
+        }
     }
     // Serializza provision+migrazione per questo progetto (vedi PROVISION_LOCKS).
     let lock = {
@@ -532,8 +550,10 @@ async fn project_meta_pool_core(
     };
     let _guard = lock.lock().await;
     // Doppio controllo: un altro worker potrebbe aver provisionato durante l'attesa.
-    if let Some(pool) = cache.get(&project_id) {
-        return Ok(pool);
+    if schema_ensured(project_id) {
+        if let Some(pool) = nexus_project_pools::cached_pool(project_id) {
+            return Ok(pool);
+        }
     }
     let url = match resolve_meta_db_url(meta, project_id).await? {
         Some(u) => u,
@@ -552,13 +572,18 @@ async fn project_meta_pool_core(
                 .ok_or_else(|| "DB metadati non risolvibile dopo il provisioning".to_string())?
         }
     };
-    // Tetto e attesa dal punto unico (regola L): lo stesso DB `<slug>_nexus`
-    // veniva aperto anche da nexus-project-pools, con un tetto diverso.
-    let pool = nexus_project_pools::sizing::project_pool_options()
-        .connect(&url)
-        .await
-        .map_err(|e| format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}"))?;
-    let arc = std::sync::Arc::new(pool);
+    // Registro, tetto e attesa dal punto unico (regola L): lo stesso DB
+    // `<slug>_nexus` veniva aperto anche da nexus-project-pools, che teneva il
+    // proprio registro — due pool per lo stesso database dentro un solo processo.
+    let arc = nexus_project_pools::pool_or_open(project_id, || async {
+        nexus_project_pools::sizing::project_pool_options()
+            .connect(&url)
+            .await
+    })
+    .await
+    .map_err(|e: sqlx::Error| {
+        format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}")
+    })?;
     // Schema per-progetto idempotente (db/migrations/project, _sqlx_migrations nel DB-progetto).
     sqlx::migrate::Migrator::new(std::path::Path::new("db/migrations/project"))
         .await
@@ -568,7 +593,10 @@ async fn project_meta_pool_core(
         .map_err(|e| {
             format!("migrazioni schema per-progetto (progetto {project_id}) fallite: {e}")
         })?;
-    cache.insert(project_id, arc.clone());
+    SCHEMA_ENSURED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(project_id);
     Ok(arc)
 }
 
@@ -602,11 +630,6 @@ pub enum ProjectDbError {
     #[error("DB del progetto {project_id} non disponibile: {message}")]
     Unavailable { project_id: Uuid, message: String },
 
-    /// Il registry globale dei pool (`init_global_pools`) non e' inizializzato:
-    /// accade solo se un helper viene invocato prima del bootstrap di main.
-    #[error("registry dei pool per-progetto non inizializzato")]
-    RegistryNotReady,
-
     /// L'entita' non esiste in ALCUN DB-progetto raggiungibile (ricerca
     /// by-id esaurita con tutti i progetti interrogati).
     #[error("{entity_kind} {entity_id} non trovata in alcun DB progetto")]
@@ -634,9 +657,9 @@ impl ProjectDbError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             ProjectDbError::EntityNotFound { .. } => StatusCode::NOT_FOUND,
-            ProjectDbError::Unavailable { .. }
-            | ProjectDbError::RegistryNotReady
-            | ProjectDbError::SearchInconclusive { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            ProjectDbError::Unavailable { .. } | ProjectDbError::SearchInconclusive { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -645,9 +668,9 @@ impl ProjectDbError {
     pub fn error_code(&self) -> &'static str {
         match self {
             ProjectDbError::EntityNotFound { .. } => "entity_not_found",
-            ProjectDbError::Unavailable { .. }
-            | ProjectDbError::RegistryNotReady
-            | ProjectDbError::SearchInconclusive { .. } => "project_db_unavailable",
+            ProjectDbError::Unavailable { .. } | ProjectDbError::SearchInconclusive { .. } => {
+                "project_db_unavailable"
+            }
         }
     }
 }
@@ -672,10 +695,9 @@ impl From<ProjectDbError> for (StatusCode, Json<Value>) {
 /// il fallback silenzioso leggeva liste vuote e SCRIVEVA sul DB sbagliato.
 async fn project_data_pool_core(
     meta: &sqlx::PgPool,
-    cache: &nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     project_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    match project_meta_pool_core(meta, cache, project_id).await {
+    match project_meta_pool_core(meta, project_id).await {
         Ok(pool) => Ok((*pool).clone()),
         Err(message) => Err(ProjectDbError::Unavailable {
             project_id,
@@ -688,7 +710,7 @@ pub async fn project_data_pool(
     state: &AppState,
     project_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    project_data_pool_core(&state.db, &state.project_meta_pools, project_id).await
+    project_data_pool_core(&state.db, project_id).await
 }
 
 /// Risolve il `project_id` di un'entita' (session/message/run) dalla directory di
@@ -730,36 +752,26 @@ pub async fn project_data_pool_by_session(
     project_data_pool_by_search_from(&state.db, "session", "chat_sessions", session_id).await
 }
 
-// ── Registry globale del pool per-progetto (route-at-helper) ──────────────────
+// ── Pool per-progetto per gli helper senza &AppState (route-at-helper) ────────
 // Permette agli helper centrali (insert_message, load_message_by_id,
 // persist_message_attachments, ...) di instradare i dati per-progetto SENZA
-// ricevere &AppState: hanno gia' il pool meta-DB e il project_id, e la cache dei
-// pool vive qui. La cache CONDIVIDE lo store con AppState.project_meta_pools
-// (TtlCache::clone condivide l'Arc<DashMap>) -> nessun pool aperto due volte.
-
-/// Cache globale dei pool metadati per-progetto. Inizializzata una volta all'avvio.
-static GLOBAL_PROJECT_POOL_CACHE: once_cell::sync::OnceCell<
-    nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
-> = once_cell::sync::OnceCell::new();
-
-/// Inizializza il registry globale con la cache di `AppState` (chiamato in main.rs).
-pub fn init_global_pools(cache: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>) {
-    let _ = GLOBAL_PROJECT_POOL_CACHE.set(cache);
-}
+// ricevere &AppState: hanno gia' il pool meta-DB e il project_id.
+//
+// Qui viveva un secondo registro di pool (`GLOBAL_PROJECT_POOL_CACHE`, inizializzato
+// da main con lo store di `AppState.project_meta_pools`) il cui scopo dichiarato era
+// proprio "nessun pool aperto due volte" — ma la promessa valeva solo fra i chiamanti
+// di QUESTO modulo: nexus-project-pools, raggiunto nello stesso processo da
+// nexus-tool-kit e nexus-wiki, ne teneva un altro. Ora il registro e' uno solo
+// (`nexus_project_pools::pool_or_open`) e la garanzia non dipende piu' da quale
+// strada prende il chiamante, ne' da un'inizializzazione all'avvio.
 
 /// Pool dove risiedono i dati per-progetto, per gli helper che hanno il pool
-/// meta-DB (`meta`) e il `project_id` ma non `&AppState`. Usa la cache globale;
-/// registry non inizializzato -> `Err(RegistryNotReady)` (regola M): il vecchio
-/// "ricade su meta, sicuro" era il fallback silenzioso che scriveva sul DB
-/// sbagliato quando un helper partiva prima del bootstrap.
+/// meta-DB (`meta`) e il `project_id` ma non `&AppState`.
 pub async fn project_data_pool_from(
     meta: &sqlx::PgPool,
     project_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    match GLOBAL_PROJECT_POOL_CACHE.get() {
-        Some(cache) => project_data_pool_core(meta, cache, project_id).await,
-        None => Err(ProjectDbError::RegistryNotReady),
-    }
+    project_data_pool_core(meta, project_id).await
 }
 
 /// Variante per worker e task best-effort (punto unico del pattern, regola L):
@@ -820,19 +832,16 @@ async fn project_data_pool_by_search_from(
     table: &str,
     entity_id: Uuid,
 ) -> Result<sqlx::PgPool, ProjectDbError> {
-    let Some(cache) = GLOBAL_PROJECT_POOL_CACHE.get() else {
-        return Err(ProjectDbError::RegistryNotReady);
-    };
     // Fast-path: directory.
     if let Some(pid) = resolve_project_for_entity(meta, entity_kind, entity_id).await {
-        return project_data_pool_core(meta, cache, pid).await;
+        return project_data_pool_core(meta, pid).await;
     }
     // Fallback: cerca l'entita' nei DB-progetto. `table` e' un identificatore
     // costante interno (mai input utente): nessuna SQL-injection.
     let sql = format!("SELECT 1 FROM {table} WHERE id = $1 LIMIT 1");
     let mut unreachable = 0usize;
     for pid in list_all_project_ids(meta).await {
-        let pool = match project_data_pool_core(meta, cache, pid).await {
+        let pool = match project_data_pool_core(meta, pid).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -1040,10 +1049,8 @@ mod tests {
             .acquire_timeout(std::time::Duration::from_millis(500))
             .connect_lazy("postgres://nexus:nope@127.0.0.1:9/meta_irraggiungibile")
             .expect("connect_lazy non contatta il server: l'URL basta che sia ben formata");
-        let cache: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>> =
-            nexus_cache::TtlCache::new(std::time::Duration::from_secs(60));
         let ghost = Uuid::new_v4();
-        match project_data_pool_core(&meta, &cache, ghost).await {
+        match project_data_pool_core(&meta, ghost).await {
             Err(ProjectDbError::Unavailable { project_id, .. }) => {
                 assert_eq!(project_id, ghost);
             }
@@ -1072,11 +1079,6 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(unavailable.error_code(), "project_db_unavailable");
-
-        assert_eq!(
-            ProjectDbError::RegistryNotReady.status_code(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
 
         let inconclusive = ProjectDbError::SearchInconclusive {
             entity_kind: "session",

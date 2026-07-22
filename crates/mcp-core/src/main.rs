@@ -194,14 +194,6 @@ struct AppState {
             std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
         >,
     >,
-    /// Pool-cache dei DB metadati Nexus per-progetto (separazione DB, regola L).
-    /// Popolata/letta SOLO da `project_db_routes` (`project_meta_pool_core`, che
-    /// risolve/provisiona `<slug>_nexus` sotto lock per-progetto, e i suoi
-    /// chiamanti `project_data_pool*`). Lo stesso store e' condiviso con il
-    /// registry globale via `init_global_pools`, cosi' gli helper che non hanno
-    /// `&AppState` non aprono un secondo pool per progetto. Invalidazione su
-    /// re-provisioning / scadenza TTL.
-    pub(crate) project_meta_pools: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     /// Istante di avvio del processo mcp-core. Usato dal boot-grace dell'observer
     /// (`service_observer_remediation::within_boot_grace`): dopo un restart da
     /// deploy i servizi del progetto sono nel transitorio di riavvio e non vanno
@@ -746,8 +738,8 @@ async fn build_orchestrator(
 /// invariato). NOTA (separazione DB, sempre attiva da mig 0527): `agent_processes`
 /// e' MIGRATA al DB per-progetto. Questo blocco opera sul META (solo righe
 /// storiche pre-migrazione): il meta e' quasi vuoto -> no-op benigno. La
-/// riconciliazione dei processi per-progetto e' gestita dal blocco mark-only DOPO
-/// init_global_pools, che itera list_all_project_ids + project_data_pool_from.
+/// riconciliazione dei processi per-progetto e' gestita dal blocco mark-only in
+/// `build_app_state`, che itera list_all_project_ids + project_data_pool_from.
 /// NON duplicare qui.
 async fn reconcile_stale_processes(db: &sqlx::PgPool) {
     use sqlx::Row;
@@ -1405,24 +1397,20 @@ async fn build_app_state(
         watching_projects: Arc::new(DashSet::new()),
         project_channels: nexus_events::dispatcher::new_registry(),
         monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-        project_meta_pools: nexus_cache::TtlCache::new(std::time::Duration::from_secs(600)),
         boot_at: std::time::Instant::now(),
     };
     // Singleton globale per emit da contesti senza &ProjectChannels (NexusToolHandler).
     nexus_events::dispatcher::init_global(state.project_channels.clone());
-    // Registry globale dei pool per-progetto (separazione DB): condivide lo store
-    // con state.project_meta_pools, cosi' gli helper che instradano i dati
-    // per-progetto (insert_message, ...) non aprono pool doppi.
-    project_db_routes::init_global_pools(state.project_meta_pools.clone());
 
-    // Boot-recovery run/processi orfani (vedi `run_boot_recovery`), DOPO
-    // init_global_pools (regola H).
+    // Boot-recovery run/processi orfani (vedi `run_boot_recovery`). Il registro
+    // dei pool per-progetto non ha piu' un'inizializzazione da attendere: vive in
+    // `nexus_project_pools` e si popola alla prima risoluzione.
     run_boot_recovery(&state).await;
 
     state
 }
 
-/// Boot-recovery dopo `init_global_pools`: reap dei run 'running' orfani (mig 0392,
+/// Boot-recovery a `AppState` costruito: reap dei run 'running' orfani (mig 0392,
 /// await: deve concludere PRIMA del bind HTTP — ogni 'running' e' orfano del processo
 /// precedente e va marcato 'interrupted' per sbloccare il gate 409; esclude
 /// 'awaiting_confirmation' resumibile) + mark-only dei processi per-progetto stale
@@ -1591,8 +1579,8 @@ async fn async_main() -> anyhow::Result<()> {
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
     // Riconciliazione META dei processi 'running'/'starting' stale (vedi
-    // `reconcile_stale_processes`). Il reap dei run orfani e' in `build_app_state`,
-    // DOPO init_global_pools (regola H).
+    // `reconcile_stale_processes`). Il reap dei run orfani e' in `build_app_state`
+    // (regola H).
     reconcile_stale_processes(&db).await;
 
     // Redis + esposizione a provider_cooldown + restore cooldown billing.
@@ -1618,7 +1606,7 @@ async fn async_main() -> anyhow::Result<()> {
     let (orchestrator, port_registry_cache) =
         build_orchestrator(&db, neural_client, template_cache.clone(), caches).await;
 
-    // Sandbox + AppState + init_global_pools + boot-recovery (vedi `build_app_state`).
+    // Sandbox + AppState + boot-recovery (vedi `build_app_state`).
     let state = build_app_state(db, redis, orchestrator, template_cache, port_registry_cache).await;
 
     // Worker fire-and-forget e loop periodici, nell'ordine esatto (vedi
