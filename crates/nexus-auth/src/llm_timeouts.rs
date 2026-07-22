@@ -145,7 +145,29 @@ impl LlmTimeouts {
     /// parsabile ricade sul proprio default, poi la derivazione riallinea il
     /// tutto: nessuna combinazione di settings puo' violare l'invariante.
     pub async fn resolve(db: &PgPool) -> Self {
-        let run = setting_u64(db, KEY_RUN_TIMEOUT, DEFAULT_RUN_TIMEOUT_SECS).await;
+        Self::resolve_for_run(db, None).await
+    }
+
+    /// Come [`resolve`], ma per un run di durata NOTA.
+    ///
+    /// L'invariante `request_budget * min_turns <= run_timeout` vale solo
+    /// rispetto al run su cui e' stata calcolata. `resolve` usa il default
+    /// globale (`orchestrator.subagent_default_timeout_s`, 300s), ma le figure
+    /// hanno il PROPRIO `nexus_subagent_definitions.timeout_s`: `review` ne ha
+    /// 240, `implement` 600. Con `min_turns = 4` il budget derivato dal globale
+    /// e' 75s, quindi a un `review` venivano promessi 4 turni da 75s = 300s
+    /// dentro un run che ne dura 240: l'invariante era verificata contro un run
+    /// che nessuna figura possiede davvero, e la figura veniva uccisa dal
+    /// cronometro credendo di avere ancora turni a disposizione.
+    ///
+    /// Passando qui la durata reale, i turni garantiti tornano a essere una
+    /// promessa mantenibile (240/4 = 60s per turno). NON allunga nulla: stringe
+    /// il budget della singola chiamata quando il run e' piu' corto del default.
+    pub async fn resolve_for_run(db: &PgPool, run_timeout_secs: Option<u64>) -> Self {
+        let run = match run_secs_utile(run_timeout_secs) {
+            Some(reale) => reale,
+            None => setting_u64(db, KEY_RUN_TIMEOUT, DEFAULT_RUN_TIMEOUT_SECS).await,
+        };
         let complete = setting_u64(db, KEY_COMPLETE_TIMEOUT, DEFAULT_COMPLETE_TIMEOUT_SECS).await;
         let stream = setting_u64(db, KEY_STREAM_TIMEOUT, DEFAULT_STREAM_TIMEOUT_SECS).await;
         let turns = setting_u64(db, KEY_MIN_GUARANTEED_TURNS, DEFAULT_MIN_GUARANTEED_TURNS).await;
@@ -159,6 +181,16 @@ async fn setting_u64(db: &PgPool, key: &str, default: u64) -> u64 {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(default)
+}
+
+/// La durata di run da usare, quando e' NOTA. `None` significa "non la so,
+/// chiedila al DB": e' la sola porta d'ingresso del default globale.
+///
+/// Estratta perche' la SCELTA della sorgente e' il punto in cui il difetto
+/// vive, e dentro `resolve_for_run` sarebbe verificabile solo con un DB —
+/// cioe' mai (regola O).
+fn run_secs_utile(run_timeout_secs: Option<u64>) -> Option<u64> {
+    run_timeout_secs.filter(|&s| s > 0)
 }
 
 #[cfg(test)]
@@ -221,6 +253,65 @@ mod tests {
     fn il_client_condiviso_copre_lo_streaming() {
         let t = LlmTimeouts::derive(300, 120, 300, 4);
         assert_eq!(t.client_http_timeout(), Duration::from_secs(300));
+    }
+
+    /// Il difetto che `resolve_for_run` chiude: l'invariante veniva verificata
+    /// contro un run che la figura non possiede.
+    ///
+    /// `orchestrator.subagent_default_timeout_s` vale 300, ma la figura `review`
+    /// ha `timeout_s = 240` in `nexus_subagent_definitions`. Derivando dal
+    /// default, a un review venivano promessi 4 turni da 75s = 300s dentro un
+    /// cronometro che scade a 240: il quarto turno non esisteva, e la figura
+    /// veniva uccisa mentre credeva di avere ancora budget. Con la durata reale
+    /// i turni tornano a essere una promessa mantenibile.
+    #[test]
+    fn il_budget_deve_nascere_dal_run_reale_non_dal_default_globale() {
+        let review_reale = 240_u64;
+
+        let dal_default = LlmTimeouts::derive(
+            DEFAULT_RUN_TIMEOUT_SECS,
+            120,
+            300,
+            DEFAULT_MIN_GUARANTEED_TURNS,
+        );
+        assert!(
+            dal_default.request_budget.as_secs() * dal_default.min_guaranteed_turns > review_reale,
+            "premessa del difetto: il budget derivato dal default sfora il run \
+             vero della figura review"
+        );
+
+        let dal_reale =
+            LlmTimeouts::derive(review_reale, 120, 300, DEFAULT_MIN_GUARANTEED_TURNS);
+        assert_eq!(dal_reale.request_budget, Duration::from_secs(60));
+        assert!(
+            dal_reale.request_budget.as_secs() * dal_reale.min_guaranteed_turns <= review_reale,
+            "coi 240s reali i turni garantiti devono starci dentro"
+        );
+        assert!(
+            dal_reale.client_budget < Duration::from_secs(review_reale),
+            "nemmeno l'attesa del client puo' superare il run della figura"
+        );
+    }
+
+    /// La durata nota vince sul default; solo l'assenza (o uno zero, che nel DB
+    /// significa "non impostato") lascia parlare il setting globale.
+    #[test]
+    fn la_durata_nota_vince_sul_default_globale() {
+        assert_eq!(run_secs_utile(Some(240)), Some(240));
+        assert_eq!(
+            run_secs_utile(Some(0)),
+            None,
+            "timeout_s = 0 e' 'non impostato', non 'run istantaneo'"
+        );
+        assert_eq!(run_secs_utile(None), None);
+    }
+
+    /// Un run piu' LUNGO del default non deve essere stretto dal default: la
+    /// figura `implement` ha `timeout_s = 600` e i suoi turni valgono 150s.
+    #[test]
+    fn un_run_piu_lungo_del_default_ottiene_il_suo_budget() {
+        let t = LlmTimeouts::derive(600, 1000, 300, DEFAULT_MIN_GUARANTEED_TURNS);
+        assert_eq!(t.request_budget, Duration::from_secs(150));
     }
 
     #[test]

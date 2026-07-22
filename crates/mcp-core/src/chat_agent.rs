@@ -592,6 +592,39 @@ pub async fn get_session_meta_steps(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // STATO REALE DEI TODO del piano. Il payload del meta-step "plan" e' la
+    // FOTOGRAFIA scattata quando il piano e' stato creato: tutti i todo
+    // `pending`. Gli aggiornamenti live (`TodoUpdated`) vivono solo in memoria
+    // nel client, quindi bastava un reload -- o un run finito male, che e'
+    // proprio il momento in cui si vuole sapere cosa e' stato fatto -- perche' la
+    // checklist tornasse a mostrare TUTTO da fare a lavoro svolto.
+    // Qui il payload viene servito con lo stato CORRENTE letto da
+    // `nexus_agent_todos`, cosi' la vista non racconta piu' un piano fermo.
+    // Best-effort: se la lettura fallisce si serve la fotografia, come prima.
+    let plan_runs: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| {
+            r.try_get::<String, _>("kind")
+                .map(|k| k == "plan")
+                .unwrap_or(false)
+        })
+        .filter_map(|r| r.try_get::<Uuid, _>("run_id").ok())
+        .collect();
+    let mut stato_todo: std::collections::HashMap<(Uuid, String), String> =
+        std::collections::HashMap::new();
+    if !plan_runs.is_empty() {
+        let righe: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT run_id, id::text, status FROM nexus_agent_todos WHERE run_id = ANY($1)",
+        )
+        .bind(&plan_runs)
+        .fetch_all(&run_pool)
+        .await
+        .unwrap_or_default();
+        for (r, id, st) in righe {
+            stato_todo.insert((r, id), st);
+        }
+    }
+
     // Raggruppa per run_id nel formato MetaStepEntry atteso dal frontend.
     let mut runs: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
     for row in rows {
@@ -601,11 +634,24 @@ pub async fn get_session_meta_steps(
         };
         let kind: String = row.try_get("kind").unwrap_or_default();
         let title: String = row.try_get("title").unwrap_or_default();
-        let payload: Value = row
+        let mut payload: Value = row
             .try_get::<Option<Value>, _>("payload")
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}));
+        // Sovrascrive lo status di ogni todo con quello attuale (vedi sopra). I
+        // todo assenti dalla mappa restano com'erano: un piano di cui non si
+        // trovano piu' le righe si serve invariato, non azzerato.
+        if kind == "plan" {
+            if let Some(todos) = payload.get_mut("todos").and_then(|t| t.as_array_mut()) {
+                for t in todos.iter_mut() {
+                    let id = t.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                    if let Some(st) = id.and_then(|i| stato_todo.get(&(run_id, i))) {
+                        t["status"] = json!(st);
+                    }
+                }
+            }
+        }
         let correlation_id: Option<String> = row.try_get("correlation_id").ok().flatten();
         let created_at: chrono::DateTime<chrono::Utc> = row
             .try_get("created_at")

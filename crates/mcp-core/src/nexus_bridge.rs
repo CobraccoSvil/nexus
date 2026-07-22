@@ -1749,8 +1749,37 @@ mod tests {
         // Router ha 4 agenti registrati
         let stats = bridge.router_stats();
         assert_eq!(stats.total_decisions, 0);
-        // Scheduler ha 12 worker (Ruflo plan completo)
-        assert_eq!(bridge.scheduler.len(), 12);
+
+        // Composizione dello scheduler, non solo il conteggio: un numero nudo
+        // (era `assert_eq!(len(), 12)`) dice che qualcosa e' cambiato ma non
+        // cosa, e va aggiornato a mano ogni volta senza che nessuno verifichi
+        // se il cambiamento era voluto.
+        //
+        // Senza pool DB i worker che lo richiedono (prompt_optimizer,
+        // guideline_alignment) non vengono registrati: qui restano gli altri.
+        let nomi = bridge.scheduler.worker_names();
+        assert!(
+            !nomi.iter().any(|n| n == "audit"),
+            "AuditWorker e' stato rimosso: dichiarava 'security scanning' ma \
+             cercava otto stringhe con contains() e i suoi alert non li leggeva \
+             nessuno. Se ricompare, e' un ripristino da giustificare. Trovati: {nomi:?}"
+        );
+        for atteso in [
+            "cleanup",
+            "session_persistence",
+            "replication",
+            "metrics_aggregation",
+        ] {
+            assert!(
+                nomi.iter().any(|n| n == atteso),
+                "worker '{atteso}' non registrato. Trovati: {nomi:?}"
+            );
+        }
+        assert_eq!(
+            nomi.len(),
+            11,
+            "numero di worker senza pool DB cambiato. Trovati: {nomi:?}"
+        );
     }
 
     #[test]
