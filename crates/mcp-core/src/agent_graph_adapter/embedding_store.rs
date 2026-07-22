@@ -49,7 +49,7 @@ impl EmbeddingStore for PgEmbeddingStore {
             // Run shadow read-only: niente embedding (gate shadow). Il nodo degrada
             // al troncamento posizionale, senza divergere dal replay.
             return Err(PortError::Tool(
-                "embed: no-op in Replay (run shadow read-only)".to_string(),
+                "embed: no-op in Replay (run shadow read-only)".to_string().into(),
             ));
         }
         if texts.is_empty() {
@@ -71,7 +71,7 @@ impl EmbeddingStore for PgEmbeddingStore {
                         n_texts = texts.len(),
                         "embed: embedder non disponibile, il nodo degrada al troncamento posizionale"
                     );
-                    return Err(PortError::Tool(format!("embed: {e}")));
+                    return Err(PortError::Tool(format!("embed: {e}").into()));
                 }
             }
         }

@@ -448,6 +448,89 @@ else
   echo "OK migrazioni-search-path: nessuna migrazione manipola il search_path"
 fi
 
+# ── error-presentation (2026-07-22) ──────────────────────────────────────────
+# Un errore si RENDE leggibile in un solo posto
+# (nexus-types/src/error_presentation.rs), partendo dai segnali strutturati.
+# Il difetto storico: mancava il punto unico della PRESENTAZIONE (esisteva solo
+# quello della classificazione), quindi ogni superficie usava il Display degli
+# errori tipizzati -- che per contratto porta il body grezzo -- e da li' sono
+# nate quattro funzioni gemelle che tagliavano CARATTERI invece di tradurre
+# (compact_provider_error alla prima graffa, humanize_ai_error sulla prima riga,
+# format_compact_error a 300 char, humanizeTraceText a regex). Erano cieche a
+# ogni Debug senza graffa: il MetadataMap di tonic e la catena
+# io(ConnectionRefused, os_error=10061) arrivavano intatti in chat.
+#
+# Due divieti, entrambi sintomi dello stesso errore di progetto:
+# 1) nuove funzioni di compattazione testuale fuori dal modulo autoritativo;
+# 2) regex che riconoscono un errore dalla FORMA del suo Debug (regola M).
+ep_hits="$(grep -rnE "fn (compact_|humanize_|format_compact_)[a-z_]*error" crates --include='*.rs' 2>/dev/null \
+  | grep -v 'crates/nexus-types/src/error_presentation.rs' || true)"
+if [[ -n "$ep_hits" ]]; then
+  echo "!! error-presentation: una resa d'errore fuori dal punto unico:" >&2
+  echo "$ep_hits" | sed 's/^/     /' >&2
+  echo "   Il messaggio si costruisce da ErrorFacts via render_user_error" >&2
+  echo "   (crates/nexus-types/src/error_presentation.rs), non tagliando caratteri." >&2
+  fail=1
+else
+  echo "OK error-presentation: nessuna resa d'errore duplicata nei crate"
+fi
+
+ep_regex="$(grep -rnE "MetadataMap|grpc[_ -]?status|details:\\\\s\*\\\\\[" crates apps --include='*.rs' --include='*.ts' --include='*.tsx' 2>/dev/null \
+  | grep -vE 'crates/nexus-types/src/error_presentation.rs|/(node_modules|\.next)/|scripts/' \
+  | grep -vE ':[0-9]+:\s*(//|\*|#)' || true)"
+if [[ -n "$ep_regex" ]]; then
+  echo "!! error-presentation: si riconosce un errore dalla FORMA del suo Debug:" >&2
+  echo "$ep_regex" | sed 's/^/     /' >&2
+  echo "   Regola M: lo stato tecnico si legge da status/code/enum alla fonte," >&2
+  echo "   non da una regex sul testo gia' appiattito." >&2
+  fail=1
+else
+  echo "OK error-presentation: nessun riconoscimento d'errore dal testo"
+fi
+
+# ── schema-di-test-dalla-migrazione (2026-07-22) ─────────────────────────────
+# Lo schema su cui gira un test del dominio run/chat deriva dalla MIGRAZIONE
+# reale (nexus_test_schema::PROJECT_MIGRATOR, il migrator del set
+# db/migrations/project che la produzione applica al DB <slug>_nexus), mai da un
+# CREATE TABLE ricopiato a mano nel modulo di test.
+#
+# Il difetto (regola O): una fixture scritta a mano non fallisce quando diverge —
+# mente in silenzio. `nexus_agent_todos` ne aveva DUE, diverse fra loro e dalla
+# migrazione (seq INTEGER vs BIGINT, depends_on UUID[] vs TEXT[], content NOT
+# NULL vs nullable), entrambe senza project_id, senza i CHECK e senza la FK verso
+# nexus_agent_plans: hanno retto finche' una query di produzione non ha chiesto
+# una colonna che non avevano (acceptance_criteria). Convertendo i test allo
+# schema reale sono emerse righe che il DB di produzione rifiuta e che i test
+# creavano da anni: run senza sessione, todo senza piano, step senza tool_input.
+#
+# L'elenco delle tabelle protette si LEGGE dal set di migrazioni (non e' una
+# lista ricopiata qui, che divergerebbe a sua volta).
+proj_tables="$(grep -hoE 'CREATE TABLE (IF NOT EXISTS )?(public\.)?[a-z_]+' db/migrations/project/*.sql 2>/dev/null \
+  | awk '{print $NF}' | sed 's/^public\.//' | sort -u)"
+if [[ -z "$proj_tables" ]]; then
+  echo "!! schema-di-test: nessuna tabella letta da db/migrations/project (set mancante?)" >&2
+  fail=1
+else
+  schema_hits=""
+  for t in $proj_tables; do
+    # I commenti che CITANO una vecchia fixture (la doc dei seeder lo fa) non
+    # sono codice: si filtrano come negli altri check.
+    h="$(grep -rnE "CREATE TABLE (IF NOT EXISTS )?(public\.)?$t[[:space:](]" crates --include='*.rs' \
+      --exclude-dir=target 2>/dev/null | grep -vE ':[0-9]+:\s*(//|/\*|\*)' || true)"
+    [[ -n "$h" ]] && schema_hits+="$h"$'\n'
+  done
+  if [[ -n "$schema_hits" ]]; then
+    echo "!! schema-di-test: tabella del set project ricreata a mano in un test:" >&2
+    printf '%s' "$schema_hits" | sed 's/^/     /' >&2
+    echo "   Usa lo schema reale:" >&2
+    echo "     #[sqlx::test(migrator = \"nexus_test_schema::PROJECT_MIGRATOR\")]" >&2
+    echo "   e semina le righe coi seeder (mcp_core::test_support::seed_*)." >&2
+    fail=1
+  else
+    echo "OK schema-di-test: nessuna tabella del set project ricreata a mano"
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

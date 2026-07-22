@@ -1195,7 +1195,7 @@ mod tests {
         /// come dispatch fallito (None), non propagato come NodeError::Failed.
         fn port_error(message: &str) -> Self {
             Self {
-                responses: Mutex::new(vec![Err(PortError::Tool(message.to_string()))]),
+                responses: Mutex::new(vec![Err(PortError::Tool(message.to_string().into()))]),
                 seen: Mutex::new(vec![]),
             }
         }

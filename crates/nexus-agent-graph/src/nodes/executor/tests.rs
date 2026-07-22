@@ -5981,7 +5981,7 @@ fn solo_le_cause_deterministiche_contano_per_il_tetto() {
         None
     );
     assert_eq!(
-        deterministic_gateway_cause(&PortError::Llm("boom".to_string()), &[]),
+        deterministic_gateway_cause(&PortError::Llm("boom".to_string().into()), &[]),
         None,
         "un errore generico non tipizzato non entra nel tetto"
     );
@@ -6052,34 +6052,80 @@ async fn la_grazia_sulla_chiusura_volontaria_e_one_shot() {
     );
 }
 
-// ── compact_provider_error: il blob JSON del gateway non arriva in chat ──────
+// ── port_error_message: cosa dell'errore arriva davvero in chat ──────────────
+//
+// Questi due test hanno sostituito quelli di `compact_provider_error`. Il
+// vecchio `errore_provider_senza_json_resta_intatto_e_lungo_viene_troncato`
+// asseriva che una stringa senza graffe passasse INTATTA: fissava come
+// comportamento corretto esattamente il difetto (gli errori di trasporto graffe
+// non ne hanno, e arrivavano crudi all'utente). Era verde e sbagliato.
 
+use nexus_types::error_presentation::{
+    render_user_error, ErrorDomain, ErrorFacts, TransportFacts,
+};
+
+/// Il body JSON del provider non arriva in chat -- ma ora perche' non e' MAI
+/// entrato nel messaggio, non perche' e' stato tagliato a valle.
 #[test]
-fn errore_provider_compresso_senza_blob_json() {
-    // Input REALE (run 1db02ed3, 21/07): l'errore del gateway incorpora il
-    // body JSON del provider; nel resoconto in chat arrivava intero.
-    let raw = r#"provider non disponibile: Nexus Gateway 400 Bad Request: {"error":"tutti i provider hanno fallito -> mistral (mistral HTTP 400: {\"object\":\"error\",\"message\":\"Unexpected role 'tool' after role 'user'\"})","code":"PROVIDER_ERROR"}"#;
-    let out = super::compact_provider_error(raw);
-    // Mutazione che rende rosso: usare {err} invece di {err_short} al call
-    // site, o rimuovere il taglio alla prima '{' in compact_provider_error.
+fn il_body_del_provider_non_entra_nel_messaggio_in_chat() {
+    // Body REALE (run 1db02ed3, 21/07), come lo produce il gateway.
+    let body = r#"{"error":"tutti i provider hanno fallito -> mistral (mistral HTTP 400: {\"message\":\"Unexpected role 'tool' after role 'user'\"})","code":"PROVIDER_ERROR"}"#;
+    let rendered = render_user_error(
+        &ErrorFacts::opaque(ErrorDomain::Gateway, body).with_code("PROVIDER_ERROR"),
+    );
+    let out = super::port_error_message(&PortError::Llm(rendered.clone()));
+
     assert!(!out.contains('{'), "il payload JSON non deve comparire: {out}");
-    assert_eq!(out, "provider non disponibile: Nexus Gateway 400 Bad Request");
+    assert!(
+        out.contains("fornitore") || out.contains("fornitori"),
+        "deve essere una frase, non un codice: {out}"
+    );
+    assert!(
+        rendered.detail.contains("Unexpected role"),
+        "il dettaglio tecnico non si perde, cambia canale"
+    );
 }
 
+/// LA REGRESSIONE: un errore di TRASPORTO non ha graffe. Il vecchio taglio alla
+/// prima `{` lo lasciava passare parola per parola.
+///
+/// Mutazione che rende rosso: far tornare `port_error_message` a
+/// `err.to_string()` sul detail, o reintrodurre il taglio testuale.
 #[test]
-fn errore_provider_senza_json_resta_intatto_e_lungo_viene_troncato() {
-    assert_eq!(
-        super::compact_provider_error("timeout di rete verso il gateway"),
-        "timeout di rete verso il gateway"
+fn l_errore_di_trasporto_non_arriva_piu_crudo() {
+    let crudo = "error sending request for url (http://127.0.0.1:4060/v1/complete) \
+                 [kind=connect] <- io(ConnectionRefused, os_error=10061): \
+                 Nessuna connessione (10061)";
+    let rendered = render_user_error(&ErrorFacts {
+        transport: Some(TransportFacts {
+            is_connect: true,
+            os_error: Some(10061),
+            io_kind: Some("ConnectionRefused".into()),
+            target: Some("127.0.0.1:4060".into()),
+            ..Default::default()
+        }),
+        ..ErrorFacts::opaque(ErrorDomain::Transport, crudo)
+    });
+    let out = super::port_error_message(&PortError::Llm(rendered));
+
+    assert!(!out.contains("os_error"), "gergo di sistema in chat: {out}");
+    assert!(!out.contains("kind="), "gergo di reqwest in chat: {out}");
+    assert!(
+        !out.contains("error sending request"),
+        "il Display di reqwest in chat: {out}"
     );
-    let lungo = "x".repeat(400);
-    let out = super::compact_provider_error(&lungo);
-    assert!(out.len() <= 203, "tetto caratteri: {}", out.len());
-    assert!(out.ends_with("..."));
-    // Solo payload tecnico -> frase di ripiego onesta, mai stringa vuota.
-    let solo_json = r#"{"error":"x"}"#;
+    assert!(
+        out.contains("127.0.0.1:4060"),
+        "senza dire CHI non risponde il messaggio e' inutile: {out}"
+    );
+}
+
+/// Un messaggio vuoto non deve produrre una bolla muta.
+#[test]
+fn il_messaggio_vuoto_ha_un_ripiego_onesto() {
+    let out = super::port_error_message(&PortError::Llm("   ".to_string().into()));
     assert_eq!(
-        super::compact_provider_error(solo_json),
+        out,
         "richiesta rifiutata dal provider (dettaglio tecnico nei log del run)"
     );
 }

@@ -98,6 +98,7 @@ pub mod progress_controller;
 pub mod reward;
 pub mod scale_reason;
 pub mod supervisor;
+pub mod switch_reason;
 pub mod text_repetition;
 pub mod tiers;
 pub mod tool_dispatch;

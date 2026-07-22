@@ -101,26 +101,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    async fn create_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_agent_meta_steps ( \
-                 id BIGSERIAL PRIMARY KEY, \
-                 run_id UUID NOT NULL, \
-                 kind TEXT NOT NULL, \
-                 title TEXT NOT NULL DEFAULT '', \
-                 payload JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 correlation_id TEXT, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table meta_steps");
-    }
-
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn real_inserisce_con_kind(pool: PgPool) {
-        create_table(&pool).await;
         let run_id = Uuid::new_v4();
         let store = PgMetaStepStore::new(pool.clone(), run_id);
         store
@@ -140,9 +122,8 @@ mod tests {
         assert_eq!(row.1, "Piano");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_e_no_op(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgMetaStepStore::new(pool.clone(), Uuid::new_v4());
         store
             .persist_meta_step(json!({"kind": "routing"}), ExecMode::Replay)
@@ -155,9 +136,8 @@ mod tests {
         assert_eq!(count, 0, "in Replay nessuna scrittura");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn kind_vuoto_non_inserisce(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgMetaStepStore::new(pool.clone(), Uuid::new_v4());
         store
             .persist_meta_step(json!({"title": "senza kind"}), ExecMode::Real)

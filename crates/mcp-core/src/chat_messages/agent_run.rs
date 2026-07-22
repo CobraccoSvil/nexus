@@ -6035,89 +6035,53 @@ mod tests_review_gate {
 mod tests_session_active {
     use super::*;
 
-    async fn create_agent_runs_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID NOT NULL DEFAULT gen_random_uuid(), \
-                 session_id UUID NOT NULL, \
-                 status TEXT NOT NULL \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table agent_runs");
+    /// Sessione con un run nello stato voluto. Lo schema reale vincola
+    /// `agent_runs.session_id` a `chat_sessions(id)`: la sessione va seminata,
+    /// non inventata (la vecchia fixture a mano, senza FK, la accettava).
+    async fn sessione_con_run(pool: &sqlx::PgPool, status: &str) -> Uuid {
+        let project = Uuid::new_v4();
+        let sess = crate::test_support::seed_chat_session(pool, project).await;
+        crate::test_support::insert_agent_run(pool, sess, project, status).await;
+        sess
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn vero_su_running(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running')")
-            .bind(sess)
-            .execute(&pool)
-            .await
-            .expect("insert running");
+        let sess = sessione_con_run(&pool, "running").await;
         assert!(session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn vero_su_awaiting_confirmation(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_confirmation')",
-        )
-        .bind(sess)
-        .execute(&pool)
-        .await
-        .expect("insert awaiting");
+        let sess = sessione_con_run(&pool, "awaiting_confirmation").await;
         assert!(session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn vero_su_awaiting_subagents(pool: sqlx::PgPool) {
         // Fase D: un padre sospeso su awaiting_subagents e' un run ATTIVO/sospeso-vivo
         // sulla sessione (punto unico ACTIVE_RUN_STATUSES) -> session_has_active_run
         // deve vederlo, altrimenti process_resume/service_observer avvierebbero un 2o
         // run parallelo (S2 della re-review).
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_subagents')",
-        )
-        .bind(sess)
-        .execute(&pool)
-        .await
-        .expect("insert awaiting_subagents");
+        let sess = sessione_con_run(&pool, "awaiting_subagents").await;
         assert!(session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn falso_se_solo_run_conclusi(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (session_id, status) \
-             VALUES ($1, 'completed'), ($1, 'cancelled'), ($1, 'failed')",
-        )
-        .bind(sess)
-        .execute(&pool)
-        .await
-        .expect("insert conclusi");
+        let project = Uuid::new_v4();
+        let sess = crate::test_support::seed_chat_session(&pool, project).await;
+        for status in ["completed", "cancelled", "failed"] {
+            crate::test_support::insert_agent_run(&pool, sess, project, status).await;
+        }
         assert!(!session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn isolamento_per_sessione(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess_a = Uuid::new_v4();
-        let sess_b = Uuid::new_v4();
+        let sess_a = crate::test_support::seed_chat_session(&pool, Uuid::new_v4()).await;
         // Solo sess_b ha un run attivo.
-        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running')")
-            .bind(sess_b)
-            .execute(&pool)
-            .await
-            .expect("insert running sess_b");
+        let sess_b = sessione_con_run(&pool, "running").await;
         assert!(!session_has_active_run(&pool, sess_a).await);
         assert!(session_has_active_run(&pool, sess_b).await);
     }
@@ -6953,6 +6917,33 @@ mod tests_finalize_turn {
         assert_eq!(short_file_label("a/b/c/d.ts"), ".../c/d.ts");
     }
 
+    /// Sub-run di background nello stato voluto, con i NOT NULL dello schema
+    /// reale (`project_id`, `kind`, `task_description`) che la vecchia fixture a
+    /// mano non aveva: il DB di produzione non accetta un sub-run senza.
+    async fn insert_sub_run(
+        pool: &sqlx::PgPool,
+        anchor: Uuid,
+        dispatcher: Uuid,
+        status: &str,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs \
+             (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+              status, is_background) \
+             VALUES ($1, $2, $3, $4, 'coder', 'task di test', $5, true)",
+        )
+        .bind(id)
+        .bind(anchor)
+        .bind(dispatcher)
+        .bind(Uuid::new_v4())
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert sub-run");
+        id
+    }
+
     /// ALTA 1 (isolamento per-run del FETCH): con l'annidamento tutti i sub-run
     /// condividono `parent_run_id = session_id` (anchor), ma il fetch del padre P
     /// deve iniettare SOLO i suoi figli DIRETTI (dispatcher_run_id = P), MAI i
@@ -6960,25 +6951,8 @@ mod tests_finalize_turn {
     /// filtra su `dispatcher_run_id` (mig project 0010): riproduce il bug perche'
     /// col vecchio filtro `parent_run_id = anchor` la lista di P conterrebbe ANCHE
     /// Cs1 (nipote mai dispatchato da P).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fetch_fanin_isola_per_dispatcher_non_anchor(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 kind TEXT NOT NULL DEFAULT 'coder', \
-                 status TEXT NOT NULL, \
-                 final_summary TEXT, \
-                 verdict JSONB, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 fanin_consumed_at TIMESTAMPTZ, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create nexus_subagent_runs");
-
         // Annidamento: tutti i sub-run hanno parent_run_id = session (anchor
         // degenere), ma dispatcher distinto. P dispatcha Cp1,Cp2; Cp1 dispatcha Cs1.
         let session = Uuid::new_v4();
@@ -6987,17 +6961,7 @@ mod tests_finalize_turn {
         let insert = |anchor: Uuid, dispatcher: Uuid, status: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query(
-                    "INSERT INTO nexus_subagent_runs \
-                     (parent_run_id, dispatcher_run_id, status, is_background) \
-                     VALUES ($1, $2, $3, true)",
-                )
-                .bind(anchor)
-                .bind(dispatcher)
-                .bind(status)
-                .execute(&pool)
-                .await
-                .expect("insert sub-run");
+                insert_sub_run(&pool, anchor, dispatcher, status).await;
             }
         };
         // Cp1, Cp2: figli DIRETTI di P (dispatcher = P), terminali.
@@ -7035,41 +6999,14 @@ mod tests_finalize_turn {
     /// dello stesso dispatcher rifetcherebbe anche i figli della 1a ondata (doppia
     /// iniezione nel modello). Con `fanin_consumed_at` (mig project 0011) la 1a
     /// fetch li marca e la 2a NON li rivede; solo i figli NUOVI vengono iniettati.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fetch_fanin_consuma_e_non_re_inietta_seconda_ondata(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 kind TEXT NOT NULL DEFAULT 'coder', \
-                 status TEXT NOT NULL, \
-                 final_summary TEXT, \
-                 verdict JSONB, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 fanin_consumed_at TIMESTAMPTZ, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create nexus_subagent_runs");
-
         let session = Uuid::new_v4();
         let dispatcher = Uuid::new_v4();
         let insert = |status: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query(
-                    "INSERT INTO nexus_subagent_runs \
-                     (parent_run_id, dispatcher_run_id, status, is_background) \
-                     VALUES ($1, $2, $3, true)",
-                )
-                .bind(session)
-                .bind(dispatcher)
-                .bind(status)
-                .execute(&pool)
-                .await
-                .expect("insert sub-run");
+                insert_sub_run(&pool, session, dispatcher, status).await;
             }
         };
         // 1a ondata: 2 figli diretti terminali.
@@ -7118,39 +7055,11 @@ mod tests_native_mapping {
 
     use nexus_agent_graph::StopReason;
 
-    /// Tabelle minimali per il mapping: agent_runs (guard) + agent_steps.
-    async fn create_steps_tables(pool: &sqlx::PgPool) {
-        sqlx::query("CREATE TABLE agent_runs (id UUID PRIMARY KEY)")
-            .execute(pool)
-            .await
-            .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'completed', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
-
-    /// Preambolo comune dei test di mapping: tabelle minime + riga run.
+    /// Preambolo comune dei test di mapping: un run reale (sessione + riga
+    /// `agent_runs` con i suoi NOT NULL) sullo schema del DB-progetto. Le tabelle
+    /// non si creano piu' qui: le porta il migrator del set `db/migrations/project`.
     async fn setup_mapping_run(pool: &sqlx::PgPool) -> Uuid {
-        create_steps_tables(pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(pool)
-            .await
-            .expect("insert run");
-        run
+        crate::test_support::seed_agent_run(pool).await
     }
 
     // Chiavi/valori fixture ricorrenti degli outcome dichiarati.
@@ -7189,37 +7098,20 @@ mod tests_native_mapping {
         }
     }
 
-    /// Tabella dei todo del piano, con le sole colonne lette da
-    /// `TodoStore::list_todos` (i test che non la creano esercitano il ramo
-    /// best-effort: query fallita -> nessun todo -> detection hollow invariata).
-    async fn create_todos_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            // Seconda copia a mano dello schema di nexus_agent_todos (l'altra e'
-            // in agent_graph_adapter/todo_store.rs), gia' divergente da quella:
-            // qui seq e' BIGINT e depends_on TEXT[], li' INTEGER e UUID[].
-            // Nessuna delle due deriva dalla migrazione vera, quindi entrambe si
-            // scoprono disallineate solo quando una query chiede una colonna che
-            // non hanno.
-            "CREATE TABLE nexus_agent_todos ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 seq BIGINT, \
-                 status TEXT NOT NULL, \
-                 depends_on TEXT[] NOT NULL DEFAULT '{}', \
-                 write_scope TEXT[] NOT NULL DEFAULT '{}', \
-                 content TEXT, \
-                 priority TEXT, \
-                 acceptance_criteria JSONB NOT NULL DEFAULT '[]'::jsonb \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_agent_todos");
-    }
-
+    /// Todo del piano del run. Semina prima il piano (`nexus_agent_todos.run_id`
+    /// e' vincolato da una FK verso `nexus_agent_plans(run_id)`) e ne eredita il
+    /// `project_id`, NOT NULL nello schema reale.
+    ///
+    /// I test che NON chiamano questa fn lavorano su una tabella VUOTA - lo
+    /// scenario reale "run senza piano" - e non piu' su una tabella ASSENTE, che
+    /// in produzione non capita mai: la detection hollow resta invariata in
+    /// entrambi i casi, ma ora il ramo esercitato e' quello che esiste davvero.
     async fn insert_todo(pool: &sqlx::PgPool, run: Uuid, seq: i64, status: &str, content: &str) {
+        crate::test_support::seed_plan(pool, run, Uuid::new_v4()).await;
         sqlx::query(
-            "INSERT INTO nexus_agent_todos (run_id, seq, status, content) VALUES ($1,$2,$3,$4)",
+            "INSERT INTO nexus_agent_todos (run_id, project_id, seq, status, content) \
+             SELECT $1, p.project_id, $2, $3, $4 \
+             FROM nexus_agent_plans p WHERE p.run_id = $1",
         )
         .bind(run)
         .bind(seq)
@@ -7233,10 +7125,9 @@ mod tests_native_mapping {
     /// Il run DISPATCHER della todo-isolation non e' hollow: 0 step e risposta
     /// vuota sono la sua forma NORMALE (delega ai sub-run), non un fallimento.
     /// Riproduce l'incidente 79d2d6eb (7/7 todo completed mostrati "falliti").
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn dispatcher_todo_isolation_non_e_hollow(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
-        create_todos_table(&pool).await;
         insert_todo(&pool, run, 1, "completed", "Scrivi index.html").await;
         insert_todo(&pool, run, 2, "completed", "Scrivi script.js").await;
         insert_todo(&pool, run, 3, "skipped", "Passo opzionale").await;
@@ -7260,10 +7151,9 @@ mod tests_native_mapping {
 
     /// Contro-prova: un dispatch PARZIALMENTE FALLITO (todo `blocked`) resta
     /// hollow. Il gate non deve inghiottire i fallimenti veri.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn dispatcher_con_todo_blocked_resta_hollow(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
-        create_todos_table(&pool).await;
         insert_todo(&pool, run, 1, "completed", "Fatto").await;
         insert_todo(&pool, run, 2, "blocked", "Rimasto bloccato").await;
 
@@ -7280,10 +7170,9 @@ mod tests_native_mapping {
 
     /// Regressione gap 0-step (incidente b07c7e78): un run SENZA piano che
     /// chiude muto resta hollow come prima del gate.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn run_senza_piano_resta_hollow(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
-        create_todos_table(&pool).await; // tabella presente ma nessun todo
 
         let mut outcome = outcome_base();
         outcome.final_answer = None;
@@ -7293,7 +7182,7 @@ mod tests_native_mapping {
         assert!(r.hollow_completion_kind.contains("EMPTY_ANSWER"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
         // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
@@ -7301,8 +7190,12 @@ mod tests_native_mapping {
             (1000, "read_file", "completed"),
             (2000, "write_file", "failed"),
         ] {
+            // `tool_input` e' NOT NULL SENZA default nello schema reale: la vecchia
+            // fixture gli aveva inventato un `DEFAULT '{}'` che permetteva di
+            // ometterlo, cosa che in produzione il DB rifiuta.
             sqlx::query(
-                "INSERT INTO agent_steps (run_id, step_index, tool_name, status) VALUES ($1,$2,$3,$4)",
+                "INSERT INTO agent_steps (run_id, step_index, tool_name, tool_input, status) \
+                 VALUES ($1,$2,$3,'{}'::jsonb,$4)",
             )
             .bind(run)
             .bind(si)
@@ -7337,7 +7230,7 @@ mod tests_native_mapping {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_declared_outcome_stati_canonici(pool: sqlx::PgPool) {
         // ADR 0034: l'esito DICHIARATO via task_complete e' un segnale MACCHINA
         // che decide lo status canonico (mai la prosa, regola M).
@@ -7387,7 +7280,7 @@ mod tests_native_mapping {
         assert_eq!(r.status, AgentRunStatus::Completed);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_final_gate_non_superato(pool: sqlx::PgPool) {
         // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
         // il verdetto strutturato final_gate_passed=false (regola M) prevale su una
@@ -7434,7 +7327,7 @@ mod tests_native_mapping {
         assert_eq!(r.final_answer.as_deref(), Some("fatto"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_final_gate_bocciato_mai_riverificato(pool: sqlx::PgPool) {
         // REGRESSIONE run a5db0985: final_gate 1/2 FALLITO -> correzione in volo
         // (che introduce una regressione) -> provider esauriti bruciano i turni
@@ -7475,7 +7368,7 @@ mod tests_native_mapping {
         assert_eq!(r.status, AgentRunStatus::Completed);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_final_gate_bocciato_precedenze_di_stato(pool: sqlx::PgPool) {
         // Ordine della catena col segnale `final_gate_failed_pending` attivo:
         // gli stati piu' specifici mantengono la precedenza sulla bocciatura.
@@ -7511,7 +7404,7 @@ mod tests_native_mapping {
         assert_eq!(r.status, AgentRunStatus::AwaitingConfirmation);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_hitl_e_awaiting_confirmation(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
         let mut o = outcome_base();
@@ -7525,7 +7418,7 @@ mod tests_native_mapping {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_forced_close_failed_diagnosed(pool: sqlx::PgPool) {
         let run = setup_mapping_run(&pool).await;
         let mut o = outcome_base();
@@ -7539,7 +7432,7 @@ mod tests_native_mapping {
         assert_eq!(r.stop_reason.as_deref(), Some("loop_abort"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_risposta_vuota_zero_step_hollow_e_recap(pool: sqlx::PgPool) {
         // REGRESSIONE incidente run b07c7e78 (gap 2): run nativo TERMINATO con
         // risposta vuota e ZERO step non deve restare un 'completed' MUTO. Il
@@ -7564,7 +7457,7 @@ mod tests_native_mapping {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_hollow_non_scatta_su_risposta_o_step_presenti(pool: sqlx::PgPool) {
         // Contro-prova del calcolo hollow nativo: risposta presente (o run
         // HITL non concluso) -> hollow false, status invariato.
@@ -7590,7 +7483,7 @@ mod tests_native_mapping {
         assert_eq!(r.status, AgentRunStatus::Failed);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn native_mapping_forced_close_risposta_vuota_mai_completed(pool: sqlx::PgPool) {
         // REGRESSIONE incidente run b07c7e78 (gap 1, lato mapping): risposta
         // VUOTA al turno forzato -> l'executor marca forced_close_unverified;
@@ -7644,32 +7537,20 @@ mod tests_native_mapping {
 mod tests_enforce_cancellation {
     use super::*;
 
-    async fn create_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL, \
-                 cancellation_requested TIMESTAMPTZ \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-    }
-
+    /// Run nello stato voluto, eventualmente con lo Stop utente registrato.
+    /// Sessione e NOT NULL reali vengono dal seeder condiviso: la tabella la
+    /// porta il migrator del set project.
     async fn insert(pool: &sqlx::PgPool, status: &str, cancelled: bool) -> Uuid {
-        let id = Uuid::new_v4();
-        let sql = if cancelled {
-            "INSERT INTO agent_runs (id, status, cancellation_requested) VALUES ($1, $2, NOW())"
-        } else {
-            "INSERT INTO agent_runs (id, status) VALUES ($1, $2)"
-        };
-        sqlx::query(sql)
-            .bind(id)
-            .bind(status)
-            .execute(pool)
-            .await
-            .expect("insert");
+        let project = Uuid::new_v4();
+        let session = crate::test_support::seed_chat_session(pool, project).await;
+        let id = crate::test_support::insert_agent_run(pool, session, project, status).await;
+        if cancelled {
+            sqlx::query("UPDATE agent_runs SET cancellation_requested = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("registra lo Stop utente");
+        }
         id
     }
 
@@ -7685,9 +7566,8 @@ mod tests_enforce_cancellation {
     /// chiamata LLM, il modello conclude -> finalizzato 'completed' con
     /// `cancellation_requested` valorizzato. La riconciliazione lo porta a
     /// 'cancelled', cosi' lo Stop utente si riflette nello stato finale.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn completed_con_cancellazione_diventa_cancelled(pool: sqlx::PgPool) {
-        create_table(&pool).await;
         let id = insert(&pool, "completed", true).await;
         enforce_user_cancellation_status(&pool, id).await;
         assert_eq!(status_of(&pool, id).await, "cancelled");
@@ -7695,9 +7575,8 @@ mod tests_enforce_cancellation {
 
     /// Senza cancellazione un 'completed' resta 'completed': nessun falso Stop su
     /// un run terminato normalmente.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn completed_senza_cancellazione_resta_completed(pool: sqlx::PgPool) {
-        create_table(&pool).await;
         let id = insert(&pool, "completed", false).await;
         enforce_user_cancellation_status(&pool, id).await;
         assert_eq!(status_of(&pool, id).await, "completed");
@@ -7706,9 +7585,8 @@ mod tests_enforce_cancellation {
     /// Un 'failed' con cancellazione NON viene mascherato da 'cancelled': il
     /// fallimento tecnico resta informativo (la riconciliazione tocca solo
     /// 'completed').
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn failed_con_cancellazione_resta_failed(pool: sqlx::PgPool) {
-        create_table(&pool).await;
         let id = insert(&pool, "failed", true).await;
         enforce_user_cancellation_status(&pool, id).await;
         assert_eq!(status_of(&pool, id).await, "failed");

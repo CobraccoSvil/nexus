@@ -15,6 +15,7 @@
 //! matrix).
 
 use async_trait::async_trait;
+use nexus_types::error_presentation::RenderedError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -30,8 +31,15 @@ use crate::state::ToolUse;
 #[derive(Debug, Error)]
 pub enum PortError {
     /// Il gateway LLM ha risposto con un errore (provider down, billing, 4xx).
+    ///
+    /// Porta un [`RenderedError`] e non una `String` perche' questo e' il tipo
+    /// che attraversa il confine fino al messaggio in chat: con una stringa
+    /// opaca il dettaglio tecnico e la frase per l'utente erano la STESSA cosa,
+    /// e cio' che arrivava all'occhio era la riga diagnostica nata per i log
+    /// ("error sending request for url ... <- io(ConnectionRefused,
+    /// os_error=10061)"). Ora `Display` da' la frase e `detail` resta per i log.
     #[error("gateway LLM: {0}")]
-    Llm(String),
+    Llm(RenderedError),
     /// Il gateway LLM ha risposto che il/i provider risolti per la richiesta NON
     /// sono disponibili (cooldown billing/transient, rifiuto 4xx del provider,
     /// esclusione di policy per tier, o `PROVIDER_ERROR` aggregato: "tutti i
@@ -46,8 +54,12 @@ pub enum PortError {
     #[error("provider non disponibile: {0}")]
     ProviderUnavailable(ProviderUnavailableInfo),
     /// L'esecuzione di un tool e' fallita (ToolRunner down o errore applicativo).
+    ///
+    /// Stesso motivo di [`PortError::Llm`]: da qui passava il `Display` di
+    /// `tonic::Status`, che stampa `details: [], metadata: MetadataMap { headers:
+    /// {...} }` dentro il tool_result mostrato nel nastro attivita'.
     #[error("esecuzione tool: {0}")]
-    Tool(String),
+    Tool(RenderedError),
     /// In modalita' Replay il tool_result del run primario non e' disponibile.
     #[error("replay non disponibile per la chiamata '{0}'")]
     ReplayMissing(String),

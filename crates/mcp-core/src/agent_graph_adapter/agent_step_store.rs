@@ -146,42 +146,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// agent_runs minimale (guard untracked_run) + agent_steps (mig 0009).
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query("CREATE TABLE agent_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid())")
-            .execute(pool)
-            .await
-            .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
-
+    /// Run reale su cui appendere gli step: `agent_steps.run_id` e' vincolato da
+    /// una FK verso `agent_runs(id)`. Le tabelle le porta il migrator del set
+    /// `db/migrations/project`.
     async fn insert_run(pool: &PgPool) -> Uuid {
-        let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(id)
-            .execute(pool)
-            .await
-            .expect("insert run");
-        id
+        crate::test_support::seed_agent_run(pool).await
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn real_inserisce_con_step_index_deterministico(pool: PgPool) {
-        create_tables(&pool).await;
         let run_id = insert_run(&pool).await;
         let store = PgAgentStepStore::new(pool.clone());
         // iteration=3, idx=2 -> step_index = 3*1000+2 = 3002.
@@ -208,9 +181,8 @@ mod tests {
         assert_eq!(row.2.as_deref(), Some("done"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn idempotente_sui_retry(pool: PgPool) {
-        create_tables(&pool).await;
         let run_id = insert_run(&pool).await;
         let store = PgAgentStepStore::new(pool.clone());
         let block = json!({"name": "read_file"});
@@ -238,9 +210,8 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn untracked_run_non_inserisce(pool: PgPool) {
-        create_tables(&pool).await;
         // run_id NON presente in agent_runs: il guard EXISTS impedisce la FK orfana.
         let store = PgAgentStepStore::new(pool.clone());
         store
@@ -261,9 +232,8 @@ mod tests {
         assert_eq!(count, 0, "run non tracciato -> nessuno step");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_e_no_op(pool: PgPool) {
-        create_tables(&pool).await;
         let run_id = insert_run(&pool).await;
         let store = PgAgentStepStore::new(pool.clone());
         store

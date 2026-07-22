@@ -63,7 +63,7 @@ impl ContextOffload for RagContextOffloadAdapter {
         if mode != ExecMode::Real {
             // Run shadow read-only: nessuna scrittura su Qdrant (gate shadow).
             return Err(PortError::Tool(
-                "context_offload: no-op in Replay (run shadow read-only)".to_string(),
+                "context_offload: no-op in Replay (run shadow read-only)".to_string().into(),
             ));
         }
 
@@ -75,7 +75,7 @@ impl ContextOffload for RagContextOffloadAdapter {
         };
         if text.trim().is_empty() {
             return Err(PortError::Tool(
-                "context_offload: payload vuoto, niente da offloadare".to_string(),
+                "context_offload: payload vuoto, niente da offloadare".to_string().into(),
             ));
         }
 
@@ -115,7 +115,7 @@ impl ContextOffload for RagContextOffloadAdapter {
                 Ok(pointer)
             }
             Ok(_) => Err(PortError::Tool(
-                "context_offload: nessun chunk indicizzato (payload troppo piccolo)".to_string(),
+                "context_offload: nessun chunk indicizzato (payload troppo piccolo)".to_string().into(),
             )),
             Err(e) => {
                 // Degrado a troncamento: errore infra (embed/Qdrant down, RAG off).
@@ -123,7 +123,7 @@ impl ContextOffload for RagContextOffloadAdapter {
                     error = %e,
                     "context_offload: indicizzazione fallita, il chiamante degrada a troncamento"
                 );
-                Err(PortError::Tool(format!("context_offload: {e}")))
+                Err(PortError::Tool(format!("context_offload: {e}").into()))
             }
         }
     }

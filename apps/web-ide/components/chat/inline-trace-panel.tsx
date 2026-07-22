@@ -23,27 +23,25 @@ function traceCost(trace: AITraceEvent, catalog: ModelPricingEntry[]): number | 
   );
 }
 
-function humanizeTraceText(raw: string | undefined | null): string {
+/// Il testo di una trace, scartando solo il wrapper `[Error: ...]`.
+///
+/// Qui viveva `humanizeTraceText`, che sceglieva la frase da mostrare cercando
+/// "429", "timeout", "MetadataMap" DENTRO il testo. Due difetti opposti nello
+/// stesso posto: quando indovinava buttava via l'informazione vera (qualunque
+/// blob tecnico diventava "Errore del provider AI.", senza provider ne' status),
+/// e quando non indovinava lasciava passare il blob intero.
+///
+/// Ora nessuno indovina. Il messaggio leggibile nasce alla fonte, dal punto
+/// unico `nexus-types::error_presentation`, dove status, codice e natura del
+/// trasporto sono ancora vivi. Questo e' un pannello DIAGNOSTICO: il testo
+/// tecnico che ci arriva e' al suo posto, ed e' gia' dentro un blocco
+/// espandibile.
+function traceText(raw: string | undefined | null): string {
   if (!raw) return "";
   const text = raw.trim();
   if (!text) return "";
   const errMatch = text.match(/^\[Error:\s*([\s\S]*?)\]?\s*$/);
-  const isError = !!errMatch;
-  const inner = errMatch ? errMatch[1].trim() : text;
-  const low = inner.toLowerCase();
-  if (/request too large|too large for|tokens? per min|tpm.*limit|input.*tokens?.*reduced/i.test(inner))
-    return "Richiesta troppo grande per il modello (limite token al minuto superato).";
-  if (/resourceexhausted|message larger than|larger than max/i.test(inner))
-    return "Il provider AI ha rifiutato un payload troppo grande.";
-  if (/unauthenticated|invalid api key|401/.test(low)) return "Credenziali del provider AI non valide.";
-  if (/deadlineexceeded|timed? ?out|timeout/.test(low)) return "Il provider AI non ha risposto in tempo.";
-  if (/rate ?limit|429|quota/.test(low)) return "Limite di richieste del provider AI raggiunto.";
-  if (/unavailable|connection refused|503/.test(low)) return "Provider AI momentaneamente non disponibile.";
-  const looksTechnical =
-    /MetadataMap|status:\s*\w+|details:\s*\[|grpc[\s_-]?status|^\s*[[{]/i.test(inner) ||
-    /\borg-[a-z0-9]{10,}/i.test(inner);
-  if (looksTechnical) return isError ? "Errore del provider AI." : text;
-  return isError ? `${inner}` : text;
+  return errMatch ? errMatch[1].trim() : text;
 }
 
 function stopReasonColor(reason: string, tc: ReturnType<typeof useThemeColors>): string {
@@ -67,7 +65,7 @@ function CompactTraceCard({
   catalog: ModelPricingEntry[];
 }) {
   const [textExpanded, setTextExpanded] = useState(false);
-  const safeText = humanizeTraceText(trace.responseText);
+  const safeText = traceText(trace.responseText);
   // "lungo" = più di una riga logica (contiene \n o supera ~90 char)
   const isLong = safeText.length > 90 || safeText.includes("\n");
   const firstLine = safeText.split("\n")[0].slice(0, 90) + (safeText.split("\n")[0].length > 90 ? "…" : "");

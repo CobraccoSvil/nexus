@@ -97,7 +97,7 @@ impl TodoStore for PgTodoStore {
     /// confronto `depends_on` (id come stringa) nelle funzioni pure.
     async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}").into()))?;
         let rows = sqlx::query_as::<
             _,
             (
@@ -121,7 +121,7 @@ impl TodoStore for PgTodoStore {
         .bind(run_uuid)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}").into()))?;
         Ok(rows
             .into_iter()
             .map(
@@ -158,14 +158,14 @@ impl TodoStore for PgTodoStore {
     /// riuso intent/mode-aware). `None` = nessun piano (prima pianificazione).
     async fn fetch_plan(&self, run_id: &str) -> Result<Option<PlanRow>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("fetch_plan: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("fetch_plan: run_id non UUID: {e}").into()))?;
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT user_intent, behavior_mode FROM nexus_agent_plans WHERE run_id = $1",
         )
         .bind(run_uuid)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("fetch_plan: query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("fetch_plan: query fallita: {e}").into()))?;
         Ok(row.map(|(user_intent, behavior_mode)| PlanRow {
             user_intent,
             behavior_mode,
@@ -324,14 +324,14 @@ impl TodoStore for PgTodoStore {
         // Content dei todo non e' in `Todo` (forma minimale del grafo): lo leggo
         // per il render leggibile. Mappa id::text -> content.
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("build_reminder_text: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("build_reminder_text: run_id non UUID: {e}").into()))?;
         let content_rows = sqlx::query_as::<_, (String, String)>(
             "SELECT id::text, content FROM nexus_agent_todos WHERE run_id = $1",
         )
         .bind(run_uuid)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("build_reminder_text: content query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("build_reminder_text: content query fallita: {e}").into()))?;
         let content_of = |id: &str| -> String {
             content_rows
                 .iter()
@@ -383,42 +383,9 @@ impl TodoStore for PgTodoStore {
 mod tests {
     use super::*;
 
-    async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_agent_plans ( \
-                 run_id UUID PRIMARY KEY, \
-                 user_intent TEXT, \
-                 behavior_mode TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create plans");
-        sqlx::query(
-            "CREATE TABLE nexus_agent_todos ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 seq INTEGER NOT NULL, \
-                 content TEXT NOT NULL, \
-                 priority TEXT, \
-                 status TEXT NOT NULL, \
-                 verify_failures INTEGER NOT NULL DEFAULT 0, \
-                 iteration_seen INTEGER NOT NULL DEFAULT 0, \
-                 depends_on UUID[] NOT NULL DEFAULT '{}', \
-                 write_scope TEXT[] NOT NULL DEFAULT '{}', \
-                 acceptance_criteria JSONB NOT NULL DEFAULT '[]'::jsonb, \
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-            // NB: questo schema e' una COPIA A MANO di
-            // db/migrations/project/0002_run.sql e puo' divergere da quello vero
-            // senza che nulla lo segnali finche' una query non chiede una colonna
-            // che qui manca — e' esattamente cosa e' successo aggiungendo
-            // acceptance_criteria. La colonna sopra e' allineata alla riga 253
-            // della migrazione (jsonb NOT NULL DEFAULT '[]').
-        )
-        .execute(pool)
-        .await
-        .expect("create todos");
+    /// Tabelle META che il set project NON contiene (la config globale vive nel
+    /// meta-DB, regola G) e che quindi restano a carico del test.
+    async fn create_meta_schema(pool: &PgPool) {
         sqlx::query(
             "CREATE TABLE settings ( \
                  key TEXT PRIMARY KEY, \
@@ -430,6 +397,20 @@ mod tests {
         .expect("create settings");
     }
 
+    /// Preambolo comune: tabelle meta + un run con il suo piano. Ritorna il
+    /// `run_id` su cui i todo sono inseribili.
+    ///
+    /// Il piano non e' decorazione: `nexus_agent_todos.run_id` e' vincolato da
+    /// una FK verso `nexus_agent_plans(run_id)`, quindi un todo senza piano - che
+    /// la vecchia fixture a mano, priva di FK, accettava - in produzione non puo'
+    /// esistere.
+    async fn setup_run_con_piano(pool: &PgPool) -> Uuid {
+        create_meta_schema(pool).await;
+        let run_id = Uuid::new_v4();
+        crate::test_support::seed_plan(pool, run_id, Uuid::new_v4()).await;
+        run_id
+    }
+
     async fn insert_todo(
         pool: &PgPool,
         run_id: Uuid,
@@ -439,9 +420,12 @@ mod tests {
         depends_on: &[Uuid],
     ) -> Uuid {
         let id = Uuid::new_v4();
+        // `project_id` e' NOT NULL nello schema reale: si legge dal piano del run
+        // invece di inventarlo, cosi' piano e todo restano coerenti.
         sqlx::query(
-            "INSERT INTO nexus_agent_todos (id, run_id, seq, content, status, depends_on) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO nexus_agent_todos (id, run_id, project_id, seq, content, status, depends_on) \
+             SELECT $1, $2, p.project_id, $3, $4, $5, $6 \
+             FROM nexus_agent_plans p WHERE p.run_id = $2",
         )
         .bind(id)
         .bind(run_id)
@@ -455,10 +439,9 @@ mod tests {
         id
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn list_todos_cast_depends_on_e_ordine_seq(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let a = insert_todo(&pool, run_id, 1, "primo", "completed", &[]).await;
         // b dipende da a; inserito con seq 2 ma per verificare l'ORDER BY lo
         // inseriamo dopo c (seq 3) per disordinare l'ordine fisico.
@@ -480,24 +463,19 @@ mod tests {
         assert!(todos[1].write_scope.is_empty());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn list_todos_round_trip_write_scope(pool: PgPool) {
         // PR5 (mig project 0006): write_scope persistito e riletto da list_todos.
         // Un todo con scope -> Vec non vuoto; uno senza -> Vec vuoto (DEFAULT '{}').
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         // Todo con scope dichiarato.
-        let scoped = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO nexus_agent_todos (id, run_id, seq, content, status, write_scope) \
-             VALUES ($1, $2, 1, 'con scope', 'pending', $3)",
-        )
-        .bind(scoped)
-        .bind(run_id)
-        .bind(vec!["crates/api/".to_string(), "db/".to_string()])
-        .execute(&pool)
-        .await
-        .expect("insert scoped");
+        let scoped = insert_todo(&pool, run_id, 1, "con scope", "pending", &[]).await;
+        sqlx::query("UPDATE nexus_agent_todos SET write_scope = $2 WHERE id = $1")
+            .bind(scoped)
+            .bind(vec!["crates/api/".to_string(), "db/".to_string()])
+            .execute(&pool)
+            .await
+            .expect("dichiara lo scope del todo");
         // Todo senza scope (colonna omessa -> DEFAULT '{}').
         insert_todo(&pool, run_id, 2, "senza scope", "pending", &[]).await;
 
@@ -513,10 +491,9 @@ mod tests {
         assert!(todos[1].write_scope.is_empty());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn active_todo_preferisce_in_progress(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         insert_todo(&pool, run_id, 1, "a", "completed", &[]).await;
         insert_todo(&pool, run_id, 2, "b", "pending", &[]).await;
         let ip = insert_todo(&pool, run_id, 3, "c", "in_progress", &[]).await;
@@ -525,10 +502,9 @@ mod tests {
         assert_eq!(active.expect("attivo").id, ip.to_string());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn mark_status_real_aggiorna_e_blocked_incrementa_failures(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
@@ -550,10 +526,9 @@ mod tests {
     /// todo-isolation questo adapter e' l'unico a scrivere lo stato, quindi senza
     /// emissione la checklist resta ferma su `[ ]` per tutto il run anche a todo
     /// completati (segnalato dall'utente il 2026-07-22).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn mark_status_annuncia_il_cambio(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let channels: nexus_events::ProjectChannels =
             std::sync::Arc::new(dashmap::DashMap::new());
@@ -586,10 +561,9 @@ mod tests {
         assert_eq!(status, "blocked");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn mark_status_replay_e_no_op(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
@@ -605,10 +579,9 @@ mod tests {
         assert_eq!(status, "pending", "in Replay lo status NON cambia");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn increment_iteration_seen_solo_non_terminali(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let p = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let c = insert_todo(&pool, run_id, 2, "b", "completed", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
@@ -632,19 +605,18 @@ mod tests {
         assert_eq!(seen_c, 0, "completed NON incrementato");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fetch_plan_legge_intent_e_mode(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO nexus_agent_plans (run_id, user_intent, behavior_mode) VALUES ($1, $2, $3)",
-        )
-        .bind(run_id)
-        .bind("fix")
-        .bind("bilanciata")
-        .execute(&pool)
-        .await
-        .expect("insert plan");
+        let run_id = setup_run_con_piano(&pool).await;
+        // Il piano esiste gia' (i NOT NULL reali sono seminati dal preambolo):
+        // il test valorizza i due soli campi che `fetch_plan` legge.
+        sqlx::query("UPDATE nexus_agent_plans SET user_intent = $2, behavior_mode = $3 WHERE run_id = $1")
+            .bind(run_id)
+            .bind("fix")
+            .bind("bilanciata")
+            .execute(&pool)
+            .await
+            .expect("valorizza intent/mode del piano");
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         let plan = store.fetch_plan(&run_id.to_string()).await.expect("ok");
         let plan = plan.expect("piano presente");
@@ -652,10 +624,9 @@ mod tests {
         assert_eq!(plan.behavior_mode.as_deref(), Some("bilanciata"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn build_reminder_none_se_plan_phase_off(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         for i in 1..=4 {
             insert_todo(&pool, run_id, i, "x", "pending", &[]).await;
         }
@@ -668,9 +639,9 @@ mod tests {
         assert!(r.is_none(), "feature OFF -> nessun reminder");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn build_reminder_render_quando_attivo_e_sopra_soglia(pool: PgPool) {
-        create_schema(&pool).await;
+        let run_id = setup_run_con_piano(&pool).await;
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES ('orchestrator.plan_phase_enabled', 'true')",
         )
@@ -681,7 +652,6 @@ mod tests {
             .execute(&pool)
             .await
             .expect("set soglia");
-        let run_id = Uuid::new_v4();
         insert_todo(&pool, run_id, 1, "fatto", "completed", &[]).await;
         insert_todo(&pool, run_id, 2, "in corso", "in_progress", &[]).await;
         insert_todo(&pool, run_id, 3, "da fare", "pending", &[]).await;

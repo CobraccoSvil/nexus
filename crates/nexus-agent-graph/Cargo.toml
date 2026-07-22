@@ -45,3 +45,6 @@ uuid.workspace = true
 # (verify.yml). Senza DB i test sqlx falliscono in locale: e' il pattern gia'
 # usato dagli altri test del repo (es. agent_run.rs tests_session_active).
 serde_json.workspace = true
+# Schema di test del DB-progetto (migrator del set db/migrations/project):
+# i test del checkpointer girano sullo schema reale, non su una copia.
+nexus-test-schema = { path = "../nexus-test-schema" }

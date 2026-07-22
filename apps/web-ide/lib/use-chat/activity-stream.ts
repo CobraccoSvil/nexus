@@ -98,7 +98,18 @@ export interface SwitchEvent {
   fromModel?: string;
   toProvider: string;
   toModel?: string;
+  /** Identificatore canonico del motivo (`final_gate_nonconvergence`,
+   *  `signature_loop`, ...): serve alla logica e ai test, NON all'occhio. */
   reason?: string;
+  /** La frase che spiega il motivo, composta dal backend dove il vocabolario e'
+   *  definito (`decisions::switch_reason::SwitchReason::descrizione`).
+   *
+   *  Additiva: senza di essa il renderer degradava al codice grezzo dentro un
+   *  `<code>`, e nella card si leggeva `Motivo: final_gate_nonconvergence`. La
+   *  descrizione NON viene tenuta qui in una tabella parallela: sarebbe la copia
+   *  scritta a mano che diverge al primo motivo nuovo -- e' esattamente cio' che
+   *  era gia' successo con SWITCH_CAUSE_LABELS. */
+  reasonDescription?: string;
   /** Causa STRUTTURATA dello switch (vocabolario chiuso del backend,
    *  ProviderFailureCause: cooldown | billing | client_error |
    *  policy_tier_excluded | unknown). Il renderer la mappa in etichetta umana
@@ -771,6 +782,7 @@ export function composeActivityStream(
             toProvider,
             toModel,
             reason: asString(p.reason),
+            reasonDescription: asString(p.reason_description),
             // Causa strutturata dello switch (regola M): vocabolario chiuso
             // emesso dall'executor (payload.cause), mai dedotta dal titolo.
             cause: asString(p.cause),

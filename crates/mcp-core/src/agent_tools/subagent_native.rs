@@ -4871,7 +4871,7 @@ mod tests {
     /// Senza la traduzione del `JoinError` il consiglio perderebbe una figura
     /// IN SILENZIO: il roster direbbe 6, i risultati sarebbero 5, e il quorum
     /// (b152ef0d) conterebbe su un denominatore sbagliato.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn spawn_fanout_traduce_il_panic_in_esito_strutturato(pool: sqlx::PgPool) {
         sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .execute(&pool)
@@ -4971,7 +4971,7 @@ mod tests {
     }
 
     /// Il tetto di concorrenza viene dal DB (regola G) e clampa a >=1.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanout_max_parallel_dal_db(pool: sqlx::PgPool) {
         sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .execute(&pool)
@@ -5380,25 +5380,6 @@ mod tests {
         assert!(!should_isolate_batch(true, &[ws2]));
     }
 
-    /// Tabella minima per i test di `insert_subagent_run` (colonne toccate
-    /// dall'INSERT; `id` col DEFAULT reale della mig 0151, worktree senza default
-    /// come la mig project 0005).
-    async fn create_subagent_runs_min(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, project_id UUID NOT NULL, \
-                 kind TEXT NOT NULL, task_description TEXT NOT NULL, \
-                 context_blob TEXT, expected_format TEXT, status TEXT NOT NULL, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 depth INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'db', \
-                 worktree_path TEXT, base_commit TEXT, dispatcher_run_id UUID )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs");
-    }
-
     async fn fetch_worktree_cols(
         pool: &sqlx::PgPool,
         id: Uuid,
@@ -5415,9 +5396,8 @@ mod tests {
     /// (regola H): ramo sequenziale -> id generato dal DB (DEFAULT) + colonne
     /// worktree NULL; ramo isolato -> id = run_id del worktree + worktree_path/
     /// base_commit persistiti.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn insert_subagent_run_equivalenza_rami(pool: sqlx::PgPool) {
-        create_subagent_runs_min(&pool).await;
         let row = NewSubagentRun {
             anchor: Uuid::new_v4(),
             dispatcher_run_id: Uuid::new_v4(),
@@ -5477,50 +5457,6 @@ mod tests {
         assert!(vuoto.get(K_MODEL).is_none());
     }
 
-    /// Schema minimo per i test del run TRACCIATO del figlio (senza FK di
-    /// sessione: qui interessa il contratto insert/close, non lo schema pieno).
-    async fn create_child_run_tables(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 project_id UUID NOT NULL, \
-                 user_id UUID NOT NULL, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 automation_mode TEXT NOT NULL DEFAULT 'confirm', \
-                 provider TEXT, \
-                 model TEXT, \
-                 nexus_agent_type TEXT, \
-                 parent_run_id UUID REFERENCES agent_runs(id) ON DELETE SET NULL, \
-                 iteration_count INT NOT NULL DEFAULT 0, \
-                 final_answer TEXT, \
-                 prompt_tokens INT NOT NULL DEFAULT 0, \
-                 completion_tokens INT NOT NULL DEFAULT 0, \
-                 total_tokens INT NOT NULL DEFAULT 0, \
-                 total_cost DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 completed_at TIMESTAMPTZ, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 final_summary TEXT, \
-                 iterations INT NOT NULL DEFAULT 0, \
-                 tokens_prompt INT NOT NULL DEFAULT 0, \
-                 tokens_completion INT NOT NULL DEFAULT 0, \
-                 cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 verdict JSONB, \
-                 completed_at TIMESTAMPTZ )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs (chiusura)");
-    }
-
     /// Helper: crea il run TRACCIATO del figlio con ids freschi (punto unico
     /// dei call-site di test, evita blocchi duplicati).
     async fn ensure_child(
@@ -5530,11 +5466,16 @@ mod tests {
         provider: &str,
         model: &str,
     ) {
+        // La sessione dev'essere REALE: `agent_runs.session_id` e' vincolato da
+        // una FK verso `chat_sessions(id)` (la vecchia fixture, dichiaratamente
+        // "senza FK di sessione", accettava run appesi al nulla).
+        let project = Uuid::new_v4();
+        let session = crate::test_support::seed_chat_session(pool, project).await;
         ensure_child_agent_run(
             pool,
             child,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
+            session,
+            project,
             Uuid::new_v4(),
             anchor,
             provider,
@@ -5548,9 +5489,8 @@ mod tests {
     /// silenzio ogni tool_result del figlio (incidente 2026-07-06). L'ancora
     /// NON tracciata (sessione) NON deve violare la FK: parent_run_id resta
     /// NULL via subquery.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ensure_child_agent_run_traccia_il_figlio(pool: sqlx::PgPool) {
-        create_child_run_tables(&pool).await;
         let child = Uuid::new_v4();
         let anchor_non_tracciato = Uuid::new_v4(); // sessione: NON in agent_runs
         ensure_child(
@@ -5588,21 +5528,9 @@ mod tests {
 
     /// Con l'ancora TRACCIATA (run padre reale) parent_run_id viene valorizzato:
     /// e' il collegamento padre<->figlio per audit e query.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ensure_child_agent_run_collega_il_padre_tracciato(pool: sqlx::PgPool) {
-        create_child_run_tables(&pool).await;
-        let parent = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, user_id) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(parent)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .execute(&pool)
-        .await
-        .expect("padre");
+        let parent = crate::test_support::seed_agent_run(&pool).await;
         let child = Uuid::new_v4();
         ensure_child(&pool, child, parent, "google", "gemini-2.5-flash").await;
         let linked: Option<Uuid> =
@@ -5622,7 +5550,6 @@ mod tests {
         parent_provider: &str,
         catalog: &[(&str, &str)],
     ) -> (Uuid, SubagentDefinition) {
-        create_child_run_tables(pool).await;
         // Il DB di test di questo modulo e' bare (#[sqlx::test] non applica le
         // migrazioni meta): creo le tabelle di routing come fanno gli altri test.
         crate::test_support::create_ai_price_catalog_table(pool).await;
@@ -5637,31 +5564,17 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
-        // `chat_sessions` (pin provider) vive nel DB PROGETTO. Nei test il pool e'
-        // unico, quindi la creo qui: senza pin i test review/worker-standard
-        // leggono NULL -> nessun pin (parita').
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS chat_sessions ( \
-                 id UUID PRIMARY KEY, \
-                 preferred_provider TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create chat_sessions");
-        let parent = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, user_id, provider, model) \
-             VALUES ($1, $2, $3, $4, $5, 'pm')",
-        )
-        .bind(parent)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(parent_provider)
-        .execute(pool)
-        .await
-        .expect("padre");
+        // Padre TRACCIATO su una sessione reale (FK agent_runs.session_id).
+        let project = Uuid::new_v4();
+        let session = crate::test_support::seed_chat_session(pool, project).await;
+        let parent =
+            crate::test_support::insert_agent_run(pool, session, project, "running").await;
+        sqlx::query("UPDATE agent_runs SET provider = $2, model = 'pm' WHERE id = $1")
+            .bind(parent)
+            .bind(parent_provider)
+            .execute(pool)
+            .await
+            .expect("provider/model del padre");
         for (prov, model) in catalog {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
@@ -5693,7 +5606,7 @@ mod tests {
 
     /// C2: un sub-run `kind == "review"` risolve il modello ESCLUDENDO il provider
     /// del padre (worker) -> il giudice gira su un provider diverso.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn review_esclude_il_provider_del_worker(pool: sqlx::PgPool) {
         let (parent, def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
@@ -5707,7 +5620,7 @@ mod tests {
 
     /// C2 fallback: se il provider del worker e' l'UNICO capable, il review gira
     /// comunque su quel provider (preferenza forte, non hard filter).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn review_fallback_se_unico_provider_capable(pool: sqlx::PgPool) {
         let (parent, def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
         let (provider, _model) =
@@ -5720,7 +5633,7 @@ mod tests {
 
     /// C2 parita': un kind NON review non esclude nulla (il provider del padre e'
     /// ammesso, comportamento invariato).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn non_review_non_esclude_il_provider_del_padre(pool: sqlx::PgPool) {
         // Solo 'alpha' capable; un worker (kind implement) risolve su 'alpha'
         // senza alcuna esclusione anche se il padre e' 'alpha'.
@@ -5769,7 +5682,7 @@ mod tests {
 
     /// Due figure, due provider capable -> assegnazioni DISTINTE: la seconda
     /// figura esclude il provider gia' dato alla prima.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn figure_del_consiglio_su_provider_distinti(pool: sqlx::PgPool) {
         let (_parent, _def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
@@ -5794,7 +5707,7 @@ mod tests {
     /// Pool monoprovider: la seconda figura tiene il DUPLICATO invece di saltare
     /// (preferenza forte, non hard filter: meglio un parere in piu' che una
     /// figura in meno).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn consiglio_monoprovider_duplica_invece_di_perdere_figure(pool: sqlx::PgPool) {
         let (_parent, _def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
         seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
@@ -5817,18 +5730,14 @@ mod tests {
 
     /// Pin di sessione presente -> NESSUNA pre-assegnazione: il pin si propaga
     /// ai subagenti per scelta deliberata e la diversita' non si applica.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_di_sessione_disattiva_la_diversita(pool: sqlx::PgPool) {
         let (_parent, _def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
         seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
             .await;
         let session = Uuid::new_v4();
-        sqlx::query("INSERT INTO chat_sessions (id, preferred_provider) VALUES ($1, 'alpha')")
-            .bind(session)
-            .execute(&pool)
-            .await
-            .expect("pin");
+        seed_session_pin(&pool, session, Some("alpha")).await;
         let kinds = vec![
             "software_architect".to_string(),
             "security_engineer".to_string(),
@@ -5890,15 +5799,6 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
-        sqlx::query(
-            "CREATE TABLE chat_sessions ( \
-                 id UUID PRIMARY KEY, \
-                 preferred_provider TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create chat_sessions");
         for (prov, model, tier, cost) in catalog {
             seed_catalog_row(pool, prov, model, tier, *cost).await;
         }
@@ -5918,20 +5818,24 @@ mod tests {
         (Uuid::new_v4(), def)
     }
 
-    /// Inserisce una sessione con `preferred_provider` = pin.
+    /// Inserisce una sessione con `preferred_provider` = pin. `project_id` e'
+    /// NOT NULL nello schema reale (la vecchia fixture a due colonne lo ignorava).
     async fn seed_session_pin(pool: &sqlx::PgPool, session_id: Uuid, pin: Option<&str>) {
-        sqlx::query("INSERT INTO chat_sessions (id, preferred_provider) VALUES ($1, $2)")
-            .bind(session_id)
-            .bind(pin)
-            .execute(pool)
-            .await
-            .expect("session pin");
+        sqlx::query(
+            "INSERT INTO chat_sessions (id, project_id, preferred_provider) \
+             VALUES ($1, gen_random_uuid(), $2)",
+        )
+        .bind(session_id)
+        .bind(pin)
+        .execute(pool)
+        .await
+        .expect("session pin");
     }
 
     /// TEST 1 — pin propagato felice: pin='deepseek' + purpose worker medium/code/
     /// tool_use -> ritorna il modello DEEPSEEK del tier (non mistral, non il light).
     /// Senza pin vincerebbe mistral (piu' economico): il pin sposta la scelta.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_propagato_sceglie_provider_pinnato(pool: sqlx::PgPool) {
         let (session, def) = seed_pin_routing(
             &pool,
@@ -5958,7 +5862,7 @@ mod tests {
     /// TEST 2 — pin non-capable -> degrado: il provider pinnato non ha un modello
     /// medium+code+tool_use -> NoCapableModel col pin -> fallback SENZA pin ->
     /// modello purpose normale (mistral). MAI ("","").
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_non_capable_degrada_al_purpose_normale(pool: sqlx::PgPool) {
         // deepseek ha solo un modello 'light' (tier sbagliato): non capable per
         // il tier 'medium' del purpose. mistral ha il medium capable.
@@ -5987,7 +5891,7 @@ mod tests {
     /// TEST 3 — pin in cooldown -> degrado: il provider pinnato e' capable ma in
     /// cooldown (escluso dalla query) -> query pinnata vuota -> fallback senza pin
     /// (il figlio non resta bloccato).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_in_cooldown_degrada_senza_bloccare(pool: sqlx::PgPool) {
         // Provider con nomi DEDICATI: il cooldown e' uno snapshot GLOBALE in-memory
         // condiviso tra i test paralleli, quindi non riuso 'deepseek'/'mistral'
@@ -6015,7 +5919,7 @@ mod tests {
 
     /// TEST 5 — Auto (nessun pin) bit-identico: preferred_provider NULL -> stesso
     /// (provider, model) del comportamento pre-pin (il cost-first sceglie mistral).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn nessun_pin_bit_identico_al_comportamento_attuale(pool: sqlx::PgPool) {
         let (session, def) = seed_pin_routing(
             &pool,
@@ -6036,7 +5940,7 @@ mod tests {
     /// TEST 4 — review ignora il pin: kind='review', pin = provider del padre ->
     /// il modello risolto NON e' del provider padre (l'esclusione giudice != worker
     /// vince sul pin). Nota: qui il purpose e' tier-only agentico su due provider.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn review_ignora_il_pin_esclusione_vince(pool: sqlx::PgPool) {
         let (parent, def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
@@ -6054,15 +5958,19 @@ mod tests {
 
     /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
     /// gemella agent_runs) nella stessa statement, con status/metriche coerenti.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn mark_run_chiude_anche_la_riga_agent_runs(pool: sqlx::PgPool) {
-        create_child_run_tables(&pool).await;
         let child = Uuid::new_v4();
-        sqlx::query("INSERT INTO nexus_subagent_runs (id) VALUES ($1)")
-            .bind(child)
-            .execute(&pool)
-            .await
-            .expect("sub-run");
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs \
+                 (id, parent_run_id, project_id, kind, task_description, status) \
+             VALUES ($1, gen_random_uuid(), gen_random_uuid(), 'coder', 'task di test', \
+                     'running')",
+        )
+        .bind(child)
+        .execute(&pool)
+        .await
+        .expect("sub-run");
         ensure_child(&pool, child, Uuid::new_v4(), "mistral", "mistral-medium-3").await;
         mark_run(
             &pool,
@@ -6169,17 +6077,6 @@ mod tests {
     /// stesso, cosi' si verifica la meccanica SQL (COUNT + INSERT ON CONFLICT).
     async fn create_fanin_tables(pool: &sqlx::PgPool) {
         sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs");
-        sqlx::query(
             "CREATE TABLE subagent_fanin_resume_queue ( \
                  parent_run_id UUID PRIMARY KEY, \
                  project_id UUID NOT NULL, \
@@ -6209,8 +6106,10 @@ mod tests {
         status: &str,
     ) {
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO nexus_subagent_runs \
+                 (parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                  is_background, status) \
+             VALUES ($1, $2, gen_random_uuid(), 'coder', 'task di test', $3, $4)",
         )
         .bind(anchor)
         .bind(dispatcher)
@@ -6233,7 +6132,7 @@ mod tests {
 
     /// Con un figlio background ancora `running`, l'enqueue NON scatta: si aspetta
     /// l'ULTIMO. Quando tutti i background sono terminali, accoda (idempotente).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_enqueue_solo_quando_tutti_background_terminali(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
         let parent = Uuid::new_v4();
@@ -6289,32 +6188,24 @@ mod tests {
     /// Senza il fix `fanin_enqueue_if_last` accodava `parent_run_id` (unico id, =
     /// anchor): questo test — con anchor != resume_run_id — fallirebbe perche' in
     /// coda ci sarebbe l'anchor e il CAS sul run corrente non lo troverebbe.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_enqueue_usa_run_corrente_non_anchor(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
-        // Tabella agent_runs minima per simulare il CAS del worker.
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create agent_runs");
 
         // anchor (famiglia figli) e run corrente (sospeso) DISTINTI: e' il caso del
-        // run principale (anchor = session_id, run corrente = agent_runs.id).
-        let anchor = Uuid::new_v4();
-        let resume_run_id = Uuid::new_v4();
+        // run principale (anchor = session_id, run corrente = agent_runs.id). La
+        // sessione e' reale: `agent_runs.session_id` ha una FK verso `chat_sessions`.
         let project = Uuid::new_v4();
-        let session = anchor; // per un run di primo livello l'anchor E' la sessione
-
+        let session = crate::test_support::seed_chat_session(&pool, project).await;
+        let anchor = session; // per un run di primo livello l'anchor E' la sessione
         // Il run corrente e' sospeso su awaiting_subagents (lo marca il finalize).
-        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'awaiting_subagents')")
-            .bind(resume_run_id)
-            .execute(&pool)
-            .await
-            .expect("insert run corrente");
+        let resume_run_id = crate::test_support::insert_agent_run(
+            &pool,
+            session,
+            project,
+            "awaiting_subagents",
+        )
+        .await;
 
         // Un solo figlio background, gia' terminale: e' l'ultimo -> accoda. Il
         // figlio ha anchor (session_id) DISTINTO dal dispatcher (run corrente):
@@ -6369,7 +6260,7 @@ mod tests {
     /// (scenario insert-one-at-a-time) l'enqueue scatta (rischio); con TUTTE le row
     /// inserite PRIMA (come fa `run_batch_background` prepare-all/spawn-all) il 1o
     /// che termina NON accoda (ne restano 2).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_batch_background_no_enqueue_prematuro(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
         let anchor = Uuid::new_v4();
@@ -6431,7 +6322,7 @@ mod tests {
     /// Cp1) NON entra nella COUNT di P. Senza il fix (COUNT su `parent_run_id =
     /// anchor = session`) Cs1 conterebbe come figlio di P -> P NON si accoderebbe
     /// (solo il backstop lo salverebbe) e il fetch inietterebbe il nipote.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_annidamento_count_isolata_per_dispatcher(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
         let session = Uuid::new_v4(); // anchor condiviso da TUTTI i sub-run
@@ -6656,20 +6547,8 @@ mod tests {
     /// dalla CATENA ANTENATI (depth del dispatcher), NON dal MAX tra i fratelli
     /// paralleli sotto l'anchor. Le 6 figure convocate dal run principale sono
     /// tutte figlie DIRETTE -> depth 1, non 1/2/3 (che faceva rifiutare le ultime).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn chain_depth_immune_ai_fratelli_paralleli(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 depth INTEGER, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create nexus_subagent_runs");
-
         let main = Uuid::new_v4(); // run principale (dispatcher figure): NON ha row
         let anchor = Uuid::new_v4(); // anchor condiviso dalle figure
 
@@ -6678,8 +6557,10 @@ mod tests {
         // 4a figura avrebbe preso 1 -> depth 2, poi 3 -> rifiuto.
         for _ in 0..3 {
             sqlx::query(
-                "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, depth, status) \
-                 VALUES ($1, $2, 1, 'running')",
+                "INSERT INTO nexus_subagent_runs \
+                     (parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                      depth, status) \
+                 VALUES ($1, $2, gen_random_uuid(), 'coder', 'task di test', 1, 'running')",
             )
             .bind(anchor)
             .bind(main)
@@ -6698,8 +6579,10 @@ mod tests {
         // Catena reale: un dispatcher che E' un sub-run a depth 1 -> figlio depth 2.
         let d1 = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, depth, status) \
-             VALUES ($1, $2, $3, 1, 'running')",
+            "INSERT INTO nexus_subagent_runs \
+                 (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                  depth, status) \
+             VALUES ($1, $2, $3, gen_random_uuid(), 'coder', 'task di test', 1, 'running')",
         )
         .bind(d1)
         .bind(anchor)
@@ -6900,7 +6783,7 @@ mod tests {
     }
 
     /// Mig 0555: purpose ultracode da settings con fallback a model_purpose.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ultracode_purpose_da_settings_con_fallback(pool: sqlx::PgPool) {
         sqlx::query(
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",

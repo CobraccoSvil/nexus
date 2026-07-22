@@ -36,10 +36,11 @@ use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError};
 use nexus_agent_graph::state::ToolUse;
-
+// La resa di un errore del gateway vive accanto ai tipi che la sanno produrre
+// (`crate::nexus_gateway`): qui si delega, non si ri-decide.
 use crate::nexus_gateway::{
-    GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall, GwToolFunctionCall,
-    NexusGatewayClient,
+    rendered_from_error, GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall,
+    GwToolFunctionCall, NexusGatewayClient,
 };
 
 /// Adapter [`LlmGateway`] -> [`NexusGatewayClient`].
@@ -124,7 +125,7 @@ fn purpose_for_empty_model(req: &LlmRequest) -> Result<Option<String>, PortError
             "richiesta LLM senza modello ne' purpose: il chiamante deve risolvere \
              provider/modello a monte (routing matrix) o indicare un purpose \
              (nexus_purpose_model, regola G)"
-                .to_string(),
+                .to_string().into(),
         )),
     }
 }
@@ -141,7 +142,7 @@ impl LlmGateway for GatewayLlmAdapter {
                 crate::internal_routing::resolve_purpose_model_db(&self.db, &purpose)
                     .await
                     .into_model(&purpose)
-                    .map_err(PortError::Llm)?;
+                    .map_err(|msg| PortError::Llm(msg.into()))?;
             tracing::debug!(
                 purpose = %purpose,
                 provider = %provider,
@@ -255,7 +256,12 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
         .chain()
         .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())
     else {
-        return PortError::Llm(err.to_string());
+        // Ramo di degrado: e' qui che finisce OGNI errore non-HTTP, cioe' tutto
+        // il trasporto. Restituiva `err.to_string()`, e siccome a monte
+        // l'errore era un `anyhow!` costruito sulla riga diagnostica dei log,
+        // quella riga diventava il messaggio in chat. Ora l'errore di trasporto
+        // e' TIPIZZATO (`GatewayTransportError`) e porta la sua frase.
+        return PortError::Llm(rendered_from_error(err));
     };
     match http.code.as_deref() {
         Some("PROVIDER_ERROR") => {
@@ -283,14 +289,21 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 Some("empty_completion") => ProviderFailureCause::EmptyCompletion,
                 _ => ProviderFailureCause::Unknown,
             };
-            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(cause, err.to_string()))
+            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
+                cause,
+                rendered_from_error(err).message,
+            ))
         }
-        Some("POLICY_TIER_EXCLUDED") => PortError::ProviderUnavailable(
-            ProviderUnavailableInfo::new(ProviderFailureCause::PolicyTierExcluded, err.to_string()),
-        ),
-        _ => PortError::Llm(err.to_string()),
+        Some("POLICY_TIER_EXCLUDED") => {
+            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
+                ProviderFailureCause::PolicyTierExcluded,
+                rendered_from_error(err).message,
+            ))
+        }
+        _ => PortError::Llm(rendered_from_error(err)),
     }
 }
+
 
 /// Mappa una [`LlmRequest`] (porta) nel [`GwRequest`] del client gateway.
 ///
@@ -394,6 +407,11 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
         } else {
             Some(req.provider.clone())
         },
+        // `None` di proposito: questa e' una funzione PURA e il run non lo
+        // conosce. Lo timbra il client in `NexusGatewayClient::complete`, che e'
+        // stato costruito PER quel run (`from_db_for_run`). E' lo stesso motivo
+        // per cui il pin del provider viene applicato al momento della chiamata.
+        run_timeout_secs: None,
         metadata: GwMetadata {
             tenant_id: String::new(),
             user_id: "system".to_string(),
@@ -639,7 +657,7 @@ async fn load_replay_steps(
     .bind(primary_run_id)
     .fetch_all(db)
     .await
-    .map_err(|e| PortError::Llm(format!("replay caricamento agent_steps: {e}")))?;
+    .map_err(|e| PortError::Llm(format!("replay caricamento agent_steps: {e}").into()))?;
 
     Ok(rows
         .into_iter()
@@ -667,7 +685,7 @@ async fn load_primary_final_answer(
             .bind(primary_run_id)
             .fetch_optional(db)
             .await
-            .map_err(|e| PortError::Llm(format!("replay lettura final_answer: {e}")))?;
+            .map_err(|e| PortError::Llm(format!("replay lettura final_answer: {e}").into()))?;
     Ok(row.and_then(|(fa,)| fa))
 }
 
@@ -1593,41 +1611,16 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
 
     // ── ReplayLlmGateway: end-to-end via complete() (sqlx) ─────────────────────
 
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 final_answer TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
-
+    /// Run reale su cui rileggere gli step in Replay: le tabelle
+    /// (`agent_runs`, `agent_steps`) le porta il migrator del set project.
     async fn insert_run(pool: &PgPool, final_answer: Option<&str>) -> Uuid {
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, final_answer) VALUES ($1, $2)")
+        let run = crate::test_support::seed_agent_run(pool).await;
+        sqlx::query("UPDATE agent_runs SET final_answer = $2 WHERE id = $1")
             .bind(run)
             .bind(final_answer)
             .execute(pool)
             .await
-            .expect("run");
+            .expect("risposta finale del run primario");
         run
     }
 
@@ -1645,9 +1638,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// end_turn + final_answer del primario. (b) conteggio tool per turno = primario.
     /// I turni sono discriminati dal GAP di `created_at` (turno 1 stesso timestamp,
     /// turno 2 a +2s).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_executor_sequenza_multi_turno(pool: PgPool) {
-        create_tables(&pool).await;
         let run = insert_run(&pool, Some("FATTO")).await;
         // Turno 1: read_file (0) + list_files (1) stesso created_at (batch).
         insert_step_at(&pool, run, 0, "read_file", "2026-06-27T10:00:00Z").await;
@@ -1681,9 +1673,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// Il vecchio raggruppamento per quoziente /1000 le ACCORPAVA in un solo turno da
     /// 8 tool -> signature-loop spurio. Col raggruppamento per turno reale lo shadow
     /// vede DUE turni separati (4 + 4 tool), come il primario. Riproduce 6cfd2e34.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_executor_due_ondate_non_collassano_in_mega_turno(pool: PgPool) {
-        create_tables(&pool).await;
         let run = insert_run(&pool, Some("done")).await;
         // Ondata 1: step 3000-3003 stesso created_at.
         insert_step_at(&pool, run, 3000, "read_file", "2026-06-27T10:50:53Z").await;
@@ -1716,9 +1707,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
 
     /// (c) purpose ausiliario via complete() -> risposta neutra SENZA leggere il DB
     /// (run_id inesistente: se toccasse il DB fallirebbe, ma e' neutralizzato prima).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_purpose_ausiliario_neutro_senza_io(pool: PgPool) {
-        create_tables(&pool).await;
         // Nessun run inserito: un purpose ausiliario NON deve leggere agent_steps.
         let gw = ReplayLlmGateway::new(pool.clone(), Uuid::new_v4());
         for purpose in ["planner", "reflection", "clarify_expand"] {
@@ -1742,9 +1732,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
 
     /// (d) cursore esausto subito (nessuno step) -> la PRIMA complete() executor
     /// chiude con end_turn (final_answer NULL -> content vuoto).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_executor_cursore_esausto_subito(pool: PgPool) {
-        create_tables(&pool).await;
         let run = insert_run(&pool, None).await; // final_answer NULL
         let gw = ReplayLlmGateway::new(pool.clone(), run);
 
@@ -1761,9 +1750,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// ordine da complete() successive. Lo `step_index` e' irrilevante per i confini
     /// di turno: conta solo il GAP di `created_at` (qui ogni tool a +1s dal
     /// precedente -> tre turni). Verifica anche il caso single-tool-per-turno.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_executor_turni_separati_single_tool(pool: PgPool) {
-        create_tables(&pool).await;
         let run = insert_run(&pool, Some("done")).await;
         insert_step_at(&pool, run, 0, "a", "2026-06-27T10:00:00Z").await;
         insert_step_at(&pool, run, 2000, "b", "2026-06-27T10:00:01Z").await;
@@ -1817,9 +1805,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// (ondate retry/fallback del primario) l'ordine di `load_replay_steps` deve
     /// seguire `created_at` (tiebreak `step_index`, poi `id`), NON il solo
     /// `step_index`. Un ordinamento per solo `step_index` mescolerebbe le ondate.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn load_replay_steps_ordina_per_created_at_con_step_index_duplicati(pool: PgPool) {
-        create_tables(&pool).await;
         let run = insert_run(&pool, Some("done")).await;
         // Ondate con step_index COLLIDENTI ma created_at crescente nell'ordine reale:
         // ondata 1 (idx 0,1) PRIMA, poi ondata 2 (idx 0,1 di nuovo, retry) DOPO.

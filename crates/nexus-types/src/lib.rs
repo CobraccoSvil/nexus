@@ -16,6 +16,7 @@ pub use fs_browse::{
 pub mod admin_dto;
 pub mod code_files;
 pub mod documents_dto;
+pub mod error_presentation;
 pub mod gateway_client;
 pub mod git_exec;
 pub mod llm_json;
@@ -35,6 +36,27 @@ pub type ApiResult = Result<Json<Value>, ApiError>;
 
 pub fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     (status, Json(json!({ "error": message.into() })))
+}
+
+/// Errore API che porta anche la RESA, per le superfici lette da un umano.
+///
+/// `error` resta il testo TECNICO: lo leggono gia' i ~180 call site di
+/// [`api_error`] e i pannelli diagnostici, e cambiarne il senso sarebbe una
+/// migrazione a tappeto. Le tre chiavi additive sono la stessa convenzione del
+/// gateway (`user_message` la frase, `user_code` l'identificatore su cui il
+/// frontend sceglie icona e azione, `user_detail` il tecnico integrale), cosi'
+/// il client ha UNA sola forma da leggere su tutti i confini.
+///
+/// `user_detail` e non `detail` perche' sulle risposte del gateway convive gia'
+/// `details` con significato opposto: due chiavi a un carattere di distanza sono
+/// la trappola che qui ha gia' prodotto il bug dei costi a $0.00.
+pub fn api_error_rendered(
+    status: StatusCode,
+    rendered: &error_presentation::RenderedError,
+) -> ApiError {
+    let mut body = json!({ "error": rendered.log_line() });
+    rendered.write_into(&mut body);
+    (status, Json(body))
 }
 
 /// Validazione nome directory con errore API pronto (BAD_REQUEST).

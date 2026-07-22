@@ -176,17 +176,20 @@ fn can_manage_instance(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -
     owner == Some(user_id) || (scope == "global" && role == "admin")
 }
 
-fn format_compact_error(message: &str) -> String {
-    let compact = message
-        .replace(['\n', '\r'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.chars().count() > 300 {
-        format!("{}...", compact.chars().take(300).collect::<String>())
-    } else {
-        compact
-    }
+/// Messaggio d'errore di un plugin, dal punto unico di presentazione.
+///
+/// Era il gemello identico di quello in `mcp-core/src/plugins/mod.rs`: stessa
+/// normalizzazione, stesso tetto di 300, due copie che nessuno teneva allineate.
+/// La normalizzazione ora vive una volta sola in `render_user_error`.
+fn plugin_error_message(message: &str) -> String {
+    nexus_types::error_presentation::render_user_error(
+        &nexus_types::error_presentation::ErrorFacts::opaque(
+            nexus_types::error_presentation::ErrorDomain::Plugin,
+            message,
+        )
+        .with_upstream(message),
+    )
+    .message
 }
 
 fn sanitize_return_to(value: Option<&str>) -> String {
@@ -1134,7 +1137,7 @@ async fn persist_discovered_tools(
 // al caso Figma HTTP 401 (token PAT vs OAuth). Estratto dal ramo Err di `test_plugin`.
 async fn describe_test_failure(state: &AppState, resolution: &PluginResolution, error: &nexus_mcp_client::McpError) -> String {
     let raw = error.to_string();
-    let mut msg = format_compact_error(&raw);
+    let mut msg = plugin_error_message(&raw);
     if resolution.plugin_slug.eq_ignore_ascii_case("figma-http") && raw.contains("HTTP 401") {
         let th = resolve_secret_value(&state.db, "figma_oauth_token").await;
         msg = if th.as_deref().map(is_figma_pat).unwrap_or(false) {

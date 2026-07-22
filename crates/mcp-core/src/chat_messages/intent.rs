@@ -67,35 +67,14 @@ pub(crate) fn model_belongs_to_provider(provider: &str, model: &str) -> bool {
 // Per leggere il default per provider usare:
 //   crate::orchestrator::default_model_for_provider(matrix, provider)
 // con matrix ottenuta da state.orchestrator.routing_matrix.current().
-pub(crate) fn humanize_ai_error(raw: &str) -> String {
-    let lower = raw.to_lowercase();
-    if lower.contains("429")
-        || lower.contains("529")
-        || lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("overloaded")
-        || lower.contains("quota")
-        || lower.contains("resource_exhausted")
-        || lower.contains("service unavailable")
-        || lower.contains("503")
-    {
-        return "Il provider AI è temporaneamente sovraccarico (overloaded). Sto ritentando automaticamente con backoff; riprova tra poco se persiste.".to_string();
-    }
-    if lower.contains("timeout") {
-        return "La richiesta AI e' scaduta per timeout. Riprova con un prompt piu' corto o tra qualche secondo.".to_string();
-    }
+// `humanize_ai_error` viveva qui. Cercava "429", "quota", "timeout" DENTRO il
+// testo dell'errore per scegliere la frase (regola M: lo stato tecnico non si
+// deduce dalla prosa — quel "429" poteva essere un numero qualsiasi del body) e,
+// quando non trovava nulla, incollava la prima riga troncata a 220 caratteri:
+// il blob mozzato che si leggeva in chat. Rimossa insieme al suo unico call site
+// (`fallback_assistant_after_run_turn_error`), che ora usa il punto unico
+// `nexus_types::error_presentation`.
 
-    let first_line = raw
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("Richiesta AI non completata");
-    let trimmed = first_line.trim();
-    if trimmed.chars().count() > 220 {
-        format!("{}...", trimmed.chars().take(220).collect::<String>())
-    } else {
-        trimmed.to_string()
-    }
-}
 /// Azzera la preferenza di provider della sessione e segna l'evento privacy.
 /// Va chiamato ogni volta che il gateway ha re-instradato su un provider locale per privacy.
 /// Al messaggio successivo il sistema userà il routing automatico invece della preferenza precedente.

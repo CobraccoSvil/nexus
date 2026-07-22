@@ -4570,31 +4570,17 @@ mod tests {
         assert_eq!(c["has_produced_work"], json!(false));
     }
 
-    /// Tabelle minimali per `primary_canonical`: agent_runs (status) + agent_steps.
-    async fn create_primary_tables(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL DEFAULT 'running' \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'completed' \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
+    /// Run primario `completed` su cui `primary_canonical` legge stato e step.
+    /// Le tabelle (`agent_runs`, `agent_steps`) le porta il migrator del set
+    /// `db/migrations/project`.
+    async fn seed_run_completed(pool: &sqlx::PgPool) -> Uuid {
+        let run = crate::test_support::seed_agent_run(pool).await;
+        sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE id = $1")
+            .bind(run)
+            .execute(pool)
+            .await
+            .expect("chiudi il run primario");
+        run
     }
 
     async fn create_shadow_telemetry_table(pool: &sqlx::PgPool) {
@@ -4614,20 +4600,14 @@ mod tests {
         .expect("create nexus_shadow_telemetry");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn primary_canonical_legge_status_e_step(pool: sqlx::PgPool) {
-        create_primary_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'completed')")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = seed_run_completed(&pool).await;
         // Due step: un read_file (non mutativo) + un write_file (mutativo).
         for (i, name) in [(1000, "read_file"), (2000, "write_file")] {
             sqlx::query(
-                "INSERT INTO agent_steps (id, run_id, step_index, tool_name) \
-                 VALUES (gen_random_uuid(), $1, $2, $3)",
+                "INSERT INTO agent_steps (id, run_id, step_index, tool_name, tool_input) \
+                 VALUES (gen_random_uuid(), $1, $2, $3, '{}'::jsonb)",
             )
             .bind(run)
             .bind(i)
@@ -4644,21 +4624,15 @@ mod tests {
         assert_eq!(c["has_produced_work"], json!(true), "write_file mutativo");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn shadow_persiste_un_solo_record_final_state(pool: sqlx::PgPool) {
         // Replica la parte finale di run_shadow (dopo l'esecuzione del grafo): il
         // confronto canonico primario(DB)<->shadow(stato) e la persistenza del
         // SINGOLO record "__final_state__". Verifica che ci sia ESATTAMENTE una
         // riga, sul nodo "__final_state__", con i divergent_keys attesi.
-        create_primary_tables(&pool).await;
         create_shadow_telemetry_table(&pool).await;
-        let run = Uuid::new_v4();
         // Primario: completed, 0 step (nessun tool, nessun lavoro).
-        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'completed')")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let run = seed_run_completed(&pool).await;
 
         let primary = primary_canonical(&pool, run).await.expect("primary");
         // Shadow: completato ma con un write_file (diverge su num_tool_calls +

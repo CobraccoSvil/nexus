@@ -1707,12 +1707,24 @@ async fn fallback_assistant_after_run_turn_error(
     error: &(StatusCode, Json<Value>),
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let err_text = error.1["error"].as_str().unwrap_or("generation_error");
+    // La frase gia' resa a monte, quando i fatti erano vivi (`api_error_rendered`
+    // su run_turn). Quando c'e' si USA: ri-renderla da `err_text` darebbe il
+    // messaggio generico del dominio Gateway, perche' da qui provider, modello e
+    // status non sono piu' leggibili.
+    let user_message = error.1["user_message"].as_str().map(str::to_string);
+    let user_code = error.1["user_code"].as_str().unwrap_or("");
     let fallback_metadata = json!({
         "provider": "none",
         "model": "none",
         "intent": "chat",
         "runId": "",
         "error": err_text,
+        // Identificatore canonico della classe: e' il campo su cui la UI puo'
+        // decidere un'azione (riprova, cambia modello, ricarica credito) senza
+        // guardare il testo (regola M). CamelCase come i vicini di questo
+        // metadata (promptTokens, totalCost), non snake_case come sul wire del
+        // gateway: la convenzione locale vince sulla coerenza cross-confine.
+        "userCode": user_code,
         "promptTokens": 0,
         "completionTokens": 0,
         "totalTokens": 0,
@@ -1725,7 +1737,26 @@ async fn fallback_assistant_after_run_turn_error(
         session_id,
         project_id,
         "assistant",
-        &format!("Operazione non completata: {}", humanize_ai_error(err_text)),
+        // Il testo tecnico NON entra nel corpo del messaggio: e' gia' in
+        // `fallback_metadata["error"]`, da cui il pannello diagnostico lo legge.
+        // Qui viveva `humanize_ai_error`, che decideva la frase cercando "429" o
+        // "timeout" DENTRO il testo (regola M) e, quando non li trovava, ci
+        // incollava la prima riga troncata a 220 caratteri — cioe' il blob
+        // mozzato che si leggeva in chat.
+        //
+        // I fatti opachi restano il RIPIEGO onesto: valgono per gli errori che
+        // non attraversano il gateway (validazione, DB, permessi), dove non c'e'
+        // nessuna resa da trasportare.
+        &format!(
+            "Operazione non completata: {}",
+            user_message.unwrap_or_else(|| nexus_types::error_presentation::render_user_error(
+                &nexus_types::error_presentation::ErrorFacts::opaque(
+                    nexus_types::error_presentation::ErrorDomain::Gateway,
+                    err_text,
+                ),
+            )
+            .message)
+        ),
         fallback_metadata,
         Some(user_message_id),
     )

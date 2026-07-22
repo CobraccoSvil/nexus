@@ -2041,6 +2041,7 @@ dependencies = [
  "nexus-pricing",
  "nexus-project-db",
  "nexus-project-pools",
+ "nexus-test-schema",
  "nexus-tool-kit",
  "nexus-types",
  "nexus-wiki",
@@ -2248,6 +2249,7 @@ dependencies = [
  "futures",
  "nexus-graph",
  "nexus-graph-derive",
+ "nexus-test-schema",
  "nexus-types",
  "rand 0.8.5",
  "regex",
@@ -2374,6 +2376,7 @@ dependencies = [
  "nexus-cache",
  "nexus-pricing",
  "nexus-tool-kit",
+ "nexus-types",
  "regex",
  "reqwest",
  "serde",
@@ -2514,6 +2517,13 @@ dependencies = [
  "regex",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "nexus-test-schema"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
 ]
 
 [[package]]

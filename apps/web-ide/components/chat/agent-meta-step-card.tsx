@@ -424,7 +424,11 @@ function renderPayload(
     return (
       <div style={grid}>
         <DefRow k="A" v={`${String(payload.to_provider ?? "?")} / ${String(payload.to_model ?? "?")}`} tc={tc} />
-        <DefRow k="Motivo" v={String(payload.reason ?? "—")} tc={tc} />
+        <DefRow
+          k="Motivo"
+          v={String(payload.reason_description ?? payload.reason ?? "—")}
+          tc={tc}
+        />
         <DefRow k="Tentativo" v={`#${String(payload.attempt ?? "?")}`} tc={tc} />
       </div>
     );
@@ -434,7 +438,12 @@ function renderPayload(
     // strutturata (punto unico switchCauseLabel, regola L/M) invece del codice
     // grezzo `provider_failover`, che resta il degrado per cause ignote.
     const cause = payload.cause as string | undefined;
-    const reason = switchCauseLabel(cause) ?? String(payload.reason ?? cause ?? "—");
+    // La descrizione arriva dal backend (`SwitchReason::descrizione`), dove il
+    // vocabolario dei motivi e' definito: qui non si tiene una tabella parallela.
+    // Il codice grezzo resta l'ultimo ripiego, per gli eventi gia' in DB.
+    const reason =
+      switchCauseLabel(cause) ??
+      String(payload.reason_description ?? payload.reason ?? cause ?? "—");
     return (
       <div style={grid}>
         <DefRow k="Da" v={`${String(payload.from_provider ?? "?")}`} tc={tc} />
