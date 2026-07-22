@@ -115,7 +115,7 @@ use nexus_agent_graph::runtime::ports::{
 use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
-    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict, LearnerConfig,
+    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict,
     LearnerNode, Message, OnFailure, ReviewGateConfig, ReviewGateNode, ReviewGateVerdict,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
@@ -189,6 +189,19 @@ pub struct NativeRunInput {
     pub model: String,
     /// System prompt completo del run.
     pub system_text: String,
+    /// CHIAVE del template di sistema usato (`nexus_prompt_templates.key`), es.
+    /// `system.nexus_base` per il run principale o la `prompt_key` della
+    /// definizione subagente per un sub-run.
+    ///
+    /// Non e' cosmetica: e' la chiave con cui il ReflectionNode persiste in
+    /// `nexus_agent_reflections`, e senza di essa la persistenza esce subito.
+    /// Il campo era gia' previsto nello stato (`profile_name`) ma nessuno lo
+    /// valorizzava — l'unica assegnazione in tutto il workspace era una fixture
+    /// di test — quindi quella tabella era a ZERO righe e con lei
+    /// `prompt_ab_experiments`. A digiuno restavano cinque consumatori vivi: il
+    /// `PromptOptimizerWorker`, registrato e con `optimizer_enabled=true`, e le
+    /// tre rotte `/prompt-experiments` di admin-service.
+    pub prompt_key: Option<String>,
     /// Messaggio iniziale dell'utente (con blocco allegati gia' inline).
     pub initial_msg: String,
     /// History conversazione in forma LangChain (`Vec<Value>`): convertita in
@@ -2481,7 +2494,7 @@ async fn build_native_engine(
             meta_steps.clone(),
         )),
         reflection: Arc::new(ReflectionNode::new(reflection_cfg)),
-        learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
+        learner: Arc::new(LearnerNode::new()),
     };
 
     // Checkpointer: dipende dal ruolo.
@@ -2799,6 +2812,10 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         thread_id: Some(input.run_id.to_string()),
         session_id: Some(input.session_id.to_string()),
         system_text: Some(input.system_text.clone()),
+        // Chiave del prompt di sistema: la usa il ReflectionNode come
+        // `prompt_key` per persistere in `nexus_agent_reflections`. Senza,
+        // `spawn_persist` esce subito e la tabella resta vuota (com'era).
+        profile_name: input.prompt_key.clone(),
         intent_hint: input.intent_hint.clone(),
         user_intent: initial_intent,
         action_oriented: initial_action_oriented,
@@ -3588,6 +3605,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "claude-x".to_string(),
             system_text: "sei un assistente".to_string(),
+            prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),
             conversation_history: vec![serde_json::json!({
                 "role": "user",
@@ -3910,6 +3928,32 @@ mod tests {
 
     /// PRIMARIO RUST + classifier RISOLTO su turno d'azione (requires_tools=true):
     /// action_oriented=true FEDELE -> l'agente usa i tool, come il primario Python.
+    /// La chiave del prompt arriva nello stato: senza, il ReflectionNode esce
+    /// subito da `spawn_persist` e `nexus_agent_reflections` resta a zero righe —
+    /// com'e' stata finora, lasciando a digiuno il PromptOptimizerWorker (che e'
+    /// registrato e abilitato) e le rotte `/prompt-experiments`.
+    #[test]
+    fn prompt_key_arriva_nello_stato_del_run() {
+        let input = sample_input();
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(
+            state.profile_name.as_deref(),
+            Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY),
+            "il prompt_key deve arrivare allo stato: e' la chiave con cui la \
+             reflection viene persistita e attribuita al template"
+        );
+    }
+
+    /// Un run senza chiave non persiste, e va bene cosi': meglio nessuna riga
+    /// che una riga attribuita al prompt sbagliato.
+    #[test]
+    fn prompt_key_assente_resta_assente() {
+        let mut input = sample_input();
+        input.prompt_key = None;
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(state.profile_name, None);
+    }
+
     #[test]
     fn initial_state_primary_classifier_azione_action_true() {
         let mut input = sample_input();

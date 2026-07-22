@@ -106,7 +106,14 @@ impl PromptOptimizerWorker {
                AND r.prompt_version = t.version
                AND r.created_at >= NOW() - INTERVAL '7 days'
             WHERE t.is_active = TRUE
-              AND t.key LIKE 'agent.%'
+              -- Prompt degli AGENTI: i template dei subagenti (agent.*) e il
+              -- system del run principale (system.nexus_base). Il filtro era il
+              -- solo 'agent.%', che escludeva proprio il prompt su cui passa la
+              -- quasi totalita' del volume: nell'ultima settimana 575 delle 579
+              -- interazioni erano del run principale. Con quel filtro il worker
+              -- non avrebbe MAI raggiunto min_runs su nessuna chiave, restando a
+              -- zero con l'aria di funzionare (regola O).
+              AND (t.key LIKE 'agent.%' OR t.key = 'system.nexus_base')
             GROUP BY t.key, t.version, t.content
             HAVING COUNT(r.id) >= $1
             ORDER BY avg_reflection_score ASC

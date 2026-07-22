@@ -1,158 +1,62 @@
 //! `LearnerNode` — porta la parte DETERMINISTICA del `learner_node`
 //! (`brain/agents/nodes/__init__.py:4466-4635`).
 //!
-//! Il learner e' il nodo TERMINALE del grafo agentico: non instrada (nessun
-//! edge da portare) e produce un delta minimale `{completed_at}`. Tutto il resto
-//! sono SIDE-EFFECT di persistenza/feedback chiusi nel nodo:
-//!   - filtra il salvataggio Qdrant via un reward PRELIMINARE di qualita';
-//!   - persiste l'interazione (Qdrant + PostgreSQL `brain_learning_interactions`);
-//!   - invia il feedback Q-learning al router (Q-table di mcp-core);
-//!   - in coda lancia il `closure_judge` in SHADOW (best-effort, mig 0391).
+//! Il learner e' il nodo TERMINALE del grafo agentico: non instrada e produce un
+//! delta minimale `{completed_at}`. Il suo unico effetto e' persistere
+//! l'interazione in `brain_learning_interactions` / `brain_task_stats` via
+//! `ctx.db`, fire-and-forget e gated su shadow.
 //!
-//! ## Cosa porta QUESTO PR (deterministico, testato golden 1:1)
+//! ## Cosa faceva e non fa piu' (rimosso, non rimandato)
 //!
-//! - **`prelim_reward`** (`__init__.py:4502-4508`): PUNTO UNICO in
-//!   `decisions::reward` (regola L), accanto a `heuristic_reward`. E' un reward
-//!   DIVERSO dall'euristico (conta `end_turn` + presenza result, non le
-//!   iterazioni). Il nodo lo CHIAMA, non lo re-implementa.
-//! - **`heuristic_reward`** (`__init__.py:4580-4587`): RIUSATO dal punto unico
-//!   `decisions::reward` (regola L: identico al reflection, NON duplicato qui).
-//! - **reward fusion** (`__init__.py:4590-4591`): `final_reward` dallo stato se
-//!   presente, altrimenti l'euristico. Selezione pura ([`Self::fuse_reward`]).
-//! - **save_to_qdrant gate** (`__init__.py:4512`): `auto_extract AND prelim_reward
-//!   >= min_confidence` ([`Self::should_save_qdrant`]).
-//! - **estrazione user_input** (primo HumanMessage, `__init__.py:4491-4495`),
-//!   **payload Qdrant** con preview troncate a 200 CHAR
-//!   (`__init__.py:4538-4539`), **interaction_text** (`__init__.py:4530`),
-//!   **completed_at** (now UTC isoformat, `__init__.py:4488`): tutto in
-//!   [`Self::build_qdrant_payload`] / [`Self::interaction_text`], deterministico.
+//! Il learner Python aveva quattro effetti; il porting ne aveva portato uno solo
+//! e lasciato gli altri tre come valori calcolati e scartati con `let _`, dietro
+//! TODO. Misurando i destinatari si e' visto che non c'era nulla da cablare:
 //!
-//! ## Cosa NON porta (I/O posticipato dietro TODO espliciti, regola H)
+//! - **feedback Q-learning**: `nexus_q_values` e' ferma da settimane,
+//!   `feedback_score` e' valorizzato in 0 righe su 2179, e chi la interroga ha
+//!   due soli chiamanti non-test (un endpoint gRPC senza client e una rotta di
+//!   prova). Il routing reale passa dalla routing matrix, che non la legge. La
+//!   sua chiave — `(task_type, AgentType)`, senza provider ne' modello ne' tier —
+//!   non sarebbe nemmeno agganciabile al routing senza cambiarne lo schema. Il
+//!   trait `RewardSink` che i TODO citavano non e' mai esistito.
+//! - **upsert Qdrant**: nessuna collection di interazioni esiste, e lo stesso
+//!   contenuto e' gia' indicizzato per due vie con lettori vivi
+//!   (`conversation_context`, `chat_history_chunks`). Da notare che qui il
+//!   porting aveva REGREDITO una funzione viva: `qdrant_id` risulta popolato
+//!   fino a giugno e a zero da luglio.
+//! - **closure_judge**: mai portato, nessun codice, flag spenti, nessun
+//!   consumatore.
 //!
-//! Il learner ha 4 effetti di I/O. Per il porting incrementale (path Rust NON
-//! instradato in produzione) NESSUN nuovo trait viene introdotto in questo PR:
-//!
-//! - **submit_feedback** (Q-learning -> Q-table di mcp-core,
-//!   `agent_router_client.py:146`): non mappa su nessuno dei 4 trait esistenti
-//!   (`LlmGateway`/`ToolExecutor`/`EventSink`/`db`). TODO esplicito (porta
-//!   dedicata `RewardSink`, vedi [`Self::run`]). Gated da `(profile_name presente)`
-//!   nel Python (`_agent_router` + `profile_name`): qui calcoliamo COMUNQUE il
-//!   reward fuso (deterministico, golden-abile) ma NON lo inviamo.
-//! - **Persistenza Qdrant** (`store_interaction_vector`: embedding + upsert,
-//!   `__init__.py:4541`): richiede embedding + client Qdrant non disponibili al
-//!   nodo. Costruiamo il payload deterministico (golden-abile) ma NON upsertiamo.
-//!   TODO esplicito.
-//! - **Persistenza PostgreSQL** `brain_learning_interactions`
-//!   (`memory/storage.py:35`): DELEGATA a `ctx.db` come task best-effort
-//!   fire-and-forget, GATED su `!ctx.shadow` (come reflection per
-//!   `nexus_agent_reflections`). In shadow zero scritture; ogni errore e' WARN
-//!   non-fatale (parita' col Python che logga e non rilancia). Vedi
-//!   [`Self::spawn_persist_pg`].
-//! - **closure_judge shadow** (`closure_judge.py`, chiamata LLM avvolta in
-//!   try/except che ingoia tutto, `__init__.py:4627-4631`): e' un sotto-modulo a
-//!   se' (punto unico in `closure_judge.py`). NON portato qui -> TODO esplicito.
-//!   I flag (`agent.closure_judge.*`) sono shadow/OFF di default -> nessuna
-//!   divergenza dal path di produzione.
-//!
-//! REGOLA SHADOW: in `ctx.shadow == true` NESSUN side-effect (niente INSERT,
-//! niente feedback, niente upsert). Verificato nei test.
+//! REGOLA SHADOW: in `ctx.shadow == true` NESSUN side-effect. Verificato nei test.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
-use crate::decisions::reward::{heuristic_reward, prelim_reward, MAX_AGENT_ITERATIONS};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, Message, StateDelta};
 
-/// Lunghezza massima delle preview nel payload Qdrant (`__init__.py:4538-4539`:
-/// `user_input[:200]` / `result[:200]`). Troncamento su CHAR, non byte.
-const PREVIEW_MAX_CHARS: usize = 200;
+// `LearnerConfig` (auto_extract / min_confidence) e' stata rimossa insieme al
+// salvataggio Qdrant che governava: era l'unico suo lettore. Non era comunque
+// configurazione viva — i due call site la costruivano sempre con `::default()`
+// e non esisteva alcun `load_learner_config` che la leggesse dal DB, a
+// differenza di ogni altro nodo del grafo.
 
-/// Config DB-driven del nodo learner, PASSATA (regola G: nessuna lettura DB nel
-/// nodo, nessun fallback hardcoded dentro la logica decisionale).
-///
-/// Mappa i settings letti dal brain via `_get_learning_config()`
-/// (`__init__.py:214-217`, categoria `settings`: `learning_auto_extract` /
-/// `learning_min_confidence`). Default IDENTICI ai safe-default conservativi del
-/// brain (`_LEARNING_CFG_DEFAULTS`): valgono SOLO se il DB e' irraggiungibile,
-/// mai come magic fallback nella logica.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LearnerConfig {
-    /// Estrazione automatica abilitata (`learning_auto_extract`, default true).
-    /// OFF -> nessun salvataggio Qdrant (`__init__.py:4512`).
-    pub auto_extract: bool,
-    /// Soglia minima del `prelim_reward` per salvare in Qdrant
-    /// (`learning_min_confidence`, default 0.6).
-    pub min_confidence: f64,
-}
+// `QdrantPayload` rimosso con il salvataggio che lo produceva. La sua
+// `to_json` era gia' marcata `#[cfg(test)]` con la motivazione esplicita che a
+// runtime non veniva chiamata: un tipo che esisteva solo per i propri test.
 
-impl Default for LearnerConfig {
-    fn default() -> Self {
-        // Default IDENTICI ai `_LEARNING_CFG_DEFAULTS` del brain
-        // (`__init__.py:214-217`). Safe-default se il DB e' irraggiungibile.
-        Self {
-            auto_extract: true,
-            min_confidence: 0.6,
-        }
-    }
-}
-
-/// Payload deterministico costruito per il salvataggio Qdrant
-/// (`__init__.py:4532-4540`). E' golden-abile 1:1: i campi e i troncamenti sono
-/// puri. L'upsert reale (embedding + client Qdrant) e' un TODO esplicito.
-#[derive(Debug, Clone, PartialEq)]
-pub struct QdrantPayload {
-    /// Id del thread (= run_id Nexus).
-    pub thread_id: String,
-    /// Tipo di task (`user_intent`, `__init__.py:4480`).
-    pub task_type: String,
-    /// Modalita' di comportamento.
-    pub behavior_mode: String,
-    /// Provider effettivamente usato (`provider_used`).
-    pub provider: Option<String>,
-    /// Modello effettivamente usato (`model_used`).
-    pub model: Option<String>,
-    /// Preview dell'input utente (primi 200 char).
-    pub input_preview: String,
-    /// Preview dell'output (primi 200 char; vuota se result vuoto).
-    pub output_preview: String,
-}
-
-impl QdrantPayload {
-    /// Serializza nella forma del dict Python (`__init__.py:4532-4540`), per il
-    /// confronto golden 1:1. `provider`/`model` -> `null` se assenti. Usato dai
-    /// test/golden (l'upsert reale e' un TODO, quindi qui non e' chiamato a
-    /// runtime: marcato `cfg(test)` per non figurare come dead_code in build).
-    #[cfg(test)]
-    fn to_json(&self) -> serde_json::Value {
-        json!({
-            "thread_id": self.thread_id,
-            "task_type": self.task_type,
-            "behavior_mode": self.behavior_mode,
-            "provider": self.provider,
-            "model": self.model,
-            "input_preview": self.input_preview,
-            "output_preview": self.output_preview,
-        })
-    }
-}
-
-/// Nodo learner. Stateless: legge lo stato + la config passata. La persistenza
-/// PostgreSQL e' delegata a `ctx.db` (gated su shadow); gli altri I/O sono TODO
-/// espliciti dietro porte dedicate da cablare nell'integrazione (Fase 3 PR2).
-pub struct LearnerNode {
-    /// Config DB-driven (regola G: passata, mai letta dal nodo).
-    cfg: LearnerConfig,
-}
+/// Nodo learner. Stateless e senza configurazione: persiste l'interazione in
+/// `brain_learning_interactions`/`brain_task_stats` via `ctx.db`, gated su
+/// shadow. Era l'unico dei suoi effetti davvero eseguito.
+#[derive(Default)]
+pub struct LearnerNode;
 
 impl LearnerNode {
-    /// Costruisce il nodo con la config DB-driven gia' risolta dal chiamante.
-    pub fn new(cfg: LearnerConfig) -> Self {
-        Self { cfg }
+    pub fn new() -> Self {
+        Self
     }
 
     /// Testo input utente = content del PRIMO HumanMessage dei messages
@@ -165,57 +69,6 @@ impl LearnerNode {
             }
         }
         String::new()
-    }
-
-    /// Tronca una stringa ai primi `PREVIEW_MAX_CHARS` CHAR (`s[:200]` Python su
-    /// stringa: indicizzazione per code-point, non byte). Replica esattamente la
-    /// semantica per stringhe unicode.
-    fn preview(s: &str) -> String {
-        s.chars().take(PREVIEW_MAX_CHARS).collect()
-    }
-
-    /// `interaction_text` per l'embedding Qdrant (`__init__.py:4530`):
-    /// `"Input: {user_input}\nOutput: {result}"`. Deterministico, golden-abile.
-    pub fn interaction_text(user_input: &str, result: &str) -> String {
-        format!("Input: {user_input}\nOutput: {result}")
-    }
-
-    /// Gate del salvataggio Qdrant (`__init__.py:4512`):
-    /// `auto_extract AND prelim_reward >= min_confidence`. Funzione PURA: il
-    /// `prelim_reward` arriva gia' calcolato dal punto unico (regola L).
-    pub fn should_save_qdrant(cfg: &LearnerConfig, prelim: f64) -> bool {
-        cfg.auto_extract && prelim >= cfg.min_confidence
-    }
-
-    /// Costruisce il [`QdrantPayload`] deterministico (`__init__.py:4532-4540`),
-    /// con le preview troncate a 200 char. Non esegue I/O.
-    pub fn build_qdrant_payload(
-        thread_id: &str,
-        task_type: &str,
-        behavior_mode: &str,
-        provider: Option<&str>,
-        model: Option<&str>,
-        user_input: &str,
-        result: &str,
-    ) -> QdrantPayload {
-        QdrantPayload {
-            thread_id: thread_id.to_string(),
-            task_type: task_type.to_string(),
-            behavior_mode: behavior_mode.to_string(),
-            provider: provider.map(str::to_string),
-            model: model.map(str::to_string),
-            input_preview: Self::preview(user_input),
-            // `result[:200] if result else ""` (__init__.py:4539): result vuoto
-            // -> preview vuota (preview("") e' gia' "", quindi equivalente).
-            output_preview: Self::preview(result),
-        }
-    }
-
-    /// Selezione del reward inviato al Q-learning (`__init__.py:4590-4591`):
-    /// `final_reward` dallo stato (prodotto dal reflection) se presente, altrimenti
-    /// l'euristico. Funzione PURA. `final_reward_state` e' `state.get("final_reward")`.
-    pub fn fuse_reward(final_reward_state: Option<f64>, heuristic: f64) -> f64 {
-        final_reward_state.unwrap_or(heuristic)
     }
 
     /// Stringa snake_case dello `stop_reason` per i confronti `== "end_turn"` /
@@ -266,58 +119,28 @@ impl GraphNode<AgentState, AgentNodeCtx> for LearnerNode {
         let user_input = Self::user_input(&state.messages);
         let stop_reason = Self::stop_reason_str(state);
 
-        // ── Reward PRELIMINARE (PUNTO UNICO decisions::reward, regola L) ──────
-        // Filtra il salvataggio Qdrant: interazioni di bassa qualita' non devono
-        // inquinare il RAG (__init__.py:4502-4508). DIVERSO dall'euristico.
-        let prelim = prelim_reward(&stop_reason, !result.is_empty());
-        let save_to_qdrant = Self::should_save_qdrant(&self.cfg, prelim);
-
-        if !self.cfg.auto_extract {
-            tracing::debug!(
-                target: "nexus_agent_graph::learner",
-                "learner: salvataggio Qdrant saltato (auto_extract=false)"
-            );
-        } else if prelim < self.cfg.min_confidence {
-            tracing::debug!(
-                target: "nexus_agent_graph::learner",
-                prelim,
-                min_confidence = self.cfg.min_confidence,
-                stop = %stop_reason,
-                "learner: salvataggio Qdrant saltato (reward_prelim < min_confidence)"
-            );
-        }
         if result.is_empty() {
             tracing::warn!(
                 target: "nexus_agent_graph::learner",
                 stop = %stop_reason,
-                "learner: result vuoto, skip Qdrant/PostgreSQL"
+                "learner: result vuoto, skip persistenza"
             );
         }
 
-        // ── Payload Qdrant deterministico (golden-abile) ──────────────────────
-        // Costruito SEMPRE (puro): l'upsert reale e' un TODO. Il gate Python
-        // (__init__.py:4529) richiede user_input && result && save_to_qdrant.
-        let _qdrant_payload: Option<QdrantPayload> =
-            if !user_input.is_empty() && !result.is_empty() && save_to_qdrant {
-                let p = Self::build_qdrant_payload(
-                    &thread_id,
-                    &task_type,
-                    &behavior_mode,
-                    provider.as_deref(),
-                    model.as_deref(),
-                    &user_input,
-                    &result,
-                );
-                // TODO porting: upsert Qdrant (store_interaction_vector,
-                // __init__.py:4541) dietro porta dedicata (embedding + client
-                // Qdrant non disponibili al nodo, Fase 3 PR2 integrazione). Qui
-                // costruiamo SOLO il payload deterministico (interaction_text +
-                // metadata), senza upsertare: niente side-effect, niente qdrant_id.
-                let _interaction_text = Self::interaction_text(&user_input, &result);
-                Some(p)
-            } else {
-                None
-            };
+        // Qui si costruiva un payload Qdrant che nessuno upsertava. RIMOSSO
+        // invece che cablato, dopo aver misurato: nessuna collection di
+        // interazioni esiste su Qdrant (10 censite, nessuna e' quella), e lo
+        // stesso contenuto ("Input: ... Output: ...") e' gia' indicizzato per
+        // due vie CON lettori vivi — `conversation_context`, scritta a ogni
+        // turno, e `chat_history_chunks` via ContextOffload. Cablarlo avrebbe
+        // aggiunto un terzo supporto per lo stesso dato, in una collection che
+        // nessuno interroga.
+        //
+        // Il porting Rust aveva pero' REGREDITO una funzione viva: in
+        // `brain_learning_interactions` il campo `qdrant_id` risulta popolato a
+        // maggio (74 righe) e giugno (430), e a zero da luglio. Non e' un TODO
+        // mai fatto: e' una funzione persa. Lo storico e' comunque gia' orfano —
+        // quei `qdrant_id` non trovano riscontro in nessuna collection viva.
 
         // ── Persistenza PostgreSQL (best-effort, GATED su shadow) ─────────────
         // brain_learning_interactions (memory/storage.py:35). Gate Python:
@@ -338,35 +161,23 @@ impl GraphNode<AgentState, AgentNodeCtx> for LearnerNode {
             );
         }
 
-        // ── Reward fuso per il Q-learning (deterministico, golden-abile) ──────
-        // heuristic_reward: PUNTO UNICO decisions::reward (regola L, RIUSATO).
-        // iteration_budget non e' nel learner Python: usa MAX_AGENT_ITERATIONS
-        // come floor (`iterations >= MAX_AGENT_ITERATIONS`, __init__.py:4582).
-        let iterations = state.iterations.unwrap_or(0);
-        let heuristic = heuristic_reward(
-            &stop_reason,
-            !result.is_empty(),
-            iterations,
-            // budget=0 -> il punto unico ricade su MAX_AGENT_ITERATIONS (il
-            // learner Python confronta direttamente con MAX_AGENT_ITERATIONS).
-            0,
-        );
-        let _reward = Self::fuse_reward(state.final_reward, heuristic);
-
-        // TODO porting: feedback Q-table dietro trait RewardSink, Fase 3 PR2
-        // integrazione (submit_feedback -> Q-table di mcp-core,
-        // agent_router_client.py:146). Non mappa su nessuno dei 4 trait esistenti
-        // (LlmGateway/ToolExecutor/EventSink/db); NON introduciamo un nuovo trait
-        // ora. Gated nel Python da (profile_name presente); qui calcoliamo
-        // COMUNQUE il reward fuso (deterministico) ma NON lo inviamo. In shadow
-        // andrebbe comunque soppresso (zero side-effect).
-        let _ = (MAX_AGENT_ITERATIONS, &state.profile_name);
-
-        // TODO porting: closure_judge come modulo separato (closure_judge.py,
-        // mig 0391). Chiamata LLM best-effort avvolta in try/except che ingoia
-        // tutto (__init__.py:4627-4631). E' un punto unico a se'; i flag
-        // (agent.closure_judge.shadow_enabled/active) sono shadow/OFF di default
-        // -> nessuna divergenza dal path di produzione. NON portato qui.
+        // Qui si calcolava un reward fuso che nessuno riceveva. RIMOSSO invece
+        // che cablato, dopo aver misurato il destinatario: la Q-table
+        // (`nexus_q_values`) e' ferma da settimane, `feedback_score` e'
+        // valorizzato in 0 righe su 2179, e chi la interroga
+        // (`suggest_agent`/`select_agent`) ha due soli chiamanti non-test — un
+        // endpoint gRPC senza client e una rotta di prova. Il routing vero passa
+        // dalla routing matrix, che la Q-table non la legge mai.
+        //
+        // Non e' solo lavoro inerte: la chiave della Q-table e'
+        // `(task_type, AgentType)`, senza provider ne' modello ne' tier, quindi
+        // non e' nemmeno agganciabile al routing dei modelli senza prima
+        // cambiarne lo schema. Il trait `RewardSink` che i commenti citavano non
+        // e' mai esistito in questo repo.
+        //
+        // `closure_judge` era anch'esso solo un commento: nessun codice, flag
+        // spenti, nessun consumatore. Rimosso il riferimento con lo stesso
+        // criterio.
 
         tracing::info!(
             target: "nexus_agent_graph::learner",
@@ -571,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_delta_solo_completed_at() {
-        let node = LearnerNode::new(LearnerConfig::default());
+        let node = LearnerNode::new();
         let ctx = ctx_with(false);
         let st = base_state();
         let delta_typed: StateDelta = {
@@ -596,7 +407,7 @@ mod tests {
     /// persistenza e' soppressa, ma il nodo termina pulito).
     #[tokio::test]
     async fn shadow_nessun_side_effect() {
-        let node = LearnerNode::new(LearnerConfig::default());
+        let node = LearnerNode::new();
         let ctx = ctx_with(true); // shadow
         let st = base_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -604,33 +415,10 @@ mod tests {
         assert!(out.completed_at.is_some());
     }
 
-    /// auto_extract=false: il gate Qdrant e' chiuso (nessun salvataggio), ma il
-    /// nodo termina comunque con {completed_at}.
-    #[tokio::test]
-    async fn flag_auto_extract_off() {
-        let cfg = LearnerConfig {
-            auto_extract: false,
-            ..Default::default()
-        };
-        let node = LearnerNode::new(cfg);
-        let ctx = ctx_with(false);
-        let st = base_state();
-        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
-        assert!(out.completed_at.is_some());
-        // Gate Qdrant chiuso indipendentemente dal reward.
-        assert!(!LearnerNode::should_save_qdrant(
-            &LearnerConfig {
-                auto_extract: false,
-                ..Default::default()
-            },
-            1.0
-        ));
-    }
-
-    /// result vuoto: il nodo non scrive Qdrant/PG ma chiude pulito.
+    /// result vuoto: il nodo non persiste ma chiude pulito.
     #[tokio::test]
     async fn result_vuoto_chiude_pulito() {
-        let node = LearnerNode::new(LearnerConfig::default());
+        let node = LearnerNode::new();
         let ctx = ctx_with(false);
         let mut st = base_state();
         st.result = Some(String::new());
@@ -648,253 +436,15 @@ mod tests {
         assert_eq!(LearnerNode::user_input(&[]), "");
     }
 
-    #[test]
-    fn should_save_qdrant_gate() {
-        let cfg = LearnerConfig {
-            auto_extract: true,
-            min_confidence: 0.6,
-        };
-        // prelim >= soglia E auto_extract -> true.
-        assert!(LearnerNode::should_save_qdrant(&cfg, 0.6));
-        assert!(LearnerNode::should_save_qdrant(&cfg, 1.0));
-        // prelim < soglia -> false.
-        assert!(!LearnerNode::should_save_qdrant(&cfg, 0.4));
-        // auto_extract off -> false anche se sopra soglia.
-        let off = LearnerConfig {
-            auto_extract: false,
-            min_confidence: 0.6,
-        };
-        assert!(!LearnerNode::should_save_qdrant(&off, 1.0));
-    }
 
-    #[test]
-    fn fuse_reward_final_o_heuristic() {
-        // final_reward presente -> usa quello.
-        assert_eq!(LearnerNode::fuse_reward(Some(0.94), 1.0), 0.94);
-        // final_reward assente -> usa l'euristico.
-        assert_eq!(LearnerNode::fuse_reward(None, 0.4), 0.4);
-    }
 
-    #[test]
-    fn preview_tronca_a_200_char() {
-        let lunga = "x".repeat(500);
-        let p = LearnerNode::preview(&lunga);
-        assert_eq!(p.chars().count(), 200);
-        // Unicode: i 200 sono CODE-POINT, non byte.
-        let unicode = "à".repeat(300);
-        let pu = LearnerNode::preview(&unicode);
-        assert_eq!(pu.chars().count(), 200);
-    }
 
-    #[test]
-    fn interaction_text_formato() {
-        assert_eq!(
-            LearnerNode::interaction_text("dom", "ris"),
-            "Input: dom\nOutput: ris"
-        );
-    }
 
-    #[test]
-    fn build_payload_preview_e_provider_null() {
-        let p = LearnerNode::build_qdrant_payload(
-            "tid",
-            "code_write",
-            "bilanciata",
-            None,
-            None,
-            &"a".repeat(300),
-            &"b".repeat(300),
-        );
-        assert_eq!(p.input_preview.chars().count(), 200);
-        assert_eq!(p.output_preview.chars().count(), 200);
-        let j = p.to_json();
-        assert_eq!(j["provider"], json!(null));
-        assert_eq!(j["model"], json!(null));
-        assert_eq!(j["thread_id"], json!("tid"));
-    }
 }
 
-#[cfg(test)]
-mod golden {
-    //! Golden-test di PARITA' 1:1 vs Python sulla logica DETERMINISTICA del nodo
-    //! learner + del punto unico reward. Lo script `/tmp/gen_golden_learner.py`
-    //! replica byte-fedele la logica inline del `learner_node`
-    //! (`prelim_reward`, reward fusion, save_to_qdrant gate, troncamenti payload,
-    //! user_input) e per il reward Q-learning importa il punto unico gia' validato
-    //! e salva `{case_id, function, input, output}` in `/tmp/golden_learner.json`.
-    //!
-    //! `#[ignore]` perche' dipende dal file generato. Comando:
-    //!   python3 /tmp/gen_golden_learner.py
-    //!   cargo test -p nexus-agent-graph --lib golden_learner_parita -- --ignored
+// Il `mod golden` del learner e' stato rimosso con le funzioni che esercitava
+// (fuse_reward, should_save_qdrant, interaction_text, build_qdrant_payload).
+// Era comunque un test che non poteva girare: `#[ignore]`, dipendente da
+// `/tmp/golden_learner.json` e da uno script generatore Python cancellato col
+// porting zero-Python (ADR 0041), su un percorso che su Windows non esiste.
 
-    use serde::Deserialize;
-    use serde_json::{json, Value};
-
-    use super::{LearnerConfig, LearnerNode};
-    use crate::decisions::reward::{heuristic_reward, prelim_reward};
-    use crate::state::{Message, MessageContent};
-
-    #[derive(Debug, Deserialize)]
-    struct GoldenCase {
-        case_id: String,
-        function: String,
-        input: Value,
-        output: Value,
-    }
-
-    #[test]
-    #[ignore = "richiede /tmp/golden_learner.json generato da gen_golden_learner.py"]
-    fn golden_learner_parita() {
-        let Some(raw) =
-            crate::golden_util::load_golden("golden_learner.json", "gen_golden_learner.py")
-        else {
-            return;
-        };
-        let cases: Vec<GoldenCase> = serde_json::from_str(&raw).expect("golden JSON malformato");
-        assert!(!cases.is_empty(), "golden vuoto");
-
-        let mut checked = 0usize;
-        for c in &cases {
-            let got: Value = match c.function.as_str() {
-                "prelim_reward" => {
-                    let sr = c
-                        .input
-                        .get("stop_reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let res = c
-                        .input
-                        .get("result_non_empty")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    json!(prelim_reward(sr, res))
-                }
-                "heuristic_reward" => {
-                    let sr = c
-                        .input
-                        .get("stop_reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let res = c
-                        .input
-                        .get("result_non_empty")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let it = c
-                        .input
-                        .get("iterations")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0);
-                    let bud = c
-                        .input
-                        .get("iteration_budget")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0);
-                    json!(heuristic_reward(sr, res, it, bud))
-                }
-                "fuse_reward" => {
-                    // final_reward_state e' null o un float.
-                    let frs = c.input.get("final_reward_state").and_then(Value::as_f64);
-                    let h = c
-                        .input
-                        .get("heuristic")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    json!(LearnerNode::fuse_reward(frs, h))
-                }
-                "should_save_qdrant" => {
-                    let auto = c
-                        .input
-                        .get("auto_extract")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let minc = c
-                        .input
-                        .get("min_confidence")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let prelim = c
-                        .input
-                        .get("prelim_reward")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0);
-                    let cfg = LearnerConfig {
-                        auto_extract: auto,
-                        min_confidence: minc,
-                    };
-                    json!(LearnerNode::should_save_qdrant(&cfg, prelim))
-                }
-                "interaction_text" => {
-                    let ui = c
-                        .input
-                        .get("user_input")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let res = c.input.get("result").and_then(Value::as_str).unwrap_or("");
-                    json!(LearnerNode::interaction_text(ui, res))
-                }
-                "build_qdrant_payload" => {
-                    let ui = c
-                        .input
-                        .get("user_input")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let res = c.input.get("result").and_then(Value::as_str).unwrap_or("");
-                    let tid = c
-                        .input
-                        .get("thread_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let tt = c
-                        .input
-                        .get("task_type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let bm = c
-                        .input
-                        .get("behavior_mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let prov = c.input.get("provider").and_then(Value::as_str);
-                    let model = c.input.get("model").and_then(Value::as_str);
-                    let p = LearnerNode::build_qdrant_payload(tid, tt, bm, prov, model, ui, res);
-                    p.to_json()
-                }
-                "user_input" => {
-                    // input.messages = lista di {role, content}; ricostruiamo i Message.
-                    let msgs_raw = c
-                        .input
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .expect("messages");
-                    let msgs: Vec<Message> = msgs_raw
-                        .iter()
-                        .filter_map(|m| {
-                            let role = m.get("role").and_then(Value::as_str)?;
-                            let content = m.get("content").and_then(Value::as_str).unwrap_or("");
-                            match role {
-                                "user" | "human" => Some(Message::Human {
-                                    content: MessageContent::text(content),
-                                }),
-                                _ => None,
-                            }
-                        })
-                        .collect();
-                    json!(LearnerNode::user_input(&msgs))
-                }
-                other => panic!("funzione golden sconosciuta: {other} (caso {})", c.case_id),
-            };
-
-            assert!(
-                got == c.output,
-                "PARITA' FALLITA caso {} ({}):\n  rust   = {}\n  python = {}",
-                c.case_id,
-                c.function,
-                got,
-                c.output
-            );
-            checked += 1;
-        }
-        println!("golden learner: {checked} casi verificati, tutti verdi");
-    }
-}

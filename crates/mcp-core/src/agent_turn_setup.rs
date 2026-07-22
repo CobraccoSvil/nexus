@@ -39,6 +39,15 @@ use crate::agent_types::{
 /// PRIMA la fonte Python, altrimenti i due motori divergerebbero).
 pub const PRIMARY_BEHAVIOR_MODE: &str = "bilanciata";
 
+/// Chiave del template di sistema del run PRINCIPALE
+/// (`nexus_prompt_templates.key`). Punto unico (regola L): il letterale era
+/// ripetuto nei call site che risolvono il system prompt, e serve ora anche come
+/// `prompt_key` con cui il ReflectionNode persiste in `nexus_agent_reflections`.
+///
+/// I sub-run NON usano questa: portano la `prompt_key` della propria definizione
+/// (`nexus_subagent_definitions.prompt_key`).
+pub const PRIMARY_PROMPT_KEY: &str = "system.nexus_base";
+
 
 /// Costruisce il JSON tools da inviare al brain applicando la discovery mode.
 ///

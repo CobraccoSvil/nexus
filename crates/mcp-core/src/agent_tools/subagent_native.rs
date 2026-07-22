@@ -3285,6 +3285,7 @@ async fn prepare_subagent_run(
         provider,
         model,
         system_text,
+        prompt_key: definition.prompt_key.clone(),
         initial_msg,
         tools_json,
         current_depth,
@@ -3340,6 +3341,11 @@ struct SubagentExecInputs {
     provider: String,
     model: String,
     system_text: String,
+    /// Chiave del template di sistema del sub-run
+    /// (`nexus_subagent_definitions.prompt_key`): viaggia fino allo stato del
+    /// grafo perche' il ReflectionNode attribuisca la reflection al prompt
+    /// giusto invece che a quello del run principale.
+    prompt_key: String,
     initial_msg: String,
     tools_json: Value,
     current_depth: i64,
@@ -3381,6 +3387,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         provider,
         model,
         system_text,
+        prompt_key,
         initial_msg,
         tools_json,
         current_depth,
@@ -3449,6 +3456,10 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         provider,
         model,
         system_text,
+        // Il sub-run porta la chiave della PROPRIA definizione, cosi' le sue
+        // reflection sono attribuite al prompt giusto e non a quello del run
+        // principale.
+        prompt_key: Some(prompt_key.clone()),
         initial_msg,
         // Sub-run isolato: NIENTE history del main (parita' col brain `run_subagent`,
         // che parte da messages=[Human(task)]).
