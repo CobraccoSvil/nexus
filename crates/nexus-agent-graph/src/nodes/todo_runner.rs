@@ -171,6 +171,24 @@ pub enum OnFailure {
     Continue,
 }
 
+impl OnFailure {
+    /// PUNTO UNICO di parse dell'identificatore canonico (regola N): i soli
+    /// valori ammessi sono `stop` | `retry` | `continue`, gli stessi che la
+    /// migrazione 0431 documenta per `agent.continuous.todo_isolation_on_failure`.
+    ///
+    /// Un valore ignoto ritorna `None` e NON degrada in silenzio: il chiamante
+    /// deve segnalarlo, altrimenti un refuso nel DB farebbe girare il sistema con
+    /// una politica che l'operatore non ha scelto, senza alcuna traccia.
+    pub fn try_parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "stop" => Some(Self::Stop),
+            "retry" => Some(Self::Retry),
+            "continue" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
 /// Tronca un summary su CHAR (codepoint) a `max_chars`, con suffisso
 /// `...[troncato]`. Replica 1:1 `_compact` (`todo_runner_node.py:56-62`):
 /// `str(text or "").strip()`, se `len <= max_chars` ritorna intero, altrimenti
@@ -1816,6 +1834,25 @@ mod tests {
     }
 
     // ── Funzioni pure (smoke; il golden copre la parita' 1:1) ────────────────────
+
+    #[test]
+    fn on_failure_parse_identificatori_canonici() {
+        // Punto unico di parse (regola N): SOLO stop|retry|continue, gli stessi
+        // identificatori che la mig 0431 documenta per la chiave DB.
+        assert_eq!(OnFailure::try_parse("stop"), Some(OnFailure::Stop));
+        assert_eq!(OnFailure::try_parse("retry"), Some(OnFailure::Retry));
+        assert_eq!(OnFailure::try_parse("continue"), Some(OnFailure::Continue));
+        // Il valore arriva dal DB ed e' editabile a mano: spazi e maiuscole non
+        // devono far perdere la scelta dell'operatore.
+        assert_eq!(
+            OnFailure::try_parse("  CONTINUE "),
+            Some(OnFailure::Continue)
+        );
+        // Sinonimo italiano e stringa vuota NON sono identificatori canonici:
+        // None, cosi' il chiamante segnala invece di degradare in silenzio.
+        assert_eq!(OnFailure::try_parse("continua"), None);
+        assert_eq!(OnFailure::try_parse(""), None);
+    }
 
     #[test]
     fn compact_tronca_su_char() {

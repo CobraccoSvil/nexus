@@ -116,7 +116,7 @@ use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
     ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict, LearnerConfig,
-    LearnerNode, Message, ReviewGateConfig, ReviewGateNode, ReviewGateVerdict,
+    LearnerNode, Message, OnFailure, ReviewGateConfig, ReviewGateNode, ReviewGateVerdict,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
     UnderstandingNode, SupervisorMode,
@@ -1771,18 +1771,45 @@ async fn resolve_prompt_template(db: &PgPool, key: &str) -> Option<String> {
 }
 
 /// Costruisce la [`TodoRunnerConfig`] DB-driven (regola G): legge dal DB il kind
-/// del sub-agent e il numero massimo di retry col PUNTO UNICO
-/// `nexus_auth::get_setting` (per `todo_isolation_kind`, campo String, il pattern
-/// `get_setting().unwrap_or(default)` come `planner_prompt_key`). Gli ALTRI campi
-/// (on_failure, dag_topological_enabled, summary_max_chars) restano al `Default`
-/// (safe-default identico ai `_SAFE_DEFAULTS` del brain: valgono SOLO se la chiave
-/// manca o il DB e' irraggiungibile, mai come magic fallback nella logica).
+/// del sub-agent, la POLITICA AL FALLIMENTO e il numero massimo di retry col
+/// PUNTO UNICO `nexus_auth::get_setting`. I restanti campi
+/// (dag_topological_enabled, summary_max_chars) restano al `Default`
+/// (safe-default: vale SOLO se la chiave manca o il DB e' irraggiungibile, mai
+/// come magic fallback nella logica).
+///
+/// `on_failure` era un SETTING FANTASMA: la migrazione 0431 semina
+/// `agent.continuous.todo_isolation_on_failure` e ne documenta le tre politiche,
+/// ma nessuno la leggeva e il nodo restava inchiodato a `stop`. Conseguenza vista
+/// sul campo (2026-07-22): un fallimento sul backend chiudeva l'intero piano e
+/// lasciava `pending` frontend e README, che non ne dipendevano affatto; scegliere
+/// `continue` dal DB non aveva alcun effetto.
 async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
     let d = TodoRunnerConfig::default();
     TodoRunnerConfig {
         todo_isolation_kind: nexus_auth::get_setting(db, "agent.continuous.todo_isolation_kind")
             .await
             .unwrap_or(d.todo_isolation_kind),
+        on_failure: match nexus_auth::get_setting(
+            db,
+            "agent.continuous.todo_isolation_on_failure",
+        )
+        .await
+        {
+            Some(raw) => match OnFailure::try_parse(&raw) {
+                Some(p) => p,
+                None => {
+                    // Refuso nel DB: non si degrada in silenzio a una politica
+                    // che l'operatore non ha scelto (regola M).
+                    tracing::warn!(
+                        valore = %raw,
+                        "agent.continuous.todo_isolation_on_failure: valore ignoto \
+                         (attesi stop|retry|continue), uso il default"
+                    );
+                    d.on_failure
+                }
+            },
+            None => d.on_failure,
+        },
         max_retries: setting_i64(
             db,
             "agent.continuous.todo_isolation_max_retries",
