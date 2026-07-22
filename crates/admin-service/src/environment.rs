@@ -100,9 +100,50 @@ async fn check_playwright_libs() -> EnvironmentCheck {
     )
 }
 
+/// Cartella dove Playwright installa i browser, secondo l'OS.
+///
+/// Era `$HOME/.cache/ms-playwright` con fallback `/root`: un percorso che su
+/// Windows non esiste, quindi il check riportava "Chromium browser: not
+/// installed" SEMPRE, anche col browser regolarmente installato — un falso
+/// allarme fisso nel pannello Environment. Gli altri due check dello stesso file
+/// avevano gia' il ramo portabile (`check_playwright_libs` con
+/// `#[cfg(windows)]`, `check_frontend_process` col probe TCP): questo era
+/// rimasto indietro.
+///
+/// `PLAYWRIGHT_BROWSERS_PATH` ha la precedenza, come per Playwright stesso: chi
+/// la imposta sta dicendo dove guardare.
+fn playwright_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(esplicito) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
+        if !esplicito.trim().is_empty() {
+            return Some(std::path::PathBuf::from(esplicito));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // %LOCALAPPDATA%\ms-playwright
+        std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|d| std::path::PathBuf::from(d).join("ms-playwright"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".cache").join("ms-playwright"))
+    }
+}
+
 async fn check_playwright_browser() -> EnvironmentCheck {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let cache_dir = format!("{}/.cache/ms-playwright", home);
+    let Some(cache_dir) = playwright_cache_dir() else {
+        // Nessuna variabile da cui dedurre il percorso: si dichiara l'incertezza
+        // invece di riportare "not installed", che sarebbe una diagnosi non
+        // supportata dai fatti.
+        return EnvironmentCheck::error(
+            "playwright_browser",
+            "Chromium browser",
+            "percorso della cache Playwright non determinabile (ne' PLAYWRIGHT_BROWSERS_PATH, ne' la home dell'utente)",
+        );
+    };
 
     let found = if let Ok(mut rd) = tokio::fs::read_dir(&cache_dir).await {
         let mut has_entry = false;

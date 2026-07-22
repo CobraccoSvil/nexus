@@ -36,7 +36,7 @@ pub use final_gate::{
     build_error_files, count_build_errors, error_file_matches_touched, FinalGateConfig,
     FinalGateNode, FINAL_GATE_ESCALATION_KEY,
 };
-pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
+pub use learner::LearnerNode;
 pub use planner::{
     clarifying_branch, plan_reuse_decision, ClarifyingBranch, PlanReuse, PlannerConfig,
     PlannerNode, ToolResultOutcome,
@@ -101,4 +101,4 @@ pub async fn emit_phase_meta_correlated(
     });
     let _ = store.persist_meta_step(meta, mode).await;
 }
-pub use verifier::{suggest_remediation, VerifierConfig, VerifierNode};
+pub use verifier::{suggest_remediation, TodoCriteriaMode, VerifierConfig, VerifierNode};

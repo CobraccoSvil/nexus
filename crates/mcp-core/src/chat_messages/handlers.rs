@@ -1081,6 +1081,7 @@ async fn try_resume_interrupted_run(
             provider: provider_r.clone(),
             model: model_r.clone(),
             system_text: String::new(),
+            prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: resume_prompt,
             conversation_history: resume_history,
             tools_json: tools_for_resume,

@@ -8,7 +8,11 @@
 #   4. Endpoint interno /health su PROD_HOST -> 200
 #   5. Log core/webide ultimi 100 righe senza ERROR/panic
 #   6. Endpoint pubblico PUBLIC_URL/health attraverso .03 -> 200
-#   7. (Best-effort) routing_matrix populated
+#   7. routing_matrix popolata - BLOCCANTE come gli altri (direttiva G): una
+#      matrice vuota fa panicare mcp-core all'avvio, quindi un deploy in quello
+#      stato non e' degradato, e' rotto. L'intestazione lo dava per "best-effort"
+#      ma il check incrementa CHECKS_FAILED come tutti e lo script esce 1: a
+#      mentire era il commento, non il codice.
 #
 # Exit code: 0 tutto OK, 1 al primo fallimento.
 # Uso: ./deploy/health-check.sh [--verbose] [--external-only]

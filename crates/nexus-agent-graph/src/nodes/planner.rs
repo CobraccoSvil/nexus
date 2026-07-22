@@ -1858,6 +1858,7 @@ mod tests {
             write_scope: Vec::new(),
             content: None,
             priority: None,
+            acceptance_criteria: Vec::new(),
         }
     }
 

@@ -415,7 +415,7 @@ mod tests {
 
     use crate::nodes::{
         ClarifyConfig, ClarifyOrExpandNode, ExecutorConfig, ExecutorNode, FinalGateConfig,
-        FinalGateNode, LearnerConfig, LearnerNode, PlannerNode, ReflectionConfig, ReflectionNode,
+        FinalGateNode, LearnerNode, PlannerNode, ReflectionConfig, ReflectionNode,
         RouterNode, ScaleControlNode, StallRecoveryNode, SupervisorNode, TodoRunnerConfig,
         TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
         UnderstandingNode, VerifierConfig, VerifierNode,
@@ -743,7 +743,7 @@ mod tests {
                 meta_steps.clone(),
             )),
             reflection: Arc::new(ReflectionNode::new(ReflectionConfig::default())),
-            learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
+            learner: Arc::new(LearnerNode::new()),
         }
     }
 

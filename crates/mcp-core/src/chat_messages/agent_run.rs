@@ -3121,6 +3121,9 @@ pub(crate) async fn spawn_agent_run(
                     provider: provider_clone.clone(),
                     model: model_clone.clone(),
                     system_text: system_text_clone.clone(),
+                    // Chiave del prompt di sistema del run principale: la usa il
+                    // ReflectionNode per attribuire la reflection al template.
+                    prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
                     initial_msg: initial_msg_clone.clone(),
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
@@ -4187,6 +4190,7 @@ pub(crate) async fn confirm_native_run(
         provider: provider.clone(),
         model: model.clone(),
         system_text: String::new(),
+        prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
         conversation_history: Vec::new(),
         tools_json: serde_json::json!([]),
@@ -4577,6 +4581,7 @@ pub(crate) async fn resume_fanin(
         provider,
         model,
         system_text: String::new(),
+        prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
         conversation_history: Vec::new(),
         tools_json: serde_json::json!([]),

@@ -105,7 +105,7 @@ use nexus_agent_graph::decisions::supervisor::{
 };
 use nexus_agent_graph::nodes::{
     ExecutorConfig, ExecutorNode, ScaleConfig, ScaleControlNode, StallRecoveryNode, SupervisorNode,
-    VerifierConfig, VerifierNode,
+    TodoCriteriaMode, VerifierConfig, VerifierNode,
 };
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
@@ -115,7 +115,7 @@ use nexus_agent_graph::runtime::ports::{
 use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
-    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict, LearnerConfig,
+    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict,
     LearnerNode, Message, OnFailure, ReviewGateConfig, ReviewGateNode, ReviewGateVerdict,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
@@ -189,6 +189,19 @@ pub struct NativeRunInput {
     pub model: String,
     /// System prompt completo del run.
     pub system_text: String,
+    /// CHIAVE del template di sistema usato (`nexus_prompt_templates.key`), es.
+    /// `system.nexus_base` per il run principale o la `prompt_key` della
+    /// definizione subagente per un sub-run.
+    ///
+    /// Non e' cosmetica: e' la chiave con cui il ReflectionNode persiste in
+    /// `nexus_agent_reflections`, e senza di essa la persistenza esce subito.
+    /// Il campo era gia' previsto nello stato (`profile_name`) ma nessuno lo
+    /// valorizzava — l'unica assegnazione in tutto il workspace era una fixture
+    /// di test — quindi quella tabella era a ZERO righe e con lei
+    /// `prompt_ab_experiments`. A digiuno restavano cinque consumatori vivi: il
+    /// `PromptOptimizerWorker`, registrato e con `optimizer_enabled=true`, e le
+    /// tre rotte `/prompt-experiments` di admin-service.
+    pub prompt_key: Option<String>,
     /// Messaggio iniziale dell'utente (con blocco allegati gia' inline).
     pub initial_msg: String,
     /// History conversazione in forma LangChain (`Vec<Value>`): convertita in
@@ -876,8 +889,9 @@ pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> Superv
 ///   (`prompt_missing` -> skip): innocuo finche' la plan-phase non si attivava mai,
 ///   diventato bloccante quando i segnali del classifier (task_complexity/
 ///   agentic_score) propagati nello stato hanno reso il planner eleggibile davvero.
-/// - `turn_focus_enabled`: viene dalla CONTINUITY config (`agent.context.turn_focus_enabled`),
-///   non da `orchestrator_config` — TODO wiring continuity (default true).
+/// - `turn_focus_enabled`: letto da `agent.context.turn_focus_enabled`, la STESSA
+///   chiave che legge l'executor. Restava al default hardcoded, quindi spegnere
+///   il setting spegneva il turn-focus per l'executor e non per il planner.
 async fn load_planner_config(db: &PgPool) -> PlannerConfig {
     let d = PlannerConfig::default();
     // Prompt del planner risolto dal registry (vedi nota sopra): chiave -> testo.
@@ -946,9 +960,18 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
             d.orchestration_enabled,
         )
         .await,
-        // Risolti a monte / da altra fonte (vedi doc della funzione): default.
+        // Risolto a monte (vedi doc della funzione): default.
         planner_system_text,
-        turn_focus_enabled: d.turn_focus_enabled,
+        // Stessa chiave che legge l'executor: prima qui restava al default
+        // hardcoded, quindi mettere il setting a `false` spegneva il turn-focus
+        // solo per l'executor e lo lasciava acceso per il planner. Un flag che
+        // vale a meta' e' peggio di un flag assente (regola G).
+        turn_focus_enabled: setting_bool(
+            db,
+            "agent.context.turn_focus_enabled",
+            d.turn_focus_enabled,
+        )
+        .await,
     }
 }
 
@@ -1066,6 +1089,12 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
     let d = VerifierConfig::default();
     VerifierConfig {
         enabled: setting_bool(db, "orchestrator.verifier_enabled", d.enabled).await,
+        // Modo criteri: stringa a tre valori, parse dal punto unico
+        // `TodoCriteriaMode::try_parse` (un valore ignoto ricade su `off` con un
+        // WARN, non accende un enforcement per caso).
+        todo_criteria_mode: TodoCriteriaMode::try_parse(
+            &setting_string(db, "agent.verifier.todo_criteria_mode", "off").await,
+        ),
         max_verify_cycles: setting_i64(db, "orchestrator.max_verify_cycles", d.max_verify_cycles)
             .await,
         fail_closed: setting_bool(db, "agent.verifier.fail_closed", d.fail_closed).await,
@@ -2475,7 +2504,7 @@ async fn build_native_engine(
             meta_steps.clone(),
         )),
         reflection: Arc::new(ReflectionNode::new(reflection_cfg)),
-        learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
+        learner: Arc::new(LearnerNode::new()),
     };
 
     // Checkpointer: dipende dal ruolo.
@@ -2793,6 +2822,10 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         thread_id: Some(input.run_id.to_string()),
         session_id: Some(input.session_id.to_string()),
         system_text: Some(input.system_text.clone()),
+        // Chiave del prompt di sistema: la usa il ReflectionNode come
+        // `prompt_key` per persistere in `nexus_agent_reflections`. Senza,
+        // `spawn_persist` esce subito e la tabella resta vuota (com'era).
+        profile_name: input.prompt_key.clone(),
         intent_hint: input.intent_hint.clone(),
         user_intent: initial_intent,
         action_oriented: initial_action_oriented,
@@ -3582,6 +3615,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "claude-x".to_string(),
             system_text: "sei un assistente".to_string(),
+            prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),
             conversation_history: vec![serde_json::json!({
                 "role": "user",
@@ -3904,6 +3938,32 @@ mod tests {
 
     /// PRIMARIO RUST + classifier RISOLTO su turno d'azione (requires_tools=true):
     /// action_oriented=true FEDELE -> l'agente usa i tool, come il primario Python.
+    /// La chiave del prompt arriva nello stato: senza, il ReflectionNode esce
+    /// subito da `spawn_persist` e `nexus_agent_reflections` resta a zero righe —
+    /// com'e' stata finora, lasciando a digiuno il PromptOptimizerWorker (che e'
+    /// registrato e abilitato) e le rotte `/prompt-experiments`.
+    #[test]
+    fn prompt_key_arriva_nello_stato_del_run() {
+        let input = sample_input();
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(
+            state.profile_name.as_deref(),
+            Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY),
+            "il prompt_key deve arrivare allo stato: e' la chiave con cui la \
+             reflection viene persistita e attribuita al template"
+        );
+    }
+
+    /// Un run senza chiave non persiste, e va bene cosi': meglio nessuna riga
+    /// che una riga attribuita al prompt sbagliato.
+    #[test]
+    fn prompt_key_assente_resta_assente() {
+        let mut input = sample_input();
+        input.prompt_key = None;
+        let state = build_initial_state(&input, RunRole::Primary);
+        assert_eq!(state.profile_name, None);
+    }
+
     #[test]
     fn initial_state_primary_classifier_azione_action_true() {
         let mut input = sample_input();

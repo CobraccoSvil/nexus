@@ -105,6 +105,22 @@ pub struct Todo {
     /// meta-step di presentazione; non usata dallo scheduling.
     #[serde(default)]
     pub priority: Option<String>,
+    /// Criteri di accettazione (`nexus_agent_todos.acceptance_criteria`, JSONB).
+    /// TRASPORTATI come `content`/`priority`, e come loro non usati dallo
+    /// scheduling: li consuma il `VerifierNode`.
+    ///
+    /// Senza questo campo il verifier non ne eseguiva MAI uno. Il dato c'era —
+    /// la colonna esiste dalla migrazione project 0002 e il tool `todos` la
+    /// scrive — ma il verifier lo cercava dentro la ri-serializzazione di questo
+    /// tipo (`todo_value_of`), che non lo portava: risultato, lista sempre vuota
+    /// e ramo "nessun criterion" a ogni giro. La prova indipendente e' che
+    /// `nexus_agent_verifier_runs` era a zero righe su 104 todo con criteri.
+    ///
+    /// `Vec<Value>` e non un tipo strutturato: la forma la normalizza il
+    /// verifier (`normalize_criteria`), che e' il punto unico dove il
+    /// vocabolario dei criteri viene interpretato.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<serde_json::Value>,
 }
 
 /// Config del DAG parallelo (PARAMETRO esplicito, no lettura DB: regola G).
@@ -282,6 +298,7 @@ mod tests {
             write_scope: Vec::new(),
             content: None,
             priority: None,
+            acceptance_criteria: Vec::new(),
         }
     }
 
