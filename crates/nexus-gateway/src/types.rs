@@ -168,7 +168,89 @@ pub struct LlmRequest {
     /// storico invariato).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_provider: Option<String>,
+    /// Durata del RUN che ha originato questa richiesta, in secondi.
+    ///
+    /// Il gateway deriva i propri budget (`request_budget`, `per_attempt`) dal
+    /// run: `budget = run / min_turns`. Ma li derivava una volta sola all'avvio,
+    /// dal default globale `orchestrator.subagent_default_timeout_s` (300s),
+    /// mentre il run vero e' PER FIGURA (`nexus_subagent_definitions.timeout_s`:
+    /// `review` 240, `implement` 600). Una figura da 240s riceveva tentativi
+    /// dimensionati su 300: il gateway prometteva turni che il cronometro del
+    /// chiamante non poteva mantenere.
+    ///
+    /// Il chiamante e' l'unico a conoscere questo numero, quindi lo porta con se'.
+    /// Retrocompatibile in entrambi i versi: assente (client vecchio) = i timeout
+    /// per-processo di sempre; ignoto (gateway vecchio) = serde lo scarta.
+    /// Puo' solo STRINGERE i budget, mai allungarli oltre il default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout_secs: Option<u64>,
     pub metadata: RequestMetadata,
+}
+
+#[cfg(test)]
+mod test_wire_run_timeout {
+    use super::*;
+
+    /// Client VECCHIO -> gateway NUOVO.
+    ///
+    /// Il corpo e' lo stesso sottoinsieme di campi che `scripts/onprem-smoke.sh`
+    /// invia oggi in produzione: se questo test diventa rosso, quel corpo smette
+    /// di essere accettato e lo smoke test on-prem si rompe in silenzio.
+    #[test]
+    fn un_corpo_senza_il_campo_resta_valido() {
+        let corpo = r#"{
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "ciao"}],
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"smoke"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo).expect("corpo storico valido");
+        assert_eq!(req.run_timeout_secs, None);
+    }
+
+    /// Client NUOVO -> gateway NUOVO: il valore arriva.
+    #[test]
+    fn il_campo_arriva_quando_e_presente() {
+        let corpo = r#"{
+            "model": "gpt-4o-mini",
+            "messages": [],
+            "run_timeout_secs": 240,
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"agent"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo).expect("corpo nuovo valido");
+        assert_eq!(req.run_timeout_secs, Some(240));
+    }
+
+    /// Client NUOVO -> gateway VECCHIO: il campo non deve comparire quando e'
+    /// assente, o un deserializzatore piu' rigido a valle lo vedrebbe come
+    /// `null` inatteso.
+    #[test]
+    fn il_campo_assente_non_viene_serializzato() {
+        let req = LlmRequest {
+            model: "m".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            run_timeout_secs: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "f".into(),
+            },
+        };
+        let json = serde_json::to_string(&req).expect("serializza");
+        assert!(
+            !json.contains("run_timeout_secs"),
+            "campo assente non deve finire sul wire: {json}"
+        );
+    }
 }
 
 /// Configurazione extended thinking (`thinking` di `LLMRequest`). `budget_tokens`

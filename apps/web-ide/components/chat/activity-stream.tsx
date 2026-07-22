@@ -234,15 +234,18 @@ function SwitchBand({ sw, tc, domId }: { sw: SwitchEvent; tc: ThemeColors; domId
         <span style={{ fontSize: 15, color: toColor, flexShrink: 0 }}>{"→"}</span>
         <ProviderBadge provider={sw.toProvider} model={sw.toModel ?? null} />
       </div>
-      {(causeLabel || sw.reason || sw.cooldown) && (
+      {(causeLabel || sw.reasonDescription || sw.reason || sw.cooldown) && (
         <div style={{ marginTop: 4, fontSize: 11.5, color: tc.textSecondary }}>
-          {(causeLabel || sw.reason) && (
+          {(causeLabel || sw.reasonDescription || sw.reason) && (
             <>
               Motivo:{" "}
-              {causeLabel ? (
-                // Causa strutturata nota: etichetta umana onesta al posto del
-                // codice tecnico (che resta nel payload per gli sviluppatori).
-                <span>{causeLabel}</span>
+              {/* Una frase, non un identificatore. La causa strutturata (quando
+                  c'e') e' piu' specifica del motivo generico; a seguire la
+                  descrizione composta dal backend. Il codice grezzo resta come
+                  ultimo ripiego per gli eventi vecchi in DB, che la descrizione
+                  non ce l'hanno. */}
+              {(causeLabel ?? sw.reasonDescription) ? (
+                <span>{causeLabel ?? sw.reasonDescription}</span>
               ) : (
                 <code style={codeStyle}>{sw.reason}</code>
               )}

@@ -719,6 +719,7 @@ mod tests {
                 sensitivity_tier: 0,
                 feature: "chat".into(),
             },
+            run_timeout_secs: None,
         }
     }
 

@@ -522,6 +522,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 

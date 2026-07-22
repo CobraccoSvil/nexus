@@ -382,6 +382,7 @@ mod tests {
                 sensitivity_tier: 0,
                 feature: "f".to_string(),
             },
+            run_timeout_secs: None,
         }
     }
 

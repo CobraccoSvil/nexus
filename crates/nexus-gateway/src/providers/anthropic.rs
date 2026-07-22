@@ -1275,6 +1275,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let body = build_request_body(&req, false, None, CacheTtl::Off);
         let json = serde_json::to_value(&body).unwrap();
@@ -1306,6 +1307,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1340,6 +1342,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1374,6 +1377,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1412,6 +1416,7 @@ mod tests {
             tool_choice: Some(choice),
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -1599,6 +1604,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -1717,6 +1723,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
 
@@ -1756,6 +1763,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, false, None, CacheTtl::Off)).unwrap();
         let m = &json["messages"][0];
@@ -1806,6 +1814,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 

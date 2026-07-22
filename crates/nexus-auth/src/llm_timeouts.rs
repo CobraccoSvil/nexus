@@ -92,6 +92,16 @@ pub struct LlmTimeouts {
     pub stream_timeout: Duration,
     /// Turni minimi garantiti usati nella derivazione.
     pub min_guaranteed_turns: u64,
+    /// Il cap per-tentativo GREZZO, prima del `min` col budget.
+    ///
+    /// Serve a [`Self::for_run`]: ri-derivare passando `per_attempt` (gia'
+    /// clampato) al posto del cap originale e' LOSSY. Coi valori reali
+    /// (run 300 / complete 120 / 4 turni -> per_attempt 75), una figura
+    /// `implement` da 600s otterrebbe `min(75, 150) = 75` invece del corretto
+    /// `min(120, 150) = 120`: non un regresso rispetto a oggi, ma meta' del
+    /// beneficio buttata via per i run lunghi. Conservando il grezzo, la
+    /// ri-derivazione da' lo stesso risultato di una lettura fresca dal DB.
+    pub complete_cap: Duration,
 }
 
 impl LlmTimeouts {
@@ -119,6 +129,29 @@ impl LlmTimeouts {
             client_budget: Duration::from_secs(budget.saturating_add(CLIENT_BUDGET_MARGIN_SECS)),
             stream_timeout: Duration::from_secs(stream_secs.max(1)),
             min_guaranteed_turns: turns,
+            complete_cap: Duration::from_secs(complete_secs.max(1)),
+        }
+    }
+
+    /// Gli stessi timeout, ri-derivati per un run di durata NOTA. Senza DB.
+    ///
+    /// E' [`Self::resolve_for_run`] senza IO: serve dove il run reale si scopre
+    /// a valle della lettura dei settings — nel gateway, che conosce la durata
+    /// solo quando arriva la richiesta, e non puo' interrogare il DB a ogni
+    /// chiamata.
+    ///
+    /// `None` (o zero: nel DB significa "non impostato") lascia i timeout
+    /// invariati. Punto unico della scelta: la stessa `run_secs_utile` che usa
+    /// `resolve_for_run`.
+    pub fn for_run(&self, run_timeout_secs: Option<u64>) -> Self {
+        match run_secs_utile(run_timeout_secs) {
+            Some(run) => Self::derive(
+                run,
+                self.complete_cap.as_secs(),
+                self.stream_timeout.as_secs(),
+                self.min_guaranteed_turns,
+            ),
+            None => *self,
         }
     }
 
@@ -145,7 +178,11 @@ impl LlmTimeouts {
     /// parsabile ricade sul proprio default, poi la derivazione riallinea il
     /// tutto: nessuna combinazione di settings puo' violare l'invariante.
     pub async fn resolve(db: &PgPool) -> Self {
-        Self::resolve_for_run(db, None).await
+        let run = setting_u64(db, KEY_RUN_TIMEOUT, DEFAULT_RUN_TIMEOUT_SECS).await;
+        let complete = setting_u64(db, KEY_COMPLETE_TIMEOUT, DEFAULT_COMPLETE_TIMEOUT_SECS).await;
+        let stream = setting_u64(db, KEY_STREAM_TIMEOUT, DEFAULT_STREAM_TIMEOUT_SECS).await;
+        let turns = setting_u64(db, KEY_MIN_GUARANTEED_TURNS, DEFAULT_MIN_GUARANTEED_TURNS).await;
+        Self::derive(run, complete, stream, turns)
     }
 
     /// Come [`resolve`], ma per un run di durata NOTA.
@@ -164,14 +201,7 @@ impl LlmTimeouts {
     /// promessa mantenibile (240/4 = 60s per turno). NON allunga nulla: stringe
     /// il budget della singola chiamata quando il run e' piu' corto del default.
     pub async fn resolve_for_run(db: &PgPool, run_timeout_secs: Option<u64>) -> Self {
-        let run = match run_secs_utile(run_timeout_secs) {
-            Some(reale) => reale,
-            None => setting_u64(db, KEY_RUN_TIMEOUT, DEFAULT_RUN_TIMEOUT_SECS).await,
-        };
-        let complete = setting_u64(db, KEY_COMPLETE_TIMEOUT, DEFAULT_COMPLETE_TIMEOUT_SECS).await;
-        let stream = setting_u64(db, KEY_STREAM_TIMEOUT, DEFAULT_STREAM_TIMEOUT_SECS).await;
-        let turns = setting_u64(db, KEY_MIN_GUARANTEED_TURNS, DEFAULT_MIN_GUARANTEED_TURNS).await;
-        Self::derive(run, complete, stream, turns)
+        Self::resolve(db).await.for_run(run_timeout_secs)
     }
 }
 
@@ -189,7 +219,7 @@ async fn setting_u64(db: &PgPool, key: &str, default: u64) -> u64 {
 /// Estratta perche' la SCELTA della sorgente e' il punto in cui il difetto
 /// vive, e dentro `resolve_for_run` sarebbe verificabile solo con un DB —
 /// cioe' mai (regola O).
-fn run_secs_utile(run_timeout_secs: Option<u64>) -> Option<u64> {
+pub fn run_secs_utile(run_timeout_secs: Option<u64>) -> Option<u64> {
     run_timeout_secs.filter(|&s| s > 0)
 }
 
@@ -304,6 +334,39 @@ mod tests {
             "timeout_s = 0 e' 'non impostato', non 'run istantaneo'"
         );
         assert_eq!(run_secs_utile(None), None);
+    }
+
+    /// `for_run` deve dare lo STESSO risultato di una lettura fresca dal DB.
+    ///
+    /// E' il punto in cui la ri-derivazione poteva perdere informazione: se
+    /// `LlmTimeouts` non conservasse `complete_cap`, l'unico cap disponibile
+    /// sarebbe `per_attempt`, GIA' clampato al budget del run precedente. Coi
+    /// valori reali (300/120/4 -> per_attempt 75), una figura `implement` da
+    /// 600s otterrebbe 75 invece di 120: non un regresso, ma meta' del
+    /// beneficio buttata via -- e in silenzio.
+    ///
+    /// Mutazione che rende rosso: in `for_run` passare `self.per_attempt`
+    /// invece di `self.complete_cap`.
+    #[test]
+    fn ri_derivare_senza_db_equivale_a_rileggere_dal_db() {
+        let complete = 120_u64;
+        for run_reale in [60_u64, 240, 300, 600, 900] {
+            let dal_db_fresco = LlmTimeouts::derive(run_reale, complete, 300, 4);
+            let ri_derivato = LlmTimeouts::derive(DEFAULT_RUN_TIMEOUT_SECS, complete, 300, 4)
+                .for_run(Some(run_reale));
+            assert_eq!(
+                ri_derivato, dal_db_fresco,
+                "run {run_reale}: ri-derivare non deve perdere il cap grezzo"
+            );
+        }
+    }
+
+    /// Durata sconosciuta: i timeout restano quelli del default globale.
+    #[test]
+    fn senza_durata_nota_for_run_non_tocca_nulla() {
+        let base = LlmTimeouts::derive(300, 120, 300, 4);
+        assert_eq!(base.for_run(None), base);
+        assert_eq!(base.for_run(Some(0)), base, "0 = non impostato");
     }
 
     /// Un run piu' LUNGO del default non deve essere stretto dal default: la

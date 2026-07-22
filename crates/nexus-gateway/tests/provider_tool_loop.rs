@@ -120,6 +120,7 @@ fn richiesta_turno1(modello: &str) -> LlmRequest {
         // chiamando `provider.complete` direttamente (non passa dal gateway).
         pin_provider: None,
         metadata: metadata(),
+        run_timeout_secs: None,
     }
 }
 
@@ -181,6 +182,7 @@ fn richiesta_turno2(modello: &str, risposta1: &LlmResponse) -> LlmRequest {
         tool_choice: None,
         pin_provider: None,
         metadata: metadata(),
+        run_timeout_secs: None,
     }
 }
 
