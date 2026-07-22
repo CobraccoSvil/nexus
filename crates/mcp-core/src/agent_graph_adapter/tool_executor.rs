@@ -375,27 +375,10 @@ mod tests {
 
     // ── Replay: lettura da agent_steps + correlazione per nome+ordine ─────────
 
-    /// agent_runs minimale + agent_steps (mig 0009), come nel test di F2a.
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query("CREATE TABLE agent_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid())")
-            .execute(pool)
-            .await
-            .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
+    /// Run reale su cui rileggere gli step in Replay. Le tabelle
+    /// (`agent_runs`, `agent_steps`) le porta il migrator del set project.
+    async fn seed_run(pool: &PgPool) -> Uuid {
+        crate::test_support::seed_agent_run(pool).await
     }
 
     async fn insert_step(
@@ -419,25 +402,14 @@ mod tests {
         .expect("insert step");
     }
 
-    async fn insert_run(pool: &PgPool) -> Uuid {
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(pool)
-            .await
-            .expect("run");
-        run
-    }
-
     // I test Replay esercitano `replay_tool_result` (punto unico della query) +
     // `map_result_to_outcome` (mapping esito) direttamente col solo `&PgPool`:
     // execute_real richiede un `ToolRunnerDeps` reale (ctx di progetto) ed e'
     // coperto a livello E2E in F3 quando run_via_native sara' cablato.
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_legge_tool_result_del_primario(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool).await;
+        let run = seed_run(&pool).await;
         insert_step(&pool, run, 1000, "read_file", Some("contenuto A")).await;
 
         let text = replay_tool_result(&pool, run, "read_file", 0)
@@ -448,10 +420,9 @@ mod tests {
         assert!(!out.is_error);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_correla_per_nome_e_ordine_progressivo(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool).await;
+        let run = seed_run(&pool).await;
         // Due chiamate read_file (step 1000, 2000) + una list_files in mezzo (1500).
         insert_step(&pool, run, 1000, "read_file", Some("primo read")).await;
         insert_step(&pool, run, 1500, "list_files", Some("listing")).await;
@@ -479,10 +450,9 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_missing_se_nessuna_riga(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool).await;
+        let run = seed_run(&pool).await;
         insert_step(&pool, run, 1000, "read_file", Some("solo uno")).await;
 
         // offset 0 ok, offset 1 manca -> ReplayMissing.
@@ -495,10 +465,9 @@ mod tests {
         assert!(matches!(err, PortError::ReplayMissing(_)));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_tool_result_null_e_contenuto_vuoto(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool).await;
+        let run = seed_run(&pool).await;
         // step con tool_result NULL (blocco senza risultato registrato).
         insert_step(&pool, run, 1000, "read_file", None).await;
 
@@ -516,10 +485,9 @@ mod tests {
     /// del cursore per-nome usata in produzione. NB: usa la struct senza il path
     /// Real, quindi serve un `db` valido — lo iniettiamo via il costruttore di test
     /// `from_db_for_replay` (solo per i test, evita di fabbricare `ToolRunnerDeps`).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_cursore_avanza_per_nome(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool).await;
+        let run = seed_run(&pool).await;
         insert_step(&pool, run, 1000, "read_file", Some("uno")).await;
         insert_step(&pool, run, 2000, "read_file", Some("due")).await;
 
@@ -542,6 +510,8 @@ mod tests {
         assert!(matches!(&e, PortError::ReplayMissing(m) if m.ends_with("#2")));
     }
 
+    // Nessun migrator: questo caso non tocca lo schema (l'adapter rifiuta la
+    // chiamata prima di qualunque query), quindi non paga il setup.
     #[sqlx::test]
     async fn real_su_replay_only_e_infra_error_senza_side_effect(pool: PgPool) {
         // Un adapter Replay-only (deps assente) NON deve eseguire tool reali: una

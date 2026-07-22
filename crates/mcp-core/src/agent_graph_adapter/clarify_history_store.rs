@@ -150,41 +150,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Ricrea lo schema minimale (agent_runs + nexus_agent_meta_steps) per i test
-    /// di lettura: solo le colonne che la query usa.
-    async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE nexus_agent_meta_steps ( \
-                 id BIGSERIAL PRIMARY KEY, \
-                 run_id UUID NOT NULL, \
-                 kind TEXT NOT NULL, \
-                 payload JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_agent_meta_steps");
+    /// Sessione chat reale su cui appendere i run: `agent_runs.session_id` e'
+    /// vincolato da una FK verso `chat_sessions(id)`. Le tabelle le porta il
+    /// migrator del set `db/migrations/project`.
+    async fn seed_sessione(pool: &PgPool) -> Uuid {
+        crate::test_support::seed_chat_session(pool, Uuid::new_v4()).await
     }
 
     /// Inserisce un run della sessione con un meta_step clarify che porta `question`.
     async fn insert_clarify(pool: &PgPool, session_id: Uuid, question: &str) {
-        let run_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id) VALUES ($1, $2)")
-            .bind(run_id)
-            .bind(session_id)
-            .execute(pool)
-            .await
-            .expect("insert run");
+        let run_id =
+            crate::test_support::insert_agent_run(pool, session_id, Uuid::new_v4(), "running").await;
         sqlx::query(
             "INSERT INTO nexus_agent_meta_steps (run_id, kind, payload) \
              VALUES ($1, 'clarify', $2)",
@@ -198,10 +174,9 @@ mod tests {
 
     /// La stessa domanda ripetuta 3 volte nella sessione -> conteggio 3 per la
     /// firma della piu' recente. Firme di domande diverse non contano.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn conta_domande_identiche_della_sessione(pool: PgPool) {
-        create_schema(&pool).await;
-        let session = Uuid::new_v4();
+        let session = seed_sessione(&pool).await;
         insert_clarify(&pool, session, "Qual e' la tua email di login?").await;
         insert_clarify(&pool, session, "  qual e' la TUA email di login? ").await; // == a meno di spazi/case
         insert_clarify(&pool, session, "Quale database vuoi usare?").await; // domanda diversa
@@ -224,11 +199,10 @@ mod tests {
     }
 
     /// Isolamento per sessione: le domande di un'ALTRA sessione non contano.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn isola_per_sessione(pool: PgPool) {
-        create_schema(&pool).await;
-        let session_a = Uuid::new_v4();
-        let session_b = Uuid::new_v4();
+        let session_a = seed_sessione(&pool).await;
+        let session_b = seed_sessione(&pool).await;
         insert_clarify(&pool, session_a, "domanda sessione A").await;
         insert_clarify(&pool, session_b, "domanda sessione A").await; // stessa testo, altra sessione
 
@@ -239,10 +213,9 @@ mod tests {
 
     /// Nessuna storia clarify -> firma None, conteggio 0 (asse mai attivo,
     /// comportamento invariato).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn nessuna_storia_conteggio_zero(pool: PgPool) {
-        create_schema(&pool).await;
-        let session = Uuid::new_v4();
+        let session = seed_sessione(&pool).await;
         let store = PgClarifyHistoryStore::new(pool.clone());
         let (sig, count) = store.latest_signature_and_repeat_count(session).await;
         assert!(sig.is_none());
@@ -250,9 +223,8 @@ mod tests {
     }
 
     /// Firma vuota nel metodo del trait -> 0 (nessuna domanda da contare).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn firma_vuota_zero(pool: PgPool) {
-        create_schema(&pool).await;
         let store = PgClarifyHistoryStore::new(pool.clone());
         let count = store
             .repeated_clarify_count(Uuid::new_v4(), "  ")

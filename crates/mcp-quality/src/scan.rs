@@ -42,6 +42,40 @@ fn is_test_file(path: &str) -> bool {
     path.contains("/tests/") || path.ends_with("/tests.rs") || path.ends_with("_tests.rs")
 }
 
+/// Vero se il file INTERO esiste solo nei test, perche' lo dichiara con
+/// l'attributo interno `#![cfg(test)]`.
+///
+/// Terzo criterio della policy di scoping, accanto a [`is_test_file`] (per
+/// path) e [`strip_cfg_test_items`] (per item inline). Copre il caso che gli
+/// altri due mancano: un modulo di SUPPORTO ai test in `src/`, dichiarato dal
+/// genitore come `#[cfg(test)] mod x;`. Il suo path non ha nulla di speciale e
+/// il suo contenuto non ha `#[cfg(test)]` inline, quindi il gate lo contava
+/// come produzione — dichiarando "test esclusi" mentre includeva codice che il
+/// compilatore non mette mai in un binario di produzione (regola O: lo
+/// strumento deve misurare cio' che dichiara).
+///
+/// Il criterio e' SEMANTICO, non un pattern di nome: l'attributo e' la stessa
+/// verita' che vede il compilatore.
+fn file_solo_di_test(src: &str) -> bool {
+    for line in src.lines() {
+        let t = line.trim_start();
+        // Gli attributi interni stanno in testa, dopo la sola doc di modulo.
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        return t.starts_with("#![cfg(test)]");
+    }
+    false
+}
+
+/// Vero se il file e' fuori dallo scope del gate: punto unico dei due criteri
+/// per-file (path di test, file interamente `#![cfg(test)]`), cosi' il gate e la
+/// work-list non possono divergere (regola L). Il terzo criterio, lo strip degli
+/// item `#[cfg(test)]` inline, agisce sul contenuto in [`scoped_source`].
+fn fuori_scope(path: &str, src: &str, include_tests: bool) -> bool {
+    !include_tests && (is_test_file(path) || file_solo_di_test(src))
+}
+
 /// Sostituisce con righe vuote gli item annotati `#[cfg(test)]` (tipicamente
 /// `mod tests { ... }` inline), preservando la numerazione delle righe.
 ///
@@ -279,12 +313,12 @@ pub fn scan_targets(roots: &[PathBuf], include_tests: bool) -> Vec<FileTarget> {
     let mut targets: Vec<FileTarget> = Vec::new();
     for file in collect_rust_files(roots) {
         let path_str = file.to_string_lossy().replace('\\', "/");
-        if !include_tests && is_test_file(&path_str) {
-            continue;
-        }
         let Ok(src) = fs::read_to_string(&file) else {
             continue;
         };
+        if fuori_scope(&path_str, &src, include_tests) {
+            continue;
+        }
         let src = scoped_source(&src, include_tests);
         let report = crate::analyze_source(&path_str, &src);
 
@@ -359,12 +393,12 @@ pub fn scan_counts(roots: &[PathBuf], include_tests: bool) -> QualityCounts {
     let mut counts = QualityCounts::default();
     for file in collect_rust_files(roots) {
         let path_str = file.to_string_lossy().replace('\\', "/");
-        if !include_tests && is_test_file(&path_str) {
-            continue;
-        }
         let Ok(src) = fs::read_to_string(&file) else {
             continue;
         };
+        if fuori_scope(&path_str, &src, include_tests) {
+            continue;
+        }
         counts.files_scanned += 1;
 
         let src = scoped_source(&src, include_tests);
@@ -424,6 +458,29 @@ mod tests {
             "un lifetime non apre un char literal: {out}"
         );
         assert!(!out.contains("fn t<"), "il modulo test e' azzerato");
+    }
+
+    /// Un modulo di supporto ai test in `src/` e' fuori scope: il gate dichiara
+    /// "test esclusi" e questo file, con `#![cfg(test)]` in testa, non finisce
+    /// mai in un binario di produzione. Il difetto misurato: i seeder di
+    /// `mcp-core::test_support` venivano contati come debito di produzione, e i
+    /// loro commenti che parlano dei "todo" del piano scattavano perfino come
+    /// marker TODO.
+    #[test]
+    fn file_con_attributo_interno_cfg_test_e_fuori_scope() {
+        let src = "//! doc di modulo\n\n#![cfg(test)]\n\npub fn helper() {}\n";
+        assert!(file_solo_di_test(src), "l'attributo interno dichiara il file di test");
+        // La doc di modulo prima dell'attributo non lo nasconde.
+        assert!(file_solo_di_test("#![cfg(test)]\nfn x() {}\n"));
+    }
+
+    /// Contro-prova: un file di produzione che CONTIENE un `#[cfg(test)]`
+    /// inline (la stragrande maggioranza) resta nello scope — lo strip degli
+    /// item inline basta, e escluderlo interamente cancellerebbe il debito vero.
+    #[test]
+    fn file_di_produzione_con_mod_test_inline_resta_nello_scope() {
+        let src = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n";
+        assert!(!file_solo_di_test(src));
     }
 
     #[test]

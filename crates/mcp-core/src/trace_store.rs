@@ -107,46 +107,23 @@ pub async fn get_session_traces(
 mod tests {
     use super::*;
 
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 user_id UUID NOT NULL, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
+    /// Sessione + run dell'utente indicato. Le tabelle le porta il migrator del
+    /// set project: qui si semina solo la riga, coi NOT NULL e la FK
+    /// `agent_runs.session_id -> chat_sessions(id)` che lo schema reale impone.
+    async fn seed_run(pool: &PgPool, user_id: Uuid) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(pool, project_id).await;
+        let run_id = crate::test_support::insert_agent_run_as(
+            pool, session_id, project_id, user_id, "running",
         )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE nexus_agent_traces ( \
-                 id BIGSERIAL PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 run_id UUID NOT NULL, \
-                 seq INTEGER NOT NULL DEFAULT 0, \
-                 payload JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_agent_traces");
+        .await;
+        (session_id, run_id)
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn persist_e_get_raggruppa_per_run(pool: PgPool) {
-        create_tables(&pool).await;
-        let session_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        let run_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id, user_id) VALUES ($1, $2, $3)")
-            .bind(run_id)
-            .bind(session_id)
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let (session_id, run_id) = seed_run(&pool, user_id).await;
 
         persist_trace(
             &pool,
@@ -175,20 +152,11 @@ mod tests {
         assert_eq!(traces[1]["provider"], json!("google"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn get_isola_per_utente(pool: PgPool) {
-        create_tables(&pool).await;
-        let session_id = Uuid::new_v4();
         let owner = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let run_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id, user_id) VALUES ($1, $2, $3)")
-            .bind(run_id)
-            .bind(session_id)
-            .bind(owner)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let (session_id, run_id) = seed_run(&pool, owner).await;
         persist_trace(&pool, session_id, run_id, 0, &json!({"x": 1})).await;
 
         // L'altro utente non vede le tracce della sessione altrui.

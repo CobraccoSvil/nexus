@@ -488,6 +488,49 @@ else
   echo "OK error-presentation: nessun riconoscimento d'errore dal testo"
 fi
 
+# ── schema-di-test-dalla-migrazione (2026-07-22) ─────────────────────────────
+# Lo schema su cui gira un test del dominio run/chat deriva dalla MIGRAZIONE
+# reale (nexus_test_schema::PROJECT_MIGRATOR, il migrator del set
+# db/migrations/project che la produzione applica al DB <slug>_nexus), mai da un
+# CREATE TABLE ricopiato a mano nel modulo di test.
+#
+# Il difetto (regola O): una fixture scritta a mano non fallisce quando diverge —
+# mente in silenzio. `nexus_agent_todos` ne aveva DUE, diverse fra loro e dalla
+# migrazione (seq INTEGER vs BIGINT, depends_on UUID[] vs TEXT[], content NOT
+# NULL vs nullable), entrambe senza project_id, senza i CHECK e senza la FK verso
+# nexus_agent_plans: hanno retto finche' una query di produzione non ha chiesto
+# una colonna che non avevano (acceptance_criteria). Convertendo i test allo
+# schema reale sono emerse righe che il DB di produzione rifiuta e che i test
+# creavano da anni: run senza sessione, todo senza piano, step senza tool_input.
+#
+# L'elenco delle tabelle protette si LEGGE dal set di migrazioni (non e' una
+# lista ricopiata qui, che divergerebbe a sua volta).
+proj_tables="$(grep -hoE 'CREATE TABLE (IF NOT EXISTS )?(public\.)?[a-z_]+' db/migrations/project/*.sql 2>/dev/null \
+  | awk '{print $NF}' | sed 's/^public\.//' | sort -u)"
+if [[ -z "$proj_tables" ]]; then
+  echo "!! schema-di-test: nessuna tabella letta da db/migrations/project (set mancante?)" >&2
+  fail=1
+else
+  schema_hits=""
+  for t in $proj_tables; do
+    # I commenti che CITANO una vecchia fixture (la doc dei seeder lo fa) non
+    # sono codice: si filtrano come negli altri check.
+    h="$(grep -rnE "CREATE TABLE (IF NOT EXISTS )?(public\.)?$t[[:space:](]" crates --include='*.rs' \
+      --exclude-dir=target 2>/dev/null | grep -vE ':[0-9]+:\s*(//|/\*|\*)' || true)"
+    [[ -n "$h" ]] && schema_hits+="$h"$'\n'
+  done
+  if [[ -n "$schema_hits" ]]; then
+    echo "!! schema-di-test: tabella del set project ricreata a mano in un test:" >&2
+    printf '%s' "$schema_hits" | sed 's/^/     /' >&2
+    echo "   Usa lo schema reale:" >&2
+    echo "     #[sqlx::test(migrator = \"nexus_test_schema::PROJECT_MIGRATOR\")]" >&2
+    echo "   e semina le righe coi seeder (mcp_core::test_support::seed_*)." >&2
+    fail=1
+  else
+    echo "OK schema-di-test: nessuna tabella del set project ricreata a mano"
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
