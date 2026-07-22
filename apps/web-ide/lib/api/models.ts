@@ -27,6 +27,10 @@ export interface ModelCatalogEntry {
   displayName: string;
   inputCostPerMillionTokens: number;
   outputCostPerMillionTokens: number;
+  /** Tariffa dei token letti da cache (`ai_price_catalog`, mig 0130/0403).
+   *  `null` = il catalog non la conosce per questo modello: la UI mostra il
+   *  costo senza sconto cache invece di inventarsi un rapporto. */
+  cacheReadCostPerMillionTokens: number | null;
   currency: string;
   /** `null` = tier ignoto (mig 0599: la colonna e' nullable, e NULL significa
    *  "nessuna fonte lo ha stabilito" — non "medium"). */

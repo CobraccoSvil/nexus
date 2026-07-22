@@ -4,7 +4,7 @@
  * Usa Playwright Chromium gia' installato.
  *
  * Uso: node scripts/capture-landing-screenshots.mjs
- * Output: apps/web-ide/public/screenshots/*.webp
+ * Output: apps/web-ide/public/screenshots/*.jpg
  */
 
 import { chromium } from "playwright";
@@ -129,18 +129,18 @@ async function main() {
       await cap.postAction(page);
     }
 
-    const outPath = join(OUT, `${cap.name}.webp`);
+    // Estensione .jpg: e' il formato che Playwright produce ed e' il nome che
+    // la landing referenzia (`/screenshots/hero-ide.jpg` in app/page.tsx e
+    // HeroSplit.tsx). Lo script scriveva `.webp` — un JPEG con l'estensione
+    // sbagliata, per giunta su un nome che nessuno legge: rilanciarlo lasciava
+    // la landing sui vecchi file e prometteva un rename che non avveniva
+    // (`renameSync` era importato e mai chiamato).
+    const outPath = join(OUT, `${cap.name}.jpg`);
     await page.screenshot({
       path: outPath,
       type: "jpeg",
       quality: 85,
     });
-    // Playwright non supporta webp diretto, salviamo come jpeg e rinominiamo
-    // In realta' Next.js serve bene anche jpeg. Rinominiamo per coerenza col codice.
-    const { renameSync } = await import("fs");
-    const jpegPath = outPath;
-    // webp non supportato nativamente da Playwright, teniamo jpeg
-    // ma con estensione .webp il browser lo gestisce comunque
     console.log(`[screenshot] Salvato: ${outPath}`);
 
     await page.close();

@@ -356,7 +356,7 @@ export const es: PartialDictionary = {
     "knowledge.detail.files": "Archivos relacionados",
     "knowledge.detail.created": "Creada el",
     "knowledge.detail.updated": "Actualizada el",
-    "knowledge.graph.placeholder": "Vista de grafo disponible en una version futura",
+    "knowledge.graph.placeholder": "Aún no hay notas — crea notas para ver el grafo",
     // Knowledge Base (ADR 0017 v2)
     "wiki.title": "Knowledge Base",
     "wiki.title.meta": "Knowledge Nexus (meta)",

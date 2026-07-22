@@ -37,6 +37,7 @@ import { UUID_RE, type BusyAction, type MetaStepEntry } from "./use-chat/types";
 import { upsertSyntheticAssistantMessage, isStatusTerminal, mergeIncomingStep } from "./use-chat/helpers";
 import { createTerminalMessage } from "./use-chat/run-summary";
 import { formatChatError } from "./use-chat/errors";
+import { childRunIdsFromToolResult } from "./use-chat/subagent-runs";
 
 export function useChat(
   projectId = "default",
@@ -197,8 +198,9 @@ export function useChat(
   // - ChatSessionCompacted: il backend invia totali freschi dopo compact;
   //   riallineiamo subito la barra (caso bug "percentuale solo dopo F5").
   // - ChatMessageAdded: il backend invia totali assoluti aggiornati ad ogni
-  //   INSERT messaggio (TODO: cablare emit lato chat_messages.rs); per ora
-  //   resta inattivo finche' il cablaggio backend e' completo.
+  //   INSERT messaggio (emesso da chat_messages/run.rs, con i totali del
+  //   payload). Sui messaggi senza contabilita' i totali sono null e la barra
+  //   resta sull'ultimo valore noto.
   const lastCompact = useProjectStore(selectChatLastCompact(sessionId ?? null));
   const lastMessage = useProjectStore(selectChatLastMessage(sessionId ?? null));
 
@@ -233,8 +235,11 @@ export function useChat(
 
   useEffect(() => {
     if (!lastMessage || !sessionId) return;
-    // Totali assoluti dal backend (idempotente, non incrementale)
-    if (lastMessage.totalTokens !== undefined && lastMessage.totalCostUsd !== undefined) {
+    // Totali assoluti dal backend (idempotente, non incrementale).
+    // Il test e' sul TIPO, non su `!== undefined`: il backend manda `null` per i
+    // messaggi senza contabilita' (disambiguazione), e un null passava il vecchio
+    // controllo azzerando la barra a meta' conversazione.
+    if (typeof lastMessage.totalTokens === "number" && typeof lastMessage.totalCostUsd === "number") {
       setTokenUsage({
         totalTokens: lastMessage.totalTokens,
         totalCostUsd: lastMessage.totalCostUsd,
@@ -419,27 +424,28 @@ export function useChat(
               // toolResult non e' JSON parseabile, skip silenzioso
             }
           }
-          // Se lo step contiene un sub-run lanciato da dispatch_subtask, sottoscriviti
-          if (event.step.toolName === "dispatch_subtask" && event.step.toolResult) {
-            const match = event.step.toolResult.match(/ID:\s*([0-9a-f-]{36})/i);
-            if (match) {
-              const childRunId = match[1];
-              const childRun: AgentRunInfo = {
-                runId: childRunId,
-                sessionId: sid,
-                status: "running",
-                automationMode: "automatic",
-                provider: "auto",  // placeholder: aggiornato da getAgentRun()
-                model: "auto",     // placeholder: aggiornato da getAgentRun()
-                iterationCount: 0,
-                pendingActions: [],
-                steps: [],
-                createdAt: new Date().toISOString(),
-              };
-              setAgentRuns((prev) => new Map(prev).set(childRunId, childRun));
-              setAgentStepsMap((prev) => new Map(prev).set(childRunId, []));
-              subscribeToRun(sid, childRunId, false);
-            }
+          // Sub-run avviati da questo step: gli id arrivano dal campo
+          // strutturato `subagent_run_id` del tool_result (punto unico
+          // childRunIdsFromToolResult), mai dal testo del messaggio.
+          for (const childRunId of childRunIdsFromToolResult(
+            event.step.toolName,
+            event.step.toolResult,
+          )) {
+            const childRun: AgentRunInfo = {
+              runId: childRunId,
+              sessionId: sid,
+              status: "running",
+              automationMode: "automatic",
+              provider: "auto",  // placeholder: aggiornato da getAgentRun()
+              model: "auto",     // placeholder: aggiornato da getAgentRun()
+              iterationCount: 0,
+              pendingActions: [],
+              steps: [],
+              createdAt: new Date().toISOString(),
+            };
+            setAgentRuns((prev) => new Map(prev).set(childRunId, childRun));
+            setAgentStepsMap((prev) => new Map(prev).set(childRunId, []));
+            subscribeToRun(sid, childRunId, false);
           }
         },
         async () => {

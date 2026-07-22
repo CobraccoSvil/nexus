@@ -35,6 +35,7 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   // Provider e modelli dal registry/catalog (fonte unica, regola G): niente piu'
   // lista hardcoded a 5. Fallback ai noti finche' il fetch non completa.
   const [providers, setProviders] = useState<string[]>(FALLBACK_PROVIDERS);
+  const [providersError, setProvidersError] = useState<string | null>(null);
   const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
   const [config, setConfig] = useState<RoutingConfigState>(() => buildRoutingState(settings, FALLBACK_PROVIDERS));
   const [purposeLoading, setPurposeLoading] = useState(false);
@@ -69,19 +70,28 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   // partecipa legittimamente alle catene) e i modelli abilitati per provider.
   useEffect(() => {
     let active = true;
-    Promise.all([
-      getProviderRegistry().catch(() => ({ providers: [] })),
-      getModels().catch(() => ({ models: [] })),
-    ]).then(([reg, cat]) => {
-      if (!active) return;
-      const names = (reg.providers ?? []).filter((p) => p.isActive).map((p) => p.name);
-      if (names.length > 0) setProviders(names);
-      const byProvider: Record<string, string[]> = {};
-      for (const m of cat.models ?? []) {
-        (byProvider[m.provider] ??= []).push(m.model);
-      }
-      setModelsByProvider(byProvider);
-    });
+    Promise.all([getProviderRegistry(), getModels()])
+      .then(([reg, cat]) => {
+        if (!active) return;
+        const names = (reg.providers ?? []).filter((p) => p.isActive).map((p) => p.name);
+        if (names.length > 0) setProviders(names);
+        const byProvider: Record<string, string[]> = {};
+        for (const m of cat.models ?? []) {
+          (byProvider[m.provider] ??= []).push(m.model);
+        }
+        setModelsByProvider(byProvider);
+        setProvidersError(null);
+      })
+      .catch((e: unknown) => {
+        // L'errore era inghiottito da due `.catch(() => vuoto)`: la pagina
+        // restava sui cinque provider storici di FALLBACK_PROVIDERS e non
+        // mostrava groq, openrouter o vertex, senza che nulla lo segnalasse.
+        // Chi configurava il routing concludeva che quei provider non ci fossero.
+        if (!active) return;
+        setProvidersError(
+          e instanceof Error ? e.message : "Registry provider non raggiungibile",
+        );
+      });
     return () => { active = false; };
   }, []);
 
@@ -282,6 +292,23 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
             }}>
 
             {error}
+          </div>
+        )}
+
+        {providersError && (
+          <div
+            className="text-base"
+            style={{
+              padding: "10px 14px",
+              marginBottom: 16,
+              borderRadius: 8,
+              border: `1px solid ${tc.error}`,
+              background: resolved === "dark" ? "#2d1215" : "#fef2f2",
+              color: "var(--color-error)",
+            }}>
+            Elenco provider non aggiornato: {providersError}. La pagina mostra i
+            provider storici e potrebbe ometterne di configurati — ricarica prima
+            di salvare il routing.
           </div>
         )}
 

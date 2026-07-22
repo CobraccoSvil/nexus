@@ -52,8 +52,11 @@ export interface ChatSessionUsage {
 export interface ChatMessageDelta {
   messageId: string;
   role: string;
-  totalTokens?: number;
-  totalCostUsd?: number;
+  /** `null` quando il messaggio non porta contabilita' (il backend serializza
+   *  `Option::None` come null, non come chiave assente): chi legge deve
+   *  distinguerlo da un totale valido, non trattarlo come zero. */
+  totalTokens?: number | null;
+  totalCostUsd?: number | null;
   ts: number;
 }
 

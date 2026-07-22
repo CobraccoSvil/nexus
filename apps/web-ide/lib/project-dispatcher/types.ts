@@ -54,7 +54,11 @@ export type ProjectEvent =
   | { kind: "HighlightPanel"; panel: string; duration_ms: number }
   | { kind: "Custom"; event_name: string; resource: string; payload: unknown }
   | { kind: "ChatSessionCompacted"; session_id: string; summary_point_id?: string; total_tokens: number; total_cost_usd: number }
-  | { kind: "ChatMessageAdded"; session_id: string; message_id: string; role: string; total_tokens?: number; total_cost_usd?: number }
+  // total_tokens/total_cost_usd sono `Option<i64>`/`Option<f64>` lato Rust: sul
+  // wire arrivano come `null`, non come chiave assente (es. il messaggio di
+  // disambiguazione emesso da agent_run.rs li manda entrambi a None). Il tipo
+  // deve dirlo, altrimenti un check `!== undefined` lascia passare il null.
+  | { kind: "ChatMessageAdded"; session_id: string; message_id: string; role: string; total_tokens?: number | null; total_cost_usd?: number | null }
   | { kind: "ChatSessionStatusChanged"; session_id: string; status: string }
   | { kind: "MutationRecorded"; method: string; path: string; status_code: number; session_id?: string; summary?: string; actor_user_id?: string }
   | { kind: "EventEnriched"; event_id: string; ui_hint?: UiHint; semantic_tags?: string[]; severity_inferred?: string; panel_target?: string }

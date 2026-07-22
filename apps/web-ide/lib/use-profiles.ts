@@ -17,14 +17,19 @@ export const DEFAULT_PROFILE_ID = "default";
 export function useProfiles() {
   const [profiles, setProfiles] = useState<UserProfile[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setIsLoading(true);
+    setError(null);
     try {
       const data = await getProfiles();
       setProfiles(data.profiles ?? []);
-    } catch {
-      // profili opzionali, fail silenzioso
+    } catch (e) {
+      // Il fallimento era silenzioso: l'utente vedeva la lista vuota e
+      // concludeva di non avere profili, invece che di non poterli leggere.
+      // Lista vuota e API irraggiungibile sono due cose diverse e vanno dette.
+      setError(e instanceof Error ? e.message : "Impossibile caricare i profili");
     } finally {
       setIsLoading(false);
     }
@@ -56,5 +61,5 @@ export function useProfiles() {
 
   const defaultProfile = profiles.find((p) => p.isDefault) ?? null;
 
-  return { profiles, isLoading, defaultProfile, reload: load, create, update, remove, setDefault };
+  return { profiles, isLoading, error, defaultProfile, reload: load, create, update, remove, setDefault };
 }

@@ -19,6 +19,13 @@ pub struct ModelCatalogEntry {
     pub display_name: String,
     pub input_cost_per_million_tokens: f64,
     pub output_cost_per_million_tokens: f64,
+    /// Tariffa dei token letti da cache (mig 0130, popolata dalla 0403 con i
+    /// rapporti per provider). `None` = il catalog non la conosce per questo
+    /// modello: chi prezza deve dirlo, non stimarla. Senza questo campo nel wire
+    /// il frontend compensava con un `input * 0.1` scritto a mano, che e' la
+    /// stima giusta per Anthropic e sbagliata per tutti gli altri.
+    #[sqlx(default)]
+    pub cache_read_cost_per_million_tokens: Option<f64>,
     pub currency: String,
     /// `None` = tier ignoto: nessuna fonte si e' espressa (mig 0599/0608).
     /// Prima era `String` con `#[sqlx(default)]`, che rendeva un NULL
@@ -78,6 +85,7 @@ macro_rules! catalog_select {
             "SELECT provider, model, display_name, \
              input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens, \
              output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens, \
+             cache_read_cost_per_million_tokens::float8 AS cache_read_cost_per_million_tokens, \
              currency, performance_tier, tier_source, \
              agentic_index::float8 AS agentic_index, qualification_state, speed_tier, \
              capabilities, context_window, supports_tool_use, batch_discount_pct, \

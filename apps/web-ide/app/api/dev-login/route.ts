@@ -14,10 +14,11 @@ export async function GET(request: Request) {
 
   try {
     const reqUrl = new URL(request.url);
-    const _origin = reqUrl.origin;
 
-    // Leggi jwt_secret direttamente da nexus-core (bypass gateway, porta 4000)
-    const coreUrl = 'http://localhost:4000';
+    // Leggi jwt_secret direttamente da nexus-core (bypass gateway).
+    // 127.0.0.1 e non localhost: su Windows la risoluzione prova prima ::1 e
+    // paga ~2s di timeout per richiesta quando il core ascolta su IPv4.
+    const coreUrl = process.env.CORE_SERVICE_URL || 'http://127.0.0.1:4000';
     const secretRes = await fetch(`${coreUrl}/internal/settings/jwt_secret`, { cache: 'no-store' });
     if (!secretRes.ok) {
       return NextResponse.json({ error: `Cannot read jwt_secret from core: ${secretRes.status}` }, { status: 500 });
@@ -38,8 +39,11 @@ export async function GET(request: Request) {
     const sig     = crypto.createHmac('sha256', jwtSecret).update(`${header}.${payload}`).digest('base64url');
     const token   = `${header}.${payload}.${sig}`;
 
-    // Redirect a /ide — hardcoded su localhost:3000 per dev
-    const response = NextResponse.redirect('http://localhost:3000/ide');
+    // Redirect a /ide SULLA STESSA origine della richiesta: l'indirizzo era
+    // fissato su localhost:3000, quindi con il web-ide su un'altra porta il
+    // login rimandava a un'altra istanza (o a un orfano rimasto su :3000) e il
+    // cookie appena impostato sembrava non funzionare.
+    const response = NextResponse.redirect(new URL('/ide', reqUrl.origin));
     response.cookies.set('token', token, {
       httpOnly: false,  // dev only
       secure: false,

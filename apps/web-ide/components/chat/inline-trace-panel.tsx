@@ -4,7 +4,24 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { useThemeColors } from "../../lib/theme";
 import type { AITraceEvent } from "../../lib/api-client";
-import { calcModelCost as calcCost, formatCostUsd as formatCost } from "../../lib/model-catalog";
+import {
+  costFromCatalog,
+  findCatalogEntry,
+  formatCostUsd as formatCost,
+} from "../../lib/model-catalog";
+import { usePricingCatalog, type ModelPricingEntry } from "./provider-badge";
+
+/** Costo di una singola trace col catalogo prezzi di `/api/models`.
+ *  `null` = modello non nel catalog: la UI nasconde la cella invece di
+ *  mostrare zero (prima il listino era hardcoded in lib/model-catalog.ts). */
+function traceCost(trace: AITraceEvent, catalog: ModelPricingEntry[]): number | null {
+  return costFromCatalog(
+    findCatalogEntry(catalog, trace.provider, trace.model),
+    trace.inputTokens ?? 0,
+    trace.outputTokens ?? 0,
+    trace.cacheReadTokens ?? 0,
+  );
+}
 
 function humanizeTraceText(raw: string | undefined | null): string {
   if (!raw) return "";
@@ -41,21 +58,20 @@ function stopReasonColor(reason: string, tc: ReturnType<typeof useThemeColors>):
 function CompactTraceCard({
   trace,
   tc,
+  catalog,
 }: {
   trace: AITraceEvent;
   tc: ReturnType<typeof useThemeColors>;
+  /** Catalogo prezzi risolto UNA volta dal padre: l'hook qui dentro girerebbe
+   *  per ogni riga della lista. */
+  catalog: ModelPricingEntry[];
 }) {
   const [textExpanded, setTextExpanded] = useState(false);
   const safeText = humanizeTraceText(trace.responseText);
   // "lungo" = più di una riga logica (contiene \n o supera ~90 char)
   const isLong = safeText.length > 90 || safeText.includes("\n");
   const firstLine = safeText.split("\n")[0].slice(0, 90) + (safeText.split("\n")[0].length > 90 ? "…" : "");
-  const cost = calcCost(
-    trace.model,
-    trace.inputTokens ?? 0,
-    trace.outputTokens ?? 0,
-    trace.cacheReadTokens ?? 0,
-  );
+  const cost = traceCost(trace, catalog);
   const toolNames = (trace.toolCalls ?? []).map((tc) => tc.name).join(", ");
 
   return (
@@ -224,14 +240,18 @@ function CompactTraceCard({
 export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
   const tc = useThemeColors();
   const [open, setOpen] = useState(false);
+  // Hook PRIMA dell'early return: le regole degli hook non ammettono rami.
+  const catalog = usePricingCatalog();
 
   if (traces.length === 0) return null;
 
   const totalInput  = traces.reduce((s, t) => s + (t.inputTokens ?? 0), 0);
   const totalOutput = traces.reduce((s, t) => s + (t.outputTokens ?? 0), 0);
   const totalCache  = traces.reduce((s, t) => s + (t.cacheReadTokens ?? 0), 0);
+  // Somma solo le trace che il catalog copre; se non ne copre nessuna resta
+  // `null` e il totale non si mostra (mai uno zero che sembra "gratis").
   const totalCost   = traces.reduce<number | null>((acc, t) => {
-    const c = calcCost(t.model, t.inputTokens ?? 0, t.outputTokens ?? 0, t.cacheReadTokens ?? 0);
+    const c = traceCost(t, catalog);
     if (c === null) return acc;
     return (acc ?? 0) + c;
   }, null);
@@ -293,7 +313,12 @@ export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
           }}
         >
           {traces.map((t) => (
-            <CompactTraceCard key={`${t.runId}-${t.iteration}`} trace={t} tc={tc} />
+            <CompactTraceCard
+              key={`${t.runId}-${t.iteration}`}
+              trace={t}
+              tc={tc}
+              catalog={catalog}
+            />
           ))}
         </div>
       )}

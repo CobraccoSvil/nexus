@@ -47,8 +47,14 @@ export const PURPOSE_TIER_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "frontier", label: "Frontier" },
 ];
 
-// Fallback usato solo finche' il registry non e' caricato o se il fetch fallisce.
-// A regime la lista provider arriva da GET /api/admin/provider-registry.
+// Lista di PARTENZA, valida solo nell'istante fra il primo render e la risposta
+// di GET /api/admin/provider-registry, che e' la fonte autoritativa. Serve a non
+// far nascere la pagina con catene vuote (verrebbero salvate come tali).
+//
+// NON e' piu' una rete per il fetch fallito: se il registry non risponde la
+// pagina lo DICE (`providersError` in index.tsx). Prima taceva, e restare su
+// questi cinque nomi significava nascondere groq, openrouter e vertex facendoli
+// sembrare inesistenti.
 export const FALLBACK_PROVIDERS: string[] = ["anthropic", "openai", "google", "deepseek", "mistral"];
 
 export const BEHAVIOR_MODES: { value: BehaviorMode; label: string; desc: string }[] = [

@@ -5,8 +5,11 @@
 // Aggrega i token per (provider, model) dalle trace del run (punto unico
 // aggregateTokensByProvider) e PREZZA col catalogo /api/models (usePricingCatalog
 // di provider-badge.tsx). NIENTE prezzi hardcoded (regola G): se il catalogo non
-// ha la entry, il costo di quel bucket e' 0 e restano solo i token. NON usa
-// lib/model-catalog.ts (prezzi hardcoded, deprecato dall'ADR).
+// ha la entry, il costo di quel bucket e' 0 e restano solo i token.
+//
+// La formula del costo vive in lib/model-catalog.ts (costFromCatalog): quel file
+// non contiene piu' il listino scritto a mano da cui l'ADR prendeva le distanze
+// — ora e' solo il calcolo, alimentato dal catalogo del DB.
 //
 // Densita': a larghezze strette il NOME provider nei costi cede (classe
 // nx-as-cost-provider-name); restano barra + numeri.
@@ -22,21 +25,21 @@ import {
   type ProviderTokenBucket,
 } from "../../lib/use-chat/activity-stream";
 import type { AITraceEvent } from "../../lib/api/agent";
+import { costFromCatalog, findCatalogEntry } from "../../lib/model-catalog";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
 /** Costo USD di un bucket dato il catalogo prezzi (0 se entry assente).
  *
- *  I nomi dei campi seguono il wire di `/api/models` (camelCase, punto unico
- *  `lib/api/models.ts`): sono obbligatori, quindi NIENTE `?? 0` a valle. Il
- *  fallback a zero e' ammesso in UN solo caso esplicito — il modello non e' nel
- *  catalog — e non puo' piu' mascherare un campo letto col nome sbagliato. */
+ *  Il calcolo e' quello del punto unico `costFromCatalog` (regola L): questa
+ *  funzione era una seconda implementazione della stessa formula, e sarebbe
+ *  divergente dall'altra alla prima modifica (i token di cache, per esempio,
+ *  qui non erano tariffati affatto). Qui resta solo l'adattamento del bucket
+ *  alla firma comune e la scelta — voluta, locale a questo footer — di trattare
+ *  un modello non a catalogo come contributo zero anziche' nasconderlo. */
 function bucketCost(bucket: ProviderTokenBucket, catalog: ModelPricingEntry[]): number {
-  const entry = catalog.find((e) => e.provider === bucket.provider && e.model === bucket.model);
-  if (!entry) return 0;
-  const inCost = entry.inputCostPerMillionTokens * (bucket.inputTokens / 1_000_000);
-  const outCost = entry.outputCostPerMillionTokens * (bucket.outputTokens / 1_000_000);
-  return inCost + outCost;
+  const entry = findCatalogEntry(catalog, bucket.provider, bucket.model);
+  return costFromCatalog(entry, bucket.inputTokens, bucket.outputTokens) ?? 0;
 }
 
 export function ActivityCostFooter({

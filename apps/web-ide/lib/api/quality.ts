@@ -28,7 +28,14 @@ export async function runQualityScan(projectId: string): Promise<QualityScanResu
   if (start.scan_id != null) {
     return pollQualityScanStatus(projectId, start.scan_id);
   }
-  return start as unknown as QualityScanResult;
+  // Senza `scan_id` non c'e' scansione da seguire. Qui c'era
+  // `return start as unknown as QualityScanResult`: un cast che spacciava
+  // `{status}` per un risultato completo, e la UI leggeva `totalFindings` e
+  // `filesScanned` come `undefined` mostrando un riepilogo vuoto al posto di un
+  // errore. Il doppio cast zittiva proprio il compilatore che lo segnalava.
+  throw new Error(
+    `Scansione qualita' non avviata dal backend${start.status ? ` (stato: ${start.status})` : ""}.`,
+  );
 }
 
 async function pollQualityScanStatus(projectId: string, scanId: number): Promise<QualityScanResult> {

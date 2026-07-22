@@ -12,7 +12,7 @@ Commands:
   health        Check platform health (MCP Core + Neural)
   dashboard     Show dashboard metrics
   chat <msg>    Send a message to AI assistant
-  analyze <f>   Analyze a source file for quality issues
+  analyze <f>   Count TODO/FIXME/HACK/XXX markers and .unwrap() calls in a file
   providers     List available LLM providers and models
   intent <msg>  Classify intent of a message
   route <msg>   Route a message to the best model
@@ -90,30 +90,46 @@ async function cmdAnalyze(filePath: string) {
     process.exit(1);
   }
   const source = fs.readFileSync(filePath, "utf-8");
-  console.log(`Analyzing ${filePath} (${source.split("\n").length} lines)...\n`);
-  // Use the quality endpoint if available, otherwise show local analysis
+  // Conteggio testuale locale, e il comando lo dichiara. Prima l'output si
+  // intitolava "quality issues" e un commento prometteva "use the quality
+  // endpoint if available": l'endpoint non veniva mai chiamato (e non sarebbe
+  // nemmeno applicabile — la scansione qualita' lavora per PROGETTO, non per
+  // singolo file), quindi due grep passavano per un'analisi di qualita'.
+  console.log(`Scansione marker in ${filePath}\n`);
   console.log(`File: ${filePath}`);
   console.log(`Lines: ${source.split("\n").length}`);
   console.log(`Size: ${source.length} bytes`);
 
   const todos = (source.match(/TODO|FIXME|HACK|XXX/gi) || []).length;
   const unwraps = (source.match(/\.unwrap\(\)/g) || []).length;
-  console.log(`\nFindings:`);
-  if (todos > 0) console.log(`  - ${todos} TODO/FIXME markers`);
-  if (unwraps > 0) console.log(`  - ${unwraps} .unwrap() calls`);
-  if (todos === 0 && unwraps === 0) console.log(`  (none)`);
+  console.log(`\nMarker trovati (conteggio testuale, non un'analisi semantica):`);
+  if (todos > 0) console.log(`  - ${todos} marker TODO/FIXME/HACK/XXX`);
+  if (unwraps > 0) console.log(`  - ${unwraps} chiamate .unwrap()`);
+  if (todos === 0 && unwraps === 0) console.log(`  (nessuno)`);
 }
 
 async function cmdProviders() {
   console.log("LLM Providers\n");
-  for (const provider of ["openai", "anthropic", "google"]) {
-    try {
-      const data = (await fetchJson(`${NEURAL_BASE}/providers/${provider}/models`)) as Record<string, unknown>;
-      const models = data.models as string[];
-      console.log(`${provider}: ${models.join(", ")}`);
-    } catch {
-      console.log(`${provider}: (unavailable)`);
-    }
+  // Provider e modelli dal catalogo (`/api/models` -> ai_price_catalog): la
+  // lista era fissata a openai/anthropic/google, quindi il comando taceva su
+  // deepseek, mistral, groq, openrouter e vertex — tutti provider configurati
+  // e instradabili. Un elenco scritto a mano invecchia a ogni provider nuovo.
+  const data = (await fetchJson(`${API_BASE}/api/models`)) as {
+    models?: { provider: string; model: string }[];
+  };
+  const models = data.models ?? [];
+  if (models.length === 0) {
+    console.log("(catalogo vuoto o non disponibile)");
+    return;
+  }
+  const byProvider = new Map<string, string[]>();
+  for (const m of models) {
+    const list = byProvider.get(m.provider) ?? [];
+    list.push(m.model);
+    byProvider.set(m.provider, list);
+  }
+  for (const provider of [...byProvider.keys()].sort()) {
+    console.log(`${provider}: ${(byProvider.get(provider) ?? []).sort().join(", ")}`);
   }
 }
 
