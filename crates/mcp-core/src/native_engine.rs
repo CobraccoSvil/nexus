@@ -105,7 +105,7 @@ use nexus_agent_graph::decisions::supervisor::{
 };
 use nexus_agent_graph::nodes::{
     ExecutorConfig, ExecutorNode, ScaleConfig, ScaleControlNode, StallRecoveryNode, SupervisorNode,
-    VerifierConfig, VerifierNode,
+    TodoCriteriaMode, VerifierConfig, VerifierNode,
 };
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
@@ -1066,6 +1066,12 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
     let d = VerifierConfig::default();
     VerifierConfig {
         enabled: setting_bool(db, "orchestrator.verifier_enabled", d.enabled).await,
+        // Modo criteri: stringa a tre valori, parse dal punto unico
+        // `TodoCriteriaMode::try_parse` (un valore ignoto ricade su `off` con un
+        // WARN, non accende un enforcement per caso).
+        todo_criteria_mode: TodoCriteriaMode::try_parse(
+            &setting_string(db, "agent.verifier.todo_criteria_mode", "off").await,
+        ),
         max_verify_cycles: setting_i64(db, "orchestrator.max_verify_cycles", d.max_verify_cycles)
             .await,
         fail_closed: setting_bool(db, "agent.verifier.fail_closed", d.fail_closed).await,

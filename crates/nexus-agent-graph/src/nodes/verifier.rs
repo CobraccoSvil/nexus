@@ -127,11 +127,74 @@ use crate::state::{AgentState, Message, MessageContent, StateDelta, StopReason};
 ///     Qui lo rendiamo ESPLICITO (default 3) per non perdere la semantica.
 ///     Trasportato per completezza: i rami esplorativo/panel sono OFF e NON
 ///     portati, quindi non e' letto dal codice di questo PR.
+/// Cosa fa il verifier con gli `acceptance_criteria` di un todo.
+///
+/// Tre stati e non un booleano, e la ragione e' una misura: quando i criteri
+/// hanno cominciato ad arrivare al verifier (prima non arrivavano affatto),
+/// TUTTI i 104 todo censiti ne avevano almeno uno, per un totale di 163. Passare
+/// da "mai eseguiti" a "decidono l'esito" in un colpo solo avrebbe cambiato il
+/// percorso di ogni run pianificato, in gran parte per ragioni di forma e di
+/// vocabolario, non di merito. Un booleano avrebbe lasciato solo la scelta fra
+/// non sapere e rompere.
+///
+/// `Observe` esegue gli stessi criteri che `Enforce` eseguirebbe e ne registra
+/// l'esito, ma il verdetto resta quello di prima: e' l'unico modo di misurare
+/// davvero, perche' un "dry-run" che NON esegue misurerebbe un'imitazione
+/// (regola O).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TodoCriteriaMode {
+    /// I criteri non vengono eseguiti: comportamento precedente al trasporto.
+    Off,
+    /// Eseguiti e registrati, ma NON decidono l'esito del todo.
+    Observe,
+    /// Eseguiti e decidono l'esito.
+    Enforce,
+}
+
+impl TodoCriteriaMode {
+    /// Punto unico di parse (regola N: un identificatore canonico per stato,
+    /// nessun sinonimo, nessun alias italiano). Valore ignoto -> `Off` con un
+    /// WARN che riporta cosa ha letto: un modo sconosciuto non deve accendere
+    /// un enforcement per caso.
+    pub fn try_parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => TodoCriteriaMode::Off,
+            "observe" => TodoCriteriaMode::Observe,
+            "enforce" => TodoCriteriaMode::Enforce,
+            altro => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::verifier",
+                    valore = %altro,
+                    chiave = "agent.verifier.todo_criteria_mode",
+                    "modo criteri todo sconosciuto: uso 'off'"
+                );
+                TodoCriteriaMode::Off
+            }
+        }
+    }
+
+    /// `true` se i criteri vanno eseguiti (in `Observe` si eseguono ma non
+    /// decidono).
+    pub fn esegue(&self) -> bool {
+        matches!(self, TodoCriteriaMode::Observe | TodoCriteriaMode::Enforce)
+    }
+
+    /// `true` se l'esito dei criteri determina quello del todo.
+    pub fn decide(&self) -> bool {
+        matches!(self, TodoCriteriaMode::Enforce)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifierConfig {
     /// Verifier abilitato (`verifier_enabled`, default FALSE). OFF -> pass-through
     /// `{}` (`verifier_node.py:52`).
     pub enabled: bool,
+    /// Cosa fare degli `acceptance_criteria` del todo
+    /// (`agent.verifier.todo_criteria_mode`). Vedi [`TodoCriteriaMode`].
+    #[serde(default = "modo_criteri_default")]
+    pub todo_criteria_mode: TodoCriteriaMode,
     /// Cap di cicli di verifica per todo (`max_verify_cycles`, default 3). Al cap
     /// il todo viene bloccato (`verifier_node.py:246-247`).
     pub max_verify_cycles: i64,
@@ -148,6 +211,14 @@ pub struct VerifierConfig {
     pub exploratory_verify_max_total: i64,
 }
 
+/// Default del modo criteri quando il campo manca (checkpoint pre-esistenti,
+/// DB irraggiungibile): `Off`, cioe' il comportamento di prima. Un default
+/// permissivo qui accenderebbe l'esecuzione dei criteri proprio quando la
+/// configurazione non e' leggibile.
+fn modo_criteri_default() -> TodoCriteriaMode {
+    TodoCriteriaMode::Off
+}
+
 impl Default for VerifierConfig {
     fn default() -> Self {
         // Default IDENTICI ai safe-default del brain (orchestrator_config.py)
@@ -156,6 +227,7 @@ impl Default for VerifierConfig {
         // logica.
         Self {
             enabled: false,
+            todo_criteria_mode: modo_criteri_default(),
             max_verify_cycles: 3,
             fail_closed: true,
             dag_topological_enabled: false,
@@ -503,7 +575,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
         let criteria_raw = normalize_criteria(todo_value.get("acceptance_criteria"));
 
         // ── Ramo "nessun criterion" (verifier_node.py:82-133) ────────────────
-        if criteria_raw.is_empty() {
+        //
+        // Ci si finisce anche a criteri PRESENTI se il modo e' `Off`: i criteri
+        // sono arrivati fin qui ma non li si esegue. E' il comportamento che il
+        // verifier ha sempre avuto, quando i criteri non arrivavano affatto.
+        if criteria_raw.is_empty() || !self.cfg.todo_criteria_mode.esegue() {
+            if !criteria_raw.is_empty() {
+                tracing::debug!(
+                    target: "nexus_agent_graph::verifier",
+                    todo_id = %active_todo_id,
+                    criteri = criteria_raw.len(),
+                    "verifier: criteri presenti ma modo 'off', non eseguiti"
+                );
+            }
             return self
                 .fail_closed_or_complete(state, &run_id, &active_todo_id, todo_content, mode)
                 .await;
@@ -578,8 +662,29 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
             all_passed,
             criteria = results.len(),
             duration_ms,
+            modo = ?self.cfg.todo_criteria_mode,
             "verifier: esito criteri"
         );
+
+        // ── Modo `observe`: misurato, non applicato ─────────────
+        //
+        // I criteri sono stati eseguiti e la riga in `nexus_agent_verifier_runs`
+        // e' scritta (sopra), cosi' l'esito e' consultabile; ma il verdetto del
+        // todo resta quello di prima. Serve a rispondere con dati veri alla
+        // domanda "cosa succederebbe accendendo l'enforcement?" prima di
+        // accenderlo: quella tabella era a zero righe, quindi finora la risposta
+        // non esisteva.
+        if !self.cfg.todo_criteria_mode.decide() {
+            tracing::info!(
+                target: "nexus_agent_graph::verifier",
+                todo_id = %active_todo_id,
+                all_passed,
+                "verifier: modo 'observe', l'esito dei criteri NON decide il todo"
+            );
+            return self
+                .fail_closed_or_complete(state, &run_id, &active_todo_id, todo_content, mode)
+                .await;
+        }
 
         // ── Rami esplorativo/panel (verifier_node.py:197-236): OFF + NON portati.
         //     Coi default OFF il blocco `if all_passed and (panel or expl)` e'
@@ -814,11 +919,27 @@ fn criterion_type_repr(t: &str) -> String {
     }
 }
 
-/// Normalizza `acceptance_criteria` del todo (`verifier_node.py:76-81`): lista ->
+/// Chiavi che non fanno parte della `spec` di un criterio: sono metadati suoi.
+const CHIAVI_NON_SPEC: &[&str] = &["type", "spec", "expected", "timeout_s", "id"];
+
+/// Normalizza `acceptance_criteria` del todo: lista ->
 /// [`crate::runtime::ports::CriterionSpec`]; stringa -> json.loads (se array);
-/// altro/assente -> vuoto. Ogni elemento e' una spec `{type, spec, expected}`
-/// (l'`id` viene assegnato dal runner se assente, qui non serve per il golden
-/// deterministico). I campi mancanti diventano default coerenti col Python.
+/// altro/assente -> vuoto.
+///
+/// Accetta DUE forme, e la seconda e' quella che i criteri hanno davvero:
+///
+/// - annidata: `{"type": "...", "spec": {...}, "expected": ...}`
+/// - PIATTA:   `{"type": "file_exists", "path": "backend/package.json"}`
+///
+/// Solo la prima era gestita, e su 163 criteri reali NESSUNO la usava: il
+/// planner scrive la forma piatta, cosi' `spec` risultava sempre `{}` e ogni
+/// criterio sarebbe morto sul controllo del proprio parametro obbligatorio
+/// ("spec.command obbligatorio", "spec.url obbligatorio"). Il difetto non si
+/// vedeva solo perche' i criteri non arrivavano nemmeno qui — chiuso quel buco,
+/// questo sarebbe diventato un fallimento di massa per FORMA, non per merito.
+///
+/// Nella forma piatta la `spec` e' l'oggetto stesso meno i suoi metadati, cosi'
+/// `path`, `command`, `url` finiscono dove il runner li cerca.
 fn normalize_criteria(v: Option<&Value>) -> Vec<crate::runtime::ports::CriterionSpec> {
     let arr = match v {
         Some(Value::Array(a)) => a.clone(),
@@ -831,13 +952,24 @@ fn normalize_criteria(v: Option<&Value>) -> Vec<crate::runtime::ports::Criterion
     arr.into_iter()
         .filter_map(|c| {
             let map = c.as_object()?;
+            let spec = match map.get("spec") {
+                // Forma annidata: la spec e' dichiarata esplicitamente.
+                Some(s) if s.is_object() => s.clone(),
+                // Forma piatta: tutto cio' che non e' metadato del criterio.
+                _ => Value::Object(
+                    map.iter()
+                        .filter(|(k, _)| !CHIAVI_NON_SPEC.contains(&k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+            };
             Some(crate::runtime::ports::CriterionSpec {
                 criterion_type: map
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                spec: map.get("spec").cloned().unwrap_or(json!({})),
+                spec,
                 expected: map.get("expected").cloned().unwrap_or(json!({})),
                 timeout_s: map.get("timeout_s").and_then(Value::as_f64),
             })
@@ -857,9 +989,13 @@ fn todos_to_values(todos: &[dag_scheduler::Todo]) -> Vec<Value> {
 }
 
 /// Restituisce il `Todo` (forma DAG) come `Value` opaco, o `Value::Null` se non
-/// trovato. Vedi nota in `todo_runner::todo_value_of`: il modello DAG non porta i
-/// campi non-DAG (content/acceptance_criteria); nel runtime concreto la
-/// `TodoStore` mappera' il todo completo (TODO impl concreta).
+/// trovato.
+///
+/// Il `Todo` porta ora anche i campi non usati dallo scheduling — `content`,
+/// `priority` e `acceptance_criteria` — quindi questa serializzazione e' la
+/// fonte da cui il verifier legge i criteri. Finche' `acceptance_criteria` non
+/// era nel tipo, qui usciva un oggetto senza quel campo e il verifier concludeva
+/// "nessun criterion" per ogni todo.
 fn todo_value_of(todos: &[dag_scheduler::Todo], todo_id: &str) -> Value {
     todos
         .iter()
@@ -921,6 +1057,116 @@ mod tests {
             passed: true,
             evidence: json!({}),
         }
+    }
+
+    /// I criteri arrivano al verifier attraverso la serializzazione del `Todo`:
+    /// e' esattamente li' che si perdevano, quindi il test parte da un `Todo` e
+    /// non da un `Value` costruito a mano (regola O).
+    #[test]
+    fn i_criteri_del_todo_arrivano_al_verifier() {
+        let criteri = vec![
+            json!({"type": "file_exists", "path": "backend/package.json"}),
+            json!({"type": "http", "url": "http://127.0.0.1:8080/health", "expected_status": 200}),
+        ];
+        let todo = Todo {
+            id: "t1".into(),
+            status: TodoStatus::InProgress,
+            depends_on: vec![],
+            seq: Some(1),
+            write_scope: vec![],
+            content: Some("crea il backend".into()),
+            priority: None,
+            acceptance_criteria: criteri.clone(),
+        };
+
+        // Il passaggio che prima perdeva il dato.
+        let value = todo_value_of(&[todo], "t1");
+        let normalizzati = normalize_criteria(value.get("acceptance_criteria"));
+
+        assert_eq!(
+            normalizzati.len(),
+            2,
+            "i criteri non sono arrivati: e' il difetto per cui il verifier non ne \
+             ha mai eseguito uno (nexus_agent_verifier_runs a zero righe su 104 todo)"
+        );
+        assert_eq!(normalizzati[0].criterion_type, "file_exists");
+        assert_eq!(normalizzati[1].criterion_type, "http");
+    }
+
+    /// La forma REALE dei criteri e' piatta. Su 163 criteri misurati in DB,
+    /// ZERO avevano la chiave `spec` che il normalizzatore cercava: i parametri
+    /// stanno accanto a `type`, non dentro un oggetto annidato.
+    #[test]
+    fn forma_piatta_reale_produce_una_spec_utilizzabile() {
+        let reali = json!([
+            {"type": "run_command", "command": "ls -la | grep package.json", "expected": "package.json presente"},
+            {"type": "file_exists", "path": "backend/package.json"},
+            {"type": "http", "url": "http://127.0.0.1:3000/api/health", "expected_status": 200}
+        ]);
+        let out = normalize_criteria(Some(&reali));
+        assert_eq!(out.len(), 3);
+
+        // Senza questo, il runner uscirebbe subito con "spec.command obbligatorio".
+        assert_eq!(
+            out[0].spec.get("command").and_then(Value::as_str),
+            Some("ls -la | grep package.json"),
+            "il comando deve finire nella spec, non restare fuori"
+        );
+        assert_eq!(
+            out[1].spec.get("path").and_then(Value::as_str),
+            Some("backend/package.json")
+        );
+        assert_eq!(
+            out[2].spec.get("url").and_then(Value::as_str),
+            Some("http://127.0.0.1:3000/api/health")
+        );
+        // `type` e `expected` sono metadati del criterio: non devono finire
+        // nella spec, che rappresenta i soli parametri.
+        assert!(out[0].spec.get("type").is_none());
+        assert!(out[0].spec.get("expected").is_none());
+        assert_eq!(out[0].expected.as_str(), Some("package.json presente"));
+    }
+
+    /// La forma annidata continua a funzionare: le due convivono.
+    #[test]
+    fn forma_annidata_resta_supportata() {
+        let annidata = json!([
+            {"type": "run_command", "spec": {"command": "cargo test"}, "expected": "ok", "timeout_s": 30.0}
+        ]);
+        let out = normalize_criteria(Some(&annidata));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].spec.get("command").and_then(Value::as_str),
+            Some("cargo test")
+        );
+        assert_eq!(out[0].timeout_s, Some(30.0));
+    }
+
+    /// Il modo si parla in inglese e non ha sinonimi (regola N); un valore
+    /// ignoto NON accende l'enforcement.
+    #[test]
+    fn modo_criteri_parse_canonico() {
+        assert_eq!(TodoCriteriaMode::try_parse("off"), TodoCriteriaMode::Off);
+        assert_eq!(
+            TodoCriteriaMode::try_parse("observe"),
+            TodoCriteriaMode::Observe
+        );
+        assert_eq!(
+            TodoCriteriaMode::try_parse(" ENFORCE "),
+            TodoCriteriaMode::Enforce
+        );
+        for ignoto in ["osserva", "true", "", "enforced"] {
+            assert_eq!(
+                TodoCriteriaMode::try_parse(ignoto),
+                TodoCriteriaMode::Off,
+                "il valore '{ignoto}' non deve accendere l'esecuzione dei criteri"
+            );
+        }
+        // Solo `enforce` fa decidere i criteri; `observe` li esegue soltanto.
+        assert!(!TodoCriteriaMode::Off.esegue());
+        assert!(TodoCriteriaMode::Observe.esegue());
+        assert!(!TodoCriteriaMode::Observe.decide());
+        assert!(TodoCriteriaMode::Enforce.decide());
     }
 
     fn fail_result(t: &str, evidence: Value) -> CriterionResult {
@@ -995,6 +1241,7 @@ mod tests {
             write_scope: Vec::new(),
             content: None,
             priority: None,
+            acceptance_criteria: Vec::new(),
         }
     }
 

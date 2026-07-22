@@ -101,4 +101,4 @@ pub async fn emit_phase_meta_correlated(
     });
     let _ = store.persist_meta_step(meta, mode).await;
 }
-pub use verifier::{suggest_remediation, VerifierConfig, VerifierNode};
+pub use verifier::{suggest_remediation, TodoCriteriaMode, VerifierConfig, VerifierNode};

@@ -7189,6 +7189,12 @@ mod tests_native_mapping {
     /// best-effort: query fallita -> nessun todo -> detection hollow invariata).
     async fn create_todos_table(pool: &sqlx::PgPool) {
         sqlx::query(
+            // Seconda copia a mano dello schema di nexus_agent_todos (l'altra e'
+            // in agent_graph_adapter/todo_store.rs), gia' divergente da quella:
+            // qui seq e' BIGINT e depends_on TEXT[], li' INTEGER e UUID[].
+            // Nessuna delle due deriva dalla migrazione vera, quindi entrambe si
+            // scoprono disallineate solo quando una query chiede una colonna che
+            // non hanno.
             "CREATE TABLE nexus_agent_todos ( \
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
                  run_id UUID NOT NULL, \
@@ -7197,7 +7203,8 @@ mod tests_native_mapping {
                  depends_on TEXT[] NOT NULL DEFAULT '{}', \
                  write_scope TEXT[] NOT NULL DEFAULT '{}', \
                  content TEXT, \
-                 priority TEXT \
+                 priority TEXT, \
+                 acceptance_criteria JSONB NOT NULL DEFAULT '[]'::jsonb \
              )",
         )
         .execute(pool)
