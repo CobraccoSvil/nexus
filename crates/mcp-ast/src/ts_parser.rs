@@ -210,6 +210,9 @@ pub fn index_with_treesitter(file_path: &str, language: &str, source: &str) -> O
         calls,
         line_count: source.lines().count(),
         precise: true,
+        // L'indice e' preciso (tree-sitter) ma puo' essere INCOMPLETO: chi lo
+        // consuma deve poterlo sapere senza leggere i log.
+        truncated,
     })
 }
 
@@ -230,5 +233,33 @@ mod tests_walk_guard {
         let idx = index_with_treesitter("bundle.min.js", "javascript", &profondo);
         // L'indice puo' essere parziale, ma la chiamata TORNA.
         assert!(idx.is_some(), "il parser deve sopravvivere all'input profondo");
+    }
+
+    /// Un indice troncato lo DICHIARA. Prima il troncamento viveva solo in un
+    /// `warn!` mentre l'indice usciva con `precise: true`: chi lo consumava non
+    /// aveva modo di sapere che mancavano dei simboli.
+    ///
+    /// Il test parte dallo stesso input che causa davvero il troncamento, non da
+    /// un `AstIndex` costruito a mano col flag gia' impostato.
+    #[test]
+    fn un_indice_troncato_lo_dichiara() {
+        let profondo = format!("const x = {};", vec!["1"; 60_000].join("||"));
+        let idx = index_with_treesitter("bundle.min.js", "javascript", &profondo)
+            .expect("il parser deve tornare");
+        assert!(
+            idx.truncated,
+            "l'indice si e' fermato al tetto di profondita' e deve dirlo"
+        );
+        // `precise` continua a significare tutt'altro: tree-sitter, non regex.
+        assert!(idx.precise, "resta un indice da tree-sitter");
+    }
+
+    /// Un file normale non e' troncato: il flag non e' sempre vero.
+    #[test]
+    fn un_indice_completo_non_e_troncato() {
+        let normale = "function saluta(nome) { return `ciao ${nome}`; }";
+        let idx = index_with_treesitter("saluti.js", "javascript", normale)
+            .expect("il parser deve tornare");
+        assert!(!idx.truncated);
     }
 }

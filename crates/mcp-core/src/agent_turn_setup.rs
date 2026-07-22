@@ -338,24 +338,42 @@ async fn count_accessible_mcp_tools(db: &PgPool, user_id: Uuid, project_id: Uuid
 /// (SUBAGENT_ONLY_TOOLS, punto unico in nexus-agent-tools): quei tool
 /// arrivano SOLO via tool_whitelist di nexus_subagent_definitions
 /// (build_tools_json in subagent_native.rs).
+///
+/// PANICA se la costante non e' JSON valido, e lo fa apposta. Qui c'era un
+/// `unwrap_or_else(|_| json!([]))`: un refuso nella raw string avrebbe dato a
+/// OGNI run un catalogo VUOTO — l'agente senza un solo tool, che risponde a voce
+/// invece di lavorare — senza un errore da nessuna parte. Il dato e' statico e
+/// noto a compile-time: se non parsa, il binario e' rotto, e va scoperto al
+/// primo turno invece che dedotto da settimane di run inspiegabilmente inerti.
 fn load_base_agent_tools() -> Value {
-    serde_json::from_str(AGENT_TOOLS_JSON)
-        .map(|v: Value| {
-            let filtered: Vec<Value> = v
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| {
-                    t.get("name")
-                        .and_then(Value::as_str)
-                        .map(|n| !nexus_agent_tools::tool_schema::SUBAGENT_ONLY_TOOLS.contains(&n))
-                        .unwrap_or(true)
-                })
-                .collect();
-            json!(filtered)
+    let v: Value = serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|e| {
+        panic!(
+            "AGENT_TOOLS_JSON non e' JSON valido ({e}): il catalogo tool del run \
+             principale sarebbe vuoto e l'agente non potrebbe fare nulla. \
+             E' un refuso nella costante di nexus-agent-tools::tool_schema."
+        )
+    });
+    let filtered: Vec<Value> = v
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| {
+            t.get("name")
+                .and_then(Value::as_str)
+                .map(|n| !nexus_agent_tools::tool_schema::SUBAGENT_ONLY_TOOLS.contains(&n))
+                .unwrap_or(true)
         })
-        .unwrap_or_else(|_| json!([]))
+        .collect();
+    // Un catalogo vuoto DOPO un parse riuscito significherebbe che il filtro ha
+    // escluso tutto: altrettanto inutilizzabile, e altrettanto silenzioso.
+    if filtered.is_empty() {
+        panic!(
+            "catalogo tool del run principale VUOTO dopo il filtro dei tool \
+             riservati ai sub-agenti: nessun tool resterebbe all'agente"
+        );
+    }
+    json!(filtered)
 }
 
 /// Sostituisce l'enum `kind` dei tool dispatch_subagent(s) coi kind reali passati
