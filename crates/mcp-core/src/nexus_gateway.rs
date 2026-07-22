@@ -324,8 +324,8 @@ fn transport_error_detail(e: &reqwest::Error) -> String {
 /// 120 non era applicato da nessuno): il risultato era che mcp-core attendeva
 /// una singola chiamata piu' a lungo (435s) di quanto vivesse l'intero run che
 /// l'aveva chiesta (300s). Ora il budget e' DERIVATO dal run, non moltiplicato.
-async fn resolve_client_timeout_secs(db: &sqlx::PgPool) -> u64 {
-    nexus_auth::llm_timeouts::LlmTimeouts::resolve(db)
+async fn resolve_client_timeout_secs(db: &sqlx::PgPool, run_timeout_secs: Option<u64>) -> u64 {
+    nexus_auth::llm_timeouts::LlmTimeouts::resolve_for_run(db, run_timeout_secs)
         .await
         .client_budget
         .as_secs()
@@ -364,11 +364,23 @@ impl NexusGatewayClient {
     /// nativa (`agent_tools::subagent_native`): prima la sequenza
     /// `resolve_port -> format url -> NexusGatewayClient::new` era duplicata.
     pub async fn from_db(db: &sqlx::PgPool) -> Self {
+        Self::from_db_for_run(db, None).await
+    }
+
+    /// Come [`from_db`], ma per un run di durata NOTA (il `timeout_s` della
+    /// figura sub-agente).
+    ///
+    /// Il budget d'attesa nasceva sempre dal default globale di 300s anche
+    /// quando il run che lo conteneva ne durava 240 (`review`): mcp-core poteva
+    /// restare appeso a una singola chiamata oltre la vita del sub-run che
+    /// l'aveva chiesta, ed e' il timeout che uccideva i review. Passando qui la
+    /// durata reale, l'attesa del client resta dentro il cronometro della figura.
+    pub async fn from_db_for_run(db: &sqlx::PgPool, run_timeout_secs: Option<u64>) -> Self {
         let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
         let gw_url = format!("http://127.0.0.1:{gw_port}");
         let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
             .unwrap_or_else(|_| "dev-internal-token".to_string());
-        let timeout_secs = resolve_client_timeout_secs(db).await;
+        let timeout_secs = resolve_client_timeout_secs(db, run_timeout_secs).await;
         Self::with_timeout(gw_url, gw_token, timeout_secs)
     }
 

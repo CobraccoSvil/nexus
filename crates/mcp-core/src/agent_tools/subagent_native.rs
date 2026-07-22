@@ -3422,7 +3422,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // STESSA session_id del parent (eredita root/permessi/canali). Lo stato porta
     // parent_run_id + subagent_depth -> il grafo applica i guard di annidamento
     // (UnderstandingNode salta il fan-out explore se depth>=1).
-    let deps = build_native_deps_for_tool(&ctx).await;
+    let deps = build_native_deps_for_tool(&ctx, timeout_s).await;
     // Canale SSE proprio del sub-run: NON instrada al frontend (l'output utente
     // resta quello del main, che riceve solo il summary). Il receiver alimenta
     // il PONTE narrazione verso il padre (prima era scartato: feature muta);
@@ -4496,7 +4496,12 @@ fn compact_summary(text: &str) -> String {
 /// `AgentToolContext`. Specchio di `build_native_deps` (agent_run.rs) ma a partire
 /// dal ctx del tool (che non porta `AppState`): riusa il PUNTO UNICO del cablaggio
 /// gateway (`NexusGatewayClient::from_db`, regola L).
-async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
+///
+/// `run_timeout_s` e' il timeout REALE della figura (gia' clampato dalla
+/// deadline del padre): da li' nasce il budget d'attesa verso il gateway. Prima
+/// il budget veniva derivato dal default globale (300s) anche per una figura che
+/// vive 240s.
+async fn build_native_deps_for_tool(ctx: &AgentToolContext, run_timeout_s: i64) -> NativeDeps {
     let db = (*ctx.core.db).clone();
     let tool_runner_deps = crate::tool_runner_server::ToolRunnerDeps {
         db: db.clone(),
@@ -4507,7 +4512,11 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
         monitor_registry: ctx.core.monitor_registry.clone(),
         port_registry: ctx.port_registry.clone(),
     };
-    let gateway = crate::nexus_gateway::NexusGatewayClient::from_db(&db).await;
+    let gateway = crate::nexus_gateway::NexusGatewayClient::from_db_for_run(
+        &db,
+        u64::try_from(run_timeout_s).ok().filter(|&s| s > 0),
+    )
+    .await;
     NativeDeps {
         db,
         tool_runner_deps,
