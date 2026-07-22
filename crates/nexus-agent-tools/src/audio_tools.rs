@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::attachment_inspector::{detect_kind, load_attachment, read_header};
-use super::gateway_client::{gateway_text_to_speech, gateway_transcribe_audio};
+use super::gateway_client::{gateway_text_to_speech, gateway_transcribe_audio, GwCaller};
 use super::ToolContextCore;
 use nexus_auth::get_setting_checked;
 use nexus_types::routing_client::resolve_purpose_via_http;
@@ -147,6 +147,11 @@ pub async fn tool_nexus_transcribe_audio(ctx: &ToolContextCore, input: &Value) -
         Some(mime_reale.clone()),
         language,
         AUDIO_PURPOSE,
+        &GwCaller {
+            user_id: ctx.user_id,
+            project_id: ctx.project_id,
+            run_id: ctx.run_id,
+        },
     )
     .await
     {
@@ -275,6 +280,11 @@ pub async fn tool_nexus_text_to_speech(ctx: &ToolContextCore, input: &Value) -> 
         voice,
         Some(response_format.clone()),
         TTS_PURPOSE,
+        &GwCaller {
+            user_id: ctx.user_id,
+            project_id: ctx.project_id,
+            run_id: ctx.run_id,
+        },
     )
     .await
     {

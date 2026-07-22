@@ -196,12 +196,184 @@ pub fn calculate_cost(
     (input_cost, output_cost, input_cost + output_cost)
 }
 
+// ── Listino per unita' non-token (immagini, secondi, caratteri) ─────────────
+//
+// Le modalita' non-testuali del gateway non si pagano a token: un'immagine, un
+// secondo di video o di audio, un carattere sintetizzato. Il listino a token non
+// puo' esprimerle e `calculate_cost` non e' estendibile senza snaturarla, quindi
+// qui convivono due funzioni di calcolo — ma restano UNA sola fonte (regola L):
+// nessun altro modulo puo' moltiplicare un prezzo per una quantita'.
+
+/// Unita' di consumo di una chiamata non-testuale. E' un enum e non una stringa
+/// perche' finisce in una colonna con CHECK e in una chiave di listino: un refuso
+/// non deve poter arrivare al DB (regola M).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageUnit {
+    /// Immagini generate.
+    Image,
+    /// Secondi di audio o video, in ingresso o in uscita.
+    Second,
+    /// Caratteri sintetizzati (TTS).
+    Character,
+}
+
+impl UsageUnit {
+    /// Etichetta che va nel DB (`ai_usage_ledger.quantity_unit`,
+    /// `ai_price_catalog_unit.unit`). Coincide coi CHECK della mig 0634.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UsageUnit::Image => "image",
+            UsageUnit::Second => "second",
+            UsageUnit::Character => "character",
+        }
+    }
+}
+
+/// Prezzo di UNA unita' (non per milione, a differenza di [`PriceSnapshot`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitPriceSnapshot {
+    pub unit_cost: f64,
+    pub unit: UsageUnit,
+    pub currency: String,
+}
+
+/// Esito della ricerca nel listino per-unita'. Tipo PROPRIO, non un
+/// [`PriceLookup`] con dentro un prezzo unitario travestito da prezzo per
+/// milione: far viaggiare un numero in un campo che significa un'altra cosa e'
+/// il difetto che questo lavoro sta bonificando altrove.
+///
+/// Due stati e non tre: qui non esiste l'equivalente di
+/// `pricing_state = 'unknown'`, perche' una riga in `ai_price_catalog_unit` la
+/// si inserisce solo quando il prezzo lo si conosce davvero.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnitPriceLookup {
+    Priced(UnitPriceSnapshot),
+    /// Nessun listino per questa (provider, model, unita'). Con la tabella
+    /// ancora vuota e' l'esito NORMALE, e va mostrato come tale: significa
+    /// "non so quanto costa", mai "e' gratis".
+    NotInCatalog,
+}
+
+impl UnitPriceLookup {
+    /// Etichetta per `details.price_state` del ledger, allineata a quella del
+    /// listino a token cosi' i due percorsi si leggono con lo stesso vocabolario.
+    pub fn state_label(&self) -> &'static str {
+        match self {
+            UnitPriceLookup::Priced(_) => "priced",
+            UnitPriceLookup::NotInCatalog => "not_in_catalog",
+        }
+    }
+
+    /// Costo totale della quantita' consumata, o `None` se il prezzo non e'
+    /// noto. Il chiamante che riceve `None` scrive 0 DICHIARANDO il perche' in
+    /// `details.price_state`, non un importo inventato.
+    pub fn cost_for(&self, quantity: f64) -> Option<f64> {
+        match self {
+            UnitPriceLookup::Priced(p) => Some(quantity.max(0.0) * p.unit_cost),
+            UnitPriceLookup::NotInCatalog => None,
+        }
+    }
+}
+
+/// Prezzo attivo per (provider, model, unita') nella currency data.
+pub async fn resolve_unit_price(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    unit: UsageUnit,
+    currency: &str,
+) -> Result<UnitPriceLookup> {
+    let row = sqlx::query_as::<_, (f64, String)>(
+        "SELECT unit_cost::float8, currency \
+           FROM ai_price_catalog_unit \
+          WHERE provider = $1 \
+            AND model = $2 \
+            AND unit = $3 \
+            AND currency = $4 \
+            AND effective_from <= NOW() \
+            AND (effective_to IS NULL OR effective_to > NOW()) \
+          ORDER BY effective_from DESC \
+          LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(unit.as_str())
+    .bind(currency)
+    .fetch_optional(db)
+    .await
+    .with_context(|| {
+        format!(
+            "lettura listino per-{} di {provider}/{model} fallita",
+            unit.as_str()
+        )
+    })?;
+
+    Ok(interpret_unit_row(row, unit))
+}
+
+/// Parte PURA: dalla riga del listino unitario all'esito. Estratta per essere
+/// testabile senza DB, come [`interpret_row`] per il listino a token.
+fn interpret_unit_row(row: Option<(f64, String)>, unit: UsageUnit) -> UnitPriceLookup {
+    match row {
+        None => UnitPriceLookup::NotInCatalog,
+        Some((unit_cost, currency)) => UnitPriceLookup::Priced(UnitPriceSnapshot {
+            unit_cost,
+            unit,
+            currency,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn row(input: f64, output: f64, state: &str) -> Option<(f64, f64, String, String)> {
         Some((input, output, "USD".to_string(), state.to_string()))
+    }
+
+    /// Listino assente e listino a zero sono due cose diverse anche per le unita'.
+    #[test]
+    fn unita_listino_assente_non_e_gratis() {
+        let assente = interpret_unit_row(None, UsageUnit::Image);
+        assert_eq!(assente, UnitPriceLookup::NotInCatalog);
+        // Nessun costo calcolabile: il chiamante deve scrivere 0 dichiarando il
+        // perche', non un importo dedotto.
+        assert_eq!(assente.cost_for(3.0), None);
+        assert_eq!(assente.state_label(), "not_in_catalog");
+
+        // Un prezzo REALE a zero (modello gratuito) resta un prezzo: da' Some(0.0).
+        let gratis = interpret_unit_row(Some((0.0, "USD".into())), UsageUnit::Image);
+        assert_eq!(gratis.cost_for(3.0), Some(0.0));
+        assert_eq!(gratis.state_label(), "priced");
+    }
+
+    /// Il costo e' quantita' x prezzo unitario, non diviso per un milione.
+    #[test]
+    fn costo_unitario_moltiplica_la_quantita() {
+        let p = interpret_unit_row(Some((0.04, "USD".into())), UsageUnit::Image);
+        assert_eq!(p.cost_for(3.0), Some(0.12));
+
+        let audio = interpret_unit_row(Some((0.006, "USD".into())), UsageUnit::Second);
+        let atteso = 42.0 * 0.006;
+        let ottenuto = audio.cost_for(42.0).unwrap();
+        assert!((ottenuto - atteso).abs() < 1e-9, "atteso {atteso}, ottenuto {ottenuto}");
+    }
+
+    /// Una quantita' negativa non genera un credito.
+    #[test]
+    fn quantita_negativa_non_produce_costo_negativo() {
+        let p = interpret_unit_row(Some((0.04, "USD".into())), UsageUnit::Image);
+        assert_eq!(p.cost_for(-5.0), Some(0.0));
+    }
+
+    /// Le etichette finiscono nel DB sotto CHECK: devono combaciare con la
+    /// migrazione 0634, non somigliarle.
+    #[test]
+    fn etichette_unita_allineate_ai_check_della_migrazione() {
+        assert_eq!(UsageUnit::Image.as_str(), "image");
+        assert_eq!(UsageUnit::Second.as_str(), "second");
+        assert_eq!(UsageUnit::Character.as_str(), "character");
     }
 
     #[test]

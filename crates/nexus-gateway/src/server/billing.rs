@@ -23,7 +23,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_pricing::{calculate_cost, resolve_active_price_in, PriceLookup};
+use nexus_pricing::{calculate_cost, resolve_active_price_in, PriceLookup, UsageUnit};
 
 use crate::types::{LlmRequest, LlmResponse, MessageContent};
 
@@ -94,6 +94,25 @@ pub fn estimate_prompt_tokens(req: &LlmRequest) -> i64 {
     ((chars as i64) + 3) / 4
 }
 
+/// Come si stima il consumo ai fini della quota.
+///
+/// Esiste perche' la stima a token ha senso solo per le chiamate testuali. Sulle
+/// modalita' media produce numeri senza rapporto col consumo: il prompt di
+/// un'immagine diviso quattro, e per la trascrizione addirittura zero (il
+/// messaggio user della richiesta sintetica e' vuoto). Finche' quelle chiamate
+/// non avevano identita' la quota era comunque no-op e la cosa non si vedeva;
+/// dal momento in cui l'identita' c'e', ereditare quella stima significherebbe
+/// consumare la quota-token di un progetto con un numero inventato — e nel caso
+/// peggiore rifiutare una richiesta per un motivo falso.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaEstimate {
+    /// Chiamata testuale: token stimati da messaggi e `max_tokens`.
+    Testuale,
+    /// Modalita' non-testuale: nessun token stimato. Resta attiva la quota di
+    /// COSTO, che diventa efficace appena `ai_price_catalog_unit` e' popolata.
+    NonTestuale,
+}
+
 /// Enforce quota PRIMA della chiamata al provider (guardrail). Stima i token e il
 /// costo, somma all'uso corrente del periodo e blocca se sfora un limite attivo.
 /// No-op se mancano `tenant_id`/`user_id` o se non ci sono quote (parita' server.ts).
@@ -102,6 +121,7 @@ pub async fn enforce_quota(
     req: &LlmRequest,
     provider: &str,
     model: &str,
+    stima: QuotaEstimate,
 ) -> Result<()> {
     let project_id = req.metadata.tenant_id.trim();
     let user_id = req.metadata.user_id.trim();
@@ -120,8 +140,15 @@ pub async fn enforce_quota(
         .await
         .unwrap_or_else(|_| "currency non configurata".to_string());
 
-    let estimated_prompt = estimate_prompt_tokens(req);
-    let estimated_completion = req.max_tokens.map(|t| t as i64).unwrap_or(0);
+    let (estimated_prompt, estimated_completion) = match stima {
+        QuotaEstimate::Testuale => (
+            estimate_prompt_tokens(req),
+            req.max_tokens.map(|t| t as i64).unwrap_or(0),
+        ),
+        // Nessun token: queste chiamate non ne consumano, e fingere il contrario
+        // eroderebbe la quota-token del progetto con un numero arbitrario.
+        QuotaEstimate::NonTestuale => (0, 0),
+    };
     let estimated_total = estimated_prompt + estimated_completion;
 
     // Stima per le quote: senza listino resta 0 (non si inventa un prezzo, e
@@ -330,10 +357,337 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
     }
 }
 
+// ── Consumo delle modalita' non-testuali ──────────────────
+//
+// Image-gen, video-gen, trascrizione e sintesi vocale costano denaro reale e
+// fino alla mig 0634 non producevano NESSUNA riga di ledger: quote e report
+// sottostimavano in silenzio. Non era una dimenticanza — lo schema non aveva
+// modo di dire "3 immagini" o "42 secondi", e i doc-comment dei 4 handler
+// dichiaravano la scelta di non inventare un costo (regola G/H).
+//
+// Ora la quantita' si registra sempre; il COSTO si accende quando
+// `ai_price_catalog_unit` viene popolata. Finche' e' vuota le righe portano 0
+// con `price_state='not_in_catalog'`, che e' un'informazione, non una bugia.
+
+/// Modalita' della chiamata. Finisce in `ai_usage_ledger.usage_kind`, che ha un
+/// CHECK: le stringhe qui sotto devono combaciare con la mig 0634.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Video,
+    /// Audio in ingresso: trascrizione.
+    AudioIn,
+    /// Audio in uscita: sintesi vocale.
+    AudioOut,
+}
+
+impl MediaKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Video => "video",
+            MediaKind::AudioIn => "audio_in",
+            MediaKind::AudioOut => "audio_out",
+        }
+    }
+}
+
+/// Da dove viene la quantita' registrata.
+///
+/// Non e' un dettaglio: nessuno dei quattro provider dichiara oggi quanto ha
+/// prodotto (OpenAI Images scarta l'usage, la trascrizione gira con
+/// `response_format=json` che non porta la durata, il video non riporta i
+/// secondi effettivi). Fatturare cio' che abbiamo CHIESTO e' accettabile, ma chi
+/// legge la riga deve poter distinguere un dato misurato da una stima.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantitySource {
+    /// Contata sulla risposta del provider.
+    Provider,
+    /// Dedotta da cio' che e' stato richiesto.
+    Request,
+    /// Non conoscibile.
+    None,
+}
+
+impl QuantitySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QuantitySource::Provider => "provider",
+            QuantitySource::Request => "request",
+            QuantitySource::None => "none",
+        }
+    }
+}
+
+/// Quanto e' stato consumato da una chiamata non-testuale.
+#[derive(Debug, Clone)]
+pub struct MediaUsage {
+    pub kind: MediaKind,
+    /// `None` quando la quantita' non e' conoscibile: il CHECK
+    /// `chk_ledger_quantity_coerente` impone che allora `source` sia `None`, cosi'
+    /// "non lo so" non puo' travestirsi da zero.
+    pub quantity: Option<f64>,
+    pub unit: UsageUnit,
+    pub source: QuantitySource,
+}
+
+impl MediaUsage {
+    /// Quantita' contata sulla risposta del provider.
+    pub fn misurata(kind: MediaKind, unit: UsageUnit, quantity: f64) -> Self {
+        Self { kind, quantity: Some(quantity), unit, source: QuantitySource::Provider }
+    }
+
+    /// Quantita' dedotta dalla richiesta (il provider non la dichiara).
+    pub fn da_richiesta(kind: MediaKind, unit: UsageUnit, quantity: f64) -> Self {
+        Self { kind, quantity: Some(quantity), unit, source: QuantitySource::Request }
+    }
+
+    /// Consumo avvenuto ma non quantificabile: la riga si scrive lo stesso
+    /// (chi, cosa, quale modello), senza inventare un numero.
+    pub fn non_quantificabile(kind: MediaKind, unit: UsageUnit) -> Self {
+        Self { kind, quantity: None, unit, source: QuantitySource::None }
+    }
+}
+
+/// `(project_id, user_id)` dai metadata, o `None` se non sono utilizzabili.
+///
+/// Stessa guard del percorso testuale, ma qui il fallimento si DICE: quando
+/// scatta, un consumo reale resta fuori dalla contabilita', e il silenzio e'
+/// esattamente il motivo per cui il buco e' rimasto aperto tanto a lungo.
+fn identita_del_chiamante(req: &LlmRequest, kind: MediaKind) -> Option<(Uuid, Uuid)> {
+    let project_id = req.metadata.tenant_id.trim();
+    let user_id = req.metadata.user_id.trim();
+    if project_id.is_empty() || user_id.is_empty() {
+        tracing::warn!(
+            kind = kind.as_str(),
+            "gateway-ledger: consumo media NON registrato, identita' assente nei metadata"
+        );
+        return None;
+    }
+    match (Uuid::parse_str(project_id), Uuid::parse_str(user_id)) {
+        (Ok(p), Ok(u)) => Some((p, u)),
+        _ => {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "gateway-ledger: consumo media NON registrato, identita' non e' un UUID"
+            );
+            None
+        }
+    }
+}
+
+/// Costo del consumo e stato del listino, come coppia `(costo, price_state)`.
+///
+/// Il costo esiste solo se esistono ENTRAMBI: un listino per quell'unita' E una
+/// quantita' da moltiplicare. Mancando l'uno o l'altra il risultato e' 0
+/// DICHIARATO via `price_state`, mai dedotto — chi legge la riga distingue
+/// "gratis" da "non so quanto costa" senza guardare l'importo.
+async fn prezza_consumo(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    usage: &MediaUsage,
+    currency: &str,
+) -> (f64, &'static str) {
+    let price = match nexus_pricing::resolve_unit_price(db, provider, model, usage.unit, currency)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "gateway-ledger: lookup listino per-unita' fallito");
+            nexus_pricing::UnitPriceLookup::NotInCatalog
+        }
+    };
+    let costo = usage.quantity.and_then(|q| price.cost_for(q)).unwrap_or(0.0);
+    (costo, price.state_label())
+}
+
+/// Registra il consumo di una chiamata non-testuale. Gemella di
+/// [`record_usage_to_ledger`] e con le stesse regole: no-op senza identita',
+/// best-effort, `status='finalized'`.
+///
+/// PUNTO UNICO (regola L): i quattro handler media sono copie parallele, e
+/// scrivere il ledger in ognuno avrebbe creato la quinta copia. Qui la logica
+/// sta una volta sola e i chiamanti dichiarano soltanto cosa hanno consumato.
+pub async fn record_media_usage_to_ledger(
+    db: &PgPool,
+    req: &LlmRequest,
+    provider_used: &str,
+    model_used: &str,
+    usage: MediaUsage,
+) {
+    let Some((project_uuid, user_uuid)) = identita_del_chiamante(req, usage.kind) else {
+        return;
+    };
+
+    // Currency prima del prezzo: serve comunque, perche' la colonna e' NOT NULL
+    // senza default (un default hardcoded qui e' gia' costato 3.993 righe orfane
+    // prima della mig 0294).
+    let currency = match nexus_pricing::platform_currency(db).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "gateway-ledger: currency di piattaforma illeggibile, riga media non scritta");
+            return;
+        }
+    };
+
+    let (total_cost, price_state) =
+        prezza_consumo(db, provider_used, model_used, &usage, &currency).await;
+
+    let details = json!({
+        "request_id": req.metadata.request_id,
+        "feature": req.metadata.feature,
+        "price_missing": total_cost == 0.0,
+        "price_state": price_state,
+    });
+
+    let run_uuid = Uuid::parse_str(req.metadata.request_id.trim()).ok();
+
+    let riga = RigaMedia {
+        user_uuid,
+        project_uuid,
+        run_uuid,
+        provider: provider_used,
+        model: model_used,
+        total_cost,
+        currency: &currency,
+        details,
+        usage: &usage,
+    };
+    if let Err(e) = inserisci_riga_media(db, riga).await {
+        tracing::warn!(error = %e, "gateway-ledger: insert ledger media fallita (best-effort)");
+    }
+}
+
+/// Campi di una riga di consumo media, raggruppati per non passare dodici
+/// argomenti sciolti.
+struct RigaMedia<'a> {
+    user_uuid: Uuid,
+    project_uuid: Uuid,
+    run_uuid: Option<Uuid>,
+    provider: &'a str,
+    model: &'a str,
+    total_cost: f64,
+    currency: &'a str,
+    details: serde_json::Value,
+    usage: &'a MediaUsage,
+}
+
+/// L'INSERT vero e proprio.
+///
+/// I costi per-unita' finiscono in `total_cost`: non sono ne' input ne' output, e
+/// spalmarli su una delle due colonne token-oriented direbbe una cosa falsa a chi
+/// le legge. `input_cost`/`output_cost` e i token restano 0 (default di colonna):
+/// per queste righe il consumo vive in `quantity`.
+async fn inserisci_riga_media(db: &PgPool, r: RigaMedia<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO ai_usage_ledger (
+            user_id, project_id, run_id, provider, model,
+            total_cost, currency, status, details,
+            usage_kind, quantity, quantity_unit, quantity_source
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, 'finalized', $8, $9, $10, $11, $12
+        )
+        "#,
+    )
+    .bind(r.user_uuid)
+    .bind(r.project_uuid)
+    .bind(r.run_uuid)
+    .bind(r.provider)
+    .bind(r.model)
+    .bind(r.total_cost)
+    .bind(r.currency)
+    .bind(r.details)
+    .bind(r.usage.kind.as_str())
+    .bind(r.usage.quantity)
+    .bind(r.usage.quantity.map(|_| r.usage.unit.as_str()))
+    .bind(r.usage.source.as_str())
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, RequestMetadata};
+
+    // ── Vocabolario del consumo media ──────────────────
+    //
+    // Le stringhe di `MediaKind`, `QuantitySource` e `UsageUnit` finiscono in
+    // colonne con un CHECK: se divergono dalla migrazione, l'INSERT fallisce a
+    // RUNTIME e il consumo torna invisibile — cioe' il difetto che questo lavoro
+    // ha appena chiuso, di nuovo, senza che nessun test se ne accorga.
+    //
+    // Il testo della migrazione e' incluso a compile-time dal file VERO applicato
+    // al database (regola O): non e' una copia delle costanti riscritta nel test,
+    // che direbbe soltanto che il codice e' uguale a se stesso.
+    const MIGRAZIONE_0634: &str =
+        include_str!("../../../../db/migrations/0634_media_usage_units.sql");
+
+    /// Ogni `usage_kind` che il codice sa produrre deve essere ammesso dal CHECK.
+    #[test]
+    fn i_kind_del_codice_sono_ammessi_dalla_migrazione() {
+        for kind in [
+            MediaKind::Image,
+            MediaKind::Video,
+            MediaKind::AudioIn,
+            MediaKind::AudioOut,
+        ] {
+            let atteso = format!("'{}'", kind.as_str());
+            assert!(
+                MIGRAZIONE_0634.contains(&atteso),
+                "usage_kind {atteso} non compare nella migrazione 0634: l'INSERT fallirebbe sul CHECK"
+            );
+        }
+    }
+
+    /// Idem per la provenienza della quantita'.
+    #[test]
+    fn le_fonti_della_quantita_sono_ammesse_dalla_migrazione() {
+        for source in [
+            QuantitySource::Provider,
+            QuantitySource::Request,
+            QuantitySource::None,
+        ] {
+            let atteso = format!("'{}'", source.as_str());
+            assert!(
+                MIGRAZIONE_0634.contains(&atteso),
+                "quantity_source {atteso} non compare nella migrazione 0634"
+            );
+        }
+    }
+
+    /// E per le unita', che vivono nel crate pricing ma finiscono in due CHECK
+    /// (ledger e listino unitario).
+    #[test]
+    fn le_unita_sono_ammesse_dalla_migrazione() {
+        for unit in [UsageUnit::Image, UsageUnit::Second, UsageUnit::Character] {
+            let atteso = format!("'{}'", unit.as_str());
+            assert!(
+                MIGRAZIONE_0634.contains(&atteso),
+                "quantity_unit {atteso} non compare nella migrazione 0634"
+            );
+        }
+    }
+
+    /// "Non lo so" e "zero" restano distinguibili: il costruttore per il
+    /// consumo non quantificabile non deve produrre una quantita'.
+    #[test]
+    fn non_quantificabile_non_inventa_uno_zero() {
+        let u = MediaUsage::non_quantificabile(MediaKind::AudioIn, UsageUnit::Second);
+        assert_eq!(u.quantity, None);
+        assert_eq!(u.source, QuantitySource::None);
+        // E' la coppia che il CHECK chk_ledger_quantity_coerente impone:
+        // (quantity_source = 'none') = (quantity IS NULL).
+        let misurata = MediaUsage::misurata(MediaKind::Image, UsageUnit::Image, 3.0);
+        assert_eq!(misurata.quantity, Some(3.0));
+        assert_ne!(misurata.source, QuantitySource::None);
+        let stimata = MediaUsage::da_richiesta(MediaKind::Video, UsageUnit::Second, 8.0);
+        assert_eq!(stimata.source, QuantitySource::Request);
+        assert!(stimata.quantity.is_some());
+    }
 
     fn req(messages: Vec<&str>, max_tokens: Option<u32>) -> LlmRequest {
         LlmRequest {

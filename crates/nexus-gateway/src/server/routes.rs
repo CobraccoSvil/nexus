@@ -48,7 +48,11 @@ use crate::types::{
     TranscribeResponse, TtsRequest, TtsResponse, VideoGenRequest, VideoGenResponse,
 };
 
-use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
+use super::billing::{
+    enforce_quota, record_media_usage_to_ledger, record_usage_to_ledger, MediaKind, MediaUsage,
+    QuotaEstimate, QuotaExceeded,
+};
+use nexus_pricing::UsageUnit;
 use super::bootstrap::{build_http_client, build_runtime, GatewayConfig};
 use nexus_auth::llm_timeouts::LlmTimeouts;
 use super::AppState;
@@ -310,7 +314,13 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
 
     // Guardrail quota PRIMA della chiamata: usa il primo provider+modello (preview).
     let preview = &resolved[0];
-    enforce_quota(&state.db, req, preview.provider.name(), &preview.model)
+    enforce_quota(
+        &state.db,
+        req,
+        preview.provider.name(),
+        &preview.model,
+        QuotaEstimate::Testuale,
+    )
         .await
         .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
@@ -1198,7 +1208,15 @@ async fn build_sse_stream(
         };
 
         // Quota guardrail (non blocca lo stream se passa).
-        if let Err(e) = enforce_quota(&state.db, &body, rp.provider.name(), &rp.model).await {
+        if let Err(e) = enforce_quota(
+            &state.db,
+            &body,
+            rp.provider.name(),
+            &rp.model,
+            QuotaEstimate::Testuale,
+        )
+        .await
+        {
             let msg = e
                 .downcast_ref::<QuotaExceeded>()
                 .map(|q| q.to_string())
@@ -1292,11 +1310,11 @@ async fn build_sse_stream(
 /// il primo provider image-capable non in cooldown. Nessun fallback cross-provider
 /// in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e non
-/// si applica all'image-gen, il cui costo e' per-immagine (non riportato in token
-/// dai provider). Per non INVENTARE costi (regola G/H: niente fallback nascosto),
-/// in questo PR il ledger NON viene scritto per le immagini. TODO PR successiva:
-/// estendere il billing con un costo per-immagine censito in `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` con la quantita' di immagini
+/// prodotte (`usage_kind='image'`, `quantity_unit='image'`, contate sulla
+/// risposta). Il costo si applica se `ai_price_catalog_unit` ha un prezzo
+/// per-immagine per questo (provider, model); finche' non ce l'ha la riga porta
+/// costo 0 con `details.price_state='not_in_catalog'` — dichiarato, non dedotto.
 pub async fn generate_image(
     State(state): State<AppState>,
     Json(body): Json<ImageGenRequest>,
@@ -1335,9 +1353,15 @@ async fn run_generate_image(
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L): stima dal prompt come singolo messaggio user.
     let quota_req = image_gen_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1349,10 +1373,23 @@ async fn run_generate_image(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .generate_image(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider(e.to_string()))?;
+
+    // Consumo: le immagini prodotte si CONTANO sulla risposta, quindi la
+    // quantita' e' misurata, non stimata.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        MediaUsage::misurata(MediaKind::Image, UsageUnit::Image, resp.images.len() as f64),
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per l'image-gen (punto unico, regola L). Con `pin`:
@@ -1439,12 +1476,11 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
 /// quel provider; senza pin sceglie il primo provider video-capable non in
 /// cooldown. Nessun fallback cross-provider in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
-/// non si applica al video-gen, il cui costo e' al secondo di video (non
-/// riportato in token dal provider, non censito in `ai_price_catalog`). Per non
-/// INVENTARE costi (regola G/H: niente fallback nascosto), in questo PR il ledger
-/// NON viene scritto per i video, allineato al pattern image-gen / audio. TODO PR
-/// successiva: costo per-secondo-video in `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` (`usage_kind='video'`,
+/// `quantity_unit='second'`). La durata PRODOTTA non e' riportata dal provider,
+/// quindi si registra quella richiesta con `quantity_source='request'`; se il
+/// chiamante non la indica (default lato provider) la quantita' resta NULL con
+/// `quantity_source='none'`, invece di un numero inventato.
 pub async fn generate_video(
     State(state): State<AppState>,
     Json(body): Json<VideoGenRequest>,
@@ -1481,9 +1517,15 @@ async fn run_generate_video(
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L): stima dal prompt come singolo messaggio user.
     let quota_req = video_gen_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1495,10 +1537,28 @@ async fn run_generate_video(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .generate_video(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider(e.to_string()))?;
+
+    // Consumo: la risposta NON riporta la durata prodotta, quindi al massimo si
+    // registra quella richiesta. Se il chiamante non l'ha indicata (il default e'
+    // lato provider) la quantita' resta ignota: meglio una riga senza numero che
+    // un numero inventato.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        match body.duration_seconds {
+            Some(s) => MediaUsage::da_richiesta(MediaKind::Video, UsageUnit::Second, s as f64),
+            None => MediaUsage::non_quantificabile(MediaKind::Video, UsageUnit::Second),
+        },
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per il video-gen (punto unico, regola L). Gemello di
@@ -1580,13 +1640,12 @@ fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
 /// quel provider; senza pin sceglie il primo provider audio-capable non in
 /// cooldown. Nessun fallback cross-provider in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
-/// non si applica alla trascrizione, il cui costo e' al minuto/secondo di audio
-/// (non riportato in token dal provider) e il testo risultante non e' noto a
-/// priori. Per non INVENTARE costi (regola G/H: niente fallback nascosto), in
-/// questo PR il ledger NON viene scritto per le trascrizioni, allineato al
-/// pattern image-gen. TODO PR successiva: costo per-durata-audio in
-/// `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` (`usage_kind='audio_in'`).
+/// La durata dell'audio non e' nota a nessuna delle due parti — la richiesta
+/// porta i byte codificati e la risposta gira con `response_format=json`, che non
+/// include `duration` — quindi la riga registra CHI ha consumato e con quale
+/// modello, con `quantity` NULL e `quantity_source='none'`. Registrare il fatto
+/// senza il numero e' piu' onesto che non registrarlo affatto.
 pub async fn transcribe_audio(
     State(state): State<AppState>,
     Json(body): Json<TranscribeRequest>,
@@ -1625,9 +1684,15 @@ async fn run_transcribe_audio(
     // messaggio user vuoto). Coerente col pattern image-gen, che NON scrive
     // ledger: niente costo inventato (regola G/H).
     let quota_req = transcribe_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1639,10 +1704,27 @@ async fn run_transcribe_audio(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .transcribe_audio(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider(e.to_string()))?;
+
+    // Consumo: la trascrizione si paga al secondo di audio, ma la durata non e'
+    // nota da nessuna delle due parti — la richiesta porta i byte codificati (da
+    // cui i secondi non si ricavano senza decodificare il contenitore) e la
+    // risposta gira con `response_format=json`, che non include `duration`.
+    // La riga si scrive comunque: chi ha consumato, con quale modello e quando
+    // sono fatti utili anche senza il numero.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        MediaUsage::non_quantificabile(MediaKind::AudioIn, UsageUnit::Second),
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per la trascrizione audio (punto unico, regola L).
@@ -1724,12 +1806,9 @@ fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmReques
 /// `pin_provider` esegue quel provider; senza pin sceglie il primo provider
 /// audio-out-capable non in cooldown. Nessun fallback cross-provider in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
-/// non si applica al TTS, il cui costo e' al carattere di input (non riportato in
-/// token dal provider). Per non INVENTARE costi (regola G/H: niente fallback
-/// nascosto), in questo PR il ledger NON viene scritto per la sintesi vocale,
-/// allineato al pattern image-gen / transcribe. TODO PR successiva: costo
-/// per-carattere-audio in `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` (`usage_kind='audio_out'`,
+/// `quantity_unit='character'`). Qui la quantita' e' esatta: il testo di input lo
+/// conosciamo, e si contano i CARATTERI, non i byte.
 pub async fn text_to_speech(
     State(state): State<AppState>,
     Json(body): Json<TtsRequest>,
@@ -1768,9 +1847,15 @@ async fn run_text_to_speech(
     // dell'input. Coerente col pattern image-gen, NON scrive ledger: niente costo
     // inventato (regola G/H).
     let quota_req = tts_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1782,10 +1867,28 @@ async fn run_text_to_speech(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .text_to_speech(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider(e.to_string()))?;
+
+    // Consumo: il TTS si paga al carattere di input, e l'input lo conosciamo
+    // esattamente. `chars()` e non `len()`: i byte UTF-8 non sono caratteri, e
+    // fatturare un testo accentato piu' di uno ASCII sarebbe un errore silenzioso.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        MediaUsage::da_richiesta(
+            MediaKind::AudioOut,
+            UsageUnit::Character,
+            body.input.chars().count() as f64,
+        ),
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per la sintesi vocale (punto unico, regola L). Gemello di

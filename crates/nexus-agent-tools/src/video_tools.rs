@@ -30,7 +30,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::{json, Value};
 
-use super::gateway_client::gateway_generate_video;
+use super::gateway_client::{gateway_generate_video, GwCaller};
 use super::ToolContextCore;
 use nexus_types::routing_client::resolve_purpose_via_http;
 use nexus_types::workspace_paths::resolve_workspace_target;
@@ -100,6 +100,11 @@ pub async fn tool_nexus_generate_video(ctx: &ToolContextCore, input: &Value) -> 
         &prompt,
         duration_seconds,
         VIDEO_PURPOSE,
+        &GwCaller {
+            user_id: ctx.user_id,
+            project_id: ctx.project_id,
+            run_id: ctx.run_id,
+        },
     )
     .await
     {
