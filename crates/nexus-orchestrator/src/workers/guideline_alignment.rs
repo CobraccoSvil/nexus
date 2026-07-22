@@ -31,7 +31,11 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Cadenza del worker: 30 minuti, come il gemello `prompt_optimizer` e per lo
+/// stesso motivo (interroga il modello). Vedi [`GuidelineAlignmentWorker::interval`].
+const ALIGNMENT_INTERVAL_SECS: u64 = 1800;
 use tracing::{debug, error, info, warn};
 
 /// Template attivo candidato alla valutazione di conformita'.
@@ -280,6 +284,17 @@ impl LearningWorker for GuidelineAlignmentWorker {
 
     fn trigger(&self) -> WorkerTrigger {
         WorkerTrigger::Periodic
+    }
+
+    /// 30 minuti come il gemello `prompt_optimizer`, e per la stessa ragione:
+    /// quando `alignment_enabled` e' acceso questo worker interroga il modello
+    /// per i prompt da verificare. Il throttle interno
+    /// (`alignment_check_interval_hours`, `alignment_max_checks_per_tick`) limita
+    /// il lavoro per esecuzione, ma la cadenza va dichiarata comunque: dal
+    /// momento in cui lo scheduler onora `interval()`, tacere significherebbe
+    /// ereditare il default di 60s del trait.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(ALIGNMENT_INTERVAL_SECS)
     }
 
     async fn run(&self, _context: &LearningContext) -> WorkerOutcome {

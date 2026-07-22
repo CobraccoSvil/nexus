@@ -53,7 +53,7 @@ pub use types::{
     RoutingDecision, SelectionStrategy,
 };
 pub use workers::{
-    AnomalyDetectionWorker, AuditWorker, CleanupWorker, ClusteringWorker,
+    AnomalyDetectionWorker, CleanupWorker, ClusteringWorker,
     GuidelineAlignmentWorker, MemoryConsolidationWorker, MetricsAggregationWorker,
     ProfilingWorker, PromptOptimizerWorker, QLearningReplayWorker, ReplicationBatch,
     ReplicationEntry, ReplicationWorker, SessionPersistenceWorker,

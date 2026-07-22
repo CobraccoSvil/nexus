@@ -22,7 +22,7 @@
 //! raccolto abbastanza dati.
 
 use nexus_orchestrator::{
-    AgentType, AnomalyDetectionWorker, AuditWorker, CleanupWorker, ClusteringWorker,
+    AgentType, AnomalyDetectionWorker, CleanupWorker, ClusteringWorker,
     ConsensusEngine, ConsensusStrategy, Embedder, ExecutionOutcome, GuidelineAlignmentWorker,
     HashEmbedder, LearningContext, LearningScheduler, MemoryConsolidationWorker, MemoryNamespace,
     MetricsAggregationWorker, OnnxMiniLmEmbedder, ProfilingWorker, PromptOptimizerWorker,
@@ -88,6 +88,12 @@ pub struct NexusBridge {
 /// provider/model (agent_type_to_model) è parziale. E' una tabella dati (non
 /// una funzione): il contenuto e' invariato rispetto alla versione inline
 /// precedente in `new_internal`.
+/// Ogni quanto lo scheduler si sveglia per chiedersi quali worker sono in
+/// scadenza. NON e' la cadenza dei worker: quella e' `LearningWorker::interval()`
+/// di ciascuno. Va tenuta piu' fine dell'intervallo del worker piu' frequente
+/// (oggi `CleanupWorker`, 60s).
+const SCHEDULER_GRANULARITY_SECS: u64 = 60;
+
 static AGENT_REGISTRATIONS: &[(AgentType, &str)] = &[
     // ── Core (4) ──────────────────────────────────────────────────────────
     (
@@ -408,8 +414,8 @@ impl NexusBridge {
     /// e li registra. Estratta da `new_internal` per contenerne la lunghezza
     /// (regola long-fn); comportamento e ordine di registrazione invariati.
     ///
-    /// Reactive (OnTaskComplete): UltralearnWorker, AuditWorker,
-    ///   MetricsAggregationWorker, VersioningWorker
+    /// Reactive (OnTaskComplete): UltralearnWorker, MetricsAggregationWorker,
+    ///   VersioningWorker
     /// Periodic: ProfilingWorker, AnomalyDetectionWorker, MemoryConsolidationWorker,
     ///   CleanupWorker, SessionPersistenceWorker, QLearningReplayWorker,
     ///   ReplicationWorker, ClusteringWorker
@@ -431,7 +437,6 @@ impl NexusBridge {
         } else {
             info!("UltralearnWorker disabilitato: learning_auto_extract=false");
         }
-        scheduler.register(Arc::new(AuditWorker::new()));
         scheduler.register(Arc::new(MetricsAggregationWorker::new()));
         scheduler.register(Arc::new(VersioningWorker::new()));
         scheduler.register(Arc::new(ProfilingWorker::new()));
@@ -653,18 +658,24 @@ impl NexusBridge {
     /// `init_global_with_pool` per contenerne la lunghezza (long-fn).
     ///
     /// Trigger = Periodic o Both: CleanupWorker, MemoryConsolidationWorker,
-    /// MetricsAggregationWorker, PromptOptimizerWorker. Intervallo: 1800s (30 min).
-    /// NOTA COSTI: il PromptOptimizerWorker chiama direttamente l'API Anthropic
-    /// (claude-haiku, max_tokens=4096) per ogni prompt candidato ad ogni tick.
-    /// A 60s generava fino a 1440 chiamate/giorno. A 1800s = max 48 chiamate/giorno.
-    /// L'optimizer puo' essere disabilitato completamente via DB:
+    /// MetricsAggregationWorker, PromptOptimizerWorker.
+    ///
+    /// I 60s qui sotto sono la GRANULARITA' dello scheduler (ogni quanto si
+    /// chiede chi e' in scadenza), non la cadenza dei worker: quella e'
+    /// `LearningWorker::interval()` di ciascuno, ora effettivamente onorata.
+    /// Prima il valore era 1800s ed era la cadenza di TUTTI: serviva a contenere
+    /// la spesa del solo PromptOptimizerWorker (che chiama il modello per ogni
+    /// prompt candidato), ma nel farlo rallentava di 30 volte il cleanup e
+    /// lasciava lo snapshot di sessione scaduto per due terzi del tempo. Il
+    /// vincolo di costo ora vive nel worker che lo genera
+    /// (`prompt_optimizer::interval` = 1800s), e resta spegnibile via DB:
     ///   UPDATE settings SET value='false' WHERE key='optimizer_enabled';
     async fn start_periodic_workers(&self) {
         let scheduler = self.scheduler.clone();
         let ns = self.observability_ns.clone();
         let router = self.router.clone();
         let handle = scheduler.start_periodic_loop(
-            Duration::from_secs(1800),
+            Duration::from_secs(SCHEDULER_GRANULARITY_SECS),
             Arc::new(move || {
                 LearningContext::new()
                     .with_namespace(ns.clone())
@@ -672,7 +683,7 @@ impl NexusBridge {
             }),
         );
         *self.periodic_handle.lock().await = Some(handle);
-        info!("Learning workers: periodic loop avviato (interval=1800s)");
+        info!("Learning workers: periodic loop avviato (granularita'=60s, cadenza per-worker)");
     }
 
     /// Accesso al singleton. Ritorna None se non inizializzato.
@@ -848,7 +859,7 @@ impl NexusBridge {
     }
 
     /// Spawna un tokio task per eseguire i reactive learning workers
-    /// (UltralearnWorker, AuditWorker, ProfilingWorker, AnomalyDetectionWorker…)
+    /// (UltralearnWorker, ProfilingWorker, AnomalyDetectionWorker…)
     /// con un `LearningContext` costruito dal singolo task completato.
     fn fire_reactive_workers(
         &self,
@@ -945,33 +956,94 @@ impl NexusBridge {
     /// È la controparte consumatrice di `ReplicationWorker`: il worker prepara
     /// il batch nel namespace, questo metodo lo persiste su DB.
     /// Chiamato ogni 5 minuti circa e durante lo shutdown.
-    pub async fn flush_replication_pending(&self) {
-        let ns = &self.observability_ns;
-        let Some(entry) = ns.get("replication:pending") else {
-            return;
+    /// Chiavi dei batch in attesa, in ordine di preparazione (la chiave inizia
+    /// con l'istante). Include la chiave singola usata prima delle chiavi
+    /// per-batch, cosi' un batch preparato dalla versione precedente e
+    /// sopravvissuto all'aggiornamento non resta indietro.
+    fn pending_replication_keys(ns: &MemoryNamespace) -> Vec<String> {
+        use nexus_orchestrator::workers::replication::{
+            REPLICATION_PENDING_LEGACY_KEY, REPLICATION_PENDING_PREFIX,
         };
+        let mut keys: Vec<String> = ns
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with(REPLICATION_PENDING_PREFIX))
+            .collect();
+        keys.sort();
+        if ns.get(REPLICATION_PENDING_LEGACY_KEY).is_some() {
+            keys.insert(0, REPLICATION_PENDING_LEGACY_KEY.to_string());
+        }
+        keys
+    }
 
+    /// Replica UN batch accodato e lo toglie dalla coda. Ritorna
+    /// `(entry scritte, entry attese)`; `(0, 0)` se la chiave e' sparita o il
+    /// contenuto non e' leggibile.
+    ///
+    /// La rimozione avviene DOPO la scrittura: se il processo muore a meta', il
+    /// batch resta in coda e viene ritentato al flush successivo. Un batch
+    /// illeggibile viene invece rimosso subito, altrimenti bloccherebbe la coda
+    /// a ogni giro; l'errore va detto, non ingoiato.
+    async fn flush_one_batch(
+        pool: &Arc<PgPool>,
+        ns: &MemoryNamespace,
+        key: &str,
+    ) -> (usize, usize) {
+        let Some(entry) = ns.get(key) else {
+            return (0, 0);
+        };
         let batch: ReplicationBatch = match serde_json::from_value(entry.value) {
             Ok(b) => b,
             Err(e) => {
-                warn!("flush_replication_pending: deserializzazione fallita: {e}");
-                return;
+                warn!("flush_replication_pending: batch {key} illeggibile, scartato: {e}");
+                ns.remove(key);
+                return (0, 0);
             }
         };
+        let expected = batch.entries.len();
+        let ok = replicate_batch(pool, &batch).await;
+        ns.remove(key);
+        (ok, expected)
+    }
+
+    pub async fn flush_replication_pending(&self) {
+        let ns = &self.observability_ns;
+        // TUTTI i batch accodati, non solo l'ultimo. Il worker ne prepara uno
+        // ogni 180s mentre questo flush gira su un'altra cadenza: finche' la
+        // chiave era una sola (`replication:pending`, riscritta ogni volta) i
+        // batch non ancora consumati venivano sovrascritti e persi in silenzio.
+        let keys = Self::pending_replication_keys(ns);
+        if keys.is_empty() {
+            return;
+        }
 
         let Some(pool) = &self.pool else {
             debug!("flush_replication_pending: nessun pool DB configurato, skip");
             return;
         };
 
-        let ok = replicate_batch(pool, &batch).await;
+        let (mut batches, mut ok_total, mut expected_total) = (0usize, 0usize, 0usize);
+        for key in keys {
+            let (ok, expected) = Self::flush_one_batch(pool, ns, &key).await;
+            if expected > 0 || ok > 0 {
+                batches += 1;
+            }
+            ok_total += ok;
+            expected_total += expected;
+        }
 
-        info!(
-            "flush_replication_pending: {}/{} entry replicate su PostgreSQL",
-            ok,
-            batch.entries.len()
-        );
-        ns.remove("replication:pending");
+        let non_scritte = expected_total - ok_total;
+        if non_scritte > 0 {
+            warn!(
+                "flush_replication_pending: {ok_total}/{expected_total} entry \
+                 replicate ({batches} batch): {non_scritte} non scritte"
+            );
+        } else {
+            info!(
+                "flush_replication_pending: {ok_total}/{expected_total} entry \
+                 replicate ({batches} batch)"
+            );
+        }
     }
 
     /// Graceful shutdown completo:

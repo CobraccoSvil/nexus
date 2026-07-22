@@ -126,7 +126,7 @@ continua a usare il flusso provider/model standard.
 **Diagnosi**:
 1. Controllare i log di boot di `mcp-core` per l'esito di `NexusBridge::init_global()`.
 2. Cercare panic o errori nei worker di `nexus-orchestrator` (`UltralearnWorker`,
-   `AuditWorker`, ecc.). Un panic in `new()` potrebbe impedire l'init, anche se
+   `CleanupWorker`, ecc.). Un panic in `new()` potrebbe impedire l'init, anche se
    al momento la `new()` non dovrebbe avere punti di fallimento.
 3. Verificare che le deps `nexus-agents` / `nexus-orchestrator` abbiano compilato.
 
@@ -152,8 +152,7 @@ dato si perde.
 
 **Diagnosi**:
 1. `/nexus/stats` → `scheduler.per_worker` mostra quale worker fallisce.
-2. I worker affettati tipicamente sono `AuditWorker` (heuristic patterns) o
-   `AnomalyDetectionWorker` (tuning soglie).
+2. Il worker tipicamente affetto e' `AnomalyDetectionWorker` (tuning soglie).
 
 **Recovery**:
 - Un worker failed non blocca gli altri (test Fase 7:

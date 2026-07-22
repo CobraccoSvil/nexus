@@ -25,11 +25,15 @@
 //! - Auto-rollback: monitorato separatamente nella logica di promozione.
 
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
+
+/// Cadenza del worker: 30 minuti. Vedi [`PromptOptimizerWorker::interval`] per
+/// il perche' (vincolo di costo, non preferenza).
+const OPTIMIZER_INTERVAL_SECS: u64 = 1800;
 use crate::workers::prompt_variants;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Metriche aggregate per un singolo (prompt_key, version).
@@ -417,6 +421,20 @@ impl LearningWorker for PromptOptimizerWorker {
 
     fn trigger(&self) -> WorkerTrigger {
         WorkerTrigger::Periodic
+    }
+
+    /// 30 minuti, ed e' un vincolo di COSTO, non una preferenza: questo worker
+    /// chiama il modello per ogni prompt candidato a ogni esecuzione. Al default
+    /// del trait (60s) arriverebbe a ~1440 chiamate al giorno; qui sono al piu'
+    /// 48.
+    ///
+    /// Il numero viveva nel chiamante, come intervallo globale dello scheduler:
+    /// conteneva la spesa di questo worker rallentando pero' tutti gli altri
+    /// (cleanup e session_persistence compresi, che ne uscivano storpiati).
+    /// Ora il vincolo sta dove nasce, e gli altri worker corrono alla loro
+    /// cadenza. Per spegnerlo del tutto resta il flag DB `optimizer_enabled`.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(OPTIMIZER_INTERVAL_SECS)
     }
 
     async fn run(&self, _context: &LearningContext) -> WorkerOutcome {
