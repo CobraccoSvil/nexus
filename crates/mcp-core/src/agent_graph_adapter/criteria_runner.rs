@@ -1358,11 +1358,9 @@ mod tests {
         assert_eq!(res[0].evidence["exists"], json!(true));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn outputs_exist_na_senza_step(pool: PgPool) {
-        // agent_steps tabella minimale per la query.
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
+        let run = crate::test_support::seed_agent_run(&pool).await;
         let exec = FakeToolExecutor::with(&[]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
         let res = runner
@@ -1381,10 +1379,9 @@ mod tests {
         assert!(res[0].evidence["skipped"].is_string());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn outputs_exist_fallisce_se_output_assente(pool: PgPool) {
-        create_steps_tables(&pool).await;
-        let run = Uuid::new_v4();
+        let run = crate::test_support::seed_agent_run(&pool).await;
         // Step write_file su "nuovo.rs": il file NON e' nel listing -> missing.
         sqlx::query(
             "INSERT INTO agent_steps (id, run_id, step_index, tool_name, tool_input, status) \
@@ -1429,23 +1426,6 @@ mod tests {
         assert!(res[0].evidence["error"].is_string());
     }
 
-    async fn create_steps_tables(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
 
     // ── helper puri ───────────────────────────────────────────────────────────
 

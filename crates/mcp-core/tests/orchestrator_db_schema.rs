@@ -37,18 +37,21 @@ async fn tabelle_plan_act_verify_esistono() {
             "tabella '{t}' NON ESISTE - applicare migration"
         );
     }
-    // Tabelle del dominio run: migrate ai DB-progetto (decommissionate nel
-    // meta dalla 0507) — la fonte di verita' e' il set db/migrations/project.
-    // Verifica sui file del set: un DB-progetto effimero richiederebbe
-    // credenziali del cluster app non garantite in CI.
-    let project_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../db/migrations/project");
-    let mut project_sql = String::new();
-    for entry in std::fs::read_dir(project_dir).expect("dir db/migrations/project") {
-        let path = entry.expect("entry").path();
-        if path.extension().and_then(|e| e.to_str()) == Some("sql") {
-            project_sql.push_str(&std::fs::read_to_string(&path).expect("read sql"));
-        }
-    }
+}
+
+/// Tabelle del dominio run: migrate ai DB-progetto (decommissionate nel meta
+/// dalla 0507). La verifica APPLICA il set `db/migrations/project` a un DB
+/// effimero e interroga lo schema risultante.
+///
+/// Prima cercava `CREATE TABLE <nome>` nel testo dei file: quel controllo
+/// imitava il parser invece di chiedere al DB (regola O), quindi passava anche
+/// se la CREATE era dentro un blocco che non veniva mai eseguito e falliva su
+/// una tabella creata in modo diverso da come la stringa se l'aspettava. Il
+/// dubbio storico ("un DB-progetto effimero richiederebbe credenziali del
+/// cluster app") non regge: il migrator gira su qualunque DB vuoto, ed e' lo
+/// stesso che la produzione applica a `<slug>_nexus`.
+#[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+async fn tabelle_dominio_run_esistono_dopo_le_migrazioni(pool: PgPool) {
     let attese_project = [
         "nexus_agent_plans",
         "nexus_agent_todos",
@@ -56,15 +59,17 @@ async fn tabelle_plan_act_verify_esistono() {
         "nexus_subagent_runs",
     ];
     for t in attese_project {
-        // Il set project e' generato da pg_dump: le tabelle sono qualificate con
-        // lo schema (`public.<t>`). Il match accetta sia la forma qualificata sia
-        // quella nuda (robustezza al prefisso schema).
+        let row = sqlx::query(
+            "SELECT 1 AS x FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(t)
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
         assert!(
-            project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t}"))
-                || project_sql.contains(&format!("CREATE TABLE {t}"))
-                || project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS public.{t}"))
-                || project_sql.contains(&format!("CREATE TABLE public.{t}")),
-            "tabella '{t}' non definita nel set db/migrations/project - dominio run incompleto"
+            row.is_some(),
+            "tabella '{t}' assente dopo db/migrations/project - dominio run incompleto"
         );
     }
 }

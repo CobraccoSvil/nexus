@@ -271,24 +271,24 @@ async fn finalize_reaped(meta: &PgPool, db: &PgPool, reaped: Vec<uuid::Uuid>) ->
 mod tests {
     use super::*;
 
-    /// Schema minimo di `agent_runs` per il reaper: le colonne che tocca e quella
-    /// che il TASK legge (`cancellation_requested`).
-    async fn crea_agent_runs(pool: &PgPool) {
+    /// Run del progetto con eta'/heartbeat espressi in secondi nel passato.
+    /// Le tabelle le porta il migrator del set `db/migrations/project`; qui si
+    /// semina la riga coi NOT NULL reali e le si retrodatano i tempi.
+    async fn run_datato(pool: &PgPool, eta_s: i64, heartbeat_s: i64) -> uuid::Uuid {
+        let id = crate::test_support::seed_agent_run(pool).await;
         sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 status TEXT NOT NULL, \
-                 final_answer TEXT, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-                 updated_at TIMESTAMPTZ, \
-                 completed_at TIMESTAMPTZ, \
-                 cancellation_requested TIMESTAMPTZ, \
-                 cancellation_reason TEXT \
-             )",
+            "UPDATE agent_runs SET status = 'running', \
+                 created_at = NOW() - make_interval(secs => $2), \
+                 updated_at = NOW() - make_interval(secs => $3) \
+             WHERE id = $1",
         )
+        .bind(id)
+        .bind(eta_s as f64)
+        .bind(heartbeat_s as f64)
         .execute(pool)
         .await
-        .expect("tabella agent_runs");
+        .expect("retrodata il run");
+        id
     }
 
     /// IL TEST CHE CONTA: il reaper deve emettere il SEGNALE DI STOP, non solo
@@ -302,18 +302,10 @@ mod tests {
     ///
     /// Due punti chiudono un run (`supersede_active_runs` e il reaper) e solo uno
     /// lo diceva: regola L.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn il_reap_emette_il_segnale_di_stop_non_solo_lo_stato(pool: PgPool) {
-        crea_agent_runs(&pool).await;
         // Un run fermo da 1000s: oltre la soglia di 900s.
-        let id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_runs (status, created_at, updated_at) \
-             VALUES ('running', NOW() - interval '1000 seconds', \
-                     NOW() - interval '1000 seconds') RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("run stantio");
+        let id = run_datato(&pool, 1000, 1000).await;
 
         let reaped = mark_stale_on_pool(&pool, 900).await;
         assert_eq!(reaped, vec![id], "il run stantio deve essere reapato");
@@ -340,17 +332,10 @@ mod tests {
     /// Un run VIVO (heartbeat recente) non si tocca. E' il difetto opposto, e la
     /// mig 0392 nasce proprio da li': un reaper troppo aggressivo uccideva run che
     /// stavano lavorando.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn un_run_vivo_non_viene_reapato(pool: PgPool) {
-        crea_agent_runs(&pool).await;
         // Nato 1000s fa ma con l'heartbeat battuto ORA: sta lavorando.
-        let id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_runs (status, created_at, updated_at) \
-             VALUES ('running', NOW() - interval '1000 seconds', NOW()) RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("run vivo");
+        let id = run_datato(&pool, 1000, 0).await;
         assert!(
             mark_stale_on_pool(&pool, 900).await.is_empty(),
             "il criterio e' la LIVENESS (updated_at), non l'eta': un run che batte \
@@ -367,18 +352,17 @@ mod tests {
 
     /// Una cancellazione dell'UTENTE gia' registrata non viene sovrascritta: e'
     /// arrivata prima, e il suo motivo e' piu' informativo di 'reaped_stale'.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn il_reap_non_sovrascrive_una_cancellazione_utente(pool: PgPool) {
-        crea_agent_runs(&pool).await;
-        let id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_runs \
-                 (status, created_at, updated_at, cancellation_requested, cancellation_reason) \
-             VALUES ('running', NOW() - interval '1000 seconds', NOW() - interval '1000 seconds', \
-                     NOW() - interval '500 seconds', 'utente') RETURNING id",
+        let id = run_datato(&pool, 1000, 1000).await;
+        sqlx::query(
+            "UPDATE agent_runs SET cancellation_requested = NOW() - interval '500 seconds', \
+                 cancellation_reason = 'utente' WHERE id = $1",
         )
-        .fetch_one(&pool)
+        .bind(id)
+        .execute(&pool)
         .await
-        .expect("run cancellato dall'utente");
+        .expect("cancellazione utente registrata");
         mark_stale_on_pool(&pool, 900).await;
         let reason: Option<String> =
             sqlx::query_scalar("SELECT cancellation_reason FROM agent_runs WHERE id = $1")

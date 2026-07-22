@@ -79,6 +79,9 @@ tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# Schema di test del DB-progetto: il migrator del set db/migrations/project
+# (punto unico, regola O). Vedi crates/nexus-test-schema.
+nexus-test-schema = { path = "../nexus-test-schema" }
 
 [features]
 # default: include onnx — l'ambiente locale canonico (WSL, regola "Esecuzione

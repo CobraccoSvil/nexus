@@ -94,25 +94,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Tabella minimale senza FK strette (il gate/best-effort si testa cosi' senza
-    /// dover ricostruire l'intero schema plans/todos).
-    async fn create_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_agent_verifier_runs ( \
-                 id UUID NOT NULL DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 todo_id UUID, \
-                 cycle INTEGER NOT NULL, \
-                 criteria_results JSONB NOT NULL, \
-                 passed BOOLEAN NOT NULL, \
-                 duration_ms INTEGER \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table verifier_runs");
-    }
-
     fn record(run_id: Uuid, todo_id: Uuid) -> VerifierRunRecord {
         VerifierRunRecord {
             run_id: run_id.to_string(),
@@ -124,12 +105,14 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn real_inserisce(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgVerifierRunStore::new(pool.clone());
+        // Piano e todo sono PREREQUISITI reali: `nexus_agent_verifier_runs` ha le
+        // FK verso `nexus_agent_plans(run_id)` e `nexus_agent_todos(id)`, che la
+        // vecchia fixture ometteva per non "dover ricostruire l'intero schema".
         let run_id = Uuid::new_v4();
-        let todo_id = Uuid::new_v4();
+        let todo_id = crate::test_support::seed_todo(&pool, run_id, 1, "pending").await;
         store
             .record(record(run_id, todo_id), ExecMode::Real)
             .await
@@ -143,9 +126,8 @@ mod tests {
         assert_eq!(count, 1, "in Real la INSERT avviene");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn replay_e_no_op(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgVerifierRunStore::new(pool.clone());
         let run_id = Uuid::new_v4();
         store
@@ -159,9 +141,8 @@ mod tests {
         assert_eq!(count, 0, "in Replay (shadow) NESSUNA scrittura");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn run_id_non_uuid_e_best_effort(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgVerifierRunStore::new(pool.clone());
         let rec = VerifierRunRecord {
             run_id: "non-un-uuid".to_string(),

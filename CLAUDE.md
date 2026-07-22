@@ -288,6 +288,7 @@ condividere codice (fragile base class).
 | Vocabolario performance-tier (light<medium<high<heavy<frontier) | `nexus-types/src/tiers.rs`; `decisions/tiers.rs` e' un re-export |
 | Tool mutativo ("questo tool scrive?") | `nexus-agent-graph/src/decisions/hitl.rs` (`is_mutator_tool_name`, `pending_contains_mutator`) su `agent.tools.result_cache_mutators`; gate HITL e barriera advisory delegano |
 | Whitelist runtime dei kind (CSV `orchestrator.subagent_kinds_whitelist`) | `admin-service/src/figures.rs` (`mutate_kinds_whitelist`) |
+| Schema di test del DB-progetto (i `#[sqlx::test]` girano sulla migrazione reale, mai su un `CREATE TABLE` ricopiato) | crate `nexus-test-schema` (`PROJECT_MIGRATOR` = set `db/migrations/project`) + seeder in `mcp-core::test_support` (`seed_chat_session`, `seed_agent_run`, `seed_plan`, `seed_todo`). Guard `schema-di-test` |
 
 ### Enforcement automatico (la regola e' duratura, non una-tantum)
 
@@ -435,6 +436,7 @@ domanda. Entrambi funzionano, su cose diverse. Casi REALI di questo repo:
 | helper di test `run()` | fissava `inconclusive: 0` | il ramo del silenzio, mai esercitato |
 | script diagnostico | ricopiava `SQL_CLAIM` a mano | leggeva la suite dalla tabella sbagliata: "0 candidati" contro 29 |
 | `rg -rn` | `-r` e' `--replace`, non "recursive" | output falsato per un'intera sessione |
+| fixture `CREATE TABLE` nei `mod tests` | ricopiavano lo schema a mano | 41 copie divergenti dalla migrazione: righe che il DB di produzione RIFIUTA (run senza sessione, todo senza piano, step senza `tool_input`) create dai test per anni. Fix: `nexus-test-schema::PROJECT_MIGRATOR` + guard `schema-di-test` |
 
 ### Cosa e' richiesto
 

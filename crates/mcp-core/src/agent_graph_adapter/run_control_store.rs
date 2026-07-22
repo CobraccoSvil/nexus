@@ -129,55 +129,37 @@ impl RunControlStore for PgRunControlStore {
 mod tests {
     use super::*;
 
-    async fn create_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 provider TEXT, \
-                 model TEXT, \
-                 updated_at TIMESTAMPTZ, \
-                 cancellation_requested TIMESTAMPTZ \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-    }
-
+    /// Run reale (sessione + NOT NULL dello schema del DB-progetto), con lo Stop
+    /// utente registrato se `superseded`. La tabella la porta il migrator del set
+    /// `db/migrations/project`.
     async fn insert_run(pool: &PgPool, superseded: bool) -> Uuid {
-        let id = Uuid::new_v4();
-        let sql = if superseded {
-            "INSERT INTO agent_runs (id, cancellation_requested) VALUES ($1, NOW())"
-        } else {
-            "INSERT INTO agent_runs (id) VALUES ($1)"
-        };
-        sqlx::query(sql)
-            .bind(id)
-            .execute(pool)
-            .await
-            .expect("insert");
+        let id = crate::test_support::seed_agent_run(pool).await;
+        if superseded {
+            sqlx::query("UPDATE agent_runs SET cancellation_requested = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("registra la supersessione");
+        }
         id
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn is_superseded_vero_quando_cancellation_requested(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, true).await;
         assert!(store.is_superseded(&run_id.to_string()).await.expect("ok"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn is_superseded_falso_run_attivo(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         assert!(!store.is_superseded(&run_id.to_string()).await.expect("ok"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn is_superseded_fail_open_run_inesistente_e_uuid_invalido(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         // Run inesistente -> false (prosegue).
         assert!(!store
@@ -188,9 +170,8 @@ mod tests {
         assert!(!store.is_superseded("non-uuid").await.expect("fail-open"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn heartbeat_real_aggiorna_updated_at(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         store
@@ -209,9 +190,8 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn heartbeat_replay_e_no_op(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         store
@@ -227,9 +207,8 @@ mod tests {
         assert!(updated.is_none(), "in Replay nessun heartbeat");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn set_effective_model_real_scrive_replay_no(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         // Replay: no-op.
