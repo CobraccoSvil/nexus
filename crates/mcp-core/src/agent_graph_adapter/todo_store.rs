@@ -325,6 +325,7 @@ mod tests {
                  run_id UUID NOT NULL, \
                  seq INTEGER NOT NULL, \
                  content TEXT NOT NULL, \
+                 priority TEXT, \
                  status TEXT NOT NULL, \
                  verify_failures INTEGER NOT NULL DEFAULT 0, \
                  iteration_seen INTEGER NOT NULL DEFAULT 0, \

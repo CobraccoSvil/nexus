@@ -192,6 +192,32 @@ pub fn pick_next_todo(todos: &[Todo], dag_topological_enabled: bool) -> Option<&
     }
 }
 
+/// `true` se il piano dei todo e' PIENAMENTE RISOLTO CON LAVORO REALE: OGNI todo
+/// e' in uno stato terminale che soddisfa una dipendenza
+/// ([`TodoStatus::satisfies_dependency`], cioe' `completed`/`skipped`) E almeno
+/// uno e' `completed`.
+///
+/// Punto unico (regola L) del criterio "il piano si e' concluso avendo prodotto
+/// lavoro". NON e' equivalente a `pick_next_todo(..) == None`: quello ritorna
+/// `None` anche quando restano todo `blocked` (piano FERMO, non completato) e
+/// non distingue un piano tutto `skipped` (nessun lavoro reale) da uno eseguito.
+///
+/// A COSA SERVE (regola M, falso positivo hollow su todo-isolation): quando
+/// `supervisor_mode=continuous` i todo vengono eseguiti come SUB-RUN isolati e il
+/// run PRINCIPALE e' un semplice dispatcher: `route_after_todo_runner` lo manda a
+/// FinalGate/Learner e MAI all'Executor, percio' non scrive `agent_steps` sul
+/// proprio `run_id` e non produce un `final_answer` (nessun turno di sintesi).
+/// La detection "hollow completion" del finalizzatore vedrebbe quindi 0 step +
+/// risposta vuota e lo scambierebbe per un completamento allucinato: questo
+/// predicato e' il SEGNALE STRUTTURATO che distingue "lavoro svolto per delega"
+/// da "nessun lavoro". Un piano vuoto, con `pending`/`in_progress`/`blocked`, o
+/// tutto `skipped`, NON lo soddisfa: quei run restano soggetti alla detection.
+pub fn plan_todos_all_completed(todos: &[Todo]) -> bool {
+    !todos.is_empty()
+        && todos.iter().all(|t| t.status.satisfies_dependency())
+        && todos.iter().any(|t| matches!(t.status, TodoStatus::Completed))
+}
+
 /// Insieme dei todo che dipendono (diretta o transitivamente) da `todo_id`
 /// (1:1 con `dag_scheduler._descendants`, `dag_scheduler.py:76-90`). Usato per
 /// il cascade-skip: se un todo fallisce, tutti i suoi discendenti vengono
@@ -295,6 +321,90 @@ mod tests {
         let todos = vec![todo("a", TodoStatus::Pending, &[])];
         let ready = compute_ready_layer(&todos);
         assert!(!should_parallelize(&ready, &todos, &DagConfig::default()));
+    }
+
+    // --- plan_todos_all_completed: segnale "piano concluso con lavoro" -------
+    // Boundary del predicato che salva i run dispatcher di todo-isolation dal
+    // falso positivo "hollow completion" (0 step + risposta vuota per delega).
+
+    #[test]
+    fn piano_tutto_completed_e_concluso_con_lavoro() {
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Completed, &["a"]),
+        ];
+        assert!(plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_completed_piu_skipped_resta_concluso_con_lavoro() {
+        // `skipped` soddisfa una dipendenza (cascade-skip legittimo): finche'
+        // ALMENO UNO e' completed il piano ha prodotto lavoro reale.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Skipped, &["a"]),
+        ];
+        assert!(plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_tutto_skipped_non_e_lavoro() {
+        // Nessun todo eseguito davvero: il run NON va esentato dalla detection
+        // hollow, altrimenti si inghiottirebbe un dispatch a vuoto.
+        let todos = vec![
+            todo("a", TodoStatus::Skipped, &[]),
+            todo("b", TodoStatus::Skipped, &[]),
+        ];
+        assert!(!plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_con_blocked_non_e_concluso() {
+        // Dispatch parzialmente FALLITO: deve restare hollow-eligible, cosi' il
+        // fallimento vero emerge invece di essere mascherato.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Blocked, &["a"]),
+        ];
+        assert!(!plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_con_pending_o_in_progress_non_e_concluso() {
+        let con_pending = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Pending, &[]),
+        ];
+        assert!(!plan_todos_all_completed(&con_pending));
+        let con_in_progress = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::InProgress, &[]),
+        ];
+        assert!(!plan_todos_all_completed(&con_in_progress));
+    }
+
+    #[test]
+    fn piano_vuoto_non_e_concluso() {
+        // Run SENZA piano (la maggioranza): nessuna esenzione, detection hollow
+        // invariata (nessuna regressione sull'incidente 0-step b07c7e78).
+        assert!(!plan_todos_all_completed(&[]));
+    }
+
+    #[test]
+    fn non_e_equivalente_a_pick_next_todo_none() {
+        // TRANELLO da non reintrodurre: `pick_next_todo == None` NON e' il
+        // segnale giusto. Qui non c'e' alcun pending (quindi pick_next -> None)
+        // ma il piano e' FERMO su un blocked, non concluso.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Blocked, &["a"]),
+        ];
+        assert!(pick_next_todo(&todos, true).is_none());
+        assert!(
+            !plan_todos_all_completed(&todos),
+            "un piano con todo blocked non e' concluso: usare pick_next_todo==None \
+             come proxy esenterebbe un dispatch fallito"
+        );
     }
 
     #[test]
