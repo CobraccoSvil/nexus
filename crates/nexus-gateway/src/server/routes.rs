@@ -188,9 +188,95 @@ struct ResolvedProvider {
 /// riservato alla pipeline stessa.
 const BUDGET_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// I timeout DI QUESTA richiesta: quelli per-processo, ri-derivati sul run che
+/// il chiamante dichiara (`run_timeout_secs`).
+///
+/// I budget del gateway nascono dal run — `budget = run / min_turns` — ma erano
+/// derivati una volta sola all'avvio dal default globale (300s), mentre il run
+/// vero e' per figura: `review` ne ha 240. Il gateway prometteva quindi turni
+/// che il cronometro del chiamante non poteva mantenere.
+///
+/// Il doppio `min` e' il vincolo: puo' solo STRINGERE. Un chiamante non deve
+/// poter allungare i propri budget oltre quelli configurati dichiarando un run
+/// lunghissimo — il tetto di trasporto e' comunque congelato nel client HTTP
+/// all'avvio (`client_http_timeout`), e sforarlo trasformerebbe un
+/// `attempt_timeout` strutturato in un errore di trasporto opaco (regola M).
+fn request_timeouts(base: &LlmTimeouts, run_timeout_secs: Option<u64>) -> LlmTimeouts {
+    let per_run = base.for_run(run_timeout_secs);
+    LlmTimeouts {
+        request_budget: per_run.request_budget.min(base.request_budget),
+        per_attempt: per_run.per_attempt.min(base.per_attempt),
+        ..per_run
+    }
+}
+
+#[cfg(test)]
+mod test_request_timeouts {
+    use super::*;
+
+    fn base() -> LlmTimeouts {
+        // I valori LIVE: run 300 (default globale), complete 120, 4 turni.
+        LlmTimeouts::derive(300, 120, 300, 4)
+    }
+
+    /// Il caso che ha motivato il lavoro: la figura `review` vive 240s, non 300.
+    /// I suoi turni valgono 60s, non 75.
+    #[test]
+    fn un_run_piu_corto_stringe_il_budget() {
+        let t = request_timeouts(&base(), Some(240));
+        assert_eq!(t.request_budget, std::time::Duration::from_secs(60));
+        assert!(
+            t.request_budget.as_secs() * t.min_guaranteed_turns <= 240,
+            "i turni promessi devono starci nel run vero"
+        );
+    }
+
+    /// L'INVARIANTE del doppio `min`: un chiamante non deve poter allungare i
+    /// budget del gateway dichiarando un run lunghissimo. Il tetto di trasporto
+    /// e' congelato nel client HTTP all'avvio: sforarlo trasformerebbe un
+    /// `attempt_timeout` strutturato in un errore di trasporto opaco (regola M).
+    ///
+    /// Mutazione che rende rosso: togliere i due `.min(base...)`.
+    #[test]
+    fn nessun_run_dichiarato_puo_allungare_i_budget() {
+        let b = base();
+        for run in [600_u64, 3_600, 86_400, u64::MAX] {
+            let t = request_timeouts(&b, Some(run));
+            assert!(
+                t.request_budget <= b.request_budget,
+                "run {run}: il budget e' cresciuto ({:?} > {:?})",
+                t.request_budget,
+                b.request_budget
+            );
+            assert!(t.per_attempt <= b.per_attempt, "run {run}: per_attempt cresciuto");
+        }
+    }
+
+    /// Chiamante che non dichiara nulla (client vecchio): comportamento storico.
+    #[test]
+    fn senza_dichiarazione_i_budget_sono_quelli_di_sempre() {
+        let b = base();
+        assert_eq!(request_timeouts(&b, None).request_budget, b.request_budget);
+        assert_eq!(request_timeouts(&b, Some(0)).request_budget, b.request_budget);
+    }
+}
+
 /// Esegue la pipeline completa di completion (classify -> route -> fallback ->
 /// rehydrate -> ledger). Ritorna la risposta o un errore tradotto in HTTP.
-async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse, PipelineError> {
+///
+/// `timeouts` arriva dal chiamante GIA' risolto e non viene riletto qui: prima
+/// c'erano due `runtime_snapshot()` distinti, uno per il wrapper esterno e uno
+/// per la deadline interna. Ri-derivandoli separatamente sul run della richiesta
+/// avrebbero potuto divergere, e il wrapper esterno sarebbe scaduto PRIMA della
+/// deadline interna: la pipeline verrebbe troncata senza mai produrre l'errore
+/// strutturato su cui il motore fa failover, e il chiamante riceverebbe il 504
+/// anonimo -- esattamente il difetto che `BUDGET_RESPONSE_MARGIN` esiste per
+/// evitare. Un solo calcolo, passato per parametro.
+async fn run_complete(
+    state: &AppState,
+    req: &LlmRequest,
+    timeouts: LlmTimeouts,
+) -> Result<LlmResponse, PipelineError> {
     validate_logical_model(&req.model)?;
     let runtime = state.runtime_snapshot().await;
     // DEADLINE della richiesta (incidente figure 2026-07-14): le ATTESE della
@@ -198,8 +284,7 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
     // budget e potevano dormire OLTRE la deadline esterna: il chiamante moriva
     // di timeout senza mai ricevere un errore strutturato su cui failovare.
     let deadline = tokio::time::Instant::now()
-        + runtime
-            .timeouts
+        + timeouts
             .request_budget
             .saturating_sub(BUDGET_RESPONSE_MARGIN)
             .max(std::time::Duration::from_secs(1));
@@ -340,7 +425,7 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
         &state.cooldown,
         &redacted_req,
         strict,
-        runtime.timeouts.per_attempt,
+        timeouts.per_attempt,
         deadline,
     )
     .await?;
@@ -1065,13 +1150,21 @@ pub async fn complete(
     // consumava il 100% della vita del run, che moriva con `it=0`, e la colpa
     // finiva ogni volta sul modello di turno. Il budget garantisce invece
     // `min_guaranteed_turns` turni per run (punto unico: nexus_auth::llm_timeouts).
-    let budget = state.runtime_snapshot().await.timeouts.request_budget;
-    match tokio::time::timeout(budget, run_complete(&state, &body)).await {
+    // I timeout di QUESTA richiesta, dal run che il chiamante dichiara. Calcolati
+    // UNA volta e passati a `run_complete`: wrapper esterno e deadline interna
+    // devono venire dallo stesso numero, o il primo scade prima della seconda.
+    let base = state.runtime_snapshot().await.timeouts;
+    let timeouts = request_timeouts(&base, body.run_timeout_secs);
+    let budget = timeouts.request_budget;
+    match tokio::time::timeout(budget, run_complete(&state, &body, timeouts)).await {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err(e)) => e.into_response(),
         Err(_) => {
             tracing::warn!(
                 budget_s = budget.as_secs(),
+                // Da quale run e' nato il budget: senza, un 504 con budget 60s
+                // sembra una configurazione sbagliata invece di una figura corta.
+                run_timeout_s = body.run_timeout_secs.unwrap_or(0),
                 model = %body.model,
                 feature = %body.metadata.feature,
                 "gateway: budget della richiesta esaurito -> 504, il motore fara' failover"
@@ -1456,6 +1549,7 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -1625,6 +1719,7 @@ fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -1791,6 +1886,7 @@ fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmReques
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -1956,6 +2052,7 @@ fn tts_to_llm_request(body: &TtsRequest, model: &str) -> LlmRequest {
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -2702,6 +2799,7 @@ mod tests {
                 sensitivity_tier: 0,
                 feature: "chat".into(),
             },
+            run_timeout_secs: None,
         }
     }
 

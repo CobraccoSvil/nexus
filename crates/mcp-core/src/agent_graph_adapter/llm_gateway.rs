@@ -432,6 +432,11 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
         } else {
             Some(req.provider.clone())
         },
+        // `None` di proposito: questa e' una funzione PURA e il run non lo
+        // conosce. Lo timbra il client in `NexusGatewayClient::complete`, che e'
+        // stato costruito PER quel run (`from_db_for_run`). E' lo stesso motivo
+        // per cui il pin del provider viene applicato al momento della chiamata.
+        run_timeout_secs: None,
         metadata: GwMetadata {
             tenant_id: String::new(),
             user_id: "system".to_string(),

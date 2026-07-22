@@ -9,6 +9,10 @@ pub struct NexusGatewayClient {
     http: reqwest::Client,
     base_url: String,
     service_token: String,
+    /// Il run per cui questo client e' stato costruito, se noto: viene timbrato
+    /// su ogni richiesta cosi' il gateway dimensiona i propri budget sullo stesso
+    /// cronometro del chiamante.
+    run_timeout_secs: Option<u64>,
 }
 
 /// Messaggio della conversazione inviato al gateway.
@@ -117,6 +121,15 @@ pub struct GwRequest {
     /// un secondo routing divergente (regola G).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_provider: Option<String>,
+    /// Durata del run che ha originato la richiesta: da qui il gateway deriva i
+    /// budget di QUESTA chiamata invece di usare il default globale.
+    ///
+    /// Non si valorizza a mano nei costruttori: lo timbra il client in
+    /// [`NexusGatewayClient::complete`], che e' l'unico a sapere per quale run e'
+    /// stato costruito. Chi compone la richiesta (funzioni pure come
+    /// `build_gw_request`) il run non lo conosce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_timeout_secs: Option<u64>,
     pub metadata: GwMetadata,
 }
 
@@ -429,11 +442,17 @@ impl NexusGatewayClient {
         let timeout_secs = nexus_auth::llm_timeouts::LlmTimeouts::defaults()
             .client_budget
             .as_secs();
-        Self::with_timeout(base_url, service_token, timeout_secs)
+        Self::with_timeout(base_url, service_token, timeout_secs, None)
     }
 
-    fn with_timeout(base_url: String, service_token: String, timeout_secs: u64) -> Self {
+    fn with_timeout(
+        base_url: String,
+        service_token: String,
+        timeout_secs: u64,
+        run_timeout_secs: Option<u64>,
+    ) -> Self {
         Self {
+            run_timeout_secs,
             // Resilienza connessioni morte post-sleep (regola H): niente riuso di
             // socket idle dal pool + keepalive. Il default keep-alive faceva fallire
             // le chiamate mcp-core -> gateway con "error sending request" dopo che la
@@ -474,7 +493,23 @@ impl NexusGatewayClient {
         let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
             .unwrap_or_else(|_| "dev-internal-token".to_string());
         let timeout_secs = resolve_client_timeout_secs(db, run_timeout_secs).await;
-        Self::with_timeout(gw_url, gw_token, timeout_secs)
+        Self::with_timeout(
+            gw_url,
+            gw_token,
+            timeout_secs,
+            nexus_auth::llm_timeouts::run_secs_utile(run_timeout_secs),
+        )
+    }
+
+    /// Timbra sulla richiesta il run per cui il client e' stato costruito.
+    ///
+    /// Sta QUI e non nei costruttori di [`GwRequest`] perche' chi compone la
+    /// richiesta e' una funzione pura che il run non lo conosce: lo conosce il
+    /// client, che e' stato creato per quel sub-run. Stesso precedente del pin
+    /// provider applicato in `agent_graph_adapter::llm_gateway`.
+    fn body_for(&self, mut req: GwRequest) -> GwRequest {
+        req.run_timeout_secs = self.run_timeout_secs;
+        req
     }
 
     pub async fn complete(&self, req: GwRequest) -> Result<GwResponse> {
@@ -482,7 +517,7 @@ impl NexusGatewayClient {
             .http
             .post(format!("{}/v1/complete", self.base_url))
             .header("Authorization", format!("Bearer {}", self.service_token))
-            .json(&req)
+            .json(&self.body_for(req))
             .send()
             .await
             .map_err(|e| anyhow::Error::new(GatewayTransportError::from_reqwest(&e, &self.base_url)))?;

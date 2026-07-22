@@ -3363,6 +3363,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
@@ -3389,6 +3390,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3420,6 +3422,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3461,6 +3464,7 @@ mod tests {
             tool_choice: Some(choice),
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -3513,6 +3517,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3606,6 +3611,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -3736,6 +3742,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3763,6 +3770,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json["contents"][0]["parts"][0]
@@ -3927,6 +3935,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -4069,6 +4078,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 

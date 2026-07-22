@@ -459,6 +459,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: meta(request_id),
+            run_timeout_secs: None,
         }
     }
 
