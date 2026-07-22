@@ -3679,6 +3679,45 @@ pub(crate) async fn spawn_agent_run(
             // 'completed' -> 'cancelled' (punto unico, regola L).
             enforce_user_cancellation_status(&run_pool, run_id).await;
 
+            // IL LAVORO NON FATTO NON SVANISCE COL RUN. I todo rimasti non
+            // terminali (`pending` = mai iniziati, `blocked` = falliti) vengono
+            // marcati `carry_over`: il backlog del progetto li conserva e un run
+            // successivo puo' RIPRENDERLI invece di ripartire da un'analisi da
+            // zero. Senza questa marcatura la colonna `carry_over` (mig 0244,
+            // con tanto di indice dedicato) e l'endpoint che la legge restavano
+            // lettera morta: nessuno la scriveva MAI, quindi un run che chiudeva
+            // con 12 todo indietro li perdeva del tutto.
+            //
+            // Gli `skipped` sono ESCLUSI di proposito: sono discendenti di un
+            // todo fallito (cascade), quindi vanno ri-pianificati a valle della
+            // causa, non riproposti tali e quali.
+            //
+            // `origin_run_id` conserva la provenienza (solo se non gia' scritto:
+            // un todo ereditato piu' volte deve ricordare da DOVE nasce).
+            // Best-effort: un errore qui non deve impedire la chiusura del run.
+            let carried = sqlx::query(
+                "UPDATE nexus_agent_todos \
+                 SET carry_over = true, \
+                     origin_run_id = COALESCE(origin_run_id, run_id) \
+                 WHERE run_id = $1 AND status IN ('pending', 'blocked')",
+            )
+            .bind(run_id)
+            .execute(&run_pool)
+            .await;
+            match carried {
+                Ok(r) if r.rows_affected() > 0 => tracing::info!(
+                    run_id = %run_id,
+                    todo = r.rows_affected(),
+                    "todo non completati riportati nel backlog del progetto (carry_over)"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "carry_over dei todo non riuscito (best-effort)"
+                ),
+            }
+
             // ── Terminatore dello stream: SOLO per gli stati TERMINALI ─────────
             // Emesso DOPO l'INSERT chat_messages e l'UPDATE agent_runs: quando il
             // frontend riceve `is_final` e rilegge il run dal DB, il record e' gia'
