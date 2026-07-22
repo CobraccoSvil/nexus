@@ -161,6 +161,7 @@ use crate::decisions::end_turn::{
     should_upscale, strip_suggested_actions, upscale_required_tokens,
 };
 use crate::decisions::escalation::{cap_candidates_one_step, pick_escalation_model};
+use crate::decisions::switch_reason::SwitchReason;
 use crate::decisions::g1_accounting::{g1_accounting, G1Signals};
 use crate::decisions::helpers::{
     provider_style_supports_forcing, should_force_tool_choice, structural_unfulfilled_signal,
@@ -853,7 +854,7 @@ fn switch_payload(
     from_model: &str,
     to_provider: &str,
     to_model: &str,
-    reason: &str,
+    reason: SwitchReason,
     cooldown: Option<bool>,
     cause: Option<&str>,
 ) -> Value {
@@ -862,7 +863,13 @@ fn switch_payload(
     p.insert("from_model".into(), from_model.into());
     p.insert("to_provider".into(), to_provider.into());
     p.insert("to_model".into(), to_model.into());
-    p.insert("reason".into(), reason.into());
+    // `reason` = identificatore canonico, invariato: e' cio' che la logica e i
+    // test confrontano. `reason_description` e' il canale per l'occhio, additivo
+    // (un frontend che non lo conosce continua a funzionare come prima).
+    // Prima il motivo era un `&str` libero e la card mostrava il codice grezzo:
+    // "Motivo: final_gate_nonconvergence".
+    p.insert("reason".into(), reason.code().into());
+    p.insert("reason_description".into(), reason.descrizione().into());
     if let Some(c) = cooldown {
         p.insert("cooldown".into(), c.into());
     }
@@ -883,7 +890,7 @@ fn stall_switch_payload(
     cur_model: &Option<String>,
     to_provider: &str,
     to_model: &str,
-    reason: &str,
+    reason: SwitchReason,
 ) -> Value {
     switch_payload(
         cur_provider.as_deref().unwrap_or(""),
@@ -1254,7 +1261,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                 .maybe_escalate_nonconvergence(
                     state,
                     iters_in,
-                    "final_gate_nonconvergence",
+                    SwitchReason::FinalGateNonconvergence,
                     ctx,
                     mode,
                     false,
@@ -1503,7 +1510,7 @@ oppure riprova piu' tardi."
             // sotto (bit-identico al pre-fix). Bound: auto_escalations + hard-cap
             // token/costo.
             if let Some(delta) = self
-                .maybe_escalate_nonconvergence(state, iters_in, "iteration_cap", ctx, mode, true)
+                .maybe_escalate_nonconvergence(state, iters_in, SwitchReason::IterationCap, ctx, mode, true)
                 .await
             {
                 return Ok(delta);
@@ -1688,7 +1695,7 @@ piu' specifico, oppure alza agent.run_time_budget_s se il task richiede piu' tem
             // -> backstop sotto. Chiude il cerchio: la non-convergenza fa SALIRE il
             // modello invece di chiudere secco.
             if let Some(delta) = self
-                .maybe_escalate_nonconvergence(state, iters_in, "budget_token", ctx, mode, false)
+                .maybe_escalate_nonconvergence(state, iters_in, SwitchReason::BudgetToken, ctx, mode, false)
                 .await
             {
                 return Ok(delta);
@@ -1966,7 +1973,7 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
                         &g1_cur_model,
                         &pick.provider,
                         &pick.model,
-                        "g1_cap",
+                        SwitchReason::G1Cap,
                     ),
                 )
                 .await;
@@ -2272,7 +2279,7 @@ la richiesta in modo piu' specifico.",
                             &expl_cur_model,
                             &pick.provider,
                             &pick.model,
-                            "exploration",
+                            SwitchReason::Exploration,
                         ),
                     )
                     .await;
@@ -2746,7 +2753,7 @@ indicalo esplicitamente."
                                 &ra_cur_model,
                                 &pick.provider,
                                 &pick.model,
-                                "repeated_action",
+                                SwitchReason::RepeatedAction,
                             ),
                         )
                         .await;
@@ -3905,7 +3912,7 @@ switch_payload(
                                     &model,
                                     &pick.provider,
                                     &pick.model,
-                                    "provider_failover",
+                                    SwitchReason::ProviderFailover,
                                     Some(pu.cause.is_cooldown_like()),
                                     Some(pu.cause.as_str()),
                                 ),
@@ -4256,7 +4263,7 @@ riassumi lo stato."
                             &model,
                             &pick.provider,
                             &pick.model,
-                            "signature_loop",
+                            SwitchReason::SignatureLoop,
                             None,
                             None,
                         ),
@@ -5333,7 +5340,7 @@ impl ExecutorNode {
                 &model,
                 &pick.provider,
                 &pick.model,
-                "provider_no_progress",
+                SwitchReason::ProviderNoProgress,
                 Some(false),
                 Some("no_progress"),
             ),
@@ -5454,7 +5461,7 @@ una tool call, non descrivere.",
         &self,
         state: &AgentState,
         iters_in: i64,
-        reason: &'static str,
+        reason: SwitchReason,
         ctx: &AgentNodeCtx,
         mode: crate::runtime::ports::ExecMode,
         reset_iterations: bool,
@@ -5495,7 +5502,7 @@ una tool call, non descrivere.",
             from_provider = cur_provider.as_deref().unwrap_or(""),
             to_provider = %pick.provider,
             to_model = %pick.model,
-            reason,
+            reason = reason.code(),
             "non-convergenza: ESCALATION agentica di un gradino -> budget del turno azzerato per il promosso"
         );
         self.emit_phase(
@@ -5731,7 +5738,7 @@ azioni concrete e mirate verso il completamento.",
                     format!("Passo a {}/{} (meta-reasoner)", pick.provider, pick.model),
                     // Punto unico del payload switch (regola L): come sopra, from_* dalla
                     // coppia corrente (:5700) per non mostrare "Da: <provider> / ?".
-                    stall_switch_payload(&cur_provider, &cur_model, &pick.provider, &pick.model, "stall_recovery"),
+                    stall_switch_payload(&cur_provider, &cur_model, &pick.provider, &pick.model, SwitchReason::StallRecovery),
                 )
                 .await;
                 let esc_nudge = human_msg(
