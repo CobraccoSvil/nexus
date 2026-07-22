@@ -286,6 +286,25 @@ pub fn subtasks_are_disjoint(scopes: &[Vec<String>]) -> bool {
     true
 }
 
+/// PUNTO UNICO (regola L) della domanda "posso far scrivere PIU' sub-run in
+/// PARALLELO?". Vero solo se esiste l'isolamento FISICO (worktree git effimeri)
+/// E gli scope di scrittura dichiarati sono DISGIUNTI.
+///
+/// Servono ENTRAMBI i termini, e per ragioni diverse: la disgiunzione e' una
+/// promessa DICHIARATIVA del pianificatore, l'isolamento e' la guard FISICA.
+/// Senza isolamento i sub-run condividono la root reale del progetto, quindi
+/// qualunque svista o incompletezza del piano si traduce in una race sul
+/// filesystem. Incidente del 2026-07-22 (progetto non-git, wave da 8): sette
+/// sub-run hanno scritto lo stesso file, `server.js` e' stato troncato da 2.3KB a
+/// 595B da un edit concorrente e sono nati file duplicati.
+///
+/// Chi risponde "no" NON deve degradare l'ISOLAMENTO (eseguendo comunque in
+/// parallelo sulla root condivisa, che e' il difetto trovato): deve degradare il
+/// PARALLELISMO, cioe' procedere un todo per volta.
+pub fn parallel_writers_allowed(isolation_available: bool, scopes: &[Vec<String>]) -> bool {
+    isolation_available && subtasks_are_disjoint(scopes)
+}
+
 /// Valida l'output JSON dell'LLM contro l'enum CHIUSO [`OrchestrationMove`]. Punto
 /// unico (regola L): il nodo/gate di orchestrazione e l'impl della porta chiamano
 /// SOLO questa funzione. Qualunque forma malformata / con collezione vuota dove
@@ -341,7 +360,10 @@ pub fn validate_orch_move(
             coordination: Coordination::ParallelIsolated,
         } => {
             let scopes: Vec<Vec<String>> = tasks.iter().map(|t| t.write_scope.clone()).collect();
-            let coordination = if isolation_available && subtasks_are_disjoint(&scopes) {
+            // Delega al punto unico (regola L): la stessa domanda la pone anche il
+            // TodoRunner quando apre l'ondata dei todo. Prima erano due luoghi, e
+            // solo questo — il meno battuto — la poneva davvero.
+            let coordination = if parallel_writers_allowed(isolation_available, &scopes) {
                 Coordination::ParallelIsolated
             } else {
                 Coordination::Sequential
@@ -737,6 +759,24 @@ mod tests {
             sc(&["src/a", "src/shared"]),
             sc(&["src/b", "src/shared"]),
         ]));
+    }
+
+    #[test]
+    fn parallel_writers_richiede_isolamento_e_disgiunzione() {
+        let disgiunti = [sc(&["src/a"]), sc(&["src/b"])];
+        let sovrapposti = [sc(&["src/a"]), sc(&["src/a"])];
+        // Unico caso ammesso: guard fisica presente E promessa del piano coerente.
+        assert!(parallel_writers_allowed(true, &disgiunti));
+        // ISOLAMENTO ASSENTE (ogni progetto non-git): anche con scope
+        // PERFETTAMENTE disgiunti il fronte parallelo non e' ammesso. La
+        // disgiunzione e' una promessa dichiarativa del pianificatore, non una
+        // guard fisica: se il piano sbaglia, i sub-run si pestano sulla root reale.
+        assert!(!parallel_writers_allowed(false, &disgiunti));
+        // Isolamento presente ma aree dichiarate sovrapposte.
+        assert!(!parallel_writers_allowed(true, &sovrapposti));
+        assert!(!parallel_writers_allowed(false, &sovrapposti));
+        // Scope non dichiarato -> nessun parallelismo (coerente con subtasks_are_disjoint).
+        assert!(!parallel_writers_allowed(true, &[sc(&[]), sc(&["src/b"])]));
     }
 
     #[test]
