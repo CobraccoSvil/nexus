@@ -1023,6 +1023,24 @@ export function ChatPanel({
   }, []);
   const isCompactPanel = panelWidth < 340;
 
+  // ADR 0037: centro notifiche del run (campanella). Definito QUI, e non dentro
+  // il blocco della barra contesto, perche' ha due possibili ospiti e nessuno dei
+  // due deve costargli una riga: mentre il run gira viaggia in coda alla barra di
+  // stato (che e' gia' a schermo); a run concluso torna accanto alla barra
+  // contesto, che a quel punto ha i suoi dati e occupa comunque la sua riga.
+  const runNotifications =
+    activityStreamEnabled && agentRun?.runId && liveActivityStream ? (
+      <RunNotifications
+        stream={liveActivityStream}
+        runStatus={agentRun.status}
+        runId={agentRun.runId}
+        pendingActions={agentRun.pendingActions}
+        onConfirm={handleConfirmAgent}
+        isConfirming={confirmingRunId === agentRun.runId}
+        tc={tc}
+      />
+    ) : null;
+
   /* ---- Render ---- */
 
   return (
@@ -1396,6 +1414,7 @@ export function ChatPanel({
       {isChatBusy && (
         <AgentActivityBar
           tc={tc}
+          trailing={runNotifications}
           isAgentStuck={isAgentStuck}
           secondsSinceLastStep={secondsSinceLastStep}
           busyLabel={busyLabel}
@@ -1428,22 +1447,6 @@ export function ChatPanel({
           selectedModel,
           modelCatalog,
         );
-        // ADR 0037: col flag ON, accanto alla barra contesto compare il centro
-        // notifiche del run attivo (campanella): eventi salienti del turno
-        // (cambio provider, step fallito, attesa conferma). Auto-apertura solo
-        // per eventi bloccanti.
-        const runNotifications =
-          activityStreamEnabled && agentRun?.runId && liveActivityStream ? (
-            <RunNotifications
-              stream={liveActivityStream}
-              runStatus={agentRun.status}
-              runId={agentRun.runId}
-              pendingActions={agentRun.pendingActions}
-              onConfirm={handleConfirmAgent}
-              isConfirming={confirmingRunId === agentRun.runId}
-              tc={tc}
-            />
-          ) : null;
         const usageBar = (
           <TokenUsageBar
             totalTokens={tokenUsage.totalTokens}
@@ -1453,9 +1456,13 @@ export function ChatPanel({
             modelLabel={fill.activeModel}
           />
         );
-        // Flag OFF: rendering IDENTICO a oggi (barra nuda, nessun wrapper). Flag
-        // ON: affianca il centro notifiche del run alla barra contesto.
-        return runNotifications ? (
+        // Mentre il run gira la campanella viaggia gia' in coda alla barra di
+        // stato (prop `trailing`): qui NON va aggiunta, altrimenti nasce una riga
+        // che esiste solo per lei -- a inizio run la barra contesto e' vuota,
+        // quindi si vedeva una fascia alta 28px col solo badge (difetto
+        // segnalato). A run concluso invece la barra contesto ha i suoi dati e
+        // occupa comunque la riga: li' affiancarla non costa nulla.
+        return runNotifications && !isChatBusy ? (
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
             <div style={{ flex: 1, minWidth: 0 }}>{usageBar}</div>
             {runNotifications}

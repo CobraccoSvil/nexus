@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
 import { stepLabel } from "./tool-labels";
 
@@ -29,6 +30,7 @@ export function AgentActivityBar({
   latestOutputSnippet,
   latestStepWithOutputResult,
   timelineSteps,
+  trailing,
 }: {
   tc: Record<string, string>;
   isAgentStuck: boolean;
@@ -48,6 +50,10 @@ export function AgentActivityBar({
   latestOutputSnippet: string | undefined;
   latestStepWithOutputResult: string | undefined;
   timelineSteps: AgentStep[];
+  /** Contenuto agganciato in coda alla riga di stato (es. centro notifiche del
+   *  run). Sta QUI e non in una riga propria: la barra esiste gia' per l'intera
+   *  durata del run, quindi ospitarlo non costa altezza. */
+  trailing?: ReactNode;
 }) {
   return (
     <div
@@ -142,6 +148,21 @@ export function AgentActivityBar({
             {agentStatusExpanded ? "▾" : "▸"}
           </button>
         )}
+        {/* Slot in coda: ospita il centro notifiche del run. Se il toggle sopra
+            e' presente, il suo marginLeft:auto ha gia' spinto il gruppo a destra
+            e qui basta un piccolo distacco; altrimenti ci si spinge da soli. */}
+        {trailing ? (
+          <span
+            style={{
+              marginLeft: isAgentRunning ? 4 : "auto",
+              display: "inline-flex",
+              alignItems: "center",
+              flex: "0 0 auto",
+            }}
+          >
+            {trailing}
+          </span>
+        ) : null}
       </div>
       {/* Dettagli espandibili */}
       {isAgentRunning && agentStatusExpanded && (
