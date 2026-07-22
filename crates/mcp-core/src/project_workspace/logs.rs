@@ -1267,24 +1267,9 @@ pub async fn get_playwright_runs(
     // del progetto. La query `projects` piu' sotto resta sul meta-pool (non migrata).
     let proj_pool =
         crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
-    let rows = sqlx::query(
-        r#"
-        SELECT id, kind, status, input, created_at, updated_at, progress
-        FROM jobs
-        WHERE project_id = $1 AND kind ILIKE '%playwright%'
-        ORDER BY created_at DESC
-        LIMIT 50
-        "#,
-    )
-    .bind(project_id)
-    .fetch_all(&proj_pool)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let runs = rows
-        .into_iter()
-        .map(playwright_run_to_json)
-        .collect::<Vec<_>>();
+    let runs = playwright_runs_for_project(&proj_pool, project_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Verifica se Playwright e' configurato (config file nella project root)
     let project_root: Option<String> =
@@ -1298,6 +1283,39 @@ pub async fn get_playwright_runs(
     let configured = playwright_configured(project_root.as_deref());
 
     Ok(Json(json!({ "runs": runs, "configured": configured })))
+}
+
+/// Elenco dei run Playwright di un progetto, nel formato atteso dal pannello.
+///
+/// PUNTO UNICO (regola L) della lettura `jobs` per Playwright: la usano sia
+/// l'endpoint REST `get_playwright_runs` sia lo snapshot del dispatcher
+/// (`dispatcher_routes::project_snapshot`). Prima ognuno aveva la PROPRIA copia
+/// della query: quando `jobs` e' stata migrata al DB per-progetto solo la copia
+/// in questo file e' stata aggiornata, e lo snapshot ha continuato a leggere dal
+/// meta-pool -- dove la tabella non esiste piu' -- restituendo 500 a ogni
+/// bootstrap del dispatcher. Un solo lettore, una sola volta da aggiornare.
+///
+/// `pool` DEVE essere il pool del progetto (`project_data_pool_from`): qui non
+/// si risolve da soli, cosi' il chiamante resta responsabile dell'ownership
+/// (che ha gia' verificato con `load_project_context`).
+pub async fn playwright_runs_for_project(
+    pool: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Result<Vec<Value>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, kind, status, input, created_at, updated_at, progress
+        FROM jobs
+        WHERE project_id = $1 AND kind ILIKE '%playwright%'
+        ORDER BY created_at DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(playwright_run_to_json).collect())
 }
 
 /// Mappa una riga job playwright sul formato lista run.
@@ -1666,4 +1684,59 @@ pub async fn clear_playwright_runs(
     );
 
     Ok(Json(json!({ "deleted": deleted })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    /// Semina un job e ritorna il suo id.
+    async fn seed_job(pool: &PgPool, project_id: Uuid, kind: &str, input: Value) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO jobs (project_id, kind, status, input) \
+             VALUES ($1, $2, 'passed', $3) RETURNING id",
+        )
+        .bind(project_id)
+        .bind(kind)
+        .bind(input)
+        .fetch_one(pool)
+        .await
+        .expect("insert job")
+    }
+
+    /// I run Playwright si leggono dal DB del PROGETTO, filtrati per progetto e
+    /// per kind. Il test gira sulla migrazione reale del set `project`
+    /// (`PROJECT_MIGRATOR`, regola O): e' li' che `jobs` vive dopo la
+    /// separazione, ed e' esattamente il fatto che il bug ignorava leggendola
+    /// dal meta-pool. Se `jobs` uscisse dal set project, questo test cade.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn playwright_runs_letti_dal_db_progetto(pool: PgPool) {
+        let progetto = Uuid::new_v4();
+        let altro_progetto = Uuid::new_v4();
+
+        let atteso = seed_job(
+            &pool,
+            progetto,
+            "playwright_test",
+            json!({ "label": "suite login", "command": "npx playwright test", "exit_code": 0 }),
+        )
+        .await;
+        // Rumore che NON deve comparire: altro kind, e altro progetto.
+        seed_job(&pool, progetto, "shadow_db_validation", json!({})).await;
+        seed_job(&pool, altro_progetto, "playwright_test", json!({})).await;
+
+        let runs = playwright_runs_for_project(&pool, progetto)
+            .await
+            .expect("lettura run playwright");
+
+        assert_eq!(runs.len(), 1, "solo il job playwright di QUESTO progetto");
+        let run = &runs[0];
+        assert_eq!(run["id"], json!(atteso.to_string()));
+        assert_eq!(run["label"], json!("suite login"));
+        assert_eq!(run["status"], json!("passed"));
+        // Campi che la copia nello snapshot non mappava: ora la fonte e' una sola.
+        assert_eq!(run["command"], json!("npx playwright test"));
+        assert_eq!(run["exitCode"], json!(0));
+    }
 }
