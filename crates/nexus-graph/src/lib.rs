@@ -5,11 +5,11 @@
 //! `nexus-agent-graph`. Separazione runtime/nodi -> regola L (punto unico) +
 //! composition-over-inheritance.
 //!
-//! FASE 0 (scaffold): esiste solo `NoOpNode`; i 12 nodi reali sono placeholder
-//! in `NodeId`. Il motore esegue, instrada, fa checkpoint e si interrompe, ma
-//! il path Rust non viene mai imboccato in produzione finche' la tabella di
-//! routing non lo abilita (vedi `select_engine` in mcp-core, che ritorna sempre
-//! `Python` in Fase 0).
+//! Qui dentro l'unica implementazione di `GraphNode` e' `NoOpNode`, che serve ai
+//! test del motore: il crate resta indipendente dai nodi concreti e non ne
+//! dichiara il numero. Chi esegue il grafo in produzione e' `mcp-core`
+//! (`native_engine`), che assembla i nodi di `nexus-agent-graph` su questo
+//! motore.
 
 pub mod checkpoint;
 pub mod edge;

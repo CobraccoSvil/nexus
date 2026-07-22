@@ -5,9 +5,9 @@
  * Punto unico (regola L) e SEGNALE STRUTTURATO (regola M). Prima la chat faceva
  * due cose sbagliate insieme:
  *
- *  1. ascoltava `dispatch_subtask`, che e' uno stub disabilitato dal refactor
- *     Fase 4 (mig 0345) — i tool vivi sono `dispatch_subagent` e
- *     `dispatch_subagents`, quindi la sottoscrizione non scattava mai;
+ *  1. ascoltava `dispatch_subtask`, che non esiste piu' tra i tool — la delega
+ *     vive in `dispatch_subagent` e `dispatch_subagents`, quindi la
+ *     sottoscrizione non scattava mai;
  *  2. ricavava l'id con `toolResult.match(/ID:\s*([0-9a-f-]{36})/i)`, cioe'
  *     leggendo la PROSA del risultato. Il backend il campo lo dichiara —
  *     `subagent_run_id`, `const K_SUB_RUN_ID` in
@@ -20,8 +20,8 @@
  * riuscita (`finalize_success`), timeout, e dispatch in background.
  */
 
-/** Nomi dei tool che avviano sub-run. `dispatch_subtask` NON e' incluso: e' lo
- *  stub disabilitato dalla mig 0345 e non produce alcun sub-run. */
+/** Nomi dei tool che avviano sub-run. `dispatch_subtask` NON e' incluso: quel
+ *  tool non esiste piu' e non produce alcun sub-run. */
 const SUBAGENT_DISPATCH_TOOLS = new Set(["dispatch_subagent", "dispatch_subagents"]);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

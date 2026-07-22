@@ -7041,15 +7041,12 @@ mod tests_native_mapping {
 
 
 
-    // `run_via_native` (FASE 3) richiede un `AppState` reale (ToolRunnerDeps +
-    // gateway), non costruibile in unit test: il suo corpo e' un assemblaggio di
-    // clone da AppState + delega al PUNTO UNICO `native_engine::run_native`. La
-    // logica testabile (costruzione initial_state dal prompt, mapping esito) e'
-    // coperta dai test di `crate::native_engine`; il grafo end-to-end con gateway
+    // `run_via_native` richiede un `AppState` reale (ToolRunnerDeps + gateway),
+    // non costruibile in unit test: il suo corpo e' un assemblaggio di clone da
+    // AppState + delega al PUNTO UNICO `native_engine::run_native`. La logica
+    // testabile (costruzione initial_state dal prompt, mapping esito) e' coperta
+    // dai test di `crate::native_engine`; il grafo end-to-end con gateway
     // scriptato e' coperto da `nexus_agent_graph::graph` (stessi tipi e builder).
-    // I due `select_engine_*` sotto coprono il confine di routing: default
-    // difensivo 'python' a tabella vuota e scoping per-sessione (override sul
-    // default globale, che in produzione e' '*'=rust, il primario instradato).
 
     // ── DEBITO 3: mapping NativeRunOutcome -> AgentRunResult (finalize unico) ─────
 

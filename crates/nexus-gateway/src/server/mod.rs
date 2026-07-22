@@ -1,21 +1,9 @@
-//! Server HTTP del Nexus LLM Gateway (Fase 5).
+//! Server HTTP del Nexus LLM Gateway: espone il contratto LLM di Nexus (lingua
+//! franca OpenAI Chat Completions).
 //!
-//! Porting di `apps/nexus-gateway/src/server.ts`. Espone gli stessi endpoint e
-//! lo stesso contratto del gateway Node:
-//!   - `GET  /health`     stato profilo + provider (proxy mcp-core, fallback cooldown);
-//!   - `GET  /providers`  stato provider;
-//!   - `GET  /v1/models`  autodiscovery live aggregato di tutti i provider;
-//!   - `GET  /v1/models/{provider}` autodiscovery live del singolo provider;
-//!   - `POST /v1/complete` completion non-streaming;
-//!   - `POST /v1/stream`   completion SSE;
-//!   - `POST /v1/batch`    crea un batch (Anthropic completo, Google 501);
-//!   - `GET  /v1/batch/{provider}/{batch_id}` stato + risultati del batch;
-//!   - `POST /admin/reload` ricarica chiavi/policy dal DB.
-//!
-//! VINCOLO di migrazione (vedi `lib.rs`): a runtime il gateway Node resta
-//! autoritativo finche' la parita' non e' validata (Fase 6). Questo binario si
-//! limita a compilare/testare; non deve essere avviato in produzione ne' rubare
-//! la porta 4060.
+//! L'elenco autoritativo delle rotte e' il `Router` costruito in
+//! `bin/server.rs`: non e' duplicato qui perche' un elenco scritto a mano va in
+//! drift (questa intestazione ne ometteva quattro).
 //!
 //! Riuso punti unici (regola L):
 //!   - `nexus_auth`: lettura settings (`get_setting`), risoluzione porta DB

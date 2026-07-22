@@ -8,9 +8,11 @@
 //! sottomodulo [`signals`] e riusano le funzioni decisionali della Fase 2a
 //! (`super::decisions`, regola L: niente re-implementazione).
 //!
-//! NB: questo modulo NON e' ancora cablato nel runtime (`agent_run.rs` resta
-//! sul path Python). E' il pezzo a rischio massimo del porting e va validato
-//! 1:1 col golden-test (`/tmp/golden_phase2b.json`) PRIMA di imboccare il path.
+//! NB: questo modulo E' il routing del runtime. `graph.rs` (`build_edges`) cabla
+//! ogni edge condizionale del grafo sulle `route_after_*`, e mcp-core costruisce
+//! ed esegue quel grafo in `native_engine.rs`: e' l'unico motore agentico
+//! esistente. L'ordine dei branch-path e' load-bearing ed e' coperto dai test
+//! del modulo.
 
 pub mod config;
 pub mod signals;
@@ -117,21 +119,26 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
     }
     // (2-bis) Stallo che richiede META-RAGIONAMENTO -> nodo dedicato StallRecovery
     // (superstep isolato, ADR 0036-style). L'executor emette questo stop_reason
-    // (blocco successivo del piano) dopo il livello-1 GUIDE cheap e prima delle
-    // mosse costose; il nodo consulta la porta MetaReasonerPort (UNA LLM-call via
-    // ctx.llm, replay-safe) e rientra nell'executor via self-loop (StallResolved).
-    // INERTE finche' nessun detector emette StallReason (flag OFF di default).
+    // dopo il livello-1 GUIDE cheap e prima delle mosse costose; il nodo consulta
+    // la porta MetaReasonerPort (UNA LLM-call via ctx.llm, replay-safe) e rientra
+    // nell'executor via self-loop (StallResolved). Lo emettono
+    // `maybe_stall_reason_delta` e il gemello runaway pre-LLM, entrambi gated su
+    // `agent.stall_recovery.enabled` truthy e budget per-sessione non esaurito.
+    // Quel valore vive in `settings` e cambia a caldo: qui non c'e' un default di
+    // compile-time. Senza il flag questo ramo non e' preso e decide la gerarchia
+    // fissa di `progress_controller::decide`.
     if stop_reason == Some(StopReason::StallReason) {
         return NodeTarget::StallRecovery;
     }
     // (2-ter) Valutazione di SCALA-TIER (up/down del modello, pre-crisi) -> nodo
     // dedicato ScaleControl (superstep isolato, gemello di StallRecovery). L'executor
-    // emette questo stop_reason (detector-emissione, PR-B3) quando il break-even e i
-    // trigger strutturali autorizzano la valutazione; il nodo consulta la porta
+    // emette questo stop_reason quando il break-even e i trigger strutturali
+    // autorizzano la valutazione; il nodo consulta la porta
     // MetaReasonerPort::assess_scale (UNA LLM-call via ctx.llm, replay-safe) e rientra
     // nell'executor via self-loop (ScaleResolved). Segue subito il ramo StallReason
-    // perche' lo stallo REATTIVO ha precedenza sulla scala PRE-EMPTIVA (FIX-E). INERTE
-    // finche' nessun detector emette ScaleReason (flag agent.scale.enabled OFF).
+    // perche' lo stallo REATTIVO ha precedenza sulla scala PRE-EMPTIVA (FIX-E). Lo
+    // emette `maybe_scale_reason_delta` (pre-LLM), gated su `agent.scale.enabled`
+    // truthy in `settings`, tetto cambi-tier non raggiunto e budget non esaurito.
     if stop_reason == Some(StopReason::ScaleReason) {
         return NodeTarget::ScaleControl;
     }

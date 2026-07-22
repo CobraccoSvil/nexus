@@ -1,9 +1,6 @@
-//! Binario del Nexus LLM Gateway (Rust, Fase 5).
-//!
-//! ATTENZIONE (vincolo di migrazione): il gateway Node resta AUTORITATIVO a
-//! runtime finche' la parita' non e' validata (Fase 6). Questo binario si compila
-//! e si testa, ma NON va avviato in produzione ne' deve rubare la porta 4060 al
-//! gateway Node. Il deploy/systemd NON e' toccato in questa fase.
+//! Binario del Nexus LLM Gateway: il processo in ascolto sulla porta del
+//! gateway, avviato come servizio dal deploy. Qui vive il `Router` che dichiara
+//! le rotte, unica fonte del loro elenco.
 //!
 //! Bootstrap:
 //!   1. pool Postgres (DATABASE_URL);

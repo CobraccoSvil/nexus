@@ -1,15 +1,15 @@
-//! PromptOptimizerWorker — Fase 3 del piano Nexus
+//! PromptOptimizerWorker — loop di auto-miglioramento dei prompt.
 //!
-//! Worker periodico che chiude il loop di auto-miglioramento dei prompt:
+//! Worker periodico:
 //!
 //! 1. **Aggregate**: raccoglie metriche da `nexus_agent_reflections` per ogni
 //!    `(prompt_key, version)`. Richiede >= `min_runs` run per cohort.
 //! 2. **Identify candidates**: prompt con `avg_reflection_score < threshold`
 //!    o `feedback_rate < success_threshold` sono candidati all'ottimizzazione.
-//! 3. **Generate variants**: chiama il brain `POST /agent/prompt-revise`
-//!    (mode `evaluate_and_revise`). Il brain sceglie il modello via routing
-//!    tier-only e valida la conformita' XML lato server. Usa il campo
-//!    `revised_template` della risposta come variante.
+//! 3. **Generate variants**: `prompt_variants::call_prompt_revise` in modo
+//!    `evaluate_and_revise` — risolve il modello dal purpose `prompt_revise`
+//!    (regola G) e chiama il gateway. Usa il campo `revised_template` della
+//!    risposta come variante.
 //! 4. **Insert as inactive**: nuove versioni in `nexus_prompt_templates`
 //!    con `is_active=FALSE`, `experimental=TRUE`.
 //! 5. **Register canary**: inserisce in `prompt_ab_experiments` (status=running).
@@ -160,12 +160,9 @@ impl PromptOptimizerWorker {
         count.unwrap_or(0) > 0
     }
 
-    /// Genera una variante migliorata del prompt via brain `/agent/prompt-revise`.
-    ///
-    /// Il brain valuta e riscrive il template (mode `evaluate_and_revise`),
-    /// scegliendo il modello via routing tier-only e validando la conformita'
-    /// XML lato server (la validazione locale dei tag e' stata rimossa: e' ora
-    /// responsabilita' del conformance check del brain).
+    /// Genera una variante migliorata del prompt delegando al punto unico
+    /// `prompt_variants::call_prompt_revise` (mode `evaluate_and_revise`), che
+    /// risolve il modello dal purpose e chiama il gateway.
     ///
     /// Restituisce il contenuto della variante (revised_template) o None se la
     /// generazione fallisce o non c'e' `revised_template`.

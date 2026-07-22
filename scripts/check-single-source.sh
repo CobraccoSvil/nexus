@@ -579,6 +579,39 @@ else
   fi
 fi
 
+# ── migrazione-stub ─────────────────────────────────────────────────────────
+# Una migrazione il cui corpo e' solo `SELECT 1;` occupa un numero di versione
+# senza contenerne lo schema: e' informazione distrutta in modo irrecuperabile.
+# Le quattro della serie 0104-0107 furono svuotate al bootstrap del monorepo
+# perche' i loro oggetti erano gia' presenti sul DB di sviluppo; l'originale non
+# esiste in nessun ramo (git log --follow da' un solo commit, e li' il file e'
+# gia' stub). Risultato: per anni un DB ricostruito da zero non ha ricevuto
+# `nexus_quality_scans` ne' le colonne vettoriali di
+# `project_quality_findings`, e nessuno strumento poteva vederlo — uno stub non
+# fallisce, lascia solo un buco. Il ripristino ha richiesto un'indagine e una
+# migrazione nuova (0637), scritta leggendo lo schema dal DB vivo.
+#
+# Le quattro storiche sono immutabili e restano dove sono: il check le esclude
+# per numero e blocca solo le NUOVE.
+stub_hits=""
+for f in db/migrations/*.sql db/migrations/project/*.sql; do
+  [[ -f "$f" ]] || continue
+  case "$(basename "$f")" in 010[4-7]_*) continue ;; esac
+  # corpo = tutto tranne righe vuote e commenti `--`
+  body="$(sed 's/--.*//' "$f" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  [[ "$body" == "select1;" ]] && stub_hits+="$f"$'\n'
+done
+if [[ -n "$stub_hits" ]]; then
+  echo "!! migrazione-stub: migrazione con corpo 'SELECT 1;' (nessuno schema dentro):" >&2
+  printf '%s' "$stub_hits" | sed 's/^/     /' >&2
+  echo "   Una migrazione deve contenere il DDL che dichiara, anche se l'oggetto" >&2
+  echo "   esiste gia' sul TUO DB: usa IF NOT EXISTS / ADD COLUMN IF NOT EXISTS," >&2
+  echo "   cosi' un DB ricostruito da zero lo riceve e uno popolato non cambia." >&2
+  fail=1
+else
+  echo "OK migrazione-stub: nessuna nuova migrazione svuotata a 'SELECT 1;'"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

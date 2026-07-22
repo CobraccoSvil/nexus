@@ -189,10 +189,12 @@ pub enum StopReason {
     /// `NodeTarget::StallRecovery`. Il `StallContext` serializzato viaggia in
     /// `extra` (chiave [`crate::nodes::stall_recovery::STALL_CONTEXT_KEY`]).
     ///
-    /// INERTE a oggi: nessun nodo lo emette ancora (l'innesto nei detector
-    /// dell'executor e' un blocco successivo del piano). La variante esiste per il
-    /// wiring del nodo/routing; con `agent.stall_recovery.enabled=false` (default)
-    /// il motore resta bit-identico a oggi.
+    /// Prodotto dai gate di emissione dell'executor — `maybe_stall_reason_delta`
+    /// per gli assi di stallo, piu' il gemello per gli assi runaway pre-LLM — solo
+    /// quando `agent.stall_recovery.enabled` e' truthy in `settings` (il valore
+    /// vive nel DB e cambia a caldo: qui non c'e' un default di compile-time) e il
+    /// budget per-sessione non e' esaurito. Senza il flag nulla lo produce e
+    /// decide la sola gerarchia fissa di `progress_controller::decide`.
     StallReason,
     /// Il nodo `StallRecovery` ha risolto lo stallo (mossa scelta o fallback) e
     /// rientra nell'executor (self-loop, come `G1Escalated -> executor`).
@@ -206,17 +208,19 @@ pub enum StopReason {
     /// e' un segnale di ROUTING interno; il `ScaleContext` serializzato viaggia in
     /// `extra`.
     ///
-    /// INERTE in PR-A: nessun detector lo emette ancora (il nodo `ScaleControl` e
-    /// l'innesto nell'executor sono PR-B). La variante esiste per il futuro wiring;
-    /// con `agent.scale.enabled=false` (default) nulla la produce -> bit-identico.
-    /// `route_after_executor` la instradera' in PR-B (in PR-A cade sul ramo default
-    /// come qualunque stop non gestito, ma non e' mai prodotta).
+    /// Prodotto dal detector di scala dell'executor (`maybe_scale_reason_delta`,
+    /// pre-LLM) solo quando `agent.scale.enabled` e' truthy in `settings`, il tetto
+    /// dei cambi-tier non e' raggiunto e il budget `max_evals_per_run` non e'
+    /// esaurito. `route_after_executor` lo instrada su `NodeTarget::ScaleControl`;
+    /// senza il flag nulla lo produce.
     ScaleReason,
     /// Il nodo `ScaleControl` ha risolto la scala (mossa scelta o `KeepTier`) e
     /// rientra nell'executor (self-loop, come `StallResolved`). Gemello di
     /// [`StopReason::StallResolved`].
     ///
-    /// INERTE in PR-A: nessun nodo la produce (il nodo `ScaleControl` e' PR-B).
+    /// La produce il nodo `ScaleControl` al termine del suo superstep: compare
+    /// quindi solo nei run in cui e' stato emesso uno
+    /// [`StopReason::ScaleReason`], che ha per gate `agent.scale.enabled`.
     ScaleResolved,
     /// Il nodo `Supervisor` ha completato il check (continue/redirect) e rientra
     /// nell'executor.

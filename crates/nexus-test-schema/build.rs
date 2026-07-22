@@ -11,4 +11,5 @@ fn main() {
     // rerun-if-changed su mcp-core e nexus-agent-graph, l'aggiunta di una
     // migrazione lasciava la colonna invisibile ai test).
     println!("cargo:rerun-if-changed=../../db/migrations/project");
+    println!("cargo:rerun-if-changed=../../db/migrations");
 }

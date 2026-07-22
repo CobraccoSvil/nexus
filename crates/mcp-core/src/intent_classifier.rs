@@ -1,16 +1,14 @@
-//! Classifier intent agentico LLM-based — porting Rust di
-//! `brain/router/agentic_classifier.py::AgenticIntentClassifier`.
-//!
-//! SCAFFOLD ISOLATO (Tappa 1a, pattern F1): questo modulo e' completo e
-//! testato ma NON e' ancora cablato a nessun call site. Il flusso vivo di
-//! classificazione resta il path Python via `orchestrator::intent` (chiamata
-//! HTTP `/classify-intent-agentic`). L'integrazione (intent.rs + grafo + flag)
-//! e' la Tappa 1b separata. Finche' nessuno chiama `classify`, il rischio sul
-//! comportamento in produzione e' zero.
+//! Classifier intent agentico LLM-based: e' l'unico motore di classificazione
+//! dell'intent in Nexus.
 //!
 //! Metodo: un LLM piccolo e veloce (risolto via purpose `intent_classifier`,
 //! regola G — niente nome modello hardcoded) produce un JSON strutturato che
 //! viene parsato e validato. Niente keyword/embeddings.
+//!
+//! Chi lo chiama: `orchestrator::intent` per la classificazione del turno e
+//! `native_engine` per i segnali del RouterNode. I `derive_*` sono il punto unico
+//! (regola L) che traduce l'esito in `action_oriented`/`report_only`: chiunque
+//! abbia bisogno di quei due booleani passa di qui, non li ri-deduce.
 //!
 //! Punti unici riusati (regola L):
 //! - estrazione JSON dalla risposta LLM: `nexus_types::llm_json::extract_json_block`
@@ -19,12 +17,6 @@
 //! - risoluzione modello: `internal_routing::resolve_purpose_model_db`
 //! - chiamata LLM: `nexus_gateway::NexusGatewayClient::complete`
 //! - schema slot: `routing_slots::ActionSlots`
-//!
-//! CABLATO (Tappa 1b): `classify` e' richiamato da `orchestrator::intent`
-//! (selettore `routing.classifier_engine`, flag mig 0458) e dallo SHADOW
-//! (`agent_run.rs`, derivazione fedele di action_oriented/report_only). I
-//! `derive_*` sono il punto unico (regola L) usato da `native_engine`. I test
-//! (`#[cfg(test)]`) esercitano tutta la logica.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -701,10 +693,9 @@ async fn try_classify_once(
 }
 
 // ── Punto unico derivazione action_oriented / report_only (regola L) ─────────
-// Porting 1:1 di `brain/agents/nodes/__init__.py:680-739`. Le decisioni
-// `action_oriented` e `report_only` vivono in un solo posto: i call site
-// (tool_choice forcing, G1, resoconto, route_after_executor lato Python; in
-// Rust i futuri consumer in Tappa 1b) delegano qui invece di re-implementare.
+// Le decisioni `action_oriented` e `report_only` vivono in un solo posto: i call
+// site (tool_choice forcing, G1, resoconto, routing post-executor) delegano qui
+// invece di re-implementare la deduzione dai campi del classifier.
 
 /// Default per `routing.action_oriented_min_agentic_score` (parita' col `0.5`
 /// hardcoded nel ramo Python). Il caller passa il valore letto dal DB.

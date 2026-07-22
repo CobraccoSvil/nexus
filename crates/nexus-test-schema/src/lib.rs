@@ -30,10 +30,24 @@
 //! migrator dichiarano `cargo:rerun-if-changed=../../db/migrations/project` nel
 //! proprio `build.rs`.
 //!
-//! FUORI perimetro: le tabelle META (`settings`, `ai_price_catalog`,
-//! `nexus_purpose_model`, code di servizio...) vivono nel set `db/migrations`,
-//! 600+ file la cui applicazione per-test costerebbe piu' di quanto renda:
-//! restano fixture esplicite nei test che le usano.
+//! Lo stesso vale per lo schema META: [`META_MIGRATOR`] espone il set
+//! `db/migrations`. Questa nota diceva che applicarlo per-test "costerebbe piu'
+//! di quanto renda": la misura l'ha smentita — l'intero set si applica a un DB
+//! vergine in circa 2,5 secondi, lo stesso ordine di grandezza del gemello
+//! per-progetto. E il costo di NON averlo era gia' stato pagato: quattro
+//! migrazioni della serie 0104-0107 sono `SELECT 1;` e per anni nessun test ha
+//! potuto accorgersi che un DB ricostruito da zero non riceveva
+//! `nexus_quality_scans` ne' le colonne vettoriali di
+//! `project_quality_findings`. I contract test esistenti si connettevano a
+//! `DATABASE_URL`, cioe' all'unico DB in cui il difetto non esisteva.
 
 /// Migrator del set `db/migrations/project` (schema del DB-progetto).
 pub static PROJECT_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../db/migrations/project");
+
+/// Migrator del set `db/migrations` (schema META: settings, catalog, routing,
+/// telemetria, code di servizio).
+///
+/// Un test che lo dichiara gira su un DB ricostruito da zero, non su quello di
+/// sviluppo: e' l'unico modo per accorgersi che una migrazione dichiara un
+/// oggetto che non crea.
+pub static META_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../db/migrations");

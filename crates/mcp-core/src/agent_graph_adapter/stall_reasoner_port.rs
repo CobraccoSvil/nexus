@@ -67,18 +67,19 @@
 //! parametrizzato dalla [`MetaConsultSpec`] dello scope, non re-inventato):
 //!   1. GATE REPLAY opzione A: in [`ExecMode::Replay`] -> `Ok(None)` immediato,
 //!      senza I/O (il `ReplayLlmGateway` rigioca solo `purpose=="executor"`);
-//!   2. kill-switch `agent.orchestration.enabled` (opt-in, default OFF, regola G):
-//!      OFF -> `Ok(None)` -> il gate ricade su `is_eligible`/`should_parallelize`
-//!      -> BIT-IDENTICO a oggi (vincolo primario);
+//!   2. kill-switch `agent.orchestration.enabled` (chiave `settings`, regola G):
+//!      non truthy -> `Ok(None)` -> il gate ricade su
+//!      `is_eligible`/`should_parallelize`;
 //!   3. purpose `orchestration_decide` via `resolve_purpose_model_db` (regola G,
 //!      STESSA distinzione NotFound/NoCapableModel/MatrixUnavailable di recover);
 //!   4. template `system.orchestration.decide` via `TemplateCache`;
 //!   5. chiamata LLM one-shot passando SOLO l'[`OrchestrationContext`] serializzato;
 //!   6. parse con `extract_json_block` + validazione col PUNTO UNICO
 //!      [`nexus_agent_graph::decisions::orchestration_reason::validate_orch_move`]
-//!      (`isolation_available=false` in Fase 1 -> `ParallelIsolated` rifiutata;
-//!      `delegation_forbidden` dal ctx). Malformato -> `Fallback` (il gate lo
-//!      tratta come `None`). Vedi mig 0512.
+//!      (segnali strutturati dal ctx: con `isolation_available=false`
+//!      `ParallelIsolated` degrada a `Sequential`, `delegation_forbidden` blocca
+//!      la delega). Malformato -> `Fallback` (il gate lo tratta come `None`).
+//!      Vedi mig 0512.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -154,8 +155,8 @@ const SCALE_PURPOSE: &str = "scale_assess";
 /// regola D). Gemello di [`STALL_TEMPLATE_KEY`]/[`ORCH_TEMPLATE_KEY`].
 const SCALE_TEMPLATE_KEY: &str = "system.scale.assess";
 
-/// Setting kill-switch (opt-in, default OFF): con `false` la porta e' inerte per la
-/// scala (`Ok(None)`). PR-A: nessun nodo/detector la chiama comunque -> bit-identico.
+/// Setting kill-switch: se non truthy la porta e' inerte per la scala (`Ok(None)`)
+/// e il nodo `ScaleControl` rientra senza mossa.
 const SCALE_ENABLED_SETTING: &str = "agent.scale.enabled";
 
 /// Chiave del template ADDENDUM del SIZING (mig 0524): descrive la mossa
@@ -564,10 +565,10 @@ impl PgMetaReasonerPort {
     /// Wrapper ORCHESTRAZIONE sul flusso unico [`Self::consult_meta_llm`] (regola L).
     /// Applica la validazione col punto unico `validate_orch_move` (enum CHIUSO
     /// `OrchestrationMove`), passando i segnali strutturati `isolation_available` /
-    /// `delegation_forbidden` dal ctx (regola M): in Fase 1 `ctx.isolation_available`
-    /// e' sempre `false` -> `ParallelIsolated` degrada a `Sequential`. Vincolo
-    /// primario: kill-switch OFF (default) -> `Ok(None)` -> il gate ricade su
-    /// `is_eligible` -> BIT-IDENTICO a oggi.
+    /// `delegation_forbidden` dal ctx (regola M): `ctx.isolation_available` e'
+    /// calcolato a runtime da `compute_run_isolation_available`, e quando e' `false`
+    /// `ParallelIsolated` degrada a `Sequential`. Kill-switch non truthy ->
+    /// `Ok(None)` -> il gate ricade su `is_eligible`.
     async fn consult_orch_llm(
         &self,
         ctx: &OrchestrationContext,
@@ -599,7 +600,8 @@ impl PgMetaReasonerPort {
     /// Wrapper SCALE-CONTROLLER sul flusso unico [`Self::consult_meta_llm`] (regola
     /// L). Applica la validazione col punto unico `validate_scale_move` (enum CHIUSO
     /// `ScaleMove`; tier fuori vocabolario / confidence fuori `[0,1]` -> `KeepTier`).
-    /// I 5 gate deterministici dell'anti-oscillazione sono a valle nel nodo PR-B.
+    /// I 5 gate deterministici dell'anti-oscillazione sono a valle, nel nodo
+    /// `ScaleControl`: questa porta non li applica.
     async fn consult_scale_llm(&self, ctx: &ScaleContext) -> Result<Option<ScaleMove>, PortError> {
         match self.consult_meta_llm(&SCALE_SPEC, ctx).await? {
             MetaLlmParse::Degrade => Ok(None),
@@ -743,14 +745,12 @@ impl MetaReasonerPort for PgMetaReasonerPort {
     /// - `Replay` -> `Ok(None)` IMMEDIATO, senza toccare DB/gateway (GATE REPLAY,
     ///   opzione A): il `ReplayLlmGateway` rigioca solo `purpose=="executor"`,
     ///   quindi consultare l'LLM qui darebbe vuoto. Il gate degrada all'euristica
-    ///   esistente (`is_eligible`/`should_parallelize`) -> parita' shadow col
-    ///   percorso Python (che non ha il reasoner di orchestrazione).
+    ///   esistente (`is_eligible`/`should_parallelize`).
     /// - `Real` -> consulta l'LLM (kill-switch `agent.orchestration.enabled`,
     ///   purpose `orchestration_decide`, template `system.orchestration.decide`,
-    ///   parse + `validate_orch_move` con `isolation_available=false` in Fase 1).
+    ///   parse + `validate_orch_move` sui segnali strutturati del ctx).
     ///
-    /// Vincolo primario: kill-switch OFF (default) -> `Ok(None)` -> il gate ricade
-    /// su `is_eligible` -> comportamento BIT-IDENTICO a oggi.
+    /// Kill-switch non truthy -> `Ok(None)` -> il gate ricade su `is_eligible`.
     async fn orchestrate(
         &self,
         ctx: OrchestrationContext,
@@ -769,14 +769,14 @@ impl MetaReasonerPort for PgMetaReasonerPort {
     ///
     /// - `Replay` -> `Ok(None)` IMMEDIATO senza I/O (GATE REPLAY opzione A): la
     ///   scala-move e' persistita in `extra`/`sticky` dal primario; il rientro
-    ///   rilegge sticky -> stesso modello per costruzione (parita' shadow col
-    ///   Python, che non ha il controller).
-    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled` OFF di default,
-    ///   purpose `scale_assess`, template `system.scale.assess`, parse +
-    ///   `validate_scale_move`; i 5 gate deterministici sono a valle nel nodo PR-B).
+    ///   rilegge sticky -> stesso modello per costruzione.
+    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled`, purpose
+    ///   `scale_assess`, template `system.scale.assess`, parse +
+    ///   `validate_scale_move`; i 5 gate deterministici dell'anti-oscillazione
+    ///   sono a valle, nel nodo `ScaleControl`).
     ///
-    /// PR-A: nessun nodo/detector chiama questo metodo (quello e' PR-B) e il flag e'
-    /// OFF di default -> BIT-IDENTICO a oggi (vincolo primario).
+    /// Il chiamante e' il nodo `ScaleControl`; con kill-switch non truthy la porta
+    /// ritorna `Ok(None)` e il nodo rientra senza mossa.
     async fn assess_scale(
         &self,
         ctx: ScaleContext,
@@ -909,8 +909,8 @@ mod tests {
 
     /// Con risposta malformata `validate_orch_move` degrada a `Fallback` (il gate
     /// lo tratta come "usa euristica"). Verifica del punto unico di validazione
-    /// riusato dall'impl (regola L). In Fase 1 `isolation_available=false`: una
-    /// delega `parallel_isolated` con task validi NON e' `Fallback` ma DEGRADA a
+    /// riusato dall'impl (regola L). Con `isolation_available=false` una delega
+    /// `parallel_isolated` con task validi NON e' `Fallback` ma DEGRADA a
     /// `Sequential` (la delega resta, cade solo il parallelismo).
     #[test]
     fn validate_orch_move_su_risposta_malformata_e_fallback() {
@@ -923,7 +923,7 @@ mod tests {
         );
         // Testo senza JSON -> extract_json_block None (l'impl mappa a Fallback).
         assert!(nexus_types::llm_json::extract_json_block("nessun json qui").is_none());
-        // Delega parallela senza isolamento fisico (Fase 1): la delega resta valida,
+        // Delega parallela con isolation_available=false: la delega resta valida,
         // cade solo il parallelismo -> Sequential (NON Fallback).
         let par = nexus_types::llm_json::extract_json_block(
             r#"{"move":"delegate_subagents","tasks":[{"task_description":"x","kind":"coder","write_scope":["src/a"]}],"coordination":"parallel_isolated"}"#,
@@ -938,7 +938,7 @@ mod tests {
         ));
     }
 
-    // ── assess_scale (SCALE-CONTROLLER PR-A) ────────────────────────────────────
+    // ── assess_scale (SCALE-CONTROLLER) ─────────────────────────────────────────
 
     fn scale_ctx() -> ScaleContext {
         ScaleContext {

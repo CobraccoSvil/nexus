@@ -58,9 +58,10 @@
 //!
 //! L'edge `understanding -> {planner|executor}` delega al PUNTO UNICO
 //! [`crate::nodes::PlannerConfig::is_eligible`] (regola L: non re-implementiamo
-//! la decisione). La variante `is_eligible_adaptive` Python (segnali classifier)
-//! e' un superset OPZIONALE non ancora portato (come il classifier LLM del
-//! `RouterNode`): qui si usa il gate base, comportamento definito e testabile.
+//! la decisione), che decide su `behavior_mode`, `user_intent` e `token_budget`.
+//! Non esiste una variante che pesi anche i segnali fini del classifier
+//! (complexity, agentic_score): quei segnali arrivano nello stato ma questo gate
+//! non li legge.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,13 +107,14 @@ pub struct AgentGraphNodes {
     /// Dispatch dei tool pendenti (loop agentico).
     pub tool_dispatch: Arc<AgentGraphNode>,
     /// Meta-reasoner di recovery-da-stallo (superstep dedicato; self-loop verso
-    /// l'executor). Inerte a flag OFF (porta `MetaReasonerPort` che ritorna
-    /// `Ok(None)`).
+    /// l'executor). E' raggiunto quando l'executor emette `StallReason` (gate
+    /// `agent.stall_recovery.enabled`); se la porta `MetaReasonerPort` ritorna
+    /// `Ok(None)` il superstep gira a vuoto e rientra senza mossa.
     pub stall_recovery: Arc<AgentGraphNode>,
     /// Scale-controller (superstep dedicato; self-loop verso l'executor). Gemello di
-    /// `stall_recovery`. Inerte a flag OFF (`agent.scale.enabled`): la porta
-    /// `MetaReasonerPort::assess_scale` ritorna `Ok(None)` e nessun detector emette
-    /// `ScaleReason`, quindi il nodo non e' mai raggiunto (bit-identico).
+    /// `stall_recovery`. E' raggiunto quando l'executor emette `ScaleReason` (gate
+    /// `agent.scale.enabled`): senza quel segnale il grafo si comporta come se il
+    /// nodo non ci fosse.
     pub scale_control: Arc<AgentGraphNode>,
     /// Supervisore worker (monitoraggio periodico post tool_dispatch).
     pub supervisor: Arc<AgentGraphNode>,
@@ -233,14 +235,14 @@ fn build_edges(
     // stall_recovery -> executor (rientro nel loop agentico dopo il superstep di
     // recovery). Il nodo emette sempre StopReason::StallResolved e torna
     // nell'executor, che consuma la RecoveryMove eventualmente persistita in extra
-    // (self-loop, analogo a `G1Escalated -> executor`). INERTE oggi: nessun
-    // detector emette StallReason, quindi il nodo non e' mai raggiunto.
+    // (self-loop, analogo a `G1Escalated -> executor`). Il nodo e' raggiunto
+    // quando l'executor emette StallReason (gate `agent.stall_recovery.enabled`).
     edges.insert(NodeId::StallRecovery, Edge::Static(NodeId::Executor));
     // scale_control -> executor (self-loop di rientro dopo il superstep di scala,
     // gemello di stall_recovery). Il nodo emette sempre StopReason::ScaleResolved e
     // torna nell'executor, che consuma la ScaleMove eventualmente persistita in extra
-    // (rientro-applicazione, PR-B3). INERTE oggi: nessun detector emette ScaleReason,
-    // quindi il nodo non e' mai raggiunto.
+    // (rientro-applicazione). Il nodo e' raggiunto quando l'executor emette
+    // ScaleReason (gate `agent.scale.enabled`).
     edges.insert(NodeId::ScaleControl, Edge::Static(NodeId::Executor));
     // review_gate -> executor (bocciatura rimandata in correzione, stesso
     // predicato del final_gate: punto unico gate_rimanda_in_correzione) oppure

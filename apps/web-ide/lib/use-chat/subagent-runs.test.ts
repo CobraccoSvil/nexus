@@ -57,7 +57,7 @@ test("timeout: il figlio si aggancia comunque", () => {
   assert.deepEqual(childRunIdsFromToolResult("dispatch_subagent", result), [RUN_A]);
 });
 
-test("dispatch_subtask non aggancia nulla: e' lo stub disabilitato (mig 0345)", () => {
+test("dispatch_subtask non aggancia nulla: quel tool non esiste piu'", () => {
   const result = JSON.stringify({ subagent_run_id: RUN_A });
   assert.deepEqual(childRunIdsFromToolResult("dispatch_subtask", result), []);
 });

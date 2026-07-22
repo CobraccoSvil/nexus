@@ -1,25 +1,15 @@
-#![allow(dead_code)]
-//! Nexus Bridge — integrazione di `nexus-orchestrator` in mcp-core
+//! Nexus Bridge — integrazione di `nexus-orchestrator` in mcp-core.
 //!
-//! Design osservazionale (non invasivo):
-//! - Espone un `NexusBridge` singleton inizializzato all'avvio del servizio
-//! - Mantiene un `QLearningRouter`, un `LearningScheduler`
-//! - `SwarmCoordinator` rimosso nella fase 5g (l'esecuzione vive nel brain LangGraph)
-//! - Fornisce API di alto livello per:
-//!     * `suggest_agent(task_type, instructions)` — suggerisce quale agente
-//!       useresti per un task; **non** sostituisce il routing provider/model attuale,
-//!       ma lo affianca con un secondo livello decisionale (qual è l'AGENT_TYPE
-//!       astratto migliore: Coder, Tester, Reviewer, Architect, ...)
-//!     * `record_outcome(...)` — chiamato dopo l'esecuzione di un tool/iterazione
-//!       per alimentare il Q-Learning
-//!     * `run_learning_loop(swarm_result)` — opzionale, fa girare i worker di
-//!       background su un risultato di swarm
+//! Espone un singleton `NexusBridge`, inizializzato all'avvio del servizio, che
+//! tiene insieme il `QLearningRouter` e il `LearningScheduler` dei worker
+//! periodici. Non sostituisce il routing provider/modello: lo affianca con un
+//! secondo livello decisionale (quale AGENT_TYPE astratto — Coder, Tester,
+//! Reviewer, Architect — conviene per un task) e raccoglie gli esiti.
 //!
-//! L'integrazione è **opt-in**: se `NexusBridge::global()` non viene inizializzato,
-//! i siti di chiamata in `agent_loop.rs` fanno fallback silenzioso (no-op).
-//! Questo ci permette di deployare la Fase 6 senza toccare il flusso di routing
-//! attuale, poi abilitare gradualmente l'uso attivo del Q-Learning quando avremo
-//! raccolto abbastanza dati.
+//! L'accesso e' sempre via `NexusBridge::global()`: se il singleton non e' stato
+//! inizializzato, ogni chiamante degrada a no-op invece di fallire. Chi ha
+//! bisogno del bridge lo prende da li'; non esiste un secondo modo di
+//! raggiungerlo.
 
 use nexus_orchestrator::{
     AgentType, AnomalyDetectionWorker, CleanupWorker, ClusteringWorker,

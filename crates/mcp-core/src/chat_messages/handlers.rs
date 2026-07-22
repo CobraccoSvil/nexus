@@ -1540,7 +1540,6 @@ pub async fn resend_chat_message(
                  - \"service\": run_service, read_service_output, stop_service\n\
                  - \"files_advanced\": delete_file, rename_file\n\
                  - \"profile\": create_profile, update_profile\n\
-                 - \"subtask\": dispatch_subtask\n\
                  - \"mcp\": tool da server MCP esterni\n\
                  Autonomia: NON chiedere mai struttura, tecnologia, OS, comandi — ricava tutto dal contesto progetto o con list_files/read_file.\n\
                  PERO' SE ti mancano informazioni che NON puoi ricavare autonomamente (connection string, API keys, credenziali, \

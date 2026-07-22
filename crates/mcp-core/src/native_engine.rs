@@ -950,10 +950,9 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
             d.dag_topological_enabled,
         )
         .await,
-        // Gate orchestrazione LLM-driven della plan-phase (Fase 1). DEFAULT SAFE
-        // FALSE (regola G): il setting sara' seminato dalla migrazione del
-        // sotto-blocco successivo; finche' assente o false il gate ricade sempre
-        // su is_eligible -> comportamento bit-identico a oggi.
+        // Gate orchestrazione LLM-driven della plan-phase. La chiave vive in
+        // `settings` (regola G): con chiave assente o non truthy il gate ricade
+        // su `is_eligible`; quando e' truthy la decisione LLM lo SCAVALCA.
         orchestration_enabled: setting_bool(
             db,
             "agent.orchestration.enabled",

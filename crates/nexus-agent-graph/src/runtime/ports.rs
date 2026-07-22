@@ -512,30 +512,26 @@ pub struct CriterionSpec {
     pub timeout_s: Option<f64>,
 }
 
-/// Esito dell'esecuzione di UN criterio (`{type, passed, evidence}` Python,
-/// `final_gate.py:386-390`). `evidence` e' JSON arbitrario: per il criterio
-/// build contiene `output_excerpt`/`exit_code`/`output_total_chars`/
+/// Esito dell'esecuzione di UN criterio. `evidence` e' JSON arbitrario: per il
+/// criterio build contiene `output_excerpt`/`exit_code`/`output_total_chars`/
 /// `output_truncated`, per gli altri `verdict`/`error`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CriterionResult {
     /// Tipo del criterio (eco dello spec).
     pub criterion_type: String,
-    /// `true` se il criterio e' passato (`bool(ok)` Python).
+    /// `true` se il criterio e' passato.
     pub passed: bool,
     /// Evidenza diagnostica (JSON opaco al nodo).
     pub evidence: Value,
 }
 
-/// Astrazione del motore di verifica dei criteri generali del final gate
-/// (`brain/agents/criteria_runner.py`). mcp-core la implementera' delegando ai
-/// `_check_*` concreti (che a loro volta usano il ToolRunner gRPC).
+/// Astrazione del motore di verifica dei criteri generali del final gate.
+/// L'implementazione concreta e' in mcp-core (`agent_graph_adapter`), che esegue
+/// i singoli `_check_*` sui tool del run.
 ///
-/// E' un SOTTO-SISTEMA a se' (come `closure_judge` per il learner): la LOGICA
-/// dei singoli criteri NON e' portata in questo PR (vedi TODO in
-/// `nodes::final_gate`). Il confine e' pulito: il `FinalGateNode` costruisce le
-/// [`CriterionSpec`] e ottiene i [`CriterionResult`]; in modalita' shadow passa
-/// `ExecMode::Replay` (i criteri rileggono i tool_result del primario = zero
-/// side-effect).
+/// Il confine e' pulito: il `FinalGateNode` costruisce le [`CriterionSpec`] e
+/// ottiene i [`CriterionResult`]; con `ExecMode::Replay` i criteri rileggono i
+/// tool_result gia' registrati, quindi non hanno side-effect.
 #[async_trait]
 pub trait CriteriaRunner: Send + Sync {
     /// Esegue (o replaya) i criteri nell'ordine dato; un fallimento di un
@@ -730,15 +726,14 @@ pub struct PlanRow {
     pub behavior_mode: Option<String>,
 }
 
-/// Astrazione dell'I/O sui todo del DAG (`brain/agents/todo_store.py`). Confine
-/// d'inversione: la LOGICA DAG (selezione, ready layer, discendenti) e' pura e
-/// vive in [`crate::decisions::dag_scheduler`] (punto unico, regola L); questo
-/// trait isola SOLO l'accesso DB. I nodi (`verifier`/`todo_runner`/`planner`)
-/// leggono i todo da qui e delegano la decisione al modulo puro.
+/// Astrazione dell'I/O sui todo del DAG. Confine d'inversione: la LOGICA DAG
+/// (selezione, ready layer, discendenti) e' pura e vive in
+/// [`crate::decisions::dag_scheduler`] (punto unico, regola L); questo trait
+/// isola SOLO l'accesso DB. I nodi (`verifier`/`todo_runner`/`planner`) leggono
+/// i todo da qui e delegano la decisione al modulo puro.
 ///
-/// mcp-core la implementera' con `sqlx` su `nexus_agent_todos` (TODO: impl
-/// concreta nel PR dei nodi). Il trait e' astratto: definisce il contratto, non
-/// l'implementazione.
+/// L'implementazione concreta e' `sqlx` su `nexus_agent_todos`, in
+/// `mcp-core::agent_graph_adapter::todo_store`.
 ///
 /// INVARIANTE (regola H, bug 2026-06-10): [`list_todos`](TodoStore::list_todos)
 /// DEVE restituire `Todo::depends_on` come `Vec`, MAI una stringa `"{...}"`.
@@ -1563,8 +1558,10 @@ pub enum Coordination {
     #[default]
     Sequential,
     /// Esecuzione PARALLELA con isolamento fisico (worktree). Ammessa SOLO quando
-    /// `isolation_available=true` (fase infra successiva); in Fase 1 sempre
-    /// rifiutata dalla validazione.
+    /// `isolation_available=true`, valore calcolato a runtime dal chiamante
+    /// (`compute_run_isolation_available` in mcp-core: dipende dal progetto e
+    /// dalla disponibilita' dei worktree git). Quando e' `false` la validazione
+    /// degrada la mossa a `Sequential`.
     ParallelIsolated,
 }
 
@@ -1984,16 +1981,15 @@ pub trait MetaReasonerPort: Send + Sync {
     /// L): [`ScaleContext`] -> [`ScaleMove`], STESSO contratto `mode`/degrado di
     /// [`MetaReasonerPort::recover`]/[`MetaReasonerPort::orchestrate`].
     ///
-    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled` OFF di default
+    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled` non truthy
     ///   / purpose `scale_assess` NotFound -> `Ok(None)` = degrado legittimo; DB-down
     ///   / provider indisponibile -> `Err(PortError::ProviderUnavailable)`, MAI
     ///   `Ok(None)` mascherante — regola G).
     /// - `Replay` -> `Ok(None)` IMMEDIATO senza I/O (opzione A): la mossa e' gia'
-    ///   rigiocata/riletta dallo stato checkpointato; il rientro usa sticky (parita'
-    ///   shadow col Python, che non ha il controller).
+    ///   rigiocata/riletta dallo stato checkpointato; il rientro usa sticky.
     ///
-    /// PR-A: nessun nodo/detector consuma ancora questo metodo (quello e' PR-B).
-    /// Con `agent.scale.enabled=false` (default) l'adapter e' inerte -> `Ok(None)`.
+    /// Lo consuma il nodo `ScaleControl`, raggiunto quando l'executor emette
+    /// `ScaleReason`; su `Ok(None)` il nodo non persiste alcuna mossa.
     async fn assess_scale(
         &self,
         ctx: ScaleContext,

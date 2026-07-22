@@ -191,24 +191,24 @@ pub(crate) fn spawn_routing_decision_insert(
         let res = sqlx::query(
             r#"INSERT INTO nexus_routing_decisions
                (prompt_hash, estimated_tokens, behavior_mode,
-                intent, classifier_source, classifier_confidence, classifier_cached,
+                intent, classifier_source, classifier_confidence,
                 selected_provider, selected_model, decision_source, rationale,
                 no_capable_provider, providers_in_cooldown, fallback_triggered)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
         )
         .bind(&p_hash)
         .bind(estimated_tokens)
         .bind(&behavior_mode)
         .bind(&intent)
-        // classifier_source: per ora derivato (LLM se confidence > soglia,
-        // altrimenti keyword/promotion). Fase 4 separera' i flussi esplicitamente.
+        // classifier_source e' DEDOTTO dalla soglia di confidenza, non ricevuto
+        // dal classificatore: due soli valori possibili, e quello sotto soglia
+        // non sa distinguere il percorso keyword dalla promozione agentica.
         .bind(if classifier_confidence >= 0.85 {
             "llm"
         } else {
             "keyword_or_promotion"
         })
         .bind(classifier_confidence)
-        .bind::<Option<bool>>(None) // classifier_cached: non noto a questo livello
         .bind(&selected_provider)
         .bind(&selected_model)
         .bind(&decision_source)

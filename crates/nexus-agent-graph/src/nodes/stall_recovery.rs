@@ -44,14 +44,18 @@
 //!   5. ritorna `StopReason::StallResolved` -> self-loop rientra nell'executor,
 //!      che al rientro consuma la mossa (blocco successivo del piano).
 //!
-//! ## Inerzia a runtime (VINCOLO)
+//! ## Quando questo nodo viene raggiunto
 //!
-//! Con la porta iniettata che ritorna `Ok(None)` (kill-switch OFF / purpose
-//! `NotFound` / stub), il nodo NON persiste alcuna mossa e ritorna comunque
-//! `StallResolved`: il rientro nell'executor ricade sulla gerarchia fissa
-//! `progress_controller::decide` (rete di sicurezza). E poiche' NESSUN detector
-//! emette ancora `StallReason` (blocco successivo), questo nodo non e' MAI
-//! raggiunto oggi: il comportamento del motore resta bit-identico.
+//! I detector che lo attivano sono `maybe_stall_reason_delta` e il gemello
+//! runaway pre-LLM nell'executor: emettono `StopReason::StallReason` solo quando
+//! `agent.stall_recovery.enabled` e' truthy in `settings` (valore nel DB, non un
+//! default di compile-time) e il budget per-sessione non e' esaurito. Senza il
+//! flag questo nodo non viene raggiunto.
+//!
+//! Anche quando lo e', se la porta iniettata ritorna `Ok(None)` (kill-switch
+//! spento / purpose `NotFound` / stub) il nodo NON persiste alcuna mossa e
+//! ritorna comunque `StallResolved`: il rientro nell'executor ricade sulla
+//! gerarchia fissa `progress_controller::decide` (rete di sicurezza).
 //!
 //! Il nodo NON instrada: l'edge `StallRecovery -> Executor` e' dichiarato fuori,
 //! in `graph.rs` (self-loop come `G1Escalated -> executor`).
