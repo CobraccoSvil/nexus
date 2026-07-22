@@ -1351,6 +1351,39 @@ async fn resolve_disambiguation_reply(
     )
 }
 
+/// Riepilogo del run "dispatcher" di todo-isolation, composto DAI DATI dei todo
+/// completati (regola M), non da prosa generata.
+///
+/// Serve perche' il run principale che delega ai sub-run non attraversa mai un
+/// turno di sintesi (`route_after_todo_runner` -> FinalGate/Learner, mai
+/// Executor) e quindi non produce un `final_answer` proprio: senza questo recap
+/// resterebbe MUTO in chat ora che un piano concluso non viene piu' declassato a
+/// `failed_diagnosed`. Comporlo dai dati -- invece di chiedere un riassunto al
+/// modello -- evita sia una chiamata LLM in piu' sia il rischio di ritrovarsi con
+/// una seconda risposta vuota.
+fn compose_todo_isolation_recap(
+    todos: &[nexus_agent_graph::decisions::dag_scheduler::Todo],
+) -> String {
+    use nexus_agent_graph::decisions::dag_scheduler::TodoStatus;
+    let completati: Vec<&str> = todos
+        .iter()
+        .filter(|t| matches!(t.status, TodoStatus::Completed))
+        .filter_map(|t| t.content.as_deref())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let n = todos
+        .iter()
+        .filter(|t| matches!(t.status, TodoStatus::Completed))
+        .count();
+    let mut out = format!("Piano completato: {n} attivita' eseguite in sub-run isolati.");
+    for c in completati {
+        out.push_str("\n- ");
+        out.push_str(c);
+    }
+    out
+}
+
 /// Mappa l'esito del motore nativo Rust ([`crate::native_engine::NativeRunOutcome`])
 /// nello STESSO [`AgentRunResult`] prodotto da `run_via_brain`, cosi' il primario
 /// nativo converge sul finalizzatore unico (regola L): NESSUNA seconda forma di
@@ -1532,6 +1565,48 @@ pub(crate) async fn native_outcome_to_run_result(
         (other, _, _) => other,
     };
 
+    // Segnale STRUTTURATO del lavoro svolto per DELEGA (regola M). Sotto
+    // todo-isolation (`supervisor_mode=continuous`) i todo del piano sono
+    // eseguiti come SUB-RUN isolati: il run PRINCIPALE e' solo un dispatcher e
+    // `route_after_todo_runner`, a todo esauriti, lo instrada a FinalGate/Learner
+    // e MAI all'Executor. Non scrive quindi `agent_steps` sul proprio run_id e
+    // non produce un `final_answer` (non passa da alcun turno di sintesi): la
+    // detection hollow qui sotto vedrebbe "0 step + risposta vuota" e
+    // declasserebbe a `failed_diagnosed` un run che ha fatto TUTTO il lavoro
+    // (incidente run 79d2d6eb: 7/7 todo completed e file creati, mostrati
+    // all'utente come "fallito").
+    //
+    // FONTE AUTORITATIVA: la tabella `nexus_agent_todos` letta FRESCA dal punto
+    // unico `TodoStore::list_todos` (regola L: la query NON si riscrive qui).
+    // NON si usa lo snapshot in-memory `state.current_todos`: il TodoRunner lo
+    // aggiorna solo nel ramo "c'e' un todo successivo", non in quello terminale
+    // (EndTurn), quindi a piano concluso e' STANTIO e direbbe "non completato".
+    // Best-effort come la lettura degli step: errore -> nessun todo -> il
+    // predicato e' falso -> detection hollow invariata (nessuna regressione sul
+    // gap 0-step b07c7e78).
+    let plan_todos = {
+        use nexus_agent_graph::runtime::ports::TodoStore as _;
+        // `meta` = `db`: `list_todos` non legge `settings`, il pool meta non
+        // viene mai toccato da questa chiamata.
+        crate::agent_graph_adapter::todo_store::PgTodoStore::new(db.clone(), db.clone())
+            .list_todos(&run_id.to_string())
+            .await
+            .unwrap_or_default()
+    };
+    let plan_concluso_con_lavoro =
+        nexus_agent_graph::decisions::dag_scheduler::plan_todos_all_completed(&plan_todos);
+
+    // Recap del dispatcher (regola M): ora che un piano concluso non viene piu'
+    // declassato, il run resterebbe MUTO in chat (prima il placeholder di
+    // diagnosi copriva il buco). Il riepilogo e' composto DAI DATI dei todo
+    // completati -- non da prosa generata: nessuna chiamata LLM in piu' e
+    // nessun rischio di produrre una seconda risposta vuota.
+    let final_answer = match final_answer {
+        Some(ans) if !ans.trim().is_empty() => Some(ans),
+        _ if plan_concluso_con_lavoro => Some(compose_todo_isolation_recap(&plan_todos)),
+        other => other,
+    };
+
     // Hollow sul path NATIVO (prima: false hardcoded, "detection del client
     // SSE" che il grafo non ha): un run TERMINATO senza risposta ne' step
     // eseguiti restava MUTO in chat con status 'completed' (incidente run
@@ -1544,10 +1619,17 @@ pub(crate) async fn native_outcome_to_run_result(
     // e' una detection del client SSE che qui non esiste; il contatore
     // generico consecutive_failures e' la semantica corretta per l'empty
     // answer.
+    //
+    // GATE (regola M): un piano concluso con lavoro reale NON e' mai hollow. Il
+    // gate sta sul PRODUTTORE del flag, cosi' entrambi i consumatori --
+    // `hollow_no_work` del finalizzatore e il gemello puro
+    // `is_report_hollow`/`canonical_run_status` del resume -- lo ereditano senza
+    // duplicare la condizione (regola L).
     let hollow_completion = outcome.completed
         && !matches!(outcome.stop_reason, Some(StopReason::Error))
         && final_answer.is_none()
-        && steps.is_empty();
+        && steps.is_empty()
+        && !plan_concluso_con_lavoro;
 
     crate::agent_types::AgentRunResult {
         run_id: run_id.to_string(),
@@ -7061,6 +7143,103 @@ mod tests_native_mapping {
             review_panel_last: None,
             pending_actions: Vec::new(),
         }
+    }
+
+    /// Tabella dei todo del piano, con le sole colonne lette da
+    /// `TodoStore::list_todos` (i test che non la creano esercitano il ramo
+    /// best-effort: query fallita -> nessun todo -> detection hollow invariata).
+    async fn create_todos_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_agent_todos ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                 run_id UUID NOT NULL, \
+                 seq BIGINT, \
+                 status TEXT NOT NULL, \
+                 depends_on TEXT[] NOT NULL DEFAULT '{}', \
+                 write_scope TEXT[] NOT NULL DEFAULT '{}', \
+                 content TEXT, \
+                 priority TEXT \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_agent_todos");
+    }
+
+    async fn insert_todo(pool: &sqlx::PgPool, run: Uuid, seq: i64, status: &str, content: &str) {
+        sqlx::query(
+            "INSERT INTO nexus_agent_todos (run_id, seq, status, content) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(run)
+        .bind(seq)
+        .bind(status)
+        .bind(content)
+        .execute(pool)
+        .await
+        .expect("insert todo");
+    }
+
+    /// Il run DISPATCHER della todo-isolation non e' hollow: 0 step e risposta
+    /// vuota sono la sua forma NORMALE (delega ai sub-run), non un fallimento.
+    /// Riproduce l'incidente 79d2d6eb (7/7 todo completed mostrati "falliti").
+    #[sqlx::test]
+    async fn dispatcher_todo_isolation_non_e_hollow(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        create_todos_table(&pool).await;
+        insert_todo(&pool, run, 1, "completed", "Scrivi index.html").await;
+        insert_todo(&pool, run, 2, "completed", "Scrivi script.js").await;
+        insert_todo(&pool, run, 3, "skipped", "Passo opzionale").await;
+
+        // Dispatcher: NESSUNO step sul proprio run_id, NESSUNA risposta propria.
+        let mut outcome = outcome_base();
+        outcome.final_answer = None;
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert!(
+            !r.hollow_completion,
+            "un piano concluso con lavoro non e' hollow: il declassamento a \
+             failed_diagnosed marcherebbe 'fallito' un run che ha fatto tutto"
+        );
+        assert!(r.hollow_completion_kind.is_empty());
+        // Recap dai dati: il run non resta muto in chat.
+        let ans = r.final_answer.expect("recap del dispatcher");
+        assert!(ans.contains("Piano completato"), "recap inatteso: {ans}");
+        assert!(ans.contains("Scrivi index.html"), "recap senza todo: {ans}");
+    }
+
+    /// Contro-prova: un dispatch PARZIALMENTE FALLITO (todo `blocked`) resta
+    /// hollow. Il gate non deve inghiottire i fallimenti veri.
+    #[sqlx::test]
+    async fn dispatcher_con_todo_blocked_resta_hollow(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        create_todos_table(&pool).await;
+        insert_todo(&pool, run, 1, "completed", "Fatto").await;
+        insert_todo(&pool, run, 2, "blocked", "Rimasto bloccato").await;
+
+        let mut outcome = outcome_base();
+        outcome.final_answer = None;
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert!(
+            r.hollow_completion,
+            "piano fermo su un todo blocked: il fallimento deve restare visibile"
+        );
+        assert!(r.final_answer.is_none(), "nessun recap su piano non concluso");
+    }
+
+    /// Regressione gap 0-step (incidente b07c7e78): un run SENZA piano che
+    /// chiude muto resta hollow come prima del gate.
+    #[sqlx::test]
+    async fn run_senza_piano_resta_hollow(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        create_todos_table(&pool).await; // tabella presente ma nessun todo
+
+        let mut outcome = outcome_base();
+        outcome.final_answer = None;
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert!(r.hollow_completion, "run senza piano: detection invariata");
+        assert!(r.hollow_completion_kind.contains("EMPTY_ANSWER"));
     }
 
     #[sqlx::test]

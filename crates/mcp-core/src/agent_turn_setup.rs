@@ -1212,40 +1212,6 @@ fn determine_run_status(
     AgentRunStatus::Completed
 }
 
-/// Calcola i segnali di "hollow completion" (completamento allucinato):
-///   (A) `hollow_no_tools`: aveva tool ma ha chiuso senza usarne al primo turno;
-///   (B) `hollow_empty_answer`: risposta vuota/whitespace-only su Completed.
-/// Ritorna `(hollow_completion, hollow_no_tools, hollow_kind)`. La detection
-/// "RESIGNED" lessicale e' stata RIMOSSA (ADR 0018 fase 3, regola M): la rinuncia
-/// va dichiarata in forma STRUTTURATA via task_complete.
-fn compute_hollow_completion(
-    status: &AgentRunStatus,
-    tools_json: &Value,
-    steps: &[AgentStep],
-    iteration: u32,
-    final_answer: &str,
-) -> (bool, bool, &'static str) {
-    let had_tools = tools_json
-        .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    let final_answer_empty = final_answer.trim().is_empty();
-    let is_completed = *status == AgentRunStatus::Completed;
-    let hollow_no_tools = is_completed && had_tools && steps.is_empty() && iteration <= 1;
-    let hollow_empty_answer = is_completed && final_answer_empty;
-    let hollow_completion = hollow_no_tools || hollow_empty_answer;
-    let hollow_kind: &str = if !hollow_completion {
-        ""
-    } else if hollow_empty_answer && !hollow_no_tools {
-        "EMPTY_ANSWER"
-    } else if hollow_empty_answer {
-        "EMPTY_ANSWER+NO_TOOLS"
-    } else {
-        "NO_TOOLS"
-    };
-    (hollow_completion, hollow_no_tools, hollow_kind)
-}
-
 /// Costruisce il messaggio-risposta a partire dall'errore quando il run non ha
 /// prodotto testo. Fix M23: distingue le due cause piu' comuni di interruzione
 /// SSE dal brain (chunk decode error, silenzio prolungato) dal generico errore
