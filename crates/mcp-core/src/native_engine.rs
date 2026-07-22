@@ -2174,7 +2174,27 @@ async fn build_native_engine(
     let steps: Arc<dyn AgentStepStore> = Arc::new(PgAgentStepStore::new(run_db.clone()));
     let meta_steps: Arc<dyn MetaStepStore> =
         Arc::new(PgMetaStepStore::new(run_db.clone(), input.run_id));
-    let todos: Arc<dyn TodoStore> = Arc::new(PgTodoStore::new(run_db.clone(), db.clone()));
+    // `project_id` della sessione: serve SOLO per l'evento live `TodoUpdated`,
+    // che fa spuntare le voci della checklist del piano in chat mentre il lavoro
+    // procede. Lettura puntuale (una volta per run), come quella del ledger qui
+    // sopra. Se manca, lo store resta quello senza eventi: i todo si aggiornano
+    // comunque nel DB, semplicemente la checklist non si muove da sola.
+    let project_id_per_eventi: Option<Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
+            .bind(input.session_id)
+            .fetch_optional(&run_db)
+            .await
+            .ok()
+            .flatten();
+    let todos: Arc<dyn TodoStore> = match project_id_per_eventi {
+        Some(pid) => Arc::new(PgTodoStore::with_events(
+            run_db.clone(),
+            db.clone(),
+            deps.tool_runner_deps.project_channels.clone(),
+            pid,
+        )),
+        None => Arc::new(PgTodoStore::new(run_db.clone(), db.clone())),
+    };
     let verifier_runs: Arc<dyn VerifierRunStore> =
         Arc::new(PgVerifierRunStore::new(run_db.clone()));
     let offload: Arc<dyn ContextOffload> = Arc::new(RagContextOffloadAdapter::new(db.clone()));
