@@ -889,8 +889,9 @@ pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> Superv
 ///   (`prompt_missing` -> skip): innocuo finche' la plan-phase non si attivava mai,
 ///   diventato bloccante quando i segnali del classifier (task_complexity/
 ///   agentic_score) propagati nello stato hanno reso il planner eleggibile davvero.
-/// - `turn_focus_enabled`: viene dalla CONTINUITY config (`agent.context.turn_focus_enabled`),
-///   non da `orchestrator_config` — TODO wiring continuity (default true).
+/// - `turn_focus_enabled`: letto da `agent.context.turn_focus_enabled`, la STESSA
+///   chiave che legge l'executor. Restava al default hardcoded, quindi spegnere
+///   il setting spegneva il turn-focus per l'executor e non per il planner.
 async fn load_planner_config(db: &PgPool) -> PlannerConfig {
     let d = PlannerConfig::default();
     // Prompt del planner risolto dal registry (vedi nota sopra): chiave -> testo.
@@ -959,9 +960,18 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
             d.orchestration_enabled,
         )
         .await,
-        // Risolti a monte / da altra fonte (vedi doc della funzione): default.
+        // Risolto a monte (vedi doc della funzione): default.
         planner_system_text,
-        turn_focus_enabled: d.turn_focus_enabled,
+        // Stessa chiave che legge l'executor: prima qui restava al default
+        // hardcoded, quindi mettere il setting a `false` spegneva il turn-focus
+        // solo per l'executor e lo lasciava acceso per il planner. Un flag che
+        // vale a meta' e' peggio di un flag assente (regola G).
+        turn_focus_enabled: setting_bool(
+            db,
+            "agent.context.turn_focus_enabled",
+            d.turn_focus_enabled,
+        )
+        .await,
     }
 }
 
