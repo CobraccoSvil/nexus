@@ -2357,6 +2357,7 @@ async fn build_native_engine(
             load_todo_runner_config(&db).await,
             todos.clone(),
             tools.clone(),
+            run_control.clone(),
         )),
         executor: {
             let mut executor = ExecutorNode::new(

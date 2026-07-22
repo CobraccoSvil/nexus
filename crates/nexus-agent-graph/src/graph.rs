@@ -685,6 +685,7 @@ mod tests {
                 TodoRunnerConfig::default(),
                 todos.clone(),
                 tools.clone(),
+                run_control.clone(),
             )),
             executor: Arc::new(ExecutorNode::new(
                 exec_cfg,
