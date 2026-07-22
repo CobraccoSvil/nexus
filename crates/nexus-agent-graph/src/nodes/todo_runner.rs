@@ -86,7 +86,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::dag_scheduler::{self, Todo, TodoStatus};
-use crate::runtime::ports::{ExecMode, TodoStore, ToolCall, ToolExecutor};
+use crate::runtime::ports::{ExecMode, RunControlStore, TodoStore, ToolCall, ToolExecutor};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, StateDelta, StopReason};
 
@@ -262,6 +262,13 @@ pub struct TodoRunnerNode {
     /// Esecutore del tool `dispatch_subagents` (Real -> ToolRunner gRPC, Replay
     /// -> rilegge il result del primario in shadow). Impl concreta in mcp-core.
     tools: Arc<dyn ToolExecutor>,
+    /// Battito di vita del run (`agent_runs.updated_at`), come in `executor` e
+    /// `tool_dispatch`. SENZA di esso il run_reaper scambiava per orfano un run
+    /// che stava lavorando: mentre i sub-run dei todo giravano, `updated_at`
+    /// restava NULL e alla soglia stale (900s) il padre veniva marcato
+    /// `interrupted` a lavoro in corso (incidente 2026-07-22: run ucciso a 905s
+    /// mentre i file continuavano a comparire).
+    run_control: Arc<dyn RunControlStore>,
 }
 
 impl TodoRunnerNode {
@@ -271,8 +278,14 @@ impl TodoRunnerNode {
         cfg: TodoRunnerConfig,
         store: Arc<dyn TodoStore>,
         tools: Arc<dyn ToolExecutor>,
+        run_control: Arc<dyn RunControlStore>,
     ) -> Self {
-        Self { cfg, store, tools }
+        Self {
+            cfg,
+            store,
+            tools,
+            run_control,
+        }
     }
 
     /// Costruisce il context del sub-run (testo provider-neutro,
@@ -740,6 +753,18 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
             }
         };
 
+        // BATTITO DI VITA. Il nodo rientra a ogni todo, quindi batterlo qui tiene
+        // `agent_runs.updated_at` in movimento per tutta la durata del piano.
+        // Serve perche' l'esecuzione dei todo avviene nei SUB-RUN: il run padre
+        // non fa altro I/O sulla propria riga e, senza questo, restava con
+        // `updated_at` NULL finche' il run_reaper non lo marcava `interrupted`
+        // scambiandolo per orfano -- mentre stava lavorando (incidente
+        // 2026-07-22: ucciso a 905s con la soglia stale a 900s, e i file
+        // continuavano a comparire dopo la "chiusura").
+        // Best-effort come negli altri nodi: un errore di battito non deve far
+        // fallire il turno; in Replay e' no-op (gate shadow dentro la porta).
+        let _ = self.run_control.heartbeat(&run_id, ctx.exec_mode()).await;
+
         // ── (3) todos vuoti -> end_turn + active_todo_id None (py:238-252) ────
         let todos = self.store.list_todos(&run_id).await.map_err(port_err)?;
         if todos.is_empty() {
@@ -1110,7 +1135,9 @@ mod tests {
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::routing::config::RoutingConfig;
     use crate::runtime::ports::{PortError, ToolCall, ToolOutcome};
-    use crate::runtime::test_doubles::{NullEventSink, StubLlmGateway, StubTodoStore};
+    use crate::runtime::test_doubles::{
+        NullEventSink, StubLlmGateway, StubRunControlStore, StubTodoStore,
+    };
     use crate::runtime::AgentNodeCtx;
     use crate::state::{AgentState, AutomationMode};
 
@@ -1309,7 +1336,18 @@ mod tests {
         store: Arc<dyn TodoStore>,
         tools: Arc<dyn ToolExecutor>,
     ) -> TodoRunnerNode {
-        TodoRunnerNode::new(cfg, store, tools)
+        node_con_battito(cfg, store, tools).0
+    }
+
+    /// Variante che espone anche lo stub del battito, per asserire che il nodo
+    /// tenga viva la riga del run.
+    fn node_con_battito(
+        cfg: TodoRunnerConfig,
+        store: Arc<dyn TodoStore>,
+        tools: Arc<dyn ToolExecutor>,
+    ) -> (TodoRunnerNode, Arc<StubRunControlStore>) {
+        let rc = Arc::new(StubRunControlStore::default());
+        (TodoRunnerNode::new(cfg, store, tools, rc.clone()), rc)
     }
 
     // ── Gate OFF (isolamento non attivo) -> no-op {} ─────────────────────────────
@@ -1834,6 +1872,34 @@ mod tests {
     }
 
     // ── Funzioni pure (smoke; il golden copre la parita' 1:1) ────────────────────
+
+    /// Il nodo deve tenere VIVA la riga del run. L'esecuzione dei todo avviene
+    /// nei sub-run, quindi il padre non fa altro I/O sulla propria riga: senza
+    /// battito `agent_runs.updated_at` resta NULL e il run_reaper lo scambia per
+    /// orfano, marcandolo `interrupted` alla soglia stale mentre sta lavorando
+    /// (incidente 2026-07-22: ucciso a 905s, con i file che continuavano a
+    /// comparire dopo la presunta chiusura).
+    #[tokio::test]
+    async fn tiene_vivo_il_run_col_battito() {
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
+            "a",
+            TodoStatus::Pending,
+            &[],
+            1,
+        )]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
+            "fatto a", 0.1,
+        )]));
+        let (n, rc) = node_con_battito(TodoRunnerConfig::default(), store, tools);
+        let ctx = ctx_with(false, routing_cfg_on());
+        let thread = "11111111-1111-1111-1111-111111111111";
+        let st = isolated_state(Some(thread));
+        let _ = n.run(&st, &ctx).await.expect("run ok");
+
+        let battiti = rc.heartbeats.lock().unwrap();
+        assert_eq!(battiti.len(), 1, "un battito per esecuzione del nodo");
+        assert_eq!(battiti[0], thread, "battito sul run corrente");
+    }
 
     #[test]
     fn on_failure_parse_identificatori_canonici() {
