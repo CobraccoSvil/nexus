@@ -741,7 +741,35 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
             let dag_cfg = dag_scheduler::DagConfig {
                 dag_parallel_min_ready: self.cfg.dag_parallel_min_ready,
             };
-            if ready.len() >= 2 && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg) {
+            // GUARD FISICA ANTI-RACE (regola L, punto unico
+            // `parallel_writers_allowed`): un fronte parallelo di SCRITTORI e'
+            // ammesso solo con isolamento disponibile E scope disgiunti. Senza
+            // isolamento i sub-run condividono la root reale del progetto: prima
+            // questa domanda qui non veniva posta affatto (il campo
+            // `ctx.isolation_available` esisteva ma era inerte) e l'ondata partiva
+            // comunque, con i sub-run che si sovrascrivevano i file a vicenda.
+            // Falso -> nessuna wave: si prosegue con `dispatch_one`, UN todo per
+            // re-ingresso del nodo (degrada il PARALLELISMO, non l'isolamento).
+            let scopes: Vec<Vec<String>> = ready.iter().map(|t| t.write_scope.clone()).collect();
+            let writers_ok = crate::decisions::orchestration_reason::parallel_writers_allowed(
+                ctx.isolation_available,
+                &scopes,
+            );
+            if ready.len() >= 2 && !writers_ok {
+                // Il degrado non deve essere silenzioso (regola M: il motivo e' un
+                // dato, non un'assenza): senza questa riga l'operatore vede solo
+                // un piano lento e non sa che il multicasting e' stato negato.
+                tracing::info!(
+                    run_id = %run_id,
+                    ready = ready.len(),
+                    isolation_available = ctx.isolation_available,
+                    "todo_runner: ondata parallela NON aperta (isolamento assente o scope non disgiunti) -> un todo per volta"
+                );
+            }
+            if ready.len() >= 2
+                && writers_ok
+                && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg)
+            {
                 let mode = ctx.exec_mode();
                 return self
                     .dispatch_wave(state, &run_id, &todos, ready, mode)
@@ -1232,6 +1260,32 @@ mod tests {
         }
     }
 
+    /// Ctx con isolamento FISICO disponibile (worktree git effimeri). Un fronte
+    /// parallelo di scrittori e' ammesso solo qui: senza isolamento i sub-run
+    /// condividono la root reale e si sovrascriverebbero.
+    fn ctx_isolated(shadow: bool, cfg: RoutingConfig) -> AgentNodeCtx {
+        AgentNodeCtx {
+            isolation_available: true,
+            ..ctx_with(shadow, cfg)
+        }
+    }
+
+    /// Todo che DICHIARA la propria area di scrittura. Serve per l'ondata
+    /// parallela: uno scope vuoto non e' disgiunto per costruzione, quindi un todo
+    /// che non dichiara cosa scrive non entra mai in una wave.
+    fn todo_scoped(
+        id: &str,
+        status: TodoStatus,
+        deps: &[&str],
+        seq: i64,
+        scope: &[&str],
+    ) -> Todo {
+        Todo {
+            write_scope: scope.iter().map(|s| s.to_string()).collect(),
+            ..todo(id, status, deps, seq)
+        }
+    }
+
     fn node(
         cfg: TodoRunnerConfig,
         store: Arc<dyn TodoStore>,
@@ -1355,9 +1409,11 @@ mod tests {
         // DAG topologico ON + 2 todo pending senza dipendenze -> compute_ready_layer
         // ritorna entrambi, should_parallelize=true -> UN solo dispatch_subagents con
         // 2 task (ondata), non due dispatch sequenziali. Entrambi completed -> end_turn.
+        // Scope DISGIUNTI + isolamento disponibile: sono le due condizioni del
+        // punto unico `parallel_writers_allowed`. Se ne manca una, niente ondata.
         let store = Arc::new(StubTodoStore::with_todos(vec![
-            todo("a", TodoStatus::Pending, &[], 1),
-            todo("b", TodoStatus::Pending, &[], 2),
+            todo_scoped("a", TodoStatus::Pending, &[], 1, &["src/a.rs"]),
+            todo_scoped("b", TodoStatus::Pending, &[], 2, &["src/b.rs"]),
         ]));
         let payload = json!({"results": [
             {"status": "completed", "summary": "fatto a", "cost_usd": 0.3},
@@ -1370,7 +1426,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_isolated(false, routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         {
@@ -1397,13 +1453,69 @@ mod tests {
         assert!(marks.contains(&("b".to_string(), TodoStatus::Completed)));
     }
 
+    /// GUARD FISICA ANTI-RACE: stesse identiche todo del test precedente (scope
+    /// disgiunti, DAG ON, min_ready=2) ma isolamento NON disponibile — il caso di
+    /// ogni progetto creato vuoto dalla UI, che non e' un repo git.
+    ///
+    /// Prima del fix l'ondata partiva lo stesso e gli N sub-run scrivevano sulla
+    /// STESSA root: incidente del 2026-07-22, sette sub-run sullo stesso file,
+    /// `server.js` troncato da un edit concorrente, file duplicati. Atteso ora: un
+    /// solo todo per volta (`max_parallel: 1`) e re-entry per il successivo, cioe'
+    /// si degrada il PARALLELISMO, non l'isolamento.
+    #[tokio::test]
+    async fn wave_negata_senza_isolamento_un_todo_per_volta() {
+        let store = Arc::new(StubTodoStore::with_todos(vec![
+            todo_scoped("a", TodoStatus::Pending, &[], 1, &["src/a.rs"]),
+            todo_scoped("b", TodoStatus::Pending, &[], 2, &["src/b.rs"]),
+        ]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
+            "fatto a", 0.5,
+        )]));
+        let cfg = TodoRunnerConfig {
+            dag_topological_enabled: true,
+            dag_parallel_min_ready: 2,
+            ..TodoRunnerConfig::default()
+        };
+        let n = node(cfg, store.clone(), tools.clone());
+        // UNICA differenza rispetto a `wave_parallelo_due_todo_completed`:
+        // ctx_with -> isolation_available = false.
+        let ctx = ctx_with(false, routing_cfg_on());
+        let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
+        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+        {
+            let seen = tools.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "un solo dispatch");
+            assert_eq!(
+                seen[0].0.input["tasks"].as_array().unwrap().len(),
+                1,
+                "UN solo task: senza isolamento il fronte parallelo non si apre"
+            );
+            assert_eq!(
+                seen[0].0.input["max_parallel"],
+                json!(1),
+                "ramo sequenziale: concorrenza 1"
+            );
+        }
+        // Il piano PROSEGUE in serie (re-entry sul successivo), non si chiude.
+        assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(out.active_todo_id.as_deref(), Some("b"));
+        let marks = store.marks.lock().unwrap();
+        assert_eq!(marks[0], ("a".to_string(), TodoStatus::InProgress));
+        assert!(
+            !marks
+                .iter()
+                .any(|(id, s)| id == "b" && *s == TodoStatus::InProgress),
+            "b non va pre-marcato in_progress: resta pending, quindi schedulabile"
+        );
+    }
+
     #[tokio::test]
     async fn wave_fallito_stop_chiude_catena() {
         // Un fallito nell'ondata con on_failure=stop (default) -> blocked + chiusura
         // catena (end_turn), parita' col ramo stop sequenziale.
         let store = Arc::new(StubTodoStore::with_todos(vec![
-            todo("a", TodoStatus::Pending, &[], 1),
-            todo("b", TodoStatus::Pending, &[], 2),
+            todo_scoped("a", TodoStatus::Pending, &[], 1, &["src/a.rs"]),
+            todo_scoped("b", TodoStatus::Pending, &[], 2, &["src/b.rs"]),
         ]));
         let payload = json!({"results": [
             {"status": "completed", "summary": "ok a", "cost_usd": 0.1},
@@ -1416,7 +1528,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_isolated(false, routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
