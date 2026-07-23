@@ -96,5 +96,8 @@ jobs:
       - name: Gate ratchet duplicazione (jscpd)
         run: bash scripts/dup-report.sh
 
+      - name: Gate ratchet marker (debito + inerzia)
+        run: bash scripts/markers-ratchet.sh
+
       - name: Lint commits (xtask)
         run: pnpm xtask lint-commits origin/main HEAD || true

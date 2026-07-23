@@ -296,8 +296,15 @@ condividere codice (fragile base class).
   con gate "ratchet" — il numero di cloni puo' solo SCENDERE rispetto a
   `.dup-baseline.json`. Si riallinea la baseline al ribasso dopo ogni consolidamento.
 - `scripts/check-single-source.sh`: guard testuale che blocca nuove definizioni di
-  un punto unico fuori dal suo modulo. I check si attivano per wave.
-- `docs/tech-debt-dup.md`: metrica del debito e baseline.
+  un punto unico fuori dal suo modulo. I check si attivano per wave. Include il
+  check `migrazione-stub`, che rifiuta nuove migrazioni con corpo solo `SELECT 1;`
+  (informazione di schema distrutta in modo irrecuperabile).
+- `scripts/markers-ratchet.sh` + `scripts/markers-baseline.json`: gate "ratchet"
+  su due famiglie di marker testuali — debito esplicito
+  (`TODO|FIXME|HACK|XXX|WORKAROUND|DEBITO`) e frasi di inerzia
+  (`INERTE|mai raggiunt|non ancora cablat/portat/instradat`) — che possono solo
+  SCENDERE. Impedisce di reintrodurre commenti fossili (regola O).
+- `docs/tech-debt-dup.md`, `docs/tech-debt-markers.md`: metrica del debito e baseline.
 - Innesto: `lefthook.yml` (pre-commit veloce) + `.github/workflows/verify.yml` (gate completo).
 
 ### Trigger imperativo
@@ -488,5 +495,6 @@ rifiutato come una toppa (regola H).
 - `docs/tech-debt-rust.md` — backlog `unwrap`/clippy
 - `docs/tech-debt-ts.md` — backlog `any`/strict
 - `docs/tech-debt-dup.md` — metrica duplicazione e baseline ratchet (regola L)
+- `docs/tech-debt-markers.md` — marker di debito e frasi di inerzia, gate ratchet (regola O)
 - `docs/.nexus-vault/adr/0026-punto-unico-de-duplicazione.md` — catalogo punti unici + meccanismo
 - `config/policies/` — profili cloud/onprem/hybrid (contratto gateway LLM)
