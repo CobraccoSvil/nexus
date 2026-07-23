@@ -1,7 +1,7 @@
 //! Adapter del trait [`nexus_agent_graph::runtime::ports::TodoStore`].
 //!
-//! IMPLEMENTERA' (FASE 2) l'I/O sui todo del DAG su `nexus_agent_todos` via
-//! `sqlx` (1:1 con `brain/agents/todo_store.py`). INVARIANTE (regola H): `list_todos`
+//! Esegue l'I/O sui todo del DAG su `nexus_agent_todos` via
+//! `sqlx`. INVARIANTE (regola H): `list_todos`
 //! restituisce `depends_on` come `Vec` (cast `::text[]`), MAI una stringa
 //! `"{...}"`, e i todo gia' ordinati per `seq` ASC. Le scritture (`mark_status`,
 //! `increment_iteration_seen`) sono gata `Real` (no-op in `ExecMode::Replay`,

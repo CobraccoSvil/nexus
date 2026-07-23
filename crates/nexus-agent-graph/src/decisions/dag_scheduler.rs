@@ -85,12 +85,13 @@ pub struct Todo {
     #[serde(default)]
     pub seq: Option<i64>,
     /// Aree file (path/prefissi relativi alla root) che il todo DICHIARA di voler
-    /// scrivere. Popolato in un PR successivo dalla colonna `nexus_agent_todos`
-    /// quando `dispatch_wave` la consuma per verificare la DISGIUNZIONE della wave
-    /// parallela via [`crate::decisions::orchestration_reason::subtasks_are_disjoint`]
-    /// (punto unico, regola L). In PR1 e' solo il campo Rust (nessuna persistenza):
-    /// resta vuoto -> il comportamento e' invariato. `#[serde(default)]` per
-    /// retrocompat (golden/checkpoint pre-esistenti non hanno il campo).
+    /// scrivere. Persistito nella colonna `nexus_agent_todos.write_scope`
+    /// (`TEXT[] NOT NULL DEFAULT '{}'`) e riletto dall'adapter `TodoStore`:
+    /// `dispatch_wave` lo usa per verificare la DISGIUNZIONE della wave parallela
+    /// via [`crate::decisions::orchestration_reason::subtasks_are_disjoint`]
+    /// (punto unico, regola L). Vuoto = nessuna area dichiarata, quindi nessun
+    /// vincolo di disgiunzione da imporre. `#[serde(default)]` per retrocompat
+    /// (golden/checkpoint pre-esistenti non hanno il campo).
     #[serde(default)]
     pub write_scope: Vec<String>,
     /// Testo del todo (`nexus_agent_todos.content`). TRASPORTATO per la

@@ -14,9 +14,9 @@
 // registrata solo se `record_revision` rileva un body_hash nuovo (dedup
 // automatico via CTE in `storage::record_revision`).
 //
-// Embedding + upsert Qdrant: best-effort. Se il brain e' down il documento
-// viene comunque salvato in `wiki_docs` ma senza `qdrant_point_id`; un re-run
-// successivo lo completera'.
+// Embedding + upsert Qdrant: best-effort. Se l'embedder o Qdrant non
+// rispondono il documento viene comunque salvato in `wiki_docs` ma senza
+// `qdrant_point_id`; un re-run successivo lo completera'.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::model::WikiScope;

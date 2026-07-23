@@ -1,23 +1,12 @@
-//! Tool agente per gestione profili utente + stub dispatch_subtask.
+//! Tool agente per la gestione dei profili utente.
 //!
-//! Estratto da mod.rs (refactor god-file).
+//! La delega a sotto-agenti NON sta qui: vive in `dispatch_subagent` /
+//! `dispatch_subagents`.
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use super::ToolContextCore;
-
-// TODO(fase 4b): portare subtask dispatch sul brain
-pub async fn tool_dispatch_subtask(_ctx: ToolContextCore, _input: Value) -> String {
-    // Fase 4 refactor Nexus: AgentLoop locale eliminato. dispatch_subtask non
-    // e' piu' esposto nello schema (vedi rimozione in TOOL_CATALOG). Se un
-    // client legacy lo invoca, istruisci l'agente a procedere direttamente
-    // invece di terminare il run.
-    "[dispatch_subtask] non disponibile. NON terminare il task: procedi direttamente nel run corrente \
-     usando write_file/edit_file per generare i sorgenti e run_command/run_service per eseguire \
-     comandi. Non delegare a sub-agenti: esegui tutto qui."
-        .to_string()
-}
 
 // ── Profili utente ──────────────────────────────────────────────────────────
 

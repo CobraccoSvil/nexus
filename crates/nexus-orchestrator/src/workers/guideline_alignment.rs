@@ -6,11 +6,11 @@
 //!
 //! 1. **Dirty-check**: salta i template gia' valutati di recente (stesso
 //!    `content_hash` + `guideline_set_hash`, `checked_at` entro l'intervallo
-//!    configurato). Lo scheduler dei periodic worker tickka ogni 1800s e ignora
-//!    `interval()`, quindi il throttling 24h e' interno qui.
-//! 2. **Conformance check** (brain `POST /agent/prompt-revise`, mode `evaluate`):
-//!    salva l'esito in `nexus_prompt_conformance` (append-only, ON CONFLICT
-//!    DO NOTHING).
+//!    configurato). E' un throttling per-template, indipendente dalla cadenza
+//!    con cui lo scheduler chiama il worker (`interval()`).
+//! 2. **Conformance check**: `prompt_variants::call_prompt_revise` in mode
+//!    `evaluate`; l'esito va in `nexus_prompt_conformance` (append-only, ON
+//!    CONFLICT DO NOTHING).
 //! 3. **Revisione** (solo se `alignment_autovariant_enabled` e score sotto soglia):
 //!    - `system.*`/`automation.*` (safelist): genera una PROPOSTA in
 //!      `nexus_alignment_proposal` (status pending) da approvare a mano.
@@ -23,7 +23,7 @@
 //! - Revisione automatica separata: `alignment_autovariant_enabled=false`
 //!   (default) = solo valutazione.
 //! - Cap costo: `alignment_max_checks_per_tick` conformance check per esecuzione.
-//! - Selezione modello tier-only lato brain (purpose `prompt_conformance_check`).
+//! - Selezione modello dal purpose (regola G), non hardcoded qui.
 
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
 use crate::workers::prompt_variants;

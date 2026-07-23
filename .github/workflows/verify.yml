@@ -65,16 +65,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # cargo (dentro pnpm verify) verifica le query sqlx a COMPILE-TIME contro
-      # il DB: non esiste cache .sqlx, quindi serve un DB con lo schema. Il
-      # Postgres del service e' vuoto -> senza migrazioni sqlx fallisce con
-      # "relation ... does not exist". Applichiamo le migrazioni versionate
-      # (stesso approccio di nexus-suite.yml) prima di compilare/testare.
-      - name: Apply DB migrations (schema per sqlx)
-        run: |
-          for f in db/migrations/*.sql; do
-            psql "$DATABASE_URL" -f "$f" || true
-          done
+      # Il Postgres del service e' vuoto: i test che girano su schema reale
+      # (`#[sqlx::test(migrator = ...)]`) hanno bisogno del set applicato.
+      #
+      # Si usa `sqlx migrate run`, cioe' LO STESSO motore della produzione
+      # (`Migrator` in mcp-core/src/db.rs), e l'exit code conta. Il ciclo
+      # precedente era `psql -f "$f" || true`: applicava i file uno per uno e
+      # buttava via ogni errore, quindi un set che non si applica passava
+      # comunque il gate (regola O — lo strumento non raggiungeva il suo
+      # oggetto come la produzione).
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+
+      - name: Apply DB migrations
+        run: sqlx migrate run --source db/migrations --database-url "$DATABASE_URL"
 
       # Il crate mcp-proto usa prost-build, che richiede il compilatore protobuf
       # `protoc` a build time. Senza, `cargo check/clippy/test` (dentro pnpm

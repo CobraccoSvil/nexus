@@ -1,15 +1,13 @@
 //! Nexus LLM Gateway (Rust).
 //!
-//! Migrazione del gateway proxy multi-provider da Node/TypeScript a Rust.
-//! Il contratto LLM e' fedele a `packages/shared/src/llm-types.ts` (lingua
-//! franca: OpenAI Chat Completions). Vedi ADR 0032 ("il compilato e'
-//! autoritativo"): a regime questo crate sostituisce `apps/nexus-gateway`
-//! (Node) e il cooldown billing vive nello stesso runtime di mcp-core,
-//! eliminando lo split che oggi impedisce il re-probe reattivo dei provider.
+//! Proxy multi-provider: e' il punto di uscita LLM di Nexus, in esercizio come
+//! servizio a se' (unit systemd / WinSW). Il contratto e' la lingua franca
+//! OpenAI Chat Completions, fedele a `packages/shared/src/llm-types.ts`.
+//! Vedi ADR 0032 ("il compilato e' autoritativo").
 //!
-//! Migrazione INCREMENTALE: il gateway Node resta autoritativo a runtime
-//! finche' la parita' non e' validata (Fase 6). I moduli vengono aggiunti
-//! una fase alla volta, sempre mantenendo `cargo check` verde.
+//! Il cooldown billing vive qui dentro, non nel chiamante: il re-probe loop
+//! (`bin/server.rs`) e' avviato incondizionatamente, quindi un provider rientra
+//! da solo appena torna a rispondere.
 
 /// Chiave DB del limite body. Seed: mig **0588**.
 pub const MAX_BODY_MB_SETTING: &str = "gateway.max_request_body_mb";

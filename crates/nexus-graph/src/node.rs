@@ -1,14 +1,13 @@
 //! Nodi del grafo: identificatore esaustivo, contratto `GraphNode`, errori.
 //!
-//! Il grafo Nexus e' FISSO e piccolo (12 nodi reali, topologia nota a
-//! compile-time). `NodeId` e' un enum chiuso: il `match` esaustivo del
-//! compilatore garantisce che ogni nodo abbia un edge dichiarato (impossibile
-//! dimenticarne uno), vantaggio strutturale rispetto ai dict Python.
+//! Il grafo Nexus e' FISSO: `NodeId` e' un enum chiuso e la topologia e' nota a
+//! compile-time. Il `match` esaustivo del compilatore garantisce che ogni nodo
+//! abbia un edge dichiarato: aggiungere una variante senza instradarla non
+//! compila.
 //!
-//! In FASE 0 (scaffold) esiste solo `NoOpNode`: i 12 nodi reali sono dichiarati
-//! come varianti placeholder ma NON implementati (verranno portati nelle fasi
-//! successive). Il path Rust non viene mai imboccato finche' la tabella di
-//! routing non lo abilita.
+//! Le implementazioni concrete non stanno qui: questo crate definisce il
+//! contratto `GraphNode` e `NoOpNode` (usato dai test del motore). I nodi veri
+//! vivono in `nexus-agent-graph::nodes`, uno per variante di `NodeId`.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -17,11 +16,10 @@ use crate::state::StateDelta;
 
 /// Identificatore di nodo: enum chiuso sull'intera topologia del grafo agentico.
 ///
-/// `NoOp`/`End` servono allo scaffold e ai test del motore. Le restanti varianti
-/// sono i 12 nodi reali del grafo Nexus (placeholder finche' non portati). Il
-/// nodo Python `g1_continue` NON e' presente: nel runtime Rust il self-loop
-/// `Executor -> Executor` e' nativo, quindi quel workaround si elimina alla
-/// radice (regola H), non si porta.
+/// `NoOp`/`End` servono al motore e ai suoi test; ogni altra variante ha
+/// un'implementazione in `nexus-agent-graph::nodes`. Non esiste una variante
+/// `g1_continue`: il self-loop `Executor -> Executor` e' nativo del runtime,
+/// quindi quel nodo-ponte non serve (regola H: causa rimossa, non aggirata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeId {
     /// Nodo di test: ritorna delta vuoto e instrada a `End`.
@@ -46,8 +44,8 @@ pub enum NodeId {
     /// Raggiunto dall'executor quando un detector strutturato segnala di valutare la
     /// scala-tier del modello (`StopReason::ScaleReason`); consulta la porta
     /// `MetaReasonerPort::assess_scale` (UNA sola LLM-call via `ctx.llm`, replay-safe)
-    /// e rientra nell'executor via self-loop (`StopReason::ScaleResolved`). Inerte
-    /// finche' nessun detector emette `ScaleReason` (flag `agent.scale.enabled` OFF).
+    /// e rientra nell'executor via self-loop (`StopReason::ScaleResolved`).
+    /// L'emissione di `ScaleReason` ha per gate `agent.scale.enabled`.
     ScaleControl,
     /// Supervisore worker: monitora l'avanzamento e puo' redirectare/abbandonare.
     Supervisor,

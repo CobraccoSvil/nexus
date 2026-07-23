@@ -1,21 +1,22 @@
 //! `context_reduction`: parte PURA della riduzione del contesto dell'executor.
 //!
-//! Porting 1:1 (FASE 2a) della fetta DETERMINISTICA del context management del
-//! brain (`brain/agents/nodes/__init__.py` area ~2680-2911 + `helpers.py`).
-//! Ogni funzione e' un PUNTO UNICO (regola L) del proprio concern: il futuro
-//! chiamante Rust (il nodo executor, in un PR successivo) delega qui invece di
-//! re-implementare la logica.
+//! Ogni funzione e' un PUNTO UNICO (regola L) del proprio concern: il nodo
+//! executor delega qui invece di re-implementare la logica.
 //!
 //! ## Confine PURO / I/O (separazione netta)
 //!
 //! Questo modulo contiene SOLO la parte pura: stessa entrata -> stessa uscita,
-//! nessuna lettura DB, nessuna chiamata LLM/embeddings/tiktoken/Qdrant. Le parti
-//! I/O dell'executor NON sono qui (TODO espliciti, diventeranno trait dedicati):
-//!   - `summarizer.summarize_old_messages` (LLM small)  -> trait `SummaryStore`;
-//!   - `_offload_system_prompt_if_huge` (Qdrant)        -> trait `EmbeddingStore`;
-//!   - `apply_continuity_trim` (embeddings/cosine)      -> trait `EmbeddingStore`;
-//!   - `_apply_rolling_summary` (Qdrant batch)          -> trait `EmbeddingStore`;
-//!   - `_smart_upscale_model`, `_model_context_window`  -> DB (routing/catalog).
+//! nessuna lettura DB, nessuna chiamata LLM/embeddings/tiktoken/Qdrant. L'I/O
+//! sta dietro le porte di `runtime::ports`, iniettate dall'adapter mcp-core:
+//!   - riassunto dei messaggi vecchi  -> `SummaryStore`;
+//!   - offload dei blocchi compressi  -> `ContextOffload`;
+//!   - continuity-trim e rolling      -> `EmbeddingStore` (vettori) +
+//!     `ContextOffload` (persistenza);
+//!   - upscale del modello e finestra -> DB (routing/catalog).
+//!
+//! Un solo pezzo del disegno originale non ha una porta e quindi non viene
+//! eseguito: l'offload del system prompt sovradimensionato. Un system prompt
+//! enorme resta intero in finestra.
 //!
 //! Due punti di confine sono parametrizzati con CALLBACK pure cosi' la decisione
 //! resta qui e l'I/O resta fuori (regola G - niente IO nella primitiva):
@@ -713,13 +714,12 @@ originale.]"
 //  4) _compress_old_tool_results (con marker_fn pura iniettabile)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Marker "degraded" del Python quando l'offload RAG non e' disponibile
-/// (`_compress_marker` con `offload is None`): `"\n[... compresso: N char
-/// originali ...]"` dove `N = content.chars().count()`. PURO.
+/// Marker usato quando l'offload RAG non e' disponibile: `"\n[... compresso: N
+/// char originali ...]"` dove `N = content.chars().count()`. PURO.
 ///
-/// In produzione il chiamante passa un `marker_fn` che fa l'offload RAG (I/O,
-/// TODO `EmbeddingStore`) e ritorna il marker con `ref`. Qui resta solo la forma
-/// pura/degraded, usata anche dai golden (offload disabilitato).
+/// Quando l'offload e' attivo il chiamante passa un `marker_fn` che persiste il
+/// blocco via `ContextOffload` e ritorna un marker con `ref`. Questa e' la forma
+/// degradata, quella che l'executor emette se la porta non c'e' o fallisce.
 pub fn degraded_marker(content: &str) -> String {
     format!(
         "\n[... compresso: {} char originali ...]",

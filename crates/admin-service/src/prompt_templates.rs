@@ -667,7 +667,8 @@ fn nexus_builtin_tools() -> Vec<AvailableMcpTool> {
         ("stop_service",           "Termina un processo avviato con run_service"),
         ("create_profile",         "Crea un profilo utente specializzato per un dominio"),
         ("update_profile",         "Aggiorna un profilo utente esistente"),
-        ("dispatch_subtask",       "Delega lavoro a un sotto-agente parallelo"),
+        ("dispatch_subagent",      "Delega un task a un sotto-agente"),
+        ("dispatch_subagents",     "Delega piu' task a sotto-agenti in un solo fronte"),
         ("nexus_doc_generate",     "Genera un documento Word (.docx) dal contenuto del progetto"),
         ("request_tools",          "Richiede l'abilitazione di tool MCP aggiuntivi durante una sessione"),
     ];

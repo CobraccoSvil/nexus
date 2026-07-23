@@ -55,7 +55,8 @@ pub struct ToolContextCore {
     /// (separazione DB: a flag OFF coincide col meta). I tool che toccano il
     /// dominio run DEVONO usare questo, non `db`.
     pub run_db: Arc<PgPool>,
-    /// ID del run padre (per agenti figlio lanciati da dispatch_subtask).
+    /// ID del run padre (per agenti figlio lanciati da
+    /// `dispatch_subagent`/`dispatch_subagents`).
     pub parent_run_id: Option<Uuid>,
     /// ID del run CORRENTE che sta eseguendo i tool (il run del grafo nativo che
     /// ha invocato il tool). Diverso da `parent_run_id`/`session_id`: e' il run

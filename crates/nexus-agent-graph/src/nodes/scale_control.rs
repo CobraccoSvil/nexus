@@ -53,15 +53,18 @@
 //!   5. ritorna `StopReason::ScaleResolved` -> self-loop rientra nell'executor, che
 //!      al rientro consuma la mossa (detector-rientro, PR-B3).
 //!
-//! ## Inerzia a runtime (VINCOLO PR-B2)
+//! ## Quando questo nodo viene raggiunto
 //!
-//! PR-B2 e' INERTE PER COSTRUZIONE: NESSUN detector emette ancora
-//! `StopReason::ScaleReason` (quello e' PR-B3), quindi
-//! `route_after_executor` non instrada MAI qui e questo nodo non e' raggiunto:
-//! il comportamento del motore resta bit-identico. Anche se raggiunto, con la porta
-//! che ritorna `Ok(None)` (kill-switch `agent.scale.enabled` OFF di default / stub)
-//! il nodo NON persiste alcuna mossa e ritorna comunque `ScaleResolved`: al rientro
-//! l'executor mantiene lo sticky corrente (nessun cambio-tier).
+//! Il detector che lo attiva esiste: `maybe_scale_reason_delta` nell'executor
+//! emette `StopReason::ScaleReason` e `route_after_executor` lo instrada qui.
+//! L'emissione e' gated su `agent.scale.enabled` truthy in `settings` (valore nel
+//! DB, non un default di compile-time), sul tetto dei cambi-tier e sul budget
+//! `max_evals_per_run`: senza il flag nessuno lo produce e il nodo non viene
+//! raggiunto.
+//!
+//! Anche quando lo e', se la porta ritorna `Ok(None)` il nodo NON persiste alcuna
+//! mossa e ritorna comunque `ScaleResolved`: al rientro l'executor mantiene lo
+//! sticky corrente (nessun cambio-tier).
 //!
 //! Il nodo NON instrada: l'edge `ScaleControl -> Executor` e' dichiarato fuori, in
 //! `graph.rs` (self-loop come `StallRecovery -> Executor`).
