@@ -347,6 +347,58 @@ pub(crate) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str)
     "errore generico — leggi stderr per la causa specifica, poi usa un approccio alternativo o un comando diverso"
 }
 
+/// Rileva quando il comando DUPLICA il `working_dir` gia' applicato come CWD.
+///
+/// Causa radice di ambiente incoerente (misurata sul test pulito diag-deps,
+/// 2026-07-23): `run_command` esegue con CWD = <root>/<working_dir>. Se il comando
+/// RIPETE quel segmento (`cd frontend`, path `frontend/...`) mentre working_dir e'
+/// gia' `frontend`, i path si SOMMANO (`frontend/frontend`): il `rm -rf
+/// frontend/node_modules` non tocca il vero node_modules, l'`npm install` scrive
+/// altrove, e l'ambiente resta incoerente (typescript/@types assenti -> build
+/// impossibile -> todo bloccato -> run che non converge). E' generale, non
+/// npm-specifico: spiega anche node_modules creato nella root e i path assoluti
+/// errati (`/app/backend`).
+///
+/// Ritorna `Some(spiegazione)` se il comando duplica il working_dir, `None`
+/// altrimenti. Conservativo per evitare falsi positivi: blocca SOLO `cd <wd>` e i
+/// path con prefisso `<wd>/` (segno inequivocabile di path); un `<wd>` nudo (es.
+/// `echo frontend`) NON e' bloccato. Root (`""`, `"."`, `"./"`) non ha segmento da
+/// duplicare. `wd_rel` e' il valore grezzo del parametro `working_dir`.
+pub(crate) fn detect_workdir_path_duplication(wd_rel: &str, command: &str) -> Option<String> {
+    let wd = wd_rel
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_lowercase();
+    if wd.is_empty() || wd == "." {
+        return None;
+    }
+    let prefix = format!("{wd}/");
+    let toks: Vec<String> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '|' | '(' | ')'))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.trim_start_matches("./").to_lowercase())
+        .collect();
+    for (i, tok) in toks.iter().enumerate() {
+        // Duplica se: path con prefisso `<wd>/` (percorso inequivocabile) oppure
+        // `cd <wd>` esatto (naviga nella CWD gia' impostata). Il caso `cd <wd>/sub`
+        // ricade gia' nel prefisso, quindi non serve una condizione a parte.
+        let cd_into_wd = i > 0 && toks[i - 1] == "cd" && *tok == wd;
+        if tok.starts_with(&prefix) || cd_into_wd {
+            return Some(format!(
+                "[working_dir gia' applicato] Il comando gira GIA' dentro '{wd_rel}' \
+                 (working_dir E' la directory di lavoro corrente). Il token '{tok}' ripete \
+                 quel percorso: la directory diventerebbe '<...>/{wd}/{wd}', che non esiste, \
+                 e rm/install/build opererebbero sulla dir sbagliata lasciando l'ambiente \
+                 incoerente. Correggi il comando: togli 'cd {wd}' e i prefissi '{wd}/' dai \
+                 path (usa ad es. 'node_modules', non '{wd}/node_modules'). In alternativa \
+                 ometti 'working_dir' e usa i percorsi completi dalla root del progetto."
+            ));
+        }
+    }
+    None
+}
+
 /// Hint platform-aware per i comandi agente che falliscono perche' usano sintassi
 /// cmd/PowerShell (Windows-native) mentre `run_command` gira in Git Bash (POSIX).
 /// Senza, l'agente ripete lo stesso comando -> repeated_action -> force-close
@@ -504,5 +556,35 @@ mod tests {
             hint.contains("comando non trovato"),
             "command not found deve avere priorita' sul ramo build: {hint}"
         );
+    }
+
+    #[test]
+    fn detect_workdir_dup_blocca_solo_la_vera_duplicazione() {
+        // Caso reale misurato (diag-deps 2026-07-23): working_dir=frontend +
+        // 'rm -rf frontend/node_modules...' -> frontend/frontend -> il rm non tocca
+        // il vero node_modules, l'ambiente resta incoerente. DEVE bloccare.
+        let d = detect_workdir_path_duplication(
+            "frontend",
+            "rm -rf frontend/node_modules/.package-lock.json frontend/package-lock.json",
+        );
+        assert!(d.is_some(), "path 'frontend/...' con working_dir=frontend deve bloccare");
+        assert!(d.unwrap().contains("working_dir"), "il messaggio spiega il working_dir");
+        // 'cd <wd>' = navigazione nella CWD gia' impostata -> blocca.
+        assert!(detect_workdir_path_duplication("frontend", "cd frontend && npm install").is_some());
+        // 'cd <wd>/sub' idem.
+        assert!(detect_workdir_path_duplication("backend", "cd backend/src && ls").is_some());
+        // './frontend' normalizzato = frontend.
+        assert!(detect_workdir_path_duplication("./frontend", "cat frontend/tsconfig.json").is_some());
+
+        // NESSUN falso positivo:
+        // - comando senza duplicazione del working_dir.
+        assert!(detect_workdir_path_duplication("frontend", "npm install").is_none());
+        // - '<wd>' NUDO (non un path) non e' bloccato (es. echo/grep della parola).
+        assert!(detect_workdir_path_duplication("frontend", "echo frontend build ok").is_none());
+        // - riferimento a un'ALTRA dir (non il working_dir) non e' duplicazione.
+        assert!(detect_workdir_path_duplication("backend", "cat frontend/package.json").is_none());
+        // - working_dir root/vuoto: nessun segmento da duplicare.
+        assert!(detect_workdir_path_duplication("", "cd frontend && npm install").is_none());
+        assert!(detect_workdir_path_duplication(".", "cd frontend && npm install").is_none());
     }
 }
