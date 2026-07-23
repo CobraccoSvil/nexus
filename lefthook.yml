@@ -77,6 +77,18 @@ pre-commit:
       run: bash scripts/check-single-source.sh
       fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
 
+    # Gate ratchet dei marker di debito e delle frasi di inerzia
+    # (scripts/markers-baseline.json): grep istantaneo. Il conteggio puo' solo
+    # SCENDERE — nessun commit aggiunge un TODO/FIXME/INERTE netto. Come gli altri
+    # gate globali, lo vede chi lo introduce, non chi esegue `pnpm verify` dopo.
+    markers_ratchet:
+      glob:
+        - "*.rs"
+        - "*.ts"
+        - "*.tsx"
+      run: bash scripts/markers-ratchet.sh
+      fail_text: "pre-commit: un marker di debito o una frase di inerzia in piu' della baseline. Rimuovilo, o aggiorna markers-baseline.json se giustificato (dichiaralo nel commit)."
+
 commit-msg:
   commands:
     # Check estratto in scripts/check-no-emoji.sh: la regex \x{...} inline veniva
