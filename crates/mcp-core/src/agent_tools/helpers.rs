@@ -55,6 +55,31 @@ pub(crate) fn is_long_oneshot(command: &str) -> bool {
         || c.contains("yarn add")
 }
 
+/// Exit code di un processo ucciso da SIGPIPE (128 + 13).
+///
+/// Con `pipefail` una pipeline riporta il PRIMO stadio fallito: se il consumatore
+/// a valle chiude presto (il caso tipico e' `... | head -N`), il produttore riceve
+/// SIGPIPE e la pipeline riporterebbe 141. Non e' un fallimento del comando — e'
+/// il consumatore che ha smesso di leggere — quindi va trattato come successo.
+pub(crate) const EXIT_SIGPIPE: i32 = 141;
+
+/// Avvolge il comando dell'agente nella riga di shell effettivamente eseguita.
+///
+/// PUNTO UNICO (regola L): entrambi i punti che lanciano la shell (`run_command` e
+/// `run_tests`) passano da qui, cosi' la semantica di esecuzione e' una sola.
+///
+/// Aggiunge `set -o pipefail`. Senza, l'exit code di una pipeline e' quello
+/// dell'ULTIMO stadio: `npm install 2>&1 | tail -5` riportava l'esito di `tail`
+/// (sempre 0) e un install FALLITO risultava riuscito. E' il segnale strutturato
+/// su cui l'anti-loop e la diagnostica decidono, mascherato alla fonte (regola M).
+/// Misurato: su verifica-wd 38 comandi su 183 usano una pipe, e tutti e 6 gli
+/// `npm install ... | tail` risultavano exit 0 mentre l'ambiente restava rotto.
+///
+/// Il costo noto e' [`EXIT_SIGPIPE`], gestito dal chiamante.
+pub(crate) fn shell_line(command: &str) -> String {
+    format!("set -o pipefail; {command}")
+}
+
 /// True se il comando MUTA l'albero delle dipendenze di un package manager
 /// (install/add/remove/update di npm, pnpm, yarn, bun, pip, poetry, composer,
 /// gem, bundle, go mod).
@@ -617,6 +642,42 @@ mod tests {
             hint.contains("comando non trovato"),
             "command not found deve avere priorita' sul ramo build: {hint}"
         );
+    }
+
+    /// La riga di shell riporta l'esito del comando che CONTA, non dell'ultimo
+    /// stadio della pipe.
+    ///
+    /// Esegue davvero la shell dell'agente (`sandbox::agent_shell`, la stessa
+    /// della produzione) invece di simulare: il difetto misurato e' proprio che
+    /// `npm install ... | tail` tornava 0 mentre l'install falliva, e un test che
+    /// non attraversa una shell vera non lo vedrebbe.
+    #[test]
+    fn shell_line_non_lascia_che_la_pipe_mascheri_il_fallimento() {
+        let esegui = |cmd: String| -> i32 {
+            std::process::Command::new(crate::sandbox::agent_shell())
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .expect("shell agente")
+                .status
+                .code()
+                .unwrap_or(-1)
+        };
+
+        // Il caso reale: un comando che FALLISCE dietro una pipe.
+        assert_eq!(
+            esegui("exit 7 | tail -5".to_string()),
+            0,
+            "premessa del difetto: senza pipefail la pipe riporta l'esito di tail"
+        );
+        assert_ne!(
+            esegui(shell_line("exit 7 | tail -5")),
+            0,
+            "con pipefail il fallimento dietro la pipe deve emergere"
+        );
+
+        // Un comando che riesce resta riuscito (nessun falso allarme).
+        assert_eq!(esegui(shell_line("echo ok | tail -1")), 0);
     }
 
     #[test]

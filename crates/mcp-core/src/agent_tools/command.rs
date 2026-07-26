@@ -504,7 +504,7 @@ async fn spawn_command_child(
 
     crate::sandbox::isolated_command(&shell_path)
         .arg("-c")
-        .arg(command)
+        .arg(super::helpers::shell_line(command))
         .current_dir(work_dir)
         .env("NEXUS_PROJECT_DB_URL", &project_db_url)
         .env("NEXUS_PROJECT_DB_NAME", &project_db_name)
@@ -526,6 +526,17 @@ async fn format_command_completed(
     stderr: &str,
     hints_prefix: &str,
 ) -> String {
+    // Con `pipefail` (vedi helpers::shell_line) una pipeline riporta il primo
+    // stadio fallito. Se il consumatore a valle chiude presto (`... | head -N`)
+    // il produttore muore di SIGPIPE e la pipeline riporterebbe 141: non e' un
+    // fallimento del comando, e' il consumatore che ha smesso di leggere. Senza
+    // questa normalizzazione, guadagnare l'esito vero degli install (lo scopo di
+    // pipefail) costerebbe falsi fallimenti su ogni `| head`.
+    let exit_code = if exit_code == super::helpers::EXIT_SIGPIPE {
+        0
+    } else {
+        exit_code
+    };
     let hint = command_result_hint(exit_code, stdout, stderr, command);
     // Registra risultati Playwright nella tabella jobs (fire-and-forget)
     record_playwright_job(ctx, command, stdout, stderr, exit_code);
@@ -658,7 +669,7 @@ async fn run_tests_execution(
 ) -> String {
     let child = crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
         .arg("-c")
-        .arg(command)
+        .arg(super::helpers::shell_line(command))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
