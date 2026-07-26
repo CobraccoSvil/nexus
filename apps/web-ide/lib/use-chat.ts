@@ -370,17 +370,43 @@ export function useChat(
   // tracciate qui: vivono legate al ciclo del run padre.
   const primarySubCleanupRef = useRef<(() => void) | null>(null);
 
+  /** Cleanup delle subscription FIGLIE (una per sub-agente), per runId.
+   *
+   *  Prima venivano semplicemente scartate (`if (isPrimary)`), quindi ogni
+   *  EventSource figlio sopravviveva al componente col proprio loop di reconnect.
+   *  Un batch di sub-agenti ne apre 8 di default (fino a 32), e ogni riaggancio
+   *  del padre li ri-sottoscriveva TUTTI senza chiudere i precedenti: su un
+   *  budget di 6 connessioni per origine (HTTP/1.1) questo affamava le fetch
+   *  normali, e il bootstrap della chat non completava (pulsante Invia muto).
+   *  Tenerli qui permette di chiuderli e di non riaprirli due volte. */
+  const childSubCleanupsRef = useRef<Map<string, () => void>>(new Map());
+
+  /** Chiude TUTTE le subscription figlie ancora aperte. */
+  const stopChildAgentStreams = useCallback(() => {
+    for (const cleanup of childSubCleanupsRef.current.values()) {
+      try {
+        cleanup();
+      } catch {
+        // best-effort: un cleanup che fallisce non deve impedire gli altri
+      }
+    }
+    childSubCleanupsRef.current.clear();
+  }, []);
+
   /** Chiude la subscription SSE primaria e azzera il banner "Connessione persa".
    *  Punto unico (regola L): ogni chiusura del canale run (watchdog, reattach,
    *  cancel, cambio run) deve passare da qui, altrimenti il loop di reconnect
-   *  resta attivo con isReconnecting=true anche senza agentRun in UI. */
+   *  resta attivo con isReconnecting=true anche senza agentRun in UI.
+   *  Chiude anche le figlie: vivono legate al ciclo del run padre, quindi quando
+   *  il padre se ne va non hanno piu' motivo di restare aperte. */
   const stopPrimaryAgentStream = useCallback(() => {
     if (primarySubCleanupRef.current) {
       primarySubCleanupRef.current();
       primarySubCleanupRef.current = null;
     }
+    stopChildAgentStreams();
     setIsReconnecting(false);
-  }, []);
+  }, [stopChildAgentStreams]);
 
   // Sottoscrive a un run (primario o figlio) e aggiorna le map di stato
   const subscribeToRun = useCallback(
@@ -389,6 +415,12 @@ export function useChat(
       // (idempotenza del riaggancio: mai due EventSource primari attivi).
       if (isPrimary) {
         stopPrimaryAgentStream();
+      } else if (childSubCleanupsRef.current.has(runId)) {
+        // Stesso principio per i figli: a ogni riaggancio del padre arrivano di
+        // nuovo gli stessi child_run_ids, e senza questo controllo si apriva un
+        // secondo EventSource sullo stesso sub-run lasciando aperto il primo --
+        // il moltiplicatore che portava le connessioni ben oltre il budget.
+        return;
       }
       const cleanup = subscribeAgentStream(
         sid,
@@ -797,9 +829,13 @@ export function useChat(
           }
         },
       );
-      // Conserva il cleanup della sola subscription primaria (vedi ref sopra).
+      // Conserva il cleanup: quello primario nel suo ref, quelli figli nella
+      // mappa per runId. Scartare i cleanup figli (com'era) lasciava un
+      // EventSource orfano per ogni sub-agente, col suo loop di reconnect.
       if (isPrimary) {
         primarySubCleanupRef.current = cleanup;
+      } else {
+        childSubCleanupsRef.current.set(runId, cleanup);
       }
     },
     [projectId, refreshSessionUsage, stopPrimaryAgentStream],
