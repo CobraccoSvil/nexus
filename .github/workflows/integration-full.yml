@@ -21,21 +21,25 @@ name: integration-full
 #
 # COSA COPRE, e cosa no. Gli obiettivi sono elencati uno per uno nello step
 # finale, non con un `cargo test --workspace`: cosi' l'elenco e' leggibile e
-# nessuno crede che il job copra piu' di quanto copre. Restano fuori, per
-# difetto NOSTRO e non dell'ambiente:
+# nessuno crede che il job copra piu' di quanto copre.
 #
-#   - `m71_cost_breakdown`: legge `chat_sessions` e scrive `agent_runs` sul
-#     meta-DB, dove la migrazione 0507 le ha decommissionate (il dominio chat/run
-#     vive nei DB-progetto). Nessun seed puo' soddisfarlo: va riscritto
-#     cross-DB.
-#   - `chat_history_run_anchor`: pretende una sessione con turni assistant, dati
-#     che vivono in un DB-progetto e si raggiungono via API; inoltre firma con
-#     `bearer_auth` mentre `nexus_auth::validate_token` legge il token SOLO dal
-#     cookie, quindi con l'ambiente completo prenderebbe 401.
+# Restano fuori `m71_cost_breakdown` e `chat_history_run_anchor`. Erano scritti
+# contro il meta-DB, dove la migrazione 0507 ha decommissionato il dominio
+# chat/run: sono stati riscritti (seminano nel DB-progetto tramite la fixture
+# `tests/progetto`, con la stessa forma che scrive la produzione), ma la loro
+# esecuzione dipende da un token accettato dal servizio, e li' c'e' un difetto
+# aperto: un token emesso da `/internal/dev-login-token`, con firma verificata
+# contro `settings.jwt_secret` E con la sua riga viva in `sessions`, riceve
+# comunque 401 su ogni endpoint autenticato (misurato in locale il 2026-07-26
+# contro un mcp-core in ascolto). Finche' non e' chiuso, includerli qui
+# significherebbe un rosso che non si puo' spegnere — e un rosso perenne si
+# impara a ignorare.
 #
-# Entrambi sono lavori a se'. Inserirli qui renderebbe il job rosso per motivi
-# che non riguardano l'ambiente, e un rosso che non si puo' spegnere si impara a
-# ignorare.
+# NB: lo stesso difetto colpisce `settings_update_contract` e
+# `agent_runs_endpoints`, che sono inclusi perche' l'ambiente per loro c'e' tutto.
+# Se falliscono con 401, il log di mcp-core ora dice quale dei tre controlli di
+# `validate_token` ha rifiutato il token (firma, scadenza, sessione): e' il
+# segnale che mancava mentre si diagnosticava a mano.
 
 on:
   workflow_dispatch:
@@ -192,7 +196,14 @@ jobs:
 
       # Il token viene dal backend, con la chiave di firma della piattaforma: e'
       # il percorso del dev-login, non una firma fabbricata qui.
-      - name: Conia il JWT dal percorso di produzione
+      #
+      # La riga in `sessions` va aggiunta a parte: `validate_token` verifica
+      # SEMPRE che il token abbia una sessione viva (`check_session_exists`), e
+      # `dev_login_token` firma soltanto — la scrittura in `sessions` la fa il
+      # callback OAuth (`crates/mcp-core/src/auth.rs`), che qui non passa. Senza
+      # questo INSERT ogni chiamata autenticata prende 401 con una firma
+      # perfettamente valida.
+      - name: Conia il JWT e aprigli la sessione
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
             -c "UPDATE settings SET value = 'true' WHERE key = 'auth.dev_login_enabled';"
@@ -202,6 +213,23 @@ jobs:
             exit 1
           fi
           echo "::add-mask::$token"
+
+          # `sessions.token_hash` e' lo sha256 esadecimale del token (hash_token
+          # in crates/nexus-auth). L'utente e' quello che il token DICHIARA: e'
+          # l'unico che gli handler accetteranno.
+          hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+          sub="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.sub')"
+          if [ -z "$sub" ] || [ "$sub" = "null" ]; then
+            echo "::error::il token non porta un claim 'sub' leggibile"
+            exit 1
+          fi
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
+          INSERT INTO users (id, email, display_name, role)
+          VALUES ('$sub', 'ci-integration@nexus.local', 'CI integration', 'admin')
+            ON CONFLICT (id) DO NOTHING;
+          INSERT INTO sessions (user_id, token_hash, expires_at)
+          VALUES ('$sub', '$hash', NOW() + INTERVAL '2 hours');
+          SQL
           echo "NEXUS_TEST_JWT=$token" >> "$GITHUB_ENV"
 
       # Un obiettivo per riga: l'elenco E' la dichiarazione di copertura. La

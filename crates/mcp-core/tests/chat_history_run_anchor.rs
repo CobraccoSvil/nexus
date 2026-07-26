@@ -18,30 +18,47 @@
 //!
 //! Perche' al wire e non sul DB (regola O): mcp-core e' bin-only, quindi un test
 //! in `tests/` non puo' importare la SELECT di produzione e dovrebbe RICOPIARLA
-//! -- misurando una propria imitazione, che divergerebbe al primo ritocco. E il
-//! DB del gate (meta) non ha nemmeno `chat_messages`/`agent_runs`, che vivono
-//! solo nel DB del progetto. Interrogare l'endpoint pone la domanda al sistema
-//! invece di riscriverla.
+//! -- misurando una propria imitazione, che divergerebbe al primo ritocco.
+//! Interrogare l'endpoint pone la domanda al sistema invece di riscriverla.
 //!
-//! ATTENZIONE allo skip: senza server o JWT questo test si presenta come "ok"
-//! nel gate. Per non passare in modo VACUO (una sessione senza turni agentici
-//! renderebbe verde qualunque implementazione), quando la storia e' raggiungibile
-//! ma non contiene alcun assistant agganciabile il test FALLISCE dichiarandolo.
+//! # Cosa e' cambiato il 2026-07-26
+//!
+//! Il test cercava una sessione con turni assistant GIA' PRESENTE nell'ambiente,
+//! e senza quella si dichiarava non misurabile. Due difetti in quella forma:
+//!
+//! 1. dipendeva da dati che nessuno garantisce — in un DB appena migrato non
+//!    c'era nulla da trovare, e il test restava un verde vacuo;
+//! 2. firmava con `bearer_auth`, ma `nexus_auth::validate_token` estrae il token
+//!    SOLO dal cookie: con l'ambiente completo ogni chiamata avrebbe preso 401,
+//!    che la vecchia forma leggeva come "nessuna sessione agganciabile". Il
+//!    difetto si sarebbe mascherato da mancanza di dati.
+//!
+//! Ora il test SEMINA la propria conversazione nel DB-progetto (dove il dominio
+//! chat vive dopo il cutover della 0507) nella stessa forma che scrive la
+//! produzione, poi interroga l'endpoint e rimuove tutto. Non dipende da nessun
+//! dato preesistente e non puo' passare in modo vacuo: se l'aggancio non torna,
+//! il messaggio che ha seminato lui e' li' a dimostrarlo.
 
+mod progetto;
+
+use nexus_test_preconditions::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
+use progetto::{progetto_o_salta, pulisci_conversazione, semina_conversazione, utente_del_token_o_salta};
 use serde_json::Value;
-use nexus_test_preconditions::{base_url, jwt_o_salta, salta, Motivo};
 
+/// GET autenticato. Il token viaggia nel COOKIE: `nexus_auth::validate_token` lo
+/// estrae solo da li', quindi con `bearer_auth` la risposta sarebbe 401 qualunque
+/// sia il contratto sotto test.
 async fn get_json(token: &str, path: &str) -> Option<Value> {
     let res = reqwest::Client::new()
         .get(format!("{}{path}", base_url()))
-        .bearer_auth(token)
+        .header("Cookie", format!("token={token}"))
         .send()
         .await
         .ok()?;
     if !res.status().is_success() {
         // Uno status di rifiuto NON e' un servizio giu': con
         // REQUIRE_INTEGRATION_TESTS=1 diventa un fallimento, cosi' un 401
-        // sistematico non puo' piu' presentarsi come "nessuna sessione con turni".
+        // sistematico non puo' piu' presentarsi come "dati mancanti".
         salta(Motivo::RispostaInattesa {
             status: res.status().as_u16(),
             path,
@@ -51,125 +68,127 @@ async fn get_json(token: &str, path: &str) -> Option<Value> {
     res.json::<Value>().await.ok()
 }
 
-/// Una sessione con almeno un turno agentico: e' li' che l'aggancio conta.
-async fn sessione_con_turni(token: &str) -> Option<String> {
-    let body = get_json(token, "/api/chat/sessions").await?;
-    let sessions = body
-        .get("sessions")
+/// I messaggi della sessione, come li consegna l'endpoint.
+fn messaggi(body: &Value) -> Vec<Value> {
+    body.get("messages")
         .and_then(Value::as_array)
-        .or_else(|| body.as_array())?;
-    for s in sessions {
-        let id = s.get("id").and_then(Value::as_str)?;
-        let msgs = get_json(token, &format!("/api/chat/sessions/{id}/messages")).await?;
-        let n = msgs
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|m| m.iter().filter(|x| ruolo(x) == "assistant").count())
-            .unwrap_or(0);
-        if n > 0 {
-            return Some(id.to_string());
-        }
-    }
-    None
+        .or_else(|| body.as_array())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn ruolo(m: &Value) -> &str {
     m.get("role").and_then(Value::as_str).unwrap_or_default()
 }
 
+fn campo(m: &Value, nome: &str) -> Option<String> {
+    m.get(nome).and_then(Value::as_str).map(|s| s.to_string())
+}
+
+/// Il contratto in una frase: il messaggio ASSISTANT prodotto da un run deve
+/// portare l'id di quel run, anche se il run e' agganciato al messaggio UTENTE.
 #[tokio::test]
 async fn un_messaggio_assistant_porta_il_run_che_lo_ha_prodotto() {
     let Some(token) = jwt_o_salta() else { return };
-    let Some(session_id) = sessione_con_turni(&token).await else {
-        salta(Motivo::DatiAssenti(
-            "nessuna sessione con turni assistant raggiungibile",
-        ));
+    let Some(meta) = db_o_salta().await else { return };
+    let Some(progetto) = progetto_o_salta(&meta).await else {
         return;
     };
-    let Some(body) = get_json(&token, &format!("/api/chat/sessions/{session_id}/messages")).await
-    else {
-        salta(Motivo::ServizioGiu(&base_url()));
+    let Some(user_id) = utente_del_token_o_salta(&meta, &token).await else {
         return;
     };
 
-    let messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let assistants: Vec<&Value> = messages.iter().filter(|m| ruolo(m) == "assistant").collect();
+    let conv = semina_conversazione(&progetto, user_id, "completed", "anthropic", "claude-haiku-4-5")
+        .await
+        .expect("seed della conversazione nel DB-progetto");
 
-    // Guardia anti-vacuita': senza questa, una storia priva di assistant
-    // renderebbe verde anche l'implementazione difettosa.
-    assert!(
-        !assistants.is_empty(),
-        "campione vuoto: la sessione {session_id} non ha messaggi assistant, \
-         il contratto non e' stato verificato"
-    );
+    let body = get_json(
+        &token,
+        &format!("/api/chat/sessions/{}/messages", conv.session_id),
+    )
+    .await;
 
-    let con_run = assistants
-        .iter()
-        .filter(|m| {
-            m.get("runId")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-        })
-        .count();
+    let esito = body.map(|b| {
+        let msgs = messaggi(&b);
+        let assistant = msgs
+            .iter()
+            .find(|m| campo(m, "id").as_deref() == Some(&conv.messaggio_assistant_id.to_string()))
+            .cloned();
+        (msgs.len(), assistant)
+    });
+
+    pulisci_conversazione(&progetto, &conv).await;
+
+    // Il cleanup PRIMA delle asserzioni: un panic qui lascerebbe altrimenti
+    // sessione, messaggi e run nel DB del progetto.
+    let Some((totale, assistant)) = esito else {
+        return; // lo skip l'ha gia' dichiarato get_json
+    };
+
+    let assistant = assistant.unwrap_or_else(|| {
+        panic!(
+            "la storia della sessione non contiene il messaggio assistant appena seminato \
+             ({} messaggi restituiti): l'endpoint non consegna cio' che e' nel DB del progetto",
+            totale
+        )
+    });
 
     assert_eq!(
-        con_run,
-        assistants.len(),
-        "ogni messaggio assistant di un turno agentico deve portare il runId del \
-         run che lo ha prodotto: senza, message-list.tsx fa `return null` e il \
-         nastro attivita' del turno (Consiglio incluso) sparisce al reload. \
-         Trovati {con_run}/{} con runId",
-        assistants.len()
+        ruolo(&assistant),
+        "assistant",
+        "il messaggio seminato come assistant torna con un altro ruolo"
+    );
+    assert_eq!(
+        campo(&assistant, "runId").as_deref(),
+        Some(conv.run_id.to_string().as_str()),
+        "il messaggio assistant deve portare il runId del run che lo ha prodotto. \
+         Il run e' agganciato al messaggio UTENTE via run_message_id: se il JOIN \
+         non usa COALESCE(request_message_id, id), qui torna null e il nastro \
+         attivita' sparisce al reload"
     );
 }
 
-/// L'altra meta' dello stesso aggancio: `run_status` alimenta il badge di stato
-/// persistente della riga storica. Cadeva sul messaggio utente, dove nessuno lo
-/// legge, lasciando il badge dell'assistant sempre vuoto.
+/// Il contro-caso dello stesso JOIN: oltre all'id deve arrivare lo STATO del run,
+/// che e' quanto la UI usa per sapere se il turno e' finito.
 #[tokio::test]
 async fn un_messaggio_assistant_porta_anche_lo_stato_del_run() {
     let Some(token) = jwt_o_salta() else { return };
-    let Some(session_id) = sessione_con_turni(&token).await else {
-        salta(Motivo::DatiAssenti(
-            "nessuna sessione con turni assistant raggiungibile",
-        ));
+    let Some(meta) = db_o_salta().await else { return };
+    let Some(progetto) = progetto_o_salta(&meta).await else {
         return;
     };
-    let Some(body) = get_json(&token, &format!("/api/chat/sessions/{session_id}/messages")).await
-    else {
-        salta(Motivo::ServizioGiu(&base_url()));
+    let Some(user_id) = utente_del_token_o_salta(&meta, &token).await else {
         return;
     };
 
-    let messages = body
-        .get("messages")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let assistants: Vec<&Value> = messages.iter().filter(|m| ruolo(m) == "assistant").collect();
-    assert!(
-        !assistants.is_empty(),
-        "campione vuoto: contratto non verificato sulla sessione {session_id}"
-    );
+    // Stato volutamente diverso dal default 'running': cosi' un handler che
+    // restituisse una costante invece del valore letto verrebbe scoperto.
+    let conv = semina_conversazione(&progetto, user_id, "failed", "deepseek", "deepseek-chat")
+        .await
+        .expect("seed della conversazione nel DB-progetto");
 
-    let con_stato = assistants
-        .iter()
-        .filter(|m| {
-            m.get("runStatus")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-        })
-        .count();
+    let body = get_json(
+        &token,
+        &format!("/api/chat/sessions/{}/messages", conv.session_id),
+    )
+    .await;
 
+    let stato = body.map(|b| {
+        messaggi(&b)
+            .iter()
+            .find(|m| campo(m, "id").as_deref() == Some(&conv.messaggio_assistant_id.to_string()))
+            .and_then(|m| campo(m, "runStatus"))
+    });
+
+    pulisci_conversazione(&progetto, &conv).await;
+
+    let Some(stato) = stato else {
+        return; // skip gia' dichiarato
+    };
     assert_eq!(
-        con_stato,
-        assistants.len(),
-        "lo stato del run appartiene al messaggio assistant (era 0/6 sugli \
-         assistant e 6/6 sugli utenti). Trovati {con_stato}/{}",
-        assistants.len()
+        stato.as_deref(),
+        Some("failed"),
+        "il messaggio assistant deve portare lo stato del run agganciato \
+         (seminato 'failed'): senza, la UI non sa se il turno e' concluso"
     );
 }

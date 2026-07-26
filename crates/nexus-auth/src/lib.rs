@@ -558,26 +558,68 @@ fn extract_token_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> 
 
 // --- Token validation ---
 
+/// Valida il token del cookie: firma, scadenza del claim e sessione viva.
+///
+/// # Perche' i tre modi di fallire si distinguono nel log
+///
+/// Tutti e tre danno 401 al chiamante, e cosi' deve essere: dire a chi non e'
+/// autenticato PERCHE' non lo e' regala informazione a chi sta provando. Ma il
+/// log e' interno, e li' l'indistinguibilita' costa: un token rifiutato per
+/// firma sbagliata e uno rifiutato perche' la sua sessione non e' mai stata
+/// creata hanno cause opposte — nel primo caso il segreto non combacia, nel
+/// secondo il percorso di login non ha scritto in `sessions` — e il messaggio
+/// unico "token validation failed" non permetteva di sceglierne una senza
+/// modificare il codice per scoprirlo (misurato il 2026-07-26 diagnosticando un
+/// 401 sistematico sui token del dev-login: firma verificata a mano, sessione
+/// inserita a mano, e nessun modo di sapere dall'esterno cosa rifiutasse il
+/// servizio). Il motivo esiste gia' in forma strutturata a ogni passo: qui viene
+/// solo emesso invece di essere appiattito (regola M).
 pub async fn validate_token(
     db: &PgPool,
     headers: &axum::http::HeaderMap,
 ) -> Result<Claims, StatusCode> {
-    let token = extract_token_from_cookie(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let Some(token) = extract_token_from_cookie(headers) else {
+        tracing::debug!("validate_token: nessun cookie 'token' nella richiesta");
+        return Err(StatusCode::UNAUTHORIZED);
+    };
 
-    let jwt_secret = get_setting(db, "jwt_secret")
-        .await
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let Some(jwt_secret) = get_setting(db, "jwt_secret").await else {
+        tracing::warn!(
+            "validate_token: settings.jwt_secret assente o illeggibile: nessun token puo' essere validato"
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    };
 
-    let token_data = decode::<Claims>(
+    let token_data = match decode::<Claims>(
         &token,
         &DecodingKey::from_secret(jwt_secret.as_bytes()),
         &Validation::default(),
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            // `e.kind()` distingue firma non valida, token scaduto e payload
+            // malformato: e' il segnale strutturato della libreria, non una
+            // frase da interpretare. Il token NON viene loggato (e' una
+            // credenziale, regola F).
+            tracing::warn!(
+                "validate_token: decodifica rifiutata ({:?}): firma non corrispondente al jwt_secret corrente, token scaduto o claim malformati",
+                e.kind()
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
 
-    // Verify session exists and not expired
+    // La firma da' per buono il contenuto, non l'esistenza della sessione: un
+    // token puo' essere perfettamente firmato e non avere mai avuto una riga in
+    // `sessions` (percorso di login che non la scrive) o averla scaduta.
     let token_hash = hash_token(&token);
     if !check_session_exists(db, &token_hash).await? {
+        tracing::warn!(
+            "validate_token: firma valida ma nessuna sessione viva per questo token (user={}). \
+             La riga in `sessions` la scrive il percorso di login: un token emesso senza passarci \
+             e' valido come firma e inutilizzabile come credenziale",
+            token_data.claims.sub
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
