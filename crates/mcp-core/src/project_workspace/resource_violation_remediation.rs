@@ -573,6 +573,7 @@ async fn close_after_remediation(state: &AppState, project_id: Uuid, run_id: Uui
         crate::security::resource_linter::lint_tree(&root_path, &alloc_clone)
     })
     .await
+    .map(|t| t.findings)
     .unwrap_or_default();
 
     let open_rows: Vec<(Uuid, String, Option<String>, f64)> = sqlx::query_as(

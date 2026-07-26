@@ -211,8 +211,21 @@ fn should_lint_file(path: &Path) -> bool {
     }
 }
 
+/// Esito di un walk: i finding E se l'albero e' stato attraversato per intero.
+///
+/// La completezza non e' un dettaglio diagnostico: e' la premessa senza la quale
+/// la lista non significa nulla per chi deve CHIUDERE le violazioni rientrate
+/// (regola O). Uno scan fermato al cap produce una lista indistinguibile da una
+/// completa; usarla per decidere le chiusure chiuderebbe le violazioni dei file
+/// mai visitati. Il tipo obbliga il chiamante a rispondere alla domanda "ho
+/// visto tutto?" prima di trarne conclusioni.
+pub struct TreeLint {
+    pub findings: Vec<ResourceLintFinding>,
+    pub complete: bool,
+}
+
 /// Walk sincrono della project_root (da chiamare in `spawn_blocking`).
-pub fn lint_tree(root: &Path, allocated: &HashSet<u32>) -> Vec<ResourceLintFinding> {
+pub fn lint_tree(root: &Path, allocated: &HashSet<u32>) -> TreeLint {
     let mut findings = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     let mut scanned = 0usize;
@@ -225,7 +238,10 @@ pub fn lint_tree(root: &Path, allocated: &HashSet<u32>) -> Vec<ResourceLintFindi
                 tracing::warn!(
                     "resource_linter: cap {MAX_FILES_PER_SCAN} file raggiunto, scan parziale"
                 );
-                return findings;
+                return TreeLint {
+                    findings,
+                    complete: false,
+                };
             }
             let path = entry.path();
             let name = entry.file_name();
@@ -255,7 +271,12 @@ pub fn lint_tree(root: &Path, allocated: &HashSet<u32>) -> Vec<ResourceLintFindi
             findings.extend(lint_file_content(&rel, &content, allocated));
         }
     }
-    findings
+    // Uscita naturale del walk: lo stack e' vuoto, l'albero e' stato percorso
+    // tutto. L'unica uscita parziale e' quella al cap, sopra.
+    TreeLint {
+        findings,
+        complete: true,
+    }
 }
 
 /// Variante mirata per la catena del kill runtime: solo finding sulla porta data.
@@ -264,7 +285,10 @@ pub fn lint_tree_for_port(
     allocated: &HashSet<u32>,
     target: u32,
 ) -> Vec<ResourceLintFinding> {
+    // Qui la completezza non serve: si cerca UNA porta gia' osservata a runtime,
+    // non si decide la chiusura di violazioni.
     lint_tree(root, allocated)
+        .findings
         .into_iter()
         .filter(|f| f.port == target)
         .collect()
@@ -294,13 +318,14 @@ pub async fn lint_project(state: &crate::AppState, project_id: Uuid, root_path: 
         return 0;
     }
     let alloc_clone = allocated.clone();
-    let findings = match tokio::task::spawn_blocking(move || lint_tree(&root, &alloc_clone)).await {
+    let scan = match tokio::task::spawn_blocking(move || lint_tree(&root, &alloc_clone)).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, "resource_linter: walk fallito");
             return 0;
         }
     };
+    let findings = scan.findings;
 
     let mut opened = 0usize;
     for f in &findings {
@@ -308,6 +333,28 @@ pub async fn lint_project(state: &crate::AppState, project_id: Uuid, root_path: 
             opened += 1;
         }
     }
+
+    // Simmetria fra apertura e chiusura (regola H, niente fantasmi eterni nel
+    // pannello Problemi). Il walk ha appena prodotto l'insieme COMPLETO dei
+    // finding del progetto: le diagnosi per-file la cui firma non compare piu'
+    // sono rientrate, anche quando a cambiare non e' stato il file ma le porte
+    // allocate al progetto — il caso che la ri-validazione per-file non puo'
+    // vedere, perche' la innesca la scrittura del file.
+    //
+    // Solo su scan COMPLETO: fermarsi al cap dei file e chiudere sarebbe
+    // dichiarare rientrate le violazioni dei file mai visitati.
+    if scan.complete {
+        let present = present_signatures(project_id, &findings);
+        let resolved = resolve_absent_file_violations(db, project_id, None, &present).await;
+        if !resolved.is_empty() {
+            tracing::info!(
+                project_id = %project_id,
+                resolved = resolved.len(),
+                "resource_linter: violazioni non piu' presenti nei sorgenti risolte"
+            );
+        }
+    }
+
     if opened > 0 {
         tracing::warn!(
             project_id = %project_id,
@@ -339,12 +386,7 @@ pub async fn lint_project(state: &crate::AppState, project_id: Uuid, root_path: 
 /// (dedup per firma a monte: non riapre violazioni gia' note).
 async fn open_lint_finding(db: &PgPool, project_id: Uuid, f: &ResourceLintFinding) -> bool {
     let (kind, rule) = f.kind.rule();
-    let sig = crate::security::resource_governance::violation_signature(
-        project_id,
-        Some(&f.rel_path),
-        &f.value,
-        &format!("{kind}/{rule}"),
-    );
+    let sig = finding_signature(project_id, f);
     let detail = format!(
         "{}:{} {} ({}/{}) | {}\n-> {}",
         f.rel_path,
@@ -446,31 +488,84 @@ pub async fn revalidate_file_violations(
         let _ = open_lint_finding(db, project_id, f).await;
     }
 
-    // Firme ancora presenti: una diagnosi resta aperta solo se la sua firma
-    // compare ancora tra i finding correnti del file.
-    let present_sigs: std::collections::HashSet<String> = findings
-        .iter()
-        .map(|f| {
-            let (kind, rule) = f.kind.rule();
-            crate::security::resource_governance::violation_signature(
-                project_id,
-                Some(&f.rel_path),
-                &f.value,
-                &format!("{kind}/{rule}"),
-            )
-        })
-        .collect();
+    // 2) Chiusura delle violazioni non piu' presenti su QUESTO file.
+    let present_sigs = present_signatures(project_id, &findings);
+    let resolved =
+        resolve_absent_file_violations(db, project_id, Some(&rel_path), &present_sigs).await;
+    if !resolved.is_empty() {
+        tracing::info!(
+            project_id = %project_id,
+            file = %rel_path,
+            resolved = resolved.len(),
+            "resource_linter: violazioni risorse risolte dopo edit del file"
+        );
+    }
+}
 
-    // 2) Diagnosi policy_violation aperte su QUESTO file (open/diagnosing/failed_remediation):
-    //    quelle la cui firma non e' piu' presente vanno risolte.
+/// Firma di UN finding: PUNTO UNICO (regola L) condiviso da chi apre le
+/// diagnosi e da chi le chiude. Se le due strade la calcolassero ciascuna per
+/// conto proprio, una divergenza qualunque (il path relativo, l'ordine di
+/// kind/rule) non romperebbe nulla in modo visibile: semplicemente nessuna
+/// diagnosi verrebbe mai piu' chiusa, e il pannello Problemi accumulerebbe
+/// fantasmi in silenzio.
+fn finding_signature(project_id: Uuid, f: &ResourceLintFinding) -> String {
+    let (kind, rule) = f.kind.rule();
+    crate::security::resource_governance::violation_signature(
+        project_id,
+        Some(&f.rel_path),
+        &f.value,
+        &format!("{kind}/{rule}"),
+    )
+}
+
+/// Firme delle violazioni presenti in un insieme di finding.
+fn present_signatures(
+    project_id: Uuid,
+    findings: &[ResourceLintFinding],
+) -> std::collections::HashSet<String> {
+    findings
+        .iter()
+        .map(|f| finding_signature(project_id, f))
+        .collect()
+}
+
+/// PUNTO UNICO (regola L) della CHIUSURA delle violazioni per-file rientrate:
+/// una diagnosi resta aperta solo finche' la sua firma compare ancora fra i
+/// finding correnti. `file_scope` sceglie l'ampiezza: `Some(rel_path)` dopo
+/// l'edit di un file, `None` per l'intero progetto dopo il lint completo.
+/// Ritorna gli id risolti (vuoto se non c'era nulla da chiudere).
+///
+/// Perche' serve anche lo scope progetto (regola H, niente fantasmi eterni nel
+/// pannello Problemi): una violazione di porta dipende da DUE fatti — il
+/// contenuto del file E l'insieme delle porte allocate al progetto. La
+/// ri-validazione per-file copre solo il primo, perche' e' innescata dalla
+/// scrittura del file. Quando e' il secondo a cambiare — la porta viene
+/// allocata DOPO che il file e' stato scritto — nessuno rivaluta e la diagnosi
+/// resta aperta per sempre su un problema che non esiste piu'. Caso reale del
+/// 26/07/2026: `scripts/setup-crud.sh` scritto alle 13:36 UTC con la porta
+/// 32987 non ancora allocata, porta poi allocata (`adopted`) alle 15:04 UTC,
+/// diagnosi ancora `open` a fine giornata; e una gemella sulla 33276 aperta dal
+/// 23/07. Il lint completo attraversa gia' tutto l'albero e conosce l'insieme
+/// dei finding correnti: gli mancava solo la simmetria fra aprire e chiudere.
+///
+/// Le diagnosi con `file_path IS NULL` sono escluse di proposito: appartengono
+/// alle violazioni rilevate a runtime, il cui ciclo di vita e' gestito da
+/// `resolve_stale_runtime_port_violations` (port_enforcer).
+async fn resolve_absent_file_violations(
+    db: &PgPool,
+    project_id: Uuid,
+    file_scope: Option<&str>,
+    present_sigs: &std::collections::HashSet<String>,
+) -> Vec<Uuid> {
     let open_rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, error_signature_hash FROM service_diagnoses \
           WHERE project_id = $1 AND signal_kind = 'policy_violation' \
-            AND file_path = $2 \
+            AND file_path IS NOT NULL \
+            AND ($2::text IS NULL OR file_path = $2) \
             AND status IN ('open', 'diagnosing', 'failed_remediation')",
     )
     .bind(project_id)
-    .bind(&rel_path)
+    .bind(file_scope)
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -482,7 +577,7 @@ pub async fn revalidate_file_violations(
         .collect();
 
     if resolved_ids.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let _ = sqlx::query(
@@ -492,13 +587,6 @@ pub async fn revalidate_file_violations(
     .bind(&resolved_ids)
     .execute(db)
     .await;
-
-    tracing::info!(
-        project_id = %project_id,
-        file = %rel_path,
-        resolved = resolved_ids.len(),
-        "resource_linter: violazioni risorse risolte dopo edit del file"
-    );
 
     // Realtime: il pannello Problemi ascolta FindingsUpdated e ri-fetcha.
     // total/critical/warnings restano 0: il pannello Problemi non li usa per
@@ -511,9 +599,10 @@ pub async fn revalidate_file_violations(
             total: 0,
             critical: 0,
             warnings: 0,
-            resolved_ids,
+            resolved_ids: resolved_ids.clone(),
         },
     );
+    resolved_ids
 }
 
 /// Worker periodico: linta tutti i progetti con `port_lint_enabled=true` e
@@ -611,6 +700,58 @@ mod tests {
         let allocated = HashSet::new();
         let f = lint_file_content(".env", "PORT=5000\n", &allocated);
         assert!(f.is_empty());
+    }
+
+    /// Il walk vero su un albero vero: la lista dei finding, da sola, non dice
+    /// se e' completa, e chi decide le chiusure deve saperlo prima di trarne
+    /// conclusioni (regola O).
+    #[test]
+    fn lint_tree_dichiara_se_ha_visto_tutto_l_albero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.py"), "PORT = 21970\n").expect("write");
+        let scan = lint_tree(dir.path(), &HashSet::new());
+        assert!(
+            scan.complete,
+            "albero di un file: lo scan non puo' essere parziale"
+        );
+        assert!(scan.findings.iter().any(|f| f.port == 21970));
+    }
+
+    /// La chiusura filtra le diagnosi per firma: se la firma non distinguesse
+    /// file e porta, chiudere una violazione rientrata ne chiuderebbe altre
+    /// ancora vive. Caso reale del 26/07: `scripts/setup-crud.sh` con la 32987.
+    #[test]
+    fn la_firma_distingue_file_e_porta_ed_e_deterministica() {
+        let project_id = Uuid::nil();
+        let findings = lint_file_content("scripts/setup-crud.sh", "PORT=32987\n", &HashSet::new());
+        let f = findings
+            .first()
+            .expect("una porta del bucket non allocata e' una violazione");
+        assert_eq!(f.kind, ResourceViolationKind::PortBucketNotAllocated);
+
+        let presenti = present_signatures(project_id, &findings);
+        assert!(
+            presenti.contains(&finding_signature(project_id, f)),
+            "una violazione ancora presente non deve risultare assente: verrebbe chiusa da viva"
+        );
+        // Determinismo: due calcoli della stessa firma coincidono, altrimenti
+        // nessuna diagnosi verrebbe mai richiusa.
+        assert_eq!(
+            finding_signature(project_id, f),
+            finding_signature(project_id, f)
+        );
+
+        let altro_file = ResourceLintFinding {
+            rel_path: "scripts/altro.sh".into(),
+            ..f.clone()
+        };
+        let altra_porta = ResourceLintFinding {
+            value: "32988".into(),
+            port: 32988,
+            ..f.clone()
+        };
+        assert!(!presenti.contains(&finding_signature(project_id, &altro_file)));
+        assert!(!presenti.contains(&finding_signature(project_id, &altra_porta)));
     }
 
     #[test]
