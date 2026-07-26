@@ -36,6 +36,11 @@ struct IntentRequirement {
     intent: String,
     behavior_mode: String,
     required_capabilities: Vec<String>,
+    /// Capability BASE dell'intent (`nexus_intent_capability`), gia' inclusa fra
+    /// le `required_capabilities`. Tenuta a parte perche' non e' una richiesta
+    /// come le altre: e' cio' che definisce il compito, e chi non la possiede non
+    /// puo' svolgerlo per quanto bene copra il resto.
+    base_capability: Option<String>,
     requires_tool_use: bool,
     preferred_tier: String,
     weight_tier: f32,
@@ -539,6 +544,7 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
                     THEN r.required_capabilities || ARRAY[c.base_capability]
                   ELSE r.required_capabilities
                 END AS required_capabilities,
+                NULLIF(c.base_capability, '') AS base_capability,
                 r.requires_tool_use,
                 r.preferred_tier, r.weight_tier, r.weight_cost, r.weight_context,
                 r.weight_capabilities, r.cost_direction
@@ -557,6 +563,7 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
             required_capabilities: r
                 .try_get::<Vec<String>, _>("required_capabilities")
                 .unwrap_or_default(),
+            base_capability: r.try_get::<Option<String>, _>("base_capability").unwrap_or(None),
             requires_tool_use: r.try_get("requires_tool_use").unwrap_or(false),
             preferred_tier: r
                 .try_get("preferred_tier")
@@ -663,37 +670,83 @@ async fn load_catalog_with_gate(
         .collect())
 }
 
+/// Candidati che possiedono la capability BASE dell'intent.
+///
+/// `None` quando il vincolo non e' applicabile — nessuna base dichiarata, oppure
+/// nessun modello la possiede — e il chiamante deve aprire la selezione a tutti.
+/// Distinguere "vincolo non applicabile" da "nessun candidato" e' il punto:
+/// restituire un elenco vuoto lascerebbe l'intent senza modelli invece che senza
+/// vincolo.
+fn filtra_per_capability_base<'a>(
+    req: &IntentRequirement,
+    catalog: &'a [CatalogModel],
+) -> Option<Vec<&'a CatalogModel>> {
+    let base = req.base_capability.as_ref()?.to_lowercase();
+    let con_base: Vec<&CatalogModel> = catalog
+        .iter()
+        .filter(|m| m.capabilities.iter().any(|c| c.to_lowercase() == base))
+        .collect();
+    if con_base.is_empty() {
+        tracing::warn!(
+            intent = %req.intent,
+            behavior_mode = %req.behavior_mode,
+            base_capability = %base,
+            "routing: nessun modello possiede la capability base dell'intent, \
+             vincolo aperto per non lasciare lo slot senza candidati"
+        );
+        return None;
+    }
+    Some(con_base)
+}
+
+/// Filtri di eleggibilita' che non ammettono compromessi (a differenza dello
+/// scoring, dove una carenza si compensa con un pregio).
+fn passa_filtri_obbligatori(req: &IntentRequirement, m: &CatalogModel) -> bool {
+    if req.requires_tool_use && !m.supports_tool_use {
+        return false;
+    }
+    // FASE 2b: per gli slot che richiedono tool_use, escludi i modelli con
+    // agentic_thinking_policy='exclude' (allineamento al routing live, ADR 0025):
+    // cosi' la matrix non pinna modelli che il live scarta.
+    if req.requires_tool_use && m.agentic_thinking_policy == "exclude" {
+        return false;
+    }
+    if req.required_capabilities.is_empty() || m.capabilities.is_empty() {
+        return true;
+    }
+    let required_lc: Vec<String> = req
+        .required_capabilities
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
+    // Almeno 50% delle capability richieste devono essere presenti.
+    capability_match_pct(&required_lc, &cap_lc) >= 0.5
+}
+
 /// Per un (intent, behavior_mode) ritorna top-N candidati distinti per provider
 /// (max 3, uno per provider). Score 0..1.
 fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> Vec<ScoredModel> {
-    let mut scored: Vec<ScoredModel> = catalog
-        .iter()
-        .filter(|m| {
-            // Filtri obbligatori.
-            if req.requires_tool_use && !m.supports_tool_use {
-                return false;
-            }
-            // FASE 2b: per gli slot che richiedono tool_use, escludi i modelli
-            // con agentic_thinking_policy='exclude' (allineamento al routing live,
-            // ADR 0025): cosi' la matrix non pinna modelli che il live scarta.
-            if req.requires_tool_use && m.agentic_thinking_policy == "exclude" {
-                return false;
-            }
-            if !req.required_capabilities.is_empty() && !m.capabilities.is_empty() {
-                let required_lc: Vec<String> = req
-                    .required_capabilities
-                    .iter()
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
-                let pct = capability_match_pct(&required_lc, &cap_lc);
-                // Almeno 50% delle capability richieste devono essere presenti.
-                if pct < 0.5 {
-                    return false;
-                }
-            }
-            true
-        })
+    // La capability BASE dell'intent e' cio' che definisce il compito: chi non la
+    // possiede ne resta fuori, per quanto copra il resto e per quanto costi poco.
+    // Il solo punteggio non bastava: il peso capability (0.20) e' inferiore a
+    // quello del costo (0.25), quindi un modello molto economico privo della base
+    // poteva vincere lo stesso. Su `debug` accadeva esattamente questo.
+    //
+    // La degradazione evita la starvation (ADR 0025): se NESSUN candidato possiede
+    // la base — oggi `web_search`, zero modelli nel catalog — il vincolo si apre e
+    // si sceglie fra tutti, dichiarandolo nei log invece di restare senza
+    // candidati in silenzio.
+    // Il pool di NORMALIZZAZIONE del costo resta il catalogo intero: restringerlo
+    // ai soli candidati cambierebbe il significato del punteggio di costo a ogni
+    // filtro, rendendo i punteggi non confrontabili fra slot.
+    let candidati = match filtra_per_capability_base(req, catalog) {
+        Some(ridotto) => ridotto,
+        None => catalog.iter().collect(),
+    };
+    let mut scored: Vec<ScoredModel> = candidati
+        .into_iter()
+        .filter(|m| passa_filtri_obbligatori(req, m))
         .map(|m| ScoredModel {
             score: score_model(req, m, catalog),
             catalog: m.clone(),
@@ -757,6 +810,9 @@ pub(crate) async fn select_models_for_requirement(
         intent: String::new(),
         behavior_mode: String::new(),
         required_capabilities: required_capabilities.to_vec(),
+        // Il chiamante slot-based esprime gia' tier+capability senza distinguere
+        // una base: nessuna capability e' privilegiata qui.
+        base_capability: None,
         requires_tool_use,
         preferred_tier: preferred_tier.to_string(),
         weight_tier: weights.tier,
@@ -773,21 +829,42 @@ pub(crate) async fn select_models_for_requirement(
 
 /// Calcola lo score 0..1 per un modello dato un requirement.
 /// Esposto per testabilita'.
+/// Punteggio capability di un modello, 0..1.
+///
+/// La capability BASE dell'intent non e' una richiesta come le altre: e' cio'
+/// che definisce il compito. Chi non la possiede prende 0, per quanto copra il
+/// resto. Senza questa distinzione un modello poteva PAREGGIARE il punteggio
+/// coprendo capability diverse da quella che conta e vincere sul prezzo: su
+/// `debug` ({code, fix, reasoning}) un modello con code+fix ma senza reasoning
+/// pareggiava 2/3 contro uno con code+reasoning, e passava perche' costava meno.
+///
+/// Non e' un filtro: chi manca della base resta candidabile. Se NESSUN modello
+/// la possiede — oggi `web_search`, zero modelli nel catalog — tutti prendono 0
+/// e la scelta torna a tier, costo e finestra, senza starvation (ADR 0025).
+fn capability_score(req: &IntentRequirement, m: &CatalogModel) -> f32 {
+    if req.required_capabilities.is_empty() {
+        return 1.0;
+    }
+    let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
+    if let Some(base) = req.base_capability.as_ref() {
+        let base_lc = base.to_lowercase();
+        if !cap_lc.contains(&base_lc) {
+            return 0.0;
+        }
+    }
+    let required_lc: Vec<String> = req
+        .required_capabilities
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    capability_match_pct(&required_lc, &cap_lc)
+}
+
 fn score_model(req: &IntentRequirement, m: &CatalogModel, full_catalog: &[CatalogModel]) -> f32 {
     let tier_score = tier_score(&req.preferred_tier, &m.performance_tier);
     let cost_score = cost_score(req, m, full_catalog);
     let context_score = context_score(m.context_window);
-    let cap_score = if req.required_capabilities.is_empty() {
-        1.0
-    } else {
-        let required_lc: Vec<String> = req
-            .required_capabilities
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
-        let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
-        capability_match_pct(&required_lc, &cap_lc)
-    };
+    let cap_score = capability_score(req, m);
 
     req.weight_tier * tier_score
         + req.weight_cost * cost_score
@@ -946,6 +1023,7 @@ mod tests {
             intent: intent.into(),
             behavior_mode: behavior.into(),
             required_capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            base_capability: None,
             requires_tool_use: tools,
             preferred_tier: tier.into(),
             weight_tier: 0.35,
@@ -1439,6 +1517,93 @@ mod tests {
             caricati,
             vec!["qualificato".to_string()],
             "col gate acceso il selettore slot-based deve caricare SOLO il modello              qualificato e non scaduto: i non qualificati, gli scaduti, i preview e              i modelli marcati morti dal probe sono tutti piu' economici e              vincerebbero lo scoring se il gate mancasse"
+        );
+    }
+
+    /// REGRESSIONE (2026-07-26, seguito del fix `agentic_default`): con tutte le
+    /// capability trattate alla pari, su `debug` ({code, fix, reasoning}) un
+    /// modello con code+fix ma SENZA reasoning pareggiava 2/3 contro uno con
+    /// code+reasoning, e vinceva perche' costava molto meno. La capability BASE
+    /// dell'intent non e' una richiesta come le altre: chi non ce l'ha non puo'
+    /// svolgere il compito, per quanto copra il resto.
+    #[test]
+    fn senza_la_capability_base_il_punteggio_capability_e_nullo() {
+        let mut requisito = req(
+            "debug",
+            "economica",
+            vec!["code", "fix", "reasoning"],
+            true,
+            "medium",
+            "asc",
+        );
+        requisito.base_capability = Some("reasoning".into());
+
+        // Copre due richieste su tre, ma non quella che definisce il compito.
+        let senza_base = model("mistral", "piccolo", "medium", 0.06, 128_000, true, vec!["code", "fix"]);
+        // Copre due richieste su tre, fra cui la base.
+        let con_base = model(
+            "mistral",
+            "ragionante",
+            "medium",
+            0.50,
+            128_000,
+            true,
+            vec!["code", "reasoning"],
+        );
+
+        assert_eq!(
+            capability_score(&requisito, &senza_base),
+            0.0,
+            "senza la capability base il punteggio capability deve azzerarsi, \
+             altrimenti il pareggio con chi la possiede lascia decidere il prezzo"
+        );
+        assert!(
+            capability_score(&requisito, &con_base) > 0.0,
+            "chi possiede la base mantiene il punteggio delle altre capability"
+        );
+
+        // La conseguenza che conta e' la SELEZIONE, non il punteggio: il peso
+        // capability (0.20) e' inferiore a quello del costo (0.25), quindi il
+        // solo punteggio azzerato lascerebbe vincere il modello molto piu'
+        // economico. Chi non ha la base va escluso dai candidati.
+        let catalogo = vec![senza_base.clone(), con_base.clone()];
+        let scelti: Vec<String> = select_top_candidates(&requisito, &catalogo)
+            .into_iter()
+            .map(|s| s.catalog.model)
+            .collect();
+        assert_eq!(
+            scelti,
+            vec!["ragionante".to_string()],
+            "il piu' economico privo della capability base non deve essere candidabile"
+        );
+    }
+
+    /// Nessuna starvation quando la base non ha offerta: se NESSUN modello la
+    /// possiede (oggi `web_search`, zero modelli nel catalog) tutti prendono 0 e
+    /// la scelta torna a tier, costo e finestra. E' l'incidente dell'ADR 0025.
+    #[test]
+    fn base_senza_offerta_non_azzera_la_selezione() {
+        let mut requisito = req(
+            "ricerca_web",
+            "veloce",
+            vec!["chat", "web_search"],
+            true,
+            "medium",
+            "asc",
+        );
+        requisito.base_capability = Some("web_search".into());
+        let a = model("p", "a", "medium", 0.10, 128_000, true, vec!["chat"]);
+        let b = model("p", "b", "medium", 0.20, 128_000, true, vec!["chat"]);
+        let catalogo = vec![a.clone(), b.clone()];
+
+        assert_eq!(capability_score(&requisito, &a), 0.0);
+        assert_eq!(capability_score(&requisito, &b), 0.0);
+        // Il punteggio complessivo resta non nullo e ordinabile: la selezione
+        // continua a scegliere, non resta senza candidati.
+        assert!(score_model(&requisito, &a, &catalogo) > 0.0);
+        assert!(
+            score_model(&requisito, &a, &catalogo) > score_model(&requisito, &b, &catalogo),
+            "a parita' di capability decide il costo, come prima"
         );
     }
 
