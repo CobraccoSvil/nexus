@@ -1098,7 +1098,8 @@ impl ProviderHttpError {
     /// Costruisce dall'HTTP status + body grezzo, estraendo il codice d'errore
     /// STRUTTURATO dal JSON (non dalla prosa).
     pub fn from_response(provider: &str, status: u16, body: String) -> Self {
-        let code = extract_structured_error_code(&body);
+        let code = extract_structured_error_code(&body)
+            .map(|c| normalizza_codice_provider(provider, status, &c, &body));
         Self {
             provider: provider.to_string(),
             status,
@@ -1201,6 +1202,53 @@ fn extract_structured_error_message(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Codice di fatturazione emesso quando un provider segnala credito esaurito
+/// senza un identificatore proprio. Contiene `billing`, quindi
+/// [`classify_by_status_code`] lo riconosce senza sapere da quale provider venga.
+const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
+
+/// Traduce nel vocabolario comune un codice che il provider riporta AMBIGUO.
+///
+/// Anthropic risponde al credito esaurito con status 400 e
+/// `error.type = "invalid_request_error"`: lo STESSO identificatore che usa per
+/// una richiesta davvero malformata. Chi legge solo status+codice non puo'
+/// distinguere "non hai credito" da "hai sbagliato la richiesta", e il gateway
+/// infatti trattava il credito esaurito come errore di formato: faceva partire un
+/// retry di sanificazione della history (rimedio che non c'entra e non puo'
+/// funzionare) e NON metteva il provider in cooldown, continuando a sceglierlo e a
+/// spendere una chiamata per ciclo (misurato il 26/07 sui log del gateway).
+///
+/// La regola M prevede questo caso: quando il provider non offre un codice
+/// distinto, il quirk si ISOLA qui - dove sappiamo di chi e' la risposta - e si
+/// traduce in un codice strutturato. Il punto di decisione a valle resta
+/// deterministico e non impara nulla di provider-specifico.
+///
+/// Il testo e' consultato SOLO qui, SOLO per il provider che ha l'ambiguita' e
+/// SOLO sul `error.message` strutturato: e' il perimetro minimo, non una
+/// classificazione dalla prosa.
+fn normalizza_codice_provider(provider: &str, status: u16, code: &str, body: &str) -> String {
+    let e_anthropic = provider.trim().eq_ignore_ascii_case("anthropic");
+    if e_anthropic
+        && status == 400
+        && code == "invalid_request_error"
+        && dichiara_credito_esaurito(body)
+    {
+        return CODICE_BILLING_NORMALIZZATO.to_string();
+    }
+    code.to_string()
+}
+
+/// Il body dichiara credito/saldo insufficiente? Guarda il `error.message`
+/// STRUTTURATO (non il body grezzo), sulle formule con cui Anthropic segnala il
+/// saldo esaurito: "credit balance ... too low" e il rimando a Plans & Billing.
+fn dichiara_credito_esaurito(body: &str) -> bool {
+    let Some(msg) = extract_structured_error_message(body) else {
+        return false;
+    };
+    let m = msg.to_ascii_lowercase();
+    m.contains("credit balance") || m.contains("plans & billing")
 }
 
 /// Classifica in modo DETERMINISTICO da status HTTP + codice strutturato.
@@ -1621,6 +1669,57 @@ mod tests {
         let models = parse_models_response(&body);
         // Ordinato e deduplicato.
         assert_eq!(models, vec!["gpt-4o", "gpt-4o-mini"]);
+    }
+
+    /// Body VERBATIM catturato dai log del gateway il 26/07 (13:53 UTC), quando
+    /// il credito Anthropic si e' esaurito nel mezzo di un run.
+    const BODY_CREDITO_ANTHROPIC: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+
+    /// Errore Anthropic di formato VERO: stesso status, stesso codice, messaggio
+    /// che non parla di credito. Il discrimine e' solo questo.
+    const BODY_FORMATO_ANTHROPIC: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1: Expected `thinking` or `redacted_thinking`, but found `text`"}}"#;
+
+    #[test]
+    fn credito_anthropic_esaurito_e_billing_non_errore_di_formato() {
+        // Attraversa il PRODUTTORE (from_response), non un codice scritto a mano:
+        // costruire l'errore a mano fisserebbe l'assunto da verificare (regola O).
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "anthropic",
+            400,
+            BODY_CREDITO_ANTHROPIC.to_string(),
+        ));
+        // Il VERDETTO, non la stringa: e' cio' su cui a valle si decidono
+        // cooldown e failover.
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::Billing,
+            "un credito esaurito non e' una richiesta malformata: senza questo il \
+             gateway ritenta sanificando la history e non mette in cooldown"
+        );
+    }
+
+    #[test]
+    fn un_400_di_formato_anthropic_resta_errore_client() {
+        // La traduzione non deve inghiottire i 400 legittimi: stesso provider,
+        // stesso status, stesso codice, messaggio diverso -> resta ClientError.
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "anthropic",
+            400,
+            BODY_FORMATO_ANTHROPIC.to_string(),
+        ));
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
+    }
+
+    #[test]
+    fn lo_stesso_messaggio_da_un_altro_provider_non_diventa_billing() {
+        // Il quirk resta isolato al provider che ce l'ha: un altro provider non
+        // viene reinterpretato qui (il suo caso, se esiste, avra' il suo ramo).
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "deepseek",
+            400,
+            BODY_CREDITO_ANTHROPIC.to_string(),
+        ));
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
     }
 
     #[test]
