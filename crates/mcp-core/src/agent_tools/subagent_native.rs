@@ -2167,24 +2167,78 @@ pub(crate) async fn convene_council(
 /// un verdetto valido. Best-effort: i guard di `prepare_subagent_run` restano
 /// attivi; il routing esclude il provider del padre (indipendenza avversaria,
 /// review). `reviewers` e' clampato a >=1.
+/// Purpose da cui il panel di review pesca i provider dei revisori. E' una
+/// CHIAVE di configurazione, non un modello: provider e modello concreti stanno
+/// in `nexus_purpose_model` ed e' li' che si cambiano (regola G).
+const REVIEW_PANEL_PURPOSE: &str = "reviewer";
+
+/// Lancia gli `n` revisori, ciascuno pinnato su un provider distinto.
+///
+/// Senza pin il routing instrada tutti gli N revisori allo stesso
+/// provider/modello: non e' un quorum, e' UN solo giudizio contato N volte, e
+/// quando quel modello sbaglia il run viene rimandato in correzione fino al cap
+/// dei tentativi con l'apparenza di una verifica plurale. I candidati arrivano
+/// dal purpose, come nel panel multi-provider (regola L).
+///
+/// Round-robin: si mantengono gli N revisori decisi dal dimensionamento e si
+/// ripete un provider solo se ne esistono meno di N, invece di sacrificare la
+/// dimensione del panel alla diversita'.
+async fn spawn_reviewers(
+    ctx: &AgentToolContext,
+    n: usize,
+    task: &str,
+    expected: &str,
+) -> Vec<Value> {
+    let candidates = crate::internal_routing::resolve_purpose_provider_candidates_db(
+        &ctx.core.db,
+        REVIEW_PANEL_PURPOSE,
+        n,
+        1,
+    )
+    .await
+    .unwrap_or_else(|resolution| {
+        tracing::warn!(
+            purpose = %REVIEW_PANEL_PURPOSE,
+            resolution = ?resolution,
+            "review panel: purpose non risolvibile, revisori senza pin (giudizio unico replicato)"
+        );
+        Vec::new()
+    });
+    // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
+    spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, move |i| {
+        let ctx = ctx.clone();
+        let task = task.to_string();
+        let expected = expected.to_string();
+        let pin = candidates
+            .get(i % candidates.len().max(1))
+            .map(|c| (c.provider.clone(), c.model.clone()));
+        async move {
+            match pin {
+                Some((provider, model)) => {
+                    run_single_subagent_with_model_pin(
+                        &ctx, "review", &task, "", &expected, &provider, &model,
+                    )
+                    .await
+                }
+                None => {
+                    run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await
+                }
+            }
+        }
+    })
+    .await
+}
+
 pub(crate) async fn convene_review_panel(
     ctx: &AgentToolContext,
     task: &str,
     reviewers: usize,
     policy: &nexus_agent_graph::decisions::QuorumPolicy,
 ) -> Option<nexus_agent_graph::decisions::PanelOutcome> {
-    let n = reviewers.max(1);
     let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
-    // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
-    let results = spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, |_| {
-        let ctx = ctx.clone();
-        let task = task.to_string();
-        let expected = expected.to_string();
-        async move { run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await }
-    })
-    .await;
+    let results = spawn_reviewers(ctx, reviewers.max(1), task, expected).await;
     let outcomes: Vec<Value> = results
         .into_iter()
         .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
@@ -4662,6 +4716,34 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSIONE (2026-07-26): tutti i revisori giravano sullo STESSO
+    /// provider/modello, perche' `convene_review_panel` li lanciava senza pin e
+    /// il routing li instradava identici. N revisori identici non sono un
+    /// quorum: sono un giudizio unico contato N volte, e quando quel modello
+    /// sbaglia il run viene bocciato fino al cap dei tentativi con l'apparenza
+    /// di una verifica plurale (osservato: 8 sub-run di review, tutti
+    /// mistral/mistral-small-latest, 4 review consecutive non superate).
+    ///
+    /// Se il purpose sparisce dal seed il pin non viene applicato e il difetto
+    /// torna in silenzio: questo test lo impedisce, girando sulle migrazioni
+    /// reali invece che su uno schema ricopiato (regola O).
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn il_purpose_dei_revisori_esiste_nel_seed(pool: sqlx::PgPool) {
+        let presente: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM nexus_purpose_model WHERE purpose = $1)",
+        )
+        .bind(REVIEW_PANEL_PURPOSE)
+        .fetch_one(&pool)
+        .await
+        .expect("query purpose");
+        assert!(
+            presente,
+            "il purpose '{REVIEW_PANEL_PURPOSE}' deve esistere in nexus_purpose_model: \
+             senza di esso i revisori tornano tutti sullo stesso provider e il panel \
+             smette di essere un quorum"
+        );
+    }
 
     // Nomi fixture ricorrenti dei test del ponte narrazione.
     const T_EDIT: &str = "edit_file";
