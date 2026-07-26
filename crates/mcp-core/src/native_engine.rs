@@ -581,6 +581,18 @@ impl NativeRunOutcome {
     /// che un coordinatore legge da un sub-run e' lo STESSO che il run padre
     /// otterrebbe. L'ordine dei rami e' significativo (dichiarazione onesta del
     /// modello > forced_close > verdetto oggettivo del gate).
+    /// True se il run ha consegnato un verdetto di RUOLO: il suo prodotto e' un
+    /// giudizio, non una modifica al codice.
+    ///
+    /// Gemello di `nexus_agent_graph::routing::declared_role_channel`, che sullo
+    /// stato del grafo risponde alla stessa domanda per instradare il turno alla
+    /// chiusura; qui la si pone sull'esito del run.
+    fn ha_dichiarato_verdetto_di_ruolo(&self) -> bool {
+        self.review_verdict.is_some()
+            || self.advisory_verdict.is_some()
+            || self.debate_position.is_some()
+    }
+
     pub fn classify_status(&self) -> crate::agent_types::AgentRunStatus {
         use crate::agent_types::AgentRunStatus;
 
@@ -633,13 +645,23 @@ impl NativeRunOutcome {
             AgentRunStatus::FailedDiagnosed
         } else if forced_close {
             AgentRunStatus::FailedDiagnosed
-        } else if self.final_gate_passed == Some(false) {
+        } else if self.final_gate_passed == Some(false) && !self.ha_dichiarato_verdetto_di_ruolo() {
             // Verifica oggettiva pre-chiusura NON superata (final_gate al
             // cap/forced): il verdetto STRUTTURATO del gate (regola M) prevale
             // su una dichiarazione "done" ottimista del modello -> mai
             // "completed" su un task la cui verifica e' fallita. Difesa in
             // profondita' rispetto a `forced_close`: il cap del final_gate NON
             // imposta forced_close_unverified.
+            //
+            // ECCEZIONE: chi ha dichiarato un verdetto di RUOLO (revisore,
+            // advisor, avvocato) non produce codice, lo giudica. Il final_gate
+            // verifica il codice del progetto, quindi bocciarlo significa
+            // squalificare il giudice perche' cio' che sta giudicando e' rotto:
+            // piu' il codice e' guasto, meno voti restano validi. Nell'incidente
+            // del 26/07 entrambi i revisori avevano votato (uno `fail` con
+            // evidenza grave, uno `pass`) e il panel li ha scartati entrambi
+            // -> "inconclusive (0/2 voti validi)" -> review mai superata fino al
+            // cap. Il loro lavoro E' il verdetto, ed e' stato consegnato.
             AgentRunStatus::FailedDiagnosed
         } else if self.review_panel_rejected {
             // Review adversariale programmatica NON approvata (Fail/NeedsChanges)
@@ -4279,6 +4301,48 @@ mod tests {
     #[test]
     fn classify_status_completed_pulito() {
         assert_eq!(base_outcome().classify_status(), AgentRunStatus::Completed);
+    }
+
+    /// REGRESSIONE (incidente "0/2 voti validi", 26/07/2026): un revisore che
+    /// aveva votato veniva declassato a FailedDiagnosed dal final_gate, quindi
+    /// il suo outcome usciva con `success: false` e `extract_vote` lo scartava.
+    /// Il panel restava senza voti e la review non poteva passare fino al cap.
+    ///
+    /// Il cortocircuito: il final_gate verifica il CODICE DEL PROGETTO, ma il
+    /// revisore quel codice lo giudica, non lo scrive. Bocciarlo significava
+    /// squalificare il giudice perche' cio' che stava giudicando era rotto: piu'
+    /// il codice era guasto, meno voti restavano validi.
+    #[test]
+    fn il_verdetto_di_ruolo_sopravvive_al_final_gate_fallito() {
+        let mut o = base_outcome();
+        o.final_gate_passed = Some(false);
+        o.review_verdict = Some(serde_json::json!({
+            "verdict": "fail",
+            "findings": [{"file": "backend/src/server.ts", "severity": "high"}],
+        }));
+
+        assert_eq!(
+            o.classify_status(),
+            AgentRunStatus::Completed,
+            "il revisore ha consegnato il suo verdetto: il gate sul codice altrui \
+             non deve declassarlo"
+        );
+        // La conseguenza che conta: l'esito strutturato dichiara success, unica
+        // condizione per cui extract_vote accetta il voto.
+        assert_eq!(
+            o.structured_verdict().get("success").and_then(|v| v.as_bool()),
+            Some(true),
+            "senza success=true il voto viene scartato dal panel"
+        );
+    }
+
+    /// Il gate resta pieno per chi il codice lo SCRIVE: senza un verdetto di
+    /// ruolo dichiarato, una verifica fallita continua a declassare.
+    #[test]
+    fn senza_verdetto_di_ruolo_il_final_gate_declassa_ancora() {
+        let mut o = base_outcome();
+        o.final_gate_passed = Some(false);
+        assert_eq!(o.classify_status(), AgentRunStatus::FailedDiagnosed);
     }
 
     /// Un run bocciato dalla review adversariale programmatica non e' un

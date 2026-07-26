@@ -936,7 +936,19 @@ where
     if est_after >= window {
         let first_human = first_human_index(&work);
         let n = work.len();
-        let mut keep_idx: std::collections::BTreeSet<usize> = (n.saturating_sub(2)..n).collect();
+        // La coda tenuta non deve APRIRSI con un tool_result: il suo tool_use
+        // resterebbe fuori dal taglio e il payload uscirebbe con piu' risposte
+        // che chiamate. Mistral lo rifiuta con 400 "Not the same number of
+        // function calls and responses", e il run muore per un difetto di
+        // costruzione, non per il compito (incidente 26/07, morto a 62
+        // iterazioni). Le altre due primitive che rimuovono messaggi hanno gia'
+        // questa guardia (`select_rolling_summary_cutoff`, continuity-trim):
+        // qui mancava, ed e' l'unica che taglia per INDICI.
+        let mut inizio_coda = n.saturating_sub(2);
+        while inizio_coda > 0 && work.get(inizio_coda).is_some_and(opens_with_tool_result) {
+            inizio_coda -= 1;
+        }
+        let mut keep_idx: std::collections::BTreeSet<usize> = (inizio_coda..n).collect();
         if first_human >= 0 {
             keep_idx.insert(first_human as usize);
         }
