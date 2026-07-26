@@ -341,6 +341,20 @@ export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
   const MARK: Record<string, string> = {
     completed: "[x]", in_progress: "[~]", blocked: "[!]", skipped: "[-]", pending: "[ ]",
   };
+  // I marker sono compatti per stare in una colonna stretta, ma da soli non si
+  // spiegano: `[~]` e `[!]` non dicono cosa sono. Il tooltip nomina lo stato
+  // della voce e riporta la legenda completa, cosi' la si impara passando il
+  // mouse invece di doverla cercare altrove.
+  const NOME_STATO: Record<string, string> = {
+    completed: "Completato",
+    in_progress: "In corso",
+    blocked: "Bloccato",
+    skipped: "Saltato",
+    pending: "Da fare",
+  };
+  const LEGENDA = Object.keys(MARK)
+    .map((k) => `${MARK[k]} ${NOME_STATO[k].toLowerCase()}`)
+    .join("   ");
   return (
     <ol style={{ listStyle: "none", paddingLeft: 0, margin: 0, display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
       {todos.map((t, i) => {
@@ -351,11 +365,13 @@ export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
                 pannello stretto viene compresso e "[ ]" si spezza sullo spazio
                 interno, mandando "]" a capo (checklist illeggibile). */}
             <span
+              title={`${NOME_STATO[status] ?? NOME_STATO.pending}\n\nLegenda:  ${LEGENDA}`}
               style={{
                 fontFamily: "var(--font-mono)",
                 opacity: 0.7,
                 flex: "0 0 auto",
                 whiteSpace: "nowrap",
+                cursor: "help",
               }}
             >
               {MARK[status] ?? MARK.pending}
