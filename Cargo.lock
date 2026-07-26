@@ -323,6 +323,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "dashmap",
+ "dotenvy",
  "futures",
  "nexus-auth",
  "pkcs1",
