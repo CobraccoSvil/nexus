@@ -4,7 +4,7 @@
 //! Il learner e' il nodo TERMINALE del grafo agentico: non instrada e produce un
 //! delta minimale `{completed_at}`. Il suo unico effetto e' persistere
 //! l'interazione in `brain_learning_interactions` / `brain_task_stats` via
-//! `ctx.db`, fire-and-forget e gated su shadow.
+//! `ctx.db`, fire-and-forget.
 //!
 //! ## Cosa faceva e non fa piu' (rimosso, non rimandato)
 //!
@@ -26,8 +26,6 @@
 //!   fino a giugno e a zero da luglio.
 //! - **closure_judge**: mai portato, nessun codice, flag spenti, nessun
 //!   consumatore.
-//!
-//! REGOLA SHADOW: in `ctx.shadow == true` NESSUN side-effect. Verificato nei test.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -49,8 +47,8 @@ use crate::state::{AgentState, Message, StateDelta};
 // runtime non veniva chiamata: un tipo che esisteva solo per i propri test.
 
 /// Nodo learner. Stateless e senza configurazione: persiste l'interazione in
-/// `brain_learning_interactions`/`brain_task_stats` via `ctx.db`, gated su
-/// shadow. Era l'unico dei suoi effetti davvero eseguito.
+/// `brain_learning_interactions`/`brain_task_stats` via `ctx.db`. Era l'unico
+/// dei suoi effetti davvero eseguito.
 #[derive(Default)]
 pub struct LearnerNode;
 
@@ -142,12 +140,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for LearnerNode {
         // mai fatto: e' una funzione persa. Lo storico e' comunque gia' orfano —
         // quei `qdrant_id` non trovano riscontro in nessuna collection viva.
 
-        // ── Persistenza PostgreSQL (best-effort, GATED su shadow) ─────────────
+        // ── Persistenza PostgreSQL (best-effort) ──────────────────────────────
         // brain_learning_interactions (memory/storage.py:35). Gate Python:
-        // `_storage is not None and user_input` (__init__.py:4546). In shadow
-        // NON scrive (zero side-effect). Fire-and-forget: errore -> WARN, mai
-        // fatale (parita' col Python che logga e non rilancia, __init__.py:4561).
-        if !ctx.shadow && !user_input.is_empty() {
+        // `_storage is not None and user_input` (__init__.py:4546).
+        // Fire-and-forget: errore -> WARN, mai fatale (parita' col Python che
+        // logga e non rilancia, __init__.py:4561).
+        if !user_input.is_empty() {
             self.spawn_persist_pg(
                 ctx,
                 &thread_id,
@@ -199,9 +197,6 @@ impl LearnerNode {
     /// Persiste l'interazione in `brain_learning_interactions` come task
     /// best-effort fire-and-forget (`memory/storage.py:35` `save_interaction`).
     /// Delega a `ctx.db`.
-    ///
-    /// GATING SHADOW: chiamata SOLO quando `!ctx.shadow` (il gate e' nel
-    /// chiamante `run`): in shadow zero scritture.
     ///
     /// NOTA divergenza CONTROLLATA: `save_interaction` Python esegue anche un
     /// secondo upsert su `brain_task_stats` (`_update_stats`, storage.py:79). Lo
@@ -344,7 +339,7 @@ mod tests {
     /// Ctx di test con PgPool lazy (i test che NON innescano persistenza non
     /// toccano il DB; quelli con persistenza la spawnano fire-and-forget e non
     /// attendono l'esito, quindi il pool lazy non si connette mai davvero).
-    fn ctx_with(shadow: bool) -> AgentNodeCtx {
+    fn ctx_with() -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy non si connette");
@@ -359,7 +354,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -383,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn happy_path_delta_solo_completed_at() {
         let node = LearnerNode::new();
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = base_state();
         let delta_typed: StateDelta = {
             // Verifichiamo che il delta tipizzato porti SOLO completed_at.
@@ -403,23 +397,11 @@ mod tests {
         assert!(out.completed_at.is_some(), "completed_at popolato");
     }
 
-    /// Shadow: NESSUN side-effect. Il delta e' comunque {completed_at} (la
-    /// persistenza e' soppressa, ma il nodo termina pulito).
-    #[tokio::test]
-    async fn shadow_nessun_side_effect() {
-        let node = LearnerNode::new();
-        let ctx = ctx_with(true); // shadow
-        let st = base_state();
-        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
-        // Il delta resta {completed_at}; nessuna scrittura DB (pool lazy mai usato).
-        assert!(out.completed_at.is_some());
-    }
-
     /// result vuoto: il nodo non persiste ma chiude pulito.
     #[tokio::test]
     async fn result_vuoto_chiude_pulito() {
         let node = LearnerNode::new();
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = base_state();
         st.result = Some(String::new());
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));

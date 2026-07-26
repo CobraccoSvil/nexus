@@ -3,9 +3,7 @@
 //! Implementa `CriteriaRunner::run` eseguendo i criteri generali del final gate
 //! (parita' con `brain/agents/criteria_runner.py`). I criteri che orchestrano
 //! tool delegano al PUNTO UNICO dell'esecuzione tool ([`ToolExecutor`], regola L):
-//! NON ricostruiscono il dispatch. In modalita' shadow i criteri girano in
-//! [`ExecMode::Replay`] (rileggono i tool_result del primario = zero side-effect):
-//! il `mode` e' propagato INVARIATO a ogni `ToolExecutor::execute`.
+//! NON ricostruiscono il dispatch.
 //!
 //! COPERTURA DEI CRITERI (segnalata esplicitamente):
 //!
@@ -41,7 +39,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{
-    CriteriaRunner, CriterionResult, CriterionSpec, ExecMode, PortError, ToolCall, ToolExecutor,
+    CriteriaRunner, CriterionResult, CriterionSpec, PortError, ToolCall, ToolExecutor,
 };
 
 /// Timeout di default per i criteri (parita' col Python: `30.0s`). I criteri con
@@ -65,8 +63,7 @@ const OUTPUT_PATH_KEYS: &[(&str, &str)] = &[
 /// Adapter [`CriteriaRunner`] -> criteri NATIVI su [`ToolExecutor`] + HTTP/DB.
 pub struct FinalGateCriteriaRunnerAdapter {
     /// Esecutore tool (PUNTO UNICO, regola L): i criteri che usano `run_command`/
-    /// `list_files` delegano qui invece di ricostruire il dispatch. Il `mode` e'
-    /// propagato a ogni `execute` (Real esegue, Replay rilegge il primario).
+    /// `list_files` delegano qui invece di ricostruire il dispatch.
     tool_executor: Arc<dyn ToolExecutor>,
     /// Pool Postgres: lettura `agent_steps` per il criterio `outputs_exist`.
     db: PgPool,
@@ -91,7 +88,6 @@ impl FinalGateCriteriaRunnerAdapter {
         &self,
         name: &str,
         input: Value,
-        mode: ExecMode,
     ) -> Result<String, PortError> {
         let call = ToolCall {
             id: Uuid::new_v4().to_string(),
@@ -99,7 +95,7 @@ impl FinalGateCriteriaRunnerAdapter {
             input,
             thought_signature: None,
         };
-        let outcome = self.tool_executor.execute(call, mode).await?;
+        let outcome = self.tool_executor.execute(call).await?;
         // content e' tipicamente una stringa (output del tool); normalizziamo.
         Ok(match outcome.content {
             Value::String(s) => s,
@@ -124,7 +120,7 @@ impl FinalGateCriteriaRunnerAdapter {
             tool_input["working_dir"] = json!(wd);
         }
         let raw = self
-            .run_tool("run_command", tool_input, ExecMode::Real)
+            .run_tool("run_command", tool_input)
             .await
             .ok()?;
         crate::tool_runner_server::extract_exit_code(&raw).map(|e| e as i64)
@@ -137,12 +133,11 @@ impl FinalGateCriteriaRunnerAdapter {
     async fn run_one(
         &self,
         c: &CriterionSpec,
-        mode: ExecMode,
     ) -> Result<CriterionResult, PortError> {
         let timeout_s = c.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
         let (passed, mut evidence) = match c.criterion_type.as_str() {
             "run_command" => {
-                self.check_run_command(&c.spec, &c.expected, mode, timeout_s)
+                self.check_run_command(&c.spec, &c.expected, timeout_s)
                     .await
             }
             "design_verify" => Self::check_design_verify(&c.spec),
@@ -152,15 +147,15 @@ impl FinalGateCriteriaRunnerAdapter {
             "tool_capability" => Self::check_tool_capability(&c.spec),
             "completion_confirmed" => Self::check_completion_confirmed(&c.spec),
             "service_logs_clean" => {
-                self.check_service_logs_clean(&c.spec, mode, timeout_s)
+                self.check_service_logs_clean(&c.spec, timeout_s)
                     .await
             }
-            "http" => self.check_http(&c.spec, &c.expected, mode, timeout_s).await,
+            "http" => self.check_http(&c.spec, &c.expected, timeout_s).await,
             "file_exists" => {
-                self.check_file_exists(&c.spec, &c.expected, mode, timeout_s)
+                self.check_file_exists(&c.spec, &c.expected, timeout_s)
                     .await
             }
-            "outputs_exist" => self.check_outputs_exist(&c.spec, mode, timeout_s).await?,
+            "outputs_exist" => self.check_outputs_exist(&c.spec, timeout_s).await?,
             // Anti-placeholder grafo import: non ancora portato (F3) -> inconclusive.
             "no_orphan_imported" | "imported_code_mounted" => (
                 true,
@@ -307,7 +302,6 @@ task_complete (outcome + summary)"
         &self,
         spec: &Value,
         expected: &Value,
-        mode: ExecMode,
         _timeout_s: f64,
     ) -> (bool, Value) {
         let cmd = spec.get("command").and_then(Value::as_str).unwrap_or("");
@@ -318,9 +312,9 @@ task_complete (outcome + summary)"
         if let Some(wd) = spec.get("working_dir").and_then(Value::as_str) {
             tool_input["working_dir"] = json!(wd);
         }
-        // Delega al ToolExecutor (Real esegue, Replay rilegge). Un guasto di porta
-        // -> evidence.error (parita' col try/except Python), non propaga.
-        let raw = match self.run_tool("run_command", tool_input, mode).await {
+        // Delega al ToolExecutor. Un guasto di porta -> evidence.error (parita'
+        // col try/except Python), non propaga.
+        let raw = match self.run_tool("run_command", tool_input).await {
             Ok(s) => s,
             Err(e) => {
                 return (
@@ -457,7 +451,6 @@ task_complete (outcome + summary)"
     async fn check_service_logs_clean(
         &self,
         spec: &Value,
-        mode: ExecMode,
         _timeout_s: f64,
     ) -> (bool, Value) {
         let cmd = spec.get("command").and_then(Value::as_str).unwrap_or("");
@@ -479,7 +472,7 @@ task_complete (outcome + summary)"
             );
         }
         let raw = match self
-            .run_tool("run_command", json!({ "command": cmd }), mode)
+            .run_tool("run_command", json!({ "command": cmd }))
             .await
         {
             Ok(s) => s,
@@ -525,26 +518,8 @@ task_complete (outcome + summary)"
         &self,
         spec: &Value,
         expected: &Value,
-        mode: ExecMode,
         timeout_s: f64,
     ) -> (bool, Value) {
-        // SHADOW-SAFETY (FIX FINDING F2c-2): il criterio `http` esegue reqwest
-        // verso un endpoint REALE — un side-effect che NON passa per il
-        // ToolExecutor (che in Replay rilegge senza eseguire). In modalita'
-        // Replay (run shadow read-only) NON deve partire alcuna chiamata: si
-        // ritorna inconclusive (passed=true, non conteggiato dal gate, parita'
-        // col trattamento di un criterio non valutabile), con evidence che
-        // dichiara lo skip. Cosi' lo shadow resta a ZERO side-effect anche sui
-        // criteri side-effect-ful estranei al ToolExecutor.
-        if matches!(mode, ExecMode::Replay) {
-            return (
-                true,
-                json!({
-                    "inconclusive": true,
-                    "skipped_reason": "criterio http saltato in modalita' Replay (shadow): nessuna chiamata di rete reale",
-                }),
-            );
-        }
         let url = spec.get("url").and_then(Value::as_str).unwrap_or("");
         if url.is_empty() {
             return (false, json!({ "error": "spec.url obbligatorio" }));
@@ -625,7 +600,6 @@ task_complete (outcome + summary)"
         &self,
         spec: &Value,
         expected: &Value,
-        mode: ExecMode,
         _timeout_s: f64,
     ) -> (bool, Value) {
         let path = spec.get("path").and_then(Value::as_str).unwrap_or("");
@@ -641,7 +615,7 @@ task_complete (outcome + summary)"
             None => (".", path),
         };
         let raw = match self
-            .run_tool("list_files", json!({ "directory": parent_dir }), mode)
+            .run_tool("list_files", json!({ "directory": parent_dir }))
             .await
         {
             Ok(s) => s,
@@ -703,7 +677,6 @@ task_complete (outcome + summary)"
     async fn check_outputs_exist(
         &self,
         spec: &Value,
-        mode: ExecMode,
         timeout_s: f64,
     ) -> Result<(bool, Value), PortError> {
         let run_id = spec
@@ -768,7 +741,7 @@ task_complete (outcome + summary)"
         // Cap difensivo (parita' Python: 20 output).
         for p in paths.iter().take(20) {
             let (ok, _ev) = self
-                .check_file_exists(&json!({ "path": p }), &json!({}), mode, timeout_s)
+                .check_file_exists(&json!({ "path": p }), &json!({}), timeout_s)
                 .await;
             checked.push(p.clone());
             if !ok {
@@ -794,11 +767,10 @@ impl CriteriaRunner for FinalGateCriteriaRunnerAdapter {
     async fn run(
         &self,
         criteria: Vec<CriterionSpec>,
-        mode: ExecMode,
     ) -> Result<Vec<CriterionResult>, PortError> {
         let mut out = Vec::with_capacity(criteria.len());
         for c in &criteria {
-            out.push(self.run_one(c, mode).await?);
+            out.push(self.run_one(c).await?);
         }
         Ok(out)
     }
@@ -852,12 +824,12 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     /// ToolExecutor fittizio: ritorna risultati pre-programmati per nome, e
-    /// registra le chiamate ricevute (per asserire il `mode` propagato e gli args).
+    /// registra le chiamate ricevute (per asserire gli args).
     struct FakeToolExecutor {
         /// risultati per tool_name (in coda: la N-esima chiamata pop dell'indice N).
         results: std::collections::HashMap<String, Vec<String>>,
-        /// log delle chiamate (name, mode) per le asserzioni.
-        calls: StdMutex<Vec<(String, ExecMode)>>,
+        /// log dei nomi tool chiamati per le asserzioni.
+        calls: StdMutex<Vec<String>>,
     }
 
     impl FakeToolExecutor {
@@ -881,15 +853,14 @@ mod tests {
         async fn execute(
             &self,
             call: ToolCall,
-            mode: ExecMode,
         ) -> Result<nexus_agent_graph::runtime::ports::ToolOutcome, PortError> {
-            self.calls.lock().unwrap().push((call.name.clone(), mode));
+            self.calls.lock().unwrap().push(call.name.clone());
             let idx = self
                 .calls
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(n, _)| n == &call.name)
+                .filter(|n| *n == &call.name)
                 .count()
                 - 1;
             let content = self
@@ -929,7 +900,6 @@ mod tests {
                     json!({ "command": "cargo check" }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -967,7 +937,6 @@ mod tests {
                     json!({ "command": "pnpm build" }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -996,7 +965,6 @@ mod tests {
                     json!({ "command": "cargo check" }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1023,7 +991,6 @@ mod tests {
                     json!({ "command": "npx eslint src", "baseline_exit_code": 2, "touched_files": ["src/app/x.ts"] }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1052,7 +1019,6 @@ mod tests {
                     json!({ "command": "npx eslint src", "baseline_exit_code": 1 }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1080,7 +1046,6 @@ mod tests {
                     json!({ "command": "npx tsc --noEmit", "baseline_exit_code": 2, "touched_files": ["src/app/x.ts"] }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1109,7 +1074,6 @@ mod tests {
                     json!({ "command": "npx tsc --noEmit", "touched_files": ["src/app/pages/LoginPage.tsx"] }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1140,7 +1104,6 @@ mod tests {
                     json!({ "command": "npx tsc --noEmit", "touched_files": ["src/app/services/authService.ts"] }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1171,7 +1134,6 @@ mod tests {
                     json!({ "command": "npx tsc --noEmit" }),
                     json!({ "exit_code": 0 }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1183,24 +1145,21 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn run_command_propaga_mode_replay(pool: PgPool) {
+    async fn run_command_delega_al_tool_executor(pool: PgPool) {
         let exec = FakeToolExecutor::with(&[("run_command", &["EXIT CODE: 0"])]);
         let runner = FinalGateCriteriaRunnerAdapter::new(exec.clone(), pool);
         runner
-            .run(
-                vec![spec(
-                    "run_command",
-                    json!({ "command": "x" }),
-                    json!({ "exit_code": 0 }),
-                )],
-                ExecMode::Replay,
-            )
+            .run(vec![spec(
+                "run_command",
+                json!({ "command": "x" }),
+                json!({ "exit_code": 0 }),
+            )])
             .await
             .expect("ok");
-        // Il mode Replay e' arrivato INVARIATO al ToolExecutor (zero side-effect).
+        // La chiamata e' arrivata al ToolExecutor (punto unico dell'esecuzione).
         let calls = exec.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], ("run_command".to_string(), ExecMode::Replay));
+        assert_eq!(calls[0], "run_command".to_string());
     }
 
     #[sqlx::test]
@@ -1215,7 +1174,6 @@ mod tests {
                     json!({ "command": "docker logs app", "patterns": ["does not exist", "ERROR"] }),
                     json!({}),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1236,7 +1194,6 @@ mod tests {
                     json!({ "command": "docker logs app", "patterns": ["does not exist"] }),
                     json!({}),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1256,7 +1213,6 @@ mod tests {
                     json!({ "staging_dir": "figma_export" }),
                     json!({ "mounted": true }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1279,7 +1235,6 @@ mod tests {
                     json!({ "tools_count": 0, "has_tool_calls": true }),
                     json!({ "capable": true }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1299,7 +1254,6 @@ mod tests {
                     json!({ "tools_count": 0, "has_tool_calls": false }),
                     json!({ "capable": true }),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1309,34 +1263,6 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
-    async fn http_in_replay_e_inconclusive_senza_chiamata(pool: PgPool) {
-        // FIX FINDING F2c-2: il criterio http in modalita' Replay (shadow) NON
-        // deve eseguire reqwest. Si esercita con un URL irraggiungibile: se la
-        // chiamata partisse il criterio fallirebbe (passed=false, evidence.error);
-        // invece deve ritornare inconclusive (passed=true) senza alcuna rete.
-        let exec = FakeToolExecutor::with(&[]);
-        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
-        let res = runner
-            .run(
-                vec![spec(
-                    "http",
-                    json!({ "url": "http://127.0.0.1:1/never-reached" }),
-                    json!({ "status": 200 }),
-                )],
-                ExecMode::Replay,
-            )
-            .await
-            .expect("ok");
-        assert!(
-            res[0].passed,
-            "Replay -> inconclusive (passed=true, non conteggiato)"
-        );
-        assert_eq!(res[0].evidence["inconclusive"], json!(true));
-        // Nessuna evidence di una chiamata avvenuta (no status, no error di rete).
-        assert!(res[0].evidence.get("status").is_none());
-        assert!(res[0].evidence.get("error").is_none());
-    }
 
     #[sqlx::test]
     async fn file_exists_trova_basename_nel_listing(pool: PgPool) {
@@ -1350,7 +1276,6 @@ mod tests {
                     json!({ "path": "variables.txt" }),
                     json!({}),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1370,7 +1295,6 @@ mod tests {
                     json!({ "run_id": run.to_string() }),
                     json!({}),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1403,7 +1327,6 @@ mod tests {
                     json!({ "run_id": run.to_string() }),
                     json!({}),
                 )],
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -1418,7 +1341,6 @@ mod tests {
         let res = runner
             .run(
                 vec![spec("inventato", json!({}), json!({}))],
-                ExecMode::Real,
             )
             .await
             .expect("ok");

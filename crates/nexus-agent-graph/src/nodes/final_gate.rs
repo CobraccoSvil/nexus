@@ -58,10 +58,6 @@
 //!   al risolutore della config; `nexus-agent-graph` non puo' dipendere da
 //!   mcp-core, regola L).
 //!
-//! GATING SHADOW: in `ctx.shadow == true` l'esecuzione criteri usa
-//! `ExecMode::Replay` (i criteri rileggono i tool_result del primario = zero
-//! side-effect); il nodo NON emette eventi e NON scrive. Verificato nei test.
-//!
 //! Il nodo NON instrada: l'edge post-final_gate vive in `routing::route_after_final_gate`.
 
 use std::sync::LazyLock;
@@ -872,7 +868,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         crate::nodes::emit_phase_meta(
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
-            ctx.exec_mode(),
             "final_gate",
             format!("Verifico il risultato (tentativo {cycle}/{max_cycles})"),
             serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "start"}),
@@ -887,7 +882,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             crate::nodes::emit_phase_meta(
                 ctx.emit.as_ref(),
                 self.meta_steps.as_ref(),
-                ctx.exec_mode(),
                 "final_gate",
                 "Verifica tecnica dell'ambiente NON eseguita: profilo non disponibile (inferenza LLM non riuscita)".to_string(),
                 serde_json::json!({"phase": "profile_missing"}),
@@ -896,15 +890,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         }
 
         // ── Esecuzione criteri (sotto-sistema delegato) ───────────────────────
-        // GATING SHADOW: ExecMode::Replay in shadow (zero side-effect), punto
-        // unico ctx.exec_mode() (regola L). Un guasto infrastrutturale del runner
-        // propaga NodeError; un fallimento di un singolo criterio e' mappato dal
-        // concreto su CriterionResult{passed:false} (parita' col try/except
-        // Python, final_gate.py:381-385) e NON propaga errore.
+        // Un guasto infrastrutturale del runner propaga NodeError; un fallimento
+        // di un singolo criterio e' mappato dal concreto su
+        // CriterionResult{passed:false} (parita' col try/except Python,
+        // final_gate.py:381-385) e NON propaga errore.
         let criteria = self.build_criteria(state);
         let results = self
             .criteria
-            .run(criteria, ctx.exec_mode())
+            .run(criteria)
             .await
             .map_err(|e| NodeError::Failed {
                 node: "final_gate",
@@ -924,7 +917,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             crate::nodes::emit_phase_meta(
                 ctx.emit.as_ref(),
                 self.meta_steps.as_ref(),
-                ctx.exec_mode(),
                 "final_gate",
                 "Verifica superata".to_string(),
                 serde_json::json!({"cycle": cycle, "phase": "passed"}),
@@ -975,7 +967,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 crate::nodes::emit_phase_meta(
                     ctx.emit.as_ref(),
                     self.meta_steps.as_ref(),
-                    ctx.exec_mode(),
                     "final_gate",
                     "Criteri oggettivi superati: chiudi con task_complete".to_string(),
                     serde_json::json!({"cycle": cycle, "phase": "completion_grace"}),
@@ -1047,7 +1038,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 crate::nodes::emit_phase_meta(
                     ctx.emit.as_ref(),
                     self.meta_steps.as_ref(),
-                    ctx.exec_mode(),
                     "final_gate",
                     "Verifica non superata al limite tentativi: promuovo a un modello piu' capace".to_string(),
                     serde_json::json!({"cycle": cycle, "phase": "nonconvergence_escalation", "failed_criteria": Self::failed_criteria_meta(&results)}),
@@ -1081,7 +1071,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             crate::nodes::emit_phase_meta(
                 ctx.emit.as_ref(),
                 self.meta_steps.as_ref(),
-                ctx.exec_mode(),
                 "final_gate",
                 "Verifica non superata: chiudo (limite tentativi)".to_string(),
                 serde_json::json!({"cycle": cycle, "phase": "forced_close", "forced": forced_close, "failed_criteria": Self::failed_criteria_meta(&results)}),
@@ -1108,7 +1097,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         crate::nodes::emit_phase_meta(
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
-            ctx.exec_mode(),
             "final_gate",
             format!("Verifica fallita: rimando in correzione ({cycle}/{max_cycles})"),
             serde_json::json!({"cycle": cycle, "max_cycles": max_cycles, "phase": "failed", "failed_criteria": Self::failed_criteria_meta(&results)}),
@@ -1155,7 +1143,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::runtime::ports::ExecMode;
     use crate::runtime::test_doubles::{
         NullEventSink, StubCriteriaRunner, StubLlmGateway, StubMetaStepStore, StubToolExecutor,
     };
@@ -1184,11 +1171,10 @@ mod tests {
         }
     }
 
-    /// Ctx di test con flag shadow. Il motore criteri NON e' nel ctx: vive nel
-    /// nodo (`FinalGateNode::new`), quindi qui basta lo shadow per derivare la
-    /// `ExecMode`. PgPool lazy (il final_gate non scrive DB), LLM stub mai
-    /// chiamato (nodo deterministico).
-    fn ctx_with(shadow: bool) -> AgentNodeCtx {
+    /// Ctx di test. Il motore criteri NON e' nel ctx: vive nel nodo
+    /// (`FinalGateNode::new`). PgPool lazy (il final_gate non scrive DB), LLM stub
+    /// mai chiamato (nodo deterministico).
+    fn ctx_with() -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy non si connette");
@@ -1203,7 +1189,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -1258,7 +1243,7 @@ mod tests {
             "no_orphan_imported",
         )]));
         let node = node_with(cfg, runner.clone());
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = software_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         // Pass-through: nessun cambio di stop_reason / final_gate_passed.
@@ -1275,7 +1260,7 @@ mod tests {
             "no_orphan_imported",
         )]));
         let node = node_with(FinalGateConfig::default(), runner.clone());
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = AgentState {
             user_intent: Some("chat".into()),
             ..Default::default()
@@ -1294,16 +1279,15 @@ mod tests {
             ok_result("outputs_exist"),
         ]));
         let node = node_with(FinalGateConfig::default(), runner.clone());
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = software_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(out.final_gate_passed, Some(true));
         assert_eq!(out.final_gate_cycle, Some(0));
-        // Criteri eseguiti in Real (non shadow).
+        // Criteri eseguiti una volta.
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].1, ExecMode::Real);
     }
 
     // ── Turno di grazia completion ──────────────────────────────────────────────
@@ -1340,7 +1324,7 @@ mod tests {
             ),
         ]));
         let node = node_with(FinalGateConfig::default(), runner);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = AgentState {
             final_gate_cycle: Some(1), // -> cycle diventa 2 == max_cycles
             ..software_state()
@@ -1369,7 +1353,7 @@ mod tests {
             fail_result("completion_confirmed", json!({})),
         ]));
         let node = node_with(FinalGateConfig::default(), runner);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = AgentState {
             final_gate_cycle: Some(2), // -> cycle diventa 3 > max_cycles
             ..software_state()
@@ -1392,7 +1376,7 @@ mod tests {
             json!({"verdict": "placeholder rilevato"}),
         )]));
         let node = node_with(FinalGateConfig::default(), runner.clone());
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = software_state();
         st.forced_close_unverified = Some(true);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1422,7 +1406,7 @@ mod tests {
             },
             runner.clone(),
         );
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = software_state();
         st.final_gate_cycle = Some(1);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1444,7 +1428,7 @@ mod tests {
             json!({"verdict": "fail"}),
         )]));
         let node = node_with(FinalGateConfig::default(), runner);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = software_state();
         st.final_gate_cycle = Some(1); // cycle -> 2 == max_cycles
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1479,7 +1463,7 @@ mod tests {
             json!({"verdict": "fail"}),
         )]));
         let node = node_with(FinalGateConfig::default(), runner);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = software_state();
         st.final_gate_cycle = Some(1);
         st.extra
@@ -1504,7 +1488,7 @@ mod tests {
             fail_result("completion_confirmed", json!({})),
         ]));
         let node = node_with(FinalGateConfig::default(), runner);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = software_state();
         st.final_gate_cycle = Some(2); // cycle -> 3 > max_cycles: no grazia, no delega
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1522,7 +1506,7 @@ mod tests {
             json!({"verdict": "hello-world non raggiunge il design importato"}),
         )]));
         let node = node_with(FinalGateConfig::default(), runner.clone());
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         // cycle parte da 0 -> 1, max_cycles 2, non forced -> FAIL.
         let st = software_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1543,22 +1527,6 @@ mod tests {
             }
             other => panic!("atteso HumanMessage, trovato {other:?}"),
         }
-    }
-
-    // ── Shadow: ExecMode::Replay, zero side-effect ───────────────────────────────
-
-    #[tokio::test]
-    async fn shadow_usa_replay() {
-        let runner = Arc::new(StubCriteriaRunner::with_results(vec![ok_result(
-            "no_orphan_imported",
-        )]));
-        let node = node_with(FinalGateConfig::default(), runner.clone());
-        let ctx = ctx_with(true); // shadow
-        let st = software_state();
-        let _ = node.run(&st, &ctx).await.expect("run ok");
-        let seen = runner.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].1, ExecMode::Replay, "shadow deve usare Replay");
     }
 
     // ── build_criteria deterministico ────────────────────────────────────────────

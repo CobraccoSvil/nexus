@@ -6,21 +6,15 @@
 //! `WHERE EXISTS (run in agent_runs)` (no FK orfane) `AND NOT EXISTS (step gia'
 //! presente per run_id+step_index)` (equivale a `ON CONFLICT DO NOTHING`, ma
 //! `agent_steps` ha solo un INDEX non-UNIQUE su `(run_id, step_index)` — mig 0009 —
-//! quindi non esiste un constraint su cui fare `ON CONFLICT`). Gata `Real` (no-op in
-//! `ExecMode::Replay`, punto unico del gate shadow). Best-effort: errore DB loggato,
-//! `Ok(())`.
-//!
-//! NB: questa e' anche la fonte Replay (F3): la riga porta `run_id`, `step_index`,
-//! `tool_name`, `tool_input` (block), `tool_result` (result) e `status`. F3
-//! rileggera' il `tool_result` del run primario da qui filtrando per `run_id` +
-//! `step_index` (ordinamento globale stabile).
+//! quindi non esiste un constraint su cui fare `ON CONFLICT`). Best-effort: errore
+//! DB loggato, `Ok(())`.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{AgentStepStore, ExecMode, PortError};
+use nexus_agent_graph::runtime::ports::{AgentStepStore, PortError};
 
 /// Adapter [`AgentStepStore`] -> `agent_steps` via `sqlx`.
 pub struct PgAgentStepStore {
@@ -38,7 +32,7 @@ impl PgAgentStepStore {
 #[async_trait]
 impl AgentStepStore for PgAgentStepStore {
     /// Persiste UN blocco di un'iterazione su `agent_steps`. Vedi il mapping in
-    /// testa al modulo. Gata `Real` (regola L); best-effort.
+    /// testa al modulo. Best-effort.
     async fn persist_step(
         &self,
         run_id: &str,
@@ -46,11 +40,7 @@ impl AgentStepStore for PgAgentStepStore {
         idx: i64,
         block: Value,
         result: Option<Value>,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
             Err(e) => {
@@ -165,7 +155,6 @@ mod tests {
                 2,
                 json!({"name": "edit_file", "input": {"p": "x"}}),
                 Some(json!("done")),
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -194,7 +183,6 @@ mod tests {
                     0,
                     block.clone(),
                     None,
-                    ExecMode::Real,
                 )
                 .await
                 .expect("ok");
@@ -221,7 +209,6 @@ mod tests {
                 0,
                 json!({}),
                 None,
-                ExecMode::Real,
             )
             .await
             .expect("best-effort Ok");
@@ -230,20 +217,5 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0, "run non tracciato -> nessuno step");
-    }
-
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn replay_e_no_op(pool: PgPool) {
-        let run_id = insert_run(&pool).await;
-        let store = PgAgentStepStore::new(pool.clone());
-        store
-            .persist_step(&run_id.to_string(), 1, 0, json!({}), None, ExecMode::Replay)
-            .await
-            .expect("ok");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_steps")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(count, 0, "in Replay (shadow) nessuna scrittura");
     }
 }

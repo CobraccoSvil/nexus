@@ -17,11 +17,6 @@
 //! funzione (mig settings rolling), gia' popolata; usarla evita di mescolare due
 //! fonti di verita' (regola G/L) e di ereditare il modello di un altro purpose.
 //!
-//! GATE Real/Replay (PUNTO UNICO del gate shadow, regola L; uniforme con
-//! [`super::context_offload::RagContextOffloadAdapter`]): in [`ExecMode::Replay`]
-//! (run shadow read-only) e' un NO-OP che ritorna `PortError` -> il nodo NON
-//! riassume (degrado a history invariata), cosi' lo shadow non diverge dal replay
-//! ne' spende una chiamata LLM. In [`ExecMode::Real`] riassume davvero.
 //! BEST-EFFORT con DEGRADO A HISTORY INVARIATA: su guasto (modello non risolto,
 //! porta gateway assente, HTTP error, timeout) ritorna `PortError` e il nodo
 //! prosegue (compress/token_brake fanno comunque il loro lavoro). Il guasto del
@@ -33,7 +28,7 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, PortError, SummaryStore};
+use nexus_agent_graph::runtime::ports::{PortError, SummaryStore};
 
 use crate::nexus_gateway::{GwMessage, GwMetadata, GwRequest, NexusGatewayClient};
 
@@ -119,18 +114,9 @@ impl PgSummaryStore {
 #[async_trait]
 impl SummaryStore for PgSummaryStore {
     /// Riassume `text` (prefisso serializzato dal punto unico puro) col modello
-    /// economico risolto dal DB (regola G). GATE Real: in [`ExecMode::Replay`] e'
-    /// un no-op che ritorna `PortError` (il run shadow non riassume). Su qualunque
-    /// guasto (anche in Real) ritorna `PortError` (il nodo degrada a history
-    /// invariata). Best-effort.
-    async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError> {
-        if mode != ExecMode::Real {
-            // Run shadow read-only: niente chiamata LLM (gate shadow). Il nodo
-            // degrada = salta il summary, non diverge dal replay.
-            return Err(PortError::Llm(
-                "rolling_summary: no-op in Replay (run shadow read-only)".to_string().into(),
-            ));
-        }
+    /// economico risolto dal DB (regola G). Su qualunque guasto ritorna `PortError`
+    /// (il nodo degrada a history invariata). Best-effort.
+    async fn summarize(&self, text: String) -> Result<String, PortError> {
         if text.trim().is_empty() {
             return Err(PortError::Llm(
                 "rolling_summary: prefisso vuoto, niente da riassumere".to_string().into(),
@@ -223,30 +209,12 @@ impl SummaryStore for PgSummaryStore {
 mod tests {
     use super::*;
 
-    /// In `Replay` la summarize e' un no-op che ritorna `PortError` (gate shadow):
-    /// nessuna chiamata LLM, nessun accesso al gateway. Il nodo degrada a history
-    /// invariata. Il gate scatta prima di toccare il DB.
+    /// Prefisso vuoto -> `PortError` (niente da riassumere). Non tocca il gateway
+    /// perche' il controllo precede la risoluzione del modello.
     #[sqlx::test]
-    async fn replay_e_un_noop_che_ritorna_porterror(pool: PgPool) {
+    async fn prefisso_vuoto_ritorna_porterror(pool: PgPool) {
         let store = PgSummaryStore::new(pool.clone());
-        let res = store
-            .summarize(
-                "[human]: ciao\n[assistant]: salve".to_string(),
-                ExecMode::Replay,
-            )
-            .await;
-        assert!(
-            res.is_err(),
-            "in Replay la summarize deve fallire (no-op), il nodo degrada"
-        );
-    }
-
-    /// Prefisso vuoto in `Real` -> `PortError` (niente da riassumere). Non tocca il
-    /// gateway perche' il controllo precede la risoluzione del modello.
-    #[sqlx::test]
-    async fn prefisso_vuoto_in_real_ritorna_porterror(pool: PgPool) {
-        let store = PgSummaryStore::new(pool.clone());
-        let res = store.summarize("   ".to_string(), ExecMode::Real).await;
+        let res = store.summarize("   ".to_string()).await;
         assert!(res.is_err(), "prefisso vuoto -> PortError");
     }
 }

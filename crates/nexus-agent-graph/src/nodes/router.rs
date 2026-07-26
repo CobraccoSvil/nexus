@@ -141,17 +141,18 @@ impl GraphNode<AgentState, AgentNodeCtx> for RouterNode {
         // TODO(PR successivo): profile selection + Q-router (__init__.py:787-838)
         //   e RAG-KB inline; dipendono dal profile_loader e dal canale gRPC.
         //
-        // ── action_oriented: rispetta la pre-derivazione fedele dello shadow ─────
-        // Lo shadow pre-deriva `action_oriented` nello stato INIZIALE dai dati
-        // completi del classifier del turno (Tappa 1b punto B, `build_initial_state`
-        // ramo Shadow -> `intent_classifier::derive_action_oriented`, porting 1:1
-        // del primario Python). Quando lo stato lo porta gia', il RouterNode NON
-        // lo sovrascrive: cosi' lo shadow converge col primario (niente G1 sui
-        // turni conversazionali read-only). Nel primario `action_oriented` arriva
-        // None (build_initial_state Primary) -> si applica il fallback conservativo
-        // sotto, comportamento INVARIATO. `None` nel delta = "non toccare lo stato".
+        // ── action_oriented: rispetta la pre-derivazione fedele a monte ─────────
+        // Il primario Rust pre-deriva `action_oriented` nello stato INIZIALE dai
+        // dati completi del classifier del turno (Tappa 1b punto B,
+        // `build_initial_state` -> `intent_classifier::derive_action_oriented`,
+        // porting 1:1 del primario Python). Quando lo stato lo porta gia', il
+        // RouterNode NON lo sovrascrive: cosi' converge col primario Python
+        // (niente G1 sui turni conversazionali read-only). Senza dati del
+        // classifier `action_oriented` arriva None -> si applica il fallback
+        // conservativo sotto, comportamento INVARIATO. `None` nel delta = "non
+        // toccare lo stato".
         let action_oriented_delta: Option<Option<bool>> = match state.action_oriented {
-            Some(_) => None,          // gia' derivato a monte (shadow) -> preserva
+            Some(_) => None,          // gia' derivato a monte -> preserva
             None => Some(Some(true)), // fallback NEUTRO conservativo (Python degradato)
         };
 
@@ -220,7 +221,7 @@ mod tests {
     /// Costruisce un ctx di test senza toccare il DB: il `PgPool` e' creato
     /// LAZY (`connect_lazy`) — il RouterNode di questo PR non esegue query, e
     /// `connect_lazy` non apre connessioni finche' non si interroga il DB.
-    fn test_ctx(shadow: bool) -> AgentNodeCtx {
+    fn test_ctx() -> AgentNodeCtx {
         // URL fittizio: `connect_lazy` non si connette, quindi e' innocuo. Non
         // e' un fallback hardcoded di produzione (regola G): e' solo per
         // soddisfare il tipo `PgPool` in un test che NON tocca il DB.
@@ -238,7 +239,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_intent_hint_salta_classificazione() {
         let node = RouterNode;
-        let ctx = test_ctx(false);
+        let ctx = test_ctx();
         let state = AgentState {
             messages: vec![human("A")],
             intent_hint: Some("code_write".to_string()),
@@ -284,14 +284,14 @@ mod tests {
     }
 
     /// Tappa 1b (B): nel ramo generale, se lo stato porta GIA' `action_oriented`
-    /// (pre-derivato dallo shadow dai dati del classifier), il RouterNode NON lo
-    /// sovrascrive -> lo shadow converge col primario (niente G1 forzato a true
+    /// (pre-derivato a monte dai dati del classifier), il RouterNode NON lo
+    /// sovrascrive -> converge col primario Python (niente G1 forzato a true
     /// sui turni read-only). Lo stato iniziale con action_oriented=Some(false)
     /// resta false dopo il router.
     #[tokio::test]
     async fn ramo_generale_preserva_action_oriented_prederivato() {
         let node = RouterNode;
-        let ctx = test_ctx(true); // shadow
+        let ctx = test_ctx();
         let state = AgentState {
             messages: vec![human("riassumi cosa hai fatto")],
             // Nessun intent_hint -> ramo generale; action_oriented pre-derivato.
@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(
             out.action_oriented,
             Some(false),
-            "action_oriented pre-derivato preservato (shadow converge)"
+            "action_oriented pre-derivato preservato"
         );
     }
 
@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn ramo_generale_fallback_action_oriented_true() {
         let node = RouterNode;
-        let ctx = test_ctx(false); // primario
+        let ctx = test_ctx(); // primario
         let state = AgentState {
             messages: vec![human("ciao")],
             action_oriented: None,
@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn intent_hint_vuoto_non_e_passthrough() {
         let node = RouterNode;
-        let ctx = test_ctx(false);
+        let ctx = test_ctx();
         let state = AgentState {
             messages: vec![human("ciao")],
             intent_hint: Some("   ".to_string()),
@@ -362,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn nessun_messaggio_routing_chat() {
         let node = RouterNode;
-        let ctx = test_ctx(false);
+        let ctx = test_ctx();
         let state = AgentState {
             iterations: Some(2),
             ..Default::default()
@@ -382,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn token_budget_stimato_da_testo_lungo() {
         let node = RouterNode;
-        let ctx = test_ctx(false);
+        let ctx = test_ctx();
         // 2000 caratteri -> 2000/4 = 500 > 400.
         let lungo = "x".repeat(2000);
         let state = AgentState {
@@ -396,15 +396,4 @@ mod tests {
         assert_eq!(out.token_budget, Some(500));
     }
 
-    /// `exec_mode()` del ctx (punto unico shadow->Replay): primario=Real,
-    /// shadow=Replay. Vincolo di safety dello shadow read-only.
-    ///
-    /// `#[tokio::test]`: `test_ctx` usa `connect_lazy`, che richiede un contesto
-    /// Tokio anche se non apre alcuna connessione.
-    #[tokio::test]
-    async fn ctx_exec_mode_riflette_shadow() {
-        use crate::runtime::ports::ExecMode;
-        assert_eq!(test_ctx(false).exec_mode(), ExecMode::Real);
-        assert_eq!(test_ctx(true).exec_mode(), ExecMode::Replay);
-    }
 }

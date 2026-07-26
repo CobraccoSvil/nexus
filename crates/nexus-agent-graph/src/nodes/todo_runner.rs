@@ -42,9 +42,7 @@
 //!   `mark_status`) isola l'accesso a `nexus_agent_todos` (cast `::text[]` sul
 //!   lato concreto).
 //! - **Dispatch sub-run**: il trait [`crate::runtime::ToolExecutor`] esegue il
-//!   tool `dispatch_subagents` (`{tasks, max_parallel: 1}`). In shadow
-//!   `ctx.exec_mode() -> Replay` (rilegge il result del primario, ZERO
-//!   side-effect: nessun sub-run, nessuna scrittura FS/DB). E' l'UNICO I/O attivo.
+//!   tool `dispatch_subagents` (`{tasks, max_parallel: 1}`). E' l'UNICO I/O attivo.
 //!
 //! ## Cosa NON porta (TODO espliciti)
 //!
@@ -86,7 +84,7 @@ use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::dag_scheduler::{self, Todo, TodoStatus};
-use crate::runtime::ports::{ExecMode, RunControlStore, TodoStore, ToolCall, ToolExecutor};
+use crate::runtime::ports::{RunControlStore, TodoStore, ToolCall, ToolExecutor};
 use crate::runtime::AgentNodeCtx;
 use crate::state::{AgentState, StateDelta, StopReason};
 
@@ -259,8 +257,8 @@ pub struct TodoRunnerNode {
     cfg: TodoRunnerConfig,
     /// Store dei todo (`nexus_agent_todos`). Impl concreta in mcp-core; stub nei test.
     store: Arc<dyn TodoStore>,
-    /// Esecutore del tool `dispatch_subagents` (Real -> ToolRunner gRPC, Replay
-    /// -> rilegge il result del primario in shadow). Impl concreta in mcp-core.
+    /// Esecutore del tool `dispatch_subagents` (delega al ToolRunner gRPC). Impl
+    /// concreta in mcp-core.
     tools: Arc<dyn ToolExecutor>,
     /// Battito di vita del run (`agent_runs.updated_at`), come in `executor` e
     /// `tool_dispatch`. SENZA di esso il run_reaper scambiava per orfano un run
@@ -448,7 +446,6 @@ impl TodoRunnerNode {
         &self,
         state: &AgentState,
         todo: &Value,
-        mode: ExecMode,
         extra_context: &str,
     ) -> Result<Option<Value>, NodeError> {
         let prior = state.subagent_results.clone().unwrap_or_default();
@@ -480,12 +477,12 @@ impl TodoRunnerNode {
         // infrastrutturale gRPC/ToolRunner down INCLUSO, non solo un fallimento
         // applicativo) viene catturato e ritorna None -> il chiamante ripristina
         // il todo a `pending` e fa pass-through {} (fallback all'executor
-        // classico). Quindi un `Err(PortError)` (Tool/Llm/ReplayMissing) NON deve
+        // classico). Quindi un `Err(PortError)` (Tool/Llm) NON deve
         // propagare come NodeError::Failed: il run NON fallisce, si degrada al
         // fallback come fa Python. La cancellation cooperativa NON passa di qui
         // (e' modellata via `ctx.cancel`, non come variante di `PortError`),
         // quindi questo catch-all non la inghiotte.
-        let outcome = match self.tools.execute(call, mode).await {
+        let outcome = match self.tools.execute(call).await {
             Ok(o) => o,
             Err(_) => return Ok(None),
         };
@@ -531,7 +528,6 @@ impl TodoRunnerNode {
         run_id: &str,
         todos: &[Todo],
         ready: Vec<Todo>,
-        mode: ExecMode,
     ) -> Result<OpaqueDelta, NodeError> {
         // Cap all'ampiezza del batch del tool (dispatch_subagents: max 8 task).
         let wave: Vec<Todo> = ready.into_iter().take(8).collect();
@@ -542,7 +538,7 @@ impl TodoRunnerNode {
         let mut tasks: Vec<Value> = Vec::with_capacity(wave.len());
         for t in &wave {
             self.store
-                .mark_status(&t.id, TodoStatus::InProgress, mode)
+                .mark_status(&t.id, TodoStatus::InProgress)
                 .await
                 .map_err(port_err)?;
             let tv = todo_value_of(todos, &t.id);
@@ -575,12 +571,12 @@ impl TodoRunnerNode {
             input: json!({ "tasks": tasks }),
             thought_signature: None,
         };
-        let outcome = match self.tools.execute(call, mode).await {
+        let outcome = match self.tools.execute(call).await {
             Ok(o) => o,
-            Err(_) => return self.wave_dispatch_failed(&wave, mode).await,
+            Err(_) => return self.wave_dispatch_failed(&wave).await,
         };
         if outcome.is_error {
-            return self.wave_dispatch_failed(&wave, mode).await;
+            return self.wave_dispatch_failed(&wave).await;
         }
         let data = match &outcome.content {
             Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(json!({})),
@@ -593,7 +589,7 @@ impl TodoRunnerNode {
             .unwrap_or_default();
         if results.len() != wave.len() {
             // results non allineati ai task -> trattato come dispatch fallito.
-            return self.wave_dispatch_failed(&wave, mode).await;
+            return self.wave_dispatch_failed(&wave).await;
         }
 
         let mut accumulated = prior.clone();
@@ -612,17 +608,17 @@ impl TodoRunnerNode {
             let mut record = build_record(seq.as_ref(), &t.id, &content, &summary, cost);
             if !result_failed(result) {
                 self.store
-                    .mark_status(&t.id, TodoStatus::Completed, mode)
+                    .mark_status(&t.id, TodoStatus::Completed)
                     .await
                     .map_err(port_err)?;
                 record.insert("status".to_string(), json!("completed"));
             } else {
                 any_failed = true;
                 self.store
-                    .mark_status(&t.id, TodoStatus::Blocked, mode)
+                    .mark_status(&t.id, TodoStatus::Blocked)
                     .await
                     .map_err(port_err)?;
-                self.cascade_skip(&t.id, todos, mode).await?;
+                self.cascade_skip(&t.id, todos).await?;
                 record.insert("status".to_string(), json!("failed"));
             }
             accumulated.push(Value::Object(record));
@@ -659,11 +655,10 @@ impl TodoRunnerNode {
     async fn wave_dispatch_failed(
         &self,
         wave: &[Todo],
-        mode: ExecMode,
     ) -> Result<OpaqueDelta, NodeError> {
         for t in wave {
             self.store
-                .mark_status(&t.id, TodoStatus::Pending, mode)
+                .mark_status(&t.id, TodoStatus::Pending)
                 .await
                 .map_err(port_err)?;
         }
@@ -677,17 +672,14 @@ impl TodoRunnerNode {
     /// Cascade-skip: marca tutti i discendenti di `todo_id` come `skipped`,
     /// delegando l'insieme dei discendenti al PUNTO UNICO
     /// [`dag_scheduler::descendants`] (regola L: niente DFS re-implementata qui).
-    /// `mode` propaga il gate shadow alla [`TodoStore::mark_status`] (no-op in
-    /// Replay).
     async fn cascade_skip(
         &self,
         todo_id: &str,
         todos: &[Todo],
-        mode: ExecMode,
     ) -> Result<(), NodeError> {
         for desc in dag_scheduler::descendants(todos, todo_id) {
             self.store
-                .mark_status(desc, TodoStatus::Skipped, mode)
+                .mark_status(desc, TodoStatus::Skipped)
                 .await
                 .map_err(port_err)?;
         }
@@ -762,8 +754,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
         // 2026-07-22: ucciso a 905s con la soglia stale a 900s, e i file
         // continuavano a comparire dopo la "chiusura").
         // Best-effort come negli altri nodi: un errore di battito non deve far
-        // fallire il turno; in Replay e' no-op (gate shadow dentro la porta).
-        let _ = self.run_control.heartbeat(&run_id, ctx.exec_mode()).await;
+        // fallire il turno.
+        let _ = self.run_control.heartbeat(&run_id).await;
 
         // ── (3) todos vuoti -> end_turn + active_todo_id None (py:238-252) ────
         let todos = self.store.list_todos(&run_id).await.map_err(port_err)?;
@@ -813,9 +805,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                 && writers_ok
                 && dag_scheduler::should_parallelize(&ready, &todos, &dag_cfg)
             {
-                let mode = ctx.exec_mode();
                 return self
-                    .dispatch_wave(state, &run_id, &todos, ready, mode)
+                    .dispatch_wave(state, &run_id, &todos, ready)
                     .await;
             }
         }
@@ -839,13 +830,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
         let seq = next_value.get("seq").cloned();
         let content = str_or_empty(next_value.get("content"));
 
-        // Punto unico del gate shadow (regola L): un run shadow usa Replay ->
-        // mark_status diventa no-op (zero scritture su nexus_agent_todos).
-        let mode = ctx.exec_mode();
-
         // ── (4) Marca in_progress prima di delegare (py:259) ──────────────────
         self.store
-            .mark_status(&todo_id, TodoStatus::InProgress, mode)
+            .mark_status(&todo_id, TodoStatus::InProgress)
             .await
             .map_err(port_err)?;
 
@@ -856,14 +843,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
         );
 
         // ── (6) Delega via dispatch_subagents (max_parallel=1) ────────────────
-        let result = self.dispatch_one(state, &next_value, mode, "").await?;
+        let result = self.dispatch_one(state, &next_value, "").await?;
 
         // Dispatch fallito (NON sub-run fallita) -> ripristina pending + {} (py:271-276).
         let result = match result {
             Some(r) => r,
             None => {
                 self.store
-                    .mark_status(&todo_id, TodoStatus::Pending, mode)
+                    .mark_status(&todo_id, TodoStatus::Pending)
                     .await
                     .map_err(port_err)?;
                 tracing::warn!(
@@ -887,7 +874,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
         // ── Ramo SUCCESSO ─────────────────────────────────────────────────────
         if !result_failed(&result) {
             self.store
-                .mark_status(&todo_id, TodoStatus::Completed, mode)
+                .mark_status(&todo_id, TodoStatus::Completed)
                 .await
                 .map_err(port_err)?;
             record.insert("status".to_string(), json!("completed"));
@@ -925,7 +912,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                     "todo fallito, retry con context arricchito"
                 );
                 self.store
-                    .mark_status(&todo_id, TodoStatus::Pending, mode)
+                    .mark_status(&todo_id, TodoStatus::Pending)
                     .await
                     .map_err(port_err)?;
                 let err_ctx = format!(
@@ -936,12 +923,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
                      </tentativo_precedente_fallito>"
                 );
                 let retry_result = self
-                    .dispatch_one(state, &next_value, mode, &err_ctx)
+                    .dispatch_one(state, &next_value, &err_ctx)
                     .await?;
                 if let Some(rr) = retry_result.as_ref() {
                     if !result_failed(rr) {
                         self.store
-                            .mark_status(&todo_id, TodoStatus::Completed, mode)
+                            .mark_status(&todo_id, TodoStatus::Completed)
                             .await
                             .map_err(port_err)?;
                         // Sostituisce i campi del record (lo stesso oggetto Python):
@@ -971,10 +958,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
         // (continue) blocca questo + cascade-skip, ma PROSEGUE col prossimo (py:340-348).
         if self.cfg.on_failure == OnFailure::Continue {
             self.store
-                .mark_status(&todo_id, TodoStatus::Blocked, mode)
+                .mark_status(&todo_id, TodoStatus::Blocked)
                 .await
                 .map_err(port_err)?;
-            self.cascade_skip(&todo_id, &todos, mode).await?;
+            self.cascade_skip(&todo_id, &todos).await?;
             tracing::warn!(
                 target: "nexus_agent_graph::todo_runner",
                 %todo_id,
@@ -988,10 +975,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for TodoRunnerNode {
 
         // (stop, DEFAULT o degrado dal retry) blocca + cascade-skip + chiusura onesta (py:350-365).
         self.store
-            .mark_status(&todo_id, TodoStatus::Blocked, mode)
+            .mark_status(&todo_id, TodoStatus::Blocked)
             .await
             .map_err(port_err)?;
-        self.cascade_skip(&todo_id, &todos, mode).await?;
+        self.cascade_skip(&todo_id, &todos).await?;
         tracing::warn!(
             target: "nexus_agent_graph::todo_runner",
             %todo_id,
@@ -1148,11 +1135,11 @@ mod tests {
     }
 
     /// Esecutore di tool a CODA: ritorna le risposte in ordine (per i test del
-    /// retry, che fanno due dispatch). Registra le chiamate ricevute con la mode.
+    /// retry, che fanno due dispatch). Registra le chiamate ricevute.
     struct QueueToolExecutor {
         /// Risposte da ritornare in ordine (clonate; l'ultima si ripete).
         responses: Mutex<Vec<Result<ToolOutcome, PortError>>>,
-        seen: Mutex<Vec<(ToolCall, ExecMode)>>,
+        seen: Mutex<Vec<ToolCall>>,
     }
 
     impl QueueToolExecutor {
@@ -1203,8 +1190,8 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for QueueToolExecutor {
-        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
-            self.seen.lock().unwrap().push((call, mode));
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
+            self.seen.lock().unwrap().push(call);
             let mut q = self.responses.lock().unwrap();
             if q.len() > 1 {
                 // Consuma la prima risposta finche' ne resta piu' di una.
@@ -1215,7 +1202,6 @@ mod tests {
                         PortError::Llm(s) => PortError::Llm(s),
                         PortError::ProviderUnavailable(s) => PortError::ProviderUnavailable(s),
                         PortError::Tool(s) => PortError::Tool(s),
-                        PortError::ReplayMissing(s) => PortError::ReplayMissing(s),
                     }),
                 }
             } else {
@@ -1227,9 +1213,6 @@ mod tests {
                         Err(PortError::ProviderUnavailable(s.clone()))
                     }
                     Some(Err(PortError::Tool(s))) => Err(PortError::Tool(s.clone())),
-                    Some(Err(PortError::ReplayMissing(s))) => {
-                        Err(PortError::ReplayMissing(s.clone()))
-                    }
                     None => Ok(ToolOutcome {
                         tool_call_id: "empty".to_string(),
                         content: json!({}),
@@ -1251,8 +1234,8 @@ mod tests {
         json!({"results": [{"status": "failed", "summary": summary}]})
     }
 
-    /// Ctx con shadow flag e la RoutingConfig data (per il gate todo_isolation).
-    fn ctx_with(shadow: bool, cfg: RoutingConfig) -> AgentNodeCtx {
+    /// Ctx con la RoutingConfig data (per il gate todo_isolation).
+    fn ctx_with(cfg: RoutingConfig) -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy");
@@ -1269,7 +1252,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -1309,10 +1291,10 @@ mod tests {
     /// Ctx con isolamento FISICO disponibile (worktree git effimeri). Un fronte
     /// parallelo di scrittori e' ammesso solo qui: senza isolamento i sub-run
     /// condividono la root reale e si sovrascriverebbero.
-    fn ctx_isolated(shadow: bool, cfg: RoutingConfig) -> AgentNodeCtx {
+    fn ctx_isolated(cfg: RoutingConfig) -> AgentNodeCtx {
         AgentNodeCtx {
             isolation_available: true,
-            ..ctx_with(shadow, cfg)
+            ..ctx_with(cfg)
         }
     }
 
@@ -1364,7 +1346,7 @@ mod tests {
         )]));
         let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("x", 0.0)]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
-        let ctx = ctx_with(false, RoutingConfig::default());
+        let ctx = ctx_with(RoutingConfig::default());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // No-op: nessun cambio stop_reason/active_todo_id.
@@ -1387,7 +1369,7 @@ mod tests {
         )]));
         let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("x", 0.0)]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(None); // thread_id None.
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, None);
@@ -1401,7 +1383,7 @@ mod tests {
         let store = Arc::new(StubTodoStore::with_todos(vec![]));
         let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("x", 0.0)]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
@@ -1419,7 +1401,7 @@ mod tests {
         ]));
         let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload("x", 0.0)]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
@@ -1439,7 +1421,7 @@ mod tests {
             "fatto a", 0.5,
         )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // a completato, b ancora pending -> re-entry (tool_use), active_todo_id = b.
@@ -1455,8 +1437,8 @@ mod tests {
         let marks = store.marks.lock().unwrap();
         assert_eq!(marks[0], ("a".to_string(), TodoStatus::InProgress));
         assert_eq!(marks[1], ("a".to_string(), TodoStatus::Completed));
-        // Dispatch eseguito in Real (non shadow).
-        assert_eq!(tools.seen.lock().unwrap()[0].1, ExecMode::Real);
+        // Dispatch eseguito una volta.
+        assert_eq!(tools.seen.lock().unwrap().len(), 1);
     }
 
     // ── MULTICASTING: ondata parallela (dispatch_wave) ───────────────────────────
@@ -1483,7 +1465,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_isolated(false, routing_cfg_on());
+        let ctx = ctx_isolated(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         {
@@ -1494,7 +1476,7 @@ mod tests {
                 "una sola chiamata dispatch per l'intera ondata"
             );
             assert_eq!(
-                seen[0].0.input["tasks"].as_array().unwrap().len(),
+                seen[0].input["tasks"].as_array().unwrap().len(),
                 2,
                 "il dispatch porta 2 task in parallelo"
             );
@@ -1536,19 +1518,19 @@ mod tests {
         let n = node(cfg, store.clone(), tools.clone());
         // UNICA differenza rispetto a `wave_parallelo_due_todo_completed`:
         // ctx_with -> isolation_available = false.
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         {
             let seen = tools.seen.lock().unwrap();
             assert_eq!(seen.len(), 1, "un solo dispatch");
             assert_eq!(
-                seen[0].0.input["tasks"].as_array().unwrap().len(),
+                seen[0].input["tasks"].as_array().unwrap().len(),
                 1,
                 "UN solo task: senza isolamento il fronte parallelo non si apre"
             );
             assert_eq!(
-                seen[0].0.input["max_parallel"],
+                seen[0].input["max_parallel"],
                 json!(1),
                 "ramo sequenziale: concorrenza 1"
             );
@@ -1585,7 +1567,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_isolated(false, routing_cfg_on());
+        let ctx = ctx_isolated(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
@@ -1613,7 +1595,7 @@ mod tests {
             "fatto", 0.2,
         )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
@@ -1634,7 +1616,7 @@ mod tests {
             "rotto",
         )]));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Chiusura catena: end_turn, active_todo_id = a (il bloccato).
@@ -1674,7 +1656,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Prosegue (advance): tool_use, prossimo pending = d (b e' skipped).
@@ -1707,7 +1689,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Retry riuscito -> advance, prossimo = b.
@@ -1746,7 +1728,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Degrado a stop: end_turn, a bloccato, b skipped.
@@ -1781,7 +1763,7 @@ mod tests {
             ..TodoRunnerConfig::default()
         };
         let n = node(cfg, store.clone(), tools.clone());
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let mut st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         st.todo_isolation_retries = Some(1); // gia' al massimo.
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
@@ -1802,7 +1784,7 @@ mod tests {
         )]));
         let tools = Arc::new(QueueToolExecutor::tool_error());
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // No-op (fallback executor): nessun stop_reason.
@@ -1828,7 +1810,7 @@ mod tests {
         )]));
         let tools = Arc::new(QueueToolExecutor::port_error("gRPC down"));
         let n = node(TodoRunnerConfig::default(), store.clone(), tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
         // Il run NON deve fallire: si aspetta Ok (pass-through), non Err.
         let out = apply(
@@ -1842,34 +1824,6 @@ mod tests {
         assert_eq!(marks[0], ("t1".to_string(), TodoStatus::InProgress));
         assert_eq!(marks[1], ("t1".to_string(), TodoStatus::Pending));
         assert_eq!(marks.len(), 2);
-    }
-
-    // ── Shadow: ExecMode::Replay sul dispatch ────────────────────────────────────
-
-    #[tokio::test]
-    async fn shadow_usa_replay() {
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
-            "a",
-            TodoStatus::Pending,
-            &[],
-            1,
-        )]));
-        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
-            "ok", 0.0,
-        )]));
-        let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
-        let ctx = ctx_with(true, routing_cfg_on()); // shadow
-        let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
-        let _ = n.run(&st, &ctx).await.expect("run ok");
-        // Il ToolExecutor riceve Replay (nessun side-effect del dispatch).
-        assert_eq!(tools.seen.lock().unwrap()[0].1, ExecMode::Replay);
-        // ZERO scritture su nexus_agent_todos in shadow: tutte le mark_status
-        // (in_progress/completed/...) sono no-op in Replay -> marks vuoto. Senza
-        // il gate sul trait, il run shadow corromperebbe il DAG del primario.
-        assert!(
-            store.marks.lock().unwrap().is_empty(),
-            "in shadow mark_status deve essere no-op (zero scritture)"
-        );
     }
 
     // ── Funzioni pure (smoke; il golden copre la parita' 1:1) ────────────────────
@@ -1892,7 +1846,7 @@ mod tests {
             "fatto a", 0.1,
         )]));
         let (n, rc) = node_con_battito(TodoRunnerConfig::default(), store, tools);
-        let ctx = ctx_with(false, routing_cfg_on());
+        let ctx = ctx_with(routing_cfg_on());
         let thread = "11111111-1111-1111-1111-111111111111";
         let st = isolated_state(Some(thread));
         let _ = n.run(&st, &ctx).await.expect("run ok");

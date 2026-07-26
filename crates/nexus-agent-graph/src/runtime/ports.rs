@@ -60,9 +60,6 @@ pub enum PortError {
     /// {...} }` dentro il tool_result mostrato nel nastro attivita'.
     #[error("esecuzione tool: {0}")]
     Tool(RenderedError),
-    /// In modalita' Replay il tool_result del run primario non e' disponibile.
-    #[error("replay non disponibile per la chiamata '{0}'")]
-    ReplayMissing(String),
 }
 
 /// Causa STRUTTURATA dell'indisponibilita' di un provider (vocabolario chiuso,
@@ -317,15 +314,11 @@ pub struct LlmRequest {
     /// `"reflection"` / `"clarify_expand"`). `None` (Default) per i call site che
     /// non lo valorizzano (test, turni minimali).
     ///
-    /// SCOPO (regola L): e' un discriminante OPACO al gateway concreto. L'impl di
-    /// produzione [`LlmGateway`] (`GatewayLlmAdapter` di mcp-core) lo IGNORA
-    /// completamente — un turno REAL non cambia comportamento. Serve SOLO al
-    /// decorator di REPLAY usato dallo shadow (`ReplayLlmGateway`), che distingue
-    /// la chiamata dell'executor (da RIGIOCARE sulla sequenza tool del primario
-    /// letta da `agent_steps`) da quelle ausiliarie (planner/reflection/
-    /// clarify_expand, da NEUTRALIZZARE con una risposta neutra deterministica).
-    /// Il trait [`LlmGateway`] resta invariato (firma `complete()` non cambia):
-    /// `purpose` viaggia nel payload, l'impl decide se guardarlo.
+    /// SCOPO (regola L): e' un discriminante OPACO al gateway concreto trasportato
+    /// nel payload. L'impl di produzione [`LlmGateway`] (`GatewayLlmAdapter` di
+    /// mcp-core) lo usa per risolvere un purpose model quando il modello richiesto
+    /// e' vuoto (`purpose_for_empty_model`); il trait [`LlmGateway`] resta invariato
+    /// (firma `complete()` non cambia): l'impl decide se guardarlo.
     pub purpose: Option<String>,
 }
 
@@ -422,21 +415,6 @@ pub trait LlmGateway: Send + Sync {
 /// per non duplicare la struttura nome/args/id, regola L).
 pub type ToolCall = ToolUse;
 
-/// Modalita' d'esecuzione di un tool.
-///
-/// `Replay` e' il cuore della modalita' shadow: invece di RIESEGUIRE il tool
-/// (che avrebbe side-effect sul filesystem/DB/container del progetto),
-/// l'esecutore RILEGGE il `tool_result` registrato dal run PRIMARIO. Cosi' il
-/// run shadow osserva gli stessi risultati senza causare effetti collaterali
-/// (ZERO side-effect, requisito di safety per lo shadow read-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecMode {
-    /// Esecuzione reale: il tool viene eseguito davvero (side-effect possibili).
-    Real,
-    /// Replay: rilegge il tool_result del run primario, nessun side-effect.
-    Replay,
-}
-
 /// Esito dell'esecuzione di un tool nel formato minimale richiesto dai nodi.
 ///
 /// COERENZA `exit_code` (regola L, un solo segnale d'esito): un `ToolOutcome`
@@ -477,12 +455,11 @@ pub struct ToolOutcome {
 }
 
 /// Astrazione dell'esecutore di tool. mcp-core la implementera' delegando al
-/// ToolRunner gRPC (modalita' `Real`) e a un lettore dei tool_result del run
-/// primario (modalita' `Replay`, per lo shadow).
+/// ToolRunner gRPC.
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    /// Esegue (o replaya) una chiamata a tool secondo `mode`.
-    async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError>;
+    /// Esegue una chiamata a tool.
+    async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError>;
 }
 
 /// Specifica di UN criterio di verifica costruita dal `FinalGateNode`
@@ -530,11 +507,10 @@ pub struct CriterionResult {
 /// i singoli `_check_*` sui tool del run.
 ///
 /// Il confine e' pulito: il `FinalGateNode` costruisce le [`CriterionSpec`] e
-/// ottiene i [`CriterionResult`]; con `ExecMode::Replay` i criteri rileggono i
-/// tool_result gia' registrati, quindi non hanno side-effect.
+/// ottiene i [`CriterionResult`].
 #[async_trait]
 pub trait CriteriaRunner: Send + Sync {
-    /// Esegue (o replaya) i criteri nell'ordine dato; un fallimento di un
+    /// Esegue i criteri nell'ordine dato; un fallimento di un
     /// criterio NON deve propagare un errore: il concreto lo mappa su un
     /// [`CriterionResult`] con `passed=false` + `evidence.error` (parita' col
     /// try/except del Python, `final_gate.py:381-385`). L'errore di porta resta
@@ -542,7 +518,6 @@ pub trait CriteriaRunner: Send + Sync {
     async fn run(
         &self,
         criteria: Vec<CriterionSpec>,
-        mode: ExecMode,
     ) -> Result<Vec<CriterionResult>, PortError>;
 }
 
@@ -616,12 +591,7 @@ pub struct VerifierRunRecord {
 
 /// Astrazione della persistenza degli esiti del verifier su
 /// `nexus_agent_verifier_runs` (`verifier_node._persist_verifier_run`). mcp-core
-/// la implementera' con `sqlx` (INSERT best-effort). E' una SCRITTURA DB: come
-/// [`TodoStore::mark_status`] e [`ToolExecutor::execute`], il `mode` gata
-/// l'effetto (punto unico del gate shadow, regola L): l'impl concreta DEVE
-/// eseguire la INSERT solo in [`ExecMode::Real`]; in [`ExecMode::Replay`] (run
-/// shadow read-only) la chiamata e' un NO-OP (zero scritture, il run shadow non
-/// inquina la telemetria del primario).
+/// la implementera' con `sqlx` (INSERT best-effort).
 ///
 /// Parita' col Python: la INSERT e' BEST-EFFORT (su errore DB il verifier
 /// prosegue, `verifier_node.py:600`). L'impl concreta NON deve propagare un
@@ -629,8 +599,8 @@ pub struct VerifierRunRecord {
 /// `PortError` resta per un contratto rotto (mai usato nel flusso normale).
 #[async_trait]
 pub trait VerifierRunStore: Send + Sync {
-    /// Persiste (best-effort) un esito del verifier. No-op in [`ExecMode::Replay`].
-    async fn record(&self, run: VerifierRunRecord, mode: ExecMode) -> Result<(), PortError>;
+    /// Persiste (best-effort) un esito del verifier.
+    async fn record(&self, run: VerifierRunRecord) -> Result<(), PortError>;
 }
 
 /// Conteggio token del contesto (ADR 0016 D1). Porta SINCRONA e CPU-only
@@ -769,17 +739,10 @@ pub trait TodoStore: Send + Sync {
 
     /// Aggiorna lo status di un todo (UPDATE best-effort). 1:1 con i `_mark` /
     /// `_mark_todo_status` di `dag_scheduler.py` e `verifier_node.py`.
-    ///
-    /// `mode` gata la scrittura come [`ToolExecutor::execute`] (punto unico del
-    /// gate shadow, regola L): l'impl concreta DEVE eseguire l'UPDATE solo in
-    /// [`ExecMode::Real`]. In [`ExecMode::Replay`] (run shadow read-only) la
-    /// chiamata e' un NO-OP: nessuna scrittura su `nexus_agent_todos`, cosi' il
-    /// run shadow non corrompe il DAG del run primario (ZERO side-effect).
     async fn mark_status(
         &self,
         todo_id: &str,
         status: TodoStatus,
-        mode: ExecMode,
     ) -> Result<(), PortError>;
 
     /// Reminder testuale dei todo da iniettare nel prompt dell'executor quando la
@@ -787,20 +750,17 @@ pub trait TodoStore: Send + Sync {
     /// todos del run e rende il testo (lista compatta stato/seq), `None` se non
     /// c'e' un piano attivo o nessun todo. Default `Ok(None)` per non obbligare
     /// gli store che non servono l'executor (es. il `TodoRunnerNode` esistente).
-    /// SOLA LETTURA: nessun gate `mode` (non scrive).
+    /// SOLA LETTURA (non scrive).
     async fn build_reminder_text(&self, _run_id: &str) -> Result<Option<String>, PortError> {
         Ok(None)
     }
 
     /// Incrementa il contatore di iterazioni "viste" per il run (telemetria di
-    /// avanzamento del piano). UPDATE best-effort gata `Real` (no-op in
-    /// [`ExecMode::Replay`], stesso gate shadow di [`mark_status`](TodoStore::mark_status),
-    /// regola L). Default no-op: gli store che non lo servono non lo
-    /// sovrascrivono.
+    /// avanzamento del piano). UPDATE best-effort. Default no-op: gli store che
+    /// non lo servono non lo sovrascrivono.
     async fn increment_iteration_seen(
         &self,
         _run_id: &str,
-        _mode: ExecMode,
     ) -> Result<(), PortError> {
         Ok(())
     }
@@ -824,25 +784,23 @@ pub trait RunControlStore: Send + Sync {
     /// `true` se il run e' stato superato (last-wins) e deve fermarsi. FAIL-OPEN
     /// (regola di sicurezza): un errore di lettura DB ritorna `Ok(false)` (il run
     /// PROSEGUE), mai un `PortError` che lo bloccherebbe per un guasto
-    /// infrastrutturale. SOLA LETTURA: nessun gate `mode`.
+    /// infrastrutturale. SOLA LETTURA.
     async fn is_superseded(&self, run_id: &str) -> Result<bool, PortError>;
 
     /// Heartbeat del run (UPDATE `updated_at` best-effort): segnala che il run e'
-    /// vivo (anti-recovery prematuro). Gata `Real` (no-op in [`ExecMode::Replay`]:
-    /// il run shadow non tocca la telemetria del primario, regola L).
-    /// Best-effort: l'impl logga e ritorna `Ok(())` su errore DB.
-    async fn heartbeat(&self, _run_id: &str, _mode: ExecMode) -> Result<(), PortError>;
+    /// vivo (anti-recovery prematuro). Best-effort: l'impl logga e ritorna
+    /// `Ok(())` su errore DB.
+    async fn heartbeat(&self, _run_id: &str) -> Result<(), PortError>;
 
     /// Registra il modello EFFETTIVAMENTE usato dal gateway (da
     /// [`LlmResponse::provider_used`]/[`LlmResponse::model_used`]) sul run, per la
     /// telemetria/osservabilita' (la chat mostra il modello reale, non quello
-    /// richiesto). Gata `Real` (no-op in [`ExecMode::Replay`]). Best-effort.
+    /// richiesto). Best-effort.
     async fn set_effective_model(
         &self,
         _run_id: &str,
         _provider: &str,
         _model: &str,
-        _mode: ExecMode,
     ) -> Result<(), PortError>;
 }
 
@@ -862,9 +820,7 @@ pub trait AgentStepStore: Send + Sync {
     /// (tool_use/testo, JSON opaco), `result` = l'eventuale tool_result associato
     /// (`None` per i blocchi di testo o quando non ancora disponibile).
     ///
-    /// Gata `Real` (punto unico gate shadow, regola L): INSERT solo in
-    /// [`ExecMode::Real`]; no-op in [`ExecMode::Replay`] (il run shadow non scrive
-    /// step). Best-effort come [`VerifierRunStore::record`]: errore DB loggato,
+    /// Best-effort come [`VerifierRunStore::record`]: errore DB loggato,
     /// `Ok(())` ritornato (il `PortError` resta per un contratto rotto).
     async fn persist_step(
         &self,
@@ -873,7 +829,6 @@ pub trait AgentStepStore: Send + Sync {
         idx: i64,
         block: Value,
         result: Option<Value>,
-        mode: ExecMode,
     ) -> Result<(), PortError>;
 }
 
@@ -883,19 +838,17 @@ pub trait AgentStepStore: Send + Sync {
 ///
 /// SCELTA `MetaStepStore` vs estendere [`EventSink`] (documentata, regola L):
 /// resta un TRAIT SEPARATO. `EventSink::emit` e' il canale LIVE verso il
-/// frontend — SINCRONO, infallibile, best-effort, NON gata `mode` (lo shadow usa
-/// un sink no-op). La PERSISTENZA DB e' invece una scrittura ASYNC, FALLIBILE e
-/// GATA `Real/Replay` (no-op shadow): semantica diversa. Fonderle in `EventSink`
-/// costringerebbe a un `emit` async fallibile e a un gate `mode` sul canale live,
-/// rompendo i call site `emit` esistenti e mescolando due concern (live vs
-/// storico). I due trait sono complementari: un meta-step tipicamente si EMETTE
-/// (live) e si PERSISTE (storico) nello stesso punto.
+/// frontend — SINCRONO, infallibile, best-effort. La PERSISTENZA DB e' invece
+/// una scrittura ASYNC e FALLIBILE: semantica diversa. Fonderle in `EventSink`
+/// costringerebbe a un `emit` async fallibile sul canale live, rompendo i call
+/// site `emit` esistenti e mescolando due concern (live vs storico). I due trait
+/// sono complementari: un meta-step tipicamente si EMETTE (live) e si PERSISTE
+/// (storico) nello stesso punto.
 #[async_trait]
 pub trait MetaStepStore: Send + Sync {
     /// Persiste un meta-step (`meta_step` = JSON `{kind,title,payload}` opaco allo
-    /// store). Gata `Real` (INSERT solo in [`ExecMode::Real`], no-op in
-    /// [`ExecMode::Replay`], regola L). Best-effort: errore DB loggato, `Ok(())`.
-    async fn persist_meta_step(&self, meta_step: Value, mode: ExecMode) -> Result<(), PortError>;
+    /// store). Best-effort: errore DB loggato, `Ok(())`.
+    async fn persist_meta_step(&self, meta_step: Value) -> Result<(), PortError>;
 }
 
 /// Offload del contesto verso RAG (Qdrant + embeddings) quando un payload e'
@@ -908,19 +861,11 @@ pub trait MetaStepStore: Send + Sync {
 /// Best-effort con DEGRADO A TRONCAMENTO: se l'offload fallisce (embed/Qdrant
 /// down), l'impl ritorna un `PortError` e il chiamante degrada troncando inline
 /// (non blocca il run).
-///
-/// Gata `Real` (PUNTO UNICO gate shadow, regola L; uniforme con
-/// [`AgentStepStore`]/[`RunControlStore`]/[`TodoStore`]/[`VerifierRunStore`]/
-/// [`MetaStepStore`]): la SCRITTURA su Qdrant e' un side-effect, quindi
-/// `offload_to_rag` riceve `mode` e in [`ExecMode::Replay`] e' un NO-OP che
-/// ritorna `PortError` (il chiamante degrada a troncamento testa+coda non-RAG).
-/// Cosi' il gate vive nell'impl/porta (un solo punto), NON sparso nel nodo.
 #[async_trait]
 pub trait ContextOffload: Send + Sync {
     /// Scrive `payload` su RAG e ritorna un POINTER opaco (chiave per il recupero
-    /// successivo). Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna
-    /// `PortError` (il run shadow non scrive Qdrant). Su guasto infrastrutturale
-    /// (anche in Real) ritorna `PortError` (il chiamante degrada a troncamento).
+    /// successivo). Su guasto infrastrutturale ritorna `PortError` (il chiamante
+    /// degrada a troncamento).
     ///
     /// `kind` sceglie la collection RAG di destinazione (regola L: la porta resta
     /// agnostica dall'enum `SourceKind` concreto di mcp-core, mappato dall'impl):
@@ -936,7 +881,6 @@ pub trait ContextOffload: Send + Sync {
         kind: OffloadKind,
         session_id: Option<String>,
         project_id: Option<String>,
-        mode: ExecMode,
     ) -> Result<String, PortError>;
 }
 
@@ -969,20 +913,13 @@ pub enum OffloadKind {
 /// il nodo executor degrada lasciando la history invariata (a valle compress e
 /// token_brake fanno comunque il loro lavoro). Il guasto del summarizer NON deve
 /// MAI rompere il run.
-///
-/// Gata `Real` (PUNTO UNICO gate shadow, regola L; uniforme con
-/// [`ContextOffload`]/[`MetaStepStore`]): la chiamata LLM e' un side-effect che
-/// COSTA e che, in shadow, divergerebbe dal replay; quindi `summarize` riceve
-/// `mode` e in [`ExecMode::Replay`] e' un NO-OP che ritorna `PortError` (il nodo
-/// degrada = salta il summary, non riassume in replay).
 #[async_trait]
 pub trait SummaryStore: Send + Sync {
     /// Riassume `text` (il prefisso della history gia' serializzato dal punto
     /// unico puro) chiamando il modello economico, e ritorna il testo del
-    /// riassunto. Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna
-    /// `PortError` (il run shadow non riassume). Su guasto LLM (anche in Real)
-    /// ritorna `PortError` (il nodo degrada a history invariata). Best-effort.
-    async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError>;
+    /// riassunto. Su guasto LLM ritorna `PortError` (il nodo degrada a history
+    /// invariata). Best-effort.
+    async fn summarize(&self, text: String) -> Result<String, PortError>;
 }
 
 /// Embedding di testo per la compressione SEMANTICA del contesto (continuity-trim):
@@ -996,19 +933,14 @@ pub trait SummaryStore: Send + Sync {
 /// `apply_continuity_trim`). Questo trait espone SOLO l'I/O: il calcolo del vettore
 /// (embedder ONNX in-process, punto unico `NeuralCoreClient::embed_text_with_model`).
 ///
-/// Gata `Real` (PUNTO UNICO gate shadow, regola L; uniforme con
-/// [`ContextOffload`]/[`SummaryStore`]): l'embedding COSTA (CPU) e in shadow
-/// divergerebbe dal replay; quindi `embed` riceve `mode` e in [`ExecMode::Replay`]
-/// e' un NO-OP che ritorna `PortError` (il nodo degrada al troncamento posizionale
-/// odierno). Best-effort: su guasto infra (embedder down) ritorna `PortError` e il
-/// nodo degrada = niente continuity-trim, la history resta invariata.
+/// Best-effort: su guasto infra (embedder down) ritorna `PortError` e il nodo
+/// degrada = niente continuity-trim, la history resta invariata.
 #[async_trait]
 pub trait EmbeddingStore: Send + Sync {
     /// Calcola l'embedding di ciascun testo (batch), preservando l'ordine di input.
-    /// Gata `Real`: in [`ExecMode::Replay`] e' un no-op che ritorna `PortError`.
-    /// Su qualunque guasto (anche in Real) ritorna `PortError` (il nodo degrada al
-    /// troncamento posizionale). Best-effort. `texts` vuoto -> `Ok(vec![])`.
-    async fn embed(&self, texts: Vec<String>, mode: ExecMode) -> Result<Vec<Vec<f32>>, PortError>;
+    /// Su qualunque guasto ritorna `PortError` (il nodo degrada al troncamento
+    /// posizionale). Best-effort. `texts` vuoto -> `Ok(vec![])`.
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, PortError>;
 }
 
 /// Dati di INPUT dell'auto-escalation gia' risolti dall'impl (catena DB + gate
@@ -1150,18 +1082,14 @@ pub trait ModelUpscalePort: Send + Sync {
     ///
     /// Ritorna `Some((provider, model))` se un modello del tier soddisfa i vincoli,
     /// `None` se nessun candidato (-> il chiamante ANNULLA il cambio-tier, fail-safe
-    /// che mantiene il modello corrente). GATE `mode` opzione A (parita' replay):
-    /// in [`ExecMode::Replay`] ritorna `Ok(None)` (il rientro nell'executor rilegge
-    /// lo sticky checkpointato dal primario -> stesso modello per costruzione, nessun
-    /// I/O di risoluzione). Fail-open: errore di lettura -> `Ok(None)`, MAI un
-    /// `PortError` nel flusso normale.
+    /// che mantiene il modello corrente). Fail-open: errore di lettura -> `Ok(None)`,
+    /// MAI un `PortError` nel flusso normale.
     async fn select_model_for_tier(
         &self,
         tier: &str,
         min_context_window: i64,
         capability: Option<&str>,
         exclude_providers: &[String],
-        mode: ExecMode,
     ) -> Result<Option<(String, String)>, PortError>;
 }
 
@@ -1180,13 +1108,10 @@ pub trait EscalationPort: Send + Sync {
     /// intra-provider di `(provider, model)`, stato cooldown del provider e
     /// candidato cross-provider per `intent`. SOLA LETTURA.
     ///
-    /// GATE `mode` (governance telemetria-aware, opt-in): in [`ExecMode::Real`]
-    /// l'impl PUO' RIORDINARE la `chain` per PROBABILITA' di successo derivata da
-    /// telemetria strutturata (punto unico puro
+    /// GOVERNANCE telemetria-aware (opt-in): l'impl PUO' RIORDINARE la `chain` per
+    /// PROBABILITA' di successo derivata da telemetria strutturata (punto unico puro
     /// [`crate::decisions::governance::rank_candidates`]) quando il flag di
-    /// governance e' ON; in [`ExecMode::Replay`] il riordino e' SALTATO -> catena
-    /// nell'ordine DB (parita' shadow col baseline Python, come le altre decisioni
-    /// gata `mode`). Con flag OFF (default) il riordino non avviene neppure in Real:
+    /// governance e' ON. Con flag OFF (default) il riordino non avviene:
     /// comportamento bit-identico. La SELEZIONE resta il punto unico puro
     /// [`crate::decisions::escalation::pick_escalation_model`] (invariato).
     ///
@@ -1200,7 +1125,6 @@ pub trait EscalationPort: Send + Sync {
         intent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
-        mode: ExecMode,
     ) -> Result<EscalationInputs, PortError>;
 
     /// FAILOVER cross-provider su provider CADUTO (gateway 500 `PROVIDER_ERROR` /
@@ -1218,7 +1142,7 @@ pub trait EscalationPort: Send + Sync {
     /// `None` SOLO quando nessun provider sano resta (rete davvero esaurita ->
     /// chiusura `Error` onesta). FAIL-OPEN: un guasto di lettura -> `Ok(None)`
     /// (nessun failover, il chiamante chiude come oggi), MAI un `PortError` nel
-    /// flusso normale. SOLA LETTURA: nessun gate `mode`.
+    /// flusso normale. SOLA LETTURA.
     ///
     /// `cause` = causa TIPIZZATA del fallimento del provider corrente (regola M).
     /// L'impl la usa per il filtro finestra CAUSA-AWARE: solo per
@@ -1305,20 +1229,17 @@ pub trait ClarifyHistoryPort: Send + Sync {
 #[async_trait]
 pub trait StallBudgetPort: Send + Sync {
     /// Numero di consultazioni del meta-reasoner gia' registrate nella SESSIONE
-    /// (cross-run). SOLA LETTURA: nessun gate `mode`; consultata all'avvio del
-    /// gate di emissione. FAIL-OPEN: guasto DB -> `Ok(0)` (mai bloccare),
-    /// MAI un `PortError` nel flusso normale.
+    /// (cross-run). SOLA LETTURA; consultata all'avvio del gate di emissione.
+    /// FAIL-OPEN: guasto DB -> `Ok(0)` (mai bloccare), MAI un `PortError` nel
+    /// flusso normale.
     async fn consultations_in_session(&self, session_id: uuid::Uuid) -> Result<i64, PortError>;
 
     /// Registra UNA consultazione effettiva del meta-reasoner per la sessione
-    /// (append). Gata `Real` (punto unico gate shadow, regola L): NO-OP in
-    /// [`ExecMode::Replay`] (il run shadow non incrementa il budget del primario).
-    /// Best-effort: errore DB loggato, `Ok(())` ritornato (il `PortError` resta per
-    /// un contratto rotto, mai nel flusso normale).
+    /// (append). Best-effort: errore DB loggato, `Ok(())` ritornato (il `PortError`
+    /// resta per un contratto rotto, mai nel flusso normale).
     async fn record_consultation(
         &self,
         session_id: uuid::Uuid,
-        mode: ExecMode,
     ) -> Result<(), PortError>;
 }
 
@@ -1946,68 +1867,54 @@ pub enum ScaleMove {
 /// (recovery) e [`crate::decisions::orchestration_reason`] (orchestrazione),
 /// golden-abili in isolamento.
 ///
-/// A differenza delle porte SOLA-LETTURA, entrambi i metodi consultano l'LLM e
-/// PRENDONO `mode`:
-/// - `Real` -> consulta l'LLM; kill-switch OFF / purpose `NotFound` -> `Ok(None)`
-///   (degrado legittimo alla gerarchia/euristica fissa, opt-in); DB-down /
-///   provider indisponibile -> `Err(PortError::ProviderUnavailable)` (MAI
-///   `Ok(None)` mascherante, regola G).
-/// - `Replay` -> NON consulta l'LLM: la mossa e' gia' stata rigiocata dal
-///   `ReplayLlmGateway` e riletta dal nodo dalla cache di stato; se manca ->
-///   `Err(PortError::ReplayMissing)` (mai `Ok(None)` silenzioso che divergerebbe
-///   dallo shadow).
+/// A differenza delle porte SOLA-LETTURA, questi metodi consultano l'LLM:
+/// kill-switch OFF / purpose `NotFound` -> `Ok(None)` (degrado legittimo alla
+/// gerarchia/euristica fissa, opt-in); DB-down / provider indisponibile ->
+/// `Err(PortError::ProviderUnavailable)` (MAI `Ok(None)` mascherante, regola G).
 #[async_trait]
 pub trait MetaReasonerPort: Send + Sync {
-    /// Consulta il meta-reasoner per il contesto di stallo `ctx` secondo `mode`.
+    /// Consulta il meta-reasoner per il contesto di stallo `ctx`.
     async fn recover(
         &self,
         ctx: StallContext,
-        mode: ExecMode,
     ) -> Result<Option<RecoveryMove>, PortError>;
 
     /// Consulta il meta-reasoner per la decisione di ORCHESTRAZIONE (plan-phase /
-    /// decompose / delega) sul contesto `ctx` secondo `mode`. Stesso contratto
-    /// `mode`/degrado di [`MetaReasonerPort::recover`] ma su tipi DISGIUNTI:
+    /// decompose / delega) sul contesto `ctx`. Stesso contratto/degrado di
+    /// [`MetaReasonerPort::recover`] ma su tipi DISGIUNTI:
     /// [`OrchestrationContext`] -> [`OrchestrationMove`]. `Ok(None)` = degrado
     /// legittimo all'euristica esistente (`is_eligible`/`should_parallelize`).
     async fn orchestrate(
         &self,
         ctx: OrchestrationContext,
-        mode: ExecMode,
     ) -> Result<Option<OrchestrationMove>, PortError>;
 
     /// Consulta lo SCALE-CONTROLLER per la scala-tier del modello (up/down
-    /// PRE-CRISI) sul contesto `ctx` secondo `mode`. TERZO scope disgiunto (regola
-    /// L): [`ScaleContext`] -> [`ScaleMove`], STESSO contratto `mode`/degrado di
+    /// PRE-CRISI) sul contesto `ctx`. TERZO scope disgiunto (regola L):
+    /// [`ScaleContext`] -> [`ScaleMove`], STESSO contratto/degrado di
     /// [`MetaReasonerPort::recover`]/[`MetaReasonerPort::orchestrate`].
     ///
-    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled` non truthy
-    ///   / purpose `scale_assess` NotFound -> `Ok(None)` = degrado legittimo; DB-down
-    ///   / provider indisponibile -> `Err(PortError::ProviderUnavailable)`, MAI
-    ///   `Ok(None)` mascherante — regola G).
-    /// - `Replay` -> `Ok(None)` IMMEDIATO senza I/O (opzione A): la mossa e' gia'
-    ///   rigiocata/riletta dallo stato checkpointato; il rientro usa sticky.
+    /// Consulta l'LLM (kill-switch `agent.scale.enabled` non truthy / purpose
+    /// `scale_assess` NotFound -> `Ok(None)` = degrado legittimo; DB-down /
+    /// provider indisponibile -> `Err(PortError::ProviderUnavailable)`, MAI
+    /// `Ok(None)` mascherante — regola G).
     ///
     /// Lo consuma il nodo `ScaleControl`, raggiunto quando l'executor emette
     /// `ScaleReason`; su `Ok(None)` il nodo non persiste alcuna mossa.
     async fn assess_scale(
         &self,
         ctx: ScaleContext,
-        mode: ExecMode,
     ) -> Result<Option<ScaleMove>, PortError>;
 
     /// Consulta il supervisore worker (`automation.supervisor_monitoring`) sul
-    /// contesto `ctx` secondo `mode`. QUARTO scope disgiunto (regola L):
+    /// contesto `ctx`. QUARTO scope disgiunto (regola L):
     /// [`SupervisorContext`] -> [`crate::decisions::supervisor::SupervisorDecision`].
     ///
-    /// - `Real` -> consulta l'LLM (purpose `supervisor_monitoring`, regola G).
-    ///   Guasto infrastrutturale -> `Err(PortError::ProviderUnavailable)`.
-    /// - `Replay` -> `Ok(Some(Continue))` senza I/O (parita' shadow: il Python
-    ///   non aveva supervisore nativo).
+    /// Consulta l'LLM (purpose `supervisor_monitoring`, regola G). Guasto
+    /// infrastrutturale -> `Err(PortError::ProviderUnavailable)`.
     async fn supervise(
         &self,
         ctx: SupervisorContext,
-        mode: ExecMode,
     ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError>;
 }
 

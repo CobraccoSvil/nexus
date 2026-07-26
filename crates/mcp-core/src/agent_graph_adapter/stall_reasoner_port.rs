@@ -4,38 +4,22 @@
 //! recovery-da-stallo (piano meta-reasoner, blocco #7) — copiando 1:1 il
 //! PARADIGMA ADR 0036 di [`crate::verify_profile::infer_call`] (regola L: stesso
 //! flusso, non re-inventato):
-//!   1. GATE REPLAY: in [`ExecMode::Replay`] ritorna `Ok(None)` SENZA chiamare
-//!      l'LLM (vedi nota sotto).
-//!   2. kill-switch `agent.stall_recovery.enabled` (opt-in, default OFF, regola G);
-//!   3. risoluzione del modello via
+//!   1. kill-switch `agent.stall_recovery.enabled` (opt-in, default OFF, regola G);
+//!   2. risoluzione del modello via
 //!      [`crate::internal_routing::resolve_purpose_model_db`] (purpose
 //!      `stall_recovery`, regola G — nessun nome modello hardcoded qui);
-//!   4. caricamento del template `system.stall_recovery.decide` via
+//!   3. caricamento del template `system.stall_recovery.decide` via
 //!      [`crate::prompt_templates::TemplateCache`] (punto unico loader, regola L);
-//!   5. chiamata LLM one-shot con timeout clamp + `max_tokens` basso, passando
+//!   4. chiamata LLM one-shot con timeout clamp + `max_tokens` basso, passando
 //!      SOLO lo [`StallContext`] serializzato in JSON (non l'intera history:
 //!      budget/costo);
-//!   6. parse con [`nexus_types::llm_json::extract_json_block`] +
+//!   5. parse con [`nexus_types::llm_json::extract_json_block`] +
 //!      validazione col PUNTO UNICO
 //!      [`nexus_agent_graph::decisions::meta_reason::validate_move`] (enum CHIUSO
 //!      `RecoveryMove`, blocker ADR 0034; malformato -> `Fallback`).
 //!
-//! ## GATE REPLAY (critico, dalla scoperta verificata sul codice)
-//!
-//! [`crate::agent_graph_adapter::llm_gateway::ReplayLlmGateway`] rigioca SOLO le
-//! completion con `purpose=="executor"`; ogni altra completion (planner,
-//! reflection, e questo `stall_recovery`) ottiene una risposta ausiliaria neutra
-//! VUOTA. Quindi consultare l'LLM in Replay per `stall_recovery` non produrrebbe
-//! nulla di utile. Il modello corretto di replay del recovery e':
-//!   - **Real** (primario): consulta l'LLM, la mossa e' persistita in
-//!     `extra["stall_move::…"]` (checkpoint) dal nodo `StallRecovery`.
-//!   - **Resume Rust->Rust**: il checkpoint contiene gia' la mossa -> il nodo fa
-//!     cache-hit dall'`extra` (0 LLM). Deterministico.
-//!   - **Shadow Rust<->Python**: il Python non ha il reasoner; qui in Replay la
-//!     porta ritorna `Ok(None)` -> il nodo degrada a `Fallback` -> gerarchia fissa
-//!     `progress_controller::decide` -> **matcha il Python** (parita' shadow).
-//! Per questo `recover` gatta su `mode`: `Replay` -> `Ok(None)` immediato, SENZA
-//! toccare DB/gateway.
+//! La mossa validata e' persistita in `extra["stall_move::…"]` (checkpoint) dal
+//! nodo `StallRecovery`: un resume da checkpoint fa cache-hit dall'`extra` (0 LLM).
 //!
 //! ## NotFound vs DB-down (regola G — mai un OFF mascherante)
 //!
@@ -65,16 +49,14 @@
 //! implementato in [`PgMetaReasonerPort::consult_orch_llm`] sul FLUSSO UNICO
 //! condiviso [`PgMetaReasonerPort::consult_meta_llm`] (regola L: STESSO flusso,
 //! parametrizzato dalla [`MetaConsultSpec`] dello scope, non re-inventato):
-//!   1. GATE REPLAY opzione A: in [`ExecMode::Replay`] -> `Ok(None)` immediato,
-//!      senza I/O (il `ReplayLlmGateway` rigioca solo `purpose=="executor"`);
-//!   2. kill-switch `agent.orchestration.enabled` (chiave `settings`, regola G):
+//!   1. kill-switch `agent.orchestration.enabled` (chiave `settings`, regola G):
 //!      non truthy -> `Ok(None)` -> il gate ricade su
 //!      `is_eligible`/`should_parallelize`;
-//!   3. purpose `orchestration_decide` via `resolve_purpose_model_db` (regola G,
+//!   2. purpose `orchestration_decide` via `resolve_purpose_model_db` (regola G,
 //!      STESSA distinzione NotFound/NoCapableModel/MatrixUnavailable di recover);
-//!   4. template `system.orchestration.decide` via `TemplateCache`;
-//!   5. chiamata LLM one-shot passando SOLO l'[`OrchestrationContext`] serializzato;
-//!   6. parse con `extract_json_block` + validazione col PUNTO UNICO
+//!   3. template `system.orchestration.decide` via `TemplateCache`;
+//!   4. chiamata LLM one-shot passando SOLO l'[`OrchestrationContext`] serializzato;
+//!   5. parse con `extract_json_block` + validazione col PUNTO UNICO
 //!      [`nexus_agent_graph::decisions::orchestration_reason::validate_orch_move`]
 //!      (segnali strutturati dal ctx: con `isolation_available=false`
 //!      `ParallelIsolated` degrada a `Sequential`, `delegation_forbidden` blocca
@@ -88,7 +70,7 @@ use nexus_agent_graph::decisions::meta_reason::validate_move;
 use nexus_agent_graph::decisions::orchestration_reason::validate_orch_move;
 use nexus_agent_graph::decisions::scale_reason::validate_scale_move;
 use nexus_agent_graph::runtime::ports::{
-    ExecMode, MetaReasonerPort, OrchestrationContext, OrchestrationMove, PortError, RecoveryMove,
+    MetaReasonerPort, OrchestrationContext, OrchestrationMove, PortError, RecoveryMove,
     ScaleContext, ScaleMove, StallContext, SupervisorContext,
 };
 use nexus_agent_graph::decisions::supervisor::{validate_supervisor_response, SupervisorDecision};
@@ -718,74 +700,43 @@ impl PgMetaReasonerPort {
 
 #[async_trait]
 impl MetaReasonerPort for PgMetaReasonerPort {
-    /// Consulta il meta-reasoner di RECOVERY secondo `mode`.
-    ///
-    /// - `Replay` -> `Ok(None)` IMMEDIATO, senza toccare DB/gateway: il
-    ///   `ReplayLlmGateway` rigioca solo `purpose=="executor"`, quindi consultare
-    ///   l'LLM qui darebbe vuoto. Il nodo usa la cache-in-extra (resume) o degrada
-    ///   a `Fallback` -> euristica (shadow, parita' col Python che non ha il
-    ///   reasoner).
-    /// - `Real` -> consulta l'LLM (kill-switch, purpose, template, parse+validate).
+    /// Consulta il meta-reasoner di RECOVERY: consulta l'LLM (kill-switch, purpose,
+    /// template, parse+validate). La mossa e' persistita in `extra` dal nodo
+    /// `StallRecovery`, quindi un resume da checkpoint non riconsulta l'LLM.
     async fn recover(
         &self,
         ctx: StallContext,
-        mode: ExecMode,
     ) -> Result<Option<RecoveryMove>, PortError> {
-        if mode != ExecMode::Real {
-            // GATE REPLAY (vedi doc-modulo): niente LLM in Replay.
-            return Ok(None);
-        }
         self.consult_llm(&ctx).await
     }
 
     /// Consulta il meta-reasoner di ORCHESTRAZIONE (plan-phase / decompose /
-    /// delega) secondo `mode`. GEMELLO di [`Self::recover`] su scope disgiunto
-    /// (regola L: STESSO flusso).
-    ///
-    /// - `Replay` -> `Ok(None)` IMMEDIATO, senza toccare DB/gateway (GATE REPLAY,
-    ///   opzione A): il `ReplayLlmGateway` rigioca solo `purpose=="executor"`,
-    ///   quindi consultare l'LLM qui darebbe vuoto. Il gate degrada all'euristica
-    ///   esistente (`is_eligible`/`should_parallelize`).
-    /// - `Real` -> consulta l'LLM (kill-switch `agent.orchestration.enabled`,
-    ///   purpose `orchestration_decide`, template `system.orchestration.decide`,
-    ///   parse + `validate_orch_move` sui segnali strutturati del ctx).
+    /// delega). GEMELLO di [`Self::recover`] su scope disgiunto (regola L: STESSO
+    /// flusso). Consulta l'LLM (kill-switch `agent.orchestration.enabled`, purpose
+    /// `orchestration_decide`, template `system.orchestration.decide`, parse +
+    /// `validate_orch_move` sui segnali strutturati del ctx).
     ///
     /// Kill-switch non truthy -> `Ok(None)` -> il gate ricade su `is_eligible`.
     async fn orchestrate(
         &self,
         ctx: OrchestrationContext,
-        mode: ExecMode,
     ) -> Result<Option<OrchestrationMove>, PortError> {
-        if mode != ExecMode::Real {
-            // GATE REPLAY (opzione A, vedi doc-metodo): niente LLM in Replay.
-            return Ok(None);
-        }
         self.consult_orch_llm(&ctx).await
     }
 
-    /// Consulta lo SCALE-CONTROLLER (scala-tier up/down) secondo `mode`. GEMELLO di
+    /// Consulta lo SCALE-CONTROLLER (scala-tier up/down). GEMELLO di
     /// [`Self::recover`]/[`Self::orchestrate`] su scope disgiunto (regola L: STESSO
-    /// flusso).
-    ///
-    /// - `Replay` -> `Ok(None)` IMMEDIATO senza I/O (GATE REPLAY opzione A): la
-    ///   scala-move e' persistita in `extra`/`sticky` dal primario; il rientro
-    ///   rilegge sticky -> stesso modello per costruzione.
-    /// - `Real` -> consulta l'LLM (kill-switch `agent.scale.enabled`, purpose
-    ///   `scale_assess`, template `system.scale.assess`, parse +
-    ///   `validate_scale_move`; i 5 gate deterministici dell'anti-oscillazione
-    ///   sono a valle, nel nodo `ScaleControl`).
+    /// flusso). Consulta l'LLM (kill-switch `agent.scale.enabled`, purpose
+    /// `scale_assess`, template `system.scale.assess`, parse + `validate_scale_move`;
+    /// i 5 gate deterministici dell'anti-oscillazione sono a valle, nel nodo
+    /// `ScaleControl`).
     ///
     /// Il chiamante e' il nodo `ScaleControl`; con kill-switch non truthy la porta
     /// ritorna `Ok(None)` e il nodo rientra senza mossa.
     async fn assess_scale(
         &self,
         ctx: ScaleContext,
-        mode: ExecMode,
     ) -> Result<Option<ScaleMove>, PortError> {
-        if mode != ExecMode::Real {
-            // GATE REPLAY (opzione A, vedi doc-metodo): niente LLM in Replay.
-            return Ok(None);
-        }
         self.consult_scale_llm(&ctx).await
     }
 
@@ -793,11 +744,7 @@ impl MetaReasonerPort for PgMetaReasonerPort {
     async fn supervise(
         &self,
         ctx: SupervisorContext,
-        mode: ExecMode,
     ) -> Result<Option<SupervisorDecision>, PortError> {
-        if mode != ExecMode::Real {
-            return Ok(Some(SupervisorDecision::Continue));
-        }
         self.consult_supervisor_llm(&ctx).await
     }
 }
@@ -836,34 +783,6 @@ mod tests {
         }
     }
 
-    /// In `Replay` la porta ritorna `Ok(None)` SENZA toccare DB/gateway (il gate
-    /// scatta prima di qualunque I/O: il pool lazy non connesso non e' mai usato).
-    #[tokio::test]
-    async fn replay_ritorna_none_senza_llm() {
-        let res = port().recover(stall_ctx(), ExecMode::Replay).await;
-        assert_eq!(
-            res.expect("ok"),
-            None,
-            "Replay -> Ok(None) senza consultare l'LLM"
-        );
-    }
-
-    /// Il gate `Replay` precede ogni accesso al DB: anche con un pool non
-    /// connesso non c'e' errore (nessuna query). Robustezza del gate.
-    #[tokio::test]
-    async fn replay_non_dipende_dal_db() {
-        // Chiamata ripetuta: deterministica, nessun panico, nessuna connessione.
-        for _ in 0..3 {
-            assert_eq!(
-                port()
-                    .recover(stall_ctx(), ExecMode::Replay)
-                    .await
-                    .expect("ok"),
-                None
-            );
-        }
-    }
-
     /// Con risposta malformata `validate_move` degrada a `Fallback` (il nodo lo
     /// tratta come "usa euristica"). Verifica del punto unico di validazione
     /// riusato dall'impl (regola L): il parse+validate NON re-implementa la logica.
@@ -878,34 +797,6 @@ mod tests {
     }
 
     // ── orchestrate (#11c) ────────────────────────────────────────────────────
-
-    /// In `Replay` la porta di orchestrazione ritorna `Ok(None)` SENZA toccare
-    /// DB/gateway (GATE REPLAY opzione A: gata prima di qualunque I/O, il pool
-    /// lazy non connesso non e' mai usato).
-    #[tokio::test]
-    async fn orchestrate_replay_ritorna_none_senza_llm() {
-        let res = port().orchestrate(orch_ctx(), ExecMode::Replay).await;
-        assert_eq!(
-            res.expect("ok"),
-            None,
-            "Replay -> Ok(None) senza consultare l'LLM"
-        );
-    }
-
-    /// Il gate `Replay` dell'orchestrazione precede ogni accesso al DB: anche con
-    /// un pool non connesso non c'e' errore (nessuna query). Robustezza del gate.
-    #[tokio::test]
-    async fn orchestrate_replay_non_dipende_dal_db() {
-        for _ in 0..3 {
-            assert_eq!(
-                port()
-                    .orchestrate(orch_ctx(), ExecMode::Replay)
-                    .await
-                    .expect("ok"),
-                None
-            );
-        }
-    }
 
     /// Con risposta malformata `validate_orch_move` degrada a `Fallback` (il gate
     /// lo tratta come "usa euristica"). Verifica del punto unico di validazione
@@ -947,34 +838,6 @@ mod tests {
             iteration_cap: 20,
             requires_tool_use: true,
             ..Default::default()
-        }
-    }
-
-    /// In `Replay` la porta di scala ritorna `Ok(None)` SENZA toccare DB/gateway
-    /// (GATE REPLAY opzione A: gata prima di qualunque I/O, il pool lazy non
-    /// connesso non e' mai usato).
-    #[tokio::test]
-    async fn assess_scale_replay_ritorna_none_senza_llm() {
-        let res = port().assess_scale(scale_ctx(), ExecMode::Replay).await;
-        assert_eq!(
-            res.expect("ok"),
-            None,
-            "Replay -> Ok(None) senza consultare l'LLM"
-        );
-    }
-
-    /// Il gate `Replay` della scala precede ogni accesso al DB: anche con un pool
-    /// non connesso non c'e' errore (nessuna query). Robustezza del gate.
-    #[tokio::test]
-    async fn assess_scale_replay_non_dipende_dal_db() {
-        for _ in 0..3 {
-            assert_eq!(
-                port()
-                    .assess_scale(scale_ctx(), ExecMode::Replay)
-                    .await
-                    .expect("ok"),
-                None
-            );
         }
     }
 

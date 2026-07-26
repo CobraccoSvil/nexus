@@ -1390,7 +1390,7 @@ fn compose_todo_isolation_recap(
 /// finalize, NESSUN ramo `if engine` nel persistente.
 ///
 /// Gli step sono RICOSTRUITI da `agent_steps` (il grafo Rust li ha gia' persistiti
-/// per-superstep via `PgAgentStepStore`, `ExecMode::Real`): il chiamante marca
+/// per-superstep via `PgAgentStepStore`): il chiamante marca
 /// `native_steps_persisted=true` cosi' il finalizzatore NON li re-inserisce
 /// (eviterebbe doppioni; gli step_index del grafo sono `iteration*1000+idx`, non
 /// idempotenti con quelli del path Python). Il worklog usa comunque questi step.
@@ -3008,12 +3008,10 @@ pub(crate) async fn spawn_agent_run(
     // Intent risolto dalla risposta di disambiguazione, propagato al brain
     // (None per i run normali: il router_node classifica come sempre).
     let intent_hint_for_brain: Option<String> = resolved_intent_hint.clone();
-    // Messaggio passato al classifier (con contesto recente) catturato per i rami
-    // nativi: serve a ricostruire i dati COMPLETI del classifier del turno
-    // (Tappa 1b punto B) via `resolve_classifier_fields`. Usato nei rami
-    // Engine::Rust (primario instradato globalmente) ed Engine::Shadow
-    // (attivabile solo per-sessione).
-    let classifier_input_for_shadow: String = classifier_input.clone();
+    // Messaggio passato al classifier (con contesto recente) catturato per il
+    // motore nativo: serve a ricostruire i dati COMPLETI del classifier del turno
+    // (Tappa 1b punto B) via `resolve_classifier_fields`.
+    let classifier_input_for_native: String = classifier_input.clone();
     let pre_run_advisory_synthesis_clone = pre_run_advisory_synthesis.clone();
     let pre_run_advisory_source_clone = pre_run_advisory_source;
     // Barriera advisory (overlap, mig 0606): il receiver entra nel ctx del grafo
@@ -3099,11 +3097,11 @@ pub(crate) async fn spawn_agent_run(
                 // run (esito disonesto, doppio costo). Su Err si finalizza il run
                 // come FAILED diagnosticato (`native_engine_failure_result`).
                 // ── action_oriented ────────────────────────────────────────────────
-                // Il primario nativo (RunRole::Primary) deve derivare action_oriented/
-                // report_only ESATTAMENTE come il primario Python (che riclassifica nel
-                // router_node col SUO classifier). Riusiamo il PUNTO UNICO condiviso
-                // con lo shadow (`resolve_classifier_fields`, regola L): classifica il
-                // turno col porting 1:1 + legge la soglia DB. `build_initial_state`
+                // Il primario nativo deve derivare action_oriented/report_only
+                // ESATTAMENTE come il primario Python (che riclassifica nel
+                // router_node col SUO classifier). Riusiamo il PUNTO UNICO
+                // `resolve_classifier_fields` (regola L): classifica il turno col
+                // porting 1:1 + legge la soglia DB. `build_initial_state`
                 // ramo Primary deriva poi i flag fedeli (read->false: niente G1 spurio;
                 // azione->true: tool). Senza gateway o su fallback del classifier i
                 // campi restano neutri e build_initial_state lascia None (RouterNode
@@ -3112,7 +3110,7 @@ pub(crate) async fn spawn_agent_run(
                 let primary_classifier = crate::native_engine::resolve_classifier_fields(
                     &db_clone,
                     &state_for_finalize.orchestrator.nexus_gateway,
-                    &classifier_input_for_shadow,
+                    &classifier_input_for_native,
                 )
                 .await;
                 let native_input = crate::native_engine::NativeRunInput {
@@ -3128,8 +3126,8 @@ pub(crate) async fn spawn_agent_run(
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
                     intent_hint: intent_hint_for_brain.clone(),
-                    // Dati del classifier del turno (helper condiviso con lo shadow):
-                    // il PRIMARIO RUST deriva action_oriented/report_only fedeli.
+                    // Dati del classifier del turno: il PRIMARIO RUST deriva
+                    // action_oriented/report_only fedeli.
                     requires_tools: primary_classifier.requires_tools,
                     agentic_score: primary_classifier.agentic_score,
                     authorizes_changes: primary_classifier.authorizes_changes,
@@ -4710,9 +4708,8 @@ pub(crate) async fn resume_fanin(
 }
 
 /// Assembla le `NativeDeps` (ToolRunner in-process + client gateway) da
-/// `AppState`. PUNTO UNICO (regola L): sia il run nativo primario
-/// (`run_via_native`) sia lo shadow (`run_shadow_for_state`) lo riusano, niente
-/// duplicazione del cablaggio infra.
+/// `AppState`. PUNTO UNICO (regola L): il cablaggio infra del run nativo vive
+/// in un solo posto.
 /// Assemblaggio delle `ToolRunnerDeps` da `AppState` (PUNTO UNICO, regola L): stessa
 /// slice sottile usata dal server gRPC (`main.rs`) per l'esecuzione IN-PROCESS
 /// (mcp-core E' il ToolRunner). Riusato da `build_native_deps` e dal pre-step del
@@ -5920,21 +5917,6 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
         tool_runner_deps,
         gateway,
     }
-}
-
-/// Avvio del run SHADOW (Engine::Shadow): ri-esegue il grafo Rust in modalita'
-/// shadow (read-only) confrontando lo stato finale col primario gia'
-/// concluso (`primary_run_id`). Riusa il PUNTO UNICO `build_native_deps` +
-/// `native_engine::run_shadow` (regola L). Non prodotto dal routing globale (che
-/// e' rust); attivabile solo per-sessione con `engine='shadow'`. Lo shadow non
-/// impatta MAI il primario: su errore il chiamante logga WARN.
-pub(crate) async fn run_shadow_for_state(
-    state: &AppState,
-    input: &crate::native_engine::NativeRunInput,
-    primary_run_id: Uuid,
-) -> anyhow::Result<()> {
-    let deps = build_native_deps(state).await;
-    crate::native_engine::run_shadow(&deps, input, primary_run_id).await
 }
 
 #[cfg(test)]

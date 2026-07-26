@@ -96,19 +96,8 @@
 //! esaurita / provider in cooldown senza cross / `auto_escalations >= 3`) si chiude
 //! secco con `loop_detected` (ramo MINORITARIO `not tried_escalation`).
 //! [`exploration_counter_update`]; meta_step `executor_call` (EventSink +
-//! MetaStepStore gata Real); delta con iterations+1, pending, stop_reason, messages,
+//! MetaStepStore); delta con iterations+1, pending, stop_reason, messages,
 //! provider_used/model_used, recent_tool_signatures, auto_escalations, ecc.
-//!
-//! ## SHADOW (`ExecMode::Replay`)
-//!
-//! Scritture gated shadow no-op in Replay: heartbeat/set_effective_model
-//! (RunControlStore), persist meta_step (MetaStepStore). La chiamata LLM in shadow
-//! (sia il turno principale sia la RI-chiamata dell'auto-escalation del
-//! signature-loop) segue il pattern del crate: oggi [`LlmGateway`] NON ha
-//! `ExecMode` (come per reflection/planner/clarify) — la pendenza e' documentata,
-//! il gateway concreto la gestira' (un run shadow non emette eventi: `EventSink`
-//! no-op nel ctx shadow). La porta [`EscalationPort`] e' SOLA LETTURA (catena +
-//! cooldown + cross-provider): nessun gate `mode`.
 //!
 //! ## Cosa NON porta — DUE classi (etichettatura onesta, regola H)
 //!
@@ -791,7 +780,7 @@ pub struct ExecutorNode {
     /// Controllo run condiviso (superseded + heartbeat + modello effettivo).
     /// PUNTO UNICO (regola L) con il tool_dispatch.
     run_control: Arc<dyn RunControlStore>,
-    /// Persistenza meta-step (`executor_call` heartbeat), gata Real.
+    /// Persistenza meta-step (`executor_call` heartbeat).
     meta_steps: Arc<dyn MetaStepStore>,
     /// Persistenza step incrementale (non usata nel turno LLM: gli step tool si
     /// persistono nel dispatch; tenuto per simmetria/uso futuro). Gata Real.
@@ -972,10 +961,10 @@ impl ExecutorNode {
     }
 
     /// Costruisce la mappa `content -> pointer` per il compress-offload: offloada su
-    /// RAG (best-effort, gata dal flag `compress_offload_enabled` + porta + gate
-    /// Real) i tool_result che [`ctxr::compress_old_tool_results`] comprimera'
+    /// RAG (best-effort, gata dal flag `compress_offload_enabled` + porta) i
+    /// tool_result che [`ctxr::compress_old_tool_results`] comprimera'
     /// (SELEZIONE pura [`ctxr::contents_eligible_for_offload`], regola L). Mappa
-    /// VUOTA se disabilitato, senza porta, o su guasto/Replay -> il marker degrada a
+    /// VUOTA se disabilitato, senza porta, o su guasto -> il marker degrada a
     /// [`ctxr::degraded_marker`] (bit-identico a oggi).
     async fn build_compress_offload_map(
         &self,
@@ -983,7 +972,6 @@ impl ExecutorNode {
         cutoff_index: usize,
         threshold: usize,
         run_id: &str,
-        mode: crate::runtime::ports::ExecMode,
     ) -> std::collections::HashMap<String, String> {
         let mut map = std::collections::HashMap::new();
         if !self.cfg.compress_offload_enabled {
@@ -1007,7 +995,6 @@ impl ExecutorNode {
                     OffloadKind::ToolResult,
                     session.clone(),
                     None,
-                    mode,
                 )
                 .await
             {
@@ -1167,7 +1154,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
 
     async fn run(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
         let run_id = state.thread_id.clone().unwrap_or_default();
-        let mode = ctx.exec_mode();
         let iters_in = state.iterations.unwrap_or(0);
 
         // ── (1)+(2) Gate di TESTA (superseded -> declared-done>=3) ────────────
@@ -1217,7 +1203,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // la gerarchia fissa (rete di sicurezza). A flag OFF nessun detector emette
         // StallReason, quindi StallResolved non arriva MAI qui -> bit-identico.
         if state.stop_reason == Some(StopReason::StallResolved) {
-            if let Some(delta) = self.consume_recovery_move(state, iters_in, ctx, mode).await {
+            if let Some(delta) = self.consume_recovery_move(state, iters_in, ctx).await {
                 return Ok(delta);
             }
         }
@@ -1230,7 +1216,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
         // prosegue il turno normale. A flag OFF nessun detector emette ScaleReason,
         // quindi ScaleResolved non arriva MAI qui -> bit-identico.
         if state.stop_reason == Some(StopReason::ScaleResolved) {
-            if let Some(delta) = self.consume_scale_move(state, iters_in, ctx, mode).await {
+            if let Some(delta) = self.consume_scale_move(state, iters_in, ctx).await {
                 return Ok(delta);
             }
         }
@@ -1263,7 +1249,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for ExecutorNode {
                     iters_in,
                     SwitchReason::FinalGateNonconvergence,
                     ctx,
-                    mode,
                     false,
                 )
                 .await
@@ -1351,7 +1336,6 @@ oppure riprova piu' tardi."
                 );
                 self.emit_phase(
                     ctx,
-                    mode,
                     "outcome_declared",
                     format!("Esito dichiarato: {outcome_kind}"),
                     json!({"outcome": outcome_kind}),
@@ -1510,7 +1494,7 @@ oppure riprova piu' tardi."
             // sotto (bit-identico al pre-fix). Bound: auto_escalations + hard-cap
             // token/costo.
             if let Some(delta) = self
-                .maybe_escalate_nonconvergence(state, iters_in, SwitchReason::IterationCap, ctx, mode, true)
+                .maybe_escalate_nonconvergence(state, iters_in, SwitchReason::IterationCap, ctx, true)
                 .await
             {
                 return Ok(delta);
@@ -1638,7 +1622,7 @@ modo piu' specifico, oppure riprova con un modello piu' economico.",
                 // `None` (non e' un ruolo / grazia gia' concessa) -> si prosegue al
                 // ramo di chiusura sotto, bit-identico.
                 if let Some(delta) = self
-                    .maybe_time_grace_delta(state, iters_in, ctx, mode, elapsed_s)
+                    .maybe_time_grace_delta(state, iters_in, ctx, elapsed_s)
                     .await
                 {
                     return Ok(delta);
@@ -1695,7 +1679,7 @@ piu' specifico, oppure alza agent.run_time_budget_s se il task richiede piu' tem
             // -> backstop sotto. Chiude il cerchio: la non-convergenza fa SALIRE il
             // modello invece di chiudere secco.
             if let Some(delta) = self
-                .maybe_escalate_nonconvergence(state, iters_in, SwitchReason::BudgetToken, ctx, mode, false)
+                .maybe_escalate_nonconvergence(state, iters_in, SwitchReason::BudgetToken, ctx, false)
                 .await
             {
                 return Ok(delta);
@@ -1755,7 +1739,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             // CAMBIARE PROVIDER (un provider fermo non deve affossare il run se un altro
             // puo' procedere). `None` -> chiusura backstop sotto (bit-identico, flag OFF).
             if let Some(delta) = self
-                .maybe_switch_provider_on_no_progress(state, iters_in, ctx, mode, text_only_streak)
+                .maybe_switch_provider_on_no_progress(state, iters_in, ctx, text_only_streak)
                 .await
             {
                 return Ok(delta);
@@ -1766,7 +1750,7 @@ piu' specifico, oppure riprova con un modello piu' capace.",
             // meta-reasoner NON e' intervenuto (budget stall esaurito) e si andrebbe
             // dritti a close_runaway: e' il caso reale fe4dc12c (functional_analyst
             // deepseek, it=60). `None` (non-figura / grazia gia' concessa) -> close sotto.
-            if let Some(delta) = self.maybe_advisory_grace_delta(state, iters_in, ctx, mode).await {
+            if let Some(delta) = self.maybe_advisory_grace_delta(state, iters_in, ctx).await {
                 return Ok(delta);
             }
             let stall_text = format!(
@@ -1928,7 +1912,6 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
                         state.user_intent.as_deref(),
                         g1_cur_provider.as_deref(),
                         g1_cur_model.as_deref(),
-                        ctx.exec_mode(),
                     )
                     .await
                     .unwrap_or_default();
@@ -1962,7 +1945,6 @@ Riformula la richiesta, oppure riprova con un modello piu' capace di usare i too
                 );
                 self.emit_phase(
                     ctx,
-                    mode,
                     "escalation",
                     format!(
                         "Passo a {}/{} (il modello descrive senza agire)",
@@ -2013,7 +1995,7 @@ descrivere, ESEGUI subito il prossimo step concreto con un tool call.",
             // forzato — l'esito del run diventa la dichiarazione strutturata
             // del modello invece del testo sintetico qui sotto.
             if let Some(delta) = self
-                .forced_declaration_delta(state, iters_in, ctx, mode)
+                .forced_declaration_delta(state, iters_in, ctx)
                 .await
             {
                 return Ok(delta);
@@ -2032,7 +2014,6 @@ la richiesta in modo piu' specifico.",
             );
             self.emit_phase(
                 ctx,
-                mode,
                 "loop_break",
                 "Interrompo: il modello non agisce dopo i solleciti".to_string(),
                 json!({"reason": "g1_cap", "reroute": g1_reroute_count}),
@@ -2201,7 +2182,6 @@ la richiesta in modo piu' specifico.",
                         state.user_intent.as_deref(),
                         expl_cur_provider.as_deref(),
                         expl_cur_model.as_deref(),
-                        ctx.exec_mode(),
                     )
                     .await
                     .unwrap_or_default();
@@ -2268,7 +2248,6 @@ la richiesta in modo piu' specifico.",
                     );
                     self.emit_phase(
                         ctx,
-                        mode,
                         "escalation",
                         format!(
                             "Passo a {}/{} (esplorazione senza risultato)",
@@ -2520,7 +2499,6 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                             state.user_intent.as_deref(),
                             ra_cur_provider.as_deref(),
                             ra_cur_model.as_deref(),
-                            ctx.exec_mode(),
                         )
                         .await
                         .unwrap_or_default();
@@ -2609,7 +2587,6 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         }
                         self.emit_phase(
                             ctx,
-                            mode,
                             "strategy_shift",
                             format!("Cambio strategia su '{label}'"),
                             json!({"label": label, "count": ra_count}),
@@ -2635,7 +2612,7 @@ diverso, comando alternativo, lettura della doc, oppure chiedi all'utente)."
                         // gia' al final_gate (esito oggettivo): restano invariati.
                         if touched.is_empty() && !ra_read_only {
                             if let Some(delta) = self
-                                .forced_declaration_delta(state, iters_in, ctx, mode)
+                                .forced_declaration_delta(state, iters_in, ctx)
                                 .await
                             {
                                 return Ok(delta);
@@ -2703,7 +2680,6 @@ indicalo esplicitamente."
                         );
                         self.emit_phase(
                             ctx,
-                            mode,
                             "loop_break",
                             format!("Interrompo: '{label}' ripetuto senza progresso"),
                             json!({"label": label, "count": ra_count, "reason": "repeated_action"}),
@@ -2742,7 +2718,6 @@ indicalo esplicitamente."
                         );
                         self.emit_phase(
                             ctx,
-                            mode,
                             "escalation",
                             format!(
                                 "Passo a {}/{} (stallo su '{label}')",
@@ -2830,7 +2805,6 @@ ripetere la verifica: dichiaralo concludendo positivamente con un breve riepilog
                             state.user_intent.as_deref(),
                             rp_cur_provider.as_deref(),
                             rp_cur_model.as_deref(),
-                            ctx.exec_mode(),
                         )
                         .await
                         .unwrap_or_default();
@@ -3188,14 +3162,14 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             payload: calling_meta.get("payload").cloned().unwrap_or(Value::Null),
             correlation_id: None,
         });
-        let _ = self.meta_steps.persist_meta_step(calling_meta, mode).await;
-        // Heartbeat best-effort (anti-recovery prematuro), gata Real.
-        let _ = self.run_control.heartbeat(&run_id, mode).await;
+        let _ = self.meta_steps.persist_meta_step(calling_meta).await;
+        // Heartbeat best-effort (anti-recovery prematuro).
+        let _ = self.run_control.heartbeat(&run_id).await;
 
         // ── CONTEXT REDUCTION (parte PURA, punti unici PR-D) ──────────────────
         // I/O (continuity-trim / system-offload) NON portati: TODO trait dedicati.
         // Il ROLLING-SUMMARY (riassume i vecchi via LLM economico) e' agganciato al
-        // cambio-fase qui sotto via la porta [`SummaryStore`] (best-effort, gata Real).
+        // cambio-fase qui sotto via la porta [`SummaryStore`] (best-effort).
         let mut hist: Vec<HistoryMessage> = messages.iter().map(message_to_history).collect();
         let compress_iter = iters_in;
 
@@ -3228,8 +3202,8 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
 
             // ROLLING-SUMMARY (intervento 3): RIASSUME il prefisso vecchio invece di
             // limitarsi a comprimere/troncare. DECISIONE pura (punto unico, regola L):
-            // cutoff -> serialize -> SummaryStore.summarize (I/O, gata Real) -> apply.
-            // BEST-EFFORT: su guasto (LLM down, cooldown, Replay no-op) la history
+            // cutoff -> serialize -> SummaryStore.summarize (I/O) -> apply.
+            // BEST-EFFORT: su guasto (LLM down, cooldown) la history
             // resta INVARIATA e si prosegue (compress/token_brake fanno il resto).
             if eff_rolling_enabled {
                 if let Some(cut) = ctxr::select_rolling_summary_cutoff(&hist, eff_rolling_keep) {
@@ -3254,7 +3228,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                         let prefix_text = ctxr::serialize_prefix_for_summary(&hist, cut);
                         match self
                             .summary_store
-                            .summarize(prefix_text.clone(), mode)
+                            .summarize(prefix_text.clone())
                             .await
                         {
                             Ok(summary) if !summary.trim().is_empty() => {
@@ -3273,7 +3247,6 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                                                     Some(run_id.clone())
                                                 },
                                                 None,
-                                                mode,
                                             )
                                             .await
                                         {
@@ -3310,7 +3283,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                                 // prossima iterazione). Un run che comprime il
                                 // contesto sta lavorando, e deve poterlo dimostrare
                                 // al reaper invece di sembrare fermo.
-                                let _ = self.run_control.heartbeat(&run_id, mode).await;
+                                let _ = self.run_control.heartbeat(&run_id).await;
                             }
                             Ok(_) => {
                                 // Summary vuoto: degrada (history invariata).
@@ -3321,7 +3294,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                                 );
                             }
                             Err(e) => {
-                                // Guasto LLM / Replay no-op: degrado best-effort.
+                                // Guasto LLM: degrado best-effort.
                                 tracing::warn!(
                                     target: "nexus_agent_graph::executor",
                                     run_id = %run_id,
@@ -3337,8 +3310,8 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             // CONTINUITY-TRIM SEMANTICO: scarta dal prefisso vecchio gli atomi (turno
             // assistant + i suoi tool_result) semanticamente IRRILEVANTI al FOCUS del
             // turno, invece del solo troncamento posizionale. DECISIONE pura (regola L:
-            // select/decide/apply in context_reduction); EMBEDDING via porta (gata Real).
-            // BEST-EFFORT: su guasto embedder / Replay no-op la history resta invariata.
+            // select/decide/apply in context_reduction); EMBEDDING via porta.
+            // BEST-EFFORT: su guasto embedder la history resta invariata.
             if self.cfg.continuity_trim_enabled {
                 if let Some(embedder) = self.embedding_store.as_ref() {
                     let candidates = ctxr::select_continuity_trim_candidates(
@@ -3351,7 +3324,7 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
                         let mut texts: Vec<String> = Vec::with_capacity(candidates.len() + 1);
                         texts.push(focus_text);
                         texts.extend(candidates.iter().map(|c| c.text.clone()));
-                        match embedder.embed(texts, mode).await {
+                        match embedder.embed(texts).await {
                             Ok(vecs) if vecs.len() == candidates.len() + 1 => {
                                 let focus_vec = &vecs[0];
                                 let cand_vecs = &vecs[1..];
@@ -3400,12 +3373,11 @@ file. Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call.";
             // COMPRESS-OFFLOAD: se abilitato, offloada su RAG i tool_result che
             // verranno compressi PRIMA di comprimerli, cosi' il marker porta un `ref`
             // recuperabile invece del solo "[... compresso ...]". SELEZIONE pura
-            // (regola L: contents_eligible_for_offload), I/O gata da flag + porta +
-            // gate Real. Su guasto/Replay la mappa resta vuota -> degraded_marker
-            // (bit-identico a oggi).
+            // (regola L: contents_eligible_for_offload), I/O gata da flag + porta.
+            // Su guasto la mappa resta vuota -> degraded_marker (bit-identico a oggi).
             let max_chars = params.max_content_chars.max(0) as usize;
             let offload_map = self
-                .build_compress_offload_map(&hist, cutoff_idx as usize, max_chars, &run_id, mode)
+                .build_compress_offload_map(&hist, cutoff_idx as usize, max_chars, &run_id)
                 .await;
             let marker_fn = |content: &str| -> String {
                 match offload_map.get(content) {
@@ -3549,7 +3521,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                     payload: overflow_meta.get("payload").cloned().unwrap_or(Value::Null),
                     correlation_id: None,
                 });
-                let _ = self.meta_steps.persist_meta_step(overflow_meta, mode).await;
+                let _ = self.meta_steps.persist_meta_step(overflow_meta).await;
                 // `extra` nel delta e' overwrite: merge con lo stato per non
                 // perdere le chiavi esistenti.
                 let mut extra = state.extra.clone();
@@ -3657,13 +3629,8 @@ della finestra {effective_window} del modello {provider}/{model}"
         // GEMELLO del detector stallo (`maybe_stall_reason_delta`, call site
         // 1382/1707/2000): valutato PRIMA della chiamata LLM del turno (non a fine
         // turno). Cosi':
-        //   - REPLAY-SAFE (F1): il superstep di emissione NON chiama `complete` ->
-        //     in shadow-replay NON consuma un gruppo dal cursore (allineato al
-        //     gemello stallo, che e' gia' pre-LLM). Nessun gate su `mode` serve:
-        //     l'asimmetria che disallineava il cursore era proprio l'emissione
-        //     post-LLM. In Replay `select_model_for_tier` ritorna Ok(None)
-        //     (opzione A): il rientro non cambia modello, ma NON avviene alcuna
-        //     doppia `complete` perche' la (sola) chiamata LLM del turno e' a valle.
+        //   - IDEMPOTENTE AL RESUME: il superstep di emissione NON chiama `complete`,
+        //     quindi un resume da checkpoint non ripete una chiamata LLM del turno.
         //   - NIENTE TURNO SCARTATO (F4/F6): se la scala cambia il tier, il rientro
         //     applica sticky+current_tier e si prosegue il turno col modello GIUSTO
         //     (la `complete` sotto usa il nuovo modello). Su KeepTier / cambio
@@ -3721,9 +3688,8 @@ della finestra {effective_window} del modello {provider}/{model}"
             },
             iteration: Some(iters_in),
             intent: state.user_intent.clone(),
-            // Nodo chiamante = executor: il decorator di replay (shadow) rigioca
-            // la sequenza di tool del primario su questo purpose (regola L). Il
-            // gateway concreto (GatewayLlmAdapter) lo IGNORA.
+            // Nodo chiamante = executor. Il gateway concreto (GatewayLlmAdapter)
+            // lo IGNORA quando il modello e' gia' risolto (regola L).
             purpose: Some("executor".into()),
         };
 
@@ -3866,7 +3832,7 @@ della finestra {effective_window} del modello {provider}/{model}"
                             // sopravvissuto solo perche' le iterazioni successive
                             // battevano. La mig 0392 dichiara il limite: "il battito
                             // si ferma durante un tool sincrono lungo".
-                            let _ = self.run_control.heartbeat(&run_id, mode).await;
+                            let _ = self.run_control.heartbeat(&run_id).await;
                             // Motivo ONESTO dello switch (regola M): la causa
                             // tipizzata arriva dal body strutturato del gateway
                             // (details.primary_cause / POLICY_TIER_EXCLUDED), mai
@@ -3904,7 +3870,6 @@ passo a {}/{}",
                             };
                             self.emit_phase(
                                 ctx,
-                                mode,
                                 "escalation",
                                 title,
 switch_payload(
@@ -4074,8 +4039,7 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                 },
                 iteration: Some(iters_in),
                 intent: state.user_intent.clone(),
-                // Retry-senza-forcing dello stesso turno executor: stesso purpose
-                // (in shadow consuma lo stesso gruppo-iterazione del replay).
+                // Retry-senza-forcing dello stesso turno executor: stesso purpose.
                 purpose: Some("executor".into()),
             };
             if let Ok(r) = ctx.llm.complete(retry).await {
@@ -4221,7 +4185,6 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                         state.user_intent.as_deref(),
                         Some(&provider),
                         Some(&model),
-                        ctx.exec_mode(),
                     )
                     .await
                     .unwrap_or_default();
@@ -4252,7 +4215,6 @@ riassumi lo stato."
                     );
                     self.emit_phase(
                         ctx,
-                        mode,
                         "escalation",
                         format!(
                             "Passo a {}/{} (tool call ripetuta identica)",
@@ -4334,7 +4296,7 @@ riassumi lo stato."
                 // La risposta corrente (la tool call ripetuta identica) viene
                 // scartata: non va ne' eseguita ne' persistita.
                 if let Some(delta) = self
-                    .forced_declaration_delta(state, iters_in, ctx, mode)
+                    .forced_declaration_delta(state, iters_in, ctx)
                     .await
                 {
                     return Ok(delta);
@@ -4344,7 +4306,6 @@ riassumi lo stato."
                 // vuoto e' uno stallo del RUN, non un verdetto sul modello.
                 self.emit_phase(
                     ctx,
-                    mode,
                     "loop_break",
                     format!("Interrompo: '{tool_name}' ripetuto identico senza progresso"),
                     json!({"tool": tool_name, "reason": "signature_loop"}),
@@ -4399,7 +4360,6 @@ Riformula la richiesta in modo piu' specifico oppure indica un punto di partenza
                 );
                 self.emit_phase(
                     ctx,
-                    mode,
                     "repetition_collapse",
                     format!("Risposta degenere di {provider}/{model}: interrompo (testo ripetuto)"),
                     json!({
@@ -4437,7 +4397,7 @@ modello piu' capace.",
 
         // Provider/model EFFETTIVI (cascade interno del gateway), calcolati DOPO l'
         // eventuale escalation cosi' il confronto e' col NUOVO modello promosso
-        // (py:3457+). set_effective_model best-effort (gata Real) -> modello reale UI.
+        // (py:3457+). set_effective_model best-effort -> modello reale UI.
         let eff_provider = resp
             .provider_used
             .clone()
@@ -4447,7 +4407,7 @@ modello piu' capace.",
         if cascade_did_fallback {
             let _ = self
                 .run_control
-                .set_effective_model(&run_id, &eff_provider, &eff_model, mode)
+                .set_effective_model(&run_id, &eff_provider, &eff_model)
                 .await;
         }
         // ── usage del turno (py:3087-3125, 3320, 3476-3480) ───────────────────
@@ -4558,7 +4518,7 @@ modello piu' capace.",
             && final_result.trim().is_empty();
         if empty_forced_reply {
             if let Some(d) = self
-                .forced_declaration_delta(state, iters_in, ctx, mode)
+                .forced_declaration_delta(state, iters_in, ctx)
                 .await
             {
                 tracing::warn!(
@@ -4588,7 +4548,6 @@ modello piu' capace.",
                     Some(assistant_msg.clone()),
                     iters_in,
                     ctx,
-                    mode,
                 )
                 .await
             {
@@ -4638,7 +4597,7 @@ modello piu' capace.",
                     payload,
                     correlation_id: None,
                 });
-                let _ = self.meta_steps.persist_meta_step(meta, mode).await;
+                let _ = self.meta_steps.persist_meta_step(meta).await;
             }
 
             // (2) unfulfilled-report: in modalita' NON autonoma con esito NON
@@ -4720,10 +4679,7 @@ modello piu' capace.",
 
         // ── SSE verso il frontend (parita' 1:1 con run_via_brain) ─────────────
         // L'executor ha deciso l'esito del turno: emette gli eventi che l'utente
-        // si aspetta dal canale chat. Best-effort, infallibile (il sink no-op
-        // dello shadow scarta tutto: in Replay nessun evento esce, garanzia gia'
-        // assicurata dal `NullEventSink` iniettato nel ctx shadow da
-        // `build_native_engine`; qui non si re-implementa alcun gate `shadow`).
+        // si aspetta dal canale chat. Best-effort, infallibile.
         //  - ToolUse: un evento per ogni blocco tool_use deciso (mappa il `tool_use`
         //    del brain, che emette uno step Running per ogni tool richiesto).
         //  - EndTurn: turno concluso senza tool pendenti (il modello ha terminato
@@ -4974,7 +4930,6 @@ impl ExecutorNode {
     async fn emit_phase(
         &self,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
         kind: &str,
         title: String,
         payload: Value,
@@ -4982,7 +4937,6 @@ impl ExecutorNode {
         crate::nodes::emit_phase_meta(
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
-            mode,
             kind,
             title,
             payload,
@@ -5264,7 +5218,6 @@ impl ExecutorNode {
         state: &AgentState,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
         text_only_streak: u32,
     ) -> Option<OpaqueDelta> {
         if !self.cfg.provider_no_progress_switch_enabled {
@@ -5329,7 +5282,6 @@ impl ExecutorNode {
         );
         self.emit_phase(
             ctx,
-            mode,
             "escalation",
             format!(
                 "{provider} non avanza (solo testo): passo a {}/{}",
@@ -5463,7 +5415,6 @@ una tool call, non descrivere.",
         iters_in: i64,
         reason: SwitchReason,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
         reset_iterations: bool,
     ) -> Option<OpaqueDelta> {
         let escal = state
@@ -5481,7 +5432,6 @@ una tool call, non descrivere.",
                 state.user_intent.as_deref(),
                 cur_provider.as_deref(),
                 cur_model.as_deref(),
-                mode,
             )
             .await
             .unwrap_or_default();
@@ -5507,7 +5457,6 @@ una tool call, non descrivere.",
         );
         self.emit_phase(
             ctx,
-            mode,
             "escalation",
             format!(
                 "Passo a {}/{} (non-convergenza sul budget del turno)",
@@ -5582,13 +5531,12 @@ azioni concrete e mirate verso il completamento.",
     /// Incrementa il budget su consultazione EFFETTIVA (una mossa applicata),
     /// preservando l'intero `extra` (clone-whole-map): il PER-RUN in
     /// `extra["stall_moves_used"]` E il CROSS-RUN via [`StallBudgetPort`]
-    /// (`record_consultation`, gata Real, best-effort).
+    /// (`record_consultation`, best-effort).
     async fn consume_recovery_move(
         &self,
         state: &AgentState,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
         // Lo StallContext dice quale (axis, work_epoch) leggere: la chiave-cache e'
         // il punto unico `stall_move_key` (stessa formula del nodo produttore).
@@ -5633,14 +5581,14 @@ azioni concrete e mirate verso il completamento.",
         // Budget consumato su consultazione EFFETTIVA (mossa applicata). Due gambe:
         //  - PER-RUN: `extra["stall_moves_used"]` (checkpointato, si azzera tra run);
         //  - CROSS-RUN: la porta [`StallBudgetPort`] persiste la consultazione per
-        //    SESSIONE (append, gata Real via `mode`), cosi' il cap e' effettivo
+        //    SESSIONE (append), cosi' il cap e' effettivo
         //    per-sessione anche sul loop email cross-run. Best-effort (fail-open):
         //    un guasto di persistenza non deve rompere il turno.
         let moves_used = Self::stall_moves_used(state) + 1;
         let mut extra_out = state.extra.clone();
         extra_out.insert("stall_moves_used".to_string(), json!(moves_used));
         if let Some(budget) = &self.stall_budget {
-            if let Err(err) = budget.record_consultation(ctx.session_id, mode).await {
+            if let Err(err) = budget.record_consultation(ctx.session_id).await {
                 tracing::warn!(
                     target: "nexus_agent_graph::executor",
                     error = %err,
@@ -5673,7 +5621,6 @@ azioni concrete e mirate verso il completamento.",
                 extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
                 self.emit_phase(
                     ctx,
-                    mode,
                     "stall_recovery",
                     format!("Recovery: {}", dec.reason),
                     json!({"axis": stall.axis, "action": action_str(dec.action)}),
@@ -5717,7 +5664,6 @@ azioni concrete e mirate verso il completamento.",
                             state.user_intent.as_deref(),
                             cur_provider.as_deref(),
                             cur_model.as_deref(),
-                            ctx.exec_mode(),
                         )
                         .await
                         .unwrap_or_default();
@@ -5733,7 +5679,6 @@ azioni concrete e mirate verso il completamento.",
                 let pick = picked?;
                 self.emit_phase(
                     ctx,
-                    mode,
                     "escalation",
                     format!("Passo a {}/{} (meta-reasoner)", pick.provider, pick.model),
                     // Punto unico del payload switch (regola L): come sopra, from_* dalla
@@ -5791,7 +5736,6 @@ con un tool call.",
                 .unwrap_or_else(|_| json!({"outcome": "needs_input", "summary": question}));
                 self.emit_phase(
                     ctx,
-                    mode,
                     "outcome_declared",
                     "Esito dichiarato: needs_input (meta-reasoner)".to_string(),
                     json!({"outcome": "needs_input", "axis": stall.axis}),
@@ -5836,7 +5780,6 @@ al mio controllo e va risolta prima di continuare."
                 .unwrap_or_else(|_| json!({"outcome": "blocked", "summary": summary}));
                 self.emit_phase(
                     ctx,
-                    mode,
                     "outcome_declared",
                     format!("Esito dichiarato: blocked ({blocker})"),
                     json!({"outcome": "blocked", "blocker": blocker, "axis": stall.axis}),
@@ -6035,8 +5978,8 @@ al mio controllo e va risolta prima di continuare."
     /// Gate di EMISSIONE dello `ScaleReason` (detector-emissione, PR-B3). GEMELLO di
     /// [`Self::maybe_stall_reason_delta`]. Chiamato PRE-LLM (FIX-A), subito prima
     /// della `complete` del turno, dopo che `hist` e' finalizzato (est_tokens
-    /// accurato). Emetterlo prima della chiamata LLM lo rende replay-safe (in
-    /// shadow non consuma un gruppo dal cursore) e non scarta mai una `complete`
+    /// accurato). Emetterlo prima della chiamata LLM lo rende idempotente al resume
+    /// da checkpoint e non scarta mai una `complete`
     /// produttiva: se la scala cambia il tier, il turno si prosegue col modello
     /// nuovo; su KeepTier / cambio annullato si prosegue con UNA sola `complete`.
     /// Ritorna `Some(delta)` — che instrada al nodo `ScaleControl` — SOLO se il
@@ -6332,7 +6275,6 @@ al mio controllo e va risolta prima di continuare."
         state: &AgentState,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
         // Contesto + chiave-cache trasportati dal detector (produttore). Assenti ->
         // guasto a monte: prosegui il turno normale (nessuna marcatura).
@@ -6357,7 +6299,7 @@ al mio controllo e va risolta prima di continuare."
         // (nessuna risoluzione modello/tier). Deviato QUI prima della macchina tier.
         if let ScaleMove::AdjustSizing { posture, .. } = &mv {
             return self
-                .consume_sizing_move(state, iters_in, *posture, &scale_ctx, ctx, mode)
+                .consume_sizing_move(state, iters_in, *posture, &scale_ctx, ctx)
                 .await;
         }
 
@@ -6445,12 +6387,10 @@ al mio controllo e va risolta prima di continuare."
         let required = (scale_ctx.est_tokens.max(0) as f64 * overhead).ceil() as i64;
 
         // Risolve il modello del tier target dietro la porta (regola L: MAI
-        // select_agentic_model direttamente dal nodo). Opzione A: in Replay la porta
-        // ritorna Ok(None) e il rientro NON cambia modello (lo sticky del primario e'
-        // gia' checkpointato -> stesso modello per costruzione).
+        // select_agentic_model direttamente dal nodo).
         let resolved = self
             .upscale
-            .select_model_for_tier(target_tier.as_str(), required, None, &[], mode)
+            .select_model_for_tier(target_tier.as_str(), required, None, &[])
             .await
             .unwrap_or(None);
 
@@ -6541,7 +6481,6 @@ al mio controllo e va risolta prima di continuare."
         let direction_label = if is_down { "down" } else { "up" };
         self.emit_phase(
             ctx,
-            mode,
             "scale_applied",
             format!(
                 "Scala {direction_label} a {provider}/{model} (tier {})",
@@ -6599,7 +6538,6 @@ al mio controllo e va risolta prima di continuare."
         posture: crate::runtime::ports::SizingPosture,
         scale_ctx: &crate::runtime::ports::ScaleContext,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
         // Baseline = soglie FISSE correnti (regola L: il calcolo puro non tocca il DB;
         // il produttore risolve i valori da ExecutorConfig e li passa al risolutore).
@@ -6637,7 +6575,6 @@ al mio controllo e va risolta prima di continuare."
         // Narrazione live: la chat spiega che il motore ha adattato il dimensionamento.
         self.emit_phase(
             ctx,
-            mode,
             "sizing_applied",
             format!("Dimensionamento adattato ({posture_label})"),
             json!({
@@ -6714,7 +6651,6 @@ al mio controllo e va risolta prima di continuare."
         state: &AgentState,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
         let already = state
             .extra
@@ -6737,7 +6673,6 @@ al mio controllo e va risolta prima di continuare."
         // (catalogo ridotto a task_complete).
         self.emit_phase(
             ctx,
-            mode,
             "declaration_request",
             "Chiedo al modello di dichiarare l'esito del lavoro".to_string(),
             json!({}),
@@ -6928,7 +6863,6 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         state: &AgentState,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
         elapsed_s: u64,
     ) -> Option<OpaqueDelta> {
         if self.cfg.time_grace_pct == 0 {
@@ -6938,7 +6872,7 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         if elapsed_s < soglia_s {
             return None;
         }
-        self.maybe_advisory_grace_delta(state, iters_in, ctx, mode)
+        self.maybe_advisory_grace_delta(state, iters_in, ctx)
             .await
     }
 
@@ -6947,9 +6881,8 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         state: &AgentState,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
-        self.maybe_advisory_grace_delta_preserving(state, None, iters_in, ctx, mode)
+        self.maybe_advisory_grace_delta_preserving(state, None, iters_in, ctx)
             .await
     }
 
@@ -6964,7 +6897,6 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         preserve: Option<Message>,
         iters_in: i64,
         ctx: &AgentNodeCtx,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Option<OpaqueDelta> {
         let directive = pending_role_channel_grace(state)?;
         if state
@@ -6988,7 +6920,6 @@ serve una decisione dell'utente. Nel summary scrivi il resoconto finale per l'ut
         extra_out.insert("repeat_scan_floor".to_string(), json!(state.messages.len()));
         self.emit_phase(
             ctx,
-            mode,
             "advisory_grace",
             "Turno di grazia: il ruolo chiude col proprio verdetto".to_string(),
             json!({ "iters": iters_in }),

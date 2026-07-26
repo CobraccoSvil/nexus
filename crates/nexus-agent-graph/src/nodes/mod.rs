@@ -55,20 +55,19 @@ pub use tool_dispatch::{
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
 
 /// NARRAZIONE LIVE di una FASE semantica del run (punto unico, regola L):
-/// emette il meta-step verso la chat (`EventSink`, no-op in shadow) e lo
-/// persiste per il ripristino post-reload (`MetaStepStore`, gata Real).
+/// emette il meta-step verso la chat (`EventSink`) e lo persiste per il
+/// ripristino post-reload (`MetaStepStore`).
 /// Best-effort: non fallisce mai il turno. Usato da executor / tool_dispatch /
 /// final_gate / planner — i due canali (live vs storico) restano trait separati
 /// per contratto (vedi doc di `MetaStepStore`), qui si compongono UNA volta.
 pub(crate) async fn emit_phase_meta(
     emit: &dyn crate::runtime::ports::EventSink,
     store: &dyn crate::runtime::ports::MetaStepStore,
-    mode: crate::runtime::ports::ExecMode,
     kind: &str,
     title: String,
     payload: serde_json::Value,
 ) {
-    emit_phase_meta_correlated(emit, store, mode, kind, None, title, payload).await;
+    emit_phase_meta_correlated(emit, store, kind, None, title, payload).await;
 }
 
 /// Variante CORRELATA del punto unico di narrazione (stessa composizione
@@ -81,7 +80,6 @@ pub(crate) async fn emit_phase_meta(
 pub async fn emit_phase_meta_correlated(
     emit: &dyn crate::runtime::ports::EventSink,
     store: &dyn crate::runtime::ports::MetaStepStore,
-    mode: crate::runtime::ports::ExecMode,
     kind: &str,
     correlation_id: Option<String>,
     title: String,
@@ -99,6 +97,6 @@ pub async fn emit_phase_meta_correlated(
         "payload": payload,
         "correlation_id": correlation_id,
     });
-    let _ = store.persist_meta_step(meta, mode).await;
+    let _ = store.persist_meta_step(meta).await;
 }
 pub use verifier::{suggest_remediation, TodoCriteriaMode, VerifierConfig, VerifierNode};

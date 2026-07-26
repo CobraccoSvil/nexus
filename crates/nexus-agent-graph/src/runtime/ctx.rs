@@ -3,8 +3,7 @@
 //! Aggrega tutte le dipendenze di un nodo: il pool DB condiviso, le PORTE I/O
 //! astratte (LLM/tool/eventi, vedi `ports.rs`), la config DB-driven (regola G:
 //! PASSATA, mai letta qui dentro), il cancellation token cooperativo e gli id
-//! del run/sessione/thread. Lo `shadow` flag distingue il run primario da quello
-//! shadow (read-only): i nodi lo leggono per decidere la `ExecMode` dei tool.
+//! del run/sessione/thread.
 //!
 //! Le porte sono `Arc<dyn Trait>`: il ctx e' clonabile a basso costo e
 //! condivisibile fra task. mcp-core costruira' questo ctx iniettando le proprie
@@ -30,9 +29,9 @@ pub struct AgentNodeCtx {
     pub db: PgPool,
     /// Gateway LLM astratto (mcp-core delega a nexus-gateway).
     pub llm: Arc<dyn LlmGateway>,
-    /// Esecutore di tool astratto (Real -> ToolRunner gRPC, Replay -> shadow).
+    /// Esecutore di tool astratto (delega al ToolRunner gRPC).
     pub tools: Arc<dyn ToolExecutor>,
-    /// Canale eventi verso il frontend (no-op nel ctx shadow).
+    /// Canale eventi verso il frontend.
     pub emit: Arc<dyn EventSink>,
     /// Config DB-driven del routing, PASSATA (regola G): nessuna lettura DB qui.
     pub cfg: RoutingConfig,
@@ -45,9 +44,6 @@ pub struct AgentNodeCtx {
     pub session_id: Uuid,
     /// Id del thread del grafo (allineato a run_id nel runtime Rust).
     pub thread_id: Uuid,
-    /// `true` se questo e' un run SHADOW (read-only, tool in Replay, no eventi):
-    /// confronta col primario senza side-effect ne' output verso l'utente.
-    pub shadow: bool,
     /// `true` se l'isolamento fisico dei sub-run (worktree git effimeri) e'
     /// DISPONIBILE per questo run: flag `orchestrator.subagent_isolation_enabled`
     /// ON E la root del progetto e' un repo git isolabile (probe fail-closed).
@@ -68,19 +64,6 @@ pub struct AgentNodeCtx {
     /// MUTATIVO attende che la barriera si sciolga. E' un `watch`: leggerlo non
     /// consuma nulla, e chi arriva tardi vede subito l'ultimo stato.
     pub advisory_gate: Option<tokio::sync::watch::Receiver<crate::nodes::AdvisoryGateState>>,
-}
-
-impl AgentNodeCtx {
-    /// Modalita' d'esecuzione tool derivata dal flag shadow (punto unico, regola
-    /// L): un run shadow usa SEMPRE `Replay` (zero side-effect), il primario
-    /// `Real`. I nodi non duplicano questo `if`: chiamano `exec_mode()`.
-    pub fn exec_mode(&self) -> crate::runtime::ports::ExecMode {
-        if self.shadow {
-            crate::runtime::ports::ExecMode::Replay
-        } else {
-            crate::runtime::ports::ExecMode::Real
-        }
-    }
 }
 
 /// Adattatore al motore di grafo (`nexus_graph::GraphEngine`): il motore richiede

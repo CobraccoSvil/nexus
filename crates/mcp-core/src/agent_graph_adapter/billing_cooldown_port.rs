@@ -8,7 +8,7 @@
 //! `Ok(vec![])` (nessun fail-fast, il run prosegue), mai un `PortError`. CONFINE
 //! (regola L): la DECISIONE fail-fast resta PURA in
 //! `nexus_agent_graph::decisions::end_turn::billing_fail_fast_message`; qui SOLO la
-//! lettura dello snapshot. SOLA LETTURA: nessun gate `mode`.
+//! lettura dello snapshot. SOLA LETTURA.
 //!
 //! Stateless (delega a funzioni libere del modulo cooldown a stato globale):
 //! l'adapter e' una unit-struct senza handle.
@@ -51,37 +51,6 @@ impl BillingCooldownPort for CooldownBillingPort {
     }
 }
 
-/// Porta billing NO-OP per il run SHADOW: ritorna SEMPRE lista vuota (nessun
-/// provider in cooldown).
-///
-/// PERCHE' (FIX shadow LLM-Replay): lo shadow deve RIPRODURRE la DECISIONE del
-/// primario, non rivalutare lo stato esterno corrente. Il cooldown billing e'
-/// stato GLOBALE in-memory che evolve nel tempo (snapshot LIVE): leggerlo dallo
-/// shadow introduce NON-DETERMINISMO e un fail-fast esplorazione SPURIO (un
-/// provider andato in cooldown DOPO il primario fa scattare `LoopAbort` ->
-/// canonical "loop" mentre il primario chiudeva diversamente). Neutralizzandolo
-/// (come gli altri ausiliari shadow gia' no-op: `NullEventSink`,
-/// `MemoryCheckpointer`), il gate fail-fast non scatta su stato esterno e la
-/// proiezione canonica converge col primario. Allineata al FAIL-OPEN del trait
-/// (lista vuota = nessun fail-fast).
-#[derive(Default)]
-pub struct NullBillingCooldownPort;
-
-impl NullBillingCooldownPort {
-    /// Costruisce la porta no-op (stateless).
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl BillingCooldownPort for NullBillingCooldownPort {
-    /// Sempre lista vuota: nello shadow nessun provider e' considerato in cooldown.
-    async fn billing_exhausted_providers(&self) -> Result<Vec<String>, PortError> {
-        Ok(Vec::new())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,21 +77,6 @@ mod tests {
         assert!(
             providers.iter().all(|p| p == &p.to_lowercase()),
             "i nomi provider devono essere lowercase"
-        );
-    }
-
-    /// FIX shadow: la porta no-op non vede MAI provider in cooldown, cosi' il
-    /// fail-fast esplorazione non scatta su stato esterno durante il replay.
-    #[tokio::test]
-    async fn null_billing_port_e_sempre_vuota() {
-        let port = NullBillingCooldownPort::new();
-        let providers = port
-            .billing_exhausted_providers()
-            .await
-            .expect("no-op: mai un PortError");
-        assert!(
-            providers.is_empty(),
-            "shadow: nessun provider in cooldown (lista vuota)"
         );
     }
 }

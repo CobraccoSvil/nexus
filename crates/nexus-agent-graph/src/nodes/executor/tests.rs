@@ -40,16 +40,15 @@ fn cfg_resolved() -> ExecutorConfig {
     }
 }
 
-/// Ctx con un gateway LLM dato e shadow configurabile.
-fn ctx_with(llm: Arc<dyn crate::runtime::ports::LlmGateway>, shadow: bool) -> AgentNodeCtx {
-    ctx_with_emit(llm, shadow, Arc::new(NullEventSink))
+/// Ctx con un gateway LLM dato.
+fn ctx_with(llm: Arc<dyn crate::runtime::ports::LlmGateway>) -> AgentNodeCtx {
+    ctx_with_emit(llm, Arc::new(NullEventSink))
 }
 
 /// Come [`ctx_with`] ma con un [`EventSink`] iniettabile (per asserire gli emit
 /// SSE del nodo): i test passano un `RecordingEventSink` e leggono `events`.
 fn ctx_with_emit(
     llm: Arc<dyn crate::runtime::ports::LlmGateway>,
-    shadow: bool,
     emit: Arc<dyn crate::runtime::ports::EventSink>,
 ) -> AgentNodeCtx {
     let pool = PgPoolOptions::new()
@@ -66,7 +65,6 @@ fn ctx_with_emit(
         run_id: Uuid::new_v4(),
         session_id: Uuid::new_v4(),
         thread_id: Uuid::new_v4(),
-        shadow,
         advisory_gate: None,
     }
 }
@@ -201,7 +199,7 @@ async fn superseded_early_return() {
     });
     let (n, _meta, _steps) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("ciao")],
@@ -220,7 +218,7 @@ async fn declared_done_ripetuto_chiude() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea x")],
@@ -246,7 +244,7 @@ async fn declared_done_non_chiude_durante_correzione_final_gate() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("applico il fix richiesto dal gate"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![
@@ -279,7 +277,7 @@ async fn g1_cap_raggiunto_ferma_senza_modello() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // Re-entry G1: prev end_turn, iter>=1, action_oriented, no pending, no error.
     // current_count 2 + 1 = 3 = cap -> G1CapReached (escalation = TODO -> cap secco).
     let state = AgentState {
@@ -309,7 +307,7 @@ async fn nudge_esplorazione_a_soglia_iniettato() {
     // output. Con una call produttiva il flag verrebbe RESETTATO a false (reset
     // coordinato 1:1 col Python), che e' un comportamento gia' coperto altrove.
     let llm = Arc::new(StubLlmGateway::with_text("Procedo con la risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // exploration_count == soglia (6), nudge non ancora inviato -> nudge iniettato.
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -341,7 +339,7 @@ async fn nudge_comando_fallito_a_tre() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = llm_tool_call("read_file", json!({"path": "x"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // Stesso comando fallito 3 volte (run_command + tool_msg errore).
     let mut messages = vec![human("builda")];
     for _ in 0..3 {
@@ -379,7 +377,7 @@ async fn repeated_action_abort_chiude() {
     // il vecchio "ESITO: non completato / loop a vuoto".
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // write_file ripetuto 2 volte SENZA mai riuscire (stallo, stesso contenuto).
     let messages = vec![
         human("scrivi"),
@@ -437,7 +435,7 @@ async fn repeated_action_edit_fallito_diagnose_prima_di_abort() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("correggo"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let messages = vec![
         human("modifica il file"),
         ai_tool(
@@ -537,7 +535,7 @@ async fn repeated_action_escalate_promuove_sticky_e_scrive_floor() {
     ));
     let (n, meta, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let messages = edit_fallito_x2();
     let msg_len = messages.len() as i64;
     let state = AgentState {
@@ -606,7 +604,7 @@ async fn repeated_action_dopo_escalate_il_promosso_fa_il_turno() {
     let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("procedo col fix"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // Stato POST-merge del delta Escalate: azioni pre-escalation + nudge,
     // sticky promosso, contatore e floor scritti.
     let mut messages = edit_fallito_x2();
@@ -653,7 +651,7 @@ async fn abort_con_task_complete_forza_turno_dichiarativo() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota -> Abort
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: edit_fallito_x2(),
@@ -693,7 +691,7 @@ async fn abort_senza_task_complete_chiusura_storica() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: edit_fallito_x2(),
@@ -721,7 +719,7 @@ async fn turno_dichiarativo_riduce_catalogo_a_task_complete() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("dichiaro"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut messages = edit_fallito_x2();
     let floor = messages.len() as i64;
     messages.push(human(
@@ -799,7 +797,7 @@ async fn forced_text_risposta_vuota_rientra_turno_dichiarativo() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text(""));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: history_pre_forced_text(),
@@ -843,7 +841,7 @@ async fn forced_text_risposta_vuota_senza_task_complete_forced_close() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text(""));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: history_pre_forced_text(),
@@ -872,7 +870,7 @@ async fn turno_dichiarativo_risposta_vuota_forced_close() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text(""));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut messages = history_pre_forced_text();
     messages.push(human(
         "Chiama ORA il tool task_complete dichiarando l'esito.",
@@ -909,7 +907,7 @@ async fn forced_text_risposta_testuale_chiude_senza_forced_close() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("resoconto finale del lavoro"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: history_pre_forced_text(),
@@ -938,7 +936,7 @@ async fn dichiarazione_avvenuta_chiude_con_summary() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert("outcome_declaration_forced".into(), json!(true));
     let state = AgentState {
@@ -972,7 +970,7 @@ async fn chiusura_dichiarativa_una_tantum_non_ricattura_rientro_final_gate() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("applico il fix richiesto"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert("outcome_declaration_forced".into(), json!(true));
     extra.insert("outcome_declaration_closed".into(), json!(true));
@@ -1010,7 +1008,7 @@ async fn escalation_current_pair_ancora_a_model_used_senza_sticky() {
     let esc = Arc::new(StubEscalationPort::with_chain(&["claude-piu-capace"]));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: edit_fallito_x2(),
@@ -1055,7 +1053,7 @@ async fn happy_path_tool_use_produce_pending() {
         provider_unavailable_cause: None,
         seen: std::sync::Mutex::new(vec![]),
     });
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi a.rs")],
@@ -1087,7 +1085,7 @@ async fn happy_path_end_turn_testuale() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta finale."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -1129,7 +1127,7 @@ async fn executor_emette_tool_use_su_pending() {
         seen: std::sync::Mutex::new(vec![]),
     });
     let sink = Arc::new(RecordingEventSink::default());
-    let ctx = ctx_with_emit(llm, false, sink.clone());
+    let ctx = ctx_with_emit(llm, sink.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi a.rs")],
@@ -1163,7 +1161,7 @@ async fn executor_emette_end_turn_su_chiusura_testuale() {
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta finale."));
     let sink = Arc::new(RecordingEventSink::default());
-    let ctx = ctx_with_emit(llm, false, sink.clone());
+    let ctx = ctx_with_emit(llm, sink.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -1187,29 +1185,6 @@ async fn executor_emette_end_turn_su_chiusura_testuale() {
     );
 }
 
-/// DEBITO 3 (shadow intatto): in shadow l'EventSink iniettato nel ctx e' il no-op
-/// (NullEventSink), quindi un `RecordingEventSink` collegato al ramo Real NON
-/// verrebbe usato. Qui verifichiamo la PROPRIETA' a livello di nodo: con
-/// `NullEventSink` (il sink dello shadow) nessun emit e' osservabile.
-#[tokio::test]
-async fn shadow_sink_noop_non_emette() {
-    let rc = Arc::new(StubRunControlStore::default());
-    let (n, _m, _s) = node(cfg_resolved(), rc);
-    let llm = Arc::new(StubLlmGateway::with_text("risposta"));
-    // shadow=true + NullEventSink: e' la combinazione che build_native_engine
-    // costruisce per il run shadow. Un emit qui e' un no-op by-construction.
-    let ctx = ctx_with(llm, true);
-    let state = AgentState {
-        thread_id: Some("r1".into()),
-        messages: vec![human("dammi un dato")],
-        action_oriented: Some(false),
-        ..Default::default()
-    };
-    // Non deve panicare: gli emit cadono nel no-op. (La garanzia che lo shadow
-    // riceva NullEventSink e' nel punto unico build_native_engine.)
-    let _ = n.run(&state, &ctx).await.expect("run shadow");
-}
-
 #[tokio::test]
 async fn no_provider_sentinella_node_error() {
     let rc = Arc::new(StubRunControlStore::default());
@@ -1220,7 +1195,7 @@ async fn no_provider_sentinella_node_error() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("fai qualcosa")],
@@ -1281,7 +1256,7 @@ async fn retry_senza_forcing_su_errore() {
     let llm = Arc::new(RetryLlm {
         calls: std::sync::Mutex::new(vec![]),
     });
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi")],
@@ -1323,7 +1298,7 @@ async fn forcing_early_action_non_scatta_se_turno_precedente_ha_agito() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("Ecco lo stack in 2 righe."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("elenca i file e dimmi lo stack")],
@@ -1360,7 +1335,7 @@ async fn forcing_early_action_non_scatta_al_primo_turno() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("Risposta diretta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("domanda semplice")],
@@ -1394,7 +1369,7 @@ async fn forcing_early_action_scatta_se_turno_precedente_non_ha_agito() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = llm_tool_call("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi il file")],
@@ -1430,7 +1405,7 @@ async fn lettura_ripetuta_identica_informativa_guida_a_concludere() {
     };
     let (n, _m, _s) = node(cfg, rc); // progress_controller ON
     let llm = Arc::new(StubLlmGateway::with_text("Concludo a parole."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // read_file stesso path 2 volte, entrambe RIUSCITE (la rilettura riuscita
     // ripetuta E' lo stallo da fermare per i read-only).
     let messages = vec![
@@ -1502,7 +1477,7 @@ async fn lettura_ripetuta_identica_action_oriented_orienta_all_edit() {
     };
     let (n, _m, _s) = node(cfg, rc); // progress_controller ON
     let llm = Arc::new(StubLlmGateway::with_text("Applico l'edit."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let messages = vec![
         human("correggi la porta hardcoded 35198 in vite.config.ts: usa la porta allocata"),
         ai_tool("read_file", json!({"path": "vite.config.ts"})),
@@ -1577,7 +1552,7 @@ async fn lettura_ripetuta_esaurita_chiude_onestamente_non_fallimento() {
     };
     let (n, _m, _s) = node(cfg, rc); // progress_controller ON
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // read_file stesso path 2 volte, entrambe RIUSCITE: contenuto GIA' nel contesto.
     let messages = vec![
         human("dimmi cosa contiene il file"),
@@ -1630,24 +1605,6 @@ async fn lettura_ripetuta_esaurita_chiude_onestamente_non_fallimento() {
 }
 
 #[tokio::test]
-async fn shadow_no_scritture() {
-    let rc = Arc::new(StubRunControlStore::default());
-    let (n, meta, _s) = node(cfg_resolved(), rc.clone());
-    let llm = Arc::new(StubLlmGateway::with_text("risposta"));
-    let ctx = ctx_with(llm.clone(), true); // shadow=true -> Replay
-    let state = AgentState {
-        thread_id: Some("r1".into()),
-        messages: vec![human("fai")],
-        tools_json: Some(vec![json!({"name": "read_file"})]),
-        ..Default::default()
-    };
-    let _ = n.run(&state, &ctx).await.expect("run");
-    // In Replay: heartbeat e meta_step sono no-op (zero scritture).
-    assert!(rc.heartbeats.lock().unwrap().is_empty());
-    assert!(meta.meta_steps.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
 async fn signature_loop_chiude() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
@@ -1657,7 +1614,7 @@ async fn signature_loop_chiude() {
     let same_input = json!({"path": "x"});
     let sig = build_signature("read_file", &same_input);
     let llm = llm_tool_call("read_file", same_input.clone());
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
@@ -1687,7 +1644,7 @@ async fn errore_gateway_persiste_contatori() {
     let llm = Arc::new(StubLlmGateway::with_error(
         "billing_error: credito esaurito",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi il file")],
@@ -1750,7 +1707,7 @@ async fn provider_cooldown_fallback_cross_provider_invece_di_error() {
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
 (in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi il file")],
@@ -1832,7 +1789,7 @@ async fn provider_cooldown_senza_candidato_chiude_error() {
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
 (in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("scrivi il file")],
@@ -1869,7 +1826,7 @@ async fn failover_cascata_accumula_provider_gia_provati() {
         "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> mistral\",\
 \"code\":\"PROVIDER_ERROR\"}",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     // Stato: un salto precedente ha gia' provato deepseek; auto_escalations=1 (< 3).
     extra.insert("failover_tried".into(), json!(["deepseek"]));
@@ -1933,7 +1890,7 @@ async fn client_error_non_scatena_failover_cross_provider() {
         ProviderFailureCause::ClientError,
         "deepseek HTTP 400 invalid_request_error",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi file")],
@@ -2008,7 +1965,7 @@ async fn signature_loop_escalation_riesegue() {
         same_input: same_input.clone(),
         calls: std::sync::Mutex::new(vec![]),
     });
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
@@ -2116,7 +2073,7 @@ async fn signature_loop_escalation_non_forza_tool_choice() {
         same_input: same_input.clone(),
         calls: std::sync::Mutex::new(vec![]),
     });
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
@@ -2149,7 +2106,7 @@ async fn signature_loop_senza_escalation_chiude_secco() {
     let same_input = json!({"path": "x"});
     let sig = build_signature("read_file", &same_input);
     let llm = llm_tool_call("read_file", same_input.clone());
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
@@ -2185,7 +2142,7 @@ async fn signature_loop_secco_con_task_complete_forza_dichiarazione() {
     let same_input = json!({"path": "x"});
     let sig = build_signature("read_file", &same_input);
     let llm = llm_tool_call("read_file", same_input.clone());
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("leggi")],
@@ -2219,7 +2176,7 @@ async fn signature_loop_cap_escalations_chiude_secco() {
     let same_input = json!({"path": "x"});
     let sig = build_signature("read_file", &same_input);
     let llm = llm_tool_call("read_file", same_input.clone());
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert("auto_escalations".into(), json!(3));
     let state = AgentState {
@@ -2249,7 +2206,7 @@ async fn g1_cap_escalation_promuove_sticky() {
     let esc = Arc::new(StubEscalationPort::with_cross("google", "gemini-2.5-pro"));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // Re-entry G1: current_count 2 + 1 = 3 = cap. provider_used corrente noto.
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -2289,7 +2246,7 @@ async fn g1_cap_senza_escalation_chiude_secco() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc); // porta vuota
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("avvia il servizio")],
@@ -2321,7 +2278,7 @@ async fn esplorazione_escalation_promuove_sticky() {
     cfg.progress_controller_enabled = true;
     let (n, _m, _s) = node_esc(cfg, rc, esc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("sistema l'app")],
@@ -2356,7 +2313,7 @@ async fn esplorazione_senza_candidato_aborta() {
     cfg.progress_controller_enabled = true;
     let (n, _m, _s) = node(cfg, rc); // porta escalation vuota
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("sistema l'app")],
@@ -2388,7 +2345,7 @@ async fn cap_assoluto_iterazioni_chiude() {
     cfg.iteration_cap = 10;
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("task complesso")],
@@ -2424,7 +2381,7 @@ async fn iteration_cap_prova_escalation_prima_del_backstop() {
     cfg.iteration_cap = 10;
     let (n, _m, _s) = node_esc(cfg, rc, esc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("task complesso")],
@@ -2458,7 +2415,7 @@ async fn final_gate_nonconvergence_promuove_e_consuma_flag() {
     ));
     let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert(
         crate::nodes::FINAL_GATE_ESCALATION_KEY.into(),
@@ -2506,7 +2463,7 @@ async fn escalation_nonconvergenza_payload_porta_from_model() {
     ));
     let (n, meta, _s) = node_esc(cfg_resolved(), rc, esc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert(crate::nodes::FINAL_GATE_ESCALATION_KEY.into(), json!(true));
     let state = AgentState {
@@ -2552,7 +2509,7 @@ async fn final_gate_nonconvergence_senza_candidato_chiude() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc); // porta escalation vuota
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert(
         crate::nodes::FINAL_GATE_ESCALATION_KEY.into(),
@@ -2587,7 +2544,7 @@ async fn billing_fail_fast_chiude_loop_abort() {
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("task complesso")],
@@ -2619,7 +2576,7 @@ async fn billing_nessun_esausto_prosegue() {
     // Testuale -> end_turn (oltre soglia il nudge anti-esplorazione si inietta ma
     // non chiude: la chiamata LLM avviene).
     let llm = Arc::new(StubLlmGateway::with_text("Ecco il dato."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -2652,7 +2609,7 @@ async fn next_actions_rimuove_blocco_e_deriva() {
     let llm = Arc::new(StubLlmGateway::with_text(
         "Ecco la home page.\n<suggested_actions>\n[{\"label\":\"x\",\"prompt\":\"y\"}]\n</suggested_actions>",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea la home")],
@@ -2691,7 +2648,7 @@ async fn next_actions_derive_fallita_blocco_comunque_rimosso() {
     let llm = Arc::new(StubLlmGateway::with_text(
         "Risposta finale.\n<suggested_actions>[{\"label\":\"x\"}]</suggested_actions>",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("fai")],
@@ -2728,7 +2685,7 @@ async fn unfulfilled_report_sostituisce_in_confirm() {
     let llm = Arc::new(StubLlmGateway::with_text(
         "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![
@@ -2761,7 +2718,7 @@ async fn g1_nudge_scatta_via_segnale_strutturale_senza_blacklist() {
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![
@@ -2802,7 +2759,7 @@ async fn unfulfilled_report_non_sostituisce_in_automatic() {
     let (n, _m) = node_ports(cfg_resolved(), rc, next_actions, billing, upscale);
     let promessa = "Ora attendo che il servizio parta e poi verifichero' il risultato.";
     let llm = Arc::new(StubLlmGateway::with_text(promessa));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("sistema il login")],
@@ -2834,7 +2791,7 @@ async fn unfulfilled_report_segue_il_segnale_post_ignorando_closure_fulfilled() 
     let llm = Arc::new(StubLlmGateway::with_text(
         "Analisi fatta. Prossimi passi:\n1. Avviare il servizio\n2. Verificare il login",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![
@@ -2875,7 +2832,7 @@ async fn g1_resta_closure_first_non_conta_se_closure_fulfilled() {
     let llm = Arc::new(StubLlmGateway::with_text(
         "Ora attendo che il servizio parta e poi verifichero' il risultato.",
     ));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         // Re-entry G1: turno precedente chiuso end_turn senza agire, l'ultima
@@ -2928,7 +2885,7 @@ async fn smart_upscale_promuove_modello() {
     };
     let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale.clone());
     let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // History abbastanza grande da superare 90% di 200 token (~180): un testo lungo.
     let big = "x".repeat(2000);
     let state = AgentState {
@@ -2971,7 +2928,7 @@ async fn smart_upscale_sotto_soglia_non_promuove() {
     };
     let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale.clone());
     let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("ciao")],
@@ -3012,7 +2969,7 @@ async fn hard_cap_termina_il_run_senza_chiamare_llm() {
     };
     let (n, meta) = node_ports(cfg, rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text("MAI CHIAMATO"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let big = "x".repeat(2000); // ~500 token stimati >> 95 (0.95*100)
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -3064,7 +3021,7 @@ async fn hard_cap_inerte_con_ratio_default() {
     };
     let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let big = "x".repeat(2000);
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -3107,7 +3064,7 @@ async fn hard_cap_non_scatta_dopo_upscale_a_window_grande() {
     };
     let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale);
     let llm = Arc::new(StubLlmGateway::with_text("Risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let big = "x".repeat(2000); // ~500 token: oltre la window 100, sotto 95k
     let state = AgentState {
         thread_id: Some("r1".into()),
@@ -3175,7 +3132,7 @@ async fn token_counter_iniettato_pilota_l_hard_cap() {
     )
     .with_token_counter(counter.clone());
     let llm = Arc::new(StubLlmGateway::with_text("MAI CHIAMATO"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("ciao")], // ~1 token reale: e' il counter a dire 1M
@@ -3248,7 +3205,7 @@ async fn rolling_summary_collassa_la_history_al_cambio_fase() {
     ));
     let n = node_summary(cfg_rolling(), rc, summary.clone());
     let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_cambio_fase();
     let _ = n.run(&state, &ctx).await.expect("run");
 
@@ -3287,7 +3244,7 @@ async fn rolling_summary_degrado_best_effort_history_invariata() {
     // node_summary col default: summarize -> PortError (degrado).
     let n = node_summary(cfg_rolling(), rc, Arc::new(StubSummaryStore::default()));
     let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_cambio_fase();
     let _ = n.run(&state, &ctx).await.expect("run");
 
@@ -3368,7 +3325,7 @@ async fn continuity_trim_scarta_atomo_irrilevante_al_cambio_fase() {
     ]));
     let n = node_continuity(cfg_continuity(), rc, embedding.clone());
     let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let _ = n.run(&state_cambio_fase(), &ctx).await.expect("run");
 
     // L'embedder ha ricevuto il focus (per primo) + i 2 atomi candidati.
@@ -3416,7 +3373,7 @@ async fn continuity_trim_flag_off_non_chiama_embedder() {
     };
     let n = node_continuity(cfg, rc, embedding.clone());
     let llm = Arc::new(StubLlmGateway::with_text("Procedo."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let _ = n.run(&state_cambio_fase(), &ctx).await.expect("run");
 
     assert!(
@@ -3491,7 +3448,7 @@ async fn stall_recovery_off_non_emette_stall_reason() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3512,7 +3469,7 @@ async fn stall_recovery_on_emette_stall_reason() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3540,7 +3497,7 @@ async fn stall_recovery_budget_esaurito_ricade_su_fissa() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = state_stallo_repeated_action();
     state.extra.insert("stall_moves_used".to_string(), json!(2));
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -3589,7 +3546,7 @@ async fn stall_recovery_rientro_fallback_marca_epoca_e_prosegue() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("x"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let epoch = stall_work_epoch(0, 0, 0);
     let state = state_rientro("repeated_action", epoch, None);
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -3615,7 +3572,7 @@ async fn stall_recovery_consume_ask_user_produce_needs_input() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("x"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let epoch = stall_work_epoch(0, 0, 0);
     let mv = RecoveryMove::AskUser {
         question: "Qual e' l'email reale da usare per il login?".into(),
@@ -3653,7 +3610,7 @@ async fn stall_recovery_consume_declare_blocked_produce_blocked() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("x"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let epoch = stall_work_epoch(0, 0, 0);
     let mv = RecoveryMove::DeclareBlocked {
         blocker: "credential".into(),
@@ -3712,7 +3669,7 @@ async fn stall_context_redaction_rejected_da_segnale_strutturato() {
         ..cfg_resolved()
     };
     let (n, _m, _s) = node(cfg, rc);
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")));
     let state = state_stallo_con_redazione_rifiutata();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3741,7 +3698,7 @@ async fn stall_context_redaction_rejected_false_senza_segnale() {
         ..cfg_resolved()
     };
     let (n, _m, _s) = node(cfg, rc);
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")));
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3802,11 +3759,8 @@ impl crate::runtime::ports::StallBudgetPort for StubStallBudget {
     async fn record_consultation(
         &self,
         _session_id: Uuid,
-        mode: crate::runtime::ports::ExecMode,
     ) -> Result<(), crate::runtime::ports::PortError> {
-        if mode == crate::runtime::ports::ExecMode::Real {
-            *self.recorded.lock().unwrap() += 1;
-        }
+        *self.recorded.lock().unwrap() += 1;
         Ok(())
     }
 }
@@ -3831,7 +3785,7 @@ async fn stall_budget_cross_run_esaurito_ricade_su_fissa() {
         ..cfg_resolved()
     };
     let n = node_budget(cfg, Arc::new(StubStallBudget::with_count(3)));
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("non chiamato")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("non chiamato")));
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3849,7 +3803,7 @@ async fn stall_budget_cross_run_somma_al_per_run() {
         ..cfg_resolved()
     };
     let n = node_budget(cfg, Arc::new(StubStallBudget::with_count(2)));
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")));
     let mut state = state_stallo_repeated_action();
     state.extra.insert("stall_moves_used".to_string(), json!(1)); // 1 + 2 == cap 3
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -3867,7 +3821,7 @@ async fn stall_budget_cross_run_sotto_cap_emette() {
         ..cfg_resolved()
     };
     let n = node_budget(cfg, Arc::new(StubStallBudget::with_count(2)));
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")));
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3885,7 +3839,7 @@ async fn stall_budget_cross_run_fail_open_non_blocca() {
         ..cfg_resolved()
     };
     let n = node_budget(cfg, Arc::new(StubStallBudget::failing_read()));
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")));
     let state = state_stallo_repeated_action();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -3902,7 +3856,7 @@ async fn stall_budget_consumo_registra_cross_run() {
     };
     let budget = Arc::new(StubStallBudget::with_count(0));
     let n = node_budget(cfg, budget.clone());
-    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")), false);
+    let ctx = ctx_with(Arc::new(StubLlmGateway::with_text("x")));
     let epoch = stall_work_epoch(0, 0, 0);
     let mv = RecoveryMove::DeclareBlocked {
         blocker: "credential".into(),
@@ -3990,7 +3944,7 @@ async fn scale_off_non_emette_scale_reason() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc); // scale.enabled=false di default
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_scale_turn();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -4010,11 +3964,11 @@ async fn scale_on_trigger_emette_scale_reason() {
     // (b) Flag ON + cadenza + coda ampia -> il detector emette ScaleReason con lo
     // ScaleContext strutturato e la chiave-cache in extra. FIX-A: il detector e'
     // PRE-LLM, quindi la `complete` del turno NON e' stata chiamata (nessun turno
-    // LLM produttivo scartato; in shadow-replay non consuma un gruppo dal cursore).
+    // LLM produttivo scartato).
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_scale_on(), rc);
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_scale_turn();
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -4051,7 +4005,7 @@ async fn scale_precedenza_stallo_no_scale_reason() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_scale_on(), rc);
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = state_scale_turn();
     // Ultimo tool_result = errore -> detect_recent_tool_error true -> stall_active.
     // `Message::Tool` (ToolMessage) con hint errore: e' la forma che
@@ -4084,7 +4038,7 @@ async fn scale_break_even_coda_corta_no_trigger() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_scale_turn(); // iterations 4 -> tail 8-4=4 < 6
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -4145,7 +4099,7 @@ async fn scale_rientro_downscale_con_modello_applica_sticky() {
     ));
     let (n, _m) = node_ports(cfg_scale_on(), rc, next_actions, billing, upscale.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_scale_rientro(
         ScaleTier::Medium,
         ScaleMove::DownscaleTo {
@@ -4189,7 +4143,7 @@ async fn scale_rientro_downscale_senza_modello_annulla() {
     let upscale = Arc::new(StubModelUpscalePort::default());
     let (n, _m) = node_ports(cfg_scale_on(), rc, next_actions, billing, upscale.clone());
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = state_scale_rientro(
         ScaleTier::Medium,
         ScaleMove::DownscaleTo {
@@ -4213,37 +4167,6 @@ async fn scale_rientro_downscale_senza_modello_annulla() {
 }
 
 #[tokio::test]
-async fn scale_replay_detector_non_emette_doppia_complete() {
-    // (F1) In Replay il detector-emissione e' PRE-LLM: se emette ScaleReason,
-    // il superstep NON chiama `complete` (nessun consumo di un gruppo dal cursore
-    // replay); se prosegue, chiama `complete` UNA sola volta. In entrambi i casi il
-    // conteggio complete di QUESTO superstep e' <= 1, mai 2. Qui il turno emette
-    // ScaleReason -> zero complete nel superstep di emissione (allineato al gemello
-    // stallo, che e' gia' pre-LLM). Prima del fix (detector post-LLM) lo shadow
-    // consumava un gruppo in emissione + un secondo al rientro annullato = cursore
-    // disallineato.
-    let rc = Arc::new(StubRunControlStore::default());
-    let (n, _m, _s) = node(cfg_scale_on(), rc);
-    let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    // shadow=true -> ExecMode::Replay.
-    let ctx = ctx_with(llm.clone(), true);
-    let state = state_scale_turn();
-    let delta = n.run(&state, &ctx).await.expect("run");
-    let out = apply(state, delta);
-    assert_eq!(
-        out.stop_reason,
-        Some(StopReason::ScaleReason),
-        "detector emette anche in Replay"
-    );
-    // Il superstep di emissione NON ha chiamato complete (replay-safe: nessun
-    // gruppo consumato dal cursore).
-    assert!(
-        llm.seen.lock().unwrap().is_empty(),
-        "emissione pre-LLM in Replay: zero complete nel superstep (cursore allineato al primario)"
-    );
-}
-
-#[tokio::test]
 async fn scale_rientro_keeptier_prosegue_una_sola_complete() {
     // (F4/F6) Rientro con KeepTier (mossa assente in cache): `consume_scale_move`
     // ritorna None e il turno PROSEGUE con UNA sola chiamata LLM (nessun turno
@@ -4252,7 +4175,7 @@ async fn scale_rientro_keeptier_prosegue_una_sola_complete() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_scale_on(), rc);
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // Rientro ScaleResolved con ScaleContext ma NESSUNA mossa persistita alla
     // chiave-cache (KeepTier non viene persistito dal nodo).
     let scale_ctx = ScaleContext {
@@ -4326,7 +4249,7 @@ async fn scale_tetto_cambi_tier_pinna_heavy() {
     };
     let (n, _m) = node_ports(cfg, rc, next_actions, billing, upscale.clone());
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     // Rientro con una DownscaleTo Light (l'LLM proponeva un downscale) e current=Medium.
     let state = state_scale_rientro(
         ScaleTier::Medium,
@@ -4377,7 +4300,7 @@ async fn scale_pinned_heavy_disattiva_detector() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_scale_on(), rc);
     let llm = llm_tool_use("write_file", json!({"path": "a.rs"}));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = state_scale_turn();
     state
         .extra
@@ -4433,7 +4356,7 @@ async fn run_token_budget_oltre_soglia_forza_chiusura_senza_modello() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("continua")],
@@ -4471,7 +4394,7 @@ async fn run_token_budget_sotto_soglia_prosegue() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -4495,7 +4418,7 @@ async fn tokens_used_total_accumula_usage_del_turno() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = llm_text_usage("risposta", 1_000, 500);
-    let ctx = ctx_with(llm, false);
+    let ctx = ctx_with(llm);
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -4521,7 +4444,7 @@ async fn budget_conta_prompt_incrementale_non_la_history_ripetuta() {
     // Turno precedente: prompt 50_000 (history grande). Turno corrente: 51_000
     // prompt (1_000 di contesto nuovo) + 200 completion.
     let llm = llm_text_usage("risposta", 51_000, 200);
-    let ctx = ctx_with(llm, false);
+    let ctx = ctx_with(llm);
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -4544,7 +4467,7 @@ async fn budget_prompt_compresso_clampa_a_zero_il_delta() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = llm_text_usage("risposta", 30_000, 400);
-    let ctx = ctx_with(llm, false);
+    let ctx = ctx_with(llm);
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -4571,7 +4494,7 @@ async fn max_consecutive_text_only_turns_oltre_soglia_forza_chiusura() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea il file")],
@@ -4610,7 +4533,7 @@ async fn figura_al_cap_text_only_riceve_turno_di_grazia_invece_di_nd() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("analizza l'auth")],
@@ -4666,7 +4589,7 @@ async fn figura_grazia_una_tantum_poi_chiude() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut extra = serde_json::Map::new();
     extra.insert("advisory_grace_used".into(), json!(true));
     let state = AgentState {
@@ -4699,7 +4622,7 @@ async fn consecutive_text_only_turns_incrementa_su_testo_e_azzera_su_tool() {
     };
     let (n, _m, _s) = node(cfg.clone(), rc.clone());
     let llm = Arc::new(StubLlmGateway::with_text("descrivo soltanto"));
-    let ctx = ctx_with(llm, false);
+    let ctx = ctx_with(llm);
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea il file")],
@@ -4715,7 +4638,7 @@ async fn consecutive_text_only_turns_incrementa_su_testo_e_azzera_su_tool() {
     // (b) Turno con tool_use: azzera a 0.
     let (n2, _m2, _s2) = node(cfg, rc);
     let llm2 = llm_tool_call("write_file", json!({"path": "a.rs"}));
-    let ctx2 = ctx_with(llm2, false);
+    let ctx2 = ctx_with(llm2);
     let state2 = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea il file")],
@@ -4745,7 +4668,7 @@ async fn limiti_token_disabilitati_a_zero_sono_retro_compatibili() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("Ecco la risposta."));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("dammi un dato")],
@@ -4784,7 +4707,7 @@ async fn run_token_budget_a_flag_on_emette_stall_reason_runaway() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea il servizio")],
@@ -4828,7 +4751,7 @@ async fn text_only_a_flag_on_emette_stall_reason_runaway() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("crea il file")],
@@ -4865,7 +4788,7 @@ async fn token_hard_cap_a_flag_on_chiude_diretto_senza_giudice() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("continua")],
@@ -4908,7 +4831,7 @@ async fn run_cost_budget_oltre_soglia_chiude_diretto() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("continua")],
@@ -4945,7 +4868,7 @@ async fn run_cost_budget_sotto_soglia_prosegue() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("ok"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("continua")],
@@ -4975,7 +4898,7 @@ async fn run_time_budget_oltre_deadline_chiude_diretto() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let started_way_back = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("epoch")
@@ -5020,7 +4943,7 @@ async fn run_time_budget_disattivato_o_senza_epoch_prosegue() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("ok"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("continua")],
@@ -5049,7 +4972,7 @@ async fn runaway_budget_esaurito_a_flag_on_ricade_su_close_runaway() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = AgentState {
         thread_id: Some("r1".into()),
         messages: vec![human("continua")],
@@ -5089,7 +5012,7 @@ async fn runaway_stall_consuma_escalate_model() {
     let esc = Arc::new(StubEscalationPort::with_chain(&["claude-y"]));
     let (n, _m, _s) = node_esc(cfg, rc, esc);
     let llm = Arc::new(StubLlmGateway::with_text("x"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let epoch = stall_work_epoch(0, 0, 0);
     let state = state_rientro("token_overflow", epoch, Some(RecoveryMove::EscalateModel));
     let delta = n.run(&state, &ctx).await.expect("run");
@@ -5817,7 +5740,7 @@ async fn figura_sotto_deadline_riceve_sollecito_invece_di_morire_muta() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = figura_muta_da(80); // 80% del budget: oltre la soglia del 70%
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -5862,7 +5785,7 @@ async fn sotto_soglia_il_modello_viene_interrogato_ma_la_chiusura_muta_no() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("risposta"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let state = figura_muta_da(50); // 50% del budget: sotto la soglia
     let delta = n.run(&state, &ctx).await.expect("run");
     let out = apply(state, delta);
@@ -5912,7 +5835,7 @@ async fn grazia_gia_concessa_a_budget_esaurito_chiude_time_budget() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("non chiamato"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = figura_muta_da(120); // budget esaurito
     state
         .extra
@@ -6002,7 +5925,7 @@ async fn il_turno_di_ruolo_forza_il_tool_sul_wire() {
     };
     let (n, _m, _s) = node(cfg, rc);
     let llm = Arc::new(StubLlmGateway::with_text("ancora prosa"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = figura_muta_da(10);
     state
         .extra
@@ -6034,7 +5957,7 @@ async fn la_grazia_sulla_chiusura_volontaria_e_one_shot() {
     let rc = Arc::new(StubRunControlStore::default());
     let (n, _m, _s) = node(cfg_resolved(), rc);
     let llm = Arc::new(StubLlmGateway::with_text("chiudo senza dichiarare"));
-    let ctx = ctx_with(llm.clone(), false);
+    let ctx = ctx_with(llm.clone());
     let mut state = figura_muta_da(10);
     state
         .extra

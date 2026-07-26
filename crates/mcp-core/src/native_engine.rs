@@ -49,8 +49,8 @@
 //! l'esecuzione primaria; restano da chiudere per parita' piena col brain legacy:
 //! 1. CHIUSO (F5a). `build_initial_state` valorizza `behavior_mode` con la STESSA
 //!    fonte del primario Python (`PRIMARY_BEHAVIOR_MODE`, costante riusata dal
-//!    client brain): lo shadow attraversa il grafo col mode IDENTICO. Conta dal
-//!    momento in cui il planner e' eleggibile (`plan_phase_enabled=true`).
+//!    client brain). Conta dal momento in cui il planner e' eleggibile
+//!    (`plan_phase_enabled=true`).
 //! 2. CHIUSO (F5a). `PlannerConfig`/`FinalGateConfig`/`VerifierConfig` sono LETTE
 //!    dal DB (`load_*_config`, punto unico `get_setting`, regola G piena), 1:1 con
 //!    le chiavi `orchestrator.*`/`agent.*` del brain; il `Default` resta solo come
@@ -74,12 +74,10 @@
 //! 5. CLASSIFIER LLM nel `RouterNode` (TODO `router.rs`, FIX A): la
 //!    classificazione intent via LLM (`AgenticIntentClassifier`) NON e' ancora
 //!    portata. Senza `intent_hint` il RouterNode cade nel fallback
-//!    `agentic_default`/`action_oriented=true`. Per lo SHADOW questo divergeva dal
-//!    primario (g1 sui run 0-tool, loop sui run con tool): mitigato derivando
-//!    `action_oriented`/`user_intent` dall'`intent_hint` in `build_initial_state`
-//!    (ramo Shadow, punto unico `decisions::action_oriented_for_intent`). Resta da
-//!    portare il classifier completo come debito residuo: senza, i turni shadow
-//!    SENZA `intent_hint` non hanno l'intent reale del primario.
+//!    `agentic_default`/`action_oriented=true`. Mitigato derivando
+//!    `action_oriented`/`user_intent` dai dati del classifier del turno in
+//!    `build_initial_state` quando disponibili. Resta da portare il classifier
+//!    completo come debito residuo.
 //!
 //! ## Stato: unico motore
 //!
@@ -112,7 +110,6 @@ use nexus_agent_graph::runtime::ports::{
     LlmGateway, MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
     RunControlStore, SummaryStore, TodoStore, ToolExecutor, VerifierRunStore,
 };
-use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
     ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict,
@@ -125,14 +122,14 @@ use nexus_graph::outcome::StepOutcome;
 
 use crate::agent_graph_adapter::{
     agent_step_store::PgAgentStepStore,
-    billing_cooldown_port::{CooldownBillingPort, NullBillingCooldownPort},
+    billing_cooldown_port::CooldownBillingPort,
     clarify_history_store::PgClarifyHistoryStore,
     context_offload::RagContextOffloadAdapter,
     criteria_runner::FinalGateCriteriaRunnerAdapter,
     embedding_store::PgEmbeddingStore,
     escalation_port::PgEscalationPort,
     event_sink::SseEventSinkAdapter,
-    llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
+    llm_gateway::GatewayLlmAdapter,
     meta_step_store::PgMetaStepStore,
     model_upscale_port::CatalogModelUpscalePort,
     next_actions_deriver::NextActionsDeriverAdapter,
@@ -212,13 +209,11 @@ pub struct NativeRunInput {
     /// Intent gia' risolto (es. risposta a disambiguazione). `None` -> il router
     /// classifica normalmente.
     pub intent_hint: Option<String>,
-    /// Dati COMPLETI del classifier del turno (Tappa 1b, punto B). Popolati SOLO
-    /// nel ramo Shadow (`build_initial_state` li usa per derivare
-    /// `action_oriented`/`report_only` FEDELI al primario Python via
-    /// `intent_classifier::derive_*`, sostituendo la mappa grossolana
-    /// `action_oriented_for_intent`). Per il primario restano ai default
-    /// (`None`/`false`): il primario NON forza `action_oriented` (decide il
-    /// RouterNode), comportamento INVARIATO.
+    /// Dati COMPLETI del classifier del turno (Tappa 1b, punto B).
+    /// `build_initial_state` li usa per derivare `action_oriented`/`report_only`
+    /// FEDELI al primario Python via `intent_classifier::derive_*`. Se assenti
+    /// restano ai default (`None`/`false`): il grafo NON forza `action_oriented`
+    /// (decide il RouterNode), comportamento INVARIATO.
     ///
     /// `requires_tools`: il turno richiede tool? (giudizio LLM del classifier).
     pub requires_tools: Option<bool>,
@@ -265,9 +260,9 @@ pub struct NativeRunInput {
     /// git worktree effimero). Threadato fino al `ToolRunnerExecutorAdapter` ->
     /// `build_ctx_with_root`, che quando presente sovrascrive `root_path` e imposta
     /// `isolated_subrun=true` (soppressione autocommit/reindex). `None` (default per
-    /// il run principale, il resume, lo shadow e i sub-run non isolati) ->
-    /// comportamento invariato: il ctx usa la root del progetto. In PR3 TUTTI i
-    /// call site lasciano `None`; l'accensione (passare `Some`) e' PR4.
+    /// il run principale, il resume e i sub-run non isolati) -> comportamento
+    /// invariato: il ctx usa la root del progetto. In PR3 TUTTI i call site
+    /// lasciano `None`; l'accensione (passare `Some`) e' PR4.
     pub working_root: Option<std::path::PathBuf>,
     /// Sintesi advisory strutturata prodotta PRIMA del run (panel multi-provider
     /// o consiglio a monte). Seed in `AgentState.extra` per il coordinatore
@@ -303,14 +298,11 @@ pub struct NativeRunInput {
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
 /// `action_oriented`/`report_only` FEDELI al primario Python (Tappa 1b).
 ///
-/// PUNTO UNICO (regola L) della loro RISOLUZIONE: sia il ramo Shadow sia il ramo
-/// PRIMARY-Rust del call site (`agent_run.rs`) duplicavano la stessa sequenza
-/// (classifica il turno col porting 1:1 `intent_classifier::classify` -> mappa
-/// `requires_tools`/`agentic_score`/`authorizes_changes`/`classifier_resolved` +
-/// legge la soglia DB `routing.action_oriented_min_agentic_score`). Ora entrambi
-/// chiamano [`resolve_classifier_fields`]: la derivazione e' identica, niente
-/// logica copiata-e-adattata. Per il primario PYTHON (`run_via_brain`) questo NON
-/// si applica: continua a ri-classificare internamente nel `router_node`.
+/// PUNTO UNICO (regola L) della loro RISOLUZIONE: il call site (`agent_run.rs`)
+/// chiama [`resolve_classifier_fields`] (classifica il turno col porting 1:1
+/// `intent_classifier::classify` -> mappa `requires_tools`/`agentic_score`/
+/// `authorizes_changes`/`classifier_resolved` + legge la soglia DB
+/// `routing.action_oriented_min_agentic_score`), senza logica copiata-e-adattata.
 #[derive(Debug, Clone, Copy)]
 pub struct ClassifierFields {
     /// `requires_tools` del classifier (None = classifier non interrogato/degradato).
@@ -329,11 +321,10 @@ pub struct ClassifierFields {
 /// PORTING 1:1 (`intent_classifier::classify`, regola L) e leggendo la soglia DB
 /// `routing.action_oriented_min_agentic_score` (regola G, mig 0387).
 ///
-/// PUNTO UNICO (regola L) condiviso dai rami Shadow e PRIMARY-Rust di
-/// `spawn_agent_run`: prima ciascuno re-implementava questa sequenza. Su
-/// fallback del classifier i campi del giudizio restano neutri (`None`/`false`);
-/// la soglia DB e' comunque risolta (fallback al default tecnico
-/// `DEFAULT_ACTION_ORIENTED_MIN_SCORE` se la chiave manca).
+/// PUNTO UNICO (regola L) di `spawn_agent_run`. Su fallback del classifier i
+/// campi del giudizio restano neutri (`None`/`false`); la soglia DB e' comunque
+/// risolta (fallback al default tecnico `DEFAULT_ACTION_ORIENTED_MIN_SCORE` se la
+/// chiave manca).
 ///
 /// Il `gateway` non e' piu' `Option`: era il residuo di quando l'orchestrator
 /// poteva nascere senza: quel ramo produceva `classifier_resolved=false` in
@@ -771,9 +762,9 @@ async fn resolve_purpose(db: &PgPool, purpose: &str) -> (String, String) {
 // nel tipo del default: bool da `{true,1,yes,on}` (case-insensitive); CSV ->
 // `list[str]` con strip + scarto dei vuoti; int/float con parse e fallback al
 // default. Replichiamo qui la STESSA semantica perche' le config nodi Rust devono
-// coincidere coi valori che il brain calcola dalle medesime chiavi (presupposto
-// del confronto shadow). `get_setting` (punto unico, regola L) gia' fa trim +
-// scarto dei vuoti -> una chiave assente/vuota torna `None` e si usa il default.
+// coincidere coi valori che il brain calcola dalle medesime chiavi. `get_setting`
+// (punto unico, regola L) gia' fa trim + scarto dei vuoti -> una chiave
+// assente/vuota torna `None` e si usa il default.
 
 /// `value` -> bool con la semantica `_coerce` del brain (`{true,1,yes,on}` truthy).
 fn coerce_bool(raw: &str) -> bool {
@@ -1860,33 +1851,10 @@ async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
     }
 }
 
-/// Ruolo del run nel motore nativo: distingue il run PRIMARIO (side-effect
-/// reali, output SSE, checkpoint persistente) dal run SHADOW (read-only).
-///
-/// PUNTO UNICO (regola L) della differenza primario/shadow: `build_native_engine`
-/// e `run_engine` leggono SOLO questo enum per decidere tools/emit/checkpointer
-/// e il flag `shadow` del ctx; non c'e' alcun altro `if shadow` sparso. Lo shadow
-/// porta con se' il `primary_run_id` da cui rileggere i tool_result in Replay.
-#[derive(Clone, Copy)]
-enum RunRole {
-    /// Run primario: tool REALI, SSE verso il frontend, checkpoint Postgres.
-    Primary,
-    /// Run shadow read-only: tool in Replay dal primario (`primary_run_id`),
-    /// EventSink no-op, checkpointer in-memory (niente scritture).
-    Shadow { primary_run_id: Uuid },
-}
-
-impl RunRole {
-    /// `true` se questo e' un run shadow (read-only).
-    fn is_shadow(&self) -> bool {
-        matches!(self, RunRole::Shadow { .. })
-    }
-}
-
 /// Modalita' di ingresso del motore nativo (punto unico, regola L): distingue
 /// l'avvio nuovo dal resume HITL. Estrae la decisione "init Some/None +
-/// resume_delta" da `run_engine` in un solo enum, cosi' i tre call site
-/// (run nuovo, resume HITL, shadow) la esprimono in modo esplicito.
+/// resume_delta" da `run_engine` in un solo enum, cosi' i due call site
+/// (run nuovo, resume HITL) la esprimono in modo esplicito.
 enum RunMode {
     /// Avvio nuovo: `build_initial_state` dal prompt -> parte da `entry`.
     New,
@@ -1975,8 +1943,7 @@ async fn probe_gate_steps(
 }
 
 /// Misura gli step gate del profilo di verifica PRIMA che l'executor tocchi i
-/// file, e persiste il profilo solo se qualcosa e' cambiato. Da chiamare solo
-/// nel primario (in shadow niente inferenza: zero side-effect e zero costo).
+/// file, e persiste il profilo solo se qualcosa e' cambiato.
 /// Entrambe le misure passano dal PUNTO UNICO del runner criteri (regola L/M:
 /// exit code strutturato), e questo e' l'unico posto che esegue i comandi gate
 /// ad albero pulito.
@@ -2045,18 +2012,11 @@ async fn measure_gate_steps(
     }
 }
 
-/// Il `role` decide le sole tre porte che cambiano fra primario e shadow (regola
-/// L: un solo punto): `tools` (Real vs Replay), `emit` (SSE vs no-op),
-/// `checkpointer` (Postgres vs in-memory). Tutto il resto (nodi, config DB-driven,
-/// purpose model) e' IDENTICO -> lo shadow attraversa la STESSA topologia del
-/// primario, presupposto del confronto di parita'.
-///
-/// Ritorna anche la `RoutingConfig` risolta (serve a popolare il ctx, il cui
+/// Ritorna la `RoutingConfig` risolta (serve a popolare il ctx, il cui
 /// `recursion_limit` viene letto dal motore) + le porte gateway/tools per il ctx.
 async fn build_native_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
-    role: RunRole,
 ) -> anyhow::Result<(
     AgentGraphEngine,
     RoutingConfig,
@@ -2098,98 +2058,72 @@ async fn build_native_engine(
     // I/O). Corto-circuito su flag OFF (default) -> nessun probe git: zero costo
     // aggiunto al percorso normale. Vedi `compute_run_isolation_available`.
     let isolation_available =
-        compute_run_isolation_available(&db, &run_db, input.session_id, role).await;
+        compute_run_isolation_available(&db, &run_db, input.session_id).await;
 
-    // ── Porte I/O concrete (14 impl FASE 2) ──────────────────────────────────
-    // Gateway LLM: dipende dal ruolo (regola L, punto unico, stesso switch del
-    // `tools` sotto).
-    //  - Primary: GatewayLlmAdapter REAL (provider/model gia' risolti, il client
-    //    non re-instrada).
-    //  - Shadow: ReplayLlmGateway (executor rigioca le decisioni del primario da
-    //    agent_steps, ausiliari neutralizzati): nessuna chiamata LLM reale ->
-    //    num_tool_calls converge col primario, costo zero, zero RNG-divergenza.
-    let llm: Arc<dyn LlmGateway> = match role {
-        RunRole::Primary => {
-            // Identita' del run per il ledger di billing: ricavata dalla sessione
-            // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
-            // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
-            // il costo risulta sempre 0. Lettura puntuale (una volta per run).
-            let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
-                "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+    // ── Porte I/O concrete ────────────────────────────────────────────────────
+    // Gateway LLM: GatewayLlmAdapter REAL (provider/model gia' risolti, il client
+    // non re-instrada).
+    let llm: Arc<dyn LlmGateway> = {
+        // Identita' del run per il ledger di billing: ricavata dalla sessione
+        // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
+        // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
+        // il costo risulta sempre 0. Lettura puntuale (una volta per run).
+        let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+            "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+        )
+        .bind(input.session_id)
+        .fetch_optional(&run_db)
+        .await
+        .ok()
+        .flatten()
+        .map(|(p, u)| {
+            (
+                p.map(|x| x.to_string()).unwrap_or_default(),
+                u.map(|x| x.to_string()).unwrap_or_default(),
             )
-            .bind(input.session_id)
-            .fetch_optional(&run_db)
-            .await
-            .ok()
-            .flatten()
-            .map(|(p, u)| {
-                (
-                    p.map(|x| x.to_string()).unwrap_or_default(),
-                    u.map(|x| x.to_string()).unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
-            Arc::new(GatewayLlmAdapter::new(
-                deps.gateway.clone(),
-                deps.db.clone(),
-                proj_id,
-                usr_id,
-            ))
-        }
-        RunRole::Shadow { primary_run_id } => {
-            Arc::new(ReplayLlmGateway::new(run_db.clone(), primary_run_id))
-        }
-    };
-
-    // ToolExecutor: dipende dal ruolo (regola L, punto unico).
-    //  - Primary: ToolRunner in-process REALE (mcp-core E' il ToolRunner, no gRPC
-    //    su se' stesso). `primary_run_id=None`.
-    //  - Shadow: Replay-only by-construction (nessun `ToolRunnerDeps`): rilegge i
-    //    tool_result del primario da `agent_steps`, ZERO side-effect.
-    let tools: Arc<dyn ToolExecutor> = match role {
-        RunRole::Primary => Arc::new(ToolRunnerExecutorAdapter::new(
-            deps.tool_runner_deps.clone(),
-            input.session_id,
-            None,
-            // Override root del sub-run isolato (FASE 2). `None` per default (run
-            // principale/sub-run non isolato) -> ctx sulla root del progetto,
-            // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
-            input.working_root.clone(),
-            // Narrazione verso QUESTO run: i tool a lunga durata (dispatch_
-            // subagents) emettono meta-step di avvio/progresso/chiusura sul
-            // canale SSE del run invocante mentre lavorano. Vale anche per i
-            // sub-run (il loro canale e' il ponte verso il padre): la
-            // narrazione risale la catena in modo ricorsivo.
-            Some(crate::agent_tools::context::ParentNarration {
-                run_id: input.run_id,
-                session_id: input.session_id,
-                step_tx: input.step_tx.clone(),
-            }),
-        )),
-        RunRole::Shadow { primary_run_id } => Arc::new(
-            ToolRunnerExecutorAdapter::from_db_for_replay(run_db.clone(), Some(primary_run_id)),
-        ),
-    };
-
-    // Canale eventi: dipende dal ruolo.
-    //  - Primary: STESSO broadcast SSE del run (parita' 1:1 con run_via_brain).
-    //  - Shadow: NullEventSink (no-op): il run shadow non emette NULLA verso il
-    //    frontend (l'output all'utente resta quello del primario).
-    let emit: Arc<dyn EventSink> = if role.is_shadow() {
-        Arc::new(NullEventSink)
-    } else {
-        // Primario: oltre a emettere gli eventi LIVE, l'adapter ricostruisce e
-        // PERSISTE le tracce gateway (`AITraceEvent`) su `nexus_agent_traces` cosi'
-        // il trace panel sopravvive al refresh (FIX persistenza tracing nativo:
-        // prima il ramo nativo non scriveva mai questa tabella). Best-effort,
-        // punto unico `trace_store::persist_trace` (regola L).
-        Arc::new(SseEventSinkAdapter::with_persistence(
-            input.step_tx.clone(),
-            input.run_id,
-            input.session_id,
-            run_db.clone(),
+        })
+        .unwrap_or_default();
+        Arc::new(GatewayLlmAdapter::new(
+            deps.gateway.clone(),
+            deps.db.clone(),
+            proj_id,
+            usr_id,
         ))
     };
+
+    // ToolExecutor: ToolRunner in-process REALE (mcp-core E' il ToolRunner, no gRPC
+    // su se' stesso).
+    let tools: Arc<dyn ToolExecutor> = Arc::new(ToolRunnerExecutorAdapter::new(
+        deps.tool_runner_deps.clone(),
+        input.session_id,
+        // Override root del sub-run isolato (FASE 2). `None` per default (run
+        // principale/sub-run non isolato) -> ctx sulla root del progetto,
+        // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
+        input.working_root.clone(),
+        // Narrazione verso QUESTO run: i tool a lunga durata (dispatch_
+        // subagents) emettono meta-step di avvio/progresso/chiusura sul
+        // canale SSE del run invocante mentre lavorano. Vale anche per i
+        // sub-run (il loro canale e' il ponte verso il padre): la
+        // narrazione risale la catena in modo ricorsivo.
+        Some(crate::agent_tools::context::ParentNarration {
+            run_id: input.run_id,
+            session_id: input.session_id,
+            step_tx: input.step_tx.clone(),
+        }),
+    ));
+
+    // Canale eventi: STESSO broadcast SSE del run (parita' 1:1 con run_via_brain).
+    // Oltre a emettere gli eventi LIVE, l'adapter ricostruisce e PERSISTE le tracce
+    // gateway (`AITraceEvent`) su `nexus_agent_traces` cosi' il trace panel
+    // sopravvive al refresh (FIX persistenza tracing nativo: prima il ramo nativo
+    // non scriveva mai questa tabella). Best-effort, punto unico
+    // `trace_store::persist_trace` (regola L).
+    let emit: Arc<dyn EventSink> = Arc::new(SseEventSinkAdapter::with_persistence(
+        input.step_tx.clone(),
+        input.run_id,
+        input.session_id,
+        run_db.clone(),
+    ));
 
     // Store DB + porte ausiliarie. Le store del dominio run (agent_runs,
     // agent_steps, nexus_agent_meta_steps, nexus_agent_todos/plans,
@@ -2229,22 +2163,12 @@ async fn build_native_engine(
     let escalation: Arc<dyn EscalationPort> = Arc::new(PgEscalationPort::new(db.clone()));
     let next_actions: Arc<dyn NextActionsDeriver> =
         Arc::new(NextActionsDeriverAdapter::new(db.clone()));
-    // Porta billing: dipende dal ruolo (FIX shadow LLM-Replay).
-    //  - Primary: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
-    //    esplorazione riflette lo stato reale dei provider.
-    //  - Shadow: NO-OP (lista vuota). Lo shadow rigioca la DECISIONE del primario,
-    //    non rivaluta il billing corrente: leggere lo snapshot LIVE introdurrebbe
-    //    non-determinismo e un fail-fast SPURIO (-> canonical "loop") da stato
-    //    esterno evoluto dopo il primario. Allineata agli altri ausiliari shadow
-    //    gia' neutralizzati (NullEventSink, MemoryCheckpointer).
-    let billing: Arc<dyn BillingCooldownPort> = if role.is_shadow() {
-        Arc::new(NullBillingCooldownPort::new())
-    } else {
-        Arc::new(CooldownBillingPort::new())
-    };
+    // Porta billing: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
+    // esplorazione riflette lo stato reale dei provider.
+    let billing: Arc<dyn BillingCooldownPort> = Arc::new(CooldownBillingPort::new());
     let upscale: Arc<dyn ModelUpscalePort> = Arc::new(CatalogModelUpscalePort::new(db.clone()));
     // Rolling-summary (intervento 3): riassume i vecchi via LLM economico (modello
-    // da `agent.context.rolling_summary_model`, regola G). Gata Real (no-op shadow).
+    // da `agent.context.rolling_summary_model`, regola G).
     let summary_store: Arc<dyn SummaryStore> = Arc::new(PgSummaryStore::new(db.clone()));
 
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
@@ -2257,8 +2181,7 @@ async fn build_native_engine(
     ));
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
-    // Porta del panel di review (ReviewGate). Nel ruolo shadow il nodo passa
-    // in Replay e non chiama la porta; il concreto resta comunque innocuo.
+    // Porta del panel di review (ReviewGate).
     let review_panel: Arc<dyn nexus_agent_graph::runtime::ports::ReviewPanelPort> =
         Arc::new(crate::agent_graph_adapter::review_panel::ReviewPanelAdapter::new(
             db.clone(),
@@ -2275,8 +2198,7 @@ async fn build_native_engine(
     // dal DB col PUNTO UNICO `nexus_auth::get_setting` (regola L), 1:1 con le chiavi
     // settings del brain. Il `Default` di ciascuna config resta SOLO come
     // safe-default se la chiave manca (identico ai `_SAFE_DEFAULTS` del brain): mai
-    // come magic fallback (regola G). Copre SIA il primario nativo (run_native) SIA
-    // lo shadow (run_shadow): entrambi passano di qui (punto unico).
+    // come magic fallback (regola G).
     let planner_cfg = load_planner_config(&db).await;
     let mut final_gate_cfg = load_final_gate_config(&db).await;
     let review_gate_cfg = load_review_gate_config(&db).await;
@@ -2286,27 +2208,20 @@ async fn build_native_engine(
     // Il profilo del progetto e' INFERITO da un LLM che osserva l'ambiente
     // reale (verify_profile::ensure_profile: sceglie lui i file da leggere e
     // definisce step liberi con flag gate). Qui, risolto a monte del grafo
-    // (regola G), si innestano nel final_gate gli step gate=true. In SHADOW
-    // niente inferenza (zero side-effect/costo): sola lettura del persistito.
+    // (regola G), si innestano nel final_gate gli step gate=true.
     if final_gate_cfg.enabled {
         if let Some((pid, root)) =
             resolve_session_project_root(&run_db, &db, input.session_id).await
         {
-            let mut steps = if role.is_shadow() {
-                crate::verify_profile::profile_steps(&db, pid).await
-            } else {
-                crate::verify_profile::ensure_profile(
-                    &db,
-                    &deps.tool_runner_deps.neural,
-                    pid,
-                    std::path::Path::new(&root),
-                )
-                .await
-            };
+            let mut steps = crate::verify_profile::ensure_profile(
+                &db,
+                &deps.tool_runner_deps.neural,
+                pid,
+                std::path::Path::new(&root),
+            )
+            .await;
 
-            if !role.is_shadow() {
-                measure_gate_steps(&db, pid, &root, &mut steps, &criteria_adapter).await;
-            }
+            measure_gate_steps(&db, pid, &root, &mut steps, &criteria_adapter).await;
             final_gate_cfg.verify_steps = steps
                 .into_iter()
                 // Uno step PROVATO CIECO non e' una verifica, qualunque cosa
@@ -2506,18 +2421,10 @@ async fn build_native_engine(
         learner: Arc::new(LearnerNode::new()),
     };
 
-    // Checkpointer: dipende dal ruolo.
-    //  - Primary: Postgres (persistenza per-superstep su nexus_graph_checkpoints,
-    //    serve al recovery di un run interrotto).
-    //  - Shadow: IN-MEMORY. Lo shadow gira UNA volta fino a End e NON deve scrivere
-    //    su nexus_graph_checkpoints (i checkpoint Python e Rust hanno topologie
-    //    diverse: persisterli inquinerebbe la tabella di recovery del primario).
+    // Checkpointer: Postgres (persistenza per-superstep su nexus_graph_checkpoints,
+    // serve al recovery di un run interrotto).
     let checkpointer: Arc<dyn nexus_graph::checkpoint::Checkpointer<AgentState>> =
-        if role.is_shadow() {
-            Arc::new(nexus_graph::MemoryCheckpointer::<AgentState>::new())
-        } else {
-            Arc::new(nexus_agent_graph::PgCheckpointer::new(run_db.clone()))
-        };
+        Arc::new(nexus_agent_graph::PgCheckpointer::new(run_db.clone()));
 
     let supervisor_cfg = load_supervisor_config(&db).await;
     let engine = build_agent_graph(
@@ -2560,11 +2467,10 @@ async fn resolve_session_project_root(
 
 /// Isolamento fisico DISPONIBILE per questo run (Fase C3 Part B). Ordine dei
 /// corto-circuiti scelto per NON aggiungere I/O al percorso normale:
-///   1. run SHADOW -> `false` (nessuna orchestrazione delegata in replay);
-///   2. flag `orchestrator.subagent_isolation_enabled` OFF (default) -> `false`
+///   1. flag `orchestrator.subagent_isolation_enabled` OFF (default) -> `false`
 ///      SENZA risolvere la root ne' fare il probe git (costo zero);
-///   3. root del progetto non risolvibile -> `false`;
-///   4. `probe_isolatable` (FAIL-CLOSED) sulla root: `git worktree` utilizzabile.
+///   2. root del progetto non risolvibile -> `false`;
+///   3. `probe_isolatable` (FAIL-CLOSED) sulla root: `git worktree` utilizzabile.
 /// Riusa gli STESSI punti unici del batch tool (`isolation_flag_enabled`,
 /// `probe_isolatable`), cosi' il gate del planner e l'esecuzione reale
 /// dell'isolamento vedono lo stesso verdetto.
@@ -2580,11 +2486,7 @@ async fn compute_run_isolation_available(
     meta_db: &PgPool,
     run_db: &PgPool,
     session_id: Uuid,
-    role: RunRole,
 ) -> bool {
-    if role.is_shadow() {
-        return false;
-    }
     // Flag GLOBALE -> meta_db (NON run_db: li' `settings` non esiste a
     // separazione DB ON e la query fallirebbe mascherandosi come flag OFF).
     if !crate::agent_tools::subagent_native::isolation_flag_enabled(meta_db).await {
@@ -2637,17 +2539,15 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
 /// in `Message` + il messaggio utente del turno in coda,
 /// system/session/intent/automation/provider override valorizzati.
 ///
-/// `role` distingue primario da shadow. Sia il ramo Shadow sia il PRIMARIO RUST
-/// (`RunRole::Primary`, usato SOLO da `run_via_native`/`Engine::Rust`, non
-/// instradato globalmente) valorizzano `user_intent`/`action_oriented`/
-/// `report_only` derivandoli dai dati del classifier del turno (`requires_tools`/
+/// Il PRIMARIO RUST valorizza `user_intent`/`action_oriented`/`report_only`
+/// derivandoli dai dati del classifier del turno (`requires_tools`/
 /// `agentic_score`/`authorizes_changes`) col PUNTO UNICO `intent_classifier::
-/// derive_*` (regola L): cosi' il primario Rust converge col primario Python (no
-/// G1 spurio sui turni read-only, tool sui turni d'azione). Quando i dati del
-/// classifier sono ASSENTI il primario resta INTATTO (None -> il `RouterNode`
-/// decide come oggi), comportamento INVARIATO. Il primario PYTHON
-/// (`run_via_brain`) NON passa di qui: ri-classifica internamente nel router_node.
-fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
+/// derive_*` (regola L): cosi' converge col primario Python (no G1 spurio sui
+/// turni read-only, tool sui turni d'azione). Quando i dati del classifier sono
+/// ASSENTI resta INTATTO (None -> il `RouterNode` decide come oggi), comportamento
+/// INVARIATO. Il primario PYTHON (`run_via_brain`) NON passa di qui: ri-classifica
+/// internamente nel router_node.
+fn build_initial_state(input: &NativeRunInput) -> AgentState {
     use nexus_agent_graph::state::MessageContent;
 
     // History pregressa nel formato compatto `{"role","content"}` prodotto da
@@ -2677,21 +2577,18 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
     // invece deriva `action_oriented` dal classifier del turno: per i turni
     // conversazionali read-only e' `false` -> niente G1.
     //
-    // Per far CONVERGERE sia lo SHADOW sia il PRIMARIO RUST col primario Python
-    // deriviamo `action_oriented`/`report_only` dagli STESSI dati del classifier
-    // del turno (`requires_tools`/`agentic_score`/`authorizes_changes`) col PUNTO
-    // UNICO `intent_classifier::derive_*` (regola L: porting 1:1 di
+    // Per far CONVERGERE il PRIMARIO RUST col primario Python deriviamo
+    // `action_oriented`/`report_only` dagli STESSI dati del classifier del turno
+    // (`requires_tools`/`agentic_score`/`authorizes_changes`) col PUNTO UNICO
+    // `intent_classifier::derive_*` (regola L: porting 1:1 di
     // `brain/agents/nodes/__init__.py:686-739`). Il call site popola questi campi
     // in `NativeRunInput` via [`resolve_classifier_fields`] (helper condiviso,
-    // regola L) in ENTRAMBI i rami Shadow e PRIMARY-Rust; il fix precedente
-    // grossolano (`action_oriented_for_intent(intent_hint)`) resta SOLO come
-    // fallback (ramo shadow) quando i dati del classifier non sono disponibili.
-    // Quando NESSUN dato del classifier e' presente il primario resta None ->
-    // il RouterNode decide (comportamento INVARIATO). Il primario PYTHON NON
+    // regola L). Quando NESSUN dato del classifier e' presente lo stato resta None
+    // -> il RouterNode decide (comportamento INVARIATO). Il primario PYTHON NON
     // passa di qui.
     //
     // `derive_from_classifier`: i dati del classifier sono presenti (popolati dal
-    // call site). Sia per Shadow sia per Primary la derivazione FEDELE e' identica.
+    // call site).
     let derive_from_classifier = input.classifier_resolved
         || input.requires_tools.is_some()
         || input.agentic_score.is_some();
@@ -2703,16 +2600,13 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
 
     let (initial_intent, initial_action_oriented): (Option<String>, Option<bool>) =
         if derive_from_classifier {
-            // Derivazione FEDELE (Shadow o Primary-Rust), identica al primario Python.
+            // Derivazione FEDELE (Primary-Rust), identica al primario Python.
             let action_oriented = crate::intent_classifier::derive_action_oriented(
                 intent_hint,
                 input.requires_tools,
                 input.agentic_score,
                 input.action_oriented_min_score,
             );
-            // user_intent: l'intent del primario se noto (intent_hint), altrimenti
-            // None (l'intent vive nel routing, non e' richiesto dal grafo per
-            // action_oriented).
             // user_intent = intent del classifier del turno (propagato dal call
             // site) cosi' il RouterNode lo preserva invece del neutro; fallback
             // all'intent_hint (disambiguazione risolta) se il classifier manca.
@@ -2723,21 +2617,6 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
                     .or_else(|| intent_hint.map(str::to_string)),
                 Some(action_oriented),
             )
-        } else if role.is_shadow() {
-            // Fallback grossolano SOLO shadow (classifier non disponibile): deriva
-            // dall'intent_hint con la mappa deterministica. Quando manca anche
-            // l'hint, None -> il RouterNode shadow applica il fallback del Python
-            // degradato. Il PRIMARIO RUST senza dati resta None (decide il
-            // RouterNode), comportamento INVARIATO.
-            match intent_hint {
-                Some(intent) => (
-                    Some(intent.to_string()),
-                    Some(nexus_agent_graph::decisions::action_oriented_for_intent(
-                        intent,
-                    )),
-                ),
-                None => (None, None),
-            }
         } else {
             // Primario Rust senza dati classifier: INTATTO (None -> RouterNode).
             (None, None)
@@ -2748,8 +2627,8 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
     // di sola lettura (incidente 2026-07-02: "elenca i file" ha requires_tools=true
     // -> action_oriented=true, ma authorizes_changes=false -> report_only=true; lo
     // strip lasciava solo tool di scrittura e il run degenerava in edit-loop).
-    // Vale per ENTRAMBI Shadow e Primary-Rust quando i dati del classifier sono
-    // presenti; senza dati resta None (guard inerti solo su Some(true)).
+    // Vale quando i dati del classifier sono presenti; senza dati resta None
+    // (guard inerti solo su Some(true)).
     let initial_report_only: Option<bool> = if derive_from_classifier {
         let report_only = crate::intent_classifier::derive_report_only(
             input.classifier_resolved,
@@ -2758,7 +2637,6 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         );
         tracing::debug!(
             run_id = %input.run_id,
-            role_shadow = role.is_shadow(),
             report_only,
             action_oriented = ?initial_action_oriented,
             "native: derivazione fedele action_oriented/report_only dal classifier"
@@ -2844,12 +2722,11 @@ fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
         // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
         // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
         // costante `PRIMARY_BEHAVIOR_MODE` (`agent_turn_setup.rs`): la riusiamo
-        // qui (punto unico, regola L) cosi' lo shadow confronta un grafo col mode
-        // IDENTICO. Conta sul serio dal momento in cui il planner e' eleggibile
-        // (`plan_phase_enabled=true`, mig 0426/0439): `PlannerConfig::is_eligible`
-        // gata su questo mode; senza valorizzarlo, lo shadow divergerebbe (None vs
-        // "bilanciata"). Il valore-vero-dal-turno (derivarlo dall'automation_mode/
-        // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
+        // qui (punto unico, regola L). Conta sul serio dal momento in cui il
+        // planner e' eleggibile (`plan_phase_enabled=true`, mig 0426/0439):
+        // `PlannerConfig::is_eligible` gata su questo mode; senza valorizzarlo lo
+        // stato divergerebbe (None vs "bilanciata"). Il valore-vero-dal-turno
+        // (derivarlo dall'automation_mode/routing) e' un miglioramento separato
         // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
         behavior_mode: Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE.to_string()),
         // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
@@ -2909,13 +2786,12 @@ fn automation_mode_skips_hitl(mode: Option<nexus_agent_graph::AutomationMode>) -
 /// `initial_state` dal prompt, gira `run_until_interrupt` e mappa l'esito.
 ///
 /// `init` distingue nuovo run (Some) da resume (None, riparte dal checkpoint).
-/// Per il path primario `shadow=false` (`ExecMode::Real`): i tool hanno
-/// side-effect reali sul progetto.
+/// I tool hanno side-effect reali sul progetto.
 pub async fn run_native(
     deps: &NativeDeps,
     input: &NativeRunInput,
 ) -> anyhow::Result<NativeRunOutcome> {
-    let outcome = run_engine(deps, input, RunMode::New, RunRole::Primary).await?;
+    let outcome = run_engine(deps, input, RunMode::New).await?;
     Ok(map_outcome(outcome))
 }
 
@@ -2944,7 +2820,6 @@ pub async fn resume_native(
         deps,
         input,
         RunMode::Resume { resume_delta },
-        RunRole::Primary,
     )
     .await?;
     Ok(map_outcome(outcome))
@@ -3068,29 +2943,25 @@ pub async fn resume_native_fanin(
         deps,
         input,
         RunMode::Resume { resume_delta },
-        RunRole::Primary,
     )
     .await?;
     Ok(map_outcome(outcome))
 }
 
 /// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
-/// stato finale, non solo il sommario): il run shadow ne ha bisogno per la
-/// proiezione canonica (conteggio tool, produced_work). Punto unico (regola L)
-/// dell'esecuzione del motore: sia il primario che lo shadow passano di qui,
-/// distinti solo dal `role` (e dal `mode`).
+/// stato finale, non solo il sommario). Punto unico (regola L) dell'esecuzione
+/// del motore.
 ///
 /// `mode` distingue avvio nuovo (`RunMode::New`, initial_state dal prompt) da
 /// resume HITL (`RunMode::Resume`, riparte dal checkpoint applicando il delta di
-/// approvazione). `role` decide tools/emit/checkpointer + il flag `shadow` del ctx.
+/// approvazione).
 async fn run_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
     mode: RunMode,
-    role: RunRole,
 ) -> anyhow::Result<StepOutcome<AgentState>> {
     let (engine, routing_cfg, llm, tools, emit, isolation_available) =
-        build_native_engine(deps, input, role).await?;
+        build_native_engine(deps, input).await?;
 
     let ctx = AgentNodeCtx {
         db: deps.db.clone(),
@@ -3102,10 +2973,6 @@ async fn run_engine(
         run_id: input.run_id,
         session_id: input.session_id,
         thread_id: input.run_id,
-        // `shadow` deriva dal ruolo: in Shadow i nodi usano ExecMode::Replay (punto
-        // unico AgentNodeCtx::exec_mode) -> tutti gli store gatati no-op, zero
-        // side-effect. Il primario e' Real.
-        shadow: role.is_shadow(),
         // Fase C3 Part B: isolamento fisico dei sub-run disponibile (calcolato in
         // build_native_engine, flag-gated). Alimenta il gate di orchestrazione.
         isolation_available,
@@ -3119,7 +2986,7 @@ async fn run_engine(
     // Resume HITL: nessun init (carica il checkpoint), applica il resume_delta.
     match mode {
         RunMode::New => {
-            let mut init_state = build_initial_state(input, role);
+            let mut init_state = build_initial_state(input);
             // ── ROUTING INIZIALE tier (FIX-A scale-controller) ───────────────────
             // Il primo modello del run e' `(input.provider, input.model)` risolto dal
             // routing a monte (il primo turno dell'executor lo usa via
@@ -3129,8 +2996,7 @@ async fn run_engine(
             // scriviamo nel checkpoint iniziale. Cosi' `current_tier` e' popolato dal
             // primo turno, non solo dopo un'escalation/upscale. INERTE (PR-A): nessun
             // decisore lo legge ancora -> bit-identico. Determinismo: la query e'
-            // FUORI dal loop del grafo (non nel path di Replay); il tier vive poi
-            // nello stato checkpointato, condiviso da Primary e Shadow (convergono).
+            // FUORI dal loop del grafo; il tier vive poi nello stato checkpointato.
             init_state.current_tier =
                 Some(resolve_initial_tier(&deps.db, &input.provider, &input.model).await);
             // Playbook matcher (punto unico, regola L): popola i passi del playbook
@@ -3160,51 +3026,45 @@ async fn run_engine(
             }
 
             // ── Detector clarification CROSS-RUN (loop email, blocco #5) ─────────
-            // Calcolato UNA volta all'avvio del run PRIMARIO, FUORI dal grafo
-            // (replay-safe): il valore e' checkpointato in `AgentState`, cosi' il
-            // grafo e il replay lo rileggono dallo stato senza re-interrogare il DB
-            // (il principio guida del piano: la decisione e' presa fuori dal
-            // percorso caldo, il percorso caldo la rilegge). Solo PRIMARIO: nello
-            // shadow (Replay) NON leggiamo stato live che evolve (come
-            // `NullBillingCooldownPort`) — lo shadow rigioca lo stato del primario,
-            // che porta gia' `repeated_clarify_count` checkpointato.
+            // Calcolato UNA volta all'avvio del run, FUORI dal grafo: il valore e'
+            // checkpointato in `AgentState`, cosi' il grafo lo rilegge dallo stato
+            // senza re-interrogare il DB (la decisione e' presa fuori dal percorso
+            // caldo, il percorso caldo la rilegge).
             //
             // FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della
             // sessione. Il pool e' quello del DOMINIO RUN (agent_runs/meta_steps
             // migrati al DB progetto), risolto col PUNTO UNICO per-sessione.
             // Fail-open: DB progetto non disponibile -> detector saltato con WARN
             // (asse mai attivo, invariato); niente fallback al meta-DB.
-            if !role.is_shadow() {
-                match crate::project_db_routes::project_data_pool_by_session_from(
-                    &deps.db,
-                    input.session_id,
-                )
-                .await
-                {
-                    Ok(run_db) => {
-                        let clarify_history = PgClarifyHistoryStore::new(run_db);
-                        let (sig, repeat_count) = clarify_history
-                            .latest_signature_and_repeat_count(input.session_id)
-                            .await;
-                        if repeat_count > 0 {
-                            tracing::info!(
-                                target: "mcp_core::native_engine",
-                                session_id = %input.session_id,
-                                repeated_clarify_count = repeat_count,
-                                signature = sig.as_deref().unwrap_or(""),
-                                "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
-                            );
-                        }
-                        init_state.repeated_clarify_count = Some(repeat_count);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
+            match crate::project_db_routes::project_data_pool_by_session_from(
+                &deps.db,
+                input.session_id,
+            )
+            .await
+            {
+                Ok(run_db) => {
+                    let clarify_history = PgClarifyHistoryStore::new(run_db);
+                    let (sig, repeat_count) = clarify_history
+                        .latest_signature_and_repeat_count(input.session_id)
+                        .await;
+                    if repeat_count > 0 {
+                        tracing::info!(
                             target: "mcp_core::native_engine",
                             session_id = %input.session_id,
-                            error = %e,
-                            "detector clarify cross-run: DB progetto non disponibile, detector saltato"
+                            repeated_clarify_count = repeat_count,
+                            signature = sig.as_deref().unwrap_or(""),
+                            "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
                         );
                     }
+                    init_state.repeated_clarify_count = Some(repeat_count);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mcp_core::native_engine",
+                        session_id = %input.session_id,
+                        error = %e,
+                        "detector clarify cross-run: DB progetto non disponibile, detector saltato"
+                    );
                 }
             }
 
@@ -3325,264 +3185,6 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
     }
 }
 
-// ===========================================================================
-// SHADOW (F4): driver di confronto STATO FINALE primario Python <-> shadow Rust.
-//
-// Modello STRADA B (confronto stato finale, NON per-nodo): il grafo Python e
-// quello Rust hanno topologie DIVERSE (i nodi non corrispondono 1:1), quindi un
-// confronto per-nodo e' inutile. Si esegue l'INTERO grafo Rust in shadow (Replay
-// dei tool_result del primario, LlmGateway REAL) e si confronta la PROIEZIONE
-// CANONICA dell'esito (segnali STRUTTURALI), NON il testo della risposta (con
-// LLM Real il testo diverge sempre -> rumore inutile). Si persiste UN solo record
-// in nexus_shadow_telemetry con node_name "__final_state__".
-// ===========================================================================
-
-/// Pseudo-nodo della telemetria shadow: il confronto e' sullo STATO FINALE, non
-/// per-nodo (le topologie Python/Rust differiscono). Un solo record per run.
-const SHADOW_FINAL_STATE_NODE: &str = "__final_state__";
-
-/// Tool che producono LAVORO concreto sul progetto (scrittura/modifica/esecuzione).
-/// Se il run ne ha invocato almeno uno, `has_produced_work=true` nella proiezione
-/// canonica. Lista MINIMA estendibile (e' una proiezione, non un enforcement).
-const MUTATING_TOOLS: &[&str] = &[
-    "write_file",
-    "edit_file",
-    "create_file",
-    "apply_patch",
-    "rename_file",
-    "fs_move",
-    "run_command",
-];
-
-/// Canonicalizza un `stop_reason` (Rust o Python) al VOCABOLARIO COMUNE della
-/// proiezione: `end_turn` / `tool_use` / `failed` / `interrupted` / `loop` /
-/// `superseded` / `other`. Punto unico (regola L): sia il primario (stringa dal
-/// DB) sia lo shadow (enum Rust mappato a stringa via serde) passano di qui, cosi'
-/// i due lati sono confrontabili anche se nascono da rappresentazioni diverse.
-///
-/// `None` (nessun stop_reason) -> `"none"`. Stringhe Python note (es. lo status
-/// `agent_runs.status` quando lo stop_reason non e' separato) sono mappate ai
-/// valori del vocabolario; le ignote ricadono su `"other"` (esplicito, niente
-/// magic fallback su un valore di business — regola G).
-fn canonical_stop_reason(raw: Option<&str>) -> &'static str {
-    match raw.map(|s| s.trim().to_ascii_lowercase()) {
-        None => "none",
-        Some(s) => match s.as_str() {
-            // Vocabolario comune diretto.
-            "end_turn"
-            | "endturn"
-            | "stop"
-            | "completed"
-            | "completed_verified"
-            | "completed_unverified" => "end_turn",
-            "tool_use" | "tooluse" => "tool_use",
-            "error" | "failed" | "failed_diagnosed" => "failed",
-            "interrupted" | "awaiting_confirmation" | "blocked_needs_input" => "interrupted",
-            "loop_detected" | "loop_abort" | "loopdetected" | "loopabort" => "loop",
-            "superseded" => "superseded",
-            "g1_escalated" | "g1_cap_reached" | "g1escalated" | "g1capreached" => "g1",
-            "" => "none",
-            _ => "other",
-        },
-    }
-}
-
-/// Serializza lo `StopReason` Rust nella sua forma snake_case (la stessa del
-/// `#[serde(rename_all = "snake_case")]` dell'enum) per poi canonicalizzarla con
-/// lo STESSO `canonical_stop_reason` del primario (un solo vocabolario, regola L).
-fn stop_reason_label(sr: Option<StopReason>) -> Option<String> {
-    sr.and_then(|r| match serde_json::to_value(r) {
-        Ok(Value::String(s)) => Some(s),
-        _ => None,
-    })
-}
-
-/// Proiezione canonica MINIMA dell'esito di un run (chiavi STRUTTURALI, NON il
-/// testo della risposta). E' il punto unico del confronto shadow (regola L):
-/// sia il primario sia lo shadow producono questa stessa forma, cosi'
-/// `compute_diff` opera su chiavi omogenee. Estendibile con altre chiavi
-/// strutturali (es. files_touched) senza toccare il confronto.
-///
-/// Chiavi:
-/// - `completed` (bool): il grafo e' arrivato a completare?
-/// - `stop_reason` (string): vocabolario comune (vedi `canonical_stop_reason`).
-/// - `num_tool_calls` (int): quanti tool sono stati invocati.
-/// - `has_produced_work` (bool): almeno un tool mutativo (write/edit/run/...)?
-fn make_canonical(
-    completed: bool,
-    stop_reason: &str,
-    num_tool_calls: i64,
-    has_produced_work: bool,
-) -> Value {
-    serde_json::json!({
-        "completed": completed,
-        "stop_reason": stop_reason,
-        "num_tool_calls": num_tool_calls,
-        "has_produced_work": has_produced_work,
-    })
-}
-
-/// Proiezione canonica dell'esito del run SHADOW dal suo `AgentState` finale.
-///
-/// - `completed`: lo `StepOutcome` e' `Completed` (passato dal driver).
-/// - `stop_reason`: canonicalizzato dall'enum Rust.
-/// - tool calls: contati dai `Message` dello stato (forma OpenAI-compat
-///   `Ai.tool_calls` + forma Anthropic `ContentBlock::ToolUse` inline). Per
-///   `has_produced_work` si guarda il NOME del tool contro `MUTATING_TOOLS`.
-fn shadow_canonical(state: &AgentState, completed: bool) -> Value {
-    use nexus_agent_graph::state::{ContentBlock, MessageContent};
-
-    let mut num_tool_calls: i64 = 0;
-    let mut produced = false;
-    let mut note_tool = |name: &str| {
-        num_tool_calls += 1;
-        if MUTATING_TOOLS.contains(&name) {
-            produced = true;
-        }
-    };
-
-    for m in &state.messages {
-        if let Message::Ai {
-            content,
-            tool_calls,
-            ..
-        } = m
-        {
-            // Forma OpenAI-compat: tool_calls fuori dal contenuto.
-            for tc in tool_calls {
-                note_tool(&tc.name);
-            }
-            // Forma Anthropic: ToolUse come blocco di contenuto inline.
-            if let MessageContent::Blocks(blocks) = content {
-                for b in blocks {
-                    if let ContentBlock::ToolUse { name, .. } = b {
-                        note_tool(name);
-                    }
-                }
-            }
-        }
-    }
-
-    let sr_label = stop_reason_label(state.stop_reason);
-    make_canonical(
-        completed,
-        canonical_stop_reason(sr_label.as_deref()),
-        num_tool_calls,
-        produced,
-    )
-}
-
-/// Proiezione canonica dell'esito del run PRIMARIO (Python) letta dal DB.
-///
-/// - `completed`: lo `status` di `agent_runs` e' uno stato di successo
-///   (completed / completed_verified).
-/// - `stop_reason`: canonicalizzato dallo `status` (il primario Python non
-///   persiste uno `stop_reason` separato in agent_runs: lo status e' il segnale
-///   strutturale di chiusura).
-/// - tool calls: contati da `agent_steps` (gli step del run = i tool invocati);
-///   `has_produced_work` se almeno un `tool_name` e' mutativo.
-async fn primary_canonical(db: &PgPool, primary_run_id: Uuid) -> anyhow::Result<Value> {
-    // status e' TEXT NOT NULL (mig 0009): fetch_optional -> Option<String> (None
-    // solo se il run non esiste, caso anomalo nel flusso shadow).
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
-        .bind(primary_run_id)
-        .fetch_optional(db)
-        .await?;
-
-    let tool_names: Vec<String> =
-        sqlx::query_scalar("SELECT tool_name FROM agent_steps WHERE run_id = $1")
-            .bind(primary_run_id)
-            .fetch_all(db)
-            .await?;
-
-    let num_tool_calls = tool_names.len() as i64;
-    let has_produced_work = tool_names
-        .iter()
-        .any(|n| MUTATING_TOOLS.contains(&n.as_str()));
-    let status_lc = status.as_deref().map(|s| s.to_ascii_lowercase());
-    let completed = matches!(
-        status_lc.as_deref(),
-        Some("completed") | Some("completed_verified") | Some("completed_unverified")
-    );
-
-    Ok(make_canonical(
-        completed,
-        canonical_stop_reason(status.as_deref()),
-        num_tool_calls,
-        has_produced_work,
-    ))
-}
-
-/// Driver SHADOW: dato un run PRIMARIO Python gia' concluso, ri-esegue l'intero
-/// grafo Rust in modalita' shadow (read-only) e persiste UN record di telemetria
-/// con il confronto della proiezione canonica.
-///
-/// Shadow-safety (zero side-effect, regola E/F): `ExecMode::Replay` (tool e store
-/// gatati no-op), `ToolExecutor::from_db_for_replay` (rilegge i tool_result del
-/// primario), `NullEventSink` (niente SSE), `MemoryCheckpointer` (niente scritture
-/// su nexus_graph_checkpoints), criterio http del final_gate gatato in Replay
-/// (niente reqwest). L'LLM e' in REPLAY sullo shadow (`ReplayLlmGateway`):
-/// l'executor RIGIOCA la sequenza di tool del primario letta da `agent_steps` (cosi'
-/// `num_tool_calls` converge col primario e le divergenze residue sono BUG VERI del
-/// grafo, non artefatti LLM), gli ausiliari (planner/reflection/clarify) sono
-/// neutralizzati con una risposta neutra deterministica (costo token ZERO). REAL
-/// coesiste sul PRIMARIO via `RunRole` (switch nel punto unico `build_native_engine`).
-///
-/// Su QUALUNQUE errore lo shadow ritorna `Err` ma il chiamante lo tratta come
-/// WARN: lo shadow non deve MAI impattare il run primario.
-pub async fn run_shadow(
-    deps: &NativeDeps,
-    input: &NativeRunInput,
-    primary_run_id: Uuid,
-) -> anyhow::Result<()> {
-    // Esegue il grafo Rust in shadow: nuovo run (initial_state dal prompt del
-    // primario), tools in Replay sul primario, checkpointer in-memory.
-    let outcome = run_engine(
-        deps,
-        input,
-        RunMode::New,
-        RunRole::Shadow { primary_run_id },
-    )
-    .await?;
-
-    let (shadow_state, completed) = match &outcome {
-        StepOutcome::Completed(s) => (s, true),
-        StepOutcome::Interrupted { state, .. } => (state, false),
-    };
-
-    // Proiezioni canoniche: primario dal DB, shadow dallo stato finale.
-    // Separazione DB: agent_runs/agent_steps del primario vivono nel DB del
-    // progetto -> stesso pool risolto dalla sessione usato da run_engine, non il
-    // meta (dove la proiezione uscirebbe vuota: 0 tool calls, completed=false).
-    let primary_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
-            .await?;
-    let primary = primary_canonical(&primary_pool, primary_run_id).await?;
-    let shadow = shadow_canonical(shadow_state, completed);
-
-    // Persiste UN record "__final_state__" col diff (punto unico shadow, regola L:
-    // NESSUN uso di DiffCollector::record per-nodo). persist_node_diff ricalcola
-    // internamente i divergent_keys via compute_diff.
-    let divergent = nexus_agent_graph::compute_diff(&primary, &shadow);
-    nexus_agent_graph::persist_node_diff(
-        &deps.db,
-        primary_run_id,
-        SHADOW_FINAL_STATE_NODE,
-        &primary,
-        &shadow,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("persistenza telemetria shadow: {e}"))?;
-
-    // Niente leak (regola F): si logga la convergenza strutturale, non il testo.
-    tracing::info!(
-        primary_run_id = %primary_run_id,
-        converged = divergent.is_empty(),
-        divergent_keys = ?divergent,
-        "shadow: confronto stato finale persistito (__final_state__)"
-    );
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -3654,7 +3256,7 @@ mod tests {
     #[test]
     fn initial_state_da_prompt_history_e_override() {
         let input = sample_input();
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(state.messages.len(), 2, "history (1) + turno corrente (1)");
         // L'ULTIMO messaggio e' il prompt utente del turno.
         match state.messages.last().expect("almeno un messaggio") {
@@ -3679,7 +3281,7 @@ mod tests {
         assert_eq!(
             state.behavior_mode.as_deref(),
             Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE),
-            "behavior_mode = fonte primario (bilanciata), per parita' con lo shadow"
+            "behavior_mode = fonte primario (bilanciata)"
         );
 
         // Tools propagati (array non vuoto).
@@ -3687,8 +3289,8 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "read_file");
 
-        // FIX shadow: il PRIMARIO non forza action_oriented/user_intent: restano
-        // None e il RouterNode reale decide come oggi (zero impatto sul Real).
+        // Senza dati del classifier il PRIMARIO non forza action_oriented/
+        // user_intent: restano None e il RouterNode reale decide come oggi.
         assert_eq!(
             state.action_oriented, None,
             "primario: action_oriented non forzato (decide il RouterNode)"
@@ -3707,7 +3309,7 @@ mod tests {
             "requirements": ["punto unico routing"],
         }));
         input.pre_run_advisory_source = Some("multi_provider_synthesis");
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert!(state
             .extra
             .contains_key(nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY));
@@ -3738,7 +3340,7 @@ mod tests {
             "risks": [{"severity": "high", "description": "x"}],
         }));
         input.pre_run_advisory_source = Some("council");
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         // Il segnale advisory c'e' (il coordinatore lo LEGGE)...
         assert!(state
             .extra
@@ -3770,7 +3372,7 @@ mod tests {
     fn initial_state_tools_null_diventa_none() {
         let mut input = sample_input();
         input.tools_json = serde_json::Value::Null;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert!(state.tools_json.is_none(), "tools null -> None");
     }
 
@@ -3778,7 +3380,7 @@ mod tests {
     #[test]
     fn initial_state_principale_senza_parent_depth() {
         let input = sample_input();
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(state.parent_run_id, None, "run principale: nessun parent");
         assert_eq!(state.subagent_depth, None, "run principale: nessun depth");
     }
@@ -3791,7 +3393,7 @@ mod tests {
         let parent = Uuid::new_v4();
         input.parent_run_id = Some(parent);
         input.subagent_depth = Some(2);
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.parent_run_id.as_deref(),
             Some(parent.to_string().as_str()),
@@ -3801,114 +3403,6 @@ mod tests {
             state.subagent_depth,
             Some(2),
             "sub-run: subagent_depth propagato (anti-ricorsione/guard fan-out)"
-        );
-    }
-
-    /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` OPERATIVO
-    /// (`code_write`), lo stato iniziale deriva `user_intent` + `action_oriented`
-    /// (true) col punto unico, cosi' il grafo shadow non parte da `action_oriented`
-    /// forzato dal fallback del RouterNode.
-    #[test]
-    fn initial_state_shadow_intent_operativo_deriva_action() {
-        let input = sample_input(); // intent_hint = "code_write"
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.user_intent.as_deref(), Some("code_write"));
-        assert_eq!(
-            state.action_oriented,
-            Some(true),
-            "intent operativo -> azione"
-        );
-    }
-
-    /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` CONVERSAZIONALE
-    /// (`chat`), `action_oriented` deriva a `false` -> niente G1 sui turni 0-tool
-    /// (questa era la RADICE della divergenza `g1`).
-    #[test]
-    fn initial_state_shadow_intent_chat_action_false() {
-        let mut input = sample_input();
-        input.intent_hint = Some("chat".to_string());
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.user_intent.as_deref(), Some("chat"));
-        assert_eq!(
-            state.action_oriented,
-            Some(false),
-            "intent conversazionale -> NON azione (niente G1)"
-        );
-    }
-
-    /// FIX shadow (fallback grossolano): nel ramo Shadow SENZA `intent_hint` E
-    /// senza dati del classifier, lo stato resta a None (il RouterNode shadow
-    /// applichera' il fallback del Python degradato).
-    #[test]
-    fn initial_state_shadow_senza_intent_resta_none() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.user_intent, None);
-        assert_eq!(state.action_oriented, None);
-    }
-
-    // ── Tappa 1b (B): derivazione FEDELE dal classifier completo ─────────────
-
-    /// Shadow + classifier RISOLTO su un turno read-only (requires_tools=false,
-    /// agentic_score sotto soglia, niente intent_hint): action_oriented=false
-    /// FEDELE al primario Python -> niente G1Continue -> stop_reason converge.
-    /// Questa e' la RADICE della divergenza g1 che la Tappa 1b chiude.
-    #[test]
-    fn initial_state_shadow_classifier_read_only_action_false() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        input.classifier_resolved = true;
-        input.requires_tools = Some(false);
-        input.agentic_score = Some(0.10);
-        input.authorizes_changes = Some(false);
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(
-            state.action_oriented,
-            Some(false),
-            "turno read-only (classifier risolto) -> NON azione, niente G1"
-        );
-    }
-
-    /// Shadow + classifier RISOLTO su un turno d'azione (requires_tools=true):
-    /// action_oriented=true FEDELE, anche se l'agentic_score e' basso.
-    #[test]
-    fn initial_state_shadow_classifier_azione_action_true() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        input.classifier_resolved = true;
-        input.requires_tools = Some(true);
-        input.agentic_score = Some(0.20);
-        input.authorizes_changes = Some(true);
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(
-            state.action_oriented,
-            Some(true),
-            "requires_tools=true -> azione (fedele al primario)"
-        );
-    }
-
-    /// Shadow + classifier RISOLTO con requires_tools assente ma agentic_score
-    /// SOPRA la soglia: action_oriented=true via soglia (porting __init__.py:699).
-    #[test]
-    fn initial_state_shadow_classifier_score_sopra_soglia_action_true() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        input.classifier_resolved = true;
-        input.requires_tools = None;
-        input.agentic_score = Some(0.80);
-        input.action_oriented_min_score = 0.5;
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(
-            state.action_oriented,
-            Some(true),
-            "score 0.80 >= 0.5 -> azione"
         );
     }
 
@@ -3927,7 +3421,7 @@ mod tests {
         input.requires_tools = Some(false);
         input.agentic_score = Some(0.10);
         input.authorizes_changes = Some(false);
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented,
             Some(false),
@@ -3944,7 +3438,7 @@ mod tests {
     #[test]
     fn prompt_key_arriva_nello_stato_del_run() {
         let input = sample_input();
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.profile_name.as_deref(),
             Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY),
@@ -3959,7 +3453,7 @@ mod tests {
     fn prompt_key_assente_resta_assente() {
         let mut input = sample_input();
         input.prompt_key = None;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(state.profile_name, None);
     }
 
@@ -3971,7 +3465,7 @@ mod tests {
         input.requires_tools = Some(true);
         input.agentic_score = Some(0.20);
         input.authorizes_changes = Some(true);
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented,
             Some(true),
@@ -3981,7 +3475,7 @@ mod tests {
 
     /// PRIMARIO RUST + classifier RISOLTO con requires_tools assente ma agentic_score
     /// SOPRA soglia: action_oriented=true via soglia (porting __init__.py:699),
-    /// identico allo shadow e al primario Python.
+    /// identico al primario Python.
     #[test]
     fn initial_state_primary_classifier_score_sopra_soglia_action_true() {
         let mut input = sample_input();
@@ -3990,7 +3484,7 @@ mod tests {
         input.requires_tools = None;
         input.agentic_score = Some(0.80);
         input.action_oriented_min_score = 0.5;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented,
             Some(true),
@@ -4008,7 +3502,7 @@ mod tests {
         input.classifier_resolved = false;
         input.requires_tools = None;
         input.agentic_score = None;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented, None,
             "primario Rust senza dati classifier: decide il RouterNode (invariato)"
@@ -4023,7 +3517,7 @@ mod tests {
     #[test]
     fn initial_state_primary_intent_hint_senza_classifier_resta_none() {
         let input = sample_input(); // intent_hint="code_write", classifier_resolved=false
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented, None,
             "primario Rust: senza dati classifier non deriva (RouterNode passthrough)"
@@ -4040,7 +3534,7 @@ mod tests {
             serde_json::json!({"role": "system", "content": "system da scartare"}),
             serde_json::json!({"role": "assistant", "content": "ok"}),
         ];
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         // Malformata + system saltate (best-effort): resta la valida + il turno.
         assert_eq!(state.messages.len(), 2);
         // La entry valida e' l'assistant pregresso (penultimo), poi il turno Human.
@@ -4452,237 +3946,6 @@ mod tests {
             .connect_lazy("postgres://nexus@localhost:1/na")
             .expect("connect_lazy non fa I/O");
         let _adapter = GatewayLlmAdapter::new(gw, pool, String::new(), String::new());
-    }
-
-    // ── SHADOW (F4): proiezione canonica + persistenza telemetria ─────────────
-    //
-    // Il driver completo `run_shadow` esegue il grafo via `build_native_engine`,
-    // che costruisce un `GatewayLlmAdapter` su `NexusGatewayClient` HTTP: non
-    // scriptabile in unit test (l'E2E del grafo con gateway stub vive in
-    // `nexus_agent_graph::graph`). Qui copriamo la parte SPECIFICA del driver che
-    // quel test non tocca: la PROIEZIONE CANONICA (vocabolario comune Python/Rust)
-    // e la PERSISTENZA del singolo record "__final_state__". Le garanzie di
-    // zero-scrittura (Replay, MemoryCheckpointer, NullEventSink, gate http in
-    // Replay) sono testate ognuna nel proprio modulo.
-
-    use serde_json::json;
-
-    #[test]
-    fn canonical_stop_reason_mappa_vocabolario_comune() {
-        // Python (status agent_runs) -> vocabolario comune.
-        assert_eq!(canonical_stop_reason(Some("completed")), "end_turn");
-        assert_eq!(
-            canonical_stop_reason(Some("completed_verified")),
-            "end_turn"
-        );
-        assert_eq!(
-            canonical_stop_reason(Some("completed_unverified")),
-            "end_turn"
-        );
-        assert_eq!(canonical_stop_reason(Some("failed")), "failed");
-        assert_eq!(canonical_stop_reason(Some("failed_diagnosed")), "failed");
-        assert_eq!(
-            canonical_stop_reason(Some("awaiting_confirmation")),
-            "interrupted"
-        );
-        // Rust (StopReason snake_case) -> stesso vocabolario.
-        assert_eq!(canonical_stop_reason(Some("end_turn")), "end_turn");
-        assert_eq!(canonical_stop_reason(Some("tool_use")), "tool_use");
-        assert_eq!(canonical_stop_reason(Some("error")), "failed");
-        assert_eq!(canonical_stop_reason(Some("loop_abort")), "loop");
-        assert_eq!(canonical_stop_reason(Some("superseded")), "superseded");
-        assert_eq!(canonical_stop_reason(Some("g1_escalated")), "g1");
-        // None / ignoto.
-        assert_eq!(canonical_stop_reason(None), "none");
-        assert_eq!(canonical_stop_reason(Some("qualcosa-di-strano")), "other");
-    }
-
-    #[test]
-    fn stop_reason_label_serializza_snake_case() {
-        // L'enum Rust serializza nella forma snake_case poi canonicalizzata uguale
-        // al primario (un solo vocabolario, regola L).
-        let lbl = stop_reason_label(Some(StopReason::EndTurn));
-        assert_eq!(lbl.as_deref(), Some("end_turn"));
-        assert_eq!(canonical_stop_reason(lbl.as_deref()), "end_turn");
-        assert!(stop_reason_label(None).is_none());
-    }
-
-    #[test]
-    fn shadow_canonical_conta_tool_e_produced_work() {
-        use nexus_agent_graph::state::{ContentBlock, MessageContent, ToolUse};
-
-        let state = AgentState {
-            stop_reason: Some(StopReason::EndTurn),
-            messages: vec![
-                Message::Human {
-                    content: MessageContent::text("scrivi e leggi"),
-                },
-                // Forma OpenAI-compat: un read_file (non mutativo).
-                Message::Ai {
-                    content: MessageContent::text(""),
-                    tool_calls: vec![ToolUse {
-                        id: "t1".to_string(),
-                        name: "read_file".to_string(),
-                        input: json!({}),
-                        thought_signature: None,
-                    }],
-                    reasoning: None,
-                    thinking_signature: None,
-                },
-                // Forma Anthropic: un edit_file inline (mutativo) -> produced_work.
-                Message::Ai {
-                    content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                        id: "t2".to_string(),
-                        name: "edit_file".to_string(),
-                        input: json!({}),
-                        thought_signature: None,
-                    }]),
-                    tool_calls: vec![],
-                    reasoning: None,
-                    thinking_signature: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let c = shadow_canonical(&state, true);
-        assert_eq!(c["completed"], json!(true));
-        assert_eq!(c["stop_reason"], json!("end_turn"));
-        assert_eq!(c["num_tool_calls"], json!(2), "read_file + edit_file");
-        assert_eq!(c["has_produced_work"], json!(true), "edit_file e' mutativo");
-    }
-
-    #[test]
-    fn shadow_canonical_solo_testo_nessun_lavoro() {
-        let state = AgentState {
-            stop_reason: Some(StopReason::EndTurn),
-            messages: vec![Message::Ai {
-                content: nexus_agent_graph::state::MessageContent::text("risposta testuale"),
-                tool_calls: vec![],
-                reasoning: None,
-                thinking_signature: None,
-            }],
-            ..Default::default()
-        };
-        let c = shadow_canonical(&state, true);
-        assert_eq!(c["num_tool_calls"], json!(0));
-        assert_eq!(c["has_produced_work"], json!(false));
-    }
-
-    /// Run primario `completed` su cui `primary_canonical` legge stato e step.
-    /// Le tabelle (`agent_runs`, `agent_steps`) le porta il migrator del set
-    /// `db/migrations/project`.
-    async fn seed_run_completed(pool: &sqlx::PgPool) -> Uuid {
-        let run = crate::test_support::seed_agent_run(pool).await;
-        sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE id = $1")
-            .bind(run)
-            .execute(pool)
-            .await
-            .expect("chiudi il run primario");
-        run
-    }
-
-    async fn create_shadow_telemetry_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_shadow_telemetry ( \
-                 id UUID PRIMARY KEY, \
-                 run_id UUID NOT NULL, \
-                 node_name TEXT NOT NULL, \
-                 primary_output JSONB NOT NULL, \
-                 shadow_output JSONB NOT NULL, \
-                 divergent_keys TEXT[] NOT NULL DEFAULT '{}', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_shadow_telemetry");
-    }
-
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn primary_canonical_legge_status_e_step(pool: sqlx::PgPool) {
-        let run = seed_run_completed(&pool).await;
-        // Due step: un read_file (non mutativo) + un write_file (mutativo).
-        for (i, name) in [(1000, "read_file"), (2000, "write_file")] {
-            sqlx::query(
-                "INSERT INTO agent_steps (id, run_id, step_index, tool_name, tool_input) \
-                 VALUES (gen_random_uuid(), $1, $2, $3, '{}'::jsonb)",
-            )
-            .bind(run)
-            .bind(i)
-            .bind(name)
-            .execute(&pool)
-            .await
-            .expect("insert step");
-        }
-
-        let c = primary_canonical(&pool, run).await.expect("canonical");
-        assert_eq!(c["completed"], json!(true));
-        assert_eq!(c["stop_reason"], json!("end_turn"), "completed -> end_turn");
-        assert_eq!(c["num_tool_calls"], json!(2));
-        assert_eq!(c["has_produced_work"], json!(true), "write_file mutativo");
-    }
-
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn shadow_persiste_un_solo_record_final_state(pool: sqlx::PgPool) {
-        // Replica la parte finale di run_shadow (dopo l'esecuzione del grafo): il
-        // confronto canonico primario(DB)<->shadow(stato) e la persistenza del
-        // SINGOLO record "__final_state__". Verifica che ci sia ESATTAMENTE una
-        // riga, sul nodo "__final_state__", con i divergent_keys attesi.
-        create_shadow_telemetry_table(&pool).await;
-        // Primario: completed, 0 step (nessun tool, nessun lavoro).
-        let run = seed_run_completed(&pool).await;
-
-        let primary = primary_canonical(&pool, run).await.expect("primary");
-        // Shadow: completato ma con un write_file (diverge su num_tool_calls +
-        // has_produced_work rispetto al primario a 0 tool).
-        let shadow_state = AgentState {
-            stop_reason: Some(StopReason::EndTurn),
-            messages: vec![Message::Ai {
-                content: nexus_agent_graph::state::MessageContent::text(""),
-                tool_calls: vec![nexus_agent_graph::state::ToolUse {
-                    id: "t".to_string(),
-                    name: "write_file".to_string(),
-                    input: json!({}),
-                    thought_signature: None,
-                }],
-                reasoning: None,
-                thinking_signature: None,
-            }],
-            ..Default::default()
-        };
-        let shadow = shadow_canonical(&shadow_state, true);
-
-        nexus_agent_graph::persist_node_diff(
-            &pool,
-            run,
-            SHADOW_FINAL_STATE_NODE,
-            &primary,
-            &shadow,
-        )
-        .await
-        .expect("persist telemetria shadow");
-
-        // ESATTAMENTE un record, sul nodo __final_state__.
-        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
-            "SELECT node_name, divergent_keys FROM nexus_shadow_telemetry WHERE run_id = $1",
-        )
-        .bind(run)
-        .fetch_all(&pool)
-        .await
-        .expect("select telemetria");
-        assert_eq!(rows.len(), 1, "un solo record per run shadow");
-        assert_eq!(rows[0].0, "__final_state__");
-        // Divergenze attese: num_tool_calls (0 vs 1) + has_produced_work (false vs true).
-        let mut keys = rows[0].1.clone();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "has_produced_work".to_string(),
-                "num_tool_calls".to_string()
-            ]
-        );
     }
 
     /// Tabella `settings` minimale (key, value) per i test DB-driven delle config.
@@ -5212,7 +4475,6 @@ mod tests {
         async fn execute(
             &self,
             call: nexus_agent_graph::runtime::ports::ToolCall,
-            _mode: nexus_agent_graph::runtime::ports::ExecMode,
         ) -> Result<
             nexus_agent_graph::runtime::ports::ToolOutcome,
             nexus_agent_graph::runtime::ports::PortError,

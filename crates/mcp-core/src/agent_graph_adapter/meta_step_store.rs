@@ -3,16 +3,16 @@
 //! IMPLEMENTERA' (FASE 2) `MetaStepStore::persist_meta_step` con una INSERT su
 //! `agent_meta_steps` via `sqlx` (plan/routing/clarify/fallback/reflection
 //! persistiti per la cronologia, distinti dal canale live SSE
-//! [`super::event_sink`]). Gata `Real` (no-op in `ExecMode::Replay`). Best-effort:
-//! errore DB loggato, `Ok(())`. E' un trait SEPARATO da `EventSink` (persistenza
-//! async/fallibile/gata vs canale live sincrono/infallibile, vedi doc del trait).
+//! [`super::event_sink`]). Best-effort: errore DB loggato, `Ok(())`. E' un trait
+//! SEPARATO da `EventSink` (persistenza async/fallibile vs canale live
+//! sincrono/infallibile, vedi doc del trait).
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, MetaStepStore, PortError};
+use nexus_agent_graph::runtime::ports::{MetaStepStore, PortError};
 
 /// Adapter [`MetaStepStore`] -> `nexus_agent_meta_steps` via `sqlx`.
 ///
@@ -40,13 +40,9 @@ impl MetaStepStore for PgMetaStepStore {
     /// `{kind, title, payload, correlation_id?}` (forma del canale SSE); i campi
     /// mancanti degradano ai default di colonna (`title=''`, `payload='{}'`).
     ///
-    /// Gate shadow (regola L): no-op in [`ExecMode::Replay`]. Best-effort: un
-    /// `kind` vuoto o un errore DB sono loggati e ritornano `Ok(())` (parita' col
-    /// best-effort psycopg2 di `brain/agents/meta_steps.py`).
-    async fn persist_meta_step(&self, meta_step: Value, mode: ExecMode) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
+    /// Best-effort: un `kind` vuoto o un errore DB sono loggati e ritornano
+    /// `Ok(())` (parita' col best-effort psycopg2 di `brain/agents/meta_steps.py`).
+    async fn persist_meta_step(&self, meta_step: Value) -> Result<(), PortError> {
         let kind = meta_step
             .get("kind")
             .and_then(|v| v.as_str())
@@ -108,7 +104,6 @@ mod tests {
         store
             .persist_meta_step(
                 json!({"kind": "plan", "title": "Piano", "payload": {"n": 3}}),
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -123,24 +118,10 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn replay_e_no_op(pool: PgPool) {
-        let store = PgMetaStepStore::new(pool.clone(), Uuid::new_v4());
-        store
-            .persist_meta_step(json!({"kind": "routing"}), ExecMode::Replay)
-            .await
-            .expect("ok");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nexus_agent_meta_steps")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(count, 0, "in Replay nessuna scrittura");
-    }
-
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn kind_vuoto_non_inserisce(pool: PgPool) {
         let store = PgMetaStepStore::new(pool.clone(), Uuid::new_v4());
         store
-            .persist_meta_step(json!({"title": "senza kind"}), ExecMode::Real)
+            .persist_meta_step(json!({"title": "senza kind"}))
             .await
             .expect("best-effort Ok");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nexus_agent_meta_steps")

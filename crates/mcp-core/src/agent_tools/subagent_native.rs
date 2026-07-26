@@ -537,12 +537,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     //        (identico a oggi). Con flag OFF (default) -> sempre sequenziale ->
     //        comportamento BIT-IDENTICO. ─────────────────────────────────────────
     //
-    // DETERMINISMO/REPLAY: questo intero handler gira SOLO in `ExecMode::Real`. In
-    // Replay/Shadow il `ToolExecutorAdapter` rilegge il tool_result di
-    // `dispatch_subagents` da `agent_steps` (`execute_replay`) senza mai chiamare
-    // `execute_real`: il ramo isolato (worktree/apply, side-effect Real-only) non
-    // viene mai ricreato in shadow -> nessuna divergenza. L'apply e' l'unica fonte
-    // del commit e avviene solo qui, in Real.
+    // L'apply e' l'unica fonte del commit del sub-run isolato e avviene solo qui.
     let scopes: Vec<Vec<String>> = parsed.iter().map(|p| p.write_scope.clone()).collect();
     // I/O (flag DB + probe git) separato dalla decisione pura: il probe scatta solo
     // se il flag e' ON (compute_isolation_available corto-circuita), poi la
@@ -2754,14 +2749,11 @@ impl ParentNarrator {
     }
 
     /// Emette (live) + persiste (storico) UN meta-step della narrazione,
-    /// correlato al sub-run. Best-effort: mai un errore al chiamante. Il tool
-    /// gira SOLO in `ExecMode::Real` (in Replay il tool_result e' riletto da
-    /// `agent_steps` senza eseguire l'handler), quindi il mode e' fissato.
+    /// correlato al sub-run. Best-effort: mai un errore al chiamante.
     async fn say(&self, kind: &str, title: String, payload: Value, subagent_run_id: Uuid) {
         nexus_agent_graph::nodes::emit_phase_meta_correlated(
             &self.sink,
             &self.store,
-            nexus_agent_graph::runtime::ports::ExecMode::Real,
             kind,
             Some(subagent_run_id.to_string()),
             title,

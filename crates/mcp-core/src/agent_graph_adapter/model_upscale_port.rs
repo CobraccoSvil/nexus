@@ -10,12 +10,12 @@
 //! (`agent.upscale.*`) sono settings letti via `sqlx`. CONFINE (regola L): la
 //! DECISIONE di SE fare upscale resta PURA in
 //! `nexus_agent_graph::decisions::end_turn`; qui SOLO l'I/O. BEST-EFFORT:
-//! `Ok(0)` / `Ok(None)` su guasto, mai `PortError`. SOLA LETTURA: nessun gate `mode`.
+//! `Ok(0)` / `Ok(None)` su guasto, mai `PortError`. SOLA LETTURA.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, ModelUpscalePort, PortError, UpscalePick};
+use nexus_agent_graph::runtime::ports::{ModelUpscalePort, PortError, UpscalePick};
 
 
 /// Adapter [`ModelUpscalePort`] -> `ai_price_catalog` + settings `agent.upscale.*`.
@@ -137,25 +137,16 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
     /// Selezione BIDIREZIONALE per lo SCALE-CONTROLLER (PR-B3): DELEGA al PUNTO
     /// UNICO `select_agentic_model` (regola L) col `tier` target e il
     /// `min_context_window` richiesto (FIX-B: nel downscale = est_tokens*overhead).
-    /// GATE mode opzione A: in Replay ritorna `Ok(None)` (il rientro rilegge lo
-    /// sticky checkpointato -> nessun I/O di risoluzione, parita' shadow). Fail-open
-    /// gia' incorporato: `select_agentic_model` ritorna `None` su guasto/nessun
-    /// candidato (nessun panico), che qui e' `Ok(None)` -> il chiamante ANNULLA il
-    /// cambio-tier (fail-safe, mantiene il modello corrente).
+    /// Fail-open gia' incorporato: `select_agentic_model` ritorna `None` su
+    /// guasto/nessun candidato (nessun panico), che qui e' `Ok(None)` -> il
+    /// chiamante ANNULLA il cambio-tier (fail-safe, mantiene il modello corrente).
     async fn select_model_for_tier(
         &self,
         tier: &str,
         min_context_window: i64,
         capability: Option<&str>,
         exclude_providers: &[String],
-        mode: ExecMode,
     ) -> Result<Option<(String, String)>, PortError> {
-        if mode != ExecMode::Real {
-            // Opzione A: nessuna risoluzione in Replay (lo sticky del primario e' la
-            // fonte di verita' checkpointata; risolvere qui divergerebbe se il
-            // catalog e' cambiato tra primario e resume).
-            return Ok(None);
-        }
         // SERVIZIO UNICO (regola L). `Exact{ScaleTarget}`: il tier arriva GIA'
         // deciso dal modulo puro dello scale-controller — questa funzione lo
         // ESEGUE, non lo negozia. Degradare qui darebbe al chiamante un modello

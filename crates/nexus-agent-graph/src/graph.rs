@@ -424,7 +424,7 @@ mod tests {
     };
     use crate::runtime::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
-        EscalationPort, ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore,
+        EscalationPort, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore,
         ModelUpscalePort, NextActionsDeriver, PortError, RunControlStore, SummaryStore, TodoStore,
         ToolCall, ToolExecutor, ToolOutcome, VerifierRunStore,
     };
@@ -572,7 +572,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for TrackingStubTool {
-        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             self.exec_count.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutcome {
                 tool_call_id: call.id,
@@ -612,7 +612,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for StubToolForGraph {
-        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             Ok(ToolOutcome {
                 tool_call_id: call.id,
                 content: json!("contenuto del file letto"),
@@ -749,7 +749,7 @@ mod tests {
         }
     }
 
-    /// Ctx con il gateway scriptato + stub. `shadow=false`: run primario (Real).
+    /// Ctx con il gateway scriptato + stub.
     fn ctx_with(
         llm: Arc<dyn LlmGateway>,
         tools: Arc<dyn ToolExecutor>,
@@ -766,7 +766,6 @@ mod tests {
             run_id,
             session_id: Uuid::new_v4(),
             thread_id: run_id,
-            shadow: false,
             advisory_gate: None,
         }
     }

@@ -596,8 +596,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
         // sono portati (OFF di default, I/O KB+LLM+DB): vedi doc del modulo. Con i
         // default DB il flusso non li attraversa, quindi nessuna divergenza.
 
-        let mode = ctx.exec_mode();
-
         // ── project_context: UNA list_files top-level (I/O dietro la porta) ───
         // Best-effort: errore -> blocco vuoto (comportamento storico, :561-563).
         let project_context = {
@@ -607,7 +605,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 input: json!({ "directory": "." }),
                 thought_signature: None,
             };
-            match ctx.tools.execute(call, mode).await {
+            match ctx.tools.execute(call).await {
                 Ok(outcome) => {
                     let raw = Self::outcome_result_json(&outcome.content);
                     Self::build_project_context(&raw)
@@ -656,10 +654,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for ClarifyOrExpandNode {
                 model: String::new(),
                 messages,
                 tools: Some(vec![Self::tool_schema()]),
-                // Nodo chiamante = clarify/understanding: in shadow il decorator di
-                // replay neutralizza questo purpose (no-op, il nodo gestisce gia' il
-                // caso "nessun tool_use emesso" come skip). Il gateway concreto lo
-                // IGNORA (regola L).
+                // Nodo chiamante = clarify/understanding. Il gateway concreto lo
+                // IGNORA quando il modello e' gia' risolto (regola L).
                 purpose: Some("clarify_expand".into()),
                 ..Default::default()
             };
@@ -750,7 +746,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::ports::{
-        EventSink, ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent,
+        EventSink, LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError, SseEvent,
         ToolCall, ToolExecutor, ToolOutcome,
     };
     use crate::runtime::AgentNodeCtx;
@@ -824,34 +820,6 @@ mod tests {
         }
     }
 
-    /// Tool executor che ritorna un listing fisso per `list_files` e registra le
-    /// modalita' osservate.
-    struct ListingTools {
-        listing: String,
-        modes: std::sync::Mutex<Vec<ExecMode>>,
-    }
-    impl ListingTools {
-        fn new(listing: &str) -> Self {
-            Self {
-                listing: listing.to_string(),
-                modes: std::sync::Mutex::new(vec![]),
-            }
-        }
-    }
-    #[async_trait]
-    impl ToolExecutor for ListingTools {
-        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
-            self.modes.lock().unwrap().push(mode);
-            assert_eq!(call.name, "list_files");
-            Ok(ToolOutcome {
-                tool_call_id: call.id,
-                content: Value::String(self.listing.clone()),
-                is_error: false,
-                ..Default::default()
-            })
-        }
-    }
-
     /// Tool executor che fallisce sempre (project_context vuoto, best-effort).
     struct FailingTools;
     #[async_trait]
@@ -859,7 +827,6 @@ mod tests {
         async fn execute(
             &self,
             _call: ToolCall,
-            _mode: ExecMode,
         ) -> Result<ToolOutcome, PortError> {
             Err(PortError::Tool("simulato".to_string().into()))
         }
@@ -874,7 +841,6 @@ mod tests {
     fn ctx_with(
         llm: Arc<dyn LlmGateway>,
         tools: Arc<dyn ToolExecutor>,
-        shadow: bool,
     ) -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
@@ -890,7 +856,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -1166,7 +1131,7 @@ mod tests {
             "reversible": true
         })));
         let tools = Arc::new(FailingTools); // project_context vuoto, irrilevante
-        let ctx = ctx_with(llm, tools, false);
+        let ctx = ctx_with(llm, tools);
         let st = trigger_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
 
@@ -1189,7 +1154,7 @@ mod tests {
             "mode": "expand",
             "expanded_query": "implementazione cache sessioni utente con TTL e invalidazione"
         })));
-        let ctx = ctx_with(llm, Arc::new(FailingTools), false);
+        let ctx = ctx_with(llm, Arc::new(FailingTools));
         let st = trigger_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
 
@@ -1208,7 +1173,7 @@ mod tests {
         let llm = Arc::new(ScriptedLlm::with_decision(
             json!({"mode": "ask", "question": "x"}),
         ));
-        let ctx = ctx_with(llm.clone(), Arc::new(FailingTools), false);
+        let ctx = ctx_with(llm.clone(), Arc::new(FailingTools));
         let mut st = trigger_state();
         st.intent_confidence = Some(0.95); // sopra soglia -> skip
         let delta = node.run(&st, &ctx).await.expect("run ok");
@@ -1224,7 +1189,6 @@ mod tests {
         let ctx = ctx_with(
             Arc::new(ScriptedLlm::no_tool()),
             Arc::new(FailingTools),
-            false,
         );
         let st = trigger_state();
         let delta = node.run(&st, &ctx).await.expect("run ok");
@@ -1235,25 +1199,12 @@ mod tests {
     #[tokio::test]
     async fn nodo_llm_fallito_noop() {
         let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
-        let ctx = ctx_with(Arc::new(FailingLlm), Arc::new(FailingTools), false);
+        let ctx = ctx_with(Arc::new(FailingLlm), Arc::new(FailingTools));
         let st = trigger_state();
         let delta = node.run(&st, &ctx).await.expect("run ok");
         assert_eq!(delta.as_map().len(), 0);
     }
 
-    /// Shadow: la list_files del project_context gira in Replay (zero side-effect).
-    #[tokio::test]
-    async fn nodo_shadow_usa_replay() {
-        let node = ClarifyOrExpandNode::new(ClarifyConfig::default());
-        let tools = Arc::new(ListingTools::new("package.json\nsrc/"));
-        let llm = Arc::new(ScriptedLlm::with_decision(json!({"mode": "skip"})));
-        let ctx = ctx_with(llm, tools.clone(), true);
-        let st = trigger_state();
-        let _ = node.run(&st, &ctx).await.expect("run ok");
-        let modes = tools.modes.lock().unwrap();
-        assert!(!modes.is_empty());
-        assert!(modes.iter().all(|m| *m == ExecMode::Replay));
-    }
 }
 
 #[cfg(test)]

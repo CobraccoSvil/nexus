@@ -3,9 +3,7 @@
 //! Esegue l'I/O sui todo del DAG su `nexus_agent_todos` via
 //! `sqlx`. INVARIANTE (regola H): `list_todos`
 //! restituisce `depends_on` come `Vec` (cast `::text[]`), MAI una stringa
-//! `"{...}"`, e i todo gia' ordinati per `seq` ASC. Le scritture (`mark_status`,
-//! `increment_iteration_seen`) sono gata `Real` (no-op in `ExecMode::Replay`,
-//! punto unico del gate shadow). La LOGICA DAG resta pura in
+//! `"{...}"`, e i todo gia' ordinati per `seq` ASC. La LOGICA DAG resta pura in
 //! `nexus_agent_graph::decisions::dag_scheduler` (questo adapter isola SOLO il DB).
 
 use async_trait::async_trait;
@@ -13,7 +11,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::decisions::dag_scheduler::{Todo, TodoStatus};
-use nexus_agent_graph::runtime::ports::{ExecMode, PlanRow, PortError, TodoStore};
+use nexus_agent_graph::runtime::ports::{PlanRow, PortError, TodoStore};
 
 /// Adapter [`TodoStore`] -> `nexus_agent_todos` via `sqlx`.
 pub struct PgTodoStore {
@@ -175,16 +173,12 @@ impl TodoStore for PgTodoStore {
     /// Aggiorna lo status di un todo (UPDATE best-effort). 1:1 con
     /// `verifier_node._mark_todo_status` / `dag_scheduler._mark`: incrementa
     /// `verify_failures` quando il nuovo status e' `blocked` (heuristic anti-stall).
-    /// Gata `Real` (no-op in shadow, regola L). Best-effort: errore loggato, `Ok(())`.
+    /// Best-effort: errore loggato, `Ok(())`.
     async fn mark_status(
         &self,
         todo_id: &str,
         status: TodoStatus,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let todo_uuid = match Uuid::parse_str(todo_id) {
             Ok(u) => u,
             Err(_) => return Ok(()),
@@ -240,16 +234,11 @@ impl TodoStore for PgTodoStore {
     }
 
     /// Incrementa `iteration_seen` dei todo non terminali del run (telemetria
-    /// avanzamento, 1:1 con `todo_store.increment_iteration_seen`). Gata `Real`
-    /// (no-op in shadow). Best-effort.
+    /// avanzamento, 1:1 con `todo_store.increment_iteration_seen`). Best-effort.
     async fn increment_iteration_seen(
         &self,
         run_id: &str,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
             Err(_) => return Ok(()),
@@ -508,7 +497,7 @@ mod tests {
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
-            .mark_status(&t.to_string(), TodoStatus::Blocked, ExecMode::Real)
+            .mark_status(&t.to_string(), TodoStatus::Blocked)
             .await
             .expect("ok");
         let (status, vf): (String, i32) =
@@ -537,7 +526,7 @@ mod tests {
             PgTodoStore::with_events(pool.clone(), pool.clone(), channels.clone(), project_id);
 
         store
-            .mark_status(&t.to_string(), TodoStatus::Completed, ExecMode::Real)
+            .mark_status(&t.to_string(), TodoStatus::Completed)
             .await
             .expect("ok");
 
@@ -549,7 +538,7 @@ mod tests {
         // Lo store SENZA canali resta valido: scrive e basta (percorsi di sola
         // lettura e test non devono essere costretti a fornire i canali).
         let muto = PgTodoStore::new(pool.clone(), pool.clone());
-        muto.mark_status(&t.to_string(), TodoStatus::Blocked, ExecMode::Real)
+        muto.mark_status(&t.to_string(), TodoStatus::Blocked)
             .await
             .expect("ok anche senza canali");
         let status: String =
@@ -561,23 +550,6 @@ mod tests {
         assert_eq!(status, "blocked");
     }
 
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn mark_status_replay_e_no_op(pool: PgPool) {
-        let run_id = setup_run_con_piano(&pool).await;
-        let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
-        let store = PgTodoStore::new(pool.clone(), pool.clone());
-        store
-            .mark_status(&t.to_string(), TodoStatus::Completed, ExecMode::Replay)
-            .await
-            .expect("ok");
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM nexus_agent_todos WHERE id = $1")
-                .bind(t)
-                .fetch_one(&pool)
-                .await
-                .expect("riga");
-        assert_eq!(status, "pending", "in Replay lo status NON cambia");
-    }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn increment_iteration_seen_solo_non_terminali(pool: PgPool) {
@@ -586,7 +558,7 @@ mod tests {
         let c = insert_todo(&pool, run_id, 2, "b", "completed", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
-            .increment_iteration_seen(&run_id.to_string(), ExecMode::Real)
+            .increment_iteration_seen(&run_id.to_string())
             .await
             .expect("ok");
         let seen_p: i32 =

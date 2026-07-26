@@ -24,7 +24,7 @@
 //!   [`estimate_tool_result_size_bytes`]/[`extract_returned_bytes`]/
 //!   [`estimate_context_chars`]/[`current_context_token_estimate`]/
 //!   [`append_reminder_block`] + le costanti di cap.
-//! - Trait `runtime::ports`: [`ToolExecutor`] (esecuzione, `ExecMode` Real|Replay),
+//! - Trait `runtime::ports`: [`ToolExecutor`] (esecuzione),
 //!   [`AgentStepStore`] (persist step), [`RunControlStore`] (superseded +
 //!   heartbeat), [`TodoStore`] (reminder), [`ContextOffload`] (offload RAG). Sono
 //!   CAMPI del nodo (coerente con `FinalGateNode`/`TodoRunnerNode`).
@@ -41,7 +41,7 @@
 //!    SYNTHETIC-blocked col SENTINEL (NON eseguito); M16 `is_tool_allowed` ->
 //!    SYNTHETIC error (forza nexus_mcp_tool_search); budget allegati ->
 //!    SYNTHETIC error; altrimenti KEPT.
-//! 4. esecuzione: `join_all` dei KEPT via `ToolExecutor::execute(mode)`. Il nodo
+//! 4. esecuzione: `join_all` dei KEPT via `ToolExecutor::execute`. Il nodo
 //!    PRESERVA l'ordine ORIGINALE dei pending nella ricomposizione (allineamento
 //!    per POSIZIONE, non per id): load-bearing.
 //! 5. exit_code: fluisce da `ToolOutcome::exit_code` al `ContentBlock::ToolResult`
@@ -49,7 +49,7 @@
 //! 6. aggiorna `attachment_read_bytes` dai tool_result attachment.
 //! 7. guard "blocked-da-cap": se task_complete outcome=blocked + un tool_result
 //!    col SENTINEL -> rifiuta la dichiarazione UNA volta.
-//! 8. persist step via `AgentStepStore::persist_step` (gata Real).
+//! 8. persist step via `AgentStepStore::persist_step`.
 //! 9. context-budget cap: se `ctx_chars + new_chars > max_context_chars`, tronca
 //!    ogni tool_result a `budget_per_tool` con offload best-effort
 //!    (`ContextOffload`), degrado a troncamento testa+coda.
@@ -58,13 +58,6 @@
 //! 11. `_dispatch_updates`: `discovered_tools_next_turn` SEMPRE scritto, ANCHE `[]`
 //!     (distinzione `None`=no-op vs `Some(vec![])`=azzera, load-bearing) +
 //!     `merge_discovered_run` per `discovered_tools_run`. Heartbeat best-effort.
-//!
-//! ## SHADOW (`ExecMode::Replay`)
-//!
-//! In shadow tutto l'I/O e' no-op/replay: `ToolExecutor` rilegge il primario,
-//! `AgentStepStore`/`heartbeat` no-op, `ContextOffload::offload_to_rag` e' gata
-//! `Real` (in Replay ritorna `PortError`, no-op) -> il troncamento degrada
-//! inline testa+coda senza scrivere su Qdrant. Zero side-effect.
 //!
 //! ## TURN_FOCUS
 //!
@@ -112,7 +105,7 @@ use crate::decisions::tool_dispatch::{
 use crate::decisions::{build_m16_allowed, is_tool_allowed, merge_discovered_run, M16_META_TOOLS};
 use crate::py_json::{py_json_dumps, SortKeys};
 use crate::runtime::ports::{
-    AgentStepStore, ContextOffload, ExecMode, MetaStepStore, OffloadKind, RunControlStore,
+    AgentStepStore, ContextOffload, MetaStepStore, OffloadKind, RunControlStore,
     SseEvent, TodoStore, ToolCall, ToolExecutor,
 };
 use crate::runtime::AgentNodeCtx;
@@ -611,14 +604,13 @@ impl ToolDispatchNode {
     /// Esegue UN tool (parita' con la closure `_run` Python, righe 3786-3896).
     /// `task_complete`/`nexus_run_notes` sono brain-only (non via ToolExecutor):
     /// ritornano un ack e raccolgono outcome/notes nel `RunCollector`. Gli altri
-    /// vanno via `ToolExecutor::execute(mode)`. Il `try/except` Python e'
+    /// vanno via `ToolExecutor::execute`. Il `try/except` Python e'
     /// ONNICOMPRENSIVO (qualunque errore -> tool_result d'errore, niente
     /// propagazione): qui un `Err(PortError)` (anche infra) diventa un
     /// ToolResult `is_error=true` (NON un `NodeError`), 1:1 col Python.
     async fn run_one(
         &self,
         block: &Value,
-        mode: ExecMode,
         collector: &RunCollector,
     ) -> ToolResultBlock {
         let tool_use_id = block
@@ -720,7 +712,7 @@ impl ToolDispatchNode {
             input,
             thought_signature: None,
         };
-        match self.tools.execute(call, mode).await {
+        match self.tools.execute(call).await {
             Ok(outcome) => {
                 // WAVE 2.2: errore infrastrutturale (ToolRunner gRPC down)
                 // segnalato strutturato (mcp-core NON scala i provider).
@@ -814,7 +806,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         }
 
         let run_id = state.thread_id.clone().unwrap_or_default();
-        let mode = ctx.exec_mode();
 
         // ── (1) Uscita cooperativa: cancel del ctx O run superato (py:3545) ───
         // ctx.cancel e' la fonte primaria in Rust (l'orchestratore lo cancella
@@ -840,8 +831,8 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
             .into_opaque());
         }
 
-        // Heartbeat best-effort (anti-recovery prematuro), gata Real.
-        let _ = self.run_control.heartbeat(&run_id, mode).await;
+        // Heartbeat best-effort (anti-recovery prematuro).
+        let _ = self.run_control.heartbeat(&run_id).await;
 
         // ── (2b) HITL Conferma: sospensione strutturale prima dei mutators ───
         if should_suspend_for_hitl(
@@ -995,7 +986,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
         };
         let kept_futs = kept_indices
             .iter()
-            .map(|&i| self.run_one(&pending[i], mode, &collector));
+            .map(|&i| self.run_one(&pending[i], &collector));
         let kept_results: Vec<ToolResultBlock> = join_all(kept_futs).await;
         // Ricompone nell'ordine originale: ogni slot vuoto prende il prossimo kept.
         let mut kept_iter = kept_results.into_iter();
@@ -1013,10 +1004,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for ToolDispatchNode {
 
         // ── (5) Tronca i singoli tool_result a tool_result_max_chars (offload) ─
         // Solo i KEPT (non synthetic: i synthetic sono brevi). Stringa-content.
-        // `mode` propagato: in Replay l'offload e' saltato (degrado a troncamento).
         for (idx, r) in results.iter_mut().enumerate() {
             if kept_indices.contains(&idx) {
-                self.truncate_content(&mut r.content, self.cfg.tool_result_max_chars, mode)
+                self.truncate_content(&mut r.content, self.cfg.tool_result_max_chars)
                     .await;
             }
         }
@@ -1107,7 +1097,7 @@ dell'utente.";
                 // un guasto della persistenza NON deve far fallire il run.
                 let _ = self
                     .steps
-                    .persist_step(&run_id, iteration, idx as i64, block, result, mode)
+                    .persist_step(&run_id, iteration, idx as i64, block, result)
                     .await;
             }
         }
@@ -1122,7 +1112,7 @@ dell'utente.";
             let budget_per_tool =
                 std::cmp::max(1500i64, span / std::cmp::max(results.len() as i64, 1)) as usize;
             for r in results.iter_mut() {
-                self.truncate_content(&mut r.content, budget_per_tool, mode)
+                self.truncate_content(&mut r.content, budget_per_tool)
                     .await;
             }
             tracing::warn!(
@@ -1148,7 +1138,7 @@ dell'utente.";
                     .unwrap_or(None);
                 if reminder_text.is_some() {
                     // Best-effort: traccia che i todos sono stati "visti".
-                    let _ = self.todos.increment_iteration_seen(&run_id, mode).await;
+                    let _ = self.todos.increment_iteration_seen(&run_id).await;
                     new_reminder_counter = 0;
                 }
             }
@@ -1227,13 +1217,11 @@ dell'utente.";
         // Prima restavano solo nel canale stato (delta) e NON arrivavano mai al
         // frontend ne' al DB: la timeline mostrava solo gli executor_call
         // ("quale modello") — incidente narrazione 2026-07-02. Pattern
-        // emit (live, sink no-op in shadow) + persist (storico, gata Real),
-        // identico all'executor_call (regola L).
+        // emit (live) + persist (storico), identico all'executor_call (regola L).
         for ms in &tool_steps {
             crate::nodes::emit_phase_meta(
                 ctx.emit.as_ref(),
                 self.meta_steps.as_ref(),
-                ctx.exec_mode(),
                 &ms.kind,
                 ms.title.clone(),
                 ms.payload.clone(),
@@ -1356,15 +1344,13 @@ dell'utente.";
 impl ToolDispatchNode {
     /// Tronca `content` (se stringa) a `max_chars` con offload best-effort in RAG
     /// e degrado a troncamento testa+coda (`_smart_truncate_lossless`,
-    /// `__init__.py:153-181`). In [`ExecMode::Replay`] l'offload e' un no-op (la
-    /// porta gata `Real` ritorna `PortError`): si degrada DIRETTAMENTE al
-    /// troncamento testa+coda non-RAG (zero scritture Qdrant nel run shadow).
+    /// `__init__.py:153-181`).
     ///
     /// PURO se il content non e' stringa o e' sotto soglia (no-op). Sopra soglia:
     /// head = `max_chars/5`, tail = `max(200, max_chars - head - 200)`, pointer
     /// in mezzo (col pointer RAG se l'offload riesce, un marker di troncamento
     /// altrimenti).
-    async fn truncate_content(&self, content: &mut Value, max_chars: usize, mode: ExecMode) {
+    async fn truncate_content(&self, content: &mut Value, max_chars: usize) {
         let Value::String(text) = content else {
             return; // non-stringa: il tool_result reale e' sempre JSON-stringa.
         };
@@ -1375,9 +1361,9 @@ impl ToolDispatchNode {
         let head_size = max_chars / 5;
         let tail_size = std::cmp::max(200, max_chars.saturating_sub(head_size).saturating_sub(200));
         let total = chars.len();
-        // Offload best-effort: pointer RAG se la porta riesce (solo in Real),
-        // altrimenti marker di troncamento (Replay o guasto Qdrant).
-        let pointer = match self.try_offload(text, mode).await {
+        // Offload best-effort: pointer RAG se la porta riesce, altrimenti marker
+        // di troncamento (guasto Qdrant).
+        let pointer = match self.try_offload(text).await {
             Some(ptr) => format!(
                 "\n\n[...troncato: {total} char totali offloadati in RAG, recupera con \
                  nexus_search_semantic (pointer={ptr})...]\n\n"
@@ -1390,11 +1376,8 @@ impl ToolDispatchNode {
     }
 
     /// Offload best-effort verso RAG. `None` su errore della porta (degrado a
-    /// troncamento). Il gate shadow vive nella porta (regola L): in
-    /// [`ExecMode::Replay`] [`ContextOffload::offload_to_rag`] e' un no-op che
-    /// ritorna `PortError` -> qui `None` -> il chiamante tronca senza scrivere
-    /// Qdrant. Passiamo `mode` end-to-end senza re-implementare il gate qui.
-    async fn try_offload(&self, text: &str, mode: ExecMode) -> Option<String> {
+    /// troncamento).
+    async fn try_offload(&self, text: &str) -> Option<String> {
         // Tool_result grande al dispatch: collection ToolResult, senza filtro
         // session/project (comportamento storico, cache del contesto offloadato).
         self.offload
@@ -1403,7 +1386,6 @@ impl ToolDispatchNode {
                 OffloadKind::ToolResult,
                 None,
                 None,
-                mode,
             )
             .await
             .ok()
@@ -1975,12 +1957,12 @@ mod tests {
     }
 
     /// Esecutore di tool a coda per il dispatch: mappa per nome del tool a un
-    /// `ToolOutcome` (content) e registra le chiamate con la mode. Cosi' un test
-    /// puo' restituire payload diversi per tool diversi e verificare l'ordine.
+    /// `ToolOutcome` (content) e registra le chiamate. Cosi' un test puo'
+    /// restituire payload diversi per tool diversi e verificare l'ordine.
     struct MapToolExecutor {
         by_name: std::collections::HashMap<String, ToolOutcome>,
         default: ToolOutcome,
-        pub seen: std::sync::Mutex<Vec<(ToolCall, ExecMode)>>,
+        pub seen: std::sync::Mutex<Vec<ToolCall>>,
     }
 
     impl MapToolExecutor {
@@ -2004,8 +1986,8 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for MapToolExecutor {
-        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
-            self.seen.lock().unwrap().push((call.clone(), mode));
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
+            self.seen.lock().unwrap().push(call.clone());
             Ok(self
                 .by_name
                 .get(&call.name)
@@ -2022,20 +2004,18 @@ mod tests {
         async fn execute(
             &self,
             _call: ToolCall,
-            _mode: ExecMode,
         ) -> Result<ToolOutcome, PortError> {
             Err(PortError::Tool("grpc down".into()))
         }
     }
 
-    fn ctx_with(shadow: bool, cancel: CancellationToken) -> AgentNodeCtx {
-        ctx_with_emit(shadow, cancel, Arc::new(NullEventSink))
+    fn ctx_with(cancel: CancellationToken) -> AgentNodeCtx {
+        ctx_with_emit(cancel, Arc::new(NullEventSink))
     }
 
     /// Come [`ctx_with`] ma con un [`EventSink`] iniettabile (per asserire gli
     /// emit `ToolResult` del nodo): i test passano un `RecordingEventSink`.
     fn ctx_with_emit(
-        shadow: bool,
         cancel: CancellationToken,
         emit: Arc<dyn crate::runtime::ports::EventSink>,
     ) -> AgentNodeCtx {
@@ -2053,7 +2033,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -2136,7 +2115,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool(
             "w1",
             "write_file",
@@ -2164,7 +2143,7 @@ mod tests {
         tokio::sync::watch::Sender<AdvisoryGateState>,
     ) {
         let (tx, rx) = tokio::sync::watch::channel(state);
-        let mut ctx = ctx_with(false, CancellationToken::new());
+        let mut ctx = ctx_with(CancellationToken::new());
         ctx.advisory_gate = Some(rx);
         (ctx, tx)
     }
@@ -2380,7 +2359,7 @@ mod tests {
         // Flag OFF (nessun canale nel ctx): il gate non esiste, la scrittura
         // procede come prima e nessuna chiave sporca lo stato.
         let (n, steps) = writer_node();
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool(
             "w1",
             "write_file",
@@ -2407,7 +2386,7 @@ mod tests {
                 ),
             ),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool(
             "w1",
             "write_file",
@@ -2425,7 +2404,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::EndTurn));
@@ -2463,7 +2442,7 @@ mod tests {
         );
         let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools);
         let sink = Arc::new(RecordingEventSink::default());
-        let ctx = ctx_with_emit(false, CancellationToken::new(), sink.clone());
+        let ctx = ctx_with_emit(CancellationToken::new(), sink.clone());
         let st = state_with_pending(vec![
             pending_tool("a", "read_file", json!({"path": "x"})),
             pending_tool("b", "run_command", json!({"cmd": "ls"})),
@@ -2498,20 +2477,6 @@ mod tests {
         );
     }
 
-    /// Shadow intatto: in shadow il sink iniettato e' NullEventSink (no-op). Qui
-    /// verifichiamo la proprieta' a livello di nodo: con NullEventSink (sink dello
-    /// shadow) il run non panica e nessun emit e' osservabile (by-construction).
-    #[tokio::test]
-    async fn tool_dispatch_shadow_sink_noop() {
-        let tools = Arc::new(MapToolExecutor::new());
-        let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools);
-        let ctx = ctx_with(true, CancellationToken::new());
-        let st = state_with_pending(vec![pending_tool("a", "read_file", json!({}))]);
-        // shadow=true + NullEventSink (la combinazione di build_native_engine):
-        // gli emit cadono nel no-op, nessun panic.
-        let _ = n.run(&st, &ctx).await.expect("run shadow ok");
-    }
-
     // ── (1) superseded via RunControlStore -> stop_reason superseded ─────────────
 
     #[tokio::test]
@@ -2527,7 +2492,7 @@ mod tests {
             Arc::new(StubTodoStore::with_todos(vec![])),
             Arc::new(StubContextOffload::default()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("a", "read_file", json!({}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::Superseded));
@@ -2544,7 +2509,7 @@ mod tests {
         );
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let ctx = ctx_with(false, cancel);
+        let ctx = ctx_with(cancel);
         let st = state_with_pending(vec![pending_tool("a", "read_file", json!({}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::Superseded));
@@ -2565,7 +2530,7 @@ mod tests {
             Arc::new(StubTodoStore::with_todos(vec![])),
             Arc::new(StubContextOffload::default()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("a", "read_file", json!({}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Errore di lettura -> trattato come false -> il run esegue (tool_use).
@@ -2599,7 +2564,7 @@ mod tests {
                 ),
         );
         let (n, steps, _rc) = node(ToolDispatchConfig::default(), tools);
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![
             pending_tool("c1", "read_file", json!({"path": "a"})),
             pending_tool("c2", "run_command", json!({"command": "build"})),
@@ -2633,7 +2598,7 @@ mod tests {
         };
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(cfg, tools.clone());
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         // un tool NON esente, con length grande -> sfora il cap.
         let st = state_with_pending(vec![pending_tool(
             "c1",
@@ -2690,7 +2655,7 @@ mod tests {
             },
         ));
         let (n, _steps, _rc) = node(cfg, tools.clone());
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         let blocks = blocks_of(out.messages.last().expect("msg"));
         assert_eq!(blocks.len(), 1);
@@ -2706,7 +2671,7 @@ mod tests {
         let (cfg, st) = cap_fixture(Some(0)); // non valida -> fallback config
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(cfg, tools.clone());
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         let blocks = blocks_of(out.messages.last().expect("msg"));
         assert!(blocks[0]["is_error"].as_bool().expect("bool"));
@@ -2730,7 +2695,7 @@ mod tests {
             ..Default::default()
         };
         let (n, _steps, _rc) = node(cfg, Arc::new(MapToolExecutor::new()));
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         // Una chiamata bloccata dal cap + un task_complete outcome=blocked.
         let st = state_with_pending(vec![
             pending_tool("c1", "nexus_read_attachment", json!({"length": 100000})),
@@ -2766,7 +2731,7 @@ mod tests {
         };
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(cfg, tools.clone());
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({"path": "a"}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         let blocks = blocks_of(out.messages.last().expect("msg"));
@@ -2789,7 +2754,7 @@ mod tests {
         };
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(cfg, tools.clone());
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st =
             state_with_pending(vec![pending_tool("c1", "nexus_read_attachment", json!({}))]);
         st.attachment_read_bytes = Some(2000); // gia' oltre il budget.
@@ -2809,7 +2774,7 @@ mod tests {
     async fn brain_only_run_notes_e_task_complete() {
         let tools = Arc::new(MapToolExecutor::new());
         let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools.clone());
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![
             pending_tool(
                 "c1",
@@ -2844,7 +2809,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         st.declared_outcome = Some(json!({"outcome": "partial", "summary": "meta'"}));
         st.declared_done_count = Some(0);
@@ -2864,7 +2829,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         st.advisory_verdict = Some(json!({"verdict": "proceed", "summary": "gia' dichiarato"}));
 
@@ -2890,7 +2855,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool(
             "c1",
             "advisory_verdict",
@@ -2921,7 +2886,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         st.review_verdict = Some(json!({"verdict": "fail", "summary": "difetto grave"}));
         st.debate_position = Some(json!({"stance": "oppose", "summary": "cedo la tesi"}));
@@ -2951,7 +2916,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool(
             "c1",
             "advisory_verdict",
@@ -2992,7 +2957,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool(
             "c1",
             "task_complete",
@@ -3025,7 +2990,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool(
             "c1",
             "advisory_verdict",
@@ -3048,7 +3013,7 @@ mod tests {
     #[tokio::test]
     async fn errore_porta_non_propaga_node_error() {
         let (n, _steps, _rc) = node(ToolDispatchConfig::default(), Arc::new(FailingToolExecutor));
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         let out = apply(
             st.clone(),
@@ -3068,7 +3033,7 @@ mod tests {
             ToolDispatchConfig::default(),
             Arc::new(MapToolExecutor::new()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         // Scritto a lista vuota (azzera i discovered del turno prima).
@@ -3094,7 +3059,7 @@ mod tests {
             },
         ));
         let (n, _steps, _rc) = node(ToolDispatchConfig::default(), tools);
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool(
             "c1",
             "nexus_mcp_tool_search",
@@ -3108,35 +3073,6 @@ mod tests {
         // P3: discovered_tools_run accumulato (merge dedup).
         let run_acc = out.discovered_tools_run.expect("run acc");
         assert_eq!(run_acc.len(), 2);
-    }
-
-    // ── (8) shadow: ExecMode::Replay, zero side-effect ───────────────────────────
-
-    #[tokio::test]
-    async fn shadow_usa_replay_zero_side_effect() {
-        let tools = Arc::new(MapToolExecutor::new());
-        let steps = Arc::new(StubAgentStepStore::default());
-        let rc = Arc::new(StubRunControlStore::default());
-        let n = ToolDispatchNode::new(
-            ToolDispatchConfig::default(),
-            tools.clone(),
-            steps.clone(),
-            rc.clone(),
-            Arc::new(StubTodoStore::with_todos(vec![])),
-            Arc::new(StubContextOffload::default()),
-            Arc::new(StubMetaStepStore::default()),
-        );
-        let ctx = ctx_with(true, CancellationToken::new()); // shadow
-        let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
-        let _ = n.run(&st, &ctx).await.expect("run ok");
-        // ToolExecutor chiamato in Replay.
-        let seen = tools.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].1, ExecMode::Replay);
-        // AgentStepStore no-op in shadow (zero step persistiti).
-        assert!(steps.steps.lock().unwrap().is_empty());
-        // Heartbeat no-op in shadow.
-        assert!(rc.heartbeats.lock().unwrap().is_empty());
     }
 
     // ── (10) reminder TODO iniettato alla soglia ─────────────────────────────────
@@ -3158,7 +3094,6 @@ mod tests {
                 &self,
                 _id: &str,
                 _s: crate::decisions::dag_scheduler::TodoStatus,
-                _m: ExecMode,
             ) -> Result<(), PortError> {
                 Ok(())
             }
@@ -3180,7 +3115,7 @@ mod tests {
             Arc::new(StubContextOffload::default()),
             Arc::new(StubMetaStepStore::default()),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let mut st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         st.plan_phase_active = Some(true);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
@@ -3228,7 +3163,7 @@ mod tests {
             Arc::new(StubTodoStore::with_todos(vec![])),
             offload.clone(),
         );
-        let ctx = ctx_with(false, CancellationToken::new());
+        let ctx = ctx_with(CancellationToken::new());
         let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
         let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
         let blocks = blocks_of(out.messages.last().expect("msg"));
@@ -3240,60 +3175,6 @@ mod tests {
         assert_eq!(offload.offloaded.lock().unwrap().len(), 1);
     }
 
-    /// FIX 1 (gate shadow su ContextOffload): in `ExecMode::Replay` il troncamento
-    /// NON deve produrre scritture su Qdrant. Con un tool_result oltre soglia, il
-    /// content e' troncato INLINE (testa+coda, marker non-RAG) e `offloaded` resta
-    /// VUOTO (zero side-effect, gate `Real` nella porta).
-    #[tokio::test]
-    async fn context_budget_cap_in_shadow_non_offloada() {
-        let cfg = ToolDispatchConfig {
-            max_context_chars: 100,    // soglia minuscola -> forza il cap (passo 9).
-            tool_result_max_chars: 50, // taglia anche al passo (5).
-            ..Default::default()
-        };
-        let big = "x".repeat(5000);
-        let tools = Arc::new(MapToolExecutor::new().with(
-            "read_file",
-            ToolOutcome {
-                tool_call_id: "c1".into(),
-                content: Value::String(big.clone()),
-                is_error: false,
-                ..Default::default()
-            },
-        ));
-        let offload = Arc::new(StubContextOffload::default());
-        let (n, _steps) = node_full(
-            cfg,
-            tools,
-            Arc::new(StubRunControlStore::default()),
-            Arc::new(StubTodoStore::with_todos(vec![])),
-            offload.clone(),
-        );
-        // ctx SHADOW: ExecMode::Replay.
-        let ctx = ctx_with(true, CancellationToken::new());
-        let st = state_with_pending(vec![pending_tool("c1", "read_file", json!({}))]);
-        let out = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
-        let blocks = blocks_of(out.messages.last().expect("msg"));
-        let content = blocks[0]["content"].as_str().unwrap();
-        // Content TRONCATO inline (testa+coda) ma SENZA pointer RAG.
-        assert!(
-            content.chars().count() < big.chars().count(),
-            "il content deve essere troncato anche in shadow"
-        );
-        assert!(
-            content.contains("coda preservata sotto"),
-            "in shadow il marker e' il troncamento testa+coda non-RAG"
-        );
-        assert!(
-            !content.contains("offloadati in RAG"),
-            "in shadow NON ci deve essere un pointer di offload RAG"
-        );
-        // ZERO scritture Qdrant: il gate Real della porta rende l'offload no-op.
-        assert!(
-            offload.offloaded.lock().unwrap().is_empty(),
-            "in shadow l'offload non deve scrivere nulla (zero side-effect)"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -3345,7 +3226,7 @@ mod golden {
 
     #[async_trait]
     impl ToolExecutor for GoldenToolExecutor {
-        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             Ok(self.by_id.get(&call.id).cloned().unwrap_or(ToolOutcome {
                 tool_call_id: call.id,
                 content: Value::String("{}".to_string()),
@@ -3510,7 +3391,6 @@ mod golden {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow: false,
             advisory_gate: None,
         }
     }

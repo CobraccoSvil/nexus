@@ -25,15 +25,14 @@
 //! [`StallBudgetPort::consultations_in_session`] ritorna `Ok(0)` su guasto DB
 //! (budget non esaurito -> il meta-reasoner resta consultabile, degrado al solo cap
 //! per-run), MAI un `PortError`. [`StallBudgetPort::record_consultation`] e'
-//! best-effort e gata `Real` (no-op in `Replay`: lo shadow non incrementa il budget
-//! del primario). CONFINE (regola L): qui SOLO l'I/O; la DECISIONE (cap raggiunto?)
+//! best-effort. CONFINE (regola L): qui SOLO l'I/O; la DECISIONE (cap raggiunto?)
 //! resta nel gate di emissione dell'executor.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, PortError, StallBudgetPort};
+use nexus_agent_graph::runtime::ports::{PortError, StallBudgetPort};
 
 /// `kind` della riga `nexus_agent_meta_steps` usata come contatore append-only
 /// delle consultazioni del meta-reasoner. Distinto dagli altri kind del canale
@@ -96,13 +95,9 @@ impl StallBudgetPort for PgStallBudgetStore {
     }
 
     /// Appende UNA riga `kind='stall_budget'` per il run corrente (una
-    /// consultazione effettiva). Gata `Real` (no-op in `Replay`: lo shadow non
-    /// incrementa il budget del primario). Best-effort: errore DB loggato,
-    /// `Ok(())` ritornato (il `PortError` resta per un contratto rotto).
-    async fn record_consultation(&self, session_id: Uuid, mode: ExecMode) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
+    /// consultazione effettiva). Best-effort: errore DB loggato, `Ok(())` ritornato
+    /// (il `PortError` resta per un contratto rotto).
+    async fn record_consultation(&self, session_id: Uuid) -> Result<(), PortError> {
         let res = sqlx::query(
             "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload) \
              VALUES ($1, $2, '', $3)",
@@ -152,18 +147,18 @@ mod tests {
         let run1 = insert_run(&pool, session).await;
         let run2 = insert_run(&pool, session).await;
         PgStallBudgetStore::new(pool.clone(), run1)
-            .record_consultation(session, ExecMode::Real)
+            .record_consultation(session)
             .await
             .expect("ok");
         PgStallBudgetStore::new(pool.clone(), run2)
-            .record_consultation(session, ExecMode::Real)
+            .record_consultation(session)
             .await
             .expect("ok");
 
         // Run di un'ALTRA sessione: non deve contare per `session`.
         let run_alieno = insert_run(&pool, altra_sessione).await;
         PgStallBudgetStore::new(pool.clone(), run_alieno)
-            .record_consultation(altra_sessione, ExecMode::Real)
+            .record_consultation(altra_sessione)
             .await
             .expect("ok");
 
@@ -178,23 +173,6 @@ mod tests {
             .await
             .expect("fail-open");
         assert_eq!(count_altra, 1, "l'altra sessione conta la propria");
-    }
-
-    /// Gate shadow (regola L): in Replay `record_consultation` e' no-op.
-    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
-    async fn replay_e_no_op(pool: PgPool) {
-        let session = seed_sessione(&pool).await;
-        let run = insert_run(&pool, session).await;
-        let store = PgStallBudgetStore::new(pool.clone(), run);
-        store
-            .record_consultation(session, ExecMode::Replay)
-            .await
-            .expect("ok");
-        let count = store
-            .consultations_in_session(session)
-            .await
-            .expect("fail-open");
-        assert_eq!(count, 0, "in Replay nessuna scrittura -> conteggio 0");
     }
 
     /// FAIL-OPEN: se la lettura fallisce -> conteggio 0, mai un errore. E' l'UNICO

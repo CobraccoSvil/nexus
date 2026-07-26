@@ -25,7 +25,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 
 use crate::decisions::PanelOutcome;
 use crate::runtime::ports::{
-    ExecMode, ReviewPanelReport, ReviewPanelRequest, ReviewSkipReason,
+    ReviewPanelReport, ReviewPanelRequest, ReviewSkipReason,
 };
 use crate::state::{AgentState, Message, MessageContent, ReviewGateVerdict, StopReason};
 use crate::state::delta::StateDelta;
@@ -45,8 +45,7 @@ pub struct ReviewGateConfig {
 
 pub struct ReviewGateNode {
     cfg: ReviewGateConfig,
-    /// Porta del panel (mcp-core convoca i sub-run revisori). In Replay non
-    /// viene chiamata: la review ha side-effect (sub-run, spesa).
+    /// Porta del panel (mcp-core convoca i sub-run revisori).
     panel: std::sync::Arc<dyn crate::runtime::ports::ReviewPanelPort>,
     /// Narrazione live (pattern emit+persist, punto unico `emit_phase_meta`).
     meta_steps: std::sync::Arc<dyn crate::runtime::ports::MetaStepStore>,
@@ -81,7 +80,6 @@ impl ReviewGateNode {
         crate::nodes::emit_phase_meta(
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
-            ctx.exec_mode(),
             "review_gate",
             title,
             serde_json::Value::Object(payload),
@@ -169,10 +167,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReviewGateNode {
         ) || state.final_gate_passed == Some(false)
         {
             return Ok(Self::verdict_delta(None, ReviewGateVerdict::NotApplicable));
-        }
-        // Replay/shadow: la porta convoca sub-run reali (spesa) -> mai in replay.
-        if ctx.exec_mode() == ExecMode::Replay {
-            return Ok(Self::pass_through());
         }
 
         // GUARD ANTI-LOOP: se il run e' GIA' stato bocciato in modo DEFINITIVO
@@ -387,7 +381,7 @@ mod tests {
     use crate::runtime::AgentNodeCtx;
     use crate::routing::RoutingConfig;
 
-    fn ctx_with(shadow: bool) -> AgentNodeCtx {
+    fn ctx_with() -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy non si connette");
@@ -402,7 +396,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -493,7 +486,7 @@ mod tests {
     async fn bocciatura_rimanda_in_correzione() {
         let node = nodo(1, ReviewPanelReport::Convened(panel_bocciato()));
         let delta = node
-            .run(&stato_done(), &ctx_with(false))
+            .run(&stato_done(), &ctx_with())
             .await
             .expect("nodo ok");
         let s = apply(stato_done(), delta);
@@ -536,7 +529,7 @@ mod tests {
             ..stato_done()
         };
         let delta = node
-            .run(&gia_rimandato, &ctx_with(false))
+            .run(&gia_rimandato, &ctx_with())
             .await
             .expect("nodo ok");
         let s = apply(gia_rimandato, delta);
@@ -563,7 +556,7 @@ mod tests {
             ..stato_done()
         };
         let delta = node
-            .run(&gia_definitivo, &ctx_with(false))
+            .run(&gia_definitivo, &ctx_with())
             .await
             .expect("nodo ok");
         let s = apply(gia_definitivo, delta);
@@ -582,7 +575,7 @@ mod tests {
     async fn approvazione_chiude_senza_rimando() {
         let node = nodo(1, ReviewPanelReport::Convened(panel_approvato()));
         let delta = node
-            .run(&stato_done(), &ctx_with(false))
+            .run(&stato_done(), &ctx_with())
             .await
             .expect("nodo ok");
         let s = apply(stato_done(), delta);
@@ -598,7 +591,7 @@ mod tests {
             declared_outcome: Some(json!({"outcome": "blocked", "summary": "x"})),
             ..stato_done()
         };
-        let delta = node.run(&blocked, &ctx_with(false)).await.expect("nodo ok");
+        let delta = node.run(&blocked, &ctx_with()).await.expect("nodo ok");
         let s = apply(blocked, delta);
         assert_eq!(s.review_gate_verdict, Some(ReviewGateVerdict::NotApplicable));
         assert!(!crate::routing::gate_rimanda_in_correzione(&s));

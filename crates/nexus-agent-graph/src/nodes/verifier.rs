@@ -15,7 +15,7 @@
 //! Stato di default: il verifier e' **OFF** (`verifier_enabled=false`,
 //! `orchestrator_config.py:175`) cosi' il sistema continua a comportarsi come
 //! prima del PR-2. Il path Rust inoltre NON e' instradato (porting incrementale:
-//! golden 1:1 + shadow PRIMA di imboccare il path).
+//! golden 1:1 PRIMA di imboccare il path).
 //!
 //! ## Cosa porta QUESTO modulo (deterministico, golden 1:1)
 //!
@@ -81,11 +81,6 @@
 //!   concreto del [`CriteriaRunner`] li ricava dal proprio ambiente (mcp-core),
 //!   non sono input della decision machine.
 //!
-//! GATING SHADOW: in `ctx.shadow == true` l'esecuzione criteri usa
-//! `ExecMode::Replay` (rilegge i tool_result del primario = zero side-effect);
-//! `mark_status` e `VerifierRunStore::record` sono no-op in Replay. Il nodo NON
-//! emette eventi e NON scrive. Verificato nei test.
-//!
 //! Il nodo NON instrada: l'edge post-verifier vive in
 //! `routing::route_after_verifier` (gia' portato 1:1).
 
@@ -105,7 +100,7 @@ use crate::py_json::{py_json_dumps, SortKeys};
 use crate::routing::config::RoutingConfig;
 use crate::routing::signals;
 use crate::runtime::ports::{
-    CriteriaRunner, CriterionResult, ExecMode, PortError, TodoStore, VerifierRunRecord,
+    CriteriaRunner, CriterionResult, PortError, TodoStore, VerifierRunRecord,
     VerifierRunStore,
 };
 use crate::runtime::AgentNodeCtx;
@@ -365,7 +360,7 @@ pub struct VerifierNode {
     /// lo implementera' col ToolRunner gRPC; nei test e' stubato.
     criteria: Arc<dyn CriteriaRunner>,
     /// Persistenza degli esiti del verifier (`nexus_agent_verifier_runs`,
-    /// best-effort, no-op in shadow). Impl concreta in mcp-core; stub nei test.
+    /// best-effort). Impl concreta in mcp-core; stub nei test.
     runs: Arc<dyn VerifierRunStore>,
     /// Nodo final_gate per i gate generali fail-closed (RIUSO di
     /// `build_criteria`/`all_passed`, regola L: nessuna duplicazione di
@@ -407,8 +402,8 @@ impl VerifierNode {
     /// selezione al PUNTO UNICO [`dag_scheduler::pick_next_todo`] (regola L). Se
     /// non c'e' prossimo -> `{active_todo_id:None, stop_reason:end_turn}`;
     /// altrimenti marca il prossimo `in_progress` e ritorna `{active_todo_id,
-    /// stop_reason:tool_use, current_todos}`. `mode` propaga il gate shadow.
-    async fn advance_or_end(&self, run_id: &str, mode: ExecMode) -> Result<StateDelta, NodeError> {
+    /// stop_reason:tool_use, current_todos}`.
+    async fn advance_or_end(&self, run_id: &str) -> Result<StateDelta, NodeError> {
         let todos = self.store.list_todos(run_id).await.map_err(port_err)?;
         match dag_scheduler::pick_next_todo(&todos, self.cfg.dag_topological_enabled) {
             None => {
@@ -426,7 +421,7 @@ impl VerifierNode {
             Some(next) => {
                 let next_id = next.id.clone();
                 self.store
-                    .mark_status(&next_id, TodoStatus::InProgress, mode)
+                    .mark_status(&next_id, TodoStatus::InProgress)
                     .await
                     .map_err(port_err)?;
                 Ok(StateDelta {
@@ -520,7 +515,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
         NodeId::Verifier
     }
 
-    async fn run(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
+    async fn run(&self, state: &AgentState, _ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
         // ── Guard enabled / plan_phase (verifier_node.py:52) ──────────────────
         if !self.cfg.enabled || !state.plan_phase_active.unwrap_or(false) {
             return Ok(pass_through());
@@ -534,10 +529,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
                 return Ok(pass_through());
             }
         };
-
-        // Punto unico del gate shadow (regola L): Replay in shadow -> mark_status
-        // / persist no-op (zero scritture).
-        let mode = ctx.exec_mode();
 
         // ── Risoluzione active_todo_id (verifier_node.py:56-67) ───────────────
         // Se assente, prova a calcolarlo via TodoStore::active_todo.
@@ -589,7 +580,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
                 );
             }
             return self
-                .fail_closed_or_complete(state, &run_id, &active_todo_id, todo_content, mode)
+                .fail_closed_or_complete(state, &run_id, &active_todo_id, todo_content)
                 .await;
         }
 
@@ -597,7 +588,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
         let started = Instant::now();
         let mut results =
             self.criteria
-                .run(criteria_raw, mode)
+                .run(criteria_raw)
                 .await
                 .map_err(|e| NodeError::Failed {
                     node: "verifier",
@@ -627,7 +618,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
             // ACCODATI ai results (verifier_node.py:178-181) cosi' la persistenza
             // / il render li vede.
             if self.cfg.fail_closed && signals::is_software_task(state, &self.routing_cfg) {
-                let (gate_passed, gate_results) = self.run_general_gates(state, mode).await?;
+                let (gate_passed, gate_results) = self.run_general_gates(state).await?;
                 results.extend(gate_results);
                 gate_passed
             } else {
@@ -638,20 +629,16 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
         let cycle = state.verify_cycle.unwrap_or(0) + 1;
 
         // ── Persistenza best-effort (verifier_node.py:185) ────────────────────
-        // Scrittura DB gated su shadow (no-op in Replay). I results includono gli
-        // eventuali gate generali accodati sopra.
+        // I results includono gli eventuali gate generali accodati sopra.
         self.runs
-            .record(
-                VerifierRunRecord {
-                    run_id: run_id.clone(),
-                    todo_id: active_todo_id.clone(),
-                    cycle,
-                    criteria_results: results_to_value(&results),
-                    passed: all_passed,
-                    duration_ms,
-                },
-                mode,
-            )
+            .record(VerifierRunRecord {
+                run_id: run_id.clone(),
+                todo_id: active_todo_id.clone(),
+                cycle,
+                criteria_results: results_to_value(&results),
+                passed: all_passed,
+                duration_ms,
+            })
             .await
             .map_err(port_err)?;
 
@@ -682,7 +669,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
                 "verifier: modo 'observe', l'esito dei criteri NON decide il todo"
             );
             return self
-                .fail_closed_or_complete(state, &run_id, &active_todo_id, todo_content, mode)
+                .fail_closed_or_complete(state, &run_id, &active_todo_id, todo_content)
                 .await;
         }
 
@@ -694,10 +681,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
         if all_passed {
             // PASSED: completa + advance, azzera i due cicli.
             self.store
-                .mark_status(&active_todo_id, TodoStatus::Completed, mode)
+                .mark_status(&active_todo_id, TodoStatus::Completed)
                 .await
                 .map_err(port_err)?;
-            let mut advance = self.advance_or_end(&run_id, mode).await?;
+            let mut advance = self.advance_or_end(&run_id).await?;
             advance.verify_cycle = Some(Some(0));
             advance.exploratory_verify_cycle = Some(Some(0));
             tracing::info!(
@@ -712,7 +699,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
         let max_cycles = self.cfg.max_verify_cycles;
         if cycle >= max_cycles {
             self.store
-                .mark_status(&active_todo_id, TodoStatus::Blocked, mode)
+                .mark_status(&active_todo_id, TodoStatus::Blocked)
                 .await
                 .map_err(port_err)?;
             tracing::warn!(
@@ -721,7 +708,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for VerifierNode {
                 cycle,
                 "verifier: cap raggiunto -> blocked"
             );
-            let mut advance = self.advance_or_end(&run_id, mode).await?;
+            let mut advance = self.advance_or_end(&run_id).await?;
             advance.verify_cycle = Some(Some(0));
             advance.verifier_last_result = Some(Some(json!({
                 "passed": false,
@@ -765,26 +752,25 @@ impl VerifierNode {
         run_id: &str,
         active_todo_id: &str,
         todo_content: &str,
-        mode: ExecMode,
     ) -> Result<OpaqueDelta, NodeError> {
         // Task non software / fail-closed OFF: comportamento storico (completed +
         // advance), senza gate generali (verifier_node.py:131-133).
         if !(self.cfg.fail_closed && signals::is_software_task(state, &self.routing_cfg)) {
             self.store
-                .mark_status(active_todo_id, TodoStatus::Completed, mode)
+                .mark_status(active_todo_id, TodoStatus::Completed)
                 .await
                 .map_err(port_err)?;
-            return Ok(self.advance_or_end(run_id, mode).await?.into_opaque());
+            return Ok(self.advance_or_end(run_id).await?.into_opaque());
         }
 
         // Fail-closed: esegui i gate generali (no_orphan_imported + outputs_exist).
-        let (gate_passed, gate_results) = self.run_general_gates(state, mode).await?;
+        let (gate_passed, gate_results) = self.run_general_gates(state).await?;
         if gate_passed {
             self.store
-                .mark_status(active_todo_id, TodoStatus::Completed, mode)
+                .mark_status(active_todo_id, TodoStatus::Completed)
                 .await
                 .map_err(port_err)?;
-            return Ok(self.advance_or_end(run_id, mode).await?.into_opaque());
+            return Ok(self.advance_or_end(run_id).await?.into_opaque());
         }
 
         // Gate generale fallito: cap / retry (verifier_node.py:94-130).
@@ -792,7 +778,7 @@ impl VerifierNode {
         let fc_max = self.cfg.max_verify_cycles;
         if fc_cycle >= fc_max {
             self.store
-                .mark_status(active_todo_id, TodoStatus::Blocked, mode)
+                .mark_status(active_todo_id, TodoStatus::Blocked)
                 .await
                 .map_err(port_err)?;
             tracing::warn!(
@@ -801,7 +787,7 @@ impl VerifierNode {
                 cycle = fc_cycle,
                 "verifier: gate generale fallito -> blocked"
             );
-            let mut advance = self.advance_or_end(run_id, mode).await?;
+            let mut advance = self.advance_or_end(run_id).await?;
             advance.verify_cycle = Some(Some(0));
             advance.verifier_last_result = Some(Some(json!({
                 "passed": false,
@@ -842,16 +828,15 @@ impl VerifierNode {
     /// i 2 criteri sempre presenti + gli opzionali (service_logs_clean, build,
     /// http-endpoint) risolti a monte nella `FinalGateConfig`: il fail-closed del
     /// verifier eredita anche il criterio endpoint senza re-implementarlo. Ritorna
-    /// `(all_passed, results)`. `mode` propaga il gate shadow al `CriteriaRunner`.
+    /// `(all_passed, results)`.
     async fn run_general_gates(
         &self,
         state: &AgentState,
-        mode: ExecMode,
     ) -> Result<(bool, Vec<CriterionResult>), NodeError> {
         let criteria = self.final_gate.build_criteria(state);
         let results = self
             .criteria
-            .run(criteria, mode)
+            .run(criteria)
             .await
             .map_err(|e| NodeError::Failed {
                 node: "verifier",
@@ -1185,10 +1170,10 @@ mod tests {
         }
     }
 
-    /// Ctx con flag shadow. Le porte del verifier vivono nel nodo (non nel ctx);
-    /// qui basta lo shadow per derivare la ExecMode. PgPool lazy (il verifier non
-    /// scrive DB direttamente: tutto via i trait), LLM/tool stub mai usati.
-    fn ctx_with(shadow: bool) -> AgentNodeCtx {
+    /// Ctx di test. Le porte del verifier vivono nel nodo (non nel ctx). PgPool
+    /// lazy (il verifier non scrive DB direttamente: tutto via i trait), LLM/tool
+    /// stub mai usati.
+    fn ctx_with() -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy");
@@ -1203,7 +1188,6 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
             advisory_gate: None,
         }
     }
@@ -1291,7 +1275,7 @@ mod tests {
             runner.clone(),
             runs,
         );
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = plan_state("a", false);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, None);
@@ -1306,7 +1290,7 @@ mod tests {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![]));
         let runs = Arc::new(StubVerifierRunStore::default());
         let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = plan_state("a", false);
         st.plan_phase_active = Some(false); // non plan-phase -> {}.
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1326,7 +1310,7 @@ mod tests {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![]));
         let runs = Arc::new(StubVerifierRunStore::default());
         let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = plan_state("inesistente", false);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, None);
@@ -1352,7 +1336,7 @@ mod tests {
         let runner = Arc::new(StubCriteriaRunner::with_results(vec![]));
         let runs = Arc::new(StubVerifierRunStore::default());
         let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs.clone());
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = plan_state("a", false); // non software -> niente fail-closed.
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         // a completato (nessun criterion + non software -> completed), advance a b.
@@ -1377,7 +1361,7 @@ mod tests {
         ]));
         let runs = Arc::new(StubVerifierRunStore::default());
         let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = plan_state("a", true); // software.
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
@@ -1403,7 +1387,7 @@ mod tests {
         )]));
         let runs = Arc::new(StubVerifierRunStore::default());
         let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let st = plan_state("a", true);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.stop_reason, Some(StopReason::ToolUse));
@@ -1438,7 +1422,7 @@ mod tests {
         let runs = Arc::new(StubVerifierRunStore::default());
         // max_verify_cycles=3, verify_cycle gia' a 2 -> cycle=3 >= 3 -> cap.
         let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs);
-        let ctx = ctx_with(false);
+        let ctx = ctx_with();
         let mut st = plan_state("a", true);
         st.verify_cycle = Some(2);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -1448,35 +1432,6 @@ mod tests {
         assert!(out.verifier_last_result.is_some());
         let marks = store.marks.lock().unwrap();
         assert!(marks.contains(&("a".to_string(), TodoStatus::Blocked)));
-    }
-
-    // ── Shadow: Replay, zero scritture ────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn shadow_replay_zero_scritture() {
-        let store = Arc::new(StubTodoStore::with_todos(vec![
-            todo("a", TodoStatus::InProgress, &[], 1),
-            todo("b", TodoStatus::Pending, &[], 2),
-        ]));
-        let runner = Arc::new(StubCriteriaRunner::with_results(vec![
-            ok_result("no_orphan_imported"),
-            ok_result("outputs_exist"),
-        ]));
-        let runs = Arc::new(StubVerifierRunStore::default());
-        let node = node_with(enabled_cfg(), store.clone(), runner.clone(), runs.clone());
-        let ctx = ctx_with(true); // shadow.
-        let st = plan_state("a", true);
-        let _ = node.run(&st, &ctx).await.expect("run ok");
-        // Criteri eseguiti in Replay.
-        let seen = runner.seen.lock().unwrap();
-        assert_eq!(seen[0].1, ExecMode::Replay);
-        // mark_status no-op in shadow (marks vuoto).
-        assert!(
-            store.marks.lock().unwrap().is_empty(),
-            "zero scritture todo"
-        );
-        // persist no-op in shadow (records vuoto).
-        assert!(runs.records.lock().unwrap().is_empty(), "zero persist");
     }
 
     // ── Conteggio evaluable / inconclusive ────────────────────────────────────────

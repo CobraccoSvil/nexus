@@ -36,7 +36,7 @@ use nexus_agent_graph::decisions::escalation::{
 };
 use nexus_agent_graph::decisions::governance::ModelTelemetry;
 use nexus_agent_graph::runtime::ports::{
-    EscalationInputs, EscalationPort, ExecMode, PortError, ProviderFailureCause,
+    EscalationInputs, EscalationPort, PortError, ProviderFailureCause,
 };
 
 use crate::governance_telemetry::{load_governance_policy, load_model_telemetry};
@@ -345,14 +345,13 @@ impl EscalationPort for PgEscalationPort {
     /// FAIL-OPEN: ogni sotto-lettura degrada a vuoto, mai un `PortError`.
     ///
     /// La catena Tier 1 puo' essere RIORDINATA per probabilita' di successo
-    /// (governance telemetria-aware, `maybe_rank_chain`): gata `mode` (solo Real) e
-    /// dietro il flag `agent.governance.telemetry_aware` (OFF = bit-identico).
+    /// (governance telemetria-aware, `maybe_rank_chain`): dietro il flag
+    /// `agent.governance.telemetry_aware` (OFF = bit-identico).
     async fn escalation_inputs(
         &self,
         _intent: Option<&str>,
         provider: Option<&str>,
         model: Option<&str>,
-        mode: ExecMode,
     ) -> Result<EscalationInputs, PortError> {
         // Candidato cross-provider (loop_fallback_default), sempre risolto.
         let cross = self.cross_provider(provider, model).await;
@@ -390,10 +389,8 @@ impl EscalationPort for PgEscalationPort {
 
         let policy = load_governance_policy(&self.db).await;
 
-        // Telemetria: caricata SOLO in Real. In Replay resterebbe non-deterministica
-        // (parita' shadow), quindi telemetria default (sano) -> il ranking si riduce a
-        // tier + ordine d'ingresso, replay-stabile (come le altre decisioni gata mode).
-        let candidates = self.enrich_candidates(pmt, mode == ExecMode::Real).await;
+        // Telemetria strutturata caricata dal catalog per il ranking governance.
+        let candidates = self.enrich_candidates(pmt, true).await;
 
         Ok(EscalationInputs { candidates, policy })
     }
@@ -656,7 +653,6 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
-                ExecMode::Real,
             )
             .await
             .expect("fail-open: mai PortError");
@@ -690,7 +686,6 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
-                ExecMode::Real,
             )
             .await
             .expect("fail-open");
@@ -778,7 +773,6 @@ mod tests {
                 None,
                 Some("deepseek"),
                 Some("deepseek-v4-flash"),
-                ExecMode::Real,
             )
             .await
             .expect("fail-open");
@@ -834,7 +828,6 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
-                ExecMode::Real,
             )
             .await
             .expect("fail-open");
@@ -857,7 +850,6 @@ mod tests {
                 None,
                 Some("anthropic"),
                 Some("claude-haiku-4-5"),
-                ExecMode::Real,
             )
             .await
             .expect("fail-open");
@@ -873,7 +865,7 @@ mod tests {
         create_schema(&pool).await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, None, None, ExecMode::Real)
+            .escalation_inputs(None, None, None)
             .await
             .expect("fail-open");
         assert!(inputs.candidates.is_empty());
@@ -886,7 +878,7 @@ mod tests {
         set_api_key(&pool, "openai", "sk-live").await;
         let port = PgEscalationPort::new(pool.clone());
         let inputs = port
-            .escalation_inputs(None, Some("openai"), Some("gpt-4o-mini"), ExecMode::Real)
+            .escalation_inputs(None, Some("openai"), Some("gpt-4o-mini"))
             .await
             .expect("fail-open");
         assert!(inputs.candidates.is_empty());

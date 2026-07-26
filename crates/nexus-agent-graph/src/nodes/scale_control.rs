@@ -7,26 +7,16 @@
 //!
 //! Identica ragione dello `stall_recovery`: la sola LLM-call dello scale-controller
 //! vive qui, in un superstep isolato dietro [`MetaReasonerPort`]. Consultare il
-//! reasoner mid-superstep dentro l'executor romperebbe replay e shadow-diff (una
-//! LLM-call non prevista dalla sequenza del run primario). Il percorso caldo
-//! (executor) rilegge la [`ScaleMove`] dal checkpoint, non la ricalcola.
+//! reasoner mid-superstep dentro l'executor introdurrebbe una LLM-call non prevista
+//! dalla sequenza del run. Il percorso caldo (executor) rilegge la [`ScaleMove`]
+//! dal checkpoint, non la ricalcola.
 //!
-//! ## Modello di replay dello scale-controller (opzione A, gia' nell'adapter)
+//! ## Idempotenza / resume
 //!
-//! Come per il recovery, il `ReplayLlmGateway` (mcp-core) rigioca SOLO le
-//! completion con `purpose=="executor"`; la completion `scale_assess` di questo
-//! nodo ottiene una risposta ausiliaria neutra. La replay-safety si regge su tre
-//! regimi coerenti:
-//!   - **Real** (primario): la porta consulta l'LLM e la [`ScaleMove`] validata e'
+//!   - **Prima esecuzione**: la porta consulta l'LLM e la [`ScaleMove`] validata e'
 //!     PERSISTITA in `extra[scale_cache_key]` (checkpoint del nodo, punto (4-5)).
-//!   - **Resume Rust->Rust**: il checkpoint contiene gia' la mossa -> CACHE-HIT
-//!     dall'`extra` (0 LLM, punto (2)). Deterministico.
-//!   - **Shadow / Replay**: l'impl concreta ([`PgMetaReasonerPort::assess_scale`])
-//!     applica l'OPZIONE A e in `Replay` ritorna `Ok(None)` IMMEDIATO senza I/O
-//!     (nessuna LLM-call) -> il nodo degrada a `resolved_only()` -> il rientro
-//!     nell'executor usa lo sticky corrente (il tier resta), parita' shadow col
-//!     Python che non ha il controller. Il gate `mode` NON e' nel nodo: e' gia'
-//!     nell'adapter (come per `recover`/`orchestrate`).
+//!   - **Resume**: il checkpoint contiene gia' la mossa -> CACHE-HIT dall'`extra`
+//!     (0 LLM, punto (2)). Deterministico.
 //!
 //! ## Flusso del nodo (`run`)
 //!
@@ -164,9 +154,8 @@ impl ScaleControlNode {
     /// Delta di sola risoluzione (nessuna mossa persistita): rientra nell'executor
     /// via `ScaleResolved`. Usato quando manca lo [`ScaleContext`] (guasto di
     /// costruzione a monte), quando il reasoner ritorna `Ok(None)` (kill-switch OFF
-    /// / stub / Replay opzione A), o quando la mossa e' `KeepTier` (rete di
-    /// sicurezza: al rientro l'executor mantiene lo sticky corrente, nessun
-    /// cambio-tier).
+    /// / stub), o quando la mossa e' `KeepTier` (rete di sicurezza: al rientro
+    /// l'executor mantiene lo sticky corrente, nessun cambio-tier).
     fn resolved_only() -> OpaqueDelta {
         StateDelta {
             stop_reason: Some(Some(StopReason::ScaleResolved)),
@@ -285,7 +274,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for ScaleControlNode {
         NodeId::ScaleControl
     }
 
-    async fn run(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
+    async fn run(&self, state: &AgentState, _ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
         // (1) Contesto strutturato dell'executor. Assente/malformato -> degrado
         // sicuro (risolvi senza mossa): il rientro mantiene lo sticky corrente.
         let scale_ctx = match Self::read_context(state) {
@@ -313,13 +302,11 @@ impl GraphNode<AgentState, AgentNodeCtx> for ScaleControlNode {
             return Ok(Self::resolved_only());
         }
 
-        // (3) Cache-miss: UNA sola LLM-call via la porta. `mode` deriva dal flag
-        // shadow (punto unico, regola L): in Replay l'adapter (opzione A) ritorna
-        // Ok(None) IMMEDIATO senza I/O -> qui degradiamo a resolved-only (parita'
-        // shadow). A flag OFF / stub questo ramo ritorna comunque Ok(None).
+        // (3) Cache-miss: UNA sola LLM-call via la porta. A flag OFF / stub questo
+        // ramo ritorna comunque Ok(None).
         let raw_move = match self
             .reasoner
-            .assess_scale(scale_ctx.clone(), ctx.exec_mode())
+            .assess_scale(scale_ctx.clone())
             .await
         {
             // Mossa proposta: valida col PUNTO UNICO (enum CHIUSO + confidence in
@@ -327,20 +314,19 @@ impl GraphNode<AgentState, AgentNodeCtx> for ScaleControlNode {
             // li scavalca). `KeepTier` post-gate -> resolved-only (nessun cambio).
             Ok(Some(raw)) => raw,
             // Nessuna mossa (kill-switch `agent.scale.enabled` OFF / purpose
-            // NotFound / stub inerte / Replay opzione A): degrado LEGITTIMO (mantieni
-            // il tier corrente). Non e' un errore (regola G): e' il comportamento a
-            // flag OFF.
+            // NotFound / stub inerte): degrado LEGITTIMO (mantieni il tier
+            // corrente). Non e' un errore (regola G): e' il comportamento a flag OFF.
             Ok(None) => {
                 tracing::debug!(
                     target: "nexus_agent_graph::scale_control",
                     current_tier = scale_ctx.current_tier.as_str(),
-                    "scale_control: reasoner Ok(None) (inerte/OFF/replay), mantengo il tier"
+                    "scale_control: reasoner Ok(None) (inerte/OFF), mantengo il tier"
                 );
                 return Ok(Self::resolved_only());
             }
-            // Errore di porta (provider indisponibile / DB-down / ReplayMissing): NON
-            // abortiamo il run (lo scale e' best-effort pre-crisi, lo sticky corrente
-            // e' la rete di sicurezza). Loggato come WARN.
+            // Errore di porta (provider indisponibile / DB-down): NON abortiamo il
+            // run (lo scale e' best-effort pre-crisi, lo sticky corrente e' la rete
+            // di sicurezza). Loggato come WARN.
             Err(err) => {
                 tracing::warn!(
                     target: "nexus_agent_graph::scale_control",
@@ -409,7 +395,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::routing::config::RoutingConfig;
-    use crate::runtime::ports::{ExecMode, PortError};
+    use crate::runtime::ports::PortError;
     use crate::runtime::ports::{OrchestrationContext, OrchestrationMove};
     use crate::runtime::ports::{RecoveryMove, ScaleTier, StallContext, SupervisorContext};
     use crate::runtime::{AgentNodeCtx, NullEventSink, StubMetaReasonerPort};
@@ -426,7 +412,6 @@ mod tests {
         async fn recover(
             &self,
             _ctx: StallContext,
-            _mode: ExecMode,
         ) -> Result<Option<RecoveryMove>, PortError> {
             Ok(None)
         }
@@ -434,7 +419,6 @@ mod tests {
         async fn orchestrate(
             &self,
             _ctx: OrchestrationContext,
-            _mode: ExecMode,
         ) -> Result<Option<OrchestrationMove>, PortError> {
             Ok(None)
         }
@@ -442,7 +426,6 @@ mod tests {
         async fn assess_scale(
             &self,
             _ctx: ScaleContext,
-            _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
             Ok(Some(self.0.clone()))
         }
@@ -450,7 +433,6 @@ mod tests {
         async fn supervise(
             &self,
             _ctx: SupervisorContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
             Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
@@ -464,7 +446,6 @@ mod tests {
         async fn recover(
             &self,
             _ctx: StallContext,
-            _mode: ExecMode,
         ) -> Result<Option<RecoveryMove>, PortError> {
             Ok(None)
         }
@@ -472,7 +453,6 @@ mod tests {
         async fn orchestrate(
             &self,
             _ctx: OrchestrationContext,
-            _mode: ExecMode,
         ) -> Result<Option<OrchestrationMove>, PortError> {
             Ok(None)
         }
@@ -480,7 +460,6 @@ mod tests {
         async fn assess_scale(
             &self,
             _ctx: ScaleContext,
-            _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
             Err(PortError::ProviderUnavailable("test".to_string().into()))
         }
@@ -488,7 +467,6 @@ mod tests {
         async fn supervise(
             &self,
             _ctx: SupervisorContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
             Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
@@ -511,7 +489,6 @@ mod tests {
         async fn execute(
             &self,
             call: crate::runtime::ports::ToolCall,
-            _mode: ExecMode,
         ) -> Result<crate::runtime::ports::ToolOutcome, PortError> {
             Ok(crate::runtime::ports::ToolOutcome {
                 tool_call_id: call.id,
@@ -520,8 +497,8 @@ mod tests {
         }
     }
 
-    /// Ctx Real minimale: la porta del reasoner ignora `ctx.llm` (gli stub non lo
-    /// consultano), ma `run` legge `ctx.exec_mode()` -> serve un ctx valido.
+    /// Ctx minimale: la porta del reasoner ignora `ctx.llm` (gli stub non lo
+    /// consultano), ma `run` richiede un ctx valido.
     fn real_ctx() -> AgentNodeCtx {
         let run_id = Uuid::new_v4();
         AgentNodeCtx {
@@ -535,7 +512,6 @@ mod tests {
             run_id,
             session_id: Uuid::new_v4(),
             thread_id: run_id,
-            shadow: false,
             advisory_gate: None,
         }
     }
