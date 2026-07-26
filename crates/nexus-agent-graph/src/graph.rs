@@ -162,7 +162,7 @@ pub fn node_target_to_node_id(target: NodeTarget) -> NodeId {
 /// `PlannerConfig` (per l'eligibilita' planner dell'edge understanding).
 /// Entrambe sono clonate nelle closure (`'static`), come nel runtime reale dove
 /// vengono risolte a monte (regola G).
-fn build_edges(
+pub(crate) fn build_edges(
     routing_cfg: RoutingConfig,
     planner_cfg: PlannerConfig,
     supervisor_cfg: SupervisorConfig,
@@ -892,9 +892,18 @@ mod tests {
     /// ReviewGate; se l'edge del ReviewGate usasse `node_target_to_node_id`
     /// (invece di Reflection ESPLICITO) il nodo ricircolerebbe su se stesso
     /// all'infinito. Il test asserisce entrambe le direzioni sul GRAFO REALE.
+    ///
+    /// Lo stato porta SOLO `gate_routing`, il campo che il gate dichiara e che
+    /// l'edge legge. Prima portava `stop_reason: ToolUse` con la didascalia "dal
+    /// delta del nodo": non veniva da nessun nodo, era un letterale, e fissava
+    /// l'assunto che rendeva il difetto invisibile — quel valore lo scrive
+    /// l'executor a ogni turno, quindi il test restava verde mentre in
+    /// produzione l'edge rispediva all'executor anche le review APPROVATE. La
+    /// verifica che attraversa il produttore (nodo reale -> delta -> edge) e'
+    /// `approvazione_chiude_e_non_riconvoca_i_revisori` in `nodes::review_gate`.
     #[test]
     fn review_gate_rimanda_o_chiude_senza_ricircolare() {
-        use crate::state::StopReason;
+        use crate::state::GateRouting;
         let edges = build_edges(
             RoutingConfig::default(),
             PlannerConfig::default(),
@@ -907,17 +916,28 @@ mod tests {
             "la chiusura deve passare dal gate della review"
         );
         let edge = edges.get(&NodeId::ReviewGate).expect("edge review_gate");
-        // Bocciatura rimandata (stop_reason ToolUse dal delta del nodo) -> Executor.
+        // Bocciatura rimandata: il gate lo DICHIARA -> Executor.
         let rimandato = AgentState {
-            stop_reason: Some(StopReason::ToolUse),
+            gate_routing: Some(GateRouting::RimandaInCorrezione),
             ..Default::default()
         };
         assert_eq!(edge.resolve(&rimandato), NodeId::Executor);
         // Chiusura (approvato/non applicabile/cap) -> Reflection, MAI ReviewGate.
-        let chiude = AgentState::default();
-        let next = edge.resolve(&chiude);
-        assert_eq!(next, NodeId::Reflection, "chiusura su Reflection");
-        assert_ne!(next, NodeId::ReviewGate, "mai un self-loop del gate");
+        for dichiarazione in [Some(GateRouting::Chiude), None] {
+            let chiude = AgentState {
+                gate_routing: dichiarazione,
+                // Il turno dell'executor che precede il gate lascia sempre
+                // questi due: nessuno dei due deve poter dirottare l'edge.
+                stop_reason: Some(crate::state::StopReason::ToolUse),
+                pending_tool_uses: Some(vec![serde_json::json!({
+                    "type": "tool_use", "id": "t1", "name": "read_file", "input": {}
+                })]),
+                ..Default::default()
+            };
+            let next = edge.resolve(&chiude);
+            assert_eq!(next, NodeId::Reflection, "chiusura su Reflection");
+            assert_ne!(next, NodeId::ReviewGate, "mai un self-loop del gate");
+        }
     }
 
     #[test]
