@@ -580,28 +580,62 @@ fn tabella_listener<T>(af: u32) -> Option<Vec<T>> {
         GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
     };
 
-    const NO_ERROR_U32: u32 = 0;
-    const ERROR_INSUFFICIENT_BUFFER_U32: u32 = 122;
-
     // Le due chiamate differiscono SOLO per il buffer di destinazione: qui il
     // resto degli argomenti si scrive una volta.
     // SAFETY: `size` e' sempre la capacita' in byte di cio' che `ptr` indirizza
     // (0 e null alla prima chiamata); l'API non scrive oltre quel limite.
-    let chiama = |ptr: *mut std::ffi::c_void, size: &mut u32| -> u32 {
-        unsafe { GetExtendedTcpTable(ptr, size, 0, af, TCP_TABLE_OWNER_PID_LISTENER, 0) }
-    };
+    tabella_listener_con(|ptr, size| unsafe {
+        GetExtendedTcpTable(ptr, size, 0, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
+    })
+}
 
+/// Codice di ritorno "tutto bene" delle API IpHelper.
+#[cfg(windows)]
+const NO_ERROR_U32: u32 = 0;
+/// `ERROR_INSUFFICIENT_BUFFER`: il buffer non basta, `size` dice quanto serve.
+#[cfg(windows)]
+const ERROR_INSUFFICIENT_BUFFER_U32: u32 = 122;
+/// Quanti giri di riallocazione concedere prima di arrendersi. La tabella puo'
+/// crescere fra il dimensionamento e la lettura, ma non all'infinito: tre giri
+/// coprono qualunque burst realistico senza trasformare un difetto in un ciclo.
+#[cfg(windows)]
+const MAX_TENTATIVI_TABELLA: usize = 3;
+
+/// Dimensionamento + lettura della tabella, con RIALLOCAZIONE se nel frattempo
+/// e' cresciuta. Separata dalla syscall perche' e' la parte che possiamo
+/// sbagliare noi: cosi' il test la attraversa davvero, invece di dover
+/// provocare una race col kernel per sperare di vederla (regola O).
+///
+/// La riallocazione non e' zelo difensivo. Fra la chiamata che misura e quella
+/// che legge basta che un processo qualsiasi apra un socket: l'API risponde
+/// `ERROR_INSUFFICIENT_BUFFER` e, arrendendosi li', si perderebbero TUTTE le
+/// porte di quella famiglia per quell'iterazione. Il danno sarebbe quello gia'
+/// visto con l'enumerazione IPv4-only: la lista non e' vuota (l'altra famiglia
+/// l'ha riempita), quindi la guardia fail-closed di `scan_and_enforce` non
+/// scatta, lo sweep gira su dati parziali e `resolve_stale_runtime_port_violations`
+/// chiude come "rientrate" violazioni ancora vive.
+#[cfg(windows)]
+fn tabella_listener_con<T, F>(mut chiama: F) -> Option<Vec<T>>
+where
+    F: FnMut(*mut std::ffi::c_void, &mut u32) -> u32,
+{
     let mut size: u32 = 0;
     if chiama(std::ptr::null_mut(), &mut size) != ERROR_INSUFFICIENT_BUFFER_U32 || size == 0 {
         return None;
     }
 
-    let elementi = (size as usize).div_ceil(std::mem::size_of::<T>());
-    let mut buffer: Vec<T> = Vec::with_capacity(elementi.max(1));
-    if chiama(buffer.as_mut_ptr().cast(), &mut size) != NO_ERROR_U32 {
-        return None;
+    for _ in 0..MAX_TENTATIVI_TABELLA {
+        let elementi = (size as usize).div_ceil(std::mem::size_of::<T>());
+        let mut buffer: Vec<T> = Vec::with_capacity(elementi.max(1));
+        match chiama(buffer.as_mut_ptr().cast(), &mut size) {
+            NO_ERROR_U32 => return Some(buffer),
+            // La tabella e' cresciuta fra le due chiamate: `size` porta gia' il
+            // nuovo fabbisogno, si rialloca e si rilegge.
+            ERROR_INSUFFICIENT_BUFFER_U32 => continue,
+            _ => return None,
+        }
     }
-    Some(buffer)
+    None
 }
 
 /// La MIB tiene la porta nei due byte bassi del DWORD, in ordine di rete.
@@ -645,6 +679,79 @@ mod tests {
             porte.iter().all(|(porta, pid)| *porta > 0 && *pid > 0),
             "riga con porta o pid nullo: {porte:?}"
         );
+    }
+
+    /// Se la tabella cresce fra il dimensionamento e la lettura, il secondo
+    /// giro deve riallocare e rileggere, non arrendersi.
+    ///
+    /// Il test attraversa `tabella_listener_con`, la STESSA funzione che la
+    /// produzione usa: cambia solo chi risponde al posto del kernel, perche' la
+    /// race vera (un socket che si apre fra due chiamate) non e' provocabile a
+    /// comando. Arrendersi qui costerebbe tutte le porte di una famiglia per
+    /// quell'iterazione, con la lista che resta piena a meta' e la guardia
+    /// fail-closed che percio' non scatta.
+    #[cfg(windows)]
+    #[test]
+    fn la_tabella_cresciuta_fra_le_due_chiamate_viene_riletta() {
+        let mut chiamate = 0usize;
+        let esito: Option<Vec<u8>> = tabella_listener_con(|ptr, size| {
+            chiamate += 1;
+            match chiamate {
+                // Dimensionamento: servono 100 byte.
+                1 => {
+                    assert!(ptr.is_null(), "il dimensionamento passa un buffer nullo");
+                    *size = 100;
+                    ERROR_INSUFFICIENT_BUFFER_U32
+                }
+                // Lettura: nel frattempo si e' aperto un socket, ne servono 200.
+                2 => {
+                    *size = 200;
+                    ERROR_INSUFFICIENT_BUFFER_U32
+                }
+                // Terzo giro col buffer giusto.
+                _ => NO_ERROR_U32,
+            }
+        });
+        assert!(
+            esito.is_some(),
+            "tabella persa: il buffer non e' stato riallocato dopo la crescita"
+        );
+        assert_eq!(chiamate, 3, "giri di riallocazione inattesi: {chiamate}");
+    }
+
+    /// Una tabella che cresce a ogni giro non deve diventare un ciclo: dopo i
+    /// tentativi previsti si rinuncia a quella famiglia (lista incompleta ma
+    /// nessun blocco dello scan).
+    #[cfg(windows)]
+    #[test]
+    fn la_riallocazione_non_gira_all_infinito() {
+        let mut chiamate = 0usize;
+        let esito: Option<Vec<u8>> = tabella_listener_con(|_ptr, size| {
+            chiamate += 1;
+            *size = 100 * chiamate as u32;
+            ERROR_INSUFFICIENT_BUFFER_U32
+        });
+        assert!(esito.is_none(), "nessun buffer valido, doveva rinunciare");
+        // 1 dimensionamento + MAX_TENTATIVI_TABELLA letture.
+        assert_eq!(chiamate, 1 + MAX_TENTATIVI_TABELLA);
+    }
+
+    /// Un errore diverso da "buffer insufficiente" non e' ritentabile.
+    #[cfg(windows)]
+    #[test]
+    fn un_errore_non_ritentabile_ferma_subito() {
+        let mut chiamate = 0usize;
+        let esito: Option<Vec<u8>> = tabella_listener_con(|_ptr, size| {
+            chiamate += 1;
+            if chiamate == 1 {
+                *size = 100;
+                ERROR_INSUFFICIENT_BUFFER_U32
+            } else {
+                87 // ERROR_INVALID_PARAMETER
+            }
+        });
+        assert!(esito.is_none());
+        assert_eq!(chiamate, 2, "un errore non ritentabile non va ritentato");
     }
 
     /// Il probe deve vedere un listener IPv6, non solo IPv4: Node e Vite bindano
