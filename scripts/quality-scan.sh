@@ -16,6 +16,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Ambiente comune dei gate (CARGO_INCREMENTAL=0 e simili): punto unico.
+# shellcheck source=scripts/gate-env.sh
+source "$ROOT_DIR/scripts/gate-env.sh"
+
 # SEMPRE via cargo (regola O: lo strumento misura il codice CORRENTE).
 # Il vecchio shortcut `target/debug/xtask` riusava un binario possibilmente
 # STANTIO: dopo una modifica ai detector (mcp-quality) misurava con la logica

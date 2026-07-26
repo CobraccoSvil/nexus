@@ -31,6 +31,11 @@ jobs:
 
     env:
       DATABASE_URL: postgres://nexus:nexus@localhost:5432/nexus
+      # Il runner parte da zero e muore a fine job: la cache incrementale non
+      # verrebbe MAI riusata, ma verrebbe scritta lo stesso. Stesso motivo (e
+      # stesse misure) di scripts/gate-env.sh, che i gate locali sorgono; qui
+      # va ripetuto perche' un workflow YAML non puo' sorgere uno script shell.
+      CARGO_INCREMENTAL: 0
 
     steps:
       - uses: actions/checkout@v4
