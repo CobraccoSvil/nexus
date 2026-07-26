@@ -416,7 +416,33 @@ pub async fn get_agent_run(
     let prompt_tokens = run.try_get::<i32, _>("prompt_tokens").unwrap_or(0);
     let completion_tokens = run.try_get::<i32, _>("completion_tokens").unwrap_or(0);
     let total_tokens = run.try_get::<i32, _>("total_tokens").unwrap_or(0);
-    let total_cost = run.try_get::<f64, _>("total_cost").unwrap_or(0.0);
+    // Costo del run INCLUSI i suoi sub-run (figure del consiglio, revisori,
+    // sub-agenti dispatchati): girano su provider PROPRI e con run_id propri,
+    // quindi il solo `agent_runs.total_cost` del padre ne ignorava la spesa.
+    // Misurato su verifica-wd: card a "mistral $0.0986" mentre il costo reale del
+    // run era $0.1337 su 6 run (openrouter 0.0170, google 0.0085, deepseek
+    // 0.0048, mistral figli 0.0048) -- il 26% mancava, ed era esattamente il
+    // lavoro delle figure che l'utente vedeva elencate sopra la card.
+    let costo_figli: f64 = sqlx::query_scalar::<_, f64>(
+        "SELECT COALESCE(SUM(total_cost), 0)::float8 FROM agent_runs WHERE parent_run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&run_pool)
+    .await
+    .unwrap_or(0.0);
+    let total_cost = run.try_get::<f64, _>("total_cost").unwrap_or(0.0) + costo_figli;
+
+    // Gli id su cui contare la spesa: il run e i suoi sub-run. Serve al breakdown
+    // per elencare anche i provider delle figure, che altrimenti comparivano
+    // nella narrazione ma non nel riepilogo dei costi.
+    let mut run_ids_con_figli: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM agent_runs WHERE parent_run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_all(&run_pool)
+    .await
+    .unwrap_or_default();
+    run_ids_con_figli.push(run_id);
 
     // M71: breakdown per coppia provider/model dalla ai_usage_ledger.
     // Mostriamo una riga per ogni provider/modello effettivamente usato nel run
@@ -433,11 +459,11 @@ pub async fn get_agent_run(
                 MIN(created_at)                AS first_call_at,
                 MAX(created_at)                AS last_call_at
          FROM ai_usage_ledger
-         WHERE run_id = $1 AND status = 'finalized'
+         WHERE run_id = ANY($1) AND status = 'finalized'
          GROUP BY provider, model
          ORDER BY MIN(created_at) ASC",
     )
-    .bind(run_id)
+    .bind(&run_ids_con_figli)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
