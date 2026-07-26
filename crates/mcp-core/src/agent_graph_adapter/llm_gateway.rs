@@ -255,9 +255,11 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
     };
     match http.code.as_deref() {
         Some("PROVIDER_ERROR") => {
-            let cause = match http
-                .details
-                .as_ref()
+            // Causa e codice si leggono dallo STESSO blocco `details`, e dallo
+            // stesso fallimento: il gateway scrive `primary_cause` e
+            // `failures[0]` insieme (`nexus-gateway/src/server/routes.rs`).
+            let details = http.details.as_ref();
+            let cause = match details
                 .and_then(|d| d.get("primary_cause"))
                 .and_then(|c| c.as_str())
             {
@@ -279,10 +281,10 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 Some("empty_completion") => ProviderFailureCause::EmptyCompletion,
                 _ => ProviderFailureCause::Unknown,
             };
-            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
-                cause,
-                rendered_from_error(err).message,
-            ))
+            PortError::ProviderUnavailable(
+                ProviderUnavailableInfo::new(cause, rendered_from_error(err).message)
+                    .with_code(codice_del_fallimento_primario(details)),
+            )
         }
         Some("POLICY_TIER_EXCLUDED") => {
             PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
@@ -292,6 +294,29 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
         }
         _ => PortError::Llm(rendered_from_error(err)),
     }
+}
+
+/// Codice d'errore STRUTTURATO del fallimento PRIMARIO, dai `details` del
+/// gateway (`failures[0].code`, regola M: mai dalla prosa del messaggio).
+///
+/// E' lo stesso elemento da cui nasce `primary_cause`, quindi causa e codice
+/// descrivono sempre il medesimo fallimento.
+///
+/// Perche' esiste: il codice viaggiava gia' sul wire e il consumatore esisteva
+/// gia' ([`ProviderUnavailableInfo::allows_cross_provider_failover`], col
+/// vocabolario DB `routing.client_error_failover_codes`), ma nessuno collegava i
+/// due capi: `code` restava `None` su OGNI errore reale, e per un `ClientError`
+/// `None` significa "non recuperabile". La whitelist non veniva quindi mai
+/// consultata, e i test del gate restavano verdi perche' costruivano il codice a
+/// mano invece di riceverlo dal produttore (regola O).
+fn codice_del_fallimento_primario(details: Option<&Value>) -> Option<String> {
+    details
+        .and_then(|d| d.get("failures"))
+        .and_then(|f| f.as_array())
+        .and_then(|f| f.first())
+        .and_then(|f| f.get("code"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
 }
 
 
@@ -722,6 +747,86 @@ invalid request)\",\"code\":\"PROVIDER_ERROR\",\"details\":{\"primary_cause\":\"
             PortError::ProviderUnavailable(info) => {
                 assert_eq!(info.cause, ProviderFailureCause::ClientError);
                 assert!(!info.cause.is_cooldown_like());
+            }
+            other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
+        }
+    }
+
+    /// Il vocabolario REALE dei codici recuperabili, dal produttore che lo
+    /// definisce (safe-default di `ExecutorConfig`, sovrascritto dal DB in
+    /// esercizio). Ricopiarlo qui a mano renderebbe il test cieco a una modifica
+    /// del vocabolario: e' l'errore che ha tenuto verde questo gate mentre era
+    /// morto (regola O).
+    fn codici_recuperabili() -> Vec<String> {
+        nexus_agent_graph::nodes::ExecutorConfig::default().recoverable_client_error_codes
+    }
+
+    #[test]
+    fn il_codice_del_provider_arriva_al_gate_del_failover() {
+        // Un 400 PROVIDER-SPECIFICO (Google invalid_argument): un altro provider
+        // accetterebbe la stessa richiesta -> il failover DEVE essere consentito.
+        // L'asserzione e' sul VERDETTO, non sulla stringa: e' il consumatore vero
+        // del codice, ed e' l'unica cosa che prova che il dato ha attraversato
+        // tutto il percorso invece di fermarsi a meta' (regola O).
+        let err = gw_err(
+            400,
+            "{\"error\":\"tutti i provider hanno fallito -> google (google HTTP 400: \
+invalid argument)\",\"code\":\"PROVIDER_ERROR\",\"details\":{\"primary_cause\":\"client_error\",\
+\"failures\":[{\"provider\":\"google\",\"class\":\"client_error\",\"status\":400,\
+\"code\":\"invalid_argument\"}]}}",
+        );
+        match classify_gateway_error(&err) {
+            PortError::ProviderUnavailable(info) => {
+                assert_eq!(info.code.as_deref(), Some("invalid_argument"));
+                assert!(
+                    info.allows_cross_provider_failover(&codici_recuperabili()),
+                    "un 400 provider-specifico deve poter ripiegare su un altro provider"
+                );
+            }
+            other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
+        }
+    }
+
+    #[test]
+    fn il_400_di_formato_condiviso_non_apre_il_failover() {
+        // Mistral invalid_request_message_order: la history malformata e' la
+        // STESSA per ogni provider, ritentare altrove fallirebbe uguale bruciando
+        // token (incidente f0ad0337). Il codice arriva, e il verdetto e' NO.
+        let err = gw_err(
+            400,
+            "{\"error\":\"tutti i provider hanno fallito -> mistral (mistral HTTP 400: Not the \
+same number of function calls and responses)\",\"code\":\"PROVIDER_ERROR\",\
+\"details\":{\"primary_cause\":\"client_error\",\"failures\":[{\"provider\":\"mistral\",\
+\"class\":\"client_error\",\"status\":400,\"code\":\"invalid_request_message_order\"}]}}",
+        );
+        match classify_gateway_error(&err) {
+            PortError::ProviderUnavailable(info) => {
+                assert_eq!(info.code.as_deref(), Some("invalid_request_message_order"));
+                assert!(
+                    !info.allows_cross_provider_failover(&codici_recuperabili()),
+                    "un 400 di history condivisa fallirebbe su qualunque provider"
+                );
+            }
+            other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
+        }
+    }
+
+    #[test]
+    fn senza_codice_strutturato_il_failover_resta_chiuso() {
+        // Gateway che non espone `failures[].code`: nessun segnale strutturato,
+        // quindi nessun failover cieco (conservativo, regola M). E' anche lo
+        // stato in cui si trovava OGNI errore prima che il codice venisse
+        // collegato: serve a distinguere "non recuperabile" da "non misurato".
+        let err = gw_err(
+            400,
+            "{\"error\":\"tutti i provider hanno fallito -> deepseek (HTTP 400)\",\
+\"code\":\"PROVIDER_ERROR\",\"details\":{\"primary_cause\":\"client_error\",\
+\"failures\":[{\"provider\":\"deepseek\",\"class\":\"client_error\",\"status\":400}]}}",
+        );
+        match classify_gateway_error(&err) {
+            PortError::ProviderUnavailable(info) => {
+                assert_eq!(info.code, None);
+                assert!(!info.allows_cross_provider_failover(&codici_recuperabili()));
             }
             other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
         }
