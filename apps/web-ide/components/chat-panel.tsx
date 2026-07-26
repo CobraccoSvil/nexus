@@ -367,7 +367,10 @@ export function ChatPanel({
   const runStartedAt = agentRun?.createdAt
     ? new Date(agentRun.createdAt).getTime()
     : Date.now();
-  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - runStartedAt) / 1000));
+  // Nome allineato a cio' che misura: si chiamava `secondsSinceLastStep` anche
+  // dopo essere stato spostato sull'avvio run, e la barra attivita' ci scriveva
+  // sopra "Forza stop" facendo leggere una lunga elaborazione come un blocco.
+  const runElapsedSeconds = Math.max(0, Math.floor((nowTick - runStartedAt) / 1000));
   // "Stuck" calcolato sul tempo dall'ULTIMO step (non dall'inizio run): se
   // l'agente non emette step da >60s e' in attesa di qualcosa (LLM lento).
   // Meta-step live del run corrente: arrivano via SSE in tempo reale, a
@@ -397,8 +400,8 @@ export function ChatPanel({
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
     : runStartedAt;
   const lastStepAt = Math.max(lastAgentStepAt, lastMetaStepAt);
-  const secondsSinceLastStepInternal = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
-  const isAgentStuck = isAgentRunning && secondsSinceLastStepInternal > 60;
+  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
+  const isAgentStuck = isAgentRunning && secondsSinceLastStep > 60;
 
   // Auto-abort rimosso: il client non puo' sapere se "nessun nuovo step da Xs"
   // significa "bloccato" o "legittimamente lento" (provider in fallback dopo
@@ -414,7 +417,7 @@ export function ChatPanel({
   // Lato client conserviamo solo:
   //   - pulsante Stop rosso sempre visibile (cancellazione esplicita utente)
   //   - banner informativo nella timeline se isAgentStuck (gia' presente:
-  //     calcolo `secondsSinceLastStepInternal > 60` poco sopra)
+  //     calcolo `secondsSinceLastStep > 60` poco sopra)
 
   const timelineSteps = [...agentSteps]
     .sort((a, b) => a.stepIndex - b.stepIndex)
@@ -1416,6 +1419,7 @@ export function ChatPanel({
           tc={tc}
           trailing={runNotifications}
           isAgentStuck={isAgentStuck}
+          runElapsedSeconds={runElapsedSeconds}
           secondsSinceLastStep={secondsSinceLastStep}
           busyLabel={busyLabel}
           isAgentRunning={isAgentRunning}

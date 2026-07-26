@@ -872,14 +872,14 @@ pub async fn cancel_agent_run(
     let status: String = run.get::<String, _>("status");
     if status != "running" && status != "awaiting_confirmation" {
         // Anche se il run target e' gia' terminale, sblocchiamo eventuali ALTRI
-        // run rimasti stuck sulla stessa sessione (vedi fix cascade sotto): il
-        // 'Forza Stop' lato utente deve sempre liberare la sessione.
+        // run rimasti stuck sulla stessa sessione (vedi fix cascade sotto):
+        // l'interruzione richiesta dall'utente deve sempre liberare la sessione.
     }
 
     // Cancel CASCADING per sessione (fix architetturale): l'invariante "max 1
     // run attivo per sessione" che assume la guardia 409 (handlers.rs) puo'
     // venire violata da path "resume", auto-continuation o race condition tra
-    // INSERT e cleanup. Senza cascade, un singolo Forza Stop lascia un secondo
+    // INSERT e cleanup. Senza cascade, una singola interruzione lascia un secondo
     // run "running" stuck nel DB per fino a 15 min (sintomo osservato: dopo
     // Stop, la POST successiva sulla stessa sessione torna 409 ripetuto).
     // Cancellando TUTTI i run attivi della sessione si ristabilisce

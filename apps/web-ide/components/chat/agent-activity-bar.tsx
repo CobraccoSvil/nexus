@@ -3,6 +3,12 @@
 import type { ReactNode } from "react";
 import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
 import { stepLabel } from "./tool-labels";
+import {
+  activityStatusView,
+  formatDuration,
+  interruptButtonView,
+  RUN_LONG_THRESHOLD_SECONDS,
+} from "./interrupt-button-logic";
 
 /**
  * Barra di stato "AI in esecuzione": riassume lo stato del run agente in corso
@@ -14,6 +20,7 @@ import { stepLabel } from "./tool-labels";
 export function AgentActivityBar({
   tc,
   isAgentStuck,
+  runElapsedSeconds,
   secondsSinceLastStep,
   busyLabel,
   isAgentRunning,
@@ -34,6 +41,14 @@ export function AgentActivityBar({
 }: {
   tc: Record<string, string>;
   isAgentStuck: boolean;
+  /**
+   * Secondi dall'AVVIO del run: e' il timer che la barra mostra e la grandezza
+   * su cui scattano l'evidenza arancione e il pulsante di interruzione. Si
+   * chiamava `secondsSinceLastStep` pur misurando l'avvio run, ed e' cosi' che
+   * la comparsa del pulsante veniva letta come "agente bloccato".
+   */
+  runElapsedSeconds: number;
+  /** Secondi dall'ultimo step o meta-step: l'inattivita' vera, per i tooltip. */
   secondsSinceLastStep: number;
   busyLabel: string;
   isAgentRunning: boolean;
@@ -55,6 +70,18 @@ export function AgentActivityBar({
    *  durata del run, quindi ospitarlo non costa altezza. */
   trailing?: ReactNode;
 }) {
+  const interrupt = interruptButtonView({
+    runElapsedSeconds,
+    secondsSinceLastStep,
+    isAgentStuck,
+  });
+  const status = activityStatusView({
+    runElapsedSeconds,
+    secondsSinceLastStep,
+    isAgentStuck,
+    busyLabel,
+  });
+  const runIsLong = runElapsedSeconds > RUN_LONG_THRESHOLD_SECONDS;
   return (
     <div
       style={{
@@ -102,8 +129,11 @@ export function AgentActivityBar({
             flexShrink: 0,
           }}
         />
-        <strong style={{ color: isAgentStuck ? "#f97316" : tc.text, fontSize: 12 }}>
-          {secondsSinceLastStep > 120 ? "⚠ AI in elaborazione" : isAgentStuck ? "⚠ Agente in attesa" : busyLabel}
+        <strong
+          title={status.title}
+          style={{ color: status.warn ? "#f97316" : tc.text, fontSize: 12 }}
+        >
+          {status.text}
         </strong>
         {isAgentRunning && runningAgentStep ? (
           <span style={{ color: tc.textMuted, fontSize: 11 }}>
@@ -128,28 +158,30 @@ export function AgentActivityBar({
           </span>
         ) : null}
         {isAgentRunning && (
-          <span style={{
-            fontSize: 10,
-            color: secondsSinceLastStep > 120 ? "#f97316" : tc.textMuted,
-            fontVariantNumeric: "tabular-nums",
-            marginLeft: 4,
-          }}>
-            {secondsSinceLastStep < 60
-              ? `${secondsSinceLastStep}s`
-              : `${Math.floor(secondsSinceLastStep / 60)}m ${secondsSinceLastStep % 60}s`}
+          <span
+            title="Tempo trascorso dall'avvio del run"
+            style={{
+              fontSize: 10,
+              color: runIsLong ? "#f97316" : tc.textMuted,
+              fontVariantNumeric: "tabular-nums",
+              marginLeft: 4,
+            }}
+          >
+            {formatDuration(runElapsedSeconds)}
           </span>
         )}
-        {secondsSinceLastStep > 120 && agentRun?.runId && (
+        {interrupt.visible && agentRun?.runId && (
           <button
             type="button"
             onClick={() => onCancelRun(agentRun.runId)}
+            title={interrupt.title}
             style={{
               fontSize: 10, padding: "2px 8px", borderRadius: 4,
               border: "1px solid #f9731680", background: "#f9731618",
               color: "#f97316", cursor: "pointer", fontWeight: 600,
             }}
           >
-            Forza stop
+            {interrupt.label}
           </button>
         )}
         {isAgentRunning && (
