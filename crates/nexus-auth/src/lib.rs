@@ -560,20 +560,28 @@ fn extract_token_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> 
 
 /// Valida il token del cookie: firma, scadenza del claim e sessione viva.
 ///
-/// # Perche' i tre modi di fallire si distinguono nel log
+/// # Perche' i modi di fallire si distinguono nel log
 ///
-/// Tutti e tre danno 401 al chiamante, e cosi' deve essere: dire a chi non e'
+/// Tutti danno 401 al chiamante, e cosi' deve essere: dire a chi non e'
 /// autenticato PERCHE' non lo e' regala informazione a chi sta provando. Ma il
-/// log e' interno, e li' l'indistinguibilita' costa: un token rifiutato per
-/// firma sbagliata e uno rifiutato perche' la sua sessione non e' mai stata
-/// creata hanno cause opposte — nel primo caso il segreto non combacia, nel
-/// secondo il percorso di login non ha scritto in `sessions` — e il messaggio
-/// unico "token validation failed" non permetteva di sceglierne una senza
-/// modificare il codice per scoprirlo (misurato il 2026-07-26 diagnosticando un
-/// 401 sistematico sui token del dev-login: firma verificata a mano, sessione
-/// inserita a mano, e nessun modo di sapere dall'esterno cosa rifiutasse il
-/// servizio). Il motivo esiste gia' in forma strutturata a ogni passo: qui viene
-/// solo emesso invece di essere appiattito (regola M).
+/// log e' interno, e li' l'indistinguibilita' costa: cookie assente, firma non
+/// corrispondente e sessione mai aperta hanno rimedi opposti, e il messaggio
+/// unico "token validation failed" non permetteva di sceglierne uno senza
+/// modificare il codice per scoprirlo.
+///
+/// Il caso che ha portato a questa modifica lo dimostra al rovescio. Il
+/// 2026-07-26, diagnosticando un 401 sistematico, sono state verificate a mano la
+/// firma (HMAC ricalcolato contro `settings.jwt_secret`: combaciava) e la sessione
+/// (riga inserita, `expires_at` valido): tutto in ordine, e il 401 restava. La
+/// causa era il PRIMO ramo, quello del cookie: lo strumento di misura —
+/// `Invoke-WebRequest` di PowerShell 5.1 — scarta l'header `Cookie` passato in
+/// `-Headers` e usa il proprio CookieContainer, quindi la credenziale non
+/// arrivava affatto. Con `curl` la stessa richiesta rispondeva 200. Un log che
+/// dicesse "nessun cookie 'token' nella richiesta" avrebbe chiuso la diagnosi in
+/// un secondo invece di un'ora.
+///
+/// Il motivo esiste gia' in forma strutturata a ogni passo: qui viene solo emesso
+/// invece di essere appiattito (regola M).
 pub async fn validate_token(
     db: &PgPool,
     headers: &axum::http::HeaderMap,

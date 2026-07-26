@@ -138,10 +138,13 @@ fn decimale(v: &serde_json::Value, campo: &str) -> f64 {
 async fn agent_run_endpoint_include_usage_breakdown_aggregato() {
     let Some(token) = jwt_o_salta() else { return };
     let Some(meta) = db_o_salta().await else { return };
-    let Some(progetto) = progetto_o_salta(&meta).await else {
+    let Some(user_id) = utente_del_token_o_salta(&meta, &token).await else {
         return;
     };
-    let Some(user_id) = utente_del_token_o_salta(&meta, &token).await else {
+    // Il progetto va scelto DOPO l'utente: deve essere uno a cui quell'utente ha
+    // accesso, altrimenti gli handler rispondono 403 e il test misurerebbe la
+    // propria scelta sbagliata invece del contratto.
+    let Some(progetto) = progetto_o_salta(&meta, user_id).await else {
         return;
     };
 

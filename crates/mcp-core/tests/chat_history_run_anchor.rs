@@ -29,20 +29,27 @@
 //! 1. dipendeva da dati che nessuno garantisce — in un DB appena migrato non
 //!    c'era nulla da trovare, e il test restava un verde vacuo;
 //! 2. firmava con `bearer_auth`, ma `nexus_auth::validate_token` estrae il token
-//!    SOLO dal cookie: con l'ambiente completo ogni chiamata avrebbe preso 401,
-//!    che la vecchia forma leggeva come "nessuna sessione agganciabile". Il
-//!    difetto si sarebbe mascherato da mancanza di dati.
+//!    SOLO dal cookie: ogni chiamata avrebbe preso 401, che la vecchia forma
+//!    leggeva come "nessuna sessione agganciabile". Il difetto si sarebbe
+//!    mascherato da mancanza di dati.
 //!
 //! Ora il test SEMINA la propria conversazione nel DB-progetto (dove il dominio
 //! chat vive dopo il cutover della 0507) nella stessa forma che scrive la
 //! produzione, poi interroga l'endpoint e rimuove tutto. Non dipende da nessun
 //! dato preesistente e non puo' passare in modo vacuo: se l'aggancio non torna,
 //! il messaggio che ha seminato lui e' li' a dimostrarlo.
+//!
+//! Verificato E2E il 2026-07-26 contro un mcp-core in ascolto: verde, con il
+//! contro-caso (assistant senza `request_message_id` -> `runId` assente) che prova
+//! che il campo viene dal JOIN e non da un riempimento indiscriminato.
 
 mod progetto;
 
 use nexus_test_preconditions::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
-use progetto::{progetto_o_salta, pulisci_conversazione, semina_conversazione, utente_del_token_o_salta};
+use progetto::{
+    progetto_o_salta, pulisci_conversazione, semina_conversazione,
+    semina_conversazione_senza_legame, utente_del_token_o_salta,
+};
 use serde_json::Value;
 
 /// GET autenticato. Il token viaggia nel COOKIE: `nexus_auth::validate_token` lo
@@ -85,20 +92,39 @@ fn campo(m: &Value, nome: &str) -> Option<String> {
     m.get(nome).and_then(Value::as_str).map(|s| s.to_string())
 }
 
-/// Il contratto in una frase: il messaggio ASSISTANT prodotto da un run deve
-/// portare l'id di quel run, anche se il run e' agganciato al messaggio UTENTE.
+/// Il contratto, in un solo test: il messaggio ASSISTANT prodotto da un run deve
+/// portare `runId` E `runStatus` di quel run, anche se il run e' agganciato al
+/// messaggio UTENTE.
+///
+/// # Perche' un test e non due
+///
+/// I due campi vengono dallo STESSO `LEFT JOIN`, quindi una fixture sola li copre
+/// entrambi. Ma la ragione vera e' un vincolo misurato: ogni `#[tokio::test]`
+/// crea il proprio runtime, mentre il pool del DB-progetto vive in un registro
+/// statico (`nexus_project_pools`) che sopravvive al test. Il secondo test
+/// ritrovava il pool del primo con le connessioni legate a un runtime gia'
+/// terminato, e il seed moriva con `PoolTimedOut` — un fallimento che non diceva
+/// niente sul contratto e tutto sull'infrastruttura del test (misurato il
+/// 2026-07-26: 20 connessioni su 50 sul cluster, quindi non saturazione).
+///
+/// Lo `status` seminato e' `failed`, diverso dal default `running` della colonna:
+/// un handler che restituisse una costante invece del valore letto verrebbe
+/// scoperto qui.
 #[tokio::test]
 async fn un_messaggio_assistant_porta_il_run_che_lo_ha_prodotto() {
     let Some(token) = jwt_o_salta() else { return };
     let Some(meta) = db_o_salta().await else { return };
-    let Some(progetto) = progetto_o_salta(&meta).await else {
-        return;
-    };
     let Some(user_id) = utente_del_token_o_salta(&meta, &token).await else {
         return;
     };
+    // Il progetto va scelto DOPO l'utente: deve essere uno a cui quell'utente ha
+    // accesso, altrimenti gli handler rispondono 403 e il test misurerebbe la
+    // propria scelta sbagliata invece del contratto.
+    let Some(progetto) = progetto_o_salta(&meta, user_id).await else {
+        return;
+    };
 
-    let conv = semina_conversazione(&progetto, user_id, "completed", "anthropic", "claude-haiku-4-5")
+    let conv = semina_conversazione(&progetto, user_id, "failed", "deepseek", "deepseek-chat")
         .await
         .expect("seed della conversazione nel DB-progetto");
 
@@ -127,9 +153,7 @@ async fn un_messaggio_assistant_porta_il_run_che_lo_ha_prodotto() {
 
     let assistant = assistant.unwrap_or_else(|| {
         panic!(
-            "la storia della sessione non contiene il messaggio assistant appena seminato \
-             ({} messaggi restituiti): l'endpoint non consegna cio' che e' nel DB del progetto",
-            totale
+            "la storia della sessione non contiene il messaggio assistant appena seminato              ({totale} messaggi restituiti): l'endpoint non consegna cio' che e' nel DB del progetto"
         )
     });
 
@@ -141,54 +165,49 @@ async fn un_messaggio_assistant_porta_il_run_che_lo_ha_prodotto() {
     assert_eq!(
         campo(&assistant, "runId").as_deref(),
         Some(conv.run_id.to_string().as_str()),
-        "il messaggio assistant deve portare il runId del run che lo ha prodotto. \
-         Il run e' agganciato al messaggio UTENTE via run_message_id: se il JOIN \
-         non usa COALESCE(request_message_id, id), qui torna null e il nastro \
-         attivita' sparisce al reload"
+        "il messaggio assistant deve portare il runId del run che lo ha prodotto.          Il run e' agganciato al messaggio UTENTE via run_message_id: se il JOIN          non usa COALESCE(request_message_id, id), qui torna null e il nastro          attivita' sparisce al reload"
     );
-}
+    assert_eq!(
+        campo(&assistant, "runStatus").as_deref(),
+        Some("failed"),
+        "il messaggio assistant deve portare anche lo STATO del run agganciato \
+         (seminato 'failed', diverso dal default della colonna): senza, la UI non \
+         sa se il turno e' concluso"
+    );
 
-/// Il contro-caso dello stesso JOIN: oltre all'id deve arrivare lo STATO del run,
-/// che e' quanto la UI usa per sapere se il turno e' finito.
-#[tokio::test]
-async fn un_messaggio_assistant_porta_anche_lo_stato_del_run() {
-    let Some(token) = jwt_o_salta() else { return };
-    let Some(meta) = db_o_salta().await else { return };
-    let Some(progetto) = progetto_o_salta(&meta).await else {
-        return;
-    };
-    let Some(user_id) = utente_del_token_o_salta(&meta, &token).await else {
-        return;
-    };
-
-    // Stato volutamente diverso dal default 'running': cosi' un handler che
-    // restituisse una costante invece del valore letto verrebbe scoperto.
-    let conv = semina_conversazione(&progetto, user_id, "failed", "deepseek", "deepseek-chat")
+    // ---- CONTRO-CASO, nello stesso runtime (vedi la nota sul pool sopra) ----
+    //
+    // Un assistant SENZA `request_message_id` non ha nulla da agganciare: il
+    // `runId` deve essere assente. Senza questa verifica, le asserzioni sopra
+    // passerebbero anche se l'handler riempisse `runId` per ogni messaggio a
+    // prescindere dal legame — cioe' misurerebbero se stesse invece del JOIN
+    // (regola O).
+    let orfana = semina_conversazione_senza_legame(&progetto, user_id, "completed")
         .await
-        .expect("seed della conversazione nel DB-progetto");
+        .expect("seed della conversazione senza legame");
 
-    let body = get_json(
+    let body_orfana = get_json(
         &token,
-        &format!("/api/chat/sessions/{}/messages", conv.session_id),
+        &format!("/api/chat/sessions/{}/messages", orfana.session_id),
     )
     .await;
 
-    let stato = body.map(|b| {
+    let run_id_orfano = body_orfana.map(|b| {
         messaggi(&b)
             .iter()
-            .find(|m| campo(m, "id").as_deref() == Some(&conv.messaggio_assistant_id.to_string()))
-            .and_then(|m| campo(m, "runStatus"))
+            .find(|m| campo(m, "id").as_deref() == Some(&orfana.messaggio_assistant_id.to_string()))
+            .and_then(|m| campo(m, "runId"))
     });
 
-    pulisci_conversazione(&progetto, &conv).await;
+    pulisci_conversazione(&progetto, &orfana).await;
 
-    let Some(stato) = stato else {
-        return; // skip gia' dichiarato
-    };
-    assert_eq!(
-        stato.as_deref(),
-        Some("failed"),
-        "il messaggio assistant deve portare lo stato del run agganciato \
-         (seminato 'failed'): senza, la UI non sa se il turno e' concluso"
-    );
+    if let Some(run_id_orfano) = run_id_orfano {
+        assert!(
+            run_id_orfano.is_none(),
+            "un messaggio assistant senza request_message_id non ha run da \
+             agganciare, ma l'endpoint ha restituito runId={run_id_orfano:?}: \
+             allora il campo non viene dal JOIN e le asserzioni sopra non provano \
+             il contratto"
+        );
+    }
 }

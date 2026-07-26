@@ -41,13 +41,24 @@ pub struct ProgettoDiProva {
     pub pool: PgPool,
 }
 
-/// Cerca un progetto PROVISIONATO (che abbia cioe' un DB raggiungibile) e ne
-/// restituisce il pool, risolto dal punto unico della produzione.
+/// Cerca un progetto su cui il test possa davvero lavorare: ACCESSIBILE
+/// all'utente del token e PROVISIONATO (con un DB raggiungibile).
 ///
-/// Scandaglia i progetti del meta finche' uno risponde: un progetto in elenco ma
-/// mai provisionato da' `NotProvisioned`, che qui non e' un errore ma un
-/// candidato scartato. Se nessuno risponde la precondizione manca.
-pub async fn progetto_o_salta(meta: &PgPool) -> Option<ProgettoDiProva> {
+/// Servono entrambe le condizioni, e per entrambe si interroga il codice della
+/// produzione invece di ricopiarne la regola (regola L):
+///
+/// - l'accesso lo decide [`nexus_types::ensure_project_access`], lo STESSO
+///   predicato che gli handler applicano prima di servire una sessione (owner del
+///   progetto oppure riga in `project_members`). Scegliere il primo progetto
+///   qualunque produceva 403 sulle chiamate successive — il test misurava il
+///   proprio errore di scelta, non il contratto;
+/// - il DB lo risolve `nexus_project_pools::project_data_pool`, che su un
+///   progetto mai provisionato da' `NotProvisioned`: qui non e' un errore, e' un
+///   candidato scartato.
+///
+/// Se nessun progetto soddisfa entrambe, la precondizione manca e il test lo
+/// dichiara.
+pub async fn progetto_o_salta(meta: &PgPool, user_id: Uuid) -> Option<ProgettoDiProva> {
     let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM projects ORDER BY created_at")
         .fetch_all(meta)
         .await
@@ -58,15 +69,29 @@ pub async fn progetto_o_salta(meta: &PgPool) -> Option<ProgettoDiProva> {
         return None;
     }
 
+    let mut accessibili = 0usize;
     for project_id in ids {
+        if nexus_types::ensure_project_access(meta, user_id, project_id)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        accessibili += 1;
         if let Ok(pool) = nexus_project_pools::project_data_pool(meta, project_id).await {
             return Some(ProgettoDiProva { project_id, pool });
         }
     }
 
-    salta(Motivo::DatiAssenti(
-        "nessun progetto con DB provisionato (project_data_pool non risolve per nessuno)",
-    ));
+    if accessibili == 0 {
+        salta(Motivo::DatiAssenti(
+            "nessun progetto accessibile all'utente del token (ne' owner ne' membro)",
+        ));
+    } else {
+        salta(Motivo::DatiAssenti(
+            "nessun progetto accessibile ha un DB provisionato",
+        ));
+    }
     None
 }
 
@@ -167,6 +192,33 @@ pub async fn semina_conversazione(
     provider: &str,
     model: &str,
 ) -> Result<Conversazione, sqlx::Error> {
+    semina(progetto, user_id, stato_run, provider, model, true).await
+}
+
+/// Come [`semina_conversazione`] ma SENZA il legame `request_message_id` sul
+/// messaggio assistant.
+///
+/// Serve al contro-caso: e' la forma su cui il JOIN non ha nulla da agganciare, e
+/// l'API deve rispondere con `runId` assente. Senza questo caso, un test che
+/// verifica solo la presenza del runId passerebbe anche se l'handler lo
+/// riempisse per tutti i messaggi a prescindere dal legame — misurerebbe se
+/// stesso invece del contratto.
+pub async fn semina_conversazione_senza_legame(
+    progetto: &ProgettoDiProva,
+    user_id: Uuid,
+    stato_run: &str,
+) -> Result<Conversazione, sqlx::Error> {
+    semina(progetto, user_id, stato_run, "anthropic", "claude-haiku-4-5", false).await
+}
+
+async fn semina(
+    progetto: &ProgettoDiProva,
+    user_id: Uuid,
+    stato_run: &str,
+    provider: &str,
+    model: &str,
+    lega_assistant: bool,
+) -> Result<Conversazione, sqlx::Error> {
     let session_id = Uuid::new_v4();
     let messaggio_utente_id = Uuid::new_v4();
     let messaggio_assistant_id = Uuid::new_v4();
@@ -199,7 +251,13 @@ pub async fn semina_conversazione(
     .bind(messaggio_assistant_id)
     .bind(session_id)
     .bind(progetto.project_id)
-    .bind(messaggio_utente_id)
+    // `None` = nessun legame col messaggio che ha innescato il run: il JOIN
+    // dell'handler non trovera' nulla da agganciare (contro-caso).
+    .bind(if lega_assistant {
+        Some(messaggio_utente_id)
+    } else {
+        None
+    })
     .execute(&progetto.pool)
     .await?;
 
