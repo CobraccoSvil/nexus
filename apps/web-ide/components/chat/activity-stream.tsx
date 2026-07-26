@@ -1216,7 +1216,10 @@ function GruppoSubagenteView({
               color: tc.textMuted,
               cursor: "pointer",
               minWidth: 0,
-              padding: "2px 0",
+              // Stesse tacche orizzontali di EventRow: il toggle appartiene al
+              // blocco del sub-agente, quindi si allinea alla colonna del suo
+              // testo invece di sporgere a filo del nastro.
+              padding: "2px 34px 4px 42px",
             }}
           >
             <span
