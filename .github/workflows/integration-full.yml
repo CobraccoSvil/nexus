@@ -211,7 +211,16 @@ jobs:
           # in crates/nexus-auth). L'utente e' quello che il token DICHIARA: e'
           # l'unico che gli handler accetteranno.
           hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
-          sub="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.sub')"
+
+          # Il payload di un JWT e' base64url SENZA padding, e `base64 -d` di
+          # coreutils lo rifiuta ("invalid input") quando la lunghezza non e'
+          # multipla di 4 — cioe' in 2 casi su 4, a seconda del claim `exp` e
+          # dell'id utente. Verificato prima di lanciare il job: senza il padding
+          # qui sotto, `sub` sarebbe vuoto e lo step morirebbe con "claim 'sub'
+          # non leggibile", un rosso che parla del workflow e non dell'ambiente.
+          payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          sub="$(printf '%s' "$payload" | base64 -d | jq -r '.sub')"
           if [ -z "$sub" ] || [ "$sub" = "null" ]; then
             echo "::error::il token non porta un claim 'sub' leggibile"
             exit 1
