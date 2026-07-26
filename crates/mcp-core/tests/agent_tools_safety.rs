@@ -7,10 +7,8 @@
 //! siano compilati. La test suite ricca unit-level vive in
 //! `src/agent_tools/safety.rs` modulo `tests` (23 test, gia' verde).
 
-mod support;
-
 use std::process::Command;
-use support::{salta, Motivo};
+use nexus_test_preconditions::{salta, Motivo};
 
 fn release_binary() -> std::path::PathBuf {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

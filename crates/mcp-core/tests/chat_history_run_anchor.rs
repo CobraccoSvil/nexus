@@ -28,10 +28,8 @@
 //! renderebbe verde qualunque implementazione), quando la storia e' raggiungibile
 //! ma non contiene alcun assistant agganciabile il test FALLISCE dichiarandolo.
 
-mod support;
-
 use serde_json::Value;
-use support::{base_url, jwt_o_salta, salta, Motivo};
+use nexus_test_preconditions::{base_url, jwt_o_salta, salta, Motivo};
 
 async fn get_json(token: &str, path: &str) -> Option<Value> {
     let res = reqwest::Client::new()

@@ -26,10 +26,8 @@
 //! Idempotente e indipendente dall'ordine (regola F): crea le proprie righe con
 //! un suffisso unico e le rimuove in chiusura.
 
-mod support;
-
 use sqlx::PgPool;
-use support::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
+use nexus_test_preconditions::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
 use uuid::Uuid;
 
 async fn seed(pool: &PgPool, key: &str, protected: bool) {

@@ -9,10 +9,8 @@
 //!   2. `bash /tmp/mint_jwt.sh`  (helper JWT admin per i test protetti)
 //!   3. `MCP_CORE_URL=http://localhost:4000 NEXUS_TEST_JWT=$(cat /tmp/nexus_jwt.txt) cargo test --test agent_runs_endpoints`
 
-mod support;
-
 use std::time::Duration;
-use support::{base_url, jwt_o_salta, salta, Motivo};
+use nexus_test_preconditions::{base_url, jwt_o_salta, salta, Motivo};
 
 /// Client HTTP per i contract test, che richiedono auth admin: se il JWT manca il
 /// punto unico dichiara lo skip (o fallisce sotto REQUIRE_INTEGRATION_TESTS=1).

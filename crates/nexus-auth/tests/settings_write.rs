@@ -7,15 +7,19 @@
 //!
 //! Idempotente e indipendente dall'ordine (regola F): ogni test crea le proprie
 //! righe con un suffisso unico e le rimuove in chiusura.
+//!
+//! Serve un DB: la precondizione passa dal punto unico
+//! `nexus_test_preconditions::db_o_salta`, che stampa un marker
+//! `NEXUS_TEST_SKIP` e sotto `REQUIRE_INTEGRATION_TESTS=1` FALLISCE. Prima era
+//! `eprintln!("skip: DATABASE_URL non impostata")` + `return`: un verde
+//! indistinguibile da un contratto verificato. In CI `DATABASE_URL` C'E', quindi
+//! questi due test girano davvero; erano muti solo in locale e in ambienti
+//! parziali.
 
 use nexus_auth::{update_setting_value, SettingWriteError};
+use nexus_test_preconditions::db_o_salta;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn db() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
 
 async fn cleanup(pool: &PgPool, key: &str) {
     let _ = sqlx::query("DELETE FROM settings WHERE key = $1")
@@ -26,10 +30,7 @@ async fn cleanup(pool: &PgPool, key: &str) {
 
 #[tokio::test]
 async fn chiave_assente_non_viene_creata() {
-    let Some(pool) = db().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
 
     let key = format!("test.write_unit.assente.{}", Uuid::new_v4());
     cleanup(&pool, &key).await;
@@ -52,10 +53,7 @@ async fn chiave_assente_non_viene_creata() {
 
 #[tokio::test]
 async fn chiave_esistente_viene_aggiornata() {
-    let Some(pool) = db().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
 
     let key = format!("test.write_unit.esistente.{}", Uuid::new_v4());
     cleanup(&pool, &key).await;

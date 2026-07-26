@@ -7,10 +7,8 @@
 //! Eseguire con:
 //!   DATABASE_URL=postgres://nexus:nexus@localhost:5433/nexus cargo test --test orchestrator_db_schema
 
-mod support;
-
 use sqlx::{PgPool, Row};
-use support::db_o_salta;
+use nexus_test_preconditions::db_o_salta;
 
 #[tokio::test]
 async fn tabelle_plan_act_verify_esistono() {

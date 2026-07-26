@@ -688,38 +688,68 @@ fi
 # NEXUS_TEST_JWT no e nessun mcp-core e' in ascolto: tutti i test al wire erano
 # verdi senza aver interrogato niente.
 #
-# Ora la precondizione passa da `tests/support/mod.rs` (`salta`), che stampa un
-# marker NEXUS_TEST_SKIP e sotto REQUIRE_INTEGRATION_TESTS=1 fallisce; la
-# sentinella `tests/precondizioni_integrazione.rs` dichiara il quadro a ogni
-# esecuzione. Questo check impedisce di rientrare nello skip muto.
+# Ora la precondizione passa dal crate `nexus-test-preconditions` (`salta`), che
+# stampa un marker NEXUS_TEST_SKIP e sotto REQUIRE_INTEGRATION_TESTS=1 fallisce;
+# la sentinella `mcp-core/tests/precondizioni_integrazione.rs` dichiara il quadro
+# a ogni esecuzione. Il punto unico vive in un crate perche' mcp-core e' bin-only
+# e nexus-auth / nexus-project-pools sono sue DIPENDENZE: nessuno dei tre poteva
+# ospitarlo per gli altri, e tre copie sarebbero tre verita' (regola L).
 #
-# Il pattern esclude le righe di commento (`^[^/]*`): l'intestazione del punto
-# unico cita `eprintln!("skip: ...")` per spiegare cosa ha sostituito.
+# Questo check copre tutti i crate con test opportunistici e impedisce sia di
+# rientrare nello skip muto, sia di ri-fondare un secondo punto unico locale.
+#
+# Il pattern esclude le righe di commento (`^[^/]*`): le intestazioni citano
+# `eprintln!("skip: ...")` per spiegare cosa ha sostituito.
+crate_opportunistici=(
+  crates/mcp-core/tests
+  crates/nexus-auth/tests
+  crates/nexus-project-pools/tests
+)
 skip_muti=""
 while IFS= read -r hit; do
-  [[ -n "$hit" ]] && skip_muti+="$hit"$'\n'
-done < <(grep -rnE '^[^/]*eprintln!\("skip' crates/mcp-core/tests/ 2>/dev/null || true)
+  [[ -n "$hit" ]] && skip_muti+="$hit"$'
+'
+done < <(grep -rnE '^[^/]*eprintln!\("skip' "${crate_opportunistici[@]}" 2>/dev/null || true)
 
-if [[ -n "$skip_muti" ]]; then
-  echo "!! test-skip-visibile: skip stampato a mano negli integration test di mcp-core:" >&2
-  printf '%s' "$skip_muti" | sed 's/^/     /' >&2
-  echo "   Usare support::salta(Motivo::...) — stampa il marker NEXUS_TEST_SKIP e," >&2
-  echo "   con REQUIRE_INTEGRATION_TESTS=1, FALLISCE invece di ritornare verde." >&2
+# Un secondo `fn salta` / `fn db_o_salta` / `fn jwt_o_salta` fuori dal crate
+# autoritativo sarebbe una copia della stessa decisione, libera di divergere: e'
+# il modo in cui questo difetto e' nato (ogni file il suo skip, ogni crate il suo
+# helper di connessione).
+punto_unico="crates/nexus-test-preconditions/src/lib.rs"
+doppioni=""
+while IFS= read -r hit; do
+  [[ -n "$hit" ]] && doppioni+="$hit"$'
+'
+done < <(grep -rnE '^[^/]*fn (salta|db_o_salta|jwt_o_salta)\('   --include='*.rs' crates/ 2>/dev/null | grep -v "^$punto_unico:" || true)
+
+if [[ -n "$skip_muti" || -n "$doppioni" ]]; then
+  if [[ -n "$skip_muti" ]]; then
+    echo "!! test-skip-visibile: skip stampato a mano negli integration test:" >&2
+    printf '%s' "$skip_muti" | sed 's/^/     /' >&2
+    echo "   Usare nexus_test_preconditions::salta(Motivo::...) — stampa il marker" >&2
+    echo "   NEXUS_TEST_SKIP e, con REQUIRE_INTEGRATION_TESTS=1, FALLISCE." >&2
+  fi
+  if [[ -n "$doppioni" ]]; then
+    echo "!! test-skip-visibile: punto unico dello skip ri-definito fuori da $punto_unico:" >&2
+    printf '%s' "$doppioni" | sed 's/^/     /' >&2
+    echo "   Aggiungerlo al crate condiviso e usarlo come dev-dependency." >&2
+  fi
   fail=1
 else
-  supporto="crates/mcp-core/tests/support/mod.rs"
   sentinella="crates/mcp-core/tests/precondizioni_integrazione.rs"
   mancanti=""
-  [[ -f "$supporto" ]] && grep -q 'pub fn salta' "$supporto" ||
-    mancanti+="manca il punto unico support::salta in $supporto"$'\n'
+  [[ -f "$punto_unico" ]] && grep -q 'pub fn salta' "$punto_unico" ||
+    mancanti+="manca il punto unico salta() in $punto_unico"$'
+'
   [[ -f "$sentinella" ]] && grep -q 'fn precondizioni_dichiarate' "$sentinella" ||
-    mancanti+="manca la sentinella precondizioni_dichiarate in $sentinella"$'\n'
+    mancanti+="manca la sentinella precondizioni_dichiarate in $sentinella"$'
+'
   if [[ -n "$mancanti" ]]; then
     echo "!! test-skip-visibile: il punto unico dello skip non e' al suo posto:" >&2
     printf '%s' "$mancanti" | sed 's/^/     /' >&2
     fail=1
   else
-    echo "OK test-skip-visibile: nessuno skip muto negli integration test di mcp-core"
+    echo "OK test-skip-visibile: nessuno skip muto, un solo punto unico delle precondizioni"
   fi
 fi
 

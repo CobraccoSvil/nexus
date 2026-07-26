@@ -13,11 +13,9 @@
 //! stampavano il solo `"skip"`, senza dire QUALE cluster mancasse, e nel gate
 //! erano indistinguibili da un'isolation verificata.
 
-mod support;
-
 use sqlx::{PgPool, Row};
 use std::env;
-use support::db_url_o_salta;
+use nexus_test_preconditions::db_url_o_salta;
 
 async fn nexus_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL")

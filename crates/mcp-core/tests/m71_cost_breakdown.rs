@@ -4,10 +4,8 @@
 //! `usageBreakdown` aggregato da `ai_usage_ledger`. Test sintetico:
 //! inserisce ledger fake → fetcha endpoint → controlla breakdown.
 
-mod support;
-
 use std::time::Duration;
-use support::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
+use nexus_test_preconditions::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
 use uuid::Uuid;
 
 #[tokio::test]

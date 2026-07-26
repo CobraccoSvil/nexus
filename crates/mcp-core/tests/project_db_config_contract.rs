@@ -13,10 +13,8 @@
 //! Eseguire con:
 //!   DATABASE_URL=postgres://nexus:nexus@localhost:5433/nexus cargo test --test project_db_config_contract
 
-mod support;
-
 use sqlx::{PgPool, Row};
-use support::{db_o_salta, salta, Motivo};
+use nexus_test_preconditions::{db_o_salta, salta, Motivo};
 use uuid::Uuid;
 
 async fn un_progetto(pool: &PgPool) -> Option<Uuid> {

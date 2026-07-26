@@ -2041,6 +2041,7 @@ dependencies = [
  "nexus-pricing",
  "nexus-project-db",
  "nexus-project-pools",
+ "nexus-test-preconditions",
  "nexus-test-schema",
  "nexus-tool-kit",
  "nexus-types",
@@ -2306,6 +2307,7 @@ dependencies = [
  "axum",
  "jsonwebtoken",
  "nexus-cache",
+ "nexus-test-preconditions",
  "rand 0.8.5",
  "serde",
  "sha2",
@@ -2501,6 +2503,7 @@ name = "nexus-project-pools"
 version = "0.1.0"
 dependencies = [
  "nexus-auth",
+ "nexus-test-preconditions",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
@@ -2516,6 +2519,13 @@ dependencies = [
  "regex",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "nexus-test-preconditions"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
 ]
 
 [[package]]

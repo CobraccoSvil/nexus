@@ -2,17 +2,16 @@
 //! del pool DB per-progetto dai servizi separati, separazione DB per-progetto).
 //!
 //! Tutti i test sono READ-ONLY sul meta-DB (idempotenti, regola F) e vengono
-//! saltati se `DATABASE_URL` non e' impostata (stesso pattern di
-//! `mcp-core/tests/orchestrator_db_schema.rs`).
+//! saltati se il DB non e' raggiungibile. La precondizione passa dal punto unico
+//! `nexus_test_preconditions::db_o_salta` (stesso di
+//! `mcp-core/tests/orchestrator_db_schema.rs`), che stampa un marker
+//! `NEXUS_TEST_SKIP` e sotto `REQUIRE_INTEGRATION_TESTS=1` FALLISCE: prima i
+//! quattro `eprintln!("skip: ...")` + `return` erano verdi indistinguibili da un
+//! contratto verificato, e non distinguevano "variabile assente" da "DB che non
+//! risponde".
 
-use sqlx::PgPool;
-use std::env;
+use nexus_test_preconditions::db_o_salta;
 use uuid::Uuid;
-
-async fn meta_pool_or_skip() -> Option<PgPool> {
-    let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
 
 /// Le tabelle del contratto di risoluzione devono esistere nel meta: sono la
 /// fonte da cui il crate instrada (elenco progetti, registry connessioni,
@@ -20,10 +19,7 @@ async fn meta_pool_or_skip() -> Option<PgPool> {
 /// il punto unico e' rotto per TUTTI i servizi separati.
 #[tokio::test]
 async fn tabelle_contratto_meta_esistono() {
-    let Some(pool) = meta_pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     for t in [
         "projects",
         "project_database_config",
@@ -47,10 +43,7 @@ async fn tabelle_contratto_meta_esistono() {
 /// (errore tipizzato, regola M).
 #[tokio::test]
 async fn progetto_sconosciuto_fallisce_tipizzato() {
-    let Some(pool) = meta_pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let ghost = Uuid::new_v4();
     match nexus_project_pools::project_data_pool(&pool, ghost).await {
         Err(nexus_project_pools::ProjectPoolError::NotProvisioned(pid)) => {
@@ -67,10 +60,7 @@ async fn progetto_sconosciuto_fallisce_tipizzato() {
 /// (esercita la query su `nexus_data_routing` contro lo schema reale).
 #[tokio::test]
 async fn entita_non_mappata_ritorna_none() {
-    let Some(pool) = meta_pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let ghost = Uuid::new_v4();
     let got = nexus_project_pools::project_id_for_entity(&pool, "session", ghost).await;
     assert!(got.is_none(), "entita' fantasma non deve risultare mappata");
@@ -82,10 +72,7 @@ async fn entita_non_mappata_ritorna_none() {
 /// decommissionate (mig 0507/0525).
 #[tokio::test]
 async fn sessione_sconosciuta_not_found() {
-    let Some(pool) = meta_pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let ghost = Uuid::new_v4();
     match nexus_project_pools::project_data_pool_by_session(&pool, ghost).await {
         Err(nexus_project_pools::ProjectPoolError::SessionNotFound(sid)) => {
