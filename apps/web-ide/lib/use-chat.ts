@@ -481,6 +481,25 @@ export function useChat(
           }
         },
         async () => {
+          // Un sub-run CONCLUSO non ha piu' nulla da trasmettere: il suo stream
+          // resta pero' agganciato fino alla fine del padre, e con un batch di
+          // sub-agenti quegli slot pesano sul budget di 6 connessioni per origine
+          // proprio mentre il lavoro e' al massimo. I sub-agenti finiscono a
+          // scaglioni, quindi liberare qui abbassa il PICCO, che e' la grandezza
+          // che conta. Gli step gia' ricevuti restano in agentStepsMap: il tab del
+          // sub-agente continua a mostrarli. Il primario NON si tocca (il suo
+          // ciclo di vita e' governato da stopPrimaryAgentStream).
+          if (!isPrimary) {
+            const chiudi = childSubCleanupsRef.current.get(runId);
+            if (chiudi) {
+              childSubCleanupsRef.current.delete(runId);
+              try {
+                chiudi();
+              } catch {
+                // best-effort: la chiusura non deve impedire la finalizzazione
+              }
+            }
+          }
           try {
             // Polling con retry: se l'evento agent_final SSE e' arrivato MA
             // il DB risponde ancora "running", potrebbe esserci una race
