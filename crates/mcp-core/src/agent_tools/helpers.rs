@@ -55,6 +55,67 @@ pub(crate) fn is_long_oneshot(command: &str) -> bool {
         || c.contains("yarn add")
 }
 
+/// True se il comando MUTA l'albero delle dipendenze di un package manager
+/// (install/add/remove/update di npm, pnpm, yarn, bun, pip, poetry, composer,
+/// gem, bundle, go mod).
+///
+/// Serve a SERIALIZZARE quei comandi per progetto: npm & co. non sono
+/// concurrency-safe sulla stessa directory di dipendenze. Due install simultanei
+/// si sovrascrivono a vicenda — uno rimuove cio' che l'altro sta scrivendo — e
+/// lasciano lo stato interno del package manager (`node_modules/.package-lock.json`)
+/// incoerente col disco: da quel momento `npm install <pkg>` risponde "up to date"
+/// senza installare nulla, il binario atteso (tsc, vite, ...) non c'e', il build
+/// fallisce e il lavoro non converge.
+///
+/// Misurato sul progetto verifica-wd (2026-07-23): 11 coppie di `npm install` da
+/// run_id DIVERSI entro 60s sulla stessa area, di cui una a distanza ZERO secondi
+/// (un sub-agente con working_dir=backend e un altro con `cd backend && npm
+/// install`), 13 run distinti coinvolti e fino a 12 sub-agenti sovrapposti.
+///
+/// `cargo` e' ESCLUSO di proposito: ha gia' un file-lock interno sul registry e su
+/// target/, quindi serializzarlo qui aggiungerebbe attesa senza togliere rischio.
+///
+/// Inclusivo per scelta: un falso positivo costa solo un po' di serializzazione,
+/// un falso negativo costa un ambiente corrotto.
+pub(crate) fn is_package_manager_mutation(command: &str) -> bool {
+    /// Package manager che mutano una directory di dipendenze condivisa.
+    const PM: &[&str] = &[
+        "npm", "pnpm", "yarn", "bun", "pip", "pip3", "poetry", "composer", "gem", "bundle", "go",
+    ];
+    /// Sotto-comandi che SCRIVONO nell'albero delle dipendenze.
+    const MUT: &[&str] = &[
+        "install",
+        "ci",
+        "add",
+        "remove",
+        "uninstall",
+        "update",
+        "upgrade",
+        "prune",
+        "dedupe",
+        "link",
+        "require",
+        "rebuild",
+        "get",
+        "mod",
+    ];
+    // Segmenta su &&, ||, ;, | e newline: in `cd frontend && npm install` il
+    // package manager sta nel SECONDO segmento, e senza segmentazione il `cd`
+    // iniziale maschererebbe la posizione del comando vero.
+    command
+        .to_lowercase()
+        .split(|c: char| matches!(c, '&' | '|' | ';' | '\n'))
+        .any(|seg| {
+            let toks: Vec<&str> = seg.split_whitespace().collect();
+            match toks.iter().position(|t| PM.contains(t)) {
+                // Il sotto-comando mutante deve venire DOPO il package manager:
+                // `npm install` si', `install npm` (frase qualsiasi) no.
+                Some(i) => toks[i + 1..].iter().any(|t| MUT.contains(t)),
+                None => false,
+            }
+        })
+}
+
 /// Controlla se il comando corrisponde a uno dei pattern long-running caricati dal DB.
 /// Ogni pattern è una sequenza di token (es. "npm run dev") che viene cercata
 /// come sottosequenza contigua nei token del comando.
@@ -556,6 +617,42 @@ mod tests {
             hint.contains("comando non trovato"),
             "command not found deve avere priorita' sul ramo build: {hint}"
         );
+    }
+
+    #[test]
+    fn pkg_mutation_riconosce_i_comandi_misurati_e_non_gli_innocui() {
+        // I DUE comandi realmente concorrenti misurati su verifica-wd (07:33:29,
+        // run_id diversi, distanza ZERO secondi): entrambi devono entrare in
+        // sezione critica, altrimenti si sovrascrivono node_modules a vicenda.
+        assert!(is_package_manager_mutation("npm install"));
+        assert!(is_package_manager_mutation(
+            "cd backend && npm install typescript --no-save"
+        ));
+        // Altre forme viste nei run reali.
+        assert!(is_package_manager_mutation("npm install --legacy-peer-deps"));
+        assert!(is_package_manager_mutation("npm install -D typescript"));
+        assert!(is_package_manager_mutation(
+            "cd frontend && rm -rf node_modules package-lock.json && npm install"
+        ));
+        assert!(is_package_manager_mutation("npm ci"));
+        // Altri ecosistemi: la corruzione da concorrenza non e' specifica di npm.
+        assert!(is_package_manager_mutation("pnpm add -D vite"));
+        assert!(is_package_manager_mutation("yarn install --frozen-lockfile"));
+        assert!(is_package_manager_mutation("pip install -r requirements.txt"));
+        assert!(is_package_manager_mutation("poetry add fastapi"));
+        assert!(is_package_manager_mutation("go mod download"));
+
+        // NON deve serializzare cio' che non tocca le dipendenze: sarebbe
+        // parallelismo perso per nulla.
+        assert!(!is_package_manager_mutation("npm run build"));
+        assert!(!is_package_manager_mutation("npm run dev"));
+        assert!(!is_package_manager_mutation("npx tsc --noEmit"));
+        assert!(!is_package_manager_mutation("ls node_modules/.bin"));
+        assert!(!is_package_manager_mutation("cat package.json"));
+        // `cargo` e' escluso di proposito (ha un file-lock interno).
+        assert!(!is_package_manager_mutation("cargo build"));
+        // Il sotto-comando mutante deve venire DOPO il package manager.
+        assert!(!is_package_manager_mutation("echo install npm"));
     }
 
     #[test]
