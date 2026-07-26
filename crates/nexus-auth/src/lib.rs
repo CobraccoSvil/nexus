@@ -146,6 +146,49 @@ pub async fn get_setting_nonempty(db: &PgPool, key: &str) -> anyhow::Result<Opti
         .filter(|v| !v.is_empty()))
 }
 
+/// Esito della lettura di una setting da un contesto NON autenticato
+/// (segnale strutturato, regola M: il chiamante mappa la variante sullo status
+/// HTTP, non deduce nulla dal valore).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicSettingRead {
+    /// Chiave non marcata segreta: il valore puo' essere esposto (anche vuoto).
+    Value(String),
+    /// Chiave con `is_secret = TRUE`: il valore NON viene letto ne' restituito.
+    Redacted,
+    /// La chiave non esiste in tabella.
+    NotFound,
+}
+
+/// Legge una setting per un contesto NON autenticato, rifiutando i segreti.
+///
+/// PUNTO UNICO (regola L) del predicato "questa chiave e' esponibile senza
+/// autenticazione". Esiste perche' `GET /internal/settings/:key` e' montato
+/// fuori dal layer di auth in DUE servizi (mcp-core e admin-service, entrambi
+/// in ascolto su `0.0.0.0`) e leggeva il valore RAW senza guardare `is_secret`:
+/// `jwt_secret` e le API key dei provider erano scaricabili da chiunque
+/// raggiungesse la porta, e con la chiave di firma si conia un token di
+/// amministratore. Il masking della LISTA (`/api/settings`) guardava
+/// `is_secret`; la lettura puntuale no.
+///
+/// Non passa dalla cache: legge `is_secret` e `value` nella stessa query, cosi'
+/// il verdetto e il valore non possono divergere. Il valore di una chiave
+/// segreta non viene nemmeno deserializzato nel ramo `Redacted`.
+pub async fn get_setting_public(
+    db: &PgPool,
+    key: &str,
+) -> Result<PublicSettingRead, sqlx::Error> {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT value, is_secret FROM settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(db)
+            .await?;
+    Ok(match row {
+        None => PublicSettingRead::NotFound,
+        Some((_, true)) => PublicSettingRead::Redacted,
+        Some((value, false)) => PublicSettingRead::Value(value),
+    })
+}
+
 /// Variante best-effort che ingoia l'errore DB ritornando `None` (con trim e
 /// scarto dei vuoti). Mantenuta per i call site storici; per il codice NUOVO
 /// preferire `get_setting_checked`/`get_setting_nonempty`, che propagano.
@@ -488,6 +531,67 @@ mod tests_settings_cache {
 
         assert_eq!(v1, v2);
         assert_eq!(v2.as_deref(), Some("v1"));
+    }
+
+    /// La lettura senza autenticazione NON deve restituire un segreto.
+    ///
+    /// Il test parte dalla stessa forma che ha la riga in produzione — `jwt_secret`
+    /// e' seminata con `is_secret = TRUE` dalla migrazione 0003 — e asserisce la
+    /// VARIANTE dell'esito, non l'assenza di errore: `get_setting_public` che
+    /// ritornasse `Value(segreto)` senza fallire sarebbe verde su un assert
+    /// generico, ed e' esattamente il difetto che c'era (`GET
+    /// /internal/settings/jwt_secret` rispondeva 200 con la chiave in chiaro).
+    #[sqlx::test]
+    async fn una_chiave_segreta_non_e_leggibile_senza_auth(pool: PgPool) {
+        crea_settings(&pool).await;
+        sqlx::query("INSERT INTO settings (key, value, is_secret) VALUES ($1, $2, TRUE)")
+            .bind("jwt_secret")
+            .bind("chiave-di-firma-che-non-deve-uscire")
+            .execute(&pool)
+            .await
+            .expect("insert segreto");
+
+        let esito = get_setting_public(&pool, "jwt_secret")
+            .await
+            .expect("la lettura non deve fallire: deve RIFIUTARE");
+
+        assert_eq!(
+            esito,
+            PublicSettingRead::Redacted,
+            "una chiave is_secret deve dare Redacted, mai il valore"
+        );
+        // Prova esplicita che il segreto non e' nel risultato in nessuna forma.
+        assert!(
+            !format!("{esito:?}").contains("chiave-di-firma"),
+            "il valore del segreto non deve comparire nemmeno nel Debug: {esito:?}"
+        );
+    }
+
+    /// Il gemello: una chiave NON segreta resta leggibile, altrimenti il fix
+    /// avrebbe rotto l'endpoint invece di ripararlo.
+    #[sqlx::test]
+    async fn una_chiave_normale_resta_leggibile(pool: PgPool) {
+        crea_settings(&pool).await;
+        semina(&pool, "nexus_gateway_port", "4060").await;
+
+        let esito = get_setting_public(&pool, "nexus_gateway_port")
+            .await
+            .expect("lettura chiave pubblica");
+
+        assert_eq!(esito, PublicSettingRead::Value("4060".to_string()));
+    }
+
+    /// Una chiave assente si distingue da una rifiutata: il chiamante mappa
+    /// 404 e 403 su risposte diverse (regola M, esito tipizzato).
+    #[sqlx::test]
+    async fn una_chiave_assente_e_distinguibile_da_una_rifiutata(pool: PgPool) {
+        crea_settings(&pool).await;
+
+        let esito = get_setting_public(&pool, "chiave.che.non.esiste")
+            .await
+            .expect("lettura chiave assente");
+
+        assert_eq!(esito, PublicSettingRead::NotFound);
     }
 
     /// Il difetto piu' costoso che una cache di settings possa avere: servire a

@@ -197,15 +197,38 @@ pub async fn bulk_update(
     )
 }
 
+/// GET /internal/settings/:key — valore non mascherato delle chiavi NON segrete.
+///
+/// Gemello di `mcp_core::settings::get_raw_value`: stessa rotta, stesso difetto,
+/// stesso punto unico. La rotta e' montata fuori dal layer di auth e il servizio
+/// ascolta su `0.0.0.0`, quindi leggeva in chiaro `jwt_secret` e le API key a
+/// chiunque raggiungesse la porta. Il predicato "esponibile senza auth" vive in
+/// `nexus_auth::get_setting_public` (regola L), non qui.
 pub async fn get_raw_value(
     State(state): State<AppState>,
     Path(key): Path<String>,
-) -> Json<Value> {
-    // Fix S87: prima ingoiava silenziosamente errore DB.
-    let value = match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(&key).fetch_optional(&state.db).await {
-        Ok(opt) => opt.unwrap_or_default(),
-        Err(e) => { tracing::warn!("get_raw_value({}): SELECT fallito: {}", key, e); String::new() }
-    };
-    Json(json!({ "key": key, "value": value }))
+) -> (StatusCode, Json<Value>) {
+    match nexus_auth::get_setting_public(&state.db, &key).await {
+        Ok(nexus_auth::PublicSettingRead::Value(value)) => {
+            (StatusCode::OK, Json(json!({ "key": key, "value": value })))
+        }
+        Ok(nexus_auth::PublicSettingRead::Redacted) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "key": key,
+                "error": "chiave segreta: non leggibile da una rotta senza autenticazione",
+            })),
+        ),
+        Ok(nexus_auth::PublicSettingRead::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "key": key, "error": "chiave inesistente" })),
+        ),
+        Err(e) => {
+            tracing::warn!("get_raw_value({}): lettura fallita: {}", key, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "key": key, "error": "lettura setting fallita" })),
+            )
+        }
+    }
 }

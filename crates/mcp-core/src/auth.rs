@@ -52,6 +52,81 @@ fn clear_cookie_header() -> String {
     )
 }
 
+/// Chiave che abilita l'emissione del token di sviluppo (regola G: il gate vive
+/// nel DB, non in una `cfg!` di compilazione o in una env). Seminata a `'true'`
+/// dalla migrazione 0640 sui DB esistenti, perche' il dev-login era gia' attivo:
+/// spegnerla chiude l'endpoint senza toccare il codice.
+const DEV_LOGIN_SETTING: &str = "auth.dev_login_enabled";
+
+/// Utente di sviluppo per cui viene emesso il token. E' lo STESSO id che il
+/// dev-login del frontend usava gia' hardcoded: il comportamento non cambia,
+/// cambia solo CHI firma il token.
+const DEV_LOGIN_USER_ID: &str = "e9a5dc7e-7936-4f7b-9ff3-11bb175041d8";
+
+/// `POST /internal/dev-login-token` — emette un JWT per l'utente di sviluppo.
+///
+/// Esiste per togliere al frontend la necessita' di leggere `jwt_secret`.
+/// Prima `apps/web-ide/app/api/dev-login/route.ts` scaricava il segreto da
+/// `GET /internal/settings/jwt_secret` e coniava il token in Node: quella rotta
+/// e' senza autenticazione su un servizio in ascolto su `0.0.0.0`, quindi la
+/// chiave di firma della piattaforma era leggibile da chiunque raggiungesse la
+/// porta — e con quella si conia un token di amministratore. Ora la firma resta
+/// nel backend e il segreto non attraversa piu' il confine di processo.
+///
+/// NB: questo endpoint emette una credenziale, quindi va raggiunto solo da
+/// localhost. Oggi il confine e' il gate DB [`DEV_LOGIN_SETTING`]; il filtro
+/// sull'indirizzo sorgente per tutto il blocco `/internal/*` e' il passo
+/// successivo, e vale per l'intero blocco, non per questa sola rotta.
+pub async fn dev_login_token(State(state): State<AppState>) -> Response {
+    let abilitato = get_setting(&state.db, DEV_LOGIN_SETTING)
+        .await
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if !abilitato {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": format!("dev-login disabilitato ({DEV_LOGIN_SETTING})"),
+            })),
+        )
+            .into_response();
+    }
+
+    let jwt_secret = match get_or_create_jwt_secret(&state.db).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("dev_login_token: jwt_secret non risolvibile: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "jwt_secret non risolvibile" })),
+            )
+                .into_response();
+        }
+    };
+
+    let exp = (Utc::now() + Duration::days(7)).timestamp() as usize;
+    let claims = Claims {
+        sub: DEV_LOGIN_USER_ID.to_string(),
+        role: "admin".to_string(),
+        exp,
+    };
+    match encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret.as_bytes()),
+    ) {
+        Ok(token) => (StatusCode::OK, Json(serde_json::json!({ "token": token }))).into_response(),
+        Err(e) => {
+            tracing::warn!("dev_login_token: firma fallita: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "firma del token fallita" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn extract_token_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(header::COOKIE)?

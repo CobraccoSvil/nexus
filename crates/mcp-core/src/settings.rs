@@ -370,23 +370,45 @@ pub async fn bulk_update(
     )
 }
 
-/// GET /internal/settings/:key — get raw value (internal use, not masked)
+/// GET /internal/settings/:key — valore non mascherato delle chiavi NON segrete.
+///
+/// La rotta e' montata FUORI dal layer di auth (`routes/public.rs`) e il
+/// servizio ascolta su `0.0.0.0`: qualunque client che raggiunga la porta la
+/// interroga senza credenziali. Prima leggeva il valore RAW di qualsiasi
+/// chiave, quindi restituiva in chiaro `jwt_secret` e le API key dei provider —
+/// e con la chiave di firma si conia un token di amministratore. Ora il
+/// predicato "esponibile senza auth" sta nel punto unico
+/// `nexus_auth::get_setting_public` (regola L), che rifiuta `is_secret = TRUE`.
 pub async fn get_raw_value(
     State(state): State<super::AppState>,
     Path(key): Path<String>,
-) -> Json<serde_json::Value> {
-    // Lettura via punto unico (regola L / ADR 0026).
-    // Fix S87: uso la variante _checked che propaga errori DB invece di
-    // ingoiarli silenziosamente. Su Err logga + ritorna "".
-    let value = match nexus_auth::get_setting_checked(&state.db, &key).await {
-        Ok(opt) => opt.unwrap_or_default(),
+) -> (StatusCode, Json<serde_json::Value>) {
+    match nexus_auth::get_setting_public(&state.db, &key).await {
+        Ok(nexus_auth::PublicSettingRead::Value(value)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "key": key, "value": value })),
+        ),
+        // 403 e non 404: la chiave esiste, ma non e' leggibile da qui. Chi ha
+        // bisogno di un segreto passa dal percorso autenticato.
+        Ok(nexus_auth::PublicSettingRead::Redacted) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "key": key,
+                "error": "chiave segreta: non leggibile da una rotta senza autenticazione",
+            })),
+        ),
+        Ok(nexus_auth::PublicSettingRead::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "key": key, "error": "chiave inesistente" })),
+        ),
         Err(e) => {
-            tracing::warn!("get_raw_value({}): get_setting_checked fallito: {}", key, e);
-            String::new()
+            tracing::warn!("get_raw_value({}): lettura fallita: {}", key, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "key": key, "error": "lettura setting fallita" })),
+            )
         }
-    };
-
-    Json(serde_json::json!({ "key": key, "value": value }))
+    }
 }
 
 /// Lettura setting: punto unico in nexus-auth (regola L / ADR 0026).
