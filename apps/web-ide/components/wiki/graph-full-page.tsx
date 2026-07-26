@@ -18,6 +18,7 @@ import {
 } from "../../lib/wiki-client";
 import { useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
+import { AutoWidthSelect } from "../auto-width-select";
 
 cytoscape.use(coseBilkent);
 
@@ -305,9 +306,10 @@ export function GraphFullPage({ scope, projectId, onOpenDoc }: Props) {
         </label>
         <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
           {t("wiki.graph.layout")}:
-          <select
+          <AutoWidthSelect
             value={layout}
-            onChange={(e) => setLayout(e.target.value as LayoutName)}
+            options={LAYOUTS.map((l) => ({ value: l, label: l }))}
+            onChange={(value) => setLayout(value as LayoutName)}
             style={{
               padding: "3px 6px",
               background: tc.bgInput,
@@ -316,17 +318,24 @@ export function GraphFullPage({ scope, projectId, onOpenDoc }: Props) {
               borderRadius: 4,
               fontSize: 11,
             }}
-          >
-            {LAYOUTS.map((l) => (
-              <option key={l} value={l}>
-                {l}
-              </option>
-            ))}
-          </select>
+          />
         </label>
-        <select
+        <AutoWidthSelect
           value={predicate}
-          onChange={(e) => setPredicate(e.target.value)}
+          options={[
+            { value: "", label: `— ${t("wiki.graph.all_predicates")} —` },
+            ...[
+              "relates",
+              "supersedes",
+              "depends_on",
+              "mentions",
+              "implements",
+              "tests",
+              "blocks",
+              "duplicate_of",
+            ].map((p) => ({ value: p, label: p })),
+          ]}
+          onChange={(value) => setPredicate(value)}
           style={{
             padding: "3px 6px",
             background: tc.bgInput,
@@ -335,23 +344,7 @@ export function GraphFullPage({ scope, projectId, onOpenDoc }: Props) {
             borderRadius: 4,
             fontSize: 11,
           }}
-        >
-          <option value="">— {t("wiki.graph.all_predicates")} —</option>
-          {[
-            "relates",
-            "supersedes",
-            "depends_on",
-            "mentions",
-            "implements",
-            "tests",
-            "blocks",
-            "duplicate_of",
-          ].map((p) => (
-            <option key={p} value={p}>
-              {p}
-            </option>
-          ))}
-        </select>
+        />
         <div style={{ flex: 1, minWidth: 0 }} />
         <input
           value={searchTerm}

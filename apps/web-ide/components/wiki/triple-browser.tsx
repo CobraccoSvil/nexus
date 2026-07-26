@@ -13,6 +13,7 @@ import {
 } from "../../lib/wiki-client";
 import { useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
+import { AutoWidthSelect } from "../auto-width-select";
 
 interface Props {
   scope: WikiScope;
@@ -195,38 +196,32 @@ export function TripleBrowser({ scope, projectId, onOpenDoc, docTitles }: Props)
         }}
       >
         <FilterField label={t("wiki.triples.predicate")}>
-          <select
+          <AutoWidthSelect
             value={predicate}
-            onChange={(e) => {
+            options={[
+              { value: "", label: `— ${t("wiki.filter.any")} —` },
+              ...PREDICATES.map((p) => ({ value: p, label: p })),
+            ]}
+            onChange={(value) => {
               setOffset(0);
-              setPredicate(e.target.value);
+              setPredicate(value);
             }}
             style={selectStyle(tc)}
-          >
-            <option value="">— {t("wiki.filter.any")} —</option>
-            {PREDICATES.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
+          />
         </FilterField>
         <FilterField label={t("wiki.triples.source")}>
-          <select
+          <AutoWidthSelect
             value={source}
-            onChange={(e) => {
+            options={[
+              { value: "", label: `— ${t("wiki.filter.any")} —` },
+              ...SOURCES.map((s) => ({ value: s, label: s })),
+            ]}
+            onChange={(value) => {
               setOffset(0);
-              setSource(e.target.value);
+              setSource(value);
             }}
             style={selectStyle(tc)}
-          >
-            <option value="">— {t("wiki.filter.any")} —</option>
-            {SOURCES.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
+          />
         </FilterField>
         <FilterField label={`${t("wiki.triples.confidence")} >= ${minConfidence.toFixed(2)}`}>
           <input

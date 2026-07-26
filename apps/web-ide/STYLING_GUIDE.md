@@ -410,6 +410,42 @@ Per testi su più righe che si troncano a 2 righe:
 
 ---
 
+## Dropdown a Larghezza Automatica (`AutoWidthSelect`)
+
+Un `<select>` nativo si dimensiona sull'opzione **piu' lunga** della lista, non su
+quella selezionata: la pillola chiusa resta larga anche quando mostra due caratteri.
+`components/auto-width-select.tsx` e' il punto unico (regola L) che corregge questo.
+
+```tsx
+import { AutoWidthSelect } from "../components/auto-width-select";
+
+<AutoWidthSelect
+  options={[{ value: "auto", label: "Auto" }, { value: "opus", label: "Claude Opus 4.6" }]}
+  value={modello}
+  onChange={(v) => setModello(v)}
+  style={{ ...pillStyle, color: tc.text }}  // stesso style per select e fantasma
+/>
+```
+
+**Quando usarlo**: dropdown la cui larghezza dipende dal contenuto (pillole di
+toolbar, header, barra chat) e che accanto ad altri elementi non devono sprecare
+spazio orizzontale.
+
+**Quando NON usarlo**: campi di form a larghezza imposta dal layout (`width: 100%`,
+`flex: 1`). Li' la lista non detta niente e restringere il campo romperebbe
+l'allineamento delle colonne: usa un `<select className="input">` normale.
+
+**Il fatto non ovvio**: il select deve stare in **overlay assoluto** sopra un fantasma
+di misura. In flusso normale (griglia sovrapposta, overlay in-flow) un `width: 100%`
+percentuale NON toglie il select dal calcolo della larghezza intrinseca del
+contenitore, che torna a essere quella dell'opzione piu' lunga: l'effetto si annulla.
+
+**Freccia nativa**: vive DENTRO il box e comprimerebbe il testo. Misurata sul browser
+a 19,8-20,5px a prescindere da testo, font-size e padding (e' il widget, non il
+contenuto): il componente la riserva con `arrowWidth` (default 22, con margine).
+
+---
+
 ## Deploy Notes
 
 - `globals.css` è servito una sola volta dal root layout
