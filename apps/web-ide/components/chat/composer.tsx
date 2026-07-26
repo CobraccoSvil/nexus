@@ -251,7 +251,12 @@ export function Composer({
           onPaste={handlePaste}
           disabled={!hasProject}
           placeholder={hasProject ? "Chiedi a Nexus..." : "Apri un progetto per iniziare..."}
-          rows={2}
+          // UNA riga a riposo: il composta sta in fondo alla colonna della chat,
+          // quindi ogni riga che occupa qui e' una riga in meno di conversazione
+          // visibile. Resta ridimensionabile a mano (resize: vertical) e cresce
+          // comunque fino a maxHeight quando il testo lo richiede: si paga lo
+          // spazio solo quando serve davvero.
+          rows={1}
           style={{
             width: "100%",
             padding: 0,
@@ -262,7 +267,7 @@ export function Composer({
             fontSize: compact ? 13 : 14,
             resize: "vertical",
             fontFamily: "inherit",
-            minHeight: compact ? 32 : 40,
+            minHeight: compact ? 20 : 24,
             maxHeight: compact ? 200 : 340,
             boxSizing: "border-box",
             outline: "none",

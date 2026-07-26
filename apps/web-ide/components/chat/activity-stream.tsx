@@ -583,6 +583,18 @@ function FoldedToolsBody({
   );
 }
 
+/** Toglie dal titolo il prefisso "subagente <kind>:" con cui arriva dal backend.
+ *
+ *  Il ponte lo compone cosi' (`subagent_native.rs`: `subagente {kind}: {tool} —
+ *  {target}`) perche' serve dove il titolo viaggia da solo. Nel nastro invece il
+ *  kind e' gia' scritto nell'etichetta accanto, mostrata una volta in testa al
+ *  sub-run: ripeterlo su OGNI riga ruba larghezza al contenuto vero (il tool e il
+ *  file su cui lavora) e manda a capo le righe lunghe. Se il prefisso non c'e',
+ *  il titolo torna invariato. */
+function senzaPrefissoSubagente(title: string): string {
+  return title.replace(/^\s*subagente\s+[^:]+:\s*/i, "");
+}
+
 function EventBody({
   event,
   segColor,
@@ -710,7 +722,7 @@ function EventBody({
               </span>
             )}
             <span style={{ fontSize: 12.5, color: isErr ? tc.error : tc.text }}>
-              {event.title}
+              {senzaPrefissoSubagente(event.title)}
             </span>
             {event.phase === "completed" && typeof event.costUsd === "number" && event.costUsd > 0 && (
               <span style={metaStyle(tc)}>${event.costUsd.toFixed(4)}</span>
