@@ -1351,7 +1351,24 @@ pub async fn models_for_provider(
                 .into_response()
         }
         Err(e) => {
-            tracing::warn!(provider = %provider, "gateway: list_models singolo fallita");
+            // Il 502 e' corretto (il chiamante ha chiesto QUESTO provider), ma
+            // senza status/codice il log non distingue una chiave scaduta da un
+            // timeout o da un endpoint sbagliato: nei log del 26/07 c'e' un
+            // "list_models singolo fallita provider=perplexity" che non dice
+            // niente a chi deve ripararlo. I segnali strutturati esistono gia'
+            // sull'errore (regola M): vanno emessi, non ri-dedotti dal testo.
+            let http = e
+                .chain()
+                .find_map(|c| c.downcast_ref::<ProviderHttpError>());
+            tracing::warn!(
+                provider = %provider,
+                status = http.map(|h| h.status),
+                code = http.and_then(|h| h.code.as_deref()),
+                dettaglio = %http
+                    .and_then(|h| h.structured_message())
+                    .unwrap_or_else(|| e.to_string()),
+                "gateway: list_models singolo fallita"
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "provider": provider, "error": e.to_string() })),
