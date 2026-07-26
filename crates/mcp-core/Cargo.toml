@@ -122,8 +122,14 @@ libc = "0.2"
 #   IO_COUNTERS (metriche CPU/IO del processo servizio).
 # - Win32_System_ProcessStatus: K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS
 #   (WorkingSetSize -> RSS del processo servizio).
+# - Win32_System_Diagnostics_ToolHelp: CreateToolhelp32Snapshot + Process32NextW
+#   (albero processi e nomi, ex `Get-CimInstance Win32_Process`: 3.2s -> ms).
+# - Win32_NetworkManagement_IpHelper + Win32_Networking_WinSock:
+#   GetExtendedTcpTable con TCP_TABLE_OWNER_PID_LISTENER (porte in ascolto con
+#   PID proprietario, ex `Get-NetTCPConnection`: 6.7s -> ms). Vedi
+#   process_util::windows_process_snapshot / listening_ports.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [lints]
 workspace = true

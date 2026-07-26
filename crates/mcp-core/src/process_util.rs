@@ -385,9 +385,357 @@ pub(crate) async fn kill_pid(pid: u32) {
         .await;
 }
 
+/// Una riga della fotografia dei processi: chi e' il padre e come si chiama.
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessEntry {
+    pub parent_pid: u32,
+    /// Nome senza estensione, come lo dava `Get-Process`.ProcessName (es. `node`):
+    /// i chiamanti storici confrontano quel formato.
+    pub name: String,
+}
+
+/// Fotografia di TUTTI i processi (pid -> padre + nome) via Toolhelp32.
+///
+/// PUNTO UNICO (regola L) dell'albero processi su Windows. Sostituisce
+/// `Get-CimInstance Win32_Process` e `Get-Process` lanciati in PowerShell: due
+/// interpreti da avviare a ogni scansione, misurati in 3.2s e ~1s. Il
+/// `port_enforcer` gira ogni 5s con un timeout di 10s, quindi quei probe da
+/// soli (9.9s in due) mandavano OGNI iterazione in timeout e l'enforcement
+/// delle porte non girava mai (log del 26/07: 33 "iterazione abortita").
+///
+/// Chiamata sincrona nell'ordine dei millisecondi: i chiamanti async la
+/// avvolgono in `spawn_blocking`.
+#[cfg(windows)]
+pub(crate) fn windows_process_snapshot() -> std::collections::HashMap<u32, ProcessEntry> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut map = std::collections::HashMap::new();
+    // SAFETY: `CreateToolhelp32Snapshot` non prende puntatori nostri e segnala il
+    // fallimento con INVALID_HANDLE_VALUE, controllato subito sotto. `entry` e'
+    // inizializzato con `dwSize` valorizzato come l'API richiede, e le due
+    // Process32*W ricevono un handle valido e un puntatore alla nostra struct
+    // viva per tutta la durata del ciclo. L'handle e' chiuso su ogni uscita.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return map;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                map.insert(entry.th32ProcessID, voce_da_entry(&entry));
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    map
+}
+
+/// Proietta una riga di Toolhelp32 nella nostra voce.
+#[cfg(windows)]
+fn voce_da_entry(
+    e: &windows_sys::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W,
+) -> ProcessEntry {
+    ProcessEntry {
+        parent_pid: e.th32ParentProcessID,
+        name: exe_name_senza_estensione(&e.szExeFile),
+    }
+}
+
+/// `szExeFile` (UTF-16 terminato da NUL) -> nome senza `.exe`.
+#[cfg(windows)]
+fn exe_name_senza_estensione(raw: &[u16]) -> String {
+    let fine = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    let nome = String::from_utf16_lossy(&raw[..fine]);
+    match nome.rfind('.') {
+        Some(i) if nome[i..].eq_ignore_ascii_case(".exe") => nome[..i].to_string(),
+        _ => nome,
+    }
+}
+
+/// Porte TCP in ascolto con il PID che le possiede, via `GetExtendedTcpTable`.
+///
+/// PUNTO UNICO (regola L) del rilevamento porte su Windows, gemello di
+/// [`windows_process_snapshot`]. Sostituisce `Get-NetTCPConnection` in
+/// PowerShell (misurato 6.7s per invocazione).
+///
+/// Enumera **entrambe** le famiglie di indirizzi. Non e' completezza per
+/// simmetria: Node e Vite bindano `::` per default, e su questa macchina 6
+/// porte risultano in ascolto SOLO su IPv6 — fra cui la 3000 (web-ide) e la
+/// 32987, che sta dentro il bucket dei progetti. Enumerare il solo IPv4
+/// renderebbe il `port_enforcer` cieco proprio sulla classe di processi che
+/// deve sorvegliare, e in modo peggiore della cecita' totale: la sua guardia
+/// fail-closed scatta solo su lista VUOTA, quindi con una lista parziale lo
+/// sweep girerebbe comunque e `resolve_stale_runtime_port_violations`
+/// chiuderebbe come "rientrate" violazioni ancora vive.
+///
+/// `TCP_TABLE_OWNER_PID_LISTENER` fa filtrare i soli listener al kernel: non
+/// c'e' uno stato da riconoscere a valle. Chiamata sincrona nell'ordine dei
+/// millisecondi: i chiamanti async la avvolgono in `spawn_blocking`.
+#[cfg(windows)]
+pub(crate) fn windows_listening_sockets() -> Vec<(u16, u32)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let mut out: Vec<(u16, u32)> = Vec::new();
+    raccogli_listener::<MIB_TCPTABLE_OWNER_PID>(AF_INET as u32, &mut out);
+    raccogli_listener::<MIB_TCP6TABLE_OWNER_PID>(AF_INET6 as u32, &mut out);
+
+    // Un processo in ascolto su `::` con dual-stack compare in entrambe le
+    // tabelle: la stessa coppia (porta, pid) non e' due binding distinti.
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Le due MIB dei listener (IPv4 e IPv6) hanno campi omonimi ma tipi distinti,
+/// e nessun tratto comune in `windows-sys`. Questo tratto e' il loro minimo
+/// denominatore, cosi' la lettura della tabella si scrive UNA volta sola
+/// (regola L) invece di essere copiata e adattata per famiglia.
+#[cfg(windows)]
+trait MibListener {
+    type Riga;
+    fn righe(&self) -> usize;
+    fn prima_riga(&self) -> *const Self::Riga;
+    /// `(porta in ordine di rete, pid proprietario)` della riga.
+    fn porta_e_pid(riga: &Self::Riga) -> (u32, u32);
+}
+
+/// Le due implementazioni differiscono SOLO per la coppia di tipi FFI: i corpi
+/// sono identici (campi omonimi). Scriverle a mano due volte sarebbe copia-e-
+/// adatta, il modo in cui due rami gemelli iniziano a divergere.
+#[cfg(windows)]
+macro_rules! impl_mib_listener {
+    ($tabella:ty, $riga:ty) => {
+        impl MibListener for $tabella {
+            type Riga = $riga;
+            fn righe(&self) -> usize {
+                self.dwNumEntries as usize
+            }
+            fn prima_riga(&self) -> *const Self::Riga {
+                self.table.as_ptr()
+            }
+            fn porta_e_pid(riga: &Self::Riga) -> (u32, u32) {
+                (riga.dwLocalPort, riga.dwOwningPid)
+            }
+        }
+    };
+}
+
+#[cfg(windows)]
+impl_mib_listener!(
+    windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPTABLE_OWNER_PID,
+    windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID
+);
+
+#[cfg(windows)]
+impl_mib_listener!(
+    windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP6TABLE_OWNER_PID,
+    windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP6ROW_OWNER_PID
+);
+
+/// Legge la tabella dei listener della famiglia `af` e accoda le coppie
+/// `(porta, pid)` valide. Una sola implementazione per entrambe le famiglie:
+/// il filtro delle righe prive di senso non puo' divergere fra IPv4 e IPv6.
+#[cfg(windows)]
+fn raccogli_listener<T: MibListener>(af: u32, out: &mut Vec<(u16, u32)>) {
+    let Some(buffer) = tabella_listener::<T>(af) else {
+        return;
+    };
+    // SAFETY: `tabella_listener` ritorna Some solo dopo una chiamata riuscita,
+    // quindi l'header e' inizializzato e `dwNumEntries` righe lo seguono
+    // contigue (layout documentato della MIB).
+    unsafe {
+        let table = &*buffer.as_ptr();
+        for riga in std::slice::from_raw_parts(table.prima_riga(), table.righe()) {
+            let (local_port, owning_pid) = T::porta_e_pid(riga);
+            let porta = porta_da_dword_network_order(local_port);
+            if porta > 0 && owning_pid > 0 {
+                out.push((porta, owning_pid));
+            }
+        }
+    }
+}
+
+/// Alloca e riempie la tabella dei listener per la famiglia `af`, col protocollo
+/// a due chiamate documentato da `GetExtendedTcpTable` (la prima dice quanto
+/// spazio serve).
+///
+/// Il buffer e' un `Vec<T>` e non un `Vec<u8>` per ottenere l'allineamento che
+/// la struct richiede.
+#[cfg(windows)]
+fn tabella_listener<T>(af: u32) -> Option<Vec<T>> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+
+    const NO_ERROR_U32: u32 = 0;
+    const ERROR_INSUFFICIENT_BUFFER_U32: u32 = 122;
+
+    // Le due chiamate differiscono SOLO per il buffer di destinazione: qui il
+    // resto degli argomenti si scrive una volta.
+    // SAFETY: `size` e' sempre la capacita' in byte di cio' che `ptr` indirizza
+    // (0 e null alla prima chiamata); l'API non scrive oltre quel limite.
+    let chiama = |ptr: *mut std::ffi::c_void, size: &mut u32| -> u32 {
+        unsafe { GetExtendedTcpTable(ptr, size, 0, af, TCP_TABLE_OWNER_PID_LISTENER, 0) }
+    };
+
+    let mut size: u32 = 0;
+    if chiama(std::ptr::null_mut(), &mut size) != ERROR_INSUFFICIENT_BUFFER_U32 || size == 0 {
+        return None;
+    }
+
+    let elementi = (size as usize).div_ceil(std::mem::size_of::<T>());
+    let mut buffer: Vec<T> = Vec::with_capacity(elementi.max(1));
+    if chiama(buffer.as_mut_ptr().cast(), &mut size) != NO_ERROR_U32 {
+        return None;
+    }
+    Some(buffer)
+}
+
+/// La MIB tiene la porta nei due byte bassi del DWORD, in ordine di rete.
+/// Leggerla come intero nativo darebbe numeri come 32798 al posto di 8080.
+#[cfg(windows)]
+fn porta_da_dword_network_order(raw: u32) -> u16 {
+    (((raw & 0x0000_00FF) << 8) | ((raw & 0x0000_FF00) >> 8)) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La fotografia dei processi deve contenere ME: e' il solo PID di cui il
+    /// test conosce con certezza l'esistenza, e ne conosce anche il nome.
+    #[cfg(windows)]
+    #[test]
+    fn la_fotografia_dei_processi_contiene_il_processo_corrente() {
+        let snapshot = windows_process_snapshot();
+        let io = snapshot
+            .get(&std::process::id())
+            .expect("il processo di test manca dalla fotografia");
+        assert!(
+            !io.name.is_empty() && !io.name.to_ascii_lowercase().ends_with(".exe"),
+            "nome inatteso (deve essere senza estensione, come Get-Process): {}",
+            io.name
+        );
+        // Un processo ha sempre un padre (anche se gia' morto): il campo esiste.
+        assert!(snapshot.len() > 1, "una sola voce: enumerazione interrotta");
+    }
+
+    /// Un sistema Windows vivo ha SEMPRE qualche listener (RPC, SMB, il DB
+    /// locale...). Zero porte significa rilevamento cieco, che e' esattamente
+    /// il modo in cui questo probe puo' fallire in silenzio.
+    #[cfg(windows)]
+    #[test]
+    fn le_porte_in_ascolto_non_escono_mai_vuote() {
+        let porte = windows_listening_sockets();
+        assert!(!porte.is_empty(), "nessuna porta in ascolto: probe cieco");
+        assert!(
+            porte.iter().all(|(porta, pid)| *porta > 0 && *pid > 0),
+            "riga con porta o pid nullo: {porte:?}"
+        );
+    }
+
+    /// Il probe deve vedere un listener IPv6, non solo IPv4: Node e Vite bindano
+    /// `::` per default, e su questa macchina 6 porte (fra cui la 3000 e la
+    /// 32987, dentro il bucket progetti) risultano in ascolto SOLO su IPv6.
+    ///
+    /// Il test apre un socket VERO e ne cerca la porta: non c'e' modo di
+    /// superarlo enumerando la sola tabella IPv4. "Le porte non escono mai
+    /// vuote" invece resterebbe verde, perche' le decine di listener IPv4 della
+    /// macchina bastano a riempire la lista — ed e' proprio quel riempimento
+    /// parziale a disinnescare la guardia fail-closed del port_enforcer.
+    #[cfg(windows)]
+    #[test]
+    fn il_probe_vede_anche_i_listener_ipv6() {
+        let listener = match std::net::TcpListener::bind("[::1]:0") {
+            Ok(l) => l,
+            // Se l'host non ha lo stack IPv6 il test non ha oggetto: dirlo, non
+            // fingere di aver verificato qualcosa.
+            Err(e) => {
+                eprintln!("IPv6 non disponibile su questo host, test saltato: {e}");
+                return;
+            }
+        };
+        let porta = listener.local_addr().expect("indirizzo locale").port();
+        let mio_pid = std::process::id();
+        let visti = windows_listening_sockets();
+        assert!(
+            visti.contains(&(porta, mio_pid)),
+            "listener IPv6 su [::1]:{porta} (pid {mio_pid}) invisibile al probe: \
+             enumerazione limitata a IPv4 -> il port_enforcer sarebbe cieco \
+             proprio sui processi Node dei progetti"
+        );
+    }
+
+    /// IL DIFETTO MISURATO (log mcp-core 26/07, 33 "iterazione abortita"): i due
+    /// probe in PowerShell costavano 6.7s + 3.2s = 9.9s, contro un timeout di
+    /// scan di 10s e un intervallo di 5s. Ogni iterazione del port_enforcer
+    /// finiva in timeout e l'enforcement delle porte non girava mai.
+    ///
+    /// La soglia separa DUE REGIMI, non misura una prestazione: syscall = 21ms
+    /// misurati, avvio di un interprete esterno = 1.1s il piu' veloce osservato
+    /// (PowerShell gia' caldo; a freddo 3.2s e 6.7s). 300ms sta 14x sopra il
+    /// primo e 3x sotto il secondo, quindi non e' flaky sotto carico e cattura
+    /// comunque la reintroduzione di UN SOLO comando esterno.
+    ///
+    /// La prima stesura usava 2s: la mutazione la attraversava indenne, perche'
+    /// un PowerShell caldo ci sta sotto. Un test che non rosseggia quando
+    /// rimetti il difetto copre solo se stesso (regola O).
+    #[cfg(windows)]
+    #[test]
+    fn i_due_probe_costano_millisecondi_non_secondi() {
+        let inizio = std::time::Instant::now();
+        let _ = windows_process_snapshot();
+        let _ = windows_listening_sockets();
+        let durata = inizio.elapsed();
+        assert!(
+            durata < std::time::Duration::from_millis(300),
+            "i probe hanno impiegato {durata:?}: e' il regime del processo \
+             esterno, quello che con un intervallo di scan di 5s e un timeout \
+             di 10s abortiva ogni iterazione del port_enforcer"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn la_porta_si_legge_in_ordine_di_rete() {
+        // 8080 sul wire e' 0x901F letto come intero nativo: senza lo scambio
+        // dei due byte bassi il port_enforcer confronterebbe col bucket una
+        // porta che non esiste.
+        assert_eq!(porta_da_dword_network_order(0x0000_901F), 8080);
+        assert_eq!(porta_da_dword_network_order(0x0000_5000), 80);
+        assert_eq!(porta_da_dword_network_order(0x0000_BB01), 443);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn il_nome_perde_solo_lestensione_eseguibile() {
+        let utf16 = |s: &str| {
+            let mut v: Vec<u16> = s.encode_utf16().collect();
+            v.push(0);
+            v
+        };
+        assert_eq!(exe_name_senza_estensione(&utf16("node.exe")), "node");
+        assert_eq!(exe_name_senza_estensione(&utf16("Node.EXE")), "Node");
+        // Un punto che non introduce l'estensione eseguibile resta dov'e'.
+        assert_eq!(
+            exe_name_senza_estensione(&utf16("my.service.host")),
+            "my.service.host"
+        );
+        assert_eq!(exe_name_senza_estensione(&utf16("senza-punto")), "senza-punto");
+    }
 
     #[test]
     fn current_process_e_vivo() {
