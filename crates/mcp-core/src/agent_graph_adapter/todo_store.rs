@@ -58,6 +58,46 @@ impl PgTodoStore {
             events: Some((channels, project_id)),
         }
     }
+
+    /// Annuncia l'AVANZAMENTO AGGREGATO del piano (totale/completati).
+    ///
+    /// `TodoUpdated` dice COSA e' cambiato, non A CHE PUNTO siamo: il contatore
+    /// del piano vuole il totale, e il totale va contato. Il gemello
+    /// `nexus-agent-tools::todos` lo emette gia' accanto a TodoUpdated; qui
+    /// mancava, e sotto todo-isolation questo adapter e' l'UNICO a scrivere lo
+    /// stato -- percio' il contatore restava fermo su "0/N" per tutto il run
+    /// mentre le singole voci si spuntavano regolarmente (misurato su verifica-wd:
+    /// 1 completato su 16 nel DB, "P:0/20" in barra di stato, zero PlanUpdated
+    /// nei log). Best-effort: se il conteggio fallisce le singole voci restano
+    /// comunque annunciate.
+    async fn annuncia_avanzamento_piano(
+        &self,
+        channels: &nexus_events::ProjectChannels,
+        project_id: Uuid,
+        run_id: &str,
+    ) {
+        let Ok(uuid) = Uuid::parse_str(run_id) else {
+            return;
+        };
+        let Ok((totale, completati)) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'completed')              FROM nexus_agent_todos WHERE run_id = $1",
+        )
+        .bind(uuid)
+        .fetch_one(&self.db)
+        .await
+        else {
+            return;
+        };
+        nexus_events::dispatcher::emit(
+            channels,
+            project_id,
+            nexus_events::event::ProjectEvent::PlanUpdated {
+                run_id: run_id.to_string(),
+                total: totale as i32,
+                completed: completati as i32,
+            },
+        );
+    }
 }
 
 /// Mappa lo `status` testuale del DB (CHECK constraint mig 0148) sull'enum del
@@ -217,16 +257,19 @@ impl TodoStore for PgTodoStore {
                 // stato, quindi senza questa emissione la checklist restava ferma
                 // su `[ ]` per tutto il run, anche a todo completati.
                 if let Some((channels, project_id)) = &self.events {
+                    let run_id_str = run_id.clone().unwrap_or_default();
                     nexus_events::dispatcher::emit(
                         channels,
                         *project_id,
                         nexus_events::event::ProjectEvent::TodoUpdated {
-                            run_id: run_id.unwrap_or_default(),
+                            run_id: run_id_str.clone(),
                             todo_id: todo_id.to_string(),
                             seq,
                             status: status_str.to_string(),
                         },
                     );
+                    self.annuncia_avanzamento_piano(channels, *project_id, &run_id_str)
+                        .await;
                 }
             }
         }
@@ -533,6 +576,40 @@ mod tests {
         assert!(
             channels.contains_key(&project_id),
             "il cambio di stato deve essere emesso sul canale del progetto"
+        );
+
+        // Oltre al COSA e' cambiato (TodoUpdated) deve viaggiare anche A CHE
+        // PUNTO siamo (PlanUpdated): senza, il contatore del piano resta fermo a
+        // "0/N" per tutto il run mentre le singole voci si spuntano. Misurato su
+        // verifica-wd: 1 completato su 16 nel DB, "P:0/20" in barra di stato,
+        // zero PlanUpdated nei log. Si leggono gli eventi REALMENTE emessi sul
+        // canale, non una loro imitazione.
+        let mut rx = channels
+            .get(&project_id)
+            .expect("canale del progetto")
+            .tx
+            .subscribe();
+        let t2 = insert_todo(&pool, run_id, 2, "b", "pending", &[]).await;
+        store
+            .mark_status(&t2.to_string(), TodoStatus::Completed)
+            .await
+            .expect("ok");
+        let mut visti_todo = 0;
+        let mut piano: Option<(i32, i32)> = None;
+        while let Ok(env) = rx.try_recv() {
+            match env.payload {
+                nexus_events::event::ProjectEvent::TodoUpdated { .. } => visti_todo += 1,
+                nexus_events::event::ProjectEvent::PlanUpdated {
+                    total, completed, ..
+                } => piano = Some((total, completed)),
+                _ => {}
+            }
+        }
+        assert!(visti_todo >= 1, "TodoUpdated deve essere emesso");
+        assert_eq!(
+            piano,
+            Some((2, 2)),
+            "PlanUpdated deve riportare l'avanzamento AGGREGATO (2 todo, 2 completati)"
         );
 
         // Lo store SENZA canali resta valido: scrive e basta (percorsi di sola
