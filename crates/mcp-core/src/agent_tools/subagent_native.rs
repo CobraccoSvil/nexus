@@ -2222,20 +2222,28 @@ fn revisori_effettivi(richiesti: usize, candidati_distinti: usize) -> usize {
     richiesti.min(candidati_distinti)
 }
 
-/// Chi votera', nell'ordine degli slot, come `provider/modello`. E' l'unico
-/// punto che lo sa: gli outcome dei revisori non portano la propria provenienza,
-/// quindi senza questa dichiarazione la pluralita' del panel resta invisibile a
-/// valle. `auto` quando nessun candidato e' stato risolto (revisori senza pin).
-fn etichette_revisori(
+/// Chi votera', nell'ordine degli slot. E' l'unico punto che lo sa: gli outcome
+/// dei revisori non portano la propria provenienza, quindi senza questa
+/// dichiarazione la pluralita' del panel resta invisibile a valle.
+///
+/// Provider e modello restano SEPARATI fino al consumatore (regola L): il
+/// modello puo' contenere `/` e ricomporli qui costringerebbe il frontend a
+/// indovinare dove tagliare. `auto` quando nessun candidato e' stato risolto
+/// (revisore senza pin: lo instrada il routing, e a priori non sappiamo dove).
+fn riferimenti_revisori(
     candidates: &[crate::internal_routing::PurposeProviderCandidate],
     n: usize,
-) -> Vec<String> {
+) -> Vec<nexus_agent_graph::decisions::ReviewerRef> {
     (0..n)
-        .map(|i| {
-            candidates
-                .get(i)
-                .map(|c| format!("{}/{}", c.provider, c.model))
-                .unwrap_or_else(|| "auto".to_string())
+        .map(|i| match candidates.get(i) {
+            Some(c) => nexus_agent_graph::decisions::ReviewerRef {
+                provider: c.provider.clone(),
+                model: c.model.clone(),
+            },
+            None => nexus_agent_graph::decisions::ReviewerRef {
+                provider: "auto".to_string(),
+                model: String::new(),
+            },
         })
         .collect()
 }
@@ -2245,7 +2253,7 @@ async fn spawn_reviewers(
     richiesti: usize,
     task: &str,
     expected: &str,
-    assegnati: &mut Vec<String>,
+    assegnati: &mut Vec<nexus_agent_graph::decisions::ReviewerRef>,
 ) -> Vec<Value> {
     let candidates = candidati_revisori(ctx, richiesti).await;
     // Mai due revisori sullo stesso provider: si riduce il panel invece di
@@ -2260,7 +2268,7 @@ async fn spawn_reviewers(
              revisori che due voti dallo stesso modello contati come indipendenti"
         );
     }
-    assegnati.extend(etichette_revisori(&candidates, n));
+    assegnati.extend(riferimenti_revisori(&candidates, n));
 
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
     spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, move |i| {
@@ -2296,7 +2304,7 @@ pub(crate) async fn convene_review_panel(
     let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
-    let mut assegnati: Vec<String> = Vec::new();
+    let mut assegnati: Vec<nexus_agent_graph::decisions::ReviewerRef> = Vec::new();
     let results = spawn_reviewers(ctx, reviewers.max(1), task, expected, &mut assegnati).await;
     let outcomes: Vec<Value> = results
         .into_iter()

@@ -148,10 +148,12 @@ export interface ReviewGateEvent extends EventProvenance {
   maxCycles?: number;
   /** titolo leggibile del meta-step (composto dal backend). */
   title: string;
-  /** Chi ha votato, come `provider/modello`. Le righe REVIEW portano l'icona
-   *  del run PADRE (l'evento non ha provenienza propria), quindi senza questo
-   *  campo un panel su piu' provider sembra girato tutto sullo stesso. */
-  reviewers?: string[];
+  /** Chi ha votato. Stessa forma di `panelProviders` (provider e modello
+   *  SEPARATI): il nome del modello puo' contenere `/` (`z-ai/glm-4.7-flash`),
+   *  quindi una stringa `provider/modello` costringerebbe a indovinare dove
+   *  tagliare. Senza questo campo la riga REVIEW mostra l'icona del run PADRE,
+   *  e un panel su piu' provider sembra girato tutto sullo stesso. */
+  reviewers?: PanelProviderEntry[];
 }
 
 /** Sequenza di tool consecutivi tutti ok, compressa oltre soglia densita'.
@@ -506,10 +508,14 @@ function readCouncilFigureTasks(
   return out.length > 0 ? out : undefined;
 }
 
+/** Legge una lista "chi ha eseguito" dal payload. Una sola funzione per due
+ *  chiavi (`panel_providers` del panel multi-provider, `reviewers` del review
+ *  gate): stesso concern, stessa forma `{provider, model}`, stesso lettore. */
 function readPanelProviders(
   payload: Record<string, unknown>,
+  key: string = "panel_providers",
 ): PanelProviderEntry[] | undefined {
-  const raw = payload.panel_providers;
+  const raw = payload[key];
   if (!Array.isArray(raw) || raw.length === 0) return undefined;
   const out: PanelProviderEntry[] = [];
   for (const item of raw) {
@@ -813,9 +819,7 @@ export function composeActivityStream(
             type: "review_gate",
             phase: asString(p.phase),
             verdict: asString(p.verdict),
-            reviewers: Array.isArray(p.reviewers)
-              ? p.reviewers.filter((r): r is string => typeof r === "string")
-              : undefined,
+            reviewers: readPanelProviders(p, "reviewers"),
             cycle: asNumber(p.cycle),
             maxCycles: asNumber(p.max_cycles),
             title: m.title,

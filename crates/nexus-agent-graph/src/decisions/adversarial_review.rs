@@ -119,14 +119,28 @@ pub struct PanelOutcome {
     /// Findings aggregati di TUTTI i voti validi (uniti, non deduplicati: la
     /// provenienza per-file resta nell'oggetto finding).
     pub findings: Vec<Value>,
-    /// Chi ha votato, come `provider/modello`. Popolato dal convocatore (che
-    /// conosce i pin assegnati), non deducibile dagli outcome.
+    /// Chi ha votato. Popolato dal convocatore (che conosce i pin assegnati),
+    /// non deducibile dagli outcome.
     ///
     /// Serve a rendere VERIFICABILE la pluralita' del panel: senza, il nastro
     /// mostrava sulle righe REVIEW l'icona del run padre, e quattro cicli su
     /// provider diversi sembravano girati tutti sullo stesso. Una verifica
     /// plurale che non si vede non e' verificabile.
-    pub reviewers: Vec<String>,
+    pub reviewers: Vec<ReviewerRef>,
+}
+
+/// Chi ha votato in un ciclo di review: provider e modello SEPARATI.
+///
+/// Non una stringa `provider/modello`: il nome del modello puo' contenere `/`
+/// (`openrouter` + `z-ai/glm-4.7-flash`), quindi ricomporli costringerebbe ogni
+/// consumatore a indovinare dove tagliare — ed e' esattamente cio' che il guard
+/// `model-name-opaco` vieta. Stessa forma che il panel multi-provider usa gia'
+/// per lo stesso concern (`panel_providers`), cosi' il frontend ha un solo modo
+/// di leggere "chi ha eseguito" invece di due (regola L).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerRef {
+    pub provider: String,
+    pub model: String,
 }
 
 impl PanelOutcome {
@@ -141,7 +155,7 @@ impl PanelOutcome {
             "tally": { "pass": self.pass, "fail": self.fail, "needs_changes": self.needs_changes },
             "dissent": self.dissent,
             "findings": self.findings,
-            "reviewers": self.reviewers,
+            "reviewers": self.reviewers_json(),
         })
     }
 }
@@ -283,8 +297,22 @@ pub fn compose_panel_verdict(outcomes: &[Value], policy: &QuorumPolicy) -> Optio
 }
 
 impl PanelOutcome {
-    /// Dichiara chi ha composto il panel, come `provider/modello`.
-    pub fn con_reviewers(mut self, reviewers: Vec<String>) -> Self {
+    /// I revisori nella forma che viaggia sul wire. PUNTO UNICO (regola L): sia
+    /// `to_value` (tool_result) sia il payload del meta-step `review_gate` usano
+    /// questo, cosi' le due strade non possono descrivere il panel in due modi
+    /// diversi — che e' precisamente come nascono i campi che il frontend legge
+    /// da una parte sola.
+    pub fn reviewers_json(&self) -> Value {
+        Value::Array(
+            self.reviewers
+                .iter()
+                .map(|r| serde_json::json!({ "provider": r.provider, "model": r.model }))
+                .collect(),
+        )
+    }
+
+    /// Dichiara chi ha composto il panel.
+    pub fn con_reviewers(mut self, reviewers: Vec<ReviewerRef>) -> Self {
         self.reviewers = reviewers;
         self
     }
@@ -302,6 +330,26 @@ mod tests {
             "success": true,
             "review": { "verdict": verdict, "summary": "x", "findings": findings },
         })
+    }
+
+    #[test]
+    fn il_modello_del_revisore_non_viene_spezzato_dalla_sua_barra() {
+        // `z-ai/glm-4.7-flash` contiene una barra: se provider e modello
+        // viaggiassero concatenati, il consumatore dovrebbe indovinare su quale
+        // delle due tagliare, e taglierebbe sulla prima. Viaggiano separati, e
+        // il modello arriva intero fino al frontend.
+        let panel = compose_panel_verdict(&[reviewer("pass", json!([]))], &QuorumPolicy::default())
+            .expect("un voto valido compone il panel")
+            .con_reviewers(vec![ReviewerRef {
+                provider: "openrouter".to_string(),
+                model: "z-ai/glm-4.7-flash".to_string(),
+            }]);
+
+        // Il wire: la stessa forma che il panel multi-provider usa gia'.
+        let atteso = json!([{ "provider": "openrouter", "model": "z-ai/glm-4.7-flash" }]);
+        assert_eq!(panel.reviewers_json(), atteso);
+        // E il tool_result non puo' divergere: legge dallo stesso punto unico.
+        assert_eq!(panel.to_value()["reviewers"], atteso);
     }
 
     #[test]

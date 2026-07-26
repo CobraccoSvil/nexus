@@ -267,7 +267,7 @@ impl ReviewGateNode {
         payload.insert("total".into(), panel.total_reviews.into());
         // Chi ha votato: senza, il nastro mostra sulle righe REVIEW l'icona del
         // run padre e un panel su piu' provider sembra girato tutto sullo stesso.
-        payload.insert("reviewers".into(), panel.reviewers.clone().into());
+        payload.insert("reviewers".into(), panel.reviewers_json());
         self.emit(
             ctx,
             format!(
@@ -328,7 +328,7 @@ impl ReviewGateNode {
             )
         };
         payload.insert("phase".into(), phase.into());
-        payload.insert("reviewers".into(), panel.reviewers.clone().into());
+        payload.insert("reviewers".into(), panel.reviewers_json());
         self.emit(ctx, titolo, payload, Some(panel.verdict.as_str()))
             .await;
         Self::boccia_delta(state, cycle, max_cycles, panel, definitiva)

@@ -293,6 +293,15 @@ function EventRow({
 }) {
   const domId =
     runId && event.anchorId ? runScopedAnchorId(runId, event.anchorId) : undefined;
+  // Chi ha ESEGUITO la riga, quando gli esecutori sono piu' d'uno. Due eventi
+  // sono in questo caso: il panel multi-provider e il review gate. Stessa forma
+  // {provider, model}, stessa resa a colonna, un solo ramo (regola L).
+  const esecutori =
+    event.type === "multi_provider_panel"
+      ? event.panelProviders
+      : event.type === "review_gate"
+        ? event.reviewers
+        : undefined;
   return (
     <div
       id={domId}
@@ -347,9 +356,7 @@ function EventRow({
       {/* Icona provider/model che ha ESEGUITO la riga (tooltip = modello). In
           alto a destra, compatta: scorrendo il nastro si vede chi ha fatto cosa.
           Panel multi-provider: una icona per ogni provider del panel. */}
-      {event.type === "multi_provider_panel" &&
-      event.panelProviders &&
-      event.panelProviders.length > 0 ? (
+      {esecutori && esecutori.length > 0 ? (
         <span
           style={{
             position: "absolute",
@@ -363,9 +370,9 @@ function EventRow({
             flexShrink: 0,
           }}
         >
-          {event.panelProviders.map((p) => (
+          {esecutori.map((p, i) => (
             <ProviderIcon
-              key={`${p.provider}:${p.model ?? ""}`}
+              key={`${p.provider}:${p.model ?? ""}:${i}`}
               provider={p.provider}
               model={p.model}
               size={18}
@@ -675,12 +682,17 @@ function EventBody({
           </span>
           <span style={{ fontSize: 12.5, color: tc.text }}>{event.title}</span>
           {event.verdict && <span style={tagStyle(verdictColor)}>{event.verdict}</span>}
-          {/* Chi ha votato. L'icona a destra della riga e' quella del run PADRE
-              (l'evento non ha provenienza propria), quindi senza questi badge un
-              panel su piu' provider sembra girato tutto sullo stesso modello. */}
+          {/* Chi ha votato. Il badge nomina il modello, l'icona in alto a destra
+              e' quella dei revisori (vedi il ramo dedicato in EventRow): senza,
+              mostrerebbe il provider del run PADRE e un panel su piu' provider
+              sembrerebbe girato tutto sullo stesso. */}
           {event.reviewers?.map((r, i) => (
-            <span key={`rev-${i}`} style={tagStyle(tc.textMuted)} title={`Revisore: ${r}`}>
-              {r}
+            <span
+              key={`rev-${r.provider}:${r.model ?? ""}:${i}`}
+              style={tagStyle(tc.textMuted)}
+              title={`Revisore: ${r.provider}${r.model ? ` / ${r.model}` : ""}`}
+            >
+              {r.model ? `${r.provider}/${r.model}` : r.provider}
             </span>
           ))}
         </div>

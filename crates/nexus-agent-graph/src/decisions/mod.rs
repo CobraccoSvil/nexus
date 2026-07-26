@@ -105,7 +105,7 @@ pub mod tool_dispatch;
 pub mod turn_focus;
 
 pub use adversarial_review::{
-    compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict,
+    compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict, ReviewerRef,
 };
 pub use advisory_panel::{
     compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster,
