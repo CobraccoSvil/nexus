@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useProjectStore, selectOperationalRefreshAt } from "../../lib/project-dispatcher";
+import { AutoWidthSelect } from "../auto-width-select";
 
 interface SecurityPanelProps {
   projectId: string;
@@ -49,6 +50,14 @@ const OUTCOME_LABELS: Record<string, string> = {
   blocked: "Bloccato",
   killed: "Terminato",
 };
+
+// Opzioni del filtro esito: statiche, quindi vivono fuori dal componente.
+const OUTCOME_FILTER_OPTIONS = [
+  { value: "all", label: "Tutti" },
+  { value: "allowed", label: "OK" },
+  { value: "blocked", label: "Bloccati" },
+  { value: "killed", label: "Terminati" },
+] as const;
 
 export function SecurityPanel({ projectId }: SecurityPanelProps) {
   const tc = useThemeColors();
@@ -157,20 +166,16 @@ export function SecurityPanel({ projectId }: SecurityPanelProps) {
           </>
         )}
         {/* Filtro outcome */}
-        <select
+        <AutoWidthSelect
           value={filter}
-          onChange={(e) => setFilter(e.target.value)}
+          options={OUTCOME_FILTER_OPTIONS}
+          onChange={(value) => setFilter(value)}
           style={{
             fontSize: 11, padding: "2px 6px", borderRadius: 4,
             border: `1px solid ${tc.border}`, background: tc.bgCard,
             color: tc.text, cursor: "pointer",
           }}
-        >
-          <option value="all">Tutti</option>
-          <option value="allowed">OK</option>
-          <option value="blocked">Bloccati</option>
-          <option value="killed">Terminati</option>
-        </select>
+        />
         <button
           onClick={() => { fetchAudit(); fetchQuota(); }}
           style={{

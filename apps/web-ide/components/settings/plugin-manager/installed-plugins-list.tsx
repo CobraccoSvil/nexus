@@ -6,6 +6,7 @@ import type {
   PluginInstance,
 } from "../../../lib/api-client";
 import type { Theme } from "../../../lib/theme";
+import { AutoWidthSelect } from "../../auto-width-select";
 import { healthColor } from "./plugin-helpers";
 import { actionButtonStyle, inputStyle, selectStyle } from "./plugin-styles";
 import type { PluginTestStatus } from "./types";
@@ -58,6 +59,12 @@ export function InstalledPluginsList({
         const catalogItem = catalogById.get(plugin.catalogItemId ?? "");
         const releases = catalogItem?.releases ?? [];
         const selectedVersion = instanceReleaseChoice[plugin.id] || plugin.version || "";
+        // Senza rilasci la tendina mostrava una option segnaposto: la stessa
+        // condizione ora costruisce l'array delle opzioni.
+        const releaseOptions =
+          releases.length === 0
+            ? [{ value: "", label: "Nessun rilascio" }]
+            : releases.map((release) => ({ value: release.version, label: release.version }));
         const isBusy = busyKey?.includes(plugin.id) ?? false;
         const requiredKeys = (catalogItem?.requiredSecretRefs ?? []).map((k) => k.trim()).filter(Boolean);
         const missingKeys = requiredKeys.filter((key) => !(settingsByKey.get(key)?.has_value ?? false));
@@ -187,19 +194,13 @@ export function InstalledPluginsList({
               >
                 Test
               </button>
-              <select
+              <AutoWidthSelect
                 value={selectedVersion}
+                options={releaseOptions}
                 disabled={!plugin.canManage || releases.length === 0}
-                onChange={(event) => onInstanceReleaseChoiceChange(plugin.id, event.target.value)}
+                onChange={(value) => onInstanceReleaseChoiceChange(plugin.id, value)}
                 style={selectStyle(tc, 180)}
-              >
-                {releases.length === 0 && <option value="">Nessun rilascio</option>}
-                {releases.map((release) => (
-                  <option key={release.version} value={release.version}>
-                    {release.version}
-                  </option>
-                ))}
-              </select>
+              />
               <button
                 type="button"
                 disabled={isBusy || !plugin.canManage || !selectedVersion}

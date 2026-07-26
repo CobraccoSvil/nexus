@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { AutoWidthSelect } from "../auto-width-select";
 import {
   getProviderModelsAdmin,
   setModelEnabled,
@@ -13,6 +14,12 @@ import {
 /** La scala del catalog (mig 0528/0547). Specchio di PERFORMANCE_TIERS in
  *  nexus-agent-graph/src/decisions/tiers.rs: il vocabolario vive li'. */
 const TIERS: PerformanceTier[] = ["light", "medium", "high", "heavy", "frontier"];
+
+/** Opzioni della tendina di curatela: "auto" (nessun override) piu' la scala. */
+const TIER_OPTIONS = [
+  { value: "", label: "auto" },
+  ...TIERS.map((t) => ({ value: t, label: t })),
+];
 
 /** Etichetta della PROVENIENZA del tier. E' l'informazione che dice se fidarsi
  *  del valore accanto: un tier senza fonte e' un fossile, non una decisione. */
@@ -263,13 +270,14 @@ export function ProviderModelsSection({
                     )}
                   </span>
                 </div>
-                <select
+                <AutoWidthSelect
                   disabled={busy === m.model}
                   value={m.tierSource === "manual" ? (m.performanceTier ?? "") : ""}
-                  onChange={(e) =>
-                    handleTier(m.model, (e.target.value || null) as PerformanceTier | null)
+                  onChange={(value) =>
+                    handleTier(m.model, (value || null) as PerformanceTier | null)
                   }
                   title="Curatela del tier: vince su indice e batteria. Vuoto = nessun override (decidono le fonti automatiche)."
+                  options={TIER_OPTIONS}
                   style={{
                     fontSize: 10,
                     padding: "2px 4px",
@@ -280,14 +288,7 @@ export function ProviderModelsSection({
                     cursor: busy === m.model ? "not-allowed" : "pointer",
                     flexShrink: 0,
                   }}
-                >
-                  <option value="">auto</option>
-                  {TIERS.map((t) => (
-                    <option key={t} value={t}>
-                      {t}
-                    </option>
-                  ))}
-                </select>
+                />
                 <button
                   disabled={busy === m.model}
                   onClick={() => handleToggle(m.model, !m.isEnabled)}

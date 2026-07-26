@@ -2,6 +2,7 @@
 
 import { useI18n, LOCALE_LABELS, type Locale } from "../../lib/i18n";
 import { NexusLogo } from "./NexusLogo";
+import { AutoWidthSelect } from "../auto-width-select";
 
 export function NavBar() {
   const { t, locale, setLocale } = useI18n();
@@ -57,9 +58,13 @@ export function NavBar() {
           </a>
 
           {/* Language selector */}
-          <select
+          <AutoWidthSelect
             value={locale}
-            onChange={(e) => setLocale(e.target.value as Locale)}
+            options={(Object.keys(LOCALE_LABELS) as Locale[]).map((l) => ({
+              value: l,
+              label: LOCALE_LABELS[l],
+            }))}
+            onChange={(value) => setLocale(value as Locale)}
             style={{
               background: "transparent",
               border: "1px solid #e5e5e5",
@@ -69,13 +74,7 @@ export function NavBar() {
               color: "#171717",
               cursor: "pointer",
             }}
-          >
-            {(Object.keys(LOCALE_LABELS) as Locale[]).map((l) => (
-              <option key={l} value={l}>
-                {LOCALE_LABELS[l]}
-              </option>
-            ))}
-          </select>
+          />
         </div>
       </div>
     </nav>

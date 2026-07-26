@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { AutoWidthSelect } from "../auto-width-select";
 import { iconButton } from "../../lib/icon-button-style";
 import type { ChatHeadPopoverProps } from "./chat-head-popover";
 
@@ -50,15 +51,19 @@ export function ChatHeadInline({
         onCreateNew={onCreateProfile}
         style={{ flexShrink: 0 }}
       />
-      <select
+      <AutoWidthSelect
         value={activeSessionId ?? ""}
-        onChange={(e) => {
-          const id = e.target.value;
+        options={
+          sessions.length === 0
+            ? [{ value: "", label: "Nessuna chat" }]
+            : sessions.map((s) => ({ value: s.id, label: s.title }))
+        }
+        onChange={(id) => {
           if (id) onSelectSession(id);
         }}
         disabled={sessions.length === 0}
         title="Seleziona sessione chat"
-        aria-label="Seleziona sessione chat"
+        ariaLabel="Seleziona sessione chat"
         style={{
           borderRadius: 999,
           border: `1px solid ${tc.border}`,
@@ -72,17 +77,7 @@ export function ChatHeadInline({
           flexShrink: 0,
           cursor: sessions.length === 0 ? "not-allowed" : "pointer",
         }}
-      >
-        {sessions.length === 0 ? (
-          <option value="">Nessuna chat</option>
-        ) : (
-          sessions.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.title}
-            </option>
-          ))
-        )}
-      </select>
+      />
       <button
         type="button"
         onClick={onNewSession}

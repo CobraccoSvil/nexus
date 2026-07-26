@@ -4,6 +4,7 @@ import { type FormEvent, type KeyboardEvent, type ClipboardEvent, type RefObject
 import type { ChatAttachment } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { IconButton } from "../icon-button";
+import { AutoWidthSelect } from "../auto-width-select";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -196,6 +197,18 @@ export function Composer({
     { value: "automatic", label: "Automatico" },
   ] as const;
 
+  const SUPERVISOR_OPTIONS = [
+    { value: "none", label: "👁 Supervisor off" },
+    { value: "anomaly", label: "👁 Su anomalia" },
+    { value: "interleaved", label: "👁 Ogni 5 step" },
+    { value: "continuous", label: "continuo" },
+  ] as const;
+
+  const MODEL_OPTIONS = [
+    { value: "auto", label: "Modello auto" },
+    ...providerModels.map((model) => ({ value: model, label: model })),
+  ];
+
   return (
     <form
       onSubmit={onSubmit}
@@ -370,9 +383,10 @@ export function Composer({
               )}
             </button>
           )}
-          <select
+          <AutoWidthSelect
             value={selectedProvider}
-            onChange={(e) => onProviderChange(e.target.value)}
+            options={PROVIDER_OPTIONS}
+            onChange={onProviderChange}
             title={isProviderLocked ? `Provider forzato su ${selectedProvider} — disattiva "Forza" o passa ad Auto per routing intelligente` : "Routing automatico: sceglie il modello migliore per ogni task"}
             style={{
               ...selectStyle,
@@ -381,11 +395,7 @@ export function Composer({
               color: isProviderLocked ? "#f97316" : tc.textSecondary,
               fontWeight: isProviderLocked ? 600 : 400,
             }}
-          >
-            {PROVIDER_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
+          />
           {selectedProvider !== "auto" && (
             <button
               type="button"
@@ -403,21 +413,18 @@ export function Composer({
             </button>
           )}
           {selectedProvider !== "auto" && forceProvider && (
-            <select
+            <AutoWidthSelect
               value={selectedModel}
-              onChange={(e) => onModelChange(e.target.value)}
+              options={MODEL_OPTIONS}
+              onChange={onModelChange}
+              ariaLabel="Modello"
               style={{
                 ...selectStyle,
                 background: tc.bgCard,
                 color: tc.textSecondary,
                 cursor: "pointer",
               }}
-            >
-              <option value="auto">Modello auto</option>
-              {providerModels.map((model) => (
-                <option key={model} value={model}>{model}</option>
-              ))}
-            </select>
+            />
           )}
           {(showOverrideMismatch || showModelMismatch) && (
             <span
@@ -433,10 +440,12 @@ export function Composer({
               ⚠ override → fallback
             </span>
           )}
-          <select
+          <AutoWidthSelect
             value={automationMode}
-            onChange={(e) => onAutomationModeChange(e.target.value as "study" | "confirm" | "automatic")}
+            options={AUTOMATION_OPTIONS}
+            onChange={(value) => onAutomationModeChange(value as "study" | "confirm" | "automatic")}
             title={automationTitle}
+            ariaLabel="Modalita' automazione"
             style={{
               ...selectStyle,
               cursor: "pointer",
@@ -449,27 +458,20 @@ export function Composer({
                   }
                 : {}),
             }}
-          >
-            {AUTOMATION_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-          <select
+          />
+          <AutoWidthSelect
             value={supervisorMode}
-            onChange={(e) => onSupervisorModeChange(e.target.value as "none" | "anomaly" | "interleaved" | "continuous")}
+            options={SUPERVISOR_OPTIONS}
+            onChange={(value) => onSupervisorModeChange(value as "none" | "anomaly" | "interleaved" | "continuous")}
             title="Supervisore AI (monitora e corregge l'agente). Non sostituisce Conferma/Automatico: per saltare le approvazioni usa Automatico."
+            ariaLabel="Supervisore"
             style={{
               ...selectStyle,
               border: `1px solid ${supervisorMode !== "none" ? "#8b5cf6" : tc.border}`,
               background: supervisorMode !== "none" ? "#8b5cf611" : tc.bgCard,
               color: supervisorMode !== "none" ? "#8b5cf6" : tc.textSecondary,
             }}
-          >
-            <option value="none">👁 Supervisor off</option>
-            <option value="anomaly">👁 Su anomalia</option>
-            <option value="interleaved">👁 Ogni 5 step</option>
-            <option value="continuous">continuo</option>
-          </select>
+          />
           <IconButton
             label="Allega file"
             onClick={() => fileInputRef.current?.click()}
