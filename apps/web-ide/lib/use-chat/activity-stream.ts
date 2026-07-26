@@ -148,6 +148,10 @@ export interface ReviewGateEvent extends EventProvenance {
   maxCycles?: number;
   /** titolo leggibile del meta-step (composto dal backend). */
   title: string;
+  /** Chi ha votato, come `provider/modello`. Le righe REVIEW portano l'icona
+   *  del run PADRE (l'evento non ha provenienza propria), quindi senza questo
+   *  campo un panel su piu' provider sembra girato tutto sullo stesso. */
+  reviewers?: string[];
 }
 
 /** Sequenza di tool consecutivi tutti ok, compressa oltre soglia densita'.
@@ -809,6 +813,9 @@ export function composeActivityStream(
             type: "review_gate",
             phase: asString(p.phase),
             verdict: asString(p.verdict),
+            reviewers: Array.isArray(p.reviewers)
+              ? p.reviewers.filter((r): r is string => typeof r === "string")
+              : undefined,
             cycle: asNumber(p.cycle),
             maxCycles: asNumber(p.max_cycles),
             title: m.title,

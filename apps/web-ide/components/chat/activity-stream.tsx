@@ -675,6 +675,14 @@ function EventBody({
           </span>
           <span style={{ fontSize: 12.5, color: tc.text }}>{event.title}</span>
           {event.verdict && <span style={tagStyle(verdictColor)}>{event.verdict}</span>}
+          {/* Chi ha votato. L'icona a destra della riga e' quella del run PADRE
+              (l'evento non ha provenienza propria), quindi senza questi badge un
+              panel su piu' provider sembra girato tutto sullo stesso modello. */}
+          {event.reviewers?.map((r, i) => (
+            <span key={`rev-${i}`} style={tagStyle(tc.textMuted)} title={`Revisore: ${r}`}>
+              {r}
+            </span>
+          ))}
         </div>
       );
     }

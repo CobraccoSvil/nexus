@@ -2183,11 +2183,30 @@ const REVIEW_PANEL_PURPOSE: &str = "reviewer";
 /// Round-robin: si mantengono gli N revisori decisi dal dimensionamento e si
 /// ripete un provider solo se ne esistono meno di N, invece di sacrificare la
 /// dimensione del panel alla diversita'.
+/// Chi votera', nell'ordine degli slot, come `provider/modello`. E' l'unico
+/// punto che lo sa: gli outcome dei revisori non portano la propria provenienza,
+/// quindi senza questa dichiarazione la pluralita' del panel resta invisibile a
+/// valle. `auto` quando nessun candidato e' stato risolto (revisori senza pin).
+fn etichette_revisori(
+    candidates: &[crate::internal_routing::PurposeProviderCandidate],
+    n: usize,
+) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            candidates
+                .get(i % candidates.len().max(1))
+                .map(|c| format!("{}/{}", c.provider, c.model))
+                .unwrap_or_else(|| "auto".to_string())
+        })
+        .collect()
+}
+
 async fn spawn_reviewers(
     ctx: &AgentToolContext,
     n: usize,
     task: &str,
     expected: &str,
+    assegnati: &mut Vec<String>,
 ) -> Vec<Value> {
     let candidates = crate::internal_routing::resolve_purpose_provider_candidates_db(
         &ctx.core.db,
@@ -2204,6 +2223,8 @@ async fn spawn_reviewers(
         );
         Vec::new()
     });
+    assegnati.extend(etichette_revisori(&candidates, n));
+
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
     spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, move |i| {
         let ctx = ctx.clone();
@@ -2238,12 +2259,14 @@ pub(crate) async fn convene_review_panel(
     let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
-    let results = spawn_reviewers(ctx, reviewers.max(1), task, expected).await;
+    let mut assegnati: Vec<String> = Vec::new();
+    let results = spawn_reviewers(ctx, reviewers.max(1), task, expected, &mut assegnati).await;
     let outcomes: Vec<Value> = results
         .into_iter()
         .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
         .collect();
     nexus_agent_graph::decisions::compose_panel_verdict(&outcomes, policy)
+        .map(|p| p.con_reviewers(assegnati))
 }
 
 /// Convoca lo stesso analista read-only su provider diversi, scelti dal catalog

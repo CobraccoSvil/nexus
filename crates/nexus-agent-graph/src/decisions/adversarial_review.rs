@@ -119,6 +119,14 @@ pub struct PanelOutcome {
     /// Findings aggregati di TUTTI i voti validi (uniti, non deduplicati: la
     /// provenienza per-file resta nell'oggetto finding).
     pub findings: Vec<Value>,
+    /// Chi ha votato, come `provider/modello`. Popolato dal convocatore (che
+    /// conosce i pin assegnati), non deducibile dagli outcome.
+    ///
+    /// Serve a rendere VERIFICABILE la pluralita' del panel: senza, il nastro
+    /// mostrava sulle righe REVIEW l'icona del run padre, e quattro cicli su
+    /// provider diversi sembravano girati tutti sullo stesso. Una verifica
+    /// plurale che non si vede non e' verificabile.
+    pub reviewers: Vec<String>,
 }
 
 impl PanelOutcome {
@@ -133,6 +141,7 @@ impl PanelOutcome {
             "tally": { "pass": self.pass, "fail": self.fail, "needs_changes": self.needs_changes },
             "dissent": self.dissent,
             "findings": self.findings,
+            "reviewers": self.reviewers,
         })
     }
 }
@@ -267,7 +276,18 @@ pub fn compose_panel_verdict(outcomes: &[Value], policy: &QuorumPolicy) -> Optio
         needs_changes,
         dissent: distinct > 1,
         findings,
+        // Chi ha votato lo sa il convocatore, non gli outcome: lo compila lui
+        // subito dopo (`con_reviewers`).
+        reviewers: Vec::new(),
     })
+}
+
+impl PanelOutcome {
+    /// Dichiara chi ha composto il panel, come `provider/modello`.
+    pub fn con_reviewers(mut self, reviewers: Vec<String>) -> Self {
+        self.reviewers = reviewers;
+        self
+    }
 }
 
 #[cfg(test)]
