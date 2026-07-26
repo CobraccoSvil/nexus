@@ -620,6 +620,66 @@ else
   echo "OK migrazione-stub: nessuna nuova migrazione svuotata a 'SELECT 1;'"
 fi
 
+# ── test-provider-live-onesto ───────────────────────────────────────────────
+# I test di parita' provider (crates/nexus-gateway/tests/provider_tool_loop.rs)
+# chiamano le API reali e saltano quando la chiave non c'e'. Per anni lo skip era
+# `eprintln!("skip x: no key"); return`, cioe' un VERDE: in CI le chiavi non
+# esistono (nessun workflow del repo referenzia `secrets.`, a parte il job
+# dedicato provider-live.yml), quindi quei test non hanno mai toccato un provider
+# mentre l'intestazione dichiarava di catturare i 400 di DeepSeek e Anthropic.
+# Uno skip indistinguibile da un successo e' peggio di un test assente: dava
+# copertura percepita proprio sui difetti che continuavano a costare run.
+#
+# Il file ha ora un punto unico, `chiave_provider`, che sotto
+# REQUIRE_PROVIDER_TESTS=1 fallisce e altrimenti stampa un marker contato dalla
+# sentinella `copertura_live_dichiarata`. Questo check impedisce di rientrare
+# nello skip muto: una lettura di chiave fuori dal punto unico sarebbe invisibile
+# sia alla sentinella sia al conteggio.
+live_test="crates/nexus-gateway/tests/provider_tool_loop.rs"
+if [[ -f "$live_test" ]]; then
+  live_hits=""
+
+  # 1. Nessun nome di chiave provider scritto a mano fuori dalla tabella: nella
+  #    versione onesta `leggi_chiave` riceve solo le variabili che vengono da
+  #    PROVIDER_KEYS, quindi un letterale *_API_KEY nel corpo di un test e' per
+  #    definizione un accesso che scavalca il punto unico (e con esso il marker,
+  #    il conteggio della sentinella e il fallimento sotto REQUIRE).
+  if grep -nE '(env::var|leggi_chiave)\("[A-Z_]*API_KEY"' "$live_test" >/dev/null; then
+    live_hits+="chiave provider letta con un nome letterale invece che via chiave_provider()"$'\n'
+  fi
+
+  # 2. Nessuno skip stampato a mano: il marker lo emette il punto unico.
+  if grep -nE 'eprintln!\("skip' "$live_test" >/dev/null; then
+    live_hits+="skip stampato a mano (eprintln \"skip...\"): usare chiave_provider(), che emette il marker contato"$'\n'
+  fi
+
+  # 3. Il punto unico e la sentinella devono esistere.
+  grep -q 'fn chiave_provider' "$live_test" ||
+    live_hits+="manca il punto unico chiave_provider()"$'\n'
+  grep -q 'fn copertura_live_dichiarata' "$live_test" ||
+    live_hits+="manca la sentinella copertura_live_dichiarata() che dichiara il conteggio"$'\n'
+
+  # 4. Ogni etichetta della tabella PROVIDER_KEYS deve avere il suo test: una
+  #    riga in tabella senza test gonfierebbe il denominatore della copertura
+  #    (n/5) senza che nessuno chiami quel provider.
+  while read -r etichetta; do
+    [[ -n "$etichetta" ]] || continue
+    grep -q "fn ${etichetta}_tool_loop" "$live_test" ||
+      live_hits+="provider '${etichetta}' in PROVIDER_KEYS senza il suo fn ${etichetta}_tool_loop"$'\n'
+  done < <(sed -n '/PROVIDER_KEYS/,/^];/p' "$live_test" |
+    grep -oE '^\s*\("[a-z0-9_]+"' | grep -oE '"[a-z0-9_]+"' | tr -d '"')
+
+  if [[ -n "$live_hits" ]]; then
+    echo "!! test-provider-live-onesto: lo skip dei test di parita' provider puo' tornare invisibile:" >&2
+    printf '%s' "$live_hits" | sed 's/^/     /' >&2
+    echo "   Vedi l'intestazione di $live_test: un test che salta senza dirlo e" >&2
+    echo "   un test che ha interrogato il provider sono lo stesso verde (regola O)." >&2
+    fail=1
+  else
+    echo "OK test-provider-live-onesto: skip provider visibile e contato dalla sentinella"
+  fi
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -332,7 +332,10 @@ impl LlmProvider for DeepSeekProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{LlmMessage, LlmUsage, MessageContent, RequestMetadata, ThinkingConfig};
+    use crate::types::{
+        LlmMessage, LlmToolDefinition, LlmUsage, MessageContent, RequestMetadata, ThinkingConfig,
+        ToolFunctionDef,
+    };
 
     fn base_response(content: &str) -> LlmResponse {
         LlmResponse {
@@ -483,6 +486,79 @@ mod tests {
         assert!(r_on.enabled);
         let r_none = resolve_reasoning(&req_with_thinking(None));
         assert_eq!(r_none.dialect, ReasoningDialect::None);
+    }
+
+    /// Un tool qualunque, per esercitare il ramo `has_tools` di
+    /// `resolve_reasoning`. Schema `object` vuoto ma valido.
+    fn tool_qualunque() -> LlmToolDefinition {
+        LlmToolDefinition {
+            kind: "function".to_string(),
+            function: ToolFunctionDef {
+                name: "read_file".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                strict: None,
+            },
+        }
+    }
+
+    #[test]
+    fn tool_presenti_senza_tool_choice_forzano_thinking_off() {
+        // GATE, ramo `has_tools`: e' QUESTO il ramo che scatta in produzione, dove
+        // i run agentici mandano sempre i tool e spesso senza `tool_choice`.
+        // Spegnere il thinking qui e' cio' che azzera il 400 "The
+        // reasoning_content in the thinking mode must be passed back to the API":
+        // senza thinking non nasce `reasoning_content`, quindi non c'e' niente da
+        // rimandare al turno successivo.
+        //
+        // Il ramo era SCOPERTO: gli altri otto test del gate passano tutti da
+        // `tool_choice` e la fixture `req_with_thinking` ha `tools: None`, quindi
+        // togliendo `has_tools ||` dalla condizione restavano tutti verdi e il 400
+        // tornava in produzione. Il test di parita' live
+        // (`tests/provider_tool_loop.rs`) non puo' sostituirlo: senza thinking non
+        // riesce a provocare quel 400 nemmeno con la chiave (regola O).
+        let mut req = req_with_thinking(None);
+        req.tools = Some(vec![tool_qualunque()]);
+        assert!(req.tool_choice.is_none(), "premessa: nessun tool_choice");
+
+        let r = resolve_reasoning(&req);
+        assert_eq!(r.dialect, ReasoningDialect::DeepSeek);
+        assert!(
+            !r.enabled,
+            "tool presenti (anche senza tool_choice) -> thinking forzato OFF"
+        );
+    }
+
+    #[test]
+    fn tool_presenti_vincono_sulla_preferenza_thinking_on() {
+        // Anche una richiesta esplicita di thinking ON cede alla presenza di tool:
+        // l'alternativa e' un `reasoning_content` che il loop dovrebbe ripropagare
+        // a ogni iterazione, e che al primo turno mancante da' 400.
+        let mut req = req_with_thinking(Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            mandatory: false,
+        }));
+        req.tools = Some(vec![tool_qualunque()]);
+
+        let r = resolve_reasoning(&req);
+        assert!(!r.enabled, "tool presenti -> thinking OFF nonostante enabled");
+    }
+
+    #[test]
+    fn lista_tool_vuota_non_innesca_il_gate() {
+        // `Some(vec![])` non e' "ci sono tool": senza tool veri il vincolo
+        // dell'API non esiste e vale il comportamento storico (preferenza
+        // esplicita rispettata). Fissa il confine del ramo.
+        let mut req = req_with_thinking(Some(ThinkingConfig {
+            enabled: true,
+            budget_tokens: None,
+            mandatory: false,
+        }));
+        req.tools = Some(vec![]);
+
+        let r = resolve_reasoning(&req);
+        assert!(r.enabled, "lista tool vuota -> gate non scatta");
     }
 
     #[test]

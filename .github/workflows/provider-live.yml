@@ -1,0 +1,74 @@
+name: provider-live
+
+# Test di PARITA' PROVIDER contro le API REALI
+# (crates/nexus-gateway/tests/provider_tool_loop.rs).
+#
+# PERCHE' UN JOB A PARTE. Quei test chiamano davvero DeepSeek, Google,
+# Anthropic, Mistral e OpenAI: costano denaro e dipendono da servizi di terzi,
+# quindi non possono stare nel gate `verify.yml` di ogni push. Ma finche' non
+# girano da nessuna parte, i quirk che dichiarano di catturare (i 400 di DeepSeek
+# e Anthropic sul round-trip thinking/reasoning) restano scoperti mentre la CI
+# resta verde: e' il difetto che questo file chiude.
+#
+# `REQUIRE_PROVIDER_TESTS=1` capovolge lo skip: se un segreto manca, il test
+# FALLISCE nominando la env var invece di ritornare verde. Quindi un rosso qui ha
+# due letture possibili, entrambe informative:
+#   - segreti non configurati -> lo step "Diagnostica segreti" lo dice per nome
+#     (nessun valore in chiaro, regola F);
+#   - segreti presenti -> e' una regressione vera di parita' provider.
+#
+# CADENZA. Settimanale, non nightly: cinque provider per due turni a ogni
+# esecuzione: la frequenza e' calibrata sul costo, e `workflow_dispatch` resta
+# disponibile per lanciarlo a mano prima di toccare un adapter provider.
+#
+# Il crate nexus-gateway non usa macro `sqlx::query!` ne' prost: qui non servono
+# ne' Postgres ne' protoc (a differenza di verify.yml).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1" # lunedi 04:00 UTC
+
+jobs:
+  provider-live:
+    name: "Parita' provider (API reali)"
+    runs-on: ubuntu-latest
+
+    env:
+      # Un segreto assente arriva come stringa vuota: il punto unico
+      # `chiave_provider` tratta il vuoto come mancante, quindi con REQUIRE=1
+      # arrossa invece di far passare una chiave "" al provider.
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      REQUIRE_PROVIDER_TESTS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain pinnata in rust-toolchain.toml (unica fonte di verita').
+      - name: Setup Rust toolchain (da rust-toolchain.toml)
+        run: rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Dice quali segreti mancano PRIMA di compilare, cosi' il rosso si legge
+      # in due righe invece che nel panic di cinque test. Stampa solo i NOMI.
+      - name: Diagnostica segreti (solo nomi, nessun valore)
+        run: |
+          mancanti=""
+          for v in DEEPSEEK_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY OPENAI_API_KEY; do
+            if [ -z "${!v}" ]; then mancanti="$mancanti $v"; fi
+          done
+          if [ -n "$mancanti" ]; then
+            echo "::error::segreti provider non configurati:$mancanti - i test di parita' NON possono coprire i quirk che dichiarano. Configurarli in Settings > Secrets, oppure disattivare questo workflow dichiarando che quella copertura non esiste."
+          else
+            echo "tutti i 5 segreti provider sono presenti"
+          fi
+
+      # --nocapture: il riepilogo "COPERTURA LIVE PROVIDER: n/5" e i marker
+      # NEXUS_PROVIDER_LIVE_SKIP devono restare leggibili nel log del job.
+      - name: Test parita' provider (2 turni tool-loop)
+        run: cargo test -p nexus-gateway --test provider_tool_loop -- --nocapture
