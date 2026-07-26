@@ -1004,7 +1004,11 @@ async fn complete_with_retry(
 ) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
-    let mut history_aggressive_retry = true;
+    // "Il retry aggressivo e' ANCORA DISPONIBILE", non "lo sto facendo": si parte
+    // in Standard e si passa ad Aggressive solo dopo un client_error di formato.
+    // Il nome precedente (`history_aggressive_retry`) diceva il contrario di cio'
+    // che il valore significa, e faceva leggere il ramo come invertito.
+    let mut retry_aggressivo_disponibile = true;
     loop {
         attempt += 1;
         // Cap EFFETTIVO del tentativo = min(cap per-tentativo, budget residuo
@@ -1019,7 +1023,7 @@ async fn complete_with_retry(
         }
         let attempt_cap = per_attempt.min(residual);
         let mut call_req = req.clone();
-        let sanitize_mode = if history_aggressive_retry {
+        let sanitize_mode = if retry_aggressivo_disponibile {
             SanitizeMode::Standard
         } else {
             SanitizeMode::Aggressive
@@ -1027,10 +1031,18 @@ async fn complete_with_retry(
         let sanitize_report =
             history_sanitizer::sanitize_history(&mut call_req.messages, name, sanitize_mode);
         if sanitize_report != history_sanitizer::SanitizeReport::default() {
-            tracing::debug!(
+            // A `info`, non `debug`: quando un 400 di formato arriva in chat,
+            // questa e' la sola riga che dice cosa e' stato tolto dalla history
+            // e in quale modalita'. A `debug` non compariva nei log di esercizio,
+            // e "il sanitizer non ha toccato niente" era indistinguibile da "ha
+            // tolto un campo obbligatorio e non lo vediamo" (regola O).
+            tracing::info!(
                 provider = name,
                 mode = ?sanitize_mode,
+                attempt,
                 stripped_reasoning = sanitize_report.stripped_reasoning,
+                stripped_thinking_signature = sanitize_report.stripped_thinking_signature,
+                stripped_thought_signature = sanitize_report.stripped_thought_signature,
                 stripped_trailing = sanitize_report.stripped_trailing_assistant,
                 orphan_tools = sanitize_report.removed_orphan_tool_results,
                 synthetic_tools = sanitize_report.injected_synthetic_tool_results,
@@ -1109,10 +1121,10 @@ async fn complete_with_retry(
                             );
                             return Err(failure);
                         }
-                        if history_aggressive_retry
+                        if retry_aggressivo_disponibile
                             && history_sanitizer::is_history_related_client_error(code)
                         {
-                            history_aggressive_retry = false;
+                            retry_aggressivo_disponibile = false;
                             tracing::warn!(
                                 provider = name,
                                 status = failure.status,

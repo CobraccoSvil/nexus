@@ -118,7 +118,17 @@ fn strip_provider_specific_fields(
     mode: SanitizeMode,
     report: &mut SanitizeReport,
 ) {
-    let keep_reasoning = provider_keeps_reasoning(provider) && mode != SanitizeMode::Aggressive;
+    // Il `reasoning` su DeepSeek NON e' un campo opzionale da ripulire: l'API lo
+    // ESIGE sugli assistant prodotti in thinking mode, e senza risponde HTTP 400
+    // ("The reasoning_content in the thinking mode must be passed back"). Toglierlo
+    // nel retry Aggressive produce con CERTEZZA il fallimento che quel retry doveva
+    // riparare: il vincolo del provider vince sulla modalita'. Aggressive continua a
+    // fare tutto il resto (riconciliazione tool piu' invasiva, trailing assistant).
+    //
+    // Asimmetria voluta con le due firme sotto: Anthropic e Google TOLLERANO
+    // l'assenza della firma (la richiedono solo nei turni con tool), quindi li'
+    // rimuoverla e' una semplificazione legittima dell'ultima spiaggia.
+    let keep_reasoning = provider_keeps_reasoning(provider);
     let keep_thinking = provider_keeps_thinking_signature(provider) && mode != SanitizeMode::Aggressive;
     let keep_thought = provider_keeps_thought_signature(provider) && mode != SanitizeMode::Aggressive;
 
@@ -342,6 +352,33 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_mantiene_reasoning_anche_in_aggressive() {
+        // Aggressive e' il retry che scatta DOPO un client_error di formato. Se
+        // togliesse il reasoning, DeepSeek risponderebbe 400 "must be passed
+        // back": il tentativo di riparare garantirebbe un secondo fallimento,
+        // diverso dal primo. Il campo resta; il resto della sanificazione no.
+        let mut msgs = vec![assistant_with_tools("c1", "get_time")];
+        let r = sanitize_history(&mut msgs, "deepseek", SanitizeMode::Aggressive);
+        assert_eq!(
+            r.stripped_reasoning, 0,
+            "il reasoning e' obbligatorio su deepseek: Aggressive non deve toglierlo"
+        );
+        assert!(msgs[0].reasoning.is_some());
+        // La firma Anthropic invece cade: li' l'assenza e' tollerata dal provider.
+        assert_eq!(r.stripped_thinking_signature, 1);
+    }
+
+    #[test]
+    fn fuori_deepseek_aggressive_toglie_comunque_il_reasoning() {
+        // Il campo resta provider-specifico: su un provider che non lo conosce
+        // va tolto in entrambe le modalita' (era gia' vero, non deve regredire).
+        let mut msgs = vec![assistant_with_tools("c1", "get_time")];
+        let r = sanitize_history(&mut msgs, "mistral", SanitizeMode::Aggressive);
+        assert_eq!(r.stripped_reasoning, 1);
+        assert!(msgs.iter().all(|m| m.reasoning.is_none()));
+    }
+
+    #[test]
     fn deepseek_mantiene_reasoning_in_standard() {
         let mut msgs = vec![assistant_with_tools("c1", "get_time")];
         let r = sanitize_history(&mut msgs, "deepseek", SanitizeMode::Standard);
@@ -349,13 +386,21 @@ mod tests {
         assert!(msgs[0].reasoning.is_some());
     }
 
-    #[test]
-    fn aggressive_strip_tutti_i_campi_provider_specifici() {
-        let mut msgs = vec![assistant_with_tools("c1", "get_time")];
-        let r = sanitize_history(&mut msgs, "deepseek", SanitizeMode::Aggressive);
-        assert_eq!(r.stripped_reasoning, 1);
-        assert!(msgs[0].reasoning.is_none());
-    }
+    // NOTA: qui viveva `aggressive_strip_tutti_i_campi_provider_specifici`, che
+    // asseriva `stripped_reasoning == 1` su deepseek in Aggressive. Codificava la
+    // premessa "l'ultima spiaggia toglie TUTTI i campi provider-specifici", che
+    // per il reasoning di DeepSeek e' controproducente: quel campo e' obbligatorio,
+    // e toglierlo trasforma un 400 di formato in un 400 "must be passed back".
+    // Il caso e' ora coperto da `deepseek_mantiene_reasoning_anche_in_aggressive`
+    // (reasoning conservato, firma Anthropic comunque rimossa) e da
+    // `fuori_deepseek_aggressive_toglie_comunque_il_reasoning`.
+    //
+    // TENSIONE NOTA, non risolta da questo cambio: il doc del modulo segnala anche
+    // il caso opposto (reasoning "fuori contesto" -> 400). Conservare il campo sugli
+    // assistant SUPERSTITI e' coerente per costruzione (quelli rimossi si portano via
+    // il proprio reasoning), ma se emergesse un 400 da reasoning fuori posto la
+    // risposta non sara' rimetterlo via in blocco: sara' allineare il campo al
+    // troncamento. Il log a `info` del report serve a distinguere i due casi.
 
     #[test]
     fn mistral_strip_trailing_assistant() {
