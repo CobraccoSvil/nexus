@@ -209,6 +209,15 @@ fn build_edges(
             ) {
                 return NodeId::FinalGate;
             }
+            // Stessa regola per le FIGURE, il cui deliverable non e' un task
+            // completato ma un giudizio (review_verdict / advisory_verdict /
+            // debate_position): emesso quello, la figura ha finito cio' che le e'
+            // chiesto. Senza questo ramo ricadeva sull'executor e girava a vuoto
+            // fino al wall-clock, dove il verdetto veniva scartato e sostituito da
+            // "[Sub-agent timeout]". Punto unico: declared_role_channel.
+            if crate::routing::declared_role_channel(state).is_some() {
+                return NodeId::FinalGate;
+            }
             NodeId::Executor
         }),
     );
@@ -1329,5 +1338,58 @@ mod tests {
             GraphError::RecursionLimit(limit) => assert_eq!(limit, 12),
             other => panic!("atteso RecursionLimit, ottenuto {other:?}"),
         }
+    }
+
+    /// L'edge post-ToolDispatch chiude anche quando a dichiarare e' una FIGURA.
+    ///
+    /// Attraversa l'edge REALE della produzione (`build_edges` + `Edge::resolve`),
+    /// non una sua imitazione: e' la stessa mappa che il grafo usa a runtime.
+    /// Il difetto che cattura e' quello misurato su verifica-wd: il verdetto era
+    /// gia' stato emesso e accettato, ma il routing riconosceva terminale solo
+    /// `task_complete`, quindi si tornava all'executor e la figura girava a vuoto
+    /// fino al wall-clock, dove il verdetto veniva scartato.
+    #[test]
+    fn edge_tool_dispatch_chiude_anche_sul_verdetto_di_ruolo() {
+        let edges = build_edges(
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+        );
+        let edge = edges.get(&NodeId::ToolDispatch).expect("edge ToolDispatch");
+
+        // Senza alcuna dichiarazione si prosegue: il lavoro non e' finito.
+        let vuoto = AgentState::default();
+        assert_eq!(edge.resolve(&vuoto), NodeId::Executor);
+
+        // Ogni figura chiude sul PROPRIO canale, qualunque sia il giudizio:
+        // anche un "needs_changes" e' il deliverable completo del revisore.
+        for (etichetta, mut s) in [
+            ("review", AgentState::default()),
+            ("advisory", AgentState::default()),
+            ("debate", AgentState::default()),
+        ] {
+            match etichetta {
+                "review" => s.review_verdict = Some(json!({"verdict": "needs_changes"})),
+                "advisory" => s.advisory_verdict = Some(json!({"verdict": "proceed"})),
+                _ => s.debate_position = Some(json!({"stance": "contro"})),
+            }
+            assert_eq!(
+                edge.resolve(&s),
+                NodeId::FinalGate,
+                "una figura che ha dichiarato su {etichetta} deve chiudere, non rientrare nell'executor"
+            );
+        }
+
+        // Il canale di chi ESEGUE resta invariato (nessuna regressione).
+        let mut esecutore = AgentState::default();
+        esecutore.declared_outcome = Some(json!({"outcome": "done"}));
+        assert_eq!(edge.resolve(&esecutore), NodeId::FinalGate);
+        let mut parziale = AgentState::default();
+        parziale.declared_outcome = Some(json!({"outcome": "partial"}));
+        assert_eq!(
+            edge.resolve(&parziale),
+            NodeId::Executor,
+            "`partial` e' dichiarazione onesta di lavoro incompleto: prosegue"
+        );
     }
 }
