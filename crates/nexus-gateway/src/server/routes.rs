@@ -1129,6 +1129,7 @@ async fn complete_with_retry(
                                 provider = name,
                                 status = failure.status,
                                 code = code,
+                                dettaglio = %failure.message,
                                 "gateway: client_error history -> sanificazione aggressiva e retry"
                             );
                             continue;
@@ -1137,6 +1138,11 @@ async fn complete_with_retry(
                             provider = name,
                             status = failure.status,
                             code = code,
+                            // Il `code` dei provider OpenAI-compat e' spesso il generico
+                            // `invalid_request_error`: cosa sia davvero invalido sta solo
+                            // nel messaggio. Senza, diagnosticare un 400 e' congetturare.
+                            // Resta display/diagnosi: le decisioni leggono status e code.
+                            dettaglio = %failure.message,
                             "gateway: il provider ha rifiutato la richiesta \
                              (errore client, niente retry/cooldown)"
                         );
