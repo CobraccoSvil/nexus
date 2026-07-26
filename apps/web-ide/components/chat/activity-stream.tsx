@@ -570,14 +570,12 @@ function FoldedToolsBody({
             minWidth: 0,
           }}
         >
+          {/* Niente logo provider sulle righe interne: il blocco appartiene a
+              un solo segmento, quindi a un solo provider, gia' dichiarato
+              dall'intestazione. Ripeterlo a ogni passo aggiunge una colonna di
+              icone identiche che compete con il contenuto vero (il tool). */}
           {event.tools.map((tool, i) => (
-            <ToolEventBody
-              key={`folded-tool-${i}`}
-              event={tool}
-              segColor={segColor}
-              tc={tc}
-              showProviderIcon
-            />
+            <ToolEventBody key={`folded-tool-${i}`} event={tool} segColor={segColor} tc={tc} />
           ))}
         </div>
       )}

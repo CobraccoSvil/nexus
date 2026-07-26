@@ -1333,3 +1333,27 @@ test("raggruppaBlocchiNastro lascia riga singola cio' che non e' sub-agente", ()
   // Un evento subagente SENZA id non e' raggruppabile: non si sa a chi appartiene.
   assert.equal(blocchi[1].tipo, "riga");
 });
+
+// Il blocco dei passi compressi nasceva senza provenienza: il suo tooltip
+// nominava un provider senza dire su quale modello i passi fossero girati.
+test("il blocco compresso eredita provider e modello dai passi che contiene", () => {
+  const tool = (i: number): ActivityEvent =>
+    ({
+      type: "tool",
+      outcome: "ok",
+      iteration: i,
+      title: `passo ${i}`,
+      provider: "mistral",
+      model: "magistral-small-latest",
+    }) as ActivityEvent;
+  const out = foldConsecutiveOkTools([tool(1), tool(2), tool(3)], 3);
+  assert.equal(out.length, 1, "tre tool ok consecutivi si comprimono in un blocco");
+  const blocco = out[0];
+  assert.equal(blocco.type, "folded_tools");
+  assert.equal(blocco.provider, "mistral");
+  assert.equal(
+    blocco.model,
+    "magistral-small-latest",
+    "senza il modello il tooltip del blocco resta monco: nomina il provider ma non su cosa e' girato",
+  );
+});

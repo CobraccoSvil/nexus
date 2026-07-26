@@ -1187,6 +1187,13 @@ export function foldConsecutiveOkTools(
         lastIteration: run[run.length - 1].iteration,
         // Conserva i ToolEvent originali per l'espansione (niente scarto).
         tools: run,
+        // La provenienza viene dai passi compressi: senza, il blocco perdeva
+        // provider e modello e il suo tooltip nominava un provider senza dire
+        // su quale modello fossero girati i passi. I tool raccolti sono
+        // consecutivi nello stesso segmento, quindi condividono la provenienza:
+        // il primo la rappresenta tutta.
+        provider: run[0].provider,
+        model: run[0].model,
       });
     } else {
       out.push(...run);
