@@ -128,6 +128,14 @@ assert_single "derivazione nome DB progetto" 'fn derive_project_db_name' 'crates
 assert_single "problem_group_key" 'fn problem_group_key' 'crates/mcp-core/src/project_workspace/problem_aggregation.rs' crates
 assert_single "aggregate_problems" 'fn aggregate_problems' 'crates/mcp-core/src/project_workspace/problem_aggregation.rs' crates
 
+# Lettura dei run Playwright da `jobs` (2026-07-22): la query viveva in DUE posti
+# (endpoint REST e snapshot del dispatcher). Quando `jobs` e' stata migrata al DB
+# per-progetto solo la copia in logs.rs e' stata aggiornata: lo snapshot ha
+# continuato a leggerla dal meta-pool, dove la tabella non esiste piu', e
+# rispondeva 500 a ogni bootstrap del dispatcher. Punto unico:
+# logs.rs::playwright_runs_for_project; chi serve quei run delega a quello.
+assert_single "lettura run playwright" "kind ILIKE '%playwright%'" 'crates/mcp-core/src/project_workspace/logs.rs' crates
+
 # Listino modelli (2026-07-15): "quanto costa (provider, model)?" e' UNA domanda,
 # e la risposta vive solo in crates/nexus-pricing. Era scritta TRE volte (mcp-core,
 # nexus-gateway, billing-service) e le copie erano divergenti sui soldi: filtro

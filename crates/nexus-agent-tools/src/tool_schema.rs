@@ -353,7 +353,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "working_dir": {
           "type": "string",
-          "description": "Sottodirectory in cui eseguire il comando (relativa alla root del progetto). Ometti per usare la root."
+          "description": "Sottodirectory in cui eseguire il comando (relativa alla root del progetto). Ometti per usare la root. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd <questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend + 'frontend/x' esegue in frontend/frontend/x)."
         },
         "label": {
           "type": "string",
@@ -636,7 +636,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "working_dir": {
           "type": "string",
-          "description": "Sottodirectory in cui eseguire il comando (relativa alla root). Ometti per usare la root del progetto."
+          "description": "Sottodirectory in cui eseguire il comando (relativa alla root). Ometti per usare la root del progetto. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd <questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend + 'frontend/x' esegue in frontend/frontend/x)."
         },
         "background": {
           "type": "boolean",
@@ -1648,7 +1648,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       "type": "object",
       "properties": {
         "scope": {"type": "string", "enum": ["quick", "full", "typecheck", "build", "lint", "test"], "description": "quick = typecheck+lint (rapido, dopo ogni modifica); full = catena completa typecheck+build+lint+test (prima di dichiarare done); oppure un singolo step."},
-        "working_dir": {"type": "string", "description": "Sottocartella del progetto in cui eseguire i comandi (default: root del progetto). Utile nei monorepo."}
+        "working_dir": {"type": "string", "description": "Sottocartella del progetto in cui eseguire i comandi (default: root del progetto). Utile nei monorepo. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd <questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend + 'frontend/x' esegue in frontend/frontend/x)."}
       }
     }
   }

@@ -377,7 +377,13 @@ function EventRow({
         // icona. I provider effettivi si vedono nei sub-agenti delle singole figure.
         null
       ) : (
-        event.provider && (
+        // Solo sulla PRIMA riga del sub-agente: dentro un sub-run il provider e'
+        // costante (una figura gira su un solo modello), quindi ripetere l'icona a
+        // ogni riga e' rumore. `continuaSubagente` e' gia' il segnale usato sopra per
+        // non ripetere l'intestazione del sub-run; qui deduplica anche l'icona.
+        // Sul run principale (ev.type != subagent) continuaSubagente e' sempre false:
+        // li' il provider PUO' cambiare tra step e l'icona per riga resta informativa.
+        event.provider && !continuaSubagente && (
           <span style={{ position: "absolute", right: 8, top: 9, zIndex: 2 }}>
             <ProviderIcon provider={event.provider} model={event.model} />
           </span>

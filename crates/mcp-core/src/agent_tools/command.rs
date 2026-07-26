@@ -287,6 +287,18 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         Err(msg) => return msg,
     };
 
+    // Blocca la duplicazione working_dir + path nel comando PRIMA dell'esecuzione
+    // (causa radice di ambiente incoerente, vedi
+    // helpers::detect_workdir_path_duplication): working_dir e' gia' la CWD, se il
+    // comando ripete quel segmento ('cd frontend', 'frontend/...') i path si
+    // sommano e rm/install/build operano sulla dir sbagliata. Rifiutare qui evita
+    // il danno silenzioso; il messaggio dice all'agente come correggere.
+    if let Some(wd) = input.get("working_dir").and_then(Value::as_str) {
+        if let Some(msg) = super::helpers::detect_workdir_path_duplication(wd, &command) {
+            return format!("{hints_prefix}{msg}");
+        }
+    }
+
     // ── Livello 3: probe timeout — esegui, se non finisce in 10s ri-lancia nel terminale ──
     let work_dir = match resolve_work_dir(ctx, input) {
         Ok(p) => p,
