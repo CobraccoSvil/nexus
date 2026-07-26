@@ -675,7 +675,9 @@ pub async fn qdrant_health_handler(
     axum::extract::State(_state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+        crate::settings::disambigua_loopback(
+            &std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
+        );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -1327,7 +1329,9 @@ pub async fn embeddings_validate_handler(
 /// propaga un `502` se Qdrant non e' raggiungibile o rifiuta la richiesta.
 async fn reindex_qdrant_collection(collection: &str, dim: u64) -> Result<(), ApiError> {
     let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+        crate::settings::disambigua_loopback(
+            &std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
+        );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()

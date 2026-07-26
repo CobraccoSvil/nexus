@@ -13,6 +13,7 @@ import {
   type FoldThreshold,
 } from "../../lib/use-chat/activity-stream";
 import { ActivityStreamView } from "./activity-stream";
+import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -781,6 +782,19 @@ export function AgentStepsPanel({
     ? allRuns.find((r) => r.run.runId === activeTab) ?? allRuns[0]
     : allRuns[0];
 
+  // Step del tab ATTIVO, presi dal DB se non sono gia' in memoria (punto unico
+  // `useResolvedRunSteps`, gia' usato dal nastro). Serve perche' i sub-run non
+  // hanno piu' un EventSource dedicato: aprirne uno per ogni sub-agente costava
+  // fino a 8 connessioni su un budget di 6 per origine, e affamava le fetch
+  // normali fino a bloccare il bootstrap della chat. Il progresso dei sub-agenti
+  // resta visibile nel nastro del padre (meta-step subagent_*); qui, quando si
+  // apre il tab di uno di loro, gli step si leggono dal DB. Una sola fetch per
+  // runId, e nessuna quando gli step ci sono gia' (run principale live).
+  const activeRunSteps = useResolvedRunSteps(
+    activeRunData?.run.runId,
+    activeRunData?.steps ?? [],
+  );
+
   return (
     <div
       style={{
@@ -831,7 +845,7 @@ export function AgentStepsPanel({
                 ? mainRunStream
                 : composeActivityStream(
                     metaSteps ?? [],
-                    activeRunData.steps,
+                    activeRunSteps,
                     traces ? tracesForRun(traces, activeRunData.run.runId, metaSteps ?? []) : [],
                     foldThreshold ?? 3,
                   )

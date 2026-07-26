@@ -477,7 +477,15 @@ export function useChat(
             };
             setAgentRuns((prev) => new Map(prev).set(childRunId, childRun));
             setAgentStepsMap((prev) => new Map(prev).set(childRunId, []));
-            subscribeToRun(sid, childRunId, false);
+            // NIENTE EventSource dedicato per il figlio. Aprirne uno per ogni
+            // sub-agente costava fino a 8 connessioni (cap 32) su un budget di 6
+            // per origine in HTTP/1.1: le fetch normali restavano in coda e
+            // scadevano, il bootstrap della chat non completava e il pulsante
+            // Invia diventava muto. Il progresso dei sub-agenti resta visibile
+            // nel nastro del padre (meta-step subagent_started/progress/
+            // completed, mig 0535) e i loro step si leggono dal DB quando si apre
+            // il tab del sub-agente (agent-steps-panel -> useResolvedRunSteps).
+            // Il run e' comunque registrato qui sopra, quindi il tab compare.
           }
         },
         async () => {

@@ -425,8 +425,69 @@ pub use nexus_auth::get_setting_checked as get_setting;
 /// `qdrant=False` pur con il setting DB corretto a 6333). Ora c'e' una sola
 /// risoluzione condivisa.
 pub async fn resolve_qdrant_url(db: &sqlx::PgPool) -> String {
-    nexus_auth::get_setting(db, "qdrant_url")
+    let raw = nexus_auth::get_setting(db, "qdrant_url")
         .await
         .or_else(|| std::env::var("QDRANT_URL").ok())
-        .unwrap_or_else(|| "http://localhost:6333".to_string())
+        .unwrap_or_else(|| "http://localhost:6333".to_string());
+    disambigua_loopback(&raw)
+}
+
+/// Sostituisce l'host `localhost` con `127.0.0.1` in un URL di servizio LOCALE.
+///
+/// `localhost` non e' un indirizzo, e' un nome con DUE risposte: su Windows la
+/// risoluzione restituisce `::1` (IPv6) prima di `127.0.0.1`. Qdrant ascolta su
+/// `0.0.0.0:6333`, cioe' solo IPv4: il client tentava dunque `::1:6333`, restava
+/// in SynSent fino allo scadere del timeout TCP e mcp-core si appendeva
+/// nell'avvio per minuti. Effetto a catena misurato il 2026-07-23: web-ide
+/// partiva, non riusciva a raggiungere mcp-core (`ECONNREFUSED` ripetuti) e
+/// crashava.
+///
+/// Per un servizio sulla macchina locale `127.0.0.1` e' sempre corretto e non ha
+/// quell'ambiguita'. Gli host remoti e gli indirizzi gia' espliciti non vengono
+/// toccati: si disambigua solo il nome che ha due risposte possibili.
+///
+/// Sostituisce il workaround che viveva nel `.env` (regola H: la causa sta nel
+/// codice che risolve l'host, non nella configurazione di una macchina).
+pub fn disambigua_loopback(url: &str) -> String {
+    url.replace("://localhost:", "://127.0.0.1:")
+        .replace("://localhost/", "://127.0.0.1/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::disambigua_loopback;
+
+    /// `localhost` viene disambiguato, il resto no.
+    ///
+    /// Il difetto che cattura: con `http://localhost:6333` il client tentava
+    /// `::1` (IPv6) mentre Qdrant ascolta su IPv4, restava in SynSent e mcp-core
+    /// si appendeva nell'avvio per minuti, facendo crashare web-ide a catena.
+    #[test]
+    fn loopback_disambiguato_solo_dove_serve() {
+        // Il caso reale: e' l'unico host con due risposte possibili.
+        assert_eq!(
+            disambigua_loopback("http://localhost:6333"),
+            "http://127.0.0.1:6333"
+        );
+        assert_eq!(
+            disambigua_loopback("http://localhost:6333/collections"),
+            "http://127.0.0.1:6333/collections"
+        );
+
+        // Gia' esplicito: nulla da disambiguare.
+        assert_eq!(
+            disambigua_loopback("http://127.0.0.1:6333"),
+            "http://127.0.0.1:6333"
+        );
+        // Un host REMOTO non si tocca: la sua risoluzione non e' ambigua per noi.
+        assert_eq!(
+            disambigua_loopback("http://qdrant.interno:6333"),
+            "http://qdrant.interno:6333"
+        );
+        // `localhost` come sottostringa di un altro nome non e' l'host loopback.
+        assert_eq!(
+            disambigua_loopback("http://localhost.example.com:6333"),
+            "http://localhost.example.com:6333"
+        );
+    }
 }

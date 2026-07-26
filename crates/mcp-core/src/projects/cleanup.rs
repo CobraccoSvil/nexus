@@ -484,7 +484,9 @@ async fn cleanup_qdrant_points(db: &PgPool, project_id: Uuid) -> QdrantResult {
 
     let base_url = match get_setting(db, "qdrant_url").await {
         Ok(Some(v)) if !v.is_empty() => v,
-        _ => std::env::var("QDRANT_URL").unwrap_or_else(|_| QDRANT_DEFAULT_URL.to_string()),
+        _ => crate::settings::disambigua_loopback(
+            &std::env::var("QDRANT_URL").unwrap_or_else(|_| QDRANT_DEFAULT_URL.to_string()),
+        ),
     };
 
     for (setting_key, default_name) in QDRANT_PROJECT_COLLECTIONS {
