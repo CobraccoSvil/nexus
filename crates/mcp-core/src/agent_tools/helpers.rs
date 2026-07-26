@@ -129,7 +129,7 @@ pub(crate) fn is_package_manager_mutation(command: &str) -> bool {
     // iniziale maschererebbe la posizione del comando vero.
     command
         .to_lowercase()
-        .split(|c: char| matches!(c, '&' | '|' | ';' | '\n'))
+        .split(['&', '|', ';', '\n'])
         .any(|seg| {
             let toks: Vec<&str> = seg.split_whitespace().collect();
             match toks.iter().position(|t| PM.contains(t)) {

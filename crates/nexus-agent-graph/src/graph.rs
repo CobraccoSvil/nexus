@@ -1381,11 +1381,15 @@ mod tests {
         }
 
         // Il canale di chi ESEGUE resta invariato (nessuna regressione).
-        let mut esecutore = AgentState::default();
-        esecutore.declared_outcome = Some(json!({"outcome": "done"}));
+        let esecutore = AgentState {
+            declared_outcome: Some(json!({"outcome": "done"})),
+            ..Default::default()
+        };
         assert_eq!(edge.resolve(&esecutore), NodeId::FinalGate);
-        let mut parziale = AgentState::default();
-        parziale.declared_outcome = Some(json!({"outcome": "partial"}));
+        let parziale = AgentState {
+            declared_outcome: Some(json!({"outcome": "partial"})),
+            ..Default::default()
+        };
         assert_eq!(
             edge.resolve(&parziale),
             NodeId::Executor,
