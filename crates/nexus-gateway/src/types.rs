@@ -13,7 +13,7 @@ pub type SensitivityTier = u8;
 
 /// Blocco di contenuto strutturato di un messaggio (testo, immagine, risultato
 /// di tool). Corrisponde a `LLMContentBlock`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmContentBlock {
     #[serde(rename = "type")]
     pub kind: String,
@@ -28,7 +28,7 @@ pub struct LlmContentBlock {
 }
 
 /// Chiamata a tool emessa dal modello (`LLMToolCall`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -45,7 +45,7 @@ pub struct LlmToolCall {
     pub thought_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolFunctionCall {
     pub name: String,
     pub arguments: String,
@@ -71,7 +71,7 @@ pub struct ToolFunctionDef {
 
 /// Contenuto di un messaggio: stringa semplice oppure lista di blocchi.
 /// Modella `string | LLMContentBlock[]` con un enum untagged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
@@ -79,7 +79,12 @@ pub enum MessageContent {
 }
 
 /// Messaggio della conversazione (`LLMMessage`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` non e' decorativo: e' il segnale su cui il gateway decide se un
+/// retry ha senso. Due history uguali producono la stessa richiesta e quindi lo
+/// stesso rifiuto — confrontarle e' l'unico modo di saperlo senza spendere la
+/// chiamata (vedi `history_sanitizer::retry_changes_history`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
     pub content: MessageContent,

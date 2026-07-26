@@ -980,7 +980,8 @@ impl CallFailure {
 /// transitori (Fase B1, strict pin). Classifica l'errore col punto unico
 /// [`classify_provider_error`] (regola L):
 ///   - Billing   -> `mark_billing`, niente retry, errore (ricarica necessaria);
-///   - ClientError history-related -> sanificazione aggressiva + 1 retry;
+///   - ClientError history-related -> 1 retry con sanificazione aggressiva, ma
+///     SOLO se quella sanificazione cambia davvero la richiesta;
 ///   - ClientError invalid_model -> errore immediato (niente cooldown provider);
 ///   - ClientError altro -> errore (colpa config/modello singolo);
 ///   - Transient -> retry con backoff+jitter; dopo l'ultimo tentativo
@@ -1022,14 +1023,15 @@ async fn complete_with_retry(
             return Err(CallFailure::attempt_timeout(residual));
         }
         let attempt_cap = per_attempt.min(residual);
-        let mut call_req = req.clone();
         let sanitize_mode = if retry_aggressivo_disponibile {
             SanitizeMode::Standard
         } else {
             SanitizeMode::Aggressive
         };
-        let sanitize_report =
-            history_sanitizer::sanitize_history(&mut call_req.messages, name, sanitize_mode);
+        let mut call_req = req.clone();
+        let (messages, sanitize_report) =
+            history_sanitizer::sanitized_for_attempt(&req.messages, name, sanitize_mode);
+        call_req.messages = messages;
         if sanitize_report != history_sanitizer::SanitizeReport::default() {
             // A `info`, non `debug`: quando un 400 di formato arriva in chat,
             // questa e' la sola riga che dice cosa e' stato tolto dalla history
@@ -1125,6 +1127,24 @@ async fn complete_with_retry(
                             && history_sanitizer::is_history_related_client_error(code)
                         {
                             retry_aggressivo_disponibile = false;
+                            if !history_sanitizer::retry_changes_history(
+                                &req.messages,
+                                &call_req.messages,
+                                name,
+                                SanitizeMode::Aggressive,
+                            ) {
+                                tracing::warn!(
+                                    provider = name,
+                                    status = failure.status,
+                                    code = code,
+                                    dettaglio = %failure.message,
+                                    retry_saltato = "sanificazione_aggressiva_senza_effetto",
+                                    "gateway: client_error history, ma la sanificazione \
+                                     aggressiva lascia la richiesta IDENTICA -> niente retry \
+                                     (stessa richiesta, stesso rifiuto)"
+                                );
+                                return Err(failure);
+                            }
                             tracing::warn!(
                                 provider = name,
                                 status = failure.status,
@@ -2588,8 +2608,15 @@ mod tests {
         ErrBilling,
         /// Errore lato client (400 invalid_request): non ritentabile, non da cooldown.
         ErrClient,
-        /// Primo tentativo: 400 history-related; secondo tentativo: OK (sanificazione).
-        ErrHistoryThenOk,
+        /// 400 history-related finche' la richiesta porta ancora un
+        /// `thinking_signature`, OK quando la sanificazione l'ha tolto.
+        ///
+        /// L'esito dipende da CIO' CHE ARRIVA, come nel provider vero: un fake
+        /// che rispondesse "ok al secondo giro" qualunque cosa riceva
+        /// fossilizzerebbe l'assunto sotto esame (che il retry mandi qualcosa di
+        /// diverso) e resterebbe verde anche se il gateway rispedisse due volte
+        /// la stessa identica richiesta — che e' il difetto misurato (regola O).
+        ErrHistoryUntilSanitized,
         /// Non risponde mai: simula la chiamata APPESA che ha originato il fix
         /// (misurata sul campo: 197s senza alcun log, con le figure ferme).
         Hang,
@@ -2837,15 +2864,17 @@ mod tests {
                 }
                 .into()),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: il sleep precede il match"),
-                Behaviour::ErrHistoryThenOk => {
-                    if idx == 0 {
-                        Err(crate::providers::ProviderHttpError {
-                            provider: self.name.clone(),
-                            status: 400,
-                            code: Some("invalid_request_message_order".into()),
-                            retry_after_seconds: None,
-                            message: "invalid message order".into(),
-                        }
+                Behaviour::ErrHistoryUntilSanitized => {
+                    // Corpo VERBATIM di Anthropic quando la history porta una
+                    // firma di thinking che il turno non ammette: il codice
+                    // strutturato nasce da `from_response`, non e' dettato qui.
+                    if req.messages.iter().any(|m| m.thinking_signature.is_some()) {
+                        Err(ProviderHttpError::from_response(
+                            &self.name,
+                            400,
+                            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1: Expected `thinking` or `redacted_thinking`, but found `text`"}}"#
+                                .to_string(),
+                        )
                         .into())
                     } else {
                         Ok(LlmResponse {
@@ -2904,7 +2933,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2926,7 +2955,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2946,7 +2975,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2970,7 +2999,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -3170,24 +3199,139 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.message.contains("tutti i provider hanno fallito"));
-        // history-related client_error: 1 retry con sanificazione aggressiva, poi errore
-        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        // Su questa history (un solo messaggio user) la sanificazione aggressiva
+        // non ha NIENTE da togliere: il retry manderebbe la stessa richiesta e
+        // otterrebbe lo stesso 400. Un solo tentativo.
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
         assert!(!cooldown.is_in_cooldown("google")); // niente cooldown
+    }
+
+    /// History che la sanificazione aggressiva CAMBIA davvero: un assistant con
+    /// `thinking_signature`, che la modalita' Standard conserva su Anthropic (il
+    /// dialetto la richiede nei turni con tool) e che solo Aggressive rimuove.
+    fn req_con_firma_thinking() -> LlmRequest {
+        let mut r = req();
+        r.messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: MessageContent::Text("penso".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: Some("sig-di-un-altro-turno".into()),
+            reasoning: None,
+        });
+        r
     }
 
     #[tokio::test]
     async fn history_client_error_sanitize_retry_poi_successo() {
-        let p = FakeProvider::new("mistral", Behaviour::ErrHistoryThenOk);
+        // Il retry aggressivo resta quando serve: qui la firma di thinking c'e',
+        // Aggressive la toglie, la richiesta cambia e il provider accetta.
+        let p = FakeProvider::new("anthropic", Behaviour::ErrHistoryUntilSanitized);
         let resolved = vec![ResolvedProvider {
             provider: p.clone(),
-            model: "mistral-small-latest".into(),
+            model: "claude-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
-            .await
-            .unwrap();
+        let resp = run_fallback(
+            &resolved,
+            &cooldown,
+            &req_con_firma_thinking(),
+            true,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.content, "ok-after-sanitize");
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Corpo VERBATIM del 400 DeepSeek misurato il 2026-07-26 sui log del
+    /// gateway: e' da qui che nascono status e codice strutturato, non da un
+    /// `ProviderHttpError` compilato a mano nel test (regola O).
+    const BODY_400_DEEPSEEK: &str = r#"{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#;
+
+    /// History in thinking mode DeepSeek: un assistant che porta il proprio
+    /// `reasoning`. Il sanitizer lo CONSERVA in entrambe le modalita' (DeepSeek
+    /// lo esige) e non c'e' nessuna tool-call pendente da riconciliare: e' il
+    /// caso in cui Aggressive non ha nulla da fare.
+    fn req_deepseek_con_reasoning() -> LlmRequest {
+        let mut r = req();
+        r.messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: MessageContent::Text("ecco".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+            reasoning: Some("catena di pensiero deepseek".into()),
+        });
+        r
+    }
+
+    #[tokio::test]
+    async fn history_client_error_senza_effetto_della_sanificazione_non_ritenta() {
+        // IL DIFETTO MISURATO (log gateway 2026-07-26, 13:29:04.314 -> .809): su
+        // un 400 di formato il gateway annunciava "sanificazione aggressiva e
+        // retry", la sanificazione non toglieva NIENTE, e mezzo secondo dopo la
+        // stessa identica richiesta tornava rifiutata. Una chiamata pagata a
+        // vuoto a ogni ciclo (5 occorrenze in 20 minuti su deepseek e anthropic).
+        //
+        // Un 400 e' deterministico: a input uguale, esito uguale. Se la
+        // sanificazione aggressiva non cambia la richiesta, il retry non puo'
+        // avere un esito diverso e non va speso.
+        let richiesta = req_deepseek_con_reasoning();
+
+        // PREMESSA DICHIARATA (regola O): su questa history le due modalita'
+        // coincidono davvero. Se un domani Aggressive iniziasse a toccarla, il
+        // test deve dirlo qui invece di fallire piu' sotto per un motivo oscuro.
+        let (spedita_al_primo_tentativo, _) = history_sanitizer::sanitized_for_attempt(
+            &richiesta.messages,
+            "deepseek",
+            SanitizeMode::Standard,
+        );
+        assert!(
+            !history_sanitizer::retry_changes_history(
+                &richiesta.messages,
+                &spedita_al_primo_tentativo,
+                "deepseek",
+                SanitizeMode::Aggressive,
+            ),
+            "premessa del test decaduta: su questa history Aggressive ora cambia qualcosa"
+        );
+
+        let p = RealBodyProvider::new("deepseek", 400, BODY_400_DEEPSEEK);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "deepseek-chat".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &richiesta,
+            true,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        // LA CONSEGUENZA: una sola chiamata al provider. Mutazione: rimettendo il
+        // retry incondizionato (il `continue` senza confronto) qui si legge 2.
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            1,
+            "seconda chiamata al provider con una richiesta identica alla prima"
+        );
+        // Il rifiuto resta quello onesto del provider, non degrada in altro.
+        let details = err.details.expect("details presenti");
+        assert_eq!(details["failures"][0]["class"], "client_error");
+        assert_eq!(details["failures"][0]["status"], 400);
+        assert!(!cooldown.is_in_cooldown("deepseek")); // il provider e' sano
     }
 
     // ── Body d'errore strutturato (regola M): classe per-provider nei details ──
@@ -3239,6 +3383,7 @@ mod tests {
         name: String,
         status: u16,
         body: String,
+        calls: AtomicUsize,
     }
 
     impl RealBodyProvider {
@@ -3247,6 +3392,7 @@ mod tests {
                 name: name.to_string(),
                 status,
                 body: body.to_string(),
+                calls: AtomicUsize::new(0),
             })
         }
     }
@@ -3269,6 +3415,7 @@ mod tests {
             &[0, 1, 2]
         }
         async fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Err(
                 ProviderHttpError::from_response(&self.name, self.status, self.body.clone())
                     .into(),

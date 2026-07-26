@@ -91,6 +91,55 @@ pub fn sanitize_history(
     report
 }
 
+/// Prepara la history di UN tentativo: applica [`sanitize_history`] a una copia
+/// di `original` e ritorna il risultato accanto al report.
+///
+/// Punto unico (regola L+O) di "come nasce la history che finisce sul wire". Il
+/// ciclo di retry del gateway e il controllo "un retry cambierebbe la
+/// richiesta?" devono ottenerla per la STESSA strada: se il controllo se la
+/// costruisse per conto proprio misurerebbe una richiesta diversa da quella che
+/// verrebbe davvero spedita, e la sua risposta non direbbe nulla sul sistema.
+///
+/// La funzione e' pura e deterministica: a parita' di `original`, `provider` e
+/// `mode` il risultato e' identico. E' questa proprieta' — non un caching — a
+/// garantire che il controllo e la spedizione parlino dello stesso oggetto.
+pub fn sanitized_for_attempt(
+    original: &[LlmMessage],
+    target_provider: &str,
+    mode: SanitizeMode,
+) -> (Vec<LlmMessage>, SanitizeReport) {
+    let mut messages = original.to_vec();
+    let report = sanitize_history(&mut messages, target_provider, mode);
+    (messages, report)
+}
+
+/// True se ritentare in `mode` spedirebbe una history DIVERSA da `sent` (quella
+/// che il provider ha appena rifiutato). E' la condizione perche' il retry possa
+/// avere un esito diverso: un 4xx e' deterministico, a input uguale risponde
+/// uguale, quindi rispedire gli stessi byte e' solo una chiamata pagata per
+/// riottenere lo stesso errore.
+///
+/// La modalita' [`SanitizeMode::Aggressive`] NON garantisce di cambiare qualcosa:
+/// rispetto a Standard aggiunge la rimozione delle firme di thinking (Anthropic,
+/// Google) e l'iniezione dei tool-result sintetici oltre la soglia. Su una
+/// history DeepSeek senza tool-call pendenti non ha nulla da fare — il
+/// `reasoning` non lo tocca, perche' il provider lo esige — e produce la stessa
+/// identica richiesta.
+///
+/// `original` e' la history di partenza, non quella gia' sanificata: il
+/// candidato deve nascere per la stessa strada del tentativo vero
+/// ([`sanitized_for_attempt`]), altrimenti la risposta riguarderebbe una
+/// richiesta che nessuno spedira' mai (regola O).
+pub fn retry_changes_history(
+    original: &[LlmMessage],
+    sent: &[LlmMessage],
+    target_provider: &str,
+    mode: SanitizeMode,
+) -> bool {
+    let (candidate, _) = sanitized_for_attempt(original, target_provider, mode);
+    candidate != sent
+}
+
 fn normalize_provider(p: &str) -> String {
     p.split('/').next().unwrap_or(p).trim().to_ascii_lowercase()
 }
