@@ -2183,32 +2183,13 @@ const REVIEW_PANEL_PURPOSE: &str = "reviewer";
 /// Round-robin: si mantengono gli N revisori decisi dal dimensionamento e si
 /// ripete un provider solo se ne esistono meno di N, invece di sacrificare la
 /// dimensione del panel alla diversita'.
-/// Chi votera', nell'ordine degli slot, come `provider/modello`. E' l'unico
-/// punto che lo sa: gli outcome dei revisori non portano la propria provenienza,
-/// quindi senza questa dichiarazione la pluralita' del panel resta invisibile a
-/// valle. `auto` quando nessun candidato e' stato risolto (revisori senza pin).
-fn etichette_revisori(
-    candidates: &[crate::internal_routing::PurposeProviderCandidate],
-    n: usize,
-) -> Vec<String> {
-    (0..n)
-        .map(|i| {
-            candidates
-                .get(i % candidates.len().max(1))
-                .map(|c| format!("{}/{}", c.provider, c.model))
-                .unwrap_or_else(|| "auto".to_string())
-        })
-        .collect()
-}
-
-async fn spawn_reviewers(
+/// Provider distinti su cui pinnare i revisori. Vuoto se il purpose non e'
+/// risolvibile: il panel prosegue senza pin, con un WARN che nomina il rischio.
+async fn candidati_revisori(
     ctx: &AgentToolContext,
     n: usize,
-    task: &str,
-    expected: &str,
-    assegnati: &mut Vec<String>,
-) -> Vec<Value> {
-    let candidates = crate::internal_routing::resolve_purpose_provider_candidates_db(
+) -> Vec<crate::internal_routing::PurposeProviderCandidate> {
+    crate::internal_routing::resolve_purpose_provider_candidates_db(
         &ctx.core.db,
         REVIEW_PANEL_PURPOSE,
         n,
@@ -2222,7 +2203,63 @@ async fn spawn_reviewers(
             "review panel: purpose non risolvibile, revisori senza pin (giudizio unico replicato)"
         );
         Vec::new()
-    });
+    })
+}
+
+/// Quanti revisori convocare davvero, dati `richiesti` slot e i candidati
+/// distinti disponibili.
+///
+/// Mai piu' dei candidati: due revisori sullo STESSO provider e modello non sono
+/// un quorum, sono un giudizio unico contato due volte, e il panel lo
+/// conteggerebbe come se fossero due pareri indipendenti. Meglio un panel piu'
+/// piccolo e onesto che uno grande e finto. Senza candidati (purpose non
+/// risolvibile) si tiene il numero richiesto: i revisori partono senza pin, come
+/// prima del pin per provider.
+fn revisori_effettivi(richiesti: usize, candidati_distinti: usize) -> usize {
+    if candidati_distinti == 0 {
+        return richiesti;
+    }
+    richiesti.min(candidati_distinti)
+}
+
+/// Chi votera', nell'ordine degli slot, come `provider/modello`. E' l'unico
+/// punto che lo sa: gli outcome dei revisori non portano la propria provenienza,
+/// quindi senza questa dichiarazione la pluralita' del panel resta invisibile a
+/// valle. `auto` quando nessun candidato e' stato risolto (revisori senza pin).
+fn etichette_revisori(
+    candidates: &[crate::internal_routing::PurposeProviderCandidate],
+    n: usize,
+) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            candidates
+                .get(i)
+                .map(|c| format!("{}/{}", c.provider, c.model))
+                .unwrap_or_else(|| "auto".to_string())
+        })
+        .collect()
+}
+
+async fn spawn_reviewers(
+    ctx: &AgentToolContext,
+    richiesti: usize,
+    task: &str,
+    expected: &str,
+    assegnati: &mut Vec<String>,
+) -> Vec<Value> {
+    let candidates = candidati_revisori(ctx, richiesti).await;
+    // Mai due revisori sullo stesso provider: si riduce il panel invece di
+    // duplicare. Il taglio e' dichiarato, non silenzioso.
+    let n = revisori_effettivi(richiesti, candidates.len());
+    if n < richiesti {
+        tracing::warn!(
+            richiesti,
+            convocati = n,
+            purpose = %REVIEW_PANEL_PURPOSE,
+            "review panel ridotto: provider distinti insufficienti, meglio meno \
+             revisori che due voti dallo stesso modello contati come indipendenti"
+        );
+    }
     assegnati.extend(etichette_revisori(&candidates, n));
 
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
@@ -2231,7 +2268,7 @@ async fn spawn_reviewers(
         let task = task.to_string();
         let expected = expected.to_string();
         let pin = candidates
-            .get(i % candidates.len().max(1))
+            .get(i)
             .map(|c| (c.provider.clone(), c.model.clone()));
         async move {
             match pin {
@@ -4739,6 +4776,23 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSIONE (2026-07-26, emersa dal campo grazie al campo `reviewers`):
+    /// col round-robin il panel duplicava il revisore quando i provider distinti
+    /// erano meno degli slot. Osservato: due revisori entrambi
+    /// `openrouter/z-ai/glm-4.7-flash`, cioe' un giudizio unico che il quorum
+    /// contava come due pareri indipendenti.
+    #[test]
+    fn il_panel_non_duplica_mai_lo_stesso_revisore() {
+        // Due slot ma un solo provider distinto: si convoca UN revisore.
+        assert_eq!(revisori_effettivi(2, 1), 1);
+        assert_eq!(revisori_effettivi(3, 2), 2);
+        // Candidati in abbondanza: si tiene la dimensione richiesta.
+        assert_eq!(revisori_effettivi(2, 5), 2);
+        // Nessun candidato (purpose non risolvibile): i revisori partono senza
+        // pin, come prima del pin per provider, e la dimensione resta quella.
+        assert_eq!(revisori_effettivi(3, 0), 3);
+    }
 
     /// REGRESSIONE (2026-07-26): tutti i revisori giravano sullo STESSO
     /// provider/modello, perche' `convene_review_panel` li lanciava senza pin e
