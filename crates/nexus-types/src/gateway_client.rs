@@ -13,14 +13,6 @@
 
 use sqlx::PgPool;
 
-/// Token di servizio verso il gateway. E' un SEGRETO, quindi ammesso in env
-/// (come negli altri call site del gateway, es. `NexusGatewayClient::from_db`);
-/// il fallback e' il token dev interno.
-fn gateway_service_token() -> String {
-    std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string())
-}
-
 /// Corpo della richiesta `/v1/complete`. `pin_provider` esegue ESATTAMENTE il
 /// provider gia' risolto a monte: senza, il gateway rifarebbe un routing suo e
 /// potrebbe divergere dalla decisione per tier del chiamante (regola G).
@@ -70,12 +62,16 @@ pub async fn gateway_text_complete(
     let gw_url = format!("http://127.0.0.1:{gw_port}");
     let body = complete_body(provider, model, prompt, feature, max_tokens);
 
+    // Bearer di servizio: JWT a vita breve firmato con la chiave di piattaforma
+    // (punto unico `nexus_auth::service_bearer`). Prima era un valore statico
+    // con fallback hardcoded nel sorgente, che valeva come bypass dell'auth.
+    let bearer = nexus_auth::service_bearer(db)
+        .await
+        .map_err(|e| format!("bearer di servizio non disponibile: {e}"))?;
+
     let resp = reqwest::Client::new()
         .post(format!("{gw_url}/v1/complete"))
-        .header(
-            "Authorization",
-            format!("Bearer {}", gateway_service_token()),
-        )
+        .header("Authorization", format!("Bearer {bearer}"))
         .json(&body)
         .timeout(std::time::Duration::from_secs(GATEWAY_TIMEOUT_SECS))
         .send()

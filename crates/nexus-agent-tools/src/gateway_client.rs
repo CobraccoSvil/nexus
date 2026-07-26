@@ -164,7 +164,7 @@ pub async fn gateway_vision_complete(
     feature: &str,
 ) -> Result<GwVisionResult, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwRequestBody {
         // Il gateway accetta "provider/model" come pin esplicito; valorizziamo
@@ -309,7 +309,7 @@ pub async fn gateway_image_generate(
     caller: &GwCaller,
 ) -> Result<GwImageOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwImageRequestBody {
         model: model.to_string(),
@@ -446,7 +446,7 @@ pub async fn gateway_generate_video(
     caller: &GwCaller,
 ) -> Result<GwVideoOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
     let poll_timeout = resolve_video_poll_timeout(db).await;
 
     let body = GwVideoRequestBody {
@@ -592,7 +592,7 @@ pub async fn gateway_transcribe_audio(
     caller: &GwCaller,
 ) -> Result<GwTranscribeOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwTranscribeRequestBody {
         model: model.to_string(),
@@ -717,7 +717,7 @@ pub async fn gateway_text_to_speech(
     caller: &GwCaller,
 ) -> Result<GwTtsOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwTtsRequestBody {
         model: model.to_string(),
@@ -837,7 +837,7 @@ pub async fn gateway_batch_submit(
     max_tokens: u32,
 ) -> Result<String, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let items: Vec<Value> = requests
         .iter()
@@ -907,7 +907,7 @@ pub async fn gateway_batch_status(
     batch_id: &str,
 ) -> Result<GwBatchStatus, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let client = batch_http_client()?;
     let resp = client
@@ -1012,11 +1012,17 @@ async fn resolve_gateway_url(db: &PgPool) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// Token di servizio del gateway. E' un SEGRETO: vive in env
-/// `NEXUS_GATEWAY_SERVICE_TOKEN` (stessa convenzione di `main.rs`), mai nel DB.
-/// Il fallback dev e' coerente con gli altri call site interni.
-fn resolve_gateway_token() -> String {
-    std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN").unwrap_or_else(|_| "dev-internal-token".to_string())
+/// Bearer di servizio verso il gateway: JWT a vita breve firmato con la chiave
+/// di piattaforma (punto unico `nexus_auth::service_bearer`).
+///
+/// Prima era un valore STATICO letto da env con fallback `"dev-internal-token"`
+/// scritto nel sorgente. Poiche' quell'env non era impostata da nessuna parte,
+/// il valore effettivo era la costante pubblica — e il gateway la accettava
+/// come bypass totale dell'autenticazione.
+async fn resolve_gateway_token(db: &PgPool) -> Result<String, String> {
+    nexus_auth::service_bearer(db)
+        .await
+        .map_err(|e| format!("bearer di servizio non disponibile: {e}"))
 }
 
 #[cfg(test)]

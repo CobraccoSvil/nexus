@@ -274,7 +274,11 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum_mw::from_fn_with_state(state.clone(), require_admin))
         .with_state(state.clone());
 
-    // Internal routes (no auth, only accessible from localhost)
+    // Rotte interne: nessuna autenticazione, raggiungibili SOLO dalla macchina
+    // locale. Il commento diceva gia' "only accessible from localhost", ma era
+    // un'affermazione non verificata: il servizio ascolta su 0.0.0.0 e chiunque
+    // arrivasse alla porta leggeva i settings, `jwt_secret` compreso. Ora il
+    // vincolo e' imposto da `internal_only_middleware` sull'indirizzo sorgente.
     let internal_routes = Router::new()
         .route("/settings/:key", get(settings::get_raw_value))
         .with_state(state.clone());
@@ -283,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api/admin", admin_routes)
         .nest("/internal", internal_routes)
         .route("/health", get(|| async { "ok" }))
+        .layer(axum_mw::from_fn(nexus_auth::internal_only_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
@@ -293,7 +298,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Admin Service listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info`: senza, l'indirizzo del chiamante
+    // non arriva ai middleware e `internal_only_middleware` rifiuta tutto il
+    // blocco `/internal/*` (per costruzione: non sa decidere, quindi nega).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

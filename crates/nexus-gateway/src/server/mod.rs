@@ -34,11 +34,6 @@ use crate::redaction::presidio_client::PresidioClient;
 
 use self::bootstrap::GatewayConfig;
 
-/// Token di servizio di default in dev (parita' col `?? "dev-internal-token"`
-/// del server.ts). Non e' un segreto di produzione: il token reale viaggia
-/// nell'env `NEXUS_GATEWAY_SERVICE_TOKEN`.
-pub const DEV_SERVICE_TOKEN: &str = "dev-internal-token";
-
 /// Stato condiviso del gateway. Clonabile a basso costo: i campi pesanti vivono
 /// dietro `Arc`/`RwLock`. Il blocco `runtime` e' protetto da `RwLock` perche'
 /// `/admin/reload` lo sostituisce a caldo (provider, policy, alias) senza
@@ -47,8 +42,6 @@ pub const DEV_SERVICE_TOKEN: &str = "dev-internal-token";
 pub struct AppState {
     /// Pool Postgres condiviso (settings, ledger, quota, prezzi).
     pub db: PgPool,
-    /// Token di servizio per le chiamate interne (mcp-core -> gateway).
-    pub service_token: String,
     /// Chiave di firma della piattaforma (>= 32 char, garantita dal bootstrap).
     ///
     /// NON e' un `Option`: quando lo era, l'assenza faceva passare qualunque

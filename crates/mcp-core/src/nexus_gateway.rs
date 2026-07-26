@@ -10,7 +10,15 @@ use serde_json::Value;
 pub struct NexusGatewayClient {
     http: reqwest::Client,
     base_url: String,
-    service_token: String,
+    /// Pool su cui coniare il bearer di servizio a ogni richiesta.
+    ///
+    /// Prima qui c'era un `service_token: String` STATICO, letto da un'env che
+    /// non era impostata da nessuna parte e quindi sempre pari alla costante
+    /// `"dev-internal-token"` scritta nel sorgente — che il gateway accettava
+    /// come bypass dell'autenticazione. Ora il token e' un JWT a vita breve
+    /// firmato con la chiave di piattaforma: va coniato al momento dell'uso,
+    /// non conservato, perche' scade.
+    db: sqlx::PgPool,
     /// Il run per cui questo client e' stato costruito, se noto: viene timbrato
     /// su ogni richiesta cosi' il gateway dimensiona i propri budget sullo stesso
     /// cronometro del chiamante.
@@ -496,16 +504,23 @@ async fn resolve_client_timeout_secs(db: &sqlx::PgPool, run_timeout_secs: Option
 }
 
 impl NexusGatewayClient {
-    pub fn new(base_url: String, service_token: String) -> Self {
+    /// Bearer di servizio per questa richiesta: JWT a vita breve firmato con la
+    /// chiave di piattaforma. Il conio e' cachato in `nexus_auth` (TTL piu'
+    /// corta della vita del token), quindi non firma a ogni chiamata.
+    async fn bearer(&self) -> Result<String> {
+        nexus_auth::service_bearer(&self.db).await
+    }
+
+    pub fn new(base_url: String, db: sqlx::PgPool) -> Self {
         let timeout_secs = nexus_auth::llm_timeouts::LlmTimeouts::defaults()
             .client_budget
             .as_secs();
-        Self::with_timeout(base_url, service_token, timeout_secs, None)
+        Self::with_timeout(base_url, db, timeout_secs, None)
     }
 
     fn with_timeout(
         base_url: String,
-        service_token: String,
+        db: sqlx::PgPool,
         timeout_secs: u64,
         run_timeout_secs: Option<u64>,
     ) -> Self {
@@ -523,7 +538,7 @@ impl NexusGatewayClient {
                 .build()
                 .expect("reqwest client"),
             base_url,
-            service_token,
+            db,
         }
     }
 
@@ -548,12 +563,10 @@ impl NexusGatewayClient {
     pub async fn from_db_for_run(db: &sqlx::PgPool, run_timeout_secs: Option<u64>) -> Self {
         let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
         let gw_url = format!("http://127.0.0.1:{gw_port}");
-        let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-            .unwrap_or_else(|_| "dev-internal-token".to_string());
         let timeout_secs = resolve_client_timeout_secs(db, run_timeout_secs).await;
         Self::with_timeout(
             gw_url,
-            gw_token,
+            db.clone(),
             timeout_secs,
             nexus_auth::llm_timeouts::run_secs_utile(run_timeout_secs),
         )
@@ -574,7 +587,7 @@ impl NexusGatewayClient {
         let resp = self
             .http
             .post(format!("{}/v1/complete", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header("Authorization", format!("Bearer {}", self.bearer().await?))
             .json(&self.body_for(req))
             .send()
             .await
@@ -617,7 +630,7 @@ impl NexusGatewayClient {
         let resp = self
             .http
             .get(format!("{}/v1/models/{provider}", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header("Authorization", format!("Bearer {}", self.bearer().await?))
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await

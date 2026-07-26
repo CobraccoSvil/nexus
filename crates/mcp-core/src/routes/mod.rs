@@ -73,6 +73,13 @@ pub fn build_app_router(state: AppState, cors: CorsLayer) -> Router {
     let router = prompt_templates::merge(router, &state);
 
     router
+        // Confine delle rotte interne: sono montate fuori dall'autenticazione
+        // (servono ai processi Nexus per parlarsi), ma il servizio ascolta su
+        // 0.0.0.0 — quindi "interno" dev'essere una proprieta' verificata, non
+        // una parola nel commento. Il layer sta QUI, sopra tutti i gruppi, cosi'
+        // copre ogni rotta `/internal/*` presente e FUTURA, invece di dipendere
+        // dal fatto che chi la registra si ricordi di proteggerla.
+        .layer(axum_mw::from_fn(nexus_auth::internal_only_middleware))
         .layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::event_capture_middleware,

@@ -1234,9 +1234,16 @@ async fn serve_http(state: AppState, mcp_http_port: u16) -> anyhow::Result<()> {
         tokio::net::TcpListener::from_std(std_listener)?
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(graceful_shutdown_signal())
-        .await?;
+    // `into_make_service_with_connect_info` porta l'indirizzo del chiamante fino
+    // ai middleware: senza, `internal_only_middleware` non puo' distinguere una
+    // chiamata locale da una che arriva dalla rete, e (per costruzione) rifiuta
+    // tutto il blocco `/internal/*`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful_shutdown_signal())
+    .await?;
     Ok(())
 }
 

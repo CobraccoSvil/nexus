@@ -26,7 +26,7 @@ use crate::providers::{
 use crate::redaction::presidio_client::PresidioClient;
 use crate::types::SensitivityTier;
 
-use super::{AppState, RuntimeState, DEV_SERVICE_TOKEN};
+use super::{AppState, RuntimeState};
 
 /// Default dei path dei file di configurazione (relativi alla repo root). Sono
 /// STRUTTURA, non valori di business: i nomi dei file sono fissi nel repo. I
@@ -460,9 +460,6 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
     let config = GatewayConfig::load(&db).await;
     let runtime = build_runtime(&db, &http, config, timeouts).await?;
 
-    let service_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| DEV_SERVICE_TOKEN.to_string());
-
     // Chiave di firma della piattaforma. NON e' un `Option`: finche' lo era,
     // `token_is_valid` aveva un ramo che con `None` faceva passare QUALUNQUE
     // richiesta, anche senza header — e quello stato era raggiungibile per
@@ -496,7 +493,6 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
 
     Ok(AppState {
         db,
-        service_token,
         jwt_secret,
         mcp_core_url,
         cooldown,

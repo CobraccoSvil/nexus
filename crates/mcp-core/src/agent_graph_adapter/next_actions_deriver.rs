@@ -304,17 +304,16 @@ impl NextActionsDeriverAdapter {
     }
 
     /// Costruisce il client gateway dalla porta nel DB (regola G: niente env/porta
-    /// hardcoded). `None` se la lettura della porta fallisce. Riusa il token di
-    /// servizio condiviso (env per il solo segreto, come `main.rs`).
+    /// hardcoded). Il bearer di servizio lo conia il client a ogni richiesta
+    /// (JWT a vita breve firmato con la chiave di piattaforma): qui non transita
+    /// piu' alcun segreto, e non c'e' piu' un fallback hardcoded da dimenticare.
     async fn gateway_client(&self) -> Option<NexusGatewayClient> {
         let port = nexus_auth::resolve_port(&self.db, "nexus_gateway_port").await;
         if port == 0 {
             return None;
         }
         let url = format!("http://127.0.0.1:{port}");
-        let token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-            .unwrap_or_else(|_| "dev-internal-token".to_string());
-        Some(NexusGatewayClient::new(url, token))
+        Some(NexusGatewayClient::new(url, self.db.clone()))
     }
 
     /// Prompt per il modello estrattore: template DB `system.choices_extractor` se

@@ -1,11 +1,12 @@
 pub mod llm_timeouts;
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, Request, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
+use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -343,6 +344,132 @@ pub async fn resolve_port(db: &PgPool, key: &str) -> u16 {
 
 pub async fn get_or_create_jwt_secret(db: &PgPool) -> anyhow::Result<String> {
     get_or_create_platform_secret(db, "jwt_secret").await
+}
+
+/// Prefissi delle rotte riservate alla comunicazione fra processi Nexus.
+/// Non hanno il layer di autenticazione: il loro confine e' l'origine della
+/// connessione, imposto da [`internal_only_middleware`].
+const INTERNAL_PATH_PREFIXES: &[&str] = &["/internal/", "/api/internal/"];
+
+/// Vero se il path appartiene al blocco interno. Punto unico del predicato:
+/// i due servizi che montano quelle rotte devono usare lo STESSO criterio.
+pub fn is_internal_path(path: &str) -> bool {
+    INTERNAL_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Nega le rotte `/internal/*` a chi non chiama dalla macchina locale.
+///
+/// Quelle rotte sono montate FUORI dal layer di autenticazione — e' il loro
+/// scopo: servono a far parlare fra loro i processi Nexus senza credenziali
+/// utente. Ma i servizi ascoltano su `0.0.0.0`, quindi "interno" era una parola
+/// nel commento, non una proprieta' verificata: chiunque raggiungesse la porta
+/// le interrogava. Una di esse restituiva la chiave di firma della piattaforma.
+///
+/// Il confine ora e' l'indirizzo sorgente. Se `ConnectInfo` non e' disponibile
+/// la richiesta viene RIFIUTATA, non lasciata passare: un middleware di
+/// sicurezza che degrada a permissivo quando non sa decidere e' il difetto che
+/// stiamo chiudendo, non la sua cura. Perche' l'informazione ci sia, il server
+/// deve servire con `into_make_service_with_connect_info::<SocketAddr>()`.
+///
+/// NB: se un giorno si mettesse un reverse proxy davanti a questi servizi,
+/// l'indirizzo sorgente diventerebbe quello del proxy e il filtro perderebbe
+/// significato. In quel caso le rotte interne vanno spostate su un listener
+/// separato legato a `127.0.0.1`, non "corrette" leggendo `X-Forwarded-For`
+/// (un header che il client controlla non e' un confine).
+pub async fn internal_only_middleware(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    if !is_internal_path(&path) {
+        return next.run(req).await;
+    }
+
+    let consentito = match connect_info {
+        Some(ConnectInfo(addr)) => addr.ip().is_loopback(),
+        None => {
+            tracing::error!(
+                path = %path,
+                "rotta interna senza ConnectInfo: il server non e' avviato con \
+                 into_make_service_with_connect_info, rifiuto la richiesta"
+            );
+            false
+        }
+    };
+
+    if consentito {
+        return next.run(req).await;
+    }
+
+    // Niente indirizzo nel corpo della risposta: si logga, non si racconta.
+    tracing::warn!(path = %path, "rotta interna richiesta da un'origine non locale: rifiutata");
+    (
+        StatusCode::FORBIDDEN,
+        "rotta interna: raggiungibile solo dalla macchina locale",
+    )
+        .into_response()
+}
+
+/// Vita del bearer di servizio. Corta: e' la finestra entro cui un token
+/// intercettato resta spendibile.
+const SERVICE_BEARER_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// TTL della cache del token coniato, piu' corta della vita del token: quando
+/// la cache scade il token in mano al chiamante e' ancora valido, quindi non
+/// esiste un istante in cui si presenta una credenziale gia' scaduta.
+const SERVICE_BEARER_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// `sub` dei bearer di servizio. Non e' un utente: identifica le chiamate
+/// interne fra processi Nexus nei log del gateway.
+pub const SERVICE_SUBJECT: &str = "nexus-service";
+
+static SERVICE_BEARER_CACHE: LazyLock<TtlCache<String, String>> =
+    LazyLock::new(|| TtlCache::new(SERVICE_BEARER_CACHE_TTL));
+
+/// Bearer per le chiamate interne verso il gateway: un JWT a vita breve firmato
+/// con la chiave di piattaforma.
+///
+/// Sostituisce il bearer STATICO condiviso che c'era prima
+/// (`DEV_SERVICE_TOKEN = "dev-internal-token"`, hardcoded come fallback in otto
+/// punti perche' l'env `NEXUS_GATEWAY_SERVICE_TOKEN` non era impostata da
+/// nessuna parte). Quel valore era nel sorgente e valeva come bypass totale
+/// dell'autenticazione su un servizio in ascolto su `0.0.0.0`: misurato, il
+/// gateway rispondeva 401 senza header e 200 con il token letto dal repo.
+///
+/// Perche' un JWT e non una nuova chiave dedicata: il gateway lo valida con lo
+/// STESSO `decode::<Claims>` che usa per i token utente, quindi il ramo speciale
+/// "se coincide col service token allora passa" — cioe' il bypass — sparisce
+/// invece di essere sostituito da un altro segreto da custodire. Non c'e' piu'
+/// niente da indovinare: chi non ha la chiave di firma non conia nulla.
+pub async fn service_bearer(db: &PgPool) -> anyhow::Result<String> {
+    // La chiave include l'identita' del pool (stesso criterio della cache dei
+    // settings): il token e' firmato con la chiave di QUEL database, servirlo a
+    // un altro produrrebbe un 401 inspiegabile.
+    let cache_key = format!("{}::{}", pool_identity(db), SERVICE_SUBJECT);
+    if let Some(tok) = SERVICE_BEARER_CACHE.get(&cache_key) {
+        return Ok(tok);
+    }
+
+    let secret = get_or_create_jwt_secret(db).await?;
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("orologio di sistema prima di UNIX_EPOCH: {e}"))?
+        + SERVICE_BEARER_TTL;
+    let claims = Claims {
+        sub: SERVICE_SUBJECT.to_string(),
+        role: "service".to_string(),
+        exp: exp.as_secs() as usize,
+    };
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| anyhow::anyhow!("firma del bearer di servizio fallita: {e}"))?;
+
+    SERVICE_BEARER_CACHE.insert(cache_key, token.clone());
+    Ok(token)
 }
 
 /// Risolve un segreto di piattaforma, generandolo se la riga e' vuota.
@@ -825,6 +952,52 @@ mod tests_settings_cache {
             Some("secondo"),
             "scaduto il TTL la lettura torna al DB"
         );
+    }
+}
+
+/// Il confine delle rotte interne, provato sul predicato che lo decide.
+#[cfg(test)]
+mod tests_internal_boundary {
+    use super::*;
+
+    #[test]
+    fn riconosce_le_rotte_interne_dei_due_servizi() {
+        // Le forme realmente montate: mcp-core usa entrambi i prefissi,
+        // admin-service il primo.
+        assert!(is_internal_path("/internal/settings/jwt_secret"));
+        assert!(is_internal_path("/internal/dev-login-token"));
+        assert!(is_internal_path("/api/internal/routing/decide"));
+    }
+
+    #[test]
+    fn non_tocca_le_rotte_normali() {
+        // Se il predicato fosse troppo largo, il filtro spegnerebbe l'API.
+        assert!(!is_internal_path("/api/chat/messages"));
+        assert!(!is_internal_path("/health"));
+        assert!(!is_internal_path("/api/admin/settings"));
+    }
+
+    /// Un path che CONTIENE "internal" senza esserne il prefisso non e' una
+    /// rotta interna: il filtro non deve poter essere ne' aggirato ne' esteso
+    /// per somiglianza lessicale.
+    #[test]
+    fn non_si_lascia_ingannare_da_un_path_somigliante() {
+        assert!(!is_internal_path("/api/projects/internal-docs"));
+        assert!(!is_internal_path("/notinternal/settings/jwt_secret"));
+        // Il caso che conta: un prefisso plausibile ma diverso non passa.
+        assert!(!is_internal_path("/internalx/settings/jwt_secret"));
+    }
+
+    #[test]
+    fn l_indirizzo_locale_e_distinguibile_da_quello_remoto() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // E' il criterio che il middleware applica: `is_loopback`.
+        assert!(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)).is_loopback());
+        assert!(IpAddr::V6(Ipv6Addr::LOCALHOST).is_loopback());
+        // Un indirizzo di LAN non e' locale, ed e' esattamente l'origine da cui
+        // i segreti erano scaricabili.
+        assert!(!IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)).is_loopback());
+        assert!(!IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)).is_loopback());
     }
 }
 

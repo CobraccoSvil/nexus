@@ -3938,13 +3938,15 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_client_costruibile() {
-        // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza I/O).
-        let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), "tok".to_string());
         // Pool lazy: nessuna connessione al DB, ma la costruzione del pool sqlx
         // spawna un task di manutenzione -> serve il runtime tokio del test.
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nexus@localhost:1/na")
             .expect("connect_lazy non fa I/O");
+        // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza
+        // I/O). Tiene il pool perche' il bearer di servizio si conia per
+        // richiesta, non e' piu' una stringa statica passata al costruttore.
+        let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), pool.clone());
         let _adapter = GatewayLlmAdapter::new(gw, pool, String::new(), String::new());
     }
 
