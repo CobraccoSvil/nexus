@@ -100,6 +100,7 @@ mod routing_config;
 mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
+mod run_lineage;
 mod run_reaper;
 pub use nexus_tool_kit::sandbox;
 mod security;

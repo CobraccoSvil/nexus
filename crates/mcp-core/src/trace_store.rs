@@ -66,11 +66,37 @@ pub async fn persist_trace(
 /// `run_pool` DEVE essere il pool del DB dove vivono i run della sessione
 /// (progetto a flag separazione ON), risolto dal chiamante — stessa convenzione
 /// di [`persist_trace`] (regola L: la risoluzione vive su UN solo lato).
+///
+/// ## `parentRunId`: la parentela viaggia col dato che deve essere attribuito
+///
+/// Le tracce di un sub-agente sono persistite sotto il `run_id` PROPRIO del
+/// figlio, non sotto quello del padre. Chi somma i token o compone la
+/// ripartizione per provider di un run deve quindi sapere quali run lo
+/// compongono, e finora il frontend lo deduceva dai meta-step di NARRAZIONE: un
+/// canale di presentazione, che il review panel non emette affatto. Risultato
+/// misurato: 4 cicli di review su openrouter spariti dalla barra dei costi.
+///
+/// Qui ogni traccia di un sub-run viene annotata col campo `parentRunId` letto
+/// dal PUNTO UNICO della parentela ([`crate::run_lineage`], che la prende dal
+/// DB). Il campo NON e' persistito in `nexus_agent_traces`: e' una join in
+/// lettura, quindi non puo' divergere dalla fonte. Se la lettura della parentela
+/// fallisce le tracce escono comunque (senza annotazione): la telemetria degrada,
+/// non sparisce.
 pub async fn get_session_traces(
     run_pool: &PgPool,
     session_id: Uuid,
     user_id: Uuid,
 ) -> Result<std::collections::HashMap<String, Vec<Value>>, sqlx::Error> {
+    let parent_by_child = crate::run_lineage::parent_run_by_child(run_pool, session_id, user_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "trace_store: parentela sub-run non leggibile, tracce senza parentRunId"
+            );
+            std::collections::HashMap::new()
+        });
     let rows = sqlx::query(
         "SELECT t.run_id, t.payload \
          FROM nexus_agent_traces t \
@@ -93,11 +119,18 @@ pub async fn get_session_traces(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let payload: Value = row
+        let mut payload: Value = row
             .try_get::<Option<Value>, _>("payload")
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}));
+        if let Some(parent) = parent_by_child.get(&run_id) {
+            // camelCase come il resto dell'AITraceEvent (stessa forma dell'evento
+            // SSE): il tipo TypeScript legge `parentRunId`.
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("parentRunId".to_string(), json!(parent.to_string()));
+            }
+        }
         runs.entry(run_id.to_string()).or_default().push(payload);
     }
     Ok(runs)
@@ -150,6 +183,70 @@ mod tests {
         // Ordine per seq: la prima e' iteration 0 (mistral), la seconda google.
         assert_eq!(traces[0]["provider"], json!("mistral"));
         assert_eq!(traces[1]["provider"], json!("google"));
+    }
+
+    /// REGRESSIONE (2026-07-26): la barra costo-per-provider di un run ometteva
+    /// il provider dei revisori. Le tracce del sub-run esistono, sotto il run_id
+    /// del figlio; mancava sul wire il fatto che quel run appartiene al padre,
+    /// perche' il frontend lo deduceva dai meta-step di NARRAZIONE (che il review
+    /// panel non emette). Qui si verifica il produttore reale del wire: la
+    /// traccia del figlio esce annotata col `parentRunId` del run che lo ha
+    /// convocato, quella del padre no.
+    ///
+    /// Mutazione: togliendo l'annotazione in `get_session_traces`, il campo e'
+    /// assente e la prima assert fallisce con `null`.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn la_traccia_del_subrun_dichiara_il_run_padre(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(&pool, project_id).await;
+        let padre = crate::test_support::insert_agent_run_as(
+            &pool, session_id, project_id, user_id, "completed",
+        )
+        .await;
+        let revisore = crate::test_support::seed_subagent_run(
+            &pool,
+            session_id,
+            project_id,
+            user_id,
+            padre,
+            Some(padre),
+            "review",
+        )
+        .await;
+
+        persist_trace(
+            &pool,
+            session_id,
+            padre,
+            0,
+            &json!({"runId": padre.to_string(), "provider": "deepseek"}),
+        )
+        .await;
+        persist_trace(
+            &pool,
+            session_id,
+            revisore,
+            0,
+            &json!({"runId": revisore.to_string(), "provider": "openrouter"}),
+        )
+        .await;
+
+        let runs = get_session_traces(&pool, session_id, user_id)
+            .await
+            .expect("get ok");
+        let del_figlio = &runs.get(&revisore.to_string()).expect("sub-run presente")[0];
+        assert_eq!(
+            del_figlio["parentRunId"],
+            json!(padre.to_string()),
+            "la traccia del revisore dichiara il run che lo ha convocato"
+        );
+        let del_padre = &runs.get(&padre.to_string()).expect("run padre presente")[0];
+        assert_eq!(
+            del_padre.get("parentRunId"),
+            None,
+            "un run primario non ha un run padre"
+        );
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]

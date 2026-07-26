@@ -124,6 +124,42 @@ pub(crate) async fn insert_agent_run_with_id(
     run_id
 }
 
+/// Semina un SUB-RUN con l'identita' che ha in produzione: la stessa riga in
+/// `agent_runs` (un sub-agente e' un run a se') piu' la riga in
+/// `nexus_subagent_runs` che ne dichiara la provenienza. Ritorna l'id del figlio.
+///
+/// Le due colonne di provenienza sono distinte e vanno seminate come tali:
+/// `anchor` finisce in `parent_run_id` (ancora di famiglia per depth-chain e
+/// cost-cap, che per i dispatch da tool vale la SESSIONE) e `dispatcher` in
+/// `dispatcher_run_id` (il run che ha convocato il figlio, cioe' la parentela
+/// run -> run letta da [`crate::run_lineage`]).
+pub(crate) async fn seed_subagent_run(
+    pool: &PgPool,
+    session_id: Uuid,
+    project_id: Uuid,
+    user_id: Uuid,
+    anchor: Uuid,
+    dispatcher: Option<Uuid>,
+    kind: &str,
+) -> Uuid {
+    let child = Uuid::new_v4();
+    insert_agent_run_with_id(pool, child, session_id, project_id, user_id, "completed").await;
+    sqlx::query(
+        "INSERT INTO nexus_subagent_runs \
+             (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, status) \
+         VALUES ($1, $2, $3, $4, $5, 'task di test', 'completed')",
+    )
+    .bind(child)
+    .bind(anchor)
+    .bind(dispatcher)
+    .bind(project_id)
+    .bind(kind)
+    .execute(pool)
+    .await
+    .expect("seed nexus_subagent_runs");
+    child
+}
+
 /// Semina il piano del run (`nexus_agent_plans`) con i soli NOT NULL richiesti.
 ///
 /// E' il prerequisito dei todo: lo schema reale vincola

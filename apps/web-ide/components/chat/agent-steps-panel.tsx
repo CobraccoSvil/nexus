@@ -846,7 +846,7 @@ export function AgentStepsPanel({
                 : composeActivityStream(
                     metaSteps ?? [],
                     activeRunSteps,
-                    traces ? tracesForRun(traces, activeRunData.run.runId, metaSteps ?? []) : [],
+                    traces ? tracesForRun(traces, activeRunData.run.runId) : [],
                     foldThreshold ?? 3,
                   )
             }

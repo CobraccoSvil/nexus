@@ -1540,7 +1540,7 @@ export function MessageList({
               const runId = message.runId;
               const runMeta = metaStepsMap?.get(runId) ?? [];
               const runSteps = agentStepsMap?.get(runId) ?? [];
-              const runTraces = traces ? tracesForRun(traces, runId, runMeta) : [];
+              const runTraces = traces ? tracesForRun(traces, runId) : [];
               const hasRunData = runMeta.length > 0 || runSteps.length > 0 || runTraces.length > 0;
               if (!hasRunData) return null;
               const isLastAssistantRun = message.id === lastAssistantRunMessageId;

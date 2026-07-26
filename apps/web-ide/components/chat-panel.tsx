@@ -390,7 +390,7 @@ export function ChatPanel({
     return composeActivityStream(
       meta,
       agentStepsMap.get(liveRunId) ?? [],
-      tracesForRun(traces, liveRunId, meta),
+      tracesForRun(traces, liveRunId),
       foldThreshold,
     );
   }, [activityStreamEnabled, liveRunId, metaStepsMap, agentStepsMap, traces, foldThreshold]);

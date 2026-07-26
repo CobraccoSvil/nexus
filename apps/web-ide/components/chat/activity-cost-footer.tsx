@@ -2,10 +2,15 @@
 
 // Footer costo-per-provider del nastro attivita' (ADR 0037 sez. 2).
 //
-// Aggrega i token per (provider, model) dalle trace del run (punto unico
-// aggregateTokensByProvider) e PREZZA col catalogo /api/models (usePricingCatalog
-// di provider-badge.tsx). NIENTE prezzi hardcoded (regola G): se il catalogo non
-// ha la entry, il costo di quel bucket e' 0 e restano solo i token.
+// Compone le voci per (provider, model) dal punto unico providerCostBreakdown e
+// le PREZZA col catalogo /api/models (usePricingCatalog di provider-badge.tsx).
+// NIENTE prezzi hardcoded (regola G): se il catalogo non ha la entry, il costo di
+// quella voce e' 0 e restano solo i token.
+//
+// Le trace da passare sono quelle di `tracesForRun`, che include i sub-run: una
+// barra composta sulle sole trace del run padre dichiara una ripartizione e ne
+// omette i provider usati solo dai figli (difetto misurato il 26/07/2026 —
+// vedi `crates/mcp-core/src/run_lineage.rs`).
 //
 // La formula del costo vive in lib/model-catalog.ts (costFromCatalog): quel file
 // non contiene piu' il listino scritto a mano da cui l'ADR prendeva le distanze
@@ -21,7 +26,7 @@ import {
   type ModelPricingEntry,
 } from "./provider-badge";
 import {
-  aggregateTokensByProvider,
+  providerCostBreakdown,
   type ProviderTokenBucket,
 } from "../../lib/use-chat/activity-stream";
 import type { AITraceEvent } from "../../lib/api/agent";
@@ -50,12 +55,14 @@ export function ActivityCostFooter({
   tc: ThemeColors;
 }) {
   const catalog = usePricingCatalog();
-  const buckets = aggregateTokensByProvider(traces);
-  if (buckets.length === 0) return null;
+  // Composizione dal punto unico (regola L): quali voci esistono e come si
+  // sommano vive in `providerCostBreakdown`, testato senza React; qui resta il
+  // solo rendering e il listino, che il punto unico non conosce (regola G).
+  const { voci, totalTokens, totalCostUsd } = providerCostBreakdown(traces, (b) =>
+    bucketCost(b, catalog),
+  );
+  if (voci.length === 0) return null;
 
-  const totalTokens = buckets.reduce((s, b) => s + b.inputTokens + b.outputTokens, 0);
-  const costs = buckets.map((b) => bucketCost(b, catalog));
-  const totalCost = costs.reduce((s, c) => s + c, 0);
   const totalForBar = Math.max(totalTokens, 1);
 
   return (
@@ -89,7 +96,7 @@ export function ActivityCostFooter({
           flexShrink: 0,
         }}
       >
-        {buckets.map((b, i) => {
+        {voci.map((b, i) => {
           const frac = (b.inputTokens + b.outputTokens) / totalForBar;
           return (
             <span
@@ -99,7 +106,7 @@ export function ActivityCostFooter({
           );
         })}
       </span>
-      {buckets.map((b, i) => {
+      {voci.map((b, i) => {
         const color = providerBaseColor(b.provider);
         return (
           <span
@@ -118,12 +125,12 @@ export function ActivityCostFooter({
             >
               {b.provider}
             </span>
-            <b style={{ color }}>${costs[i].toFixed(4)}</b>
+            <b style={{ color }}>${b.costUsd.toFixed(4)}</b>
           </span>
         );
       })}
       <span style={{ marginLeft: "auto" }}>
-        <b style={{ color: tc.text }}>${totalCost.toFixed(4)}</b>
+        <b style={{ color: tc.text }}>${totalCostUsd.toFixed(4)}</b>
       </span>
     </div>
   );

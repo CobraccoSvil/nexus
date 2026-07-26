@@ -4956,6 +4956,7 @@ async fn run_upstream_panels(inp: &UpstreamInputs) -> UpstreamPanels {
         maybe_convene_multi_provider_panel(
             &inp.state,
             inp.session_id,
+            inp.run_id,
             &inp.user_text,
             inp.deliberate,
             inp.plan.as_ref().map(|p| p.multi_provider_providers),
@@ -5573,6 +5574,7 @@ fn render_review_panel_note(panel: &serde_json::Value) -> String {
 async fn maybe_convene_multi_provider_panel(
     state: &AppState,
     session_id: Uuid,
+    run_id: Uuid,
     user_text: &str,
     deliberate: bool,
     provider_target: Option<usize>,
@@ -5596,10 +5598,18 @@ async fn maybe_convene_multi_provider_panel(
     }
     let deps = build_tool_runner_deps(state);
     let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
-    let ctx = match svc.build_ctx(session_id).await {
+    // Ancorato al run primario come il consiglio (punto unico
+    // `build_ctx_for_primary_run`, regola L): senza il run_id gli analisti
+    // nascevano ancorati alla sessione e il loro lavoro non era attribuibile al
+    // run che li aveva convocati (misurato: mistral, google e openrouter avevano
+    // prodotto analisi e la barra dei costi mostrava solo deepseek).
+    let ctx = match svc.build_ctx_for_primary_run(session_id, run_id).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("multi-provider panel: build_ctx fallita (session={session_id}): {e}");
+            tracing::warn!(
+                run_id = %run_id,
+                "multi-provider panel: build_ctx fallita (session={session_id}): {e}"
+            );
             return None;
         }
     };

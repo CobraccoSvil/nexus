@@ -16,8 +16,8 @@ import {
   figureVerdictDisplay,
   foldConsecutiveOkTools,
   aggregateTokensByProvider,
+  providerCostBreakdown,
   tracesForRun,
-  subagentRunIds,
   capStreamToRecent,
   raggruppaBlocchiNastro,
   activityLocalAnchorId,
@@ -26,8 +26,10 @@ import {
   type ToolEvent,
   type ReviewGateEvent,
 } from "./activity-stream.ts";
+import { costFromCatalog, findCatalogEntry } from "../model-catalog.ts";
 import type { MetaStepEntry } from "./types.ts";
 import type { AgentStep, AITraceEvent } from "../api/agent.ts";
+import type { ModelCatalogEntry } from "../api/models.ts";
 
 // ── Costruttori di fixture ──────────────────────────────────────────────────
 
@@ -55,6 +57,37 @@ function step(
     toolResult: extra.toolResult,
     status,
     createdAt: ts(),
+  };
+}
+
+/** Riga di listino: le sole tariffe variano, il resto e' il contratto reale di
+ *  `ModelCatalogEntry` (niente cast: un fixture che aggira il tipo smette di
+ *  misurare il codice vero appena il contratto cambia). */
+function listino(
+  provider: string,
+  model: string,
+  inputPerMln: number,
+  outputPerMln: number,
+): ModelCatalogEntry {
+  return {
+    provider,
+    model,
+    displayName: model,
+    inputCostPerMillionTokens: inputPerMln,
+    outputCostPerMillionTokens: outputPerMln,
+    cacheReadCostPerMillionTokens: null,
+    currency: "USD",
+    performanceTier: null,
+    tierSource: null,
+    agenticIndex: null,
+    qualificationState: null,
+    speedTier: "medium",
+    capabilities: [],
+    contextWindow: 128_000,
+    supportsToolUse: true,
+    batchDiscountPct: 0,
+    isFeatured: false,
+    isEnabled: true,
   };
 }
 
@@ -705,44 +738,108 @@ test("tracesForRun filtra per runId", () => {
   assert.equal(tracesForRun(traces, "a")[0].provider, "google");
 });
 
-test("subagentRunIds legge il campo strutturato subagent_run_id (e correlationId)", () => {
-  beforeEach();
-  const metaSteps: MetaStepEntry[] = [
-    meta("executor_call", { provider: "mistral" }),
-    meta("subagent_started", { subagent_run_id: "sub-1" }),
-    meta("subagent_progress", { subagent_run_id: "sub-1" }),
-    meta("subagent_completed", { subagent_run_id: "sub-1", cost_usd: 0.03 }),
-    { ...meta("subagent_started", {}), correlationId: "sub-2" },
-  ];
-  assert.deepEqual(subagentRunIds(metaSteps).sort(), ["sub-1", "sub-2"]);
-  // Nessun sub-run dichiarato -> nessun id (non deve inventare correlazioni).
-  assert.deepEqual(subagentRunIds([meta("executor_call", {})]), []);
-});
-
-test("tracesForRun include le trace dei sub-run dichiarati dai meta-step", () => {
+test("tracesForRun include le trace dei sub-run, dichiarate dal parentRunId del wire", () => {
   beforeEach();
   // Il subagente e' un run a se': le sue trace stanno sotto il PROPRIO run_id.
   // Filtrando per il solo run del padre sparivano dal footer costo-per-provider,
-  // insieme ai provider usati SOLO dal figlio.
+  // insieme ai provider usati SOLO dal figlio. La parentela e' quella che il
+  // backend annota sulla traccia leggendola dal DB (run_lineage.rs), non quella
+  // dedotta dai meta-step di narrazione (che il review panel non emette).
   const traces = [
     trace("padre", 1, "mistral", "mistral-large-2512", { inputTokens: 100, outputTokens: 20 }),
-    trace("sub-1", 1, "groq", "gpt-oss-120b", { inputTokens: 300, outputTokens: 50 }),
+    trace("sub-1", 1, "groq", "gpt-oss-120b", {
+      inputTokens: 300,
+      outputTokens: 50,
+      parentRunId: "padre",
+    }),
     trace("altro-run", 1, "openai", "gpt", { inputTokens: 999, outputTokens: 999 }),
   ];
-  const metaSteps: MetaStepEntry[] = [meta("subagent_completed", { subagent_run_id: "sub-1" })];
 
-  const soloPadre = tracesForRun(traces, "padre");
-  assert.equal(soloPadre.length, 1, "senza meta-step resta il comportamento per-run");
-
-  const conFigli = tracesForRun(traces, "padre", metaSteps);
+  const conFigli = tracesForRun(traces, "padre");
   assert.equal(conFigli.length, 2);
   // Il run NON correlato resta fuori: si includono solo i sub-run dichiarati.
   assert.equal(conFigli.some((t) => t.runId === "altro-run"), false);
+  // Il figlio, guardato come run a se', porta solo le proprie trace.
+  assert.equal(tracesForRun(traces, "sub-1").length, 1);
 
   const buckets = aggregateTokensByProvider(conFigli);
   const groq = buckets.find((b) => b.provider === "groq");
   assert.equal(groq?.inputTokens, 300, "i token del subagente sono contabilizzati");
   assert.equal(groq?.outputTokens, 50);
+});
+
+// ── Il difetto misurato il 26/07/2026 sul progetto e2e-todo ────────────────
+// La barra dichiarava la ripartizione per provider di un run e mostrava una sola
+// voce, "deepseek": i 4 cicli di review su openrouter/z-ai/glm-4.7-flash (21
+// iterazioni complessive, costo registrato in nexus_subagent_runs) non c'erano.
+// Non un'approssimazione: un provider intero omesso.
+//
+// Il test attraversa la stessa composizione che usa il footer
+// (`providerCostBreakdown`, con il prezzo calcolato dal punto unico
+// `costFromCatalog`) e parte dalle trace nella forma in cui arrivano dal wire.
+// MUTAZIONE: se `tracesForRun` torna a ignorare `parentRunId`, la voce openrouter
+// sparisce e il totale cala esattamente del costo del revisore.
+test("la ripartizione elenca il provider del revisore e il totale ne contiene il costo", () => {
+  beforeEach();
+  const catalogo: ModelCatalogEntry[] = [
+    listino("deepseek", "deepseek-v4-flash", 0.28, 0.42),
+    listino("openrouter", "z-ai/glm-4.7-flash", 0.1, 0.3),
+  ];
+  const prezzo = (b: { provider: string; model: string; inputTokens: number; outputTokens: number }) =>
+    costFromCatalog(findCatalogEntry(catalogo, b.provider, b.model), b.inputTokens, b.outputTokens) ?? 0;
+
+  // Token del ciclo di review piu' lungo misurato (12 iterazioni).
+  const REV_IN = 30_991;
+  const REV_OUT = 3_544;
+  const traces = [
+    trace("padre", 1, "deepseek", "deepseek-v4-flash", { inputTokens: 200_000, outputTokens: 9_000 }),
+    trace("review-1", 1, "openrouter", "z-ai/glm-4.7-flash", {
+      inputTokens: REV_IN,
+      outputTokens: REV_OUT,
+      parentRunId: "padre",
+    }),
+  ];
+
+  const ripartizione = providerCostBreakdown(tracesForRun(traces, "padre"), prezzo);
+  const providers = ripartizione.voci.map((v) => v.provider).sort();
+  assert.deepEqual(providers, ["deepseek", "openrouter"], "il revisore ha una sua voce");
+
+  // I dollari si confrontano a meno dell'ultimo bit di virgola mobile: sommare
+  // in ordine diverso cambia il risultato oltre la 15a cifra, e un'uguaglianza
+  // esatta renderebbe il test fragile su una differenza che non esiste.
+  const quasiUguale = (a: number, b: number, msg: string) =>
+    assert.ok(Math.abs(a - b) < 1e-12, `${msg}: ${a} != ${b}`);
+
+  const costoRevisore = (REV_IN * 0.1 + REV_OUT * 0.3) / 1_000_000;
+  const voceRevisore = ripartizione.voci.find((v) => v.provider === "openrouter");
+  quasiUguale(voceRevisore?.costUsd ?? 0, costoRevisore, "costo della voce revisore");
+  assert.equal(voceRevisore?.inputTokens, REV_IN);
+
+  // Il totale CONTIENE il contributo del revisore: la differenza con la
+  // ripartizione del solo run padre e' esattamente il suo costo (e i suoi token).
+  const soloPadre = providerCostBreakdown(
+    traces.filter((t) => t.runId === "padre"),
+    prezzo,
+  );
+  quasiUguale(
+    ripartizione.totalCostUsd - soloPadre.totalCostUsd,
+    costoRevisore,
+    "quota del revisore nel totale",
+  );
+  assert.equal(ripartizione.totalTokens - soloPadre.totalTokens, REV_IN + REV_OUT);
+});
+
+test("tracesForRun risale la catena: anche i nipoti appartengono al run", () => {
+  beforeEach();
+  // Un sub-run che ne convoca un altro: il nipote e' elencato PRIMA del padre
+  // intermedio, cosi' un solo passaggio di filtro lo perderebbe.
+  const traces = [
+    trace("nipote", 1, "openrouter", "glm", { inputTokens: 10, outputTokens: 5, parentRunId: "figlio" }),
+    trace("figlio", 1, "groq", "oss", { inputTokens: 20, outputTokens: 5, parentRunId: "padre" }),
+    trace("padre", 1, "deepseek", "v4", { inputTokens: 30, outputTokens: 5 }),
+  ];
+  const ids = tracesForRun(traces, "padre").map((t) => t.runId).sort();
+  assert.deepEqual(ids, ["figlio", "nipote", "padre"]);
 });
 
 test("stream vuoto: nessun segnale -> empty true", () => {

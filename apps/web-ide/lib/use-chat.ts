@@ -39,6 +39,42 @@ import { createTerminalMessage } from "./use-chat/run-summary";
 import { formatChatError } from "./use-chat/errors";
 import { childRunIdsFromToolResult } from "./use-chat/subagent-runs";
 
+/**
+ * Rilegge dal DB le tracce gateway della sessione e le installa come timeline
+ * autoritativa. Punto unico (regola L) dei due momenti in cui serve: il
+ * bootstrap della sessione e la CHIUSURA di un run.
+ *
+ * Alla chiusura serve perche' le tracce dei sub-agenti non passano dal canale
+ * SSE del padre (ogni sub-run ha un canale proprio, che non viene instradato al
+ * frontend): finche' non si rilegge il DB, la ripartizione costo-per-provider del
+ * run appena concluso non conosce i provider usati solo dai figli — la si vedeva
+ * comparire solo dopo un reload della pagina.
+ *
+ * Le tracce arrivano raggruppate per runId (ordine non garantito tra run):
+ * appiattite in un'unica timeline ordinata per timestamp, la stessa forma
+ * prodotta live dall'accumulo SSE. Cap a 100 (FIFO) come il path live.
+ * Best-effort: un errore lascia in piedi quello che c'e' gia'.
+ */
+async function ricaricaTracceDalDb(
+  sessionId: string,
+  setTraces: (t: AITraceEvent[]) => void,
+): Promise<void> {
+  try {
+    const { runs } = await getSessionTraces(sessionId);
+    const runEntries = runs ? Object.values(runs) : [];
+    if (runEntries.length === 0) return;
+    const flat = runEntries
+      .flat()
+      .filter((tr): tr is AITraceEvent => Boolean(tr && tr.runId))
+      .sort(
+        (a, b) => new Date(a.timestamp ?? 0).getTime() - new Date(b.timestamp ?? 0).getTime(),
+      );
+    setTraces(flat.length > 100 ? flat.slice(flat.length - 100) : flat);
+  } catch {
+    // best-effort: resta la timeline corrente (cache sessionStorage o accumulo SSE)
+  }
+}
+
 export function useChat(
   projectId = "default",
   profileId = "default",
@@ -301,27 +337,7 @@ export function useChat(
           }
         }
       } catch { /* ignore */ }
-      try {
-        const { runs } = await getSessionTraces(activeSessionId);
-        const runEntries = runs ? Object.values(runs) : [];
-        if (runEntries.length > 0) {
-          // Le tracce arrivano raggruppate per runId (ordine HashMap non
-          // garantito tra run). Appiattiamo in un'unica timeline ordinata per
-          // timestamp dell'AITraceEvent: e' la stessa forma di `traces` prodotta
-          // live dall'accumulo SSE. Cap a 100 (FIFO) come il path live.
-          const flat = runEntries
-            .flat()
-            .filter((tr): tr is AITraceEvent => Boolean(tr && tr.runId))
-            .sort(
-              (a, b) =>
-                new Date(a.timestamp ?? 0).getTime() - new Date(b.timestamp ?? 0).getTime(),
-            );
-          const capped = flat.length > 100 ? flat.slice(flat.length - 100) : flat;
-          setTraces(capped);
-        }
-      } catch {
-        // best-effort: il pannello resta sull'eventuale cache sessionStorage
-      }
+      await ricaricaTracceDalDb(activeSessionId, setTraces);
       const history = await getChatMessages(activeSessionId);
       setMessages(history.messages ?? []);
       // Ripristina la timeline meta_step persistita (plan/routing/clarify/
@@ -590,6 +606,11 @@ export function useChat(
                     );
                   }
                 } catch {}
+                // Tracce dal DB: il run e' chiuso, quindi anche i suoi sub-run
+                // hanno finito di scrivere. E' il momento in cui la ripartizione
+                // costo-per-provider puo' conoscere i provider usati SOLO dai
+                // figli (le loro tracce non passano dal canale SSE del padre).
+                await ricaricaTracceDalDb(sid, setTraces);
                 // Refresh dei messaggi dal DB con RETRY: il backend salva il
                 // messaggio assistant ASYNC dopo l'emissione di `agent_final`,
                 // quindi al primo getChatMessages potrebbe non essere ancora

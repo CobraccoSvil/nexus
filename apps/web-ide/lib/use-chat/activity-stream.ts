@@ -1287,39 +1287,44 @@ export function raggruppaBlocchiNastro(events: ActivityEvent[]): BloccoNastro[] 
 }
 
 /**
- * Id dei sub-run generati da un run, letti dai suoi meta-step.
- *
- * Fonte: il campo STRUTTURATO `subagent_run_id` del payload (regola M), con
- * `correlationId` come gemello per i meta-step che portano solo quello — la
- * stessa coppia usata da `buildRawTimeline` per correlare gli eventi subagente.
- */
-export function subagentRunIds(metaSteps: MetaStepEntry[]): string[] {
-  const ids = new Set<string>();
-  for (const m of metaSteps) {
-    if (!m.kind.startsWith("subagent")) continue;
-    const id = asString(m.payload?.subagent_run_id) ?? m.correlationId ?? undefined;
-    if (id) ids.add(id);
-  }
-  return Array.from(ids);
-}
-
-/**
  * Trace di un run (le trace in useChat sono per-sessione), INCLUSE quelle dei
- * suoi sub-run.
+ * suoi sub-run, a qualunque profondita'.
  *
  * Un subagente e' un run a se': le sue trace sono persistite sotto il PROPRIO
  * `run_id` (nexus_agent_traces), non sotto quello del padre. Filtrando per il
  * solo `runId` del padre, i token e il costo dei subagenti sparivano dal footer
- * costo-per-provider — il lavoro del figlio era narrato nel nastro ma non
- * contabilizzato, e provider usati SOLO dal figlio non comparivano affatto.
- * I sub-run sono dichiarati dai meta-step del padre (`subagentRunIds`).
+ * costo-per-provider, e provider usati SOLO dal figlio non comparivano affatto.
+ *
+ * La parentela viene dal campo `parentRunId` che il backend annota su ogni
+ * traccia di sub-run leggendolo dal DB (punto unico
+ * `crates/mcp-core/src/run_lineage.rs`, regola L). Prima veniva dedotta dai
+ * META-STEP di narrazione del padre: un canale di PRESENTAZIONE, che il review
+ * panel non emette affatto. Da li' il difetto misurato il 26/07/2026 — la barra
+ * dichiarava la ripartizione per provider di un run e ometteva i 4 cicli di
+ * review su openrouter, che pure avevano girato 21 iterazioni. La misura
+ * raggiungeva il suo oggetto per una strada diversa da quella della produzione
+ * (regola O).
+ *
+ * La chiusura e' transitiva: un sub-run che ne convoca un altro porta con se'
+ * anche i nipoti, che appartengono comunque al lavoro del run.
  */
-export function tracesForRun(
-  traces: AITraceEvent[],
-  runId: string,
-  metaSteps: MetaStepEntry[] = [],
-): AITraceEvent[] {
-  const ids = new Set<string>([runId, ...subagentRunIds(metaSteps)]);
+export function tracesForRun(traces: AITraceEvent[], runId: string): AITraceEvent[] {
+  const ids = new Set<string>([runId]);
+  // Punto fisso: si aggiunge ogni run il cui padre e' gia' nell'insieme, finche'
+  // l'insieme non smette di crescere. L'ordine delle trace non e' garantito
+  // (arrivano raggruppate per run), quindi un solo passaggio perderebbe i nipoti
+  // elencati prima dei genitori.
+  let cresciuto = true;
+  while (cresciuto) {
+    cresciuto = false;
+    for (const t of traces) {
+      if (!t.parentRunId || ids.has(t.runId)) continue;
+      if (ids.has(t.parentRunId)) {
+        ids.add(t.runId);
+        cresciuto = true;
+      }
+    }
+  }
   return traces.filter((t) => ids.has(t.runId));
 }
 
@@ -1406,6 +1411,41 @@ export interface ProviderTokenBucket {
   model: string;
   inputTokens: number;
   outputTokens: number;
+}
+
+/** Una voce della ripartizione: il bucket con il suo costo in USD. */
+export interface ProviderCostRow extends ProviderTokenBucket {
+  costUsd: number;
+}
+
+/** Ripartizione per provider di un run: le voci, i token e il costo totali. */
+export interface ProviderCostBreakdown {
+  voci: ProviderCostRow[];
+  totalTokens: number;
+  totalCostUsd: number;
+}
+
+/**
+ * Ripartizione costo-per-provider di un insieme di trace: PUNTO UNICO (regola L)
+ * di cio' che la barra dei costi dichiara.
+ *
+ * Il prezzo arriva come funzione perche' il listino non e' qui (regola G: viene
+ * dal catalogo `/api/models`); quello che vive qui e' la COMPOSIZIONE — quali
+ * voci esistono e come si sommano — cioe' esattamente cio' che il difetto del
+ * 26/07/2026 sbagliava. Le trace da passare sono quelle di `tracesForRun`, che
+ * include i sub-run: una barra composta sulle sole trace del run padre dichiara
+ * una ripartizione e ne omette i provider usati solo dai figli.
+ */
+export function providerCostBreakdown(
+  traces: AITraceEvent[],
+  prezzo: (bucket: ProviderTokenBucket) => number,
+): ProviderCostBreakdown {
+  const voci = aggregateTokensByProvider(traces).map((b) => ({ ...b, costUsd: prezzo(b) }));
+  return {
+    voci,
+    totalTokens: voci.reduce((s, v) => s + v.inputTokens + v.outputTokens, 0),
+    totalCostUsd: voci.reduce((s, v) => s + v.costUsd, 0),
+  };
 }
 
 /** Somma input/output token per coppia provider/model dalle trace del run. */

@@ -20,6 +20,11 @@ interface AITraceToolCall {
 
 export interface AITraceEvent {
   runId: string;
+  /** Run che ha convocato questo run, quando e' un sub-agente. Lo dichiara il
+   *  backend leggendo la parentela dal DB (`crates/mcp-core/src/run_lineage.rs`);
+   *  assente per i run primari e sugli eventi SSE live. E' la fonte con cui
+   *  `tracesForRun` attribuisce al padre il lavoro dei figli. */
+  parentRunId?: string;
   iteration: number;
   provider: string;
   model: string;

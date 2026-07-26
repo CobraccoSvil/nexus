@@ -159,9 +159,17 @@ impl ReviewPanelPort for ReviewPanelAdapter {
             Err(skip) => return Ok(ReviewPanelReport::Skipped(skip)),
         };
 
+        // Ctx ancorato al RUN che convoca la review, non alla sola sessione
+        // (punto unico `build_ctx_for_primary_run`, regola L). Con `build_ctx` i
+        // revisori nascevano orfani: `nexus_subagent_runs.dispatcher_run_id`
+        // finiva sull'id della SESSIONE, che non e' un run, e da li' il lavoro
+        // dei revisori non era piu' attribuibile al run che lo aveva ordinato —
+        // la barra costo-per-provider ometteva il loro provider intero (misurato:
+        // 4 cicli di review su openrouter, 21 iterazioni, $0.008453). Lo stesso
+        // id governa il cost-cap e il residuo di deadline dei figli.
         let svc = ToolRunnerService::new(self.deps.clone());
         let ctx = svc
-            .build_ctx(self.session_id)
+            .build_ctx_for_primary_run(self.session_id, run_id)
             .await
             .map_err(|e| PortError::Tool(format!("build_ctx fallita: {e}").into()))?;
 
