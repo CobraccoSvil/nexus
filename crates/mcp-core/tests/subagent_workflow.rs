@@ -12,8 +12,11 @@
 //! unit test di `agent_tools::subagent_native` e `native_engine` (costruzione
 //! NativeRunInput del sub-run, guard, propagazione depth).
 
+mod support;
+
 use std::env;
 use std::time::Duration;
+use support::{salta, Motivo};
 
 fn brain_url() -> String {
     env::var("BRAIN_URL").unwrap_or_else(|_| "http://localhost:8001".into())
@@ -38,7 +41,7 @@ async fn brain_alive() -> bool {
 #[tokio::test]
 async fn clarifications_get_ritorna_null_se_nessuna() {
     if !brain_alive().await {
-        eprintln!("skip");
+        salta(Motivo::ServizioGiu(&brain_url()));
         return;
     }
     let fake = "00000000-0000-0000-0000-000000000000";

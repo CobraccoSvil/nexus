@@ -9,28 +9,25 @@
 //!   2. `bash /tmp/mint_jwt.sh`  (helper JWT admin per i test protetti)
 //!   3. `MCP_CORE_URL=http://localhost:4000 NEXUS_TEST_JWT=$(cat /tmp/nexus_jwt.txt) cargo test --test agent_runs_endpoints`
 
-use std::env;
+mod support;
+
 use std::time::Duration;
+use support::{base_url, jwt_o_salta, salta, Motivo};
 
-fn base_url() -> String {
-    env::var("MCP_CORE_URL").unwrap_or_else(|_| "http://localhost:4000".into())
-}
-
-fn jwt() -> Option<String> {
-    env::var("NEXUS_TEST_JWT").ok().filter(|s| !s.is_empty())
-}
-
+/// Client HTTP per i contract test, che richiedono auth admin: se il JWT manca il
+/// punto unico dichiara lo skip (o fallisce sotto REQUIRE_INTEGRATION_TESTS=1).
 async fn client() -> Option<reqwest::Client> {
-    // Skip se nessun JWT — i contract test richiedono auth admin.
-    jwt()?;
+    jwt_o_salta()?;
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .ok()
 }
 
+/// Il token viaggia nel COOKIE: `nexus_auth::validate_token` lo estrae solo da li'.
+/// Chiamata solo dopo `client()`, che ha gia' verificato la presenza del JWT.
 async fn cookie_header() -> String {
-    format!("token={}", jwt().unwrap_or_default())
+    format!("token={}", std::env::var("NEXUS_TEST_JWT").unwrap_or_default())
 }
 
 #[tokio::test]
@@ -38,7 +35,7 @@ async fn health_endpoint_e_raggiungibile() {
     let url = format!("{}/health", base_url());
     let resp = reqwest::get(&url).await;
     if resp.is_err() {
-        eprintln!("skip: mcp-core non in ascolto su {url}");
+        salta(Motivo::ServizioGiu(&url));
         return;
     }
     let r = resp.unwrap();
@@ -50,10 +47,7 @@ async fn health_endpoint_e_raggiungibile() {
 
 #[tokio::test]
 async fn admin_settings_endpoint_richiede_auth() {
-    let Some(client) = client().await else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
+    let Some(client) = client().await else { return };
     let url = format!("{}/api/admin/settings", base_url());
     // Senza cookie → 401
     let r = client.get(&url).send().await.unwrap();
@@ -70,10 +64,7 @@ async fn admin_settings_endpoint_richiede_auth() {
 
 #[tokio::test]
 async fn reset_cooldown_endpoint_idempotente() {
-    let Some(client) = client().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(client) = client().await else { return };
     let provider = "anthropic";
     let url = format!(
         "{}/api/admin/providers/{}/reset-cooldown",
@@ -106,10 +97,7 @@ async fn provider_error_bridge_billing_attiva_cooldown_lungo() {
     // Endpoint interno: simula un brain bridge call per billing_error.
     // Verifica che il provider venga messo in cooldown e poi possa essere
     // rimosso via reset-cooldown.
-    let Some(client) = client().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(client) = client().await else { return };
     // Mark cooldown via bridge.
     let bridge_url = format!("{}/api/internal/provider-error", base_url());
     let r = client

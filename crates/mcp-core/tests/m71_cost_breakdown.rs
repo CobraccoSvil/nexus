@@ -4,33 +4,16 @@
 //! `usageBreakdown` aggregato da `ai_usage_ledger`. Test sintetico:
 //! inserisce ledger fake → fetcha endpoint → controlla breakdown.
 
-use sqlx::PgPool;
-use std::env;
+mod support;
+
 use std::time::Duration;
+use support::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
 use uuid::Uuid;
-
-fn base_url() -> String {
-    env::var("MCP_CORE_URL").unwrap_or_else(|_| "http://localhost:4000".into())
-}
-fn jwt() -> Option<String> {
-    env::var("NEXUS_TEST_JWT").ok().filter(|s| !s.is_empty())
-}
-
-async fn db() -> Option<PgPool> {
-    let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
 
 #[tokio::test]
 async fn agent_run_endpoint_include_usage_breakdown_aggregato() {
-    let Some(token) = jwt() else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
-    let Some(pool) = db().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(token) = jwt_o_salta() else { return };
+    let Some(pool) = db_o_salta().await else { return };
 
     // Setup: trova (o crea) un agent_run di test, popola ai_usage_ledger con
     // 3 record per (anthropic/claude-sonnet, deepseek/deepseek-chat, mistral/mistral-large).
@@ -48,7 +31,9 @@ async fn agent_run_endpoint_include_usage_breakdown_aggregato() {
         .await
         .unwrap_or(None);
     let (Some(sid), Some(pid), Some(uid)) = (session_id, project_id, user_id) else {
-        eprintln!("skip: DB senza session/project/user di seed");
+        salta(Motivo::DatiAssenti(
+            "serve almeno una riga in chat_sessions, projects e users",
+        ));
         return;
     };
 

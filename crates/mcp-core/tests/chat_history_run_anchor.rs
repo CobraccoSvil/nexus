@@ -28,16 +28,10 @@
 //! renderebbe verde qualunque implementazione), quando la storia e' raggiungibile
 //! ma non contiene alcun assistant agganciabile il test FALLISCE dichiarandolo.
 
+mod support;
+
 use serde_json::Value;
-use std::env;
-
-fn base_url() -> String {
-    env::var("MCP_CORE_URL").unwrap_or_else(|_| "http://localhost:4000".into())
-}
-
-fn jwt() -> Option<String> {
-    env::var("NEXUS_TEST_JWT").ok().filter(|s| !s.is_empty())
-}
+use support::{base_url, jwt_o_salta, salta, Motivo};
 
 async fn get_json(token: &str, path: &str) -> Option<Value> {
     let res = reqwest::Client::new()
@@ -47,7 +41,13 @@ async fn get_json(token: &str, path: &str) -> Option<Value> {
         .await
         .ok()?;
     if !res.status().is_success() {
-        eprintln!("skip: GET {path} ha risposto {}", res.status());
+        // Uno status di rifiuto NON e' un servizio giu': con
+        // REQUIRE_INTEGRATION_TESTS=1 diventa un fallimento, cosi' un 401
+        // sistematico non puo' piu' presentarsi come "nessuna sessione con turni".
+        salta(Motivo::RispostaInattesa {
+            status: res.status().as_u16(),
+            path,
+        });
         return None;
     }
     res.json::<Value>().await.ok()
@@ -81,17 +81,16 @@ fn ruolo(m: &Value) -> &str {
 
 #[tokio::test]
 async fn un_messaggio_assistant_porta_il_run_che_lo_ha_prodotto() {
-    let Some(token) = jwt() else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
+    let Some(token) = jwt_o_salta() else { return };
     let Some(session_id) = sessione_con_turni(&token).await else {
-        eprintln!("skip: nessuna sessione con turni assistant raggiungibile");
+        salta(Motivo::DatiAssenti(
+            "nessuna sessione con turni assistant raggiungibile",
+        ));
         return;
     };
     let Some(body) = get_json(&token, &format!("/api/chat/sessions/{session_id}/messages")).await
     else {
-        eprintln!("skip: {} non raggiungibile", base_url());
+        salta(Motivo::ServizioGiu(&base_url()));
         return;
     };
 
@@ -135,17 +134,16 @@ async fn un_messaggio_assistant_porta_il_run_che_lo_ha_prodotto() {
 /// legge, lasciando il badge dell'assistant sempre vuoto.
 #[tokio::test]
 async fn un_messaggio_assistant_porta_anche_lo_stato_del_run() {
-    let Some(token) = jwt() else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
+    let Some(token) = jwt_o_salta() else { return };
     let Some(session_id) = sessione_con_turni(&token).await else {
-        eprintln!("skip: nessuna sessione con turni assistant raggiungibile");
+        salta(Motivo::DatiAssenti(
+            "nessuna sessione con turni assistant raggiungibile",
+        ));
         return;
     };
     let Some(body) = get_json(&token, &format!("/api/chat/sessions/{session_id}/messages")).await
     else {
-        eprintln!("skip: {} non raggiungibile", base_url());
+        salta(Motivo::ServizioGiu(&base_url()));
         return;
     };
 

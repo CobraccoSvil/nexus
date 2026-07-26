@@ -15,28 +15,22 @@
 //! crea, perche' un refuso nel nome produceva una riga nuova al posto di un
 //! errore -- una scrittura senza effetto spacciata per riuscita.
 //!
-//! Test opportunistico (stesso pattern di `m71_cost_breakdown`): fa skip se
-//! mancano server, DB o JWT -- ATTENZIONE, uno skip qui si presenta come "ok"
-//! nel gate, quindi il 404 non e' verificato al wire senza NEXUS_TEST_JWT e un
-//! mcp-core aggiornato in ascolto. La rete di sicurezza e' `settings_write.rs`
-//! in nexus-auth, che copre lo stesso contratto sul punto unico col solo DB.
+//! Test opportunistico (stesso pattern di `m71_cost_breakdown`): salta se mancano
+//! server, DB o JWT. Lo skip passa dal punto unico `support::salta`, quindi
+//! stampa un marker `NEXUS_TEST_SKIP` e, con `REQUIRE_INTEGRATION_TESTS=1`,
+//! FALLISCE invece di ritornare verde -- prima questa intestazione avvisava a
+//! parole che "uno skip qui si presenta come ok nel gate", e nient'altro nel
+//! segnale lo diceva. Senza JWT e senza un mcp-core aggiornato in ascolto il 404
+//! resta non verificato al wire: la rete di sicurezza e' `settings_write.rs` in
+//! nexus-auth, che copre lo stesso contratto sul punto unico col solo DB.
 //! Idempotente e indipendente dall'ordine (regola F): crea le proprie righe con
 //! un suffisso unico e le rimuove in chiusura.
 
-use sqlx::PgPool;
-use std::env;
-use uuid::Uuid;
+mod support;
 
-fn base_url() -> String {
-    env::var("MCP_CORE_URL").unwrap_or_else(|_| "http://localhost:4000".into())
-}
-fn jwt() -> Option<String> {
-    env::var("NEXUS_TEST_JWT").ok().filter(|s| !s.is_empty())
-}
-async fn db() -> Option<PgPool> {
-    let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
+use sqlx::PgPool;
+use support::{base_url, db_o_salta, jwt_o_salta, salta, Motivo};
+use uuid::Uuid;
 
 async fn seed(pool: &PgPool, key: &str, protected: bool) {
     let _ = sqlx::query("DELETE FROM settings WHERE key = $1")
@@ -84,14 +78,8 @@ async fn put_setting(token: &str, key: &str, value: &str) -> Option<reqwest::Res
 /// Una scrittura che il DB rifiuta deve essere non-2xx: il client la vede.
 #[tokio::test]
 async fn scrittura_rifiutata_dal_db_non_e_un_200() {
-    let Some(token) = jwt() else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
-    let Some(pool) = db().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(token) = jwt_o_salta() else { return };
+    let Some(pool) = db_o_salta().await else { return };
 
     // Suffisso unico: due esecuzioni concorrenti non si pestano i piedi.
     let key = format!("test.update_contract.protected.{}", Uuid::new_v4());
@@ -101,7 +89,7 @@ async fn scrittura_rifiutata_dal_db_non_e_un_200() {
     // `NEW.value IS DISTINCT FROM OLD.value`.
     let Some(res) = put_setting(&token, &key, "valore-nuovo").await else {
         cleanup(&pool, &key).await;
-        eprintln!("skip: {} non raggiungibile", base_url());
+        salta(Motivo::ServizioGiu(&base_url()));
         return;
     };
     let status = res.status();
@@ -136,21 +124,15 @@ async fn scrittura_rifiutata_dal_db_non_e_un_200() {
 /// Senza questo, un handler che rispondesse sempre 500 passerebbe il test sopra.
 #[tokio::test]
 async fn scrittura_riuscita_e_un_200_ok() {
-    let Some(token) = jwt() else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
-    let Some(pool) = db().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(token) = jwt_o_salta() else { return };
+    let Some(pool) = db_o_salta().await else { return };
 
     let key = format!("test.update_contract.normale.{}", Uuid::new_v4());
     seed(&pool, &key, false).await;
 
     let Some(res) = put_setting(&token, &key, "valore-nuovo").await else {
         cleanup(&pool, &key).await;
-        eprintln!("skip: {} non raggiungibile", base_url());
+        salta(Motivo::ServizioGiu(&base_url()));
         return;
     };
     let status = res.status();
@@ -178,21 +160,15 @@ async fn scrittura_riuscita_e_un_200_ok() {
 /// quella col refuso.
 #[tokio::test]
 async fn chiave_assente_e_un_404_e_non_crea_la_riga() {
-    let Some(token) = jwt() else {
-        eprintln!("skip: NEXUS_TEST_JWT non impostato");
-        return;
-    };
-    let Some(pool) = db().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(token) = jwt_o_salta() else { return };
+    let Some(pool) = db_o_salta().await else { return };
 
     // Mai seedata: e' il refuso che l'admin potrebbe digitare.
     let key = format!("test.update_contract.refuso.{}", Uuid::new_v4());
     cleanup(&pool, &key).await;
 
     let Some(res) = put_setting(&token, &key, "valore-inefficace").await else {
-        eprintln!("skip: {} non raggiungibile", base_url());
+        salta(Motivo::ServizioGiu(&base_url()));
         return;
     };
     let status = res.status();

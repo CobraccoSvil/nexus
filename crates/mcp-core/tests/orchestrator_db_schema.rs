@@ -1,25 +1,20 @@
 //! Contract test (PR-4 Livello 3): schema DB delle tabelle del piano.
 //!
 //! Verifica che le tabelle e i prompt keys necessari a PR-1/PR-2/PR-3 esistano
-//! in DB. Skip se `DATABASE_URL` non impostata.
+//! in DB. Salta se `DATABASE_URL` non impostata, ma lo skip passa dal punto
+//! unico `support::salta`: prima quattro dei cinque stampavano il solo `"skip"`.
 //!
 //! Eseguire con:
 //!   DATABASE_URL=postgres://nexus:nexus@localhost:5433/nexus cargo test --test orchestrator_db_schema
 
-use sqlx::{PgPool, Row};
-use std::env;
+mod support;
 
-async fn pool_or_skip() -> Option<PgPool> {
-    let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
+use sqlx::{PgPool, Row};
+use support::db_o_salta;
 
 #[tokio::test]
 async fn tabelle_plan_act_verify_esistono() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     // Tabelle di PIATTAFORMA: vivono nel meta-DB (DATABASE_URL).
     let attese_meta = [
         "nexus_subagent_definitions",
@@ -76,10 +71,7 @@ async fn tabelle_dominio_run_esistono_dopo_le_migrazioni(pool: PgPool) {
 
 #[tokio::test]
 async fn prompt_keys_orchestrator_seedati() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let attese = [
         "agent.planner.base",
         "agent.plan_revision.tpl",
@@ -111,10 +103,7 @@ async fn prompt_keys_orchestrator_seedati() {
 
 #[tokio::test]
 async fn settings_orchestrator_eligibility_consistente() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     // Numeric/CSV settings: presenti e parseabili.
     let pairs = [
         ("orchestrator.plan_phase_enabled", "bool"),
@@ -155,10 +144,7 @@ async fn settings_orchestrator_eligibility_consistente() {
 
 #[tokio::test]
 async fn subagent_kinds_seedati_con_purpose_validi() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let rows = sqlx::query(
         "SELECT kind, model_purpose FROM nexus_subagent_definitions WHERE is_enabled = true",
     )
@@ -196,10 +182,7 @@ async fn subagent_kinds_seedati_con_purpose_validi() {
 
 #[tokio::test]
 async fn ai_usage_ledger_schema_supporta_breakdown_m71() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let cols = [
         "provider",
         "model",

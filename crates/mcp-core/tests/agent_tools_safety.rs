@@ -7,7 +7,10 @@
 //! siano compilati. La test suite ricca unit-level vive in
 //! `src/agent_tools/safety.rs` modulo `tests` (23 test, gia' verde).
 
+mod support;
+
 use std::process::Command;
+use support::{salta, Motivo};
 
 fn release_binary() -> std::path::PathBuf {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -72,7 +75,9 @@ fn binary_contiene_tutti_i_pattern_safety_attesi() {
 fn binary_contiene_env_injection_db_progetto() {
     let bin = release_binary();
     if !bin.exists() {
-        eprintln!("skip: binary non trovato");
+        salta(Motivo::ArtefattoAssente(
+            "binario release di mcp-core (cargo build --release)",
+        ));
         return;
     }
     let out = Command::new("strings").arg(&bin).output().unwrap();
@@ -95,7 +100,9 @@ fn binary_contiene_env_injection_db_progetto() {
 fn binary_contiene_tool_subagent_poll_resume() {
     let bin = release_binary();
     if !bin.exists() {
-        eprintln!("skip: binary non trovato");
+        salta(Motivo::ArtefattoAssente(
+            "binario release di mcp-core (cargo build --release)",
+        ));
         return;
     }
     let out = Command::new("strings").arg(&bin).output().unwrap();

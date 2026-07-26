@@ -13,14 +13,11 @@
 //! Eseguire con:
 //!   DATABASE_URL=postgres://nexus:nexus@localhost:5433/nexus cargo test --test project_db_config_contract
 
-use sqlx::{PgPool, Row};
-use std::env;
-use uuid::Uuid;
+mod support;
 
-async fn pool_or_skip() -> Option<PgPool> {
-    let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
+use sqlx::{PgPool, Row};
+use support::{db_o_salta, salta, Motivo};
+use uuid::Uuid;
 
 async fn un_progetto(pool: &PgPool) -> Option<Uuid> {
     sqlx::query("SELECT id FROM projects LIMIT 1")
@@ -41,10 +38,7 @@ async fn un_progetto(pool: &PgPool) -> Option<Uuid> {
 /// `detect_project_db` e `upsert_db_profile` tornano a fallire in silenzio.
 #[tokio::test]
 async fn indice_parziale_riga_primaria_esiste() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let row = sqlx::query(
         "SELECT indexdef FROM pg_indexes \
          WHERE tablename = 'project_database_config' \
@@ -73,12 +67,9 @@ async fn indice_parziale_riga_primaria_esiste() {
 /// scritta e nessuno se ne e' accorto.
 #[tokio::test]
 async fn upsert_detection_metadata_e_eseguibile() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let Some(project_id) = un_progetto(&pool).await else {
-        eprintln!("skip: nessun progetto nel meta-DB");
+        salta(Motivo::DatiAssenti("nessun progetto in projects"));
         return;
     };
 
@@ -111,12 +102,9 @@ async fn upsert_detection_metadata_e_eseguibile() {
 /// e l'unica connessione reale del progetto diventava INDELEBILE.
 #[tokio::test]
 async fn guard_delete_ignora_la_riga_metadati_nascosta() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let Some(project_id) = un_progetto(&pool).await else {
-        eprintln!("skip: nessun progetto nel meta-DB");
+        salta(Motivo::DatiAssenti("nessun progetto in projects"));
         return;
     };
 
