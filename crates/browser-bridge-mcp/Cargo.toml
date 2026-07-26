@@ -12,6 +12,9 @@ anyhow.workspace = true
 axum = { workspace = true, features = ["ws", "macros"] }
 base64.workspace = true
 dashmap.workspace = true
+# .env del repo: questo daemon gira anche come servizio (WinSW/systemd), dove
+# l'ambiente della shell non c'e'. Come gli altri servizi Rust del monorepo.
+dotenvy.workspace = true
 futures.workspace = true
 nexus-auth = { path = "../nexus-auth" }
 rand.workspace = true
