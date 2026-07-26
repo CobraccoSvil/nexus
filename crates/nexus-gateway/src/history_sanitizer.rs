@@ -83,7 +83,7 @@ pub fn sanitize_history(
     let mut report = SanitizeReport::default();
 
     strip_provider_specific_fields(messages, &provider, mode, &mut report);
-    reconcile_tool_pairing(messages, mode, &mut report);
+    reconcile_tool_pairing(messages, &mut report);
     if provider_requires_user_or_tool_last(&provider) {
         strip_trailing_assistant(messages, &mut report);
     }
@@ -121,10 +121,12 @@ pub fn sanitized_for_attempt(
 ///
 /// La modalita' [`SanitizeMode::Aggressive`] NON garantisce di cambiare qualcosa:
 /// rispetto a Standard aggiunge la rimozione delle firme di thinking (Anthropic,
-/// Google) e l'iniezione dei tool-result sintetici oltre la soglia. Su una
-/// history DeepSeek senza tool-call pendenti non ha nulla da fare — il
-/// `reasoning` non lo tocca, perche' il provider lo esige — e produce la stessa
-/// identica richiesta.
+/// Google). La riconciliazione tool_use/tool_result NON e' piu' fra le
+/// differenze: e' un vincolo del formato e vale identica in entrambe le
+/// modalita', quindi su una history con tool-call scoperte e' la Standard a
+/// ripararla e non resta nulla da fare al retry. Su una history DeepSeek senza
+/// tool-call pendenti Aggressive non ha nulla da fare — il `reasoning` non lo
+/// tocca, perche' il provider lo esige — e produce la stessa identica richiesta.
 ///
 /// `original` e' la history di partenza, non quella gia' sanificata: il
 /// candidato deve nascere per la stessa strada del tentativo vero
@@ -208,11 +210,9 @@ fn strip_provider_specific_fields(
 /// SEMPRE, anche se un messaggio user era stato iniettato in mezzo (ReviewGate,
 /// correzione post-final_gate): era la causa del Mistral 400
 /// "Unexpected role 'tool' after role 'user'".
-fn reconcile_tool_pairing(
-    messages: &mut Vec<LlmMessage>,
-    mode: SanitizeMode,
-    report: &mut SanitizeReport,
-) {
+/// Non prende la modalita': l'invariante che ristabilisce e' un vincolo del
+/// formato, uguale in Standard e in Aggressive.
+fn reconcile_tool_pairing(messages: &mut Vec<LlmMessage>, report: &mut SanitizeReport) {
     let call_ids = collect_tool_call_ids(messages);
     if call_ids.is_empty() {
         // Nessuna tool-call: elimina messaggi tool orfani.
@@ -243,20 +243,24 @@ fn reconcile_tool_pairing(
         }
     }
 
-    // 3. Soglia injection: la Standard guarda il totale mancante (storico).
-    let missing_count = kept
-        .iter()
-        .filter(|m| m.role == "assistant")
-        .flat_map(|m| m.tool_calls.as_ref().into_iter().flatten())
-        .filter(|tc| !tool_by_id.contains_key(&tc.id))
-        .count();
-    let inject = match mode {
-        SanitizeMode::Aggressive => true,
-        SanitizeMode::Standard => missing_count <= 2,
-    };
-
-    // 4. Ricostruisci: dopo ogni assistant con tool_calls, i result nell'ordine
-    //    delle call; sintetico INLINE per le mancanti (se consentito).
+    // 3. Ricostruisci: dopo ogni assistant con tool_calls, i result nell'ordine
+    //    delle call; sintetico INLINE per ogni mancante.
+    //
+    //    L'iniezione NON e' condizionata, e non lo e' per modalita': il formato
+    //    OpenAI-compat ESIGE che un assistant con `tool_calls` sia seguito da un
+    //    result per OGNI `tool_call_id`. Una history che ne lascia scoperto anche
+    //    uno solo e' invalida per costruzione, e il provider la rifiuta prima di
+    //    guardarne il merito.
+    //
+    //    Qui viveva una soglia (`Standard => missing_count <= 2`): sopra le due
+    //    call scoperte la Standard si asteneva, il gateway spediva una richiesta
+    //    che il formato vieta, incassava il 400 e solo allora - in Aggressive -
+    //    applicava il rimedio che gia' possedeva. Misurato il 26/07 sui log:
+    //    26 volte in 19 minuti, sempre con 3+ call scoperte, e ogni 400 seguito
+    //    da un retry che riusciva. La soglia non evitava di fabbricare risultati:
+    //    li fabbricava un giro dopo, al prezzo di una chiamata pagata a vuoto e
+    //    della latenza di un round-trip. Il vincolo del formato non e' negoziabile
+    //    per modalita', quindi la decisione non e' piu' una decisione.
     let mut out: Vec<LlmMessage> = Vec::with_capacity(kept.len() + tool_by_id.len());
     for m in kept {
         let calls = if m.role == "assistant" {
@@ -269,7 +273,7 @@ fn reconcile_tool_pairing(
         for tc in &calls {
             if let Some(t) = tool_by_id.remove(&tc.id) {
                 out.push(t);
-            } else if inject {
+            } else {
                 out.push(synthetic_tool_message(&tc.id, &tc.function.name));
                 report.injected_synthetic_tool_results += 1;
             }
@@ -515,6 +519,63 @@ mod tests {
         let r = sanitize_history(&mut msgs, "anthropic", SanitizeMode::Aggressive);
         assert_eq!(r.injected_synthetic_tool_results, 1);
         assert!(msgs.iter().any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_x")));
+    }
+
+    /// L'invariante che il PROVIDER verifica: ogni assistant con `tool_calls` e'
+    /// seguito immediatamente dai result di TUTTI i suoi id. Violarla e' cio' che
+    /// produce il 400 "insufficient tool messages following tool_calls message".
+    /// I test sotto asseriscono QUESTO, non il contatore: e' la conseguenza che
+    /// decide se la richiesta parte o viene rifiutata (regola O).
+    fn ogni_call_ha_il_suo_result(messages: &[LlmMessage]) -> bool {
+        messages.iter().enumerate().all(|(i, m)| {
+            let Some(calls) = m.tool_calls.as_ref() else {
+                return true;
+            };
+            let risposti: Vec<&str> = messages[i + 1..]
+                .iter()
+                .take_while(|s| s.role == "tool")
+                .filter_map(|s| s.tool_call_id.as_deref())
+                .collect();
+            calls.iter().all(|tc| risposti.contains(&tc.id.as_str()))
+        })
+    }
+
+    #[test]
+    fn standard_ripara_anche_oltre_due_call_scoperte() {
+        // Lo scenario di produzione del 26/07: la history persistita arriva con
+        // PIU' di due tool_call senza risposta (misurate 3, 5, ... 12). Qui la
+        // Standard si asteneva per soglia e DeepSeek rifiutava la richiesta.
+        let mut msgs = vec![
+            assistant_with_tools("c1", "read_file"),
+            assistant_with_tools("c2", "write_file"),
+            assistant_with_tools("c3", "run_command"),
+        ];
+        let r = sanitize_history(&mut msgs, "deepseek", SanitizeMode::Standard);
+        assert_eq!(r.injected_synthetic_tool_results, 3);
+        assert!(
+            ogni_call_ha_il_suo_result(&msgs),
+            "al PRIMO tentativo la history deve gia' rispettare il formato: \
+             se non lo fa, il 400 non e' un rischio ma una certezza"
+        );
+    }
+
+    #[test]
+    fn la_modalita_non_cambia_la_riconciliazione() {
+        // Il retry Aggressive non deve piu' essere l'unico a riparare: se le due
+        // modalita' divergessero qui, tornerebbe il giro a vuoto (una chiamata
+        // pagata per farsi dire dal provider cio' che sapevamo gia').
+        let scoperte = || {
+            vec![
+                assistant_with_tools("c1", "read_file"),
+                assistant_with_tools("c2", "write_file"),
+                assistant_with_tools("c3", "run_command"),
+            ]
+        };
+        let mut standard = scoperte();
+        let mut aggressive = scoperte();
+        sanitize_history(&mut standard, "deepseek", SanitizeMode::Standard);
+        sanitize_history(&mut aggressive, "deepseek", SanitizeMode::Aggressive);
+        assert_eq!(standard, aggressive);
     }
 
     fn user(text: &str) -> LlmMessage {
