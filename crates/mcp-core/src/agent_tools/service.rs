@@ -186,6 +186,13 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         Ok(env) => env,
         Err(msg) => return msg,
     };
+    // Porta su cui il servizio DEVE mettersi in ascolto. E' il segnale che
+    // distingue "il processo esiste" da "il servizio serve": senza, un avvio
+    // fallito viene riportato come riuscito (vedi `attende_ascolto`).
+    let porta_attesa = env_overrides
+        .as_ref()
+        .and_then(|e| e.get("PORT"))
+        .and_then(|p| p.trim().parse::<u16>().ok());
 
     let process_id =
         match spawn_service_process(ctx, &label, &command, &work_dir, env_overrides, &kind).await {
@@ -193,10 +200,49 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             Err(msg) => return msg,
         };
 
-    // Attende qualche secondo l'output iniziale, poi lo legge e compone il
-    // messaggio di avvio (con auto-detect porta ed emissione eventi).
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    report_started_service(ctx, &label, process_id).await
+    // Servizio web: si attende l'ASCOLTO, non un tempo fisso. Uno sano risponde
+    // spesso in meno di un secondo e il tool ritorna subito; uno morto consuma
+    // l'intera finestra e viene riportato come fallito.
+    // Servizio non web (nessuna porta): resta l'attesa a tempo per raccogliere
+    // l'output iniziale, unico segnale disponibile.
+    let ascolto = match porta_attesa {
+        Some(port) => Some((port, attende_ascolto(port).await)),
+        None => {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            None
+        }
+    };
+    report_started_service(ctx, &label, process_id, ascolto).await
+}
+
+/// Finestra entro cui un servizio web deve mettersi in ascolto sulla sua porta.
+const ATTESA_ASCOLTO_MS: u64 = 20_000;
+/// Pausa fra due sondaggi mentre si aspetta l'ascolto.
+const INTERVALLO_PROBE_MS: u64 = 400;
+
+/// True se `port` entra in ascolto entro [`ATTESA_ASCOLTO_MS`].
+///
+/// Esiste perche' la vita del processo NON dimostra che il servizio funzioni:
+/// `nodemon` sopravvive al crash dell'applicazione ("app crashed - waiting for
+/// file changes") e resta `running` con la porta chiusa. Riportare "avviato" in
+/// quel caso da' all'agente un esito falso, su cui costruisce i passi
+/// successivi invece di correggere l'errore che gli sta gia' nello stderr.
+/// L'ascolto e' il segnale strutturato del fatto (regola M).
+///
+/// Ritorna al PRIMO sondaggio riuscito, cosi' la finestra larga non costa nulla
+/// ai servizi sani: la paga solo chi non parte, dove l'attesa e' il prezzo di
+/// una diagnosi corretta invece di una conferma sbagliata.
+async fn attende_ascolto(port: u16) -> bool {
+    let scaduto_dopo = tokio::time::Instant::now() + std::time::Duration::from_millis(ATTESA_ASCOLTO_MS);
+    loop {
+        if crate::project_workspace::port_recovery::tcp_probe(port, INTERVALLO_PROBE_MS).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= scaduto_dopo {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(INTERVALLO_PROBE_MS)).await;
+    }
 }
 
 /// Parametri di avvio risolti da `resolve_service_launch`.
@@ -381,7 +427,12 @@ async fn spawn_service_process(
 
 /// Legge l'output iniziale di un servizio appena avviato, registra la porta
 /// rilevata, emette gli eventi di pannello e compone il messaggio di ritorno.
-async fn report_started_service(ctx: &AgentToolContext, label: &str, process_id: Uuid) -> String {
+async fn report_started_service(
+    ctx: &AgentToolContext,
+    label: &str,
+    process_id: Uuid,
+    ascolto: Option<(u16, bool)>,
+) -> String {
     let info = match crate::agent_processes::read_process_output(
         &ctx.db,
         ctx.project_id,
@@ -405,17 +456,23 @@ async fn report_started_service(ctx: &AgentToolContext, label: &str, process_id:
     if let Some(port) = detected_port {
         register_detected_port(ctx, label, port, info.pid).await;
     }
-    // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED
-    nexus_events::dispatcher::emit(
-        &ctx.project_channels,
-        ctx.project_id,
-        nexus_events::event::ProjectEvent::ServiceStarted {
-            name: label.to_string(),
-            port: detected_port,
-            pid: info.pid,
-        },
-    );
-    format_started_message(label, process_id, &info)
+    // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED.
+    // Se la porta attesa non e' mai entrata in ascolto il servizio NON e' su:
+    // emettere l'avvio accenderebbe un LED verde su un servizio morto, cioe'
+    // ripeterebbe nel pannello la stessa bugia detta all'agente.
+    let in_ascolto = !matches!(ascolto, Some((_, false)));
+    if in_ascolto {
+        nexus_events::dispatcher::emit(
+            &ctx.project_channels,
+            ctx.project_id,
+            nexus_events::event::ProjectEvent::ServiceStarted {
+                name: label.to_string(),
+                port: detected_port,
+                pid: info.pid,
+            },
+        );
+    }
+    format_started_message(label, process_id, &info, ascolto)
 }
 
 /// Registra in `nexus_port_allocations` la porta auto-rilevata dall'output ed
@@ -459,11 +516,55 @@ async fn register_detected_port(ctx: &AgentToolContext, label: &str, port: i32, 
 }
 
 /// Compone il messaggio testuale di avvio servizio (header + STDOUT/STDERR).
+/// Messaggio per un servizio che non e' mai entrato in ascolto. Mette lo STDERR
+/// per primo: e' li' che sta la causa, ed e' cio' che l'agente deve leggere per
+/// correggere invece di proseguire.
+fn format_ascolto_mancante(
+    label: &str,
+    process_id: Uuid,
+    info: &crate::agent_processes::ProcessOutput,
+    port: u16,
+) -> String {
+    let pid = info
+        .pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "?".into());
+    let mut msg = format!(
+        "Servizio '{label}' NON avviato: nessun ascolto sulla porta {port} entro {} secondi \
+         (process_id: {process_id}, pid: {pid}, status processo: {}).\n\
+         Il processo puo' essere ancora vivo senza che il servizio funzioni: alcuni runner \
+         (nodemon, watcher) sopravvivono al crash dell'applicazione. La causa e' nell'output \
+         qui sotto; correggila e riavvia, invece di proseguire come se il servizio rispondesse.\n",
+        ATTESA_ASCOLTO_MS / 1000,
+        info.status,
+    );
+    if !info.stderr.is_empty() {
+        msg.push_str(&format!("\nSTDERR:\n{}", info.stderr));
+    }
+    if !info.stdout.is_empty() {
+        msg.push_str(&format!("\nSTDOUT:\n{}", info.stdout));
+    }
+    if info.stdout.is_empty() && info.stderr.is_empty() {
+        msg.push_str(
+            "\n(Nessun output: il processo non ha scritto nulla prima di smettere di rispondere.)",
+        );
+    }
+    msg
+}
+
 fn format_started_message(
     label: &str,
     process_id: Uuid,
     info: &crate::agent_processes::ProcessOutput,
+    ascolto: Option<(u16, bool)>,
 ) -> String {
+    // Un servizio che non e' entrato in ascolto NON e' avviato, per quanto il
+    // suo processo sia ancora vivo. Dirlo apertamente e' l'intero scopo del
+    // controllo: l'agente deve leggere il fallimento e lo stderr che lo spiega,
+    // non una conferma su cui costruire i passi successivi.
+    if let Some((port, false)) = ascolto {
+        return format_ascolto_mancante(label, process_id, info, port);
+    }
     let mut msg = format!(
         "Servizio '{}' avviato (process_id: {}, pid: {}, status: {})\n",
         label,
@@ -473,6 +574,9 @@ fn format_started_message(
             .unwrap_or_else(|| "?".into()),
         info.status,
     );
+    if let Some((port, true)) = ascolto {
+        msg.push_str(&format!("In ascolto sulla porta {port} (verificato).\n"));
+    }
     if !info.stdout.is_empty() {
         msg.push_str(&format!("\nSTDOUT:\n{}", info.stdout));
     }
@@ -1112,9 +1216,74 @@ fn format_service_row(proc: &crate::agent_processes::ProcessSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_port_from_output, existing_service_action, looks_like_web_service,
-        ExistingServiceAction,
+        detect_port_from_output, existing_service_action, format_started_message,
+        looks_like_web_service, ExistingServiceAction,
     };
+
+    fn uscita_processo(status: &str, stdout: &str, stderr: &str) -> crate::agent_processes::ProcessOutput {
+        crate::agent_processes::ProcessOutput {
+            command: "npm run dev".into(),
+            pid: Some(17488),
+            status: status.into(),
+            exit_code: None,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// REGRESSIONE (2026-07-26): il tool riportava "Servizio avviato" guardando
+    /// solo se il PROCESSO esisteva. `nodemon` sopravvive al crash
+    /// dell'applicazione ("app crashed - waiting for file changes"), quindi lo
+    /// stato restava `running` con la porta chiusa: l'agente riceveva una
+    /// conferma falsa e proseguiva a costruire su un servizio inesistente,
+    /// mentre la causa gli stava gia' nello stderr.
+    #[test]
+    fn senza_ascolto_il_messaggio_dichiara_il_fallimento_e_mostra_la_causa() {
+        let info = uscita_processo(
+            "running",
+            "[nodemon] app crashed - waiting for file changes",
+            "Error: Cannot find module 'D:\\progetto\\backend\\src\\index.js'",
+        );
+        let msg = format_started_message("backend", uuid::Uuid::nil(), &info, Some((32976, false)));
+        assert!(
+            msg.contains("NON avviato"),
+            "un servizio che non ascolta non va annunciato come avviato: {msg}"
+        );
+        assert!(msg.contains("32976"), "il messaggio deve nominare la porta attesa: {msg}");
+        assert!(
+            msg.contains("Cannot find module"),
+            "lo stderr contiene la causa e deve raggiungere l'agente: {msg}"
+        );
+        // Il processo VIVO non deve mai diventare la prova che il servizio sia su.
+        assert!(
+            !msg.contains("Servizio 'backend' avviato"),
+            "status 'running' non basta a dichiarare l'avvio: {msg}"
+        );
+    }
+
+    #[test]
+    fn con_ascolto_verificato_il_messaggio_lo_dichiara() {
+        let info = uscita_processo("running", "server listening", "");
+        let msg = format_started_message("backend", uuid::Uuid::nil(), &info, Some((32976, true)));
+        assert!(msg.contains("avviato"), "{msg}");
+        assert!(
+            msg.contains("In ascolto sulla porta 32976 (verificato)"),
+            "l'ascolto verificato va dichiarato, cosi' l'agente distingue una \
+             conferma provata da una presunta: {msg}"
+        );
+    }
+
+    /// Servizi senza porta (task, worker): nessun ascolto da attendere, quindi
+    /// il messaggio resta quello storico. Il controllo non deve trasformare in
+    /// fallimento cio' che non espone una porta.
+    #[test]
+    fn senza_porta_attesa_il_messaggio_resta_invariato() {
+        let info = uscita_processo("running", "job avviato", "");
+        let msg = format_started_message("worker", uuid::Uuid::nil(), &info, None);
+        assert!(msg.contains("avviato"), "{msg}");
+        assert!(!msg.contains("NON avviato"), "{msg}");
+        assert!(!msg.contains("In ascolto"), "{msg}");
+    }
 
     /// Regressione FIX P5 (Pannello "Porte"): la regex `localhost:(\d{4,5})`
     /// cattura anche la stringa di CONNESSIONE al DB nei log del servizio (es.
