@@ -279,8 +279,11 @@ function SingleRunPanel({
         </div>
       )}
 
-      {/* Sezione riepilogo metriche estese */}
-      {(metrics.totalTokens > 0 || metrics.totalCost > 0) && (
+      {/* Sezione riepilogo metriche estese.
+          Solo per i run CONCLUSI: finche' il run e' in corso le stesse cifre sono
+          gia' nella barra di stato (AgentActivityBar, che e' la card di quel run),
+          e mostrarle anche qui significava due card adiacenti con lo STESSO dato. */}
+      {run.completedAt && (metrics.totalTokens > 0 || metrics.totalCost > 0) && (
         <div>
           <div
             onClick={() => setExpandedMetrics(!expandedMetrics)}

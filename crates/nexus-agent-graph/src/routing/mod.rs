@@ -254,6 +254,40 @@ pub(crate) fn declared_outcome_kind(state: &AgentState) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Nome del canale di ruolo su cui la figura ha gia' DICHIARATO il proprio
+/// deliverable, se ce n'e' uno.
+///
+/// PUNTO UNICO (regola L) della chiusura per ruolo, gemello di
+/// [`declared_outcome_kind`]: quello copre `task_complete` (l'esito di chi
+/// ESEGUE), questo copre le figure il cui deliverable NON e' un task completato
+/// ma un giudizio — il revisore (`review_verdict`), la figura del consiglio
+/// (`advisory_verdict`), l'avvocato del dibattito (`debate_position`).
+///
+/// Perche' esiste: senza, l'edge post-ToolDispatch riconosceva terminale solo
+/// `task_complete` e per una figura ricadeva sempre sull'executor. La figura
+/// aveva pero' gia' prodotto l'UNICA cosa che le era chiesta, quindi continuava a
+/// girare a vuoto fino allo scadere del wall-clock, e `finalize_timeout`
+/// scartava il verdetto sostituendolo con "[Sub-agent timeout]". Misurato su
+/// verifica-wd (2026-07-23): 10 sub-run in timeout con durate ESATTAMENTE pari al
+/// budget del proprio kind (600/300/240s), tutti con il tool terminale gia'
+/// emesso e `acknowledged: true` molto prima (un `task_complete` a 21s su 600,
+/// seguito da 419s di silenzio totale: nessuno step, nessuna chiamata LLM).
+///
+/// Solo le figure hanno questi tool in whitelist, quindi un run generico non
+/// puo' chiudersi per questa via.
+pub(crate) fn declared_role_channel(state: &AgentState) -> Option<&'static str> {
+    if state.review_verdict.is_some() {
+        return Some("review_verdict");
+    }
+    if state.advisory_verdict.is_some() {
+        return Some("advisory_verdict");
+    }
+    if state.debate_position.is_some() {
+        return Some("debate_position");
+    }
+    None
+}
+
 /// Decide post-verifier: re-iterare (executor) o chiudere (learner).
 /// Porting 1:1 di `route_after_verifier` (routing.py:294-311).
 pub fn route_after_verifier(state: &AgentState, _cfg: &RoutingConfig) -> NodeTarget {

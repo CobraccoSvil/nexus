@@ -2,9 +2,16 @@
 
 import type { AdminSettingEntry, PluginCatalogItem } from "../../../lib/api-client";
 import type { Theme } from "../../../lib/theme";
+import { AutoWidthSelect } from "../../auto-width-select";
 import type { CatalogEntry } from "../mcp-catalog-data";
 import { defaultReleaseVersion } from "./plugin-helpers";
 import { actionButtonStyle, inputStyle, selectStyle } from "./plugin-styles";
+
+const SCOPE_OPTIONS = [
+  { value: "global", label: "Scope globale" },
+  { value: "project", label: "Scope progetto" },
+  { value: "user", label: "Scope utente" },
+] as const;
 
 interface CatalogTabProps {
   tc: Theme;
@@ -54,15 +61,12 @@ export function CatalogTab({
           placeholder="Cerca plugin/preset MCP..."
           style={inputStyle(tc)}
         />
-        <select
+        <AutoWidthSelect
           value={installScope}
-          onChange={(event) => onInstallScopeChange(event.target.value as "global" | "project" | "user")}
+          options={SCOPE_OPTIONS}
+          onChange={(value) => onInstallScopeChange(value as "global" | "project" | "user")}
           style={selectStyle(tc)}
-        >
-          <option value="global">Scope globale</option>
-          <option value="project">Scope progetto</option>
-          <option value="user">Scope utente</option>
-        </select>
+        />
         <button
           type="button"
           onClick={() => onToggleShowAlreadyPresent()}
@@ -99,6 +103,10 @@ export function CatalogTab({
         <div style={{ display: "grid", gap: 10 }}>
           {visibleCuratedCatalog.map((item) => {
             const selectedVersion = catalogReleaseChoice[item.id] || defaultReleaseVersion(item);
+            const releaseOptions = item.releases.map((release) => ({
+              value: release.version,
+              label: release.version,
+            }));
             const alreadyInstalled = installedSlugSet.has(item.slug.toLowerCase());
             const missingSecrets = item.requiredSecretRefs.filter((key) => {
               const setting = settingsByKey.get(key);
@@ -162,17 +170,12 @@ export function CatalogTab({
                   </div>
                 )}
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                  <select
+                  <AutoWidthSelect
                     value={selectedVersion}
-                    onChange={(event) => onCatalogReleaseChoiceChange(item.id, event.target.value)}
+                    options={releaseOptions}
+                    onChange={(value) => onCatalogReleaseChoiceChange(item.id, value)}
                     style={selectStyle(tc, 170)}
-                  >
-                    {item.releases.map((release) => (
-                      <option key={release.version} value={release.version}>
-                        {release.version}
-                      </option>
-                    ))}
-                  </select>
+                  />
                   <button
                     type="button"
                     disabled={busyKey === `install:${item.id}` || cannotInstall}

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { UserProfile } from "../../lib/api-client";
 import { DEFAULT_PROFILE_ID } from "../../lib/use-profiles";
+import { AutoWidthSelect, type AutoWidthSelectItem } from "../auto-width-select";
 
 interface ProfileSelectorProps {
   profiles: UserProfile[];
@@ -85,6 +86,29 @@ export function ProfileSelector({
     opacity: 0.7,
   };
 
+  // Etichette identiche a quelle che il JSX componeva inline: emoji del profilo,
+  // nome e il segnaposto del default di progetto.
+  const etichettaProfilo = (p: UserProfile) =>
+    `${p.avatarEmoji} ${p.name}${projectDefaultProfileId === p.id ? " 📌" : ""}`;
+  const profiliUtente = profiles.filter((p) => !p.isSystem);
+  const profiliSistema = profiles.filter((p) => p.isSystem);
+  const profileOptions: AutoWidthSelectItem[] = [
+    { value: "auto", label: "✨ Auto" },
+    { value: DEFAULT_PROFILE_ID, label: "Default" },
+    ...(profiliUtente.length > 0
+      ? [{
+          label: "I miei profili",
+          options: profiliUtente.map((p) => ({ value: p.id, label: etichettaProfilo(p) })),
+        }]
+      : []),
+    ...(profiliSistema.length > 0
+      ? [{
+          label: "Profili di sistema",
+          options: profiliSistema.map((p) => ({ value: p.id, label: `🔒 ${etichettaProfilo(p)}` })),
+        }]
+      : []),
+  ];
+
   const handleSetDefault = async () => {
     if (!onSetProjectDefault) return;
     setSavingDefault(true);
@@ -122,35 +146,13 @@ export function ProfileSelector({
     <div style={baseStyle}>
       {/* Riga principale: select + pulsanti */}
       <div style={rowStyle}>
-        <select
+        <AutoWidthSelect
           value={selectedProfileId}
-          onChange={(e) => { onSelect(e.target.value); setExpanded(false); setEditingPrompt(null); }}
+          options={profileOptions}
+          onChange={(id) => { onSelect(id); setExpanded(false); setEditingPrompt(null); }}
           style={selectStyle}
           title="Seleziona profilo"
-        >
-          <option value="auto">✨ Auto</option>
-          <option value={DEFAULT_PROFILE_ID}>Default</option>
-          {/* Profili utente */}
-          {profiles.filter((p) => !p.isSystem).length > 0 && (
-            <optgroup label="I miei profili">
-              {profiles.filter((p) => !p.isSystem).map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.avatarEmoji} {p.name}{projectDefaultProfileId === p.id ? " 📌" : ""}
-                </option>
-              ))}
-            </optgroup>
-          )}
-          {/* Profili di sistema */}
-          {profiles.filter((p) => p.isSystem).length > 0 && (
-            <optgroup label="Profili di sistema">
-              {profiles.filter((p) => p.isSystem).map((p) => (
-                <option key={p.id} value={p.id}>
-                  🔒 {p.avatarEmoji} {p.name}{projectDefaultProfileId === p.id ? " 📌" : ""}
-                </option>
-              ))}
-            </optgroup>
-          )}
-        </select>
+        />
 
         {/* Bottone espandi editor (solo profili utente) */}
         {canEdit && (

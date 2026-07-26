@@ -62,16 +62,35 @@ export function AgentActivityBar({
         borderRadius: 8,
         border: `1px solid ${tc.border}`,
         background: tc.bgCard,
+        // I due blocchi (riga di stato + dettagli) si IMPILANO. Era `flex` in
+        // direzione riga di default: stavano quindi affiancati, la riga di stato
+        // si dimensionava sul proprio contenuto e sfondava la card, spingendo
+        // fuori dal bordo lo slot in coda (il centro notifiche del run). Che i
+        // dettagli vadano sotto lo dice il loro stesso `borderTop`.
         display: "flex",
-        alignItems: "center",
-        gap: 8,
+        flexDirection: "column",
+        alignItems: "stretch",
         flexShrink: 0,
+        // Nessun gap: i dettagli sono gia' separati dal proprio borderTop, e uno
+        // spazio qui aprirebbe una fessura nel bordo della card.
+        overflow: "hidden",
         boxShadow: "0 2px 8px rgba(0,0,0,0.10)",
       }}
       aria-live="polite"
     >
-      {/* Riga principale */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px" }}>
+      {/* Riga principale. `minWidth: 0` e' cio' che permette ai figli con
+          ellipsis (l'attivita' corrente) di restringersi davvero: senza, un flex
+          item non scende sotto il proprio contenuto minimo e la riga cresce oltre
+          la card invece di troncare il testo. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "7px 10px",
+          minWidth: 0,
+        }}
+      >
         <span
           style={{
             width: 8,
@@ -171,6 +190,38 @@ export function AgentActivityBar({
           padding: "6px 10px 8px",
           display: "flex", flexDirection: "column", gap: 4,
         }}>
+          {/* Metriche del run in corso. Stavano in una card separata del pannello
+              step (`agent-steps-panel`), adiacente a questa e con le STESSE cifre:
+              qui appartengono, perche' questa e' la card del run attivo. Il
+              pannello le mostra ora solo per i run gia' conclusi. */}
+          {(agentRun?.usage?.totalTokens || agentRun?.totalCostUsd) && (
+            <div style={{ color: tc.textMuted, fontSize: 11, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {agentRun?.usage?.totalTokens ? (
+                <span>
+                  Token totali:{" "}
+                  <strong style={{ fontFamily: "var(--font-mono)", color: tc.text }}>
+                    {agentRun.usage.totalTokens.toLocaleString()}
+                  </strong>
+                </span>
+              ) : null}
+              {agentRun?.totalCostUsd ? (
+                <span>
+                  Costo:{" "}
+                  <strong style={{ fontFamily: "var(--font-mono)", color: tc.text }}>
+                    ${agentRun.totalCostUsd.toFixed(6)}
+                  </strong>
+                </span>
+              ) : null}
+              {agentRun?.createdAt ? (
+                <span>
+                  Inizio:{" "}
+                  <strong style={{ fontFamily: "var(--font-mono)", color: tc.textMuted }}>
+                    {new Date(agentRun.createdAt).toLocaleTimeString()}
+                  </strong>
+                </span>
+              ) : null}
+            </div>
+          )}
           <div style={{ color: tc.textMuted, fontSize: 11 }}>
             Step completati: {completedSteps}
             {runningSteps > 0 ? ` • in corso: ${runningSteps}` : ""}

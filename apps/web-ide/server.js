@@ -87,11 +87,24 @@ sseProxy.on("proxyRes", (proxyRes, req, res) => {
   }
 });
 
-/** True per i path SSE long-lived che NON devono passare per il buffering Next.js. */
+/** True per i path SSE long-lived che NON devono passare per il buffering Next.js.
+ *
+ *  Un SSE che non finisce qui viene BUFFERIZZATO dalla rewrite Next (vedi il
+ *  commento su sseProxy): il client non riceve nulla, la connessione cade e
+ *  `EventSource` la riapre DA SOLO, all'infinito. Ogni giro lascia un socket in
+ *  TIME_WAIT e ruba uno dei 6 slot HTTP/1.1 per origine, fino ad affamare le
+ *  fetch normali: e' cosi' che il bootstrap della chat non completava (pulsante
+ *  Invia muto) e le viste operative scadevano. Misurate 52 connessioni TIME_WAIT
+ *  su :3000 con lo stack a riposo.
+ *
+ *  Quindi: ogni endpoint SSE DEVE comparire qui. `terminal-commands/stream` e
+ *  `agent-processes/{id}/stream` erano gli unici due scoperti. */
 function isSseStreamPath(path) {
   return (
     path.endsWith("/agent-stream") ||
     path.endsWith("/event-stream") ||
+    path.endsWith("/terminal-commands/stream") ||
+    /\/agent-processes\/[^/]+\/stream$/.test(path) ||
     /\/playwright\/runs\/[^/]+\/stream$/.test(path)
   );
 }
