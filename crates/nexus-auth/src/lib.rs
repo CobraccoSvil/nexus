@@ -342,16 +342,64 @@ pub async fn resolve_port(db: &PgPool, key: &str) -> u16 {
 }
 
 pub async fn get_or_create_jwt_secret(db: &PgPool) -> anyhow::Result<String> {
-    if let Some(secret) = get_setting(db, "jwt_secret").await {
-        return Ok(secret);
-    }
-    let secret: String = (0..64)
+    get_or_create_platform_secret(db, "jwt_secret").await
+}
+
+/// Risolve un segreto di piattaforma, generandolo se la riga e' vuota.
+///
+/// PUNTO UNICO (regola L) del pattern "leggi-o-genera un segreto persistente".
+///
+/// Due difetti che questa forma chiude, entrambi presenti nella versione
+/// precedente di `get_or_create_jwt_secret`:
+///
+/// 1. RACE. Leggeva con `get_setting`, che passa dalla cache: la cache
+///    memorizza anche il valore VUOTO (60s di TTL), quindi due chiamate
+///    concorrenti — o due entro la finestra — vedevano entrambe "assente",
+///    generavano DUE segreti diversi e li scrivevano una sopra l'altra.
+///    L'ultima vinceva nel DB e il primo utente restava con un JWT firmato
+///    con una chiave non piu' in uso: sessione persa senza alcun errore.
+///    Qui la generazione e' una SOLA istruzione: sul conflitto, il secondo
+///    processo attende il commit del primo, rivaluta la `CASE` sulla riga
+///    aggiornata e la `RETURNING` gli restituisce lo STESSO segreto.
+///    (`DO NOTHING` non andrebbe bene: sul conflitto non produce righe.)
+/// 2. CACHE NON INVALIDATA. La vecchia scrittura era un `UPDATE` raw: dopo
+///    aver generato il segreto, nello stesso processo la lettura successiva
+///    continuava a servire il valore vuoto dalla cache fino allo scadere del
+///    TTL — un JWT appena firmato correttamente veniva rifiutato.
+///
+/// La riga deve esistere (la seminano le migrazioni, `value` e' `NOT NULL
+/// DEFAULT ''`): se manca del tutto e' un errore di schema, non un caso da
+/// gestire in silenzio.
+pub async fn get_or_create_platform_secret(db: &PgPool, key: &str) -> anyhow::Result<String> {
+    let candidato: String = (0..64)
         .map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>()))
         .collect();
-    sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = 'jwt_secret'")
-        .bind(&secret)
-        .execute(db)
-        .await?;
+
+    let secret: Option<String> = sqlx::query_scalar(
+        "UPDATE settings \
+            SET value = CASE WHEN value = '' THEN $2 ELSE value END, \
+                updated_at = CASE WHEN value = '' THEN NOW() ELSE updated_at END \
+          WHERE key = $1 \
+        RETURNING value",
+    )
+    .bind(key)
+    .bind(&candidato)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| anyhow::anyhow!("generazione segreto '{key}' fallita: {e}"))?;
+
+    let secret = secret.ok_or_else(|| {
+        anyhow::anyhow!("segreto '{key}' assente dalla tabella settings: schema incompleto")
+    })?;
+
+    // La scrittura invalida la cache: senza, la lettura successiva nello stesso
+    // processo servirebbe il valore vecchio (vuoto) fino allo scadere del TTL,
+    // e un JWT appena firmato correttamente verrebbe rifiutato.
+    invalidate_setting_cache(db, key);
+
+    if secret.trim().is_empty() {
+        anyhow::bail!("segreto '{key}' vuoto dopo la generazione");
+    }
     Ok(secret)
 }
 
@@ -565,6 +613,81 @@ mod tests_settings_cache {
             !format!("{esito:?}").contains("chiave-di-firma"),
             "il valore del segreto non deve comparire nemmeno nel Debug: {esito:?}"
         );
+    }
+
+    /// Due generazioni concorrenti devono restituire lo STESSO segreto.
+    ///
+    /// E' il difetto che c'era: la vecchia `get_or_create_jwt_secret` leggeva
+    /// dalla cache (che memorizza anche il valore vuoto) e scriveva con un
+    /// `UPDATE` raw, quindi due chiamate ravvicinate generavano due chiavi
+    /// diverse; l'ultima vinceva nel DB e il primo utente restava con un JWT
+    /// non piu' verificabile — sessione persa senza un errore da nessuna parte.
+    ///
+    /// Il test lancia le due chiamate davvero in parallelo sullo stesso pool e
+    /// asserisce l'uguaglianza dei due valori RESTITUITI (non solo di cio' che
+    /// resta nel DB: e' il valore ricevuto dal chiamante che finisce a firmare).
+    #[sqlx::test]
+    async fn due_generazioni_concorrenti_danno_lo_stesso_segreto(pool: PgPool) {
+        crea_settings(&pool).await;
+        // La riga esiste con valore VUOTO: e' la forma con cui la seminano le
+        // migrazioni (0003), non una tabella senza riga.
+        semina(&pool, "jwt_secret", "").await;
+
+        // Apre la finestra REALE del difetto. La race non nasce dal parallelismo
+        // dei thread — con `join!` su runtime a thread singolo le due future si
+        // alternano e la seconda vedrebbe comunque la scrittura della prima, e
+        // infatti un test cosi' resta verde anche col difetto rimesso (provato).
+        // Nasce dalla CACHE: questa lettura la popola col valore vuoto, e da qui
+        // per 60s ogni chiamante che legga con `get_setting` crede che il
+        // segreto non esista — che e' esattamente il caso "due login entro un
+        // minuto" che faceva perdere la sessione al primo utente.
+        assert!(
+            get_setting(&pool, "jwt_secret").await.is_none(),
+            "precondizione: il segreto risulta assente e la cache lo memorizza"
+        );
+
+        let a = get_or_create_platform_secret(&pool, "jwt_secret")
+            .await
+            .expect("prima generazione");
+        let b = get_or_create_platform_secret(&pool, "jwt_secret")
+            .await
+            .expect("seconda generazione, con la cache gia' popolata a vuoto");
+
+        assert_eq!(
+            a, b,
+            "la seconda chiamata non deve generare un secondo segreto: \
+             il primo utente resterebbe con un JWT non piu' verificabile"
+        );
+        assert_eq!(a.len(), 128, "64 byte esadecimali");
+
+        // La cache deve vedere il segreto appena generato, non piu' il vuoto:
+        // senza invalidazione, un JWT appena firmato verrebbe rifiutato fino
+        // allo scadere del TTL.
+        assert_eq!(
+            get_setting(&pool, "jwt_secret").await.as_deref(),
+            Some(a.as_str()),
+            "dopo la generazione la cache deve servire il segreto, non il vuoto"
+        );
+
+        // E il valore restituito deve essere quello effettivamente persistito.
+        let nel_db: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'jwt_secret'")
+            .fetch_one(&pool)
+            .await
+            .expect("rilettura");
+        assert_eq!(nel_db, a, "il segreto restituito e' quello nel DB");
+    }
+
+    /// Una seconda invocazione, dopo che il segreto esiste, non lo rigenera.
+    #[sqlx::test]
+    async fn un_segreto_gia_presente_non_viene_rigenerato(pool: PgPool) {
+        crea_settings(&pool).await;
+        semina(&pool, "jwt_secret", "segreto-preesistente-da-non-toccare").await;
+
+        let letto = get_or_create_platform_secret(&pool, "jwt_secret")
+            .await
+            .expect("lettura");
+
+        assert_eq!(letto, "segreto-preesistente-da-non-toccare");
     }
 
     /// Il gemello: una chiave NON segreta resta leggibile, altrimenti il fix

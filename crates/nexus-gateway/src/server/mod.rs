@@ -49,8 +49,12 @@ pub struct AppState {
     pub db: PgPool,
     /// Token di servizio per le chiamate interne (mcp-core -> gateway).
     pub service_token: String,
-    /// JWT secret: `Some` se valido (>= 32 char), `None` in dev (auth permissiva).
-    pub jwt_secret: Option<String>,
+    /// Chiave di firma della piattaforma (>= 32 char, garantita dal bootstrap).
+    ///
+    /// NON e' un `Option`: quando lo era, l'assenza faceva passare qualunque
+    /// richiesta senza credenziali. Il tipo ora esclude quello stato — il
+    /// gateway non parte se non riesce a risolvere la chiave.
+    pub jwt_secret: String,
     /// URL di mcp-core per il proxy dello stato provider (`/health`, `/providers`).
     pub mcp_core_url: String,
     /// Manager dei cooldown (condiviso col re-probe loop).
