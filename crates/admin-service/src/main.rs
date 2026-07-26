@@ -176,8 +176,9 @@ async fn main() -> anyhow::Result<()> {
             "/quality/false-positive-stats",
             get(prompt_templates::false_positive_stats_handler),
         )
-        // Usage (billing view for admin)
-        .route("/usage", get(settings::get_raw_value))
+        // La vista consumi per admin non vive qui: e' `GET /api/admin/billing/usage`
+        // in mcp-core (`routes/admin.rs` -> `billing::admin_usage_report`, aggrega
+        // `ai_usage_ledger`). Punto unico, regola L.
         // Environment checks & fix
         .route("/environment/status", get(environment::get_environment_status))
         .route("/environment/fix", post(environment::fix_environment))
