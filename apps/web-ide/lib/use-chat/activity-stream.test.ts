@@ -19,6 +19,7 @@ import {
   tracesForRun,
   subagentRunIds,
   capStreamToRecent,
+  raggruppaBlocchiNastro,
   activityLocalAnchorId,
   segmentAnchorId,
   type ActivityEvent,
@@ -1272,4 +1273,63 @@ test("anchoring: composeActivityStream assegna l'ancora canonica a segmenti ed e
   // Guardia: il loop deve aver esercitato davvero il ramo evento (altrimenti il
   // test passerebbe a vuoto senza verificare nulla).
   assert.ok(eventsChecked >= 1, "almeno un evento non-switch con ancora verificato");
+});
+
+// Raggruppamento dei passi di un sub-agente in blocchi collassabili.
+// Il difetto che questi test bloccano: le righe erano una lista piatta, percio'
+// i comandi di un sub-agente non si potevano chiudere e restavano tutti a
+// schermo anche quando ne partiva un altro.
+test("raggruppaBlocchiNastro raccoglie i passi consecutivi dello stesso sub-agente", () => {
+  const sub = (id: string, title: string): ActivityEvent =>
+    ({ type: "subagent", phase: "tool", subagentRunId: id, title }) as ActivityEvent;
+  const blocchi = raggruppaBlocchiNastro([
+    sub("run-a", "primo"),
+    sub("run-a", "secondo"),
+    sub("run-a", "terzo"),
+    sub("run-b", "altro sub-agente"),
+  ]);
+  assert.equal(blocchi.length, 2, "due sub-run distinti, due blocchi");
+  assert.equal(blocchi[0].tipo, "gruppo_subagente");
+  assert.equal(blocchi[1].tipo, "gruppo_subagente");
+  if (blocchi[0].tipo !== "gruppo_subagente" || blocchi[1].tipo !== "gruppo_subagente") return;
+  assert.equal(blocchi[0].subagentRunId, "run-a");
+  assert.equal(blocchi[0].eventi.length, 3, "i tre passi di run-a stanno in un solo blocco");
+  assert.equal(blocchi[1].subagentRunId, "run-b");
+  // L'indice e' quello ORIGINALE nel segmento: le key di React restano stabili
+  // e il deep-link continua a puntare alla riga giusta.
+  assert.equal(blocchi[1].indice, 3);
+});
+
+test("raggruppaBlocchiNastro non fonde sub-run interlacciati e salta gli switch", () => {
+  const sub = (id: string): ActivityEvent =>
+    ({ type: "subagent", phase: "tool", subagentRunId: id, title: id }) as ActivityEvent;
+  const blocchi = raggruppaBlocchiNastro([
+    sub("run-a"),
+    { type: "switch" } as ActivityEvent,
+    sub("run-a"),
+    sub("run-b"),
+    sub("run-a"),
+  ]);
+  // Lo switch non produce una riga, quindi non spezza il gruppo che attraversa.
+  assert.equal(blocchi.length, 3, "a, b, poi di nuovo a: l'ordine reale e' preservato");
+  if (blocchi[0].tipo !== "gruppo_subagente") return assert.fail("primo blocco");
+  assert.equal(blocchi[0].eventi.length, 2, "lo switch non spezza il gruppo");
+  if (blocchi[2].tipo !== "gruppo_subagente") return assert.fail("terzo blocco");
+  assert.equal(blocchi[2].subagentRunId, "run-a");
+  assert.equal(
+    blocchi[2].indice,
+    4,
+    "run-a che ritorna dopo run-b apre un blocco NUOVO: fonderli mentirebbe sull'ordine",
+  );
+});
+
+test("raggruppaBlocchiNastro lascia riga singola cio' che non e' sub-agente", () => {
+  const blocchi = raggruppaBlocchiNastro([
+    { type: "tool", title: "un tool" } as ActivityEvent,
+    { type: "subagent", phase: "tool", title: "senza id" } as ActivityEvent,
+  ]);
+  assert.equal(blocchi.length, 2);
+  assert.equal(blocchi[0].tipo, "riga");
+  // Un evento subagente SENZA id non e' raggruppabile: non si sa a chi appartiene.
+  assert.equal(blocchi[1].tipo, "riga");
 });

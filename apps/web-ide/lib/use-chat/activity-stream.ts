@@ -1207,6 +1207,68 @@ export function foldConsecutiveOkTools(
 }
 
 /**
+ * Eventi che producono una riga. Gli `switch` non ne producono (diventano la
+ * banda di intestazione del segmento), percio' restano fuori dal tipo: cosi' il
+ * compilatore garantisce cio' che il raggruppamento gia' fa a runtime.
+ */
+export type EventoConRiga = Exclude<ActivityEvent, SwitchEvent>;
+
+/** Una riga del nastro, con la sua posizione originale nel segmento. */
+export interface RigaNastro {
+  tipo: "riga";
+  ev: EventoConRiga;
+  indice: number;
+}
+
+/** Righe CONSECUTIVE dello stesso sub-run, raccolte per poterle collassare. */
+export interface GruppoSubagente {
+  tipo: "gruppo_subagente";
+  subagentRunId: string;
+  /**
+   * Indice del primo evento del gruppo. Serve come chiave stabile: con il
+   * dispatch parallelo gli eventi di sub-run diversi si interlacciano, quindi
+   * lo stesso `subagentRunId` puo' aprire piu' gruppi distinti nel segmento e
+   * l'id da solo non li distinguerebbe.
+   */
+  indice: number;
+  eventi: RigaNastro[];
+}
+
+export type BloccoNastro = RigaNastro | GruppoSubagente;
+
+/**
+ * Divide gli eventi di un segmento in blocchi: le righe consecutive dello
+ * stesso sub-agente formano un gruppo, tutto il resto resta una riga a se'.
+ *
+ * Raggruppa per CONSECUTIVITA' e non per sola chiave, cosi' l'ordine mostrato
+ * resta quello reale degli eventi: se due sub-run procedono in parallelo e si
+ * interlacciano, si formano piu' gruppi: mostrarli fusi mentirebbe sull'ordine.
+ *
+ * Gli eventi `switch` non producono una riga (il render li salta), percio' non
+ * spezzano la continuita' di un gruppo: e' lo stesso criterio con cui il nastro
+ * decideva gia' se ripetere l'intestazione del sub-agente.
+ */
+export function raggruppaBlocchiNastro(events: ActivityEvent[]): BloccoNastro[] {
+  const out: BloccoNastro[] = [];
+  events.forEach((ev, indice) => {
+    if (ev.type === "switch") return;
+    const riga: RigaNastro = { tipo: "riga", ev, indice };
+    const id = ev.type === "subagent" ? ev.subagentRunId : undefined;
+    if (!id) {
+      out.push(riga);
+      return;
+    }
+    const ultimo = out[out.length - 1];
+    if (ultimo && ultimo.tipo === "gruppo_subagente" && ultimo.subagentRunId === id) {
+      ultimo.eventi.push(riga);
+      return;
+    }
+    out.push({ tipo: "gruppo_subagente", subagentRunId: id, indice, eventi: [riga] });
+  });
+  return out;
+}
+
+/**
  * Id dei sub-run generati da un run, letti dai suoi meta-step.
  *
  * Fonte: il campo STRUTTURATO `subagent_run_id` del payload (regola M), con

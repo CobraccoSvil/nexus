@@ -513,14 +513,39 @@ pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
     Ok(healed_total)
 }
 
+/// Le capability richieste da uno slot sono l'UNIONE fra la capability BASE
+/// dell'intent (`nexus_intent_capability`, contratto invariante del compito) e
+/// quelle dichiarate per il singolo modo (`required_capabilities`).
+///
+/// PUNTO UNICO della domanda "quali capability servono per (intent, mode)"
+/// (regola L). Prima le due tabelle rispondevano separatamente e potevano
+/// divergere: su `agentic_default` i modi `economica` e `veloce` chiedevano solo
+/// `{code}` mentre l'intent dichiara `reasoning`, cosi' il promoter sceglieva il
+/// modello piu' economico del tier SENZA reasoning e il turno agentico con
+/// tool-loop chiudeva a vuoto (`empty_completion`). L'unione si fa QUI, in
+/// lettura, percio' un dato che tornasse a divergere resta innocuo: il
+/// comportamento non dipende dall'allineamento della tabella.
+///
+/// L'unione NON e' un filtro rigido: la base entra fra le richieste e pesa nel
+/// `cap_score`, ma la soglia di rilevanza resta `capability_match_pct >= 0.5`.
+/// Irrigidirla causerebbe starvation sugli intent la cui base non ha offerta nel
+/// catalog (oggi `web_search`: zero modelli), incidente gia' visto in ADR 0025.
 async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> {
     let rows = sqlx::query(
-        "SELECT intent, behavior_mode, required_capabilities, requires_tool_use,
-                preferred_tier, weight_tier, weight_cost, weight_context,
-                weight_capabilities, cost_direction
-           FROM nexus_intent_routing_requirements
-          WHERE intent <> '*'
-          ORDER BY intent, behavior_mode",
+        "SELECT r.intent, r.behavior_mode,
+                CASE
+                  WHEN COALESCE(c.base_capability, '') <> ''
+                       AND NOT (c.base_capability = ANY(r.required_capabilities))
+                    THEN r.required_capabilities || ARRAY[c.base_capability]
+                  ELSE r.required_capabilities
+                END AS required_capabilities,
+                r.requires_tool_use,
+                r.preferred_tier, r.weight_tier, r.weight_cost, r.weight_context,
+                r.weight_capabilities, r.cost_direction
+           FROM nexus_intent_routing_requirements r
+           LEFT JOIN nexus_intent_capability c ON c.intent = r.intent
+          WHERE r.intent <> '*'
+          ORDER BY r.intent, r.behavior_mode",
     )
     .fetch_all(db)
     .await?;
@@ -1414,6 +1439,63 @@ mod tests {
             caricati,
             vec!["qualificato".to_string()],
             "col gate acceso il selettore slot-based deve caricare SOLO il modello              qualificato e non scaduto: i non qualificati, gli scaduti, i preview e              i modelli marcati morti dal probe sono tutti piu' economici e              vincerebbero lo scoring se il gate mancasse"
+        );
+    }
+
+    /// REGRESSIONE (incidente empty_completion su `agentic_default`, 2026-07-26):
+    /// due tabelle rispondevano alla stessa domanda "quali capability servono per
+    /// questo intent" e potevano divergere. `nexus_intent_capability` dichiarava
+    /// `reasoning` per `agentic_default`, ma i modi `economica` e `veloce` di
+    /// `nexus_intent_routing_requirements` chiedevano solo `{code}`: il promoter
+    /// sceglieva quindi il modello piu' economico del tier privo di reasoning
+    /// (mistral-small-latest, 0.06/M) e il turno agentico con tool-loop chiudeva
+    /// a vuoto, facendo fallire il run.
+    ///
+    /// Il test attraversa `load_requirements`, cioe' la STESSA funzione che il
+    /// promoter usa in produzione (regola O), e gira sulle migrazioni reali:
+    /// verifica prima che il seed non diverga, poi REINTRODUCE la divergenza
+    /// esatta dell'incidente per provare che il codice la sana in lettura.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn i_requisiti_includono_sempre_la_capability_base_dell_intent(pool: sqlx::PgPool) {
+        let divergenti: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM nexus_intent_routing_requirements r
+               JOIN nexus_intent_capability c ON c.intent = r.intent
+              WHERE COALESCE(c.base_capability, '') <> ''
+                AND NOT (c.base_capability = ANY(r.required_capabilities))",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("conteggio divergenze sul seed");
+        assert_eq!(
+            divergenti, 0,
+            "il seed delle migrazioni non deve piu' contenere slot che chiedono \
+             meno della capability base dichiarata per il loro intent (mig 0641)"
+        );
+
+        // Mutazione: rimette esattamente la divergenza che causo' l'incidente.
+        sqlx::query(
+            "UPDATE nexus_intent_routing_requirements
+                SET required_capabilities = ARRAY['code']
+              WHERE intent = 'agentic_default' AND behavior_mode = 'economica'",
+        )
+        .execute(&pool)
+        .await
+        .expect("reintroduce la divergenza");
+
+        let slot = load_requirements(&pool)
+            .await
+            .expect("load_requirements")
+            .into_iter()
+            .find(|r| r.intent == "agentic_default" && r.behavior_mode == "economica")
+            .expect("slot agentic_default/economica");
+
+        assert!(
+            slot.required_capabilities.iter().any(|c| c == "reasoning"),
+            "anche con la tabella tornata a divergere, il promoter deve chiedere \
+             la capability base dell'intent: l'unione avviene in lettura, percio' \
+             il comportamento non dipende dall'allineamento del dato. \
+             Capability lette: {:?}",
+            slot.required_capabilities
         );
     }
 }

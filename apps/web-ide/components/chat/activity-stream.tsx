@@ -30,6 +30,7 @@ import { ProviderIcon } from "./provider-icon";
 import {
   capStreamToRecent,
   figureVerdictDisplay,
+  raggruppaBlocchiNastro,
   runScopedAnchorId,
   switchCauseLabel,
 } from "../../lib/use-chat/activity-stream";
@@ -44,6 +45,7 @@ import type {
   FigureAdvisory,
   FigureAdvisoryReport,
   FigureVerdictTone,
+  GruppoSubagente,
 } from "../../lib/use-chat/activity-stream";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -1165,6 +1167,96 @@ function metaStyle(tc: ThemeColors): React.CSSProperties {
   return { color: tc.textMuted, fontSize: 11.5 };
 }
 
+/**
+ * I passi di UN sub-agente, collassabili. La prima riga resta sempre visibile
+ * (porta l'intestazione con kind e id corto); le successive stanno sotto un
+ * toggle.
+ *
+ * `espansoDiDefault` e' DERIVATO dai dati (e' vero solo per il sub-agente piu'
+ * recente del segmento), non impostato da un evento: cosi' quando ne parte un
+ * altro il precedente si chiude da se', senza bisogno di reagire a un segnale
+ * di avvio e senza stato che possa restare indietro. L'override manuale vince
+ * finche' l'utente non lo azzera, percio' un blocco aperto a mano non si
+ * richiude sotto le mani.
+ */
+function GruppoSubagenteView({
+  gruppo,
+  espansoDiDefault,
+  segColor,
+  tc,
+  runId,
+}: {
+  gruppo: GruppoSubagente;
+  espansoDiDefault: boolean;
+  segColor: string;
+  tc: ThemeColors;
+  runId?: string;
+}) {
+  const [override, setOverride] = useState<boolean | null>(null);
+  const espanso = override ?? espansoDiDefault;
+  const [prima, ...resto] = gruppo.eventi;
+  return (
+    <div style={{ minWidth: 0 }}>
+      <EventRow
+        event={prima.ev}
+        segColor={segColor}
+        tc={tc}
+        runId={runId}
+        continuaSubagente={false}
+      />
+      {resto.length > 0 && (
+        <>
+          <div
+            onClick={() => setOverride(!espanso)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 11.5,
+              color: tc.textMuted,
+              cursor: "pointer",
+              minWidth: 0,
+              padding: "2px 0",
+            }}
+          >
+            <span
+              aria-hidden
+              style={{ fontFamily: "var(--font-mono)", fontSize: 9, flexShrink: 0 }}
+            >
+              {espanso ? "▾" : "▸"}
+            </span>
+            <span>
+              {resto.length === 1 ? "1 passo" : `${resto.length} passi`}
+              {espanso ? "" : " · nascosti"}
+            </span>
+          </div>
+          {espanso && (
+            <div
+              style={{
+                marginLeft: 8,
+                paddingLeft: 8,
+                borderLeft: `2px solid ${withAlpha(segColor, 0.35)}`,
+                minWidth: 0,
+              }}
+            >
+              {resto.map((r) => (
+                <EventRow
+                  key={`ev-${r.indice}`}
+                  event={r.ev}
+                  segColor={segColor}
+                  tc={tc}
+                  runId={runId}
+                  continuaSubagente
+                />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 /** Un segmento: eventuale banda switch in testa, poi la spina di eventi. */
 function SegmentView({
   segment,
@@ -1176,6 +1268,14 @@ function SegmentView({
   runId?: string;
 }) {
   const segColor = providerBaseColor(segment.provider);
+  // Le righe consecutive di uno stesso sub-agente diventano un blocco: e'
+  // espanso solo quello del sub-agente piu' recente, cosi' i precedenti si
+  // chiudono da soli quando ne parte un altro.
+  const blocchi = raggruppaBlocchiNastro(segment.events);
+  const indiceGruppoPiuRecente = blocchi.reduce<number | null>(
+    (acc, b) => (b.tipo === "gruppo_subagente" ? b.indice : acc),
+    null,
+  );
   // Id DOM del SEGMENTO (fallback per l'evento cappato). Applicato alla banda
   // switch se il segmento la ha, altrimenti al placeholder "N passi precedenti":
   // mutuamente esclusivi per non emettere due nodi con lo stesso id.
@@ -1209,35 +1309,27 @@ function SegmentView({
               : `${segment.cappedCount} passi precedenti`}
           </div>
         ) : null}
-        {segment.events.map((ev, i) => {
-          if (ev.type === "switch") return null;
-          // Righe CONSECUTIVE dello stesso sub-run: l'intestazione
-          // ("SUBAGENTE #id") si mostra una volta sola e le successive si
-          // aggregano sotto. Ripeterla a ogni tool rendeva il nastro un elenco
-          // di etichette identiche, in cui il contenuto vero (il tool eseguito)
-          // era la parte meno visibile.
-          // Il confronto e' con la precedente riga VISIBILE: gli eventi "switch"
-          // non producono una riga, quindi non spezzano la continuita'.
-          const precedente = segment.events
-            .slice(0, i)
-            .reverse()
-            .find((e) => e.type !== "switch");
-          const continuaSubagente =
-            ev.type === "subagent" &&
-            precedente?.type === "subagent" &&
-            !!ev.subagentRunId &&
-            precedente.subagentRunId === ev.subagentRunId;
-          return (
+        {blocchi.map((b) =>
+          b.tipo === "riga" ? (
             <EventRow
-              key={`ev-${i}`}
-              event={ev}
+              key={`ev-${b.indice}`}
+              event={b.ev}
               segColor={segColor}
               tc={tc}
               runId={runId}
-              continuaSubagente={continuaSubagente}
+              continuaSubagente={false}
             />
-          );
-        })}
+          ) : (
+            <GruppoSubagenteView
+              key={`sub-${b.subagentRunId}-${b.indice}`}
+              gruppo={b}
+              espansoDiDefault={b.indice === indiceGruppoPiuRecente}
+              segColor={segColor}
+              tc={tc}
+              runId={runId}
+            />
+          ),
+        )}
       </div>
     </div>
   );

@@ -131,6 +131,15 @@ export interface ProjectStoreState {
   settings: { lastChangeAt: number };
   // Subagent runs: ultimo stato
   subagentRuns: { lastChangeAt: number };
+  // Stato dei todo del piano, per todo_id. Vive QUI e non nel componente della
+  // checklist perche' i renderer del piano si smontano continuamente durante un
+  // run (la card `plan` nasce chiusa, la finestra live del nastro tiene solo gli
+  // ultimi eventi, e le key posizionali rimpiazzano il sottoalbero quando la
+  // finestra scorre). La consegna degli eventi non ha replay: quanto arriva a
+  // componente smontato e' perso per sempre, percio' i marker restavano a [ ]
+  // finche' un refresh non li rileggeva dal backend. Lo store riceve gli eventi
+  // sempre, indipendentemente da cosa e' montato.
+  todos: { statusById: Record<string, string>; lastChangeAt: number };
   // Quality scan progress
   qualityScan: { scanId?: string; phase: string; percent: number; ts: number } | null;
   // Output channels
@@ -222,6 +231,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   plugins: { lastChangeAt: 0 },
   settings: { lastChangeAt: 0 },
   subagentRuns: { lastChangeAt: 0 },
+  todos: { statusById: {}, lastChangeAt: 0 },
   qualityScan: null,
   outputChannels: { lastChangeAt: 0 },
   findingsUpdate: null,
@@ -450,7 +460,15 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         };
         break;
       }
-      case "TodoUpdated":
+      case "TodoUpdated": {
+        if (p.todo_id && p.status) {
+          next.todos = {
+            statusById: { ...next.todos.statusById, [p.todo_id]: p.status },
+            lastChangeAt: env.ts,
+          };
+        }
+        break;
+      }
       case "PlanUpdated":
         break;
       case "FileChanged": {
@@ -837,6 +855,10 @@ export const selectProviderHealthChangedAt = (s: ProjectStoreState) => s.provide
 export const selectPluginsChangedAt = (s: ProjectStoreState) => s.plugins.lastChangeAt;
 export const selectSettingsChangedAt = (s: ProjectStoreState) => s.settings.lastChangeAt;
 export const selectSubagentRunsChangedAt = (s: ProjectStoreState) => s.subagentRuns.lastChangeAt;
+/// Stato piu' recente di ogni todo, per todo_id. Punto unico dell'avanzamento
+/// del piano lato UI: la checklist legge da qui invece di accumulare gli eventi
+/// in uno stato locale, che il rimontaggio azzerava.
+export const selectTodoStatuses = (s: ProjectStoreState) => s.todos.statusById;
 export const selectQualityScan = (s: ProjectStoreState) => s.qualityScan;
 export const selectOutputChannelsChangedAt = (s: ProjectStoreState) => s.outputChannels.lastChangeAt;
 export const selectKnowledgeChangedAt = (s: ProjectStoreState) => s.knowledge.lastChangeAt;

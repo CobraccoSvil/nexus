@@ -62,6 +62,7 @@ export {
   selectSettingsChangedAt,
   selectSubagentRunsChangedAt,
   selectToasts,
+  selectTodoStatuses,
   subscribeAll,
 } from "./store";
 export { useEventOfKind, useProjectEvents } from "./use-events";

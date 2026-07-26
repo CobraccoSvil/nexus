@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type CSSProperties } from "react";
-import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
+import { selectTodoStatuses, useProjectStore } from "../../lib/project-dispatcher/hooks";
 import { useThemeColors } from "../../lib/theme";
 import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
@@ -327,16 +327,14 @@ type PlanTodo = { id?: string; seq?: number; content?: string; status?: string; 
 // nastro attivita' (activity-stream.tsx) per non duplicare la logica di
 // aggiornamento TodoUpdated via SSE.
 export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
-  // overrides[todo_id] = status piu' recente ricevuto via SSE.
-  const [overrides, setOverrides] = useState<Record<string, string>>({});
-  useEventOfKind(
-    "TodoUpdated",
-    (env) => {
-      const p = env.payload as { todo_id: string; status: string };
-      setOverrides((prev) => (prev[p.todo_id] === p.status ? prev : { ...prev, [p.todo_id]: p.status }));
-    },
-    [],
-  );
+  // Gli status aggiornati arrivano dallo store del dispatcher, non da uno stato
+  // locale: questo componente si smonta di continuo durante un run (la card
+  // `plan` nasce chiusa, la finestra live del nastro tiene solo gli ultimi
+  // eventi, e le key posizionali ne rimpiazzano il sottoalbero quando la
+  // finestra scorre). Poiche' la consegna degli eventi non ha replay, ogni
+  // TodoUpdated arrivato a componente smontato era perso per sempre e i marker
+  // restavano a [ ] fino al refresh, che li rileggeva dal backend.
+  const overrides = useProjectStore(selectTodoStatuses);
   if (!todos.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessun todo</em>;
   const MARK: Record<string, string> = {
     completed: "[x]", in_progress: "[~]", blocked: "[!]", skipped: "[-]", pending: "[ ]",
