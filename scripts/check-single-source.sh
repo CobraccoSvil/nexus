@@ -202,6 +202,54 @@ else
   echo "OK pricing-single-source: listino e currency vivono solo in nexus-pricing"
 fi
 
+# Contabilita' del ledger (2026-07-27): "quale riga si scrive in ai_usage_ledger"
+# e' UNA domanda, e la risposta vive solo in crates/nexus-ledger. Erano QUATTRO
+# scrittori in due crate che non si vedevano, con le SQL tenute gemelle a mano —
+# il commento sopra `SQL_UPDATE_LEDGER_FINALIZE` lo dichiarava: "Gemella di
+# `SQL_INSERT_LEDGER_TESTO` nel gateway". Le divergenze erano gia' in atto e
+# tutte sui soldi:
+#   1. nessuno dei due sapeva dell'altro -> una chiamata lasciava DUE righe
+#      'finalized' (misurato il 27/07/2026: 0.002339 addebitati due volte);
+#   2. `ai_quota_policies.cost_limit` e' NUMERIC e sqlx non lo decodifica in f64:
+#      il gateway aveva il cast ::float8, mcp-core no. Invisibile finche' nessuno
+#      configurava una quota di COSTO, cioe' finche' non c'era una riga da
+#      decodificare;
+#   3. il marker del job batch dichiarava una currency 'EUR' di propria
+#      iniziativa, con la piattaforma su USD.
+# Nessun compilatore poteva vederlo: SQL in stringhe, in crate che non si
+# conoscono.
+#
+# Il guard NON vieta di LEGGERE il ledger: report admin, breakdown per run,
+# viste analitiche e monitor sono letture di presentazione che non decidono
+# nulla. Confina la SCRITTURA (INSERT/UPDATE), che e' dove nasce il denaro.
+#
+# Ambito: i sorgenti. Nei test la garanzia e' di natura diversa (regola O: un
+# test deve attraversare il PRODUTTORE, non ricopiarlo) e non e' un grep a
+# darla; oggi il produttore vero e' raggiungibile — prima non lo era, ed e' il
+# motivo per cui il crate esiste. Caso noto residuo:
+# `crates/mcp-core/tests/m71_cost_breakdown.rs`, che semina righe per verificare
+# un LETTORE (il breakdown costi per run) e non uno scrittore.
+ledger_hits="$(grep -rEn \
+  "(INSERT +INTO|UPDATE) +ai_usage_ledger" \
+  crates \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v '^crates/nexus-ledger/' \
+  | grep -v '/tests/' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$ledger_hits" ]]; then
+  echo "!! ledger-single-source: scrittura di ai_usage_ledger fuori da nexus-ledger:" >&2
+  echo "$ledger_hits" >&2
+  echo "   Chiama nexus_ledger::{reserve, record_tokens, record_media, insert_marker," >&2
+  echo "   finalize, release, settle}. Le copie storiche divergevano sui soldi:" >&2
+  echo "   due righe finalizzate per una chiamata, una quota di costo illeggibile," >&2
+  echo "   una currency inventata. Tenerne UNA e' il punto." >&2
+  fail=1
+else
+  echo "OK ledger-single-source: il ledger lo scrive solo nexus-ledger"
+fi
+
 # Identificatori canonici (2026-07-09): enum/command identifiers in inglese,
 # niente sinonimi IT negli parser Rust (regola CLAUDE.md sezione N).
 alias_hits="$(grep -rEn \
@@ -789,6 +837,33 @@ else
   else
     echo "OK test-skip-visibile: nessuno skip muto, un solo punto unico delle precondizioni"
   fi
+fi
+
+# ── cache-di-configurazione-chiavata ────────────────────────────────────────
+# Una cache DI PROCESSO che memorizza configurazione letta da un database deve
+# essere chiavata per DATABASE (`nexus_auth::pool_identity`). Con una chiave
+# costante il primo lettore decide per tutti fino alla scadenza del TTL, e
+# mcp-core interroga piu' database (il meta e un `<slug>_nexus` per progetto).
+#
+# Non e' teoria: il 2026-07-27 `qualification_gate` teneva il gate in una statica
+# senza chiave, un `#[sqlx::test(migrator = "META_MIGRATOR")]` lo accendeva (mig
+# 0595) e per 60s ogni altro test del processo si vedeva il catalog svuotato —
+# sei test di `internal_routing` rossi o verdi a seconda di chi partiva primo
+# (regole F e O). Lo stesso valeva per il flag isolamento, che cachava con chiave
+# `()` un valore GIA' cachato da `nexus_auth`.
+#
+# Il divieto colpisce solo le cache `static`: una `TtlCache<(), _>` come CAMPO di
+# una struct e' legittima (l'istanza e' gia' legata alla sua fonte).
+cache_hits="$(grep -rnE --include='*.rs' --exclude-dir=target \
+  'static [A-Z_]+ *:.*TtlCache<\(\)' crates 2>/dev/null || true)"
+if [[ -n "$cache_hits" ]]; then
+  echo "!! cache-di-configurazione-chiavata: cache di processo con chiave costante:" >&2
+  printf '%s\n' "$cache_hits" | sed 's/^/     /' >&2
+  echo "   Chiavala per database con nexus_auth::pool_identity(db), o togli la" >&2
+  echo "   cache se sotto c'e' gia' nexus_auth::get_setting (che cacha da solo)." >&2
+  fail=1
+else
+  echo "OK cache-di-configurazione-chiavata: nessuna cache statica a chiave costante"
 fi
 
 if [[ "$fail" -ne 0 ]]; then
