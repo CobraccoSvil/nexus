@@ -5,6 +5,12 @@ import type { ChatAttachment } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { IconButton } from "../icon-button";
 import { AutoWidthSelect } from "../auto-width-select";
+import {
+  forceButtonView,
+  isProviderPinned,
+  providerSelectTitle,
+  PROVIDER_AUTO,
+} from "./provider-choice-logic";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -169,9 +175,15 @@ export function Composer({
     minWidth: 0,
   } as const;
 
-  // Un provider selezionato (diverso da "auto") e' gia' forzato come override,
-  // a prescindere dal toggle "Forza": il dropdown e' la fonte di verita'.
-  const isProviderLocked = selectedProvider !== "auto";
+  // Il dropdown dice QUALE provider, il pulsante "Forza" dice QUANTO vincola.
+  // Sono due stati distinti e la barra li mostra distinti: una selezione senza
+  // "Forza" e' una preferenza (il routing puo' cambiare fornitore), col pulsante
+  // attivo e' un vincolo duro. Punto unico della distinzione:
+  // provider-choice-logic.ts, lo stesso che decide cosa viaggia sul wire — cosi'
+  // il colore del bordo non puo' dire una cosa e la richiesta farne un'altra.
+  const isProviderChosen = selectedProvider !== PROVIDER_AUTO;
+  const isProviderPinnedNow = isProviderPinned(selectedProvider, forceProvider);
+  const forceButton = forceButtonView(selectedProvider, forceProvider, automationMode);
   const showAutomationRunMismatch =
     !!runAutomationMode &&
     runAutomationMode !== automationMode &&
@@ -179,13 +191,17 @@ export function Composer({
   const automationTitle = showAutomationRunMismatch
     ? `Run in corso avviato in modalita' "${runAutomationMode}" — il dropdown (${automationMode}) vale solo per i prossimi messaggi.`
     : "Automazione: Studio = solo lettura, Conferma = chiede approvazione prima di modifiche, Automatico = esegue senza fermarsi";
+  // "override -> fallback" segnala che il run NON sta rispettando la scelta.
+  // Vale solo col PIN: con la sola preferenza un provider diverso e' il
+  // comportamento promesso, non un'anomalia — segnalarlo come tale sarebbe
+  // gridare al lupo a ogni fallback riuscito.
   const showOverrideMismatch =
-    isProviderLocked &&
+    isProviderPinnedNow &&
     !!runProvider &&
     runProvider !== selectedProvider &&
     isAgentRunning;
   const showModelMismatch =
-    isProviderLocked &&
+    isProviderPinnedNow &&
     selectedModel !== "auto" &&
     !!runModel &&
     runModel !== selectedModel &&
@@ -392,32 +408,35 @@ export function Composer({
             value={selectedProvider}
             options={PROVIDER_OPTIONS}
             onChange={onProviderChange}
-            title={isProviderLocked ? `Provider forzato su ${selectedProvider} — disattiva "Forza" o passa ad Auto per routing intelligente` : "Routing automatico: sceglie il modello migliore per ogni task"}
+            title={providerSelectTitle(selectedProvider, forceProvider, automationMode)}
             style={{
               ...selectStyle,
-              border: `1px solid ${isProviderLocked ? "#f97316" : tc.border}`,
-              background: isProviderLocked ? "#f9731612" : tc.bgCard,
-              color: isProviderLocked ? "#f97316" : tc.textSecondary,
-              fontWeight: isProviderLocked ? 600 : 400,
+              // Arancione = vincolo duro. Una preferenza resta evidenziata (e'
+              // una scelta attiva) ma con l'accento, non col colore che nella
+              // barra significa "questo non si negozia".
+              border: `1px solid ${isProviderPinnedNow ? "#f97316" : isProviderChosen ? tc.accent : tc.border}`,
+              background: isProviderPinnedNow ? "#f9731612" : isProviderChosen ? `${tc.accent}12` : tc.bgCard,
+              color: isProviderPinnedNow ? "#f97316" : isProviderChosen ? tc.accent : tc.textSecondary,
+              fontWeight: isProviderChosen ? 600 : 400,
             }}
           />
-          {selectedProvider !== "auto" && (
+          {isProviderChosen && (
             <button
               type="button"
               onClick={() => onForceProviderChange(!forceProvider)}
-              title={forceProvider ? "Override attivo: il provider selezionato viene forzato" : "Override disattivo: il routing può scegliere un provider diverso"}
+              title={forceButton.title}
               style={{
                 ...selectStyle,
-                border: `1px solid ${forceProvider ? "#f97316" : tc.border}`,
-                background: forceProvider ? "#f9731612" : tc.bgCard,
-                color: forceProvider ? "#f97316" : tc.textSecondary,
-                fontWeight: forceProvider ? 700 : 500,
+                border: `1px solid ${isProviderPinnedNow ? "#f97316" : tc.border}`,
+                background: isProviderPinnedNow ? "#f9731612" : tc.bgCard,
+                color: isProviderPinnedNow ? "#f97316" : tc.textSecondary,
+                fontWeight: isProviderPinnedNow ? 700 : 500,
               }}
             >
-              {forceProvider ? "Forza ✓" : "Forza"}
+              {forceButton.label}
             </button>
           )}
-          {selectedProvider !== "auto" && forceProvider && (
+          {isProviderPinnedNow && (
             <AutoWidthSelect
               value={selectedModel}
               options={MODEL_OPTIONS}
@@ -433,7 +452,7 @@ export function Composer({
           )}
           {(showOverrideMismatch || showModelMismatch) && (
             <span
-              title="La run non sta rispettando l'override. Possibili cause: provider in cooldown/quota, modello non disponibile, fallback del router."
+              title="Il run in corso non sta rispettando il pin. Cause tipiche: e' partito prima che tu pinnassi questo provider, oppure il modello pinnato non era disponibile."
               style={{
                 ...selectStyle,
                 border: "1px solid #ef4444",
@@ -442,7 +461,7 @@ export function Composer({
                 fontWeight: 700,
               }}
             >
-              ⚠ override → fallback
+              ⚠ pin non rispettato
             </span>
           )}
           <AutoWidthSelect

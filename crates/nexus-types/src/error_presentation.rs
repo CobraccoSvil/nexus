@@ -209,6 +209,26 @@ impl From<&str> for RenderedError {
 }
 
 impl RenderedError {
+    /// Annota la resa col fatto che il provider era FORZATO dall'utente.
+    ///
+    /// Quando la richiesta viaggia con un pin, il servizio esegue QUEL fornitore
+    /// e basta: nessun ripiego su un altro (nel gateway il pin costruisce una
+    /// chain di un solo elemento). Il fallimento e' allora la conseguenza
+    /// diretta della scelta dell'utente, non un guasto generico — e senza questa
+    /// riga l'utente legge "X ha rifiutato la richiesta" senza sapere che
+    /// togliendo la forzatura la richiesta sarebbe stata instradata altrove.
+    ///
+    /// Annota SOLO `message`: `code` resta quello deciso dai fatti (il frontend
+    /// ci sceglie icona e azione) e `detail` resta il tecnico integrale.
+    pub fn con_provider_forzato(mut self, provider: &str) -> Self {
+        self.message = format!(
+            "{} Provider forzato dall'utente ({provider}): con la forzatura attiva \
+             non viene tentato nessun altro fornitore.",
+            self.message.trim_end()
+        );
+        self
+    }
+
     /// Il testo per i log: messaggio E dettaglio. Da usare in `tracing`, mai
     /// verso l'utente.
     pub fn log_line(&self) -> String {
@@ -725,6 +745,35 @@ mod tests {
             &ErrorFacts::opaque(ErrorDomain::Plugin, "raw").with_upstream("   "),
         );
         assert!(!r.message.ends_with(' '), "spazio in coda: {:?}", r.message);
+    }
+
+    /// Col provider forzato la frase deve dire DUE cose: cosa e' andato storto e
+    /// che non c'e' stato alcun ripiego. `code` e `detail` non si toccano.
+    #[test]
+    fn la_forzatura_del_provider_si_legge_nel_messaggio() {
+        let base = render_user_error(
+            &ErrorFacts::opaque(ErrorDomain::Provider, "{\"error\":{\"code\":\"x\"}}")
+                .with_provider("deepseek")
+                .with_status(400),
+        );
+        let annotato = base.clone().con_provider_forzato("deepseek");
+        assert_eq!(annotato.code, base.code, "il codice classificato non cambia");
+        assert_eq!(annotato.detail, base.detail, "il dettaglio tecnico non cambia");
+        assert!(
+            annotato.message.starts_with(&base.message),
+            "l'annotazione si AGGIUNGE, non sostituisce: {}",
+            annotato.message
+        );
+        assert!(
+            annotato.message.contains("forzato") && annotato.message.contains("deepseek"),
+            "chi legge deve capire che il provider era forzato: {}",
+            annotato.message
+        );
+        assert!(
+            annotato.message.contains("nessun altro fornitore"),
+            "deve dire che non c'e' stato ripiego: {}",
+            annotato.message
+        );
     }
 
     /// `log_line` e' l'altro canale: li' il dettaglio DEVE esserci, altrimenti

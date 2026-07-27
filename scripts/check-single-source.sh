@@ -122,6 +122,34 @@ assert_single "directory nexus_data_routing" '(FROM|INTO) nexus_data_routing' 'c
 # test di regressione in provision.rs (mod tests).
 assert_single "derivazione nome DB progetto" 'fn derive_project_db_name' 'crates/mcp-core/src/project_db_routes/provision.rs' crates
 
+# Richiesta della chat al gateway (2026-07-27): modello, pin del provider
+# forzato e coppia prenotata a ledger nascono in UN punto. Prima la chat ne
+# teneva una copia inline in execute_via_gateway che prefissava il modello col
+# provider (`deepseek/coder-large`) e non valorizzava `pin_provider`: la
+# forzatura dell'utente non arrivava al gateway e rispondeva un altro fornitore.
+# Sul PREFISSO non c'e' un guard testuale: `format!("{provider}/{model}")` ha
+# usi legittimi (etichette di display, `model_used`, e gli adapter che lo
+# accoppiano a `pin_provider`, dove il gateway lo strippa). Un guard che gridasse
+# su quelli misurerebbe un'altra cosa. A presidiare il prefisso c'e' il test di
+# mutazione `provider_forzato_viaggia_come_pin_e_il_modello_non_e_prefissato`.
+assert_single "richiesta gateway chat" 'fn build_chat_gateway_call' 'crates/mcp-core/src/orchestrator/model_routing.rs' crates
+
+# Preferenza vs pin del provider (2026-07-27): "quanto vincola il provider che
+# l'utente ha scelto?" ha UN vocabolario e UN punto in cui il vincolo duro nasce.
+# Prima la forza del vincolo non esisteva sul wire — il pulsante "Forza" del
+# composer non arrivava mai al backend — e chi leggeva il solo nome del provider
+# doveva DEDURLA. Finche' l'override non aveva effetto la deduzione era innocua;
+# col pin funzionante avrebbe reso duro ogni cambio di dropdown, e persistente
+# (la preferenza di sessione riproponeva quel nome a ogni messaggio).
+# Il primo check protegge il vocabolario, il secondo il divieto: solo
+# `ProviderChoice::resolve` puo' coniare un pin, e lo fa dalla richiesta in
+# corso — mai da un ricordo. Un `ProviderChoice::Pinned(...)` costruito altrove
+# sarebbe di nuovo un vincolo nato senza che l'utente lo dia in quel momento.
+assert_single "vocabolario forza-vincolo provider" 'enum ProviderOverrideMode' 'crates/mcp-core/src/orchestrator/provider_choice.rs' crates
+# Si cerca la COSTRUZIONE (`::Pinned(`), non il nome: i riferimenti in rustdoc
+# (`[ProviderChoice::Pinned]`) documentano il concetto e non coniano nulla.
+assert_single "nascita del pin duro" 'ProviderChoice::Pinned\(' 'crates/mcp-core/src/orchestrator/provider_choice.rs' crates
+
 # Aggregazione problemi ripetitivi (2026-07-09): chiave di gruppo semantica e
 # pipeline dedup+raggruppamento del pannello Problemi. Punto unico:
 # project_workspace/problem_aggregation.rs; get_project_problems delega.

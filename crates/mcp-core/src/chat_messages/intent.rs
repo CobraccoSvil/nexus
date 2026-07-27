@@ -5,6 +5,41 @@ pub(crate) fn parse_automation_mode(value: Option<&str>) -> AutomationMode {
     AutomationMode::parse(value)
 }
 
+/// La scelta di provider di una richiesta di chat, letta dal corpo HTTP.
+///
+/// Confine HTTP dei due handler che accettano un `SendChatMessageRequest`
+/// (invio e resend): validazione dell'identificatore canonico — un valore
+/// scritto male e' 400, non un silenzioso ripiego sul default — e risoluzione
+/// col provider che una fonte persistita ricorda. Sta qui e non in ciascun
+/// handler perche' e' la stessa domanda: due copie divergerebbero, e quella che
+/// divergesse sul MODO deciderebbe di nascosto se la richiesta ha il fallback.
+///
+/// `remembered_provider`: preferenza di sessione (invio) o provider del
+/// messaggio originale (resend). Vale come preferenza e mai come pin — la
+/// regola vive in [`ProviderChoice::resolve`], qui non si duplica.
+pub(crate) fn provider_choice_from_body(
+    body: &SendChatMessageRequest,
+    remembered_provider: Option<&str>,
+) -> Result<ProviderChoice, ApiError> {
+    let mode = ProviderOverrideMode::try_parse(body.provider_override_mode.as_deref()).map_err(
+        |_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "provider_override_mode non valido: '{}'. Valori ammessi: {}",
+                    body.provider_override_mode.as_deref().unwrap_or(""),
+                    ProviderOverrideMode::CANONICAL.join(", ")
+                ),
+            )
+        },
+    )?;
+    Ok(ProviderChoice::resolve(
+        body.provider_override.as_deref(),
+        mode,
+        remembered_provider,
+    ))
+}
+
 /// Legge la modalita' di automazione persistita sulla sessione (mig 0371).
 /// Usata dai run che NON ricevono un body HTTP (process_resume, service_observer):
 /// ereditano la modalita' scelta dall'utente invece di hardcodare Confirm.

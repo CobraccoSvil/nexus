@@ -5,6 +5,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
+use crate::nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest};
+
 use super::*;
 
 #[derive(Debug)]
@@ -817,6 +819,206 @@ pub fn default_model_for_provider(
             );
             format!("unknown-provider-{}", provider)
         })
+}
+
+/// Cosa una richiesta di chat sta per chiedere al gateway: la richiesta gia'
+/// costruita e la coppia (provider, modello) su cui il ledger la prenota.
+///
+/// I due pezzi nascono INSIEME, da una sola risoluzione del modello. Prima
+/// vivevano in due calcoli distinti dentro `execute_via_gateway` e divergevano:
+/// la prenotazione portava la coppia `(deepseek, gemini-3.1-flash-lite)`,
+/// misurata nel ledger il 27/07/2026 — un modello che appartiene a google
+/// prenotato su deepseek.
+pub(crate) struct ChatGatewayCall {
+    pub(crate) request: GwRequest,
+    /// Provider su cui si prenota il credito. Col pin e' quello che eseguira'
+    /// davvero; senza pin e' la STIMA (il gateway instrada per policy).
+    pub(crate) ledger_provider: String,
+    /// Modello su cui si prenota. Col pin coincide con `request.model`; senza
+    /// pin `request.model` e' un alias logico che il gateway risolve, e questo
+    /// e' il modello concreto atteso per `ledger_provider`.
+    pub(crate) ledger_model: String,
+}
+
+/// Gli ingressi di [`build_chat_gateway_call`]. Struct e non 12 parametri: la
+/// funzione e' il punto in cui provider, modello e pin devono restare coerenti,
+/// e una lista posizionale lunga e' il modo piu' facile per scambiarne due.
+pub(crate) struct ChatCallSpec<'a> {
+    pub(crate) routing: &'a RoutingConfig,
+    pub(crate) matrix: &'a crate::routing_matrix::RoutingMatrix,
+    pub(crate) intent: &'a str,
+    /// La scelta di provider dell'utente e QUANTO vincola
+    /// ([`ProviderChoice`], punto unico): col pin duro la richiesta viaggia
+    /// pinnata, con la sola preferenza il provider entra come suggerimento e il
+    /// fallback resta. Non e' `Option<&str>` proprio perche' il solo nome del
+    /// provider costringeva a dedurre la forza del vincolo.
+    pub(crate) provider_choice: &'a ProviderChoice,
+    pub(crate) forced_model: Option<&'a str>,
+    pub(crate) suggested_provider: Option<&'a str>,
+    pub(crate) suggested_model: Option<&'a str>,
+    pub(crate) composed_prompt: &'a str,
+    pub(crate) token_budget: u32,
+    pub(crate) tenant_id: &'a str,
+    pub(crate) user_id: &'a str,
+    pub(crate) request_id: String,
+}
+
+/// PUNTO UNICO (regola L) della richiesta che la chat manda al gateway.
+///
+/// Tre regole, tutte conseguenza di un difetto misurato:
+///
+/// 1. **Il pin viaggia come pin — e SOLO il pin.** Il provider PINNATO
+///    dall'utente (dropdown + pulsante "Forza", [`ProviderChoice::Pinned`])
+///    finisce in `GwRequest::pin_provider`, il campo che esiste per questo: il
+///    gateway esegue ESATTAMENTE quel provider, senza `policy.decide` ne'
+///    fallback cross-provider. Prima il pin non veniva valorizzato e la
+///    forzatura era solo un prefisso nel nome del modello: il gateway
+///    re-instradava e rispondeva con un ALTRO provider (27/07/2026: forzato
+///    deepseek, ha risposto google).
+///    La sola PREFERENZA ([`ProviderChoice::Preferred`]: dropdown senza
+///    "Forza", o provider ricordato dalla sessione) NON pinna: entra come
+///    suggerimento — decide da dove parte il routing e su cosa il ledger
+///    prenota — e la richiesta conserva il fallback, esattamente cio' che i
+///    tooltip del composer promettono. Senza questa distinzione ogni selezione
+///    dal dropdown diventerebbe un vincolo duro e i tooltip direbbero il falso:
+///    lo stesso difetto di partenza col segno invertito.
+/// 2. **Il modello non si prefissa col provider.** `"deepseek/coder-large"` non
+///    e' un modello: il prefisso distruggeva la risoluzione dell'alias e il
+///    fornitore rifiutava il nome letterale ("you passed coder-large") con un
+///    400, da cui la cascata di policy che finiva altrove. Col pin il gateway
+///    non risolve alias, quindi qui si manda un modello CONCRETO; senza pin si
+///    manda l'alias logico e lo risolve lui.
+/// 3. **Il modello segue il provider forzato.** Il modello si risolve UNA volta
+///    sola, delegando a [`RoutingConfig::resolve_model`] (lo stesso punto unico
+///    del ramo `(Some(provider), None)` di `resolve_agent_provider`): il modello
+///    suggerito dal routing vale solo se e' del provider su cui si sta per
+///    chiedere, altrimenti si scende al default di QUEL provider. E' cio' che
+///    impedisce la coppia mista che il ledger registrava.
+///
+/// CONSEGUENZA DA CONOSCERE: col pin il gateway va in `strict` e non ripiega su
+/// un altro fornitore. Se il provider forzato fallisce, la chiamata fallisce —
+/// ed e' corretto (l'utente ha chiesto QUEL provider e deve saperlo). Non e' il
+/// "pin senza fallback" che mandava i run in abort: quello era il pin sui
+/// TRANSITORI, chiuso in ADR 0033 (col pin il gateway ritenta lo stesso modello
+/// con backoff e attende i cooldown brevi invece di fallire subito). Qui il
+/// fallimento residuo e' quello vero, e la sua frase la scrive
+/// [`rendered_chat_gateway_error`].
+pub(crate) fn build_chat_gateway_call(spec: ChatCallSpec<'_>) -> ChatGatewayCall {
+    let target = resolve_chat_target(&spec);
+    ChatGatewayCall {
+        request: GwRequest {
+            model: target.gw_model,
+            messages: vec![GwMessage {
+                role: "user".to_string(),
+                content: Value::String(spec.composed_prompt.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                thinking_signature: None,
+            }],
+            max_tokens: Some(spec.token_budget),
+            temperature: None,
+            pin_provider: target.pin_provider,
+            metadata: GwMetadata {
+                tenant_id: spec.tenant_id.to_string(),
+                user_id: spec.user_id.to_string(),
+                request_id: spec.request_id.clone(),
+                // Claim locale di sensibilita' (punto unico dlp, regola L).
+                // L'enforcement resta nel gateway, che ri-classifica e usa
+                // max(claim, classificazione) + validate_tier_claim: il claim
+                // onesto evita di dichiarare 'pubblico' (0) un prompt che il
+                // DLP locale sa gia' essere sensibile.
+                sensitivity_tier: crate::dlp::classify_sensitivity(spec.composed_prompt) as u8,
+                feature: spec.intent.to_string(),
+            },
+            ..Default::default()
+        },
+        ledger_provider: target.ledger_provider,
+        ledger_model: target.ledger_model,
+    }
+}
+
+/// Le decisioni di [`build_chat_gateway_call`] che riguardano il modello,
+/// separate dal confezionamento della richiesta.
+struct ChatTarget {
+    gw_model: String,
+    pin_provider: Option<String>,
+    ledger_provider: String,
+    ledger_model: String,
+}
+
+fn resolve_chat_target(spec: &ChatCallSpec<'_>) -> ChatTarget {
+    // Provider su cui la chiamata verra' prenotata (e, se forzato, pinnata).
+    // Fallback letto dalla matrice DB, non hardcoded (regola G).
+    let fallback_provider = spec
+        .matrix
+        .lookup("chat", "bilanciata")
+        .map(|(provider, _)| provider)
+        .unwrap_or_else(|| "openai".to_string());
+    let provider = spec
+        .provider_choice
+        .provider()
+        .or(spec.suggested_provider)
+        .map(str::to_string)
+        .unwrap_or(fallback_provider);
+
+    // UNA sola risoluzione del modello, dal punto unico. `resolve_model` onora
+    // il modello suggerito solo quando appartiene al provider passato: per
+    // questo il modello FORZATO dall'utente viaggia dichiarandolo di quel
+    // provider (scelta esplicita, vale sempre), mentre il suggerito conserva il
+    // proprio provider di provenienza e viene scartato se non combacia.
+    let provider_del_suggerito = if spec.forced_model.is_some() {
+        Some(provider.as_str())
+    } else {
+        spec.suggested_provider
+    };
+    let model = spec.routing.resolve_model(
+        spec.matrix,
+        &provider,
+        provider_del_suggerito,
+        spec.forced_model.or(spec.suggested_model),
+    );
+
+    // Col pin il gateway NON risolve alias: deve ricevere il modello concreto.
+    // Senza pin — quindi anche con la sola preferenza — resta l'alias logico,
+    // che il gateway risolve per il provider che sceglie: e' cio' che tiene in
+    // vita il fallback cross-provider promesso dai tooltip del composer.
+    let (gw_model, pin_provider) = match spec.provider_choice.pinned_provider() {
+        Some(pinned) => (model.clone(), Some(pinned.to_string())),
+        None => (
+            intent_to_alias(spec.intent, &spec.routing.behavior_mode, spec.forced_model),
+            None,
+        ),
+    };
+    ChatTarget {
+        gw_model,
+        pin_provider,
+        ledger_provider: provider,
+        ledger_model: model,
+    }
+}
+
+/// La frase da mostrare quando una chiamata chat al gateway fallisce.
+///
+/// Delega al punto unico della presentazione
+/// (`nexus_types::error_presentation` via [`crate::nexus_gateway::rendered_from_error`]):
+/// qui si aggiunge solo il fatto che il punto unico non puo' conoscere, cioe'
+/// che il provider era FORZATO — e quindi che nessun altro fornitore e' stato
+/// tentato.
+///
+/// Prima questo path chiudeva con `bail!("Nexus Gateway failed ...: {e}")`, che
+/// APPIATTIVA la catena: `GatewayHttpError` spariva e il confine HTTP della chat
+/// (`chat_messages::run`), che cerca proprio quel tipo per rendere l'errore,
+/// trovava solo una stringa. L'utente leggeva il body grezzo del 400.
+pub(crate) fn rendered_chat_gateway_error(
+    err: &anyhow::Error,
+    pin_provider: Option<&str>,
+) -> nexus_types::error_presentation::RenderedError {
+    let rendered = crate::nexus_gateway::rendered_from_error(err);
+    match pin_provider {
+        Some(provider) => rendered.con_provider_forzato(provider),
+        None => rendered,
+    }
 }
 
 pub(crate) fn completion_has_error(completion: &Value) -> bool {

@@ -28,6 +28,7 @@ import { AgentStepsPanel } from "./chat/agent-steps-panel";
 import { extractLatestNextActions } from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
+import { providerChoiceForSend } from "./chat/provider-choice-logic";
 import { MemoryPanel } from "./chat/memory-panel";
 import { TokenUsageBar } from "./chat/token-usage-bar";
 import {
@@ -665,11 +666,15 @@ export function ChatPanel({
     // dall'auto-send (via ref) oppure prop esterna. Strutturale, mai dedotto dal testo.
     const agentTypeHint = agentTypeHintOverride ?? externalAgentTypeHint;
     // ADR 0023: provider e modello sono override indipendenti.
-    // Provider: forzato solo se selezionato esplicitamente (diverso da "auto");
-    // altrimenti lascia decidere al routing (eventuale hint esterno).
-    const effectiveProvider = selectedProvider !== "auto"
-      ? selectedProvider
-      : hint?.provider;
+    // Provider: dal punto unico (provider-choice-logic). Il dropdown dice QUALE
+    // provider, il pulsante "Forza" dice QUANTO vincola — e ora entrambi
+    // viaggiano: senza il secondo il backend vedeva solo il nome e doveva
+    // dedurre la forza del vincolo, trasformando ogni selezione in un pin duro.
+    const providerChoice = providerChoiceForSend({
+      selectedProvider,
+      forceProvider,
+      hintProvider: hint?.provider,
+    });
     // Modello: un modello scelto esplicitamente va SEMPRE inviato come override,
     // anche se il provider e' "auto". Un modello identifica univocamente il suo
     // provider (il backend lo ricava dal catalogo), quindi "auto" sul provider
@@ -684,7 +689,10 @@ export function ChatPanel({
     const sendOpts = {
       profileId,
       activeFiles,
-      providerOverride: effectiveProvider,
+      // Spread e non due assegnazioni a mano: la scelta di provider e' UN
+      // oggetto (quale provider + quanto vincola) e va passata intera. Ricopiare
+      // i campi uno a uno e' il punto in cui il pulsante "Forza" si era perso.
+      ...providerChoice,
       modelOverride: effectiveModel,
       automationMode: modeForSend,
       supervisorMode: supervisorMode !== "none" ? supervisorMode : undefined,

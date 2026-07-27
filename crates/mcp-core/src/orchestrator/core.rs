@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     billing::{self, UsageNumbers},
     domain::OrchestratorAudit,
-    nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
+    nexus_gateway::NexusGatewayClient,
     provider_cooldown::is_provider_in_cooldown,
     vector_memory,
 };
@@ -1285,7 +1285,7 @@ impl Orchestrator {
         input: &OrchestratorRequest,
         routing: &RoutingConfig,
         intent: &str,
-        forced_provider: Option<&str>,
+        provider_choice: &ProviderChoice,
         forced_model: Option<&str>,
         suggested_provider: Option<&str>,
         suggested_model: Option<&str>,
@@ -1296,62 +1296,34 @@ impl Orchestrator {
         user_id: Uuid,
         project_uuid: Uuid,
     ) -> anyhow::Result<LlmExecution> {
-        let alias = intent_to_alias(intent, &routing.behavior_mode, forced_model);
-        let gw_model = if let Some(fp) = forced_provider {
-            format!("{fp}/{}", forced_model.unwrap_or(&alias))
-        } else {
-            alias
-        };
-        let gw_req = GwRequest {
-            model: gw_model,
-            messages: vec![GwMessage {
-                role: "user".to_string(),
-                content: serde_json::Value::String(composed_prompt.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning: None,
-                thinking_signature: None,
-            }],
-            max_tokens: Some(token_budget),
-            temperature: None,
-            metadata: GwMetadata {
-                tenant_id: input.project_id.clone(),
-                user_id: input.user_id.clone(),
-                request_id: run_id.to_string(),
-                // Claim locale di sensibilita' (punto unico dlp, regola L).
-                // L'enforcement resta nel gateway, che ri-classifica e usa
-                // max(claim, classificazione) + validate_tier_claim: il claim
-                // onesto evita di dichiarare 'pubblico' (0) un prompt che il
-                // DLP locale sa gia' essere sensibile.
-                sensitivity_tier: crate::dlp::classify_sensitivity(composed_prompt) as u8,
-                feature: intent.to_string(),
-            },
-            ..Default::default()
-        };
+        // Richiesta e coppia da prenotare nascono dal PUNTO UNICO (regola L):
+        // il pin del provider forzato, il modello non prefissato e il modello
+        // riallineato a quel provider sono decisi tutti li'.
+        let call = build_chat_gateway_call(ChatCallSpec {
+            routing,
+            matrix,
+            intent,
+            provider_choice,
+            forced_model,
+            suggested_provider,
+            suggested_model,
+            composed_prompt,
+            token_budget,
+            tenant_id: &input.project_id,
+            user_id: &input.user_id,
+            request_id: run_id.to_string(),
+        });
+        // Il pin serve ancora DOPO che la richiesta e' stata consumata dalla
+        // chiamata: e' cio' che rende leggibile il fallimento (nessun ripiego).
+        let pin_provider = call.request.pin_provider.clone();
         let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
         let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
-        // Fallback provider/model letti da DB (matrice routing) invece che hardcoded.
-        let fallback_provider: String = match matrix.lookup("chat", "bilanciata") {
-            Some((p, _)) => p,
-            None => "openai".to_string(),
-        };
-        let hint_provider_owned: String = forced_provider
-            .or(suggested_provider)
-            .map(String::from)
-            .unwrap_or(fallback_provider);
-        let fallback_model: String = default_model_for_provider(matrix, &hint_provider_owned);
-        let hint_model_owned: String = forced_model
-            .or(suggested_model)
-            .map(String::from)
-            .unwrap_or(fallback_model);
-        let hint_provider = hint_provider_owned.as_str();
-        let hint_model = hint_model_owned.as_str();
         let reservation = billing::reserve_usage(
             db,
             user_id,
             project_uuid,
-            hint_provider,
-            hint_model,
+            &call.ledger_provider,
+            &call.ledger_model,
             prompt_tokens,
             estimated_completion,
             json!({"intent": intent, "profile_id": input.profile_id,
@@ -1361,11 +1333,26 @@ impl Orchestrator {
         .await
         .map_err(|e| anyhow::anyhow!("billing_rejected: {e}"))?;
 
-        let gw_resp = match gw.complete(gw_req).await {
+        let gw_resp = match gw.complete(call.request).await {
             Ok(r) => r,
             Err(e) => {
                 billing::release_usage(db, &reservation, "gateway_error").await;
-                anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
+                // La resa nasce QUI, dove si sa ancora che il provider era
+                // forzato, e viaggia come errore tipizzato: il confine HTTP
+                // della chat la rilegge invece di ri-derivarla da una stringa
+                // gia' appiattita (`chat_messages::run` -> rendered_from_error).
+                let rendered = rendered_chat_gateway_error(&e, pin_provider.as_deref());
+                tracing::warn!(
+                    intent = %intent,
+                    // Lo stato del vincolo si DICHIARA (regola M): "auto",
+                    // "preferred" o "pinned" dice subito se il fallback c'era e
+                    // non e' bastato, oppure se non c'era per scelta dell'utente.
+                    provider_choice = %provider_choice.label(),
+                    pin_provider = ?pin_provider,
+                    "chat: chiamata al gateway fallita: {}",
+                    rendered.log_line()
+                );
+                return Err(anyhow::Error::new(rendered));
             }
         };
         // Dal punto unico: la costruzione a mano scartava i campi di cache che
@@ -1468,12 +1455,10 @@ impl Orchestrator {
                 .intent_provider_hierarchy
                 .insert(intent.clone(), project_chain);
         }
-        let forced_provider = input
-            .provider_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_lowercase());
+        // La scelta di provider arriva GIA' risolta (provider + forza del
+        // vincolo) dal punto unico `ProviderChoice::resolve`, chiamato al
+        // confine HTTP: qui non si deduce piu' niente dal solo nome, e la
+        // normalizzazione (trim/lowercase) vive li' invece che in ogni lettore.
         let forced_model = input
             .model_override
             .as_deref()
@@ -1520,7 +1505,7 @@ impl Orchestrator {
                 &input,
                 &routing,
                 &intent,
-                forced_provider.as_deref(),
+                &input.provider_choice,
                 forced_model.as_deref(),
                 suggested_provider.as_deref(),
                 suggested_model.as_deref(),

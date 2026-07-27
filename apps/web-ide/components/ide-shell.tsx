@@ -1482,8 +1482,11 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               selectedProvider={chatProvider}
               setSelectedProvider={(v) => {
                 setChatProvider(v);
-                // Pin per-sessione lato server (sopravvive al refresh e vale
-                // per tutti i run successivi). Cambiare provider azzera il pin
+                // PREFERENZA per-sessione lato server: sopravvive al refresh e
+                // ripropone il provider ai messaggi successivi, ma non li
+                // vincola — il pin duro nasce solo dal pulsante "Forza" e vale
+                // per la richiesta in cui lo si da' (vedi provider-choice-logic
+                // e ProviderChoice::resolve). Cambiare provider azzera la scelta
                 // del modello: la lista modelli viene ricaricata da zero.
                 const sid = multiChat.activeTabId;
                 if (sid) multiChat.setSessionPrefs(sid, { preferredProvider: v, preferredModel: "auto" });

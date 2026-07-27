@@ -272,6 +272,8 @@ condividere codice (fragile base class).
 | SQL-injection detector | ADR 0021 |
 | Capability modello (vision/tool/thinking) | vista `0318` + `mcp-core/src/capability.rs` (ADR 0024) |
 | Routing/default/purpose model | `routing_matrix.rs` + tabelle mig 0101/0102 (regola G) |
+| Richiesta della CHAT al gateway (modello, pin del provider forzato, coppia prenotata a ledger) | `mcp-core/src/orchestrator/model_routing.rs` (`build_chat_gateway_call`); il modello lo risolve delegando a `RoutingConfig::resolve_model`. Guard `richiesta gateway chat`. Vedi ADR 0023 |
+| Forza del vincolo sul provider scelto in chat (preferenza vs pin duro) | `mcp-core/src/orchestrator/provider_choice.rs` (`ProviderOverrideMode` = `preferred\|pinned`, `ProviderChoice::resolve` = unico punto in cui un pin nasce, e nasce solo dalla richiesta in corso: il pin non si eredita da sessione o resend) + `apps/web-ide/components/chat/provider-choice-logic.ts` lato UI. Guard `vocabolario forza-vincolo provider`, `nascita del pin duro`. Vedi ADR 0023 |
 | Scrittura del tier di un modello (precedenza `manual` > `measured` > `synced` > fonte ignota) | `mcp-core/src/orchestrator/model_service.rs` (`apply_tier`, `TierSource`, `puo_sovrascrivere`); il sync dell'indice e la batteria delegano. Guard `tier-write` |
 | Listino modelli (prezzo di una chiamata + currency di piattaforma) | crate `nexus-pricing` (`resolve_active_price` -> `PriceLookup{Priced\|Unknown\|NotInCatalog}`, `platform_currency`, `calculate_cost`, `assert_configured`). Guard `pricing-single-source` |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
