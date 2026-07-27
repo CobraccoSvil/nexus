@@ -20,6 +20,8 @@
 
 mod audit_settings;
 mod battery_explain;
+mod migrate;
+mod premessa;
 mod quality_scan;
 mod service_manifests;
 
@@ -53,6 +55,10 @@ fn main() -> Result<()> {
             let code = service_manifests::run(&args[2..])?;
             std::process::exit(code);
         }
+        "migrate" => {
+            let code = migrate::run(&args[2..])?;
+            std::process::exit(code);
+        }
         _ => {
             eprintln!("xtask — task runner interno");
             eprintln!("  lint-commits <base> <head>    Controlli redazionali sui commit");
@@ -63,6 +69,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  service-manifests [flags]     Manifest di servizio derivati dal catalogo (DB live)"
+            );
+            eprintln!(
+                "  migrate --set S [flags]       Applica un set di migrazioni (DB live)"
             );
             Ok(())
         }

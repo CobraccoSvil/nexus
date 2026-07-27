@@ -2037,6 +2037,7 @@ dependencies = [
  "nexus-graph",
  "nexus-http",
  "nexus-mcp-client",
+ "nexus-migrations",
  "nexus-model-eligibility",
  "nexus-orchestrator",
  "nexus-pricing",
@@ -2441,6 +2442,16 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "nexus-migrations"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -5795,6 +5806,7 @@ dependencies = [
  "dotenvy",
  "mcp-quality",
  "nexus-auth",
+ "nexus-migrations",
  "nexus-model-eligibility",
  "nexus-service-catalog",
  "nexus-test-schema",
