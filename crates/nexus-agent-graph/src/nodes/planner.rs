@@ -461,6 +461,41 @@ pub fn playbook_fallback_block(playbook_steps: &[String]) -> Option<Value> {
     }))
 }
 
+/// Esito del canale LLM del planner (`planner_node.py:211-492`): il block
+/// `nexus_todo_write` da eseguire, oppure il motivo di skip gia' formattato per
+/// [`PlannerNode::skip`]. Segnale STRUTTURATO (regola M): il chiamante non deve
+/// dedurre l'esito da stringhe libere.
+enum TodoBlockOutcome {
+    /// Block ottenuto (dal primario, dal fallback tool-robust o dal playbook).
+    Block(Value),
+    /// Nessun block ottenibile: `plan_phase_skip_reason` da propagare.
+    Skip(String),
+}
+
+/// Fallback DETERMINISTICO da `playbook_steps` (`planner_node.py:461-492`): ultimo
+/// resort quando ne' il primario ne' il fallback tool-robust hanno emesso la tool
+/// call. Senza passi di playbook non c'e' piano -> skip `no_tool_use_emitted`.
+fn playbook_todo_block(state: &AgentState) -> TodoBlockOutcome {
+    let steps = state.playbook_steps.clone().unwrap_or_default();
+    match playbook_fallback_block(&steps) {
+        Some(block) => {
+            tracing::info!(
+                target: "nexus_agent_graph::planner",
+                steps = steps.len(),
+                "planner: todos deterministici dai passi del playbook"
+            );
+            TodoBlockOutcome::Block(block)
+        }
+        None => {
+            tracing::warn!(
+                target: "nexus_agent_graph::planner",
+                "planner: nessuna nexus_todo_write emessa -> skip"
+            );
+            TodoBlockOutcome::Skip("no_tool_use_emitted".to_string())
+        }
+    }
+}
+
 /// PONTE PR5: MATERIALIZZA la mossa [`OrchestrationMove::DelegateSubagents`] in un
 /// `nexus_todo_write` block della STESSA forma del canale LLM
 /// (`{name, input:{action:"create", todos:[...]}}`), cosi' il planner lo esegue
@@ -968,6 +1003,140 @@ impl PlannerNode {
             .map(|t| json!({"name": t.name, "input": t.input, "id": t.id}))
     }
 
+    /// CANALE LLM del planner (`planner_node.py:211-492`): prompt -> chiamata al
+    /// primario -> fallback tool-robust -> fallback deterministico da playbook.
+    /// `used_provider`/`used_model` entrano col primario e vengono RISCRITTI in
+    /// loco se il fallback tool-robust prende il posto del primario (il chiamante
+    /// deve vedere il provider/model vincente anche quando il block finale arriva
+    /// poi dal playbook, come nel flusso originale).
+    async fn llm_todo_block(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+        run_id: &str,
+        used_provider: &mut String,
+        used_model: &mut String,
+    ) -> TodoBlockOutcome {
+        // Il TESTO e' risolto a monte (regola G): vuoto -> skip prompt_missing.
+        if self.cfg.planner_system_text.is_empty() {
+            tracing::warn!(
+                target: "nexus_agent_graph::planner",
+                key = %self.cfg.planner_prompt_key,
+                "planner: prompt non trovato -> skip"
+            );
+            return TodoBlockOutcome::Skip(format!("prompt_missing:{}", self.cfg.planner_prompt_key));
+        }
+
+        // hinted_system (rami ON) + chiamata LLM (planner_node.py:292-391).
+        let hinted_system = self.build_hinted_system(state, run_id);
+        let llm_messages = Self::build_llm_messages(&state.messages);
+        let mut todo_block = match Self::primary_todo_block(
+            ctx,
+            used_provider,
+            used_model,
+            llm_messages.clone(),
+            &hinted_system,
+        )
+        .await
+        {
+            Ok(block) => block,
+            Err(reason) => return TodoBlockOutcome::Skip(reason),
+        };
+
+        if todo_block.is_none() {
+            match self
+                .fallback_todo_block(ctx, used_provider, used_model, llm_messages, &hinted_system)
+                .await
+            {
+                Ok(block) => todo_block = block,
+                Err(reason) => return TodoBlockOutcome::Skip(reason),
+            }
+        }
+
+        match todo_block {
+            Some(block) => TodoBlockOutcome::Block(block),
+            None => playbook_todo_block(state),
+        }
+    }
+
+    /// Chiamata al modello PRIMARIO (`planner_node.py:292-391`). `Ok(None)` =
+    /// risposta senza la tool call `nexus_todo_write`; `Err(reason)` = errore LLM
+    /// -> skip.
+    ///
+    /// NOTA parita': la `LlmResponse` minimale NON espone provider/model (il gateway
+    /// concreto puo' aver fatto un cascade interno usando un provider diverso, ma
+    /// quel dettaglio non arriva ai nodi — forma minimale del crate). Il chiamante
+    /// tiene `used_provider`/`used_model` che ABBIAMO passato, come il fallback
+    /// Python `prov_result.provider or planner_provider` quando il provider
+    /// effettivo non e' disponibile.
+    async fn primary_todo_block(
+        ctx: &AgentNodeCtx,
+        used_provider: &str,
+        used_model: &str,
+        llm_messages: Vec<LlmMessage>,
+        hinted_system: &str,
+    ) -> Result<Option<Value>, String> {
+        let req = Self::build_request(used_provider, used_model, llm_messages, hinted_system);
+        match ctx.llm.complete(req).await {
+            Ok(resp) => Ok(Self::extract_todo_block(&resp.tool_calls)),
+            Err(err) => {
+                tracing::error!(
+                    target: "nexus_agent_graph::planner",
+                    error = %err,
+                    "planner: LLM call fallita -> skip"
+                );
+                Err("llm_error".to_string())
+            }
+        }
+    }
+
+    /// FALLBACK tool-robust (`planner_node.py:401-459`, mig 0267): se il primario
+    /// NON ha emesso la tool call, UN tentativo con il modello fallback risolto a
+    /// monte, escluse le sentinelle e purche' diverso dal (provider,model) gia'
+    /// usato. Su successo `used_provider`/`used_model` diventano quelli del
+    /// fallback. `Ok(None)` = fallback non applicabile o nessuna tool call emessa;
+    /// `Err(reason)` = errore LLM -> skip.
+    async fn fallback_todo_block(
+        &self,
+        ctx: &AgentNodeCtx,
+        used_provider: &mut String,
+        used_model: &mut String,
+        llm_messages: Vec<LlmMessage>,
+        hinted_system: &str,
+    ) -> Result<Option<Value>, String> {
+        let fb_provider = self.fallback_provider.clone();
+        let fb_model = self.fallback_model.clone();
+        if is_sentinel_provider(&fb_provider)
+            || is_sentinel_provider(&fb_model)
+            || (fb_provider.as_str(), fb_model.as_str())
+                == (used_provider.as_str(), used_model.as_str())
+        {
+            return Ok(None);
+        }
+        tracing::warn!(
+            target: "nexus_agent_graph::planner",
+            primario = %format!("{used_provider}/{used_model}"),
+            fallback = %format!("{fb_provider}/{fb_model}"),
+            "planner: nessuna tool call dal primario -> fallback tool-robust"
+        );
+        let fb_req = Self::build_request(&fb_provider, &fb_model, llm_messages, hinted_system);
+        match ctx.llm.complete(fb_req).await {
+            Ok(resp) => {
+                *used_provider = fb_provider;
+                *used_model = fb_model;
+                Ok(Self::extract_todo_block(&resp.tool_calls))
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "nexus_agent_graph::planner",
+                    error = %err,
+                    "planner: LLM call fallback fallita -> skip"
+                );
+                Err("llm_error".to_string())
+            }
+        }
+    }
+
     /// Meta-step `plan` per la pubblicazione in chat (`planner_node.py:540-559`).
     /// PURO sui todos riletti + provider/model + active_todo_id.
     fn make_plan_meta(
@@ -1191,106 +1360,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         // block. Con delega il prompt/LLM/fallback tool-robust/playbook sono saltati
         // (decisione gia' presa, regola M) e todo_block resta quello dai task.
         if todo_block.is_none() {
-            // ── Prompt (planner_node.py:211-216) ───────────────────────────────
-            // Il TESTO e' risolto a monte (regola G): vuoto -> skip prompt_missing.
-            if self.cfg.planner_system_text.is_empty() {
-                tracing::warn!(
-                    target: "nexus_agent_graph::planner",
-                    key = %self.cfg.planner_prompt_key,
-                    "planner: prompt non trovato -> skip"
-                );
-                return Ok(Self::skip(Some(&format!(
-                    "prompt_missing:{}",
-                    self.cfg.planner_prompt_key
-                ))));
-            }
-
-            // ── hinted_system (rami ON) + chiamata LLM (planner_node.py:292-391) ─
-            let hinted_system = self.build_hinted_system(state, &run_id);
-            let llm_messages = Self::build_llm_messages(&state.messages);
-
-            let req = Self::build_request(
-                &used_provider,
-                &used_model,
-                llm_messages.clone(),
-                &hinted_system,
-            );
-            todo_block = match ctx.llm.complete(req).await {
-                // NOTA parita': la `LlmResponse` minimale NON espone provider/model
-                // (il gateway concreto puo' aver fatto un cascade interno usando un
-                // provider diverso, ma quel dettaglio non arriva ai nodi — forma
-                // minimale del crate). Manteniamo used_provider/used_model che ABBIAMO
-                // passato, come il fallback Python `prov_result.provider or planner_provider`
-                // quando il provider effettivo non e' disponibile.
-                Ok(resp) => Self::extract_todo_block(&resp.tool_calls),
-                Err(err) => {
-                    tracing::error!(
-                        target: "nexus_agent_graph::planner",
-                        error = %err,
-                        "planner: LLM call fallita -> skip"
-                    );
-                    return Ok(Self::skip(Some("llm_error")));
-                }
-            };
-
-            // ── FALLBACK tool-robust (planner_node.py:401-459, mig 0267) ───────
-            // Se il primario NON ha emesso la tool call, UN tentativo con un modello
-            // fallback risolto a monte (planner_fallback), escluse sentinelle e
-            // diverso dal (provider,model) gia' usato.
-            if todo_block.is_none() {
-                let fb_provider = self.fallback_provider.clone();
-                let fb_model = self.fallback_model.clone();
-                if !is_sentinel_provider(&fb_provider)
-                    && !is_sentinel_provider(&fb_model)
-                    && (fb_provider.as_str(), fb_model.as_str())
-                        != (used_provider.as_str(), used_model.as_str())
-                {
-                    tracing::warn!(
-                        target: "nexus_agent_graph::planner",
-                        primario = %format!("{used_provider}/{used_model}"),
-                        fallback = %format!("{fb_provider}/{fb_model}"),
-                        "planner: nessuna tool call dal primario -> fallback tool-robust"
-                    );
-                    let fb_req =
-                        Self::build_request(&fb_provider, &fb_model, llm_messages, &hinted_system);
-                    match ctx.llm.complete(fb_req).await {
-                        Ok(resp) => {
-                            used_provider = fb_provider;
-                            used_model = fb_model;
-                            todo_block = Self::extract_todo_block(&resp.tool_calls);
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                target: "nexus_agent_graph::planner",
-                                error = %err,
-                                "planner: LLM call fallback fallita -> skip"
-                            );
-                            return Ok(Self::skip(Some("llm_error")));
-                        }
-                    }
-                }
-            }
-
-            // ── Fallback DETERMINISTICO da playbook_steps (planner_node.py:461-492) ─
-            if todo_block.is_none() {
-                let steps = state.playbook_steps.clone().unwrap_or_default();
-                match playbook_fallback_block(&steps) {
-                    Some(block) => {
-                        tracing::info!(
-                            target: "nexus_agent_graph::planner",
-                            steps = steps.len(),
-                            "planner: todos deterministici dai passi del playbook"
-                        );
-                        todo_block = Some(block);
-                    }
-                    None => {
-                        tracing::warn!(
-                            target: "nexus_agent_graph::planner",
-                            "planner: nessuna nexus_todo_write emessa -> skip"
-                        );
-                        return Ok(Self::skip(Some("no_tool_use_emitted")));
-                    }
-                }
+            match self
+                .llm_todo_block(state, ctx, &run_id, &mut used_provider, &mut used_model)
+                .await
+            {
+                TodoBlockOutcome::Block(block) => todo_block = Some(block),
+                TodoBlockOutcome::Skip(reason) => return Ok(Self::skip(Some(&reason))),
             }
         }
         let todo_block = todo_block.expect("todo_block presente dopo i fallback");

@@ -26,14 +26,14 @@
 //!       blocked_by   -> blocked_by
 //!       relates      -> relates
 
-use super::AgentToolContext;
+use crate::context_core::ToolContextCore;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
 /// rel_type esposti agli agenti (schema stabile). Lo stesso set della vecchia
 /// `knowledge.rel_type`: gli agenti gia' deployati ne dipendono.
-pub(crate) const KNOWLEDGE_REL_TYPES: [&str; 7] = [
+pub const KNOWLEDGE_REL_TYPES: [&str; 7] = [
     "followup",
     "correction",
     "refinement",
@@ -125,7 +125,7 @@ fn parse_search_params(input: &Value) -> Result<SearchParams, String> {
 
 /// Soglia summary-mode (DB-driven, regola G — niente fallback hardcoded sopra il
 /// safe default 20).
-async fn search_summary_threshold(ctx: &AgentToolContext) -> usize {
+async fn search_summary_threshold(ctx: &ToolContextCore) -> usize {
     sqlx::query_scalar::<_, String>(
         "SELECT value FROM settings WHERE key = 'agent.kb.graph_summary_threshold_topk'",
     )
@@ -162,7 +162,7 @@ fn cluster_rows_to_json(rows: &[sqlx::postgres::PgRow]) -> (Vec<Value>, i32) {
 
 /// Summary-mode: cluster per `intent` (o `kind` se intent assente) sui doc del
 /// progetto. Esclude i doc 'frozen' (semantica equivalente al vecchio off_topic).
-async fn knowledge_search_summary(ctx: &AgentToolContext, top_k: usize) -> String {
+async fn knowledge_search_summary(ctx: &ToolContextCore, top_k: usize) -> String {
     let rows = sqlx::query(
         r#"
         WITH ranked AS (
@@ -203,14 +203,14 @@ async fn knowledge_search_summary(ctx: &AgentToolContext, top_k: usize) -> Strin
 /// Ricerca semantica via embedding Qdrant: ritorna gli hit (doc_id, score)
 /// sopra soglia gia' filtrati a `top_k`. `Err` = JSON di errore serializzato.
 async fn knowledge_search_hits(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     p: &SearchParams,
 ) -> Result<Vec<(Uuid, f32)>, String> {
-    let vector = match ctx.neural.embed_text("", embed_slice(&p.query)).await {
+    let vector = match ctx.embedder.embed_text("", embed_slice(&p.query)).await {
         Ok(v) => v,
         Err(e) => return Err(json!({"error": format!("embed fallito: {e}")}).to_string()),
     };
-    let hits = match crate::vector_memory::search_wiki_content_points_filtered(
+    let hits = match nexus_wiki::content_points::search_wiki_content_points_filtered(
         &ctx.db,
         vector,
         (p.top_k * 2).max(10),
@@ -256,7 +256,7 @@ fn search_row_to_json(id: Uuid, r: &sqlx::postgres::PgRow) -> Value {
 /// Idrata i doc-hit con i metadati da `wiki_docs`, escludendo i frozen, e
 /// preserva l'ordine per score. `Err` = JSON di errore serializzato.
 async fn knowledge_search_render(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     doc_hits: &[(Uuid, f32)],
 ) -> Result<Vec<Value>, String> {
     let ids: Vec<Uuid> = doc_hits.iter().map(|(id, _)| *id).collect();
@@ -303,7 +303,7 @@ async fn knowledge_search_render(
 /// Input: { query, top_k?=5 (1..=100), min_score?=0.4 }.
 /// Output: { results: [{note_id,title,intent,status,tags,score,snippet}], count }
 /// oppure (top_k > soglia) { mode:"summary", clusters:[{theme,count,sample_titles}] }.
-pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_search(ctx: &ToolContextCore, input: &Value) -> String {
     let params = match parse_search_params(input) {
         Ok(p) => p,
         Err(e) => return e,
@@ -335,7 +335,7 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
 
 /// `code_doc` — documentazione code-wiki di un file. Cerca doc con
 /// `kind='code_doc'` il cui `vault_file_path` o `title` matcha `file_path`.
-pub async fn tool_code_doc(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_code_doc(ctx: &ToolContextCore, input: &Value) -> String {
     let file_path = match input.get("file_path").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p.trim(),
         _ => return json!({"error": "file_path mancante o vuoto"}).to_string(),
@@ -408,7 +408,7 @@ fn knowledge_note_json(note_id: Uuid, row: &sqlx::postgres::PgRow) -> Value {
 }
 
 /// `knowledge_get_note` — body completo di un doc by id (scoped al progetto).
-pub async fn tool_knowledge_get_note(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_get_note(ctx: &ToolContextCore, input: &Value) -> String {
     let note_id = match input
         .get("note_id")
         .and_then(|v| v.as_str())
@@ -508,7 +508,7 @@ fn parse_create_note_params(input: &Value) -> Result<CreateNoteParams, String> {
 /// Upsert del doc in `wiki_docs` (scope=project, kind='note'). Ritorna l'id del
 /// doc creato/aggiornato. `Err` = messaggio JSON di errore serializzato.
 async fn insert_note_doc(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     p: &CreateNoteParams,
     slug: &str,
     body_hash: &str,
@@ -552,10 +552,10 @@ async fn insert_note_doc(
 
 /// Embedding + upsert Qdrant del doc (best-effort). Ritorna `true` se il punto
 /// e' stato indicizzato. Non propaga errori: logga WARN e ritorna `false`.
-async fn index_note_qdrant(ctx: &AgentToolContext, note_id: Uuid, p: &CreateNoteParams) -> bool {
+async fn index_note_qdrant(ctx: &ToolContextCore, note_id: Uuid, p: &CreateNoteParams) -> bool {
     let snippet = embed_slice(&p.body_md);
     let combined = format!("{}\n\n{snippet}", p.title);
-    let vector = match ctx.neural.embed_text("", &combined).await {
+    let vector = match ctx.embedder.embed_text("", &combined).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "knowledge_create_note: embed fallito");
@@ -572,7 +572,7 @@ async fn index_note_qdrant(ctx: &AgentToolContext, note_id: Uuid, p: &CreateNote
         "kind": "note",
         "intent": p.intent,
     });
-    match crate::vector_memory::upsert_wiki_content_point(&ctx.db, &point_id, vector, payload).await
+    match nexus_wiki::content_points::upsert_wiki_content_point(&ctx.db, &point_id, vector, payload).await
     {
         Ok(_) => {
             let _ = sqlx::query("UPDATE wiki_docs SET qdrant_point_id = $1 WHERE id = $2")
@@ -590,18 +590,18 @@ async fn index_note_qdrant(ctx: &AgentToolContext, note_id: Uuid, p: &CreateNote
 }
 
 /// `knowledge_create_note` — crea un doc scope=project + embedding Qdrant.
-pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_create_note(ctx: &ToolContextCore, input: &Value) -> String {
     let params = match parse_create_note_params(input) {
         Ok(p) => p,
         Err(e) => return e,
     };
 
     // Slug derivato dal title (slugify minimal: lowercase + replace).
-    let slug = crate::wiki::vault::slugify(&params.title);
+    let slug = nexus_wiki::vault::slugify(&params.title);
     if slug.is_empty() {
         return json!({"error": "title non genera slug valido"}).to_string();
     }
-    let body_hash = crate::wiki::vault::sha256_hex(&params.body_md);
+    let body_hash = nexus_wiki::vault::sha256_hex(&params.body_md);
 
     let note_id = match insert_note_doc(ctx, &params, &slug, &body_hash).await {
         Ok(id) => id,
@@ -631,7 +631,7 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Verifica che il doc appartenga al progetto corrente.
-async fn note_in_project(ctx: &AgentToolContext, note_id: Uuid) -> bool {
+async fn note_in_project(ctx: &ToolContextCore, note_id: Uuid) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM wiki_docs \
          WHERE id = $1 AND scope = 'project' AND project_id = $2",
@@ -648,7 +648,7 @@ async fn note_in_project(ctx: &AgentToolContext, note_id: Uuid) -> bool {
 /// altrimenti verso `note_id`) verso doc visibili al progetto (proprio progetto
 /// o meta public_read=true), escludendo i doc frozen.
 async fn load_directional_links(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     note_id: Uuid,
     outgoing: bool,
 ) -> Vec<sqlx::postgres::PgRow> {
@@ -708,7 +708,7 @@ fn links_to_json(rows: &[sqlx::postgres::PgRow]) -> Vec<Value> {
 }
 
 /// `knowledge_get_links` — outbound + inbound links di un doc, scoped al progetto.
-pub async fn tool_knowledge_get_links(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_get_links(ctx: &ToolContextCore, input: &Value) -> String {
     let note_id = match input
         .get("note_id")
         .and_then(|v| v.as_str())
@@ -784,7 +784,7 @@ fn parse_subgraph_params(input: &Value) -> SubgraphParams {
 /// Risolve i nodi seed: da `query` (semantica via Qdrant) o da `note_id`.
 /// `Err` = messaggio JSON di errore serializzato (mancanza seed o embed fallito).
 async fn resolve_subgraph_seed(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     input: &Value,
     max_nodes: usize,
 ) -> Result<Vec<Uuid>, String> {
@@ -795,11 +795,11 @@ async fn resolve_subgraph_seed(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let vector = match ctx.neural.embed_text("", embed_slice(q)).await {
+        let vector = match ctx.embedder.embed_text("", embed_slice(q)).await {
             Ok(v) => v,
             Err(e) => return Err(json!({"error": format!("embed fallito: {e}")}).to_string()),
         };
-        let hits = crate::vector_memory::search_wiki_content_points_filtered(
+        let hits = nexus_wiki::content_points::search_wiki_content_points_filtered(
             &ctx.db,
             vector,
             max_nodes,
@@ -831,7 +831,7 @@ async fn resolve_subgraph_seed(
 
 /// BFS via `wiki_links` a partire dai nodi seed, fino a `depth` livelli o
 /// `max_nodes` nodi. Muta `nodes` aggiungendo i vicini scoperti.
-async fn expand_subgraph_bfs(ctx: &AgentToolContext, p: &SubgraphParams, nodes: &mut Vec<Uuid>) {
+async fn expand_subgraph_bfs(ctx: &ToolContextCore, p: &SubgraphParams, nodes: &mut Vec<Uuid>) {
     let mut frontier = nodes.clone();
     for _ in 0..p.depth {
         if nodes.len() >= p.max_nodes {
@@ -873,7 +873,7 @@ async fn expand_subgraph_bfs(ctx: &AgentToolContext, p: &SubgraphParams, nodes: 
 
 /// Dettagli dei nodi validi (scope=project + project_id + non-frozen). Ritorna
 /// gli id validi e la loro serializzazione JSON.
-async fn subgraph_nodes(ctx: &AgentToolContext, nodes: &[Uuid]) -> (Vec<Uuid>, Vec<Value>) {
+async fn subgraph_nodes(ctx: &ToolContextCore, nodes: &[Uuid]) -> (Vec<Uuid>, Vec<Value>) {
     let rows = sqlx::query(
         r#"
         SELECT id, title, intent, kind, edit_lock FROM wiki_docs
@@ -908,7 +908,7 @@ async fn subgraph_nodes(ctx: &AgentToolContext, nodes: &[Uuid]) -> (Vec<Uuid>, V
 
 /// Archi intra-sottografo tra i nodi validi, serializzati per l'agente.
 async fn subgraph_edges(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     rel_filter_wiki: &[String],
     valid_ids: &[Uuid],
 ) -> Vec<Value> {
@@ -942,7 +942,7 @@ async fn subgraph_edges(
 }
 
 /// `knowledge_get_subgraph` — BFS dal seed (query semantica o note_id) sui link.
-pub async fn tool_knowledge_get_subgraph(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_get_subgraph(ctx: &ToolContextCore, input: &Value) -> String {
     let params = parse_subgraph_params(input);
 
     let mut nodes = match resolve_subgraph_seed(ctx, input, params.max_nodes).await {
@@ -1030,7 +1030,7 @@ fn parse_create_link_params(input: &Value) -> Result<CreateLinkParams, String> {
 
 /// Verifica che entrambi i doc esistano e siano accessibili dal progetto
 /// (entrambi project corrente, oppure to_note appartiene a meta public).
-async fn both_docs_accessible(ctx: &AgentToolContext, from: Uuid, to: Uuid) -> bool {
+async fn both_docs_accessible(ctx: &ToolContextCore, from: Uuid, to: Uuid) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM wiki_docs \
          WHERE id = ANY($1) \
@@ -1046,7 +1046,7 @@ async fn both_docs_accessible(ctx: &AgentToolContext, from: Uuid, to: Uuid) -> b
 }
 
 /// `knowledge_create_link` — crea o aggiorna un link tra due doc del progetto.
-pub async fn tool_knowledge_create_link(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_create_link(ctx: &ToolContextCore, input: &Value) -> String {
     let p = match parse_create_link_params(input) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1097,7 +1097,7 @@ pub async fn tool_knowledge_create_link(ctx: &AgentToolContext, input: &Value) -
 /// `knowledge_set_relevance` — marca un doc come off-topic (`edit_lock='frozen'`)
 /// o on-topic (`edit_lock='none'`). Il campo `relevance_score` non e' piu'
 /// persistito nel nuovo schema; viene accettato per compatibilita' ma ignorato.
-pub async fn tool_knowledge_set_relevance(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_set_relevance(ctx: &ToolContextCore, input: &Value) -> String {
     let note_id = match input
         .get("note_id")
         .and_then(|v| v.as_str())
@@ -1152,7 +1152,7 @@ struct GraphImportConfig {
 }
 
 /// Legge la config di import grafi dai settings.
-async fn load_graph_import_config(ctx: &AgentToolContext) -> GraphImportConfig {
+async fn load_graph_import_config(ctx: &ToolContextCore) -> GraphImportConfig {
     let mut enabled = true;
     let mut max_nodes = 2000usize;
     let rows = sqlx::query(
@@ -1218,8 +1218,8 @@ fn prepare_graph_node(n: &Value, source_id: &str) -> Option<GraphNode> {
     tags.push(format!("ext:{source_id}"));
 
     // Slug stabile: includes ext_id per evitare collisioni.
-    let slug = crate::wiki::vault::slugify(&format!("imp-{source_id}-{ext_id}"));
-    let body_hash = crate::wiki::vault::sha256_hex(&body);
+    let slug = nexus_wiki::vault::slugify(&format!("imp-{source_id}-{ext_id}"));
+    let body_hash = nexus_wiki::vault::sha256_hex(&body);
     Some(GraphNode {
         title,
         body,
@@ -1231,7 +1231,7 @@ fn prepare_graph_node(n: &Value, source_id: &str) -> Option<GraphNode> {
 
 /// Importa un singolo nodo del grafo esterno in `wiki_docs`. Ritorna `Some(id)`
 /// del doc creato/aggiornato, `None` se il nodo va saltato o l'insert fallisce.
-async fn import_graph_node(ctx: &AgentToolContext, n: &Value, source_id: &str) -> Option<Uuid> {
+async fn import_graph_node(ctx: &ToolContextCore, n: &Value, source_id: &str) -> Option<Uuid> {
     let node = prepare_graph_node(n, source_id)?;
     let res: Result<Uuid, _> = sqlx::query_scalar(
         r#"
@@ -1280,7 +1280,7 @@ fn map_edge_type_to_rel(etype: &str) -> &'static str {
 /// Importa un singolo arco del grafo esterno in `wiki_links`, risolvendo gli
 /// endpoint tramite `id_map`. Ritorna `true` se l'arco e' stato inserito.
 async fn import_graph_edge(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     e: &Value,
     id_map: &std::collections::HashMap<String, Uuid>,
 ) -> bool {
@@ -1361,7 +1361,7 @@ fn parse_import_graph_input(input: &Value) -> Result<ImportGraphInput, String> {
 /// Esegue i due passi di import (nodi -> `wiki_docs`, archi -> `wiki_links`) e
 /// ritorna i conteggi `(nodes_created, edges_created)`.
 async fn run_graph_import(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     nodes_in: &[Value],
     edges_in: &[Value],
     source_id: &str,
@@ -1417,7 +1417,7 @@ fn parse_graph_payload(
     Ok((nodes_in, edges_in))
 }
 
-pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_knowledge_import_graph(ctx: &ToolContextCore, input: &Value) -> String {
     let args = match parse_import_graph_input(input) {
         Ok(a) => a,
         Err(e) => return e,

@@ -15,7 +15,6 @@
 //! - `semantic_tools` — ricerca semantica (codebase, recall, in-file)
 //!
 //! Sottomoduli per dominio operativo:
-//! - `files`   — operazioni su filesystem (read/write/edit/delete/list/search)
 //! - `git`     — comandi Git
 //! - `service` — gestione processi long-running e build immagine progetto
 //! - `sandbox` — configurazione sandbox del progetto
@@ -29,9 +28,7 @@ pub use nexus_agent_tools::*;
 pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
-pub(crate) mod files;
 pub(crate) mod helpers;
-pub(crate) mod knowledge;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
 pub(crate) mod privileged;
@@ -65,15 +62,13 @@ pub(crate) use std::path::{Path, PathBuf};
 
 pub(crate) use serde_json::Value;
 pub(crate) use sqlx::Row;
-pub(crate) use tokio::process::Command;
 pub(crate) use uuid::Uuid;
 
 pub(crate) use crate::projects::resolve_relative_path;
 
 pub(crate) use helpers::{
-    classify_command_error, extract_file_structure, format_process_output, is_long_oneshot,
-    is_protected_path, looks_like_long_running_command, READ_FILE_LINES_MAX,
-    READ_FILE_STRUCTURE_HINT_LINES,
+    classify_command_error, format_process_output, is_long_oneshot,
+    looks_like_long_running_command,
 };
 
 #[cfg(test)]

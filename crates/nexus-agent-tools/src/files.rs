@@ -1,6 +1,208 @@
 //! Tool di operazioni su file: lettura, scrittura, lista, ricerca, edit, delete, rename.
+//!
+//! Estratto da mcp-core (split 7.4, passo agent_tools-5). Le funzioni del
+//! monolite che chiudevano il ciclo di una mutazione (governance in scrittura,
+//! tracking ripristinabile, autocommit di sessione, reindex/scan/lint
+//! post-scrittura) restano li' e arrivano qui dal trait
+//! [`crate::context_core::FileMutationHooks`].
 
-use super::*;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use tokio::process::Command;
+
+use crate::context_core::ToolContextCore;
+use crate::paths::resolve_relative_path;
+
+// ── Helper spostati da mcp-core::agent_tools::helpers ──────────────────────
+// Erano li' quando `files` viveva nello stesso package; nessun altro modulo li
+// usa, quindi seguono il loro unico chiamante invece di restare a meta' strada.
+
+/// Soglia oltre la quale `read_file` antepone una mappa strutturale del file
+/// per orientare l'agente. NON tronca mai: il file viene comunque restituito
+/// INTEGRALE (politica "mai troncare-e-buttare").
+pub(crate) const READ_FILE_STRUCTURE_HINT_LINES: usize = 300;
+/// Numero massimo di righe leggibili con read_file_lines in una singola chiamata.
+/// read_file_lines e' un tool a RANGE esplicito (start/end), quindi non perde
+/// dati: il chiamante itera i range. Valore molto alto per non spezzare
+/// inutilmente letture ampie volute.
+pub(crate) const READ_FILE_LINES_MAX: usize = 100_000;
+
+/// File e pattern che l'agente non può mai modificare, indipendentemente dai permessi.
+/// Proteggono secrets, configurazioni ambiente e il binario in produzione.
+pub(crate) const PROTECTED_PATTERNS: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.staging",
+    ".env.development",
+    "nexus.env", // env specifico di Nexus
+    "secrets",   // qualsiasi file con "secrets" nel nome
+    "credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".pem",
+    ".key",
+    "Cargo.lock", // non modificare il lockfile manualmente
+    "pnpm-lock.yaml",
+];
+
+/// Ritorna true se il path è protetto e non deve essere modificato dall'agente.
+pub(crate) fn is_protected_path(path_str: &str) -> Option<&'static str> {
+    let lower = path_str.to_lowercase();
+    // Controlla nome file esatto o pattern nel path
+    for pattern in PROTECTED_PATTERNS {
+        let pat_lower = pattern.to_lowercase();
+        // Match esatto del nome file o estensione
+        if lower.ends_with(&pat_lower)
+            || lower.contains(&format!("/{}", pat_lower))
+            || lower.contains(&format!("\\{}", pat_lower))
+            || lower == pat_lower
+        {
+            return Some(pattern);
+        }
+    }
+    None
+}
+
+/// Estrae una mappa strutturale del file: funzioni, classi, componenti con numero di riga.
+/// Supporta Rust, TypeScript/JavaScript, Python, C#, Go.
+/// Usa corrispondenza su prefisso di parola chiave — nessuna regex, O(n) per riga.
+pub(crate) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
+    let mut entries: Vec<(usize, String)> = Vec::new();
+
+    for (line_idx, raw_line) in content.lines().enumerate() {
+        let line_num = line_idx + 1;
+        let line = raw_line.trim();
+
+        // Salta righe vuote e commenti
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('#')
+        {
+            continue;
+        }
+
+        // Helper: estrai nome identificatore dopo una keyword
+        let ident_after = |s: &str, kw: &str| -> Option<String> {
+            let rest = s.strip_prefix(kw)?.trim_start();
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        };
+
+        // Normalizza spazi multipli per matching keyword composte
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // TypeScript/JavaScript — export function, async function, function
+        if let Some(name) = [
+            "export async function ",
+            "export function ",
+            "async function ",
+            "function ",
+        ]
+        .iter()
+        .find_map(|kw| ident_after(&normalized, kw))
+        {
+            entries.push((line_num, format!("fn {name}")));
+            continue;
+        }
+
+        // TypeScript/JavaScript — export const X = (...) => / = async (
+        if normalized.starts_with("export const ") || normalized.starts_with("const ") {
+            // Solo se è assegnazione a funzione/arrow
+            if normalized.contains("= (")
+                || normalized.contains("= async (")
+                || normalized.contains(": React.")
+                || normalized.contains("FC =")
+            {
+                if let Some(name) = ident_after(&normalized, "export const ")
+                    .or_else(|| ident_after(&normalized, "const "))
+                {
+                    entries.push((line_num, format!("const {name}")));
+                    continue;
+                }
+            }
+        }
+
+        // class (TS/JS/Python/C#)
+        if let Some(name) = ["export default class ", "export class ", "class "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
+            entries.push((line_num, format!("class {name}")));
+            continue;
+        }
+
+        // Rust — pub async fn, pub fn, async fn, fn
+        if let Some(name) = ["pub async fn ", "pub fn ", "async fn ", "fn "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
+            entries.push((line_num, format!("fn {name}")));
+            continue;
+        }
+
+        // Rust — impl, struct, enum
+        if let Some(name) = ident_after(&normalized, "impl ") {
+            entries.push((line_num, format!("impl {name}")));
+            continue;
+        }
+        if let Some(name) = ["pub struct ", "struct "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
+            entries.push((line_num, format!("struct {name}")));
+            continue;
+        }
+        if let Some(name) = ["pub enum ", "enum "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
+            entries.push((line_num, format!("enum {name}")));
+            continue;
+        }
+
+        // Python — def, async def
+        if let Some(name) = ["async def ", "def "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
+            entries.push((line_num, format!("def {name}")));
+            continue;
+        }
+
+        // C# — public/private/protected method or class
+        if normalized.starts_with("public ")
+            || normalized.starts_with("private ")
+            || normalized.starts_with("protected ")
+        {
+            if normalized.contains(" class ")
+                || normalized.contains(" interface ")
+                || normalized.contains(" enum ")
+            {
+                let short: String = normalized.chars().take(60).collect();
+                entries.push((line_num, format!("class {short}")));
+                continue;
+            }
+            // method: ha parentesi aperta e non è una property semplice
+            if normalized.contains('(') && !normalized.ends_with(';') {
+                let short: String = normalized.chars().take(60).collect();
+                entries.push((line_num, format!("method {short}")));
+                continue;
+            }
+        }
+    }
+
+    entries
+}
 
 /// Risultato del preflight build graph (ADR 0020) applicato a write/edit.
 /// Variant `Block(msg)` blocca la scrittura (es. file generato); `Warn(msg)`
@@ -34,7 +236,7 @@ fn resolve_write_target(root: &std::path::Path, path_str: &str) -> Result<PathBu
 /// nel build graph o entry point o linguaggio non riconosciuto; `Warn` se
 /// e' fuori dal build graph (warning non bloccante); `Block` se in directory
 /// generata (es. node_modules, target, dist).
-async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> BuildGraphPreflight {
+async fn run_build_graph_preflight(ctx: &ToolContextCore, path_str: &str) -> BuildGraphPreflight {
     // Estensioni codice rilevanti: l'enforcement parte solo per file
     // sorgente, non per md/json/yaml/config.
     let ext = std::path::Path::new(path_str)
@@ -50,7 +252,7 @@ async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> Bu
     }
 
     let rel = std::path::Path::new(path_str.trim_start_matches(['\\', '/']));
-    let membership = match crate::build_graph::is_in_build_graph(ctx.project_id, rel).await {
+    let membership = match nexus_build_graph::is_in_build_graph(ctx.project_id, rel).await {
         Ok(m) => m,
         Err(e) => {
             // Cache non disponibile o resolver fallito: lascio passare ma loggo.
@@ -64,22 +266,22 @@ async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> Bu
         }
     };
     match membership {
-        crate::build_graph::BuildGraphMembership::Generated { reason } => {
+        nexus_build_graph::BuildGraphMembership::Generated { reason } => {
             BuildGraphPreflight::Block(format!(
                 "Scrittura rifiutata: '{}' e' un file generato ({}). I file generati dalla build non vanno modificati manualmente.",
                 path_str, reason
             ))
         }
-        crate::build_graph::BuildGraphMembership::OutOfGraph { reason } => {
+        nexus_build_graph::BuildGraphMembership::OutOfGraph { reason } => {
             let info_msg = build_graph_out_of_graph_info(ctx.project_id).await;
             BuildGraphPreflight::Warn(format!(
                 "ATTENZIONE: '{}' NON e' nel build graph del progetto ({}). I file fuori dal build graph non vengono compilati ne eseguiti.{} Se il tuo obiettivo e' modificare codice di produzione, usa `nexus_build_graph_info` per verificare quale path e' nel build graph.",
                 path_str, reason, info_msg
             ))
         }
-        crate::build_graph::BuildGraphMembership::Unknown { .. }
-        | crate::build_graph::BuildGraphMembership::InGraph { .. }
-        | crate::build_graph::BuildGraphMembership::Entrypoint { .. } => BuildGraphPreflight::Allow,
+        nexus_build_graph::BuildGraphMembership::Unknown { .. }
+        | nexus_build_graph::BuildGraphMembership::InGraph { .. }
+        | nexus_build_graph::BuildGraphMembership::Entrypoint { .. } => BuildGraphPreflight::Allow,
     }
 }
 
@@ -88,7 +290,7 @@ async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> Bu
 /// e' disponibile o il calcolo fallisce (best-effort). Estratto da
 /// `run_build_graph_preflight` per brevita'.
 async fn build_graph_out_of_graph_info(project_id: uuid::Uuid) -> String {
-    match crate::build_graph::BuildGraphCache::global() {
+    match nexus_build_graph::BuildGraphCache::global() {
         Some(cache) => match cache.get_or_compute(project_id).await {
             Ok(info) => format!(
                 " Build graph derivato da: {}. Include patterns: {}.",
@@ -101,7 +303,7 @@ async fn build_graph_out_of_graph_info(project_id: uuid::Uuid) -> String {
     }
 }
 
-pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_read_file(ctx: &ToolContextCore, input: &Value) -> String {
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
         None => return "[Errore: parametro 'path' mancante]".to_string(),
@@ -134,7 +336,7 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
     }
 
     let read_full_max_lines: usize =
-        crate::settings::get_setting(&ctx.db, "agent.fs.read_full_max_lines")
+        nexus_auth::get_setting_checked(&ctx.db, "agent.fs.read_full_max_lines")
             .await
             .ok()
             .flatten()
@@ -152,7 +354,7 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
 /// (regola L): serve sia al guard di `read_file` sia alla ricerca in-process,
 /// che senza cap leggerebbe in RAM file di qualunque dimensione.
 async fn fs_read_max_bytes(db: &sqlx::PgPool) -> u64 {
-    crate::settings::get_setting(db, "agent.fs.read_max_bytes")
+    nexus_auth::get_setting_checked(db, "agent.fs.read_max_bytes")
         .await
         .ok()
         .flatten()
@@ -161,7 +363,7 @@ async fn fs_read_max_bytes(db: &sqlx::PgPool) -> u64 {
 }
 
 async fn read_max_bytes_guard(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     target: &Path,
     path_str: &str,
 ) -> Option<String> {
@@ -291,7 +493,7 @@ fn parse_line_range(input: &Value) -> Result<(usize, usize), String> {
     Ok((start_line, end_line))
 }
 
-pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_read_file_lines(ctx: &ToolContextCore, input: &Value) -> String {
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
         None => return "[Errore: parametro 'path' mancante]".to_string(),
@@ -370,7 +572,7 @@ fn render_line_range(content: &str, path_str: &str, start_line: usize, end_line:
 /// nuovo contenuto coincide byte per byte con quello gia' su disco, cioe' quando
 /// la scrittura NON cambia nulla.
 async fn prepare_write_and_track(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     target: &Path,
     path_str: &str,
     content: &str,
@@ -394,23 +596,15 @@ async fn prepare_write_and_track(
     // 28 operazioni sullo stesso file, dimensione che oscillava avanti e
     // indietro, sub-run ucciso dal timeout senza mai convergere).
     let unchanged = before_for_track.as_deref() == Some(content);
-    if let Err(e) = crate::file_mutations::record_mutation(
-        &ctx.db,
-        ctx.project_id,
-        ctx.session_id,
-        Some(ctx.user_id),
-        path_str,
-        "write_file",
-        before_for_track.as_deref(),
-        Some(content),
-    )
-    .await
-    {
-        tracing::warn!(
-            project_id = %ctx.project_id, path = %path_str,
-            "file_mutations::record_mutation fallita (write_file): {e}"
-        );
-    }
+    ctx.hooks
+        .record_mutation(
+            ctx,
+            path_str,
+            "write_file",
+            before_for_track.as_deref(),
+            Some(content),
+        )
+        .await;
     Ok((existed_before, unchanged))
 }
 
@@ -418,7 +612,7 @@ async fn prepare_write_and_track(
 /// protetto, parametro `content` presente. Ritorna `(path_str, content)` o il
 /// messaggio d'errore. Estratto da `tool_write_file`.
 fn read_write_params<'a>(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     input: &'a Value,
 ) -> Result<(&'a str, &'a str), String> {
     if !ctx.can_write {
@@ -440,7 +634,7 @@ fn read_write_params<'a>(
     Ok((path_str, content))
 }
 
-pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_write_file(ctx: &ToolContextCore, input: &Value) -> String {
     let (path_str, content) = match read_write_params(ctx, input) {
         Ok(pair) => pair,
         Err(msg) => return msg,
@@ -449,9 +643,10 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
     // Governance risorse in scrittura (porte ADR 0010 + URL interni), punto
     // unico con audit: su violazione registra in nexus_resource_audit e
     // ritorna il rifiuto. Catalogo policy: nexus_resource_policies (mig 0397).
-    if let Some(msg) =
-        crate::security::resource_governance::enforce_on_write(ctx, "write_file", path_str, content)
-            .await
+    if let Some(msg) = ctx
+        .hooks
+        .enforce_on_write(ctx, "write_file", path_str, content)
+        .await
     {
         return msg;
     }
@@ -494,7 +689,7 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
 /// (created/modified), avvia i task di background (auto-commit + reindex/scan/
 /// lint/doc) e compone il messaggio di successo. Estratto da `tool_write_file`.
 fn on_write_success(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     target: &Path,
     path_str: &str,
     content: &str,
@@ -524,79 +719,20 @@ fn on_write_success(
 
 /// Avvia in background lo snapshot di auto-commit per sessione su branch
 /// dedicato (rete di sicurezza sopra `file_mutations`). Se non e' un git repo /
-/// setting disabilitato / session_id assente, il modulo fa no-op silenzioso.
+/// setting disabilitato / session_id assente, l'hook fa no-op silenzioso.
 /// Punto unico (regola L) condiviso da `tool_write_file` e `tool_edit_file`.
-fn spawn_autocommit_snapshot(ctx: &AgentToolContext, op: &str, path_str: &str) {
-    let ac_db = ctx.db.clone();
-    let ac_root = ctx.root_path.clone();
-    let ac_is_git = ctx.is_git_repo;
-    let ac_sid = ctx.session_id;
-    // Soppressione FASE 2 (buco B2): per un sub-run isolato l'autocommit e' no-op
-    // (il flag e' passato alla funzione, che early-return). L'unica fonte del
-    // commit e' l'apply atomico post-run (PR4).
-    let ac_isolated = ctx.isolated_subrun;
-    let ac_path = path_str.to_string();
-    let ac_op = op.to_string();
-    tokio::spawn(async move {
-        crate::session_autocommit::snapshot_after_mutation(
-            &ac_db,
-            &ac_root,
-            ac_is_git,
-            ac_sid,
-            ac_isolated,
-            &ac_op,
-            &ac_path,
-        )
-        .await;
-    });
+fn spawn_autocommit_snapshot(ctx: &ToolContextCore, op: &str, path_str: &str) {
+    ctx.hooks.spawn_autocommit_snapshot(ctx, op, path_str);
 }
 
 /// Avvia in background la re-indicizzazione del file nel code index, l'eventuale
 /// auto-scan qualita', la ri-validazione delle violazioni di governance risorse
 /// (regola H: niente residui nel pannello Problemi) e l'hook M2 di registrazione
-/// documentazione (`upsert_project_document_if_doc`). Estratto da
-/// `tool_write_file`.
-fn spawn_write_reindex(ctx: &AgentToolContext, target: &Path, path_str: &str, content: &str) {
-    // Soppressione FASE 2 (buco B2): per un sub-run ISOLATO il reindex
-    // fire-and-forget e' un no-op. Indicizzerebbe path del worktree effimero
-    // nell'indice neurale del PROGETTO (contenuti mai promossi alla root) e,
-    // non atteso, correrebbe col cleanup del worktree (lettura di file gia'
-    // rimossi, lock su Windows). Il reindex avviene UNA volta post-apply sui
-    // soli file realmente promossi alla project_root (PR4).
-    if ctx.isolated_subrun {
-        return;
-    }
-    let db_bg = ctx.db.clone();
-    let neural_bg = ctx.neural.clone();
-    let project_id_bg = ctx.project_id;
-    let root_bg = ctx.root_path.clone();
-    let target_bg = target.to_path_buf();
-    let path_str_bg = path_str.to_string();
-    let content_bg = content.to_string();
-    tokio::spawn(async move {
-        let _ = crate::projects::reindex_single_file(
-            &db_bg,
-            &neural_bg,
-            project_id_bg,
-            &root_bg,
-            &target_bg,
-        )
-        .await;
-        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &root_bg, &target_bg).await;
-        // Ri-valuta le violazioni di governance risorse sul file appena scritto:
-        // se l'edit ha rimosso la porta/URL hardcoded, la diagnosi policy_violation
-        // viene chiusa e sparisce dal pannello Problemi (regola H: niente residui).
-        crate::security::resource_linter::revalidate_file_violations(
-            &db_bg,
-            project_id_bg,
-            &root_bg.to_string_lossy(),
-            &target_bg,
-        )
-        .await;
-        // Hook M2: se il file e' un .md di documentazione, registra in project_documents
-        let _ =
-            upsert_project_document_if_doc(&db_bg, project_id_bg, &path_str_bg, &content_bg).await;
-    });
+/// documentazione (`upsert_project_document_if_doc`, abilitato dal `content`).
+/// Estratto da `tool_write_file`.
+fn spawn_write_reindex(ctx: &ToolContextCore, target: &Path, path_str: &str, content: &str) {
+    ctx.hooks
+        .spawn_post_write(ctx, target, path_str, Some(content));
 }
 
 /// Compone il messaggio di successo di `write_file`: riga base + eventuale
@@ -736,7 +872,7 @@ fn extract_doc_title(content: &str, rel_path: &str) -> String {
 /// Hook M2: rileva se un file appena scritto e' documentazione del progetto e lo registra in `project_documents`.
 /// Tipi rilevati: PRD, README, ARCHITECTURE, CHANGELOG, CONTRIBUTING, SPEC, generic markdown sotto specs/ o docs/.
 /// Idempotente: se esiste gia una riga con stesso (project_id, file_path), aggiorna updated_at e version increment patch.
-async fn upsert_project_document_if_doc(
+pub async fn upsert_project_document_if_doc(
     db: &sqlx::PgPool,
     project_id: uuid::Uuid,
     rel_path: &str,
@@ -771,7 +907,7 @@ async fn upsert_project_document_if_doc(
     Ok(())
 }
 
-pub(super) async fn tool_list_files(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_list_files(ctx: &ToolContextCore, input: &Value) -> String {
     let dir_str = input.get("directory").and_then(Value::as_str).unwrap_or("");
     let target = if dir_str.is_empty() {
         ctx.root_path.clone()
@@ -815,7 +951,7 @@ pub(super) async fn tool_list_files(ctx: &AgentToolContext, input: &Value) -> St
     }
 }
 
-pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_search_in_files(ctx: &ToolContextCore, input: &Value) -> String {
     let pattern = match input.get("pattern").and_then(Value::as_str) {
         Some(s) => s,
         None => return "[Errore: parametro 'pattern' mancante]".to_string(),
@@ -909,7 +1045,7 @@ async fn run_grep_or_fallback(
 /// Formatta l'output della ricerca (comune a grep e al fallback Rust): rende i
 /// path relativi alla root e applica il troncamento. Punto unico (regola L): la
 /// stessa logica serviva sia al ramo grep sia al fallback Windows.
-fn format_search_output(ctx: &AgentToolContext, pattern: &str, stdout: &str) -> String {
+fn format_search_output(ctx: &ToolContextCore, pattern: &str, stdout: &str) -> String {
     // Limite massimo di output: 500KB. Risultati piu' grandi causano
     // RESOURCE_EXHAUSTED gRPC (limite 16MB client Python) e consumano
     // troppi token di contesto per l'LLM. 500KB ~ 10k righe di codice.
@@ -1085,7 +1221,7 @@ fn append_file_matches(
     per_file
 }
 
-pub(super) async fn tool_delete_file(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_delete_file(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
@@ -1150,7 +1286,7 @@ async fn delete_directory(target: &Path, path_str: &str, recursive: bool) -> Str
     }
 }
 
-pub(super) async fn tool_rename_file(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_rename_file(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
@@ -1486,7 +1622,7 @@ fn build_old_string_not_found_message(
 /// `(path_str, old_string, new_string)` o il messaggio d'errore. Estratto da
 /// `tool_edit_file`.
 fn read_edit_params<'a>(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     input: &'a Value,
 ) -> Result<(&'a str, &'a str, &'a str), String> {
     if !ctx.can_write {
@@ -1512,7 +1648,7 @@ fn read_edit_params<'a>(
     Ok((path_str, old_string, new_string))
 }
 
-pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_edit_file(ctx: &ToolContextCore, input: &Value) -> String {
     let (path_str, old_string, new_string) = match read_edit_params(ctx, input) {
         Ok(triple) => triple,
         Err(msg) => return msg,
@@ -1520,13 +1656,10 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
 
     // Governance risorse in scrittura (porte + URL interni), punto unico con
     // audit: scansiona la nuova porzione e registra l'eventuale violazione.
-    if let Some(msg) = crate::security::resource_governance::enforce_on_write(
-        ctx,
-        "edit_file",
-        path_str,
-        new_string,
-    )
-    .await
+    if let Some(msg) = ctx
+        .hooks
+        .enforce_on_write(ctx, "edit_file", path_str, new_string)
+        .await
     {
         return msg;
     }
@@ -1556,7 +1689,7 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
 /// (0 = non trovato, N>1 = ambiguo) o applica la sostituzione univoca. Estratto
 /// da `tool_edit_file`.
 async fn edit_matched_content(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     target: &Path,
     path_str: &str,
     old_string: &str,
@@ -1622,24 +1755,10 @@ struct EditApply<'a> {
 /// PRIMA della scrittura (`before` e' il contenuto preesistente gia' letto dal
 /// chiamante). Best-effort: warn ma non blocca. Estratto da
 /// `apply_edit_and_persist`.
-async fn record_edit_mutation(ctx: &AgentToolContext, path_str: &str, before: &str, after: &str) {
-    if let Err(e) = crate::file_mutations::record_mutation(
-        &ctx.db,
-        ctx.project_id,
-        ctx.session_id,
-        Some(ctx.user_id),
-        path_str,
-        "edit_file",
-        Some(before),
-        Some(after),
-    )
-    .await
-    {
-        tracing::warn!(
-            project_id = %ctx.project_id, path = %path_str,
-            "file_mutations::record_mutation fallita (edit_file): {e}"
-        );
-    }
+async fn record_edit_mutation(ctx: &ToolContextCore, path_str: &str, before: &str, after: &str) {
+    ctx.hooks
+        .record_mutation(ctx, path_str, "edit_file", Some(before), Some(after))
+        .await;
 }
 
 /// Applica la sostituzione univoca (gia' validata dal chiamante), ripristina gli
@@ -1647,7 +1766,7 @@ async fn record_edit_mutation(ctx: &AgentToolContext, path_str: &str, before: &s
 /// di background (auto-commit + reindex/scan/lint). Ritorna il messaggio finale.
 /// Estratto dal ramo di successo di `tool_edit_file`.
 async fn apply_edit_and_persist(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     target: &Path,
     path_str: &str,
     apply: EditApply<'_>,
@@ -1676,7 +1795,7 @@ async fn apply_edit_and_persist(
             );
             // Auto-commit per sessione (vedi tool_write_file).
             spawn_autocommit_snapshot(ctx, "modify", path_str);
-            spawn_edit_reindex(ctx, target);
+            spawn_edit_reindex(ctx, target, path_str);
             let mut base = format!(
                 "File '{}' modificato con successo ({} byte → {} byte)",
                 path_str,
@@ -1705,45 +1824,17 @@ async fn apply_edit_and_persist(
     }
 }
 
-/// Avvia in background la re-indicizzazione del file dopo un `edit_file`:
-/// reindex nel code index, eventuale auto-scan qualita' e ri-validazione delle
-/// violazioni di governance risorse risolte dall'edit (regola H: niente residui
-/// nel pannello Problemi). Variante di `spawn_write_reindex` senza l'hook M2 sui
-/// documenti (edit non ricrea il .md da zero). Estratto da `tool_edit_file`.
-fn spawn_edit_reindex(ctx: &AgentToolContext, target: &Path) {
-    // Soppressione FASE 2 (buco B2): sub-run isolato -> reindex no-op (stesso
-    // razionale di `spawn_write_reindex`: worktree effimero, race col cleanup).
-    // Reindex-once post-apply sui file promossi alla root (PR4).
-    if ctx.isolated_subrun {
-        return;
-    }
-    let db_bg = ctx.db.clone();
-    let neural_bg = ctx.neural.clone();
-    let project_id_bg = ctx.project_id;
-    let root_bg = ctx.root_path.clone();
-    let target_bg = target.to_path_buf();
-    tokio::spawn(async move {
-        let _ = crate::projects::reindex_single_file(
-            &db_bg,
-            &neural_bg,
-            project_id_bg,
-            &root_bg,
-            &target_bg,
-        )
-        .await;
-        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &root_bg, &target_bg).await;
-        crate::security::resource_linter::revalidate_file_violations(
-            &db_bg,
-            project_id_bg,
-            &root_bg.to_string_lossy(),
-            &target_bg,
-        )
-        .await;
-    });
+/// Avvia in background la re-indicizzazione del file dopo un `edit_file`.
+/// Stesso hook di `spawn_write_reindex` con `content: None`: l'edit non ricrea
+/// il .md da zero, quindi salta il solo hook M2 sui documenti. Le due funzioni
+/// erano gemelle divergibili (stesse tre azioni ricopiate); ora convergono sul
+/// punto unico `FileMutationHooks::spawn_post_write` (regola L).
+fn spawn_edit_reindex(ctx: &ToolContextCore, target: &Path, path_str: &str) {
+    ctx.hooks.spawn_post_write(ctx, target, path_str, None);
 }
 
 /// Crea una directory con semantica `-p` (idempotente, crea genitori).
-pub(super) async fn tool_fs_mkdir(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_fs_mkdir(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
@@ -1770,7 +1861,7 @@ pub(super) async fn tool_fs_mkdir(ctx: &AgentToolContext, input: &Value) -> Stri
 }
 
 /// Copia un file o una directory (ricorsiva) dentro la root del progetto.
-pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_fs_copy(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
@@ -1886,7 +1977,7 @@ fn resolve_from_to(
 }
 
 /// Sposta (rinomina) un file o una directory. Atomico se sullo stesso filesystem.
-pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_fs_move(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
     }
@@ -1934,6 +2025,210 @@ mod tests {
     use super::build_write_success_message;
     use super::is_critical_config;
     use super::occurrence_start_lines;
+
+    use std::sync::{Arc, Mutex};
+
+    use futures::future::BoxFuture;
+
+    use crate::context_core::{FileMutationHooks, NoopEmbedder, ToolContextCore};
+
+    // ── Il contratto degli hook di mutazione, visto dal tool ────────────────
+    //
+    // Le azioni attorno a una scrittura (gate di governance, tracking,
+    // autocommit, reindex/scan/lint) vivono in mcp-core e arrivano qui da
+    // `FileMutationHooks`. Da questo lato del confine l'unica cosa osservabile
+    // e' SE il tool le invoca: un'implementazione che non chiamasse nulla
+    // lascerebbe i tool verdi e la produzione senza governance. Questi test
+    // guardano quello, attraversando i tool reali (`tool_write_file`,
+    // `tool_edit_file`), non le funzioni interne.
+
+    /// Hook che REGISTRA le chiamate invece di eseguirle.
+    #[derive(Debug, Default)]
+    struct HookRegistranti {
+        eventi: Mutex<Vec<String>>,
+        /// Se valorizzato, `enforce_on_write` RIFIUTA con questo messaggio.
+        rifiuto: Option<String>,
+    }
+
+    impl HookRegistranti {
+        fn eventi(&self) -> Vec<String> {
+            self.eventi.lock().expect("lock eventi").clone()
+        }
+
+        fn annota(&self, e: String) {
+            self.eventi.lock().expect("lock eventi").push(e);
+        }
+    }
+
+    impl FileMutationHooks for HookRegistranti {
+        fn reindex_file(
+            &self,
+            _: uuid::Uuid,
+            _: std::path::PathBuf,
+            _: std::path::PathBuf,
+        ) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+
+        fn enforce_on_write<'a>(
+            &'a self,
+            _: &'a ToolContextCore,
+            tool_name: &'a str,
+            path: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, Option<String>> {
+            self.annota(format!("enforce:{tool_name}:{path}"));
+            Box::pin(async move { self.rifiuto.clone() })
+        }
+
+        fn record_mutation<'a>(
+            &'a self,
+            _: &'a ToolContextCore,
+            path: &'a str,
+            tool_name: &'a str,
+            _: Option<&'a str>,
+            _: Option<&'a str>,
+        ) -> BoxFuture<'a, ()> {
+            self.annota(format!("record:{tool_name}:{path}"));
+            Box::pin(async {})
+        }
+
+        fn spawn_autocommit_snapshot(&self, _: &ToolContextCore, op: &str, path: &str) {
+            self.annota(format!("autocommit:{op}:{path}"));
+        }
+
+        fn spawn_post_write(
+            &self,
+            _: &ToolContextCore,
+            _: &std::path::Path,
+            path: &str,
+            content: Option<&str>,
+        ) {
+            self.annota(format!("post_write:{path}:content={}", content.is_some()));
+        }
+    }
+
+    /// Contesto reale (la struct di produzione) con gli hook sotto osservazione.
+    /// Il pool e' lazy e non viene mai contattato: il ramo write/edit di un file
+    /// non-codice non tocca il DB.
+    fn ctx_di_prova(root: std::path::PathBuf, hooks: Arc<HookRegistranti>) -> ToolContextCore {
+        let db = sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test")
+            .expect("pool lazy");
+        ToolContextCore {
+            root_path: root,
+            user_id: uuid::Uuid::nil(),
+            is_git_repo: false,
+            can_write: true,
+            project_id: uuid::Uuid::nil(),
+            session_id: None,
+            db: Arc::new(db.clone()),
+            run_db: Arc::new(db),
+            parent_run_id: None,
+            run_id: None,
+            long_running_patterns: Vec::new(),
+            user_role: "admin".to_string(),
+            is_nexus_operator: true,
+            project_channels: Arc::new(dashmap::DashMap::new()),
+            monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            hooks,
+            embedder: Arc::new(NoopEmbedder),
+            isolated_subrun: false,
+        }
+    }
+
+    /// `write_file` deve attraversare TUTTI gli hook, e nell'ordine: il gate
+    /// PRIMA di toccare il disco, il tracking prima della scrittura, autocommit
+    /// e hook post-scrittura dopo. Mutazione che rende rosso: togliere una
+    /// qualsiasi delle quattro chiamate da `tool_write_file`.
+    #[tokio::test]
+    async fn write_file_attraversa_tutti_gli_hook_di_mutazione() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = Arc::new(HookRegistranti::default());
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks.clone());
+
+        let out = super::tool_write_file(
+            &ctx,
+            &serde_json::json!({ "path": "note.txt", "content": "ciao" }),
+        )
+        .await;
+
+        assert!(out.contains("successo"), "scrittura non riuscita: {out}");
+        assert_eq!(
+            hooks.eventi(),
+            vec![
+                "enforce:write_file:note.txt".to_string(),
+                "record:write_file:note.txt".to_string(),
+                "autocommit:create:note.txt".to_string(),
+                // `content` valorizzato: e' il ramo che abilita l'hook M2 sui
+                // documenti, l'unica differenza fra i due gemelli collassati.
+                "post_write:note.txt:content=true".to_string(),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).expect("file scritto"),
+            "ciao"
+        );
+    }
+
+    /// Il gate e' BLOCCANTE: se `enforce_on_write` rifiuta, il file non deve
+    /// esistere e nessun hook successivo deve partire. Mutazione che rende
+    /// rosso: ignorare il valore di ritorno del gate e proseguire.
+    #[tokio::test]
+    async fn write_file_rifiutato_dal_gate_non_tocca_il_disco() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = Arc::new(HookRegistranti {
+            eventi: Mutex::new(Vec::new()),
+            rifiuto: Some("[Errore: porta hardcoded]".to_string()),
+        });
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks.clone());
+
+        let out = super::tool_write_file(
+            &ctx,
+            &serde_json::json!({ "path": "note.txt", "content": "porta 8080" }),
+        )
+        .await;
+
+        assert_eq!(out, "[Errore: porta hardcoded]");
+        assert_eq!(hooks.eventi(), vec!["enforce:write_file:note.txt".to_string()]);
+        assert!(
+            !dir.path().join("note.txt").exists(),
+            "il gate ha rifiutato ma il file e' stato scritto lo stesso"
+        );
+    }
+
+    /// `edit_file` passa dallo STESSO hook post-scrittura di `write_file`, ma
+    /// senza `content`: era l'unica differenza fra `spawn_write_reindex` e
+    /// `spawn_edit_reindex`, due gemelli ricopiati. Mutazione che rende rosso:
+    /// passare `Some(...)` anche dal ramo edit (l'hook M2 ricreerebbe il
+    /// documento da un contenuto parziale).
+    #[tokio::test]
+    async fn edit_file_usa_lo_stesso_hook_post_scrittura_senza_contenuto() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "prima\n").expect("seed");
+        let hooks = Arc::new(HookRegistranti::default());
+        let ctx = ctx_di_prova(dir.path().to_path_buf(), hooks.clone());
+
+        let out = super::tool_edit_file(
+            &ctx,
+            &serde_json::json!({
+                "path": "note.txt",
+                "old_string": "prima",
+                "new_string": "dopo",
+            }),
+        )
+        .await;
+
+        assert!(out.contains("modificato con successo"), "edit fallito: {out}");
+        assert_eq!(
+            hooks.eventi(),
+            vec![
+                "enforce:edit_file:note.txt".to_string(),
+                "record:edit_file:note.txt".to_string(),
+                "autocommit:modify:note.txt".to_string(),
+                "post_write:note.txt:content=false".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn is_critical_config_riconosce_i_file_di_config() {

@@ -119,7 +119,7 @@ pub async fn _reset_policy_cache_for_tests() {
 /// Esegue i sub-scanner abilitati dal catalogo; alla prima violazione audita
 /// (dentro il sub-scanner) e ritorna `Some(messaggio di rifiuto)`.
 pub async fn enforce_on_write(
-    ctx: &crate::agent_tools::AgentToolContext,
+    ctx: &nexus_agent_tools::ToolContextCore,
     tool_name: &str,
     path: &str,
     content: &str,
@@ -192,7 +192,7 @@ pub async fn enforce_on_write(
 
 /// Audit di una violazione URL respinta (resource_kind `network`).
 fn audit_url_rejection(
-    ctx: &crate::agent_tools::AgentToolContext,
+    ctx: &nexus_agent_tools::ToolContextCore,
     tool_name: &str,
     path: &str,
     findings: &[crate::agent_tools::url_scanner::UrlFinding],

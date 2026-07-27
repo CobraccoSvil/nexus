@@ -133,7 +133,7 @@ pub fn format_reject_message(tool_name: &str, field: &str, placeholder: &str) ->
 /// kind='secret', rule='no_redacted_placeholder', default fail-safe enabled)
 /// e audit. Ritorna `Some(messaggio di rifiuto)` se l'input va bloccato.
 pub async fn enforce_no_redacted_placeholder(
-    ctx: &crate::agent_tools::AgentToolContext,
+    ctx: &nexus_agent_tools::ToolContextCore,
     tool_name: &str,
     field: &str,
     text: &str,

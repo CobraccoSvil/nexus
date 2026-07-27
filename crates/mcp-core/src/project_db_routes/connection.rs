@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::shared::{api_err, normalize_pg_connection_string, ApiResult};
+use super::shared::{api_err, normalize_pg_connection_string, ApiError, ApiResult};
 use crate::{auth::Claims, AppState};
 
 // ── POST /api/projects/:id/db/detect ─────────────────────────────────────────
@@ -86,103 +86,102 @@ fn detect_from_env_content(content: &str) -> Option<(String, String)> {
     None
 }
 
+/// Pattern di variabili d'ambiente per un engine noto: per ogni campo della
+/// connection string, l'elenco ordinato delle chiavi alternative accettate.
+struct EnvPattern {
+    engine: &'static str,
+    host_keys: &'static [&'static str],
+    port_keys: &'static [&'static str],
+    db_keys: &'static [&'static str],
+    user_keys: &'static [&'static str],
+    pass_keys: &'static [&'static str],
+    default_port: &'static str,
+}
+
+/// Pattern noti, nell'ordine di precedenza applicato dalla detection.
+const ENV_PATTERNS: &[EnvPattern] = &[
+    EnvPattern {
+        engine: "postgres",
+        host_keys: &["POSTGRES_HOST", "PGHOST", "DB_HOST", "DATABASE_HOST"],
+        port_keys: &["POSTGRES_PORT", "PGPORT", "DB_PORT", "DATABASE_PORT"],
+        db_keys: &[
+            "POSTGRES_DB",
+            "PGDATABASE",
+            "DB_NAME",
+            "DATABASE_NAME",
+            "POSTGRES_DATABASE",
+        ],
+        user_keys: &[
+            "POSTGRES_USER",
+            "PGUSER",
+            "DB_USER",
+            "DATABASE_USER",
+            "POSTGRES_USERNAME",
+        ],
+        pass_keys: &[
+            "POSTGRES_PASSWORD",
+            "PGPASSWORD",
+            "DB_PASSWORD",
+            "DATABASE_PASSWORD",
+            "POSTGRES_PASS",
+        ],
+        default_port: "5432",
+    },
+    EnvPattern {
+        engine: "mysql",
+        host_keys: &["MYSQL_HOST", "DB_HOST", "DATABASE_HOST"],
+        port_keys: &["MYSQL_PORT", "DB_PORT", "DATABASE_PORT"],
+        db_keys: &["MYSQL_DATABASE", "MYSQL_DB", "DB_NAME", "DATABASE_NAME"],
+        user_keys: &["MYSQL_USER", "MYSQL_USERNAME", "DB_USER"],
+        pass_keys: &["MYSQL_PASSWORD", "MYSQL_PASS", "DB_PASSWORD"],
+        default_port: "3306",
+    },
+];
+
+/// Primo valore presente in `vars` tra le chiavi `keys`, nell'ordine dato.
+fn first_var<'a>(
+    vars: &'a std::collections::HashMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter().find_map(|k| vars.get(*k)).map(|s| s.as_str())
+}
+
+/// Connection string per un singolo pattern. Serve almeno host + database:
+/// senza uno dei due ritorna `None` e il chiamante passa al pattern seguente.
+/// Porta, utente e password hanno un default (porta dell'engine / stringa vuota).
+fn env_pattern_conn(
+    pat: &EnvPattern,
+    vars: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let host = first_var(vars, pat.host_keys)?;
+    let db = first_var(vars, pat.db_keys)?;
+    let port = first_var(vars, pat.port_keys).unwrap_or(pat.default_port);
+    let user = first_var(vars, pat.user_keys).unwrap_or("");
+    let pass = first_var(vars, pat.pass_keys).unwrap_or("");
+
+    let conn_str = if !user.is_empty() && !pass.is_empty() {
+        format!(
+            "{}://{}:{}@{}:{}/{}",
+            pat.engine, user, pass, host, port, db
+        )
+    } else if !user.is_empty() {
+        format!("{}://{}@{}:{}/{}", pat.engine, user, host, port, db)
+    } else {
+        format!("{}://{}:{}/{}", pat.engine, host, port, db)
+    };
+
+    Some((pat.engine.to_string(), conn_str))
+}
+
 /// Costruisce una connection string da variabili d'ambiente separate
 /// come POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
 /// o varianti come DB_HOST, PGHOST, MYSQL_HOST, ecc.
 fn build_connection_from_env_vars(
     vars: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
-    // Pattern di variabili per engine noti
-    struct EnvPattern {
-        engine: &'static str,
-        host_keys: &'static [&'static str],
-        port_keys: &'static [&'static str],
-        db_keys: &'static [&'static str],
-        user_keys: &'static [&'static str],
-        pass_keys: &'static [&'static str],
-        default_port: &'static str,
-    }
-
-    let patterns = [
-        EnvPattern {
-            engine: "postgres",
-            host_keys: &["POSTGRES_HOST", "PGHOST", "DB_HOST", "DATABASE_HOST"],
-            port_keys: &["POSTGRES_PORT", "PGPORT", "DB_PORT", "DATABASE_PORT"],
-            db_keys: &[
-                "POSTGRES_DB",
-                "PGDATABASE",
-                "DB_NAME",
-                "DATABASE_NAME",
-                "POSTGRES_DATABASE",
-            ],
-            user_keys: &[
-                "POSTGRES_USER",
-                "PGUSER",
-                "DB_USER",
-                "DATABASE_USER",
-                "POSTGRES_USERNAME",
-            ],
-            pass_keys: &[
-                "POSTGRES_PASSWORD",
-                "PGPASSWORD",
-                "DB_PASSWORD",
-                "DATABASE_PASSWORD",
-                "POSTGRES_PASS",
-            ],
-            default_port: "5432",
-        },
-        EnvPattern {
-            engine: "mysql",
-            host_keys: &["MYSQL_HOST", "DB_HOST", "DATABASE_HOST"],
-            port_keys: &["MYSQL_PORT", "DB_PORT", "DATABASE_PORT"],
-            db_keys: &["MYSQL_DATABASE", "MYSQL_DB", "DB_NAME", "DATABASE_NAME"],
-            user_keys: &["MYSQL_USER", "MYSQL_USERNAME", "DB_USER"],
-            pass_keys: &["MYSQL_PASSWORD", "MYSQL_PASS", "DB_PASSWORD"],
-            default_port: "3306",
-        },
-    ];
-
-    for pat in &patterns {
-        let host = pat.host_keys.iter().find_map(|k| vars.get(*k));
-        let db = pat.db_keys.iter().find_map(|k| vars.get(*k));
-
-        // Serve almeno host + database per costruire una connection string utile
-        if let (Some(host), Some(db)) = (host, db) {
-            let port = pat
-                .port_keys
-                .iter()
-                .find_map(|k| vars.get(*k))
-                .map(|s| s.as_str())
-                .unwrap_or(pat.default_port);
-            let user = pat
-                .user_keys
-                .iter()
-                .find_map(|k| vars.get(*k))
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let pass = pat
-                .pass_keys
-                .iter()
-                .find_map(|k| vars.get(*k))
-                .map(|s| s.as_str())
-                .unwrap_or("");
-
-            let conn_str = if !user.is_empty() && !pass.is_empty() {
-                format!(
-                    "{}://{}:{}@{}:{}/{}",
-                    pat.engine, user, pass, host, port, db
-                )
-            } else if !user.is_empty() {
-                format!("{}://{}@{}:{}/{}", pat.engine, user, host, port, db)
-            } else {
-                format!("{}://{}:{}/{}", pat.engine, host, port, db)
-            };
-
-            return Some((pat.engine.to_string(), conn_str));
-        }
-    }
-
-    None
+    ENV_PATTERNS
+        .iter()
+        .find_map(|pat| env_pattern_conn(pat, vars))
 }
 
 /// Sostituisce hostname che sono nomi di servizio compose con 'localhost' per
@@ -214,33 +213,45 @@ fn normalize_compose_host(host: &str) -> &str {
 /// parser: lettura riga per riga con regex/string match, sufficiente per i
 /// pattern reali osservati nei docker-compose generati dall'agente Nexus.
 fn extract_compose_connection_string(content: &str) -> Option<String> {
+    compose_url_from_env(content).or_else(|| compose_conn_from_pg_vars(content))
+}
+
+/// Strategia (a): DATABASE_URL / POSTGRES_URL / DB_URL gia' pronta dentro un
+/// blocco `environment:`. L'hostname viene normalizzato con
+/// [`normalize_compose_host`], il resto della URL resta invariato.
+fn compose_url_from_env(content: &str) -> Option<String> {
     use regex::Regex;
-    // (a) DATABASE_URL / POSTGRES_URL / DB_URL gia' pronta.
     let url_re = Regex::new(
         r#"(?im)^\s*-?\s*(?:DATABASE_URL|POSTGRES_URL|DB_URL)\s*[:=]\s*['"]?(\w+://[^\s'"]+)['"]?"#,
     )
     .ok()?;
-    if let Some(cap) = url_re.captures(content) {
-        let raw = cap.get(1)?.as_str();
-        // Sostituzione hostname: cerchiamo lo schema://[user[:pass]@]host[:port]/db
-        let split_re = Regex::new(r#"^(\w+://)(?:([^@/]+)@)?([^:/]+)(:\d+)?(.*)$"#).ok()?;
-        if let Some(parts) = split_re.captures(raw) {
-            let scheme = parts.get(1)?.as_str();
-            let userinfo = parts.get(2).map(|m| m.as_str()).unwrap_or("");
-            let host = parts.get(3)?.as_str();
-            let port = parts.get(4).map(|m| m.as_str()).unwrap_or("");
-            let tail = parts.get(5).map(|m| m.as_str()).unwrap_or("");
-            let host_norm = normalize_compose_host(host);
-            let auth = if userinfo.is_empty() {
-                String::new()
-            } else {
-                format!("{userinfo}@")
-            };
-            return Some(format!("{scheme}{auth}{host_norm}{port}{tail}"));
-        }
-        return Some(raw.to_string());
+    let cap = url_re.captures(content)?;
+    let raw = cap.get(1)?.as_str();
+    // Sostituzione hostname: cerchiamo lo schema://[user[:pass]@]host[:port]/db
+    let split_re = Regex::new(r#"^(\w+://)(?:([^@/]+)@)?([^:/]+)(:\d+)?(.*)$"#).ok()?;
+    if let Some(parts) = split_re.captures(raw) {
+        let scheme = parts.get(1)?.as_str();
+        let userinfo = parts.get(2).map(|m| m.as_str()).unwrap_or("");
+        let host = parts.get(3)?.as_str();
+        let port = parts.get(4).map(|m| m.as_str()).unwrap_or("");
+        let tail = parts.get(5).map(|m| m.as_str()).unwrap_or("");
+        let host_norm = normalize_compose_host(host);
+        let auth = if userinfo.is_empty() {
+            String::new()
+        } else {
+            format!("{userinfo}@")
+        };
+        return Some(format!("{scheme}{auth}{host_norm}{port}{tail}"));
     }
-    // (b) POSTGRES_USER + POSTGRES_PASSWORD + POSTGRES_DB + porta host.
+    // URL non scomponibile: si ritorna cosi' com'e'.
+    Some(raw.to_string())
+}
+
+/// Strategia (b): POSTGRES_USER + POSTGRES_PASSWORD + POSTGRES_DB combinati con
+/// la porta HOST del mapping `ports:`. Host fisso a `localhost` perche' siamo
+/// sull'host esterno che accede al servizio via port mapping.
+fn compose_conn_from_pg_vars(content: &str) -> Option<String> {
+    use regex::Regex;
     let postgres_var = |name: &str| -> Option<String> {
         let re = Regex::new(&format!(
             r#"(?im)^\s*-?\s*{name}\s*[:=]\s*['"]?([^\s'"]+)['"]?"#,
@@ -266,10 +277,27 @@ fn extract_compose_connection_string(content: &str) -> Option<String> {
     Some(format!("postgres://{auth}localhost:{port}/{db}"))
 }
 
+/// Scansiona la root del progetto e deduce engine, tool/percorso di migration e
+/// connection string. Ogni passo raffina lo stesso [`DetectionResult`] e non
+/// sovrascrive i campi gia' valorizzati: vince la prima evidenza trovata,
+/// nell'ordine dei passi.
 fn scan_project_db(root: &std::path::Path) -> DetectionResult {
     let mut r = DetectionResult::default();
+    scan_env_files(root, &mut r);
+    scan_compose_files(root, &mut r);
+    scan_prisma(root, &mut r);
+    scan_migration_tools(root, &mut r);
+    scan_package_json(root, &mut r);
+    scan_python_manifests(root, &mut r);
+    scan_cargo_manifest(root, &mut r);
+    scan_dotnet_appsettings(root, &mut r);
+    scan_csproj(root, &mut r);
+    apply_detection_defaults(&mut r);
+    r
+}
 
-    // 1) .env files
+/// (1) File `.env*`: engine e connection string dalle variabili d'ambiente.
+fn scan_env_files(root: &std::path::Path, r: &mut DetectionResult) {
     for name in [".env", ".env.local", ".env.development", ".env.example"] {
         let p = root.join(name);
         if let Some(content) = read_text(&p, 64 * 1024) {
@@ -285,8 +313,49 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             }
         }
     }
+}
 
-    // 2) docker-compose
+/// Engine e hosting_mode dall'immagine del servizio DB dichiarata nel compose.
+/// `lc` e' il contenuto del file gia' in minuscolo, `name` il nome del file.
+fn compose_service_image(name: &str, lc: &str, r: &mut DetectionResult) {
+    if lc.contains("image: postgres") || lc.contains("image: \"postgres") {
+        if r.engine.is_none() {
+            r.engine = Some("postgres".into());
+        }
+        r.hints.push(format!("{name}: servizio postgres"));
+        if r.hosting_mode.is_none() {
+            r.hosting_mode = Some("internal".into());
+        }
+    }
+    if lc.contains("image: mysql") || lc.contains("image: mariadb") {
+        if r.engine.is_none() {
+            r.engine = Some("mysql".into());
+        }
+        r.hints.push(format!("{name}: servizio mysql/mariadb"));
+        if r.hosting_mode.is_none() {
+            r.hosting_mode = Some("internal".into());
+        }
+    }
+}
+
+/// (2) docker-compose: servizio DB + connection string EFFETTIVA.
+///
+/// Bug storico: il pannello DB rilevava il servizio postgres ma metteva
+/// credenziali placeholder (username/password/db vuoti) perche' non si parsava
+/// la sezione environment del servizio. Risultato: l'utente vedeva "Database
+/// progetto non configurato" e non capiva se il DB applicativo esistesse o no.
+/// La connection string viene ora estratta da
+/// [`extract_compose_connection_string`], che cerca in ordine:
+///   (a) DATABASE_URL / POSTGRES_URL / DB_URL gia' pronto (la fonte piu'
+///       affidabile, e' una connection string completa);
+///   (b) altrimenti combina POSTGRES_USER/PASSWORD/DB visti nella sezione
+///       environment del servizio db + porta host del mapping ports
+///       (es. 5432:5432 -> host=localhost:5432).
+/// Gli hostname che corrispondono a nomi di servizio docker (db, postgres,
+/// postgresql, pg, mysql, mariadb) vengono sostituiti con 'localhost' perche'
+/// dall'host esterno il servizio risponde sul mapping di porta, non sul nome di
+/// servizio del network compose.
+fn scan_compose_files(root: &std::path::Path, r: &mut DetectionResult) {
     for name in [
         "docker-compose.yml",
         "docker-compose.yaml",
@@ -294,51 +363,21 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
         "compose.yaml",
     ] {
         let p = root.join(name);
-        if let Some(content) = read_text(&p, 128 * 1024) {
-            let lc = content.to_ascii_lowercase();
-            if lc.contains("image: postgres") || lc.contains("image: \"postgres") {
-                if r.engine.is_none() {
-                    r.engine = Some("postgres".into());
-                }
-                r.hints.push(format!("{name}: servizio postgres"));
-                if r.hosting_mode.is_none() {
-                    r.hosting_mode = Some("internal".into());
-                }
-            }
-            if lc.contains("image: mysql") || lc.contains("image: mariadb") {
-                if r.engine.is_none() {
-                    r.engine = Some("mysql".into());
-                }
-                r.hints.push(format!("{name}: servizio mysql/mariadb"));
-                if r.hosting_mode.is_none() {
-                    r.hosting_mode = Some("internal".into());
-                }
-            }
-            // Estrai la connection string EFFETTIVA dal docker-compose. Bug
-            // storico: il pannello DB rilevava il servizio postgres ma metteva
-            // credenziali placeholder (username/password/db vuoti) perche' qui
-            // non si parsava la sezione environment del servizio. Risultato:
-            // l'utente vedeva "Database progetto non configurato" e non capiva
-            // se il DB applicativo esistesse o no. Ora cerchiamo, in ordine:
-            //   (a) DATABASE_URL / POSTGRES_URL / DB_URL gia' pronto (la fonte
-            //       piu' affidabile, e' una connection string completa);
-            //   (b) altrimenti combiniamo POSTGRES_USER/PASSWORD/DB visti nella
-            //       sezione environment del servizio db + porta host del
-            //       mapping ports (es. 5432:5432 -> host=localhost:5432).
-            // Gli hostname che corrispondono a nomi di servizio docker (db,
-            // postgres, postgresql, pg, mysql, mariadb) vengono sostituiti con
-            // 'localhost' perche' dall'host esterno il servizio risponde
-            // sul mapping di porta, non sul nome di servizio del network compose.
-            if r.connection_string.is_none() {
-                if let Some(cs) = extract_compose_connection_string(&content) {
-                    r.connection_string = Some(cs);
-                    r.hints.push(format!("{name}: connection string estratta"));
-                }
+        let Some(content) = read_text(&p, 128 * 1024) else {
+            continue;
+        };
+        compose_service_image(name, &content.to_ascii_lowercase(), r);
+        if r.connection_string.is_none() {
+            if let Some(cs) = extract_compose_connection_string(&content) {
+                r.connection_string = Some(cs);
+                r.hints.push(format!("{name}: connection string estratta"));
             }
         }
     }
+}
 
-    // 3) Migration tools
+/// (3a) Prisma: schema, cartella migration ed engine dal `provider` dichiarato.
+fn scan_prisma(root: &std::path::Path, r: &mut DetectionResult) {
     if root.join("prisma/schema.prisma").exists() {
         r.migration_tool = Some("prisma".into());
         r.migration_path = Some("prisma/migrations".into());
@@ -353,6 +392,11 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             }
         }
     }
+}
+
+/// (3b) Altri tool di migration (alembic, knex, flyway) e cartelle migration
+/// convenzionali. Applicato dopo [`scan_prisma`], che ha la precedenza.
+fn scan_migration_tools(root: &std::path::Path, r: &mut DetectionResult) {
     if root.join("alembic.ini").exists() {
         r.migration_tool = Some("alembic".into());
         r.migration_path = Some("alembic/versions".into());
@@ -385,31 +429,46 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             break;
         }
     }
+}
 
-    // 4) package.json dependencies
-    if let Some(content) = read_text(&root.join("package.json"), 128 * 1024) {
-        let lc = content.to_ascii_lowercase();
-        if lc.contains("\"prisma\"") && r.migration_tool.is_none() {
-            r.migration_tool = Some("prisma".into());
-        }
-        if lc.contains("\"knex\"") && r.migration_tool.is_none() {
-            r.migration_tool = Some("knex".into());
-        }
-        if lc.contains("\"typeorm\"") && r.migration_tool.is_none() {
-            r.migration_tool = Some("generic_sql".into());
-            r.hints.push("TypeORM rilevato".into());
-        }
-        if lc.contains("\"pg\"") && r.engine.is_none() {
-            r.engine = Some("postgres".into());
-            r.hints.push("dep pg".into());
-        }
-        if (lc.contains("\"mysql2\"") || lc.contains("\"mysql\"")) && r.engine.is_none() {
-            r.engine = Some("mysql".into());
-            r.hints.push("dep mysql".into());
-        }
+/// Tool di migration dalle dipendenze di `package.json` (contenuto minuscolo).
+fn package_json_migration_tool(lc: &str, r: &mut DetectionResult) {
+    if lc.contains("\"prisma\"") && r.migration_tool.is_none() {
+        r.migration_tool = Some("prisma".into());
     }
+    if lc.contains("\"knex\"") && r.migration_tool.is_none() {
+        r.migration_tool = Some("knex".into());
+    }
+    if lc.contains("\"typeorm\"") && r.migration_tool.is_none() {
+        r.migration_tool = Some("generic_sql".into());
+        r.hints.push("TypeORM rilevato".into());
+    }
+}
 
-    // 5) pyproject/requirements
+/// Engine dai driver DB in `package.json` (contenuto minuscolo).
+fn package_json_engine(lc: &str, r: &mut DetectionResult) {
+    if lc.contains("\"pg\"") && r.engine.is_none() {
+        r.engine = Some("postgres".into());
+        r.hints.push("dep pg".into());
+    }
+    if (lc.contains("\"mysql2\"") || lc.contains("\"mysql\"")) && r.engine.is_none() {
+        r.engine = Some("mysql".into());
+        r.hints.push("dep mysql".into());
+    }
+}
+
+/// (4) Dipendenze dichiarate in `package.json`.
+fn scan_package_json(root: &std::path::Path, r: &mut DetectionResult) {
+    let Some(content) = read_text(&root.join("package.json"), 128 * 1024) else {
+        return;
+    };
+    let lc = content.to_ascii_lowercase();
+    package_json_migration_tool(&lc, r);
+    package_json_engine(&lc, r);
+}
+
+/// (5) Manifest Python: `pyproject.toml`, `requirements.txt`, `Pipfile`.
+fn scan_python_manifests(root: &std::path::Path, r: &mut DetectionResult) {
     for f in ["pyproject.toml", "requirements.txt", "Pipfile"] {
         if let Some(content) = read_text(&root.join(f), 64 * 1024) {
             let lc = content.to_ascii_lowercase();
@@ -426,8 +485,10 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             }
         }
     }
+}
 
-    // 6) Cargo.toml
+/// (6) `Cargo.toml`: engine dedotto dalle feature di sqlx/diesel.
+fn scan_cargo_manifest(root: &std::path::Path, r: &mut DetectionResult) {
     if let Some(content) = read_text(&root.join("Cargo.toml"), 64 * 1024) {
         let lc = content.to_ascii_lowercase();
         if lc.contains("sqlx") || lc.contains("diesel") {
@@ -443,174 +504,198 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             r.hints.push("Cargo.toml: driver DB rilevato".into());
         }
     }
+}
 
-    // 7) .NET / ASP.NET Core — appsettings.json e *.csproj
-    if r.engine.is_none() {
-        // Leggi appsettings.Development.json poi appsettings.json
-        for settings in ["appsettings.Development.json", "appsettings.json"] {
-            let candidates = [
-                root.join(settings),
-                root.join("backend").join("FreeLance.Api").join(settings),
-                root.join("src").join(settings),
-                root.join("Api").join(settings),
-            ];
-            for candidate in &candidates {
-                if let Some(content) = read_text(candidate, 64 * 1024) {
-                    for line in content.lines() {
-                        let line = line.trim();
-                        if !line.contains("Connection") || !line.contains(':') {
-                            continue;
-                        }
-                        let value = line
-                            .split(':')
-                            .skip(1)
-                            .collect::<Vec<_>>()
-                            .join(":")
-                            .trim()
-                            .to_string();
-                        let value = value.trim_matches('"').trim_matches(',').trim_matches('"');
-                        let lc = value.to_ascii_lowercase();
+/// Classifica una connection string .NET (`lc` gia' in minuscolo) e ritorna
+/// `(engine, etichetta per l'hint)`.
+///
+/// Priorita' ai segnali univoci di Postgres (Host=, Port=5432, postgres://)
+/// PRIMA di SQL Server: Npgsql usa "Server=host;Port=5432;Database=...", cioe'
+/// gli stessi token di SQL Server ("Server=host,1433;Database=...").
+fn classify_dotnet_connection(lc: &str) -> Option<(&'static str, &'static str)> {
+    if lc.contains("postgresql://")
+        || lc.contains("postgres://")
+        || lc.contains("host=")
+        || lc.contains("port=5432")
+    {
+        Some(("postgres", "PostgreSQL"))
+    } else if lc.contains("port=3306") || lc.contains("mysql://") {
+        Some(("mysql", "MySQL"))
+    } else if lc.contains("initial catalog=") {
+        // Univocamente SQL Server
+        Some(("sqlserver", "SQL Server"))
+    } else if lc.contains("server=") && (lc.contains(",1433") || lc.contains(",1434")) {
+        // Sintassi SQL Server con porta inline
+        Some(("sqlserver", "SQL Server"))
+    } else if lc.contains(";port=") || lc.starts_with("port=") {
+        // `Port=` keyword separato (non SQL Server) ma porta non 5432/3306
+        // -> probabile Postgres su porta non standard
+        Some(("postgres", "PostgreSQL"))
+    } else if lc.contains("server=") && lc.contains("database=") {
+        // Fallback legacy: nessun segnale Postgres/MySQL trovato
+        Some(("sqlserver", "SQL Server"))
+    } else {
+        None
+    }
+}
 
-                        // Helper di classificazione: priorita' ai segnali univoci
-                        // di Postgres (Host=, Port=5432, postgres://) PRIMA di SQL Server.
-                        // Necessario perche' Npgsql usa "Server=host;Port=5432;Database=...",
-                        // stessi token usati da SQL Server (Server=host,1433;Database=...).
-                        let detected: Option<&'static str> = if lc.contains("postgresql://")
-                            || lc.contains("postgres://")
-                            || lc.contains("host=")
-                            || lc.contains("port=5432")
-                        {
-                            Some("postgres")
-                        } else if lc.contains("port=3306") || lc.contains("mysql://") {
-                            Some("mysql")
-                        } else if lc.contains("initial catalog=") {
-                            // Univocamente SQL Server
-                            Some("sqlserver")
-                        } else if lc.contains("server=")
-                            && (lc.contains(",1433") || lc.contains(",1434"))
-                        {
-                            // Sintassi SQL Server con porta inline
-                            Some("sqlserver")
-                        } else if lc.contains(";port=") || lc.starts_with("port=") {
-                            // `Port=` keyword separato (non SQL Server) ma porta non 5432/3306
-                            // -> probabile Postgres su porta non standard
-                            Some("postgres")
-                        } else if lc.contains("server=") && lc.contains("database=") {
-                            // Fallback legacy: nessun segnale Postgres/MySQL trovato
-                            Some("sqlserver")
-                        } else {
-                            None
-                        };
+/// Applica a `r` il primo engine riconosciuto tra le righe "Connection" di un
+/// file appsettings. Le righe non classificabili vengono ignorate.
+fn apply_appsettings_content(content: &str, settings: &str, r: &mut DetectionResult) {
+    for line in content.lines() {
+        let line = line.trim();
+        if !line.contains("Connection") || !line.contains(':') {
+            continue;
+        }
+        let value = line
+            .split(':')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(":")
+            .trim()
+            .to_string();
+        let value = value.trim_matches('"').trim_matches(',').trim_matches('"');
+        let lc = value.to_ascii_lowercase();
 
-                        match detected {
-                            Some("postgres") => {
-                                r.engine = Some("postgres".into());
-                                r.hints.push(format!("{}: rilevato PostgreSQL", settings));
-                                if r.connection_string.is_none() {
-                                    r.connection_string = Some(value.to_string());
-                                }
-                                break;
-                            }
-                            Some("mysql") => {
-                                r.engine = Some("mysql".into());
-                                r.hints.push(format!("{}: rilevato MySQL", settings));
-                                if r.connection_string.is_none() {
-                                    r.connection_string = Some(value.to_string());
-                                }
-                                break;
-                            }
-                            Some("sqlserver") => {
-                                r.engine = Some("sqlserver".into());
-                                r.hints.push(format!("{}: rilevato SQL Server", settings));
-                                if r.connection_string.is_none() {
-                                    r.connection_string = Some(value.to_string());
-                                }
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    if r.engine.is_some() {
-                        break;
-                    }
-                }
-            }
+        let Some((engine, label)) = classify_dotnet_connection(&lc) else {
+            continue;
+        };
+        r.engine = Some(engine.into());
+        r.hints.push(format!("{}: rilevato {}", settings, label));
+        if r.connection_string.is_none() {
+            r.connection_string = Some(value.to_string());
+        }
+        break;
+    }
+}
+
+/// (7) .NET / ASP.NET Core — `appsettings.json`. Legge
+/// `appsettings.Development.json` e poi `appsettings.json`, fermandosi al primo
+/// engine riconosciuto.
+fn scan_dotnet_appsettings(root: &std::path::Path, r: &mut DetectionResult) {
+    if r.engine.is_some() {
+        return;
+    }
+    for settings in nexus_project_db::detector::APPSETTINGS_FILES {
+        let candidates = [
+            root.join(settings),
+            root.join("backend").join("FreeLance.Api").join(settings),
+            root.join("src").join(settings),
+            root.join("Api").join(settings),
+        ];
+        for candidate in &candidates {
+            let Some(content) = read_text(candidate, 64 * 1024) else {
+                continue;
+            };
+            apply_appsettings_content(&content, settings, r);
             if r.engine.is_some() {
                 break;
             }
         }
-    }
-
-    // 8) *.csproj — PackageReference EF Core provider
-    if r.engine.is_none() {
-        'csproj: for search_dir in [root, &root.join("backend"), &root.join("src")] {
-            if let Ok(entries) = std::fs::read_dir(search_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.ends_with(".csproj") {
-                        continue;
-                    }
-                    if let Some(content) = read_text(&entry.path(), 32 * 1024) {
-                        let lc = content.to_ascii_lowercase();
-                        if lc.contains("entityframeworkcore.sqlserver")
-                            || lc.contains("microsoft.data.sqlclient")
-                        {
-                            r.engine = Some("sqlserver".into());
-                            r.hints.push(format!("{name}: EF Core SQL Server"));
-                            break 'csproj;
-                        }
-                        if lc.contains("npgsql.entityframeworkcore.postgresql") {
-                            r.engine = Some("postgres".into());
-                            r.hints.push(format!("{name}: EF Core PostgreSQL (Npgsql)"));
-                            break 'csproj;
-                        }
-                        if lc.contains("pomelo.entityframeworkcore.mysql") {
-                            r.engine = Some("mysql".into());
-                            r.hints.push(format!("{name}: EF Core MySQL"));
-                            break 'csproj;
-                        }
-                        if lc.contains("microsoft.entityframeworkcore.sqlite") {
-                            r.engine = Some("sqlite".into());
-                            r.hints.push(format!("{name}: EF Core SQLite"));
-                            break 'csproj;
-                        }
-                    }
-                }
-            }
-            // Cerca anche un livello più in profondità
-            if let Ok(subdirs) = std::fs::read_dir(search_dir) {
-                for sub in subdirs.flatten() {
-                    if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        continue;
-                    }
-                    if let Ok(entries) = std::fs::read_dir(sub.path()) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if !name.ends_with(".csproj") {
-                                continue;
-                            }
-                            if let Some(content) = read_text(&entry.path(), 32 * 1024) {
-                                let lc = content.to_ascii_lowercase();
-                                if lc.contains("entityframeworkcore.sqlserver")
-                                    || lc.contains("microsoft.data.sqlclient")
-                                {
-                                    r.engine = Some("sqlserver".into());
-                                    r.hints.push(format!("{name}: EF Core SQL Server"));
-                                    break 'csproj;
-                                }
-                                if lc.contains("npgsql.entityframeworkcore.postgresql") {
-                                    r.engine = Some("postgres".into());
-                                    r.hints.push(format!("{name}: EF Core PostgreSQL (Npgsql)"));
-                                    break 'csproj;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if r.engine.is_some() {
+            break;
         }
     }
+}
 
+/// Provider EF Core riconoscibile da un `PackageReference` in un `.csproj`.
+struct CsprojPattern {
+    /// Marcatori alternativi: basta che uno compaia nel file.
+    needles: &'static [&'static str],
+    engine: &'static str,
+    hint: &'static str,
+}
+
+/// Provider noti, nell'ordine di precedenza applicato dentro un singolo file.
+const CSPROJ_PATTERNS: &[CsprojPattern] = &[
+    CsprojPattern {
+        needles: &["entityframeworkcore.sqlserver", "microsoft.data.sqlclient"],
+        engine: "sqlserver",
+        hint: "EF Core SQL Server",
+    },
+    CsprojPattern {
+        needles: &["npgsql.entityframeworkcore.postgresql"],
+        engine: "postgres",
+        hint: "EF Core PostgreSQL (Npgsql)",
+    },
+    CsprojPattern {
+        needles: &["pomelo.entityframeworkcore.mysql"],
+        engine: "mysql",
+        hint: "EF Core MySQL",
+    },
+    CsprojPattern {
+        needles: &["microsoft.entityframeworkcore.sqlite"],
+        engine: "sqlite",
+        hint: "EF Core SQLite",
+    },
+];
+
+/// Primo provider tra `patterns` trovato nei `.csproj` direttamente dentro
+/// `dir`. Ritorna `(engine, hint completo di nome file)`.
+fn csproj_engine_in_dir(
+    dir: &std::path::Path,
+    patterns: &[CsprojPattern],
+) -> Option<(String, String)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".csproj") {
+            continue;
+        }
+        let Some(content) = read_text(&entry.path(), 32 * 1024) else {
+            continue;
+        };
+        let lc = content.to_ascii_lowercase();
+        let found = patterns
+            .iter()
+            .find(|p| p.needles.iter().any(|n| lc.contains(n)));
+        if let Some(pat) = found {
+            return Some((pat.engine.to_string(), format!("{}: {}", name, pat.hint)));
+        }
+    }
+    None
+}
+
+/// Come [`csproj_engine_in_dir`] ma un livello piu' in profondita': cerca nelle
+/// sottodirectory dirette di `dir`.
+fn csproj_engine_in_subdirs(
+    dir: &std::path::Path,
+    patterns: &[CsprojPattern],
+) -> Option<(String, String)> {
+    let subdirs = std::fs::read_dir(dir).ok()?;
+    for sub in subdirs.flatten() {
+        if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(found) = csproj_engine_in_dir(&sub.path(), patterns) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// (8) `*.csproj` — provider EF Core dichiarato come PackageReference.
+///
+/// Nota comportamentale storica: nel livello diretto si riconoscono tutti i
+/// provider noti, nelle sottodirectory solo i primi due (sqlserver, postgres).
+/// L'asimmetria e' preservata passando un prefisso di [`CSPROJ_PATTERNS`].
+fn scan_csproj(root: &std::path::Path, r: &mut DetectionResult) {
+    if r.engine.is_some() {
+        return;
+    }
+    for search_dir in [root, &root.join("backend"), &root.join("src")] {
+        let found = csproj_engine_in_dir(search_dir, CSPROJ_PATTERNS)
+            .or_else(|| csproj_engine_in_subdirs(search_dir, &CSPROJ_PATTERNS[..2]));
+        if let Some((engine, hint)) = found {
+            r.engine = Some(engine);
+            r.hints.push(hint);
+            return;
+        }
+    }
+}
+
+/// Default finali per i campi che nessun passo ha valorizzato.
+fn apply_detection_defaults(r: &mut DetectionResult) {
     if r.migration_tool.is_none() {
         r.migration_tool = Some("generic_sql".into());
     }
@@ -620,14 +705,14 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
     if r.hosting_mode.is_none() {
         r.hosting_mode = Some("external".into());
     }
-    r
 }
 
-pub async fn detect_project_db(
-    State(state): State<AppState>,
-    Extension(_claims): Extension<Claims>,
-    AxumPath(project_id): AxumPath<Uuid>,
-) -> ApiResult {
+/// Root path del progetto (repository oppure `analysis_json->>'rootPath'`),
+/// validata come directory esistente.
+async fn project_root_dir(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<std::path::PathBuf, ApiError> {
     let root_path: Option<String> = sqlx::query_scalar(
         r#"SELECT COALESCE(r.root_path, p.analysis_json->>'rootPath', '')
            FROM projects p LEFT JOIN repositories r ON r.project_id = p.id
@@ -652,24 +737,27 @@ pub async fn detect_project_db(
             format!("Root path non trovato: {}", root.display()),
         ));
     }
+    Ok(root)
+}
 
-    let result = tokio::task::spawn_blocking(move || scan_project_db(&root))
-        .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Salva la detection sulla riga PRIMARIA: e' quella che il pannello mostra
-    // (`get_project_db_config`) e da cui si legge il fallback
-    // `detection_metadata->>'connection_string'` piu' sotto.
-    //
-    // `ON CONFLICT (project_id) WHERE is_primary` aggancia l'indice PARZIALE
-    // `uq_project_database_config_project_primary`. Il conflict target va
-    // qualificato perche' l'UNIQUE sul solo `project_id` NON esiste piu' (mig
-    // 0083: la tabella e' multi-connessione per progetto): la query precedente
-    // diceva `ON CONFLICT (project_id)` e falliva SEMPRE con
-    // "no unique or exclusion constraint matching the ON CONFLICT
-    // specification", per giunta ingoiata da un `let _`, quindi la
-    // detection_metadata non veniva mai salvata e nessuno se ne accorgeva.
-    let meta = serde_json::to_value(&result).unwrap_or(json!({}));
+/// Salva la detection sulla riga PRIMARIA: e' quella che il pannello mostra
+/// (`get_project_db_config`) e da cui si legge il fallback
+/// `detection_metadata->>'connection_string'` in `test_project_db_connection`.
+///
+/// `ON CONFLICT (project_id) WHERE is_primary` aggancia l'indice PARZIALE
+/// `uq_project_database_config_project_primary`. Il conflict target va
+/// qualificato perche' l'UNIQUE sul solo `project_id` NON esiste piu' (mig
+/// 0083: la tabella e' multi-connessione per progetto): la query precedente
+/// diceva `ON CONFLICT (project_id)` e falliva SEMPRE con "no unique or
+/// exclusion constraint matching the ON CONFLICT specification", per giunta
+/// ingoiata da un `let _`, quindi la detection_metadata non veniva mai salvata e
+/// nessuno se ne accorgeva.
+///
+/// Best-effort dichiarato: la detection e' comunque ritornata al chiamante. Ma
+/// l'errore si LOGGA (regola H): era proprio il `let _` a rendere invisibile una
+/// query rotta in modo incondizionato.
+async fn save_detection_metadata(state: &AppState, project_id: Uuid, result: &DetectionResult) {
+    let meta = serde_json::to_value(result).unwrap_or(json!({}));
     let saved = match (result.engine.as_deref(), result.hosting_mode.as_deref()) {
         // Detection completa: se la config manca la creiamo, se c'e' gia'
         // aggiorniamo SOLO la metadata (engine/hosting_mode scelti dall'utente
@@ -709,9 +797,6 @@ pub async fn detect_project_db(
             .await
         }
     };
-    // Best-effort dichiarato: la detection e' comunque ritornata al chiamante.
-    // Ma l'errore si LOGGA (regola H): era proprio il `let _` a rendere
-    // invisibile una query rotta in modo incondizionato.
     if let Err(e) = saved {
         tracing::warn!(
             project_id = %project_id,
@@ -719,6 +804,20 @@ pub async fn detect_project_db(
             "detect_project_db: salvataggio di detection_metadata fallito"
         );
     }
+}
+
+pub async fn detect_project_db(
+    State(state): State<AppState>,
+    Extension(_claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<Uuid>,
+) -> ApiResult {
+    let root = project_root_dir(&state, project_id).await?;
+
+    let result = tokio::task::spawn_blocking(move || scan_project_db(&root))
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    save_detection_metadata(&state, project_id, &result).await;
 
     Ok(Json(json!({
         "ok": true,
@@ -742,127 +841,195 @@ pub struct TestConnectionBody {
     pub connection_id: Option<Uuid>,
 }
 
+/// `connection_secret` della connessione indicata dal body: per `connection_id`,
+/// altrimenti per `name`, altrimenti quella primaria.
+async fn saved_connection_secret(
+    state: &AppState,
+    project_id: Uuid,
+    body: &TestConnectionBody,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let row = if let Some(id) = body.connection_id {
+        sqlx::query_scalar(
+            "SELECT connection_secret FROM project_database_config WHERE project_id=$1 AND id=$2",
+        )
+        .bind(project_id)
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+    } else if let Some(n) = body.name.as_deref() {
+        sqlx::query_scalar(
+            "SELECT connection_secret FROM project_database_config WHERE project_id=$1 AND LOWER(name)=LOWER($2)",
+        )
+        .bind(project_id)
+        .bind(n)
+        .fetch_optional(&state.db)
+        .await
+    } else {
+        sqlx::query_scalar(
+            "SELECT connection_secret FROM project_database_config WHERE project_id=$1 ORDER BY is_primary DESC, LOWER(name) LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(&state.db)
+        .await
+    };
+    let row: Option<Option<Vec<u8>>> =
+        row.map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(row.flatten())
+}
+
+/// URL da testare: dal body (override esplicito), altrimenti dal secret della
+/// connessione salvata, altrimenti dalla `detection_metadata`.
+async fn resolve_test_connection_url(
+    state: &AppState,
+    project_id: Uuid,
+    body: &TestConnectionBody,
+) -> Result<String, ApiError> {
+    if let Some(u) = body
+        .connection_string
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok(u.to_string());
+    }
+
+    let from_secret = saved_connection_secret(state, project_id, body)
+        .await?
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.trim().is_empty());
+    if let Some(s) = from_secret {
+        return Ok(s);
+    }
+
+    let detected: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        r#"SELECT detection_metadata->>'connection_string'
+           FROM project_database_config WHERE project_id=$1
+           ORDER BY is_primary DESC, LOWER(name) LIMIT 1"#,
+    )
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .flatten();
+    detected.ok_or_else(|| api_err(
+        StatusCode::BAD_REQUEST,
+        "Nessuna connection string configurata per il progetto. Configura una connessione nel pannello Database o esegui il provisioning interno.",
+    ))
+}
+
+/// Engine dedotto dalla forma della URL, quando il body non lo dichiara.
+fn infer_engine_from_url(url: &str) -> String {
+    if url.starts_with("mysql") {
+        "mysql".into()
+    } else if url.starts_with("sqlite") {
+        "sqlite".into()
+    } else if url.starts_with("jdbc:sqlserver") || {
+        let lc = url.to_lowercase();
+        lc.contains("server=")
+            && (lc.contains("initial catalog=")
+                || lc.contains("database=")
+                || lc.contains("data source="))
+    } {
+        "sqlserver".into()
+    } else {
+        "postgres".into()
+    }
+}
+
+/// Test postgres: pool monoconnessione, versione server e numero tabelle dello
+/// schema `public`. Un errore di connessione non e' un errore HTTP: viene
+/// riportato nel payload con `ok: false`.
+async fn test_postgres_engine(url: &str, started: std::time::Instant) -> ApiResult {
+    // Converte stringhe ADO.NET (Host=...;Port=...) in URL postgres://...
+    let pg_url = normalize_pg_connection_string(url);
+    match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&pg_url)
+        .await
+    {
+        Ok(pool) => {
+            let ver: Result<(String,), _> =
+                sqlx::query_as("SELECT version()").fetch_one(&pool).await;
+            let count: Result<(i64,), _> = sqlx::query_as(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'",
+            )
+            .fetch_one(&pool)
+            .await;
+            pool.close().await;
+            Ok(Json(json!({
+                "ok": true,
+                "engine": "postgres",
+                "server_version": ver.ok().map(|(v,)| v),
+                "table_count": count.ok().map(|(c,)| c),
+                "latency_ms": started.elapsed().as_millis() as u64,
+            })))
+        }
+        Err(e) => Ok(Json(json!({
+            "ok": false,
+            "engine": "postgres",
+            "error": e.to_string(),
+        }))),
+    }
+}
+
+/// Suggerimento contestuale per gli errori SQL Server piu' comuni. Solo per
+/// display all'utente: nessuna decisione tecnica dipende da questo testo.
+fn sqlserver_error_hint(msg: &str) -> Option<&'static str> {
+    if msg.contains("4060")
+        || msg.contains("non è possibile aprire il database")
+        || msg.contains("Cannot open database")
+    {
+        Some("Il database esiste ma l'utente non ha accesso: verifica che l'account SQL abbia il permesso 'db_datareader' (o superiore) sul database specificato.")
+    } else if msg.contains("18456")
+        || msg.contains("L'accesso non è riuscito")
+        || msg.contains("Login failed")
+    {
+        Some("Credenziali non valide: verifica utente e password nella connection string.")
+    } else if msg.contains("Impossibile raggiungere")
+        || msg.contains("Connection refused")
+        || msg.contains("timed out")
+    {
+        Some("Server non raggiungibile: verifica host, porta e che il servizio SQL Server sia in ascolto.")
+    } else {
+        None
+    }
+}
+
+/// Test SQL Server: esito e suggerimento diagnostico nel payload JSON.
+async fn test_sqlserver_engine(url: &str, started: std::time::Instant) -> ApiResult {
+    match test_sqlserver_connection(url).await {
+        Ok((version, table_count)) => Ok(Json(json!({
+            "ok": true,
+            "engine": "sqlserver",
+            "server_version": version,
+            "table_count": table_count,
+            "latency_ms": started.elapsed().as_millis() as u64,
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let hint = sqlserver_error_hint(&msg);
+            Ok(Json(json!({
+                "ok": false,
+                "engine": "sqlserver",
+                "error": msg,
+                "hint": hint,
+            })))
+        }
+    }
+}
+
 pub async fn test_project_db_connection(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
     AxumPath(project_id): AxumPath<Uuid>,
     Json(body): Json<TestConnectionBody>,
 ) -> ApiResult {
-    // URL: dal body (override esplicito) oppure dalla connessione salvata
-    // individuata da connection_id / name / primary.
-    let url = if let Some(u) = body
-        .connection_string
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        u.to_string()
-    } else {
-        let saved: Option<Vec<u8>> = if let Some(id) = body.connection_id {
-            sqlx::query_scalar(
-                "SELECT connection_secret FROM project_database_config WHERE project_id=$1 AND id=$2",
-            )
-            .bind(project_id)
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .flatten()
-        } else if let Some(n) = body.name.as_deref() {
-            sqlx::query_scalar(
-                "SELECT connection_secret FROM project_database_config WHERE project_id=$1 AND LOWER(name)=LOWER($2)",
-            )
-            .bind(project_id)
-            .bind(n)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .flatten()
-        } else {
-            sqlx::query_scalar(
-                "SELECT connection_secret FROM project_database_config WHERE project_id=$1 ORDER BY is_primary DESC, LOWER(name) LIMIT 1",
-            )
-            .bind(project_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .flatten()
-        };
-
-        let from_secret = saved
-            .and_then(|b| String::from_utf8(b).ok())
-            .filter(|s| !s.trim().is_empty());
-
-        if let Some(s) = from_secret {
-            s
-        } else {
-            let detected: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-                r#"SELECT detection_metadata->>'connection_string'
-                   FROM project_database_config WHERE project_id=$1
-                   ORDER BY is_primary DESC, LOWER(name) LIMIT 1"#,
-            )
-            .bind(project_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .flatten();
-            detected.ok_or_else(|| api_err(
-                StatusCode::BAD_REQUEST,
-                "Nessuna connection string configurata per il progetto. Configura una connessione nel pannello Database o esegui il provisioning interno.",
-            ))?
-        }
-    };
-
-    let engine = body.engine.unwrap_or_else(|| {
-        if url.starts_with("mysql") {
-            "mysql".into()
-        } else if url.starts_with("sqlite") {
-            "sqlite".into()
-        } else if url.starts_with("jdbc:sqlserver") || {
-            let lc = url.to_lowercase();
-            lc.contains("server=")
-                && (lc.contains("initial catalog=")
-                    || lc.contains("database=")
-                    || lc.contains("data source="))
-        } {
-            "sqlserver".into()
-        } else {
-            "postgres".into()
-        }
-    });
+    let url = resolve_test_connection_url(&state, project_id, &body).await?;
+    let engine = body.engine.unwrap_or_else(|| infer_engine_from_url(&url));
 
     let started = std::time::Instant::now();
     match engine.as_str() {
-        "postgres" => {
-            // Converte stringhe ADO.NET (Host=...;Port=...) in URL postgres://...
-            let pg_url = normalize_pg_connection_string(&url);
-            match sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(5))
-                .connect(&pg_url)
-                .await
-            {
-                Ok(pool) => {
-                    let ver: Result<(String,), _> =
-                        sqlx::query_as("SELECT version()").fetch_one(&pool).await;
-                    let count: Result<(i64,), _> = sqlx::query_as(
-                        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'"
-                    ).fetch_one(&pool).await;
-                    pool.close().await;
-                    Ok(Json(json!({
-                        "ok": true,
-                        "engine": "postgres",
-                        "server_version": ver.ok().map(|(v,)| v),
-                        "table_count": count.ok().map(|(c,)| c),
-                        "latency_ms": started.elapsed().as_millis() as u64,
-                    })))
-                }
-                Err(e) => Ok(Json(json!({
-                    "ok": false,
-                    "engine": "postgres",
-                    "error": e.to_string(),
-                }))),
-            }
-        }
+        "postgres" => test_postgres_engine(&url, started).await,
         "mysql" => Ok(Json(json!({
             "ok": false,
             "engine": "mysql",
@@ -873,45 +1040,7 @@ pub async fn test_project_db_connection(
             "engine": "sqlite",
             "error": "Driver SQLite non abilitato in mcp-core; configurare sqlx feature 'sqlite' per abilitarlo.",
         }))),
-        "sqlserver" => {
-            match test_sqlserver_connection(&url).await {
-                Ok((version, table_count)) => Ok(Json(json!({
-                    "ok": true,
-                    "engine": "sqlserver",
-                    "server_version": version,
-                    "table_count": table_count,
-                    "latency_ms": started.elapsed().as_millis() as u64,
-                }))),
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Aggiunge un suggerimento contestuale per gli errori SQL Server più comuni
-                    let hint = if msg.contains("4060")
-                        || msg.contains("non è possibile aprire il database")
-                        || msg.contains("Cannot open database")
-                    {
-                        Some("Il database esiste ma l'utente non ha accesso: verifica che l'account SQL abbia il permesso 'db_datareader' (o superiore) sul database specificato.")
-                    } else if msg.contains("18456")
-                        || msg.contains("L'accesso non è riuscito")
-                        || msg.contains("Login failed")
-                    {
-                        Some("Credenziali non valide: verifica utente e password nella connection string.")
-                    } else if msg.contains("Impossibile raggiungere")
-                        || msg.contains("Connection refused")
-                        || msg.contains("timed out")
-                    {
-                        Some("Server non raggiungibile: verifica host, porta e che il servizio SQL Server sia in ascolto.")
-                    } else {
-                        None
-                    };
-                    Ok(Json(json!({
-                        "ok": false,
-                        "engine": "sqlserver",
-                        "error": msg,
-                        "hint": hint,
-                    })))
-                }
-            }
-        }
+        "sqlserver" => test_sqlserver_engine(&url, started).await,
         other => Ok(Json(json!({
             "ok": false,
             "engine": other,
@@ -946,29 +1075,41 @@ async fn test_sqlserver_connection(conn_str: &str) -> anyhow::Result<(String, i6
 
     let mut client = Client::connect(config, tcp.compat_write())
         .await
-        .map_err(|e| {
-            let raw = e.to_string();
-            if let Some(start) = raw.find("Token error: '") {
-                let inner = &raw[start + "Token error: '".len()..];
-                let clean = if let Some(p) = inner.find("' on server") {
-                    &inner[..p]
-                } else if let Some(p) = inner.rfind('\'') {
-                    &inner[..p]
-                } else {
-                    inner.trim_end_matches('\'')
-                };
-                anyhow::anyhow!("{}", clean)
-            } else if raw.to_lowercase().contains("tls")
-                || raw.to_lowercase().contains("certificate")
-            {
-                anyhow::anyhow!("Errore TLS/certificato: {raw}")
-            } else {
-                anyhow::anyhow!("Login SQL Server fallito: {raw}")
-            }
-        })?;
+        .map_err(map_sqlserver_login_error)?;
 
-    // Versione server
-    let version: String = client
+    let version = query_sqlserver_version(&mut client).await?;
+    let table_count = query_sqlserver_table_count(&mut client).await?;
+
+    Ok((version, table_count))
+}
+
+/// Client tiberius sul TCP compat usato da [`test_sqlserver_connection`].
+type SqlServerClient = tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>;
+
+/// Traduce l'errore di login tiberius in un messaggio leggibile, estraendo il
+/// testo del "Token error" del server quando presente.
+fn map_sqlserver_login_error(e: impl std::fmt::Display) -> anyhow::Error {
+    let raw = e.to_string();
+    if let Some(start) = raw.find("Token error: '") {
+        let inner = &raw[start + "Token error: '".len()..];
+        let clean = if let Some(p) = inner.find("' on server") {
+            &inner[..p]
+        } else if let Some(p) = inner.rfind('\'') {
+            &inner[..p]
+        } else {
+            inner.trim_end_matches('\'')
+        };
+        anyhow::anyhow!("{}", clean)
+    } else if raw.to_lowercase().contains("tls") || raw.to_lowercase().contains("certificate") {
+        anyhow::anyhow!("Errore TLS/certificato: {raw}")
+    } else {
+        anyhow::anyhow!("Login SQL Server fallito: {raw}")
+    }
+}
+
+/// Versione del server (`@@VERSION`), "sconosciuta" se la riga manca.
+async fn query_sqlserver_version(client: &mut SqlServerClient) -> anyhow::Result<String> {
+    let version = client
         .query("SELECT @@VERSION", &[])
         .await
         .map_err(|e| anyhow::anyhow!("Query @@VERSION fallita: {e}"))?
@@ -976,9 +1117,12 @@ async fn test_sqlserver_connection(conn_str: &str) -> anyhow::Result<(String, i6
         .await?
         .and_then(|r| r.get::<&str, usize>(0).map(String::from))
         .unwrap_or_else(|| "sconosciuta".into());
+    Ok(version)
+}
 
-    // Numero tabelle nel database corrente
-    let table_count: i64 = client
+/// Numero di tabelle BASE TABLE nel database corrente, 0 se la riga manca.
+async fn query_sqlserver_table_count(client: &mut SqlServerClient) -> anyhow::Result<i64> {
+    let table_count = client
         .query(
             "SELECT CAST(COUNT(*) AS BIGINT) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'",
             &[],
@@ -989,8 +1133,7 @@ async fn test_sqlserver_connection(conn_str: &str) -> anyhow::Result<(String, i6
         .await?
         .and_then(|r| r.get::<i64, usize>(0))
         .unwrap_or(0);
-
-    Ok((version, table_count))
+    Ok(table_count)
 }
 
 /// Parser ADO.NET manuale per costruire un `Config` tiberius.
@@ -1003,29 +1146,9 @@ async fn test_sqlserver_connection(conn_str: &str) -> anyhow::Result<(String, i6
 ///   - `Encrypt`                               -> livello crittografia
 ///   - `TrustServerCertificate`                -> trust certificato self-signed
 fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
-    use std::collections::HashMap;
-    use tiberius::{AuthMethod, Config, EncryptionLevel};
+    use tiberius::Config;
 
-    // Tokenizza "Key=Value;" ignorando segmenti vuoti (es. ; finale)
-    let mut params: HashMap<String, String> = HashMap::new();
-    for part in conn_str.split(';') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some(eq_pos) = part.find('=') {
-            // Normalizza chiave: lowercase, spazi multipli -> singolo spazio
-            let key = part[..eq_pos]
-                .trim()
-                .to_lowercase()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            let val = part[eq_pos + 1..].trim().to_string();
-            params.insert(key, val);
-        }
-    }
-
+    let params = parse_ado_params(conn_str);
     let mut config = Config::new();
 
     // ── Host + porta ─────────────────────────────────────────────────────────
@@ -1034,19 +1157,7 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
         .or_else(|| params.get("data source"))
         .map(|s| s.as_str())
         .unwrap_or("localhost");
-
-    // Formati: "host,porta" | "tcp:host,porta" | "host\istanza" | "host"
-    let server_clean = server.trim_start_matches("tcp:");
-    let (host, port) = if let Some(comma) = server_clean.find(',') {
-        let h = &server_clean[..comma];
-        let p: u16 = server_clean[comma + 1..].trim().parse().unwrap_or(1433);
-        (h, p)
-    } else if let Some(bs) = server_clean.find('\\') {
-        (&server_clean[..bs], 1433u16)
-    } else {
-        (server_clean, 1433u16)
-    };
-
+    let (host, port) = split_server_host_port(server);
     config.host(host);
     config.port(port);
 
@@ -1058,11 +1169,64 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
         config.database(db.as_str());
     }
 
-    // ── Autenticazione ───────────────────────────────────────────────────────
-    // Chiavi normalizzate (lowercase, spazio singolo):
-    //   "user id" -> "User Id" / "User ID" (ADO.NET ufficiale .NET/C#)
-    //   "uid"     -> abbreviazione
-    //   "user"    -> variante breve
+    apply_sqlserver_auth(&mut config, &params);
+    apply_sqlserver_encryption(&mut config, &params);
+
+    Ok(config)
+}
+
+/// Tokenizza una connection string ADO.NET "Key=Value;" ignorando i segmenti
+/// vuoti (es. `;` finale). Le chiavi sono normalizzate a lowercase con gli spazi
+/// multipli compattati, cosi' "User  ID" e "user id" collassano sulla stessa.
+fn parse_ado_params(conn_str: &str) -> std::collections::HashMap<String, String> {
+    let mut params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for part in conn_str.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(eq_pos) = part.find('=') {
+            let key = part[..eq_pos]
+                .trim()
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let val = part[eq_pos + 1..].trim().to_string();
+            params.insert(key, val);
+        }
+    }
+    params
+}
+
+/// Host e porta dal valore di `Server` / `Data Source`. Formati accettati:
+/// "host,porta" | "tcp:host,porta" | "host" con istanza dopo il backslash |
+/// "host". Porta di default 1433.
+fn split_server_host_port(server: &str) -> (&str, u16) {
+    let server_clean = server.trim_start_matches("tcp:");
+    if let Some(comma) = server_clean.find(',') {
+        let h = &server_clean[..comma];
+        let p: u16 = server_clean[comma + 1..].trim().parse().unwrap_or(1433);
+        (h, p)
+    } else if let Some(bs) = server_clean.find('\\') {
+        (&server_clean[..bs], 1433u16)
+    } else {
+        (server_clean, 1433u16)
+    }
+}
+
+/// Autenticazione SQL dalle chiavi normalizzate (lowercase, spazio singolo):
+///   "user id" -> "User Id" / "User ID" (ADO.NET ufficiale .NET/C#)
+///   "uid"     -> abbreviazione
+///   "user"    -> variante breve
+/// Senza credenziali SQL resta la Windows Auth (non disponibile su Linux senza
+/// Kerberos).
+fn apply_sqlserver_auth(
+    config: &mut tiberius::Config,
+    params: &std::collections::HashMap<String, String>,
+) {
+    use tiberius::AuthMethod;
+
     let user = params
         .get("user id")
         .or_else(|| params.get("uid"))
@@ -1080,12 +1244,18 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
         (Some(u), None) => {
             config.authentication(AuthMethod::sql_server(u, String::new()));
         }
-        _ => {
-            // Nessuna credenziale SQL: Windows Auth (non disponibile su Linux senza Kerberos)
-        }
+        _ => {}
     }
+}
 
-    // ── Crittografia ─────────────────────────────────────────────────────────
+/// Livello di crittografia (`Encrypt`) e trust del certificato self-signed
+/// (`TrustServerCertificate`).
+fn apply_sqlserver_encryption(
+    config: &mut tiberius::Config,
+    params: &std::collections::HashMap<String, String>,
+) {
+    use tiberius::EncryptionLevel;
+
     let encrypt = params.get("encrypt").map(|s| s.to_lowercase());
     match encrypt.as_deref() {
         Some("false") | Some("no") | Some("0") | Some("optional") => {
@@ -1097,7 +1267,6 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
         _ => {}
     }
 
-    // ── TrustServerCertificate ───────────────────────────────────────────────
     let trust = params
         .get("trustservercertificate")
         .or_else(|| params.get("trust server certificate"))
@@ -1105,8 +1274,6 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
     if matches!(trust.as_deref(), Some("true") | Some("yes") | Some("1")) {
         config.trust_cert();
     }
-
-    Ok(config)
 }
 
 #[cfg(test)]

@@ -815,41 +815,64 @@ pub(super) async fn resolve_secret_value(db: &PgPool, setting_key: &str) -> Opti
         .filter(|value| !value.is_empty())
 }
 
-pub(super) async fn resolve_plugin_runtime_config(
+/// Campi grezzi della riga `mcp_servers` (join con il catalog) necessari a
+/// costruire la runtime config di un plugin.
+struct PluginMcpServerRow {
+    id: Uuid,
+    name: String,
+    transport: String,
+    url: Option<String>,
+    command: Option<String>,
+    args: Value,
+    static_headers: Value,
+    static_env: Value,
+    plugin_slug: String,
+}
+
+/// Legge la riga DB con i default applicati per ogni colonna mancante.
+/// Separa la decodifica della riga dalla risoluzione dei secret.
+fn read_plugin_mcp_server_row(row: &sqlx::postgres::PgRow) -> PluginMcpServerRow {
+    PluginMcpServerRow {
+        id: row.try_get("mcp_server_id").unwrap_or(Uuid::nil()),
+        name: row
+            .try_get("mcp_server_name")
+            .unwrap_or_else(|_| "Plugin MCP".to_string()),
+        transport: row
+            .try_get("transport")
+            .unwrap_or_else(|_| "http".to_string()),
+        url: row.try_get("url").unwrap_or(None),
+        command: row.try_get("command").unwrap_or(None),
+        args: row.try_get("args").unwrap_or(json!([])),
+        static_headers: row.try_get("headers").unwrap_or(json!({})),
+        static_env: row.try_get("env_vars").unwrap_or(json!({})),
+        plugin_slug: row.try_get("slug").unwrap_or_default(),
+    }
+}
+
+/// Valore da mettere nell'header `Authorization`: il prefisso `Bearer ` viene
+/// aggiunto solo se il secret non lo porta già con sé.
+/// Punto unico (regola L): serve sia ai secret binding sia agli header Figma.
+fn bearer_header_value(secret: &str) -> String {
+    if secret.to_lowercase().starts_with("bearer ") {
+        secret.to_string()
+    } else {
+        format!("Bearer {secret}")
+    }
+}
+
+/// Sovrascrive gli header statici con i secret referenziati da
+/// `secret_bindings.headers` (mappa nome header -> chiave in `settings`).
+async fn apply_header_secret_bindings(
     db: &PgPool,
-    mcp_server_row: &sqlx::postgres::PgRow,
     secret_bindings: &Value,
-) -> McpServerConfig {
-    let mcp_server_id: Uuid = mcp_server_row
-        .try_get("mcp_server_id")
-        .unwrap_or(Uuid::nil());
-    let mcp_server_name: String = mcp_server_row
-        .try_get("mcp_server_name")
-        .unwrap_or_else(|_| "Plugin MCP".to_string());
-    let transport: String = mcp_server_row
-        .try_get("transport")
-        .unwrap_or_else(|_| "http".to_string());
-    let url: Option<String> = mcp_server_row.try_get("url").unwrap_or(None);
-    let command: Option<String> = mcp_server_row.try_get("command").unwrap_or(None);
-    let args: Value = mcp_server_row.try_get("args").unwrap_or(json!([]));
-    let static_headers: Value = mcp_server_row.try_get("headers").unwrap_or(json!({}));
-    let static_env: Value = mcp_server_row.try_get("env_vars").unwrap_or(json!({}));
-    let plugin_slug: String = mcp_server_row.try_get("slug").unwrap_or_default();
-
-    let mut headers = value_to_string_map(static_headers.as_object());
-    let mut env_vars = value_to_string_map(static_env.as_object());
-    let mut figma_token = resolve_secret_value(db, "figma_oauth_token").await;
-
+    headers: &mut HashMap<String, String>,
+) {
     if let Some(bindings_headers) = get_json_object(secret_bindings, "headers") {
         for (header_name, setting_key_raw) in bindings_headers {
             if let Some(setting_key) = setting_key_raw.as_str() {
                 if let Some(secret) = resolve_secret_value(db, setting_key).await {
                     if header_name.eq_ignore_ascii_case("authorization") {
-                        if secret.to_lowercase().starts_with("bearer ") {
-                            headers.insert(header_name.clone(), secret);
-                        } else {
-                            headers.insert(header_name.clone(), format!("Bearer {secret}"));
-                        }
+                        headers.insert(header_name.clone(), bearer_header_value(&secret));
                     } else {
                         headers.insert(header_name.clone(), secret);
                     }
@@ -857,7 +880,15 @@ pub(super) async fn resolve_plugin_runtime_config(
             }
         }
     }
+}
 
+/// Sovrascrive gli env var statici con i secret referenziati da
+/// `secret_bindings.envVars` (mappa nome env var -> chiave in `settings`).
+async fn apply_env_secret_bindings(
+    db: &PgPool,
+    secret_bindings: &Value,
+    env_vars: &mut HashMap<String, String>,
+) {
     if let Some(bindings_env) = get_json_object(secret_bindings, "envVars") {
         for (env_name, setting_key_raw) in bindings_env {
             if let Some(setting_key) = setting_key_raw.as_str() {
@@ -867,83 +898,114 @@ pub(super) async fn resolve_plugin_runtime_config(
             }
         }
     }
+}
 
-    // Compatibilità Figma:
-    // - OAuth token: Authorization: Bearer <token>
-    // - Personal token (figd_...): X-Figma-Token: <token>
-    // Manteniamo entrambi se disponibili per ridurre errori 401 su setup legacy.
-    if plugin_slug.eq_ignore_ascii_case("figma-http") {
-        let has_authorization = headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("authorization"));
-        let has_x_figma_token = headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("x-figma-token"));
-        let has_x_figma_region = headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("x-figma-region"));
+/// Compatibilità Figma sul transport HTTP:
+/// - OAuth token: Authorization: Bearer <token>
+/// - Personal token (figd_...): X-Figma-Token: <token>
+/// Manteniamo entrambi se disponibili per ridurre errori 401 su setup legacy.
+/// Gli header già presenti (statici o da secret binding) non vengono toccati.
+async fn apply_figma_http_headers(
+    db: &PgPool,
+    figma_token: Option<&str>,
+    headers: &mut HashMap<String, String>,
+) {
+    let has_authorization = headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("authorization"));
+    let has_x_figma_token = headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("x-figma-token"));
+    let has_x_figma_region = headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("x-figma-region"));
 
-        if let Some(secret) = figma_token.clone() {
-            if !has_x_figma_token {
-                headers.insert("X-Figma-Token".to_string(), secret.clone());
-            }
-            if !has_authorization {
-                if secret.to_lowercase().starts_with("bearer ") {
-                    headers.insert("Authorization".to_string(), secret);
-                } else {
-                    headers.insert("Authorization".to_string(), format!("Bearer {secret}"));
-                }
-            }
+    if let Some(secret) = figma_token {
+        if !has_x_figma_token {
+            headers.insert("X-Figma-Token".to_string(), secret.to_string());
         }
-
-        if !has_x_figma_region {
-            if let Some(region) = resolve_secret_value(db, "figma_region").await {
-                headers.insert("X-Figma-Region".to_string(), region);
-            }
+        if !has_authorization {
+            headers.insert("Authorization".to_string(), bearer_header_value(secret));
         }
     }
 
-    let prefer_figma_stdio = plugin_slug.eq_ignore_ascii_case("figma-http")
-        && resolve_bool_setting(db, "figma_mcp_prefer_stdio", true).await;
+    if !has_x_figma_region {
+        if let Some(region) = resolve_secret_value(db, "figma_region").await {
+            headers.insert("X-Figma-Region".to_string(), region);
+        }
+    }
+}
+
+/// Transport stdio verso `figma-developer-mcp`: risolve il token se non è già
+/// disponibile e lo propaga negli env var del processo figlio.
+async fn build_figma_stdio_transport(
+    db: &PgPool,
+    figma_token: Option<String>,
+    mut env_vars: HashMap<String, String>,
+) -> McpTransport {
+    let mut token = figma_token;
+    if token.is_none() {
+        token = resolve_secret_value(db, "figma_oauth_token").await;
+    }
+
+    if let Some(token) = token {
+        // `figma-developer-mcp` accetta PAT e OAuth token.
+        // Passiamo entrambi gli env var per compatibilità.
+        env_vars.insert("FIGMA_API_KEY".to_string(), token.clone());
+        env_vars.insert("FIGMA_OAUTH_TOKEN".to_string(), token);
+    }
+
+    McpTransport::Stdio {
+        command: "npx".to_string(),
+        args: vec![
+            "-y".to_string(),
+            "figma-developer-mcp".to_string(),
+            "--stdio".to_string(),
+            "--json".to_string(),
+        ],
+        env_vars,
+    }
+}
+
+pub(super) async fn resolve_plugin_runtime_config(
+    db: &PgPool,
+    mcp_server_row: &sqlx::postgres::PgRow,
+    secret_bindings: &Value,
+) -> McpServerConfig {
+    let row = read_plugin_mcp_server_row(mcp_server_row);
+    let mut headers = value_to_string_map(row.static_headers.as_object());
+    let mut env_vars = value_to_string_map(row.static_env.as_object());
+    let figma_token = resolve_secret_value(db, "figma_oauth_token").await;
+
+    apply_header_secret_bindings(db, secret_bindings, &mut headers).await;
+    apply_env_secret_bindings(db, secret_bindings, &mut env_vars).await;
+
+    let is_figma_http = row.plugin_slug.eq_ignore_ascii_case("figma-http");
+    if is_figma_http {
+        apply_figma_http_headers(db, figma_token.as_deref(), &mut headers).await;
+    }
+
+    let prefer_figma_stdio =
+        is_figma_http && resolve_bool_setting(db, "figma_mcp_prefer_stdio", true).await;
 
     let transport_cfg = if prefer_figma_stdio {
-        if figma_token.is_none() {
-            figma_token = resolve_secret_value(db, "figma_oauth_token").await;
-        }
-
-        if let Some(token) = figma_token {
-            // `figma-developer-mcp` accetta PAT e OAuth token.
-            // Passiamo entrambi gli env var per compatibilità.
-            env_vars.insert("FIGMA_API_KEY".to_string(), token.clone());
-            env_vars.insert("FIGMA_OAUTH_TOKEN".to_string(), token);
-        }
-
+        build_figma_stdio_transport(db, figma_token, env_vars).await
+    } else if row.transport == "stdio" {
         McpTransport::Stdio {
-            command: "npx".to_string(),
-            args: vec![
-                "-y".to_string(),
-                "figma-developer-mcp".to_string(),
-                "--stdio".to_string(),
-                "--json".to_string(),
-            ],
-            env_vars,
-        }
-    } else if transport == "stdio" {
-        McpTransport::Stdio {
-            command: command.unwrap_or_default(),
-            args: parse_string_array(&args),
+            command: row.command.unwrap_or_default(),
+            args: parse_string_array(&row.args),
             env_vars,
         }
     } else {
         McpTransport::Http {
-            url: url.unwrap_or_default(),
+            url: row.url.unwrap_or_default(),
             headers,
         }
     };
 
     McpServerConfig {
-        id: mcp_server_id.to_string(),
-        name: mcp_server_name,
+        id: row.id.to_string(),
+        name: row.name,
         transport: transport_cfg,
         enabled: true,
     }

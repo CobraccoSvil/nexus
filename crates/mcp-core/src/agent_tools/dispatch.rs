@@ -320,7 +320,8 @@ mod tests {
                 monitor_registry: Arc::new(parking_lot::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
-                reindexer: Arc::new(nexus_agent_tools::context_core::NoopReindexer),
+                hooks: Arc::new(nexus_agent_tools::context_core::NoopMutationHooks),
+                embedder: Arc::new(nexus_agent_tools::context_core::NoopEmbedder),
                 isolated_subrun: false,
             },
             playwright_channels: crate::playwright_live::new_channels(),

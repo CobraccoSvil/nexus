@@ -435,7 +435,7 @@ fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
 /// duplicati in files.rs (regola L) e aggiunge la traccia di sicurezza che
 /// prima mancava (il rifiuto era solo un tool_result, invisibile all'audit).
 pub async fn enforce_write_ports(
-    ctx: &super::AgentToolContext,
+    ctx: &nexus_agent_tools::ToolContextCore,
     tool_name: &str,
     path: &str,
     content: &str,
@@ -551,7 +551,7 @@ async fn unallocated_bucket_findings(
 /// kind `port`, outcome `blocked`). Best-effort: il writer e' batch async e
 /// degrada in silenzio se non inizializzato.
 fn audit_port_rejection(
-    ctx: &super::AgentToolContext,
+    ctx: &nexus_agent_tools::ToolContextCore,
     action: &str,
     tool_name: &str,
     path: &str,

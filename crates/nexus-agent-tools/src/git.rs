@@ -87,8 +87,8 @@ pub async fn tool_git_commit(ctx: &ToolContextCore, input: &Value) -> String {
                 );
             }
             // Re-indicizza i file modificati nel commit in background
-            // (contratto FileReindexer: l'impl mcp-core delega a reindex_single_file).
-            let reindexer = ctx.reindexer.clone();
+            // (contratto FileMutationHooks: l'impl mcp-core delega a reindex_single_file).
+            let reindexer = ctx.hooks.clone();
             let project_id_bg = ctx.project_id;
             let root_bg = ctx.root_path.clone();
             tokio::spawn(async move {
