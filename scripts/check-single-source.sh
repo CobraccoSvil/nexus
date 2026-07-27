@@ -791,6 +791,33 @@ else
   fi
 fi
 
+# ── cache-di-configurazione-chiavata ────────────────────────────────────────
+# Una cache DI PROCESSO che memorizza configurazione letta da un database deve
+# essere chiavata per DATABASE (`nexus_auth::pool_identity`). Con una chiave
+# costante il primo lettore decide per tutti fino alla scadenza del TTL, e
+# mcp-core interroga piu' database (il meta e un `<slug>_nexus` per progetto).
+#
+# Non e' teoria: il 2026-07-27 `qualification_gate` teneva il gate in una statica
+# senza chiave, un `#[sqlx::test(migrator = "META_MIGRATOR")]` lo accendeva (mig
+# 0595) e per 60s ogni altro test del processo si vedeva il catalog svuotato —
+# sei test di `internal_routing` rossi o verdi a seconda di chi partiva primo
+# (regole F e O). Lo stesso valeva per il flag isolamento, che cachava con chiave
+# `()` un valore GIA' cachato da `nexus_auth`.
+#
+# Il divieto colpisce solo le cache `static`: una `TtlCache<(), _>` come CAMPO di
+# una struct e' legittima (l'istanza e' gia' legata alla sua fonte).
+cache_hits="$(grep -rnE --include='*.rs' --exclude-dir=target \
+  'static [A-Z_]+ *:.*TtlCache<\(\)' crates 2>/dev/null || true)"
+if [[ -n "$cache_hits" ]]; then
+  echo "!! cache-di-configurazione-chiavata: cache di processo con chiave costante:" >&2
+  printf '%s\n' "$cache_hits" | sed 's/^/     /' >&2
+  echo "   Chiavala per database con nexus_auth::pool_identity(db), o togli la" >&2
+  echo "   cache se sotto c'e' gia' nexus_auth::get_setting (che cacha da solo)." >&2
+  fail=1
+else
+  echo "OK cache-di-configurazione-chiavata: nessuna cache statica a chiave costante"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

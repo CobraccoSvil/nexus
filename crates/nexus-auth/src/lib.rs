@@ -99,7 +99,15 @@ static SETTINGS_CACHE: LazyLock<SettingsCache> = LazyLock::new(|| SettingsCache:
 /// Senza questo, una lettura fatta col pool di un progetto (`<slug>_nexus`)
 /// servirebbe il valore del meta, o viceversa: la chiave `settings.key` e' la
 /// stessa in entrambi i database, ma il valore no.
-fn pool_identity(db: &PgPool) -> String {
+///
+/// PUNTO UNICO (regola L) della chiave di una cache di processo che memorizza
+/// CONFIGURAZIONE letta da un database. E' `pub` perche' non tutta quella
+/// configurazione vive in `settings` (es. i pesi di scoring stanno in
+/// `nexus_intent_routing_requirements`): chi cacha quelle letture deve poter
+/// usare la STESSA identita', invece di inventarsi una chiave costante che
+/// confonde i database — l'errore che il 2026-07-27 ha reso sei test dipendenti
+/// dall'ordine di esecuzione.
+pub fn pool_identity(db: &PgPool) -> String {
     let o = db.connect_options();
     format!(
         "{}@{}:{}/{}",

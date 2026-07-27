@@ -665,41 +665,26 @@ struct ParsedTask {
 /// Chiave della setting kill-switch dell'isolamento fisico (regola G, opt-in).
 const ISOLATION_ENABLED_SETTING: &str = "orchestrator.subagent_isolation_enabled";
 
-/// TTL della cache del flag isolamento. Allineato ai 60s degli altri letti-da-DB
-/// (routing matrix, capability, orchestration): stesso orizzonte di refresh.
-const ISOLATION_FLAG_TTL_SECS: u64 = 60;
-
-/// Cache 60s a livello processo del solo flag booleano `subagent_isolation_enabled`
-/// (regola L: punto unico cache = `nexus_cache::TtlCache`; regola G: unica fonte
-/// DB). Chiave costante: il flag e' globale (non per-progetto).
-static ISOLATION_FLAG_CACHE: std::sync::OnceLock<nexus_cache::TtlCache<(), bool>> =
-    std::sync::OnceLock::new();
-
-fn isolation_flag_cache() -> &'static nexus_cache::TtlCache<(), bool> {
-    ISOLATION_FLAG_CACHE.get_or_init(|| {
-        nexus_cache::TtlCache::new(std::time::Duration::from_secs(ISOLATION_FLAG_TTL_SECS))
-    })
-}
-
-/// Legge il flag `orchestrator.subagent_isolation_enabled` (default false) con
-/// cache 60s. DB down o chiave assente -> `false` (fail-safe: nessun isolamento,
-/// ramo sequenziale come oggi).
+/// Legge il flag `orchestrator.subagent_isolation_enabled` (default false).
 /// PUNTO UNICO (regola L) della lettura del flag: lo condividono il batch tool
 /// (`compute_isolation_available`) e il run-init del grafo
 /// (`native_engine::compute_run_isolation_available`), cosi' il gate del planner e
 /// l'esecuzione reale dell'isolamento vedono lo STESSO valore. Prende `&PgPool`
-/// (unico bisogno reale): DB down o chiave assente -> `false` (fail-safe).
+/// (unico bisogno reale): DB down o chiave assente -> `false` (fail-safe: nessun
+/// isolamento, ramo sequenziale come oggi).
+///
+/// La cache 60s e' quella del punto unico dei settings (`nexus_auth`), chiavata
+/// per DATABASE. Qui sopra ce n'era una SECONDA, di processo e con chiave `()`:
+/// non toglieva un round-trip (sotto c'era gia' `get_bool_setting`, che cacha) e
+/// perdeva la distinzione fra i database — il flag letto sul meta rispondeva
+/// anche per un `<slug>_nexus`, e nei test il primo lettore decideva per tutti
+/// (stessa causa dei sei test flaky di `internal_routing`, 2026-07-27).
 pub(crate) async fn isolation_flag_enabled(db: &sqlx::PgPool) -> bool {
-    if let Some(v) = isolation_flag_cache().get(&()) {
-        return v;
-    }
-    let enabled = nexus_auth::get_bool_setting(db, ISOLATION_ENABLED_SETTING)
+    nexus_auth::get_bool_setting(db, ISOLATION_ENABLED_SETTING)
         .await
         .ok()
         .flatten()
-        .unwrap_or(false);
-    isolation_flag_cache().insert((), enabled);
-    enabled
+        .unwrap_or(false)
 }
 
 /// Isolamento DISPONIBILE per questo batch (regola G): flag DB ON (cache 60s) AND
