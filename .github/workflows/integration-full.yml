@@ -34,10 +34,16 @@ name: integration-full
 # membro. Con un progetto di qualcun altro la risposta e' 403, e il test
 # misurerebbe la propria scelta sbagliata invece del contratto.
 
+# SOLO A MANO, nessuno schedule. Il job costa ~25 minuti (build release di
+# mcp-core) e su un account Free il budget e' 2000 minuti/mese: una esecuzione
+# notturna ne consumerebbe 750, meta' del totale, anche nei giorni in cui nessuno
+# tocca il codice. La stessa lista di test gira in locale a costo zero con
+# `scripts/integration-full-local.ps1`; questo job serve per cio' che la' non si
+# puo' verificare — Linux, DB usa-e-getta, artefatto compilato da zero — e lo si
+# lancia quando quella differenza conta (prima di un rilascio, dopo aver toccato
+# migrazioni o lo script del cluster app).
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 3 * * *" # 03:00 UTC
 
 jobs:
   integration-full:

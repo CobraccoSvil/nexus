@@ -1,8 +1,12 @@
 name: Verify
 
+# Budget Actions: su account Free un repo privato ha 2000 minuti/mese, e questo
+# job ne costa 10-25 per esecuzione. I push su `feature/**` non lo attivano piu':
+# chi vuole il gate prima del merge apre la pull request, che lo esegue comunque.
+# Cosi' un branch di lavoro con dieci commit costa un run invece di dieci.
 on:
   push:
-    branches: [main, develop, "feature/**"]
+    branches: [main, develop]
   pull_request:
     branches: [main, develop]
 
@@ -94,6 +98,13 @@ jobs:
 
       - name: Run pnpm verify
         run: pnpm verify
+
+      # Il build di produzione era l'unica verifica esclusiva di ci.yml, che per
+      # il resto rifaceva lint/typecheck/test gia' compresi in `pnpm verify`
+      # (turbo run typecheck lint test). Assorbito qui, ci.yml e' stato rimosso:
+      # due job su ogni push costavano 25 minuti per ~20 di lavoro utile.
+      - name: Build produzione (ex ci.yml)
+        run: pnpm build
 
       - name: Guard punti unici (regola L)
         run: bash scripts/check-single-source.sh
