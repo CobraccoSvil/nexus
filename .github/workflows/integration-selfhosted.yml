@@ -53,6 +53,23 @@ jobs:
       # Windows nativo (vedi CLAUDE.md). Ritorna non-zero se un contratto cade o
       # se una precondizione manca sotto REQUIRE_INTEGRATION_TESTS=1, che imposta
       # da se'.
+      #
+      # `-SaltaRelease` esclude `agent_tools_safety`, che ispeziona
+      # `target/release/mcp-core`: il runner fa checkout in una working copy
+      # pulita (`_work/nexus/nexus`), dove quell'artefatto non c'e' e compilarlo
+      # costerebbe ~20 minuti a ogni push. Alla prima esecuzione i suoi 4 test
+      # sono infatti falliti dicendo "artefatto assente" — il meccanismo ha
+      # funzionato, era la configurazione a chiedere l'impossibile.
+      #
+      # COSA RESTA SCOPERTO QUI, e dove e' coperto: che i pattern di safety, le
+      # env del DB-progetto e i tool subagent siano COMPILATI nel binario lo
+      # verifica `integration-full` (ubuntu), che il release lo costruisce da
+      # zero. In locale lo si controlla quando serve:
+      #
+      #     cargo build -p mcp-core --release
+      #     pwsh -File scripts/integration-full-local.ps1
+      #
+      # (senza il flag, cioe' con l'artefatto presente: quattro test in piu').
       - name: Test di integrazione (servizi locali)
         shell: powershell
-        run: .\scripts\integration-full-local.ps1
+        run: .\scripts\integration-full-local.ps1 -SaltaRelease
