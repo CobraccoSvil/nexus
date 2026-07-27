@@ -269,6 +269,9 @@ async fn usage_for_scope(
 /// Una colonna dimenticata non e' un errore di compilazione — il valore cade sul
 /// DEFAULT e nessuno se ne accorge. Come costante, un test puo' confrontarla col
 /// testo VERO della migrazione che quelle colonne le ha create (regola O).
+/// `id` e' RESTITUITO dalla INSERT invece di essere letto dopo: e' l'unico modo
+/// per dichiarare al chiamante QUALE riga porta l'addebito senza una seconda
+/// query che potrebbe pescarne un'altra.
 const SQL_INSERT_LEDGER_TESTO: &str = r#"
         INSERT INTO ai_usage_ledger (
             user_id, project_id, run_id, provider, model,
@@ -279,20 +282,36 @@ const SQL_INSERT_LEDGER_TESTO: &str = r#"
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'finalized', $17
         )
+        RETURNING id
         "#;
 
 /// Registra l'usage effettivo nel ledger come `finalized` (parita' con
 /// `recordUsageToLedger`). No-op se mancano metadati o usage. Best-effort: gli
 /// errori sono loggati ma non interrompono la risposta al chiamante.
-pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmResponse) {
+///
+/// RITORNA la riga scritta ([`LedgerEntry`]), oppure `None` quando non ne ha
+/// scritta alcuna. Il valore di ritorno non e' telemetria: e' il segnale
+/// STRUTTURATO (regola M) su cui il chiamante decide se addebitare a sua volta.
+/// I casi di `None` sono reali e non deducibili dall'esito della chiamata LLM,
+/// che e' RIUSCITA in tutti e tre:
+///   - richiesta senza identita' (`tenant_id`/`user_id` vuoti): e' il caso di
+///     `NeuralCoreClient::generate_completion`, che manda `GwMetadata::default`;
+///   - identita' non-UUID;
+///   - INSERT fallita (DB) — best-effort, ma il chiamante deve saperlo, o
+///     rilasciando la propria prenotazione perderebbe del tutto l'addebito.
+pub async fn record_usage_to_ledger(
+    db: &PgPool,
+    req: &LlmRequest,
+    resp: &LlmResponse,
+) -> Option<crate::types::LedgerEntry> {
     let project_id = req.metadata.tenant_id.trim();
     let user_id = req.metadata.user_id.trim();
     if project_id.is_empty() || user_id.is_empty() {
-        return;
+        return None;
     }
     let (Ok(project_uuid), Ok(user_uuid)) = (Uuid::parse_str(project_id), Uuid::parse_str(user_id))
     else {
-        return;
+        return None;
     };
 
     let provider = &resp.provider_used;
@@ -348,7 +367,7 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
     // sessione (M71). NULL se il chiamante non lo passa o non e' un UUID valido.
     let run_uuid = Uuid::parse_str(req.metadata.request_id.trim()).ok();
 
-    let res = sqlx::query(SQL_INSERT_LEDGER_TESTO)
+    let res = sqlx::query_scalar::<_, Uuid>(SQL_INSERT_LEDGER_TESTO)
     .bind(user_uuid)
     .bind(project_uuid)
     .bind(run_uuid)
@@ -364,14 +383,22 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
     .bind(costo.cache_read_cost)
     .bind(costo.cache_creation_cost)
     .bind(costo.total_cost)
-    .bind(currency)
+    .bind(&currency)
     .bind(details)
-    .execute(db)
+    .fetch_one(db)
     .await;
 
-    if let Err(e) = res {
-        // Regola F: solo l'errore SQL, nessun payload.
-        tracing::warn!(error = %e, "gateway-ledger: insert ledger fallita (best-effort)");
+    match res {
+        Ok(id) => Some(crate::types::LedgerEntry {
+            id,
+            total_cost: costo.total_cost,
+            currency,
+        }),
+        Err(e) => {
+            // Regola F: solo l'errore SQL, nessun payload.
+            tracing::warn!(error = %e, "gateway-ledger: insert ledger fallita (best-effort)");
+            None
+        }
     }
 }
 
@@ -1004,6 +1031,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger_entry: None,
         }
     }
 
@@ -1014,7 +1042,7 @@ mod tests {
         let (user, project, run) = seed_identita(&pool).await;
         seed_listino(&pool).await;
 
-        record_usage_to_ledger(
+        let dichiarata = record_usage_to_ledger(
             &pool,
             &req_con_identita(project, user, run),
             &resp_anthropic_con_cache(),
@@ -1022,7 +1050,7 @@ mod tests {
         .await;
 
         let riga = sqlx::query(
-            "SELECT user_id, project_id, provider, model, status, currency, details, \
+            "SELECT id, user_id, project_id, provider, model, status, currency, details, \
                     prompt_tokens, completion_tokens, total_tokens, \
                     cache_read_tokens, cache_creation_tokens, \
                     input_cost::float8          AS input_cost, \
@@ -1079,5 +1107,55 @@ mod tests {
         assert_eq!(details["price_state"], "priced");
         assert_eq!(details["price_missing"], false);
         assert_eq!(details["cache_price_state"], "priced");
+
+        // E cio' che il gateway DICHIARA di aver scritto e' la riga che ha
+        // scritto davvero. Non e' una formalita': su questa dichiarazione il
+        // chiamante che ha prenotato decide di NON addebitare una seconda volta
+        // (mcp_core::billing::settle_usage). Se l'id o l'importo dichiarati non
+        // fossero quelli della riga, la correlazione punterebbe altrove e il
+        // costo mostrato all'utente divergerebbe dal ledger.
+        let entry = dichiarata.expect("il gateway ha scritto: deve dichiarare la riga");
+        assert_eq!(entry.id, riga.get::<Uuid, _>("id"));
+        assert_eq!(entry.currency, riga.get::<String, _>("currency"));
+        assert!(
+            (entry.total_cost - riga.get::<f64, _>("total_cost")).abs() < 1e-9,
+            "costo dichiarato {} != costo scritto {}",
+            entry.total_cost,
+            riga.get::<f64, _>("total_cost")
+        );
+    }
+
+    /// La domanda che decide se rilasciare una prenotazione e' "il gateway ha
+    /// scritto?", e la risposta NON e' "la chiamata e' riuscita".
+    ///
+    /// Qui la chiamata riesce (la `LlmResponse` e' identica al test sopra) ma i
+    /// metadata non portano identita': e' esattamente cio' che manda
+    /// `NeuralCoreClient::generate_completion` (`GwMetadata::default`). Il
+    /// gateway non scrive nulla, e deve DIRLO: un chiamante che rilasciasse la
+    /// prenotazione fidandosi dell'esito perderebbe l'intero addebito.
+    ///
+    /// MUTAZIONE: facendo dichiarare una riga fabbricata prima della guardia
+    /// d'identita', questo test e il suo gemello qui sopra rosseggiano entrambi
+    /// — verificato: qui zero righe scritte a fronte di una dichiarata, li'
+    /// l'id dichiarato non e' quello della riga.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn senza_identita_il_gateway_non_scrive_e_lo_dichiara(pool: PgPool) {
+        seed_listino(&pool).await;
+
+        // `req` senza tenant_id/user_id: la forma di default dei metadata.
+        let dichiarata =
+            record_usage_to_ledger(&pool, &req(vec!["ciao"], Some(64)), &resp_anthropic_con_cache())
+                .await;
+
+        assert!(
+            dichiarata.is_none(),
+            "senza identita' il gateway non scrive: dichiarare una riga inesistente \
+             autorizzerebbe il chiamante a rilasciare la prenotazione, perdendo l'addebito"
+        );
+        let righe: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_usage_ledger")
+            .fetch_one(&pool)
+            .await
+            .expect("conteggio ledger");
+        assert_eq!(righe, 0, "nessuna riga doveva essere scritta");
     }
 }

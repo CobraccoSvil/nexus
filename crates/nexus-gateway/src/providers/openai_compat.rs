@@ -928,6 +928,8 @@ fn from_chat_completion(
         // Dialetto OpenAI-compat: nessuna signature opaca da ri-passare.
         thinking_signature: None,
         citations,
+        // La riga di ledger la scrive la pipeline HTTP, non il provider.
+        ledger_entry: None,
     })
 }
 

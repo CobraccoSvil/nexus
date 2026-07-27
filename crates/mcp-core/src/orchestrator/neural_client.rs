@@ -422,6 +422,11 @@ fn completion_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
         "content": resp.content,
         "metadata": {
             "usage": usage_value_from_gw(resp),
+            // La riga di ledger dichiarata dal gateway viaggia con la completion:
+            // e' cio' che permette al chiamante che ha prenotato di NON addebitare
+            // due volte (`billing::settle_usage`). `null` quando il gateway non ha
+            // scritto: e' un'informazione, non un'assenza da interpretare.
+            "ledger": resp.ledger_entry,
         },
         "error": Value::Null,
         "error_class": Value::Null,
@@ -888,6 +893,7 @@ mod gateway_mapping_tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger_entry: None,
         }
     }
 

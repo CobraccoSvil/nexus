@@ -242,6 +242,27 @@ pub struct GwResponse {
     /// provider (regola M: campo strutturato, mai estratto dal testo).
     #[serde(default)]
     pub citations: Option<Vec<String>>,
+    /// Riga di `ai_usage_ledger` che il GATEWAY ha gia' scritto per questa
+    /// chiamata (`nexus_gateway::types::LedgerEntry` sull'altro lato del wire).
+    ///
+    /// E' il permesso strutturato di NON addebitare una seconda volta: chi ha
+    /// prenotato (`billing::reserve_usage`) rilascia invece di finalizzare, e
+    /// l'addebito resta uno solo. `None` significa "nessuno ha addebitato": il
+    /// gateway non scrive quando la richiesta arriva senza identita' o quando la
+    /// INSERT fallisce, e in quei casi la prenotazione DEVE essere finalizzata.
+    /// Il punto unico che decide e' `billing::settle_usage` (regola L).
+    #[serde(default)]
+    pub ledger_entry: Option<GwLedgerEntry>,
+}
+
+/// Riga di ledger dichiarata dal gateway. Specchio di
+/// `nexus_gateway::types::LedgerEntry` (stessi nomi di campo: e' il contratto
+/// wire).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GwLedgerEntry {
+    pub id: uuid::Uuid,
+    pub total_cost: f64,
+    pub currency: String,
 }
 
 /// Errore HTTP del Nexus Gateway coi segnali STRUTTURATI del body JSON estratti

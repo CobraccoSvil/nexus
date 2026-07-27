@@ -547,6 +547,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger_entry: None,
         };
         let rehydrated = p.rehydrate(&response, &mut res.map);
         assert!(rehydrated.content.contains("dbSecret"));

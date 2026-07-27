@@ -573,8 +573,14 @@ async fn run_complete(
     // Reidratazione post-flight: ripristina gli originali nei placeholder.
     response = pipeline.rehydrate(&response, &mut map);
 
-    // Telemetria: ledger best-effort (non blocca la risposta).
-    record_usage_to_ledger(&state.db, req, &response).await;
+    // Ledger best-effort (non blocca la risposta). La riga scritta viene
+    // DICHIARATA sulla risposta: non e' telemetria, e' il segnale su cui il
+    // chiamante decide di non addebitare una seconda volta la stessa chiamata
+    // (regola M). Prima il gateway scriveva la sua riga in silenzio e mcp-core,
+    // che non poteva saperlo, ne finalizzava una propria: due righe finalizzate
+    // e costo raddoppiato per una sola chiamata.
+    let entry = record_usage_to_ledger(&state.db, req, &response).await;
+    response.ledger_entry = entry;
 
     Ok(response)
 }
@@ -1564,6 +1570,10 @@ async fn build_sse_stream(
                         Ok(chunk) => {
                             // Chunk finale con usage + provider + model: scrivi ledger
                             // (parita' col server.ts che registra l'usage dello stream).
+                            // La riga scritta non viene dichiarata a nessuno: lo
+                            // streaming non ha un chiamante che prenoti, quindi qui
+                            // non esiste il rischio di doppio addebito che il campo
+                            // `ledger_entry` della risposta non-streaming previene.
                             if let (Some(usage), Some(provider), Some(model)) =
                                 (chunk.usage, &chunk.provider_used, &chunk.model_used)
                             {
@@ -1579,8 +1589,9 @@ async fn build_sse_stream(
                                     reasoning: None,
                                     thinking_signature: None,
                                     citations: None,
+                                    ledger_entry: None,
                                 };
-                                record_usage_to_ledger(&state.db, &body, &resp).await;
+                                let _ = record_usage_to_ledger(&state.db, &body, &resp).await;
                             }
                             let payload = serde_json::to_string(&chunk).unwrap_or_default();
                             if tx.send(Ok(Event::default().data(payload))).await.is_err() {
@@ -2862,6 +2873,7 @@ mod tests {
                     reasoning: None,
                     thinking_signature: None,
                     citations: None,
+                    ledger_entry: None,
                 }),
                 // Errori strutturati (status + codice), come i provider reali.
                 Behaviour::ErrBilling => Err(crate::providers::ProviderHttpError {
@@ -2911,6 +2923,7 @@ mod tests {
                             reasoning: None,
                             thinking_signature: None,
                             citations: None,
+                            ledger_entry: None,
                         })
                     }
                 }

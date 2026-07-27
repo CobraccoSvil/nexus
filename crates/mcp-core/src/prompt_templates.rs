@@ -576,8 +576,21 @@ async fn finalize_batch_usage(
     let usage_numbers =
         crate::billing::extract_usage_numbers(v, prompt_tokens, estimated_completion_tokens);
     if let Some(res) = reservation {
-        if let Err(e) =
-            crate::billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await
+        // Stesso punto unico del percorso chat: oggi questa strada passa per
+        // `NeuralCoreClient::generate_completion`, che manda `GwMetadata::default`
+        // (nessuna identita'), quindi il gateway NON scrive e la prenotazione va
+        // finalizzata. Chiedere lo stesso al punto unico invece di darlo per
+        // scontato costa nulla ed evita che il giorno in cui quei metadata
+        // verranno valorizzati — una riga sola — il doppio addebito rinasca qui.
+        let entry = crate::billing::extract_ledger_entry(v);
+        if let Err(e) = crate::billing::settle_usage(
+            db,
+            res,
+            uuid::Uuid::new_v4(),
+            &usage_numbers,
+            entry.as_ref(),
+        )
+        .await
         {
             tracing::error!("batch: billing finalize FAILED: {e}");
         }
@@ -663,7 +676,7 @@ async fn try_provider_once(
         Err(e) => {
             // In caso di errore, rilascia la riserva (non conteggiare).
             if let Some(res) = &reservation {
-                crate::billing::release_usage(db, res, "provider_error").await;
+                crate::billing::release_usage(db, res, "provider_error", None).await;
             }
             tracing::warn!(
                 "batch: provider {} errore gRPC: {}, marcato broken",

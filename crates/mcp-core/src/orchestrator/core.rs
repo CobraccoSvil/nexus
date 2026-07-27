@@ -1336,7 +1336,7 @@ impl Orchestrator {
         let gw_resp = match gw.complete(call.request).await {
             Ok(r) => r,
             Err(e) => {
-                billing::release_usage(db, &reservation, "gateway_error").await;
+                billing::release_usage(db, &reservation, "gateway_error", None).await;
                 // La resa nasce QUI, dove si sa ancora che il provider era
                 // forzato, e viaggia come errore tipizzato: il confine HTTP
                 // della chat la rilegge invece di ri-derivarla da una stringa
@@ -1358,8 +1358,19 @@ impl Orchestrator {
         // Dal punto unico: la costruzione a mano scartava i campi di cache che
         // `GwUsage` porta gia' (era il terzo percorso che li perdeva).
         let actual_usage = UsageNumbers::from_gateway(&gw_resp.usage);
-        let (_, _, cost, cur) =
-            billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
+        // Chi addebita questa chiamata lo decide il punto unico, dal segnale che
+        // il gateway emette solo se ha davvero scritto la sua riga: se l'ha
+        // scritta la prenotazione si rilascia (una sola riga finalizzata per
+        // run), altrimenti si finalizza come sempre (nessun addebito perso).
+        let settlement = billing::settle_usage(
+            db,
+            &reservation,
+            run_id,
+            &actual_usage,
+            gw_resp.ledger_entry.as_ref(),
+        )
+        .await?;
+        let (cost, cur) = (settlement.total_cost, settlement.currency);
         let gw_completion = json!({"content": gw_resp.content, "metadata": {
             "provider": gw_resp.provider_used, "model": gw_resp.model_used,
             "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason,

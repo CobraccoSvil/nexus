@@ -393,6 +393,30 @@ pub struct PrivacyRerouted {
     pub reason: String,
 }
 
+/// Riga di `ai_usage_ledger` che il gateway ha scritto per QUESTA chiamata.
+///
+/// E' il segnale STRUTTURATO (regola M) con cui l'unico scrittore reale del
+/// ledger dichiara al chiamante "l'addebito e' gia' registrato, qui": la sua
+/// PRESENZA e' il permesso di non addebitare una seconda volta, e la sua
+/// ASSENZA e' il permesso di addebitare. Nessuno dei due va dedotto dal fatto
+/// che la chiamata sia riuscita: il gateway NON scrive quando la richiesta
+/// arriva senza identita' (`metadata.tenant_id`/`user_id` vuoti o non-UUID,
+/// vedi `record_usage_to_ledger`) o quando la INSERT fallisce, e in quei casi
+/// un chiamante che rilasciasse la prenotazione perderebbe l'addebito.
+///
+/// Retrocompatibile: `None` sui gateway che non lo emettono ancora, e in quel
+/// caso il chiamante finalizza come ha sempre fatto.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    /// `ai_usage_ledger.id` della riga scritta: permette di CORRELARE la
+    /// prenotazione del chiamante alla riga che porta davvero l'addebito.
+    pub id: uuid::Uuid,
+    /// Costo totale REGISTRATO sulla riga (non una stima ricalcolata altrove).
+    pub total_cost: f64,
+    /// Currency della riga, come scritta nel ledger.
+    pub currency: String,
+}
+
 /// Risposta non-streaming (`LLMResponse`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
@@ -421,6 +445,11 @@ pub struct LlmResponse {
     /// mai estratto dal testo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citations: Option<Vec<String>>,
+    /// Riga di ledger scritta dal gateway per questa chiamata (vedi
+    /// [`LedgerEntry`]). La valorizza SOLO la pipeline HTTP, dopo
+    /// `record_usage_to_ledger`: i provider non la toccano.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_entry: Option<LedgerEntry>,
 }
 
 impl LlmResponse {
@@ -757,6 +786,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger_entry: None,
         }
     }
 

@@ -531,20 +531,157 @@ pub async fn finalize_usage(
     ))
 }
 
-pub async fn release_usage(db: &PgPool, reservation: &UsageReservation, reason: &str) {
-    let _ = sqlx::query(
-        r#"
+/// La UPDATE che rilascia una prenotazione.
+///
+/// AZZERA i conteggi e gli importi. Non e' pulizia estetica: su una riga
+/// `released` la stima e' denaro che nessuno ha speso, e non tutti i lettori del
+/// ledger filtrano per stato — `usage_report` (report admin/progetto/utente)
+/// somma `total_cost` di TUTTE le righe che passano i suoi filtri. Lasciarci la
+/// stima significherebbe sostituire un doppio addebito con un doppio addebito
+/// piu' discreto. L'importo di una riga deve essere coerente col suo stato
+/// strutturato (regola M): `released` = non addebitato = 0.
+///
+/// La stima non viene distrutta, trasloca in `details.released_estimate`: e'
+/// leggibile per audit e non e' sommabile per sbaglio. Le espressioni a destra
+/// dell'assegnamento vedono i valori VECCHI della riga, quindi il travaso e
+/// l'azzeramento convivono nella stessa UPDATE.
+///
+/// `$3` e' NULL quando non c'e' nulla da correlare: senza `COALESCE` la
+/// concatenazione con NULL azzererebbe l'intero `details`.
+const SQL_UPDATE_LEDGER_RELEASE: &str = r#"
         UPDATE ai_usage_ledger
         SET status = 'released',
             rejection_reason = $2,
-            finalized_at = NOW()
+            finalized_at = NOW(),
+            details = details || jsonb_build_object(
+                'released_estimate',
+                jsonb_build_object(
+                    'prompt_tokens', prompt_tokens,
+                    'completion_tokens', completion_tokens,
+                    'total_tokens', total_tokens,
+                    'total_cost', total_cost
+                )
+            ) || COALESCE($3::jsonb, '{}'::jsonb),
+            prompt_tokens = 0,
+            completion_tokens = 0,
+            total_tokens = 0,
+            input_cost = 0,
+            output_cost = 0,
+            total_cost = 0
         WHERE id = $1
-        "#,
-    )
-    .bind(reservation.ledger_id)
-    .bind(reason)
-    .execute(db)
-    .await;
+        "#;
+
+/// Rilascia una prenotazione: la riga resta (con i suoi `details`, che sono il
+/// contesto che solo il chiamante conosce — intent, profile_id,
+/// corrections_count) ma esce dalla contabilita' e dalle quote, che contano solo
+/// `reserved` e `finalized`.
+///
+/// `extra_details` si fonde nei `details`: e' il posto della CORRELAZIONE quando
+/// il rilascio avviene perche' ad addebitare e' stato qualcun altro
+/// (`superseded_by_ledger_id`). `None` quando non c'e' nulla da correlare — il
+/// rilascio per fallimento della chiamata.
+pub async fn release_usage(
+    db: &PgPool,
+    reservation: &UsageReservation,
+    reason: &str,
+    extra_details: Option<Value>,
+) {
+    if let Err(e) = sqlx::query(SQL_UPDATE_LEDGER_RELEASE)
+        .bind(reservation.ledger_id)
+        .bind(reason)
+        .bind(extra_details)
+        .execute(db)
+        .await
+    {
+        // Una prenotazione non rilasciata resta 'reserved' e continua a occupare
+        // quota per sempre: il fallimento va VISTO, non ingoiato (regola F: solo
+        // l'errore SQL, nessun payload).
+        tracing::warn!(
+            target: "billing",
+            error = %e,
+            ledger_id = %reservation.ledger_id,
+            reason = %reason,
+            "release_usage: rilascio della prenotazione fallito, la riga resta 'reserved' e occupa quota"
+        );
+    }
+}
+
+/// Esito della chiusura contabile di una chiamata RIUSCITA.
+#[derive(Debug, Clone)]
+pub struct Settlement {
+    /// Costo effettivamente REGISTRATO nel ledger per questa chiamata.
+    pub total_cost: f64,
+    pub currency: String,
+    /// `true` se ad addebitare e' stata la riga del gateway (la prenotazione e'
+    /// stata rilasciata), `false` se e' la prenotazione stessa a essere stata
+    /// finalizzata.
+    pub charged_by_gateway: bool,
+}
+
+/// PUNTO UNICO (regola L) della domanda "chi addebita questa chiamata".
+///
+/// Prima la risposta era implicita e sbagliata: chi prenotava finalizzava
+/// SEMPRE, mentre il gateway — dentro la stessa richiesta HTTP — inseriva gia'
+/// la propria riga `finalized`. Due righe finalizzate, stesso `run_id`, stessi
+/// token, costo raddoppiato. Il difetto era invisibile finche' la coppia
+/// provider/modello prenotata era impossibile e il listino non la trovava: la
+/// riga di troppo costava zero. Con una coppia valida a listino sono diventati
+/// due addebiti plausibili per una sola chiamata (incidente 2026-07-27).
+///
+/// La decisione NON si deduce dall'esito della chiamata: si legge dal segnale
+/// strutturato che il gateway emette solo quando ha davvero scritto
+/// ([`crate::nexus_gateway::GwLedgerEntry`], regola M). Rilasciare "perche' la
+/// chiamata e' riuscita" perderebbe l'addebito su tutti i percorsi in cui il
+/// gateway non scrive: richiesta senza identita' (`GwMetadata::default`),
+/// identita' non-UUID, INSERT fallita.
+///
+/// La prenotazione NON viene cancellata: resta come riga `released` che conserva
+/// i propri `details` e punta alla riga che porta l'addebito, cosi' il contesto
+/// che solo mcp-core conosce (intent, profile_id, corrections_count) non si
+/// perde e le due righe sono correlate.
+pub async fn settle_usage(
+    db: &PgPool,
+    reservation: &UsageReservation,
+    run_id: Uuid,
+    usage: &UsageNumbers,
+    gateway_entry: Option<&crate::nexus_gateway::GwLedgerEntry>,
+) -> anyhow::Result<Settlement> {
+    match gateway_entry {
+        Some(entry) => {
+            release_usage(
+                db,
+                reservation,
+                "gateway_ledger",
+                Some(json!({ "superseded_by_ledger_id": entry.id })),
+            )
+            .await;
+            Ok(Settlement {
+                total_cost: entry.total_cost,
+                currency: entry.currency.clone(),
+                charged_by_gateway: true,
+            })
+        }
+        None => {
+            let (_, _, total_cost, currency) =
+                finalize_usage(db, reservation, run_id, usage).await?;
+            Ok(Settlement {
+                total_cost,
+                currency,
+                charged_by_gateway: false,
+            })
+        }
+    }
+}
+
+/// La riga di ledger dichiarata dal gateway dentro un `Value` di completion
+/// (`metadata.ledger`, scritto da
+/// `orchestrator::neural_client::completion_value_from_gw`).
+///
+/// Gemella di [`extract_usage_numbers`] e per lo stesso motivo: i call site che
+/// lavorano sul `Value` invece che sulla `GwResponse` devono poter porre la
+/// STESSA domanda, o la decisione di [`settle_usage`] si biforca.
+pub fn extract_ledger_entry(completion: &Value) -> Option<crate::nexus_gateway::GwLedgerEntry> {
+    serde_json::from_value(completion["metadata"]["ledger"].clone()).ok()
 }
 
 /// Token dal `metadata.usage` di una completion.
@@ -1583,6 +1720,350 @@ mod tests {
         assert!(
             (tariffa_implicita - 3.0).abs() < 1e-9,
             "tariffa implicita {tariffa_implicita} $/M, attesa 3.0 come a catalog"
+        );
+    }
+
+    // ── Un addebito solo per una chiamata sola ─────────────────
+    //
+    // Il difetto misurato il 2026-07-27: un solo messaggio in chat, DUE righe
+    // finalizzate con lo stesso `run_id`, stesso provider/modello, stessi token
+    // e stesso costo (0.002339 ciascuna, 0.004678 addebitati). Una la scriveva
+    // il gateway dentro la richiesta HTTP, l'altra la finalizzava mcp-core al
+    // ritorno. Il doppio conteggio c'era da sempre ed era invisibile solo perche'
+    // la coppia provider/modello prenotata era impossibile e il listino la
+    // prezzava zero.
+
+    /// La riga che il GATEWAY ha gia' scritto dentro la stessa richiesta HTTP,
+    /// piu' la dichiarazione che ne fa sul wire.
+    ///
+    /// PREMESSA DICHIARATA (regola O): qui la riga e' seminata, perche' il suo
+    /// produttore vero — `nexus_gateway::server::billing::record_usage_to_ledger`
+    /// — vive in un crate che mcp-core non vede. Quella meta' e' misurata dal
+    /// test gemello nel gateway (`record_usage_scrive_ogni_numero_nella_sua_colonna`),
+    /// che rilegge la riga dal DB e verifica che l'entry DICHIARATA sia proprio
+    /// quella scritta. Cio' che si misura qui e' l'altra meta': che davanti a
+    /// quella dichiarazione mcp-core non ne aggiunga una seconda. Lo schema e'
+    /// comunque quello vero (META_MIGRATOR) e l'identita' viene dal seeder unico.
+    async fn riga_gia_scritta_dal_gateway(
+        pool: &PgPool,
+        user: Uuid,
+        project: Uuid,
+        run: Uuid,
+        total_tokens: i32,
+        total_cost: f64,
+    ) -> crate::nexus_gateway::GwLedgerEntry {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO ai_usage_ledger ( \
+                 user_id, project_id, run_id, provider, model, \
+                 prompt_tokens, completion_tokens, total_tokens, \
+                 input_cost, output_cost, total_cost, currency, status, details \
+             ) VALUES ($1, $2, $3, 'anthropic', 'claude-x', \
+                       $4, 0, $4, $5, 0, $5, 'USD', 'finalized', \
+                       '{\"price_state\":\"priced\"}'::jsonb) \
+             RETURNING id",
+        )
+        .bind(user)
+        .bind(project)
+        .bind(run)
+        .bind(total_tokens)
+        .bind(total_cost)
+        .fetch_one(pool)
+        .await
+        .expect("riga del gateway");
+        crate::nexus_gateway::GwLedgerEntry {
+            id,
+            total_cost,
+            currency: "USD".to_string(),
+        }
+    }
+
+    /// Il caso del difetto: una chiamata, UNA sola riga finalizzata.
+    ///
+    /// Percorso di produzione per intero: `reserve_usage` (il gate delle quote,
+    /// che deve restare) -> il gateway scrive e lo dichiara -> `settle_usage`.
+    /// Le asserzioni sono due, e servono entrambe: il CONTEGGIO delle righe
+    /// finalizzate del run, e la SOMMA degli importi su TUTTE le righe del run —
+    /// perche' non tutti i lettori del ledger filtrano per stato, e una
+    /// prenotazione rilasciata che conservasse la propria stima sarebbe lo stesso
+    /// doppio addebito con un vestito diverso.
+    ///
+    /// MUTAZIONE: rimettendo la finalizzazione incondizionata in `settle_usage`
+    /// (il comportamento pre-fix) il conteggio sale a 2 — verificato: due righe
+    /// `finalized` sullo stesso run, 0.002339 e 9.0. Togliendo invece
+    /// l'azzeramento dalla UPDATE di rilascio il conteggio resta 1 ma la somma
+    /// diventa 9.002339 — verificato.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn una_chiamata_riuscita_lascia_una_sola_riga_finalizzata(pool: PgPool) {
+        let (user, project, run) = seed_identita(&pool).await;
+        seed_listino(&pool).await;
+
+        // La prenotazione come la fa la chat (`execute_via_gateway`): stima dei
+        // token e il contesto che solo mcp-core conosce.
+        let reservation = reserve_usage(
+            &pool,
+            user,
+            project,
+            "anthropic",
+            "claude-x",
+            1_000_000,
+            400_000,
+            json!({ "intent": "chat", "profile_id": "p-1",
+                    "via_nexus_gateway": true, "corrections_count": 2 }),
+        )
+        .await
+        .expect("prenotazione");
+
+        let entry =
+            riga_gia_scritta_dal_gateway(&pool, user, project, run, 1_400_000, 0.002339).await;
+
+        let numeri = UsageNumbers::new(1_000_000, 400_000, 0, 0);
+        let settlement = settle_usage(&pool, &reservation, run, &numeri, Some(&entry))
+            .await
+            .expect("chiusura contabile");
+
+        // 1) Una sola riga finalizzata per quel run.
+        let righe: Vec<(Uuid, String, f64)> = sqlx::query_as(
+            "SELECT id, status, total_cost::float8 \
+               FROM ai_usage_ledger \
+              WHERE run_id = $1 AND status = 'finalized'",
+        )
+        .bind(run)
+        .fetch_all(&pool)
+        .await
+        .expect("righe del run");
+        assert_eq!(
+            righe.len(),
+            1,
+            "una chiamata deve lasciare UNA riga finalizzata, trovate {}: {:?}",
+            righe.len(),
+            righe
+        );
+        assert_eq!(
+            righe[0].0, entry.id,
+            "la riga che addebita deve essere quella del gateway (provider/modello \
+             EFFETTIVI della chiamata), non la stima della prenotazione"
+        );
+
+        // 2) E il denaro dell'intero run e' quello di una chiamata sola, anche
+        //    sommando le righe senza filtrare per stato.
+        let totale: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(total_cost), 0)::float8 FROM ai_usage_ledger \
+              WHERE project_id = $1",
+        )
+        .bind(project)
+        .fetch_one(&pool)
+        .await
+        .expect("somma del ledger");
+        assert!(
+            (totale - 0.002339).abs() < 1e-9,
+            "addebitato {totale} per UNA chiamata, atteso 0.002339"
+        );
+
+        // La prenotazione non e' sparita: e' rilasciata, non conta piu' per le
+        // quote, e conserva il contesto che il gateway non ha (intent, profile_id,
+        // corrections_count) piu' il puntatore alla riga che addebita davvero.
+        let prenotazione = sqlx::query(
+            "SELECT status, details, total_tokens, total_cost::float8 AS total_cost \
+               FROM ai_usage_ledger WHERE id = $1",
+        )
+        .bind(reservation.ledger_id)
+        .fetch_one(&pool)
+        .await
+        .expect("riga della prenotazione");
+        assert_eq!(prenotazione.get::<String, _>("status"), "released");
+        assert_eq!(prenotazione.get::<i32, _>("total_tokens"), 0);
+        assert!(prenotazione.get::<f64, _>("total_cost").abs() < 1e-9);
+        let details: Value = prenotazione.get("details");
+        assert_eq!(details["intent"], "chat");
+        assert_eq!(details["profile_id"], "p-1");
+        assert_eq!(details["corrections_count"], 2);
+        assert_eq!(
+            details["superseded_by_ledger_id"],
+            json!(entry.id.to_string()),
+            "la prenotazione rilasciata deve dire QUALE riga porta l'addebito"
+        );
+        // La stima non e' distrutta: e' traslocata dove nessuno la somma.
+        assert!(details["released_estimate"]["total_cost"].as_f64().unwrap() > 0.0);
+
+        // E cio' che il chiamante annuncia al resto del sistema (metadata del
+        // messaggio, budget del run) e' il costo REGISTRATO, non la stima.
+        assert!(settlement.charged_by_gateway);
+        assert!((settlement.total_cost - 0.002339).abs() < 1e-9);
+        assert_eq!(settlement.currency, "USD");
+    }
+
+    /// L'altra faccia: quando il gateway NON ha scritto, l'addebito non si perde.
+    ///
+    /// E' il caso reale di `NeuralCoreClient::generate_completion`, che manda
+    /// metadata senza identita': il gateway esce senza scrivere (vedi il test
+    /// gemello `senza_identita_il_gateway_non_scrive_e_lo_dichiara`) e la
+    /// prenotazione DEVE essere finalizzata. Rilasciare qui — per esempio
+    /// deducendo il rilascio dal fatto che la chiamata sia riuscita — vorrebbe
+    /// dire non fatturare mai piu' quella chiamata.
+    ///
+    /// MUTAZIONE: facendo rilasciare anche il ramo `None` (rilascio cieco), le
+    /// righe finalizzate del run diventano ZERO — verificato: `l'addebito non
+    /// deve sparire: []`.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn senza_riga_del_gateway_la_prenotazione_viene_finalizzata(pool: PgPool) {
+        let (user, project, run) = seed_identita(&pool).await;
+        seed_listino(&pool).await;
+
+        let reservation = reserve_usage(
+            &pool,
+            user,
+            project,
+            "anthropic",
+            "claude-x",
+            1_000_000,
+            400_000,
+            json!({ "feature": "batch" }),
+        )
+        .await
+        .expect("prenotazione");
+
+        let numeri = UsageNumbers::new(1_000_000, 400_000, 0, 0);
+        let settlement = settle_usage(&pool, &reservation, run, &numeri, None)
+            .await
+            .expect("chiusura contabile");
+
+        let righe: Vec<(Uuid, f64)> = sqlx::query_as(
+            "SELECT id, total_cost::float8 FROM ai_usage_ledger \
+              WHERE run_id = $1 AND status = 'finalized'",
+        )
+        .bind(run)
+        .fetch_all(&pool)
+        .await
+        .expect("righe del run");
+        assert_eq!(righe.len(), 1, "l'addebito non deve sparire: {righe:?}");
+        assert_eq!(righe[0].0, reservation.ledger_id);
+        // 1M x 3.0 + 0.4M x 15.0 = 9.0: il costo REALE, non uno zero di cortesia.
+        assert!((righe[0].1 - 9.0).abs() < 1e-9, "costo scritto {}", righe[0].1);
+        assert!(!settlement.charged_by_gateway);
+        assert!((settlement.total_cost - 9.0).abs() < 1e-9);
+    }
+
+    /// Il rilascio SENZA correlazione (la chiamata e' fallita) non deve
+    /// cancellare i `details` della prenotazione.
+    ///
+    /// E' il ramo che percorre `execute_via_gateway` quando il gateway risponde
+    /// errore, e passa `None` come extra. In `jsonb` la concatenazione con NULL
+    /// da' NULL: senza il `COALESCE` nella UPDATE, ogni fallimento di chiamata
+    /// azzererebbe in silenzio il contesto della riga.
+    ///
+    /// MUTAZIONE: togliendo il `COALESCE` la UPDATE viola il NOT NULL di
+    /// `details` e non passa affatto — verificato: lo stato letto e' `reserved`
+    /// invece di `released`, cioe' la prenotazione resterebbe a occupare quota
+    /// per sempre.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn il_rilascio_senza_correlazione_conserva_i_details(pool: PgPool) {
+        let (user, project, _) = seed_identita(&pool).await;
+        seed_listino(&pool).await;
+
+        let reservation = reserve_usage(
+            &pool,
+            user,
+            project,
+            "anthropic",
+            "claude-x",
+            1_000_000,
+            400_000,
+            json!({ "intent": "chat", "profile_id": "p-1" }),
+        )
+        .await
+        .expect("prenotazione");
+
+        release_usage(&pool, &reservation, "gateway_error", None).await;
+
+        let riga = sqlx::query(
+            "SELECT status, details, total_cost::float8 AS total_cost \
+               FROM ai_usage_ledger WHERE id = $1",
+        )
+        .bind(reservation.ledger_id)
+        .fetch_one(&pool)
+        .await
+        .expect("riga della prenotazione");
+        assert_eq!(riga.get::<String, _>("status"), "released");
+        let details: Value = riga.get("details");
+        assert_eq!(details["intent"], "chat", "details cancellati dal rilascio");
+        assert_eq!(details["profile_id"], "p-1");
+        // E una chiamata mai avvenuta non costa: 9.0 di stima vanno a zero.
+        assert!(riga.get::<f64, _>("total_cost").abs() < 1e-9);
+    }
+
+    /// Il vincolo da non rompere: la prenotazione non serve solo a contabilizzare,
+    /// e' il gate delle QUOTE prima della chiamata.
+    ///
+    /// Il test percorre le tre fasi con la stessa quota: prenotazione che occupa
+    /// (PRIMA della chiamata), rilascio, consumo che continua a essere visto
+    /// (DOPO la chiamata, dalla riga del gateway). Le due asserzioni di rifiuto
+    /// da sole non basterebbero — passerebbero anche se il consumo fosse contato
+    /// DUE volte — per questo in mezzo c'e' una prenotazione che deve RIUSCIRE:
+    /// e' quella a dimostrare che il rilascio non lascia un consumo fantasma.
+    ///
+    /// MUTAZIONE: con la doppia finalizzazione pre-fix il consumo pesa 4000
+    /// token invece di 2000 e la terza prenotazione viene respinta — verificato:
+    /// `consumo contato due volte ... errore: Some(quota_exceeded:project:token_limit)`.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn la_quota_vede_il_consumo_prima_e_dopo_la_chiamata(pool: PgPool) {
+        let (user, project, run) = seed_identita(&pool).await;
+        seed_listino(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_quota_policies \
+                 (scope_type, project_id, token_limit, valid_from, valid_to) \
+             VALUES ('project', $1, 3000, NOW() - INTERVAL '1 hour', NOW() + INTERVAL '1 hour')",
+        )
+        .bind(project)
+        .execute(&pool)
+        .await
+        .expect("seed quota");
+
+        let prenota = |tokens: i32| {
+            let pool = pool.clone();
+            async move {
+                reserve_usage(
+                    &pool, user, project, "anthropic", "claude-x", tokens, 0,
+                    json!({ "feature": "quota" }),
+                )
+                .await
+            }
+        };
+
+        // PRIMA della chiamata: la prenotazione occupa quota.
+        let reservation = prenota(2000).await.expect("prima prenotazione");
+        let sforata = prenota(2000).await;
+        assert!(
+            sforata.is_err(),
+            "2000 gia' prenotati + 2000 sfora il limite di 3000: la prenotazione \
+             DEVE occupare quota anche prima che la chiamata sia partita"
+        );
+
+        // La chiamata: il gateway scrive la sua riga, mcp-core rilascia.
+        let entry = riga_gia_scritta_dal_gateway(&pool, user, project, run, 2000, 0.002).await;
+        settle_usage(
+            &pool,
+            &reservation,
+            run,
+            &UsageNumbers::new(2000, 0, 0, 0),
+            Some(&entry),
+        )
+        .await
+        .expect("chiusura contabile");
+
+        // DOPO: il consumo e' ancora visto, ma UNA volta sola. 2000 usati su
+        // 3000: 1000 devono ancora passare.
+        let residuo = prenota(1000).await;
+        assert!(
+            residuo.is_ok(),
+            "consumo contato due volte: dopo il rilascio il ledger deve pesare 2000 \
+             token (la riga del gateway), non 4000 — errore: {:?}",
+            residuo.err()
+        );
+        // E il limite resta un limite.
+        let oltre = prenota(1).await;
+        assert!(
+            oltre.is_err(),
+            "3000/3000 esauriti: la quota deve continuare a respingere dopo la chiamata"
         );
     }
 }

@@ -355,6 +355,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger_entry: None,
         }
     }
 
