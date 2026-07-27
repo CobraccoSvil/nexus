@@ -10,7 +10,11 @@ pub(crate) async fn run_turn(
     request_message_id: Uuid,
     active_files: Vec<String>,
     system_context: Option<String>,
-    provider_override: Option<String>,
+    // Provider scelto dall'utente CON la forza del vincolo (preferenza o pin),
+    // risolto dal punto unico `ProviderChoice::resolve` al confine HTTP: qui
+    // viaggia gia' deciso, cosi' nessun livello intermedio puo' promuovere una
+    // preferenza a vincolo duro.
+    provider_choice: ProviderChoice,
     model_override: Option<String>,
     automation_mode: AutomationMode,
     attachments: Vec<ChatAttachment>,
@@ -31,7 +35,7 @@ pub(crate) async fn run_turn(
                 active_files,
                 session_id: Some(session_id.to_string()),
                 request_message_id: Some(request_message_id.to_string()),
-                provider_override,
+                provider_choice,
                 model_override,
                 automation_mode,
                 attachments,

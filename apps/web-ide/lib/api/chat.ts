@@ -1,4 +1,8 @@
 import { API_BASE, fetchJson, fetchJsonWithRetry } from "./_shared";
+// Vocabolario della forza del vincolo sul provider: vive nel punto unico che lo
+// decide (il composer), qui si importa solo il TIPO — cosi' il wire e la UI non
+// possono divergere sui due identificatori canonici.
+import type { ProviderOverrideMode } from "../../components/chat/provider-choice-logic";
 
 export interface ChatSessionSummary {
   id: string;
@@ -10,9 +14,12 @@ export interface ChatSessionSummary {
   lastMessagePreview?: string;
   createdAt: string;
   updatedAt: string;
-  /** Pin provider/modello per-sessione (chat_sessions.preferred_provider/
-   *  preferred_model): il dropdown della chat si re-idrata da qui al mount e
-   *  al cambio tab, cosi' il pin sopravvive al refresh della pagina. */
+  /** PREFERENZA provider/modello per-sessione (chat_sessions.preferred_provider/
+   *  preferred_model): il dropdown della chat si re-idrata da qui al mount e al
+   *  cambio tab, cosi' la scelta sopravvive al refresh della pagina.
+   *  Preferenza e non pin: il vincolo duro non si eredita da una sessione
+   *  ripresa (lo darebbe a una richiesta per cui nessuno l'ha chiesto). Vedi
+   *  `ProviderChoice::resolve` lato backend. */
   preferredProvider?: string | null;
   preferredModel?: string | null;
 }
@@ -120,6 +127,13 @@ export interface SendChatMessageOptions {
   profileId?: string;
   activeFiles?: string[];
   providerOverride?: string;
+  /** Quanto vincola `providerOverride` (identificatori canonici, come
+   *  automationMode/supervisorMode): "preferred" = suggerimento, il routing puo'
+   *  scegliere un altro provider; "pinned" = vincolo duro, la richiesta va solo
+   *  a quel provider e non ripiega. E' il pulsante "Forza" del composer, che
+   *  prima non arrivava mai al backend. Assente = "preferred" lato server:
+   *  nessuna superficie eredita un vincolo che non ha chiesto. */
+  providerOverrideMode?: ProviderOverrideMode;
   modelOverride?: string;
   automationMode?: "study" | "confirm" | "automatic";
   supervisorMode?: "none" | "anomaly" | "interleaved" | "continuous";
@@ -315,6 +329,10 @@ export async function sendChatMessage(
       profileId: options.profileId ?? "default",
       activeFiles: options.activeFiles ?? [],
       providerOverride: options.providerOverride,
+      // Dichiarato SEMPRE quando il chiamante lo conosce: e' l'informazione che
+      // distingue "parti da qui" da "vai solo qui". Assente = il backend legge
+      // "preferred" (mai un vincolo non richiesto).
+      providerOverrideMode: options.providerOverrideMode,
       modelOverride: options.modelOverride,
       // Niente default mascherante: se il valore manca si invia undefined (omesso
       // dal JSON) e il backend usa la modalita' persistita della sessione
@@ -366,6 +384,7 @@ export async function resendChatMessage(
       profileId: options.profileId ?? "default",
       activeFiles: options.activeFiles ?? [],
       providerOverride: options.providerOverride,
+      providerOverrideMode: options.providerOverrideMode,
       modelOverride: options.modelOverride,
       automationMode: options.automationMode,
       attachments: options.attachments ?? [],

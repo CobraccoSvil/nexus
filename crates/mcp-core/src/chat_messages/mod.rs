@@ -18,7 +18,10 @@ use crate::{
         normalize_text, parse_project_id, parse_user_id, ApiError, ApiResult,
     },
     chat_sessions::{load_session_context, update_user_active_project},
-    orchestrator::{AutomationMode, ChatAttachment, OrchestratorRequest, OrchestratorResult},
+    orchestrator::{
+        AutomationMode, ChatAttachment, OrchestratorRequest, OrchestratorResult, ProviderChoice,
+        ProviderOverrideMode,
+    },
     profiles::fetch_profile_context,
     projects::load_project_context,
     vector_memory, AppState,
@@ -32,6 +35,14 @@ pub struct SendChatMessageRequest {
     #[serde(default)]
     pub active_files: Vec<String>,
     pub provider_override: Option<String>,
+    /// Quanto vincola `provider_override`: identificatori canonici (regola N)
+    /// `preferred` (suggerimento, il routing puo' cambiarlo) o `pinned` (vincolo
+    /// duro, nessun ripiego su altri provider). E' il pulsante "Forza" del
+    /// composer, che prima non arrivava mai al backend: senza questo campo il
+    /// backend vedeva solo il NOME del provider e doveva dedurre la forza del
+    /// vincolo. Assente -> `preferred` (vedi `ProviderOverrideMode::try_parse`):
+    /// nessuna superficie eredita un vincolo che non ha chiesto.
+    pub provider_override_mode: Option<String>,
     pub model_override: Option<String>,
     pub automation_mode: Option<String>,
     pub supervisor_mode: Option<String>,

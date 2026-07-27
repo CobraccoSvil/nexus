@@ -478,6 +478,15 @@ impl HasErrorFacts for GatewayHttpError {
 /// motore: la stessa domanda ("che frase mostro per questo errore?") se la pone
 /// anche il confine HTTP della chat, e due copie divergerebbero.
 pub fn rendered_from_error(err: &anyhow::Error) -> RenderedError {
+    // Una resa GIA' FATTA non si ri-deriva: chi l'ha prodotta aveva i fatti
+    // ancora vivi, ed eventualmente sapeva cose che qui non esistono piu' (che
+    // il provider era pinnato dall'utente, per esempio). Senza questo ramo
+    // ri-passerebbe dal `to_string()`, cioe' dal solo `message`, e i rami sotto
+    // — che cercano tipi ormai assenti dalla catena — la degraderebbero al
+    // generico "il servizio AI interno ha risposto con un errore".
+    if let Some(r) = err.chain().find_map(|c| c.downcast_ref::<RenderedError>()) {
+        return r.clone();
+    }
     if let Some(t) = err.chain().find_map(|c| c.downcast_ref::<GatewayTransportError>()) {
         return t.rendered();
     }

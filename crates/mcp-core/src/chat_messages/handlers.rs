@@ -542,11 +542,11 @@ pub async fn send_chat_message(
         } else {
             (None, None)
         };
-    // Override effettivo: esplicito dal client > preferenza di sessione
-    let effective_provider_override = body
-        .provider_override
-        .clone()
-        .or(session_preferred_provider);
+    // Scelta di provider dal PUNTO UNICO (regola L): provider esplicito del
+    // client > preferenza di sessione, e — soprattutto — con la sua FORZA.
+    // Il pulsante "Forza" del composer viaggia qui dentro; la preferenza
+    // persistita sulla sessione resta sempre morbida (vedi ProviderChoice).
+    let provider_choice = provider_choice_from_body(&body, session_preferred_provider.as_deref())?;
     let effective_model_override = body.model_override.clone().or(session_preferred_model);
 
     let profile_id = body
@@ -700,8 +700,8 @@ pub async fn send_chat_message(
                 .current()
                 .ok()
                 .and_then(|m| m.default_models.keys().next().cloned());
-            let check_provider = effective_provider_override
-                .as_deref()
+            let check_provider = provider_choice
+                .provider()
                 .or(matrix_provider.as_deref())
                 .unwrap_or("system");
             if let Some(dlp_msg) =
@@ -762,7 +762,11 @@ pub async fn send_chat_message(
                 supervisor_mode,
                 profile_prompt_block,
                 system_context: system_context.clone(),
-                provider_override: effective_provider_override.clone(),
+                // Il path agentico non pinna (nessun `pin_provider`): il
+                // provider scelto e' il punto di partenza del routing e il
+                // failover cross-provider resta possibile. Gli basta quindi il
+                // NOME, quale che sia la forza del vincolo.
+                provider_override: provider_choice.provider().map(str::to_string),
                 model_override: effective_model_override.clone(),
                 profile_provider: profile_provider.clone(),
                 profile_model: profile_model.clone(),
@@ -818,7 +822,7 @@ pub async fn send_chat_message(
         user_message_id,
         body.active_files.clone(),
         Some(system_context),
-        effective_provider_override,
+        provider_choice,
         effective_model_override,
         automation_mode,
         enrich_attachments_with_ids(
@@ -1442,12 +1446,18 @@ pub async fn resend_chat_message(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
-    let provider_override = body.provider_override.clone().or_else(|| {
+    // Stesso punto unico del path di invio: il provider del client vale con la
+    // forza che il client dichiara, quello RICORDATO dal messaggio originale
+    // vale come preferenza. Il pulsante "Forza" non e' uno stato del messaggio
+    // ma dell'invio: chi rilancia un messaggio di ieri non sta ridando l'ordine
+    // "solo questo fornitore" — se lo vuole, lo rida' dal composer e viaggia in
+    // `providerOverrideMode`.
+    let provider_choice = provider_choice_from_body(
+        &body,
         source_metadata
             .get("providerOverride")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    });
+            .and_then(Value::as_str),
+    )?;
     let model_override = body.model_override.clone().or_else(|| {
         source_metadata
             .get("modelOverride")
@@ -1507,7 +1517,12 @@ pub async fn resend_chat_message(
         "user",
         &source_prompt,
         json!({
-            "providerOverride": provider_override.clone(),
+            // Il NOME del provider, non la forza del vincolo: quel che il
+            // messaggio ricorda vale come preferenza per un eventuale resend
+            // successivo (vedi ProviderChoice::resolve). Scriverci "pinned"
+            // creerebbe la catena che il pin non deve avere: un ordine dato una
+            // volta che si ripete da solo.
+            "providerOverride": provider_choice.provider(),
             "modelOverride": model_override.clone(),
             "automationMode": automation_mode.as_str(),
             "attachments": attachments_metadata,
@@ -1595,7 +1610,7 @@ pub async fn resend_chat_message(
                 supervisor_mode: SupervisorMode::default(),
                 profile_prompt_block,
                 system_context: system_context_str,
-                provider_override: provider_override.clone(),
+                provider_override: provider_choice.provider().map(str::to_string),
                 model_override: model_override.clone(),
                 profile_provider: None,
                 profile_model: None,
@@ -1645,7 +1660,7 @@ pub async fn resend_chat_message(
         resent_user_message_id,
         body.active_files.clone(),
         None,
-        provider_override,
+        provider_choice,
         model_override,
         automation_mode,
         attachments,
@@ -2404,7 +2419,9 @@ pub async fn legacy_chat(
         user_message_id,
         body.active_files.clone(),
         None,
-        None,
+        // Rotta legacy senza dropdown provider: nessuna scelta dell'utente,
+        // decide il routing.
+        ProviderChoice::Auto,
         None,
         AutomationMode::Confirm,
         Vec::new(),
