@@ -22,9 +22,11 @@ import { Fragment, useCallback, useMemo, useState, type CSSProperties, type Reac
 
 import { AdminModal } from "../../../components/admin/AdminModal";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
+import { FigureWizard } from "../../../components/admin/FigureWizard";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
 import {
   listSubagentDefinitions,
+  mutateKindsWhitelist,
   toSubagentUpsertBody,
   upsertSubagentDefinition,
   type SubagentDefinition,
@@ -235,6 +237,23 @@ export default function CouncilPage() {
   const [rowError, setRowError] = useState<string | null>(null);
   const [promptEditor, setPromptEditor] = useState<PromptEditorState | null>(null);
   const [descEditor, setDescEditor] = useState<DescEditorState | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+
+  /** Ripara il badge "Fuori whitelist dispatcher": senza il kind nel CSV
+   *  orchestrator.subagent_kinds_whitelist la figura e' definita ma il dispatcher
+   *  la rifiuta (Guard 1), quindi non viene mai convocata. */
+  const addToWhitelist = async (kind: string) => {
+    setRowBusy(kind);
+    setRowError(null);
+    try {
+      await mutateKindsWhitelist({ add: [kind] });
+      await reloadSettings();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : "Errore aggiornamento whitelist");
+    } finally {
+      setRowBusy(null);
+    }
+  };
 
   const toggleEnabled = async (member: CouncilMember) => {
     const def = member.definition;
@@ -427,11 +446,20 @@ export default function CouncilPage() {
         title="Consiglio delle Competenze"
         description="Figure advisory read-only convocate prima dell'esecuzione dei task sensibili. Da qui si modificano i prompt che le descrivono (con versionamento), l'abilitazione e la composizione dei gruppi."
         action={
-          <button type="button" onClick={reloadAll} style={btnStyle(tc, "ghost")}>
-            Ricarica
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={() => setWizardOpen(true)} style={btnStyle(tc, "primary")}>
+              Nuova figura
+            </button>
+            <button type="button" onClick={reloadAll} style={btnStyle(tc, "ghost")}>
+              Ricarica
+            </button>
+          </div>
         }
       />
+
+      {/* Creazione transazionale dei 4 pezzi (definition + prompt + purpose +
+          whitelist): reloadAll perche' la figura tocca sia le definitions sia i settings. */}
+      <FigureWizard open={wizardOpen} onClose={() => setWizardOpen(false)} onCreated={() => reloadAll()} />
 
       {/* ── Sezione A: stato del consiglio ─────────────────────────────────── */}
       <SectionShell
@@ -524,10 +552,7 @@ export default function CouncilPage() {
                           <span>
                             <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>{def.modelPurpose}</span>
                             {m.purposeModel ? (
-                              <span style={{ color: tc.textMuted, fontSize: 11 }}>
-                                {" "}
-                                · {m.purposeModel.tier ?? "—"} · {m.purposeModel.provider}/{m.purposeModel.model_id}
-                              </span>
+                              <ModelloRisolto tc={tc} pm={m.purposeModel} />
                             ) : null}
                           </span>
                         ) : (
@@ -544,7 +569,20 @@ export default function CouncilPage() {
                           ) : (
                             <Badge tc={tc} tone="warn" label="Definizione mancante" />
                           )}
-                          {def && !m.inWhitelist ? <Badge tc={tc} tone="warn" label="Fuori whitelist dispatcher" /> : null}
+                          {def && !m.inWhitelist ? (
+                            <>
+                              <Badge tc={tc} tone="warn" label="Fuori whitelist dispatcher" />
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => void addToWhitelist(m.kind)}
+                                style={btnStyle(tc, "ghost", busy)}
+                                title="Aggiunge il kind a orchestrator.subagent_kinds_whitelist: senza, il dispatcher non lo convoca mai"
+                              >
+                                {busy ? "…" : "Aggiungi alla whitelist"}
+                              </button>
+                            </>
+                          ) : null}
                           {def && !m.hasAdvisoryVerdict ? <Badge tc={tc} tone="warn" label="Senza advisory_verdict" /> : null}
                         </div>
                       </td>
@@ -966,6 +1004,72 @@ function Badge({ tc, label, tone }: { tc: ThemeColors; label: string; tone: "ok"
       }}
     >
       {label}
+    </span>
+  );
+}
+
+/**
+ * Il modello di una figura: quello che RISPONDE, non quello configurato.
+ *
+ * Perche' esiste. Questa colonna mostrava `provider/model_id` della riga
+ * `nexus_purpose_model`, ma quando il purpose ha un `tier` il resolver e'
+ * tier-only e quel campo lo IGNORA. Misurato il 2026-07-16: il pannello
+ * dichiarava `deepseek/deepseek-v4-flash` per cinque figure che giravano su
+ * `groq/gpt-oss-20b` — agentic_index 3.1 contro 31.1. Chi guardava la pagina
+ * per capire perche' il consiglio rispondeva male leggeva un dato che nessuno
+ * usa: un pannello che mostra la configurazione invece dell'effetto non e'
+ * incompleto, e' fuorviante.
+ *
+ * Il campo statico resta visibile solo quando e' davvero la risposta (purpose
+ * senza tier); altrimenti e' dichiarato "ignorato" invece di essere spacciato
+ * per la verita'.
+ */
+function ModelloRisolto({ tc, pm }: { tc: ThemeColors; pm: PurposeModelEntry }) {
+  const stile: CSSProperties = { color: tc.textMuted, fontSize: 11 };
+  // Purpose statico: nessun tier -> provider/model_id SONO la risposta.
+  if (!pm.tier) {
+    return (
+      <span style={stile}>
+        {" "}
+        · statico · {pm.provider}/{pm.model_id}
+      </span>
+    );
+  }
+  // Tier-based: la risposta la da' il resolver.
+  const r = pm.resolved;
+  // Lo scostamento e' un dato STRUTTURATO del servizio (regola M): non si
+  // deduce dal confronto dei tier, si legge dal rationale.
+  const sceso = r?.rationale.includes(":degraded_to=");
+  const salito = r?.rationale.includes(":upgraded_to=");
+  return (
+    <span style={stile}>
+      {" "}
+      · {pm.tier}
+      {r ? (
+        <>
+          {" · "}
+          <span
+            title={r.rationale}
+            style={{
+              color: sceso ? tc.error : tc.text,
+              fontWeight: sceso || salito ? 600 : 400,
+            }}
+          >
+            {r.provider}/{r.model}
+          </span>
+          {sceso ? (
+            <span title={r.rationale} style={{ color: tc.error }}>
+              {" "}
+              (sotto il tier)
+            </span>
+          ) : null}
+          {salito ? <span title={r.rationale}> (sopra il tier)</span> : null}
+        </>
+      ) : (
+        <span style={{ color: tc.error }} title="Nessun modello risolvibile ora: catalog, gate di qualificazione o provider in cooldown">
+          {" · non risolvibile ora"}
+        </span>
+      )}
     </span>
   );
 }

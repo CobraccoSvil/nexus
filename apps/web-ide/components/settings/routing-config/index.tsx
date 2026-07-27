@@ -35,6 +35,7 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   // Provider e modelli dal registry/catalog (fonte unica, regola G): niente piu'
   // lista hardcoded a 5. Fallback ai noti finche' il fetch non completa.
   const [providers, setProviders] = useState<string[]>(FALLBACK_PROVIDERS);
+  const [providersError, setProvidersError] = useState<string | null>(null);
   const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
   const [config, setConfig] = useState<RoutingConfigState>(() => buildRoutingState(settings, FALLBACK_PROVIDERS));
   const [purposeLoading, setPurposeLoading] = useState(false);
@@ -69,19 +70,28 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   // partecipa legittimamente alle catene) e i modelli abilitati per provider.
   useEffect(() => {
     let active = true;
-    Promise.all([
-      getProviderRegistry().catch(() => ({ providers: [] })),
-      getModels().catch(() => ({ models: [] })),
-    ]).then(([reg, cat]) => {
-      if (!active) return;
-      const names = (reg.providers ?? []).filter((p) => p.isActive).map((p) => p.name);
-      if (names.length > 0) setProviders(names);
-      const byProvider: Record<string, string[]> = {};
-      for (const m of cat.models ?? []) {
-        (byProvider[m.provider] ??= []).push(m.model);
-      }
-      setModelsByProvider(byProvider);
-    });
+    Promise.all([getProviderRegistry(), getModels()])
+      .then(([reg, cat]) => {
+        if (!active) return;
+        const names = (reg.providers ?? []).filter((p) => p.isActive).map((p) => p.name);
+        if (names.length > 0) setProviders(names);
+        const byProvider: Record<string, string[]> = {};
+        for (const m of cat.models ?? []) {
+          (byProvider[m.provider] ??= []).push(m.model);
+        }
+        setModelsByProvider(byProvider);
+        setProvidersError(null);
+      })
+      .catch((e: unknown) => {
+        // L'errore era inghiottito da due `.catch(() => vuoto)`: la pagina
+        // restava sui cinque provider storici di FALLBACK_PROVIDERS e non
+        // mostrava groq, openrouter o vertex, senza che nulla lo segnalasse.
+        // Chi configurava il routing concludeva che quei provider non ci fossero.
+        if (!active) return;
+        setProvidersError(
+          e instanceof Error ? e.message : "Registry provider non raggiungibile",
+        );
+      });
     return () => { active = false; };
   }, []);
 
@@ -135,10 +145,12 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         }),
       });
       const payload = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      if (payload && payload.status && payload.status !== "ok") {
-        const errors = Array.isArray(payload.errors) ? payload.errors.join(" | ") : "Errore salvataggio";
-        throw new Error(errors);
+      // L'esito e' lo status HTTP (il backend risponde 500 se anche una sola
+      // chiave e' stata rifiutata); il body serve solo a dire QUALE, per il
+      // display. Prima il 200-sempre rendeva il controllo su payload.status
+      // l'unico presidio, e il gemello saveRouting non ce l'aveva affatto.
+      if (!res.ok) {
+        throw new Error(payload?.error ?? `HTTP ${res.status}`);
       }
       setNexusPctSaved(true);
       setTimeout(() => setNexusPctSaved(false), 2000);
@@ -177,7 +189,14 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         }),
       });
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Difetto corretto: qui `res.ok` era l'unico controllo, e bulk_update
+      // rispondeva 200 anche quando il DB rifiutava ogni chiave (l'esito viveva
+      // solo in payload.status/errors, che questa funzione non leggeva): il
+      // pannello mostrava "Salvato" con il DB invariato.
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        throw new Error(payload?.error ?? `HTTP ${res.status}`);
+      }
 
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -273,6 +292,23 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
             }}>
 
             {error}
+          </div>
+        )}
+
+        {providersError && (
+          <div
+            className="text-base"
+            style={{
+              padding: "10px 14px",
+              marginBottom: 16,
+              borderRadius: 8,
+              border: `1px solid ${tc.error}`,
+              background: resolved === "dark" ? "#2d1215" : "#fef2f2",
+              color: "var(--color-error)",
+            }}>
+            Elenco provider non aggiornato: {providersError}. La pagina mostra i
+            provider storici e potrebbe ometterne di configurati — ricarica prima
+            di salvare il routing.
           </div>
         )}
 

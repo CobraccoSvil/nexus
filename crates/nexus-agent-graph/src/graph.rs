@@ -58,9 +58,10 @@
 //!
 //! L'edge `understanding -> {planner|executor}` delega al PUNTO UNICO
 //! [`crate::nodes::PlannerConfig::is_eligible`] (regola L: non re-implementiamo
-//! la decisione). La variante `is_eligible_adaptive` Python (segnali classifier)
-//! e' un superset OPZIONALE non ancora portato (come il classifier LLM del
-//! `RouterNode`): qui si usa il gate base, comportamento definito e testabile.
+//! la decisione), che decide su `behavior_mode`, `user_intent` e `token_budget`.
+//! Non esiste una variante che pesi anche i segnali fini del classifier
+//! (complexity, agentic_score): quei segnali arrivano nello stato ma questo gate
+//! non li legge.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,13 +107,14 @@ pub struct AgentGraphNodes {
     /// Dispatch dei tool pendenti (loop agentico).
     pub tool_dispatch: Arc<AgentGraphNode>,
     /// Meta-reasoner di recovery-da-stallo (superstep dedicato; self-loop verso
-    /// l'executor). Inerte a flag OFF (porta `MetaReasonerPort` che ritorna
-    /// `Ok(None)`).
+    /// l'executor). E' raggiunto quando l'executor emette `StallReason` (gate
+    /// `agent.stall_recovery.enabled`); se la porta `MetaReasonerPort` ritorna
+    /// `Ok(None)` il superstep gira a vuoto e rientra senza mossa.
     pub stall_recovery: Arc<AgentGraphNode>,
     /// Scale-controller (superstep dedicato; self-loop verso l'executor). Gemello di
-    /// `stall_recovery`. Inerte a flag OFF (`agent.scale.enabled`): la porta
-    /// `MetaReasonerPort::assess_scale` ritorna `Ok(None)` e nessun detector emette
-    /// `ScaleReason`, quindi il nodo non e' mai raggiunto (bit-identico).
+    /// `stall_recovery`. E' raggiunto quando l'executor emette `ScaleReason` (gate
+    /// `agent.scale.enabled`): senza quel segnale il grafo si comporta come se il
+    /// nodo non ci fosse.
     pub scale_control: Arc<AgentGraphNode>,
     /// Supervisore worker (monitoraggio periodico post tool_dispatch).
     pub supervisor: Arc<AgentGraphNode>,
@@ -120,6 +122,9 @@ pub struct AgentGraphNodes {
     pub verifier: Arc<AgentGraphNode>,
     /// Verifica E2E pre-chiusura.
     pub final_gate: Arc<AgentGraphNode>,
+    /// Review adversariale come gate di chiusura (rimando in correzione su
+    /// bocciatura, gemello del final_gate).
+    pub review_gate: Arc<AgentGraphNode>,
     /// Self-reflection (gate sampling).
     pub reflection: Arc<AgentGraphNode>,
     /// Chiusura del run (learning/persistenza).
@@ -143,9 +148,11 @@ pub fn node_target_to_node_id(target: NodeTarget) -> NodeId {
         NodeTarget::ScaleControl => NodeId::ScaleControl,
         // Self-loop G1 nativo nel motore (no nodo passthrough, regola H).
         NodeTarget::G1Continue => NodeId::Executor,
-        // graph.py: il target "learner" delle route_after_* va al nodo reflection
-        // (reflection -> learner -> END). Punto di chiusura del run.
-        NodeTarget::Learner => NodeId::Reflection,
+        // graph.py: il target "learner" delle route_after_* chiudeva su
+        // reflection; ora la chiusura ONESTA passa PRIMA dal ReviewGate
+        // (review_gate -> reflection -> learner -> END), che su bocciatura
+        // rimanda in correzione invece di lasciar chiudere un lavoro bocciato.
+        NodeTarget::Learner => NodeId::ReviewGate,
     }
 }
 
@@ -155,7 +162,7 @@ pub fn node_target_to_node_id(target: NodeTarget) -> NodeId {
 /// `PlannerConfig` (per l'eligibilita' planner dell'edge understanding).
 /// Entrambe sono clonate nelle closure (`'static`), come nel runtime reale dove
 /// vengono risolte a monte (regola G).
-fn build_edges(
+pub(crate) fn build_edges(
     routing_cfg: RoutingConfig,
     planner_cfg: PlannerConfig,
     supervisor_cfg: SupervisorConfig,
@@ -202,6 +209,15 @@ fn build_edges(
             ) {
                 return NodeId::FinalGate;
             }
+            // Stessa regola per le FIGURE, il cui deliverable non e' un task
+            // completato ma un giudizio (review_verdict / advisory_verdict /
+            // debate_position): emesso quello, la figura ha finito cio' che le e'
+            // chiesto. Senza questo ramo ricadeva sull'executor e girava a vuoto
+            // fino al wall-clock, dove il verdetto veniva scartato e sostituito da
+            // "[Sub-agent timeout]". Punto unico: declared_role_channel.
+            if crate::routing::declared_role_channel(state).is_some() {
+                return NodeId::FinalGate;
+            }
             NodeId::Executor
         }),
     );
@@ -228,15 +244,30 @@ fn build_edges(
     // stall_recovery -> executor (rientro nel loop agentico dopo il superstep di
     // recovery). Il nodo emette sempre StopReason::StallResolved e torna
     // nell'executor, che consuma la RecoveryMove eventualmente persistita in extra
-    // (self-loop, analogo a `G1Escalated -> executor`). INERTE oggi: nessun
-    // detector emette StallReason, quindi il nodo non e' mai raggiunto.
+    // (self-loop, analogo a `G1Escalated -> executor`). Il nodo e' raggiunto
+    // quando l'executor emette StallReason (gate `agent.stall_recovery.enabled`).
     edges.insert(NodeId::StallRecovery, Edge::Static(NodeId::Executor));
     // scale_control -> executor (self-loop di rientro dopo il superstep di scala,
     // gemello di stall_recovery). Il nodo emette sempre StopReason::ScaleResolved e
     // torna nell'executor, che consuma la ScaleMove eventualmente persistita in extra
-    // (rientro-applicazione, PR-B3). INERTE oggi: nessun detector emette ScaleReason,
-    // quindi il nodo non e' mai raggiunto.
+    // (rientro-applicazione). Il nodo e' raggiunto quando l'executor emette
+    // ScaleReason (gate `agent.scale.enabled`).
     edges.insert(NodeId::ScaleControl, Edge::Static(NodeId::Executor));
+    // review_gate -> executor (bocciatura rimandata in correzione, stesso
+    // predicato del final_gate: punto unico gate_rimanda_in_correzione) oppure
+    // -> reflection (chiusura). ATTENZIONE: il ramo di chiusura punta a
+    // NodeId::Reflection ESPLICITO, mai via node_target_to_node_id(Learner) --
+    // quella mappatura ora porta QUI e creerebbe un self-loop infinito.
+    edges.insert(
+        NodeId::ReviewGate,
+        Edge::conditional(|state: &AgentState| {
+            if crate::routing::gate_rimanda_in_correzione(state) {
+                NodeId::Executor
+            } else {
+                NodeId::Reflection
+            }
+        }),
+    );
     // reflection -> learner -> END (chiusura del run).
     edges.insert(NodeId::Reflection, Edge::Static(NodeId::Learner));
     edges.insert(NodeId::Learner, Edge::End);
@@ -342,6 +373,7 @@ fn build_node_map(nodes: AgentGraphNodes) -> HashMap<NodeId, Arc<AgentGraphNode>
     map.insert(NodeId::Supervisor, nodes.supervisor);
     map.insert(NodeId::Verifier, nodes.verifier);
     map.insert(NodeId::FinalGate, nodes.final_gate);
+    map.insert(NodeId::ReviewGate, nodes.review_gate);
     map.insert(NodeId::Reflection, nodes.reflection);
     map.insert(NodeId::Learner, nodes.learner);
     map
@@ -394,14 +426,14 @@ mod tests {
 
     use crate::nodes::{
         ClarifyConfig, ClarifyOrExpandNode, ExecutorConfig, ExecutorNode, FinalGateConfig,
-        FinalGateNode, LearnerConfig, LearnerNode, PlannerNode, ReflectionConfig, ReflectionNode,
+        FinalGateNode, LearnerNode, PlannerNode, ReflectionConfig, ReflectionNode,
         RouterNode, ScaleControlNode, StallRecoveryNode, SupervisorNode, TodoRunnerConfig,
         TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
         UnderstandingNode, VerifierConfig, VerifierNode,
     };
     use crate::runtime::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
-        EscalationPort, ExecMode, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore,
+        EscalationPort, LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore,
         ModelUpscalePort, NextActionsDeriver, PortError, RunControlStore, SummaryStore, TodoStore,
         ToolCall, ToolExecutor, ToolOutcome, VerifierRunStore,
     };
@@ -411,7 +443,7 @@ mod tests {
         StubNextActionsDeriver, StubRunControlStore, StubSummaryStore, StubTodoStore,
         StubVerifierRunStore,
     };
-    use crate::runtime::StubMetaReasonerPort;
+    use crate::runtime::{StubMetaReasonerPort, StubReviewPanelPort};
     use crate::state::{AutomationMode, Message, MessageContent, StateDelta, StopReason, ToolUse};
 
     // ── Checkpointer in-memory (zero DB nel test) ─────────────────────────────
@@ -549,7 +581,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for TrackingStubTool {
-        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             self.exec_count.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutcome {
                 tool_call_id: call.id,
@@ -589,7 +621,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for StubToolForGraph {
-        async fn execute(&self, call: ToolCall, _mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             Ok(ToolOutcome {
                 tool_call_id: call.id,
                 content: json!("contenuto del file letto"),
@@ -664,6 +696,7 @@ mod tests {
                 TodoRunnerConfig::default(),
                 todos.clone(),
                 tools.clone(),
+                run_control.clone(),
             )),
             executor: Arc::new(ExecutorNode::new(
                 exec_cfg,
@@ -712,12 +745,20 @@ mod tests {
                 stub_criteria(),
                 meta_steps.clone(),
             )),
+            review_gate: Arc::new(crate::nodes::review_gate::ReviewGateNode::new(
+                crate::nodes::review_gate::ReviewGateConfig {
+                    enabled: false, // fixture: gate inerte nei test topologici
+                    max_cycles: 1,
+                },
+                Arc::new(StubReviewPanelPort),
+                meta_steps.clone(),
+            )),
             reflection: Arc::new(ReflectionNode::new(ReflectionConfig::default())),
-            learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
+            learner: Arc::new(LearnerNode::new()),
         }
     }
 
-    /// Ctx con il gateway scriptato + stub. `shadow=false`: run primario (Real).
+    /// Ctx con il gateway scriptato + stub.
     fn ctx_with(
         llm: Arc<dyn LlmGateway>,
         tools: Arc<dyn ToolExecutor>,
@@ -734,7 +775,7 @@ mod tests {
             run_id,
             session_id: Uuid::new_v4(),
             thread_id: run_id,
-            shadow: false,
+            advisory_gate: None,
         }
     }
 
@@ -760,15 +801,17 @@ mod tests {
 
     #[test]
     fn mapping_g1continue_e_learner_strutturale() {
-        // Le due differenze strutturali volute (regola H): g1_continue -> executor
-        // (self-loop nativo), learner -> reflection (graph.py rimappa).
+        // Le differenze strutturali volute (regola H): g1_continue -> executor
+        // (self-loop nativo); learner -> REVIEW_GATE (la chiusura onesta passa
+        // dalla review adversariale prima di reflection: su bocciatura il gate
+        // rimanda in correzione invece di lasciar chiudere un lavoro bocciato).
         assert_eq!(
             node_target_to_node_id(NodeTarget::G1Continue),
             NodeId::Executor
         );
         assert_eq!(
             node_target_to_node_id(NodeTarget::Learner),
-            NodeId::Reflection
+            NodeId::ReviewGate
         );
         // Gli altri sono 1:1.
         assert_eq!(
@@ -841,6 +884,62 @@ mod tests {
         assert_eq!(edge.resolve(&AgentState::default()), NodeId::Executor);
     }
 
+    /// REGRESSIONE (il difetto chiesto due volte: "se non superata dovrebbe
+    /// tentare di sistemare"): la chiusura onesta passa dal ReviewGate, e il suo
+    /// edge rimanda all'Executor su bocciatura o prosegue su Reflection.
+    ///
+    /// TRAPPOLA LETALE coperta: la mappatura `NodeTarget::Learner` ora punta a
+    /// ReviewGate; se l'edge del ReviewGate usasse `node_target_to_node_id`
+    /// (invece di Reflection ESPLICITO) il nodo ricircolerebbe su se stesso
+    /// all'infinito. Il test asserisce entrambe le direzioni sul GRAFO REALE.
+    ///
+    /// Lo stato porta SOLO `gate_routing`, il campo che il gate dichiara e che
+    /// l'edge legge. Prima portava `stop_reason: ToolUse` con la didascalia "dal
+    /// delta del nodo": non veniva da nessun nodo, era un letterale, e fissava
+    /// l'assunto che rendeva il difetto invisibile — quel valore lo scrive
+    /// l'executor a ogni turno, quindi il test restava verde mentre in
+    /// produzione l'edge rispediva all'executor anche le review APPROVATE. La
+    /// verifica che attraversa il produttore (nodo reale -> delta -> edge) e'
+    /// `approvazione_chiude_e_non_riconvoca_i_revisori` in `nodes::review_gate`.
+    #[test]
+    fn review_gate_rimanda_o_chiude_senza_ricircolare() {
+        use crate::state::GateRouting;
+        let edges = build_edges(
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+        );
+        // La chiusura onesta (target Learner) entra nel ReviewGate.
+        assert_eq!(
+            node_target_to_node_id(crate::routing::NodeTarget::Learner),
+            NodeId::ReviewGate,
+            "la chiusura deve passare dal gate della review"
+        );
+        let edge = edges.get(&NodeId::ReviewGate).expect("edge review_gate");
+        // Bocciatura rimandata: il gate lo DICHIARA -> Executor.
+        let rimandato = AgentState {
+            gate_routing: Some(GateRouting::RimandaInCorrezione),
+            ..Default::default()
+        };
+        assert_eq!(edge.resolve(&rimandato), NodeId::Executor);
+        // Chiusura (approvato/non applicabile/cap) -> Reflection, MAI ReviewGate.
+        for dichiarazione in [Some(GateRouting::Chiude), None] {
+            let chiude = AgentState {
+                gate_routing: dichiarazione,
+                // Il turno dell'executor che precede il gate lascia sempre
+                // questi due: nessuno dei due deve poter dirottare l'edge.
+                stop_reason: Some(crate::state::StopReason::ToolUse),
+                pending_tool_uses: Some(vec![serde_json::json!({
+                    "type": "tool_use", "id": "t1", "name": "read_file", "input": {}
+                })]),
+                ..Default::default()
+            };
+            let next = edge.resolve(&chiude);
+            assert_eq!(next, NodeId::Reflection, "chiusura su Reflection");
+            assert_ne!(next, NodeId::ReviewGate, "mai un self-loop del gate");
+        }
+    }
+
     #[test]
     fn topologia_copre_ogni_nodo_non_terminale() {
         let edges = build_edges(
@@ -862,6 +961,7 @@ mod tests {
             NodeId::Supervisor,
             NodeId::Verifier,
             NodeId::FinalGate,
+            NodeId::ReviewGate,
             NodeId::Reflection,
             NodeId::Learner,
         ] {
@@ -1258,5 +1358,62 @@ mod tests {
             GraphError::RecursionLimit(limit) => assert_eq!(limit, 12),
             other => panic!("atteso RecursionLimit, ottenuto {other:?}"),
         }
+    }
+
+    /// L'edge post-ToolDispatch chiude anche quando a dichiarare e' una FIGURA.
+    ///
+    /// Attraversa l'edge REALE della produzione (`build_edges` + `Edge::resolve`),
+    /// non una sua imitazione: e' la stessa mappa che il grafo usa a runtime.
+    /// Il difetto che cattura e' quello misurato su verifica-wd: il verdetto era
+    /// gia' stato emesso e accettato, ma il routing riconosceva terminale solo
+    /// `task_complete`, quindi si tornava all'executor e la figura girava a vuoto
+    /// fino al wall-clock, dove il verdetto veniva scartato.
+    #[test]
+    fn edge_tool_dispatch_chiude_anche_sul_verdetto_di_ruolo() {
+        let edges = build_edges(
+            RoutingConfig::default(),
+            PlannerConfig::default(),
+            SupervisorConfig::default(),
+        );
+        let edge = edges.get(&NodeId::ToolDispatch).expect("edge ToolDispatch");
+
+        // Senza alcuna dichiarazione si prosegue: il lavoro non e' finito.
+        let vuoto = AgentState::default();
+        assert_eq!(edge.resolve(&vuoto), NodeId::Executor);
+
+        // Ogni figura chiude sul PROPRIO canale, qualunque sia il giudizio:
+        // anche un "needs_changes" e' il deliverable completo del revisore.
+        for (etichetta, mut s) in [
+            ("review", AgentState::default()),
+            ("advisory", AgentState::default()),
+            ("debate", AgentState::default()),
+        ] {
+            match etichetta {
+                "review" => s.review_verdict = Some(json!({"verdict": "needs_changes"})),
+                "advisory" => s.advisory_verdict = Some(json!({"verdict": "proceed"})),
+                _ => s.debate_position = Some(json!({"stance": "contro"})),
+            }
+            assert_eq!(
+                edge.resolve(&s),
+                NodeId::FinalGate,
+                "una figura che ha dichiarato su {etichetta} deve chiudere, non rientrare nell'executor"
+            );
+        }
+
+        // Il canale di chi ESEGUE resta invariato (nessuna regressione).
+        let esecutore = AgentState {
+            declared_outcome: Some(json!({"outcome": "done"})),
+            ..Default::default()
+        };
+        assert_eq!(edge.resolve(&esecutore), NodeId::FinalGate);
+        let parziale = AgentState {
+            declared_outcome: Some(json!({"outcome": "partial"})),
+            ..Default::default()
+        };
+        assert_eq!(
+            edge.resolve(&parziale),
+            NodeId::Executor,
+            "`partial` e' dichiarazione onesta di lavoro incompleto: prosegue"
+        );
     }
 }

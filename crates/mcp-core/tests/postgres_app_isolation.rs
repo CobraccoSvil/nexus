@@ -8,15 +8,19 @@
 //!   - Le tabelle infrastruttura Nexus (`agent_runs`, `nexus_*`) NON esistano nel
 //!     cluster app.
 //!
-//! Skip se i due cluster non sono raggiungibili (CI senza docker compose up).
+//! Salta se i due cluster non sono raggiungibili (CI senza docker compose up).
+//! Lo skip passa dal punto unico `support::salta`: prima quattro dei sei skip
+//! stampavano il solo `"skip"`, senza dire QUALE cluster mancasse, e nel gate
+//! erano indistinguibili da un'isolation verificata.
 
 use sqlx::{PgPool, Row};
 use std::env;
+use nexus_test_preconditions::db_url_o_salta;
 
 async fn nexus_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://nexus:nexus@localhost:5433/nexus".into());
-    PgPool::connect(&url).await.ok()
+    db_url_o_salta(&url, "cluster nexus (DATABASE_URL / 5433)").await
 }
 
 async fn app_pool() -> Option<PgPool> {
@@ -24,19 +28,13 @@ async fn app_pool() -> Option<PgPool> {
     let url = env::var("NEXUS_APP_ADMIN_URL").unwrap_or_else(|_| {
         "postgres://nexus_admin:nexus_admin_secret@localhost:5434/postgres".into()
     });
-    PgPool::connect(&url).await.ok()
+    db_url_o_salta(&url, "cluster app (NEXUS_APP_ADMIN_URL / 5434)").await
 }
 
 #[tokio::test]
 async fn cluster_app_e_separato_dal_cluster_nexus() {
-    let Some(nexus) = nexus_pool().await else {
-        eprintln!("skip: cluster nexus non raggiungibile");
-        return;
-    };
-    let Some(app) = app_pool().await else {
-        eprintln!("skip: cluster app non raggiungibile (postgres-app:5434 down?)");
-        return;
-    };
+    let Some(nexus) = nexus_pool().await else { return };
+    let Some(app) = app_pool().await else { return };
     // Identifico i cluster via system_identifier (univoco per data directory).
     let nexus_id: i64 =
         sqlx::query_scalar("SELECT system_identifier::bigint FROM pg_control_system()")
@@ -56,14 +54,8 @@ async fn cluster_app_e_separato_dal_cluster_nexus() {
 
 #[tokio::test]
 async fn role_nexus_app_esiste_solo_nel_cluster_app() {
-    let Some(nexus) = nexus_pool().await else {
-        eprintln!("skip");
-        return;
-    };
-    let Some(app) = app_pool().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(nexus) = nexus_pool().await else { return };
+    let Some(app) = app_pool().await else { return };
     // Nel cluster app: deve esistere
     let in_app: i64 =
         sqlx::query_scalar("SELECT COUNT(*)::bigint FROM pg_roles WHERE rolname = 'nexus_app'")
@@ -88,10 +80,7 @@ async fn role_nexus_app_esiste_solo_nel_cluster_app() {
 
 #[tokio::test]
 async fn nexus_app_ha_privilegi_minimali() {
-    let Some(app) = app_pool().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(app) = app_pool().await else { return };
     let row = sqlx::query(
         "SELECT rolsuper, rolcreaterole, rolreplication, rolbypassrls, rolcreatedb
          FROM pg_roles WHERE rolname = 'nexus_app'",
@@ -117,10 +106,7 @@ async fn nexus_app_ha_privilegi_minimali() {
 
 #[tokio::test]
 async fn cluster_app_non_ha_tabelle_infrastruttura_nexus() {
-    let Some(app) = app_pool().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(app) = app_pool().await else { return };
     let proibite = [
         "agent_runs",
         "nexus_agent_plans",

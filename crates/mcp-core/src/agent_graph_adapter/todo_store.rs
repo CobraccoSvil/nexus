@@ -1,11 +1,9 @@
 //! Adapter del trait [`nexus_agent_graph::runtime::ports::TodoStore`].
 //!
-//! IMPLEMENTERA' (FASE 2) l'I/O sui todo del DAG su `nexus_agent_todos` via
-//! `sqlx` (1:1 con `brain/agents/todo_store.py`). INVARIANTE (regola H): `list_todos`
+//! Esegue l'I/O sui todo del DAG su `nexus_agent_todos` via
+//! `sqlx`. INVARIANTE (regola H): `list_todos`
 //! restituisce `depends_on` come `Vec` (cast `::text[]`), MAI una stringa
-//! `"{...}"`, e i todo gia' ordinati per `seq` ASC. Le scritture (`mark_status`,
-//! `increment_iteration_seen`) sono gata `Real` (no-op in `ExecMode::Replay`,
-//! punto unico del gate shadow). La LOGICA DAG resta pura in
+//! `"{...}"`, e i todo gia' ordinati per `seq` ASC. La LOGICA DAG resta pura in
 //! `nexus_agent_graph::decisions::dag_scheduler` (questo adapter isola SOLO il DB).
 
 use async_trait::async_trait;
@@ -13,7 +11,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use nexus_agent_graph::decisions::dag_scheduler::{Todo, TodoStatus};
-use nexus_agent_graph::runtime::ports::{ExecMode, PlanRow, PortError, TodoStore};
+use nexus_agent_graph::runtime::ports::{PlanRow, PortError, TodoStore};
 
 /// Adapter [`TodoStore`] -> `nexus_agent_todos` via `sqlx`.
 pub struct PgTodoStore {
@@ -23,13 +21,82 @@ pub struct PgTodoStore {
     /// Pool meta-DB per le letture di `settings` (config GLOBALE, regola G: non
     /// per-progetto). A flag OFF coincide con `db`.
     meta: PgPool,
+    /// Canali per l'evento live `TodoUpdated` (checklist del piano in chat).
+    /// `None` = store senza eventi (letture, test): la scrittura funziona
+    /// comunque, semplicemente non viene annunciata.
+    events: Option<(nexus_events::ProjectChannels, Uuid)>,
 }
 
 impl PgTodoStore {
     /// Costruisce lo store: `db` = pool del dominio run (todos/plans), `meta` =
-    /// pool meta-DB per la config globale (`settings`).
+    /// pool meta-DB per la config globale (`settings`). Senza canali: nessun
+    /// evento live (va bene per i percorsi di sola lettura e per i test).
     pub fn new(db: PgPool, meta: PgPool) -> Self {
-        Self { db, meta }
+        Self {
+            db,
+            meta,
+            events: None,
+        }
+    }
+
+    /// Variante che ANNUNCIA i cambi di stato dei todo (`TodoUpdated`), cosi' la
+    /// checklist del piano in chat spunta le voci mentre il lavoro procede.
+    ///
+    /// Serve perche' sotto todo-isolation lo stato dei todo lo scrive QUESTO
+    /// adapter (via `TodoRunner`), non il tool `todos` ne' la UI: erano i due soli
+    /// punti che emettevano l'evento, quindi la checklist restava ferma su `[ ]`
+    /// per tutto il run anche a todo completati.
+    pub fn with_events(
+        db: PgPool,
+        meta: PgPool,
+        channels: nexus_events::ProjectChannels,
+        project_id: Uuid,
+    ) -> Self {
+        Self {
+            db,
+            meta,
+            events: Some((channels, project_id)),
+        }
+    }
+
+    /// Annuncia l'AVANZAMENTO AGGREGATO del piano (totale/completati).
+    ///
+    /// `TodoUpdated` dice COSA e' cambiato, non A CHE PUNTO siamo: il contatore
+    /// del piano vuole il totale, e il totale va contato. Il gemello
+    /// `nexus-agent-tools::todos` lo emette gia' accanto a TodoUpdated; qui
+    /// mancava, e sotto todo-isolation questo adapter e' l'UNICO a scrivere lo
+    /// stato -- percio' il contatore restava fermo su "0/N" per tutto il run
+    /// mentre le singole voci si spuntavano regolarmente (misurato su verifica-wd:
+    /// 1 completato su 16 nel DB, "P:0/20" in barra di stato, zero PlanUpdated
+    /// nei log). Best-effort: se il conteggio fallisce le singole voci restano
+    /// comunque annunciate.
+    async fn annuncia_avanzamento_piano(
+        &self,
+        channels: &nexus_events::ProjectChannels,
+        project_id: Uuid,
+        run_id: &str,
+    ) {
+        let Ok(uuid) = Uuid::parse_str(run_id) else {
+            return;
+        };
+        let Ok((totale, completati)) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'completed')              FROM nexus_agent_todos WHERE run_id = $1",
+        )
+        .bind(uuid)
+        .fetch_one(&self.db)
+        .await
+        else {
+            return;
+        };
+        nexus_events::dispatcher::emit(
+            channels,
+            project_id,
+            nexus_events::event::ProjectEvent::PlanUpdated {
+                run_id: run_id.to_string(),
+                total: totale as i32,
+                completed: completati as i32,
+            },
+        );
     }
 }
 
@@ -68,10 +135,23 @@ impl TodoStore for PgTodoStore {
     /// confronto `depends_on` (id come stringa) nelle funzioni pure.
     async fn list_todos(&self, run_id: &str) -> Result<Vec<Todo>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}")))?;
-        let rows = sqlx::query_as::<_, (String, Option<i64>, String, Vec<String>, Vec<String>)>(
+            .map_err(|e| PortError::Tool(format!("list_todos: run_id non UUID: {e}").into()))?;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<i64>,
+                String,
+                Vec<String>,
+                Vec<String>,
+                Option<String>,
+                Option<String>,
+                serde_json::Value,
+            ),
+        >(
             "SELECT id::text, seq::bigint, status, depends_on::text[] AS depends_on, \
-                    write_scope::text[] AS write_scope \
+                    write_scope::text[] AS write_scope, content, priority, \
+                    acceptance_criteria \
              FROM nexus_agent_todos \
              WHERE run_id = $1 \
              ORDER BY seq ASC",
@@ -79,21 +159,35 @@ impl TodoStore for PgTodoStore {
         .bind(run_uuid)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("list_todos: query fallita: {e}").into()))?;
         Ok(rows
             .into_iter()
-            .map(|(id, seq, status, depends_on, write_scope)| Todo {
-                id,
-                status: status_from_db(&status),
-                depends_on,
-                seq,
-                // PR5 (mig project 0006): scope di scrittura dichiarato dal todo,
-                // letto dalla colonna `write_scope` (TEXT[] NOT NULL DEFAULT '{}').
-                // Retrocompat: i todo senza scope hanno '{}' -> Vec vuoto -> il
-                // gating dell'isolamento a valle (dispatch_wave -> subtasks_are_disjoint)
-                // degrada a sequenziale (comportamento invariato).
-                write_scope,
-            })
+            .map(
+                |(id, seq, status, depends_on, write_scope, content, priority, criteria)| Todo {
+                    id,
+                    status: status_from_db(&status),
+                    depends_on,
+                    seq,
+                    // Testo/priorita' del todo: trasportati per il meta-step "plan"
+                    // (presentazione nel nastro), non usati dallo scheduling DAG.
+                    content,
+                    priority,
+                    // PR5 (mig project 0006): scope di scrittura dichiarato dal todo,
+                    // letto dalla colonna `write_scope` (TEXT[] NOT NULL DEFAULT '{}').
+                    // Retrocompat: i todo senza scope hanno '{}' -> Vec vuoto -> il
+                    // gating dell'isolamento a valle (dispatch_wave -> subtasks_are_disjoint)
+                    // degrada a sequenziale (comportamento invariato).
+                    write_scope,
+                    // Criteri di accettazione: la colonna e' JSONB NOT NULL DEFAULT
+                    // '[]', quindi un todo senza criteri da' un array vuoto e il
+                    // verifier prende il ramo di sempre. Finche' questa colonna non
+                    // veniva letta, il verifier NON ne eseguiva mai uno.
+                    acceptance_criteria: match criteria {
+                        serde_json::Value::Array(a) => a,
+                        _ => Vec::new(),
+                    },
+                },
+            )
             .collect())
     }
 
@@ -102,14 +196,14 @@ impl TodoStore for PgTodoStore {
     /// riuso intent/mode-aware). `None` = nessun piano (prima pianificazione).
     async fn fetch_plan(&self, run_id: &str) -> Result<Option<PlanRow>, PortError> {
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("fetch_plan: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("fetch_plan: run_id non UUID: {e}").into()))?;
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT user_intent, behavior_mode FROM nexus_agent_plans WHERE run_id = $1",
         )
         .bind(run_uuid)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("fetch_plan: query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("fetch_plan: query fallita: {e}").into()))?;
         Ok(row.map(|(user_intent, behavior_mode)| PlanRow {
             user_intent,
             behavior_mode,
@@ -119,55 +213,75 @@ impl TodoStore for PgTodoStore {
     /// Aggiorna lo status di un todo (UPDATE best-effort). 1:1 con
     /// `verifier_node._mark_todo_status` / `dag_scheduler._mark`: incrementa
     /// `verify_failures` quando il nuovo status e' `blocked` (heuristic anti-stall).
-    /// Gata `Real` (no-op in shadow, regola L). Best-effort: errore loggato, `Ok(())`.
+    /// Best-effort: errore loggato, `Ok(())`.
     async fn mark_status(
         &self,
         todo_id: &str,
         status: TodoStatus,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let todo_uuid = match Uuid::parse_str(todo_id) {
             Ok(u) => u,
             Err(_) => return Ok(()),
         };
         let status_str = status_to_db(status);
-        let res = sqlx::query(
+        // `RETURNING` dei due campi che servono all'evento live: sono gia' nella
+        // riga che stiamo scrivendo, quindi non costa una query in piu'.
+        let res = sqlx::query_as::<_, (Option<String>, Option<i32>)>(
             "UPDATE nexus_agent_todos \
              SET status = $1, updated_at = NOW(), \
                  verify_failures = CASE WHEN $1 = 'blocked' \
                                         THEN verify_failures + 1 \
                                         ELSE verify_failures END \
-             WHERE id = $2",
+             WHERE id = $2 \
+             RETURNING run_id::text, seq::int",
         )
         .bind(status_str)
         .bind(todo_uuid)
-        .execute(&self.db)
+        .fetch_optional(&self.db)
         .await;
-        if let Err(e) = res {
-            tracing::warn!(
-                todo_id = %todo_id,
-                status = %status_str,
-                error = %e,
-                "todo_store: mark_status fallito (best-effort)"
-            );
+        match res {
+            Err(e) => {
+                tracing::warn!(
+                    todo_id = %todo_id,
+                    status = %status_str,
+                    error = %e,
+                    "todo_store: mark_status fallito (best-effort)"
+                );
+            }
+            // Nessuna riga aggiornata (todo inesistente): niente da annunciare.
+            Ok(None) => {}
+            Ok(Some((run_id, seq))) => {
+                // ANNUNCIO del cambio di stato: e' quello che fa spuntare la voce
+                // nella checklist del piano in chat mentre il lavoro procede.
+                // Sotto todo-isolation questo adapter e' l'UNICO a scrivere lo
+                // stato, quindi senza questa emissione la checklist restava ferma
+                // su `[ ]` per tutto il run, anche a todo completati.
+                if let Some((channels, project_id)) = &self.events {
+                    let run_id_str = run_id.clone().unwrap_or_default();
+                    nexus_events::dispatcher::emit(
+                        channels,
+                        *project_id,
+                        nexus_events::event::ProjectEvent::TodoUpdated {
+                            run_id: run_id_str.clone(),
+                            todo_id: todo_id.to_string(),
+                            seq,
+                            status: status_str.to_string(),
+                        },
+                    );
+                    self.annuncia_avanzamento_piano(channels, *project_id, &run_id_str)
+                        .await;
+                }
+            }
         }
         Ok(())
     }
 
     /// Incrementa `iteration_seen` dei todo non terminali del run (telemetria
-    /// avanzamento, 1:1 con `todo_store.increment_iteration_seen`). Gata `Real`
-    /// (no-op in shadow). Best-effort.
+    /// avanzamento, 1:1 con `todo_store.increment_iteration_seen`). Best-effort.
     async fn increment_iteration_seen(
         &self,
         run_id: &str,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
             Err(_) => return Ok(()),
@@ -242,14 +356,14 @@ impl TodoStore for PgTodoStore {
         // Content dei todo non e' in `Todo` (forma minimale del grafo): lo leggo
         // per il render leggibile. Mappa id::text -> content.
         let run_uuid = Uuid::parse_str(run_id)
-            .map_err(|e| PortError::Tool(format!("build_reminder_text: run_id non UUID: {e}")))?;
+            .map_err(|e| PortError::Tool(format!("build_reminder_text: run_id non UUID: {e}").into()))?;
         let content_rows = sqlx::query_as::<_, (String, String)>(
             "SELECT id::text, content FROM nexus_agent_todos WHERE run_id = $1",
         )
         .bind(run_uuid)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| PortError::Tool(format!("build_reminder_text: content query fallita: {e}")))?;
+        .map_err(|e| PortError::Tool(format!("build_reminder_text: content query fallita: {e}").into()))?;
         let content_of = |id: &str| -> String {
             content_rows
                 .iter()
@@ -301,34 +415,9 @@ impl TodoStore for PgTodoStore {
 mod tests {
     use super::*;
 
-    async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_agent_plans ( \
-                 run_id UUID PRIMARY KEY, \
-                 user_intent TEXT, \
-                 behavior_mode TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create plans");
-        sqlx::query(
-            "CREATE TABLE nexus_agent_todos ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 seq INTEGER NOT NULL, \
-                 content TEXT NOT NULL, \
-                 status TEXT NOT NULL, \
-                 verify_failures INTEGER NOT NULL DEFAULT 0, \
-                 iteration_seen INTEGER NOT NULL DEFAULT 0, \
-                 depends_on UUID[] NOT NULL DEFAULT '{}', \
-                 write_scope TEXT[] NOT NULL DEFAULT '{}', \
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create todos");
+    /// Tabelle META che il set project NON contiene (la config globale vive nel
+    /// meta-DB, regola G) e che quindi restano a carico del test.
+    async fn create_meta_schema(pool: &PgPool) {
         sqlx::query(
             "CREATE TABLE settings ( \
                  key TEXT PRIMARY KEY, \
@@ -340,6 +429,20 @@ mod tests {
         .expect("create settings");
     }
 
+    /// Preambolo comune: tabelle meta + un run con il suo piano. Ritorna il
+    /// `run_id` su cui i todo sono inseribili.
+    ///
+    /// Il piano non e' decorazione: `nexus_agent_todos.run_id` e' vincolato da
+    /// una FK verso `nexus_agent_plans(run_id)`, quindi un todo senza piano - che
+    /// la vecchia fixture a mano, priva di FK, accettava - in produzione non puo'
+    /// esistere.
+    async fn setup_run_con_piano(pool: &PgPool) -> Uuid {
+        create_meta_schema(pool).await;
+        let run_id = Uuid::new_v4();
+        crate::test_support::seed_plan(pool, run_id, Uuid::new_v4()).await;
+        run_id
+    }
+
     async fn insert_todo(
         pool: &PgPool,
         run_id: Uuid,
@@ -349,9 +452,12 @@ mod tests {
         depends_on: &[Uuid],
     ) -> Uuid {
         let id = Uuid::new_v4();
+        // `project_id` e' NOT NULL nello schema reale: si legge dal piano del run
+        // invece di inventarlo, cosi' piano e todo restano coerenti.
         sqlx::query(
-            "INSERT INTO nexus_agent_todos (id, run_id, seq, content, status, depends_on) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO nexus_agent_todos (id, run_id, project_id, seq, content, status, depends_on) \
+             SELECT $1, $2, p.project_id, $3, $4, $5, $6 \
+             FROM nexus_agent_plans p WHERE p.run_id = $2",
         )
         .bind(id)
         .bind(run_id)
@@ -365,10 +471,9 @@ mod tests {
         id
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn list_todos_cast_depends_on_e_ordine_seq(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let a = insert_todo(&pool, run_id, 1, "primo", "completed", &[]).await;
         // b dipende da a; inserito con seq 2 ma per verificare l'ORDER BY lo
         // inseriamo dopo c (seq 3) per disordinare l'ordine fisico.
@@ -390,24 +495,19 @@ mod tests {
         assert!(todos[1].write_scope.is_empty());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn list_todos_round_trip_write_scope(pool: PgPool) {
         // PR5 (mig project 0006): write_scope persistito e riletto da list_todos.
         // Un todo con scope -> Vec non vuoto; uno senza -> Vec vuoto (DEFAULT '{}').
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         // Todo con scope dichiarato.
-        let scoped = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO nexus_agent_todos (id, run_id, seq, content, status, write_scope) \
-             VALUES ($1, $2, 1, 'con scope', 'pending', $3)",
-        )
-        .bind(scoped)
-        .bind(run_id)
-        .bind(vec!["crates/api/".to_string(), "db/".to_string()])
-        .execute(&pool)
-        .await
-        .expect("insert scoped");
+        let scoped = insert_todo(&pool, run_id, 1, "con scope", "pending", &[]).await;
+        sqlx::query("UPDATE nexus_agent_todos SET write_scope = $2 WHERE id = $1")
+            .bind(scoped)
+            .bind(vec!["crates/api/".to_string(), "db/".to_string()])
+            .execute(&pool)
+            .await
+            .expect("dichiara lo scope del todo");
         // Todo senza scope (colonna omessa -> DEFAULT '{}').
         insert_todo(&pool, run_id, 2, "senza scope", "pending", &[]).await;
 
@@ -423,10 +523,9 @@ mod tests {
         assert!(todos[1].write_scope.is_empty());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn active_todo_preferisce_in_progress(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         insert_todo(&pool, run_id, 1, "a", "completed", &[]).await;
         insert_todo(&pool, run_id, 2, "b", "pending", &[]).await;
         let ip = insert_todo(&pool, run_id, 3, "c", "in_progress", &[]).await;
@@ -435,14 +534,13 @@ mod tests {
         assert_eq!(active.expect("attivo").id, ip.to_string());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn mark_status_real_aggiorna_e_blocked_incrementa_failures(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
-            .mark_status(&t.to_string(), TodoStatus::Blocked, ExecMode::Real)
+            .mark_status(&t.to_string(), TodoStatus::Blocked)
             .await
             .expect("ok");
         let (status, vf): (String, i32) =
@@ -455,34 +553,89 @@ mod tests {
         assert_eq!(vf, 1, "blocked incrementa verify_failures");
     }
 
-    #[sqlx::test]
-    async fn mark_status_replay_e_no_op(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+    /// Il cambio di stato dev'essere ANNUNCIATO, non solo scritto: e' l'evento
+    /// che fa spuntare la voce nella checklist del piano in chat. Sotto
+    /// todo-isolation questo adapter e' l'unico a scrivere lo stato, quindi senza
+    /// emissione la checklist resta ferma su `[ ]` per tutto il run anche a todo
+    /// completati (segnalato dall'utente il 2026-07-22).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn mark_status_annuncia_il_cambio(pool: PgPool) {
+        let run_id = setup_run_con_piano(&pool).await;
         let t = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
-        let store = PgTodoStore::new(pool.clone(), pool.clone());
+        let channels: nexus_events::ProjectChannels =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        let project_id = Uuid::new_v4();
+        let store =
+            PgTodoStore::with_events(pool.clone(), pool.clone(), channels.clone(), project_id);
+
         store
-            .mark_status(&t.to_string(), TodoStatus::Completed, ExecMode::Replay)
+            .mark_status(&t.to_string(), TodoStatus::Completed)
             .await
             .expect("ok");
+
+        assert!(
+            channels.contains_key(&project_id),
+            "il cambio di stato deve essere emesso sul canale del progetto"
+        );
+
+        // Oltre al COSA e' cambiato (TodoUpdated) deve viaggiare anche A CHE
+        // PUNTO siamo (PlanUpdated): senza, il contatore del piano resta fermo a
+        // "0/N" per tutto il run mentre le singole voci si spuntano. Misurato su
+        // verifica-wd: 1 completato su 16 nel DB, "P:0/20" in barra di stato,
+        // zero PlanUpdated nei log. Si leggono gli eventi REALMENTE emessi sul
+        // canale, non una loro imitazione.
+        let mut rx = channels
+            .get(&project_id)
+            .expect("canale del progetto")
+            .tx
+            .subscribe();
+        let t2 = insert_todo(&pool, run_id, 2, "b", "pending", &[]).await;
+        store
+            .mark_status(&t2.to_string(), TodoStatus::Completed)
+            .await
+            .expect("ok");
+        let mut visti_todo = 0;
+        let mut piano: Option<(i32, i32)> = None;
+        while let Ok(env) = rx.try_recv() {
+            match env.payload {
+                nexus_events::event::ProjectEvent::TodoUpdated { .. } => visti_todo += 1,
+                nexus_events::event::ProjectEvent::PlanUpdated {
+                    total, completed, ..
+                } => piano = Some((total, completed)),
+                _ => {}
+            }
+        }
+        assert!(visti_todo >= 1, "TodoUpdated deve essere emesso");
+        assert_eq!(
+            piano,
+            Some((2, 2)),
+            "PlanUpdated deve riportare l'avanzamento AGGREGATO (2 todo, 2 completati)"
+        );
+
+        // Lo store SENZA canali resta valido: scrive e basta (percorsi di sola
+        // lettura e test non devono essere costretti a fornire i canali).
+        let muto = PgTodoStore::new(pool.clone(), pool.clone());
+        muto.mark_status(&t.to_string(), TodoStatus::Blocked)
+            .await
+            .expect("ok anche senza canali");
         let status: String =
             sqlx::query_scalar("SELECT status FROM nexus_agent_todos WHERE id = $1")
                 .bind(t)
                 .fetch_one(&pool)
                 .await
                 .expect("riga");
-        assert_eq!(status, "pending", "in Replay lo status NON cambia");
+        assert_eq!(status, "blocked");
     }
 
-    #[sqlx::test]
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn increment_iteration_seen_solo_non_terminali(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         let p = insert_todo(&pool, run_id, 1, "a", "pending", &[]).await;
         let c = insert_todo(&pool, run_id, 2, "b", "completed", &[]).await;
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         store
-            .increment_iteration_seen(&run_id.to_string(), ExecMode::Real)
+            .increment_iteration_seen(&run_id.to_string())
             .await
             .expect("ok");
         let seen_p: i32 =
@@ -501,19 +654,18 @@ mod tests {
         assert_eq!(seen_c, 0, "completed NON incrementato");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fetch_plan_legge_intent_e_mode(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO nexus_agent_plans (run_id, user_intent, behavior_mode) VALUES ($1, $2, $3)",
-        )
-        .bind(run_id)
-        .bind("fix")
-        .bind("bilanciata")
-        .execute(&pool)
-        .await
-        .expect("insert plan");
+        let run_id = setup_run_con_piano(&pool).await;
+        // Il piano esiste gia' (i NOT NULL reali sono seminati dal preambolo):
+        // il test valorizza i due soli campi che `fetch_plan` legge.
+        sqlx::query("UPDATE nexus_agent_plans SET user_intent = $2, behavior_mode = $3 WHERE run_id = $1")
+            .bind(run_id)
+            .bind("fix")
+            .bind("bilanciata")
+            .execute(&pool)
+            .await
+            .expect("valorizza intent/mode del piano");
         let store = PgTodoStore::new(pool.clone(), pool.clone());
         let plan = store.fetch_plan(&run_id.to_string()).await.expect("ok");
         let plan = plan.expect("piano presente");
@@ -521,10 +673,9 @@ mod tests {
         assert_eq!(plan.behavior_mode.as_deref(), Some("bilanciata"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn build_reminder_none_se_plan_phase_off(pool: PgPool) {
-        create_schema(&pool).await;
-        let run_id = Uuid::new_v4();
+        let run_id = setup_run_con_piano(&pool).await;
         for i in 1..=4 {
             insert_todo(&pool, run_id, i, "x", "pending", &[]).await;
         }
@@ -537,9 +688,9 @@ mod tests {
         assert!(r.is_none(), "feature OFF -> nessun reminder");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn build_reminder_render_quando_attivo_e_sopra_soglia(pool: PgPool) {
-        create_schema(&pool).await;
+        let run_id = setup_run_con_piano(&pool).await;
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES ('orchestrator.plan_phase_enabled', 'true')",
         )
@@ -550,7 +701,6 @@ mod tests {
             .execute(&pool)
             .await
             .expect("set soglia");
-        let run_id = Uuid::new_v4();
         insert_todo(&pool, run_id, 1, "fatto", "completed", &[]).await;
         insert_todo(&pool, run_id, 2, "in corso", "in_progress", &[]).await;
         insert_todo(&pool, run_id, 3, "da fare", "pending", &[]).await;

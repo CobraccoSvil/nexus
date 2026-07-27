@@ -3,156 +3,43 @@
 // Centro notifiche del run (ADR 0037): campanella con contatore + pannello che
 // raccoglie gli eventi salienti del turno (cambio provider, step fallito, attesa
 // conferma). Auto-apertura SOLO per eventi bloccanti (awaiting_confirmation /
-// blocked_needs_input): per gli altri solo badge + pulsazione, senza rubare il
-// focus all'utente.
+// blocked_needs_input): per gli altri solo badge, senza rubare il focus.
 //
 // Le notifiche derivano dal modello ActivityStream (punto unico) + dallo stato
 // del run: nessun parsing di testo (regola M), gli eventi sono gia' strutturati.
 //
 // Stile: inline + useThemeColors, niente Tailwind, niente emoji nei sorgenti.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useDismissOnOutside } from "../../hooks/use-dismiss-on-outside";
+import { useScrollToAnchor } from "../../hooks/use-scroll-to-anchor";
 import { useThemeColors } from "../../lib/theme";
-import { providerBaseColor } from "./provider-badge";
+import { withAlpha } from "../../lib/color";
 import { toolLabel } from "./tool-labels";
-import type { ActivityStream } from "../../lib/use-chat/activity-stream";
+import {
+  filePathFromToolInput,
+  formatStepInput,
+  humanizeToolResult,
+} from "./step-detail-logic";
+import {
+  deriveRunNotifications,
+  hasBlocking,
+  type RunNotification,
+} from "./run-notifications-model";
+import { FigureReportRow } from "./activity-stream";
+import type { ActivityStream, FigureAdvisoryReport } from "../../lib/use-chat/activity-stream";
+import type { AgentPendingAction } from "../../lib/api/agent";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
-export type RunNotificationTone = "info" | "warn" | "block";
+// Il modello dati (tipi + deriveRunNotifications + hasBlocking + BLOCKING_STATUSES)
+// vive nel modulo PURO ./run-notifications-model (regola L: modello vs vista,
+// regola O: testabile con `node --test` senza JSX). Qui resta la sola vista.
+export type { RunNotification } from "./run-notifications-model";
 
-export interface RunNotification {
-  tone: RunNotificationTone;
-  title: string;
-  detail?: string;
-  color: string;
-}
-
-/** Stati del run che richiedono l'attenzione bloccante dell'utente. */
-const BLOCKING_STATUSES: ReadonlySet<string> = new Set([
-  "awaiting_confirmation",
-  "blocked_needs_input",
-]);
-
-/** Deriva le notifiche salienti dal nastro + stato run (segnali strutturati). */
-export function deriveRunNotifications(
-  stream: ActivityStream,
-  runStatus: string | undefined,
-  tc: ThemeColors,
-): RunNotification[] {
-  const out: RunNotification[] = [];
-
-  for (const seg of stream.segments) {
-    // Cambio provider = evento saliente.
-    if (seg.openedBySwitch && seg.switch) {
-      out.push({
-        tone: "warn",
-        title: "Cambio provider",
-        detail: `${seg.switch.fromProvider ?? "?"} -> ${seg.switch.toProvider}${
-          seg.switch.reason ? ` (${seg.switch.reason})` : ""
-        }`,
-        color: providerBaseColor(seg.switch.toProvider),
-      });
-    }
-    // Step fallito = evento saliente.
-    for (const ev of seg.events) {
-      if (ev.type === "tool" && ev.outcome === "err") {
-        out.push({
-          tone: "warn",
-          title: "Passo fallito",
-          detail: `${toolLabel(ev.name)}${typeof ev.exitCode === "number" ? ` (exit ${ev.exitCode})` : ""}`,
-          color: tc.error,
-        });
-      }
-      if (ev.type === "context_overflow") {
-        out.push({
-          tone: "warn",
-          title: "Contesto oltre il limite",
-          detail: ev.detail,
-          color: tc.error,
-        });
-      }
-      if (ev.type === "council_of_competencies") {
-        const failedFigures = ev.figureReports?.filter((r) => r.status !== "advisory_ok") ?? [];
-        const figureDetail =
-          ev.phase === "convening"
-            ? typeof ev.completedCount === "number" &&
-              typeof ev.figureCount === "number" &&
-              ev.figureCount > 0
-              ? `${ev.completedCount}/${ev.figureCount} figure completate`
-              : "Convocazione figure in corso"
-            : ev.degraded && failedFigures.length > 0
-              ? failedFigures.map((r) => `${r.kind}: ${r.detail_message}`).join(" · ")
-              : undefined;
-        out.push({
-          tone: ev.phase === "convening" ? "info" : ev.degraded ? "warn" : "info",
-          title: "Consiglio delle Competenze",
-          detail:
-            figureDetail ??
-            (ev.degraded
-              ? ev.degradationReason ??
-                "Gate attivato ma la convocazione non ha prodotto una sintesi valida."
-              : "Attivato dall'analisi agentica/deterministica della richiesta."),
-          color: ev.degraded ? "#f59e0b" : "#0ea5e9",
-        });
-      }
-      if (ev.type === "multi_provider_panel") {
-        out.push({
-          tone: ev.degraded ? "warn" : "info",
-          title: ev.productName,
-          detail: ev.degraded
-            ? ev.degradationReason ??
-              "Provider distinti insufficienti: panel multi-provider non convocato."
-            : typeof ev.providerCount === "number" && ev.providerCount > 0
-              ? `${ev.providerCount} provider distinti hanno analizzato la richiesta.`
-              : "Analisi parallela su provider/modelli distinti.",
-          color: ev.degraded ? "#f59e0b" : "#6366f1",
-        });
-      }
-    }
-  }
-
-  if (runStatus && BLOCKING_STATUSES.has(runStatus)) {
-    out.push({
-      tone: "block",
-      title:
-        runStatus === "awaiting_confirmation" ? "Attesa conferma" : "Attesa input",
-      detail: "Il run e' in pausa e richiede la tua azione.",
-      color: "#8b5cf6",
-    });
-  }
-
-  // Fan-in async: il run e' sospeso in attesa dei sub-agent in background.
-  // NON e' bloccante per l'utente (non deve agire, solo attendere): tono "info"
-  // e FUORI da BLOCKING_STATUSES cosi' NON auto-apre il pannello rubando il
-  // focus. Il conteggio, se noto, arriva dall'evento awaiting_subagents del
-  // nastro (segnale strutturato, regola M).
-  if (runStatus === "awaiting_subagents") {
-    let count: number | undefined;
-    for (const seg of stream.segments) {
-      for (const ev of seg.events) {
-        if (ev.type === "awaiting_subagents" && typeof ev.count === "number") {
-          count = ev.count;
-        }
-      }
-    }
-    out.push({
-      tone: "info",
-      title: "In attesa dei sub-agent",
-      detail:
-        typeof count === "number" && count > 0
-          ? `${count} sub-agent in background, il run riprende al loro completamento.`
-          : "Il run riprende al completamento dei sub-agent in background.",
-      color: "#8b5cf6",
-    });
-  }
-
-  return out;
-}
-
-/** true se tra le notifiche c'e' almeno un evento bloccante. */
-function hasBlocking(notifications: RunNotification[]): boolean {
-  return notifications.some((n) => n.tone === "block");
+/** Bridge globale gia' esistente (ide-shell.tsx) per aprire un file nell'editor. */
+function openFileInEditor(path: string): void {
+  window.dispatchEvent(new CustomEvent("nexus:editor:open-file", { detail: { path } }));
 }
 
 export function RunNotifications({
@@ -167,7 +54,7 @@ export function RunNotifications({
   stream: ActivityStream;
   runStatus?: string;
   runId?: string;
-  pendingActions?: Array<{ description: string }>;
+  pendingActions?: AgentPendingAction[];
   onConfirm?: (runId: string, approved: boolean) => void;
   isConfirming?: boolean;
   tc: ThemeColors;
@@ -177,6 +64,35 @@ export function RunNotifications({
     [stream, runStatus, tc],
   );
   const [open, setOpen] = useState(false);
+  // Voci "Passo fallito" espanse (indice nella lista renderizzata): mostrano
+  // input strutturato + estratto errore umanizzato (delega a step-detail-logic).
+  const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
+
+  // Stato letto/non-letto (P8): high-water del numero di notifiche gia' viste,
+  // calcolato SOLO sul sottoinsieme MONOTONO (append-only) del nastro. Le voci
+  // di stato run (attesa conferma / sub-agent) sono transitorie — vengono rimosse
+  // al riprendere del run — quindi le ESCLUDIAMO: incluse nel conteggio,
+  // corromperebbero l'high-water mascherando un evento nuovo dopo un blocco.
+  const monotoneCount = useMemo(
+    () => notifications.filter((n) => n.kind !== "run_status").length,
+    [notifications],
+  );
+  const [seen, setSeen] = useState(0);
+  const seenRunRef = useRef<string | undefined>(undefined);
+  // Il conteggio e' per-run: al cambio run l'high-water riparte da zero (le
+  // notifiche del run precedente non sono piu' pertinenti).
+  useEffect(() => {
+    if (seenRunRef.current !== runId) {
+      seenRunRef.current = runId;
+      setSeen(0);
+    }
+  }, [runId]);
+  // Aprendo il pannello tutte le voci correnti diventano "lette"; se ne arrivano
+  // altre mentre e' aperto, restano lette in tempo reale (le stai guardando).
+  useEffect(() => {
+    if (open) setSeen(monotoneCount);
+  }, [open, monotoneCount]);
+  const unread = Math.max(0, monotoneCount - seen);
   const panelRef = useRef<HTMLDivElement>(null);
   const bellRef = useRef<HTMLButtonElement>(null);
   // Traccia se abbiamo gia' auto-aperto per l'attuale ondata di blocco, cosi'
@@ -198,23 +114,98 @@ export function RunNotifications({
     if (!blocking) autoOpenedRef.current = false;
   }, [blocking]);
 
-  // Chiudi al click fuori dal pannello (non blocca il resto della chat).
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (panelRef.current?.contains(target)) return;
-      if (bellRef.current?.contains(target)) return;
+  // Chiudi al click fuori dal pannello (non blocca il resto della chat). Le zone
+  // sono due — pannello e campanello — ed e' il caso per cui il punto unico
+  // accetta piu' ref. Delegando, il pannello guadagna anche la chiusura con Escape.
+  const chiudiPannello = useCallback(() => setOpen(false), []);
+  useDismissOnOutside(open, [panelRef, bellRef], chiudiPannello);
+
+  // Deep-link: click su una voce -> scroll + flash sulla riga esatta del nastro
+  // del run corrente (punto unico use-scroll-to-anchor, regola L). Solo le voci
+  // con un'ancora sono cliccabili; le voci di stato senza riga restano statiche.
+  const scrollToAnchor = useScrollToAnchor();
+  const handleNotificationClick = useCallback(
+    (n: RunNotification) => {
+      if (!runId || !n.anchorId) return;
+      scrollToAnchor(runId, n.anchorId, n.segmentAnchorId, tc.accent);
       setOpen(false);
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [open]);
+    },
+    [runId, scrollToAnchor, tc.accent],
+  );
+
+  const toggleExpand = useCallback((i: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  }, []);
+
+  // Risale al ToolEvent sorgente di una notifica "Passo fallito" (via il
+  // riferimento posizionale `source`) per leggerne input/result/target: campi
+  // gia' presenti nello stream, non ri-derivati (regola M).
+  const toolEventFor = useCallback(
+    (n: RunNotification) => {
+      if (n.kind !== "tool_error" || !n.source || n.source.evIndex == null) return undefined;
+      const ev = stream.segments[n.source.segIndex]?.events[n.source.evIndex];
+      return ev && ev.type === "tool" ? ev : undefined;
+    },
+    [stream],
+  );
+
+  // Risale ai pareri strutturati di una notifica Consiglio/multi-provider (via il
+  // riferimento posizionale) per l'espansione: riusa il renderer FigureReportRow
+  // (regola L) invece di ricomporre i pareri. `titleByProvider` distingue il
+  // panel multi-provider (righe per provider) dal consiglio (righe per figura).
+  const reportsFor = useCallback(
+    (
+      n: RunNotification,
+    ): { reports: FigureAdvisoryReport[]; titleByProvider: boolean } | undefined => {
+      if (!n.source || n.source.evIndex == null) return undefined;
+      const ev = stream.segments[n.source.segIndex]?.events[n.source.evIndex];
+      if (!ev) return undefined;
+      if (ev.type === "council_of_competencies" && ev.figureReports && ev.figureReports.length > 0) {
+        return { reports: ev.figureReports, titleByProvider: false };
+      }
+      if (ev.type === "multi_provider_panel" && ev.providerReports && ev.providerReports.length > 0) {
+        return { reports: ev.providerReports, titleByProvider: true };
+      }
+      return undefined;
+    },
+    [stream],
+  );
 
   if (notifications.length === 0) return null;
 
   const count = notifications.length;
-  const badgeColor = blocking ? "#8b5cf6" : notifications[0]?.color ?? tc.error;
+  // Segnale "nuove" (P8): se ci sono voci non lette la campanella vira
+  // sull'accent, senza rubare il focus (l'auto-apertura resta ai soli blocchi).
+  const bellHighlight = blocking ? "#8b5cf6" : unread > 0 ? tc.accent : undefined;
+  const badgeColor = bellHighlight ?? notifications[0]?.color ?? tc.error;
+
+  const monoBoxStyle: React.CSSProperties = {
+    fontFamily: "var(--font-mono)",
+    fontSize: 10,
+    color: tc.text,
+    background: `${tc.border}30`,
+    borderRadius: 4,
+    padding: "3px 6px",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+    maxHeight: 120,
+    overflowY: "auto",
+  };
+  const smallBtnStyle: React.CSSProperties = {
+    border: `1px solid ${tc.border}`,
+    background: "transparent",
+    color: tc.textSecondary,
+    borderRadius: 5,
+    padding: "2px 7px",
+    fontSize: 10,
+    fontWeight: 600,
+    cursor: "pointer",
+  };
 
   return (
     <div style={{ position: "relative", display: "inline-block", flexShrink: 0 }}>
@@ -223,16 +214,16 @@ export function RunNotifications({
         type="button"
         onClick={() => setOpen((v) => !v)}
         title="Centro notifiche del run"
-        aria-label={`Notifiche del run (${count})`}
+        aria-label={`Notifiche del run (${count}${unread > 0 ? `, ${unread} nuove` : ""})`}
         aria-expanded={open}
         style={{
           position: "relative",
           width: 28,
           height: 28,
           borderRadius: 8,
-          border: `1px solid ${blocking ? "#8b5cf6" : tc.border}`,
-          background: blocking ? "#8b5cf611" : tc.bgCard,
-          color: blocking ? "#8b5cf6" : tc.textSecondary,
+          border: `1px solid ${bellHighlight ?? tc.border}`,
+          background: blocking ? "#8b5cf611" : unread > 0 ? withAlpha(tc.accent, 0.08) : tc.bgCard,
+          color: bellHighlight ?? tc.textSecondary,
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
@@ -274,14 +265,12 @@ export function RunNotifications({
             bottom: "calc(100% + 6px)",
             right: 0,
             zIndex: 50,
-            width: 280,
+            width: 300,
             maxWidth: "85vw",
             // Drop-up (bottom): la lista cresce nello spazio libero SOPRA la
-            // campanella, ancorata in fondo alla chat. Il maxHeight relativo al
-            // viewport + overflowY:auto evita che le voci extra sforino sotto il
-            // bordo: quando eccedono, il pannello scrolla internamente invece di
-            // nascondere le notifiche fuori dal viewport.
-            maxHeight: "min(60vh, 360px)",
+            // campanella. maxHeight relativo al viewport + overflowY:auto evita
+            // che le voci extra sforino sotto il bordo (scroll interno).
+            maxHeight: "min(60vh, 380px)",
             overflowY: "auto",
             overflowX: "hidden",
             borderRadius: 10,
@@ -331,49 +320,189 @@ export function RunNotifications({
               x
             </button>
           </div>
-          {notifications.map((n, i) => (
-            <div
-              key={`notif-${i}`}
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 8,
-                padding: "5px 6px",
-                borderRadius: 8,
-                background: withAlpha(n.color, 0.08),
-                border: `1px solid ${withAlpha(n.color, 0.3)}`,
-                minWidth: 0,
-              }}
-            >
-              <span
-                aria-hidden
+
+          {notifications.map((n, i) => {
+            // Cliccabile (deep-link) solo se la voce ha un'ancora nel nastro e
+            // conosciamo il run: le voci di stato senza riga restano statiche.
+            const clickable = !!runId && !!n.anchorId;
+            const toolEv = toolEventFor(n);
+            const reports = reportsFor(n);
+            const hasBody =
+              (!!toolEv && (!!toolEv.input || !!toolEv.result)) ||
+              (!!reports && reports.reports.length > 0);
+            const filePath =
+              n.kind === "tool_error"
+                ? filePathFromToolInput(toolEv?.input) ?? toolEv?.target
+                : undefined;
+            const isExpanded = expanded.has(i);
+
+            const activate = () => {
+              if (clickable) handleNotificationClick(n);
+            };
+
+            return (
+              <div
+                key={`notif-${i}`}
                 style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  background: n.color,
-                  marginTop: 5,
-                  flexShrink: 0,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  padding: "5px 6px",
+                  borderRadius: 8,
+                  background: withAlpha(n.color, 0.08),
+                  border: `1px solid ${withAlpha(n.color, 0.3)}`,
+                  minWidth: 0,
                 }}
-              />
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 11.5, fontWeight: 600, color: tc.text }}>{n.title}</div>
-                {n.detail && (
-                  <div
+              >
+                {/* Header cliccabile per il deep-link (non un <button> per non
+                    annidare i controlli dettagli/apri: div con role button). */}
+                <div
+                  role={clickable ? "button" : undefined}
+                  tabIndex={clickable ? 0 : undefined}
+                  onClick={activate}
+                  onKeyDown={
+                    clickable
+                      ? (e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            activate();
+                          }
+                        }
+                      : undefined
+                  }
+                  title={clickable ? "Vai al punto nel nastro" : undefined}
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 8,
+                    minWidth: 0,
+                    cursor: clickable ? "pointer" : "default",
+                  }}
+                >
+                  <span
+                    aria-hidden
                     style={{
-                      fontSize: 11,
-                      color: tc.textMuted,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      wordBreak: "break-word",
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      background: n.color,
+                      marginTop: 5,
+                      flexShrink: 0,
                     }}
-                  >
-                    {n.detail}
+                  />
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      style={{
+                        fontSize: 11.5,
+                        fontWeight: 600,
+                        color: tc.text,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                      }}
+                    >
+                      <span>{n.title}</span>
+                      {n.count && n.count > 1 && (
+                        <span
+                          title={`${n.count} occorrenze`}
+                          style={{
+                            fontSize: 9.5,
+                            fontWeight: 700,
+                            color: tc.textMuted,
+                            background: `${tc.border}55`,
+                            borderRadius: 6,
+                            padding: "0 5px",
+                            fontFamily: "var(--font-mono)",
+                          }}
+                        >
+                          {`x${n.count}`}
+                        </span>
+                      )}
+                    </div>
+                    {n.detail && (
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color: tc.textMuted,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          wordBreak: "break-word",
+                        }}
+                      >
+                        {n.detail}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Controlli: espansione dettagli (passo fallito o pareri
+                    Consiglio/panel) + apri file del passo fallito. */}
+                {(hasBody || filePath) && (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {hasBody && (
+                      <button
+                        type="button"
+                        onClick={() => toggleExpand(i)}
+                        aria-expanded={isExpanded}
+                        style={smallBtnStyle}
+                      >
+                        {isExpanded ? "Nascondi dettagli" : "Dettagli"}
+                      </button>
+                    )}
+                    {filePath && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          openFileInEditor(filePath);
+                          setOpen(false);
+                        }}
+                        title={filePath}
+                        style={{ ...smallBtnStyle, color: tc.accent, borderColor: tc.accent }}
+                      >
+                        Apri nell'editor
+                      </button>
+                    )}
                   </div>
                 )}
+
+                {isExpanded && toolEv && (toolEv.input || toolEv.result) && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {toolEv.input && (
+                      <div style={monoBoxStyle}>{formatStepInput(toolEv.input)}</div>
+                    )}
+                    {toolEv.result && (
+                      <div style={{ ...monoBoxStyle, color: tc.error }}>
+                        {humanizeToolResult(toolEv.result).text}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {isExpanded && reports && (
+                  <ul
+                    style={{
+                      margin: 0,
+                      padding: "0 0 0 2px",
+                      listStyle: "none",
+                      maxHeight: 200,
+                      overflowY: "auto",
+                      fontSize: 11,
+                      color: tc.textSecondary,
+                    }}
+                  >
+                    {reports.reports.map((r, ri) => (
+                      <FigureReportRow
+                        key={`${r.kind}-${ri}`}
+                        report={r}
+                        tc={tc}
+                        titleByProvider={reports.titleByProvider}
+                      />
+                    ))}
+                  </ul>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
 
           {showHitlActions && (
             <div
@@ -383,28 +512,40 @@ export function RunNotifications({
                 borderTop: `1px solid ${tc.border}`,
                 display: "flex",
                 flexDirection: "column",
-                gap: 6,
+                gap: 8,
               }}
             >
               <div style={{ fontSize: 10.5, fontWeight: 600, color: tc.textSecondary }}>
                 Azioni in attesa:
               </div>
-              {pendingActions!.map((action, idx) => (
-                <div
-                  key={`pending-${idx}`}
-                  style={{
-                    fontFamily: "var(--font-mono)",
-                    fontSize: 10,
-                    color: tc.text,
-                    background: `${tc.border}30`,
-                    borderRadius: 4,
-                    padding: "3px 6px",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {action.description}
-                </div>
-              ))}
+              {pendingActions!.map((action, idx) => {
+                // HITL informato: mostra il tool + i parametri ESATTI che verranno
+                // eseguiti (delega a toolLabel/formatStepInput, regola L), cosi'
+                // l'approvazione e' consapevole. Se il bersaglio e' un file, lo si
+                // puo' aprire prima di approvare.
+                const path = filePathFromToolInput(action.toolInput);
+                return (
+                  <div
+                    key={`pending-${idx}`}
+                    style={{ display: "flex", flexDirection: "column", gap: 3 }}
+                  >
+                    <div style={{ fontSize: 10.5, fontWeight: 600, color: tc.text }}>
+                      {toolLabel(action.toolName)}
+                    </div>
+                    <div style={monoBoxStyle}>{formatStepInput(action.toolInput)}</div>
+                    {path && (
+                      <button
+                        type="button"
+                        onClick={() => openFileInEditor(path)}
+                        title={path}
+                        style={{ ...smallBtnStyle, alignSelf: "flex-start", color: tc.accent, borderColor: tc.accent }}
+                      >
+                        Apri il file
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
               <div style={{ display: "flex", gap: 6 }}>
                 <button
                   type="button"
@@ -455,14 +596,4 @@ export function RunNotifications({
       )}
     </div>
   );
-}
-
-function withAlpha(hex: string, alpha: number): string {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
-  if (!m) return hex;
-  const v = m[1];
-  const r = parseInt(v.slice(0, 2), 16);
-  const g = parseInt(v.slice(2, 4), 16);
-  const b = parseInt(v.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
 }

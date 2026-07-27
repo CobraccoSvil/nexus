@@ -1,27 +1,19 @@
-//! Server HTTP del Nexus LLM Gateway (Fase 5).
+//! Server HTTP del Nexus LLM Gateway: espone il contratto LLM di Nexus (lingua
+//! franca OpenAI Chat Completions).
 //!
-//! Porting di `apps/nexus-gateway/src/server.ts`. Espone gli stessi endpoint e
-//! lo stesso contratto del gateway Node:
-//!   - `GET  /health`     stato profilo + provider (proxy mcp-core, fallback cooldown);
-//!   - `GET  /providers`  stato provider;
-//!   - `GET  /v1/models`  autodiscovery live aggregato di tutti i provider;
-//!   - `GET  /v1/models/{provider}` autodiscovery live del singolo provider;
-//!   - `POST /v1/complete` completion non-streaming;
-//!   - `POST /v1/stream`   completion SSE;
-//!   - `POST /v1/batch`    crea un batch (Anthropic completo, Google 501);
-//!   - `GET  /v1/batch/{provider}/{batch_id}` stato + risultati del batch;
-//!   - `POST /admin/reload` ricarica chiavi/policy dal DB.
-//!
-//! VINCOLO di migrazione (vedi `lib.rs`): a runtime il gateway Node resta
-//! autoritativo finche' la parita' non e' validata (Fase 6). Questo binario si
-//! limita a compilare/testare; non deve essere avviato in produzione ne' rubare
-//! la porta 4060.
+//! L'elenco autoritativo delle rotte e' il `Router` costruito in
+//! `bin/server.rs`: non e' duplicato qui perche' un elenco scritto a mano va in
+//! drift (questa intestazione ne ometteva quattro).
 //!
 //! Riuso punti unici (regola L):
 //!   - `nexus_auth`: lettura settings (`get_setting`), risoluzione porta DB
 //!     (`resolve_port`), validazione JWT (`Claims`, `jsonwebtoken`);
-//!   - `billing` (questo modulo): porting fedele della logica quota/ledger del
-//!     `billing-service` (`ai_quota_policies`, `ai_usage_ledger`, `ai_price_catalog`);
+//!   - `nexus_pricing`: listino dei modelli (`resolve_active_price`,
+//!     `platform_currency`, `calculate_cost`) — punto unico, ADR 0026;
+//!   - `billing` (questo modulo): quota + scrittura del ledger
+//!     (`ai_quota_policies`, `ai_usage_ledger`). E' l'UNICO scrittore reale del
+//!     ledger: il crate `billing-service`, di cui questo modulo era un porting,
+//!     e' stato rimosso senza aver mai scritto una riga;
 //!   - moduli del crate (`CooldownManager`, `PolicyEngine`,
 //!     `ModelAliasResolver`, `RedactionPipeline`, `SensitivityClassifier`).
 
@@ -42,11 +34,6 @@ use crate::redaction::presidio_client::PresidioClient;
 
 use self::bootstrap::GatewayConfig;
 
-/// Token di servizio di default in dev (parita' col `?? "dev-internal-token"`
-/// del server.ts). Non e' un segreto di produzione: il token reale viaggia
-/// nell'env `NEXUS_GATEWAY_SERVICE_TOKEN`.
-pub const DEV_SERVICE_TOKEN: &str = "dev-internal-token";
-
 /// Stato condiviso del gateway. Clonabile a basso costo: i campi pesanti vivono
 /// dietro `Arc`/`RwLock`. Il blocco `runtime` e' protetto da `RwLock` perche'
 /// `/admin/reload` lo sostituisce a caldo (provider, policy, alias) senza
@@ -55,10 +42,12 @@ pub const DEV_SERVICE_TOKEN: &str = "dev-internal-token";
 pub struct AppState {
     /// Pool Postgres condiviso (settings, ledger, quota, prezzi).
     pub db: PgPool,
-    /// Token di servizio per le chiamate interne (mcp-core -> gateway).
-    pub service_token: String,
-    /// JWT secret: `Some` se valido (>= 32 char), `None` in dev (auth permissiva).
-    pub jwt_secret: Option<String>,
+    /// Chiave di firma della piattaforma (>= 32 char, garantita dal bootstrap).
+    ///
+    /// NON e' un `Option`: quando lo era, l'assenza faceva passare qualunque
+    /// richiesta senza credenziali. Il tipo ora esclude quello stato — il
+    /// gateway non parte se non riesce a risolvere la chiave.
+    pub jwt_secret: String,
     /// URL di mcp-core per il proxy dello stato provider (`/health`, `/providers`).
     pub mcp_core_url: String,
     /// Manager dei cooldown (condiviso col re-probe loop).

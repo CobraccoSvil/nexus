@@ -2347,8 +2347,9 @@ async fn uninstall_project_service_windows(
     let short = normalizza_short_servizio_windows(&service, &slug);
 
     // Separazione DB per-progetto: agent_processes e' migrata, instrada sul pool
-    // del progetto (flag OFF -> meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // del progetto (errore tipizzato 503/404 se non disponibile).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     // 1. taskkill dei processi ancora vivi del servizio (running | starting).
     kill_service_processes(&proj_pool, project_id, &short).await;
@@ -2684,10 +2685,7 @@ pub(super) async fn refine_with_nexus(
     root: &std::path::Path,
     suggestions: &mut [Value],
 ) {
-    let gw = match &state.orchestrator.nexus_gateway {
-        Some(g) => g,
-        None => return,
-    };
+    let gw = &state.orchestrator.nexus_gateway;
 
     let prompt = costruisci_prompt_classificazione(root, suggestions);
     let req = costruisci_gw_request(prompt, project_id, user_id);

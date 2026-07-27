@@ -26,7 +26,7 @@ use crate::providers::{
 use crate::redaction::presidio_client::PresidioClient;
 use crate::types::SensitivityTier;
 
-use super::{AppState, RuntimeState, DEV_SERVICE_TOKEN};
+use super::{AppState, RuntimeState};
 
 /// Default dei path dei file di configurazione (relativi alla repo root). Sono
 /// STRUTTURA, non valori di business: i nomi dei file sono fissi nel repo. I
@@ -460,17 +460,26 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
     let config = GatewayConfig::load(&db).await;
     let runtime = build_runtime(&db, &http, config, timeouts).await?;
 
-    let service_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| DEV_SERVICE_TOKEN.to_string());
-
-    // JWT secret dal DB (punto unico settings): valido solo se >= 32 char, come
-    // il `JWT_SECRET.length >= 32` del server.ts. Altrimenti auth permissiva (dev).
-    let jwt_secret = nexus_auth::get_setting(&db, "jwt_secret")
+    // Chiave di firma della piattaforma. NON e' un `Option`: finche' lo era,
+    // `token_is_valid` aveva un ramo che con `None` faceva passare QUALUNQUE
+    // richiesta, anche senza header — e quello stato era raggiungibile per
+    // costruzione, perche' `jwt_secret` e' seminata VUOTA dalla mig 0003 e
+    // veniva generata solo al primo login: un gateway avviato prima di quel
+    // login restava ad autenticazione disabilitata fino al riavvio successivo.
+    //
+    // Ora il segreto viene GENERATO qui se la riga e' vuota (punto unico
+    // `get_or_create_platform_secret`, atomico), quindi lo stato "nessun
+    // segreto" non e' piu' rappresentabile e il ramo permissivo non esiste.
+    // Se il DB non risponde il gateway non parte: e' gia' cosi' per la
+    // connessione (`bin/server.rs`, connect eager) e per `assert_configured`
+    // del listino, quindi non introduce un modo nuovo di non partire.
+    let jwt_secret = nexus_auth::get_or_create_platform_secret(&db, "jwt_secret")
         .await
-        .filter(|s| s.len() >= 32);
-    if jwt_secret.is_none() {
-        tracing::warn!(
-            "gateway: jwt_secret assente o < 32 char nel DB -> autenticazione JWT permissiva (dev only)"
+        .context("jwt_secret non risolvibile: il gateway non puo' autenticare")?;
+    if jwt_secret.len() < 32 {
+        anyhow::bail!(
+            "jwt_secret piu' corto di 32 caratteri ({} char): chiave di firma non accettabile",
+            jwt_secret.len()
         );
     }
 
@@ -484,7 +493,6 @@ pub async fn build_state(db: PgPool) -> Result<AppState> {
 
     Ok(AppState {
         db,
-        service_token,
         jwt_secret,
         mcp_core_url,
         cooldown,

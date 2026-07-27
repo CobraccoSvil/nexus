@@ -81,32 +81,22 @@ pub async fn list_provider_models(
     State(state): State<AppState>,
     Query(q): Query<ProviderModelsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Colonne dal punto unico (regola L): la lista vive accanto alla struct che
+    // la legge, non copiata qui.
+    use crate::models::catalog_select;
     let result: Result<Vec<ModelCatalogEntry>, _> = if let Some(ref provider) = q.provider {
-        sqlx::query_as(
-            r#"SELECT provider, model, display_name,
-                      input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-                      output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-                      currency, performance_tier, speed_tier,
-                      capabilities, context_window, supports_tool_use, batch_discount_pct,
-                      is_featured, is_enabled
-               FROM ai_price_catalog
-               WHERE provider = $1
-               ORDER BY is_enabled DESC, is_featured DESC, input_cost_per_million_tokens ASC"#,
-        )
+        sqlx::query_as(catalog_select!(
+            "WHERE provider = $1 \
+             ORDER BY is_enabled DESC, is_featured DESC, input_cost_per_million_tokens ASC"
+        ))
         .bind(provider)
         .fetch_all(&state.db)
         .await
     } else {
-        sqlx::query_as(
-            r#"SELECT provider, model, display_name,
-                      input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-                      output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-                      currency, performance_tier, speed_tier,
-                      capabilities, context_window, supports_tool_use, batch_discount_pct,
-                      is_featured, is_enabled
-               FROM ai_price_catalog
-               ORDER BY provider, is_enabled DESC, is_featured DESC, input_cost_per_million_tokens ASC"#,
-        )
+        sqlx::query_as(catalog_select!(
+            "ORDER BY provider, is_enabled DESC, is_featured DESC, \
+             input_cost_per_million_tokens ASC"
+        ))
         .fetch_all(&state.db)
         .await
     };
@@ -165,4 +155,122 @@ pub async fn set_model_enabled(
         "model": req.model,
         "enabled": req.enabled,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetModelTierRequest {
+    pub provider: String,
+    pub model: String,
+    /// Il tier deciso dall'admin, oppure `null` per RIMUOVERE la curatela e
+    /// restituire il modello alle fonti automatiche.
+    pub tier: Option<String>,
+}
+
+/// PUT /api/admin/provider-models/tier
+///
+/// La curatela del tier: l'unico punto in cui un umano decide la fascia di un
+/// modello. Scrive via `apply_tier(TierSource::Manual)`, quindi vince su indice
+/// e batteria (regola L: la precedenza vive in un solo posto).
+///
+/// Perche' esiste: fino alla mig 0608 la curatela si faceva SOLO con una
+/// migrazione SQL, cioe' serviva un deploy per correggere un tier. Il risultato
+/// e' che nessuno l'ha mai fatta davvero: le 49 righe marcate 'manual' erano
+/// fossili dell'euristica sul nome, promossi per errore a "decisione umana" —
+/// e siccome manual batte tutto, erano diventati incorreggibili.
+///
+/// `tier: null` non azzera il tier: toglie il MARCHIO di curatela
+/// (`tier_source` -> NULL) lasciando il valore com'e'. Al primo giro l'indice o
+/// la batteria lo rimpiazzano: e' il modo di dire "avevo sbagliato, decidete
+/// voi" senza aprire un buco nel routing.
+pub async fn set_model_tier(
+    State(state): State<AppState>,
+    Json(req): Json<SetModelTierRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let errore = |code: StatusCode, msg: String| (code, Json(json!({ "error": msg })));
+
+    let tier = req.tier.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    valida_tier(tier).map_err(|m| errore(StatusCode::BAD_REQUEST, m))?;
+
+    let scritto = scrivi_curatela(&state, &req.provider, &req.model, tier)
+        .await
+        .map_err(|e| errore(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Un `false` significa "nulla e' cambiato" OPPURE "modello inesistente":
+    // senza distinguerli l'admin vedrebbe un OK per un modello che non c'e'.
+    if !model_exists(&state, &req.provider, &req.model)
+        .await
+        .map_err(|e| errore(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        return Err(errore(
+            StatusCode::NOT_FOUND,
+            format!(
+                "modello non trovato nel catalog: {}/{}",
+                req.provider, req.model
+            ),
+        ));
+    }
+
+    tracing::info!(
+        provider = %req.provider, model = %req.model, tier = ?req.tier, scritto,
+        "admin: curatela del tier"
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "provider": req.provider,
+        "model": req.model,
+        "tier": req.tier,
+        "changed": scritto,
+    })))
+}
+
+/// Scrive (o rimuove) la curatela delegando al punto unico del tier (regola L):
+/// `Some` = decisione dell'admin, `None` = rimozione dell'override. Ritorna
+/// `true` se la riga e' cambiata.
+async fn scrivi_curatela(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+    tier: Option<&str>,
+) -> Result<bool, String> {
+    use crate::orchestrator::model_service::{apply_tier, clear_manual_tier, TierSource};
+    match tier {
+        Some(t) => apply_tier(
+            &state.db,
+            provider,
+            model,
+            &t.to_lowercase(),
+            TierSource::Manual,
+        )
+        .await,
+        // Il valore resta, la fonte torna ignota: le automatiche riprendono.
+        None => clear_manual_tier(&state.db, provider, model).await,
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Il tier chiesto dall'admin sta nel vocabolario? Validazione delegata al punto
+/// unico (regola L): niente lista di tier duplicata nell'handler. `None` (nessun
+/// override) e' sempre valido.
+fn valida_tier(tier: Option<&str>) -> Result<(), String> {
+    use nexus_agent_graph::decisions::tiers::{is_performance_tier, PERFORMANCE_TIERS};
+    match tier {
+        Some(t) if !is_performance_tier(t) => Err(format!(
+            "tier '{t}' fuori vocabolario: ammessi {PERFORMANCE_TIERS:?}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// La riga esiste nel catalog? Serve a distinguere "nulla e' cambiato" da
+/// "modello inesistente": entrambi i casi tornano `false` dalla scrittura, e
+/// senza questo controllo l'admin vedrebbe un OK per un modello che non c'e'.
+async fn model_exists(state: &AppState, provider: &str, model: &str) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ai_price_catalog WHERE provider = $1 AND model = $2)",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())
 }

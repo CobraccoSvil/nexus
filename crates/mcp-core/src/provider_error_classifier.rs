@@ -23,14 +23,25 @@ pub struct ClassifiedError {
     pub http_status: Option<u16>,
 }
 
+/// La classe "la richiesta non entra in questo modello". E' un identificatore del
+/// vocabolario `error_class` (regola N), non una frase: sta scritto una volta e i
+/// call site lo nominano, cosi' non puo' divergere per un refuso.
+pub const CONTEXT_TOO_LONG: &str = "context_too_long";
+
+/// La classe "le credenziali non sono valide" (401). Come [`CONTEXT_TOO_LONG`]:
+/// la nominano il ponte dello status, la tabella HTTP e il classificatore
+/// testuale — tre punti che devono dire la STESSA parola, perche' e' quella che
+/// `classification_from_error_class` traduce in "spegni il provider".
+pub const AUTH_ERROR: &str = "auth_error";
+
 /// HTTP status -> (stop_reason, retriable).
 fn http_status_to_reason(status: u16) -> Option<(&'static str, bool)> {
     match status {
         400 => Some(("invalid_request", false)),
-        401 => Some(("auth_error", false)),
+        401 => Some((AUTH_ERROR, false)),
         403 => Some(("forbidden", false)),
         404 => Some(("not_found", false)),
-        413 => Some(("context_too_long", false)),
+        413 => Some((CONTEXT_TOO_LONG, false)),
         422 => Some(("unprocessable", false)),
         429 => Some(("rate_limit", true)),
         500 => Some(("provider_error", true)),
@@ -49,9 +60,10 @@ fn http_status_to_reason(status: u16) -> Option<(&'static str, bool)> {
 /// perdita di informazione, non una classificazione. Questa funzione e' il ponte che
 /// preserva il segnale.
 ///
-/// Ritorna `Some` SOLO per le cause che AGGIUNGONO informazione rispetto al
-/// classificatore testuale; per tutto il resto ritorna `None` e il chiamante ricade
-/// su [`classify_text`] (comportamento invariato, zero regressione sui call site).
+/// Ritorna `Some` per OGNI causa che il gateway dichiara: quella e' la
+/// classificazione, e il testo non la rivede. L'unica eccezione e' `client_error`
+/// (vedi sotto), dove lo status del failure aggiunge informazione che solo il
+/// chiamante possiede.
 ///
 /// `empty_completion` e' il caso che il testo NON puo' ricostruire: il gateway ha
 /// ricevuto un `200` con zero output utile (`is_degenerate_completion`) e lo riporta
@@ -59,13 +71,77 @@ fn http_status_to_reason(status: u16) -> Option<(&'static str, bool)> {
 /// Server Error: {body}", che la regex HTTP non intercetta -> l'errore degradava a
 /// `error` -> `Transient` -> nessun contatore, nessun degrado, mai (incidente
 /// z-ai/glm-4.7-flash: 3 figure del consiglio in timeout, zero apprendimento).
+///
+/// Le altre cause tornavano `None` sulla premessa — scritta qui — che fossero
+/// "gia' ricostruibili dal testo". Non lo sono: il 2026-07-16 groq ha rifiutato una
+/// richiesta della batteria per tetto token/minuto (413, `code=rate_limit_exceeded`,
+/// "TPM: Limit 8000, Requested 20083") e il messaggio invitava ad alzare il piano
+/// "at https://console.groq.com/settings/billing". La causa strutturata
+/// (`context_too_long`) veniva scartata qui, il testo finiva alla regex billing, e
+/// quella trovava la parola `billing` DENTRO L'URL DELLA DOCUMENTAZIONE ->
+/// `billing_error` -> `credit_balance_too_low` -> groq spento 6h per credito
+/// esaurito mentre rispondeva 200 alle chiamate normali, e ogni giro della batteria
+/// chiuso `inconclusive` (zero tier `measured` su 116 modelli).
+///
+/// Una regex sul testo di un errore non e' una classificazione: e' un indovinello su
+/// prosa che il provider puo' riscrivere quando vuole. Il gateway ha gia' la
+/// risposta (status + codice macchina): questo e' il ponte che la preserva.
 pub fn error_class_from_primary_cause(cause: &str) -> Option<&'static str> {
     match cause.trim() {
         "empty_completion" => Some("empty_completion"),
-        // Le altre cause del gateway sono gia' ricostruibili dal testo/status
-        // (billing, context_too_long, rate_limit, auth...): lasciarle al fallback
-        // evita di cambiare comportamento ai consumatori esistenti.
+        // Credito/fatturazione dichiarati dal gateway: 402, oppure un CODICE
+        // strutturato del provider (`insufficient_quota`, `billing_*`). E' l'unica
+        // provenienza legittima di `billing_error`: mai la prosa del messaggio.
+        "billing" | "cooldown_billing" => Some("billing_error"),
+        // Il modello non regge QUESTA richiesta (413 senza codice di rate-limit):
+        // model-specific, nessun cooldown al provider (e' sano).
+        CONTEXT_TOO_LONG => Some(CONTEXT_TOO_LONG),
+        // Transitorio dichiarato (429/5xx/timeout/cap per-tentativo) o provider
+        // saltato perche' gia' in cooldown: il modello non e' stato misurato.
+        // `Transient` = stato invariato, si ritenta al giro dopo. Nessuno dei due
+        // e' un difetto del modello.
+        "transient" | "cooldown" => Some("transient"),
+        // Budget della richiesta esaurito da NOI, non dal provider: non e' un
+        // difetto del modello ne' della sua salute.
+        "request_budget_exceeded" => Some("request_budget_exceeded"),
+        // `client_error` copre 400/401/403/404/422: classi con conseguenze OPPOSTE
+        // (404 = modello inesistente -> disable; 400 = richiesta malformata ->
+        // niente). Non le distingue questa stringa ma lo STATUS del primo failure,
+        // che sta nei `details`: lo disambigua `client_error_class_from_status`,
+        // che il chiamante invoca quando ha i details sotto mano.
         _ => None,
+    }
+}
+
+/// PUNTO UNICO (regola L) della disambiguazione `client_error` -> classe canonica.
+///
+/// Il gateway appiattisce cinque 4xx in una sola causa (`client_error`), ma le loro
+/// conseguenze sono opposte: un 404 dice "questo modello non esiste" (va disabilitato),
+/// un 400 dice "questa richiesta era malformata" (il modello non c'entra). Lo status
+/// numerico e' il segnale certo (regola M) e sta gia' nei `details`: si legge, non si
+/// ri-deduce dal Display.
+///
+/// Le classi ritornate appartengono al vocabolario di `classification_from_error_class`
+/// (model_health_probe): e' quello che decide la conseguenza. Inventarne una fuori
+/// vocabolario significa cadere nel suo catch-all -> `Transient` -> "stato invariato,
+/// ritento" — cioe' l'esatto silenzio che questa funzione esiste per rompere. E'
+/// successo davvero: il ponte precedente ritornava `model_not_found`, stringa che
+/// NESSUN consumatore conosce.
+pub fn client_error_class_from_status(status: Option<i64>) -> &'static str {
+    match status {
+        // Il modello non esiste (o non e' servito da quel provider): ModelSpecific
+        // -> conta come fallimento del modello e alimenta l'auto-disable.
+        Some(404) => "not_found",
+        // Credenziali invalide: e' tutto il provider a essere inutilizzabile.
+        Some(401) => AUTH_ERROR,
+        // Accesso negato a QUELLA risorsa (es. modello Labs non abilitato per l'org):
+        // model-specific, non si spegne il provider.
+        Some(403) => "forbidden",
+        Some(422) => "unprocessable",
+        Some(400) => "invalid_request",
+        // Status assente o 4xx non previsto: OPACO. Non si indovina (regola H):
+        // `Transient` lascia lo stato invariato invece di punire a caso.
+        _ => "client_error_unknown",
     }
 }
 
@@ -178,14 +254,14 @@ pub fn classify_with_status(raw: &str, known_status: Option<u16>) -> ClassifiedE
     }
     if context_re().is_match(&raw_lower) {
         return ClassifiedError {
-            stop_reason: "context_too_long".into(),
+            stop_reason: CONTEXT_TOO_LONG.into(),
             retriable: false,
             http_status,
         };
     }
     if auth_re().is_match(&raw_lower) {
         return ClassifiedError {
-            stop_reason: "auth_error".into(),
+            stop_reason: AUTH_ERROR.into(),
             retriable: false,
             http_status,
         };
@@ -254,13 +330,69 @@ mod tests {
         assert_ne!(dal_testo.stop_reason, "empty_completion");
     }
 
+    /// Il corpo VERBATIM con cui groq ha rifiutato una richiesta della batteria il
+    /// 2026-07-16 (413, tetto token/minuto del piano). Nessun credito esaurito:
+    /// alla stessa chiave, nello stesso minuto, una richiesta piccola tornava 200.
+    const GROQ_413_TPM: &str = concat!(
+        r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` "#,
+        r#"in organization `org_01kxde0tfkefr82z5htyktj0g5` service tier `on_demand` "#,
+        r#"on tokens per minute (TPM): Limit 8000, Requested 20083, please reduce "#,
+        r#"your message size and try again. Need more tokens? Upgrade to Dev Tier "#,
+        r#"today at https://console.groq.com/settings/billing","type":"tokens","#,
+        r#""code":"rate_limit_exceeded"}}"#,
+    );
+
+    /// LA REGRESSIONE: il testo di groq contiene la parola `billing`, ma solo
+    /// dentro l'URL della documentazione. Il classificatore testuale ci casca — ed
+    /// e' per questo che non deve piu' essere consultato quando il gateway ha gia'
+    /// detto la causa.
     #[test]
-    fn primary_cause_ignoto_ricade_sul_classificatore_testuale() {
-        // Solo cio' che AGGIUNGE informazione viene mappato: per tutto il resto
-        // `None` -> il chiamante usa classify_text (comportamento invariato, zero
-        // regressione sui call site esistenti).
-        assert_eq!(error_class_from_primary_cause("transient"), None);
-        assert_eq!(error_class_from_primary_cause("billing"), None);
+    fn il_testo_di_un_rate_limit_mente_dicendo_billing() {
+        assert_eq!(classify_text(GROQ_413_TPM).stop_reason, "billing_error");
+        assert!(
+            GROQ_413_TPM.contains("console.groq.com/settings/billing"),
+            "la sola occorrenza di 'billing' e' l'URL: e' li' che la regex abbocca"
+        );
+    }
+
+    /// Con la causa strutturata del gateway, lo stesso identico errore NON e' piu'
+    /// un credito esaurito: groq resta acceso.
+    #[test]
+    fn la_causa_del_gateway_vince_sul_testo_bugiardo() {
+        // Il gateway vede code=rate_limit_exceeded e dichiara `transient`.
+        assert_eq!(error_class_from_primary_cause("transient"), Some("transient"));
+        // Anche se lo status 413 fosse letto come contesto (nessun codice di
+        // rate-limit), resta un difetto della richiesta: mai del credito.
+        assert_eq!(
+            error_class_from_primary_cause("context_too_long"),
+            Some("context_too_long")
+        );
+        for cause in ["transient", "context_too_long", "cooldown", "request_budget_exceeded"] {
+            assert_ne!(
+                error_class_from_primary_cause(cause),
+                Some("billing_error"),
+                "{cause}: nessuna causa non-billing puo' spegnere un provider per credito"
+            );
+        }
+    }
+
+    /// `billing_error` ha UNA sola provenienza: il gateway che l'ha stabilito dallo
+    /// status 402 o da un codice macchina del provider.
+    #[test]
+    fn solo_il_gateway_dichiara_il_credito_esaurito() {
+        assert_eq!(error_class_from_primary_cause("billing"), Some("billing_error"));
+        assert_eq!(
+            error_class_from_primary_cause("cooldown_billing"),
+            Some("billing_error")
+        );
+    }
+
+    /// `client_error` resta l'unica causa senza mappa: 404 (modello inesistente) e
+    /// 400 (richiesta malformata) hanno conseguenze opposte e le distingue lo
+    /// status, che il chiamante legge dai `details`.
+    #[test]
+    fn client_error_lo_decide_il_chiamante_che_ha_lo_status() {
+        assert_eq!(error_class_from_primary_cause("client_error"), None);
         assert_eq!(error_class_from_primary_cause(""), None);
     }
 

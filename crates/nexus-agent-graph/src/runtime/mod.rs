@@ -12,7 +12,7 @@ pub use ctx::AgentNodeCtx;
 pub use ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, ContextPressure, Coordination,
     CriteriaRunner, CriterionResult, CriterionSpec, EmbeddingStore, EscalationInputs,
-    EscalationPort, EventSink, ExecMode, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage,
+    EscalationPort, EventSink, LlmGateway, LlmMessage, LlmRequest, LlmResponse, LlmUsage,
     MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionChoice, NextActionsDeriver,
     OffloadKind, OrchPhase, OrchestrationContext, OrchestrationMove, PlanBlock, PlanRow, PortError,
     RecoveryMove, RunControlStore, ScaleContext, ScaleMove, ScaleTier, SseEvent, StallBudgetPort,
@@ -24,11 +24,10 @@ use async_trait::async_trait;
 
 /// Sink eventi NO-OP: scarta ogni evento, nessun output verso l'utente.
 ///
-/// E' un'implementazione legittima in PRODUZIONE per il run SHADOW (read-only):
-/// lo shadow non deve emettere nulla sul canale SSE del frontend (l'output
-/// all'utente resta quello del primario). Vive fuori da `#[cfg(test)]` perche'
-/// e' un no-op reale, non un doppio di test. I test lo riusano (regola L: un
-/// solo no-op sink, non duplicato in `test_doubles`).
+/// E' un no-op reale (parte dell'API pubblica del crate), non un doppio di test:
+/// utile a un consumatore che vuole eseguire il grafo senza emettere nulla sul
+/// canale SSE. I test lo riusano (regola L: un solo no-op sink, non duplicato in
+/// `test_doubles`).
 pub struct NullEventSink;
 
 impl EventSink for NullEventSink {
@@ -54,6 +53,22 @@ impl EventSink for NullEventSink {
 /// un "magic fallback" mascherante (regola G): un DB-down / provider indisponibile
 /// nell'impl CONCRETA ritorna `Err(PortError::ProviderUnavailable)`, mai `Ok(None)`.
 /// Questo stub e' inerte per COSTRUZIONE (non consulta nulla), non maschera guasti.
+/// Porta del panel di review INERTE (sempre `Skipped(AutoconveneDisabled)`):
+/// per fixture topologiche/test dove il gate non deve convocare nulla.
+pub struct StubReviewPanelPort;
+
+#[async_trait]
+impl crate::runtime::ports::ReviewPanelPort for StubReviewPanelPort {
+    async fn review(
+        &self,
+        _req: crate::runtime::ports::ReviewPanelRequest,
+    ) -> Result<crate::runtime::ports::ReviewPanelReport, PortError> {
+        Ok(crate::runtime::ports::ReviewPanelReport::Skipped(
+            crate::runtime::ports::ReviewSkipReason::AutoconveneDisabled,
+        ))
+    }
+}
+
 pub struct StubMetaReasonerPort;
 
 #[async_trait]
@@ -61,7 +76,6 @@ impl MetaReasonerPort for StubMetaReasonerPort {
     async fn recover(
         &self,
         _ctx: StallContext,
-        _mode: ExecMode,
     ) -> Result<Option<RecoveryMove>, PortError> {
         Ok(None)
     }
@@ -69,7 +83,6 @@ impl MetaReasonerPort for StubMetaReasonerPort {
     async fn orchestrate(
         &self,
         _ctx: OrchestrationContext,
-        _mode: ExecMode,
     ) -> Result<Option<OrchestrationMove>, PortError> {
         Ok(None)
     }
@@ -77,7 +90,6 @@ impl MetaReasonerPort for StubMetaReasonerPort {
     async fn assess_scale(
         &self,
         _ctx: ScaleContext,
-        _mode: ExecMode,
     ) -> Result<Option<ScaleMove>, PortError> {
         Ok(None)
     }
@@ -85,7 +97,6 @@ impl MetaReasonerPort for StubMetaReasonerPort {
     async fn supervise(
         &self,
         _ctx: SupervisorContext,
-        _mode: ExecMode,
     ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
         Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
     }
@@ -113,7 +124,6 @@ impl StallBudgetPort for NullStallBudgetPort {
     async fn record_consultation(
         &self,
         _session_id: uuid::Uuid,
-        _mode: ExecMode,
     ) -> Result<(), PortError> {
         Ok(())
     }
@@ -122,8 +132,8 @@ impl StallBudgetPort for NullStallBudgetPort {
 #[cfg(test)]
 pub mod test_doubles {
     //! Implementazioni di test delle porte (mock/stub) riusabili dai test dei
-    //! nodi e dello shadow. Ritornano valori fissi e/o registrano le chiamate
-    //! ricevute, cosi' i test verificano comportamento senza I/O reale.
+    //! nodi. Ritornano valori fissi e/o registrano le chiamate ricevute, cosi' i
+    //! test verificano comportamento senza I/O reale.
 
     use std::sync::Mutex;
 
@@ -131,7 +141,7 @@ pub mod test_doubles {
 
     use super::ports::{
         AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, CriterionResult,
-        CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort, EventSink, ExecMode,
+        CriterionSpec, EmbeddingStore, EscalationInputs, EscalationPort, EventSink,
         LlmGateway, LlmRequest, LlmResponse, LlmUsage, MetaStepStore, ModelUpscalePort,
         NextActionChoice, NextActionsDeriver, OffloadKind, PlanRow, PortError,
         ProviderFailureCause, ProviderUnavailableInfo, RunControlStore,
@@ -257,19 +267,18 @@ pub mod test_doubles {
                         ProviderUnavailableInfo::new(cause, msg.clone()),
                     ));
                 }
-                return Err(PortError::Llm(msg.clone()));
+                return Err(PortError::Llm(msg.clone().into()));
             }
             Ok(self.canned.clone())
         }
     }
 
-    /// Esecutore di tool di test: ritorna un esito fisso e registra le chiamate
-    /// con la modalita' usata (per verificare che lo shadow usi `Replay`).
+    /// Esecutore di tool di test: ritorna un esito fisso e registra le chiamate.
     pub struct StubToolExecutor {
         /// Esito fisso ritornato da ogni `execute`.
         pub canned: ToolOutcome,
-        /// Chiamate registrate: (call, mode).
-        pub seen: Mutex<Vec<(ToolCall, ExecMode)>>,
+        /// Chiamate registrate.
+        pub seen: Mutex<Vec<ToolCall>>,
     }
 
     impl StubToolExecutor {
@@ -289,21 +298,21 @@ pub mod test_doubles {
 
     #[async_trait]
     impl ToolExecutor for StubToolExecutor {
-        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
-            self.seen.lock().expect("lock seen").push((call, mode));
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
+            self.seen.lock().expect("lock seen").push(call);
             Ok(self.canned.clone())
         }
     }
 
     /// Motore criteri di test: ritorna una lista fissa di [`CriterionResult`] e
-    /// registra le chiamate con la modalita' usata (per verificare che lo shadow
-    /// usi `Replay`). I risultati dei criteri sono cosi' INPUT stubati: i test
-    /// del `FinalGateNode` esercitano la decision machine, non l'esecuzione reale.
+    /// registra le chiamate. I risultati dei criteri sono cosi' INPUT stubati: i
+    /// test del `FinalGateNode` esercitano la decision machine, non l'esecuzione
+    /// reale.
     pub struct StubCriteriaRunner {
         /// Risultati fissi ritornati da ogni `run`.
         pub canned: Vec<CriterionResult>,
-        /// Chiamate registrate: (criteria, mode).
-        pub seen: Mutex<Vec<(Vec<CriterionSpec>, ExecMode)>>,
+        /// Chiamate registrate: i criteri passati.
+        pub seen: Mutex<Vec<Vec<CriterionSpec>>>,
     }
 
     impl StubCriteriaRunner {
@@ -321,9 +330,8 @@ pub mod test_doubles {
         async fn run(
             &self,
             criteria: Vec<CriterionSpec>,
-            mode: ExecMode,
         ) -> Result<Vec<CriterionResult>, PortError> {
-            self.seen.lock().expect("lock seen").push((criteria, mode));
+            self.seen.lock().expect("lock seen").push(criteria);
             Ok(self.canned.clone())
         }
     }
@@ -342,24 +350,17 @@ pub mod test_doubles {
     }
 
     /// Sink eventi no-op: ri-esportato dal PUNTO UNICO `super::NullEventSink`
-    /// (regola L). Vive fuori da `#[cfg(test)]` perche' lo usa anche il run
-    /// shadow in produzione; i test continuano a importarlo da qui.
+    /// (regola L); i test lo importano da qui.
     pub use super::NullEventSink;
 
     /// Store todo di test: mantiene una lista di [`Todo`] in memoria e applica i
     /// `mark_status` ricevuti (cosi' i test del `TodoRunnerNode` osservano gli
     /// avanzamenti: in_progress/completed/blocked/skipped/pending). Registra anche
     /// la sequenza delle `mark_status` per asserzioni su cascade-skip e retry.
-    ///
-    /// Gate shadow (come l'impl concreta, regola L): in [`ExecMode::Replay`] la
-    /// `mark_status` e' un NO-OP (nessuna registrazione in `marks`, nessuna
-    /// mutazione dei todo). Cosi' un test puo' asserire ZERO scritture in shadow
-    /// verificando `marks` vuoto.
     pub struct StubTodoStore {
         /// Todo correnti (ordinati per `seq`, come `list_todos`).
         pub todos: Mutex<Vec<Todo>>,
-        /// Storico delle `mark_status` REALI (mode==Real): (todo_id, nuovo_status),
-        /// in ordine. Vuoto in shadow (Replay no-op).
+        /// Storico delle `mark_status`: (todo_id, nuovo_status), in ordine.
         pub marks: Mutex<Vec<(String, TodoStatus)>>,
         /// Piano restituito da `fetch_plan` (`None` = nessun piano). Usato dai
         /// test del `PlannerNode` per esercitare il riuso piano intent/mode-aware.
@@ -402,13 +403,7 @@ pub mod test_doubles {
             &self,
             todo_id: &str,
             status: TodoStatus,
-            mode: ExecMode,
         ) -> Result<(), PortError> {
-            // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta
-            // (zero side-effect sul DAG del run primario).
-            if mode != ExecMode::Real {
-                return Ok(());
-            }
             self.marks
                 .lock()
                 .expect("lock marks")
@@ -424,32 +419,23 @@ pub mod test_doubles {
         }
     }
 
-    /// Store esiti verifier di test: registra i [`VerifierRunRecord`] persistiti
-    /// (solo in `ExecMode::Real`). In `Replay` la `record` e' un NO-OP (nessuna
-    /// registrazione), come l'impl concreta: un test puo' asserire ZERO scritture
-    /// in shadow verificando `records` vuoto.
+    /// Store esiti verifier di test: registra i [`VerifierRunRecord`] persistiti.
     #[derive(Default)]
     pub struct StubVerifierRunStore {
-        /// Record persistiti in ordine (vuoto in shadow).
+        /// Record persistiti in ordine.
         pub records: Mutex<Vec<VerifierRunRecord>>,
     }
 
     #[async_trait]
     impl VerifierRunStore for StubVerifierRunStore {
-        async fn record(&self, run: VerifierRunRecord, mode: ExecMode) -> Result<(), PortError> {
-            // Gate shadow: in Replay NON si persiste (no-op), come l'impl concreta.
-            if mode != ExecMode::Real {
-                return Ok(());
-            }
+        async fn record(&self, run: VerifierRunRecord) -> Result<(), PortError> {
             self.records.lock().expect("lock records").push(run);
             Ok(())
         }
     }
 
     /// Controllo run di test (punto unico executor+tool_dispatch). `superseded`
-    /// configurabile (default `false`); registra heartbeat e modello effettivo
-    /// SOLO in `Real` (gate shadow), cosi' un test asserisce ZERO scritture in
-    /// shadow verificando i vettori vuoti.
+    /// configurabile (default `false`); registra heartbeat e modello effettivo.
     #[derive(Default)]
     pub struct StubRunControlStore {
         /// Valore ritornato da `is_superseded`.
@@ -459,9 +445,9 @@ pub mod test_doubles {
         /// prosegue). Lo stub NON applica il fail-open al posto loro: ritorna
         /// l'errore cosi' i test del nodo esercitano il loro mapping.
         pub fail_is_superseded: bool,
-        /// `run_id` per cui e' stato chiamato `heartbeat` (solo `Real`).
+        /// `run_id` per cui e' stato chiamato `heartbeat`.
         pub heartbeats: Mutex<Vec<String>>,
-        /// Modelli effettivi registrati (`Real`): (run_id, provider, model).
+        /// Modelli effettivi registrati: (run_id, provider, model).
         pub effective_models: Mutex<Vec<(String, String, String)>>,
     }
 
@@ -469,15 +455,12 @@ pub mod test_doubles {
     impl RunControlStore for StubRunControlStore {
         async fn is_superseded(&self, _run_id: &str) -> Result<bool, PortError> {
             if self.fail_is_superseded {
-                return Err(PortError::Llm("stub: is_superseded fail".to_string()));
+                return Err(PortError::Llm("stub: is_superseded fail".to_string().into()));
             }
             Ok(self.superseded)
         }
 
-        async fn heartbeat(&self, run_id: &str, mode: ExecMode) -> Result<(), PortError> {
-            if mode != ExecMode::Real {
-                return Ok(());
-            }
+        async fn heartbeat(&self, run_id: &str) -> Result<(), PortError> {
             self.heartbeats
                 .lock()
                 .expect("lock heartbeats")
@@ -490,11 +473,7 @@ pub mod test_doubles {
             run_id: &str,
             provider: &str,
             model: &str,
-            mode: ExecMode,
         ) -> Result<(), PortError> {
-            if mode != ExecMode::Real {
-                return Ok(());
-            }
             self.effective_models.lock().expect("lock models").push((
                 run_id.to_string(),
                 provider.to_string(),
@@ -504,13 +483,11 @@ pub mod test_doubles {
         }
     }
 
-    /// Store step di test: registra i blocchi persistiti (solo `Real`). In
-    /// `Replay` la `persist_step` e' un NO-OP (nessuna registrazione): un test
-    /// asserisce ZERO scritture in shadow verificando `steps` vuoto.
+    /// Store step di test: registra i blocchi persistiti.
     #[derive(Default)]
     pub struct StubAgentStepStore {
         /// Step persistiti in ordine: (run_id, step_index = iteration*1000+idx,
-        /// block, result). Vuoto in shadow.
+        /// block, result).
         pub steps: Mutex<Vec<(String, i64, serde_json::Value, Option<serde_json::Value>)>>,
     }
 
@@ -523,12 +500,7 @@ pub mod test_doubles {
             idx: i64,
             block: serde_json::Value,
             result: Option<serde_json::Value>,
-            mode: ExecMode,
         ) -> Result<(), PortError> {
-            // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta.
-            if mode != ExecMode::Real {
-                return Ok(());
-            }
             // step_index deterministico = iteration*1000 + idx (come l'impl concreta).
             self.steps.lock().expect("lock steps").push((
                 run_id.to_string(),
@@ -540,11 +512,10 @@ pub mod test_doubles {
         }
     }
 
-    /// Store meta-step di test: registra i meta-step persistiti (solo `Real`).
-    /// `Replay` no-op (zero scritture shadow).
+    /// Store meta-step di test: registra i meta-step persistiti.
     #[derive(Default)]
     pub struct StubMetaStepStore {
-        /// Meta-step persistiti in ordine (JSON). Vuoto in shadow.
+        /// Meta-step persistiti in ordine (JSON).
         pub meta_steps: Mutex<Vec<serde_json::Value>>,
     }
 
@@ -553,11 +524,7 @@ pub mod test_doubles {
         async fn persist_meta_step(
             &self,
             meta_step: serde_json::Value,
-            mode: ExecMode,
         ) -> Result<(), PortError> {
-            if mode != ExecMode::Real {
-                return Ok(());
-            }
             self.meta_steps
                 .lock()
                 .expect("lock meta_steps")
@@ -571,14 +538,11 @@ pub mod test_doubles {
     /// abbia delegato l'offload). Per esercitare il DEGRADO A TRONCAMENTO dei
     /// chiamanti si puo' impostare `fail=true` (ritorna `PortError`).
     ///
-    /// Gata `Real` come l'impl concreta: in `Replay` la scrittura e' NO-OP (nulla
-    /// in `offloaded`) e ritorna `PortError` (il chiamante degrada a troncamento).
-    /// Un test asserisce ZERO scritture in shadow verificando `offloaded` vuoto.
     #[derive(Default)]
     pub struct StubContextOffload {
-        /// Se `true`, `offload_to_rag` fallisce in Real (test del degrado a troncamento).
+        /// Se `true`, `offload_to_rag` fallisce (test del degrado a troncamento).
         pub fail: bool,
-        /// Payload "offloadati" in ordine. Vuoto in shadow (gate `Real`).
+        /// Payload "offloadati" in ordine.
         pub offloaded: Mutex<Vec<serde_json::Value>>,
         /// `OffloadKind` di ogni offload, in ordine (per asserire tool_result vs chat_history).
         pub offloaded_kinds: Mutex<Vec<OffloadKind>>,
@@ -592,15 +556,9 @@ pub mod test_doubles {
             kind: OffloadKind,
             _session_id: Option<String>,
             _project_id: Option<String>,
-            mode: ExecMode,
         ) -> Result<String, PortError> {
-            // Gate shadow: in Replay NON si scrive (no-op), come l'impl concreta.
-            // Ritorna PortError cosi' il chiamante degrada a troncamento non-RAG.
-            if mode != ExecMode::Real {
-                return Err(PortError::Tool("shadow: offload no-op".to_string()));
-            }
             if self.fail {
-                return Err(PortError::Tool("stub: offload fail".to_string()));
+                return Err(PortError::Tool("stub: offload fail".to_string().into()));
             }
             let mut g = self.offloaded.lock().expect("lock offloaded");
             g.push(payload);
@@ -616,13 +574,12 @@ pub mod test_doubles {
     /// Embedder di test: NON chiama l'ONNX bridge. In Real ritorna, per ciascun
     /// testo, il vettore associato in `vectors` per posizione (cicla se ci sono piu'
     /// testi che vettori); se `vectors` e' vuoto (DEFAULT) ritorna `PortError` cosi'
-    /// i test esercitano il DEGRADO best-effort (niente continuity-trim). Gata `Real`
-    /// come l'impl concreta: in `Replay` e' NO-OP (`PortError`).
+    /// i test esercitano il DEGRADO best-effort (niente continuity-trim).
     #[derive(Default)]
     pub struct StubEmbeddingStore {
-        /// Vettori ritornati in Real (per posizione, ciclici). Vuoto -> `PortError`.
+        /// Vettori ritornati (per posizione, ciclici). Vuoto -> `PortError`.
         pub vectors: Vec<Vec<f32>>,
-        /// Testi ricevuti da `embed`, in ordine (per asserire l'input). Vuoto in shadow.
+        /// Testi ricevuti da `embed`, in ordine (per asserire l'input).
         pub embed_seen: Mutex<Vec<String>>,
     }
 
@@ -641,14 +598,10 @@ pub mod test_doubles {
         async fn embed(
             &self,
             texts: Vec<String>,
-            mode: ExecMode,
         ) -> Result<Vec<Vec<f32>>, PortError> {
-            if mode != ExecMode::Real {
-                return Err(PortError::Tool("shadow: embed no-op".to_string()));
-            }
             if self.vectors.is_empty() {
                 return Err(PortError::Tool(
-                    "stub: nessun vettore configurato".to_string(),
+                    "stub: nessun vettore configurato".to_string().into(),
                 ));
             }
             {
@@ -672,16 +625,12 @@ pub mod test_doubles {
     /// `None` (DEFAULT) ritorna `PortError`: cosi' i test che NON configurano il
     /// summary esercitano il DEGRADO best-effort (history invariata) senza dover
     /// impostare nulla.
-    ///
-    /// Gata `Real` come l'impl concreta: in `Replay` e' NO-OP (`PortError`, niente
-    /// in `summarize_seen`).
     #[derive(Default)]
     pub struct StubSummaryStore {
-        /// Riassunto fisso ritornato in Real. `None` (default) -> `PortError`
+        /// Riassunto fisso ritornato. `None` (default) -> `PortError`
         /// (degrado best-effort: la history resta invariata).
         pub summary: Option<String>,
-        /// Testi ricevuti da `summarize`, in ordine (per asserire l'input). Vuoto
-        /// in shadow (gate `Real`).
+        /// Testi ricevuti da `summarize`, in ordine (per asserire l'input).
         pub summarize_seen: Mutex<Vec<String>>,
     }
 
@@ -697,11 +646,7 @@ pub mod test_doubles {
 
     #[async_trait]
     impl SummaryStore for StubSummaryStore {
-        async fn summarize(&self, text: String, mode: ExecMode) -> Result<String, PortError> {
-            // Gate shadow: in Replay NON si riassume (no-op), come l'impl concreta.
-            if mode != ExecMode::Real {
-                return Err(PortError::Llm("shadow: summarize no-op".to_string()));
-            }
+        async fn summarize(&self, text: String) -> Result<String, PortError> {
             self.summarize_seen
                 .lock()
                 .expect("lock summarize_seen")
@@ -710,7 +655,7 @@ pub mod test_doubles {
                 Some(s) => Ok(s.clone()),
                 // Nessun riassunto configurato: degrado best-effort (history invariata).
                 None => Err(PortError::Llm(
-                    "stub: nessun summary configurato".to_string(),
+                    "stub: nessun summary configurato".to_string().into(),
                 )),
             }
         }
@@ -802,7 +747,6 @@ pub mod test_doubles {
             intent: Option<&str>,
             provider: Option<&str>,
             model: Option<&str>,
-            _mode: ExecMode,
         ) -> Result<EscalationInputs, PortError> {
             self.seen.lock().expect("lock seen").push((
                 intent.map(str::to_string),
@@ -810,7 +754,7 @@ pub mod test_doubles {
                 model.map(str::to_string),
             ));
             if self.fail {
-                return Err(PortError::Llm("stub: escalation_inputs fail".to_string()));
+                return Err(PortError::Llm("stub: escalation_inputs fail".to_string().into()));
             }
             // Nuovo contratto agentico: insieme UNIFICATO di candidati (intra +
             // cross) con tier + telemetria. Il provider della catena intra e' quello
@@ -853,7 +797,7 @@ pub mod test_doubles {
                 .expect("lock failover_seen")
                 .push(exclude.to_vec());
             if self.fail {
-                return Err(PortError::Llm("stub: failover_provider fail".to_string()));
+                return Err(PortError::Llm("stub: failover_provider fail".to_string().into()));
             }
             Ok(self.failover.as_ref().map(|(p, m)| CrossProviderCandidate {
                 provider: p.clone(),
@@ -910,7 +854,7 @@ pub mod test_doubles {
                 .expect("lock seen")
                 .push(cleaned_text.to_string());
             if self.fail {
-                return Err(PortError::Llm("stub: derive fail".to_string()));
+                return Err(PortError::Llm("stub: derive fail".to_string().into()));
             }
             Ok(self.choices.clone())
         }
@@ -941,7 +885,7 @@ pub mod test_doubles {
     impl BillingCooldownPort for StubBillingCooldownPort {
         async fn billing_exhausted_providers(&self) -> Result<Vec<String>, PortError> {
             if self.fail {
-                return Err(PortError::Llm("stub: billing snapshot fail".to_string()));
+                return Err(PortError::Llm("stub: billing snapshot fail".to_string().into()));
             }
             Ok(self.exhausted.clone())
         }
@@ -1053,12 +997,7 @@ pub mod test_doubles {
             min_context_window: i64,
             _capability: Option<&str>,
             _exclude_providers: &[String],
-            mode: ExecMode,
         ) -> Result<Option<(String, String)>, PortError> {
-            // Opzione A: in Replay nessuna risoluzione (parita' con l'impl reale).
-            if mode != ExecMode::Real {
-                return Ok(None);
-            }
             self.tier_selected
                 .lock()
                 .expect("lock tier_selected")

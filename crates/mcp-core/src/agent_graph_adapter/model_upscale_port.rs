@@ -10,14 +10,13 @@
 //! (`agent.upscale.*`) sono settings letti via `sqlx`. CONFINE (regola L): la
 //! DECISIONE di SE fare upscale resta PURA in
 //! `nexus_agent_graph::decisions::end_turn`; qui SOLO l'I/O. BEST-EFFORT:
-//! `Ok(0)` / `Ok(None)` su guasto, mai `PortError`. SOLA LETTURA: nessun gate `mode`.
+//! `Ok(0)` / `Ok(None)` su guasto, mai `PortError`. SOLA LETTURA.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, ModelUpscalePort, PortError, UpscalePick};
+use nexus_agent_graph::runtime::ports::{ModelUpscalePort, PortError, UpscalePick};
 
-use crate::orchestrator::{select_agentic_model, select_models_tierchain, EligibilityFilter};
 
 /// Adapter [`ModelUpscalePort`] -> `ai_price_catalog` + settings `agent.upscale.*`.
 pub struct CatalogModelUpscalePort {
@@ -87,38 +86,37 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
         required_tokens: i64,
     ) -> Result<Option<UpscalePick>, PortError> {
         let tier = self.target_tier().await;
-        let filter = EligibilityFilter {
-            require_tool_use: true,
-            require_thinking_non_exclude: true,
-            capability: None,
-            min_context_window: required_tokens,
-            exclude_providers: &[],
-            apply_cooldown: true,
-            only_provider: None,
-        };
-        let rows = match select_models_tierchain(
-            &self.db,
-            &filter,
-            &[tier.as_str()],
-            "context_window DESC, input_cost_per_million_tokens ASC NULLS LAST",
-            1,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    current_model = %current_model,
-                    required_tokens,
-                    error = %e,
-                    "model_upscale_port: select_upscale_model fallita, fail-open None"
-                );
+        // SERVIZIO UNICO (regola L). `Exact{ScaleTarget}`: qui il tier NON e' un
+        // requisito da soddisfare al meglio, e' il BERSAGLIO deciso a monte dal
+        // modulo puro dello scale-controller — questa funzione lo ESEGUE, non lo
+        // negozia. Degradare significherebbe fare l'opposto di un upscale. Con
+        // `ExactReason` la differenza fra questo `&[tier]` (voluto) e quello di
+        // `best_non_agentic_model` (che era un difetto) e' finalmente DICIBILE:
+        // prima erano lo stesso identico codice.
+        let req = crate::orchestrator::model_service::ModelRequest::agentic(&tier)
+            .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
+                why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
+            })
+            .rank(crate::orchestrator::model_service::Rank::WidestWindow)
+            .min_context_window(required_tokens);
+        let choice = match crate::orchestrator::model_service::select_model(&self.db, &req).await {
+            Ok(c) => c,
+            // Fail-open invariato: nessun bersaglio -> nessun upscale, non un run
+            // morto. Il motivo TIPIZZATO distingue "il tier e' vuoto" (atteso) da
+            // un guasto del catalog: solo il secondo merita un WARN.
+            Err(reason) => {
+                if !reason.is_expected() {
+                    tracing::warn!(
+                        current_model = %current_model,
+                        required_tokens,
+                        motivo = ?reason,
+                        "model_upscale_port: select_upscale_model senza candidati, fail-open None"
+                    );
+                }
                 return Ok(None);
             }
         };
-        let Some((provider, model, _)) = rows.into_iter().next() else {
-            return Ok(None);
-        };
+        let (provider, model) = (choice.provider, choice.model);
         // Se il migliore coincide col modello corrente non c'e' upscale da fare.
         if model == current_model {
             return Ok(None);
@@ -139,37 +137,35 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
     /// Selezione BIDIREZIONALE per lo SCALE-CONTROLLER (PR-B3): DELEGA al PUNTO
     /// UNICO `select_agentic_model` (regola L) col `tier` target e il
     /// `min_context_window` richiesto (FIX-B: nel downscale = est_tokens*overhead).
-    /// GATE mode opzione A: in Replay ritorna `Ok(None)` (il rientro rilegge lo
-    /// sticky checkpointato -> nessun I/O di risoluzione, parita' shadow). Fail-open
-    /// gia' incorporato: `select_agentic_model` ritorna `None` su guasto/nessun
-    /// candidato (nessun panico), che qui e' `Ok(None)` -> il chiamante ANNULLA il
-    /// cambio-tier (fail-safe, mantiene il modello corrente).
+    /// Fail-open gia' incorporato: `select_agentic_model` ritorna `None` su
+    /// guasto/nessun candidato (nessun panico), che qui e' `Ok(None)` -> il
+    /// chiamante ANNULLA il cambio-tier (fail-safe, mantiene il modello corrente).
     async fn select_model_for_tier(
         &self,
         tier: &str,
         min_context_window: i64,
         capability: Option<&str>,
         exclude_providers: &[String],
-        mode: ExecMode,
     ) -> Result<Option<(String, String)>, PortError> {
-        if mode != ExecMode::Real {
-            // Opzione A: nessuna risoluzione in Replay (lo sticky del primario e' la
-            // fonte di verita' checkpointata; risolvere qui divergerebbe se il
-            // catalog e' cambiato tra primario e resume).
-            return Ok(None);
-        }
-        // Stesso ordinamento del routing agentico (AGENTIC_COST_FIRST_ORDER): a
-        // tier fissato prende il modello piu' economico che soddisfa i vincoli
+        // SERVIZIO UNICO (regola L). `Exact{ScaleTarget}`: il tier arriva GIA'
+        // deciso dal modulo puro dello scale-controller — questa funzione lo
+        // ESEGUE, non lo negozia. Degradare qui darebbe al chiamante un modello
+        // di un tier diverso da quello che ha chiesto, in silenzio.
+        // `CostFirst`: a tier fissato il piu' economico che soddisfa i vincoli
         // (context_window incluso), is_featured solo come tie-break.
-        let picked = select_agentic_model(
+        let picked = crate::orchestrator::model_service::select_model(
             &self.db,
-            &[tier],
-            capability,
-            min_context_window,
-            exclude_providers,
-            crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+            &crate::orchestrator::model_service::ModelRequest::agentic(tier)
+                .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
+                    why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
+                })
+                .capability(capability)
+                .min_context_window(min_context_window)
+                .exclude(exclude_providers),
         )
-        .await;
+        .await
+        .ok()
+        .map(|c| (c.provider, c.model));
         Ok(picked)
     }
 }

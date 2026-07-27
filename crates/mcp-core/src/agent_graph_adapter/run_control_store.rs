@@ -4,17 +4,14 @@
 //! `tool_dispatch` (PUNTO UNICO, regola L) su `agent_runs` via `sqlx`:
 //! - `is_superseded` (lettura del flag `superseded`/`supersede_active_runs`,
 //!   FAIL-OPEN: errore DB -> `Ok(false)`, il run prosegue);
-//! - `heartbeat` (UPDATE `updated_at` best-effort, gata `Real`);
-//! - `set_effective_model` (registra provider/model effettivi dal gateway, gata
-//!   `Real`).
-//! Le scritture sono no-op in `ExecMode::Replay` (il run shadow non tocca la
-//! telemetria del primario).
+//! - `heartbeat` (UPDATE `updated_at` best-effort);
+//! - `set_effective_model` (registra provider/model effettivi dal gateway).
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, PortError, RunControlStore};
+use nexus_agent_graph::runtime::ports::{PortError, RunControlStore};
 
 /// Adapter [`RunControlStore`] -> `agent_runs` via `sqlx`.
 pub struct PgRunControlStore {
@@ -67,11 +64,8 @@ impl RunControlStore for PgRunControlStore {
     }
 
     /// Heartbeat di liveness: UPDATE `agent_runs.updated_at = NOW()` (mig 0392,
-    /// anti-recovery prematuro). Gata `Real` (no-op in shadow). Best-effort.
-    async fn heartbeat(&self, run_id: &str, mode: ExecMode) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
+    /// anti-recovery prematuro). Best-effort.
+    async fn heartbeat(&self, run_id: &str) -> Result<(), PortError> {
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
             Err(_) => return Ok(()),
@@ -92,18 +86,13 @@ impl RunControlStore for PgRunControlStore {
 
     /// Registra provider/model EFFETTIVAMENTE usati dal gateway sul run (la chat
     /// mostra il modello reale, non quello richiesto). Riusa lo stesso UPDATE
-    /// provider/model di `agent_run.rs` (regola L). Gata `Real` (no-op in shadow).
-    /// Best-effort.
+    /// provider/model di `agent_run.rs` (regola L). Best-effort.
     async fn set_effective_model(
         &self,
         run_id: &str,
         provider: &str,
         model: &str,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
             Err(_) => return Ok(()),
@@ -129,55 +118,37 @@ impl RunControlStore for PgRunControlStore {
 mod tests {
     use super::*;
 
-    async fn create_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 provider TEXT, \
-                 model TEXT, \
-                 updated_at TIMESTAMPTZ, \
-                 cancellation_requested TIMESTAMPTZ \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-    }
-
+    /// Run reale (sessione + NOT NULL dello schema del DB-progetto), con lo Stop
+    /// utente registrato se `superseded`. La tabella la porta il migrator del set
+    /// `db/migrations/project`.
     async fn insert_run(pool: &PgPool, superseded: bool) -> Uuid {
-        let id = Uuid::new_v4();
-        let sql = if superseded {
-            "INSERT INTO agent_runs (id, cancellation_requested) VALUES ($1, NOW())"
-        } else {
-            "INSERT INTO agent_runs (id) VALUES ($1)"
-        };
-        sqlx::query(sql)
-            .bind(id)
-            .execute(pool)
-            .await
-            .expect("insert");
+        let id = crate::test_support::seed_agent_run(pool).await;
+        if superseded {
+            sqlx::query("UPDATE agent_runs SET cancellation_requested = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("registra la supersessione");
+        }
         id
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn is_superseded_vero_quando_cancellation_requested(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, true).await;
         assert!(store.is_superseded(&run_id.to_string()).await.expect("ok"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn is_superseded_falso_run_attivo(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         assert!(!store.is_superseded(&run_id.to_string()).await.expect("ok"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn is_superseded_fail_open_run_inesistente_e_uuid_invalido(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgRunControlStore::new(pool.clone());
         // Run inesistente -> false (prosegue).
         assert!(!store
@@ -188,13 +159,12 @@ mod tests {
         assert!(!store.is_superseded("non-uuid").await.expect("fail-open"));
     }
 
-    #[sqlx::test]
-    async fn heartbeat_real_aggiorna_updated_at(pool: PgPool) {
-        create_table(&pool).await;
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn heartbeat_aggiorna_updated_at(pool: PgPool) {
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         store
-            .heartbeat(&run_id.to_string(), ExecMode::Real)
+            .heartbeat(&run_id.to_string())
             .await
             .expect("ok");
         let updated: Option<chrono::DateTime<chrono::Utc>> =
@@ -205,48 +175,16 @@ mod tests {
                 .expect("riga");
         assert!(
             updated.is_some(),
-            "heartbeat Real deve valorizzare updated_at"
+            "heartbeat deve valorizzare updated_at"
         );
     }
 
-    #[sqlx::test]
-    async fn heartbeat_replay_e_no_op(pool: PgPool) {
-        create_table(&pool).await;
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn set_effective_model_scrive(pool: PgPool) {
         let store = PgRunControlStore::new(pool.clone());
         let run_id = insert_run(&pool, false).await;
         store
-            .heartbeat(&run_id.to_string(), ExecMode::Replay)
-            .await
-            .expect("ok");
-        let updated: Option<chrono::DateTime<chrono::Utc>> =
-            sqlx::query_scalar("SELECT updated_at FROM agent_runs WHERE id = $1")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .expect("riga");
-        assert!(updated.is_none(), "in Replay nessun heartbeat");
-    }
-
-    #[sqlx::test]
-    async fn set_effective_model_real_scrive_replay_no(pool: PgPool) {
-        create_table(&pool).await;
-        let store = PgRunControlStore::new(pool.clone());
-        let run_id = insert_run(&pool, false).await;
-        // Replay: no-op.
-        store
-            .set_effective_model(&run_id.to_string(), "anthropic", "m1", ExecMode::Replay)
-            .await
-            .expect("ok");
-        let pm: (Option<String>, Option<String>) =
-            sqlx::query_as("SELECT provider, model FROM agent_runs WHERE id = $1")
-                .bind(run_id)
-                .fetch_one(&pool)
-                .await
-                .expect("riga");
-        assert_eq!(pm, (None, None), "Replay non scrive provider/model");
-        // Real: scrive.
-        store
-            .set_effective_model(&run_id.to_string(), "anthropic", "m1", ExecMode::Real)
+            .set_effective_model(&run_id.to_string(), "anthropic", "m1")
             .await
             .expect("ok");
         let pm: (Option<String>, Option<String>) =

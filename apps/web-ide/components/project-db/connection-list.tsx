@@ -43,11 +43,14 @@ export function ConnectionList({
 }: Props) {
   return (
     <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      {/* wrap obbligatorio: in una sidebar da ~195px questa riga chiede 189px di
+          min-content contro 159 disponibili. Senza andare a capo i bottoni
+          sfondano e la sidebar impone uno scroll orizzontale. */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 6 }}>
         <div style={{ fontSize: 11, fontWeight: 600, color: tc.text }}>
           DB del progetto ({connections.length})
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           <button
             type="button"
             onClick={onProvisionWizard}
@@ -97,7 +100,10 @@ export function ConnectionList({
             gap: 4,
           }}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+          {/* wrap sulla riga contenitore: il gruppo bottoni sotto ha gia' il
+              proprio flexWrap, ma non basta finche' e' questa riga a non poter
+              andare a capo (misurati 166px di min-content contro 141 utili). */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: tc.text, display: "flex", alignItems: "center", gap: 4 }}>
               {c.name}
               {c.is_primary && (

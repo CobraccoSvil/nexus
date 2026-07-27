@@ -70,13 +70,12 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
 ///
 /// Separazione DB per-progetto (regola G/L): `chat_sessions` e `agent_processes`
 /// sono domini MIGRATI (vedi `db/migrations/project/0001_chat.sql`,
-/// `0002_run.sql`), quindi a flag ON vivono nel DB del progetto e NON si possono
+/// `0002_run.sql`), quindi vivono nel DB del progetto e NON si possono
 /// interrogare dal meta con una JOIN su `projects`. Iteriamo i progetti
 /// (`list_all_project_ids`, tabella globale meta) e sondiamo l'attivita' sul pool
 /// di CIASCUNO (`project_data_pool_from`) — stesso pattern del `task_watchdog`
-/// per i processi orfani. A flag OFF ogni pool e' il meta: comportamento storico
-/// preservato. Query per-pool best-effort: un errore degrada a "non attivo",
-/// mai rompe il round.
+/// per i processi orfani. Query per-pool best-effort: un errore (pool non
+/// disponibile o query fallita) degrada a "non attivo", mai rompe il round.
 async fn recent_active_projects(
     meta: &sqlx::PgPool,
     idle_minutes: i64,
@@ -98,29 +97,18 @@ async fn recent_active_projects(
     for row in projects {
         let project_id: Uuid = row.get("project_id");
         let slug: String = row.get("slug");
-        // Pool dove risiedono i dati vivi del progetto (meta a flag OFF).
-        let pool = crate::project_db_routes::project_data_pool_from(meta, project_id).await;
-        let is_active: bool = sqlx::query_scalar(
-            r#"
-            SELECT
-                EXISTS (
-                    SELECT 1 FROM chat_sessions
-                     WHERE project_id = $1
-                       AND updated_at > NOW() - ($2::text || ' minutes')::interval
-                )
-                OR EXISTS (
-                    SELECT 1 FROM agent_processes
-                     WHERE project_id = $1
-                       AND COALESCE(stopped_at, created_at) > NOW() - ($2::text || ' minutes')::interval
-                )
-            "#,
+        // Pool dove risiedono i dati vivi del progetto. Non disponibile ->
+        // progetto considerato non attivo per questo giro (WARN + skip).
+        let Some(pool) = crate::project_db_routes::project_data_pool_or_warn(
+            meta,
+            project_id,
+            "recent_active_projects",
         )
-        .bind(project_id)
-        .bind(idle.as_str())
-        .fetch_one(&pool)
         .await
-        .unwrap_or(false);
-        if is_active {
+        else {
+            continue;
+        };
+        if project_has_recent_activity(&pool, project_id, idle.as_str()).await {
             active.push((project_id, slug));
             if active.len() >= 50 {
                 break;
@@ -128,6 +116,32 @@ async fn recent_active_projects(
         }
     }
     Ok(active)
+}
+
+/// True se il progetto mostra attivita' recente (sessioni chat aggiornate o
+/// processi agente vivi) entro `idle_minutes`. Sul DB del progetto; errore
+/// query -> false (il progetto risulta non attivo per questo giro).
+async fn project_has_recent_activity(pool: &sqlx::PgPool, project_id: Uuid, idle: &str) -> bool {
+    sqlx::query_scalar(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1 FROM chat_sessions
+                 WHERE project_id = $1
+                   AND updated_at > NOW() - ($2::text || ' minutes')::interval
+            )
+            OR EXISTS (
+                SELECT 1 FROM agent_processes
+                 WHERE project_id = $1
+                   AND COALESCE(stopped_at, created_at) > NOW() - ($2::text || ' minutes')::interval
+            )
+        "#,
+    )
+    .bind(project_id)
+    .bind(idle)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
 }
 
 /// Calcola le KPI di default. Tutto best-effort: se una sorgente fallisce, la
@@ -259,8 +273,10 @@ async fn read_usage_24h(db: &sqlx::PgPool, project_id: Uuid) -> Option<UsageWind
 /// Numero di agent_runs creati nelle ultime 24h per il progetto.
 async fn count_agent_runs_24h(db: &sqlx::PgPool, project_id: Uuid) -> Result<i64, String> {
     // Separazione DB per-progetto: agent_runs e' una tabella migrata, instradiamo
-    // sul pool del progetto (a flag OFF ricade sul meta-pool, comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // sul pool del progetto (errore propagato: il chiamante degrada la metrica).
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_runs \
          WHERE project_id = $1 AND created_at > NOW() - INTERVAL '24 hours'",
@@ -387,7 +403,19 @@ async fn count_services(_state: &AppState, _project_id: Uuid, slug: &str) -> Opt
 /// chiamante degrada a "—" senza tentare path Linux.
 #[cfg(windows)]
 async fn count_services(state: &AppState, project_id: Uuid, _slug: &str) -> Option<ServiceCount> {
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // DB progetto non disponibile -> None (il chiamante mostra "—"), con WARN.
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "count_services: DB progetto non disponibile, conteggio non osservabile"
+                );
+                return None;
+            }
+        };
     // COUNT DISTINCT label evita di gonfiare i numeri con lo storico (piu' righe
     // per stessa label, ORDER BY created_at DESC nel resto del modulo).
     let row: Option<(i64, i64)> = sqlx::query_as(

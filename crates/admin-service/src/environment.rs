@@ -1,9 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
-use std::time::Duration;
 
 use crate::AppState;
 
@@ -24,13 +24,28 @@ pub struct EnvironmentCheck {
 
 impl EnvironmentCheck {
     fn ok(id: &str, label: &str, detail: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into(), status: "ok".into(), detail: detail.into() }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            status: "ok".into(),
+            detail: detail.into(),
+        }
     }
     fn warn(id: &str, label: &str, detail: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into(), status: "warn".into(), detail: detail.into() }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            status: "warn".into(),
+            detail: detail.into(),
+        }
     }
     fn error(id: &str, label: &str, detail: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into(), status: "error".into(), detail: detail.into() }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            status: "error".into(),
+            detail: detail.into(),
+        }
     }
 }
 
@@ -59,9 +74,17 @@ async fn check_playwright_libs() -> EnvironmentCheck {
     };
 
     if found {
-        EnvironmentCheck::ok("playwright_libs", "Playwright system libs", "libatk-1.0.so.0 found")
+        EnvironmentCheck::ok(
+            "playwright_libs",
+            "Playwright system libs",
+            "libatk-1.0.so.0 found",
+        )
     } else {
-        EnvironmentCheck::error("playwright_libs", "Playwright system libs", "libatk-1.0.so.0 missing")
+        EnvironmentCheck::error(
+            "playwright_libs",
+            "Playwright system libs",
+            "libatk-1.0.so.0 missing",
+        )
     }
 }
 
@@ -77,9 +100,50 @@ async fn check_playwright_libs() -> EnvironmentCheck {
     )
 }
 
+/// Cartella dove Playwright installa i browser, secondo l'OS.
+///
+/// Era `$HOME/.cache/ms-playwright` con fallback `/root`: un percorso che su
+/// Windows non esiste, quindi il check riportava "Chromium browser: not
+/// installed" SEMPRE, anche col browser regolarmente installato — un falso
+/// allarme fisso nel pannello Environment. Gli altri due check dello stesso file
+/// avevano gia' il ramo portabile (`check_playwright_libs` con
+/// `#[cfg(windows)]`, `check_frontend_process` col probe TCP): questo era
+/// rimasto indietro.
+///
+/// `PLAYWRIGHT_BROWSERS_PATH` ha la precedenza, come per Playwright stesso: chi
+/// la imposta sta dicendo dove guardare.
+fn playwright_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(esplicito) = std::env::var("PLAYWRIGHT_BROWSERS_PATH") {
+        if !esplicito.trim().is_empty() {
+            return Some(std::path::PathBuf::from(esplicito));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // %LOCALAPPDATA%\ms-playwright
+        std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|d| std::path::PathBuf::from(d).join("ms-playwright"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".cache").join("ms-playwright"))
+    }
+}
+
 async fn check_playwright_browser() -> EnvironmentCheck {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let cache_dir = format!("{}/.cache/ms-playwright", home);
+    let Some(cache_dir) = playwright_cache_dir() else {
+        // Nessuna variabile da cui dedurre il percorso: si dichiara l'incertezza
+        // invece di riportare "not installed", che sarebbe una diagnosi non
+        // supportata dai fatti.
+        return EnvironmentCheck::error(
+            "playwright_browser",
+            "Chromium browser",
+            "percorso della cache Playwright non determinabile (ne' PLAYWRIGHT_BROWSERS_PATH, ne' la home dell'utente)",
+        );
+    };
 
     let found = if let Ok(mut rd) = tokio::fs::read_dir(&cache_dir).await {
         let mut has_entry = false;
@@ -136,20 +200,24 @@ async fn check_frontend_process() -> EnvironmentCheck {
 async fn check_migrations(db: &sqlx::PgPool) -> EnvironmentCheck {
     // sqlx CLI potrebbe non essere installato. Verifichiamo via DB:
     // la tabella _sqlx_migrations tiene traccia delle migration applicate.
-    let result = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM _sqlx_migrations"
-    )
-    .fetch_one(db)
-    .await;
+    let result = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(db)
+        .await;
 
     match result {
-        Ok(count) => EnvironmentCheck::ok("migrations", "DB Migrations", format!("{count} applied")),
+        Ok(count) => {
+            EnvironmentCheck::ok("migrations", "DB Migrations", format!("{count} applied"))
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("does not exist") || msg.contains("relation") {
                 EnvironmentCheck::warn("migrations", "DB Migrations", "Migration table not found")
             } else {
-                EnvironmentCheck::warn("migrations", "DB Migrations", format!("Check failed: {msg}"))
+                EnvironmentCheck::warn(
+                    "migrations",
+                    "DB Migrations",
+                    format!("Check failed: {msg}"),
+                )
             }
         }
     }
@@ -165,7 +233,11 @@ async fn check_ai_providers(db: &sqlx::PgPool) -> EnvironmentCheck {
     .unwrap_or(0);
 
     if count > 0 {
-        EnvironmentCheck::ok("ai_providers", "AI Providers", format!("{count} configured"))
+        EnvironmentCheck::ok(
+            "ai_providers",
+            "AI Providers",
+            format!("{count} configured"),
+        )
     } else {
         EnvironmentCheck::warn("ai_providers", "AI Providers", "0 providers configured")
     }
@@ -174,8 +246,8 @@ async fn check_ai_providers(db: &sqlx::PgPool) -> EnvironmentCheck {
 #[cfg(unix)]
 async fn check_disk_space() -> EnvironmentCheck {
     // Controlla il disco dove risiede Nexus (non necessariamente il root /)
-    let nexus_root = std::env::var("NEXUS_ROOT")
-        .unwrap_or_else(|_| "/var/lib/postgresql/wal/nexus".to_string());
+    let nexus_root =
+        std::env::var("NEXUS_ROOT").unwrap_or_else(|_| "/var/lib/postgresql/wal/nexus".to_string());
 
     // df output: Filesystem Size Used Avail Use% Mounted on
     let result = Command::new("df").args(["-h", &nexus_root]).output().await;
@@ -185,10 +257,15 @@ async fn check_disk_space() -> EnvironmentCheck {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let line = stdout.lines().nth(1)?;
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 { return None; }
+        if parts.len() < 5 {
+            return None;
+        }
         let avail = parts[3];
         let use_pct: u32 = parts[4].trim_end_matches('%').parse().ok()?;
-        Some((format!("{label}: {avail} liberi ({use_pct}% usati)"), use_pct))
+        Some((
+            format!("{label}: {avail} liberi ({use_pct}% usati)"),
+            use_pct,
+        ))
     }
 
     let nexus_info = result.ok().and_then(|o| parse_df(o, "nexus"));
@@ -207,7 +284,9 @@ async fn check_disk_space() -> EnvironmentCheck {
         }
         (Some((nd, np)), None) => (nd, np),
         (None, Some((rd, rp))) => (rd, rp),
-        (None, None) => return EnvironmentCheck::warn("disk_space", "Disk space", "df non disponibile"),
+        (None, None) => {
+            return EnvironmentCheck::warn("disk_space", "Disk space", "df non disponibile")
+        }
     };
 
     if max_pct >= 95 {
@@ -234,29 +313,40 @@ async fn check_disk_space() -> EnvironmentCheck {
 }
 
 /// Controlla se un servizio HTTP interno risponde all'endpoint /health o /api/health
-async fn check_internal_service(id: &str, label: &str, port: u16, health_path: &str) -> EnvironmentCheck {
+async fn check_internal_service(
+    id: &str,
+    label: &str,
+    port: u16,
+    health_path: &str,
+) -> EnvironmentCheck {
     let url = format!("http://127.0.0.1:{port}{health_path}");
     let result = timeout(
         Duration::from_secs(3),
-        Command::new("curl").args(["-fsS", "--max-time", "2", &url]).output(),
-    ).await;
+        Command::new("curl")
+            .args(["-fsS", "--max-time", "2", &url])
+            .output(),
+    )
+    .await;
 
     match result {
         Ok(Ok(out)) if out.status.success() => {
             // Prova a estrarre la versione dal JSON se presente
             let body = String::from_utf8_lossy(&out.stdout);
             let version = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                v.get("version").and_then(|v| v.as_str()).map(|s| format!(" v{s}")).unwrap_or_default()
-            } else { String::new() };
+                v.get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| format!(" v{s}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             EnvironmentCheck::ok(id, label, format!(":{port}{version}"))
         }
         _ => EnvironmentCheck::error(id, label, format!(":{port} not responding")),
     }
 }
 
-pub async fn get_environment_status(
-    State(state): State<AppState>,
-) -> ApiResult {
+pub async fn get_environment_status(State(state): State<AppState>) -> ApiResult {
     let (
         db_check,
         playwright_libs_check,
@@ -268,7 +358,6 @@ pub async fn get_environment_status(
         svc_mcp,
         svc_admin,
         svc_doc,
-        svc_billing,
         svc_plugin,
     ) = tokio::join!(
         check_db(&state.db),
@@ -278,11 +367,10 @@ pub async fn get_environment_status(
         check_migrations(&state.db),
         check_ai_providers(&state.db),
         check_disk_space(),
-        check_internal_service("svc_mcp_core",    "MCP Core (:4000)",        4000, "/api/health"),
-        check_internal_service("svc_admin",        "Admin Service (:4010)",   4010, "/health"),
-        check_internal_service("svc_doc",          "Doc Service (:4030)",     4030, "/health"),
-        check_internal_service("svc_billing",      "Billing Service (:4040)", 4040, "/health"),
-        check_internal_service("svc_plugin",       "Plugin Service (:4050)",  4050, "/health"),
+        check_internal_service("svc_mcp_core", "MCP Core (:4000)", 4000, "/api/health"),
+        check_internal_service("svc_admin", "Admin Service (:4010)", 4010, "/health"),
+        check_internal_service("svc_doc", "Doc Service (:4030)", 4030, "/health"),
+        check_internal_service("svc_plugin", "Plugin Service (:4050)", 4050, "/health"),
     );
 
     let backend_check = check_backend_process();
@@ -300,7 +388,6 @@ pub async fn get_environment_status(
         svc_mcp,
         svc_admin,
         svc_doc,
-        svc_billing,
         svc_plugin,
     ];
 
@@ -334,9 +421,13 @@ pub async fn fix_environment(
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     let output = format!("{stdout}{stderr}");
-                    Ok(Json(json!({ "ok": out.status.success(), "output": output })))
+                    Ok(Json(
+                        json!({ "ok": out.status.success(), "output": output }),
+                    ))
                 }
-                Ok(Err(e)) => Ok(Json(json!({ "ok": false, "output": format!("Error: {e}") }))),
+                Ok(Err(e)) => Ok(Json(
+                    json!({ "ok": false, "output": format!("Error: {e}") }),
+                )),
                 Err(_) => Ok(Json(json!({ "ok": false, "output": "Timeout after 120s" }))),
             }
         }
@@ -354,18 +445,20 @@ pub async fn fix_environment(
             .await;
 
             match result {
-                Ok(Ok(_)) => Ok(Json(json!({ "ok": true, "output": "mcp-core riavviato. Le migration vengono applicate all'avvio." }))),
-                Ok(Err(e)) => Ok(Json(json!({ "ok": false, "output": format!("Error: {e}") }))),
+                Ok(Ok(_)) => Ok(Json(
+                    json!({ "ok": true, "output": "mcp-core riavviato. Le migration vengono applicate all'avvio." }),
+                )),
+                Ok(Err(e)) => Ok(Json(
+                    json!({ "ok": false, "output": format!("Error: {e}") }),
+                )),
                 Err(_) => Ok(Json(json!({ "ok": false, "output": "Timeout" }))),
             }
         }
 
-        "get_system_deps_command" => {
-            Ok(Json(json!({
-                "ok": true,
-                "output": "sudo apt-get install -y libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0"
-            })))
-        }
+        "get_system_deps_command" => Ok(Json(json!({
+            "ok": true,
+            "output": "sudo apt-get install -y libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0"
+        }))),
 
         "restart_frontend" => {
             // Kill processo sulla porta 3000
@@ -382,13 +475,20 @@ pub async fn fix_environment(
             let frontend_dir = format!("{nexus_root}/apps/web-ide");
 
             let result = Command::new("sh")
-                .args(["-c", &format!("cd {frontend_dir} && nohup pnpm start > /tmp/web-ide.log 2>&1 &")])
+                .args([
+                    "-c",
+                    &format!("cd {frontend_dir} && nohup pnpm start > /tmp/web-ide.log 2>&1 &"),
+                ])
                 .output()
                 .await;
 
             match result {
-                Ok(_) => Ok(Json(json!({ "ok": true, "output": "Frontend restart initiated. Check port 3000 in a few seconds." }))),
-                Err(e) => Ok(Json(json!({ "ok": false, "output": format!("Error: {e}") }))),
+                Ok(_) => Ok(Json(
+                    json!({ "ok": true, "output": "Frontend restart initiated. Check port 3000 in a few seconds." }),
+                )),
+                Err(e) => Ok(Json(
+                    json!({ "ok": false, "output": format!("Error: {e}") }),
+                )),
             }
         }
 
@@ -400,15 +500,19 @@ pub async fn fix_environment(
 
             let packages = "libatk1.0-0 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libnspr4 libnss3 libx11-xcb1 libxcb-dri3-0 libdrm2 libglib2.0-0 libdbus-1-3 libxshmfence1 libxext6";
 
-            let cmd = format!("echo '{}' | sudo -S apt-get install -y {} 2>&1", sudo_password, packages);
+            let cmd = format!(
+                "echo '{}' | sudo -S apt-get install -y {} 2>&1",
+                sudo_password, packages
+            );
 
             let result = tokio::time::timeout(
                 Duration::from_secs(120),
                 tokio::process::Command::new("sh")
                     .arg("-c")
                     .arg(&cmd)
-                    .output()
-            ).await;
+                    .output(),
+            )
+            .await;
 
             match result {
                 Ok(Ok(output)) => {
@@ -427,6 +531,9 @@ pub async fn fix_environment(
             }
         }
 
-        _ => Err(api_error(StatusCode::BAD_REQUEST, format!("Unknown action: {}", body.action))),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("Unknown action: {}", body.action),
+        )),
     }
 }

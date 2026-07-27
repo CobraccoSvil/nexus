@@ -2,11 +2,32 @@
 
 import { useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { AutoWidthSelect } from "../auto-width-select";
 import {
   getProviderModelsAdmin,
   setModelEnabled,
+  setModelTier,
   type ModelCatalogEntry,
+  type PerformanceTier,
 } from "../../lib/api/models";
+
+/** La scala del catalog (mig 0528/0547). Specchio di PERFORMANCE_TIERS in
+ *  nexus-agent-graph/src/decisions/tiers.rs: il vocabolario vive li'. */
+const TIERS: PerformanceTier[] = ["light", "medium", "high", "heavy", "frontier"];
+
+/** Opzioni della tendina di curatela: "auto" (nessun override) piu' la scala. */
+const TIER_OPTIONS = [
+  { value: "", label: "auto" },
+  ...TIERS.map((t) => ({ value: t, label: t })),
+];
+
+/** Etichetta della PROVENIENZA del tier. E' l'informazione che dice se fidarsi
+ *  del valore accanto: un tier senza fonte e' un fossile, non una decisione. */
+const FONTE_LABEL: Record<string, string> = {
+  synced: "indice",
+  measured: "misurato",
+  manual: "curato",
+};
 
 interface ProviderModelsSectionProps {
   /** Nome del provider (es. "perplexity"): filtra i modelli del catalog. */
@@ -69,6 +90,38 @@ export function ProviderModelsSection({
         setToggleError({
           model,
           msg: e instanceof Error ? e.message : "aggiornamento fallito",
+        });
+      })
+      .finally(() => setBusy(null));
+  }
+
+  /** Curatela del tier. `null` = rimuovi l'override: il valore resta, ma indice
+   *  e batteria tornano a poterlo correggere. */
+  function handleTier(model: string, tier: PerformanceTier | null) {
+    setBusy(model);
+    setToggleError(null);
+    void setModelTier(provider, model, tier)
+      .then(() => {
+        setModels((ms) =>
+          ms
+            ? ms.map((m) =>
+                m.model === model
+                  ? {
+                      ...m,
+                      // Con l'override rimosso il tier NON si azzera: resta il
+                      // valore corrente, con la fonte tornata ignota.
+                      performanceTier: tier ?? m.performanceTier,
+                      tierSource: tier ? "manual" : null,
+                    }
+                  : m,
+              )
+            : ms,
+        );
+      })
+      .catch((e) => {
+        setToggleError({
+          model,
+          msg: e instanceof Error ? e.message : "curatela fallita",
         });
       })
       .finally(() => setBusy(null));
@@ -161,12 +214,81 @@ export function ProviderModelsSection({
                   </span>
                   <span style={{ fontSize: 10, color: tc.textMuted }}>
                     {m.model}
-                    {m.performanceTier ? ` · ${m.performanceTier}` : ""}
                     {Array.isArray(m.capabilities) && m.capabilities.length > 0
                       ? ` · ${m.capabilities.join(", ")}`
                       : ""}
                   </span>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      color: tc.textMuted,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    {/* La FONTE accanto al tier: un tier senza fonte e' un
+                        fossile (l'euristica sul nome), non una decisione — ed e'
+                        l'informazione che dice se fidarsi del valore. */}
+                    <span
+                      title={
+                        m.tierSource
+                          ? `tier ${m.performanceTier}: ${FONTE_LABEL[m.tierSource]}`
+                          : "tier di provenienza ignota: nessuna fonte si e' espressa (indice o batteria possono correggerlo)"
+                      }
+                      style={{
+                        padding: "0 4px",
+                        borderRadius: 3,
+                        border: `1px solid ${tc.border}`,
+                        color: m.tierSource === "manual" ? tc.text : tc.textMuted,
+                        fontWeight: m.tierSource === "manual" ? 600 : 400,
+                      }}
+                    >
+                      {m.performanceTier ?? "tier ignoto"}
+                      {m.tierSource ? ` · ${FONTE_LABEL[m.tierSource]}` : " · fonte ignota"}
+                    </span>
+                    {/* L'indice esterno: il numero su cui si fonda il tier
+                        `synced`. Assente per il 63% del parco (OpenRouter non
+                        lista quei nomi): li' decide solo la batteria. */}
+                    <span
+                      title={
+                        m.agenticIndex === null
+                          ? "il servizio di classificazione esterno non copre questo modello: il tier puo' venire solo dalla batteria"
+                          : "agentic_index (Artificial Analysis): la capacita' MISURATA su harness con tool"
+                      }
+                    >
+                      idx {m.agenticIndex ?? "—"}
+                    </span>
+                    {m.qualificationState && m.qualificationState !== "qualified" && (
+                      <span
+                        title="La batteria non ha (ancora) qualificato questo modello: col gate acceso resta fuori dal routing agentico"
+                        style={{ color: tc.error }}
+                      >
+                        {m.qualificationState}
+                      </span>
+                    )}
+                  </span>
                 </div>
+                <AutoWidthSelect
+                  disabled={busy === m.model}
+                  value={m.tierSource === "manual" ? (m.performanceTier ?? "") : ""}
+                  onChange={(value) =>
+                    handleTier(m.model, (value || null) as PerformanceTier | null)
+                  }
+                  title="Curatela del tier: vince su indice e batteria. Vuoto = nessun override (decidono le fonti automatiche)."
+                  options={TIER_OPTIONS}
+                  style={{
+                    fontSize: 10,
+                    padding: "2px 4px",
+                    borderRadius: 4,
+                    border: `1px solid ${tc.border}`,
+                    background: tc.bgCard,
+                    color: tc.text,
+                    cursor: busy === m.model ? "not-allowed" : "pointer",
+                    flexShrink: 0,
+                  }}
+                />
                 <button
                   disabled={busy === m.model}
                   onClick={() => handleToggle(m.model, !m.isEnabled)}

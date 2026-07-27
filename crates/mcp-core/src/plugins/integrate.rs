@@ -8,10 +8,59 @@ use uuid::Uuid;
 
 use crate::{
     auth::Claims,
-    chat_learning::{api_error, parse_user_id, ApiResult},
+    chat_learning::{api_error, parse_user_id, ApiError, ApiResult},
     mcp_client::{self, McpServerConfig, McpTransport},
     AppState,
 };
+
+/// Chiavi secret dichiarate da un plugin, deduplicate e ripulite dai vuoti.
+fn collect_secret_refs(groups: &[&Value]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for group in groups {
+        let Some(list) = group.as_array() else { continue };
+        for key in list.iter().filter_map(Value::as_str) {
+            let key = key.trim();
+            if !key.is_empty() && !keys.iter().any(|k| k == key) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+/// Crea le righe `settings` per i secret che un plugin dichiara di leggere.
+///
+/// Dichiarare `requiredSecretRefs`/`optionalSecretRefs` significa che il plugin
+/// leggera' quelle chiavi: la riga nasce qui, dove categoria e `is_secret` sono
+/// noti e veri. Prima il catalogo le registrava senza crearle, e l'unico modo di
+/// valorizzarle dalla UI era il ramo INSERT di `settings::update_setting`, che le
+/// materializzava in categoria 'custom' con `is_secret = FALSE`: `mask_settings`
+/// maschera solo cio' che e' marcato secret, quindi il token finiva IN CHIARO
+/// nella risposta di `GET /api/admin/settings` (che la UI legge tutta, senza
+/// filtro di categoria). Quel ramo non esiste piu' (il PUT risponde 404 su
+/// chiave assente), quindi il seeding qui e' cio' che tiene configurabili i
+/// plugin integrati a runtime — e li fa nascere mascherati.
+///
+/// `ON CONFLICT DO NOTHING`: le chiavi gia' seedate da una migrazione (es.
+/// `figma_oauth_token`, mig 0017) tengono descrizione e valore che hanno.
+async fn seed_declared_secrets(
+    db: &sqlx::PgPool,
+    plugin_name: &str,
+    keys: &[String],
+) -> Result<(), ApiError> {
+    for key in keys {
+        sqlx::query(
+            "INSERT INTO settings (key, value, category, description, is_secret, updated_at) \
+             VALUES ($1, '', 'connectors', $2, TRUE, NOW()) ON CONFLICT (key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(format!("Secret del plugin MCP {plugin_name}"))
+        .execute(db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,6 +311,7 @@ pub async fn publish_plugin_integration(
         .get("optionalSecretRefs")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    let declared_secrets = collect_secret_refs(&[&required_secret_refs, &optional_secret_refs]);
     let default_scope = normalize_scope(item.get("defaultScope").and_then(Value::as_str))?;
     let allowed_commands = item
         .get("allowedCommands")
@@ -316,6 +366,8 @@ pub async fn publish_plugin_integration(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let catalog_item_id: Uuid = row.try_get("id").unwrap_or(Uuid::nil());
+
+    seed_declared_secrets(&state.db, &name, &declared_secrets).await?;
 
     let version = body.version.unwrap_or_else(|| "1.0.0".to_string());
     let changelog = body

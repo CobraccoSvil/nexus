@@ -47,8 +47,12 @@ pub(crate) struct ChatMessageView {
     /// testo del content. None per i messaggi ordinari.
     pub(crate) process_label: Option<String>,
     /// Stato CANONICO del run che ha prodotto questo messaggio assistant
-    /// (agent_runs.status via LEFT JOIN su run_message_id). None per i messaggi
-    /// utente o quando il messaggio non e' collegato a un run. Permette alla UI
+    /// (agent_runs.status via LEFT JOIN sull'ancora del run: `run_message_id`
+    /// punta al messaggio UTENTE, quindi l'assistant si aggancia dal proprio
+    /// `request_message_id`). Prima del fix il JOIN era su `cm.id` secco e lo
+    /// stato atterrava SOLO sul messaggio utente: misurato 6/6 sugli user, 0/6
+    /// sugli assistant, cioe' l'esatto contrario di quanto questo commento
+    /// dichiarava. None quando il messaggio non e' collegato a un run. Permette alla UI
     /// di mostrare un badge di stato PERSISTENTE (completato/fallito/interrotto/
     /// superato) senza un fetch separato e coerente al reload.
     pub(crate) run_status: Option<String>,
@@ -106,11 +110,24 @@ pub(crate) fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessage
             .get("intent")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        run_id: metadata
-            .get("runId")
-            .or_else(|| metadata.get("agentRunId"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        // Fonte autoritativa: la colonna `run_id` del LEFT JOIN su agent_runs
+        // (la riga del run E' il fatto). Il metadata resta come ripiego per le
+        // query che non espongono la colonna, ma non e' una fonte affidabile:
+        // misurato sul DB del progetto, la chiave `runId` non e' presente in
+        // NESSUN messaggio (0 su 6) -- il ripiego da solo lasciava `runId`
+        // undefined per tutta la storia ricaricata.
+        run_id: row
+            .try_get::<Option<Uuid>, _>("run_id")
+            .ok()
+            .flatten()
+            .map(|value| value.to_string())
+            .or_else(|| {
+                metadata
+                    .get("runId")
+                    .or_else(|| metadata.get("agentRunId"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }),
         prompt_tokens: metadata.get("promptTokens").and_then(Value::as_i64),
         last_prompt_tokens: metadata.get("lastPromptTokens").and_then(Value::as_i64),
         completion_tokens: metadata.get("completionTokens").and_then(Value::as_i64),
@@ -242,8 +259,8 @@ pub(crate) fn enrich_attachments_with_ids(
 ///
 /// Separazione DB: `chat_message_attachments` e' migrata nel DB del progetto. Il
 /// chiamante DEVE passare un pool GIA' instradato al progetto (risolto via
-/// `project_data_pool_by_message_from` o affine) — NON il meta-DB, che a flag ON
-/// non contiene piu' queste righe e ritornerebbe vuoto.
+/// `project_data_pool_by_message_from` o affine) — NON il meta-DB, che non
+/// contiene piu' queste righe e ritornerebbe vuoto.
 pub(crate) async fn enrich_attachments_with_ids_from_db(
     pool: &PgPool,
     atts: Vec<ChatAttachment>,
@@ -350,9 +367,10 @@ pub(crate) async fn insert_message_with_client_id(
 ) -> Result<ClientIdInsert, ApiError> {
     let message_id = Uuid::new_v4();
     // Cutover separazione DB (route-at-helper): il messaggio si scrive nel DB del
-    // progetto via registry globale. `db` e' il pool meta-DB per la risoluzione;
-    // flag off -> ritorna il meta-DB (comportamento storico).
-    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // progetto via registry globale. `db` e' il pool meta-DB per la risoluzione.
+    // Niente fallback al meta (mig 0527): DB progetto non disponibile -> errore
+    // propagato al chiamante, MAI scrivere il messaggio sul DB sbagliato.
+    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     let insert_result = sqlx::query(
         r#"
         INSERT INTO chat_messages (
@@ -441,7 +459,7 @@ pub(crate) async fn load_message_by_id(
     message_id: Uuid,
 ) -> Result<sqlx::postgres::PgRow, ApiError> {
     // Legge dal DB del progetto dove il messaggio e' stato scritto (route-at-helper).
-    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     sqlx::query(
         r#"
         SELECT

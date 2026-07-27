@@ -6,11 +6,11 @@
 //!
 //! 1. **Dirty-check**: salta i template gia' valutati di recente (stesso
 //!    `content_hash` + `guideline_set_hash`, `checked_at` entro l'intervallo
-//!    configurato). Lo scheduler dei periodic worker tickka ogni 1800s e ignora
-//!    `interval()`, quindi il throttling 24h e' interno qui.
-//! 2. **Conformance check** (brain `POST /agent/prompt-revise`, mode `evaluate`):
-//!    salva l'esito in `nexus_prompt_conformance` (append-only, ON CONFLICT
-//!    DO NOTHING).
+//!    configurato). E' un throttling per-template, indipendente dalla cadenza
+//!    con cui lo scheduler chiama il worker (`interval()`).
+//! 2. **Conformance check**: `prompt_variants::call_prompt_revise` in mode
+//!    `evaluate`; l'esito va in `nexus_prompt_conformance` (append-only, ON
+//!    CONFLICT DO NOTHING).
 //! 3. **Revisione** (solo se `alignment_autovariant_enabled` e score sotto soglia):
 //!    - `system.*`/`automation.*` (safelist): genera una PROPOSTA in
 //!      `nexus_alignment_proposal` (status pending) da approvare a mano.
@@ -23,7 +23,7 @@
 //! - Revisione automatica separata: `alignment_autovariant_enabled=false`
 //!   (default) = solo valutazione.
 //! - Cap costo: `alignment_max_checks_per_tick` conformance check per esecuzione.
-//! - Selezione modello tier-only lato brain (purpose `prompt_conformance_check`).
+//! - Selezione modello dal purpose (regola G), non hardcoded qui.
 
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
 use crate::workers::prompt_variants;
@@ -31,7 +31,11 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Cadenza del worker: 30 minuti, come il gemello `prompt_optimizer` e per lo
+/// stesso motivo (interroga il modello). Vedi [`GuidelineAlignmentWorker::interval`].
+const ALIGNMENT_INTERVAL_SECS: u64 = 1800;
 use tracing::{debug, error, info, warn};
 
 /// Template attivo candidato alla valutazione di conformita'.
@@ -280,6 +284,17 @@ impl LearningWorker for GuidelineAlignmentWorker {
 
     fn trigger(&self) -> WorkerTrigger {
         WorkerTrigger::Periodic
+    }
+
+    /// 30 minuti come il gemello `prompt_optimizer`, e per la stessa ragione:
+    /// quando `alignment_enabled` e' acceso questo worker interroga il modello
+    /// per i prompt da verificare. Il throttle interno
+    /// (`alignment_check_interval_hours`, `alignment_max_checks_per_tick`) limita
+    /// il lavoro per esecuzione, ma la cadenza va dichiarata comunque: dal
+    /// momento in cui lo scheduler onora `interval()`, tacere significherebbe
+    /// ereditare il default di 60s del trait.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(ALIGNMENT_INTERVAL_SECS)
     }
 
     async fn run(&self, _context: &LearningContext) -> WorkerOutcome {

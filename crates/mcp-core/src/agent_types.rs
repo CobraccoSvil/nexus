@@ -3,7 +3,7 @@
 //! Estratto da `agent_loop.rs` durante la Fase 4 del refactor Nexus: il loop
 //! vero e proprio e' ora nel brain LangGraph (Python), ma questi tipi (step,
 //! run result, eventi broadcast, helper DB, ecc.) sono ancora consumati dal
-//! ponte `brain_agent_client` e dall'SSE del frontend.
+//! ponte `agent_turn_setup` e dall'SSE del frontend.
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -151,7 +151,7 @@ pub enum AgentRunStatus {
     ProviderUnavailable,
     // ── Esiti terminali canonici (macchina a stati deterministica, ADR terminazione) ──
     // Emessi dal punto unico `outcome_node` del brain via `nexus_run_outcome` e mappati
-    // qui da `derive_status` (brain_agent_client.rs). Mutuamente esclusivi: un run d'azione
+    // qui da `derive_status` (agent_turn_setup.rs). Mutuamente esclusivi: un run d'azione
     // termina SEMPRE in uno di questi tre, mai in una domanda di disambiguazione.
     /// Il task e' completato E verificato: final_gate passato (o non applicabile),
     /// almeno un'azione produttiva applicata, risposta finale non vuota.
@@ -213,6 +213,29 @@ impl AgentRunStatus {
             Self::FailedDiagnosed => "failed_diagnosed",
             Self::BlockedNeedsInput => "blocked_needs_input",
         }
+    }
+
+    /// Gli stati NON terminali, nella forma in cui vivono in `agent_runs.status`.
+    ///
+    /// Gemello di [`Self::is_terminal`] per i call site SQL (regola L): una query
+    /// che deve selezionare "run ormai conclusi" filtra su `status <> ALL(...)` di
+    /// QUESTA lista, invece di enumerare i terminali. La lista dei terminali e'
+    /// APERTA — cresce a ogni esito canonico nuovo (`failed_diagnosed`,
+    /// `completed_verified`, ...) — e ricopiarla in SQL significa dimenticarne uno
+    /// al prossimo che si aggiunge; quella dei non-terminali e' chiusa e piccola.
+    /// `interrupted` (scritto dal cleanup di startup) NON e' qui: e' terminale,
+    /// coerentemente con `from_db_str` che lo mappa su `Cancelled`.
+    ///
+    /// Le stringhe NON sono ricopiate: derivano da [`Self::as_str`], che resta
+    /// l'unico posto dove vive la forma persistita di uno stato. La coerenza con
+    /// `is_terminal` non e' affidata alla buona volonta': la verifica
+    /// `stati_non_terminali_db_coerente_con_is_terminal`.
+    pub fn stati_non_terminali_db() -> [&'static str; 3] {
+        [
+            Self::Running.as_str(),
+            Self::AwaitingConfirmation.as_str(),
+            Self::AwaitingSubagents.as_str(),
+        ]
     }
 
     /// `true` se il run e' terminato con successo (con o senza verifica E2E).
@@ -313,6 +336,11 @@ pub struct AgentRunResult {
     /// Usato dal frontend per calcolare il context ratio (% di occupazione
     /// della context_window del modello). `prompt_tokens` resta il valore
     /// cumulativo di tutte le iterazioni, corretto per il billing.
+    ///
+    /// E' il prompt LORDO come tutti i conteggi di prompt del sistema: la
+    /// finestra di contesto la occupa tutto il prompt inviato, compresi i token
+    /// che il provider ha servito dalla propria cache (che risparmiano DENARO,
+    /// non SPAZIO).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_prompt_tokens: Option<u32>,
     /// Classe errore propagata dal brain (es. "billing_error", "rate_limit",
@@ -344,7 +372,7 @@ pub struct AgentRunResult {
     pub hollow_no_tools: bool,
     /// Sottotipo specifico dell'hollow_completion per la diagnostica QW2:
     /// "EMPTY_ANSWER" | "NO_TOOLS" | "EMPTY_ANSWER+NO_TOOLS" | "".
-    /// Vuoto se hollow_completion=false. Propagato dal caller (brain_agent_client)
+    /// Vuoto se hollow_completion=false. Propagato dal caller (agent_turn_setup)
     /// al persistente (chat_messages/agent_run) per il log in
     /// `nexus_provider_empty_responses` (mig 0291). Il kind lessicale "RESIGNED"
     /// e' stato rimosso (ADR 0018 fase 3): la rinuncia e' dichiarata dal modello
@@ -383,9 +411,20 @@ pub struct AITraceEvent {
     pub tool_calls: Vec<Value>, // tool call names + inputs
     pub stop_reason: String,
     pub timestamp: String,
+    /// Token di prompt LORDI del turno (convenzione di
+    /// `nexus_gateway::LlmUsage`): comprendono i due conteggi di cache qui sotto.
+    /// Chi prezza la traccia scorpora — tariffa piena su
+    /// `input_tokens - cache_read - cache_creation`, poi ciascuna quantita' di
+    /// cache alla sua tariffa.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Token del turno serviti da cache (tariffa ridotta): sottoinsieme di
+    /// `input_tokens`.
     pub cache_read_tokens: u32,
+    /// Token del turno scritti in cache (tariffa maggiorata). Assente nelle
+    /// tracce persistite prima dell'introduzione del campo: il frontend lo legge
+    /// come opzionale e in quel caso non ha nulla da tariffare.
+    pub cache_creation_tokens: u32,
 }
 
 /// Meta-step pubblicato in chat per dare visibilità a passaggi interni del
@@ -1011,5 +1050,43 @@ mod tests {
         // BlockedNeedsInput e' TERMINALE (ADR 0034): run concluso con
         // dichiarazione "serve input"; il prossimo input crea un nuovo run.
         assert!(AgentRunStatus::BlockedNeedsInput.is_terminal());
+    }
+
+    /// `stati_non_terminali_db` e `is_terminal` non devono poter divergere: la
+    /// costante serve ai call site SQL, che non possono chiamare il predicato.
+    /// Enumerando OGNI variante si copre anche il caso pericoloso — qualcuno
+    /// aggiunge uno stato non-terminale e non aggiorna la lista, e una query di
+    /// backstop inizia a trattare come "concluso" un run che sta ancora girando.
+    ///
+    /// Test di mutazione: togliendo `awaiting_subagents` dalla costante (o
+    /// rendendolo terminale in `is_terminal`) questo assert rosseggia nominando
+    /// lo stato divergente.
+    #[test]
+    fn stati_non_terminali_db_coerente_con_is_terminal() {
+        for st in [
+            AgentRunStatus::Running,
+            AgentRunStatus::Completed,
+            AgentRunStatus::AwaitingConfirmation,
+            AgentRunStatus::AwaitingSubagents,
+            AgentRunStatus::Failed,
+            AgentRunStatus::TimedOut,
+            AgentRunStatus::Cancelled,
+            AgentRunStatus::LoopAborted,
+            AgentRunStatus::ProviderUnavailable,
+            AgentRunStatus::CompletedVerified,
+            AgentRunStatus::CompletedUnverified,
+            AgentRunStatus::FailedDiagnosed,
+            AgentRunStatus::BlockedNeedsInput,
+        ] {
+            let nella_lista = AgentRunStatus::stati_non_terminali_db().contains(&st.as_str());
+            assert_eq!(
+                !nella_lista,
+                st.is_terminal(),
+                "'{}': is_terminal={} ma nella lista dei non-terminali={}",
+                st.as_str(),
+                st.is_terminal(),
+                nella_lista
+            );
+        }
     }
 }

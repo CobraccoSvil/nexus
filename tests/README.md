@@ -15,12 +15,15 @@ tests/
 └── README.md (questo file)
 
 crates/mcp-core/tests/                # Livello 3: contract test Rust
+├── precondizioni_integrazione.rs    # sentinella: dichiara cosa c'e' e cosa no
 ├── agent_tools_safety.rs
 ├── agent_runs_endpoints.rs
 ├── orchestrator_db_schema.rs
 ├── postgres_app_isolation.rs
-├── m71_cost_breakdown.rs
-└── subagent_workflow.rs
+├── project_db_config_contract.rs
+├── settings_update_contract.rs
+├── chat_history_run_anchor.rs
+└── m71_cost_breakdown.rs
 
 apps/web-ide/e2e/orchestrator/       # Livello 6: UI e2e Playwright
 ├── _setup.ts
@@ -65,7 +68,6 @@ I test **NON** avviano i servizi: si aspettano che siano già up.
 ```bash
 export DATABASE_URL="postgres://nexus:nexus@localhost:5433/nexus"
 export MCP_CORE_URL="http://localhost:4000"
-export BRAIN_URL="http://localhost:8001"
 export WEB_IDE_URL="http://localhost:3000"
 export ADMIN_SERVICE_URL="http://localhost:4010"
 export NEXUS_APP_ADMIN_URL="postgres://nexus_admin:nexus_admin_secret@localhost:5434/postgres"
@@ -82,17 +84,43 @@ pnpm add -D @playwright/test
 pnpm exec playwright install --with-deps chromium
 ```
 
-## Comportamento "skip if not available"
+## Comportamento quando l'ambiente non c'e'
 
-Tutti i test sono **robusti a CI shape variations**:
+I test di integrazione sono opportunistici: se manca il DB, il servizio o il JWT
+non possono girare. Come lo dicono e' il punto.
 
-- Test che richiedono DB ma `DATABASE_URL` mancante → `eprintln!("skip: ...")` ed exit 0
-- Test che richiedono auth JWT ma `NEXUS_TEST_JWT` mancante → `pytest.skip(...)`
-- Test che richiedono servizi live ma fail il health probe → `eprintln!("skip: ...")`
+Fino al 2026-07-26 facevano `eprintln!("skip: ...")` e `return`, e questa pagina
+sosteneva che cosi' si evitavano i falsi positivi: era l'opposto. Un test che
+salta e un test che ha verificato il contratto producevano lo STESSO verde, e nel
+conteggio di `cargo test` erano indistinguibili — 48 skip in 11 file di tre crate
+che il gate contava come contratti verificati.
 
-Questo permette di lanciare la suite anche in ambienti parziali (es. solo unit-level) senza falsi positivi.
+Oggi la precondizione passa dal punto unico
+[`nexus-test-preconditions`](../crates/nexus-test-preconditions/src/lib.rs):
+
+- **senza** `REQUIRE_INTEGRATION_TESTS`: il test salta stampando
+  `NEXUS_TEST_SKIP <categoria>: <motivo>` — visibile nei log, preteso dal guard
+  `test-skip-visibile` di `scripts/check-single-source.sh`;
+- **con** `REQUIRE_INTEGRATION_TESTS=1`: una precondizione mancante e' un
+  FALLIMENTO che la nomina.
+
+La sentinella `mcp-core/tests/precondizioni_integrazione.rs` gira sempre e
+dichiara il quadro (`PRECONDIZIONI INTEGRAZIONE mcp-core: n/4 presenti`), con
+cosa resta non misurato per ognuna che manca.
+
+Per lanciare la suite pretendendo l'ambiente:
+
+```bash
+REQUIRE_INTEGRATION_TESTS=1 cargo test -p mcp-core --test settings_update_contract
+```
 
 ## CI/CD
+
+Vedi [.github/workflows/integration-full.yml](../.github/workflows/integration-full.yml):
+il job che allestisce l'ambiente completo (due cluster Postgres, Redis, mcp-core
+in ascolto, JWT coniato dal percorso di produzione) e gira con
+`REQUIRE_INTEGRATION_TESTS=1`, di notte o a mano. L'elenco dei test che esegue e'
+esplicito nel workflow, insieme ai due che restano fuori e al perche'.
 
 Vedi [.github/workflows/nexus-suite.yml](../.github/workflows/nexus-suite.yml):
 - **PR**: Livello 3 (contract Rust) sempre

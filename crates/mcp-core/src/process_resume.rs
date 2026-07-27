@@ -116,8 +116,15 @@ async fn announce_cap_reached_in_chat(
     label: &str,
 ) {
     // Routing separazione DB: chat_messages e' tabella per-progetto, instradata
-    // sul pool del progetto (a flag OFF ritorna il meta-pool, comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // sul pool del progetto. Se il DB del progetto non e' disponibile l'annuncio
+    // salta (best-effort, niente fallback al meta-DB).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            tracing::warn!(project_id = %project_id, error = %e, "process_resume: DB progetto non disponibile, annuncio cap saltato per questo giro");
+            return;
+        }
+    };
     let already: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM chat_messages \
          WHERE session_id = $1 \
@@ -247,15 +254,22 @@ async fn inspect_docker_compose_health(
 
 async fn run_one_round(state: &AppState) -> Result<(), String> {
     // Routing separazione DB: agent_processes e' tabella per-progetto. La
-    // SELECT-driver che pilota il round deve girare sul pool di OGNI progetto
-    // (a flag ON il meta e' vuoto), non sul meta. Pattern worker cross-progetto
-    // (regola G/L): itero list_all_project_ids e per ciascuno risolvo il pool
-    // per-progetto ed eseguo la SELECT-driver su quel pool, poi processo le
-    // righe come prima. A flag OFF ogni pool ritorna il meta -> behavior
-    // preservato.
+    // SELECT-driver che pilota il round deve girare sul pool di OGNI progetto,
+    // non sul meta (che e' vuoto per i domini migrati). Pattern worker
+    // cross-progetto (regola G/L): itero list_all_project_ids e per ciascuno
+    // risolvo il pool per-progetto ed eseguo la SELECT-driver su quel pool, poi
+    // processo le righe come prima. Un progetto col DB non disponibile viene
+    // saltato per questo giro (niente fallback al meta-DB).
     let mut rows = Vec::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
-        let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        let proj_pool =
+            match crate::project_db_routes::project_data_pool_from(&state.db, pid).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(project_id = %pid, error = %e, "process_resume: DB progetto non disponibile, progetto saltato per questo giro");
+                    continue;
+                }
+            };
         // kind <> 'service' (fix strutturale, 2026-07-02): un SERVIZIO fermato e'
         // un crash/restart gia' osservato da service_observer / run-panel, NON un
         // batch concluso da riferire. Senza questo filtro ogni risveglio che
@@ -308,9 +322,16 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
 
         // Routing separazione DB: agent_processes e' tabella per-progetto. Risolvo
         // una volta il pool del progetto e lo riuso per tutte le scritture/letture
-        // su agent_processes in questa iterazione (a flag OFF ritorna il meta-pool).
+        // su agent_processes in questa iterazione. Se il DB del progetto non e'
+        // disponibile la riga viene saltata e ritentata al giro successivo.
         let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+            match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(project_id = %project_id, error = %e, "process_resume: DB progetto non disponibile, processo saltato per questo giro");
+                    continue;
+                }
+            };
 
         // CAUSA RADICE del loop "la chat riparte da sola": i dev server / watcher
         // long-running (vite, nodemon, dev:*) finiscono in stato stopped/failed a

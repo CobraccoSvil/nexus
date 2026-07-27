@@ -13,7 +13,7 @@ pub type SensitivityTier = u8;
 
 /// Blocco di contenuto strutturato di un messaggio (testo, immagine, risultato
 /// di tool). Corrisponde a `LLMContentBlock`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmContentBlock {
     #[serde(rename = "type")]
     pub kind: String,
@@ -28,7 +28,7 @@ pub struct LlmContentBlock {
 }
 
 /// Chiamata a tool emessa dal modello (`LLMToolCall`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -45,7 +45,7 @@ pub struct LlmToolCall {
     pub thought_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolFunctionCall {
     pub name: String,
     pub arguments: String,
@@ -71,7 +71,7 @@ pub struct ToolFunctionDef {
 
 /// Contenuto di un messaggio: stringa semplice oppure lista di blocchi.
 /// Modella `string | LLMContentBlock[]` con un enum untagged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
@@ -79,7 +79,12 @@ pub enum MessageContent {
 }
 
 /// Messaggio della conversazione (`LLMMessage`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` non e' decorativo: e' il segnale su cui il gateway decide se un
+/// retry ha senso. Due history uguali producono la stessa richiesta e quindi lo
+/// stesso rifiuto — confrontarle e' l'unico modo di saperlo senza spendere la
+/// chiamata (vedi `history_sanitizer::retry_changes_history`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
     pub content: MessageContent,
@@ -168,7 +173,89 @@ pub struct LlmRequest {
     /// storico invariato).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_provider: Option<String>,
+    /// Durata del RUN che ha originato questa richiesta, in secondi.
+    ///
+    /// Il gateway deriva i propri budget (`request_budget`, `per_attempt`) dal
+    /// run: `budget = run / min_turns`. Ma li derivava una volta sola all'avvio,
+    /// dal default globale `orchestrator.subagent_default_timeout_s` (300s),
+    /// mentre il run vero e' PER FIGURA (`nexus_subagent_definitions.timeout_s`:
+    /// `review` 240, `implement` 600). Una figura da 240s riceveva tentativi
+    /// dimensionati su 300: il gateway prometteva turni che il cronometro del
+    /// chiamante non poteva mantenere.
+    ///
+    /// Il chiamante e' l'unico a conoscere questo numero, quindi lo porta con se'.
+    /// Retrocompatibile in entrambi i versi: assente (client vecchio) = i timeout
+    /// per-processo di sempre; ignoto (gateway vecchio) = serde lo scarta.
+    /// Puo' solo STRINGERE i budget, mai allungarli oltre il default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout_secs: Option<u64>,
     pub metadata: RequestMetadata,
+}
+
+#[cfg(test)]
+mod test_wire_run_timeout {
+    use super::*;
+
+    /// Client VECCHIO -> gateway NUOVO.
+    ///
+    /// Il corpo e' lo stesso sottoinsieme di campi che `scripts/onprem-smoke.sh`
+    /// invia oggi in produzione: se questo test diventa rosso, quel corpo smette
+    /// di essere accettato e lo smoke test on-prem si rompe in silenzio.
+    #[test]
+    fn un_corpo_senza_il_campo_resta_valido() {
+        let corpo = r#"{
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "ciao"}],
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"smoke"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo).expect("corpo storico valido");
+        assert_eq!(req.run_timeout_secs, None);
+    }
+
+    /// Client NUOVO -> gateway NUOVO: il valore arriva.
+    #[test]
+    fn il_campo_arriva_quando_e_presente() {
+        let corpo = r#"{
+            "model": "gpt-4o-mini",
+            "messages": [],
+            "run_timeout_secs": 240,
+            "metadata": {"tenant_id":"t","user_id":"u","request_id":"r","sensitivity_tier":0,"feature":"agent"}
+        }"#;
+        let req: LlmRequest = serde_json::from_str(corpo).expect("corpo nuovo valido");
+        assert_eq!(req.run_timeout_secs, Some(240));
+    }
+
+    /// Client NUOVO -> gateway VECCHIO: il campo non deve comparire quando e'
+    /// assente, o un deserializzatore piu' rigido a valle lo vedrebbe come
+    /// `null` inatteso.
+    #[test]
+    fn il_campo_assente_non_viene_serializzato() {
+        let req = LlmRequest {
+            model: "m".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            run_timeout_secs: None,
+            metadata: RequestMetadata {
+                tenant_id: "t".into(),
+                user_id: "u".into(),
+                request_id: "r".into(),
+                sensitivity_tier: 0,
+                feature: "f".into(),
+            },
+        };
+        let json = serde_json::to_string(&req).expect("serializza");
+        assert!(
+            !json.contains("run_timeout_secs"),
+            "campo assente non deve finire sul wire: {json}"
+        );
+    }
 }
 
 /// Configurazione extended thinking (`thinking` di `LLMRequest`). `budget_tokens`
@@ -192,18 +279,110 @@ pub struct ThinkingConfig {
     pub mandatory: bool,
 }
 
+/// Come il provider riporta i token di prompt serviti dalla cache.
+///
+/// Non e' una preferenza ne' una policy: e' un FATTO del formato di risposta,
+/// e l'unico punto del sistema che lo conosce e' l'adapter che quel formato lo
+/// deserializza. Viaggia come enum e non come nome di provider proprio perche'
+/// il punto di normalizzazione non deve contenere un `match provider` (regola L:
+/// la conoscenza resta dove nasce, la regola sta scritta una volta sola).
+///
+/// E' il segnale STRUTTURATO (regola M) che dice in quale verso normalizzare
+/// verso la convenzione del sistema, il LORDO: la variante inclusiva non tocca
+/// nulla, quella separata somma le due quantita' di cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCacheReporting {
+    /// Il conteggio di prompt e' LORDO: comprende gia' i token serviti da cache.
+    /// OpenAI (`prompt_tokens` con `prompt_tokens_details.cached_tokens`),
+    /// DeepSeek (`prompt_cache_hit_tokens`), Google/Vertex
+    /// (`promptTokenCount` con `cachedContentTokenCount`) e tutti i dialetti
+    /// OpenAI-compatibili che ne ereditano la forma (mistral, groq, perplexity,
+    /// vllm, openrouter).
+    CachedIncludedInPrompt,
+    /// Il conteggio di prompt e' gia' NETTO e i token di cache sono riportati a
+    /// parte. Anthropic: `input_tokens` esclude sia `cache_read_input_tokens`
+    /// sia `cache_creation_input_tokens`.
+    CachedReportedSeparately,
+}
+
 /// Conteggio token consumati.
+///
+/// ## Convenzione: `input_tokens` e' il LORDO (punto unico, regola L)
+///
+/// `input_tokens` e' sempre il prompt LORDO: comprende i token serviti da cache
+/// e quelli scritti in cache, che `cache_read_tokens` e `cache_creation_tokens`
+/// riportano a parte come DETTAGLIO, non come quantita' da sommare.
+///
+/// Il lordo e' cio' che quasi tutti i consumatori vogliono — quanto contesto e'
+/// stato inviato, quanto e' piena la finestra, quanto e' cresciuta la history da
+/// un turno all'altro — ed e' l'unica quantita' confrontabile fra turni e fra
+/// provider: la quota servita da cache la decide il provider e cambia da una
+/// chiamata all'altra, quindi un prompt "al netto" oscilla per ragioni che non
+/// hanno nulla a che vedere col contesto inviato.
+///
+/// Il NETTO serve a un solo consumatore, la tariffa, perche' le tre quantita'
+/// hanno tre prezzi diversi (cache read 0.1x-0.5x, cache creation 1.25x, input
+/// 1x — vedi `db/migrations/0403_cache_prices_catalog.sql`). Lo scorporo avviene
+/// LI' e solo li': `nexus_pricing::calculate_cost_breakdown` sottrae le due
+/// quantita' di cache dal lordo e moltiplica le tre parti per le tre tariffe.
+///
+/// I provider divergono su come riportano il prompt (vedi
+/// [`PromptCacheReporting`]). La normalizzazione VERSO IL LORDO avviene UNA
+/// volta, in [`LlmUsage::normalized`], chiamata dagli adapter. A valle (gateway
+/// ledger, mcp-core, agent-graph, UI) il significato dei campi non dipende piu'
+/// da chi ha risposto.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LlmUsage {
+    /// Token di prompt LORDI: il contesto inviato, cache COMPRESA.
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// Token serviti da cache (prompt caching). Valorizzati nel passo cache;
-    /// retrocompatibile: `None` finche' il provider non li riporta.
+    /// Token serviti da cache (prompt caching): sottoinsieme di `input_tokens`,
+    /// riportato a parte perche' ha una tariffa propria. `None` finche' il
+    /// provider non li riporta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u32>,
-    /// Token scritti in cache (creazione voce cache). Vedi sopra.
+    /// Token scritti in cache (creazione voce cache): anch'essi sottoinsieme di
+    /// `input_tokens`, con la loro tariffa. Vedi sopra.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
+}
+
+impl LlmUsage {
+    /// Costruisce l'usage normalizzato alla convenzione del sistema: prompt
+    /// LORDO.
+    ///
+    /// PUNTO UNICO (regola L): e' l'unico posto del workspace dove si decide se
+    /// i token di cache vanno sommati al prompt. Gli adapter passano i numeri
+    /// VERBATIM dal wire e dichiarano soltanto la propria convenzione.
+    pub fn normalized(
+        reporting: PromptCacheReporting,
+        prompt_tokens_wire: u32,
+        output_tokens: u32,
+        cache_read_tokens: Option<u32>,
+        cache_creation_tokens: Option<u32>,
+    ) -> Self {
+        let input_tokens = match reporting {
+            // Il wire e' gia' lordo: nulla da fare. Sottrarre qui — come faceva
+            // la convenzione opposta — renderebbe il prompt non confrontabile
+            // fra turni e romperebbe ogni consumatore che misura il contesto.
+            PromptCacheReporting::CachedIncludedInPrompt => prompt_tokens_wire,
+            // Il wire e' al netto: il lordo e' la somma, dal punto unico
+            // `nexus_types::token_usage::prompt_tokens_gross` (somma satura).
+            PromptCacheReporting::CachedReportedSeparately => {
+                nexus_types::token_usage::prompt_tokens_gross(
+                    prompt_tokens_wire,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                )
+            }
+        };
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        }
+    }
 }
 
 /// Informazioni sul re-routing per privacy (`privacy_rerouted`).
@@ -635,6 +814,75 @@ mod tests {
         let mut r3 = resp("breve ma completa", None, "stop");
         r3.usage.output_tokens = 3;
         assert!(!r3.is_degenerate_completion());
+    }
+
+    /// Il punto unico della normalizzazione, sui due casi che divergono.
+    ///
+    /// La proprieta' che conta e' l'INVARIANTE: qualunque sia la convenzione del
+    /// provider, dopo la normalizzazione `input_tokens` vale il prompt LORDO —
+    /// lo stesso numero, per lo stesso contesto inviato, da un provider e
+    /// dall'altro. E' cio' su cui poggiano tutti i consumatori a valle.
+    #[test]
+    fn la_normalizzazione_porta_sempre_al_prompt_lordo() {
+        // Convenzione inclusiva: i 4 di cache stanno DENTRO i 10 di prompt, che
+        // e' gia' il lordo. Nulla da sommare.
+        let incluso = LlmUsage::normalized(
+            PromptCacheReporting::CachedIncludedInPrompt,
+            10,
+            5,
+            Some(4),
+            None,
+        );
+        assert_eq!(incluso.input_tokens, 10);
+        assert_eq!(incluso.cache_read_tokens, Some(4));
+
+        // Convenzione separata: i 4 di cache sono FUORI dai 10 di prompt, che e'
+        // il netto. Il lordo e' 14, ed e' il numero che il provider inclusivo
+        // avrebbe scritto per lo stesso contesto.
+        let separato = LlmUsage::normalized(
+            PromptCacheReporting::CachedReportedSeparately,
+            10,
+            5,
+            Some(4),
+            None,
+        );
+        assert_eq!(separato.input_tokens, 14);
+        assert_eq!(separato.cache_read_tokens, Some(4));
+
+        // Anche la cache di SCRITTURA e' fuori dall'input di Anthropic.
+        let con_creazione = LlmUsage::normalized(
+            PromptCacheReporting::CachedReportedSeparately,
+            100,
+            20,
+            Some(900),
+            Some(50),
+        );
+        assert_eq!(con_creazione.input_tokens, 1_050);
+
+        // Senza cache le due convenzioni coincidono: nessuna regressione sulle
+        // chiamate che non ne fanno uso (la stragrande maggioranza oggi).
+        for reporting in [
+            PromptCacheReporting::CachedIncludedInPrompt,
+            PromptCacheReporting::CachedReportedSeparately,
+        ] {
+            let u = LlmUsage::normalized(reporting, 42, 7, None, None);
+            assert_eq!(u.input_tokens, 42);
+        }
+    }
+
+    /// Dato incoerente dal provider a convenzione separata: la somma satura
+    /// invece di wrappare. Un `+` al posto della somma satura produrrebbe qui un
+    /// prompt piccolissimo che passerebbe per sano.
+    #[test]
+    fn somma_satura_su_conteggi_incoerenti() {
+        let u = LlmUsage::normalized(
+            PromptCacheReporting::CachedReportedSeparately,
+            u32::MAX,
+            1,
+            Some(999),
+            Some(1),
+        );
+        assert_eq!(u.input_tokens, u32::MAX);
     }
 
     #[test]

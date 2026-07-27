@@ -165,6 +165,16 @@ impl BridgeError {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // PRIMA di qualunque lettura d'ambiente: da servizio (WinSW/systemd) non
+    // c'e' la shell che ha esportato il .env, e questo daemon e' l'unico dei
+    // servizi Rust che non lo caricava. Da quando la porta si risolve dal DB
+    // (regola G) gli serve DATABASE_URL, quindi partiva solo se lanciato a mano
+    // da un terminale gia' inizializzato: come servizio panicava all'avvio
+    // ("DATABASE_URL must be set"), il watchdog lo ritentava a ogni ciclo e il
+    // bridge non e' mai stato disponibile. Prima dell'init di tracing cosi'
+    // anche RUST_LOG del .env viene onorato.
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

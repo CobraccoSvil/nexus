@@ -7,7 +7,8 @@
 //! inesistenti lato provider, sprecando token e degradando l'UX.
 //!
 //! Flusso ogni N ore (settings `catalog_sync.interval_hours`, default 6):
-//!   1. Lista provider da `catalog_sync.providers` (CSV)
+//!   1. Lista provider DEDOTTA dal `nexus_provider_registry` (is_active +
+//!      configurato) via [`providers_da_sincronizzare`] — niente CSV hardcoded
 //!   2. Per ogni provider: GET {gateway}/v1/models/{provider} (via UNICA per
 //!      la discovery — il gateway incapsula l'auth di ogni provider, Vertex
 //!      Service Account incluso). Poi confronta con catalog: INSERT nuovi
@@ -185,7 +186,7 @@ pub(crate) fn media_kind_column(kind: &str) -> Option<&'static str> {
 
 /// INSERT di un modello MEDIA scoperto via API discovery. Default sicuro:
 /// `is_enabled=false` (richiede abilitazione esplicita, come i chat nuovi),
-/// `supports_tool_use=false` e `is_thinking=false` (un media non e' agentico),
+/// `supports_tool_use=false` (un media non e' agentico),
 /// `pricing_state='unknown'` (costo placeholder, regola H: non e' "gratis").
 /// Il flag `supports_<media>` corrispondente al `kind` viene messo a TRUE.
 /// Ritorna `Some(1)` se la riga e' stata inserita, `None` altrimenti.
@@ -204,22 +205,26 @@ async fn insert_media_model(
         );
         return None;
     };
-    let inferred_tier = infer_tier_from_name(provider, api_model);
+    // performance_tier NULL (mig 0599): un modello media (image/audio/video) nasce
+    // senza prezzo (`pricing_state='unknown'`) e senza tool: non c'e' alcun fatto
+    // su cui fondare una fascia, e il tier agentico non lo riguarda nemmeno.
+    // Prima ereditava una fascia indovinata dal NOME, che per un image-gen non
+    // significa niente.
+    //
     // Colonna interpolata SOLO da `media_kind_column` (whitelist statica, niente
     // input utente): nessuna SQL injection. I valori restano bind parametrici.
     let sql = format!(
         "INSERT INTO ai_price_catalog \
          (provider, model, display_name, input_cost_per_million_tokens, \
           output_cost_per_million_tokens, currency, capabilities, performance_tier, \
-          is_enabled, supports_tool_use, is_thinking, {col}, pricing_state, effective_from) \
-         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, false, false, TRUE, 'unknown', NOW()) \
+          is_enabled, supports_tool_use, {col}, pricing_state, effective_from) \
+         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, NULL, false, false, TRUE, 'unknown', NOW()) \
          ON CONFLICT (provider, model) DO NOTHING"
     );
     match sqlx::query(&sql)
         .bind(provider)
         .bind(api_model)
         .bind(api_model)
-        .bind(inferred_tier)
         .execute(db)
         .await
     {
@@ -382,171 +387,13 @@ fn base_caps_from_name(provider: &str, m: &str) -> &'static [&'static str] {
     }
 }
 
-/// Inferisce il `performance_tier` (light|medium|heavy) dal nome del modello.
-///
-/// PERCHE': lo schema `ai_price_catalog.performance_tier` ha default 'medium',
-/// e il catalog_sync inserisce i nuovi modelli scoperti via API senza tier.
-/// Risultato: ogni modello nuovo (anche piccolo come ministral-3b/8b) diventava
-/// 'medium' ed entrava nel pool dei candidati per gli intent agentici medium,
-/// degradando la qualita'. Qui classifichiamo dal nome (euristica gemella di
-/// `infer_capabilities_from_name`), applicata SOLO ai nuovi insert (non
-/// sovrascrive le righe esistenti / override admin).
-///
-/// Regole per famiglia su scala a 5 livelli (light<medium<high<heavy<frontier,
-/// mig 0528): i "piccoli" (mini/nano/lite/haiku/ministral/small/nemo) sono light;
-/// la fascia alta si distribuisce per generazione (es. gemini-2.5-pro->high,
-/// gemini-3-pro->heavy, gpt-5.5/opus-4-8->frontier) invece di collassare tutta in
-/// 'heavy'; il resto medium. La telemetria (governance) affina a valle col dato reale.
-/// Estrae il major version number da un nome modello OpenAI della famiglia
-/// `gpt-N` / `gpt-N.M` (es. "gpt-5.5" -> 5, "gpt-4.1-nano" -> 4). Ritorna None
-/// se il nome non e' un modello `gpt-` numerato (es. o-series, chatgpt-*).
-/// Usato dall'euristica tier per distinguere i flagship recenti (gpt-5+) dai
-/// modelli precedenti senza hardcodare i nomi esatti (regola G).
-fn openai_gpt_major(model_lower: &str) -> Option<u32> {
-    let rest = model_lower.strip_prefix("gpt-")?;
-    // Prende le cifre iniziali del token di versione (fino a '.', '-' o fine).
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
-}
 
-pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str {
-    let m = model.to_ascii_lowercase();
-    // Delega per-provider: l'euristica di ogni famiglia vive in un helper
-    // dedicato (regola L), cosi' questo dispatch resta piatto e testabile.
-    match provider {
-        "google" => infer_tier_google(&m),
-        "anthropic" => infer_tier_anthropic(&m),
-        "openai" => infer_tier_openai(&m),
-        "mistral" => infer_tier_mistral(&m),
-        "deepseek" => infer_tier_deepseek(&m),
-        _ => "medium",
-    }
-}
 
-/// Euristica tier per Google (Gemini). `m` gia' lowercase.
-fn infer_tier_google(m: &str) -> &'static str {
-    // Marcatori di generazione: 3.5 e' l'attuale frontiera Google.
-    let g35 = m.contains("3.5") || m.contains("3-5");
-    let g3 = !g35 && (m.contains("gemini-3") || m.contains("-3-") || m.ends_with("-3"));
-    if m.contains("lite") {
-        "light"
-    } else if m.contains("flash") {
-        // flash veloce/economico resta light (fascia bassa invariata);
-        // ECCEZIONE: 3.5-flash e' il flagship coding Google -> heavy.
-        if g35 {
-            "heavy"
-        } else {
-            "light"
-        }
-    } else if m.contains("pro") {
-        // 3.5-pro -> frontier, gemini-3-pro/3.1-pro -> heavy, 2.5-pro -> high.
-        if g35 {
-            "frontier"
-        } else if g3 {
-            "heavy"
-        } else {
-            "high"
-        }
-    } else {
-        "light"
-    }
-}
 
-/// Euristica tier per Anthropic (Claude). `m` gia' lowercase.
-fn infer_tier_anthropic(m: &str) -> &'static str {
-    if m.contains("opus") {
-        // opus-4-8 (l'attuale flagship coding) frontier; opus precedenti heavy.
-        if m.contains("4-8") || m.contains("4.8") {
-            "frontier"
-        } else {
-            "heavy"
-        }
-    } else if m.contains("fable") {
-        // claude-fable-5: flagship "most capable widely-released".
-        "frontier"
-    } else if m.contains("haiku") {
-        "light"
-    } else {
-        // sonnet e altri
-        "medium"
-    }
-}
 
-/// Euristica tier per OpenAI (GPT / o-series). `m` gia' lowercase.
-fn infer_tier_openai(m: &str) -> &'static str {
-    // I "piccoli" hanno la precedenza assoluta: qualunque variante
-    // mini/nano (anche di un flagship, es. gpt-5.4-mini) e' light.
-    if m.contains("nano") || m.contains("mini") {
-        "light"
-    } else if m.contains("o1") {
-        "high"
-    } else if m.contains("o3") || m.contains("o4") {
-        "heavy"
-    } else if let Some(major) = openai_gpt_major(m) {
-        infer_tier_openai_gpt(m, major)
-    } else if m.contains("pro") {
-        "heavy"
-    } else {
-        "medium"
-    }
-}
 
-/// Sotto-euristica della famiglia GPT numerata (dopo aver estratto il major).
-/// La versione distingue la fascia (regola G: parsing del numero, niente nome
-/// hardcoded). I "chat-latest" sono varianti chat veloci, non flagship reasoning.
-fn infer_tier_openai_gpt(m: &str, major: u32) -> &'static str {
-    if major < 5 {
-        // gpt-4o, gpt-4.1, ecc.
-        "medium"
-    } else if m.contains("chat") {
-        "medium"
-    } else if major >= 6 || m.contains("5.5") || m.contains("5-5") {
-        // gpt-5.5 e generazioni future = frontiera.
-        "frontier"
-    } else if m.contains("pro")
-        || m.contains("codex")
-        || m.contains("5.1")
-        || m.contains("5.2")
-        || m.contains("5.3")
-        || m.contains("5.4")
-        || m.contains("5-1")
-        || m.contains("5-2")
-        || m.contains("5-3")
-        || m.contains("5-4")
-    {
-        "heavy"
-    } else {
-        // gpt-5 base
-        "high"
-    }
-}
 
-/// Euristica tier per Mistral. `m` gia' lowercase.
-fn infer_tier_mistral(m: &str) -> &'static str {
-    // Mistral non ha un tier "heavy"/"frontier" reale: large/medium-3.5 e'
-    // il loro massimo (medium). Piccoli (ministral, small, nemo, tiny) light.
-    if m.contains("ministral") || m.contains("small") || m.contains("nemo") || m.contains("tiny") {
-        "light"
-    } else {
-        // large, medium, codestral, devstral, magistral
-        "medium"
-    }
-}
 
-/// Euristica tier per DeepSeek. `m` gia' lowercase.
-fn infer_tier_deepseek(m: &str) -> &'static str {
-    // deepseek-coder/chat = completion/chat LEGACY (V2/V3) -> light. I V4
-    // sono i forti: pro/reasoner -> 'high' (fascia alta ma non frontier),
-    // flash (1M ctx, veloce) -> 'medium'.
-    if m.contains("coder") || m.contains("chat") {
-        "light"
-    } else if m.contains("pro") || m.contains("reasoner") || m.contains("r1") {
-        "high"
-    } else {
-        // deepseek-v4-flash e successivi.
-        "medium"
-    }
-}
 
 /// Flag di capability canonici di un modello (colonne reali di ai_price_catalog).
 /// Vedi ADR 0024 e migrazione 0318: il catalog e' l'UNICA fonte; il brain li
@@ -557,15 +404,11 @@ pub(crate) struct ClassifiedCaps {
     pub supports_tool_use: bool,
     /// Il modello accetta input immagine (vision).
     pub supports_vision: bool,
-    /// Concetto A: ESCLUDI dal routing agentico. Modelli reasoning-only che
-    /// non reggono il loop a tool forzati (o-series, deepseek reasoner/v4,
-    /// magistral, gemini *-pro). NON include i modelli ibridi che fanno bene
-    /// l'agentico pur avendo una modalita' thinking (Claude, gpt non-o).
-    pub is_thinking: bool,
-    /// Concetto B: gira in thinking/extended-thinking mode -> l'adapter NON
-    /// deve forzare tool_choice e abilita il budget di ragionamento. Superset
-    /// di `is_thinking` (ogni reasoning-only e' anche thinking-mode, ma anche
-    /// gli ibridi come Claude opus/sonnet lo sono).
+    /// Gira in thinking/extended-thinking mode -> l'adapter NON deve forzare
+    /// tool_choice e abilita il budget di ragionamento. Include i reasoning-only
+    /// e gli ibridi come Claude opus/sonnet. L'ESCLUSIONE dal routing agentico
+    /// (l'ex "concetto A", colonna `is_thinking` rimossa in mig 0608) e' espressa
+    /// SOLO da `agentic_thinking_policy` ('exclude'/'native'), ADR 0025.
     pub uses_thinking_mode: bool,
     /// Policy d'uso nei run agentici (ADR 0025), driver canonico dell'eleggibilita'
     /// e del toggle modalita': none | disable_for_tools | native | exclude.
@@ -597,6 +440,22 @@ pub(crate) fn classify_capabilities(
 ) -> ClassifiedCaps {
     let p = provider.to_ascii_lowercase();
     let m = model.to_ascii_lowercase();
+
+    // ── Un modello MEDIA (whisper/tts/dall-e/veo, punto unico
+    //    `classify_media_kind`) non e' un modello di testo: mai tool_use, mai
+    //    thinking. Senza questo guard il default `meta_tool_use.unwrap_or(true)`
+    //    del path LiteLLM marcava whisper-1/tts-1 come tool-capable (dato
+    //    sporco misurato il 16/07: modelli audio candidabili come consiglieri;
+    //    ripulito dalla mig 0608 — questo guard evita il rientro al sync
+    //    successivo). ──
+    if classify_media_kind(&m).is_some() {
+        return ClassifiedCaps {
+            supports_tool_use: false,
+            supports_vision: false,
+            uses_thinking_mode: false,
+            agentic_thinking_policy: "none",
+        };
+    }
 
     // ── tool_use: metadata esplicito, altrimenti default true (la stragrande
     //    maggioranza dei modelli chat moderni supporta function calling). ──
@@ -689,14 +548,10 @@ pub(crate) fn classify_capabilities(
     // Metadata esplicito reasoning (LiteLLM) ha priorita' come segnale positivo.
     let is_reasoning_signal = meta_reasoning.unwrap_or(false) || name_reasoning;
 
-    // Concetto A (escludi da agentico): solo le famiglie reasoning-only. Gli
-    // ibridi (Claude opus/sonnet, gpt non-o) restano agentic-eligibili anche
-    // se hanno una modalita' thinking.
-    let is_thinking =
-        reasoning_only_family || (meta_reasoning.unwrap_or(false) && !is_hybrid_agentic(&p, &m));
-
-    // Concetto B (non forzare tool_choice): tutti i reasoning + gli ibridi con
+    // Non forzare tool_choice: tutti i reasoning + gli ibridi con
     // extended thinking (Claude opus/sonnet) + i Gemini 2.5 thinking.
+    // L'esclusione dal routing agentico dei reasoning-only e' espressa dalla
+    // sola `agentic_thinking_policy` sotto (ex colonna is_thinking, mig 0608).
     let uses_thinking_mode = is_reasoning_signal || is_hybrid_agentic(&p, &m) || gemini_25_thinking;
 
     // Policy agentica canonica (ADR 0025):
@@ -726,7 +581,6 @@ pub(crate) fn classify_capabilities(
     ClassifiedCaps {
         supports_tool_use,
         supports_vision,
-        is_thinking,
         uses_thinking_mode,
         agentic_thinking_policy,
     }
@@ -817,6 +671,34 @@ pub(crate) const RECONCILE_MANUAL_LOCKED_SQL: &str = "(c.capability_source = 'ma
 /// Queste righe sono escluse dalla reconciliation chat.
 pub(crate) const RECONCILE_IS_MEDIA_SQL: &str = "(c.supports_image_gen OR c.supports_audio_in \
      OR c.supports_audio_out OR c.supports_video_gen)";
+/// Predicato PREZZO IGNOTO (mig 0477): la riga e' a catalogo ma il suo listino
+/// non e' noto. I provider non espongono i prezzi nelle `/v1/models`, quindi il
+/// discovery inserisce un costo 0 che e' un PLACEHOLDER, non "gratis" — ed e'
+/// proprio `pricing_state` a dirlo. Punto unico (regola L) del predicato di
+/// ELEGGIBILITA': un modello a prezzo ignoto non e' routabile, perche' altrimenti
+/// costo 0 lo rende il piu' "conveniente" di tutti nello scoring e vince il
+/// routing fatturando a zero (misurate 873 chiamate e 16,4M token a costo 0).
+///
+/// Nomina `'unknown'` ESPLICITAMENTE invece di "diverso da priced": `'free'` e' il
+/// terzo stato ammesso dal CHECK ed e' un gratuito REALE, legittimamente
+/// routabile. Regola M: si guarda lo stato strutturato, mai la grandezza del costo.
+///
+/// `alias` = alias di `ai_price_catalog` nella query ("c" dove c'e' un FROM,
+/// stringa vuota nelle UPDATE dirette sulla tabella).
+pub(crate) fn price_unknown_sql(alias: &str) -> String {
+    let prefix = if alias.is_empty() {
+        String::new()
+    } else {
+        format!("{alias}.")
+    };
+    format!("({prefix}pricing_state = 'unknown')")
+}
+
+/// Reason con cui il ciclo prezzo marca le righe disabilitate: distinta da quelle
+/// di policy, cosi' `reconcile_enable_returning_to_policy` (che ri-abilita solo
+/// `reason IS NULL` o `ILIKE '%policy%'`) non le resuscita.
+pub(crate) const PRICE_UNKNOWN_REASON: &str = "price_unknown";
+
 /// "passa la policy" — stessa espressione di `model_passes_selection_policy`,
 /// ma set-based via JOIN. Se non esiste riga policy per il provider il JOIN
 /// non matcha e la riga non viene toccata (coerente con l'ammissione di
@@ -834,6 +716,7 @@ async fn reconcile_enable_returning_to_policy(db: &PgPool) -> anyhow::Result<u64
     let manual = RECONCILE_MANUAL_LOCKED_SQL;
     let media = RECONCILE_IS_MEDIA_SQL;
     let passes = RECONCILE_PASSES_POLICY_SQL;
+    let price_unknown = price_unknown_sql("c");
     let enable_sql = format!(
         "UPDATE ai_price_catalog c \
          SET is_enabled = true, \
@@ -846,11 +729,38 @@ async fn reconcile_enable_returning_to_policy(db: &PgPool) -> anyhow::Result<u64
            AND c.is_enabled = false \
            AND NOT {manual} \
            AND NOT {media} \
+           AND NOT {price_unknown} \
            AND ( c.auto_disabled_reason IS NULL \
                  OR c.auto_disabled_reason ILIKE '%policy%' ) \
            AND ( {passes} )",
     );
     Ok(sqlx::query(&enable_sql).execute(db).await?.rows_affected())
+}
+
+/// DISABILITA (ciclo prezzo): abilitati ma a prezzo IGNOTO. E' il ramo che rende
+/// la regola AUTO-RIPARANTE: senza, i 13 modelli gia' abilitati resterebbero
+/// routabili per sempre e servirebbe un UPDATE a mano — cioe' la toppa che la
+/// regola H vieta. `reconcile_enable_returning_to_policy` non li recupera (ha
+/// `is_enabled = false` e non tocca i reason estranei alla policy).
+///
+/// Esclude `manual` e `media` come gli altri rami: le righe tts/whisper sono
+/// gestite a mano e non passano di qui.
+async fn reconcile_disable_price_unknown(db: &PgPool) -> anyhow::Result<u64> {
+    let manual = RECONCILE_MANUAL_LOCKED_SQL;
+    let media = RECONCILE_IS_MEDIA_SQL;
+    let price_unknown = price_unknown_sql("c");
+    let disable_sql = format!(
+        "UPDATE ai_price_catalog c \
+         SET is_enabled = false, \
+             auto_disabled_at = NOW(), \
+             auto_disabled_reason = '{PRICE_UNKNOWN_REASON}', \
+             updated_at = NOW() \
+         WHERE c.is_enabled = true \
+           AND {price_unknown} \
+           AND NOT {manual} \
+           AND NOT {media}",
+    );
+    Ok(sqlx::query(&disable_sql).execute(db).await?.rows_affected())
 }
 
 /// DISABILITA (reconciliation policy->catalog): attualmente abilitati ma non piu'
@@ -878,8 +788,19 @@ async fn reconcile_disable_leaving_policy(db: &PgPool) -> anyhow::Result<u64> {
 
 pub async fn reconcile_catalog_with_policy(db: &PgPool) -> anyhow::Result<PolicyReconcileStats> {
     let enabled = reconcile_enable_returning_to_policy(db).await?;
-    let disabled = reconcile_disable_leaving_policy(db).await?;
+    // Ciclo prezzo PRIMA di quello policy: un modello a prezzo ignoto non e'
+    // routabile a prescindere dalla policy, e la reason dedicata deve vincere su
+    // 'fuori model_selection_policy' (che il ramo enable ri-abiliterebbe).
+    let disabled_price = reconcile_disable_price_unknown(db).await?;
+    let disabled = reconcile_disable_leaving_policy(db).await? + disabled_price;
 
+    if disabled_price > 0 {
+        tracing::info!(
+            "catalog_sync: {} modelli disabilitati per prezzo ignoto (pricing_state='unknown'): \
+             costo 0 e' un placeholder, non 'gratis' — vedi mig 0477",
+            disabled_price,
+        );
+    }
     if enabled > 0 || disabled > 0 {
         tracing::info!(
             "catalog_sync: policy reconciliation — enabled={} disabled={}",
@@ -1037,9 +958,6 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         return Ok(SyncStats::default());
     }
 
-    let providers_csv = get_setting(db, "catalog_sync.providers")
-        .await?
-        .unwrap_or_else(|| "anthropic,openai,mistral,deepseek,google".to_string());
     let disable_missing = get_setting(db, "catalog_sync.disable_missing")
         .await?
         .map(|v| v == "true" || v == "1")
@@ -1049,12 +967,14 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
 
+    // PEZZO 1 (regola G+L): la lista dei provider da sincronizzare NON e' piu' un
+    // CSV hardcoded (setting `catalog_sync.providers`, rimosso dalla mig 0613) ma
+    // e' DEDOTTA dal `nexus_provider_registry` (unica fonte). Un provider nuovo,
+    // attivo e configurato entra nella discovery da solo, senza toccare liste.
+    let providers = providers_da_sincronizzare(db).await?;
+
     let mut stats = SyncStats::default();
-    for provider_raw in providers_csv.split(',') {
-        let provider = provider_raw.trim();
-        if provider.is_empty() {
-            continue;
-        }
+    for provider in &providers {
         sync_one_provider_into_stats(
             db,
             provider,
@@ -1066,6 +986,85 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         .await;
     }
     Ok(stats)
+}
+
+/// Riga del `nexus_provider_registry` con i campi che servono a dedurre se un
+/// provider va sincronizzato (PEZZO 1): nome + activation + le chiavi settings da
+/// cui leggere lo stato di configurazione.
+#[derive(sqlx::FromRow)]
+struct ProviderRegistryRow {
+    name: String,
+    activation: Option<String>,
+    key_setting: Option<String>,
+    enabled_setting: Option<String>,
+    base_url_setting: Option<String>,
+}
+
+/// PUNTO UNICO (regola G+L) dei provider da sincronizzare: dedotti dal
+/// `nexus_provider_registry` (unica fonte di verita'), NON da una lista CSV
+/// hardcoded. Prima il setting `catalog_sync.providers` duplicava cio' che il
+/// registry gia' sa, e un provider `is_active` + configurato ma fuori dal CSV
+/// (openrouter/groq/perplexity) restava fuori dalla discovery live pur essendo
+/// identico ai 5 nel CSV. Rimosso il CSV (mig 0613), un nuovo provider nel
+/// registry entra nella discovery da solo.
+///
+/// Un provider entra se `is_active = true` E [`provider_is_configured`].
+async fn providers_da_sincronizzare(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<ProviderRegistryRow> = sqlx::query_as::<_, ProviderRegistryRow>(
+        "SELECT name, activation, key_setting, enabled_setting, base_url_setting \
+         FROM nexus_provider_registry WHERE is_active = true ORDER BY sort_order, name",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut out = Vec::new();
+    for r in rows {
+        if provider_is_configured(db, &r).await? {
+            out.push(r.name);
+        }
+    }
+    Ok(out)
+}
+
+/// "Configurato" di un provider del registry (PEZZO 1). Due sole forme di
+/// attivazione:
+///   - activation contenente 'api_key' (incl. 'api_key_or_vertex'): richiede
+///     `enabled_setting` = 'true'/'1' E `key_setting` valorizzato nei settings;
+///   - activation = 'base_url' (vllm): richiede `base_url_setting` valorizzato.
+/// Ogni altra activation (o assente) -> non configurato (escluso pulito, niente
+/// panico). Un errore di lettura settings PROPAGA (regola M): un provider non
+/// deve sparire dalla sync per un DB che sbatte — meglio far fallire il tick.
+async fn provider_is_configured(db: &PgPool, r: &ProviderRegistryRow) -> anyhow::Result<bool> {
+    Ok(match r.activation.as_deref() {
+        Some(a) if a.contains("api_key") => {
+            setting_is_true(db, r.enabled_setting.as_deref()).await?
+                && setting_is_valued(db, r.key_setting.as_deref()).await?
+        }
+        Some("base_url") => setting_is_valued(db, r.base_url_setting.as_deref()).await?,
+        _ => false,
+    })
+}
+
+/// True se il setting `key` esiste e vale 'true'/'1'. Chiave `None`/assente -> false.
+async fn setting_is_true(db: &PgPool, key: Option<&str>) -> anyhow::Result<bool> {
+    match key {
+        Some(k) => Ok(get_setting(db, k)
+            .await?
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)),
+        None => Ok(false),
+    }
+}
+
+/// True se il setting `key` esiste ed e' valorizzato (non vuoto). Chiave
+/// `None`/assente -> false.
+async fn setting_is_valued(db: &PgPool, key: Option<&str>) -> anyhow::Result<bool> {
+    match key {
+        Some(k) => Ok(get_setting(db, k)
+            .await?
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)),
+        None => Ok(false),
+    }
 }
 
 /// Esegue `sync_provider` per un provider e accumula l'esito in `stats`
@@ -1282,7 +1281,14 @@ async fn process_discovered_chat_model(
 ) {
     match catalog_entry {
         None => {
+            // PEZZO 2 (regola L): la policy governa anche l'INSERT, non solo
+            // l'enable. Un provider con policy restrittiva inserisce SOLO i suoi
+            // allowed; un provider SENZA riga policy (`unwrap_or(true)`) inserisce
+            // tutti (comportamento invariato per i 5 provider che ce l'hanno gia').
+            // Punto unico: si riusa `model_passes_selection_policy` — la stessa SQL
+            // del reconcile e dell'enable — invece di duplicare il filtro.
             if insert_new_disabled
+                && model_passes_selection_policy(db, provider, api_model).await
                 && insert_new_chat_model(db, orchestrator, provider, api_model, declared_window)
                     .await
             {
@@ -1612,10 +1618,22 @@ fn catalog_window_value(declared: Option<i64>) -> i32 {
 /// stata inserita (rows_affected>0).
 ///
 /// pricing_state='unknown': costo 0 e' un PLACEHOLDER non raffinato, NON un
-/// modello gratuito (regola H, mig 0477). performance_tier inferito dal nome
-/// (non il default 'medium' dello schema): evita che i modelli piccoli entrino
-/// come 'medium' nel pool agentico (infer_tier_from_name + mig 0354).
-/// `context_window` esplicito via [`catalog_window_value`].
+/// modello gratuito (regola H, mig 0477). `context_window` esplicito via
+/// [`catalog_window_value`].
+///
+/// performance_tier: **NULL** (mig 0599). Un modello appena scoperto non ha
+/// ancora un agentic_index sincronizzato, quindi NON esiste alcun fatto su cui
+/// fondare una fascia — ed e' esattamente per questo che il nome sembrava l'unica
+/// opzione. Ma la risposta giusta non e' indovinare: e' non avere tier finche' i
+/// fatti non arrivano. Il tier NULL non toglie nulla, perche' la riga nasce
+/// `is_enabled=false` + `unqualified` ed e' gia' fuori dal pool agentico (gate
+/// mig 0595); al primo sync dell'indice ci pensa [`refresh_tiers_from_index`],
+/// e alla prima banda certificata la batteria scrive `measured`.
+///
+/// Prima qui c'era `infer_tier_from_name`, che indovinava la fascia dal NOME: e'
+/// cosi' che `gpt-5.6-sol` (il piu' capace del parco) e' finito in 'high' e il
+/// tier 'heavy' e' diventato un fossile di cio' che l'euristica sapeva quando fu
+/// scritta.
 async fn insert_new_chat_model(
     db: &PgPool,
     orchestrator: Option<&Orchestrator>,
@@ -1623,19 +1641,17 @@ async fn insert_new_chat_model(
     api_model: &str,
     declared_window: Option<i64>,
 ) -> bool {
-    let inferred_tier = infer_tier_from_name(provider, api_model);
     let context_window = catalog_window_value(declared_window);
     let res = sqlx::query(
         "INSERT INTO ai_price_catalog \
          (provider, model, display_name, input_cost_per_million_tokens, \
           output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, pricing_state, context_window, effective_from) \
-         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, 'unknown', $5, NOW()) \
+         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, NULL, false, 'unknown', $4, NOW()) \
          ON CONFLICT (provider, model) DO NOTHING",
     )
     .bind(provider)
     .bind(api_model)
     .bind(api_model)
-    .bind(inferred_tier)
     .bind(context_window)
     .execute(db)
     .await;
@@ -1702,31 +1718,450 @@ async fn realign_existing_model(db: &PgPool, provider: &str, api_model: &str) ->
     .execute(db)
     .await;
 
-    // Stesso principio (regola H + L) per performance_tier: UPDATE mirato (solo
-    // dove il tier differisce); le righe 'manual' restano intatte.
-    let inferred_tier = infer_tier_from_name(provider, api_model);
-    let tier_res = sqlx::query(
-        "UPDATE ai_price_catalog SET performance_tier = $3, updated_at = NOW() \
-         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
-           AND performance_tier IS DISTINCT FROM $3",
+    // performance_tier DAI FATTI (mig 0599), non dal nome. Il sync e' il momento
+    // giusto: i prezzi e la finestra sono appena stati raffinati dalla discovery.
+    refresh_tier_prior(db, provider, api_model).await
+}
+
+/// Ricalcola il tier `synced` di UN modello dall'indice della classificazione
+/// esterna. Sostituisce `infer_tier_from_name`, che indovinava la fascia dal
+/// NOME, e il ripiego sul prezzo (mig 0608).
+///
+/// La PRECEDENZA fra le fonti non si decide qui: la scrittura delega ad
+/// [`apply_tier`] (punto unico, regola L), che sa che `measured` e `manual`
+/// sono piu' autorevoli di un seme sincronizzato. Prima quella regola era una
+/// WHERE scritta a mano in questa funzione e un CASE scritto a mano nella
+/// batteria: due formulazioni della stessa cosa, allineate solo dalla diligenza.
+pub(crate) async fn refresh_tier_prior(db: &PgPool, provider: &str, api_model: &str) -> u32 {
+    let Some(bands) = tier_prior_bands(db).await else {
+        return 0; // prior disabilitato dal flag DB (o percentuali mancanti)
+    };
+    // Il path per-modello (discovery, sync LiteLLM) legge l'ANCORA PERSISTITA
+    // (mig 0615): il massimo del parco lo ricalcola solo il giro set-based
+    // `refresh_tiers_from_index`, che la aggiorna con la deadband.
+    let Some(leader) = read_anchor(db, "catalog.tier_relative.anchor").await else {
+        tracing::debug!(
+            provider = %provider, model = %api_model,
+            "refresh_tier_prior: ancora della scala relativa non ancora fissata \
+             (catalog.tier_relative.anchor vuota): tier invariato fino al primo \
+             giro di refresh_tiers_from_index"
+        );
+        return 0;
+    };
+    refresh_tier_prior_con_leader(db, provider, api_model, leader, &bands).await
+}
+
+/// Un setting NUMERICO, se presente e parsabile. Punto unico del pattern
+/// lettura+parse di questo modulo (il default, dove esiste, resta al chiamante).
+async fn setting_num<T: std::str::FromStr>(db: &PgPool, key: &str) -> Option<T> {
+    crate::settings::get_setting(db, key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// L'ancora persistita sotto `key`, se e' un numero positivo. Vuota o assente =
+/// scala non ancora ancorata.
+async fn read_anchor(db: &PgPool, key: &str) -> Option<f64> {
+    setting_num::<f64>(db, key).await.filter(|v| *v > 0.0)
+}
+
+/// Il corpo del refresh di UN modello, col leader gia' risolto dal chiamante.
+async fn refresh_tier_prior_con_leader(
+    db: &PgPool,
+    provider: &str,
+    api_model: &str,
+    leader: f64,
+    bands: &crate::orchestrator::model_service::RelativeBands,
+) -> u32 {
+    // L'indice STANTIO viene scartato QUI (non nella funzione pura): la fonte e'
+    // undocumented e puo' sparire senza preavviso — un indice vecchio non deve
+    // passare per fresco.
+    let max_age_h = setting_num::<i64>(db, "catalog.agentic_index_sync.max_age_hours")
+        .await
+        .unwrap_or(168);
+    let agentic_index: Option<Option<f64>> = sqlx::query_scalar(
+        "SELECT CASE WHEN agentic_index_at IS NULL \
+                       OR agentic_index_at < now() - make_interval(hours => $3::int) \
+                     THEN NULL ELSE agentic_index END \
+           FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
     )
     .bind(provider)
     .bind(api_model)
-    .bind(inferred_tier)
-    .execute(db)
-    .await;
-    if let Ok(r) = tier_res {
-        if r.rows_affected() > 0 {
+    .bind(max_age_h as i32)
+    .fetch_optional(db)
+    .await
+    // Regola H: l'errore SQL si LOGGA, non si inghiotte con `.ok()`. Una
+    // query invalida piu' un `.ok()` resta rotta per mesi senza che nulla
+    // arrossisca — il compilatore non guarda dentro le stringhe SQL.
+    .map_err(|e| {
+        tracing::warn!(
+            provider = %provider, model = %api_model, error = %e,
+            "refresh_tier_prior: lettura dell'indice fallita, tier non derivato"
+        );
+    })
+    .ok()
+    .flatten();
+    // Indice assente o stantio: NON si azzera il tier esistente. Un tier vecchio
+    // e' peggio di uno misurato ma MOLTO meglio di nessuno: `performance_tier`
+    // NULL non matcha il filtro della tier-chain, quindi azzerare toglierebbe il
+    // modello dal routing per tier. Misurato sul catalogo il 16/07: 43 modelli
+    // QUALIFICATI (21 heavy, 10 medium, 6 frontier) sono scoperti dall'indice —
+    // OpenRouter non lista quei nomi, e non e' una lacuna temporanea. Restano
+    // routabili col tier che hanno finche' la batteria non scrive 'measured'.
+    let Some(derived) =
+        crate::model_qualification::derive_tier_prior(agentic_index.flatten(), leader, bands)
+    else {
+        tracing::debug!(
+            provider = %provider, model = %api_model,
+            "derive_tier: indice assente o stantio -> tier invariato (lo misurera' la batteria)"
+        );
+        return 0;
+    };
+    use crate::orchestrator::model_service::{apply_tier, TierSource};
+    match apply_tier(db, provider, api_model, derived, TierSource::Synced).await {
+        Ok(true) => {
             tracing::info!(
-                "catalog_sync[{}]: tier riallineato '{}' -> {}",
-                provider,
-                api_model,
-                inferred_tier
+                provider = %provider, model = %api_model, tier = %derived,
+                "catalog_sync: tier dalla classificazione esterna (synced), non dal nome"
             );
-            return 1;
+            1
+        }
+        Ok(false) => 0,
+        // Regola H: un errore SQL si LOGGA. Con `if let Ok(r)` questo UPDATE e'
+        // rimasto muto mentre falliva (colonna assente nello schema): il tier non
+        // veniva scritto e nulla lo diceva. E' lo stesso pattern che ha tenuto
+        // rotte per mesi le query del pannello DB.
+        Err(e) => {
+            tracing::warn!(
+                provider = %provider, model = %api_model, error = %e,
+                "refresh_tier_prior: UPDATE del tier fallito"
+            );
+            0
         }
     }
-    0
+}
+
+/// Applica il tier dell'indice a TUTTE le righe che ne hanno uno, non solo a
+/// quelle che il sync del listino tocca. Ritorna quante righe sono cambiate.
+///
+/// Perche' esiste (buco misurato il 16/07): `sync_agentic_index` scrive
+/// l'indice su ogni modello che riesce a matchare, ma il TIER veniva derivato
+/// solo da `refresh_tier_prior`, chiamato per-modello da due soli path — il
+/// sync LiteLLM (`models::run_catalog_sync`) e la discovery
+/// (`realign_existing_model`). Un modello con indice fresco che non passa da
+/// nessuno dei due (perche' il listino LiteLLM non lo conosce, tipico dei
+/// modelli nuovi) non riceveva MAI il tier: l'indice restava nella riga,
+/// inerte. Se l'indice e' la BASE della classificazione, deve raggiungere
+/// tutti.
+///
+/// Regola L: non ri-deriva nulla. Calcola il LEADER una volta (il massimo
+/// `agentic_index` fresco fra le righe enabled — il cooldown transitorio di un
+/// provider NON esclude dal leader: il parco e' il parco), lo ancora con la
+/// deadband (mig 0615) e poi enumera le righe candidate delegando al punto
+/// unico `refresh_tier_prior_con_leader`, che rilegge la riga e applica la
+/// scala — cosi' le bande restano definite in un solo posto
+/// (`tier_from_leader`) invece di essere riscritte come `CASE` in questa query.
+pub(crate) async fn refresh_tiers_from_index(db: &PgPool) -> u32 {
+    let Some(bands) = tier_prior_bands(db).await else {
+        return 0; // prior disabilitato dal flag DB (o percentuali mancanti)
+    };
+    let Some(leader) = leader_riancorato(db).await else {
+        tracing::debug!(
+            "refresh_tiers_from_index: nessun indice fresco su righe enabled e \
+             nessuna ancora persistita: la scala relativa non ha un leader"
+        );
+        return 0;
+    };
+    let candidati: Vec<(String, String)> = sqlx::query_as(
+        "SELECT provider, model FROM ai_price_catalog \
+          WHERE agentic_index IS NOT NULL \
+            AND (tier_source IS NULL OR tier_source = 'synced')",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "refresh_tiers_from_index: enumerazione fallita");
+    })
+    .unwrap_or_default();
+
+    let mut cambiati = 0;
+    for (provider, model) in candidati {
+        cambiati += refresh_tier_prior_con_leader(db, &provider, &model, leader, &bands).await;
+    }
+    cambiati
+}
+
+/// Il leader della scala del prior, RI-ANCORATO: massimo indice fresco fra le
+/// righe enabled, passato per la deadband contro l'ancora persistita
+/// (`catalog.tier_relative.anchor`) e persistito se lo scarto la supera.
+/// `None` = ne' un massimo fresco ne' un'ancora precedente: la scala non parte.
+async fn leader_riancorato(db: &PgPool) -> Option<f64> {
+    use crate::orchestrator::model_service::{persist_anchor, resolve_anchor};
+    let max_age_h = setting_num::<i64>(db, "catalog.agentic_index_sync.max_age_hours")
+        .await
+        .unwrap_or(168);
+    let fresco: Option<(String, f64)> = sqlx::query_as(
+        "SELECT provider || '/' || model, agentic_index FROM ai_price_catalog \
+          WHERE is_enabled AND agentic_index IS NOT NULL \
+            AND agentic_index_at >= now() - make_interval(hours => $1::int) \
+          ORDER BY agentic_index DESC LIMIT 1",
+    )
+    .bind(max_age_h as i32)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "leader_riancorato: lettura del massimo fallita"))
+    .ok()
+    .flatten();
+    let ancora_attuale = read_anchor(db, "catalog.tier_relative.anchor").await;
+    let Some((leader_model, nuovo_max)) = fresco else {
+        // Parco senza indice fresco: si resta sull'ancora che c'e' (le righe
+        // stantie verranno comunque saltate dal check per-riga).
+        return ancora_attuale;
+    };
+    let Some(deadband) = read_deadband(db).await else {
+        return ancora_attuale.or(Some(nuovo_max)); // senza deadband non si persiste
+    };
+    let (ancora, persisti) = resolve_anchor(ancora_attuale, nuovo_max, deadband);
+    if persisti {
+        tracing::info!(
+            ancora = ancora, leader = %leader_model,
+            "scala relativa: nuova ancora del tier prior (deadband superata)"
+        );
+        persist_anchor(db, "catalog.tier_relative", ancora, &leader_model).await;
+    }
+    Some(ancora)
+}
+
+/// La deadband dell'ancora (mig 0615). Assente = WARN visibile, nessun
+/// aggiornamento dell'ancora (regola G: la chiave nasce in migrazione, non da
+/// un default nel codice).
+async fn read_deadband(db: &PgPool) -> Option<f64> {
+    let v = setting_num::<f64>(db, "catalog.tier_relative.anchor_deadband_pct").await;
+    if v.is_none() {
+        tracing::warn!(
+            "catalog.tier_relative.anchor_deadband_pct assente o non numerica \
+             (applicare la migrazione #0615): l'ancora della scala relativa non si aggiorna"
+        );
+    }
+    v
+}
+
+/// Normalizza un id modello per il confronto fra cataloghi diversi (il nostro e
+/// quello di OpenRouter). PURA.
+///
+/// Toglie il prefisso provider (`openai/gpt-5` -> `gpt-5`), il suffisso DATA e i
+/// separatori. Lo strip della data e' SICURO e misurato: `claude-opus-4-5-20251101`
+/// e' lo stesso modello di `claude-opus-4.5`, `gpt-5.4-mini-2026-03-17` di
+/// `gpt-5.4-mini`. Sul parco reale porta la copertura da 31/110 (28%) a 43/110
+/// (39%) con **zero chiavi ambigue**.
+///
+/// NON fa prefix-match, e non deve mai farlo: `gpt-5-nano` matcherebbe `gpt-5` e
+/// un nano si prenderebbe l'indice del flagship — cioe' verrebbe promosso a
+/// heavy. E' un errore gia' commesso in una prima analisi manuale (`o3` matchato
+/// con `o3-mini-high`): qui e' escluso per costruzione.
+pub(crate) fn normalize_model_key(id: &str) -> String {
+    let senza_provider = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+    // -2026-03-17 oppure -20251101 in coda (e SOLO in coda).
+    let senza_data = strip_date_suffix(&senza_provider);
+    senza_data
+        .chars()
+        .filter(|c| *c != '-' && *c != '_' && *c != '.')
+        .collect()
+}
+
+/// Toglie un suffisso data (`-YYYY-MM-DD` o `-YYYYMMDD`) in coda. PURA.
+///
+/// PUNTO UNICO (regola L). Ne esistevano DUE con lo stesso nome: questa e una che
+/// gestiva solo `-YYYYMMDD` (8 cifre) lasciando passare il formato ISO
+/// `-YYYY-MM-DD`. Il suo test lo ASSERIVA (`gpt-4o-mini-2024-07-18` invariato),
+/// ma il chiamante — `catalog_sync`, "skip alias con suffisso data se la base
+/// name e' nell'API" — dichiara l'intento OPPOSTO: era un limite
+/// dell'implementazione fossilizzato in un test, non una scelta di design.
+///
+/// Consolidando, un alias con data ISO viene ora riconosciuto come alias della
+/// sua base, quindi PRESERVATO invece che disabilitato quando la base e' viva
+/// nell'API: il cambio va verso il "non disabilitare", che e' il lato sicuro.
+fn strip_date_suffix(s: &str) -> String {
+    let b = s.as_bytes();
+    // -YYYY-MM-DD (11 char)
+    if b.len() > 11 {
+        let coda = &s[s.len() - 11..];
+        let c: Vec<char> = coda.chars().collect();
+        if c[0] == '-'
+            && c[5] == '-'
+            && c[8] == '-'
+            && c.iter()
+                .enumerate()
+                .all(|(i, ch)| matches!(i, 0 | 5 | 8) || ch.is_ascii_digit())
+        {
+            return s[..s.len() - 11].to_string();
+        }
+    }
+    // -YYYYMMDD (9 char)
+    if b.len() > 9 {
+        let coda = &s[s.len() - 9..];
+        let c: Vec<char> = coda.chars().collect();
+        if c[0] == '-' && c[1..].iter().all(char::is_ascii_digit) {
+            return s[..s.len() - 9].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Estrae `{chiave_normalizzata -> agentic_index}` dal JSON di OpenRouter. PURA
+/// (nessun I/O: il payload arriva dal chiamante, cosi' il parsing e' testabile
+/// senza rete).
+///
+/// Scarta le chiavi AMBIGUE: se due id diversi normalizzano alla stessa chiave con
+/// indici DIVERSI, nessuno dei due entra. Meglio nessun indice che quello del
+/// modello sbagliato — un indice sbagliato promuove un modello nel routing, un
+/// indice assente lo lascia al ripiego sul prezzo.
+pub(crate) fn parse_agentic_index_payload(
+    payload: &Value,
+) -> std::collections::HashMap<String, f64> {
+    use std::collections::HashMap;
+    let mut per_chiave: HashMap<String, Vec<f64>> = HashMap::new();
+    let Some(models) = payload.get("data").and_then(Value::as_array) else {
+        return HashMap::new();
+    };
+    for m in models {
+        let Some(id) = m.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(idx) = m
+            .get("benchmarks")
+            .and_then(|b| b.get("artificial_analysis"))
+            .and_then(|a| a.get("agentic_index"))
+            .and_then(Value::as_f64)
+        else {
+            continue;
+        };
+        per_chiave.entry(normalize_model_key(id)).or_default().push(idx);
+    }
+    per_chiave
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let primo = *v.first()?;
+            // Ambigua = stessi nome normalizzato, indici diversi -> si scarta.
+            if v.iter().any(|x| (x - primo).abs() > f64::EPSILON) {
+                tracing::warn!(
+                    chiave = %k, valori = ?v,
+                    "agentic_index: chiave AMBIGUA, scartata (meglio nessun indice \
+                     che quello del modello sbagliato)"
+                );
+                return None;
+            }
+            Some((k, primo))
+        })
+        .collect()
+}
+
+/// Sincronizza l'`agentic_index` dal catalogo OpenRouter (mig 0600).
+///
+/// La fonte e' pubblica e senza autenticazione, ma il campo
+/// `benchmarks.artificial_analysis` e' UNDOCUMENTED (le doc citano solo Design
+/// Arena): puo' sparire senza preavviso. Per questo scrive anche
+/// `agentic_index_at` — cosi' `refresh_tier_prior` scarta un indice STANTIO e
+/// ricade sul prezzo, invece di fidarsi per sempre di un dato morto.
+///
+/// Ritorna quanti modelli hanno ricevuto un indice.
+pub async fn sync_agentic_index(db: &PgPool) -> Result<u64, String> {
+    let on = crate::settings::get_setting(db, "catalog.agentic_index_sync.enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
+        .unwrap_or(false);
+    if !on {
+        return Ok(0);
+    }
+    let url = crate::settings::get_setting(db, "catalog.agentic_index_sync.url")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "catalog.agentic_index_sync.url assente in settings (mig 0600)".to_string()
+        })?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let payload: Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch {url}: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("json {url}: {e}"))?;
+    let per_chiave = parse_agentic_index_payload(&payload);
+    if per_chiave.is_empty() {
+        // Il campo e' undocumented: se sparisce, questo e' il segnale. Non si
+        // azzerano gli indici esistenti — invecchiano, e max_age_hours li scarta.
+        return Err(
+            "nessun agentic_index nel payload: la fonte (undocumented) potrebbe \
+             essere cambiata. Gli indici esistenti restano e invecchiano."
+                .to_string(),
+        );
+    }
+    // Il match avviene in SQL sulla chiave normalizzata, calcolata sui NOSTRI id
+    // con la STESSA funzione pura (regola L: una sola normalizzazione).
+    let nostri: Vec<(String, String)> =
+        sqlx::query_as("SELECT provider, model FROM ai_price_catalog")
+            .fetch_all(db)
+            .await
+            .map_err(|e| format!("select catalog: {e}"))?;
+    let mut aggiornati = 0u64;
+    for (provider, model) in nostri {
+        let Some(idx) = per_chiave.get(&normalize_model_key(&model)) else {
+            continue;
+        };
+        let res = sqlx::query(
+            "UPDATE ai_price_catalog \
+                SET agentic_index = $3, agentic_index_at = NOW(), updated_at = NOW() \
+              WHERE provider = $1 AND model = $2 \
+                AND (agentic_index IS DISTINCT FROM $3 OR agentic_index_at IS NULL)",
+        )
+        .bind(&provider)
+        .bind(&model)
+        .bind(idx)
+        .execute(db)
+        .await;
+        if let Ok(r) = res {
+            aggiornati += r.rows_affected();
+        }
+    }
+    tracing::info!(
+        indici_disponibili = per_chiave.len(),
+        modelli_aggiornati = aggiornati,
+        "agentic_index: sync completato"
+    );
+    Ok(aggiornati)
+}
+
+/// La scala del tier `synced` dal DB (regola G, mig 0615: le soglie ASSOLUTE
+/// della 0600 sono state sostituite dalle percentuali relative al leader).
+/// `None` = prior disabilitato dal flag O percentuali mancanti (fail-visibile,
+/// niente default hardcoded): restano solo `manual` e `measured`, e un modello
+/// mai misurato ha tier NULL. Le percentuali le carica il punto unico
+/// `model_service::relative_bands` (regola L: la stessa scala serve anche alle
+/// bande measured).
+pub(crate) async fn tier_prior_bands(
+    db: &PgPool,
+) -> Option<crate::orchestrator::model_service::RelativeBands> {
+    let on = crate::settings::get_setting(db, "catalog.tier_prior.enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    crate::orchestrator::model_service::relative_bands(db, "catalog.tier_relative").await
 }
 
 /// Riallinea `context_window` di un modello GIA' nel catalog al valore
@@ -1812,6 +2247,10 @@ async fn reenable_existing_model(
 /// irraggiungibile dal ri-test del probe (incidente magistral-small-2509,
 /// 2026-06-10).
 async fn do_reenable_model(db: &PgPool, provider: &str, api_model: &str) -> bool {
+    // "Ricomparso in API" non dice nulla sul suo PREZZO: senza questo guard e' il
+    // path che ha ri-abilitato mistral-medium-3 (prezzo ignoto) 78 volte, vanificando
+    // ogni disabilitazione. E' il piu' insidioso dei punti di eleggibilita': ignora
+    // policy e reason, quindi resuscita cio' che gli altri rami hanno escluso.
     let sql = format!(
         "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
          auto_disabled_at = NULL, \
@@ -1819,8 +2258,10 @@ async fn do_reenable_model(db: &PgPool, provider: &str, api_model: &str) -> bool
                                      THEN auto_disabled_reason \
                                      ELSE NULL END, \
          updated_at = NOW() \
-         WHERE provider = $1 AND model = $2",
-        tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL
+         WHERE provider = $1 AND model = $2 \
+           AND NOT {price_unknown}",
+        tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL,
+        price_unknown = price_unknown_sql(""),
     );
     let res = sqlx::query(&sql)
         .bind(provider)
@@ -1975,9 +2416,13 @@ async fn apply_probe_healthy(db: &PgPool, provider: &str, api_model: &str) {
 
 /// UPDATE dei flag canonici (ADR 0024) + is_enabled dopo un probe Healthy.
 /// Scrive `capabilities` solo se attualmente vuoto e i flag SOLO su righe
-/// 'auto' (le 'manual' restano intatte). `is_enabled` diventa `allowed` (gate
-/// allowlist ADR 0025). Estratta da `apply_probe_healthy` senza cambi di
-/// comportamento.
+/// 'auto' (le 'manual' restano intatte).
+///
+/// `is_enabled` diventa `allowed` (gate allowlist ADR 0025) **E** prezzo noto: un
+/// probe che risponde dimostra che il modello FUNZIONA, non che sappiamo quanto
+/// costa. I due gate sono ortogonali e vanno entrambi superati. Il gate prezzo
+/// tocca solo l'abilitazione: le capability inferite si scrivono comunque, cosi'
+/// il giorno in cui il listino arriva la riga e' gia' completa.
 async fn write_probe_healthy_flags(
     db: &PgPool,
     provider: &str,
@@ -1986,11 +2431,16 @@ async fn write_probe_healthy_flags(
     cc: &ClassifiedCaps,
     allowed: bool,
 ) {
-    let _ = sqlx::query(
+    let price_unknown = price_unknown_sql("");
+    let sql = format!(
         "UPDATE ai_price_catalog \
-         SET is_enabled = $8, \
-             auto_disabled_at = CASE WHEN $8 THEN NULL ELSE NOW() END, \
-             auto_disabled_reason = CASE WHEN $8 THEN NULL ELSE 'fuori model_selection_policy (mig 0320)' END, \
+         SET is_enabled = ($8 AND NOT {price_unknown}), \
+             last_probe_healthy_at = CASE WHEN ($8 AND NOT {price_unknown}) THEN NOW() ELSE last_probe_healthy_at END, \
+             auto_disabled_at = CASE WHEN ($8 AND NOT {price_unknown}) THEN NULL ELSE NOW() END, \
+             auto_disabled_reason = CASE \
+                 WHEN ($8 AND NOT {price_unknown}) THEN NULL \
+                 WHEN {price_unknown} THEN '{PRICE_UNKNOWN_REASON}' \
+                 ELSE 'fuori model_selection_policy (mig 0320)' END, \
              updated_at = NOW(), \
              capabilities = CASE \
                  WHEN capabilities IS NULL OR capabilities = '[]'::jsonb \
@@ -1999,34 +2449,21 @@ async fn write_probe_healthy_flags(
              END, \
              supports_tool_use = CASE WHEN capability_source='auto' THEN $4 ELSE supports_tool_use END, \
              supports_vision = CASE WHEN capability_source='auto' THEN $5 ELSE supports_vision END, \
-             is_thinking = CASE WHEN capability_source='auto' THEN $6 ELSE is_thinking END, \
-             uses_thinking_mode = CASE WHEN capability_source='auto' THEN $7 ELSE uses_thinking_mode END, \
-             agentic_thinking_policy = CASE WHEN capability_source='auto' THEN $9 ELSE agentic_thinking_policy END \
+             uses_thinking_mode = CASE WHEN capability_source='auto' THEN $6 ELSE uses_thinking_mode END, \
+             agentic_thinking_policy = CASE WHEN capability_source='auto' THEN $8 ELSE agentic_thinking_policy END \
          WHERE provider = $1 AND model = $2 AND is_enabled = false",
-    )
+    );
+    let _ = sqlx::query(&sql)
     .bind(provider)
     .bind(api_model)
     .bind(caps_json)
     .bind(cc.supports_tool_use)
     .bind(cc.supports_vision)
-    .bind(cc.is_thinking)
     .bind(cc.uses_thinking_mode)
     .bind(allowed)
     .bind(cc.agentic_thinking_policy)
     .execute(db)
     .await;
-}
-
-/// Rimuove suffisso data ISO (es. -20251201) dal model name per gestire alias.
-fn strip_date_suffix(model: &str) -> String {
-    // Pattern: trailing -YYYYMMDD (8 digits dopo dash)
-    if let Some(idx) = model.rfind('-') {
-        let suffix = &model[idx + 1..];
-        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            return model[..idx].to_string();
-        }
-    }
-    model.to_string()
 }
 
 /// FIX 2: verifica se un modello e' "recentemente sano" secondo l'account,
@@ -2131,157 +2568,20 @@ async fn fetch_provider_models(
     orchestrator: Option<&Orchestrator>,
     provider: &str,
 ) -> anyhow::Result<Vec<crate::nexus_gateway::GwModelMeta>> {
-    let gateway = orchestrator
-        .and_then(|orch| orch.nexus_gateway.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Nexus Gateway non disponibile: autodiscovery modelli impossibile")
-        })?;
-    gateway.list_models(provider).await
+    // L'orchestrator puo' mancare (chiamata fuori dal server); il suo gateway no.
+    let orch = orchestrator.ok_or_else(|| {
+        anyhow::anyhow!("orchestrator non disponibile: autodiscovery modelli impossibile")
+    })?;
+    orch.nexus_gateway.list_models(provider).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_infer_tier_mistral_small_families_are_light() {
-        // Caso del bug: ministral/small/nemo NON devono essere medium.
-        assert_eq!(
-            infer_tier_from_name("mistral", "ministral-8b-2512"),
-            "light"
-        );
-        assert_eq!(
-            infer_tier_from_name("mistral", "ministral-3b-latest"),
-            "light"
-        );
-        assert_eq!(
-            infer_tier_from_name("mistral", "mistral-small-2506"),
-            "light"
-        );
-        assert_eq!(
-            infer_tier_from_name("mistral", "magistral-small-latest"),
-            "light"
-        );
-        assert_eq!(
-            infer_tier_from_name("mistral", "open-mistral-nemo-2407"),
-            "light"
-        );
-        // I capaci restano medium (Mistral non ha heavy reale).
-        assert_eq!(
-            infer_tier_from_name("mistral", "mistral-large-latest"),
-            "medium"
-        );
-        assert_eq!(
-            infer_tier_from_name("mistral", "mistral-medium-3"),
-            "medium"
-        );
-        assert_eq!(
-            infer_tier_from_name("mistral", "codestral-latest"),
-            "medium"
-        );
-        assert_eq!(infer_tier_from_name("mistral", "devstral-2512"), "medium");
-    }
 
-    #[test]
-    fn test_infer_tier_other_providers() {
-        // Google (scala 5): 2.5-pro=high, flash*=light.
-        assert_eq!(infer_tier_from_name("google", "gemini-2.5-pro"), "high");
-        assert_eq!(infer_tier_from_name("google", "gemini-2.5-flash"), "light");
-        assert_eq!(
-            infer_tier_from_name("google", "gemini-2.5-flash-lite"),
-            "light"
-        );
-        // Anthropic: opus=heavy, sonnet=medium, haiku=light.
-        assert_eq!(
-            infer_tier_from_name("anthropic", "claude-opus-4-6"),
-            "heavy"
-        );
-        assert_eq!(
-            infer_tier_from_name("anthropic", "claude-sonnet-4-6"),
-            "medium"
-        );
-        assert_eq!(
-            infer_tier_from_name("anthropic", "claude-haiku-4-5-20251001"),
-            "light"
-        );
-        // OpenAI: o3/o1/pro=heavy, nano/mini=light, resto medium.
-        assert_eq!(infer_tier_from_name("openai", "o3"), "heavy");
-        assert_eq!(
-            infer_tier_from_name("openai", "gpt-5.4-pro-2026-03-05"),
-            "heavy"
-        );
-        assert_eq!(infer_tier_from_name("openai", "gpt-4.1-nano"), "light");
-        assert_eq!(infer_tier_from_name("openai", "o4-mini"), "light");
-        assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
-    }
 
-    #[test]
-    fn test_infer_tier_flagship_naming_recente() {
-        // OpenAI (scala 5): gpt-5 base = high; gpt-5.1..5.4 e *-pro/*-codex = heavy;
-        // gpt-5.5 e generazioni future (>=6) = frontier. Robusto alle versioni
-        // future via parsing del major (regola G).
-        assert_eq!(infer_tier_from_name("openai", "gpt-5"), "high");
-        assert_eq!(infer_tier_from_name("openai", "gpt-5.5"), "frontier");
-        assert_eq!(infer_tier_from_name("openai", "gpt-5.4"), "heavy");
-        assert_eq!(infer_tier_from_name("openai", "gpt-6"), "frontier");
-        // Le varianti piccole di un flagship restano light.
-        assert_eq!(infer_tier_from_name("openai", "gpt-5.4-mini"), "light");
-        assert_eq!(infer_tier_from_name("openai", "gpt-5-nano"), "light");
-        // chat-latest = variante chat veloce, non flagship reasoning -> medium.
-        assert_eq!(
-            infer_tier_from_name("openai", "gpt-5-chat-latest"),
-            "medium"
-        );
-        // I gpt precedenti (4.x, 4o) restano medium.
-        assert_eq!(infer_tier_from_name("openai", "gpt-4o"), "medium");
-        assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
-        // Anthropic (scala 5): opus-4-8 (flagship coding attuale) = frontier;
-        // opus precedenti = heavy.
-        assert_eq!(
-            infer_tier_from_name("anthropic", "claude-opus-4-8"),
-            "frontier"
-        );
-        assert_eq!(
-            infer_tier_from_name("anthropic", "claude-opus-4-6"),
-            "heavy"
-        );
-    }
 
-    #[test]
-    fn test_infer_tier_scala_5_fascia_alta() {
-        // Il cuore della scala a 5: la vecchia fascia 'heavy' si spalma su
-        // high/heavy/frontier per capacita' reale (distingue il "meglio disponibile").
-        // Google: 3.5-pro frontier, gemini-3/3.1-pro heavy, 2.5-pro high, 3.5-flash heavy.
-        assert_eq!(
-            infer_tier_from_name("google", "gemini-3-pro-preview"),
-            "heavy"
-        );
-        assert_eq!(
-            infer_tier_from_name("google", "gemini-3.1-pro-preview"),
-            "heavy"
-        );
-        assert_eq!(infer_tier_from_name("google", "gemini-3.5-pro"), "frontier");
-        assert_eq!(infer_tier_from_name("google", "gemini-3.5-flash"), "heavy");
-        assert_eq!(
-            infer_tier_from_name("google", "gemini-flash-lite-latest"),
-            "light"
-        );
-        // Anthropic: fable-5 frontier.
-        assert_eq!(
-            infer_tier_from_name("anthropic", "claude-fable-5"),
-            "frontier"
-        );
-        // OpenAI: *-pro / *-codex = heavy.
-        assert_eq!(infer_tier_from_name("openai", "gpt-5-pro"), "heavy");
-        assert_eq!(infer_tier_from_name("openai", "gpt-5.2-codex"), "heavy");
-        // DeepSeek: v4-pro/reasoner high, v4-flash medium, coder light.
-        assert_eq!(infer_tier_from_name("deepseek", "deepseek-v4-pro"), "high");
-        assert_eq!(
-            infer_tier_from_name("deepseek", "deepseek-v4-flash"),
-            "medium"
-        );
-        assert_eq!(infer_tier_from_name("deepseek", "deepseek-coder"), "light");
-    }
 
     #[test]
     fn test_is_chat_compatible_no_per_name_blacklist() {
@@ -2366,11 +2666,11 @@ mod tests {
             "claude-sonnet-4-6"
         );
         assert_eq!(strip_date_suffix("gpt-4o-mini"), "gpt-4o-mini");
-        assert_eq!(
-            strip_date_suffix("gpt-4o-mini-2024-07-18"),
-            "gpt-4o-mini-2024-07-18"
-        );
-        // (sopra ha 2 digits-2 digits-2 digits, non matcha 8 digits)
+        // Il formato ISO ORA viene rimosso: prima no, e il test lo asseriva — ma
+        // il chiamante vuole proprio riconoscere l'alias della sua base (vedi il
+        // doc di strip_date_suffix). Consolidamento delle due copie omonime.
+        assert_eq!(strip_date_suffix("gpt-4o-mini-2024-07-18"), "gpt-4o-mini");
+        // NON e' una data: 4 cifre. 'ministral-8b-2512' e' un nome di modello.
         assert_eq!(strip_date_suffix("ministral-8b-2512"), "ministral-8b-2512");
     }
 
@@ -2397,23 +2697,49 @@ mod tests {
         );
         assert!(c.supports_tool_use);
         assert!(c.supports_vision);
-        assert!(!c.is_thinking);
+        assert_eq!(c.agentic_thinking_policy, "none");
         assert!(!c.uses_thinking_mode);
     }
 
+    /// Un modello MEDIA non e' un modello di testo: il classificatore lo spegne
+    /// PRIMA di ogni euristica. Senza questo guard, il default
+    /// `meta_tool_use.unwrap_or(true)` del path LiteLLM marcava whisper-1/tts-1
+    /// come tool-capable: modelli audio dentro il pool agentico dei consiglieri
+    /// (dato sporco misurato il 16/07, ripulito dalla mig 0608).
     #[test]
-    fn classify_o_series_e_reasoning_only_escluso_da_agentico() {
-        // o-series: reasoning-only -> A (escludi) e B (non forzare) entrambi true.
+    fn classify_un_media_non_e_mai_tool_capable() {
+        for model in ["whisper-1", "tts-1", "tts-1-hd", "gpt-image-1", "gpt-4o-transcribe"] {
+            // Anche con metadata assente (il caso LiteLLM che sporcava i dati).
+            let c = classify_capabilities("openai", model, None, None, None, &rt());
+            assert!(!c.supports_tool_use, "{model}: un media non fa tool-loop");
+            assert!(!c.supports_vision, "{model}: un media non e' un modello vision");
+            assert_eq!(c.agentic_thinking_policy, "none");
+            // E nemmeno un metadata bugiardo lo promuove.
+            let c = classify_capabilities("openai", model, Some(true), Some(true), None, &rt());
+            assert!(
+                !c.supports_tool_use,
+                "{model}: il guard media vince sul metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_o_series_e_reasoning_only_tool_nativi() {
+        // o-series: reasoning-only -> tool NATIVI (policy 'native') + thinking
+        // mode. NB: la vecchia colonna is_thinking diceva "escludi da agentico"
+        // mentre la policy dice 'native' (dentro, con tool nativi): la
+        // contraddizione fra le due colonne e' il motivo per cui la colonna
+        // e' stata rimossa (mig 0608, ADR 0025).
         let c = classify_capabilities("openai", "o3-mini", None, None, None, &rt());
-        assert!(c.is_thinking, "o-series deve essere escluso da agentico");
+        assert_eq!(c.agentic_thinking_policy, "native");
         assert!(c.uses_thinking_mode);
     }
 
     #[test]
     fn classify_deepseek_v4_reasoning_only() {
-        // deepseek-v4-pro: reasoning-only (no reasoning_content passback) -> A+B.
+        // deepseek-v4-pro: linea reasoning -> thinking mode attivo, dual-mode
+        // nei tool-loop (policy asserita nel test di famiglia qui sotto).
         let c = classify_capabilities("deepseek", "deepseek-v4-pro", None, None, None, &rt());
-        assert!(c.is_thinking);
         assert!(c.uses_thinking_mode);
     }
 
@@ -2441,7 +2767,10 @@ mod tests {
         // thinking -> non forzare tool_choice (B=true). Caso che il merge naïf
         // avrebbe rotto.
         let c = classify_capabilities("anthropic", "claude-sonnet-4-6", None, None, None, &rt());
-        assert!(!c.is_thinking, "Claude deve restare agentic-eligibile");
+        assert_eq!(
+            c.agentic_thinking_policy, "disable_for_tools",
+            "Claude ibrido: agentic-eligibile, non-thinking nei tool-loop"
+        );
         assert!(
             c.uses_thinking_mode,
             "Claude usa extended thinking -> non forzare"
@@ -2454,7 +2783,7 @@ mod tests {
         // mistral-large: tool-capable, non-thinking -> candidato agentico ideale.
         let c = classify_capabilities("mistral", "mistral-large-2411", None, None, None, &rt());
         assert!(c.supports_tool_use);
-        assert!(!c.is_thinking);
+        assert_eq!(c.agentic_thinking_policy, "none");
         assert!(!c.uses_thinking_mode);
     }
 
@@ -2515,22 +2844,20 @@ mod tests {
     #[test]
     fn classify_gemini_25_thinking_dual_mode() {
         // Gemini 2.5 (pro E flash) ha il thinking attivo di default: e' dual-mode,
-        // NON reasoning-only. Quindi is_thinking=false (eleggibile all'agentico),
-        // uses_thinking_mode=true e policy='disable_for_tools' (non-thinking nei
-        // tool-loop -> niente MALFORMED_FUNCTION_CALL). flash-lite NON ha thinking.
+        // NON reasoning-only. Eleggibile all'agentico (policy 'disable_for_tools',
+        // non-thinking nei tool-loop -> niente MALFORMED_FUNCTION_CALL),
+        // uses_thinking_mode=true. flash-lite NON ha thinking.
         let flash = classify_capabilities("google", "gemini-2.5-flash", None, None, None, &rt());
-        assert!(
-            !flash.is_thinking,
+        assert!(flash.uses_thinking_mode, "gemini-2.5-flash e' thinking");
+        assert_eq!(
+            flash.agentic_thinking_policy, "disable_for_tools",
             "gemini-2.5-flash NON va escluso dall'agentico"
         );
-        assert!(flash.uses_thinking_mode, "gemini-2.5-flash e' thinking");
-        assert_eq!(flash.agentic_thinking_policy, "disable_for_tools");
         let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None, &rt());
-        assert!(
-            !pro.is_thinking,
+        assert_eq!(
+            pro.agentic_thinking_policy, "disable_for_tools",
             "gemini-2.5-pro e' dual-mode, non reasoning-only"
         );
-        assert_eq!(pro.agentic_thinking_policy, "disable_for_tools");
         let lite =
             classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt());
         assert!(
@@ -2579,7 +2906,7 @@ mod tests {
         // famiglia, indipendentemente dalla variante e dal metadata LiteLLM
         // (che e' incoerente: alcune varianti ritornano tool_use=false). Tutte:
         //   - supports_tool_use=true (verita' Mistral, per famiglia)
-        //   - is_thinking=true + uses_thinking_mode=true (linea reasoning)
+        //   - uses_thinking_mode=true (linea reasoning)
         //   - agentic_thinking_policy='disable_for_tools' (non-thinking nei tool)
         for model in [
             "magistral-small-latest",
@@ -2594,7 +2921,6 @@ mod tests {
                 c.supports_tool_use,
                 "{model}: tool_use deve essere true (doc Mistral)"
             );
-            assert!(c.is_thinking, "{model}: e' reasoning-only -> is_thinking");
             assert!(
                 c.uses_thinking_mode,
                 "{model}: e' reasoning -> uses_thinking_mode"
@@ -2628,6 +2954,34 @@ mod tests {
     }
 
     #[test]
+    fn test_price_unknown_predicate_nomina_solo_unknown() {
+        // REGRESSIONE (misurata): 13 modelli a prezzo IGNOTO erano routabili e
+        // hanno fatturato 873 chiamate / 16,4M token a costo 0.
+        //
+        // Il predicato deve nominare 'unknown' ESPLICITAMENTE: 'free' e' il terzo
+        // stato ammesso dal CHECK (mig 0477) ed e' un gratuito REALE, che deve
+        // restare routabile. Un predicato scritto come "<> 'priced'" escluderebbe
+        // anche i modelli gratuiti — errore silenzioso e opposto all'intento.
+        let p = price_unknown_sql("c");
+        assert!(p.contains("pricing_state = 'unknown'"), "predicato: {p}");
+        assert!(!p.contains("priced"), "non deve ragionare per negazione: {p}");
+        assert!(!p.contains("free"), "il gratuito reale resta routabile: {p}");
+        // Mai dedurre lo stato dal costo (regola M).
+        assert!(
+            !p.contains("cost"),
+            "lo stato non si deduce dalla grandezza del costo: {p}"
+        );
+    }
+
+    #[test]
+    fn test_price_unknown_predicate_alias() {
+        // Con alias (query con FROM) e senza (UPDATE diretta): stesso punto unico,
+        // due forme. Un alias sbagliato fa fallire la query a runtime, non a build.
+        assert_eq!(price_unknown_sql("c"), "(c.pricing_state = 'unknown')");
+        assert_eq!(price_unknown_sql(""), "(pricing_state = 'unknown')");
+    }
+
+    #[test]
     fn test_reconcile_media_excluded() {
         // I modelli media non rientrano nella chat policy: tutte e quattro le
         // capability media devono comparire nel predicato di esclusione.
@@ -2652,5 +3006,453 @@ mod tests {
         assert!(RECONCILE_PASSES_POLICY_SQL.contains("c.model ~ ANY(p.allowed_patterns)"));
         assert!(RECONCILE_PASSES_POLICY_SQL.contains("cardinality(p.allowed_patterns) = 0"));
         assert!(RECONCILE_PASSES_POLICY_SQL.contains("NOT ( c.model ~ ANY(p.denied_patterns) )"));
+    }
+    /// Lo strip della DATA e' sicuro: e' lo stesso modello. Misurato sul parco:
+    /// porta la copertura da 28% a 39% con ZERO ambiguita'.
+    #[test]
+    fn la_chiave_ignora_provider_separatori_e_data() {
+        // Casi REALI del catalog (i nostri id vs quelli di OpenRouter).
+        assert_eq!(
+            normalize_model_key("claude-opus-4-5-20251101"),
+            normalize_model_key("anthropic/claude-opus-4.5")
+        );
+        assert_eq!(
+            normalize_model_key("gpt-5.4-mini-2026-03-17"),
+            normalize_model_key("openai/gpt-5.4-mini")
+        );
+        assert_eq!(
+            normalize_model_key("claude-haiku-4-5-20251001"),
+            normalize_model_key("anthropic/claude-haiku-4.5")
+        );
+    }
+
+    /// IL CONFINE: niente prefix-match. `gpt-5-nano` NON e' `gpt-5` — prendersi
+    /// l'indice del flagship significherebbe promuovere un nano a heavy. E' un
+    /// errore gia' commesso in una prima analisi manuale (o3 -> o3-mini-high).
+    #[test]
+    fn un_nano_non_e_il_suo_flagship() {
+        assert_ne!(normalize_model_key("gpt-5-nano"), normalize_model_key("gpt-5"));
+        assert_ne!(normalize_model_key("gpt-5.4-mini"), normalize_model_key("gpt-5.4"));
+        assert_ne!(normalize_model_key("o3-mini-high"), normalize_model_key("o3"));
+        // E una data NON in coda non e' un suffisso data.
+        assert_eq!(normalize_model_key("gpt-4o-2024-05-13-preview"),
+                   "gpt4o20240513preview".replace('-', ""));
+    }
+
+    /// Il parsing del payload REALE di OpenRouter (forma verificata sull'API viva
+    /// il 16/07): l'indice sta in benchmarks.artificial_analysis.agentic_index.
+    #[test]
+    fn estrae_l_indice_dal_payload_reale() {
+        let payload = json!({"data": [
+            {"id": "openai/gpt-5.6-sol",
+             "benchmarks": {"artificial_analysis": {"intelligence_index": 58.9,
+                                                    "coding_index": 77.4,
+                                                    "agentic_index": 54.0}}},
+            {"id": "mistralai/mistral-large-2512",
+             "benchmarks": {"artificial_analysis": {"agentic_index": 5.5}}},
+            // Senza benchmarks: il campo e' omesso per i modelli non valutati.
+            {"id": "openai/gpt-image-1"},
+            // Solo Design Arena (l'UNICA fonte documentata): niente indice.
+            {"id": "x/y", "benchmarks": {"design_arena": [{"elo": 1172}]}}
+        ]});
+        let m = parse_agentic_index_payload(&payload);
+        assert_eq!(m.len(), 2, "solo i modelli con agentic_index");
+        assert_eq!(m.get(&normalize_model_key("gpt-5.6-sol")), Some(&54.0));
+        assert_eq!(m.get(&normalize_model_key("mistral-large-2512")), Some(&5.5));
+    }
+
+    /// Una chiave AMBIGUA viene scartata: meglio NESSUN indice che quello del
+    /// modello sbagliato. Un indice errato promuove un modello nel routing; uno
+    /// assente lascia il tier NULL finche' la batteria non misura.
+    #[test]
+    fn le_chiavi_ambigue_vengono_scartate() {
+        let payload = json!({"data": [
+            {"id": "a/modello-20250101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}},
+            {"id": "b/modello-20260101", "benchmarks": {"artificial_analysis": {"agentic_index": 50.0}}}
+        ]});
+        // Entrambi normalizzano a "modello" ma con indici DIVERSI.
+        let m = parse_agentic_index_payload(&payload);
+        assert!(m.is_empty(), "chiave ambigua -> nessun indice, non uno a caso: {m:?}");
+        // Stesso nome, STESSO indice: nessuna ambiguita', si tiene.
+        let payload = json!({"data": [
+            {"id": "a/modello-20250101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}},
+            {"id": "b/modello-20260101", "benchmarks": {"artificial_analysis": {"agentic_index": 10.0}}}
+        ]});
+        assert_eq!(parse_agentic_index_payload(&payload).len(), 1);
+    }
+    /// REGRESSIONE (difetto misurato sul campo il 16/07, introdotto da me mentre
+    /// curavo lo stesso difetto): il tier deve venire dall'agentic_index, non dal
+    /// prezzo.
+    ///
+    /// `run_catalog_sync` derivava il tier inline coi soli prezzo+finestra (l'indice
+    /// li' non e' noto: vive nella riga) e lo scriveva; `refresh_tier_prior` — che
+    /// l'indice ce l'ha — girava su un ALTRO path e non lo correggeva. Due punti
+    /// per la stessa domanda, e vinceva quello MENO informato. Effetto misurato:
+    /// mistral-large-2512 (agentic 5.5, cioe' quintultimo del parco) classificato
+    /// 'heavy' perche' costa $0.50 con 262k di finestra, e le inversioni salite a
+    /// 90 — peggio del nome, che ne faceva 64.
+    #[sqlx::test]
+    async fn il_tier_viene_dall_indice_non_dal_prezzo(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+        )
+        .execute(&pool)
+        .await
+        .expect("soglie");
+        // IL CASO REALE: mistral-large-2512 — costa poco ma ha una finestra enorme
+        // (il vecchio prior prezzo+finestra diceva 'heavy') e un agentic_index
+        // bassissimo. Solo l'indice parla (mig 0608).
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('mistral', 'mistral-large-2512', 0.5, 262144, 5.5, NOW(), NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        // DIAGNOSI: la scala si carica davvero?
+        let t = tier_prior_bands(&pool).await;
+        assert!(t.is_some(), "tier_prior_bands ha ritornato None: il prior non parte");
+        refresh_tier_prior(&pool, "mistral", "mistral-large-2512").await;
+
+        let (tier, src): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='mistral-large-2512'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(
+            (tier.as_deref(), src.as_deref()),
+            (Some("light"), Some("synced")),
+            "agentic 5.5 -> light, fonte 'synced'. Col vecchio prior sul prezzo              ($0.50 + 262k di finestra) sarebbe 'heavy': e' il difetto misurato sul campo"
+        );
+    }
+
+    /// Un indice STANTIO non vale come fresco (la fonte e' undocumented e puo'
+    /// sparire), ma il tier gia' presente NON si azzera: `performance_tier` NULL
+    /// non matcha il filtro della tier-chain, quindi azzerare toglierebbe il
+    /// modello dal routing. Misurato il 16/07: 43 modelli QUALIFICATI sono
+    /// scoperti dall'indice (OpenRouter non lista quei nomi) — azzerarli
+    /// avrebbe dimezzato il pool. Restano col loro tier finche' la batteria non
+    /// scrive 'measured'.
+    #[sqlx::test]
+    async fn l_indice_stantio_non_azzera_il_tier_gia_presente(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+        )
+        .execute(&pool)
+        .await
+        .expect("soglie");
+        // L'indice e' di un mese fa: STANTIO -> non deriva un tier nuovo. Ma il
+        // tier gia' presente resta: toglierlo significherebbe togliere il
+        // modello dal routing.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, input_cost_per_million_tokens, context_window,               agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('mistral', 'vecchio', 0.5, 262144, 5.5, NOW() - interval '30 days', 'heavy', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let scritte = refresh_tier_prior(&pool, "mistral", "vecchio").await;
+
+        let (tier, src): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='vecchio'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(scritte, 0, "nessuna scrittura: l'indice stantio non si esprime");
+        assert_eq!(
+            (tier.as_deref(), src.as_deref()),
+            (Some("heavy"), None),
+            "indice STANTIO -> il tier resta (il modello continua a essere              routabile) e la fonte resta NULL: 'non so da dove viene', che e' la              verita' finche' la batteria non lo misura"
+        );
+    }
+
+    /// L'indice deve raggiungere ANCHE i modelli che il listino LiteLLM non
+    /// conosce. `refresh_tier_prior` gira solo sui modelli toccati dal sync del
+    /// listino o dalla discovery: un modello nuovo con indice fresco restava
+    /// senza tier per sempre, con l'indice inerte nella riga. E' il caso reale
+    /// dei 6 modelli che la mig 0608 declassa da 'manual' a NULL (fra cui
+    /// claude-opus-4-7, indice 44.4, che il listino non elenca).
+    #[sqlx::test]
+    async fn il_giro_set_based_riclassifica_chi_il_listino_non_tocca(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        // Lo schema REALE dei settings (con updated_at): il giro set-based
+        // PERSISTE l'ancora via update_setting_value, e uno schema finto senza
+        // quella colonna nasconderebbe la scrittura (regola O).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, \
+             value TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+        )
+        .execute(&pool)
+        .await
+        .expect("soglie");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES              ('anthropic', 'opus-fossile', 44.4, NOW(), 'medium', NULL),              ('x', 'gia-misurato',  10.0, NOW(), 'frontier', 'measured'),              ('x', 'senza-indice',  NULL, NULL,  'heavy', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let cambiati = refresh_tiers_from_index(&pool).await;
+
+        assert_eq!(cambiati, 1, "solo il fossile con indice va riclassificato");
+        let righe: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT model, performance_tier, tier_source FROM ai_price_catalog ORDER BY model",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("righe");
+        assert_eq!(
+            righe,
+            vec![
+                ("gia-misurato".into(), Some("frontier".into()), Some("measured".into())),
+                // SEMANTICA RELATIVA (mig 0615): 44.4 e' il massimo fresco del
+                // parco enabled -> il giro RI-ANCORA (54 -> 44.4, scarto 17.8% >
+                // deadband 3%) e il leader del parco E' frontier per definizione.
+                ("opus-fossile".into(), Some("frontier".into()), Some("synced".into())),
+                ("senza-indice".into(), Some("heavy".into()), None),
+            ],
+            "l'indice riclassifica il fossile sul leader del PARCO; NON tocca chi              la batteria ha gia' misurato (measured vince), ne' azzera chi              l'indice non copre"
+        );
+        // L'ancora e' stata PERSISTITA dal punto unico (update_setting_value):
+        // il prossimo giro per-modello leggera' 44.4, non il 54 di ieri.
+        let ancora: (String,) = sqlx::query_as(
+            "SELECT value FROM settings WHERE key = 'catalog.tier_relative.anchor'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("ancora");
+        assert_eq!(ancora.0, "44.4", "l'ancora segue il massimo del parco oltre la deadband");
+    }
+
+    /// Quando l'indice CONFERMA il tier gia' presente, la PROVENIENZA deve
+    /// aggiornarsi comunque: la riga arriva dalla mig 0608 con tier fossile e
+    /// `tier_source` NULL, e l'indice l'ha appena convalidata. Col solo guard
+    /// `performance_tier IS DISTINCT FROM $3` l'UPDATE non scattava e il modello
+    /// restava a provenienza ignota per sempre — la bugia che questo lavoro
+    /// rimuove.
+    #[sqlx::test]
+    async fn l_indice_che_conferma_il_tier_ne_registra_la_provenienza(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog                ADD COLUMN tier_source TEXT,                ADD COLUMN agentic_index DOUBLE PRECISION,                ADD COLUMN agentic_index_at TIMESTAMPTZ",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne");
+        sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES              ('catalog.tier_prior.enabled', 'true'),              ('catalog.tier_relative.frontier_pct', '0.85'),              ('catalog.tier_relative.heavy_pct', '0.65'),              ('catalog.tier_relative.high_pct', '0.45'),              ('catalog.tier_relative.medium_pct', '0.20'),              ('catalog.tier_relative.anchor', '54'),              ('catalog.tier_relative.anchor_model', 'p/leader'),              ('catalog.tier_relative.anchor_at', ''),              ('catalog.tier_relative.anchor_deadband_pct', '0.03'),              ('catalog.agentic_index_sync.max_age_hours', '168')",
+        )
+        .execute(&pool)
+        .await
+        .expect("soglie");
+        // Tier 'heavy' fossile (fonte ignota) e indice fresco 36.4 -> heavy: il
+        // VALORE non cambia, la PROVENIENZA si'.
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, agentic_index, agentic_index_at, performance_tier, tier_source)              VALUES ('deepseek', 'v4-pro', 36.4, NOW(), 'heavy', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        refresh_tier_prior(&pool, "deepseek", "v4-pro").await;
+
+        let (tier, src): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT performance_tier, tier_source FROM ai_price_catalog WHERE model='v4-pro'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga");
+        assert_eq!(
+            (tier.as_deref(), src.as_deref()),
+            (Some("heavy"), Some("synced")),
+            "l'indice conferma 'heavy': il tier resta, ma ora la fonte DICE che              e' stato sincronizzato invece di tacere"
+        );
+    }
+
+    // ── PEZZO 1: i provider da sincronizzare sono DEDOTTI dal registry ──
+
+    /// Crea `nexus_provider_registry` + `settings` per i test PEZZO 1.
+    async fn crea_registry_e_settings(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE nexus_provider_registry ( \
+                 name TEXT PRIMARY KEY, \
+                 activation TEXT, \
+                 key_setting TEXT, \
+                 enabled_setting TEXT, \
+                 base_url_setting TEXT, \
+                 is_active BOOLEAN NOT NULL DEFAULT true, \
+                 sort_order INT NOT NULL DEFAULT 0 )",
+        )
+        .execute(pool)
+        .await
+        .expect("registry table");
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(pool)
+            .await
+            .expect("settings table");
+    }
+
+    /// PEZZO 1 (regola G+L, test via il produttore reale — regola O): la lista
+    /// dei provider da sincronizzare esce da `providers_da_sincronizzare` che
+    /// interroga il registry vero, NON da un CSV. openrouter (attivo+configurato,
+    /// identico ai 5 storici) DEVE entrare: era proprio il caso che il CSV
+    /// hardcoded lasciava fuori.
+    #[sqlx::test]
+    async fn pezzo1_providers_dedotti_dal_registry(pool: sqlx::PgPool) {
+        crea_registry_e_settings(&pool).await;
+        sqlx::query(
+            "INSERT INTO nexus_provider_registry \
+                 (name, activation, key_setting, enabled_setting, base_url_setting, is_active, sort_order) VALUES \
+              ('openai',     'api_key',           'openai_key',     'openai_en',     NULL,            true, 1), \
+              ('google',     'api_key_or_vertex', 'google_key',     'google_en',     NULL,            true, 2), \
+              ('openrouter', 'api_key',           'openrouter_key', 'openrouter_en', NULL,            true, 3), \
+              ('spento',     'api_key',           'spento_key',     'spento_en',     NULL,            true, 4), \
+              ('senza_key',  'api_key',           'senza_key_key',  'senza_key_en',  NULL,            true, 5), \
+              ('vllm_ok',    'base_url',          NULL,             NULL,            'vllm_ok_url',    true, 6), \
+              ('vllm_vuoto', 'base_url',          NULL,             NULL,            'vllm_vuoto_url', true, 7), \
+              ('inattivo',   'api_key',           'inattivo_key',   'inattivo_en',   NULL,            false,8)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed registry");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES \
+              ('openai_en','true'),('openai_key','sk-1'), \
+              ('google_en','true'),('google_key','g-1'), \
+              ('openrouter_en','true'),('openrouter_key','or-1'), \
+              ('spento_en','false'),('spento_key','sk-2'), \
+              ('senza_key_en','true'),('senza_key_key',''), \
+              ('vllm_ok_url','http://127.0.0.1:8000/v1'), \
+              ('vllm_vuoto_url',''), \
+              ('inattivo_en','true'),('inattivo_key','sk-3')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed settings");
+
+        let got = providers_da_sincronizzare(&pool).await.expect("query");
+
+        assert_eq!(
+            got,
+            vec![
+                "openai".to_string(),
+                "google".to_string(),
+                "openrouter".to_string(),
+                "vllm_ok".to_string(),
+            ],
+            "entrano SOLO gli attivi+configurati, ordinati per sort_order: \
+             'spento' (enabled=false) e 'senza_key' (key vuota) fuori; \
+             'vllm_vuoto' (base_url vuoto) fuori; 'inattivo' (is_active=false) fuori; \
+             openrouter — identico ai 5 storici — NON resta piu' fuori"
+        );
+    }
+
+    // ── PEZZO 2: la policy governa anche l'INSERT, non solo l'enable ──
+
+    /// PEZZO 2 (regola L; test via il produttore reale — regola O): il ramo di
+    /// INSERT di `process_discovered_chat_model` (il nodo di produzione toccato)
+    /// consulta `model_passes_selection_policy` PRIMA di inserire. Un provider
+    /// CON policy restrittiva inserisce solo gli allowed; uno SENZA riga policy
+    /// inserisce tutti (unwrap_or(true), invariato per i 5 provider storici).
+    #[sqlx::test]
+    async fn pezzo2_policy_governa_insert(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        // Colonne + UNIQUE che l'INSERT reale di `insert_new_chat_model` usa ma
+        // che lo specchio di test non ha (display_name/currency/effective_from,
+        // ON CONFLICT (provider, model)).
+        sqlx::query(
+            "ALTER TABLE ai_price_catalog \
+               ADD COLUMN display_name TEXT, \
+               ADD COLUMN currency TEXT, \
+               ADD COLUMN effective_from TIMESTAMPTZ, \
+               ADD COLUMN capability_source TEXT NOT NULL DEFAULT 'auto', \
+               ADD CONSTRAINT ux_apc UNIQUE (provider, model)",
+        )
+        .execute(&pool)
+        .await
+        .expect("colonne insert");
+        sqlx::query(
+            "CREATE TABLE nexus_model_selection_policy ( \
+                 provider TEXT PRIMARY KEY, \
+                 allowed_patterns TEXT[] NOT NULL DEFAULT '{}', \
+                 denied_patterns TEXT[] NOT NULL DEFAULT '{}', \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now() )",
+        )
+        .execute(&pool)
+        .await
+        .expect("policy table");
+        sqlx::query(
+            "INSERT INTO nexus_model_selection_policy (provider, allowed_patterns, denied_patterns) \
+             VALUES ('provA', ARRAY['^good-']::text[], ARRAY[]::text[])",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed policy");
+
+        let mut delta = ModelSyncDelta::default();
+        // ramo None (modello nuovo), orchestrator=None -> niente probe.
+        process_discovered_chat_model(&pool, None, "provA", "good-1", true, None, None, &mut delta)
+            .await;
+        process_discovered_chat_model(&pool, None, "provA", "bad-1", true, None, None, &mut delta)
+            .await;
+        process_discovered_chat_model(
+            &pool, None, "provB", "qualsiasi-1", true, None, None, &mut delta,
+        )
+        .await;
+
+        let models: Vec<String> =
+            sqlx::query_scalar("SELECT provider || '/' || model FROM ai_price_catalog ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .expect("catalog");
+        assert_eq!(
+            models,
+            vec!["provA/good-1".to_string(), "provB/qualsiasi-1".to_string()],
+            "provA con policy inserisce SOLO 'good-1' (bad-1 filtrato PRIMA \
+             dell'insert); provB senza policy inserisce comunque (unwrap_or(true))"
+        );
+        assert_eq!(delta.inserted, 2, "due soli insert: good-1 e qualsiasi-1");
     }
 }

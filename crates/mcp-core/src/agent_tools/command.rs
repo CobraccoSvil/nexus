@@ -16,6 +16,72 @@ const LONG_ONESHOT_PROBE_SECS: u64 = 300;
 const RUN_TESTS_DEFAULT_TIMEOUT: u64 = 120;
 const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
 
+/// Attesa massima per entrare nella sezione critica dei package manager.
+/// Deliberatamente MAGGIORE di `LONG_ONESHOT_PROBE_SECS`: chi tiene il lock e' un
+/// install, e il probe lo uccide comunque entro 300s. Aspettare piu' a lungo del
+/// massimo che il detentore puo' vivere garantisce che non si rinunci mentre un
+/// install legittimo e' ancora in corso.
+const PKG_LOCK_WAIT_SECS: u64 = 420;
+
+/// Serializza per PROGETTO i comandi che mutano l'albero delle dipendenze
+/// (`is_package_manager_mutation`). Stesso idioma di `PROVISION_LOCKS`
+/// (project_db_routes/provision.rs) e stessa ragione: npm/pnpm/yarn/pip non sono
+/// concurrency-safe sulla stessa directory di dipendenze, e i sub-agenti sono
+/// task tokio dello STESSO processo, quindi un lock in-process li copre tutti.
+///
+/// La chiave e' il PROGETTO, non la directory: un comando puo' cambiare directory
+/// da solo (`cd backend && npm install` con working_dir=root), quindi una chiave
+/// per-directory sarebbe elusa proprio dal caso misurato che ha corrotto
+/// l'ambiente. Serializzare per progetto costa un po' di parallelismo sugli
+/// install e in cambio rende impossibile la corruzione.
+static PKG_MANAGER_LOCKS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Handle del lock package-manager di un progetto (vedi [`PKG_MANAGER_LOCKS`]).
+fn pkg_manager_lock(project_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let mut map = PKG_MANAGER_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.entry(project_id)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Entra nella sezione critica dei package manager se il comando muta l'albero
+/// delle dipendenze; altrimenti non prende alcun lock e resta parallelo.
+///
+/// `Ok(Some(guard))` = sezione critica acquisita (il chiamante la tiene viva per
+/// tutta l'esecuzione), `Ok(None)` = comando che non tocca le dipendenze,
+/// `Err(messaggio)` = attesa scaduta, da riportare all'agente.
+async fn acquire_pkg_manager_slot(
+    project_id: Uuid,
+    command: &str,
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, String> {
+    if !super::helpers::is_package_manager_mutation(command) {
+        return Ok(None);
+    }
+    let lock = pkg_manager_lock(project_id);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PKG_LOCK_WAIT_SECS),
+        lock.lock_owned(),
+    )
+    .await
+    {
+        Ok(g) => Ok(Some(g)),
+        // Oltre il tempo massimo di vita del detentore: NON si procede in
+        // parallelo (sarebbe proprio la corruzione da evitare), si riporta il
+        // fatto cosi' l'agente puo' riprovare invece di rompere l'ambiente.
+        Err(_) => Err(format!(
+            "[Dipendenze occupate] Un altro comando di installazione e' in corso su questo \
+             progetto e non si e' liberato entro {PKG_LOCK_WAIT_SECS}s. I package manager non \
+             sono sicuri in parallelo sulla stessa directory: eseguire adesso corromperebbe \
+             node_modules. Riprova questo stesso comando fra poco, oppure prosegui con un \
+             lavoro che non tocchi le dipendenze."
+        )),
+    }
+}
+
 /// Drena stdout/stderr di un processo figlio IN PARALLELO a `child.wait()` per
 /// evitare il deadlock del buffer pipe Linux (~64 KB): comandi che producono
 /// >64KB (playwright test, npm install verbose) bloccherebbero la pipe e
@@ -65,8 +131,19 @@ fn record_playwright_job(
     let pid = ctx.project_id;
     tokio::spawn(async move {
         // Separazione DB per-progetto: `jobs` e' tabella migrata, instrada il
-        // write sul pool del progetto (a flag OFF ritorna il meta-DB).
-        let proj_pool = crate::project_db_routes::project_data_pool_from(&db, pid).await;
+        // write sul pool del progetto. Fire-and-forget: DB non disponibile ->
+        // registrazione saltata con WARN, mai fallback al meta.
+        let proj_pool = match crate::project_db_routes::project_data_pool_from(&db, pid).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %pid,
+                    error = %e,
+                    "record_playwright_job: DB progetto non disponibile, salto"
+                );
+                return;
+            }
+        };
         let _ = sqlx::query(
             "INSERT INTO jobs (project_id, kind, status, input) VALUES ($1, 'playwright_test', $2, $3)",
         )
@@ -276,10 +353,30 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         Err(msg) => return msg,
     };
 
+    // Blocca la duplicazione working_dir + path nel comando PRIMA dell'esecuzione
+    // (causa radice di ambiente incoerente, vedi
+    // helpers::detect_workdir_path_duplication): working_dir e' gia' la CWD, se il
+    // comando ripete quel segmento ('cd frontend', 'frontend/...') i path si
+    // sommano e rm/install/build operano sulla dir sbagliata. Rifiutare qui evita
+    // il danno silenzioso; il messaggio dice all'agente come correggere.
+    if let Some(wd) = input.get("working_dir").and_then(Value::as_str) {
+        if let Some(msg) = super::helpers::detect_workdir_path_duplication(wd, &command) {
+            return format!("{hints_prefix}{msg}");
+        }
+    }
+
     // ── Livello 3: probe timeout — esegui, se non finisce in 10s ri-lancia nel terminale ──
     let work_dir = match resolve_work_dir(ctx, input) {
         Ok(p) => p,
         Err(msg) => return msg,
+    };
+
+    // Sezione critica dei package manager: due install concorrenti sulla stessa
+    // directory di dipendenze si corrompono a vicenda. Il guard vive fino al
+    // termine della funzione, quindi copre spawn + attesa.
+    let _pkg_guard = match acquire_pkg_manager_slot(ctx.project_id, &command).await {
+        Ok(g) => g,
+        Err(msg) => return format!("{hints_prefix}{msg}"),
     };
 
     let child = match spawn_command_child(ctx, &command, &work_dir).await {
@@ -407,7 +504,7 @@ async fn spawn_command_child(
 
     crate::sandbox::isolated_command(&shell_path)
         .arg("-c")
-        .arg(command)
+        .arg(super::helpers::shell_line(command))
         .current_dir(work_dir)
         .env("NEXUS_PROJECT_DB_URL", &project_db_url)
         .env("NEXUS_PROJECT_DB_NAME", &project_db_name)
@@ -429,6 +526,17 @@ async fn format_command_completed(
     stderr: &str,
     hints_prefix: &str,
 ) -> String {
+    // Con `pipefail` (vedi helpers::shell_line) una pipeline riporta il primo
+    // stadio fallito. Se il consumatore a valle chiude presto (`... | head -N`)
+    // il produttore muore di SIGPIPE e la pipeline riporterebbe 141: non e' un
+    // fallimento del comando, e' il consumatore che ha smesso di leggere. Senza
+    // questa normalizzazione, guadagnare l'esito vero degli install (lo scopo di
+    // pipefail) costerebbe falsi fallimenti su ogni `| head`.
+    let exit_code = if exit_code == super::helpers::EXIT_SIGPIPE {
+        0
+    } else {
+        exit_code
+    };
     let hint = command_result_hint(exit_code, stdout, stderr, command);
     // Registra risultati Playwright nella tabella jobs (fire-and-forget)
     record_playwright_job(ctx, command, stdout, stderr, exit_code);
@@ -561,7 +669,7 @@ async fn run_tests_execution(
 ) -> String {
     let child = crate::sandbox::isolated_command(&crate::sandbox::agent_shell())
         .arg("-c")
-        .arg(command)
+        .arg(super::helpers::shell_line(command))
         .current_dir(work_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1161,5 +1269,66 @@ mod tests {
         let output = fake_build_output(3);
         let out = smart_truncate_test_output(&output, 16000);
         assert_eq!(out, output, "sotto il cap l'output resta integro");
+    }
+
+    /// Il lock dei package manager ESCLUDE davvero due esecuzioni sullo stesso
+    /// progetto, e NON penalizza progetti diversi.
+    ///
+    /// Passa dalla stessa funzione della produzione (`pkg_manager_lock`), non da
+    /// una sua imitazione: e' quella che `tool_run_command` usa per entrare in
+    /// sezione critica. Il difetto che cattura e' quello misurato su verifica-wd
+    /// (due `npm install` da sub-agenti diversi nello stesso secondo sulla stessa
+    /// directory di dipendenze).
+    #[tokio::test]
+    async fn pkg_lock_serializza_lo_stesso_progetto_e_non_progetti_diversi() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let progetto = Uuid::new_v4();
+
+        // Stesso progetto: due sezioni critiche non si sovrappongono MAI.
+        let dentro = Arc::new(AtomicUsize::new(0));
+        let max_contemporanei = Arc::new(AtomicUsize::new(0));
+        let mut task = Vec::new();
+        for _ in 0..8 {
+            let d = dentro.clone();
+            let m = max_contemporanei.clone();
+            task.push(tokio::spawn(async move {
+                let lock = pkg_manager_lock(progetto);
+                let _g = lock.lock_owned().await;
+                let ora = d.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(ora, Ordering::SeqCst);
+                // Cede il control al runtime: se il lock non escludesse, un altro
+                // task entrerebbe qui e il massimo salirebbe sopra 1.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                d.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for t in task {
+            t.await.expect("task lock");
+        }
+        assert_eq!(
+            max_contemporanei.load(Ordering::SeqCst),
+            1,
+            "due install sullo stesso progetto non devono mai sovrapporsi"
+        );
+
+        // Progetti diversi: lock distinti, nessuna attesa reciproca.
+        let altro = Uuid::new_v4();
+        let l1 = pkg_manager_lock(progetto);
+        let l2 = pkg_manager_lock(altro);
+        let _g1 = l1.lock_owned().await;
+        assert!(
+            l2.try_lock().is_ok(),
+            "il lock di un progetto non deve bloccare un progetto diverso"
+        );
+
+        // Stesso progetto = stesso lock (non uno nuovo a ogni chiamata, che non
+        // escluderebbe nulla).
+        assert!(
+            std::sync::Arc::ptr_eq(&pkg_manager_lock(progetto), &pkg_manager_lock(progetto)),
+            "lo stesso progetto deve condividere UNA sola sezione critica"
+        );
     }
 }

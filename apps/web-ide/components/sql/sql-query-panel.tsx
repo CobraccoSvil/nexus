@@ -10,6 +10,7 @@ import {
   type SqlExecuteResult,
   type UserProjectDetails,
 } from "../../lib/api-client";
+import { AutoWidthSelect } from "../auto-width-select";
 
 const MonacoEditor = dynamic(
   async () => (await import("@monaco-editor/react")).default,
@@ -223,9 +224,13 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
         {connections.length > 0 && (
           <>
             <span style={{ color: tc.textMuted, marginLeft: 4, flexShrink: 0 }}>DB:</span>
-            <select
+            <AutoWidthSelect
               value={selectedConnection}
-              onChange={(e) => setSelectedConnection(e.target.value)}
+              options={connections.map((c) => ({
+                value: c.name,
+                label: `${c.name}${c.is_primary ? " (primary)" : ""}${c.engine ? ` · ${c.engine}` : ""}`,
+              }))}
+              onChange={(value) => setSelectedConnection(value)}
               disabled={loading}
               title={
                 connections.length === 1
@@ -242,15 +247,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
                 cursor: connections.length > 1 ? "pointer" : "default",
                 flexShrink: 0,
               }}
-            >
-              {connections.map((c) => (
-                <option key={c.id} value={c.name}>
-                  {c.name}
-                  {c.is_primary ? " (primary)" : ""}
-                  {c.engine ? ` · ${c.engine}` : ""}
-                </option>
-              ))}
-            </select>
+            />
           </>
         )}
         <button

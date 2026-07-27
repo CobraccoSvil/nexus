@@ -131,7 +131,7 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `updated_at` | timestamp with time zone | NO | `now()` |
 | `display_name` | text | NO | `''::text` |
 | `context_window` | integer | NO | `8192` |
-| `performance_tier` | text | NO | `'medium'::text` |
+| `performance_tier` | text | YES | `—` |
 | `speed_tier` | text | NO | `'medium'::text` |
 | `capabilities` | jsonb | NO | `'[]'::jsonb` |
 | `supports_tool_use` | boolean | NO | `true` |
@@ -143,7 +143,9 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `auto_disabled_at` | timestamp with time zone | YES | `—` |
 | `auto_disabled_reason` | text | YES | `—` |
 | `consecutive_tool_failures` | integer | NO | `0` |
-| `is_thinking` | boolean | NO | `false` |
+| `tier_source` | text | YES | `—` |
+| `agentic_index` | double precision | YES | `—` |
+| `agentic_index_at` | timestamp with time zone | YES | `—` |
 
 ## `ai_price_catalog_audit`
 

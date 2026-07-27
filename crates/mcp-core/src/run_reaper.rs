@@ -48,30 +48,20 @@ pub async fn stale_seconds_from_settings(db: &PgPool) -> i64 {
 /// Ritorna gli id dei run reapati, cosi' il chiamante puo' sbloccare gli
 /// EventSource ancora in ascolto (emissione `is_final` sul broadcast channel).
 /// Il reaper itera i progetti (punto unico `list_all_project_ids`) per girare la
-/// chiusura sul DB di ciascuno (separazione DB): a flag off
-/// `project_data_pool_from` ritorna il meta-DB e la prima iterazione reapa
-/// tutto, le successive trovano vuoto; a flag on ogni pool e' gia' scoped.
+/// chiusura sul DB di ciascuno (separazione DB, sempre attiva da mig 0527): ogni
+/// pool e' scoped al progetto; un progetto col DB non disponibile viene saltato
+/// con WARN per questo giro (niente fallback al meta-DB).
 pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid> {
     let mut all_reaped = Vec::new();
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-        let reaped: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
-            r#"
-            UPDATE agent_runs
-            SET status = 'interrupted',
-                final_answer = COALESCE(final_answer, $1),
-                completed_at = NOW()
-            WHERE status = 'running'
-              AND completed_at IS NULL
-              AND COALESCE(updated_at, created_at) < NOW() - make_interval(secs => $2)
-            RETURNING id
-            "#,
-        )
-        .bind(INTERRUPTED_MSG)
-        .bind(stale_seconds as f64)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "run_reaper: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
+        let reaped = mark_stale_on_pool(&pool, stale_seconds).await;
         if reaped.is_empty() {
             continue;
         }
@@ -84,6 +74,46 @@ pub async fn reap_stale_runs(db: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid>
         all_reaped.extend(finalize_reaped(db, &pool, reaped).await);
     }
     all_reaped
+}
+
+/// Marca stantii i run di UN pool. Estratta da [`reap_stale_runs`] per separare
+/// "su quali pool girare" (che richiede il meta-DB e i progetti) da "cosa fare su
+/// un pool" — che e' la logica vera, e cosi' e' testabile con un solo DB.
+///
+/// Scrive DUE cose, e sono cose diverse:
+///   - lo STATO (`status`, `final_answer`, `completed_at`): per chi legge la riga
+///     — la UI, i report, chi indaga dopo;
+///   - il SEGNALE (`cancellation_requested`): per il TASK che sta ancora girando.
+/// Prima scriveva solo il primo, ed e' il difetto: `is_superseded`
+/// (`run_control_store.rs:48`) legge ESCLUSIVAMENTE `cancellation_requested`, quindi
+/// il reaper chiudeva la riga e sbloccava la UI mentre il task tokio non lo sapeva.
+/// Se il blocco si scioglieva, il run riprendeva a bruciare token su una riga gia'
+/// chiusa, con `completed_at` valorizzato. Due punti chiudevano un run
+/// (`supersede_active_runs` e il reaper) e uno solo lo diceva (regola L).
+///
+/// `COALESCE` su entrambi i campi: se una cancellazione utente e' gia' registrata,
+/// la sua ora e il suo motivo restano — e' arrivata prima, ed e' piu' informativa
+/// di "reaped_stale".
+async fn mark_stale_on_pool(pool: &PgPool, stale_seconds: i64) -> Vec<uuid::Uuid> {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        UPDATE agent_runs
+        SET status = 'interrupted',
+            final_answer = COALESCE(final_answer, $1),
+            completed_at = NOW(),
+            cancellation_requested = COALESCE(cancellation_requested, NOW()),
+            cancellation_reason = COALESCE(cancellation_reason, 'reaped_stale')
+        WHERE status = 'running'
+          AND completed_at IS NULL
+          AND COALESCE(updated_at, created_at) < NOW() - make_interval(secs => $2)
+        RETURNING id
+        "#,
+    )
+    .bind(INTERRUPTED_MSG)
+    .bind(stale_seconds as f64)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
 }
 
 /// Bootstrap recovery (regola H, causa radice del "run orfano blocca la sessione"):
@@ -106,13 +136,26 @@ pub async fn reap_orphaned_runs_at_boot(db: &PgPool) -> Vec<uuid::Uuid> {
     }
     let mut all_reaped = Vec::new();
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "run_reaper boot: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let reaped: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
             r#"
             UPDATE agent_runs
             SET status = 'interrupted',
                 final_answer = COALESCE(final_answer, $1),
-                completed_at = NOW()
+                completed_at = NOW(),
+                -- Stesso segnale del reap periodico (regola L: chiudere un run e'
+                -- UNA cosa, e si dice in UN modo). Al boot il task che eseguiva il
+                -- run e' morto col processo precedente, quindi nessuno leggera'
+                -- questo campo per QUESTO run — ma la riga resta coerente: chi la
+                -- ispeziona dopo trova un motivo, non solo uno stato.
+                cancellation_requested = COALESCE(cancellation_requested, NOW()),
+                cancellation_reason = COALESCE(cancellation_reason, 'reaped_at_boot')
             WHERE status = 'running'
               AND completed_at IS NULL
             RETURNING id
@@ -222,4 +265,115 @@ async fn finalize_reaped(meta: &PgPool, db: &PgPool, reaped: Vec<uuid::Uuid>) ->
     }
 
     reaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run del progetto con eta'/heartbeat espressi in secondi nel passato.
+    /// Le tabelle le porta il migrator del set `db/migrations/project`; qui si
+    /// semina la riga coi NOT NULL reali e le si retrodatano i tempi.
+    async fn run_datato(pool: &PgPool, eta_s: i64, heartbeat_s: i64) -> uuid::Uuid {
+        let id = crate::test_support::seed_agent_run(pool).await;
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'running', \
+                 created_at = NOW() - make_interval(secs => $2), \
+                 updated_at = NOW() - make_interval(secs => $3) \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(eta_s as f64)
+        .bind(heartbeat_s as f64)
+        .execute(pool)
+        .await
+        .expect("retrodata il run");
+        id
+    }
+
+    /// IL TEST CHE CONTA: il reaper deve emettere il SEGNALE DI STOP, non solo
+    /// cambiare lo stato.
+    ///
+    /// Il difetto (misurato il 16/07): il reaper scriveva `status='interrupted'` e
+    /// `completed_at`, sbloccando la UI, ma NON `cancellation_requested` — l'unico
+    /// campo che `is_superseded` (run_control_store.rs:48) legge. Il task tokio non
+    /// sapeva di essere stato chiuso: se il blocco si scioglieva, riprendeva a
+    /// bruciare token su una riga gia' chiusa.
+    ///
+    /// Due punti chiudono un run (`supersede_active_runs` e il reaper) e solo uno
+    /// lo diceva: regola L.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_reap_emette_il_segnale_di_stop_non_solo_lo_stato(pool: PgPool) {
+        // Un run fermo da 1000s: oltre la soglia di 900s.
+        let id = run_datato(&pool, 1000, 1000).await;
+
+        let reaped = mark_stale_on_pool(&pool, 900).await;
+        assert_eq!(reaped, vec![id], "il run stantio deve essere reapato");
+
+        let (status, cancel, reason): (String, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, cancellation_requested, cancellation_reason \
+                   FROM agent_runs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("riga");
+        assert_eq!(status, "interrupted", "lo STATO, per chi legge la riga");
+        assert!(
+            cancel.is_some(),
+            "il SEGNALE, per il TASK che gira ancora: senza questo campo \
+             is_superseded risponde false e il run riprende a bruciare token su \
+             una riga gia' chiusa"
+        );
+        assert_eq!(reason.as_deref(), Some("reaped_stale"));
+    }
+
+    /// Un run VIVO (heartbeat recente) non si tocca. E' il difetto opposto, e la
+    /// mig 0392 nasce proprio da li': un reaper troppo aggressivo uccideva run che
+    /// stavano lavorando.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn un_run_vivo_non_viene_reapato(pool: PgPool) {
+        // Nato 1000s fa ma con l'heartbeat battuto ORA: sta lavorando.
+        let id = run_datato(&pool, 1000, 0).await;
+        assert!(
+            mark_stale_on_pool(&pool, 900).await.is_empty(),
+            "il criterio e' la LIVENESS (updated_at), non l'eta': un run che batte \
+             il cuore sta lavorando, anche se e' nato 1000s fa"
+        );
+        let cancel: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT cancellation_requested FROM agent_runs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("riga");
+        assert!(cancel.is_none(), "nessun segnale di stop a un run vivo");
+    }
+
+    /// Una cancellazione dell'UTENTE gia' registrata non viene sovrascritta: e'
+    /// arrivata prima, e il suo motivo e' piu' informativo di 'reaped_stale'.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_reap_non_sovrascrive_una_cancellazione_utente(pool: PgPool) {
+        let id = run_datato(&pool, 1000, 1000).await;
+        sqlx::query(
+            "UPDATE agent_runs SET cancellation_requested = NOW() - interval '500 seconds', \
+                 cancellation_reason = 'utente' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("cancellazione utente registrata");
+        mark_stale_on_pool(&pool, 900).await;
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT cancellation_reason FROM agent_runs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("riga");
+        assert_eq!(
+            reason.as_deref(),
+            Some("utente"),
+            "il motivo dell'utente resta: e' arrivato prima ed e' piu' informativo"
+        );
+    }
 }

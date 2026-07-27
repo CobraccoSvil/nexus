@@ -23,7 +23,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::ChunkStream;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
-    LlmUsage, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall, TranscribeResponse,
+    LlmUsage, PromptCacheReporting, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
+    TranscribeResponse,
 };
 
 /// Dialetto di reasoning di un endpoint OpenAI-compatibile. Centralizza (regola
@@ -886,22 +887,20 @@ fn from_chat_completion(
             .collect()
     });
 
-    let usage = LlmUsage {
-        input_tokens: resp
-            .usage
-            .as_ref()
-            .map(|u| u.prompt_tokens)
-            .unwrap_or(0),
-        output_tokens: resp
-            .usage
-            .as_ref()
-            .map(|u| u.completion_tokens)
-            .unwrap_or(0),
-        // Prompt caching automatico (DeepSeek `prompt_cache_hit_tokens`, OpenAI
-        // `prompt_tokens_details.cached_tokens`): sottoinsieme dell'input.
-        cache_read_tokens: resp.usage.as_ref().and_then(|u| u.cached_input_tokens()),
-        cache_creation_tokens: None,
-    };
+    // Prompt caching automatico (DeepSeek `prompt_cache_hit_tokens`, OpenAI
+    // `prompt_tokens_details.cached_tokens`): il dialetto li conta DENTRO
+    // `prompt_tokens`, che e' quindi gia' il LORDO voluto dal sistema. Il punto
+    // unico `LlmUsage::normalized` (regola L) non tocca il conteggio; qui si
+    // dichiara solo la convenzione del formato.
+    let usage = LlmUsage::normalized(
+        PromptCacheReporting::CachedIncludedInPrompt,
+        resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+        resp.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+        resp.usage.as_ref().and_then(|u| u.cached_input_tokens()),
+        // Nessun dialetto OpenAI-compatibile espone un costo di SCRITTURA della
+        // cache: il caching e' automatico e il miss paga la tariffa input piena.
+        None,
+    );
 
     // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
     let citations = resp.citations.filter(|c| !c.is_empty());
@@ -939,11 +938,14 @@ fn chunk_from_sse(
     provider_name: &str,
     model_used: &str,
 ) -> Option<LlmStreamChunk> {
-    let usage = chunk.usage.map(|u| LlmUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_read_tokens: u.cached_input_tokens(),
-        cache_creation_tokens: None,
+    let usage = chunk.usage.map(|u| {
+        LlmUsage::normalized(
+            PromptCacheReporting::CachedIncludedInPrompt,
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cached_input_tokens(),
+            None,
+        )
     });
 
     let choice = chunk.choices.into_iter().next();
@@ -1098,7 +1100,8 @@ impl ProviderHttpError {
     /// Costruisce dall'HTTP status + body grezzo, estraendo il codice d'errore
     /// STRUTTURATO dal JSON (non dalla prosa).
     pub fn from_response(provider: &str, status: u16, body: String) -> Self {
-        let code = extract_structured_error_code(&body);
+        let code = extract_structured_error_code(&body)
+            .map(|c| normalizza_codice_provider(provider, status, &c, &body));
         Self {
             provider: provider.to_string(),
             status,
@@ -1144,17 +1147,31 @@ pub async fn provider_http_error(provider: &str, resp: reqwest::Response) -> Pro
 }
 
 /// Estrae il codice d'errore STRUTTURATO da un body JSON di errore provider.
-/// Cerca (in ordine) `error.type`, `error.code` (se stringa), `error.status`
+/// Cerca (in ordine) `error.code` (se stringa), `error.type`, `error.status`
 /// (enum Google), e i corrispettivi top-level. Ritorna il valore in lowercase.
 /// NB: parsa CAMPI JSON del contratto macchina del provider, non testo libero.
+///
+/// L'ordine `code` PRIMA di `type` non e' un dettaglio: dove un provider valorizza
+/// entrambi, `code` e' l'identificatore dell'errore e `type` la sua categoria — e
+/// una categoria non basta a decidere. Misurato su groq il 2026-07-16: un rifiuto
+/// per tetto token/minuto arriva come
+///   {"error":{"type":"tokens","code":"rate_limit_exceeded"}}
+/// Preferendo `type` si legge "tokens", che non dice cosa sia successo: il
+/// rate-limit non veniva riconosciuto, restava la tabella per status (413 ->
+/// ContextTooLong) e il rifiuto diventava colpa del MODELLO. La batteria ha
+/// squalificato quattro modelli groq che nello stesso giro passavano chat_smoke e
+/// tool_smoke: il piano non regge 20k token al minuto, i modelli stanno benissimo.
+/// Dove i due campi coincidono (OpenAI: code=type=insufficient_quota) l'ordine e'
+/// indifferente; dove `code` e' numerico (Google) non e' una stringa e si scende
+/// a `status`. I test di questa funzione coprono tutti e tre i casi.
 fn extract_structured_error_code(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let candidates = [
-        v.pointer("/error/type"),
         v.pointer("/error/code"),
+        v.pointer("/error/type"),
         v.pointer("/error/status"),
-        v.get("type"),
         v.get("code"),
+        v.get("type"),
         v.get("status"),
     ];
     for c in candidates.into_iter().flatten() {
@@ -1189,6 +1206,53 @@ fn extract_structured_error_message(body: &str) -> Option<String> {
     None
 }
 
+/// Codice di fatturazione emesso quando un provider segnala credito esaurito
+/// senza un identificatore proprio. Contiene `billing`, quindi
+/// [`classify_by_status_code`] lo riconosce senza sapere da quale provider venga.
+const CODICE_BILLING_NORMALIZZATO: &str = "billing_error";
+
+/// Traduce nel vocabolario comune un codice che il provider riporta AMBIGUO.
+///
+/// Anthropic risponde al credito esaurito con status 400 e
+/// `error.type = "invalid_request_error"`: lo STESSO identificatore che usa per
+/// una richiesta davvero malformata. Chi legge solo status+codice non puo'
+/// distinguere "non hai credito" da "hai sbagliato la richiesta", e il gateway
+/// infatti trattava il credito esaurito come errore di formato: faceva partire un
+/// retry di sanificazione della history (rimedio che non c'entra e non puo'
+/// funzionare) e NON metteva il provider in cooldown, continuando a sceglierlo e a
+/// spendere una chiamata per ciclo (misurato il 26/07 sui log del gateway).
+///
+/// La regola M prevede questo caso: quando il provider non offre un codice
+/// distinto, il quirk si ISOLA qui - dove sappiamo di chi e' la risposta - e si
+/// traduce in un codice strutturato. Il punto di decisione a valle resta
+/// deterministico e non impara nulla di provider-specifico.
+///
+/// Il testo e' consultato SOLO qui, SOLO per il provider che ha l'ambiguita' e
+/// SOLO sul `error.message` strutturato: e' il perimetro minimo, non una
+/// classificazione dalla prosa.
+fn normalizza_codice_provider(provider: &str, status: u16, code: &str, body: &str) -> String {
+    let e_anthropic = provider.trim().eq_ignore_ascii_case("anthropic");
+    if e_anthropic
+        && status == 400
+        && code == "invalid_request_error"
+        && dichiara_credito_esaurito(body)
+    {
+        return CODICE_BILLING_NORMALIZZATO.to_string();
+    }
+    code.to_string()
+}
+
+/// Il body dichiara credito/saldo insufficiente? Guarda il `error.message`
+/// STRUTTURATO (non il body grezzo), sulle formule con cui Anthropic segnala il
+/// saldo esaurito: "credit balance ... too low" e il rimando a Plans & Billing.
+fn dichiara_credito_esaurito(body: &str) -> bool {
+    let Some(msg) = extract_structured_error_message(body) else {
+        return false;
+    };
+    let m = msg.to_ascii_lowercase();
+    m.contains("credit balance") || m.contains("plans & billing")
+}
+
 /// Classifica in modo DETERMINISTICO da status HTTP + codice strutturato.
 /// Lo status e' il segnale primario; il codice ESCALA a Billing solo un 429/402
 /// quando e' un identificatore di credito inequivocabile (non prosa).
@@ -1203,6 +1267,17 @@ fn classify_by_status_code(status: u16, code: Option<&str>) -> ProviderErrorKind
             || c.contains("account_deactivated")
         {
             return ProviderErrorKind::Billing;
+        }
+        // Rate-limit DICHIARATO dal provider: vince sullo status, perche' lo
+        // status da solo mente. groq manda 413 (non 429) quando la richiesta
+        // supera il tetto token/minuto del piano: "on tokens per minute (TPM):
+        // Limit 8000, Requested 20083", code=rate_limit_exceeded. Leggendo solo
+        // il 413 lo si scambia per "richiesta troppo grande per la finestra" e
+        // il motore fa failover cross-provider su un altro provider, mentre la
+        // cura giusta e' aspettare: il provider e' sano e la stessa richiesta
+        // passera' fra un minuto.
+        if c.contains("rate_limit") {
+            return ProviderErrorKind::Transient;
         }
     }
     // Mappatura verificata sulle tabelle ufficiali (Anthropic/OpenAI, 2026):
@@ -1578,6 +1653,7 @@ mod tests {
                 sensitivity_tier: 0,
                 feature: "f".to_string(),
             },
+            run_timeout_secs: None,
         }
     }
 
@@ -1595,6 +1671,57 @@ mod tests {
         let models = parse_models_response(&body);
         // Ordinato e deduplicato.
         assert_eq!(models, vec!["gpt-4o", "gpt-4o-mini"]);
+    }
+
+    /// Body VERBATIM catturato dai log del gateway il 26/07 (13:53 UTC), quando
+    /// il credito Anthropic si e' esaurito nel mezzo di un run.
+    const BODY_CREDITO_ANTHROPIC: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+
+    /// Errore Anthropic di formato VERO: stesso status, stesso codice, messaggio
+    /// che non parla di credito. Il discrimine e' solo questo.
+    const BODY_FORMATO_ANTHROPIC: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1: Expected `thinking` or `redacted_thinking`, but found `text`"}}"#;
+
+    #[test]
+    fn credito_anthropic_esaurito_e_billing_non_errore_di_formato() {
+        // Attraversa il PRODUTTORE (from_response), non un codice scritto a mano:
+        // costruire l'errore a mano fisserebbe l'assunto da verificare (regola O).
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "anthropic",
+            400,
+            BODY_CREDITO_ANTHROPIC.to_string(),
+        ));
+        // Il VERDETTO, non la stringa: e' cio' su cui a valle si decidono
+        // cooldown e failover.
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::Billing,
+            "un credito esaurito non e' una richiesta malformata: senza questo il \
+             gateway ritenta sanificando la history e non mette in cooldown"
+        );
+    }
+
+    #[test]
+    fn un_400_di_formato_anthropic_resta_errore_client() {
+        // La traduzione non deve inghiottire i 400 legittimi: stesso provider,
+        // stesso status, stesso codice, messaggio diverso -> resta ClientError.
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "anthropic",
+            400,
+            BODY_FORMATO_ANTHROPIC.to_string(),
+        ));
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
+    }
+
+    #[test]
+    fn lo_stesso_messaggio_da_un_altro_provider_non_diventa_billing() {
+        // Il quirk resta isolato al provider che ce l'ha: un altro provider non
+        // viene reinterpretato qui (il suo caso, se esiste, avra' il suo ramo).
+        let err = anyhow::Error::new(ProviderHttpError::from_response(
+            "deepseek",
+            400,
+            BODY_CREDITO_ANTHROPIC.to_string(),
+        ));
+        assert_eq!(classify_provider_error(&err), ProviderErrorKind::ClientError);
     }
 
     #[test]
@@ -1866,6 +1993,73 @@ mod tests {
         let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
         let resp = from_chat_completion(parsed, "m".to_string(), "openai", 1).unwrap();
         assert_eq!(resp.usage.cache_read_tokens, Some(12));
+    }
+
+    /// La RELAZIONE fra i conteggi, non solo la loro presenza.
+    ///
+    /// I dialetti OpenAI-compatibili contano i cache hit DENTRO `prompt_tokens`,
+    /// che e' quindi gia' il LORDO: `LlmUsage.input_tokens` deve uscire IDENTICO
+    /// al wire. Sommare qui i token di cache — la normalizzazione dell'altro
+    /// verso, quella di Anthropic — li conterebbe due volte, gonfiando il
+    /// contesto misurato e il monte da cui il listino scorpora. Nessun test
+    /// fissava questa premessa: si poteva invertire il verso e restare verdi.
+    #[test]
+    fn input_tokens_resta_il_lordo_nei_dialetti_openai_compat() {
+        // Forma reale DeepSeek.
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                      "prompt_cache_hit_tokens": 4, "prompt_cache_miss_tokens": 6}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let u = from_chat_completion(parsed, "m".to_string(), "deepseek", 1)
+            .unwrap()
+            .usage;
+        assert_eq!(u.cache_read_tokens, Some(4));
+        assert_eq!(u.input_tokens, 10, "il wire e' gia' lordo: nessuna somma");
+        assert_eq!(u.cache_creation_tokens, None);
+
+        // Forma reale OpenAI.
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3,
+                      "prompt_tokens_details": {"cached_tokens": 12}}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let u = from_chat_completion(parsed, "m".to_string(), "openai", 1)
+            .unwrap()
+            .usage;
+        assert_eq!(u.input_tokens, 20, "il wire e' gia' lordo: nessuna somma");
+        assert_eq!(u.cache_read_tokens, Some(12));
+
+        // Senza cache nulla cambia (nessuna regressione).
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let u = from_chat_completion(parsed, "m".to_string(), "openai", 1)
+            .unwrap()
+            .usage;
+        assert_eq!(u.input_tokens, 20);
+        assert_eq!(u.cache_read_tokens, None);
+    }
+
+    /// Lo streaming e' un secondo percorso di produzione dello stesso usage: se
+    /// normalizza diversamente, la stessa chiamata dichiara un contesto diverso
+    /// e costa cifre diverse a seconda che sia stata servita in streaming o no.
+    #[test]
+    fn anche_lo_streaming_lascia_il_prompt_lordo() {
+        let raw = r#"{
+            "choices": [{"delta": {"content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 7,
+                      "prompt_tokens_details": {"cached_tokens": 90}}
+        }"#;
+        let parsed: ChatCompletionChunk = serde_json::from_str(raw).unwrap();
+        let chunk = chunk_from_sse(parsed, "openai", "m").expect("chunk con usage");
+        let u = chunk.usage.expect("usage presente nel chunk finale");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cache_read_tokens, Some(90));
     }
 
     // ── Content tollerante (contratto Mistral: string | ContentChunk[]) ─────
@@ -2284,6 +2478,16 @@ mod tests {
             .as_deref(),
             Some("invalid_argument")
         );
+        // groq: `type` e' la CATEGORIA ("tokens"), `code` e' l'errore. Preferendo
+        // `type` si perde l'unica informazione che decide, e un rate-limit del
+        // piano diventa un difetto del modello. Corpo VERBATIM del 2026-07-16.
+        assert_eq!(
+            extract_structured_error_code(
+                r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 8000, Requested 20083","type":"tokens","code":"rate_limit_exceeded"}}"#
+            )
+            .as_deref(),
+            Some("rate_limit_exceeded")
+        );
         // Body non-JSON o senza campi: None.
         assert_eq!(extract_structured_error_code("502 Bad Gateway (html)"), None);
     }
@@ -2332,6 +2536,30 @@ mod tests {
         assert_eq!(parse_retry_after(&h), None);
     }
 
+    /// LA REGRESSIONE, dal body alla classe: il 413 di groq attraversa
+    /// `from_response` (il produttore vero del `ProviderHttpError`, che estrae il
+    /// codice) e deve arrivare a `Transient`.
+    ///
+    /// Il 2026-07-16 finiva in `ContextTooLong` — cioe' "colpa della richiesta per
+    /// QUESTO modello" — e la batteria ha squalificato quattro modelli groq che
+    /// nello stesso giro passavano chat_smoke e tool_smoke. Il guard sul codice
+    /// c'era gia': non scattava perche' l'estrattore preferiva `type` ("tokens") a
+    /// `code` ("rate_limit_exceeded"). Un test sul solo `classify_by_status_code`
+    /// non poteva vederlo: passava un codice che in produzione non arrivava mai.
+    #[test]
+    fn il_413_di_groq_e_un_rate_limit_dal_body_alla_classe() {
+        let body = r#"{"error":{"message":"Request too large for model `openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 20083, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        let err: anyhow::Error =
+            ProviderHttpError::from_response("groq", 413, body.to_string()).into();
+        assert_eq!(
+            classify_provider_error(&err),
+            ProviderErrorKind::Transient,
+            "il tetto token/minuto del piano e' transitorio: il provider e' sano e \
+             la stessa richiesta passa fra un minuto. Trattarlo come ContextTooLong \
+             lo attribuisce al modello e lo fa squalificare"
+        );
+    }
+
     #[test]
     fn classify_deterministica_da_status_e_codice() {
         let http = |status, code: Option<&str>| {
@@ -2374,6 +2602,15 @@ mod tests {
         // 429 rate-limit puro (senza codice credito) -> Transient (ritentabile).
         assert_eq!(
             classify_provider_error(&http(429, Some("rate_limit_exceeded"))),
+            ProviderErrorKind::Transient
+        );
+        // MISURATO su groq il 2026-07-16: il tetto token/minuto del piano viene
+        // rifiutato con 413, NON con 429 ("TPM: Limit 8000, Requested 20083",
+        // code=rate_limit_exceeded). Il codice dichiarato vince sullo status: e'
+        // un rate-limit da aspettare, non una richiesta fuori finestra da mandare
+        // in failover su un altro provider.
+        assert_eq!(
+            classify_provider_error(&http(413, Some("rate_limit_exceeded"))),
             ProviderErrorKind::Transient
         );
         assert_eq!(

@@ -26,34 +26,29 @@ import {
   providerLabel,
   rgba,
 } from "./provider-icon-logic";
+import { listModelCatalog, type ModelCatalogEntry } from "../../lib/api/models";
 
 export { providerBaseColor, providerLabel, rgba };
 
-export interface ModelPricingEntry {
-  provider: string;
-  model: string;
-  display_name?: string;
-  input_cost_per_million_tokens?: number;
-  output_cost_per_million_tokens?: number;
-  context_window?: number;
-  performance_tier?: string;
-}
+/** Il catalogo prezzi e' quello di `/api/models`: un solo wire, un solo tipo
+ *  (regola L). Alias verso il punto unico `lib/api/models.ts` per i call site
+ *  storici che importano `ModelPricingEntry` da qui. */
+export type ModelPricingEntry = ModelCatalogEntry;
 
 // ── Cache pricing client-side (TTL 5 min) ──────────────────────────────────
-let _pricingCache: { loadedAt: number; entries: ModelPricingEntry[] } | null =
+let _pricingCache: { loadedAt: number; entries: ModelCatalogEntry[] } | null =
   null;
 const PRICING_TTL_MS = 5 * 60 * 1000;
 
-async function fetchPricing(): Promise<ModelPricingEntry[]> {
+async function fetchPricing(): Promise<ModelCatalogEntry[]> {
   const now = Date.now();
   if (_pricingCache && now - _pricingCache.loadedAt < PRICING_TTL_MS) {
     return _pricingCache.entries;
   }
   try {
-    const res = await fetch("/api/models", { credentials: "include" });
-    if (!res.ok) return _pricingCache?.entries ?? [];
-    const data = (await res.json()) as { models?: ModelPricingEntry[] };
-    const entries = data.models ?? [];
+    // listModelCatalog = punto unico di fetch (passa da fetchJson/_shared.ts).
+    const { models } = await listModelCatalog();
+    const entries = models ?? [];
     _pricingCache = { loadedAt: now, entries };
     return entries;
   } catch {
@@ -116,8 +111,8 @@ export function useModelPricing(
  */
 export function alphaFromCost(entry: ModelPricingEntry | null): number {
   if (!entry) return 0.55;
-  const inCost = entry.input_cost_per_million_tokens ?? 0;
-  const outCost = entry.output_cost_per_million_tokens ?? 0;
+  const inCost = entry.inputCostPerMillionTokens;
+  const outCost = entry.outputCostPerMillionTokens;
   // Output cost pesa di piu' (3x) — riflette il costo dominante nelle agent runs.
   const weighted = inCost + 3 * outCost;
   if (weighted <= 0) return 0.30; // gratis / locale
@@ -149,22 +144,16 @@ export function ProviderBadge({
   const border = rgba(base, Math.min(0.95, alpha + 0.2));
 
   const tooltipParts: string[] = [];
-  if (entry?.display_name) tooltipParts.push(entry.display_name);
-  if (entry?.input_cost_per_million_tokens != null) {
-    tooltipParts.push(
-      `In: $${entry.input_cost_per_million_tokens.toFixed(2)}/M tok`,
-    );
+  if (entry?.displayName) tooltipParts.push(entry.displayName);
+  if (entry) {
+    tooltipParts.push(`In: $${entry.inputCostPerMillionTokens.toFixed(2)}/M tok`);
+    tooltipParts.push(`Out: $${entry.outputCostPerMillionTokens.toFixed(2)}/M tok`);
   }
-  if (entry?.output_cost_per_million_tokens != null) {
-    tooltipParts.push(
-      `Out: $${entry.output_cost_per_million_tokens.toFixed(2)}/M tok`,
-    );
+  if (entry?.contextWindow) {
+    tooltipParts.push(`ctx ${entry.contextWindow.toLocaleString()}`);
   }
-  if (entry?.context_window) {
-    tooltipParts.push(`ctx ${entry.context_window.toLocaleString()}`);
-  }
-  if (entry?.performance_tier) {
-    tooltipParts.push(`tier: ${entry.performance_tier}`);
+  if (entry?.performanceTier) {
+    tooltipParts.push(`tier: ${entry.performanceTier}`);
   }
   const tooltip = tooltipParts.length
     ? tooltipParts.join(" · ")

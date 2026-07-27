@@ -199,15 +199,14 @@ async fn probe_microservices(services: &[(&'static str, u16)]) -> Vec<(&'static 
     results
 }
 
-/// Controlla i microservizi Rust ausiliari (admin, doc, billing, plugin).
+/// Controlla i microservizi Rust ausiliari (admin, doc, plugin).
 /// Li verifica in parallelo con TCP connect (1s timeout); restituisce un check
 /// aggregato con il dettaglio per ciascun servizio.
 async fn check_microservices() -> EnvironmentCheck {
-    const LABEL: &str = "Microservizi (admin/chat/doc/billing/plugin)";
+    const LABEL: &str = "Microservizi (admin/doc/plugin)";
     let services = [
         ("admin-service", 4010u16),
         ("doc-service", 4030),
-        ("billing-service", 4040),
         ("plugin-service", 4050),
     ];
 
@@ -676,7 +675,9 @@ pub async fn qdrant_health_handler(
     axum::extract::State(_state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+        crate::settings::disambigua_loopback(
+            &std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
+        );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -1123,8 +1124,6 @@ pub async fn gateway_providers_handler(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let gw_url = resolve_gateway_url(&state.db).await?;
-    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1141,9 +1140,11 @@ pub async fn gateway_providers_handler(
         &cooldown_map,
     );
 
+    // Nessun header di autorizzazione: `/providers` e' una rotta ESENTE nel
+    // gateway (come `/health`). Prima si mandava un bearer statico, che qui non
+    // serviva a nulla ed era il valore hardcoded nel sorgente.
     match client
         .get(format!("{}/providers", gw_url.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {}", gw_token))
         .send()
         .await
     {
@@ -1178,8 +1179,15 @@ pub async fn gateway_reload_handler(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let gw_url = resolve_gateway_url(&state.db).await?;
-    let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "dev-internal-token".to_string());
+    // `/admin/reload` NON e' una rotta esente: serve una credenziale vera. E' un
+    // JWT a vita breve firmato con la chiave di piattaforma, non piu' un bearer
+    // statico con fallback hardcoded.
+    let gw_token = nexus_auth::service_bearer(&state.db).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("bearer di servizio non disponibile: {e}") })),
+        )
+    })?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -1248,6 +1256,9 @@ async fn upsert_setting_value(
     .bind(description)
     .execute(db)
     .await;
+    // Upsert con query propria: invalida esplicitamente, altrimenti la lettura
+    // resta stantia fino alla scadenza della cache dei settings.
+    nexus_auth::invalidate_setting_cache(db, key);
 }
 
 fn sanitize_collection_suffix(raw: &str) -> String {
@@ -1318,7 +1329,9 @@ pub async fn embeddings_validate_handler(
 /// propaga un `502` se Qdrant non e' raggiungibile o rifiuta la richiesta.
 async fn reindex_qdrant_collection(collection: &str, dim: u64) -> Result<(), ApiError> {
     let qdrant_url =
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+        crate::settings::disambigua_loopback(
+            &std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
+        );
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()

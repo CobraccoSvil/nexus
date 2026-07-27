@@ -9,6 +9,10 @@
 //! e figma_tools (path-safety via nexus_types::workspace_paths).
 //! Passo agent_tools-4: git (esecutore in nexus_types::git_exec; reindex
 //! post-commit de-accoppiato via trait `FileReindexer` nel context core).
+//! Passo agent_tools-5: `files` e `knowledge`. Il trait del reindex diventa
+//! `FileMutationHooks` (l'INTERO ciclo di vita di una mutazione file: gate di
+//! governance pre-scrittura, tracking, autocommit, hook post-scrittura), e
+//! `TextEmbedder` copre l'unico accoppiamento vettoriale di `knowledge`.
 //! Candidato successivo: il pacchetto wiki (richiede de-axumizzazione).
 
 pub mod archive_tools;
@@ -22,10 +26,13 @@ pub mod dev_diagnostics;
 pub mod dispatcher;
 pub mod document_tools;
 pub mod figma_tools;
+pub mod files;
 pub mod gateway_client;
 pub mod git;
 pub mod image_tools;
+pub mod knowledge;
 pub mod monitor;
+pub mod paths;
 pub mod profile_tools;
 pub mod quality_tools;
 pub mod read_cache;

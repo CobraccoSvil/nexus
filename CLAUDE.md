@@ -272,12 +272,26 @@ condividere codice (fragile base class).
 | SQL-injection detector | ADR 0021 |
 | Capability modello (vision/tool/thinking) | vista `0318` + `mcp-core/src/capability.rs` (ADR 0024) |
 | Routing/default/purpose model | `routing_matrix.rs` + tabelle mig 0101/0102 (regola G) |
+| Richiesta della CHAT al gateway (modello, pin del provider forzato, coppia prenotata a ledger) | `mcp-core/src/orchestrator/model_routing.rs` (`build_chat_gateway_call`); il modello lo risolve delegando a `RoutingConfig::resolve_model`. Guard `richiesta gateway chat`. Vedi ADR 0023 |
+| Forza del vincolo sul provider scelto in chat (preferenza vs pin duro) | `mcp-core/src/orchestrator/provider_choice.rs` (`ProviderOverrideMode` = `preferred\|pinned`, `ProviderChoice::resolve` = unico punto in cui un pin nasce, e nasce solo dalla richiesta in corso: il pin non si eredita da sessione o resend) + `apps/web-ide/components/chat/provider-choice-logic.ts` lato UI. Guard `vocabolario forza-vincolo provider`, `nascita del pin duro`. Vedi ADR 0023 |
+| Scrittura del tier di un modello (precedenza `manual` > `measured` > `synced` > fonte ignota) | `mcp-core/src/orchestrator/model_service.rs` (`apply_tier`, `TierSource`, `puo_sovrascrivere`); il sync dell'indice e la batteria delegano. Guard `tier-write` |
+| Listino modelli (prezzo di una chiamata + currency di piattaforma) | crate `nexus-pricing` (`resolve_active_price` -> `PriceLookup{Priced\|Unknown\|NotInCatalog}`, `platform_currency`, `calculate_cost`, `assert_configured`). Guard `pricing-single-source` |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |
+| Scrittura settings (aggiorna, non crea: chiave assente -> 404) | `nexus-auth` (`update_setting_value` -> `SettingWriteError{UnknownKey\|Db}` + `status_code()`). Guard `update_setting_value` e `settings INSERT di ripiego` |
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
 | Pool DB metadati per-progetto (registry, elenco progetti, directory routing, cache pool) | crate `nexus-project-pools` (separazione sempre attiva, flag rimosso mig 0527); `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
+| Completion testuale via gateway per i crate FUORI da mcp-core (admin-service, worker di nexus-orchestrator) | `nexus-types/src/gateway_client.rs` (`gateway_text_complete`). Dentro mcp-core resta `nexus_gateway::NexusGatewayClient`. ADR 0041 |
 | Aggregazione problemi ripetitivi (pannello Problemi) | `mcp-core/src/project_workspace/problem_aggregation.rs` (`problem_group_key`, `aggregate_problems`); `get_project_problems` delega |
+| Discendenza di un run (quali run compongono il suo lavoro: token, costo, provider) | `mcp-core/src/run_lineage.rs` (`parent_run_by_child`, da `nexus_subagent_runs.dispatcher_run_id`); `trace_store::get_session_traces` annota `parentRunId` sulle tracce dei sub-run e il frontend (`tracesForRun` -> `providerCostBreakdown`) vi delega. NON dedurre la parentela dai meta-step di narrazione: sono un canale di presentazione che il review panel non emette |
+| Dimensionamento dei panel multi-agente (quante figure/revisori/provider/avvocati) | `nexus-agent-graph/src/decisions/orchestration_sizing.rs` (`resolve_orchestration_plan`; i cap storici restano backstop). ADR 0040 |
+| Tesi contrapposte (assegnazione posizioni + selezione opzione) | `nexus-agent-graph/src/decisions/debate_panel.rs` (`plan_debate`, `compose_debate_synthesis`). ADR 0040 |
+| Vocabolario gravita' evidenza (alta/media/bassa) + test "evidenza grave" | `nexus-agent-graph/src/decisions/severity.rs`; advisory/review/debate delegano |
+| Vocabolario performance-tier (light<medium<high<heavy<frontier) | `nexus-types/src/tiers.rs`; `decisions/tiers.rs` e' un re-export |
+| Tool mutativo ("questo tool scrive?") | `nexus-agent-graph/src/decisions/hitl.rs` (`is_mutator_tool_name`, `pending_contains_mutator`) su `agent.tools.result_cache_mutators`; gate HITL e barriera advisory delegano |
+| Whitelist runtime dei kind (CSV `orchestrator.subagent_kinds_whitelist`) | `admin-service/src/figures.rs` (`mutate_kinds_whitelist`) |
+| Schema di test del DB-progetto (i `#[sqlx::test]` girano sulla migrazione reale, mai su un `CREATE TABLE` ricopiato) | crate `nexus-test-schema` (`PROJECT_MIGRATOR` = set `db/migrations/project`) + seeder in `mcp-core::test_support` (`seed_chat_session`, `seed_agent_run`, `seed_plan`, `seed_todo`). Guard `schema-di-test` |
 
 ### Enforcement automatico (la regola e' duratura, non una-tantum)
 
@@ -285,8 +299,15 @@ condividere codice (fragile base class).
   con gate "ratchet" — il numero di cloni puo' solo SCENDERE rispetto a
   `.dup-baseline.json`. Si riallinea la baseline al ribasso dopo ogni consolidamento.
 - `scripts/check-single-source.sh`: guard testuale che blocca nuove definizioni di
-  un punto unico fuori dal suo modulo. I check si attivano per wave.
-- `docs/tech-debt-dup.md`: metrica del debito e baseline.
+  un punto unico fuori dal suo modulo. I check si attivano per wave. Include il
+  check `migrazione-stub`, che rifiuta nuove migrazioni con corpo solo `SELECT 1;`
+  (informazione di schema distrutta in modo irrecuperabile).
+- `scripts/markers-ratchet.sh` + `scripts/markers-baseline.json`: gate "ratchet"
+  su due famiglie di marker testuali — debito esplicito
+  (`TODO|FIXME|HACK|XXX|WORKAROUND|DEBITO`) e frasi di inerzia
+  (`INERTE|mai raggiunt|non ancora cablat/portat/instradat`) — che possono solo
+  SCENDERE. Impedisce di reintrodurre commenti fossili (regola O).
+- `docs/tech-debt-dup.md`, `docs/tech-debt-markers.md`: metrica del debito e baseline.
 - Innesto: `lefthook.yml` (pre-commit veloce) + `.github/workflows/verify.yml` (gate completo).
 
 ### Trigger imperativo
@@ -400,6 +421,63 @@ il codebase.
 | Parse automation_mode | `crates/mcp-core/src/orchestrator/mod.rs` (`AutomationMode::try_parse`) |
 | Parse supervisor_mode | `SupervisorMode` FromStr in `agent_types.rs` / `nexus-agent-graph` state |
 
+## O. Lo strumento di misura raggiunge il suo oggetto come la produzione
+
+Regola autoritativa per test, script diagnostici e gate: **la misura deve arrivare
+al suo oggetto per la STESSA strada della produzione**. Uno strumento che
+ri-costruisce l'input a mano, ri-scrive la query o risolve il percorso a modo suo
+non misura il sistema: misura una sua imitazione, e quando le due divergono non
+fallisce — mente con la faccia seria.
+
+E' la regola L applicata agli strumenti. Oggi test e script sono trattati come se
+non fossero codice: sono invece la parte di codice che decide **se ti fidi**.
+
+### Il pattern, e perche' non si vede
+
+Sempre lo stesso: lo strumento e il sistema usano fonti diverse per la stessa
+domanda. Entrambi funzionano, su cose diverse. Casi REALI di questo repo:
+
+| Strumento | Come raggiungeva l'oggetto | Cosa non poteva vedere |
+|---|---|---|
+| `xtask quality-scan --root` | risolveva il path dalla CWD | misurava un albero, dichiarava l'altro (fix `2ae08818`) |
+| 3 test di `error_class_from_gateway` | chiamavano la funzione a mano | che in produzione non era MAI raggiunta (codice morto con test verdi) |
+| `classify_deterministica_da_status_e_codice` | passava il codice a mano | che l'estrattore quel codice non lo produceva mai (groq 413) |
+| `read_turn_signals` + i suoi test | inventavano `turn['result']` | che il produttore scrive `content`: 0 per costruzione |
+| helper di test `run()` | fissava `inconclusive: 0` | il ramo del silenzio, mai esercitato |
+| script diagnostico | ricopiava `SQL_CLAIM` a mano | leggeva la suite dalla tabella sbagliata: "0 candidati" contro 29 |
+| `rg -rn` | `-r` e' `--replace`, non "recursive" | output falsato per un'intera sessione |
+| fixture `CREATE TABLE` nei `mod tests` | ricopiavano lo schema a mano | 41 copie divergenti dalla migrazione: righe che il DB di produzione RIFIUTA (run senza sessione, todo senza piano, step senza `tool_input`) create dai test per anni. Fix: `nexus-test-schema::PROJECT_MIGRATOR` + guard `schema-di-test` |
+
+### Cosa e' richiesto
+
+1. **Un test attraversa il produttore.** Se in produzione un valore nasce da una
+   funzione nota (`agent_turn_value_from_gw`, `ProviderHttpError::from_response`,
+   `GatewayHttpError::from_response`, `catalog_select!`), il test parte da LI'.
+   Costruire a mano l'input equivale a fissare l'assunto che si vuole verificare:
+   codice e test condividono l'errore e restano verdi per sempre.
+2. **Un test arriva alla CONSEGUENZA, non alla stringa.** Asserire che una funzione
+   ritorni `"model_not_found"` non prova niente se nessun consumatore conosce quella
+   parola (accaduto: cadeva nel catch-all `Transient`). Si asserisce il verdetto.
+3. **La diagnostica chiama il codice, non lo imita.** Uno script che ricopia una
+   query o una regola di produzione e' un punto unico violato: la copia divergera'.
+   Chi diagnostica pone la domanda al sistema; se non c'e' un modo per porla, si
+   aggiunge (un `explain`), non si riscrive la query.
+4. **Un numero senza la sua premessa e' un'opinione.** Ogni strumento dichiara DA
+   DOVE guarda: quale albero, quale fonte, quale seed. `0` non e' un risultato;
+   `0 (suite letta da ai_price_catalog)` lo e' — e si vede subito che e' sbagliato.
+5. **Ogni fix ha il suo test di mutazione.** Si rompe apposta il codice appena
+   corretto e si verifica che il test ROSSEGGI, col valore del difetto reale. Un
+   test che non fallisce quando reintroduci il bug non copre il bug: copre se
+   stesso.
+
+### Conseguenza pratica
+
+Prima di fidarti di un verde o di un numero, chiediti: *questo strumento tocca il
+sistema dove lo tocca la produzione?* Se il test costruisce l'input, se lo script
+riscrive la query, se il gate risolve il path da solo — non stai misurando il
+sistema. Un PR che aggiunge un test che fabbrica un input gia' prodotto altrove e'
+rifiutato come una toppa (regola H).
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo locale: **Windows nativo**, repo Git in `D:\IDEAI`. Shell:
@@ -420,5 +498,6 @@ il codebase.
 - `docs/tech-debt-rust.md` — backlog `unwrap`/clippy
 - `docs/tech-debt-ts.md` — backlog `any`/strict
 - `docs/tech-debt-dup.md` — metrica duplicazione e baseline ratchet (regola L)
+- `docs/tech-debt-markers.md` — marker di debito e frasi di inerzia, gate ratchet (regola O)
 - `docs/.nexus-vault/adr/0026-punto-unico-de-duplicazione.md` — catalogo punti unici + meccanismo
 - `config/policies/` — profili cloud/onprem/hybrid (contratto gateway LLM)

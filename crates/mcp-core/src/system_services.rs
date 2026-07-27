@@ -30,15 +30,18 @@
 
 use axum::extract::{Path, State};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use crate::project_workspace::port_recovery::tcp_probe;
 use crate::AppState;
 
-/// Chiave settings del catalogo unico (migrazione 0541).
-const CATALOG_SETTING_KEY: &str = "system.services_catalog";
+// Forma delle voci e lettura del catalogo: punto unico in `nexus-service-catalog`
+// (regola L). Qui restano solo probe, controllo e handler HTTP, cioe' cio' che
+// e' proprio di mcp-core. La struttura era `pub(crate)`, quindi il generatore
+// dei manifest avrebbe dovuto ricopiarsela per leggere lo stesso dato.
+pub(crate) use nexus_service_catalog::{resolve_port, CatalogEntry};
 
 /// Servizio che ospita questo processo: si controlla in modalita' detached.
 const SELF_SERVICE_NAME: &str = "mcp-core";
@@ -46,84 +49,20 @@ const SELF_SERVICE_NAME: &str = "mcp-core";
 /// Timeout del TCP probe per servizio (allineato al services_watchdog).
 const PROBE_TIMEOUT_MS: u64 = 1_500;
 
-/// Voce del catalogo dei microservizi infrastruttura. Deserializzata da
-/// `system.services_catalog`. Vedi migrazione 0541 per la semantica dei campi.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct CatalogEntry {
-    /// Nome canonico (= `--service` di deploy-local.sh), usato come id nell'URL.
-    pub name: String,
-    #[serde(default)]
-    pub label: String,
-    /// Chiave settings da cui risolvere la porta (regola G).
-    #[serde(default)]
-    pub port_setting_key: Option<String>,
-    /// Porta letterale (solo infra dati: postgres/redis).
-    #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub led: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Mostrato ma non controllabile (nessun pulsante start/stop/restart).
-    #[serde(default)]
-    pub readonly: bool,
-    /// start/stop/restart ammessi (allowlist di controllo).
-    #[serde(default)]
-    pub controllable: bool,
-    /// Mostrato nel pannello "Servizi Nexus".
-    #[serde(default)]
-    pub panel_shown: bool,
-    /// Auto-restart dal services_watchdog (mcp-core escluso: ospita il watchdog).
-    #[serde(default)]
-    pub watchdog_managed: bool,
-    /// Target di controllo su Unix.
-    #[serde(default)]
-    pub systemd_unit: Option<String>,
-    /// Target di controllo su Windows.
-    #[serde(default)]
-    pub winsw_id: Option<String>,
-    /// Hint di provenienza (non usato per lo stato: lo stato e' un TCP probe).
-    #[serde(default)]
-    pub docker_container: Option<String>,
-}
-
-/// Carica il catalogo dal DB. Punto unico usato da endpoint e watchdog.
-/// Su errore/assenza ritorna vuoto (loggato): niente lista hardcoded di
-/// emergenza nel codice (regola G).
+/// Carica il catalogo delegando al punto unico, riportando l'esito come lista.
+///
+/// I chiamanti storici (pannello, watchdog, controllo) trattavano "catalogo non
+/// leggibile" come "nessun servizio". Il punto unico ora distingue i tre casi;
+/// qui si logga il MOTIVO e si degrada a lista vuota, cosi' il pannello resta
+/// servito ma il log dice se il catalogo manca o se non si e' potuto leggere.
 pub(crate) async fn load_catalog(db: &PgPool) -> Vec<CatalogEntry> {
-    let raw = match crate::settings::get_setting(db, CATALOG_SETTING_KEY).await {
+    match nexus_service_catalog::load_catalog(db).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("system_services: lettura {CATALOG_SETTING_KEY} fallita: {e}");
-            return Vec::new();
-        }
-    };
-    let Some(raw) = raw else {
-        tracing::warn!(
-            "system_services: setting {CATALOG_SETTING_KEY} assente (applicare migrazione 0541)"
-        );
-        return Vec::new();
-    };
-    match serde_json::from_str::<Vec<CatalogEntry>>(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("system_services: catalogo {CATALOG_SETTING_KEY} non parsabile: {e}");
+            tracing::warn!("system_services: catalogo non disponibile: {e}");
             Vec::new()
         }
     }
-}
-
-/// Risolve la porta di una voce: prima `port_setting_key` dal DB (regola G),
-/// poi la porta letterale (infra dati). Punto unico usato anche dal watchdog.
-pub(crate) async fn resolve_port(db: &PgPool, entry: &CatalogEntry) -> Option<u16> {
-    if let Some(key) = entry.port_setting_key.as_deref() {
-        if let Ok(Some(v)) = crate::settings::get_setting(db, key).await {
-            if let Ok(p) = v.trim().parse::<u16>() {
-                return Some(p);
-            }
-        }
-    }
-    entry.port
 }
 
 /// Deriva lo stato onesto dalla coppia (porta risolvibile?, porta in ascolto?).
@@ -477,8 +416,16 @@ pub(crate) async fn post_system_service_action(
 mod tests {
     use super::*;
 
-    /// Sottoinsieme rappresentativo del catalogo (schema migrazione 0541).
-    const SAMPLE: &str = r#"[
+    /// Voci di comodo per esercitare i FILTRI di questo modulo.
+    ///
+    /// PREMESSA DICHIARATA (regola O): questo JSON e' scritto qui, non letto
+    /// dalla migrazione. Copre la logica di filtro — chi finisce nel pannello,
+    /// chi e' sorvegliato — e NON dice nulla sul catalogo reale: non si e' mai
+    /// accorto ne' dei sette `systemd_unit` che sul disco non esistono, ne' del
+    /// manifest mancante di browser-bridge, e non e' costruito per accorgersene.
+    /// La conformita' del catalogo VERO la verifica il test su DB del generatore
+    /// di manifest, che lo legge dalle migrazioni.
+    const FILTRI_INPUT: &str = r#"[
       {"name":"mcp-core","label":"Core","port_setting_key":"mcp_core_http_port","led":"Core","readonly":false,"controllable":true,"panel_shown":true,"watchdog_managed":false,"systemd_unit":"nexus-core-wsl","winsw_id":"nexus-mcp-core"},
       {"name":"nexus-gateway","label":"LLM Gateway","port_setting_key":"nexus_gateway_port","controllable":true,"panel_shown":true,"watchdog_managed":true,"systemd_unit":"nexus-gateway","winsw_id":"nexus-gateway"},
       {"name":"web-ide","label":"Web IDE","port_setting_key":"web_ide_port","controllable":false,"panel_shown":false,"watchdog_managed":true,"systemd_unit":"nexus-webide","winsw_id":"nexus-web-ide"},
@@ -486,20 +433,12 @@ mod tests {
     ]"#;
 
     fn parse() -> Vec<CatalogEntry> {
-        serde_json::from_str::<Vec<CatalogEntry>>(SAMPLE).expect("catalogo di esempio valido")
+        serde_json::from_str::<Vec<CatalogEntry>>(FILTRI_INPUT).expect("input dei filtri valido")
     }
 
-    #[test]
-    fn catalogo_parsa_e_campi_default() {
-        let c = parse();
-        assert_eq!(c.len(), 4);
-        let pg = c.iter().find(|e| e.name == "postgres").unwrap();
-        assert_eq!(pg.port, Some(5433));
-        assert!(pg.port_setting_key.is_none());
-        assert!(pg.readonly && !pg.controllable);
-        // systemd_unit/winsw_id assenti -> None di default, niente panico.
-        assert!(pg.systemd_unit.is_none());
-    }
+    // La deserializzazione della voce (campi obbligatori, default, round-trip)
+    // e' testata nel punto unico `nexus-service-catalog`, dove la struttura
+    // vive: ripeterla qui sarebbe una seconda copia della stessa verifica.
 
     #[test]
     fn filtro_panel_shown() {

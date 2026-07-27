@@ -11,7 +11,14 @@ export function buttonStyle(tc: ThemeColors, disabled: boolean) {
     color: tc.text,
     cursor: disabled ? "not-allowed" : "pointer",
     flexShrink: 0,
-    whiteSpace: "nowrap" as const,
+    // `nowrap` + `flexShrink: 0` rendevano il taglio inevitabile: "Clona
+    // repository nel progetto" chiede 231px di min-content in una sidebar da
+    // 186px, e nessun `flexWrap` del genitore puo' salvare un figlio che da solo
+    // e' piu' largo del contenitore. Ora il testo va a capo e `maxWidth` impedisce
+    // al bottone di superare la colonna, a qualunque larghezza.
+    maxWidth: "100%",
+    whiteSpace: "normal" as const,
+    boxSizing: "border-box" as const,
   };
 }
 

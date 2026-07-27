@@ -128,7 +128,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for SupervisorNode {
         NodeId::Supervisor
     }
 
-    async fn run(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
+    async fn run(&self, state: &AgentState, _ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
         let mode = state.supervisor_mode.unwrap_or(SupervisorMode::None);
         if mode == SupervisorMode::None {
             return Ok(StateDelta {
@@ -154,7 +154,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for SupervisorNode {
 
             let decision = match self
                 .reasoner
-                .supervise(sup_ctx, ctx.exec_mode())
+                .supervise(sup_ctx)
                 .await
             {
                 Ok(Some(d)) => d,

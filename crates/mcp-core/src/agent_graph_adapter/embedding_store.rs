@@ -8,20 +8,15 @@
 //! [`nexus_agent_graph::decisions::context_reduction`] (regola L): questo adapter
 //! isola SOLO l'I/O di embedding.
 //!
-//! GATE Real/Replay (PUNTO UNICO del gate shadow, regola L; uniforme con
-//! [`super::summary_store::PgSummaryStore`] /
-//! [`super::context_offload::RagContextOffloadAdapter`]): in [`ExecMode::Replay`]
-//! (run shadow read-only) e' un NO-OP che ritorna `PortError` -> il nodo degrada al
-//! troncamento POSIZIONALE odierno (zero divergenza dal replay, zero costo CPU).
-//! In [`ExecMode::Real`] embedda davvero. BEST-EFFORT con DEGRADO: su guasto
-//! embedder (bridge non inizializzato, vettore vuoto) ritorna `PortError` e il nodo
-//! degrada (niente continuity-trim, history invariata).
+//! BEST-EFFORT con DEGRADO: su guasto embedder (bridge non inizializzato, vettore
+//! vuoto) ritorna `PortError` e il nodo degrada (niente continuity-trim, history
+//! invariata).
 //!
 //! Regola F: niente testo in chiaro nei log (solo conteggi/lunghezze).
 
 use async_trait::async_trait;
 
-use nexus_agent_graph::runtime::ports::{EmbeddingStore, ExecMode, PortError};
+use nexus_agent_graph::runtime::ports::{EmbeddingStore, PortError};
 
 use crate::orchestrator::NeuralCoreClient;
 
@@ -40,27 +35,17 @@ impl PgEmbeddingStore {
 
 #[async_trait]
 impl EmbeddingStore for PgEmbeddingStore {
-    /// Embedda `texts` (batch) col MiniLM in-process, preservando l'ordine. GATE
-    /// Real: in [`ExecMode::Replay`] e' un no-op che ritorna `PortError` (il nodo
-    /// degrada al troncamento posizionale). Su qualunque guasto (anche in Real)
-    /// ritorna `PortError`. `texts` vuoto -> `Ok(vec![])`. Best-effort.
-    async fn embed(&self, texts: Vec<String>, mode: ExecMode) -> Result<Vec<Vec<f32>>, PortError> {
-        if mode != ExecMode::Real {
-            // Run shadow read-only: niente embedding (gate shadow). Il nodo degrada
-            // al troncamento posizionale, senza divergere dal replay.
-            return Err(PortError::Tool(
-                "embed: no-op in Replay (run shadow read-only)".to_string(),
-            ));
-        }
+    /// Embedda `texts` (batch) col MiniLM in-process, preservando l'ordine. Su
+    /// qualunque guasto ritorna `PortError`. `texts` vuoto -> `Ok(vec![])`.
+    /// Best-effort.
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, PortError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Punto unico embedder ONNX MiniLM-384d in-process (regola L). connect("")
-        // non apre canali (client zero-sized); model "" -> label MiniLM di default.
-        let neural = NeuralCoreClient::connect("")
-            .await
-            .map_err(|e| PortError::Tool(format!("embed: neural client: {e}")))?;
+        // Punto unico embedder ONNX MiniLM-384d in-process (regola L). Il client
+        // e' zero-sized e non apre canali; model "" -> label MiniLM di default.
+        let neural = NeuralCoreClient::new();
 
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for text in &texts {
@@ -73,7 +58,7 @@ impl EmbeddingStore for PgEmbeddingStore {
                         n_texts = texts.len(),
                         "embed: embedder non disponibile, il nodo degrada al troncamento posizionale"
                     );
-                    return Err(PortError::Tool(format!("embed: {e}")));
+                    return Err(PortError::Tool(format!("embed: {e}").into()));
                 }
             }
         }
@@ -89,23 +74,12 @@ impl EmbeddingStore for PgEmbeddingStore {
 mod tests {
     use super::*;
 
-    /// In `Replay` l'embed e' un no-op che ritorna `PortError` (gate shadow): il
-    /// nodo degrada al troncamento posizionale. Non tocca il bridge embedder.
+    /// `texts` vuoto -> `Ok(vec![])` (niente da embeddare, non e' un errore). Non
+    /// tocca il bridge (il controllo del vuoto precede la risoluzione embedder).
     #[tokio::test]
-    async fn replay_e_un_noop_che_ritorna_porterror() {
+    async fn testi_vuoti_ritorna_vec_vuoto() {
         let store = PgEmbeddingStore::new();
-        let res = store
-            .embed(vec!["ciao".to_string()], ExecMode::Replay)
-            .await;
-        assert!(res.is_err(), "in Replay l'embed deve fallire (no-op)");
-    }
-
-    /// `texts` vuoto in Real -> `Ok(vec![])` (niente da embeddare, non e' un errore).
-    /// Non tocca il bridge (il controllo del vuoto precede la risoluzione embedder).
-    #[tokio::test]
-    async fn testi_vuoti_in_real_ritorna_vec_vuoto() {
-        let store = PgEmbeddingStore::new();
-        let res = store.embed(vec![], ExecMode::Real).await;
+        let res = store.embed(vec![]).await;
         assert!(matches!(res, Ok(v) if v.is_empty()));
     }
 }

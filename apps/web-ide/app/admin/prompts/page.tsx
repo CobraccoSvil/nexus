@@ -21,6 +21,7 @@ import {
   type PromptPreviewResponse,
   batchAssignAllTools,
 } from "../../../lib/api-client";
+import { AutoWidthSelect } from "../../../components/auto-width-select";
 
 export default function PromptsAdminPage() {
   const tc = useThemeColors();
@@ -608,9 +609,9 @@ export default function PromptsAdminPage() {
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                     <label style={{ fontSize: 11, color: tc.textMuted }}>
                       Intent:&nbsp;
-                      <select
+                      <AutoWidthSelect
                         value={previewIntent}
-                        onChange={(e) => setPreviewIntent(e.target.value)}
+                        onChange={(value) => setPreviewIntent(value)}
                         style={{
                           fontSize: 11,
                           padding: "3px 6px",
@@ -619,16 +620,13 @@ export default function PromptsAdminPage() {
                           border: `1px solid ${tc.border}`,
                           borderRadius: 4,
                         }}
-                      >
-                        {[
+                        options={[
                           "chat", "code_generation", "code_modification", "bug_fix",
                           "refactoring", "test_generation", "code_review",
                           "documentation", "architecture", "performance",
                           "security", "database", "infrastructure", "deployment",
-                        ].map((i) => (
-                          <option key={i} value={i}>{i}</option>
-                        ))}
-                      </select>
+                        ].map((i) => ({ value: i, label: i }))}
+                      />
                     </label>
                     <label style={{ fontSize: 11, color: tc.textMuted }}>
                       Linguaggio:&nbsp;

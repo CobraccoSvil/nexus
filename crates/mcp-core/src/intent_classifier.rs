@@ -1,16 +1,14 @@
-//! Classifier intent agentico LLM-based — porting Rust di
-//! `brain/router/agentic_classifier.py::AgenticIntentClassifier`.
-//!
-//! SCAFFOLD ISOLATO (Tappa 1a, pattern F1): questo modulo e' completo e
-//! testato ma NON e' ancora cablato a nessun call site. Il flusso vivo di
-//! classificazione resta il path Python via `orchestrator::intent` (chiamata
-//! HTTP `/classify-intent-agentic`). L'integrazione (intent.rs + grafo + flag)
-//! e' la Tappa 1b separata. Finche' nessuno chiama `classify`, il rischio sul
-//! comportamento in produzione e' zero.
+//! Classifier intent agentico LLM-based: e' l'unico motore di classificazione
+//! dell'intent in Nexus.
 //!
 //! Metodo: un LLM piccolo e veloce (risolto via purpose `intent_classifier`,
 //! regola G — niente nome modello hardcoded) produce un JSON strutturato che
 //! viene parsato e validato. Niente keyword/embeddings.
+//!
+//! Chi lo chiama: `orchestrator::intent` per la classificazione del turno e
+//! `native_engine` per i segnali del RouterNode. I `derive_*` sono il punto unico
+//! (regola L) che traduce l'esito in `action_oriented`/`report_only`: chiunque
+//! abbia bisogno di quei due booleani passa di qui, non li ri-deduce.
 //!
 //! Punti unici riusati (regola L):
 //! - estrazione JSON dalla risposta LLM: `nexus_types::llm_json::extract_json_block`
@@ -19,12 +17,6 @@
 //! - risoluzione modello: `internal_routing::resolve_purpose_model_db`
 //! - chiamata LLM: `nexus_gateway::NexusGatewayClient::complete`
 //! - schema slot: `routing_slots::ActionSlots`
-//!
-//! CABLATO (Tappa 1b): `classify` e' richiamato da `orchestrator::intent`
-//! (selettore `routing.classifier_engine`, flag mig 0458) e dallo SHADOW
-//! (`agent_run.rs`, derivazione fedele di action_oriented/report_only). I
-//! `derive_*` sono il punto unico (regola L) usato da `native_engine`. I test
-//! (`#[cfg(test)]`) esercitano tutta la logica.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -189,13 +181,9 @@ pub struct AgenticIntent {
     pub intent: String,
     pub agentic_score: f32,
     pub requires_tools: bool,
-    /// Complessita' del task (`low`/`medium`/`high`). Parte del porting 1:1 e del
-    /// JSON del classifier; alimentera' l'escalation per difficolta' quando il
-    /// `RouterNode` Rust la consumera' (TODO). Non ancora letto dai call site.
-    #[allow(
-        dead_code,
-        reason = "campo del contratto classifier (escalation per difficolta'): consumato dal RouterNode Rust quando portato, vedi router.rs TODO"
-    )]
+    /// Complessita' del task (`low`/`medium`/`high`). Consumata dal gate
+    /// `deliberate` del consiglio e dal resolver di dimensionamento
+    /// (`orchestration_sizing::TaskComplexity::try_parse`, punto unico del parse).
     pub complexity: String,
     pub confidence: f32,
     pub model_used: String,
@@ -597,6 +585,9 @@ pub async fn classify(db: &PgPool, gateway: &NexusGatewayClient, message: &str) 
         db,
         CLASSIFIER_PURPOSE,
         limit,
+        // Il classificatore prova i candidati in cascata finche' uno risponde:
+        // gli basta il primo, non chiede diversita' di provider.
+        1,
     )
     .await
     {
@@ -702,10 +693,9 @@ async fn try_classify_once(
 }
 
 // ── Punto unico derivazione action_oriented / report_only (regola L) ─────────
-// Porting 1:1 di `brain/agents/nodes/__init__.py:680-739`. Le decisioni
-// `action_oriented` e `report_only` vivono in un solo posto: i call site
-// (tool_choice forcing, G1, resoconto, route_after_executor lato Python; in
-// Rust i futuri consumer in Tappa 1b) delegano qui invece di re-implementare.
+// Le decisioni `action_oriented` e `report_only` vivono in un solo posto: i call
+// site (tool_choice forcing, G1, resoconto, routing post-executor) delegano qui
+// invece di re-implementare la deduzione dai campi del classifier.
 
 /// Default per `routing.action_oriented_min_agentic_score` (parita' col `0.5`
 /// hardcoded nel ramo Python). Il caller passa il valore letto dal DB.
@@ -1039,118 +1029,7 @@ mod tests {
         fallback_used: bool,
     }
 
-    #[tokio::test]
-    #[ignore = "richiede DB+gateway+brain vivi; validazione manuale cutover"]
-    async fn parita_classifier_rust_vs_python() {
-        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        let db = sqlx::PgPool::connect(&db_url)
-            .await
-            .expect("connessione DB");
-        // Gateway: stesso default del runtime (porta dal DB, token dev).
-        let gw_port = nexus_auth::resolve_port(&db, "nexus_gateway_port").await;
-        let gw_url = format!("http://127.0.0.1:{gw_port}");
-        let token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-            .unwrap_or_else(|_| "dev-internal-token".to_string());
-        let gateway = NexusGatewayClient::new(gw_url, token);
-        let brain_url =
-            std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        let http = reqwest::Client::new();
-
-        let messages = [
-            "elenca i file nella cartella src",
-            "leggi il file src/main.rs e dimmi cosa fa",
-            "crea un file config.toml con la sezione [server]",
-            "correggi il bug di null pointer in user_service.py:42",
-            "ciao come stai",
-            "riassumi cosa hai fatto finora in questa chat",
-            "scrivi i test unitari per il modulo auth",
-            "esegui i test e fai in modo che passino tutti",
-            "verifica che il backend compili e riportami l'esito",
-            "fai un'applicazione web completa per gestire una palestra",
-            "configura un utente admin sul backend",
-            "refactora la funzione parse_config senza cambiarne il comportamento",
-        ];
-
-        println!("\n{:-<140}", "");
-        println!(
-            "{:<48} | {:^28} | {:^28} | {:^22}",
-            "MESSAGGIO",
-            "RUST (intent/score/rt/auth/ao)",
-            "PYTHON (intent/score/rt/auth/ao)",
-            "PARITA'"
-        );
-        println!("{:-<140}", "");
-
-        let min_score = DEFAULT_ACTION_ORIENTED_MIN_SCORE;
-        let mut diffs_chiari = 0;
-        for m in messages {
-            let r = classify(&db, &gateway, m).await;
-            let r_ao = derive_action_oriented(
-                None,
-                Some(r.requires_tools),
-                Some(r.agentic_score),
-                min_score,
-            );
-
-            let py: PyIntent = http
-                .post(format!(
-                    "{}/classify-intent-agentic",
-                    brain_url.trim_end_matches('/')
-                ))
-                .json(&serde_json::json!({ "message": m }))
-                .send()
-                .await
-                .expect("POST brain")
-                .json()
-                .await
-                .expect("JSON brain");
-            let p_ao = derive_action_oriented(
-                None,
-                Some(py.requires_tools),
-                Some(py.agentic_score),
-                min_score,
-            );
-
-            // Parita' "chiara": stesso intent e stesso action_oriented (i due
-            // segnali che governano il routing/governance). Le differenze di
-            // score sotto 0.15 e gli intent borderline non contano come rotture.
-            let r_ro = derive_report_only(true, None, r.authorizes_changes);
-            let p_ro = derive_report_only(true, None, py.authorizes_changes);
-            let intent_ok = r.intent == py.intent;
-            let ao_ok = r_ao == p_ao;
-            let ro_ok = r_ro == p_ro;
-            let score_gap = (r.agentic_score - py.agentic_score).abs();
-            let both_real = !r.fallback_used && !py.fallback_used;
-            let _ = (ro_ok, score_gap);
-            let verdict = if both_real && intent_ok && ao_ok {
-                "OK"
-            } else if !both_real {
-                "fallback (escl.)"
-            } else if ao_ok && !intent_ok {
-                "intent diff"
-            } else {
-                diffs_chiari += 1;
-                "ao DIFF"
-            };
-
-            println!(
-                "{:<46} | {:>10} {:.2} ao={} ro={} | {:>10} {:.2} ao={} ro={} | gap={:.2} {}",
-                truncate(m, 45),
-                r.intent,
-                r.agentic_score,
-                bool_c(r_ao),
-                bool_c(r_ro),
-                py.intent,
-                py.agentic_score,
-                bool_c(p_ao),
-                bool_c(p_ro),
-                score_gap,
-                verdict
-            );
-        }
-        println!("{:-<140}", "");
-        println!("Divergenze action_oriented sui casi non-fallback: {diffs_chiari}");
-    }
+    
 
     fn truncate(s: &str, n: usize) -> String {
         if s.len() <= n {

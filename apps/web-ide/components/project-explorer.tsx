@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useDismissOnOutside } from "../hooks/use-dismiss-on-outside";
 import {
   createProjectEntry,
   deleteProjectEntry,
@@ -642,23 +643,9 @@ function ExplorerContextMenu({
   const tc = useThemeColors();
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Click fuori + ESC = chiudi
-  useEffect(() => {
-    const onClick = (ev: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(ev.target as Node)) {
-        onClose();
-      }
-    };
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") onClose();
-    };
-    window.addEventListener("mousedown", onClick);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onClick);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [onClose]);
+  // Click fuori + ESC = chiudi. Il menu contestuale esiste nel DOM solo mentre e'
+  // aperto (nessun flag `open`), quindi le zone sono sempre attive finche' vive.
+  useDismissOnOutside(true, menuRef, onClose);
 
   // Clamp dentro viewport
   const safeX = Math.min(x, (typeof window !== "undefined" ? window.innerWidth : 1920) - 220);

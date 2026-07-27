@@ -5,7 +5,7 @@ grep -iE 'migration|sqlx_migrations|listening|started' "$LOG" | tail -10
 
 echo ""
 echo "=== Health endpoint per porta ==="
-for p in 3000 4000 4010 4020 4030 4040 4050 4055 4060 8001; do
+for p in 3000 4000 4010 4020 4030 4040 4050 4055 4060; do
   code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$p/health" 2>/dev/null || echo 000)
   printf "  :%-5s %s\n" "$p" "$code"
 done

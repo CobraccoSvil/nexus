@@ -1,8 +1,12 @@
 name: Verify
 
+# Budget Actions: su account Free un repo privato ha 2000 minuti/mese, e questo
+# job ne costa 10-25 per esecuzione. I push su `feature/**` non lo attivano piu':
+# chi vuole il gate prima del merge apre la pull request, che lo esegue comunque.
+# Cosi' un branch di lavoro con dieci commit costa un run invece di dieci.
 on:
   push:
-    branches: [main, develop, "feature/**"]
+    branches: [main, develop]
   pull_request:
     branches: [main, develop]
 
@@ -31,6 +35,11 @@ jobs:
 
     env:
       DATABASE_URL: postgres://nexus:nexus@localhost:5432/nexus
+      # Il runner parte da zero e muore a fine job: la cache incrementale non
+      # verrebbe MAI riusata, ma verrebbe scritta lo stesso. Stesso motivo (e
+      # stesse misure) di scripts/gate-env.sh, che i gate locali sorgono; qui
+      # va ripetuto perche' un workflow YAML non puo' sorgere uno script shell.
+      CARGO_INCREMENTAL: 0
 
     steps:
       - uses: actions/checkout@v4
@@ -65,16 +74,33 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # cargo (dentro pnpm verify) verifica le query sqlx a COMPILE-TIME contro
-      # il DB: non esiste cache .sqlx, quindi serve un DB con lo schema. Il
-      # Postgres del service e' vuoto -> senza migrazioni sqlx fallisce con
-      # "relation ... does not exist". Applichiamo le migrazioni versionate
-      # (stesso approccio di nexus-suite.yml) prima di compilare/testare.
-      - name: Apply DB migrations (schema per sqlx)
-        run: |
-          for f in db/migrations/*.sql; do
-            psql "$DATABASE_URL" -f "$f" || true
-          done
+      # Il Postgres del service e' vuoto: i test che girano su schema reale
+      # (`#[sqlx::test(migrator = ...)]`) hanno bisogno del set applicato.
+      #
+      # Si usa il COMANDO DEL REPO, non sqlx-cli. Prima qui c'era
+      # `cargo install sqlx-cli --locked` + `sqlx migrate run`: "lo stesso
+      # motore della produzione" era vero per CONVENZIONE — quel --locked
+      # pinnava il lockfile di sqlx-cli, non lo sqlx del workspace, quindi i due
+      # potevano divergere a un aggiornamento senza che nessuno se ne
+      # accorgesse. Ora e' vero per COSTRUZIONE: `xtask migrate` delega a
+      # `nexus-migrations`, lo stesso codice che mcp-core esegue all'avvio.
+      # In piu' sparisce un `cargo install` da ogni run.
+      - name: Apply DB migrations
+        run: cargo run --locked -p xtask -- migrate --set meta --apply
+
+      # LA SEQUENZA DI BOOTSTRAP, ESEGUITA invece che descritta.
+      #
+      # Su un database vergine esisteva un ciclo: il catalogo dei servizi arriva
+      # dalle migrazioni; le migrazioni le applicava solo mcp-core all'avvio;
+      # per avviarlo come servizio serve il suo manifest; il manifest si genera
+      # leggendo il catalogo. Lo step precedente ha appena applicato il set
+      # SENZA avviare alcun servizio, e questo dimostra che il catalogo e' li' e
+      # il piano dei manifest e' producibile.
+      #
+      # E' l'unica prova che il ciclo resti rotto nel tempo: una nota in un
+      # documento non fallisce quando qualcuno reintroduce la dipendenza.
+      - name: Bootstrap eseguibile (il ciclo catalogo/manifest e' rotto)
+        run: cargo run --locked -p xtask -- service-manifests --dry-run
 
       # Il crate mcp-proto usa prost-build, che richiede il compilatore protobuf
       # `protoc` a build time. Senza, `cargo check/clippy/test` (dentro pnpm
@@ -86,11 +112,21 @@ jobs:
       - name: Run pnpm verify
         run: pnpm verify
 
+      # Il build di produzione era l'unica verifica esclusiva di ci.yml, che per
+      # il resto rifaceva lint/typecheck/test gia' compresi in `pnpm verify`
+      # (turbo run typecheck lint test). Assorbito qui, ci.yml e' stato rimosso:
+      # due job su ogni push costavano 25 minuti per ~20 di lavoro utile.
+      - name: Build produzione (ex ci.yml)
+        run: pnpm build
+
       - name: Guard punti unici (regola L)
         run: bash scripts/check-single-source.sh
 
       - name: Gate ratchet duplicazione (jscpd)
         run: bash scripts/dup-report.sh
+
+      - name: Gate ratchet marker (debito + inerzia)
+        run: bash scripts/markers-ratchet.sh
 
       - name: Lint commits (xtask)
         run: pnpm xtask lint-commits origin/main HEAD || true

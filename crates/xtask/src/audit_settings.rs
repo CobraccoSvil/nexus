@@ -114,21 +114,25 @@ fn repo_root() -> PathBuf {
 /// docker exec hardcoded). Su Windows nativo il meta-DB e' il servizio Postgres
 /// locale, la stessa DATABASE_URL che usa mcp-core. Se .env manca o DATABASE_URL
 /// non e' definita -> None (rete di sicurezza preservata).
-fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
+/// Esegue una SELECT su una connessione effimera e ritorna le righe.
+///
+/// Punto unico della connessione (regola L): dotenv, DATABASE_URL, runtime
+/// current-thread, pool da una connessione e chiusura erano duplicati parola per
+/// parola nei due collettori che leggono il DB. Il detector di duplicazione lo ha
+/// visto subito ("blocco di 6 righe identico"): due copie della stessa sequenza
+/// divergono alla prima modifica di timeout o di gestione errori.
+///
+/// Qualunque errore collassa a `None` -> il chiamante degrada a `--no-db`.
+fn query_effimera<T>(sql: &str) -> Option<Vec<T>>
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+{
     dotenvy::dotenv().ok();
     let database_url = std::env::var("DATABASE_URL").ok()?;
-
-    // sqlx e' async: runtime current-thread effimero (questo collettore gira una
-    // sola volta per invocazione, niente pool da tenere vivo). Qualunque errore
-    // di costruzione/connessione/query collassa a None -> degrado a --no-db.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-
-    // SELECT identica al vecchio `psql -c`: key + category, ORDER BY key (la
-    // collation del DB definisce l'ordine, vedi doc sopra). `category` puo' essere
-    // NULL -> Option, mappata a "" dal chiamante come psql in modalita' -t -A.
     rt.block_on(async {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -136,15 +140,59 @@ fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
             .connect(&database_url)
             .await
             .ok()?;
-        let rows = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT key, category FROM settings ORDER BY key",
-        )
-        .fetch_all(&pool)
-        .await
-        .ok();
+        let rows = sqlx::query_as::<_, T>(sql).fetch_all(&pool).await.ok();
         pool.close().await;
         rows
     })
+}
+
+fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
+    // SELECT identica al vecchio `psql -c`: key + category, ORDER BY key (la
+    // collation del DB definisce l'ordine, vedi doc sopra). `category` puo' essere
+    // NULL -> Option, mappata a "" dal chiamante come psql in modalita' -t -A.
+    query_effimera::<(String, Option<String>)>("SELECT key, category FROM settings ORDER BY key")
+}
+
+/// Le chiavi che il CATALOGO DEI SERVIZI dichiara come `port_setting_key`.
+///
+/// Sono lette a runtime da `nexus_service_catalog::resolve_port`, che fa
+/// `get_setting_checked(db, key)` con la chiave presa dal catalogo (regola G):
+/// nel codice non compare alcun literal, quindi il censimento testuale le
+/// dichiarerebbe MORTE pur essendo vive — e cancellarle romperebbe la
+/// risoluzione della porta del servizio (`qdrant_port` e' il caso che ha fatto
+/// arrossire il gate).
+///
+/// Si LEGGONO dal catalogo invece di elencarle in `DYNAMIC_READ_PATTERNS`: una
+/// lista scritta a mano divergerebbe al primo servizio nuovo, che e' esattamente
+/// il difetto che i manifest derivati dal catalogo hanno eliminato. Cosi' ogni
+/// voce futura con `port_setting_key` e' coperta senza toccare questo file.
+///
+/// Degrada a vuoto se il DB non e' raggiungibile (modalita' `--no-db`): la
+/// classificazione resta quella testuale, come per tutto il resto.
+fn port_setting_keys_dal_catalogo() -> HashSet<String> {
+    let righe = query_effimera::<(String,)>(
+        "SELECT value FROM settings WHERE key = 'system.services_catalog'",
+    );
+    match righe.and_then(|r| r.into_iter().next()) {
+        Some((raw,)) => port_keys_da_catalogo_json(&raw),
+        None => HashSet::new(),
+    }
+}
+
+/// Le `port_setting_key` dichiarate dal JSON del catalogo. Separata dall'IO
+/// perche' e' la parte con una regola dentro: cosi' si puo' esercitare senza un
+/// DB addosso (regola O), ed e' l'unica parte che sbaglierebbe in silenzio se il
+/// catalogo cambiasse forma.
+fn port_keys_da_catalogo_json(raw: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Ok(Value::Array(voci)) = serde_json::from_str::<Value>(raw) {
+        for v in voci {
+            if let Some(k) = v.get("port_setting_key").and_then(Value::as_str) {
+                out.insert(k.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn collect_db_live() -> Option<Vec<(String, String)>> {
@@ -723,6 +771,9 @@ fn classify(
         .map(|(p, _)| Regex::new(p))
         .collect::<Result<_, _>>()?;
     let keep: HashSet<&str> = KEEP_DESPITE_NO_READER.iter().copied().collect();
+    // Chiavi dichiarate dal catalogo servizi come `port_setting_key`: lette a
+    // runtime dalla chiave, mai come literal nel codice (vedi la funzione).
+    let porte_catalogo = port_setting_keys_dal_catalogo();
     let bulk: HashSet<&str> = CATEGORY_BULK_READERS.iter().map(|(c, _)| *c).collect();
 
     // Replica re.Pattern.match: ancorato all'inizio della stringa.
@@ -742,7 +793,7 @@ fn classify(
     let keyset_db: HashSet<&String> = db.iter().map(|(k, _)| k).collect();
 
     for (key, cat) in db.iter() {
-        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, key, cat);
+        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, &porte_catalogo, key, cat);
         let is_runtime = !migrations.contains_key(key) && runtime_match(key);
         classify_db_key(&mut result, migrations, ui_cats, key, cat, via, is_runtime);
     }
@@ -764,6 +815,7 @@ fn read_via(
     keep: &HashSet<&str>,
     dynamic: &[Regex],
     bulk: &HashSet<&str>,
+    porte_catalogo: &HashSet<String>,
     key: &str,
     category: &str,
 ) -> Option<&'static str> {
@@ -784,6 +836,9 @@ fn read_via(
     }
     if dynamic.iter().any(|r| match_at_start(r, key)) {
         return Some("dynamic");
+    }
+    if porte_catalogo.contains(key) {
+        return Some("catalogo-porte");
     }
     if bulk.contains(category) {
         return Some("category");
@@ -1232,3 +1287,4 @@ fn compare_gate_counts(
     println!("GATE OK: {cur_repr} <= baseline {base_repr}");
     0
 }
+

@@ -2,15 +2,14 @@
 //!
 //! IMPLEMENTERA' (FASE 2) `VerifierRunStore::record` con una INSERT best-effort su
 //! `nexus_agent_verifier_runs` via `sqlx` (1:1 con
-//! `verifier_node._persist_verifier_run`). La scrittura e' gata `Real` (no-op in
-//! `ExecMode::Replay`, punto unico del gate shadow). Best-effort: su errore DB
-//! l'impl logga e ritorna `Ok(())` (il `PortError` resta per un contratto rotto).
+//! `verifier_node._persist_verifier_run`). Best-effort: su errore DB l'impl logga
+//! e ritorna `Ok(())` (il `PortError` resta per un contratto rotto).
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, PortError, VerifierRunRecord, VerifierRunStore};
+use nexus_agent_graph::runtime::ports::{PortError, VerifierRunRecord, VerifierRunStore};
 
 /// Adapter [`VerifierRunStore`] -> `nexus_agent_verifier_runs` via `sqlx`.
 pub struct PgVerifierRunStore {
@@ -31,15 +30,10 @@ impl VerifierRunStore for PgVerifierRunStore {
     /// `verifier_node._persist_verifier_run`, stessa colonna-list `run_id, todo_id,
     /// cycle, criteria_results, passed, duration_ms`).
     ///
-    /// Gate shadow (regola L): no-op in [`ExecMode::Replay`] (il run shadow non
-    /// inquina la telemetria del primario). Best-effort come il Python: un errore
-    /// di INSERT (run_id/todo_id non parseabili a UUID, FK assente, DB down) e'
-    /// loggato e ritorna `Ok(())`; il `PortError` resta per un contratto rotto, mai
-    /// usato nel flusso normale.
-    async fn record(&self, run: VerifierRunRecord, mode: ExecMode) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
+    /// Best-effort come il Python: un errore di INSERT (run_id/todo_id non
+    /// parseabili a UUID, FK assente, DB down) e' loggato e ritorna `Ok(())`; il
+    /// `PortError` resta per un contratto rotto, mai usato nel flusso normale.
+    async fn record(&self, run: VerifierRunRecord) -> Result<(), PortError> {
         // run_id/todo_id sono UUID a livello DB (FK su nexus_agent_plans/_todos):
         // se non parseano la riga e' incoerente -> best-effort skip con WARN.
         let run_uuid = match Uuid::parse_str(&run.run_id) {
@@ -94,25 +88,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Tabella minimale senza FK strette (il gate/best-effort si testa cosi' senza
-    /// dover ricostruire l'intero schema plans/todos).
-    async fn create_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_agent_verifier_runs ( \
-                 id UUID NOT NULL DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 todo_id UUID, \
-                 cycle INTEGER NOT NULL, \
-                 criteria_results JSONB NOT NULL, \
-                 passed BOOLEAN NOT NULL, \
-                 duration_ms INTEGER \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table verifier_runs");
-    }
-
     fn record(run_id: Uuid, todo_id: Uuid) -> VerifierRunRecord {
         VerifierRunRecord {
             run_id: run_id.to_string(),
@@ -124,14 +99,16 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn real_inserisce(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgVerifierRunStore::new(pool.clone());
+        // Piano e todo sono PREREQUISITI reali: `nexus_agent_verifier_runs` ha le
+        // FK verso `nexus_agent_plans(run_id)` e `nexus_agent_todos(id)`, che la
+        // vecchia fixture ometteva per non "dover ricostruire l'intero schema".
         let run_id = Uuid::new_v4();
-        let todo_id = Uuid::new_v4();
+        let todo_id = crate::test_support::seed_todo(&pool, run_id, 1, "pending").await;
         store
-            .record(record(run_id, todo_id), ExecMode::Real)
+            .record(record(run_id, todo_id))
             .await
             .expect("record ok");
         let count: i64 =
@@ -143,25 +120,8 @@ mod tests {
         assert_eq!(count, 1, "in Real la INSERT avviene");
     }
 
-    #[sqlx::test]
-    async fn replay_e_no_op(pool: PgPool) {
-        create_table(&pool).await;
-        let store = PgVerifierRunStore::new(pool.clone());
-        let run_id = Uuid::new_v4();
-        store
-            .record(record(run_id, Uuid::new_v4()), ExecMode::Replay)
-            .await
-            .expect("record ok");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nexus_agent_verifier_runs")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(count, 0, "in Replay (shadow) NESSUNA scrittura");
-    }
-
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn run_id_non_uuid_e_best_effort(pool: PgPool) {
-        create_table(&pool).await;
         let store = PgVerifierRunStore::new(pool.clone());
         let rec = VerifierRunRecord {
             run_id: "non-un-uuid".to_string(),
@@ -173,7 +133,7 @@ mod tests {
         };
         // Best-effort: ritorna Ok senza inserire e senza errore propagato.
         store
-            .record(rec, ExecMode::Real)
+            .record(rec)
             .await
             .expect("best-effort Ok");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nexus_agent_verifier_runs")

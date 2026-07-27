@@ -9,9 +9,11 @@ import { toolLabel } from "./tool-labels";
 import {
   composeActivityStream,
   tracesForRun,
+  type ActivityStream,
   type FoldThreshold,
 } from "../../lib/use-chat/activity-stream";
 import { ActivityStreamView } from "./activity-stream";
+import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -182,6 +184,11 @@ export interface AgentStepsPanelProps {
   // Soglia densita' del collasso tool (derivata dalla larghezza @container).
   foldThreshold?: FoldThreshold;
   isConfirming?: boolean;
+  // Refinement P13: nastro del run PRINCIPALE gia' composto una volta in
+  // chat-panel (useMemo) e condiviso con la campanella. Passandolo qui, renderer
+  // e campanella usano la STESSA istanza -> gli anchorId del deep-link coincidono
+  // per costruzione. Per i sub-run (tab) il pannello compone comunque localmente.
+  mainRunStream?: ActivityStream;
 }
 
 /** P5: Blocco collassabile per gli step piu' vecchi */
@@ -273,8 +280,11 @@ function SingleRunPanel({
         </div>
       )}
 
-      {/* Sezione riepilogo metriche estese */}
-      {(metrics.totalTokens > 0 || metrics.totalCost > 0) && (
+      {/* Sezione riepilogo metriche estese.
+          Solo per i run CONCLUSI: finche' il run e' in corso le stesse cifre sono
+          gia' nella barra di stato (AgentActivityBar, che e' la card di quel run),
+          e mostrarle anche qui significava due card adiacenti con lo STESSO dato. */}
+      {run.completedAt && (metrics.totalTokens > 0 || metrics.totalCost > 0) && (
         <div>
           <div
             onClick={() => setExpandedMetrics(!expandedMetrics)}
@@ -741,6 +751,7 @@ export function AgentStepsPanel({
   activityStreamEnabled = false,
   traces,
   foldThreshold = 3,
+  mainRunStream,
 }: AgentStepsPanelProps) {
   const [activeTab, setActiveTab] = useState<string>(agentRun.runId);
   // Lista "Decisioni del turno" collassata: durante un run la sequenza esplode a
@@ -770,6 +781,19 @@ export function AgentStepsPanel({
   const activeRunData = isMulti
     ? allRuns.find((r) => r.run.runId === activeTab) ?? allRuns[0]
     : allRuns[0];
+
+  // Step del tab ATTIVO, presi dal DB se non sono gia' in memoria (punto unico
+  // `useResolvedRunSteps`, gia' usato dal nastro). Serve perche' i sub-run non
+  // hanno piu' un EventSource dedicato: aprirne uno per ogni sub-agente costava
+  // fino a 8 connessioni su un budget di 6 per origine, e affamava le fetch
+  // normali fino a bloccare il bootstrap della chat. Il progresso dei sub-agenti
+  // resta visibile nel nastro del padre (meta-step subagent_*); qui, quando si
+  // apre il tab di uno di loro, gli step si leggono dal DB. Una sola fetch per
+  // runId, e nessuna quando gli step ci sono gia' (run principale live).
+  const activeRunSteps = useResolvedRunSteps(
+    activeRunData?.run.runId,
+    activeRunData?.steps ?? [],
+  );
 
   return (
     <div
@@ -812,14 +836,23 @@ export function AgentStepsPanel({
       {activityStreamEnabled && activeRunData ? (
         <div style={{ marginBottom: 8 }} data-testid="agent-activity-stream-live">
           <ActivityStreamView
-            stream={composeActivityStream(
-              metaSteps ?? [],
-              activeRunData.steps,
-              traces ? tracesForRun(traces, activeRunData.run.runId) : [],
-              foldThreshold ?? 3,
-            )}
+            stream={
+              // Refinement P13: per il run PRINCIPALE riusa la STESSA istanza
+              // gia' composta in chat-panel (e derivata dalla campanella), cosi'
+              // gli anchorId coincidono per costruzione. I sub-run (tab) compongono
+              // localmente (la campanella non li bersaglia).
+              mainRunStream && activeRunData.run.runId === agentRun.runId
+                ? mainRunStream
+                : composeActivityStream(
+                    metaSteps ?? [],
+                    activeRunSteps,
+                    traces ? tracesForRun(traces, activeRunData.run.runId) : [],
+                    foldThreshold ?? 3,
+                  )
+            }
             tc={tc}
             liveCap={7}
+            runId={activeRunData.run.runId}
           />
         </div>
       ) : (

@@ -10,16 +10,39 @@ use crate::AppState;
 #[derive(Debug, Serialize)]
 pub struct PurposeModelEntry {
     pub purpose: String,
+    /// Il (provider, model_id) scritto in tabella. ATTENZIONE: quando `tier` e'
+    /// valorizzato questi campi NON vengono usati — vedi [`PurposeModelEntry::resolved`].
     pub provider: String,
     pub model_id: String,
-    /// Categoria di modelli (light|medium|heavy) usata come selezione PRIMARIA
-    /// dinamica dal catalog (mig 0203). Quando valorizzata, provider/model_id
-    /// restano solo come fallback statico. `None` = selezione statica diretta.
+    /// Fascia di capacita' usata come selezione dinamica dal catalog (mig 0203).
+    /// Quando e' valorizzata, `resolve_purpose_core` e' TIER-ONLY: provider e
+    /// model_id qui sopra non sono un fallback, sono IGNORATI (regola H:
+    /// fail-loud, niente ripiego su un modello statico).
     pub tier: Option<String>,
     pub required_capability: Option<String>,
     pub requires_tool_use: bool,
     pub notes: Option<String>,
     pub updated_at: String,
+    /// Cosa risolve DAVVERO questo purpose adesso, chiedendolo al resolver.
+    ///
+    /// Perche' esiste: il pannello mostrava `provider/model_id` come se fosse il
+    /// modello del purpose. Misurato il 2026-07-16: le figure del consiglio
+    /// dichiaravano `deepseek/deepseek-v4-flash` mentre giravano su
+    /// `groq/gpt-oss-20b` (agentic_index 3.1) — il resolver ignora il campo
+    /// statico e la pagina mostrava un dato che nessuno usa. Un pannello che
+    /// mostra una configurazione invece dell'effetto e' peggio di un pannello
+    /// vuoto: sembra una verifica, ed e' una bugia.
+    pub resolved: Option<ResolvedPurposeModel>,
+}
+
+/// La risoluzione LIVE di un purpose: chi risponderebbe adesso, e perche'.
+#[derive(Debug, Serialize)]
+pub struct ResolvedPurposeModel {
+    pub provider: String,
+    pub model: String,
+    /// Segnale STRUTTURATO del servizio (regola M): `tier=medium:auto` |
+    /// `tier=medium:degraded_to=light` | `tier=medium:upgraded_to=high`.
+    pub rationale: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,32 +72,52 @@ pub async fn list_purpose_models(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let items = rows
-        .into_iter()
-        .map(
-            |(
-                purpose,
-                provider,
-                model_id,
-                tier,
-                required_capability,
-                requires_tool_use,
-                notes,
-                updated_at,
-            )| PurposeModelEntry {
-                purpose,
-                provider,
-                model_id,
-                tier,
-                required_capability,
-                requires_tool_use,
-                notes,
-                updated_at,
-            },
-        )
-        .collect();
+    let mut items = Vec::with_capacity(rows.len());
+    for (purpose, provider, model_id, tier, required_capability, requires_tool_use, notes, updated_at) in
+        rows
+    {
+        // La risoluzione si CHIEDE al resolver, non si ri-deriva qui (regola L):
+        // e' lo stesso codice che decide durante un run, quindi il pannello non
+        // puo' divergere da cio' che accade davvero. Solo per i purpose
+        // tier-based: senza tier il modello statico E' la risposta.
+        let resolved = if tier.is_some() {
+            resolve_live(&state, &purpose).await
+        } else {
+            None
+        };
+        items.push(PurposeModelEntry {
+            purpose,
+            provider,
+            model_id,
+            tier,
+            required_capability,
+            requires_tool_use,
+            notes,
+            updated_at,
+            resolved,
+        });
+    }
 
     Ok(Json(ListPurposeModelsResponse { items }))
+}
+
+/// Chiede al resolver chi risponderebbe ADESSO per `purpose`. `None` = non
+/// risolvibile ora (catalog irraggiungibile, nessun modello capable, cooldown):
+/// il pannello mostra l'assenza invece di un modello che non verrebbe usato.
+async fn resolve_live(state: &AppState, purpose: &str) -> Option<ResolvedPurposeModel> {
+    use crate::internal_routing::PurposeResolution;
+    match crate::internal_routing::resolve_purpose_model_db(&state.db, purpose).await {
+        PurposeResolution::Resolved {
+            provider,
+            model,
+            rationale,
+        } => Some(ResolvedPurposeModel {
+            provider,
+            model,
+            rationale,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -55,40 +55,18 @@ function ProjectDatabasePageInner() {
     }
   }
 
+  // Statistiche del DB Nexus. Un errore resta un errore: qui c'era un catch che
+  // sostituiva la risposta fallita con sei tabelle finte, 45,2 MB di database e
+  // un cache hit del 94,2% — su QUALSIASI errore, non solo in sviluppo. Il
+  // pannello mostrava numeri credibili mentre il backend era spento.
   async function loadNexusDbStats() {
     setNexusLoading(true);
     setError(null);
     try {
-      // Tenta di caricare dall'API, altrimenti mostra mock
-      try {
-        const data = await fetchJson<NexusDbStats>("/api/admin/nexus-database-stats");
-        setNexusDbStats(data);
-        setNexusLoading(false);
-        return;
-      } catch {
-        // Continua con i dati mock
-      }
-
-      // Dati mock per sviluppo
-      const mockData = {
-        tables: [
-          { name: "nexus_q_values", row_count: 1250, last_updated: new Date(Date.now() - 5 * 60000).toISOString() },
-          { name: "chat_messages", row_count: 8934, last_updated: new Date(Date.now() - 2 * 60000).toISOString() },
-          { name: "agent_interactions", row_count: 456, last_updated: new Date(Date.now() - 15 * 60000).toISOString() },
-          { name: "provider_credentials", row_count: 12, last_updated: new Date(Date.now() - 2 * 3600000).toISOString() },
-          { name: "project_migrations", row_count: 34, last_updated: new Date(Date.now() - 24 * 3600000).toISOString() },
-          { name: "mcp_connectors", row_count: 8, last_updated: new Date(Date.now() - 48 * 3600000).toISOString() },
-        ],
-        stats: {
-          total_rows: 11694,
-          database_size_mb: 45.2,
-          active_connections: 5,
-          table_count: 6,
-          timestamp: new Date().toISOString(),
-        },
-      };
-      setNexusDbStats(mockData);
+      const data = await fetchJson<NexusDbStats>("/api/admin/nexus-database-stats");
+      setNexusDbStats(data);
     } catch (e) {
+      setNexusDbStats(null);
       setError(e instanceof Error ? e.message : "Errore caricamento dati Nexus");
     } finally {
       setNexusLoading(false);
@@ -419,9 +397,11 @@ function ProjectDatabasePageInner() {
               )}
             </div>
           ) : (
-            <div style={{ color: tc.textMuted, fontSize: 14, padding: 24, textAlign: "center",
-              border: `1px dashed ${tc.border}`, borderRadius: 8 }}>
-              Clicca "Aggiorna" per caricare i dati del database Nexus.
+            <div style={{ color: error ? tc.error : tc.textMuted, fontSize: 14, padding: 24, textAlign: "center",
+              border: `1px dashed ${error ? tc.error : tc.border}`, borderRadius: 8 }}>
+              {error
+                ? "Statistiche non disponibili: il backend non ha risposto. Nessun dato da mostrare."
+                : 'Clicca "Aggiorna" per caricare i dati del database Nexus.'}
             </div>
           )}
         </div>

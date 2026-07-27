@@ -135,20 +135,45 @@ pub struct IntentCapability {
 
 impl IntentCapability {
     /// Calcola il tier effettivo per `tokens` applicando le soglie di
-    /// up-promotion. Sostituisce il match statico in
-    /// `orchestrator.rs:444-461`.
+    /// UP-promotion: piu' token = tier non piu' basso, mai piu' basso.
+    ///
+    /// Le soglie sono PAVIMENTI, non assegnazioni. Prima
+    /// `heavy_token_threshold` faceva `tier = "heavy"` SENZA confrontare, quindi
+    /// la funzione che deve PROMUOVERE poteva DECLASSARE: un intent con
+    /// `base_tier='frontier'` e una soglia heavy superata scendeva a 'heavy' —
+    /// la richiesta piu' pesante riceveva il modello MENO capace. Il CHECK della
+    /// tabella ammette esplicitamente 'high' e 'frontier'
+    /// (`nexus_intent_capability_base_tier_check`), quindi lo schema INVITA a
+    /// configurarli: il difetto era latente solo perche' nessuno dei 17 intent
+    /// vivi ha oggi un base_tier sopra 'heavy' (misurato). Era una trappola
+    /// armata, non un caso impossibile.
+    ///
+    /// Il confronto delega al vocabolario unico (`tiers::tier_rank`, regola L)
+    /// invece di confrontare stringhe a mano: cosi' la scala e' quella vera a 5
+    /// livelli — prima 'high' e 'frontier' non esistevano in questa aritmetica.
     pub fn tier_for_tokens(&self, tokens: u32) -> String {
         let mut tier = self.base_tier.clone();
         if let Some(threshold) = self.medium_token_threshold {
-            if tokens >= threshold && tier == "light" {
-                tier = "medium".to_string();
+            if tokens >= threshold {
+                tier = raise_to(tier, "medium");
             }
         }
         if let Some(threshold) = self.heavy_token_threshold {
             if tokens >= threshold {
-                tier = "heavy".to_string();
+                tier = raise_to(tier, "heavy");
             }
         }
+        tier
+    }
+}
+
+/// Alza `tier` ad almeno `floor`, mai sotto. Il confronto viene dal vocabolario
+/// unico (regola L): un livello nuovo entra da solo, senza toccare questa riga.
+fn raise_to(tier: String, floor: &str) -> String {
+    use nexus_agent_graph::decisions::tiers::tier_rank;
+    if tier_rank(&tier) < tier_rank(floor) {
+        floor.to_string()
+    } else {
         tier
     }
 }
@@ -391,6 +416,41 @@ mod tests {
         assert_eq!(c.tier_for_tokens(500), "light");
         assert_eq!(c.tier_for_tokens(6000), "heavy");
         assert_eq!(c.tier_for_tokens(10000), "heavy");
+    }
+
+    /// REGRESSIONE: la promozione per token NON deve mai DECLASSARE.
+    ///
+    /// `heavy_token_threshold` faceva `tier = "heavy"` senza confrontare: un
+    /// intent con `base_tier='frontier'` e la soglia superata scendeva a 'heavy'
+    /// — cioe' la richiesta PIU' PESANTE riceveva il modello MENO capace, dalla
+    /// funzione che serve a dare piu' potenza quando il carico cresce.
+    ///
+    /// Non era un caso impossibile: il CHECK della tabella
+    /// (`nexus_intent_capability_base_tier_check`) ammette esplicitamente 'high'
+    /// e 'frontier'. Era latente solo perche' nessuno dei 17 intent vivi li usa
+    /// oggi: una trappola armata per il primo admin che li configura.
+    #[test]
+    fn tier_for_tokens_promuove_ma_non_declassa_mai() {
+        // frontier + soglia heavy superata: DEVE restare frontier.
+        let c = cap("frontier", "reasoning", None, Some(3000), Some(6000));
+        assert_eq!(c.tier_for_tokens(500), "frontier", "sotto le soglie: invariato");
+        assert_eq!(
+            c.tier_for_tokens(10_000),
+            "frontier",
+            "la soglia e' un PAVIMENTO: un frontier non scende a heavy perche' la \
+             richiesta e' grossa — sarebbe l'opposto di una promozione"
+        );
+        // high + soglia heavy superata: SALE a heavy (la soglia e' sopra).
+        let c = cap("high", "reasoning", None, None, Some(6000));
+        assert_eq!(c.tier_for_tokens(1000), "high");
+        assert_eq!(c.tier_for_tokens(6000), "heavy", "high < heavy: la soglia promuove");
+        // 'high' esiste nella scala: prima non era nemmeno raggiungibile qui.
+        let c = cap("high", "code", None, Some(3000), None);
+        assert_eq!(
+            c.tier_for_tokens(5000),
+            "high",
+            "la soglia medium non declassa un 'high': medium < high"
+        );
     }
 
     #[test]

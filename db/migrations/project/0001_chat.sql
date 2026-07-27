@@ -58,7 +58,12 @@ SET idle_in_transaction_session_timeout = 0;
 SET transaction_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
-SELECT pg_catalog.set_config('search_path', '', false);
+-- Il set_config('search_path','',...) del preambolo pg_dump e' stato RIMOSSO:
+-- sqlx esegue la migrazione e l'INSERT di registrazione in _sqlx_migrations
+-- nella STESSA transazione, quindi azzerare il search_path (anche is_local)
+-- fa fallire quell'INSERT non qualificato con "relazione non esiste" e nessun
+-- DB-progetto vergine puo' nascere. Gli oggetti sono comunque tutti qualificati
+-- con lo schema public, la riga era un residuo inerte del dump.
 SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;

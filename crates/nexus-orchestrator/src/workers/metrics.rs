@@ -11,7 +11,10 @@
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Cadenza del worker: 5 minuti (aggregazione in memoria, nessun I/O esterno).
+const METRICS_INTERVAL_SECS: u64 = 300;
 
 pub struct MetricsAggregationWorker;
 
@@ -35,6 +38,13 @@ impl LearningWorker for MetricsAggregationWorker {
 
     fn trigger(&self) -> WorkerTrigger {
         WorkerTrigger::Both
+    }
+
+    /// 5 minuti: aggregazione in memoria, senza I/O verso provider. Dichiarata
+    /// esplicitamente ora che lo scheduler onora `interval()` — il default del
+    /// trait (60s) sarebbe una scelta per omissione, non una decisione.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(METRICS_INTERVAL_SECS)
     }
 
     async fn run(&self, context: &LearningContext) -> WorkerOutcome {

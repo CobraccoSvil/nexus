@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { usePathname } from "next/navigation";
+import { useDismissOnOutside } from "../hooks/use-dismiss-on-outside";
 import { fetchMe, logout, User } from "../lib/auth";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
@@ -128,17 +129,11 @@ export function UserSidebarMenu({
     fetchMe().then(setUser);
   }, []);
 
-  // Chiudi il menu quando si clicca fuori
-  useEffect(() => {
-    if (!open) return;
-    const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [open]);
+  // Chiudi il menu al clic fuori. Delegando al punto unico il menu guadagna anche
+  // la chiusura con Escape, che prima non aveva: era l'unico popover dell'IDE a
+  // restare aperto sotto Escape.
+  const chiudiMenu = useCallback(() => setOpen(false), []);
+  useDismissOnOutside(open, menuRef, chiudiMenu);
 
   if (!user) return null;
 

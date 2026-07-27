@@ -52,6 +52,21 @@ export function formatValue(val: unknown): string {
   return String(val);
 }
 
+/** Path del file bersaglio di un tool dai suoi input STRUTTURATI (regola M: le
+ *  chiavi note, mai un guess sul testo). Punto unico (regola L) condiviso da chi
+ *  deve "aprire il file" di uno step: notifiche del run (passo fallito, azione
+ *  HITL) e simili. `undefined` se nessuna chiave path e' presente. */
+export function filePathFromToolInput(
+  input: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!input) return undefined;
+  for (const key of ["path", "file_path", "filename", "file"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
 // ── Umanizzazione del RISULTATO tool ────────────────────────────────────────
 
 export interface HumanToolResult {

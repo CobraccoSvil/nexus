@@ -56,6 +56,9 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             get(plugins::figma_oauth_callback),
         )
         .route("/internal/settings/:key", get(settings::get_raw_value))
+        // Emette il JWT di sviluppo. Sostituisce la lettura di `jwt_secret` da
+        // parte del frontend: la chiave di firma non lascia piu' il backend.
+        .route("/internal/dev-login-token", post(auth::dev_login_token))
         .route(
             "/internal/nexus-database-stats",
             get(nexus_database_stats::nexus_database_stats),

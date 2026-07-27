@@ -1,0 +1,16 @@
+[package]
+name = "nexus-migrations-embedded"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sqlx.workspace = true
+# Identita' seminate dai seeder META (`users`, `projects`): le colonne sono UUID.
+uuid.workspace = true
+
+[dev-dependencies]
+# Il ponte fra le due strade: qui si verifica che il set INCORPORATO a
+# compile-time e quello che la produzione LEGGE a runtime siano lo stesso.
+# Senza questa dipendenza le due strade resterebbero legate da una convenzione.
+nexus-migrations = { path = "../nexus-migrations" }
+tokio = { workspace = true }

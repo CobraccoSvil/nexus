@@ -24,7 +24,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::{json, Value};
 
-use super::gateway_client::gateway_image_generate;
+use super::gateway_client::{gateway_image_generate, GwCaller};
 use super::ToolContextCore;
 use nexus_types::routing_client::resolve_purpose_via_http;
 use nexus_types::workspace_paths::resolve_workspace_target;
@@ -97,6 +97,13 @@ pub async fn tool_nexus_generate_image(ctx: &ToolContextCore, input: &Value) -> 
         &prompt,
         size,
         IMAGE_PURPOSE,
+        // Identita' del chiamante: senza, il gateway scarta la riga di ledger e
+        // le immagini generate restano fuori dalla contabilita'.
+        &GwCaller {
+            user_id: ctx.user_id,
+            project_id: ctx.project_id,
+            run_id: ctx.run_id,
+        },
     )
     .await
     {

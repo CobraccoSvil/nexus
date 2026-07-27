@@ -8,6 +8,7 @@ nexus-auth = { path = "../nexus-auth" }
 nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-http = { path = "../nexus-http" }
 nexus-project-pools = { path = "../nexus-project-pools" }
+nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-types = { path = "../nexus-types" }
 anyhow.workspace = true
 chrono.workspace = true

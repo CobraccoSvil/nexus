@@ -30,7 +30,13 @@ const TOGGLES: { key: string; label: string; hint: string }[] = [
   { key: "orchestrator.auto_delegation_enabled", label: "Auto-delegation by description", hint: "Cursor pattern: inserisce <available_subagents> nel system_text" },
   { key: "orchestrator.subagent_project_override_enabled", label: "Project YAML overrides", hint: "Permette .nexus/agents/<kind>.md di shadow-are le definition DB" },
   { key: "orchestrator.subagent_parallel_in_round", label: "Parallel sub-agents per turn", hint: "Permette N dispatch_subagent nello stesso turno LLM" },
-  { key: "orchestrator.dag_parallel_enabled", label: "DAG parallel execution", hint: "Se true (e DAG presente), i todo ready vengono eseguiti in parallelo via dispatch_subagents. Mutuamente esclusivo col worker-mode" },
+  // Il toggle "DAG parallel execution" (orchestrator.dag_parallel_enabled) e'
+  // stato TOLTO da qui. Il suo ramo esiste in route_after_planner, ma il campo
+  // non viene popolato dal DB di proposito: senza il dispatch DAG nell'executor
+  // abilitarlo lascerebbe i todo orfani. Il toggle prometteva quindi
+  // un'esecuzione parallela che non poteva attivare, e l'unico effetto possibile
+  // di accenderlo sarebbe stato dirottare il routing dopo il planner.
+  // I todo in parallelo li esegue gia' il todo_runner, per un'altra strada.
   { key: "orchestrator.dag_topological_enabled", label: "DAG topological order", hint: "Il verifier sceglie il prossimo todo rispettando depends_on (ordine topologico) invece del solo seq lineare" },
   { key: "orchestrator.dag_verify_layer", label: "DAG verify per layer", hint: "Dopo ogni ondata parallela verifica i todo completati prima di procedere al layer successivo" },
 ];

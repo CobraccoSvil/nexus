@@ -295,7 +295,20 @@ async fn windows_visible_service_rows(
     project_id: Uuid,
 ) -> (Vec<WindowsServiceRow>, std::collections::HashSet<String>) {
     use chrono::{DateTime, Utc};
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // DB progetto non disponibile -> nessuna riga osservabile per questo ciclo
+    // (WARN + skip, l'observer riprova al giro successivo).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "windows_visible_service_rows: DB progetto non disponibile, salto il ciclo"
+                );
+                return (Vec::new(), std::collections::HashSet::new());
+            }
+        };
     let rows: Vec<WindowsServiceRow> = sqlx::query_as(
         "SELECT label, status, created_at, pid, exit_code, output, error_output, started_at \
          FROM agent_processes \

@@ -35,7 +35,7 @@ trait LearningWorker {
 
 ## Worker registrati
 
-- **Reactive** (OnTaskComplete): `UltralearnWorker`, `AuditWorker`, `MetricsAggregationWorker`, `VersioningWorker`
+- **Reactive** (OnTaskComplete): `UltralearnWorker`, `MetricsAggregationWorker`, `VersioningWorker`
 - **Periodic**: `ProfilingWorker`, `AnomalyDetectionWorker`, `MemoryConsolidationWorker`, `CleanupWorker`, `SessionPersistenceWorker`, `QLearningReplayWorker`, `ReplicationWorker`, `ClusteringWorker`
 - **Meta-vault**: `MetaDocsRefreshWorker`, `NexusAutoFixWorker`
 

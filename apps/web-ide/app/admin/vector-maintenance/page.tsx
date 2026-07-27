@@ -10,6 +10,7 @@ import {
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
+import { AutoWidthSelect } from "../../../components/auto-width-select";
 
 export default function AdminVectorMaintenancePage() {
   const tc = useThemeColors();
@@ -92,17 +93,12 @@ export default function AdminVectorMaintenancePage() {
           flexWrap: "wrap",
         }}
       >
-        <select
+        <AutoWidthSelect
           value={selectedProjectId}
-          onChange={(e) => setSelectedProjectId(e.target.value)}
+          onChange={(value) => setSelectedProjectId(value)}
           style={inputStyle(tc)}
-        >
-          {projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
+          options={projects.map((project) => ({ value: project.id, label: project.name }))}
+        />
         <button
           onClick={() => void runCompactionNow(true)}
           style={buttonStyle(tc)}

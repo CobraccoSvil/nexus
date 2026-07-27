@@ -422,7 +422,7 @@ fn cooldown_exhaustion_note(result: &crate::agent_types::AgentRunResult) -> Opti
 /// e' finito in cooldown (billing o throttle transiente), non un completamento
 /// vuoto o altra causa ortogonale. Segnale macchina (regola M): nessun parsing di
 /// prosa. Le classi sono quelle emesse dal brain
-/// (`brain_agent_client::classify_provider_error`).
+/// (`agent_turn_setup::classify_provider_error`).
 fn error_class_indicates_cooldown(error_class: Option<&str>) -> bool {
     matches!(
         error_class,
@@ -784,7 +784,7 @@ async fn run_narrative_llm(
 /// allegati piu' recenti.
 async fn build_session_attachments_block(
     // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
-    // chiamante via project_data_pool_by_session_from. A flag OFF e' il meta.
+    // chiamante via project_data_pool_by_session_from.
     db: &PgPool,
     content: &str,
     session_id: Uuid,
@@ -853,7 +853,7 @@ async fn build_session_attachments_block(
 
 pub(crate) async fn build_initial_msg_with_attachments(
     // Pool del DB PER-PROGETTO (chat_message_attachments e' migrata): risolto dal
-    // chiamante via project_data_pool_by_session_from. A flag OFF e' il meta.
+    // chiamante via project_data_pool_by_session_from.
     db: &PgPool,
     content: &str,
     attachments: &[crate::orchestrator::ChatAttachment],
@@ -1137,10 +1137,24 @@ pub(crate) async fn supersede_active_runs(
         "Superato da un nuovo run."
     };
     // Pool del progetto risolto dalla sessione (separazione DB): tabella
-    // agent_runs migrata -> instrada la UPDATE sul DB del progetto (flag off ->
-    // meta). Riusato sotto per l'ingest del worklog dei run superati.
-    let wpool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+    // agent_runs migrata -> instrada la UPDATE sul DB del progetto. Riusato
+    // sotto per l'ingest del worklog dei run superati. DB non disponibile ->
+    // niente da superare LI' (i run vivono su quel DB): WARN e lista vuota.
+    let wpool = match crate::project_db_routes::project_data_pool_by_session_from(
+        &state.db, session_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "supersede_active_runs: DB progetto non disponibile, nessun run superato"
+            );
+            return Vec::new();
+        }
+    };
     let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
         // Cancella TUTTI i run attivi/sospesi-vivi della sessione (punto unico
         // ACTIVE_RUN_STATUSES): il force-stop deve liberare anche un padre sospeso
@@ -1196,7 +1210,7 @@ pub(crate) async fn supersede_active_runs(
             "superseduto (interrotto da un nuovo messaggio)"
         };
         // Worklog nel DB del progetto (separazione DB): riuso il pool per-progetto
-        // gia' risolto sopra dalla sessione (flag off -> meta).
+        // gia' risolto sopra dalla sessione.
         for cid in &cancelled_ids {
             if let Err(e) =
                 crate::session_worklog::ingest_from_db_steps(&state.db, &wpool, *cid, label).await
@@ -1337,13 +1351,46 @@ async fn resolve_disambiguation_reply(
     )
 }
 
+/// Riepilogo del run "dispatcher" di todo-isolation, composto DAI DATI dei todo
+/// completati (regola M), non da prosa generata.
+///
+/// Serve perche' il run principale che delega ai sub-run non attraversa mai un
+/// turno di sintesi (`route_after_todo_runner` -> FinalGate/Learner, mai
+/// Executor) e quindi non produce un `final_answer` proprio: senza questo recap
+/// resterebbe MUTO in chat ora che un piano concluso non viene piu' declassato a
+/// `failed_diagnosed`. Comporlo dai dati -- invece di chiedere un riassunto al
+/// modello -- evita sia una chiamata LLM in piu' sia il rischio di ritrovarsi con
+/// una seconda risposta vuota.
+fn compose_todo_isolation_recap(
+    todos: &[nexus_agent_graph::decisions::dag_scheduler::Todo],
+) -> String {
+    use nexus_agent_graph::decisions::dag_scheduler::TodoStatus;
+    let completati: Vec<&str> = todos
+        .iter()
+        .filter(|t| matches!(t.status, TodoStatus::Completed))
+        .filter_map(|t| t.content.as_deref())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let n = todos
+        .iter()
+        .filter(|t| matches!(t.status, TodoStatus::Completed))
+        .count();
+    let mut out = format!("Piano completato: {n} attivita' eseguite in sub-run isolati.");
+    for c in completati {
+        out.push_str("\n- ");
+        out.push_str(c);
+    }
+    out
+}
+
 /// Mappa l'esito del motore nativo Rust ([`crate::native_engine::NativeRunOutcome`])
 /// nello STESSO [`AgentRunResult`] prodotto da `run_via_brain`, cosi' il primario
 /// nativo converge sul finalizzatore unico (regola L): NESSUNA seconda forma di
 /// finalize, NESSUN ramo `if engine` nel persistente.
 ///
 /// Gli step sono RICOSTRUITI da `agent_steps` (il grafo Rust li ha gia' persistiti
-/// per-superstep via `PgAgentStepStore`, `ExecMode::Real`): il chiamante marca
+/// per-superstep via `PgAgentStepStore`): il chiamante marca
 /// `native_steps_persisted=true` cosi' il finalizzatore NON li re-inserisce
 /// (eviterebbe doppioni; gli step_index del grafo sono `iteration*1000+idx`, non
 /// idempotenti con quelli del path Python). Il worklog usa comunque questi step.
@@ -1353,7 +1400,7 @@ async fn resolve_disambiguation_reply(
 /// - forced-close anti-loop (`loop_*`/`g1_*`) -> `FailedDiagnosed`;
 /// - altrimenti -> `Completed` (il finalizzatore declassa poi l'hollow-senza-lavoro
 ///   a `FailedDiagnosed`, identico al path Python).
-async fn native_outcome_to_run_result(
+pub(crate) async fn native_outcome_to_run_result(
     db: &PgPool,
     run_id: Uuid,
     outcome: crate::native_engine::NativeRunOutcome,
@@ -1459,41 +1506,105 @@ async fn native_outcome_to_run_result(
     // "completato" mentre lo status era failed_diagnosed (run e91d4892). Non si
     // applica alle dichiarazioni oneste (blocked/needs_input/partial: il modello
     // stesso ha gia' descritto l'incompletezza nel summary).
+    // Review adversariale bocciata (ReviewGate): il titolo onesto viene PRIMA
+    // dei rami del final_gate -- l'utente leggeva "TASK COMPLETATO" con la nota
+    // della review appesa sotto, cioe' un successo, su un run failed_diagnosed.
+    let final_answer = if outcome.review_panel_rejected {
+        final_answer.map(|ans| {
+            let nota = outcome
+                .review_panel_last
+                .as_ref()
+                .map(render_review_panel_note)
+                .unwrap_or_else(|| {
+                    "**Review adversariale automatica: NON superata.**".to_string()
+                });
+            compose_unconfirmed_report(
+                &nota,
+                "NON confermata dalla review",
+                &provider,
+                &model,
+                &ans,
+            )
+        })
+    } else {
+        final_answer
+    };
     let final_answer = match (
         final_answer,
         outcome.final_gate_passed,
         outcome.final_gate_unverified,
     ) {
-        (Some(ans), Some(false), _) => Some(format!(
-            "**Verifica automatica non superata** (limite tentativi raggiunto): i \
-             criteri di verifica del progetto non sono passati; il task NON e' \
-             confermato completo. Controlla i criteri falliti nella timeline \
-             \"Decisioni del turno\" e riverifica il flusso reale prima di \
-             considerarlo concluso.\n\n---\n_Resoconto dell'agente (auto-valutazione, \
-             non confermata dalla verifica):_\n{ans}"
+        (Some(ans), Some(false), _) => Some(compose_unconfirmed_report(
+            NOTE_GATE_NON_SUPERATA,
+            "non confermata dalla verifica",
+            &provider,
+            &model,
+            &ans,
         )),
         // Bocciatura del gate in sospeso (run morto prima della ri-verifica, es.
         // provider esauriti): l'ultima verifica ESEGUITA era fallita e le
         // correzioni successive non sono mai state ri-verificate (run a5db0985).
-        (Some(ans), _, _) if outcome.final_gate_failed_pending => Some(format!(
-            "**Verifica automatica fallita e non ripetuta**: l'ultima verifica dei \
-             criteri del progetto era FALLITA e il run si e' chiuso prima di poter \
-             ri-verificare le correzioni. Il task NON risulta verificato e puo' \
-             contenere regressioni: controlla i criteri falliti nella timeline \
-             \"Decisioni del turno\" e riesegui la verifica prima di considerarlo \
-             concluso.\n\n---\n_Resoconto dell'agente (auto-valutazione, non \
-             confermata dalla verifica):_\n{ans}"
+        (Some(ans), _, _) if outcome.final_gate_failed_pending => Some(compose_unconfirmed_report(
+            NOTE_GATE_FALLITA_PENDING,
+            "non confermata dalla verifica",
+            &provider,
+            &model,
+            &ans,
         )),
         // Lavoro svolto ma verifica tecnica NON eseguita (profilo di verifica
         // dell'ambiente assente): annotazione onesta (regola M), non un fallimento.
+        // Forma DIVERSA (nota DOPO, nessun degrado ad auto-valutazione): il lavoro
+        // e' riuscito, manca solo la conferma tecnica. Resta fuori dal punto unico.
         (Some(ans), _, Some(true)) => Some(format!(
-            "{ans}\n\n---\n**Verifica tecnica non eseguita**: per questo progetto non \
-             e' disponibile un profilo di verifica (comandi di build/test), quindi \
+            "{ans}\n\n---\n\n**Verifica tecnica non eseguita**: per questo progetto \
+             non e' disponibile un profilo di verifica (comandi di build/test), quindi \
              l'esito NON e' stato confermato da un comando reale. Definisci i comandi \
              di verifica del progetto oppure ricontrolla manualmente prima di \
              considerarlo concluso."
         )),
         (other, _, _) => other,
+    };
+
+    // Segnale STRUTTURATO del lavoro svolto per DELEGA (regola M). Sotto
+    // todo-isolation (`supervisor_mode=continuous`) i todo del piano sono
+    // eseguiti come SUB-RUN isolati: il run PRINCIPALE e' solo un dispatcher e
+    // `route_after_todo_runner`, a todo esauriti, lo instrada a FinalGate/Learner
+    // e MAI all'Executor. Non scrive quindi `agent_steps` sul proprio run_id e
+    // non produce un `final_answer` (non passa da alcun turno di sintesi): la
+    // detection hollow qui sotto vedrebbe "0 step + risposta vuota" e
+    // declasserebbe a `failed_diagnosed` un run che ha fatto TUTTO il lavoro
+    // (incidente run 79d2d6eb: 7/7 todo completed e file creati, mostrati
+    // all'utente come "fallito").
+    //
+    // FONTE AUTORITATIVA: la tabella `nexus_agent_todos` letta FRESCA dal punto
+    // unico `TodoStore::list_todos` (regola L: la query NON si riscrive qui).
+    // NON si usa lo snapshot in-memory `state.current_todos`: il TodoRunner lo
+    // aggiorna solo nel ramo "c'e' un todo successivo", non in quello terminale
+    // (EndTurn), quindi a piano concluso e' STANTIO e direbbe "non completato".
+    // Best-effort come la lettura degli step: errore -> nessun todo -> il
+    // predicato e' falso -> detection hollow invariata (nessuna regressione sul
+    // gap 0-step b07c7e78).
+    let plan_todos = {
+        use nexus_agent_graph::runtime::ports::TodoStore as _;
+        // `meta` = `db`: `list_todos` non legge `settings`, il pool meta non
+        // viene mai toccato da questa chiamata.
+        crate::agent_graph_adapter::todo_store::PgTodoStore::new(db.clone(), db.clone())
+            .list_todos(&run_id.to_string())
+            .await
+            .unwrap_or_default()
+    };
+    let plan_concluso_con_lavoro =
+        nexus_agent_graph::decisions::dag_scheduler::plan_todos_all_completed(&plan_todos);
+
+    // Recap del dispatcher (regola M): ora che un piano concluso non viene piu'
+    // declassato, il run resterebbe MUTO in chat (prima il placeholder di
+    // diagnosi copriva il buco). Il riepilogo e' composto DAI DATI dei todo
+    // completati -- non da prosa generata: nessuna chiamata LLM in piu' e
+    // nessun rischio di produrre una seconda risposta vuota.
+    let final_answer = match final_answer {
+        Some(ans) if !ans.trim().is_empty() => Some(ans),
+        _ if plan_concluso_con_lavoro => Some(compose_todo_isolation_recap(&plan_todos)),
+        other => other,
     };
 
     // Hollow sul path NATIVO (prima: false hardcoded, "detection del client
@@ -1508,10 +1619,17 @@ async fn native_outcome_to_run_result(
     // e' una detection del client SSE che qui non esiste; il contatore
     // generico consecutive_failures e' la semantica corretta per l'empty
     // answer.
+    //
+    // GATE (regola M): un piano concluso con lavoro reale NON e' mai hollow. Il
+    // gate sta sul PRODUTTORE del flag, cosi' entrambi i consumatori --
+    // `hollow_no_work` del finalizzatore e il gemello puro
+    // `is_report_hollow`/`canonical_run_status` del resume -- lo ereditano senza
+    // duplicare la condizione (regola L).
     let hollow_completion = outcome.completed
         && !matches!(outcome.stop_reason, Some(StopReason::Error))
         && final_answer.is_none()
-        && steps.is_empty();
+        && steps.is_empty()
+        && !plan_concluso_con_lavoro;
 
     crate::agent_types::AgentRunResult {
         run_id: run_id.to_string(),
@@ -1531,9 +1649,12 @@ async fn native_outcome_to_run_result(
         total_tokens: outcome.total_tokens.max(0) as u32,
         total_cost: outcome.total_cost,
         // Lo stato del grafo nativo e' last-write per-turno: outcome.prompt_tokens
-        // E' il prompt dell'ultima iterazione (riempimento contesto corrente).
-        // Va catturato qui, PRIMA che reconcile_run_cost_from_ledger sovrascriva
-        // prompt_tokens col cumulativo di billing del ledger.
+        // E' il prompt LORDO dell'ultima iterazione (riempimento contesto
+        // corrente). Va catturato qui, PRIMA che reconcile_run_cost_from_ledger
+        // sovrascriva prompt_tokens col cumulativo di billing del ledger.
+        //
+        // La finestra la occupa tutto il prompt inviato, cache compresa: la cache
+        // risparmia denaro, non spazio.
         last_prompt_tokens: (outcome.prompt_tokens > 0).then_some(outcome.prompt_tokens as u32),
         // Classe d'errore STRUTTURATA dal grafo (extra.error_class, es.
         // context_overflow — ADR 0016 D2): segnale macchina, mai dal testo.
@@ -1555,6 +1676,48 @@ async fn native_outcome_to_run_result(
         // trace panel): prima il run nativo lasciava la colonna NULL.
         messages_json: outcome.messages_json,
     }
+}
+
+/// Nota di esito del final_gate NON superato al cap. Contratto riconosciuto a
+/// valle (regola M): il prefisso `**Verifica automatica non superata**` e'
+/// matchato da `is_report_hollow`/canonical_run_status e da un test. Invariato.
+const NOTE_GATE_NON_SUPERATA: &str = "**Verifica automatica non superata** \
+(limite tentativi raggiunto): i criteri di verifica del progetto non sono \
+passati; il task NON e' confermato completo. Controlla i criteri falliti nella \
+timeline \"Decisioni del turno\" e riverifica il flusso reale prima di \
+considerarlo concluso.";
+
+/// Nota di esito del gate bocciato e mai ri-verificato (run chiuso prima della
+/// ri-verifica). Contratto (regola M): prefisso invariato.
+const NOTE_GATE_FALLITA_PENDING: &str = "**Verifica automatica fallita e non \
+ripetuta**: l'ultima verifica dei criteri del progetto era FALLITA e il run si \
+e' chiuso prima di poter ri-verificare le correzioni. Il task NON risulta \
+verificato e puo' contenere regressioni: controlla i criteri falliti nella \
+timeline \"Decisioni del turno\" e riesegui la verifica prima di considerarlo \
+concluso.";
+
+/// Punto unico (regola L) del resoconto "auto-valutazione NON confermata": i tre
+/// casi (review bocciata / gate non superato / gate fallito-non-ripetuto)
+/// condividono la STESSA forma e differiscono solo per `note` e `qualifica`.
+/// Compone: nota di esito, header col PROVENIENZA (provider/model che ha
+/// generato il testo) e corpo, con spaziatura markdown ariosa. Le note passate
+/// sono un contratto a valle (regola M): non vengono alterate.
+fn compose_unconfirmed_report(
+    note: &str,
+    qualifica: &str,
+    provider: &str,
+    model: &str,
+    ans: &str,
+) -> String {
+    let prov = if !provider.is_empty() && !model.is_empty() {
+        format!("{provider}/{model} · ")
+    } else {
+        String::new()
+    };
+    format!(
+        "{note}\n\n---\n\n_Resoconto dell'agente ({prov}auto-valutazione, \
+         {qualifica}):_\n\n{ans}"
+    )
 }
 
 /// Riconosce il messaggio di errore provider sintetizzato dall'executor del
@@ -1591,21 +1754,55 @@ pub(crate) struct LedgerTotals {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// Numero di righe FINALIZZATE del ledger per il run. E' il segnale
+    /// STRUTTURATO di "il gateway ha contabilizzato questo run" (regola M):
+    /// distingue "nessuna riga" da "righe a costo zero" — due casi che il solo
+    /// `total_cost` confonde.
+    pub rows: i64,
 }
 
 impl LedgerTotals {
-    /// True se il ledger contiene almeno un costo > 0 per il run: condizione
-    /// per considerarlo la fonte autoritativa (un ledger vuoto / a costo zero
-    /// lascia decidere il fallback catalog).
-    fn has_cost(&self) -> bool {
-        self.total_cost > 0.0
+    /// True se il gateway ha contabilizzato almeno una chiamata per il run.
+    ///
+    /// Deliberatamente NON guarda l'importo: un run i cui modelli hanno prezzo
+    /// ignoto produce righe a costo 0, e quelle righe sono comunque la
+    /// contabilita' autoritativa (i token sono reali). Dedurre "il ledger non
+    /// c'e'" da "il costo e' 0" e' inferire lo stato da una grandezza invece che
+    /// dal segnale strutturato — regola M.
+    pub(crate) fn has_rows(&self) -> bool {
+        self.rows > 0
+    }
+
+    /// Token totali coerenti del run. Alcune righe del ledger possono avere
+    /// `total_tokens = 0` pur avendo prompt/completion validi: in quel caso il
+    /// totale va ricostruito, per non pubblicare "0 token" a fronte di chiamate
+    /// realmente avvenute. Punto unico del quirk (regola L): lo usano sia il run
+    /// di chat sia i sub-run.
+    pub(crate) fn coherent_total_tokens(&self) -> i64 {
+        let tt = self.total_tokens.max(0);
+        if tt > 0 {
+            tt
+        } else {
+            self.prompt_tokens
+                .max(0)
+                .saturating_add(self.completion_tokens.max(0))
+        }
     }
 }
 
 /// Aggrega costo e token dal ledger per il `run_id` dato. Best-effort: se il DB
 /// e' irraggiungibile o non esistono righe, ritorna [`LedgerTotals::default`]
-/// (tutti 0) e il chiamante ricade sul fallback catalog. Il `run_id` del ledger
-/// coincide con `agent_runs.id` (il gateway lo popola dal `request_id` del turno).
+/// (tutti 0, `rows = 0`) e il chiamante ricade sul fallback catalog. Il `run_id`
+/// del ledger coincide con `agent_runs.id` (il gateway lo popola dal
+/// `request_id` del turno).
+///
+/// Conta e somma SOLO le righe `status = 'finalized'`: e' l'unico stato che
+/// rappresenta una chiamata effettivamente contabilizzata (gli altri ammessi dal
+/// CHECK — `reserved`, `rejected`, `failed`, `released` — non lo sono). Filtrare
+/// sullo stato strutturato invece che sull'importo e' la regola M.
+///
+/// NB: NON usare `finalized_at IS NOT NULL` come predicato di finalizzazione —
+/// e' NULL sulla quasi totalita' delle righe realmente finalizzate.
 pub(crate) async fn fetch_ledger_totals(db: &PgPool, run_id: Uuid) -> LedgerTotals {
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -1613,14 +1810,16 @@ pub(crate) async fn fetch_ledger_totals(db: &PgPool, run_id: Uuid) -> LedgerTota
         prompt_tokens: i64,
         completion_tokens: i64,
         total_tokens: i64,
+        rows: i64,
     }
     let row: Option<Row> = sqlx::query_as::<_, Row>(
         "SELECT COALESCE(SUM(total_cost), 0)::float8        AS total_cost,
                 COALESCE(SUM(prompt_tokens), 0)::int8       AS prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0)::int8   AS completion_tokens,
-                COALESCE(SUM(total_tokens), 0)::int8        AS total_tokens
+                COALESCE(SUM(total_tokens), 0)::int8        AS total_tokens,
+                COUNT(*)::int8                              AS rows
            FROM ai_usage_ledger
-          WHERE run_id = $1",
+          WHERE run_id = $1 AND status = 'finalized'",
     )
     .bind(run_id)
     .fetch_optional(db)
@@ -1636,45 +1835,83 @@ pub(crate) async fn fetch_ledger_totals(db: &PgPool, run_id: Uuid) -> LedgerTota
             prompt_tokens: r.prompt_tokens,
             completion_tokens: r.completion_tokens,
             total_tokens: r.total_tokens,
+            rows: r.rows,
         },
         None => LedgerTotals::default(),
     }
 }
 
 /// Riconcilia costo e token di `result` con i totali del ledger (punto unico,
-/// regola L). Il ledger e' la fonte autoritativa: se `result.total_cost == 0`
-/// (caso path NATIVO, che non aggrega nel grafo) e il ledger ha un costo > 0,
-/// sovrascrive `total_cost`/`prompt_tokens`/`completion_tokens`/`total_tokens`
-/// di `result` con i valori aggregati, cosi' TUTTI i consumer a valle
-/// (metadata del messaggio assistant, agent_runs, budget provider) vedono il
-/// costo reale.
+/// regola L). Il ledger e' la fonte autoritativa: se il gateway ha
+/// contabilizzato il run (almeno una riga finalizzata), i suoi totali
+/// sovrascrivono `total_cost`/`prompt_tokens`/`completion_tokens`/`total_tokens`
+/// di `result`, cosi' TUTTI i consumer a valle (metadata del messaggio
+/// assistant, agent_runs, budget provider, cap di spesa dei subagenti) vedono il
+/// costo reale del RUN INTERO.
 ///
-/// Funzione pura/isolata (testabile senza DB): ritorna `true` se ha applicato
-/// i valori del ledger, `false` se ha lasciato `result` invariato (perche'
-/// `result` ha gia' un costo, o perche' il ledger e' vuoto/a costo zero — in
-/// quest'ultimo caso il chiamante mantiene il fallback al calcolo-da-catalog).
+/// Perche' il ledger vince SEMPRE quando ha righe: `result.total_cost` arriva da
+/// `state.total_cost_usd`, che il grafo aggiorna con un reducer di tipo
+/// *overwrite* — vale quindi l'ULTIMO TURNO, non il totale del run
+/// (vedi `native_engine.rs`, campo `total_cost` di `NativeRunOutcome`).
+/// La guardia precedente (`result.total_cost > 0.0` -> non riconciliare) si
+/// fondava sulla premessa "il path nativo lascia total_cost = 0, solo il brain
+/// Python lo valorizza": premessa FALSA (il path nativo lo valorizza col costo
+/// del turno) e per giunta riferita a un brain che non esiste piu'. L'effetto era
+/// che la riconciliazione si auto-disabilitava proprio sui run che doveva
+/// correggere, pubblicando il costo di una singola iterazione come totale.
+///
+/// Funzione pura/isolata (testabile senza DB): ritorna `true` se ha applicato i
+/// valori del ledger, `false` se lo ha lasciato invariato perche' il gateway non
+/// ha contabilizzato nulla per questo run (`rows == 0`) — in quel caso il
+/// chiamante mantiene il fallback al calcolo-da-catalog.
 pub(crate) fn reconcile_run_cost_from_ledger(
     result: &mut crate::agent_types::AgentRunResult,
     ledger: &LedgerTotals,
 ) -> bool {
-    if result.total_cost > 0.0 || !ledger.has_cost() {
+    if !ledger.has_rows() {
         return false;
     }
     result.total_cost = ledger.total_cost;
     result.prompt_tokens = ledger.prompt_tokens.max(0) as u32;
     result.completion_tokens = ledger.completion_tokens.max(0) as u32;
-    // Coerenza: se il ledger non riporta un total_tokens (alcune righe possono
-    // averlo 0) ricostruiscilo da prompt+completion per non mostrare 0 token a
-    // fronte di un costo > 0.
-    let tt = ledger.total_tokens.max(0);
-    result.total_tokens = if tt > 0 {
-        tt as u32
-    } else {
-        result
-            .prompt_tokens
-            .saturating_add(result.completion_tokens)
-    };
+    result.total_tokens = ledger.coherent_total_tokens() as u32;
     true
+}
+
+/// PUNTO UNICO (regola L) della riconciliazione STOP -> stato finale del run.
+///
+/// Un run per cui e' stata richiesta la cancellazione (`cancellation_requested IS
+/// NOT NULL`, scritto dallo Stop utente `user_cancel` o dal supersede last-wins)
+/// NON deve chiudersi 'completed'. Il gate di TESTA dell'executor legge la
+/// cancellazione solo a INIZIO iterazione (`executor.rs`, `head_gate` ->
+/// `StopReason::Superseded`), MAI durante la chiamata LLM: se lo Stop arriva
+/// mentre l'ultima chiamata e' in volo e il modello poi conclude (task_complete/
+/// end_turn), il run finalizza 'completed' senza ripassare dal gate. Questa
+/// riconciliazione chiude la finestra dal lato della persistenza: l'UPDATE e'
+/// ATOMICO (la condizione `cancellation_requested IS NOT NULL` e' valutata dal DB
+/// al momento della scrittura), quindi coglie anche una cancellazione arrivata
+/// DOPO la finalizzazione ma prima di questa chiamata (nessuna race read-modify).
+///
+/// Tocca SOLO il ramo 'completed': un esito 'failed'/'cancelled' resta invariato
+/// (un fallimento tecnico e' informativo, non va mascherato da 'cancelled', e un
+/// 'cancelled' e' gia' corretto). Best-effort: un guasto DB non deve far fallire
+/// la chiusura del run (l'esito 'completed' resta, degradazione onesta).
+async fn enforce_user_cancellation_status(pool: &PgPool, run_id: Uuid) {
+    let res = sqlx::query(
+        "UPDATE agent_runs SET status = 'cancelled' \
+         WHERE id = $1 AND cancellation_requested IS NOT NULL AND status = 'completed'",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "enforce_user_cancellation_status fallito (best-effort): lo Stop \
+             potrebbe non riflettersi nello stato finale"
+        );
+    }
 }
 
 /// Costruisce un [`AgentRunResult`] FAILED ONESTO per il fallimento del motore
@@ -1684,7 +1921,7 @@ pub(crate) fn reconcile_run_cost_from_ledger(
 /// F: niente stack trace), `stop_reason = "error"`. `error_class = None` (non e'
 /// un errore provider classificabile: e' un fallimento di esecuzione del grafo) ->
 /// il loop di retry NON lo ritenta su altri provider (vedi `failed_retry`).
-fn native_engine_failure_result(
+pub(crate) fn native_engine_failure_result(
     run_id: Uuid,
     provider: &str,
     model: &str,
@@ -1905,13 +2142,27 @@ pub(crate) async fn spawn_agent_run(
     // 'chat' (prompt_len=1), vanificando la scelta dell'utente.
     let mut resolved_intent_hint: Option<String> = None;
     // Separazione DB: chat_messages e' migrata -> pool del progetto risolto UNA
-    // volta e riusato per le letture conversazionali di questo spawn (metadata
-    // di disambiguazione, count messaggi, history, hint auto-referenziale).
-    // Sul meta rispondevano sempre vuoto a flag ON: disambiguazione in loop,
-    // routing mai calibrato, history vuota anche per il motore nativo.
-    let msgs_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, params.session_id)
-            .await;
+    // volta e riusato per TUTTE le letture/scritture per-progetto di questo
+    // spawn (disambiguazione, history, INSERT run, allegati, worklog). DB non
+    // disponibile -> NotStarted onesto (regola M), mai il meta: sul meta le
+    // letture rispondono vuoto e le scritture producono run/messaggi fantasma.
+    let msgs_pool = match crate::project_db_routes::project_data_pool_by_session_from(
+        &state.db,
+        params.session_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %params.session_id,
+                error = %e,
+                "spawn_agent_run: DB progetto non disponibile, run non avviato"
+            );
+            state.agent_channels.remove(&run_id);
+            return SpawnOutcome::NotStarted;
+        }
+    };
     if let Some(chosen) =
         resolve_disambiguation_reply(&msgs_pool, params.session_id, &params.content).await
     {
@@ -2154,9 +2405,8 @@ pub(crate) async fn spawn_agent_run(
         );
         // Persist run come "failed" con errore strutturato.
         // Pool del progetto (separazione DB): tabella agent_runs migrata ->
-        // instrada l'INSERT sul DB del progetto (flag off -> meta).
-        let run_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, params.project_id).await;
+        // riusa msgs_pool (stesso DB <slug>_nexus, risolto una volta sopra).
+        let run_pool = msgs_pool.clone();
         let _ = sqlx::query(
             r#"INSERT INTO agent_runs
                (id, session_id, project_id, user_id, run_message_id, status,
@@ -2214,10 +2464,9 @@ pub(crate) async fn spawn_agent_run(
         supersede_active_runs(state, params.session_id, "superseded_by_new_run").await;
 
     // Persist initial run in DB
-    // Pool del progetto (separazione DB): tabella agent_runs migrata -> instrada
-    // l'INSERT sul DB del progetto (flag off -> meta).
-    let run_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, params.project_id).await;
+    // Pool del progetto (separazione DB): tabella agent_runs migrata -> riusa
+    // msgs_pool (stesso DB <slug>_nexus, risolto una volta a inizio spawn).
+    let run_pool = msgs_pool.clone();
     let _ = sqlx::query(
         r#"INSERT INTO agent_runs
            (id, session_id, project_id, user_id, run_message_id, status,
@@ -2534,7 +2783,7 @@ pub(crate) async fn spawn_agent_run(
 
     // Istruzioni specifiche per modelli o-series (o1/o3/o4-mini): forzano
     // l'uso esplicito dei tool instead of narrare le azioni come testo.
-    let o_series_instructions = if crate::brain_agent_client::is_o_series_model_pub(&model_str) {
+    let o_series_instructions = if crate::agent_turn_setup::is_o_series_model_pub(&model_str) {
         // Direttiva tool per modelli reasoning dal DB (regola G/L). Il gate
         // (modello o-series) resta strutturale; il testo vive in
         // system.reasoning_model_tool_directive.
@@ -2549,7 +2798,11 @@ pub(crate) async fn spawn_agent_run(
         String::new()
     };
 
-    let system_text = format!(
+    // `mut`: nel ramo classico la direttiva <consiglio_analisi> viene tolta qui
+    // sotto se il consiglio ha gia' parlato (il suo parere e' nel prompt, la
+    // direttiva sarebbe rumore). Nel ramo overlap resta: il consiglio non ha
+    // ancora deliberato.
+    let mut system_text = format!(
         "{}{}{}{}{}{}{}{}{}",
         project_header,
         risorse_block,
@@ -2575,14 +2828,11 @@ pub(crate) async fn spawn_agent_run(
     // (funzione dedicata) per non gonfiare ulteriormente spawn_agent_run, che e'
     // gia' enorme: una closure complessa inline qui faceva degenerare il typeck
     // del compilatore (ICE).
-    // chat_message_attachments vive nel DB del progetto (separazione DB): risolvo
-    // il pool per-progetto dalla sessione e lo passo alle query interne, coerente
-    // con il worklog piu' sotto. A flag OFF l'helper ritorna il meta.
-    let att_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, params.session_id)
-            .await;
+    // chat_message_attachments vive nel DB del progetto (separazione DB): riusa
+    // msgs_pool (stesso DB, risolto una volta a inizio spawn), coerente con il
+    // worklog piu' sotto.
     let initial_msg = build_initial_msg_with_attachments(
-        &att_pool,
+        &msgs_pool,
         &params.content,
         &params.attachments,
         params.user_message_id,
@@ -2601,66 +2851,90 @@ pub(crate) async fn spawn_agent_run(
     } else {
         classified.complexity != "low"
     };
-    let council_outcome = maybe_convene_council(
-        &state,
-        &run_pool,
-        &tx_for_brain,
-        params.session_id,
+    // Dimensionamento dell'orchestrazione (punto unico orchestration_sizing):
+    // classe del classificatore + profilo admin della classe + budget residuo
+    // -> target dei panel. `None` = sizing spento o segnali non risolti -> cap
+    // storici invariati (bit-identico a flag OFF).
+    let sizing_complexity = if classified.classifier_resolved {
+        nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity::try_parse(
+            &classified.complexity,
+        )
+    } else {
+        None
+    };
+    let sizing_scope_system_wide = classified.slots.scope.trim() == "system_wide";
+    let orchestration_plan = if deliberate {
+        let time_remaining = crate::agent_tools::subagent_native::run_time_remaining_s(
+            &state.db, &run_pool, run_id,
+        )
+        .await;
+        resolve_orchestration_plan_for(
+            &state.db,
+            sizing_complexity,
+            sizing_scope_system_wide,
+            false,
+            0.0,
+            time_remaining,
+        )
+        .await
+    } else {
+        None
+    };
+    if let Some(plan) = &orchestration_plan {
+        emit_orchestration_plan_meta_step(&run_pool, &tx_for_brain, run_id, plan, "pre_run").await;
+    }
+    // I due panel a monte girano in PARALLELO (fase 2 del paradigma): non
+    // condividono dati — le sintesi vengono riconciliate solo a valle da
+    // select_pre_run_advisory — quindi la serializzazione era solo
+    // implementativa (fino a ~300+300s di pre-step nel caso peggiore). La
+    // pressione sub-run e' governata dal semaforo di processo del fan-out
+    // (FanoutGovernor, mig 0603). Le emissioni meta-step restano sequenziali
+    // DOPO la join: ordine deterministico degli step.
+    let upstream_inputs = UpstreamInputs {
+        state: state.clone(),
+        run_pool: run_pool.clone(),
+        tx: tx_for_brain.clone(),
+        session_id: params.session_id,
         run_id,
-        &params.content,
+        user_text: params.content.clone(),
         deliberate,
-    )
-    .await;
-    if let Some(ref outcome) = council_outcome {
-        emit_council_of_competencies_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
-    }
-    let council_block = council_outcome
-        .as_ref()
-        .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
-        .filter(|b| !b.is_empty());
-    let multi_provider_block =
-        maybe_convene_multi_provider_panel(&state, params.session_id, &params.content, deliberate)
-            .await;
-    if let Some(outcome) = &multi_provider_block {
-        emit_multi_provider_panel_meta_step(&run_pool, &tx_for_brain, run_id, outcome).await;
-    }
-    let initial_msg = match (&council_block, &multi_provider_block) {
-        (Some(council_text), Some(outcome)) => {
-            let mp_block = outcome.render_block();
-            if mp_block.is_empty() {
-                format!("{council_text}\n\n{initial_msg}")
-            } else {
-                format!("{council_text}\n\n{mp_block}\n\n{initial_msg}")
-            }
-        }
-        (Some(council_text), None) => format!("{council_text}\n\n{initial_msg}"),
-        (None, Some(outcome)) => {
-            let mp_block = outcome.render_block();
-            if mp_block.is_empty() {
+        plan: orchestration_plan,
+        complexity: sizing_complexity,
+        scope_system_wide: sizing_scope_system_wide,
+    };
+    // OVERLAP (mig 0606): il run parte SUBITO e i panel deliberano in parallelo,
+    // oppure — ramo classico, flag OFF — si attende il loro verdetto qui.
+    // I due rami condividono `run_upstream_panels` (regola L): cambia SOLO chi
+    // aspetta chi.
+    let overlap = nexus_auth::get_bool_setting(&state.db, "orchestrator.advisory_overlap_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+        && deliberate;
+    let (initial_msg, pre_run_advisory_synthesis, pre_run_advisory_source, advisory_gate) =
+        if overlap {
+            // Il modello NON vede i blocchi nel prompt iniziale (non esistono
+            // ancora): li ricevera' come promemoria alla release della barriera,
+            // prima di poter scrivere. Il system prompt tiene la direttiva
+            // <consiglio_analisi>: qui il consiglio non ha ancora parlato.
+            let (gate_tx, gate_rx) = tokio::sync::watch::channel(
+                nexus_agent_graph::nodes::AdvisoryGateState::Pending,
+            );
+            spawn_advisory_gate_task(upstream_inputs, gate_tx);
+            (initial_msg, None, None, Some(gate_rx))
+        } else {
+            let panels = run_upstream_panels(&upstream_inputs).await;
+            let msg = if panels.blocks.is_empty() {
                 initial_msg
             } else {
-                format!("{mp_block}\n\n{initial_msg}")
+                format!("{}\n\n{initial_msg}", panels.blocks.join("\n\n"))
+            };
+            if panels.council_present {
+                system_text = crate::prompt_templates::strip_council_directive(&system_text);
             }
-        }
-        (None, None) => initial_msg,
-    };
-    // Enforcement strutturato a valle (regola M): seedano `pre_run_advisory_synthesis`
-    // ENTRAMBI i panel — consiglio e multi-provider — col verdetto PIU' RESTRITTIVO
-    // che vince (asimmetria chiusa: prima solo il multi-provider era hard-enforced,
-    // un `block` del consiglio restava sola guida testuale).
-    let (pre_run_advisory_synthesis, pre_run_advisory_source) = select_pre_run_advisory(
-        council_outcome
-            .as_ref()
-            .and_then(|o| o.advisory_synthesis_value()),
-        multi_provider_block
-            .as_ref()
-            .and_then(|o| o.advisory_synthesis_value()),
-    );
-    let system_text = if council_block.is_some() {
-        crate::prompt_templates::strip_council_directive(&system_text)
-    } else {
-        system_text
-    };
+            (msg, panels.synthesis, panels.source, None)
+        };
 
     // Se questo run ha SUPERATO run attivi (last-wins), il modello vedra' nella
     // history della sessione il task precedente ancora "aperto" e tende a
@@ -2674,15 +2948,10 @@ pub(crate) async fn spawn_agent_run(
         // Nota arricchita dal worklog (mig 0411): sintesi del lavoro gia'
         // svolto dal run interrotto + puntatore al blocco <session_worklog>.
         // L'ingest e' gia' avvenuto SINCRONO dentro supersede_active_runs.
-        // Worklog nel DB del progetto (separazione DB): risolvo il pool dalla sessione.
-        let wpool = crate::project_db_routes::project_data_pool_by_session_from(
-            &state.db,
-            params.session_id,
-        )
-        .await;
+        // Worklog nel DB del progetto (separazione DB): riusa msgs_pool.
         let worklog_note = crate::session_worklog::supersede_summary(
             &state.db,
-            &wpool,
+            &msgs_pool,
             params.session_id,
             &superseded_runs,
         )
@@ -2730,7 +2999,6 @@ pub(crate) async fn spawn_agent_run(
     // Clono la routing matrix cache per il loop di fallback dentro lo spawn
     // (non posso catturare `state: &AppState` con lifetime locale dentro
     // `tokio::spawn(async move {...})` che richiede 'static).
-    let routing_matrix_for_loop = state.orchestrator.routing_matrix.clone();
     let neural_for_embed = state.orchestrator.neural.clone();
     let recent_history_for_brain = recent_history;
     // L'intent classificato pilota la decisione di retry "hollow completion":
@@ -2743,20 +3011,21 @@ pub(crate) async fn spawn_agent_run(
     // Intent risolto dalla risposta di disambiguazione, propagato al brain
     // (None per i run normali: il router_node classifica come sempre).
     let intent_hint_for_brain: Option<String> = resolved_intent_hint.clone();
-    // Messaggio passato al classifier (con contesto recente) catturato per i rami
-    // nativi: serve a ricostruire i dati COMPLETI del classifier del turno
-    // (Tappa 1b punto B) via `resolve_classifier_fields`. Usato nei rami
-    // Engine::Rust (primario instradato globalmente) ed Engine::Shadow
-    // (attivabile solo per-sessione).
-    let classifier_input_for_shadow: String = classifier_input.clone();
+    // Messaggio passato al classifier (con contesto recente) catturato per il
+    // motore nativo: serve a ricostruire i dati COMPLETI del classifier del turno
+    // (Tappa 1b punto B) via `resolve_classifier_fields`.
+    let classifier_input_for_native: String = classifier_input.clone();
     let pre_run_advisory_synthesis_clone = pre_run_advisory_synthesis.clone();
     let pre_run_advisory_source_clone = pre_run_advisory_source;
+    // Barriera advisory (overlap, mig 0606): il receiver entra nel ctx del grafo
+    // e arma il gate del ToolDispatchNode. `None` nel ramo classico.
+    let advisory_gate_for_run = advisory_gate;
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
     // in `study` esporta solo tool read-only (gating difensivo), in `confirm` e
     // `automatic` esporta la lista completa.
-    let tools_json_for_brain = crate::brain_agent_client::build_tools_json_for_agent(
+    let tools_json_for_brain = crate::agent_turn_setup::build_tools_json_for_agent(
         &state.db,
         params.user_id,
         params.project_id,
@@ -2766,14 +3035,6 @@ pub(crate) async fn spawn_agent_run(
     )
     .await;
 
-    // Lettura della soglia SSE silence da settings (mig 0132). Cache 60s
-    // tramite RoutingThresholdsCache: la doppia chiamata e' gratis.
-    // Fallback al default tecnico (120s) se DB non disponibile.
-    let sse_max_silence_secs: u64 =
-        match state.orchestrator.routing_thresholds.current_async().await {
-            Ok(t) => t.sse_heartbeat_max_silence_secs,
-            Err(_) => 120,
-        };
 
     // Cloni dedicati al panic-handler: se il corpo principale del tokio::spawn
     // panica, dobbiamo comunque emettere is_final e marcare il run come failed
@@ -2800,57 +3061,50 @@ pub(crate) async fn spawn_agent_run(
         );
 
         let agent_body = std::panic::AssertUnwindSafe(async move {
-            // ── Confine di selezione del motore (strangler-fig) ──────────────────
-            // Punto unico select_engine: legge nexus_orchestrator_engine (regola
-            // G; cutover versionato in mig 0532: '*'=rust) -> si esegue il
-            // PRIMARIO nativo (run_via_native). Il record agent_runs.engine
-            // viene popolato per il recovery (sa su quale motore girava un run
-            // interrotto). Il ramo Python legacy (run_via_brain) e' raggiungibile
-            // SOLO con una riga per-scope esplicita engine='python' ed e' INERTE
-            // (il servizio brain e' stato rimosso, mig 0462); il default
-            // difensivo (riga assente / DB down / valore non riconosciuto) e'
-            // Engine::Rust.
-            let engine = select_engine(&db_clone, &session_id_cp.to_string()).await;
-            // Pool del progetto risolto DENTRO il task (separazione DB): la tabella
-            // agent_runs (e agent_steps) e' migrata -> tutte le scritture del run
-            // vanno instradate sul DB del progetto. Risolto una volta dal clone del
-            // meta (db_clone) + project_id_cp catturati (flag off -> meta).
-            let run_pool =
-                crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await;
-            let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
-                .bind(run_id)
-                .bind(match engine {
-                    Engine::Python => "python",
-                    Engine::Rust => "rust",
-                    Engine::Shadow => "shadow",
-                })
-                .execute(&run_pool)
-                .await;
-            // DEBITO 2 (return su Ok) + 3 (finalize): l'esito del PRIMARIO nativo
-            // converge sul medesimo `result` del path Python -> stesso finalizzatore
-            // (regola L: un solo finalize). `native_result=Some` salta il loop di
-            // retry Python (NIENTE doppio-run); `native_steps_persisted` evita la
-            // re-INSERT degli step (il grafo li ha gia' persistiti).
-            let mut native_result: Option<crate::agent_types::AgentRunResult> = None;
-            let mut native_steps_persisted = false;
-            if engine == Engine::Rust {
-                // ── Engine::Rust (cutover verso zero-Python) ──────────────────────
-                // Se `select_engine` seleziona il motore nativo come PRIMARIO, lo si
-                // esegue. Su Err NON si cade piu' sul motore Python (regola H): il
-                // brain sparira' (zero-Python) e un fallback automatico mascherava il
-                // fallimento del grafo nativo dietro un secondo run su un altro motore
-                // (esito disonesto, doppio costo). Su Err si finalizza il run come
-                // FAILED diagnosticato (`native_engine_failure_result`), convergendo
-                // sullo stesso finalizzatore (regola L). Il path nativo riusa gli
-                // stessi input gia' risolti a monte (regola L) + le dipendenze infra
-                // da AppState. NB: lo SHADOW non passa di qui — il suo primario resta
-                // Python (run_via_brain) e lo shadow Rust gira DOPO, aggiuntivo.
-                // ── Parita' PRIMARIO RUST col primario Python: action_oriented ──────
-                // Il primario nativo (RunRole::Primary) deve derivare action_oriented/
-                // report_only ESATTAMENTE come il primario Python (che riclassifica nel
-                // router_node col SUO classifier). Riusiamo il PUNTO UNICO condiviso
-                // con lo shadow (`resolve_classifier_fields`, regola L): classifica il
-                // turno col porting 1:1 + legge la soglia DB. `build_initial_state`
+            // La strangler-fig e' finita: il motore e' UNO, quello nativo.
+            //
+            // Qui `select_engine` leggeva `nexus_orchestrator_engine` e sceglieva
+            // fra Rust, Python (`run_via_brain`) e Shadow (il cui PRIMARIO era
+            // Python). Il brain e' stato rimosso (mig 0462/0532): quei due rami
+            // non instradavano piu' i run su un altro motore, li instradavano nel
+            // vuoto — e restavano armabili con un UPDATE di "rollback" all'aria di
+            // innocuo. `agent_runs.engine` resta valorizzato per il recovery, ora
+            // con l'unico valore possibile.
+            match crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await
+            {
+                Ok(run_pool) => {
+                    let _ = sqlx::query("UPDATE agent_runs SET engine = $2 WHERE id = $1")
+                        .bind(run_id)
+                        .bind(ENGINE_NATIVE)
+                        .execute(&run_pool)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "run task: DB progetto non disponibile, colonna engine non aggiornata"
+                    );
+                }
+            }
+            // `native_steps_persisted` evita la re-INSERT degli step (il grafo li
+            // ha gia' persistiti) nel finalizzatore, che resta uno solo (regola L).
+            // Nessun inizializzatore: ogni ramo del blocco sotto li assegna, e il
+            // compilatore lo verifica. Un default qui sarebbe un valore che nessuno
+            // legge — cioe' un esito finto in attesa di essere scambiato per vero.
+            let native_result: Option<crate::agent_types::AgentRunResult>;
+            let native_steps_persisted: bool;
+            {
+                // Su Err NON si cade su un altro motore (regola H): un fallback
+                // automatico mascherava il fallimento del grafo dietro un secondo
+                // run (esito disonesto, doppio costo). Su Err si finalizza il run
+                // come FAILED diagnosticato (`native_engine_failure_result`).
+                // ── action_oriented ────────────────────────────────────────────────
+                // Il primario nativo deve derivare action_oriented/report_only
+                // ESATTAMENTE come il primario Python (che riclassifica nel
+                // router_node col SUO classifier). Riusiamo il PUNTO UNICO
+                // `resolve_classifier_fields` (regola L): classifica il turno col
+                // porting 1:1 + legge la soglia DB. `build_initial_state`
                 // ramo Primary deriva poi i flag fedeli (read->false: niente G1 spurio;
                 // azione->true: tool). Senza gateway o su fallback del classifier i
                 // campi restano neutri e build_initial_state lascia None (RouterNode
@@ -2858,8 +3112,8 @@ pub(crate) async fn spawn_agent_run(
                 // motore primario instradato globalmente.
                 let primary_classifier = crate::native_engine::resolve_classifier_fields(
                     &db_clone,
-                    state_for_finalize.orchestrator.nexus_gateway.as_ref(),
-                    &classifier_input_for_shadow,
+                    &state_for_finalize.orchestrator.nexus_gateway,
+                    &classifier_input_for_native,
                 )
                 .await;
                 let native_input = crate::native_engine::NativeRunInput {
@@ -2868,12 +3122,15 @@ pub(crate) async fn spawn_agent_run(
                     provider: provider_clone.clone(),
                     model: model_clone.clone(),
                     system_text: system_text_clone.clone(),
+                    // Chiave del prompt di sistema del run principale: la usa il
+                    // ReflectionNode per attribuire la reflection al template.
+                    prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
                     initial_msg: initial_msg_clone.clone(),
                     conversation_history: recent_history_for_brain.clone(),
                     tools_json: tools_json_for_brain.clone(),
                     intent_hint: intent_hint_for_brain.clone(),
-                    // Dati del classifier del turno (helper condiviso con lo shadow):
-                    // il PRIMARIO RUST deriva action_oriented/report_only fedeli.
+                    // Dati del classifier del turno: il PRIMARIO RUST deriva
+                    // action_oriented/report_only fedeli.
                     requires_tools: primary_classifier.requires_tools,
                     agentic_score: primary_classifier.agentic_score,
                     authorizes_changes: primary_classifier.authorizes_changes,
@@ -2888,14 +3145,19 @@ pub(crate) async fn spawn_agent_run(
                     // `dispatch_subagent` (subagent_native) popola questi campi.
                     parent_run_id: None,
                     subagent_depth: None,
+                    sizing_complexity,
+                    sizing_scope_system_wide,
+                    classifier_intent: Some(classified_intent_for_loop.to_string()),
+                    run_time_budget_s: None,
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
                     working_root: None,
                     pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone.clone(),
                     pre_run_advisory_source: pre_run_advisory_source_clone,
+                    advisory_gate: advisory_gate_for_run.clone(),
                 };
                 match run_via_native(&state_for_finalize, &native_input).await {
-                    Ok(mut outcome) => {
+                    Ok(outcome) => {
                         // Niente leak: si logga la LUNGHEZZA della risposta, non il
                         // contenuto (regola F). provider/model EFFETTIVI post cascade.
                         tracing::info!(
@@ -2914,31 +3176,41 @@ pub(crate) async fn spawn_agent_run(
                         // Python): il finalizzatore sotto opera su questo result.
                         // Separazione DB: agent_steps vive nel DB del progetto
                         // (PgAgentStepStore scrive sul run_db) -> la rilettura per
-                        // costruire result.steps DEVE usare lo stesso pool, non il
-                        // meta (dove la tabella e' vuota a flag ON: il worklog
-                        // perderebbe tutti i fatti del run).
-                        let steps_pool =
-                            crate::project_db_routes::project_data_pool_by_session_from(
-                                &db_clone,
-                                session_id_cp,
-                            )
-                            .await;
-                        // Rinforzo PROGRAMMATICO della review adversariale a valle
-                        // (regola H): la direttiva <revisione_finale> (mig 0571) e'
-                        // LLM-driven e puo' essere saltata. Qui, se il run ha
-                        // MODIFICATO codice e NON ha gia' fatto una review, il panel
-                        // viene convocato dal codice e il verdetto riconciliato nel
-                        // resoconto. No-op se disabilitato o non pertinente.
-                        maybe_convene_review_panel(
-                            &state_for_finalize,
-                            &steps_pool,
+                        // costruire result.steps DEVE usare lo stesso pool, mai il
+                        // meta (tabella vuota: il worklog perderebbe i fatti del run).
+                        // La review adversariale programmatica ora vive DENTRO il
+                        // grafo (nodo ReviewGate, prima della chiusura): su
+                        // bocciatura rimanda in correzione invece di annotare un
+                        // run gia' morto. Qui resta solo il mapping dell'esito
+                        // (native_outcome_to_run_result legge review_panel_rejected
+                        // e extra.review_panel_last dal medesimo stato). Se il DB
+                        // del progetto non e' disponibile al finalize, l'esito e'
+                        // un FAILED diagnosticato (regola M), mai il meta.
+                        native_result = match crate::project_db_routes::project_data_pool_by_session_from(
+                            &db_clone,
                             session_id_cp,
-                            run_id,
-                            &mut outcome,
                         )
-                        .await;
-                        native_result =
-                            Some(native_outcome_to_run_result(&steps_pool, run_id, outcome).await);
+                        .await
+                        {
+                            Ok(steps_pool) => Some(
+                                native_outcome_to_run_result(&steps_pool, run_id, outcome).await,
+                            ),
+                            Err(e) => {
+                                tracing::error!(
+                                    run_id = %run_id,
+                                    error = %e,
+                                    "motore nativo: DB progetto non disponibile al finalize"
+                                );
+                                Some(native_engine_failure_result(
+                                    run_id,
+                                    &provider_clone,
+                                    &model_clone,
+                                    format!(
+                                        "DB del progetto non disponibile al finalize del run: {e}"
+                                    ),
+                                ))
+                            }
+                        };
                         native_steps_persisted = true;
                     }
                     Err(e) => {
@@ -2958,7 +3230,7 @@ pub(crate) async fn spawn_agent_run(
                         let msg = format!(
                             "Il motore nativo non e' riuscito a completare il run ({}). \
                              Il run e' stato chiuso come non riuscito.",
-                            crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+                            crate::agent_turn_setup::sanitize_error_for_user(&e.to_string())
                         );
                         native_result = Some(native_engine_failure_result(
                             run_id,
@@ -2977,705 +3249,56 @@ pub(crate) async fn spawn_agent_run(
             // concluso) oppure dal loop di retry Python. Un blocco etichettato lascia
             // il path Python INVARIATO (nessuna re-indentazione): il primario nativo
             // esce subito con `break 'compute`, evitando il doppio-run (DEBITO 2).
-            let mut result: crate::agent_types::AgentRunResult = 'compute: {
-                if let Some(r) = native_result.take() {
-                    break 'compute r;
-                }
-                // ── Loop di retry con fallback automatico tra provider ───────────────
-                // Se il run fallisce per "credit too low" / "quota exceeded", il provider
-                // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
-                // il fallimento e ritentiamo con il prossimo provider della gerarchia
-                // ammin (escludendo quelli in cooldown).
-                //
-                // Limite dinamico: tante iterazioni quanti sono i provider con almeno
-                // un modello idoneo nel catalog (is_enabled + supports_tool_use +
-                // consecutive_failures=0). Il +1 copre il tentativo iniziale. Floor=2
-                // per garantire almeno un fallback se il catalog e' parziale.
-                let max_provider_fallbacks: usize = {
-                    let n: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(DISTINCT provider)
-                   FROM ai_price_catalog
-                  WHERE is_enabled = true
-                    AND supports_tool_use = true
-                    AND agentic_thinking_policy <> 'exclude'
-                    AND consecutive_failures = 0",
-                    )
-                    .fetch_one(&db_clone)
-                    .await
-                    .unwrap_or(4);
-                    std::cmp::max(2, (n as usize).saturating_add(1))
-                };
-                let provider_hierarchy: Vec<String> = {
-                    let row: Option<String> = sqlx::query_scalar(
-                        "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1",
-                    )
-                    .fetch_optional(&db_clone)
-                    .await
-                    .ok()
-                    .flatten();
-                    row.map(|s| {
-                        s.split(',')
-                            .map(|t| t.trim().to_lowercase())
-                            .filter(|t| !t.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_else(|| {
-                        vec![
-                            "anthropic".into(),
-                            "openai".into(),
-                            "google".into(),
-                            "deepseek".into(),
-                            "mistral".into(),
-                        ]
-                    })
-                };
-
-                let mut current_provider = provider_clone.clone();
-                let mut current_model = model_clone.clone();
-                let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-                let mut result;
-                let mut fallback_attempt: usize = 0;
-
-                // ── Fix B+C: stima tokens richiesti e scelta context-aware ──────────
-                // Approssimazione (1 token = ~4 caratteri): system prompt + msg utente
-                // + storia conversazione + descrizioni tool. Usata per:
-                //   B) troncare history se eccede 70% ctx del modello selezionato
-                //   C) pre-filtrare il routing escludendo modelli con ctx insufficiente
-                let estimated_input_chars: usize = {
-                    let history_chars: usize = recent_history_for_brain
-                        .iter()
-                        .map(|m| {
-                            m.get("content")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.len())
-                                .unwrap_or(0)
-                        })
-                        .sum();
-                    let tools_chars: usize = serde_json::to_string(&tools_json_for_brain)
-                        .map(|s| s.len())
-                        .unwrap_or(0);
-                    system_text_clone.len() + initial_msg_clone.len() + history_chars + tools_chars
-                };
-                let estimated_input_tokens: i64 = (estimated_input_chars / 4) as i64;
-                tracing::info!(
-                    "agent_run {}: input stimato {} tokens (~{} chars)",
+            // L'esito del run viene dal motore nativo: e' l'unico motore.
+            //
+            // Qui c'era un blocco etichettato 'compute con dentro 691 righe di
+            // loop di retry Python: il primario nativo usciva subito con un
+            // `break 'compute` e tutto il resto serviva solo a `run_via_brain`.
+            // Il brain e' stato rimosso, e il failover cross-provider che quel
+            // loop implementava vive gia' nel motore nativo
+            // (`nexus-agent-graph`, nodes/executor.rs: "provider caduto ->
+            // FAILOVER cross-provider via routing"): non era una rete di
+            // sicurezza in piu', era una copia irraggiungibile.
+            let mut result: crate::agent_types::AgentRunResult = match native_result {
+                Some(r) => r,
+                // Non raggiungibile per costruzione: ogni ramo del blocco nativo
+                // valorizza `native_result` (esito reale o failure diagnosticato).
+                // Se mai accadesse, il run si chiude come FALLITO dichiarandolo:
+                // un run senza esito non resta appeso ne' viene spacciato per ok.
+                None => native_engine_failure_result(
                     run_id,
-                    estimated_input_tokens,
-                    estimated_input_chars
-                );
-                // Se il modello primario non ha context_window sufficiente (con margine
-                // 30% per output), cerca subito un modello idoneo per ctx.
-                let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
-                // Idoneita' del primario: context_window sufficiente E eleggibilita'
-                // agentica (supports_tool_use AND policy<>'exclude'), lette in un'unica
-                // query. Il routing a monte (routing matrix) puo' aver scelto un modello
-                // NON tool-capable (es. mistral-small-latest, supports_tool_use=false):
-                // in un run agentico fallirebbe sistematicamente (422/MALFORMED/hollow).
-                // Va sostituito SUBITO con un modello eleggibile, non solo quando il
-                // context e' insufficiente. Cosi' il gate di capability vale anche per
-                // il PRIMARIO, non solo per i fallback (prima era bypassato).
-                // context_window e' INT4 in Postgres: il cast ::bigint evita il
-                // type-mismatch i64/INT4 che faceva fallire la decodifica sqlx. Prima
-                // l'errore veniva ingoiato da .ok() -> fallback (8192,false) ->
-                // re-route SEMPRE attivo -> degrado a un modello piccolo anche quando
-                // il routing aveva scelto un modello capace (regola G: niente fallback
-                // magico che nasconde errori). Ora l'errore reale viene loggato.
-                let (primary_ctx, primary_tool_ok): (i64, bool) = match sqlx::query_as(
-                    "SELECT context_window::bigint,
-                        (supports_tool_use AND agentic_thinking_policy <> 'exclude')
-                   FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1",
-                )
-                .bind(&current_provider)
-                .bind(&current_model)
-                .fetch_optional(&db_clone)
-                .await
-                {
-                    Ok(Some(row)) => row,
-                    Ok(None) => {
-                        tracing::warn!(
-                            "agent_run {}: {}/{} assente dal catalog per il check idoneita', \
-                         fallback conservativo (8192, non-tool)",
-                            run_id,
-                            current_provider,
-                            current_model
-                        );
-                        (8192, false)
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "agent_run {}: query idoneita' context fallita per {}/{}: {e} \
-                         (fallback conservativo)",
-                            run_id,
-                            current_provider,
-                            current_model
-                        );
-                        (8192, false)
-                    }
-                };
-                if primary_ctx < ctx_needed || !primary_tool_ok {
-                    tracing::warn!(
-                    "agent_run {}: primario {}/{} non idoneo (ctx {} < {} oppure non tool-capable: {}), re-route agentico",
-                    run_id, current_provider, current_model, primary_ctx, ctx_needed, !primary_tool_ok
-                );
-                    // Re-routing AGENTICO. PUNTO UNICO di selezione (regola L):
-                    // l'eleggibilita' agentica (tool_use, policy<>'exclude',
-                    // consecutive_failures, cooldown) e' definita una sola volta in
-                    // select_agentic_model. Vincolo extra: context_window >= ctx_needed.
-                    let alt = crate::orchestrator::select_agentic_model(
-                        &db_clone,
-                        &[],
-                        None,
-                        ctx_needed,
-                        &[],
-                        "input_cost_per_million_tokens ASC NULLS LAST",
-                    )
-                    .await;
-                    if let Some((p, m)) = alt {
-                        tracing::info!(
-                            "agent_run {}: re-route agentico: {} -> {}/{}",
-                            run_id,
-                            current_model,
-                            p,
-                            m
-                        );
-                        current_provider = p;
-                        current_model = m;
-                    }
-                }
-
-                // ADR 0023 (Fix 3a): se il re-routing context-aware ha cambiato il
-                // modello rispetto a quello registrato a spawn (provider_clone/
-                // model_clone), allinea il record agent_runs al modello EFFETTIVO
-                // con cui il run partira'. Cosi' header e badge dei meta-step (che
-                // leggono agentRun.provider/model) convergono sul modello reale.
-                // Best-effort: un fallimento qui non deve bloccare il run.
-                if current_provider != provider_clone || current_model != model_clone {
-                    let _ = sqlx::query(
-                        "UPDATE agent_runs SET provider = $1, model = $2 WHERE id = $3",
-                    )
-                    .bind(&current_provider)
-                    .bind(&current_model)
-                    .bind(run_id)
-                    // Pool del progetto (separazione DB): agent_runs migrata.
-                    .execute(&run_pool)
-                    .await;
-                    tracing::info!(
-                    "agent_run {}: agent_runs.provider/model aggiornato al modello effettivo {}/{} (era {}/{})",
-                    run_id,
-                    current_provider,
-                    current_model,
-                    provider_clone,
-                    model_clone
-                );
-                }
-
-                loop {
-                    tried.insert(current_provider.to_lowercase());
-                    tracing::info!(
-                        "agent_run {}: tentativo {}/{} con provider={} model={} (ctx_needed={})",
-                        run_id,
-                        fallback_attempt + 1,
-                        max_provider_fallbacks,
-                        current_provider,
-                        current_model,
-                        ctx_needed
-                    );
-                    result = crate::brain_agent_client::run_via_brain(
-                        run_id,
-                        session_id_cp,
-                        current_provider.clone(),
-                        current_model.clone(),
-                        system_text_clone.clone(),
-                        initial_msg_clone.clone(),
-                        tx_for_brain.clone(),
-                        recent_history_for_brain.clone(),
-                        tools_json_for_brain.clone(),
-                        sse_max_silence_secs,
-                        false, // emit_final_event: emesso manualmente dopo il break del retry loop
-                        automation_mode_for_brain.clone(),
-                        intent_hint_for_brain.clone(),
-                        db_clone.clone(),
-                    )
-                    .await;
-
-                    // ── Detection errore infrastrutturale ───────────────────────────
-                    // Il ToolRunner/sandbox down NON e' colpa del modello: non
-                    // incrementare consecutive_failures e terminare senza scalare (gli
-                    // altri provider hanno lo stesso ToolRunner).
-                    // WAVE 2.2: fonte PRIMARIA = error_class STRUTTURATO "infrastructure"
-                    // emesso dal brain (tool_runner_client su gRPC UNAVAILABLE). Il
-                    // contains testuale su final_answer resta SOLO come fallback quando
-                    // il brain non ha propagato la classe (run vecchio), loggato.
-                    let is_infrastructure_error = if result.error_class.as_deref()
-                        == Some("infrastructure")
-                    {
-                        true
-                    } else {
-                        let hit = result
-                            .final_answer
-                            .as_ref()
-                            .map(|s| {
-                                let lower = s.to_lowercase();
-                                lower.contains("sandbox")
-                                    && (lower.contains("gr pc")
-                                        || lower.contains("grpc")
-                                        || lower.contains("connession")
-                                        || lower.contains("non e' raggiungibile")
-                                        || lower.contains("non raggiungibile"))
-                                    || lower.contains("50500")
-                                    || lower.contains("tool_runner")
-                                    || lower.contains("toolrunner")
-                                    || lower.contains("tcp handshaker")
-                            })
-                            .unwrap_or(false);
-                        if hit {
-                            tracing::info!(
-                            "lexical_fallback_used: is_infrastructure_error (contains su final_answer)"
-                        );
-                        }
-                        hit
-                    };
-                    if is_infrastructure_error {
-                        tracing::warn!(
-                    "agent_run {}: errore INFRASTRUTTURALE rilevato (ToolRunner/sandbox down) — \
-                     non incremento consecutive_failures per {}/{}, termino senza fallback (altri \
-                     provider hanno lo stesso ToolRunner)",
-                    run_id, result.provider, result.model
-                );
-                        break;
-                    }
-
-                    // ── Counter hollow per modello (auto-disable) ────────────────────
-                    // Se il run e' hollow_completion REALE in produzione, incrementa
-                    // il counter consecutive_failures su ai_price_catalog. Questo e'
-                    // piu' affidabile del model_health_probe perche' rileva il problema
-                    // su workload reali (prompt lunghi, max_tokens reali) — non con
-                    // "ping" che a volte passa anche su modelli broken (es. gemini-3.5-flash
-                    // risponde a "ping" in 5s ma da hollow su prompt agente).
-                    //
-                    // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
-                    // primo successo (status=Completed e final_answer NON vuoto).
-                    let intent_uses_tools = classified_intent_for_loop != "chat";
-                    if result.status.is_success() && intent_uses_tools {
-                        let success_now = !result.hollow_completion
-                            && result
-                                .final_answer
-                                .as_ref()
-                                .map(|s| !s.trim().is_empty())
-                                .unwrap_or(false);
-
-                        // ── B: tool-failure model-specific (MALFORMED / output-vuoto su tool) ──
-                        // `hollow_no_tools` = il modello aveva tool esposti ma non ne ha
-                        // invocato nessuno al primo turno: e' il segnale runtime di
-                        // finish_reason=MALFORMED_FUNCTION_CALL / output vuoto sul
-                        // tool-forcing (es. gemini-2.5-pro sui task agentici). Questo NON
-                        // significa che il modello sia rotto in assoluto: funziona per i
-                        // task chat. Quindi NON tocchiamo is_enabled (che lo escluderebbe
-                        // ANCHE dai task chat) ma incrementiamo un contatore DEDICATO
-                        // (consecutive_tool_failures) e a soglia marchiamo
-                        // supports_tool_use=false. L'auto-promoter, che per gli intent con
-                        // requires_tool_use filtra su supports_tool_use, lo escludera' dai
-                        // soli intent agentici lasciandolo per chat; il cleanup pass (A)
-                        // disattivera' poi la riga matrix agentica gia' presente.
-                        if result.hollow_no_tools {
-                            let tool_threshold: i32 = crate::settings::get_setting(
-                                &db_clone,
-                                "agent.model_tool_failure_threshold",
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|v| v.trim().parse::<i32>().ok())
-                            .filter(|n| *n > 0)
-                            .unwrap_or(3);
-
-                            // PUNTO UNICO (regola L): counter + degrado a soglia con
-                            // guard NOT capability_locked (mig 0590) vivono in
-                            // tool_capability. Le righe con lock esplicito non vengono
-                            // mai degradate dal runtime (incidente deepseek-v4,
-                            // 2026-06-10).
-                            let rec = crate::tool_capability::record_tool_failure(
-                                &db_clone,
-                                &result.provider,
-                                &result.model,
-                                tool_threshold,
-                                crate::tool_capability::REASON_MALFORMED_TOOL_CALLS,
-                            )
-                            .await;
-                            if let crate::tool_capability::ToolFailureRecord::Counted { failures }
-                        | crate::tool_capability::ToolFailureRecord::MarkedNonToolCapable {
-                            failures,
-                        } = rec
-                        {
-                            tracing::warn!(
-                            "agent_run {}: tool-failure (MALFORMED/empty su tool) su {}/{} — tool_counter={}/{}",
-                            run_id, result.provider, result.model, failures, tool_threshold
-                        );
-                        }
-                        } else if result.hollow_completion {
-                            // Hollow generico NON dovuto al tool-forcing (empty answer):
-                            // mantiene la semantica storica sul contatore
-                            // consecutive_failures -> is_enabled=false a soglia 3.
-                            let new_count: Option<i32> = sqlx::query_scalar(
-                                "UPDATE ai_price_catalog
-                            SET consecutive_failures = consecutive_failures + 1,
-                                updated_at = NOW()
-                          WHERE provider = $1 AND model = $2
-                        RETURNING consecutive_failures",
-                            )
-                            .bind(&result.provider)
-                            .bind(&result.model)
-                            .fetch_optional(&db_clone)
-                            .await
-                            .ok()
-                            .flatten();
-                            if let Some(n) = new_count {
-                                tracing::warn!(
-                                    "agent_run {}: hollow run reale su {}/{} — counter={}/3",
-                                    run_id,
-                                    result.provider,
-                                    result.model,
-                                    n
-                                );
-                                if n >= 3 {
-                                    let _ = sqlx::query(
-                                        "UPDATE ai_price_catalog
-                                    SET is_enabled = false,
-                                        auto_disabled_at = NOW(),
-                                        auto_disabled_reason = 'hollow_completion_runtime',
-                                        updated_at = NOW()
-                                  WHERE provider = $1 AND model = $2
-                                    AND is_enabled = true",
-                                    )
-                                    .bind(&result.provider)
-                                    .bind(&result.model)
-                                    .execute(&db_clone)
-                                    .await;
-                                    tracing::warn!(
-                                        "AUTO-DISABLE runtime {}/{} dopo {} hollow consecutivi",
-                                        result.provider,
-                                        result.model,
-                                        n
-                                    );
-                                }
-                            }
-                        } else if success_now {
-                            // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
-                            // contatori (generico e tool-specific) e riabilita la
-                            // tool-capability se il degrado era automatico, da
-                            // QUALUNQUE fonte (runtime O tool-probe) — punto unico.
-                            crate::tool_capability::reset_tool_failures_on_success(
-                                &db_clone,
-                                &result.provider,
-                                &result.model,
-                                true,
-                            )
-                            .await;
-                        }
-                    }
-
-                    // FIX telemetria esiti-run (audit selezione costi/mascheramento):
-                    // gli esiti REALI dei run agentici alimentano la telemetria di
-                    // governance, cosi' un modello che non converge mai vede scendere la
-                    // sua likelihood e il routing smette di ripescarlo come partenza
-                    // economica. Prima solo probe + hollow la alimentavano: un modello che
-                    // chiudeva 10 run FailedDiagnosed (fa tool call + testo, mai hollow)
-                    // restava likelihood 1.0. Segnale MORBIDO (health-history, MAI
-                    // auto-disable); NON penalizza l'ambiente (blocker reale ->
-                    // BlockedNeedsInput; error_class ambientale escluso; hollow gia' contato
-                    // sopra coi suoi contatori dedicati). Punto unico regola L/M in
-                    // model_health_probe.
-                    if intent_uses_tools {
-                        if crate::model_health_probe::run_outcome_blames_model(
-                            result.status.clone(),
-                            result.error_class.as_deref(),
-                            result.hollow_completion,
-                            result.hollow_no_tools,
-                        ) {
-                            crate::model_health_probe::record_run_outcome_health(
-                                &db_clone,
-                                &result.provider,
-                                &result.model,
-                                false,
-                                "run_nonconvergence",
-                            )
-                            .await;
-                            tracing::info!(
-                            "agent_run {}: esito '{}' attribuito al modello {}/{} -> telemetria governance (likelihood)",
-                            run_id,
-                            result.status.as_str(),
-                            result.provider,
-                            result.model
-                        );
-                        } else if result.status.is_success() && !result.hollow_completion {
-                            // Successo reale: record POSITIVO per bilanciare la finestra
-                            // scorrevole (l'error-rate riflette gli esiti reali, non solo i
-                            // fallimenti che altrimenti la saturerebbero).
-                            crate::model_health_probe::record_run_outcome_health(
-                                &db_clone,
-                                &result.provider,
-                                &result.model,
-                                true,
-                                "",
-                            )
-                            .await;
-                        }
-                    }
-
-                    // Decide se ritentare: nuova logica basata su error_class strutturato
-                    // propagato dal brain via SSE, oltre allo stato cooldown del provider.
-                    // Casi che giustificano un retry su altro provider:
-                    //   - provider in cooldown (lungo o breve, gia' marcato dal brain_agent_client)
-                    //   - error_class in {billing_error, rate_limit, provider_error}
-                    //   - il run e' fallito con stop_reason=error (anche senza classify, ritenta una volta)
-                    //   - hollow_completion: il modello ha risposto senza usare tool (0 step)
-                    let failed_retry = matches!(result.status, AgentRunStatus::Failed) && {
-                        let in_cooldown =
-                            crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
-                        let retriable_class = matches!(
-                            result.error_class.as_deref(),
-                            Some("billing_error")
-                                | Some("rate_limit")
-                                | Some("provider_error")
-                                | Some("invalid_request")
-                        );
-                        in_cooldown || retriable_class
-                    };
-                    // Hollow completion: il modello ha risposto senza usare tool.
-                    // Per intent `chat` (chiacchierata, domande conversazionali,
-                    // meta-domande) la risposta senza tool e' attesa e corretta —
-                    // disabilitiamo il retry. Per altri intent (anche `docs` quando
-                    // l'utente chiede di scrivere/leggere documentazione) il retry
-                    // serve perche' il modello dovrebbe usare tool.
-                    //
-                    // Intent AUTORITATIVO: quello del router del brain propagato in
-                    // nexus_task_type (segnale del classifier LLM). WAVE 4
-                    // (de-lessicalizzazione): se il brain ha fornito l'intent, e' LUI
-                    // a decidere se il run d'azione hollow va ritentato (intent !=
-                    // "chat") — niente piu' OR con le keyword di detect_action_request
-                    // sull'initial_msg, che introducevano falsi positivi (una chat con
-                    // la parola "crea" forzava un retry inutile). Il keyword resta SOLO
-                    // come fallback quando il brain NON ha propagato l'intent (caso
-                    // degradato), loggato come lexical_fallback_used.
-                    let action_intent = match result.nexus_task_type.as_deref() {
-                        Some(intent) => intent != "chat",
-                        None => {
-                            let kw = crate::agent_types::detect_action_request(&initial_msg_clone);
-                            if kw {
-                                tracing::info!(
-                                "lexical_fallback_used: hollow_retry detect_action_request (brain_intent assente)"
-                            );
-                            }
-                            kw || classified_intent_for_loop != "chat"
-                        }
-                    };
-                    // Guardia is_success: il retry hollow esiste per dare una
-                    // risposta a un run "finito bene ma vuoto". Un run gia'
-                    // DIAGNOSTICATO (FailedDiagnosed da forced_close/anti-loop,
-                    // BlockedNeedsInput da dichiarazione) non va ri-eseguito da
-                    // capo su un altro provider: brucerebbe budget ripetendo un
-                    // esito gia' classificato (i Failed retriable passano da
-                    // failed_retry con la loro error_class strutturata).
-                    let hollow_retry =
-                        result.hollow_completion && action_intent && result.status.is_success();
-                    let should_retry = failed_retry || hollow_retry;
-
-                    if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
-                        break;
-                    }
-
-                    if hollow_retry {
-                        tracing::warn!(
-                            "agent_run {}: hollow completion da {}/{} — il modello ha risposto \
-                     senza usare tool, ritento con un modello piu capace",
-                            run_id,
-                            current_provider,
-                            current_model
-                        );
-                    }
-
-                    // ── ESCALATION su hollow ricorrente ─────────────────────────────
-                    // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
-                    // smetti di girare in tondo sui modelli small e scala al primo
-                    // modello "di ordine superiore" disponibile nel catalog:
-                    // performance_tier='heavy' AND is_enabled, ordinato per qualita'
-                    // (costo input desc = proxy di capacita'). Provider-agnostic:
-                    // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
-                    //
-                    // Esempi attesi (sort cost desc):
-                    //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
-                    //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
-                    //
-                    // Conta come "hollow precedente" se hollow_retry == true ora E
-                    // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
-                    let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
-                    let next_pair: Option<(String, String)> = if escalate_on_hollow {
-                        let tried_models: Vec<String> = tried.iter().cloned().collect();
-                        // Escalation su hollow ricorrente: PUNTO UNICO di selezione
-                        // (regola L). Eleggibilita' agentica + cooldown definiti una
-                        // sola volta in select_agentic_model. Esclude i provider gia'
-                        // provati; preferisce i piu' "potenti" (tier desc, costo desc) e
-                        // con context_window sufficiente.
-                        crate::orchestrator::select_agentic_model(
-                        &db_clone,
-                        &[],
-                        None,
-                        ctx_needed,
-                        &tried_models,
-                        "CASE performance_tier WHEN 'heavy' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC, \
-                         input_cost_per_million_tokens DESC NULLS LAST, \
-                         output_cost_per_million_tokens DESC NULLS LAST",
-                    )
-                    .await
-                    .map(|(p, m)| {
-                        tracing::warn!(
-                            "agent_run {}: ESCALATION hollow ricorrente — salto a {}/{} (selettore unico)",
-                            run_id, p, m
-                        );
-                        (p, m)
-                    })
-                    } else {
-                        None
-                    };
-
-                    let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
-                        pair
-                    } else {
-                        // Cerca il prossimo provider nella gerarchia che sia:
-                        //   - non gia' provato in questo run
-                        //   - non in cooldown billing/quota
-                        //   - dotato di un default model in nexus_provider_default_model
-                        //   - con coppia (provider, model) coerente (guard-rail anti-mismatch)
-                        //
-                        // INVARIANTE: provider e model devono SEMPRE appartenere allo
-                        // stesso provider. Un provider senza default model viene SKIPPATO
-                        // nel fallback, mai accoppiato al model del provider precedente.
-                        // Fonte di verita: nexus_provider_default_model (regola G); i
-                        // prefix in model_belongs_to_provider sono detection. Vedi ADR 0016.
-                        //
-                        // Se la routing_matrix non e disponibile non si puo decidere un
-                        // model coerente -> break (manteniamo il result corrente).
-                        let matrix_arc = match routing_matrix_for_loop.current_async().await {
-                            Ok(m) => m,
-                            Err(e) => {
-                                tracing::error!(
-                            "agent_run {}: routing_matrix non disponibile ({}), interrompo fallback e mantengo risultato",
-                            run_id, e
-                        );
-                                break;
-                            }
-                        };
-                        let mut chosen: Option<(String, String)> = None;
-                        for candidate in provider_hierarchy.iter() {
-                            if tried.contains(candidate)
-                                || crate::provider_cooldown::is_provider_in_cooldown(candidate)
-                            {
-                                continue;
-                            }
-                            let Some(candidate_model) = matrix_arc.default_model(candidate) else {
-                                tracing::warn!(
-                            "agent_run {}: provider '{}' senza default model in nexus_provider_default_model, skip nel fallback",
-                            run_id, candidate
-                        );
-                                continue;
-                            };
-                            // Guard-rail: la coppia (provider, model) deve essere coerente.
-                            // Previene QUALSIASI mismatch: se il default model non
-                            // appartiene al provider, NON tentiamo la chiamata (404).
-                            if !model_belongs_to_provider(candidate, &candidate_model) {
-                                tracing::error!(
-                            "agent_run {}: coppia incoerente provider='{}' model='{}' in nexus_provider_default_model, skip nel fallback",
-                            run_id, candidate, candidate_model
-                        );
-                                continue;
-                            }
-                            chosen = Some((candidate.clone(), candidate_model));
-                            break;
-                        }
-                        let Some(pair) = chosen else {
-                            tracing::warn!(
-                        "agent_run {}: nessun provider alternativo con default model coerente disponibile, mantengo risultato",
-                        run_id
-                    );
-                            break;
-                        };
-                        pair
-                    };
-                    // Invariante difensiva finale: anche i candidati da escalation
-                    // hollow (next_pair) passano per il guard-rail. Una coppia
-                    // incoerente non deve mai diventare current_provider/model.
-                    if !model_belongs_to_provider(&chosen_provider, &chosen_model) {
-                        tracing::error!(
-                    "agent_run {}: coppia incoerente scelta provider='{}' model='{}', interrompo fallback (guard-rail)",
-                    run_id, chosen_provider, chosen_model
-                );
-                        break;
-                    }
-                    current_provider = chosen_provider;
-                    current_model = chosen_model;
-                    fallback_attempt += 1;
-                    tracing::warn!(
-                        "agent_run {}: fallback automatico a {}/{} (motivo: {})",
-                        run_id,
-                        current_provider,
-                        current_model,
-                        if hollow_retry {
-                            "hollow completion"
-                        } else {
-                            "provider error/cooldown"
-                        }
-                    );
-                    // Meta-step `fallback` pubblicato in chat per trasparenza:
-                    // utente vede in tempo reale che il sistema ha cambiato
-                    // provider/modello (es. anthropic -> openai per quota_exceeded).
-                    let reason = if hollow_retry {
-                        "hollow_completion"
-                    } else {
-                        "provider_error_or_cooldown"
-                    };
-                    let _ = tx_for_brain.send(AgentStepEvent {
-                        run_id: run_id.to_string(),
-                        step: None,
-                        trace: None,
-                        is_final: false,
-                        token_delta: None,
-                        thinking_delta: None,
-                        meta_step: Some(crate::agent_types::AgentMetaStep {
-                            kind: "fallback".to_string(),
-                            title: format!("Fallback su {}/{}", current_provider, current_model),
-                            payload: serde_json::json!({
-                                "to_provider": current_provider,
-                                "to_model": current_model,
-                                "reason": reason,
-                                "attempt": fallback_attempt,
-                            }),
-                            correlation_id: None,
-                            created_at: chrono::Utc::now().to_rfc3339(),
-                        }),
-                    });
-                }
-                // Espressione finale del blocco 'compute (path Python): `result`.
-                result
-            }; // chiude il blocco 'compute (result = nativo | loop Python)
+                    &provider_clone,
+                    &model_clone,
+                    "Il motore nativo non ha prodotto alcun esito per questo run.".to_string(),
+                ),
+            };
 
             // ── Riconciliazione costo/token del run dal ledger (regola L) ───────
             // Punto unico: il ledger (`ai_usage_ledger`) e' la fonte AUTORITATIVA
             // del costo del run. Il gateway scrive una riga per OGNI chiamata LLM
             // del turno applicando i prezzi corretti del catalog (e gestendo
             // escalation / modelli multipli nello stesso run, cosa che il calcolo
-            // single-price dal catalog NON fa bene). Il path NATIVO non aggrega i
-            // token/costo nel grafo (`result.total_cost/prompt_tokens/...` = 0):
-            // senza questa riconciliazione TUTTI i consumer a valle (metadata del
-            // messaggio assistant totalCost/totalTokens per la UI, agent_runs,
-            // budget provider) vedono $0.00 pur essendo il run costato davvero.
+            // single-price dal catalog NON fa bene). Il grafo nativo, invece,
+            // tiene `total_cost`/`prompt_tokens` con un reducer di tipo overwrite:
+            // valgono l'ULTIMO TURNO, non il run. Senza questa riconciliazione
+            // TUTTI i consumer a valle (metadata del messaggio assistant per la
+            // UI, agent_runs, budget provider) pubblicano il costo di una singola
+            // iterazione spacciandolo per il totale del run.
             //
             // Una sola aggregazione, riusata da messaggio + agent_runs + budget.
-            // Autoritativa solo se `result.total_cost == 0` e il ledger ha costo
-            // > 0; altrimenti si tiene il valore gia' propagato (path Python che
-            // emette total_cost) e resta il fallback al calcolo-da-catalog piu'
-            // sotto per il caso "ledger vuoto" (provider senza ledger).
+            // Autoritativa ogni volta che il gateway ha contabilizzato il run
+            // (almeno una riga finalizzata); resta il fallback al calcolo-da-catalog
+            // piu' sotto solo per il caso "nessuna riga di ledger" (provider che non
+            // scrive ledger, o META irraggiungibile).
             let ledger_totals = fetch_ledger_totals(&db_clone, run_id).await;
-            if reconcile_run_cost_from_ledger(&mut result, &ledger_totals) {
+            // ESITO STRUTTURATO della riconciliazione (regola M): `true` = il
+            // gateway ha contabilizzato il run e i suoi totali sono stati adottati.
+            // Va tenuto: piu' sotto il budget provider deve sapere SE il costo e'
+            // autoritativo, e non puo' dedurlo da "total_cost > 0" — un run
+            // riconciliato con costo 0 (prezzo ignoto) e' contabilita' valida, non
+            // un dato mancante.
+            let cost_reconciled = reconcile_run_cost_from_ledger(&mut result, &ledger_totals);
+            if cost_reconciled {
                 tracing::debug!(
                     run_id = %run_id,
                     cost = result.total_cost,
@@ -3929,18 +3552,31 @@ pub(crate) async fn spawn_agent_run(
                         obj.insert("reasoning".to_string(), json!(reasoning));
                     }
                 }
-                let _ = sqlx::query(
-                r#"INSERT INTO chat_messages
-                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
-                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
-            )
-            .bind(session_id_cp)
-            .bind(project_id_cp)
-            .bind(&effective_answer)
-            .bind(meta)
-            .bind(user_message_id)
-            .execute(&crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp).await)
-            .await;
+                match crate::project_db_routes::project_data_pool_from(&db_clone, project_id_cp)
+                    .await
+                {
+                    Ok(msg_pool) => {
+                        let _ = sqlx::query(
+                            r#"INSERT INTO chat_messages
+                               (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
+                               VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
+                        )
+                        .bind(session_id_cp)
+                        .bind(project_id_cp)
+                        .bind(&effective_answer)
+                        .bind(meta)
+                        .bind(user_message_id)
+                        .execute(&msg_pool)
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            run_id = %run_id,
+                            error = %e,
+                            "finalize: DB progetto non disponibile, messaggio assistant non persistito"
+                        );
+                    }
+                }
 
                 spawn_embed_conversation_turn(
                     neural_for_embed.clone(),
@@ -4043,6 +3679,48 @@ pub(crate) async fn spawn_agent_run(
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&run_pool)
             .await;
+            // Stop utente arrivato durante l'ultima chiamata LLM: riconcilia
+            // 'completed' -> 'cancelled' (punto unico, regola L).
+            enforce_user_cancellation_status(&run_pool, run_id).await;
+
+            // IL LAVORO NON FATTO NON SVANISCE COL RUN. I todo rimasti non
+            // terminali (`pending` = mai iniziati, `blocked` = falliti) vengono
+            // marcati `carry_over`: il backlog del progetto li conserva e un run
+            // successivo puo' RIPRENDERLI invece di ripartire da un'analisi da
+            // zero. Senza questa marcatura la colonna `carry_over` (mig 0244,
+            // con tanto di indice dedicato) e l'endpoint che la legge restavano
+            // lettera morta: nessuno la scriveva MAI, quindi un run che chiudeva
+            // con 12 todo indietro li perdeva del tutto.
+            //
+            // Gli `skipped` sono ESCLUSI di proposito: sono discendenti di un
+            // todo fallito (cascade), quindi vanno ri-pianificati a valle della
+            // causa, non riproposti tali e quali.
+            //
+            // `origin_run_id` conserva la provenienza (solo se non gia' scritto:
+            // un todo ereditato piu' volte deve ricordare da DOVE nasce).
+            // Best-effort: un errore qui non deve impedire la chiusura del run.
+            let carried = sqlx::query(
+                "UPDATE nexus_agent_todos \
+                 SET carry_over = true, \
+                     origin_run_id = COALESCE(origin_run_id, run_id) \
+                 WHERE run_id = $1 AND status IN ('pending', 'blocked')",
+            )
+            .bind(run_id)
+            .execute(&run_pool)
+            .await;
+            match carried {
+                Ok(r) if r.rows_affected() > 0 => tracing::info!(
+                    run_id = %run_id,
+                    todo = r.rows_affected(),
+                    "todo non completati riportati nel backlog del progetto (carry_over)"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    run_id = %run_id,
+                    error = %e,
+                    "carry_over dei todo non riuscito (best-effort)"
+                ),
+            }
 
             // ── Terminatore dello stream: SOLO per gli stati TERMINALI ─────────
             // Emesso DOPO l'INSERT chat_messages e l'UPDATE agent_runs: quando il
@@ -4173,14 +3851,21 @@ pub(crate) async fn spawn_agent_run(
             // budget va stimato sommando il cost dei run reali.
             //
             // Calcolo del cost (gerarchia: ledger -> catalog -> 0):
-            //   - result.total_cost > 0 -> usalo. Copre sia il path Python che
-            //     propaga total_cost, sia il path NATIVO gia' RICONCILIATO dal
-            //     ledger sopra (fonte autoritativa: il gateway ha applicato i
-            //     prezzi corretti per ogni chiamata del run).
-            //   - Altrimenti (ledger vuoto per il run, es. provider che non
-            //     scrive ledger): fallback al calcolo da prompt/completion_tokens
+            //   - riconciliato dal ledger -> usa quel costo, SEMPRE. Il gateway ha
+            //     applicato i prezzi corretti a ogni chiamata del run; se il totale
+            //     e' 0 perche' il prezzo del modello e' ignoto, 0 e' la risposta
+            //     onesta e va addebitata come tale.
+            //   - Altrimenti (nessuna riga di ledger per il run, es. provider che
+            //     non scrive ledger): fallback al calcolo da prompt/completion_tokens
             //     × prezzi del catalog.
-            let cost_to_charge: f64 = if result.total_cost > 0.0 {
+            //
+            // La condizione e' il SEGNALE `cost_reconciled`, non `total_cost > 0`
+            // (regola M). Con la vecchia soglia, i run riconciliati a costo 0 —
+            // misurate 875 righe di ledger con token > 0 e costo 0 — cadevano nel
+            // fallback, che STIMAVA dal catalog un costo che il gateway si era
+            // deliberatamente rifiutato di attribuire, e lo addebitava al budget
+            // del provider. Una stima inventata sopra un dato dichiarato ignoto.
+            let cost_to_charge: f64 = if cost_reconciled {
                 result.total_cost
             } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
                 // Look up prezzi dal catalog. Costo per milione di token.
@@ -4259,7 +3944,7 @@ pub(crate) async fn spawn_agent_run(
             // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
             // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
             // sempre storia vuota, reflection non poteva correlare step con outcome).
-            // Gli step sono gia' raccolti in-memory dal brain_agent_client durante il loop SSE.
+            // Gli step sono gia' raccolti in-memory dal agent_turn_setup durante il loop SSE.
             // DEBITO 3: il PRIMARIO nativo li ha gia' persistiti per-superstep
             // (PgAgentStepStore) -> `native_steps_persisted` salta la re-INSERT (gli
             // step_index del grafo non sono idempotenti con quelli del path Python:
@@ -4311,92 +3996,6 @@ pub(crate) async fn spawn_agent_run(
                 }
             }
 
-            // ── SHADOW (F4): ombra Rust AGGIUNTIVA dopo il primario Python ────────
-            // Solo per Engine::Shadow (non prodotto dal routing globale '*'=rust:
-            // attivabile solo per-sessione con engine='shadow', regola G). Il
-            // primario Python sopra e' gia'
-            // concluso e i suoi agent_steps sono APPENA stati persistiti -> il
-            // Replay puo' rileggerli. Lo shadow gira in un task tokio fire-and-forget
-            // (NON aggiunge latenza all'utente: il primario ha gia' risposto) e su
-            // QUALUNQUE errore logga WARN senza impattare il run reale (lo shadow non
-            // deve mai rompere un run reale). primary_run_id = run_id del primario.
-            if engine == Engine::Shadow {
-                // AppState (con db, neural, channels...) per costruire i deps nativi
-                // dentro il task: clone a basso costo (campi Arc/pool condivisi).
-                let shadow_state = state_for_finalize.clone();
-                let (shadow_tx, _shadow_rx) = tokio::sync::broadcast::channel::<AgentStepEvent>(1);
-
-                // ── Tappa 1b (B): dati COMPLETI del classifier per lo shadow ─────
-                // Lo shadow deve derivare action_oriented/report_only ESATTAMENTE
-                // come il primario Python (che riclassifica nel router_node col SUO
-                // classifier). Replichiamo la decisione col PUNTO UNICO condiviso
-                // `resolve_classifier_fields` (regola L: lo STESSO helper del ramo
-                // PRIMARY-Rust, niente classify+soglia copiate): classifica in-process
-                // col porting 1:1 + legge la soglia DB. `build_initial_state` deriva
-                // poi i flag fedeli. Indipendente dal flag `routing.classifier_engine`:
-                // lo shadow usa SEMPRE il classifier rust per i propri dati (e' la sua
-                // natura di replay). Fire-and-forget post-primario -> ZERO latenza per
-                // l'utente. Senza gateway o su fallback del classifier i campi restano
-                // neutri (build_initial_state cade sul fallback grossolano
-                // action_oriented_for_intent).
-                let shadow_classifier = crate::native_engine::resolve_classifier_fields(
-                    &shadow_state.db,
-                    shadow_state.orchestrator.nexus_gateway.as_ref(),
-                    &classifier_input_for_shadow,
-                )
-                .await;
-
-                let shadow_input = crate::native_engine::NativeRunInput {
-                    run_id,
-                    session_id: session_id_cp,
-                    provider: provider_clone.clone(),
-                    model: model_clone.clone(),
-                    system_text: system_text_clone.clone(),
-                    initial_msg: initial_msg_clone.clone(),
-                    conversation_history: recent_history_for_brain.clone(),
-                    tools_json: tools_json_for_brain.clone(),
-                    intent_hint: intent_hint_for_brain.clone(),
-                    requires_tools: shadow_classifier.requires_tools,
-                    agentic_score: shadow_classifier.agentic_score,
-                    authorizes_changes: shadow_classifier.authorizes_changes,
-                    classifier_resolved: shadow_classifier.classifier_resolved,
-                    action_oriented_min_score: shadow_classifier.action_oriented_min_score,
-                    automation_mode: automation_mode_for_brain.clone(),
-                    supervisor_mode: crate::native_engine::graph_supervisor_mode(
-                        params.supervisor_mode,
-                    ),
-                    // Canale SSE fittizio: lo shadow usa NullEventSink (non emette
-                    // nulla), questo tx esiste solo per soddisfare la firma di
-                    // NativeRunInput e viene scartato.
-                    step_tx: shadow_tx,
-                    // Shadow del run PRINCIPALE: nessun parent/depth sub-agente.
-                    parent_run_id: None,
-                    subagent_depth: None,
-                    // Shadow Replay-only (nessun side-effect): nessun override root.
-                    working_root: None,
-                    pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone,
-                    pre_run_advisory_source: pre_run_advisory_source_clone,
-                };
-                let primary_run_id = run_id;
-                tokio::spawn(async move {
-                    match run_shadow_for_state(&shadow_state, &shadow_input, primary_run_id).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                primary_run_id = %primary_run_id,
-                                "shadow: run ombra completato (telemetria persistita)"
-                            );
-                        }
-                        Err(e) => {
-                            // Lo shadow non impatta MAI il primario: solo WARN.
-                            tracing::warn!(
-                                primary_run_id = %primary_run_id,
-                                error = %e,
-                                "shadow: run ombra fallito (nessun impatto sul primario)"
-                            );
-                        }
-                    }
-                });
-            }
         }); // chiude AssertUnwindSafe(async move { ... })
 
         // Cattura panic dell'intero body: senza questo, un panic dentro lo
@@ -4431,9 +4030,25 @@ pub(crate) async fn spawn_agent_run(
             // Pool del progetto (separazione DB): agent_runs (e chat_messages sotto)
             // migrate -> instrada le scritture del panic-handler sul DB del progetto.
             // Risolto una volta dal clone del meta (panic_db) + panic_project_id
-            // catturati (flag off -> meta); riusato per l'INSERT chat_messages sotto.
-            let panic_pool =
-                crate::project_db_routes::project_data_pool_from(&panic_db, panic_project_id).await;
+            // catturati; riusato per l'INSERT chat_messages sotto. DB non
+            // disponibile -> il panic-handler NON deve panicare a sua volta:
+            // ERROR e uscita (il run_reaper chiudera' il run stale).
+            let panic_pool = match crate::project_db_routes::project_data_pool_from(
+                &panic_db,
+                panic_project_id,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        run_id = %panic_run_id,
+                        error = %e,
+                        "panic-handler: DB progetto non disponibile, run non marcato failed"
+                    );
+                    return;
+                }
+            };
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status='failed', completed_at=NOW(), \
                  final_answer=$2 WHERE id=$1",
@@ -4474,164 +4089,17 @@ pub(crate) async fn spawn_agent_run(
 }
 
 // ===========================================================================
-// Confine di selezione del motore di orchestrazione (strangler-fig).
+// Motore di orchestrazione: uno solo, quello nativo.
 //
-// Punto UNICO (regola L) di decisione "quale motore esegue questo run":
-// `select_engine`. Cutover completo: `run_via_native` (motore Rust) e' il path
-// PRIMARIO instradato globalmente (`*`=rust). Il flusso legacy `run_via_brain`
-// (motore Python) resta solo come rollback per-sessione / default difensivo.
+// Qui viveva la strangler-fig: `select_engine` leggeva `nexus_orchestrator_engine`
+// e sceglieva fra Engine::{Rust, Python, Shadow}. Il cutover e' finito e il brain
+// Python e' stato rimosso (mig 0462/0532): l'enum, la cache TTL e la risoluzione
+// scope-specifico/jolly sono spariti con lui. Restava un solo valore vivo.
 // ===========================================================================
 
-/// Motore di orchestrazione con cui un run viene eseguito.
-///
-/// Persistito su `agent_runs.engine` (per il recovery) e deciso da
-/// `select_engine` leggendo `nexus_orchestrator_engine` (regola G: la fonte e'
-/// il DB, niente env var ne' default hardcoded di emergenza).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Engine {
-    /// Motore legacy Python/LangGraph (`run_via_brain`), ora solo rollback /
-    /// default difensivo, non piu' il corrente.
-    Python,
-    /// Motore nativo PRIMARIO in produzione (`nexus-agent-graph`).
-    Rust,
-    /// Doppia esecuzione di confronto (parita'): primario + ombra Rust senza
-    /// side-effect. Attivabile solo per-sessione (`engine='shadow'`).
-    Shadow,
-}
-
-impl Engine {
-    /// Parsing dal valore TEXT del DB. Sconosciuto -> `None` (il chiamante
-    /// cade sul default difensivo 'python' loggando un warn, senza mascherare il
-    /// dato malformato).
-    fn from_db(value: &str) -> Option<Engine> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "python" => Some(Engine::Python),
-            "rust" => Some(Engine::Rust),
-            "shadow" => Some(Engine::Shadow),
-            _ => None,
-        }
-    }
-}
-
-/// Chiave jolly (default globale) in `nexus_orchestrator_engine`.
-const ENGINE_GLOBAL_SCOPE: &str = "*";
-
-static ENGINE_CACHE: std::sync::OnceLock<nexus_cache::TtlCache<String, Engine>> =
-    std::sync::OnceLock::new();
-
-/// Cache TTL 60s del routing motore (stesso pattern di model_selection.rs,
-/// punto unico cache regola L). La chiave e' lo `scope_key` risolto.
-fn engine_cache() -> &'static nexus_cache::TtlCache<String, Engine> {
-    ENGINE_CACHE.get_or_init(|| nexus_cache::TtlCache::new(std::time::Duration::from_secs(60)))
-}
-
-/// Decide il motore di orchestrazione per il run corrente (PUNTO UNICO).
-///
-/// Legge `nexus_orchestrator_engine` (mig 0451) con cache 60s PER-SCOPE. Lo
-/// `scope_key` e' il `session_id` testuale del run. Risoluzione (regola G):
-///   1. riga con `scope_key = <scope>` (override per-sessione/progetto), se c'e';
-///   2. fallback alla riga jolly '*' (default globale = 'rust', instradato
-///      globalmente; l'override per-sessione resta comunque possibile).
-///
-/// Cosi' un `engine = 'python'`/'shadow' per-sessione (riga dedicata) puo'
-/// deviare dal default globale 'rust' senza toccare il traffico delle altre
-/// sessioni, che continuano a leggere la riga '*' = 'rust'. Niente fallback
-/// hardcoded di emergenza: la configurazione vive nel DB.
-///
-/// Cache: chiave = `scope_key` risolto. La riga specifica e la riga '*' hanno
-/// chiavi cache DISTINTE (lo scope concreto vs `ENGINE_GLOBAL_SCOPE`), quindi
-/// attivare/disattivare lo shadow su UNA sessione si propaga entro il TTL (60s)
-/// senza invalidare la cache globale esistente.
-///
-/// Comportamento difensivo coerente col resto del sistema: se il DB e'
-/// irraggiungibile o nessuna riga matcha (ne' specifica ne' '*'), ritorna
-/// `Engine::Rust` come default difensivo loggando un warn. NON e' un "magic
-/// fallback" sul comportamento configurabile (e' una decisione di safety): in
-/// assenza di configurazione leggibile ricade sul motore primario in-process —
-/// il brain Python e' stato rimosso (mig 0462/0532), quindi un fallback su
-/// `Engine::Python` instraderebbe i run verso un servizio inesistente.
-pub(crate) async fn select_engine(db: &PgPool, scope_key: &str) -> Engine {
-    let cache = engine_cache();
-    if let Some(hit) = cache.get(scope_key) {
-        return hit;
-    }
-
-    // Un'unica query: prende la riga specifica E la riga '*' (al massimo 2 righe),
-    // poi si preferisce la specifica. Evita due round-trip e tiene la logica di
-    // precedenza in un solo punto (regola L). NB: lo scope '*' coincide con la
-    // riga globale -> la `WHERE scope_key IN ('*', '*')` resta corretta.
-    let rows = sqlx::query(
-        "SELECT scope_key, engine FROM nexus_orchestrator_engine WHERE scope_key = $1 OR scope_key = $2",
-    )
-    .bind(scope_key)
-    .bind(ENGINE_GLOBAL_SCOPE)
-    .fetch_all(db)
-    .await;
-
-    let engine = match rows {
-        Ok(rows) => resolve_engine_from_rows(&rows, scope_key),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                scope_key = %scope_key,
-                "select_engine: query nexus_orchestrator_engine fallita, uso il motore primario (rust)"
-            );
-            Engine::Rust
-        }
-    };
-
-    cache.insert(scope_key.to_string(), engine);
-    engine
-}
-
-/// Logica PURA di risoluzione del motore dalle righe gia' lette (nessun DB,
-/// nessuna cache): pick specifico -> pick jolly '*' -> parse -> fallback
-/// difensivo `Engine::Rust` (il motore primario: il brain Python e' stato
-/// rimosso, mig 0462/0532 — un fallback su Python instraderebbe i run verso un
-/// servizio inesistente). Estratta da `select_engine` (regola L: la precedenza
-/// scope-specifico/jolly vive in un solo punto, testabile senza DB).
-fn resolve_engine_from_rows(rows: &[sqlx::postgres::PgRow], scope_key: &str) -> Engine {
-    if rows.is_empty() {
-        tracing::warn!(
-            scope_key = %scope_key,
-            "select_engine: nessuna riga (ne' '{scope_key}' ne' jolly '*') in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore primario (rust)"
-        );
-        return Engine::Rust;
-    }
-
-    // Preferisci la riga con scope_key == quello richiesto; altrimenti la
-    // riga jolly '*'. (Se scope_key == '*', la prima clausola coincide.)
-    let pick = rows
-        .iter()
-        .find(|r| r.get::<String, _>("scope_key") == scope_key)
-        .or_else(|| {
-            rows.iter()
-                .find(|r| r.get::<String, _>("scope_key") == ENGINE_GLOBAL_SCOPE)
-        });
-    match pick {
-        Some(r) => {
-            let raw: String = r.get("engine");
-            match Engine::from_db(&raw) {
-                Some(e) => e,
-                None => {
-                    tracing::warn!(
-                        engine_raw = %raw,
-                        scope_key = %scope_key,
-                        "select_engine: valore engine non riconosciuto in nexus_orchestrator_engine, uso il motore primario (rust)"
-                    );
-                    Engine::Rust
-                }
-            }
-        }
-        None => {
-            tracing::warn!(
-                scope_key = %scope_key,
-                "select_engine: nessuna riga specifica ne' jolly '*' in nexus_orchestrator_engine (mig 0451 applicata?), uso il motore primario (rust)"
-            );
-            Engine::Rust
-        }
-    }
-}
+/// Valore di `agent_runs.engine` per ogni run: serve al recovery, che deve
+/// sapere con che motore girava un run interrotto.
+pub(crate) const ENGINE_NATIVE: &str = "rust";
 
 /// Avvio di un run sul motore nativo Rust (`nexus-agent-graph`).
 ///
@@ -4723,6 +4191,7 @@ pub(crate) async fn confirm_native_run(
         provider: provider.clone(),
         model: model.clone(),
         system_text: String::new(),
+        prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
         conversation_history: Vec::new(),
         tools_json: serde_json::json!([]),
@@ -4737,19 +4206,29 @@ pub(crate) async fn confirm_native_run(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        sizing_complexity: None,
+        sizing_scope_system_wide: false,
+        classifier_intent: None,
+        run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
+        // tratto del run e il loro esito e' nello stato checkpointato (chiave
+        // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
+        // che e' gia' arrivato.
+        advisory_gate: None,
     };
 
     let outcome = resume_via_native(state, &input, resume_message).await;
 
     // Pool del progetto risolto dalla sessione (separazione DB): agent_runs
     // migrata -> instrada le UPDATE di finalize (esito Ok/Err) sul DB del
-    // progetto. Risolto una volta, riusato in entrambi i rami (flag off -> meta).
-    let cn_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+    // progetto. Risolto una volta, riusato in entrambi i rami.
+    let cn_pool = crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let status = match outcome {
         Ok(outcome) => {
             // Mapping unico esito->AgentRunResult (regola L), poi finalize essenziale.
@@ -4796,6 +4275,7 @@ pub(crate) async fn confirm_native_run(
             // Pool del progetto (separazione DB): agent_runs migrata.
             .execute(&cn_pool)
             .await;
+            enforce_user_cancellation_status(&cn_pool, run_id).await;
             result.status
         }
         Err(e) => {
@@ -4805,7 +4285,7 @@ pub(crate) async fn confirm_native_run(
             tracing::error!(run_id = %run_id, "confirm_native_run: resume nativo fallito");
             let msg = format!(
                 "Il resume nativo del run e' fallito ({}). Il run e' stato chiuso come non riuscito.",
-                crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+                crate::agent_turn_setup::sanitize_error_for_user(&e.to_string())
             );
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status='failed', final_answer=$2, completed_at=NOW() \
@@ -5044,7 +4524,9 @@ pub(crate) async fn resume_fanin(
     // Pool del progetto (separazione DB): agent_runs / nexus_subagent_runs sono
     // migrate. Risolto UNA volta, riusato per lettura provider/model, risultati
     // dei figli e UPDATE di finalize.
-    let cn_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    let cn_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // provider/model del run originale dal DB (il worker ha solo gli id): servono
     // a popolare ctx + porte I/O del resume (il grafo riparte comunque dal
@@ -5100,6 +4582,7 @@ pub(crate) async fn resume_fanin(
         provider,
         model,
         system_text: String::new(),
+        prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
         conversation_history: Vec::new(),
         tools_json: serde_json::json!([]),
@@ -5116,10 +4599,19 @@ pub(crate) async fn resume_fanin(
         step_tx: tx.clone(),
         parent_run_id: None,
         subagent_depth: None,
+        sizing_complexity: None,
+        sizing_scope_system_wide: false,
+        classifier_intent: None,
+        run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
+        // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
+        // tratto del run e il loro esito e' nello stato checkpointato (chiave
+        // `advisory_gate`); ri-armare la barriera farebbe attendere un verdetto
+        // che e' gia' arrivato.
+        advisory_gate: None,
     };
 
     // Costruisce le NativeDeps da AppState (PUNTO UNICO build_native_deps, regola
@@ -5157,13 +4649,14 @@ pub(crate) async fn resume_fanin(
             .bind(result.messages_json.as_deref())
             .execute(&cn_pool)
             .await;
+            enforce_user_cancellation_status(&cn_pool, parent_run_id).await;
             result.status
         }
         Err(e) => {
             tracing::error!(run_id = %parent_run_id, "resume_fanin: resume nativo fallito");
             let msg = format!(
                 "Il resume fan-in del run e' fallito ({}). Il run e' stato chiuso come non riuscito.",
-                crate::brain_agent_client::sanitize_error_for_user(&e.to_string())
+                crate::agent_turn_setup::sanitize_error_for_user(&e.to_string())
             );
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status='failed', final_answer=$2, completed_at=NOW() \
@@ -5218,9 +4711,8 @@ pub(crate) async fn resume_fanin(
 }
 
 /// Assembla le `NativeDeps` (ToolRunner in-process + client gateway) da
-/// `AppState`. PUNTO UNICO (regola L): sia il run nativo primario
-/// (`run_via_native`) sia lo shadow (`run_shadow_for_state`) lo riusano, niente
-/// duplicazione del cablaggio infra.
+/// `AppState`. PUNTO UNICO (regola L): il cablaggio infra del run nativo vive
+/// in un solo posto.
 /// Assemblaggio delle `ToolRunnerDeps` da `AppState` (PUNTO UNICO, regola L): stessa
 /// slice sottile usata dal server gRPC (`main.rs`) per l'esecuzione IN-PROCESS
 /// (mcp-core E' il ToolRunner). Riusato da `build_native_deps` e dal pre-step del
@@ -5280,6 +4772,523 @@ fn select_pre_run_advisory(
     }
 }
 
+/// Risolve il piano di orchestrazione dimensionato (regola L: punto unico
+/// `orchestration_sizing` in nexus-agent-graph; qui SOLO il caricamento degli
+/// input). Riusato pre-run (`cost_spent_usd=0`) e post-run (budget residui
+/// reali dalla review). `None` = sizing spento o segnali non risolti ->
+/// comportamento legacy coi cap storici (fail-safe, mai un piano dimensionato
+/// su un fallback del classificatore).
+pub(crate) async fn resolve_orchestration_plan_for(
+    db: &PgPool,
+    complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    scope_system_wide: bool,
+    decision_detected: bool,
+    cost_spent_usd: f64,
+    time_remaining_s: Option<i64>,
+) -> Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan> {
+    use nexus_agent_graph::decisions::orchestration_sizing as sizing;
+    let cfg =
+        crate::agent_tools::subagent_native::read_orchestration_sizing_config(db).await;
+    if !cfg.enabled {
+        return None;
+    }
+    let complexity = complexity?;
+    let demand =
+        crate::agent_tools::subagent_native::read_sizing_profile(db, complexity).await?;
+    let backstops =
+        crate::agent_tools::subagent_native::read_orchestration_backstops(db).await;
+    let unit = crate::agent_tools::subagent_native::read_panel_unit_estimate(db).await;
+    // Budget di costo del run: la STESSA chiave anti-runaway dell'executor
+    // (`agent.run_cost_budget_usd`, 0 = off). Nessuna seconda fonte di verita'.
+    let cost_budget = nexus_auth::get_setting(db, "agent.run_cost_budget_usd")
+        .await
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|b| *b > 0.0);
+    let budgets = sizing::OrchestrationBudgets {
+        cost_remaining_usd: cost_budget.map(|b| (b - cost_spent_usd).max(0.0)),
+        // Deadline di run (fase 3, mig 0604): residuo calcolato dal chiamante
+        // col punto unico `run_time_remaining_s`. None = deadline disattivata.
+        time_remaining_s,
+    };
+    Some(sizing::resolve_orchestration_plan(
+        Some(complexity),
+        scope_system_wide,
+        decision_detected,
+        &budgets,
+        &unit,
+        &demand,
+        &backstops,
+        &cfg,
+    ))
+}
+
+/// Meta-step strutturato `orchestration_plan` (regola M): i numeri del piano e
+/// QUALE vincolo li ha decisi (`sized_by`), osservabili in UI e nei log.
+async fn emit_orchestration_plan_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    plan: &nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan,
+    phase: &str,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let title = format!(
+        "Orchestrazione dimensionata: vincolo {}",
+        plan.sized_by.as_str()
+    );
+    let mut payload = plan.to_value();
+    payload["phase"] = json!(phase);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("orchestration_plan")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "orchestration plan: meta_step persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "orchestration_plan".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
+/// Ingredienti dei panel A MONTE, identici nei due rami (bloccante e overlap).
+/// Raggrupparli evita di passare 8 argomenti a ogni funzione e di clonarli a
+/// mano nel task dell'overlap.
+struct UpstreamInputs {
+    state: AppState,
+    run_pool: PgPool,
+    tx: broadcast::Sender<AgentStepEvent>,
+    session_id: Uuid,
+    run_id: Uuid,
+    user_text: String,
+    deliberate: bool,
+    plan: Option<nexus_agent_graph::decisions::orchestration_sizing::OrchestrationPlan>,
+    complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    scope_system_wide: bool,
+}
+
+/// Esito dei panel a monte: i blocchi testuali per il prompt + il verdetto
+/// strutturato per l'enforcement (regola M).
+struct UpstreamPanels {
+    /// Blocchi gia' renderizzati, nell'ordine consiglio -> dibattito ->
+    /// multi-provider (dal generale al particolare), vuoti scartati.
+    blocks: Vec<String>,
+    synthesis: Option<serde_json::Value>,
+    source: Option<&'static str>,
+    /// `true` se il consiglio ha prodotto un blocco: la direttiva
+    /// `<consiglio_analisi>` va tolta dal system prompt (l'ha gia' fatto).
+    council_present: bool,
+}
+
+/// Dibattito, se il consiglio ha dichiarato una decisione contesa: consuma il
+/// suo segnale strutturato, quindi puo' girare solo DOPO di lui. `None` = niente
+/// decisione contesa, o budget che non finanzia il contraddittorio.
+async fn run_debate_if_contested(
+    inp: &UpstreamInputs,
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+) -> Option<String> {
+    let advocates = debate_advocate_target(
+        &inp.state,
+        &inp.run_pool,
+        inp.run_id,
+        council_outcome,
+        inp.complexity,
+        inp.scope_system_wide,
+    )
+    .await?;
+    let outcome = maybe_convene_debate(
+        &inp.state,
+        &inp.run_pool,
+        &inp.tx,
+        inp.session_id,
+        inp.run_id,
+        &inp.user_text,
+        council_outcome,
+        advocates,
+    )
+    .await?;
+    Some(crate::agent_tools::subagent_native::render_debate_synthesis(
+        &outcome,
+    ))
+}
+
+/// Esegue TUTTI i panel a monte: consiglio ∥ multi-provider, poi il dibattito
+/// se il consiglio dichiara una decisione contesa.
+///
+/// PUNTO UNICO (regola L) dei due rami: bloccante (il run parte dopo) e overlap
+/// (il run e' gia' partito e questa gira in un task). Senza, l'ordine dei panel
+/// e le loro condizioni sarebbero scritti due volte e divergerebbero al primo
+/// panel nuovo.
+async fn run_upstream_panels(inp: &UpstreamInputs) -> UpstreamPanels {
+    // I due panel a monte non condividono dati (le sintesi si riconciliano solo
+    // a valle): la serializzazione era implementativa, non necessaria.
+    let (council_outcome, multi_provider) = tokio::join!(
+        maybe_convene_council(
+            &inp.state,
+            &inp.run_pool,
+            &inp.tx,
+            inp.session_id,
+            inp.run_id,
+            &inp.user_text,
+            inp.deliberate,
+            inp.plan.as_ref().map(|p| p.council_figures),
+        ),
+        maybe_convene_multi_provider_panel(
+            &inp.state,
+            inp.session_id,
+            inp.run_id,
+            &inp.user_text,
+            inp.deliberate,
+            inp.plan.as_ref().map(|p| p.multi_provider_providers),
+        )
+    );
+    if let Some(outcome) = &council_outcome {
+        emit_council_of_competencies_meta_step(&inp.run_pool, &inp.tx, inp.run_id, outcome).await;
+    }
+    if let Some(outcome) = &multi_provider {
+        emit_multi_provider_panel_meta_step(&inp.run_pool, &inp.tx, inp.run_id, outcome).await;
+    }
+    let council_block = council_outcome
+        .as_ref()
+        .map(crate::agent_tools::subagent_native::CouncilConveneOutcome::render_block)
+        .filter(|b| !b.is_empty());
+    let debate_block = run_debate_if_contested(inp, council_outcome.as_ref()).await;
+
+    let (synthesis, source) = select_pre_run_advisory(
+        council_outcome
+            .as_ref()
+            .and_then(|o| o.advisory_synthesis_value()),
+        multi_provider
+            .as_ref()
+            .and_then(|o| o.advisory_synthesis_value()),
+    );
+    UpstreamPanels {
+        council_present: council_block.is_some(),
+        blocks: [
+            council_block,
+            debate_block,
+            multi_provider.as_ref().map(|o| o.render_block()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|b| !b.trim().is_empty())
+        .collect(),
+        synthesis,
+        source,
+    }
+}
+
+/// Spawna il task dei panel a monte in OVERLAP col run (mig 0606) e scioglie la
+/// barriera di scrittura col loro esito.
+///
+/// Invariante: la barriera si scioglie SEMPRE, su ogni percorso. Un panel che
+/// muore, un panic o un errore devono produrre `Unavailable` — mai il silenzio,
+/// che al gate diventerebbe un'attesa fino al timeout (il run resterebbe fermo
+/// per nulla). Il `Drop` del sender chiuderebbe comunque il canale e il gate lo
+/// leggerebbe come `advisory_channel_closed`: la rete c'e' comunque, ma dire il
+/// motivo vero e' meglio che dedurlo da un'assenza (regola M).
+fn spawn_advisory_gate_task(
+    inp: UpstreamInputs,
+    gate_tx: tokio::sync::watch::Sender<nexus_agent_graph::nodes::AdvisoryGateState>,
+) {
+    let run_id = inp.run_id;
+    tokio::spawn(async move {
+        let panels = run_upstream_panels(&inp).await;
+        let state = gate_state_from_panels(&panels);
+        tracing::info!(
+            run_id = %run_id,
+            gate = ?state,
+            "barriera advisory: panel a monte conclusi, barriera sciolta"
+        );
+        // Il receiver puo' essere gia' caduto (run finito prima che i panel
+        // deliberassero: succede sui task brevi che non scrivono nulla). Non e'
+        // un errore: il verdetto semplicemente non serve piu'.
+        let _ = gate_tx.send(state);
+    });
+}
+
+/// Traduce l'esito dei panel nello stato della barriera. Nessuna sintesi = i
+/// panel non hanno deliberato (roster morto, gate non passato): il run prosegue
+/// SENZA approvazione e il modello deve saperlo (regola M).
+fn gate_state_from_panels(
+    panels: &UpstreamPanels,
+) -> nexus_agent_graph::nodes::AdvisoryGateState {
+    use nexus_agent_graph::nodes::AdvisoryGateState;
+    let Some(synthesis) = panels.synthesis.as_ref() else {
+        return AdvisoryGateState::Unavailable {
+            reason_code: "advisory_synthesis_unavailable".to_string(),
+        };
+    };
+    // Enforcement col PUNTO UNICO gia' usato dal ramo classico (native_engine):
+    // stessa forma, stessa semantica del veto.
+    let source = panels.source.unwrap_or("advisory_synthesis");
+    match nexus_agent_graph::nodes::panel_enforcement_from_advisory_synthesis(synthesis, source) {
+        Some(enforcement) => {
+            let terminal = enforcement
+                .get("terminal")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if terminal {
+                AdvisoryGateState::Vetoed { enforcement }
+            } else {
+                AdvisoryGateState::Released {
+                    enforcement: Some(enforcement),
+                }
+            }
+        }
+        // Sintesi senza enforcement = via libera piena: niente vincoli da
+        // ricordare.
+        None => AdvisoryGateState::Released { enforcement: None },
+    }
+}
+
+/// Estrae `(topic, options)` dalla decisione contesa dichiarata dal CONSIGLIO.
+/// Il segnale arriva dalla sua sintesi: e' il consiglio che sa riconoscere una
+/// decisione architetturale aperta (il classificatore ha un contratto 1:1
+/// congelato e gira su ogni turno, anche di chat pura). `None` = nessuna
+/// decisione contesa dichiarata, o dichiarazione senza opzioni utilizzabili.
+fn contested_decision_from(
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+) -> Option<(String, Vec<String>)> {
+    let synthesis = council_outcome?.advisory_synthesis_value()?;
+    let contested = synthesis.get("contested_decision")?;
+    let topic = contested.get("topic")?.as_str()?.trim().to_string();
+    let options: Vec<String> = contested
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|o| o.as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!topic.is_empty()).then_some((topic, options))
+}
+
+/// Quanti avvocati convocare, RI-risolvendo il piano ora che il segnale
+/// `contested_decision` del consiglio esiste (pre-run vale sempre 0: la
+/// decisione contesa la dichiara il consiglio, non il classificatore).
+///
+/// PUNTO UNICO (regola L): stesso `resolve_orchestration_plan_for` del pre-run,
+/// con `decision_detected=true` e i budget aggiornati — il consiglio ha gia'
+/// speso tempo, e il resolver deve vederlo (un dibattito non si finanzia col
+/// budget che il consiglio ha appena consumato).
+///
+/// `None` = nessun dibattito: niente decisione contesa dichiarata, sizing
+/// spento, o budget che non regge il floor di 2 avvocati (il resolver lo ha
+/// gia' azzerato). Emette il meta-step `orchestration_plan` del secondo giro
+/// cosi' la scelta e' osservabile (regola M).
+async fn debate_advocate_target(
+    state: &AppState,
+    run_pool: &PgPool,
+    run_id: Uuid,
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+    complexity: Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    scope_system_wide: bool,
+) -> Option<usize> {
+    // Gate a costo zero: senza decisione contesa non si ri-risolve nulla.
+    let synthesis = council_outcome?.advisory_synthesis_value()?;
+    synthesis.get("contested_decision").filter(|v| !v.is_null())?;
+    let time_remaining =
+        crate::agent_tools::subagent_native::run_time_remaining_s(&state.db, run_pool, run_id)
+            .await;
+    // Costo gia' speso dai panel a monte: il run principale non e' partito, ma
+    // consiglio e multi-provider hanno consumato. Punto unico `cumulative_cost`
+    // (regola L, lo stesso del cost-cap del prepare): i sub-run hanno run_id
+    // propri nel ledger, quindi un'aggregazione per-run del padre li perderebbe.
+    let spent = crate::agent_tools::subagent_native::cumulative_cost(run_pool, run_id).await;
+    let plan = resolve_orchestration_plan_for(
+        &state.db,
+        complexity,
+        scope_system_wide,
+        true, // decision_detected: il consiglio l'ha dichiarata
+        spent,
+        time_remaining,
+    )
+    .await?;
+    if plan.debate_advocates < 2 {
+        tracing::info!(
+            run_id = %run_id,
+            sized_by = plan.sized_by.as_str(),
+            advocates = plan.debate_advocates,
+            "dibattito: decisione contesa dichiarata ma il piano non finanzia il contraddittorio"
+        );
+        return None;
+    }
+    Some(plan.debate_advocates)
+}
+
+/// Convoca il DIBATTITO a tesi contrapposte quando il consiglio ha dichiarato
+/// una decisione architetturale CONTESA (`contested_decision`, segnale
+/// strutturato — regola M: mai dedotto dalla prosa dei pareri).
+///
+/// Innescato dal COORDINATORE e mai da dentro un sub-run del consiglio: un
+/// sub-run che convoca sub-run consuma il budget di profondita'
+/// (`orchestrator.subagent_max_depth`, guard in prepare) e richiederebbe
+/// `dispatch_subagents` nella whitelist delle figure — superficie inutile.
+///
+/// `None` (nessun dibattito) se: nessuna decisione contesa dichiarata, dibattito
+/// spento (`orchestrator.debate_enabled`), piano senza avvocati (budget stretto:
+/// il resolver ha gia' deciso), o nessun avvocato produce una posizione valida.
+async fn maybe_convene_debate(
+    state: &AppState,
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    session_id: Uuid,
+    run_id: Uuid,
+    user_text: &str,
+    council_outcome: Option<&crate::agent_tools::subagent_native::CouncilConveneOutcome>,
+    advocate_target: usize,
+) -> Option<crate::agent_tools::subagent_native::DebatePanelOutcome> {
+    if advocate_target < 2 {
+        return None;
+    }
+    let (topic, options) = contested_decision_from(council_outcome)?;
+    let cfg = crate::agent_tools::subagent_native::read_debate_config(&state.db).await?;
+    let deps = build_tool_runner_deps(state);
+    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
+    let ctx = match svc.build_ctx_for_primary_run(session_id, run_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(run_id = %run_id, "dibattito: build_ctx fallita: {e}");
+            return None;
+        }
+    };
+    let (quorum, quorum_pct) = debate_quorum_policy(&ctx).await;
+    tracing::info!(
+        run_id = %run_id,
+        topic = %topic,
+        options = options.len(),
+        advocates = advocate_target,
+        "dibattito: convocazione degli avvocati su decisione contesa"
+    );
+    let outcome = crate::agent_tools::subagent_native::convene_debate_panel(
+        &ctx,
+        &cfg,
+        &topic,
+        &options,
+        advocate_target,
+        user_text,
+        &quorum,
+        quorum_pct,
+    )
+    .await?;
+    emit_debate_meta_step(run_pool, tx, run_id, &outcome).await;
+    Some(outcome)
+}
+
+/// Policy di quorum del dibattito, nel vocabolario GENERICO di `panel_quorum`.
+///
+/// Il dibattito CONDIVIDE le chiavi del quorum dei panel a monte
+/// (`orchestrator.council_advisory_*`): e' la stessa domanda — "quanti voti
+/// servono perche' il panel abbia deliberato" — quindi nessuna chiave nuova da
+/// tenere allineata a mano (regola L). Ritorna anche `quorum_pct`, che nel tipo
+/// generico non esiste (li' la soglia relativa e' un parametro di
+/// `required_valid`, non un campo della policy).
+async fn debate_quorum_policy(
+    ctx: &crate::agent_tools::AgentToolContext,
+) -> (nexus_agent_graph::decisions::panel_quorum::QuorumPolicy, u8) {
+    let advisory = crate::agent_tools::subagent_native::read_advisory_policy(ctx).await;
+    (
+        nexus_agent_graph::decisions::panel_quorum::QuorumPolicy {
+            min_valid: advisory.min_valid_advisories,
+            veto_on_high_severity: advisory.block_on_high_severity,
+        },
+        advisory.quorum_pct,
+    )
+}
+
+/// Payload del meta-step `debate_panel`: la sintesi strutturata + chi difendeva
+/// cosa (regola M: l'assegnazione e' il fatto che rende leggibile il tally).
+fn debate_meta_payload(
+    outcome: &crate::agent_tools::subagent_native::DebatePanelOutcome,
+) -> serde_json::Value {
+    let mut payload = outcome.synthesis.to_value();
+    payload["product_name"] = json!("Tesi contrapposte");
+    payload["topic"] = json!(outcome.topic);
+    payload["assignments"] = json!(outcome
+        .assignments
+        .iter()
+        .map(|a| json!({
+            "advocate_index": a.advocate_index,
+            "assigned_position": a.assigned_position,
+        }))
+        .collect::<Vec<_>>());
+    payload
+}
+
+/// Meta-step strutturato `debate_panel` (regola M): esito, tally per opzione e
+/// base dei voti, osservabili in UI senza rileggere la prosa.
+async fn emit_debate_meta_step(
+    run_pool: &PgPool,
+    tx: &broadcast::Sender<AgentStepEvent>,
+    run_id: Uuid,
+    outcome: &crate::agent_tools::subagent_native::DebatePanelOutcome,
+) {
+    let created_at_dt = Utc::now();
+    let created_at = created_at_dt.to_rfc3339();
+    let title = format!(
+        "Tesi contrapposte: {} ({})",
+        outcome.topic,
+        outcome.synthesis.verdict.as_str()
+    );
+    let payload = debate_meta_payload(outcome);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(run_id)
+    .bind("debate_panel")
+    .bind(&title)
+    .bind(&payload)
+    .bind(created_at_dt)
+    .execute(run_pool)
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id,
+            error = %e,
+            "dibattito: meta_step persistito fallito (best-effort)"
+        );
+    }
+    let _ = tx.send(AgentStepEvent {
+        run_id: run_id.to_string(),
+        step: None,
+        trace: None,
+        is_final: false,
+        token_delta: None,
+        thinking_delta: None,
+        meta_step: Some(crate::agent_types::AgentMetaStep {
+            kind: "debate_panel".to_string(),
+            title,
+            payload,
+            correlation_id: None,
+            created_at,
+        }),
+    });
+}
+
 async fn maybe_convene_council(
     state: &AppState,
     run_pool: &PgPool,
@@ -5288,6 +5297,7 @@ async fn maybe_convene_council(
     run_id: Uuid,
     user_text: &str,
     deliberate: bool,
+    figure_target: Option<usize>,
 ) -> Option<crate::agent_tools::subagent_native::CouncilConveneOutcome> {
     use crate::agent_tools::subagent_native::{
         CouncilConveneOutcome, CouncilDegradeReason,
@@ -5311,7 +5321,16 @@ async fn maybe_convene_council(
     }
     // Selezione figure (DB-driven + routing per ambito): lista vuota -> niente.
     let cfg = crate::agent_tools::subagent_native::read_council_config(&state.db).await;
-    let figures = crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg);
+    let mut figures = crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg);
+    // Target del piano di orchestrazione (punto unico orchestration_sizing): la
+    // DECISIONE del numero e' del resolver, qui si applica. 0 = panel azzerato
+    // dal budget: non si convoca (il meta-step `orchestration_plan` lo documenta).
+    if let Some(target) = figure_target {
+        if target == 0 {
+            return None;
+        }
+        figures.truncate(target);
+    }
     if figures.is_empty() {
         return None;
     }
@@ -5453,7 +5472,7 @@ async fn maybe_convene_council(
         "consiglio a monte: sintesi composta, iniezione nel primo messaggio"
     );
     Some(CouncilConveneOutcome::Active {
-        synthesis,
+        synthesis: Box::new(synthesis),
         figures,
         figure_reports: convoke.figure_reports,
     })
@@ -5461,7 +5480,7 @@ async fn maybe_convene_council(
 
 /// `true` se il path e' un file di CODICE (una modifica a codice merita review;
 /// config/markdown/asset no). Estensione case-insensitive.
-fn is_code_file(path: &str) -> bool {
+pub(crate) fn is_code_file(path: &str) -> bool {
     const CODE_EXT: &[&str] = &[
         "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java", "rb", "php", "cs", "cpp",
         "cc", "c", "h", "hpp", "vue", "svelte", "sql", "kt", "swift",
@@ -5476,7 +5495,7 @@ fn is_code_file(path: &str) -> bool {
 /// CODICE modificati + se un panel di review e' GIA' stato prodotto. Il tool reale
 /// e' annidato in `agent_steps.tool_input` (`{tool_name, tool_input:{path}}`); la
 /// presenza di un panel si legge dal `panel_verdict` nel tool_result del fan-in.
-async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
+pub(crate) async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool) {
     use sqlx::Row;
     const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "create_file", "patch_file"];
     let rows = sqlx::query(
@@ -5511,23 +5530,34 @@ async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<String>, bool)
     (modified, reviewed)
 }
 
-/// Nota onesta (regola M) da anteporre/aggiungere al resoconto quando la review
-/// programmatica NON approva. Findings limitati per non gonfiare.
-fn render_review_panel_note(panel: &nexus_agent_graph::decisions::PanelOutcome) -> String {
-    use nexus_agent_graph::decisions::PanelVerdict;
-    let label = match panel.verdict {
-        PanelVerdict::Fail => "NON superata (difetti bloccanti)",
-        PanelVerdict::NeedsChanges => "richiede modifiche",
-        PanelVerdict::Inconclusive => "non conclusiva (quorum non raggiunto)",
-        PanelVerdict::Pass => "superata",
+/// Nota onesta (regola M) da anteporre al resoconto quando la review NON
+/// approva. Il `Value` e' `PanelOutcome::to_value` trasportato dallo stato del
+/// grafo (`extra.review_panel_last`): stessi campi strutturati, vocabolario di
+/// `PanelVerdict::as_str`. Findings limitati per non gonfiare.
+fn render_review_panel_note(panel: &serde_json::Value) -> String {
+    let label = match panel.get("verdict").and_then(|v| v.as_str()).unwrap_or("") {
+        "fail" => "NON superata (difetti bloccanti)",
+        "needs_changes" => "richiede modifiche",
+        "inconclusive" => "non conclusiva (quorum non raggiunto)",
+        "pass" => "superata",
+        _ => "esito non disponibile",
     };
+    let valid = panel.get("valid").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total = panel
+        .get("total_reviews")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let mut s = format!(
-        "**Review adversariale automatica: {label}** ({}/{} voti validi). Un panel di \
-         revisori indipendenti ha esaminato le modifiche di questo run.",
-        panel.valid, panel.total_reviews
+        "**Review adversariale automatica: {label}** ({valid}/{total} voti validi). Un panel di \
+         revisori indipendenti ha esaminato le modifiche di questo run."
     );
+    let vuoto = Vec::new();
+    let findings = panel
+        .get("findings")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&vuoto);
     let mut shown = 0;
-    for f in &panel.findings {
+    for f in findings {
         if shown >= 8 {
             break;
         }
@@ -5544,113 +5574,13 @@ fn render_review_panel_note(panel: &nexus_agent_graph::decisions::PanelOutcome) 
     s
 }
 
-/// RINFORZO PROGRAMMATICO della review adversariale a valle (regola H): la
-/// direttiva `<revisione_finale>` (mig 0571) e' LLM-driven e puo' essere saltata.
-/// Se il run ha DICHIARATO done, ha MODIFICATO codice e NON ha gia' fatto una
-/// review, convoca il panel dal codice (`convene_review_panel`) e riconcilia il
-/// verdetto nel resoconto (nota onesta se non approva; simmetrico alla nota
-/// final_gate). Gate DB-driven `orchestrator.review_panel_autoconvene_enabled`
-/// (mig 0572). No-op fuori dai casi pertinenti: non altera il flusso.
-async fn maybe_convene_review_panel(
-    state: &AppState,
-    steps_pool: &PgPool,
-    session_id: Uuid,
-    run_id: Uuid,
-    outcome: &mut crate::native_engine::NativeRunOutcome,
-) {
-    // Solo su un run CHIUSO come done: rivedere un lavoro dichiarato incompleto
-    // (blocked/partial/needs_input) o non completato e' rumore.
-    if !outcome.completed {
-        return;
-    }
-    let declared = outcome
-        .declared_outcome
-        .as_ref()
-        .and_then(|v| v.get("outcome"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if matches!(declared, "blocked" | "partial" | "needs_input") {
-        return;
-    }
-    if !nexus_auth::get_bool_setting(&state.db, "orchestrator.review_panel_autoconvene_enabled")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(true)
-    {
-        return;
-    }
-    let (modified, already_reviewed) = review_gate_signals(steps_pool, run_id).await;
-    if modified.is_empty() || already_reviewed {
-        return;
-    }
-    let deps = build_tool_runner_deps(state);
-    let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
-    let ctx = match svc.build_ctx(session_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(run_id = %run_id, "review panel: build_ctx fallita: {e}");
-            return;
-        }
-    };
-    let policy = nexus_agent_graph::decisions::QuorumPolicy {
-        min_valid_verdicts: nexus_auth::get_setting(&state.db, "orchestrator.review_quorum_min_valid")
-            .await
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1),
-        fail_on_high_severity: nexus_auth::get_bool_setting(
-            &state.db,
-            "orchestrator.review_fail_on_high_severity",
-        )
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(true),
-    };
-    let reviewers = nexus_auth::get_setting(&state.db, "orchestrator.review_panel_size")
-        .await
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(2)
-        .max(1);
-    let files_line = modified
-        .iter()
-        .map(|f| format!("- {f}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let task = format!(
-        "Rivedi le modifiche al codice appena applicate dal run corrente. File modificati:\n\
-         {files_line}\n\nLeggi questi file, verifica correttezza, sicurezza, edge case e \
-         regressioni, e dichiara il verdetto con review_verdict."
-    );
-    tracing::info!(
-        run_id = %run_id,
-        reviewers,
-        files = modified.len(),
-        "review panel: convocazione programmatica (rinforzo <revisione_finale>)"
-    );
-    let Some(panel) =
-        crate::agent_tools::subagent_native::convene_review_panel(&ctx, &task, reviewers, &policy)
-            .await
-    else {
-        return; // nessun verdetto valido: best-effort, niente nota
-    };
-    if !panel.verdict.is_approved() {
-        let note = render_review_panel_note(&panel);
-        let base = outcome.final_answer.clone().unwrap_or_default();
-        outcome.final_answer = Some(if base.trim().is_empty() {
-            note
-        } else {
-            format!("{base}\n\n---\n{note}")
-        });
-    }
-}
-
 async fn maybe_convene_multi_provider_panel(
     state: &AppState,
     session_id: Uuid,
+    run_id: Uuid,
     user_text: &str,
     deliberate: bool,
+    provider_target: Option<usize>,
 ) -> Option<crate::agent_tools::subagent_native::MultiProviderPanelOutcome> {
     // Decisione AGENTICA (regola M): stesso segnale del consiglio (giudizio del
     // classificatore, fallback keyword se down). Il multi-provider e' un panel di
@@ -5658,13 +5588,31 @@ async fn maybe_convene_multi_provider_panel(
     if !deliberate {
         return None;
     }
-    let cfg = crate::agent_tools::subagent_native::read_multi_provider_config(&state.db).await?;
+    let mut cfg = crate::agent_tools::subagent_native::read_multi_provider_config(&state.db).await?;
+    // Target del piano di orchestrazione (punto unico orchestration_sizing):
+    // 0 = panel azzerato dal budget, non si convoca; altrimenti il target lima
+    // max_providers (il floor di quorum e' gia' garantito dal resolver).
+    if let Some(target) = provider_target {
+        if target == 0 {
+            return None;
+        }
+        cfg.max_providers = cfg.max_providers.min(target);
+        cfg.min_providers = cfg.min_providers.min(cfg.max_providers);
+    }
     let deps = build_tool_runner_deps(state);
     let svc = crate::tool_runner_server::ToolRunnerService::new(deps);
-    let ctx = match svc.build_ctx(session_id).await {
+    // Ancorato al run primario come il consiglio (punto unico
+    // `build_ctx_for_primary_run`, regola L): senza il run_id gli analisti
+    // nascevano ancorati alla sessione e il loro lavoro non era attribuibile al
+    // run che li aveva convocati (misurato: mistral, google e openrouter avevano
+    // prodotto analisi e la barra dei costi mostrava solo deepseek).
+    let ctx = match svc.build_ctx_for_primary_run(session_id, run_id).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("multi-provider panel: build_ctx fallita (session={session_id}): {e}");
+            tracing::warn!(
+                run_id = %run_id,
+                "multi-provider panel: build_ctx fallita (session={session_id}): {e}"
+            );
             return None;
         }
     };
@@ -5984,19 +5932,35 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
     }
 }
 
-/// Avvio del run SHADOW (Engine::Shadow): ri-esegue il grafo Rust in modalita'
-/// shadow (read-only) confrontando lo stato finale col primario gia'
-/// concluso (`primary_run_id`). Riusa il PUNTO UNICO `build_native_deps` +
-/// `native_engine::run_shadow` (regola L). Non prodotto dal routing globale (che
-/// e' rust); attivabile solo per-sessione con `engine='shadow'`. Lo shadow non
-/// impatta MAI il primario: su errore il chiamante logga WARN.
-pub(crate) async fn run_shadow_for_state(
-    state: &AppState,
-    input: &crate::native_engine::NativeRunInput,
-    primary_run_id: Uuid,
-) -> anyhow::Result<()> {
-    let deps = build_native_deps(state).await;
-    crate::native_engine::run_shadow(&deps, input, primary_run_id).await
+#[cfg(test)]
+mod tests_compose_report {
+    use super::{compose_unconfirmed_report, NOTE_GATE_NON_SUPERATA};
+
+    #[test]
+    fn provenienza_inclusa_e_nota_preservata() {
+        let out = compose_unconfirmed_report(
+            NOTE_GATE_NON_SUPERATA,
+            "non confermata dalla verifica",
+            "mistral",
+            "mistral-small-latest",
+            "Ho fatto X.",
+        );
+        // Contratto a valle (regola M): il prefisso nota resta il primo carattere.
+        assert!(out.starts_with("**Verifica automatica non superata**"), "{out}");
+        // Provenienza inclusa nell'header del resoconto.
+        assert!(out.contains("mistral/mistral-small-latest · auto-valutazione"), "{out}");
+        // Corpo presente, separato dall'header.
+        assert!(out.contains("\n\nHo fatto X."), "{out}");
+        assert!(out.contains("Resoconto dell'agente"), "{out}");
+    }
+
+    #[test]
+    fn provenienza_omessa_se_provider_o_model_vuoti() {
+        // Senza provider/model noti: header senza provenienza (niente "·" spurio).
+        let out = compose_unconfirmed_report("**Nota.**", "non confermata", "", "", "corpo");
+        assert!(out.contains("_Resoconto dell'agente (auto-valutazione,"), "{out}");
+        assert!(!out.contains(" · "), "nessun separatore provenienza vuoto: {out}");
+    }
 }
 
 #[cfg(test)]
@@ -6061,605 +6025,58 @@ mod tests_review_gate {
     }
 }
 
-#[cfg(test)]
-mod tests_select_engine {
-    use super::*;
-
-    /// Crea la tabella minimale di routing motore nel DB di test.
-    async fn create_engine_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_orchestrator_engine ( \
-                 scope_key  TEXT PRIMARY KEY, \
-                 scope_kind TEXT NOT NULL DEFAULT 'global', \
-                 engine     TEXT NOT NULL DEFAULT 'python', \
-                 percent    INT NOT NULL DEFAULT 100, \
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table nexus_orchestrator_engine");
-    }
-
-    #[test]
-    fn engine_from_db_parsing() {
-        assert_eq!(Engine::from_db("python"), Some(Engine::Python));
-        assert_eq!(Engine::from_db("RUST"), Some(Engine::Rust));
-        assert_eq!(Engine::from_db(" shadow "), Some(Engine::Shadow));
-        assert_eq!(Engine::from_db("boh"), None);
-    }
-
-    #[sqlx::test]
-    async fn select_engine_ritorna_python_con_default_globale(pool: sqlx::PgPool) {
-        create_engine_table(&pool).await;
-        sqlx::query(
-            "INSERT INTO nexus_orchestrator_engine (scope_key, scope_kind, engine, percent) \
-             VALUES ('*', 'global', 'python', 100)",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert default");
-
-        let engine = select_engine(&pool, "qualsiasi-scope").await;
-        assert_eq!(
-            engine,
-            Engine::Python,
-            "il resolver legge il valore della riga jolly '*' (qui il fixture inserisce 'python')"
-        );
-    }
-
-    #[sqlx::test]
-    async fn select_engine_cade_su_rust_se_riga_assente(pool: sqlx::PgPool) {
-        // Tabella vuota: nessuna riga jolly. Comportamento difensivo: rust, il
-        // motore primario (il brain Python e' stato rimosso, mig 0462/0532: un
-        // fallback su python instraderebbe verso un servizio inesistente).
-        create_engine_table(&pool).await;
-        let engine = select_engine(&pool, "*").await;
-        assert_eq!(engine, Engine::Rust);
-    }
-
-    #[sqlx::test]
-    async fn select_engine_scoping_per_sessione(pool: sqlx::PgPool) {
-        // Riga jolly '*' = python (default globale INVARIATO) + riga specifica per
-        // una sessione = shadow. La sessione con riga dedicata deve ottenere Shadow;
-        // qualunque altra sessione (senza riga) deve cadere sul jolly '*' = Python.
-        // scope_key UNIVOCI (uuid) -> nessuna collisione con la cache statica
-        // condivisa tra i test (idempotenza, regola F).
-        create_engine_table(&pool).await;
-        let sess = Uuid::new_v4().to_string();
-        let other = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO nexus_orchestrator_engine (scope_key, scope_kind, engine, percent) \
-             VALUES ('*', 'global', 'python', 100), ($1, 'session', 'shadow', 100)",
-        )
-        .bind(&sess)
-        .execute(&pool)
-        .await
-        .expect("insert default + sessione shadow");
-
-        assert_eq!(
-            select_engine(&pool, &sess).await,
-            Engine::Shadow,
-            "la sessione con riga dedicata 'shadow' deve attivare lo shadow"
-        );
-        assert_eq!(
-            select_engine(&pool, &other).await,
-            Engine::Python,
-            "una sessione SENZA riga dedicata cade sul jolly '*' = python (globale invariato)"
-        );
-    }
-
-    // `run_via_native` (FASE 3) richiede un `AppState` reale (ToolRunnerDeps +
-    // gateway), non costruibile in unit test: il suo corpo e' un assemblaggio di
-    // clone da AppState + delega al PUNTO UNICO `native_engine::run_native`. La
-    // logica testabile (costruzione initial_state dal prompt, mapping esito) e'
-    // coperta dai test di `crate::native_engine`; il grafo end-to-end con gateway
-    // scriptato e' coperto da `nexus_agent_graph::graph` (stessi tipi e builder).
-    // I due `select_engine_*` sotto coprono il confine di routing: default
-    // difensivo 'python' a tabella vuota e scoping per-sessione (override sul
-    // default globale, che in produzione e' '*'=rust, il primario instradato).
-
-    // ── DEBITO 3: mapping NativeRunOutcome -> AgentRunResult (finalize unico) ─────
-
-    use nexus_agent_graph::StopReason;
-
-    /// Tabelle minimali per il mapping: agent_runs (guard) + agent_steps.
-    async fn create_steps_tables(pool: &sqlx::PgPool) {
-        sqlx::query("CREATE TABLE agent_runs (id UUID PRIMARY KEY)")
-            .execute(pool)
-            .await
-            .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'completed', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
-
-    /// Preambolo comune dei test di mapping: tabelle minime + riga run.
-    async fn setup_mapping_run(pool: &sqlx::PgPool) -> Uuid {
-        create_steps_tables(pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(run)
-            .execute(pool)
-            .await
-            .expect("insert run");
-        run
-    }
-
-    // Chiavi/valori fixture ricorrenti degli outcome dichiarati.
-    const K_BLOCKER: &str = "blocker";
-    const RESUME_EXECUTOR: &str = "executor";
-
-    fn outcome_base() -> crate::native_engine::NativeRunOutcome {
-        crate::native_engine::NativeRunOutcome {
-            completed: true,
-            awaiting_subagents: false,
-            final_answer: Some("fatto".to_string()),
-            stop_reason: Some(StopReason::EndTurn),
-            provider_used: Some("anthropic".to_string()),
-            model_used: Some("claude-x".to_string()),
-            resume_at: None,
-            iterations: 2,
-            prompt_tokens: 100,
-            completion_tokens: 40,
-            total_tokens: 140,
-            total_cost: 0.0,
-            user_intent: Some("code".to_string()),
-            reasoning: None,
-            messages_json: Some(r#"[{"role":"user","content":"ciao"}]"#.to_string()),
-            declared_outcome: None,
-            review_verdict: None,
-            advisory_verdict: None,
-            error_class: None,
-            forced_close_unverified: false,
-            final_gate_passed: None,
-            final_gate_unverified: None,
-            final_gate_failed_pending: false,
-            pending_actions: Vec::new(),
-        }
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
-        let run = setup_mapping_run(&pool).await;
-        // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
-        for (si, name, st) in [
-            (1000, "read_file", "completed"),
-            (2000, "write_file", "failed"),
-        ] {
-            sqlx::query(
-                "INSERT INTO agent_steps (run_id, step_index, tool_name, status) VALUES ($1,$2,$3,$4)",
-            )
-            .bind(run)
-            .bind(si)
-            .bind(name)
-            .bind(st)
-            .execute(&pool)
-            .await
-            .expect("insert step");
-        }
-
-        let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
-        assert_eq!(r.status, AgentRunStatus::Completed);
-        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
-        assert_eq!(r.provider, "anthropic");
-        assert_eq!(r.model, "claude-x");
-        assert_eq!(r.iteration_count, 2);
-        assert_eq!(r.prompt_tokens, 100);
-        assert_eq!(r.total_tokens, 140);
-        // Intent del turno -> nexus_task_type (parita' col path Python).
-        assert_eq!(r.nexus_task_type.as_deref(), Some("code"));
-        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
-        // Step ricostruiti da DB in ordine di step_index, con status mappato.
-        assert_eq!(r.steps.len(), 2);
-        assert_eq!(r.steps[0].tool_name, "read_file");
-        assert_eq!(r.steps[0].status, AgentStepStatus::Completed);
-        assert_eq!(r.steps[1].tool_name, "write_file");
-        assert_eq!(r.steps[1].status, AgentStepStatus::Failed);
-        // La conversazione finale del grafo e' propagata per agent_runs.messages_json.
-        assert_eq!(
-            r.messages_json.as_deref(),
-            Some(r#"[{"role":"user","content":"ciao"}]"#)
-        );
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_declared_outcome_stati_canonici(pool: sqlx::PgPool) {
-        // ADR 0034: l'esito DICHIARATO via task_complete e' un segnale MACCHINA
-        // che decide lo status canonico (mai la prosa, regola M).
-        let run = setup_mapping_run(&pool).await;
-
-        // blocked -> BlockedNeedsInput; senza testo, il summary fa da risposta.
-        let mut o = outcome_base();
-        o.final_answer = None;
-        o.declared_outcome = Some(serde_json::json!({
-            "outcome": "blocked",
-            "summary": "Serve la API key.",
-            K_BLOCKER: "credential"
-        }));
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
-        assert_eq!(r.final_answer.as_deref(), Some("Serve la API key."));
-
-        // partial -> FailedDiagnosed (dichiarazione onesta di incompletezza,
-        // mai "completed" su un lavoro dichiarato parziale).
-        let mut o = outcome_base();
-        o.declared_outcome = Some(serde_json::json!({"outcome": "partial", "summary": "meta'"}));
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
-
-        // refusal=true -> BlockedNeedsInput anche con outcome=done dichiarato.
-        let mut o = outcome_base();
-        o.declared_outcome = Some(serde_json::json!({
-            "outcome": "done", "summary": "no", "refusal": true
-        }));
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
-
-        // Il declared ha precedenza sul forced_close (dichiarazione onesta
-        // post-abort piu' specifica del segnale generico di chiusura).
-        let mut o = outcome_base();
-        o.stop_reason = Some(StopReason::LoopAbort);
-        o.declared_outcome = Some(serde_json::json!({
-            "outcome": "blocked", "summary": "fermo", K_BLOCKER: "service"
-        }));
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
-
-        // done senza refusal: Completed (poi final_gate/hollow a valle).
-        let mut o = outcome_base();
-        o.declared_outcome = Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::Completed);
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_final_gate_non_superato(pool: sqlx::PgPool) {
-        // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
-        // il verdetto strutturato final_gate_passed=false (regola M) prevale su una
-        // dichiarazione "done" ottimista e annota il resoconto (run e91d4892).
-        let run = setup_mapping_run(&pool).await;
-
-        // done dichiarato + gate NON passato -> FailedDiagnosed, mai Completed.
-        let mut o = outcome_base();
-        o.final_answer = Some("Task completato con successo.".to_string());
-        o.declared_outcome = Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
-        o.final_gate_passed = Some(false);
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
-        let ans = r.final_answer.expect("resoconto presente");
-        // Il verdetto oggettivo GUIDA (regola M): la prosa ottimista del modello e'
-        // retrocessa a resoconto non confermato, sotto l'annotazione del gate.
-        assert!(
-            ans.starts_with("**Verifica automatica non superata**"),
-            "il verdetto del gate deve guidare il resoconto: {ans}"
-        );
-        assert!(
-            ans.contains("Task completato con successo."),
-            "la prosa del modello resta presente (subordinata): {ans}"
-        );
-        assert!(ans.contains("Resoconto dell'agente"));
-
-        // gate PASSATO -> Completed, nessuna annotazione.
-        let mut o = outcome_base();
-        o.final_gate_passed = Some(true);
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::Completed);
-        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
-
-        // gate NON eseguito (None) -> comportamento invariato.
-        let mut o = outcome_base();
-        o.final_gate_passed = None;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::Completed);
-        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_final_gate_bocciato_mai_riverificato(pool: sqlx::PgPool) {
-        // REGRESSIONE run a5db0985: final_gate 1/2 FALLITO -> correzione in volo
-        // (che introduce una regressione) -> provider esauriti bruciano i turni
-        // fino al cap iterazioni -> chiusura SENZA gate 2/2. L'ultimo verdetto
-        // oggettivo e' una bocciatura: mai 'completed' (esito bugiardo), sempre
-        // FailedDiagnosed dal segnale strutturato (regola M).
-        let run = setup_mapping_run(&pool).await;
-
-        // Chiusura muta (la nota cooldown viene composta a valle): lo status
-        // deve comunque essere onesto.
-        let mut o = outcome_base();
-        o.final_answer = None;
-        o.final_gate_passed = None; // gate 2/2 mai eseguito
-        o.final_gate_failed_pending = true;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
-
-        // Con resoconto presente: status onesto + annotazione della bocciatura.
-        let mut o = outcome_base();
-        o.final_answer = Some("Correzioni applicate.".to_string());
-        o.final_gate_failed_pending = true;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
-        let ans = r.final_answer.expect("resoconto presente");
-        assert!(
-            ans.starts_with("**Verifica automatica fallita e non ripetuta**"),
-            "il verdetto del gate deve guidare il resoconto: {ans}"
-        );
-        assert!(
-            ans.contains("Correzioni applicate."),
-            "la prosa del modello resta presente (subordinata): {ans}"
-        );
-
-        // Contro-prova: senza bocciatura pendente il comportamento e' invariato.
-        let mut o = outcome_base();
-        o.final_gate_failed_pending = false;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::Completed);
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_final_gate_bocciato_precedenze_di_stato(pool: sqlx::PgPool) {
-        // Ordine della catena col segnale `final_gate_failed_pending` attivo:
-        // gli stati piu' specifici mantengono la precedenza sulla bocciatura.
-        let run = setup_mapping_run(&pool).await;
-
-        // La dichiarazione onesta `blocked` resta piu' specifica del segnale
-        // di bocciatura pendente (stessa precedenza del forced_close).
-        let mut o = outcome_base();
-        o.final_gate_failed_pending = true;
-        o.declared_outcome = Some(serde_json::json!({
-            "outcome": "blocked", "summary": "fermo", K_BLOCKER: "credential"
-        }));
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
-
-        // PRECEDENZA vs StopReason::Error: un errore infrastrutturale sopraggiunto
-        // DOPO la bocciatura del gate deve dare Failed (percorso retry/diagnosi),
-        // mai FailedDiagnosed. Blinda l'ordine della catena col campo nuovo attivo.
-        let mut o = outcome_base();
-        o.final_gate_failed_pending = true;
-        o.stop_reason = Some(StopReason::Error);
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::Failed);
-
-        // PRECEDENZA vs AwaitingConfirmation: un run sospeso per HITL con una
-        // bocciatura pendente resta AwaitingConfirmation (riprendera'), mai
-        // declassato a FailedDiagnosed.
-        let mut o = outcome_base();
-        o.final_gate_failed_pending = true;
-        o.completed = false;
-        o.resume_at = Some(RESUME_EXECUTOR.to_string());
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(r.status, AgentRunStatus::AwaitingConfirmation);
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_hitl_e_awaiting_confirmation(pool: sqlx::PgPool) {
-        let run = setup_mapping_run(&pool).await;
-        let mut o = outcome_base();
-        o.completed = false;
-        o.resume_at = Some(RESUME_EXECUTOR.to_string());
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(
-            r.status,
-            AgentRunStatus::AwaitingConfirmation,
-            "interrupt HITL -> awaiting_confirmation"
-        );
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_forced_close_failed_diagnosed(pool: sqlx::PgPool) {
-        let run = setup_mapping_run(&pool).await;
-        let mut o = outcome_base();
-        o.stop_reason = Some(StopReason::LoopAbort);
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(
-            r.status,
-            AgentRunStatus::FailedDiagnosed,
-            "abort anti-loop -> failed_diagnosed (esito certo)"
-        );
-        assert_eq!(r.stop_reason.as_deref(), Some("loop_abort"));
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_risposta_vuota_zero_step_hollow_e_recap(pool: sqlx::PgPool) {
-        // REGRESSIONE incidente run b07c7e78 (gap 2): run nativo TERMINATO con
-        // risposta vuota e ZERO step non deve restare un 'completed' MUTO. Il
-        // mapping calcola hollow (prima: false hardcoded), il canonico declassa
-        // a FailedDiagnosed e il compositore del messaggio produce comunque un
-        // testo per la chat (placeholder/recap deterministico).
-        let run = setup_mapping_run(&pool).await;
-        let mut o = outcome_base();
-        o.final_answer = Some("   ".to_string()); // whitespace-only = vuota
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert!(r.final_answer.is_none());
-        assert!(r.hollow_completion, "risposta vuota + 0 step -> hollow");
-        assert_eq!(r.hollow_completion_kind, "EMPTY_ANSWER+NO_TOOLS");
-        assert_eq!(
-            canonical_run_status(&r),
-            AgentRunStatus::FailedDiagnosed,
-            "mai 'completed' su un run muto senza lavoro"
-        );
-        assert!(
-            compose_turn_answer(&r).is_some(),
-            "la chat non deve restare muta: placeholder/recap garantito"
-        );
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_hollow_non_scatta_su_risposta_o_step_presenti(pool: sqlx::PgPool) {
-        // Contro-prova del calcolo hollow nativo: risposta presente (o run
-        // HITL non concluso) -> hollow false, status invariato.
-        let run = setup_mapping_run(&pool).await;
-        // Risposta presente -> non hollow.
-        let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
-        assert!(!r.hollow_completion);
-        assert_eq!(r.hollow_completion_kind, "");
-        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
-        // Interrupt HITL (final_answer assente ma run NON concluso) -> non hollow.
-        let mut o = outcome_base();
-        o.completed = false;
-        o.resume_at = Some(RESUME_EXECUTOR.to_string());
-        o.final_answer = None;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert!(!r.hollow_completion, "un interrupt HITL non e' un run muto");
-        // Errore del grafo -> non hollow (percorso Failed dedicato).
-        let mut o = outcome_base();
-        o.stop_reason = Some(StopReason::Error);
-        o.final_answer = None;
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert!(!r.hollow_completion);
-        assert_eq!(r.status, AgentRunStatus::Failed);
-    }
-
-    #[sqlx::test]
-    async fn native_mapping_forced_close_risposta_vuota_mai_completed(pool: sqlx::PgPool) {
-        // REGRESSIONE incidente run b07c7e78 (gap 1, lato mapping): risposta
-        // VUOTA al turno forzato -> l'executor marca forced_close_unverified;
-        // il mapping non deve MAI produrre 'completed' e la chat non resta muta.
-        let run = setup_mapping_run(&pool).await;
-        let mut o = outcome_base();
-        o.final_answer = None;
-        o.forced_close_unverified = true; // segnale autoritativo dell'executor
-        let r = native_outcome_to_run_result(&pool, run, o).await;
-        assert_eq!(
-            r.status,
-            AgentRunStatus::FailedDiagnosed,
-            "esito non verificato: mai 'completed' con risposta vuota"
-        );
-        assert!(
-            compose_turn_answer(&r).is_some(),
-            "recap/placeholder garantito anche a 0 step"
-        );
-    }
-
-    #[test]
-    fn native_failure_result_e_failed_onesto_senza_retry_class() {
-        // Regola H: un Err del motore nativo -> FAILED diagnosticato, NIENTE
-        // error_class (cosi' il loop di retry non lo ritenta su altri provider) e
-        // stop_reason "error". Nessun fallback al brain mascherato.
-        let run = Uuid::new_v4();
-        let r = native_engine_failure_result(
-            run,
-            "anthropic",
-            "claude-x",
-            "Il motore nativo non e' riuscito a completare il run.".to_string(),
-        );
-        assert_eq!(r.status, AgentRunStatus::Failed);
-        assert!(
-            r.error_class.is_none(),
-            "niente error_class: il fallimento del grafo non e' un errore provider ritentabile"
-        );
-        assert_eq!(r.stop_reason.as_deref(), Some("error"));
-        assert_eq!(r.provider, "anthropic");
-        assert_eq!(r.model, "claude-x");
-        assert!(r.steps.is_empty());
-        assert!(r
-            .final_answer
-            .as_deref()
-            .unwrap_or_default()
-            .contains("non e' riuscito"));
-    }
-}
 
 #[cfg(test)]
 mod tests_session_active {
     use super::*;
 
-    async fn create_agent_runs_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID NOT NULL DEFAULT gen_random_uuid(), \
-                 session_id UUID NOT NULL, \
-                 status TEXT NOT NULL \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table agent_runs");
+    /// Sessione con un run nello stato voluto. Lo schema reale vincola
+    /// `agent_runs.session_id` a `chat_sessions(id)`: la sessione va seminata,
+    /// non inventata (la vecchia fixture a mano, senza FK, la accettava).
+    async fn sessione_con_run(pool: &sqlx::PgPool, status: &str) -> Uuid {
+        let project = Uuid::new_v4();
+        let sess = crate::test_support::seed_chat_session(pool, project).await;
+        crate::test_support::insert_agent_run(pool, sess, project, status).await;
+        sess
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn vero_su_running(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running')")
-            .bind(sess)
-            .execute(&pool)
-            .await
-            .expect("insert running");
+        let sess = sessione_con_run(&pool, "running").await;
         assert!(session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn vero_su_awaiting_confirmation(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_confirmation')",
-        )
-        .bind(sess)
-        .execute(&pool)
-        .await
-        .expect("insert awaiting");
+        let sess = sessione_con_run(&pool, "awaiting_confirmation").await;
         assert!(session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn vero_su_awaiting_subagents(pool: sqlx::PgPool) {
         // Fase D: un padre sospeso su awaiting_subagents e' un run ATTIVO/sospeso-vivo
         // sulla sessione (punto unico ACTIVE_RUN_STATUSES) -> session_has_active_run
         // deve vederlo, altrimenti process_resume/service_observer avvierebbero un 2o
         // run parallelo (S2 della re-review).
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_subagents')",
-        )
-        .bind(sess)
-        .execute(&pool)
-        .await
-        .expect("insert awaiting_subagents");
+        let sess = sessione_con_run(&pool, "awaiting_subagents").await;
         assert!(session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn falso_se_solo_run_conclusi(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (session_id, status) \
-             VALUES ($1, 'completed'), ($1, 'cancelled'), ($1, 'failed')",
-        )
-        .bind(sess)
-        .execute(&pool)
-        .await
-        .expect("insert conclusi");
+        let project = Uuid::new_v4();
+        let sess = crate::test_support::seed_chat_session(&pool, project).await;
+        for status in ["completed", "cancelled", "failed"] {
+            crate::test_support::insert_agent_run(&pool, sess, project, status).await;
+        }
         assert!(!session_has_active_run(&pool, sess).await);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn isolamento_per_sessione(pool: sqlx::PgPool) {
-        create_agent_runs_table(&pool).await;
-        let sess_a = Uuid::new_v4();
-        let sess_b = Uuid::new_v4();
+        let sess_a = crate::test_support::seed_chat_session(&pool, Uuid::new_v4()).await;
         // Solo sess_b ha un run attivo.
-        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running')")
-            .bind(sess_b)
-            .execute(&pool)
-            .await
-            .expect("insert running sess_b");
+        let sess_b = sessione_con_run(&pool, "running").await;
         assert!(!session_has_active_run(&pool, sess_a).await);
         assert!(session_has_active_run(&pool, sess_b).await);
     }
@@ -7174,6 +6591,7 @@ mod tests_finalize_turn {
             prompt_tokens: 18_000,
             completion_tokens: 1_400,
             total_tokens: 19_400,
+            rows: 3,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
         assert!(
@@ -7187,9 +6605,16 @@ mod tests_finalize_turn {
     }
 
     #[test]
-    fn ledger_non_sovrascrive_costo_gia_propagato() {
-        // Path Python: result ha gia' un costo valido -> il ledger NON lo tocca
-        // (evita doppio conteggio / regressioni dove il brain e' autoritativo).
+    fn ledger_sovrascrive_il_costo_dell_ultimo_turno() {
+        // REGRESSIONE (misurata in produzione, sessione chat 25): result.total_cost
+        // NON e' il totale del run ma il costo dell'ULTIMO TURNO (reducer overwrite
+        // nel grafo). Il ledger ha le righe di TUTTE le chiamate: quando ne ha,
+        // vince, altrimenti il run pubblica l'ultima iterazione come totale
+        // (misurato: 0.0338 invece di 0.1510 -> sottostima 4.5x).
+        //
+        // Il test precedente asseriva il CONTRARIO ("result con costo > 0 non va
+        // sovrascritto"), sancendo il difetto sul razionale "il brain Python e'
+        // autoritativo": premessa falsa e brain non piu' esistente.
         let mut r = mk_result(
             AgentRunStatus::Completed,
             vec![write_step()],
@@ -7198,29 +6623,60 @@ mod tests_finalize_turn {
             "",
             Some("fix"),
         );
-        r.total_cost = 0.05;
-        r.prompt_tokens = 1_000;
-        r.completion_tokens = 200;
-        r.total_tokens = 1_200;
+        r.total_cost = 0.033842; // costo del solo ultimo turno
+        r.prompt_tokens = 13_780;
+        r.completion_tokens = 1_047;
+        r.total_tokens = 14_827;
         let ledger = super::LedgerTotals {
-            total_cost: 0.99,
-            prompt_tokens: 99_999,
-            completion_tokens: 99_999,
-            total_tokens: 199_998,
+            total_cost: 0.150972, // totale reale del run (8 chiamate)
+            prompt_tokens: 63_177,
+            completion_tokens: 4_103,
+            total_tokens: 67_280,
+            rows: 8,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
         assert!(
-            !applied,
-            "result con costo > 0 non va sovrascritto dal ledger"
+            applied,
+            "il ledger con righe e' autoritativo anche se result ha gia' un costo > 0"
         );
-        assert!((r.total_cost - 0.05).abs() < 1e-9);
-        assert_eq!(r.prompt_tokens, 1_000);
-        assert_eq!(r.total_tokens, 1_200);
+        assert!((r.total_cost - 0.150972).abs() < 1e-9, "costo del RUN, non del turno");
+        assert_eq!(r.prompt_tokens, 63_177);
+        assert_eq!(r.total_tokens, 67_280);
+    }
+
+    #[test]
+    fn ledger_con_righe_a_costo_zero_e_comunque_autoritativo() {
+        // Prezzo del modello ignoto (pricing_state='unknown') -> il gateway scrive
+        // righe con token reali e costo 0. Sono contabilita' valida: i token vanno
+        // riconciliati lo stesso. Il vecchio predicato `total_cost > 0` le
+        // scambiava per "ledger assente" (regola M: lo stato non si deduce da una
+        // grandezza).
+        let mut r = mk_result(
+            AgentRunStatus::Completed,
+            vec![write_step()],
+            Some("fatto"),
+            false,
+            "",
+            Some("fix"),
+        );
+        r.total_cost = 0.02;
+        r.prompt_tokens = 10;
+        let ledger = super::LedgerTotals {
+            total_cost: 0.0,
+            prompt_tokens: 15_162_322,
+            completion_tokens: 140_049,
+            total_tokens: 15_302_371,
+            rows: 747,
+        };
+        let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
+        assert!(applied, "righe presenti -> ledger autoritativo anche a costo 0");
+        assert_eq!(r.prompt_tokens, 15_162_322, "i token sono reali e vanno adottati");
+        assert!(r.total_cost.abs() < 1e-9, "costo onestamente 0: il prezzo e' ignoto, non stimato");
     }
 
     #[test]
     fn ledger_vuoto_lascia_result_invariato_per_fallback_catalog() {
-        // Ledger assente per il run (provider che non scrive ledger): nessuna
+        // Ledger SENZA RIGHE per il run (provider che non scrive ledger): nessuna
         // riconciliazione -> il chiamante ricade sul fallback calcolo-da-catalog.
         let mut r = mk_result(
             AgentRunStatus::Completed,
@@ -7240,7 +6696,7 @@ mod tests_finalize_turn {
         );
         let applied =
             super::reconcile_run_cost_from_ledger(&mut r, &super::LedgerTotals::default());
-        assert!(!applied, "ledger a costo zero non e' autoritativo");
+        assert!(!applied, "ledger senza righe: niente da riconciliare");
         assert_eq!(
             (
                 r.total_cost,
@@ -7275,11 +6731,12 @@ mod tests_finalize_turn {
             prompt_tokens: 1_650_000, // cumulativo multi-iterazione
             completion_tokens: 40_000,
             total_tokens: 1_690_000,
+            rows: 12,
         };
         let applied = super::reconcile_run_cost_from_ledger(&mut r, &ledger);
         assert!(
             applied,
-            "ledger con costo > 0 e' autoritativo per il billing"
+            "ledger con righe e' autoritativo per il billing"
         );
         assert_eq!(
             r.prompt_tokens, 1_650_000,
@@ -7309,6 +6766,7 @@ mod tests_finalize_turn {
             prompt_tokens: 800,
             completion_tokens: 150,
             total_tokens: 0,
+            rows: 2,
         };
         assert!(super::reconcile_run_cost_from_ledger(&mut r, &ledger));
         assert_eq!(
@@ -7454,6 +6912,33 @@ mod tests_finalize_turn {
         assert_eq!(short_file_label("a/b/c/d.ts"), ".../c/d.ts");
     }
 
+    /// Sub-run di background nello stato voluto, con i NOT NULL dello schema
+    /// reale (`project_id`, `kind`, `task_description`) che la vecchia fixture a
+    /// mano non aveva: il DB di produzione non accetta un sub-run senza.
+    async fn insert_sub_run(
+        pool: &sqlx::PgPool,
+        anchor: Uuid,
+        dispatcher: Uuid,
+        status: &str,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs \
+             (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+              status, is_background) \
+             VALUES ($1, $2, $3, $4, 'coder', 'task di test', $5, true)",
+        )
+        .bind(id)
+        .bind(anchor)
+        .bind(dispatcher)
+        .bind(Uuid::new_v4())
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert sub-run");
+        id
+    }
+
     /// ALTA 1 (isolamento per-run del FETCH): con l'annidamento tutti i sub-run
     /// condividono `parent_run_id = session_id` (anchor), ma il fetch del padre P
     /// deve iniettare SOLO i suoi figli DIRETTI (dispatcher_run_id = P), MAI i
@@ -7461,25 +6946,8 @@ mod tests_finalize_turn {
     /// filtra su `dispatcher_run_id` (mig project 0010): riproduce il bug perche'
     /// col vecchio filtro `parent_run_id = anchor` la lista di P conterrebbe ANCHE
     /// Cs1 (nipote mai dispatchato da P).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fetch_fanin_isola_per_dispatcher_non_anchor(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 kind TEXT NOT NULL DEFAULT 'coder', \
-                 status TEXT NOT NULL, \
-                 final_summary TEXT, \
-                 verdict JSONB, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 fanin_consumed_at TIMESTAMPTZ, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create nexus_subagent_runs");
-
         // Annidamento: tutti i sub-run hanno parent_run_id = session (anchor
         // degenere), ma dispatcher distinto. P dispatcha Cp1,Cp2; Cp1 dispatcha Cs1.
         let session = Uuid::new_v4();
@@ -7488,17 +6956,7 @@ mod tests_finalize_turn {
         let insert = |anchor: Uuid, dispatcher: Uuid, status: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query(
-                    "INSERT INTO nexus_subagent_runs \
-                     (parent_run_id, dispatcher_run_id, status, is_background) \
-                     VALUES ($1, $2, $3, true)",
-                )
-                .bind(anchor)
-                .bind(dispatcher)
-                .bind(status)
-                .execute(&pool)
-                .await
-                .expect("insert sub-run");
+                insert_sub_run(&pool, anchor, dispatcher, status).await;
             }
         };
         // Cp1, Cp2: figli DIRETTI di P (dispatcher = P), terminali.
@@ -7536,41 +6994,14 @@ mod tests_finalize_turn {
     /// dello stesso dispatcher rifetcherebbe anche i figli della 1a ondata (doppia
     /// iniezione nel modello). Con `fanin_consumed_at` (mig project 0011) la 1a
     /// fetch li marca e la 2a NON li rivede; solo i figli NUOVI vengono iniettati.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fetch_fanin_consuma_e_non_re_inietta_seconda_ondata(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 kind TEXT NOT NULL DEFAULT 'coder', \
-                 status TEXT NOT NULL, \
-                 final_summary TEXT, \
-                 verdict JSONB, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 fanin_consumed_at TIMESTAMPTZ, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create nexus_subagent_runs");
-
         let session = Uuid::new_v4();
         let dispatcher = Uuid::new_v4();
         let insert = |status: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query(
-                    "INSERT INTO nexus_subagent_runs \
-                     (parent_run_id, dispatcher_run_id, status, is_background) \
-                     VALUES ($1, $2, $3, true)",
-                )
-                .bind(session)
-                .bind(dispatcher)
-                .bind(status)
-                .execute(&pool)
-                .await
-                .expect("insert sub-run");
+                insert_sub_run(&pool, session, dispatcher, status).await;
             }
         };
         // 1a ondata: 2 figli diretti terminali.
@@ -7590,5 +7021,620 @@ mod tests_finalize_turn {
         let wave2 = claim_subagent_fanin_results(&pool, dispatcher).await;
         assert_eq!(wave2.len(), 1, "la 2a ondata inietta SOLO il figlio nuovo");
         assert_eq!(wave2[0]["status"], serde_json::json!("failed"));
+    }
+}
+
+/// Test del mapping esito nativo -> `AgentRunResult`. Vivevano in un modulo
+/// chiamato `tests_select_engine` insieme ai test del selettore di motore: il
+/// selettore non c'e' piu' (un motore solo), questi restano.
+#[cfg(test)]
+mod tests_native_mapping {
+    use super::*;
+
+
+
+
+
+
+    // `run_via_native` richiede un `AppState` reale (ToolRunnerDeps + gateway),
+    // non costruibile in unit test: il suo corpo e' un assemblaggio di clone da
+    // AppState + delega al PUNTO UNICO `native_engine::run_native`. La logica
+    // testabile (costruzione initial_state dal prompt, mapping esito) e' coperta
+    // dai test di `crate::native_engine`; il grafo end-to-end con gateway
+    // scriptato e' coperto da `nexus_agent_graph::graph` (stessi tipi e builder).
+
+    // ── DEBITO 3: mapping NativeRunOutcome -> AgentRunResult (finalize unico) ─────
+
+    use nexus_agent_graph::StopReason;
+
+    /// Preambolo comune dei test di mapping: un run reale (sessione + riga
+    /// `agent_runs` con i suoi NOT NULL) sullo schema del DB-progetto. Le tabelle
+    /// non si creano piu' qui: le porta il migrator del set `db/migrations/project`.
+    async fn setup_mapping_run(pool: &sqlx::PgPool) -> Uuid {
+        crate::test_support::seed_agent_run(pool).await
+    }
+
+    // Chiavi/valori fixture ricorrenti degli outcome dichiarati.
+    const K_BLOCKER: &str = "blocker";
+    const RESUME_EXECUTOR: &str = "executor";
+
+    fn outcome_base() -> crate::native_engine::NativeRunOutcome {
+        crate::native_engine::NativeRunOutcome {
+            completed: true,
+            awaiting_subagents: false,
+            final_answer: Some("fatto".to_string()),
+            stop_reason: Some(StopReason::EndTurn),
+            provider_used: Some("anthropic".to_string()),
+            model_used: Some("claude-x".to_string()),
+            resume_at: None,
+            iterations: 2,
+            prompt_tokens: 100,
+            completion_tokens: 40,
+            total_tokens: 140,
+            total_cost: 0.0,
+            user_intent: Some("code".to_string()),
+            reasoning: None,
+            messages_json: Some(r#"[{"role":"user","content":"ciao"}]"#.to_string()),
+            declared_outcome: None,
+            review_verdict: None,
+            advisory_verdict: None,
+            debate_position: None,
+            error_class: None,
+            forced_close_unverified: false,
+            final_gate_passed: None,
+            final_gate_unverified: None,
+            final_gate_failed_pending: false,
+            review_panel_rejected: false,
+            review_panel_last: None,
+            pending_actions: Vec::new(),
+        }
+    }
+
+    /// Todo del piano del run. Semina prima il piano (`nexus_agent_todos.run_id`
+    /// e' vincolato da una FK verso `nexus_agent_plans(run_id)`) e ne eredita il
+    /// `project_id`, NOT NULL nello schema reale.
+    ///
+    /// I test che NON chiamano questa fn lavorano su una tabella VUOTA - lo
+    /// scenario reale "run senza piano" - e non piu' su una tabella ASSENTE, che
+    /// in produzione non capita mai: la detection hollow resta invariata in
+    /// entrambi i casi, ma ora il ramo esercitato e' quello che esiste davvero.
+    async fn insert_todo(pool: &sqlx::PgPool, run: Uuid, seq: i64, status: &str, content: &str) {
+        crate::test_support::seed_plan(pool, run, Uuid::new_v4()).await;
+        sqlx::query(
+            "INSERT INTO nexus_agent_todos (run_id, project_id, seq, status, content) \
+             SELECT $1, p.project_id, $2, $3, $4 \
+             FROM nexus_agent_plans p WHERE p.run_id = $1",
+        )
+        .bind(run)
+        .bind(seq)
+        .bind(status)
+        .bind(content)
+        .execute(pool)
+        .await
+        .expect("insert todo");
+    }
+
+    /// Il run DISPATCHER della todo-isolation non e' hollow: 0 step e risposta
+    /// vuota sono la sua forma NORMALE (delega ai sub-run), non un fallimento.
+    /// Riproduce l'incidente 79d2d6eb (7/7 todo completed mostrati "falliti").
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn dispatcher_todo_isolation_non_e_hollow(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        insert_todo(&pool, run, 1, "completed", "Scrivi index.html").await;
+        insert_todo(&pool, run, 2, "completed", "Scrivi script.js").await;
+        insert_todo(&pool, run, 3, "skipped", "Passo opzionale").await;
+
+        // Dispatcher: NESSUNO step sul proprio run_id, NESSUNA risposta propria.
+        let mut outcome = outcome_base();
+        outcome.final_answer = None;
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert!(
+            !r.hollow_completion,
+            "un piano concluso con lavoro non e' hollow: il declassamento a \
+             failed_diagnosed marcherebbe 'fallito' un run che ha fatto tutto"
+        );
+        assert!(r.hollow_completion_kind.is_empty());
+        // Recap dai dati: il run non resta muto in chat.
+        let ans = r.final_answer.expect("recap del dispatcher");
+        assert!(ans.contains("Piano completato"), "recap inatteso: {ans}");
+        assert!(ans.contains("Scrivi index.html"), "recap senza todo: {ans}");
+    }
+
+    /// Contro-prova: un dispatch PARZIALMENTE FALLITO (todo `blocked`) resta
+    /// hollow. Il gate non deve inghiottire i fallimenti veri.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn dispatcher_con_todo_blocked_resta_hollow(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        insert_todo(&pool, run, 1, "completed", "Fatto").await;
+        insert_todo(&pool, run, 2, "blocked", "Rimasto bloccato").await;
+
+        let mut outcome = outcome_base();
+        outcome.final_answer = None;
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert!(
+            r.hollow_completion,
+            "piano fermo su un todo blocked: il fallimento deve restare visibile"
+        );
+        assert!(r.final_answer.is_none(), "nessun recap su piano non concluso");
+    }
+
+    /// Regressione gap 0-step (incidente b07c7e78): un run SENZA piano che
+    /// chiude muto resta hollow come prima del gate.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn run_senza_piano_resta_hollow(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+
+        let mut outcome = outcome_base();
+        outcome.final_answer = None;
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert!(r.hollow_completion, "run senza piano: detection invariata");
+        assert!(r.hollow_completion_kind.contains("EMPTY_ANSWER"));
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_completed_legge_step_e_usage(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        // Step gia' persistiti dal grafo (step_index = iteration*1000+idx).
+        for (si, name, st) in [
+            (1000, "read_file", "completed"),
+            (2000, "write_file", "failed"),
+        ] {
+            // `tool_input` e' NOT NULL SENZA default nello schema reale: la vecchia
+            // fixture gli aveva inventato un `DEFAULT '{}'` che permetteva di
+            // ometterlo, cosa che in produzione il DB rifiuta.
+            sqlx::query(
+                "INSERT INTO agent_steps (run_id, step_index, tool_name, tool_input, status) \
+                 VALUES ($1,$2,$3,'{}'::jsonb,$4)",
+            )
+            .bind(run)
+            .bind(si)
+            .bind(name)
+            .bind(st)
+            .execute(&pool)
+            .await
+            .expect("insert step");
+        }
+
+        let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model, "claude-x");
+        assert_eq!(r.iteration_count, 2);
+        assert_eq!(r.prompt_tokens, 100);
+        assert_eq!(r.total_tokens, 140);
+        // Intent del turno -> nexus_task_type (parita' col path Python).
+        assert_eq!(r.nexus_task_type.as_deref(), Some("code"));
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+        // Step ricostruiti da DB in ordine di step_index, con status mappato.
+        assert_eq!(r.steps.len(), 2);
+        assert_eq!(r.steps[0].tool_name, "read_file");
+        assert_eq!(r.steps[0].status, AgentStepStatus::Completed);
+        assert_eq!(r.steps[1].tool_name, "write_file");
+        assert_eq!(r.steps[1].status, AgentStepStatus::Failed);
+        // La conversazione finale del grafo e' propagata per agent_runs.messages_json.
+        assert_eq!(
+            r.messages_json.as_deref(),
+            Some(r#"[{"role":"user","content":"ciao"}]"#)
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_last_prompt_tokens_e_il_prompt_lordo(pool: sqlx::PgPool) {
+        // Il rapporto ctx% (`computeContextFill` in UI) legge `last_prompt_tokens`:
+        // la finestra di contesto la occupa TUTTO il prompt inviato, anche la
+        // parte che il provider ha servito dalla propria cache (la cache
+        // risparmia denaro, non spazio). Un prompt "al netto" dichiarerebbe una
+        // finestra quasi vuota proprio sui run lunghi, gli unici in cui
+        // l'indicatore serve.
+        //
+        // Il test parte dallo STATO DEL GRAFO e attraversa `map_outcome`, il solo
+        // produttore del `NativeRunOutcome` in produzione (regola O). Fabbricare
+        // l'outcome a mano — com'era prima — fissava proprio l'assunto da
+        // verificare: una mutazione di `map_outcome` restava verde su 1356 test.
+        //
+        // MUTAZIONE che lo rende rosso: in `map_outcome`, scorporare la cache dal
+        // prompt (`state.prompt_tokens - cache_read - cache_creation`) -> 500
+        // invece di 41_000, cioe' una finestra dichiarata all'1% del vero.
+        use nexus_agent_graph::state::AgentState;
+        use nexus_graph::outcome::StepOutcome;
+
+        let run = setup_mapping_run(&pool).await;
+        // Lo stato come lo lascia l'executor a fine turno: `prompt_tokens` e' il
+        // LORDO, di cui i due conteggi di cache sono SOTTOINSIEMI (convenzione
+        // unica fissata in `nexus_gateway::LlmUsage::normalized`).
+        let state = AgentState {
+            result: Some("fatto".to_string()),
+            iterations: Some(2),
+            prompt_tokens: Some(41_000),
+            cache_read_tokens: Some(40_000),
+            cache_creation_tokens: Some(500),
+            completion_tokens: Some(1_200),
+            total_tokens: Some(42_200),
+            ..Default::default()
+        };
+
+        let outcome = crate::native_engine::map_outcome(StepOutcome::Completed(state));
+        assert_eq!(
+            outcome.prompt_tokens, 41_000,
+            "map_outcome propaga il prompt LORDO dello stato, senza scorporare la cache"
+        );
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert_eq!(
+            r.last_prompt_tokens,
+            Some(41_000),
+            "il riempimento della finestra si misura sul prompt LORDO"
+        );
+        assert_eq!(r.prompt_tokens, 41_000);
+        // I totali restano quelli dello stato: prompt lordo + completion. Nessun
+        // consumatore risomma la cache (sarebbe un doppio conteggio).
+        assert_eq!(r.completion_tokens, 1_200);
+        assert_eq!(r.total_tokens, 42_200);
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_declared_outcome_stati_canonici(pool: sqlx::PgPool) {
+        // ADR 0034: l'esito DICHIARATO via task_complete e' un segnale MACCHINA
+        // che decide lo status canonico (mai la prosa, regola M).
+        let run = setup_mapping_run(&pool).await;
+
+        // blocked -> BlockedNeedsInput; senza testo, il summary fa da risposta.
+        let mut o = outcome_base();
+        o.final_answer = None;
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "blocked",
+            "summary": "Serve la API key.",
+            K_BLOCKER: "credential"
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+        assert_eq!(r.final_answer.as_deref(), Some("Serve la API key."));
+
+        // partial -> FailedDiagnosed (dichiarazione onesta di incompletezza,
+        // mai "completed" su un lavoro dichiarato parziale).
+        let mut o = outcome_base();
+        o.declared_outcome = Some(serde_json::json!({"outcome": "partial", "summary": "meta'"}));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+
+        // refusal=true -> BlockedNeedsInput anche con outcome=done dichiarato.
+        let mut o = outcome_base();
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "done", "summary": "no", "refusal": true
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+
+        // Il declared ha precedenza sul forced_close (dichiarazione onesta
+        // post-abort piu' specifica del segnale generico di chiusura).
+        let mut o = outcome_base();
+        o.stop_reason = Some(StopReason::LoopAbort);
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "blocked", "summary": "fermo", K_BLOCKER: "service"
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+
+        // done senza refusal: Completed (poi final_gate/hollow a valle).
+        let mut o = outcome_base();
+        o.declared_outcome = Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_final_gate_non_superato(pool: sqlx::PgPool) {
+        // Verifica oggettiva pre-chiusura NON superata (final_gate al cap/forced):
+        // il verdetto strutturato final_gate_passed=false (regola M) prevale su una
+        // dichiarazione "done" ottimista e annota il resoconto (run e91d4892).
+        let run = setup_mapping_run(&pool).await;
+
+        // done dichiarato + gate NON passato -> FailedDiagnosed, mai Completed.
+        let mut o = outcome_base();
+        o.final_answer = Some("Task completato con successo.".to_string());
+        o.declared_outcome = Some(serde_json::json!({"outcome": "done", "summary": "fatto"}));
+        o.final_gate_passed = Some(false);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+        let ans = r.final_answer.expect("resoconto presente");
+        // Il verdetto oggettivo GUIDA (regola M): la prosa ottimista del modello e'
+        // retrocessa a resoconto non confermato, sotto l'annotazione del gate.
+        assert!(
+            ans.starts_with("**Verifica automatica non superata**"),
+            "il verdetto del gate deve guidare il resoconto: {ans}"
+        );
+        assert!(
+            ans.contains("Task completato con successo."),
+            "la prosa del modello resta presente (subordinata): {ans}"
+        );
+        assert!(ans.contains("Resoconto dell'agente"));
+        // Provenienza: il resoconto dice QUALE provider/modello l'ha generato.
+        assert!(
+            ans.contains("anthropic/claude-x"),
+            "il resoconto deve riportare provider/modello: {ans}"
+        );
+
+        // gate PASSATO -> Completed, nessuna annotazione.
+        let mut o = outcome_base();
+        o.final_gate_passed = Some(true);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
+
+        // gate NON eseguito (None) -> comportamento invariato.
+        let mut o = outcome_base();
+        o.final_gate_passed = None;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+        assert_eq!(r.final_answer.as_deref(), Some("fatto"));
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_final_gate_bocciato_mai_riverificato(pool: sqlx::PgPool) {
+        // REGRESSIONE run a5db0985: final_gate 1/2 FALLITO -> correzione in volo
+        // (che introduce una regressione) -> provider esauriti bruciano i turni
+        // fino al cap iterazioni -> chiusura SENZA gate 2/2. L'ultimo verdetto
+        // oggettivo e' una bocciatura: mai 'completed' (esito bugiardo), sempre
+        // FailedDiagnosed dal segnale strutturato (regola M).
+        let run = setup_mapping_run(&pool).await;
+
+        // Chiusura muta (la nota cooldown viene composta a valle): lo status
+        // deve comunque essere onesto.
+        let mut o = outcome_base();
+        o.final_answer = None;
+        o.final_gate_passed = None; // gate 2/2 mai eseguito
+        o.final_gate_failed_pending = true;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+
+        // Con resoconto presente: status onesto + annotazione della bocciatura.
+        let mut o = outcome_base();
+        o.final_answer = Some("Correzioni applicate.".to_string());
+        o.final_gate_failed_pending = true;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::FailedDiagnosed);
+        let ans = r.final_answer.expect("resoconto presente");
+        assert!(
+            ans.starts_with("**Verifica automatica fallita e non ripetuta**"),
+            "il verdetto del gate deve guidare il resoconto: {ans}"
+        );
+        assert!(
+            ans.contains("Correzioni applicate."),
+            "la prosa del modello resta presente (subordinata): {ans}"
+        );
+
+        // Contro-prova: senza bocciatura pendente il comportamento e' invariato.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = false;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Completed);
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_final_gate_bocciato_precedenze_di_stato(pool: sqlx::PgPool) {
+        // Ordine della catena col segnale `final_gate_failed_pending` attivo:
+        // gli stati piu' specifici mantengono la precedenza sulla bocciatura.
+        let run = setup_mapping_run(&pool).await;
+
+        // La dichiarazione onesta `blocked` resta piu' specifica del segnale
+        // di bocciatura pendente (stessa precedenza del forced_close).
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = true;
+        o.declared_outcome = Some(serde_json::json!({
+            "outcome": "blocked", "summary": "fermo", K_BLOCKER: "credential"
+        }));
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::BlockedNeedsInput);
+
+        // PRECEDENZA vs StopReason::Error: un errore infrastrutturale sopraggiunto
+        // DOPO la bocciatura del gate deve dare Failed (percorso retry/diagnosi),
+        // mai FailedDiagnosed. Blinda l'ordine della catena col campo nuovo attivo.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = true;
+        o.stop_reason = Some(StopReason::Error);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::Failed);
+
+        // PRECEDENZA vs AwaitingConfirmation: un run sospeso per HITL con una
+        // bocciatura pendente resta AwaitingConfirmation (riprendera'), mai
+        // declassato a FailedDiagnosed.
+        let mut o = outcome_base();
+        o.final_gate_failed_pending = true;
+        o.completed = false;
+        o.resume_at = Some(RESUME_EXECUTOR.to_string());
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(r.status, AgentRunStatus::AwaitingConfirmation);
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_hitl_e_awaiting_confirmation(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        let mut o = outcome_base();
+        o.completed = false;
+        o.resume_at = Some(RESUME_EXECUTOR.to_string());
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(
+            r.status,
+            AgentRunStatus::AwaitingConfirmation,
+            "interrupt HITL -> awaiting_confirmation"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_forced_close_failed_diagnosed(pool: sqlx::PgPool) {
+        let run = setup_mapping_run(&pool).await;
+        let mut o = outcome_base();
+        o.stop_reason = Some(StopReason::LoopAbort);
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(
+            r.status,
+            AgentRunStatus::FailedDiagnosed,
+            "abort anti-loop -> failed_diagnosed (esito certo)"
+        );
+        assert_eq!(r.stop_reason.as_deref(), Some("loop_abort"));
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_risposta_vuota_zero_step_hollow_e_recap(pool: sqlx::PgPool) {
+        // REGRESSIONE incidente run b07c7e78 (gap 2): run nativo TERMINATO con
+        // risposta vuota e ZERO step non deve restare un 'completed' MUTO. Il
+        // mapping calcola hollow (prima: false hardcoded), il canonico declassa
+        // a FailedDiagnosed e il compositore del messaggio produce comunque un
+        // testo per la chat (placeholder/recap deterministico).
+        let run = setup_mapping_run(&pool).await;
+        let mut o = outcome_base();
+        o.final_answer = Some("   ".to_string()); // whitespace-only = vuota
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert!(r.final_answer.is_none());
+        assert!(r.hollow_completion, "risposta vuota + 0 step -> hollow");
+        assert_eq!(r.hollow_completion_kind, "EMPTY_ANSWER+NO_TOOLS");
+        assert_eq!(
+            canonical_run_status(&r),
+            AgentRunStatus::FailedDiagnosed,
+            "mai 'completed' su un run muto senza lavoro"
+        );
+        assert!(
+            compose_turn_answer(&r).is_some(),
+            "la chat non deve restare muta: placeholder/recap garantito"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_hollow_non_scatta_su_risposta_o_step_presenti(pool: sqlx::PgPool) {
+        // Contro-prova del calcolo hollow nativo: risposta presente (o run
+        // HITL non concluso) -> hollow false, status invariato.
+        let run = setup_mapping_run(&pool).await;
+        // Risposta presente -> non hollow.
+        let r = native_outcome_to_run_result(&pool, run, outcome_base()).await;
+        assert!(!r.hollow_completion);
+        assert_eq!(r.hollow_completion_kind, "");
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
+        // Interrupt HITL (final_answer assente ma run NON concluso) -> non hollow.
+        let mut o = outcome_base();
+        o.completed = false;
+        o.resume_at = Some(RESUME_EXECUTOR.to_string());
+        o.final_answer = None;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert!(!r.hollow_completion, "un interrupt HITL non e' un run muto");
+        // Errore del grafo -> non hollow (percorso Failed dedicato).
+        let mut o = outcome_base();
+        o.stop_reason = Some(StopReason::Error);
+        o.final_answer = None;
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert!(!r.hollow_completion);
+        assert_eq!(r.status, AgentRunStatus::Failed);
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_forced_close_risposta_vuota_mai_completed(pool: sqlx::PgPool) {
+        // REGRESSIONE incidente run b07c7e78 (gap 1, lato mapping): risposta
+        // VUOTA al turno forzato -> l'executor marca forced_close_unverified;
+        // il mapping non deve MAI produrre 'completed' e la chat non resta muta.
+        let run = setup_mapping_run(&pool).await;
+        let mut o = outcome_base();
+        o.final_answer = None;
+        o.forced_close_unverified = true; // segnale autoritativo dell'executor
+        let r = native_outcome_to_run_result(&pool, run, o).await;
+        assert_eq!(
+            r.status,
+            AgentRunStatus::FailedDiagnosed,
+            "esito non verificato: mai 'completed' con risposta vuota"
+        );
+        assert!(
+            compose_turn_answer(&r).is_some(),
+            "recap/placeholder garantito anche a 0 step"
+        );
+    }
+
+    #[test]
+    fn native_failure_result_e_failed_onesto_senza_retry_class() {
+        // Regola H: un Err del motore nativo -> FAILED diagnosticato, NIENTE
+        // error_class (cosi' il loop di retry non lo ritenta su altri provider) e
+        // stop_reason "error". Nessun fallback al brain mascherato.
+        let run = Uuid::new_v4();
+        let r = native_engine_failure_result(
+            run,
+            "anthropic",
+            "claude-x",
+            "Il motore nativo non e' riuscito a completare il run.".to_string(),
+        );
+        assert_eq!(r.status, AgentRunStatus::Failed);
+        assert!(
+            r.error_class.is_none(),
+            "niente error_class: il fallimento del grafo non e' un errore provider ritentabile"
+        );
+        assert_eq!(r.stop_reason.as_deref(), Some("error"));
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.model, "claude-x");
+        assert!(r.steps.is_empty());
+        assert!(r
+            .final_answer
+            .as_deref()
+            .unwrap_or_default()
+            .contains("non e' riuscito"));
+    }
+}
+
+#[cfg(test)]
+mod tests_enforce_cancellation {
+    use super::*;
+
+    /// Run nello stato voluto, eventualmente con lo Stop utente registrato.
+    /// Sessione e NOT NULL reali vengono dal seeder condiviso: la tabella la
+    /// porta il migrator del set project.
+    async fn insert(pool: &sqlx::PgPool, status: &str, cancelled: bool) -> Uuid {
+        let project = Uuid::new_v4();
+        let session = crate::test_support::seed_chat_session(pool, project).await;
+        let id = crate::test_support::insert_agent_run(pool, session, project, status).await;
+        if cancelled {
+            sqlx::query("UPDATE agent_runs SET cancellation_requested = NOW() WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("registra lo Stop utente");
+        }
+        id
+    }
+
+    async fn status_of(pool: &sqlx::PgPool, id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("status")
+    }
+
+    /// Il caso di campo (run 53dac032, 18/07): Stop premuto durante l'ultima
+    /// chiamata LLM, il modello conclude -> finalizzato 'completed' con
+    /// `cancellation_requested` valorizzato. La riconciliazione lo porta a
+    /// 'cancelled', cosi' lo Stop utente si riflette nello stato finale.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn completed_con_cancellazione_diventa_cancelled(pool: sqlx::PgPool) {
+        let id = insert(&pool, "completed", true).await;
+        enforce_user_cancellation_status(&pool, id).await;
+        assert_eq!(status_of(&pool, id).await, "cancelled");
+    }
+
+    /// Senza cancellazione un 'completed' resta 'completed': nessun falso Stop su
+    /// un run terminato normalmente.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn completed_senza_cancellazione_resta_completed(pool: sqlx::PgPool) {
+        let id = insert(&pool, "completed", false).await;
+        enforce_user_cancellation_status(&pool, id).await;
+        assert_eq!(status_of(&pool, id).await, "completed");
+    }
+
+    /// Un 'failed' con cancellazione NON viene mascherato da 'cancelled': il
+    /// fallimento tecnico resta informativo (la riconciliazione tocca solo
+    /// 'completed').
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn failed_con_cancellazione_resta_failed(pool: sqlx::PgPool) {
+        let id = insert(&pool, "failed", true).await;
+        enforce_user_cancellation_status(&pool, id).await;
+        assert_eq!(status_of(&pool, id).await, "failed");
     }
 }

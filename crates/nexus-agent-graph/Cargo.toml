@@ -19,6 +19,10 @@ path = "src/lib.rs"
 [dependencies]
 nexus-graph = { path = "../nexus-graph" }
 nexus-graph-derive = { path = "../nexus-graph-derive" }
+# Vocabolario performance-tier (punto unico, re-export in decisions/tiers.rs):
+# vive nel crate leaf perche' lo usa anche admin-service, che non puo' dipendere
+# da questo crate.
+nexus-types = { path = "../nexus-types" }
 async-trait = "0.1"
 chrono.workspace = true
 futures.workspace = true
@@ -41,3 +45,6 @@ uuid.workspace = true
 # (verify.yml). Senza DB i test sqlx falliscono in locale: e' il pattern gia'
 # usato dagli altri test del repo (es. agent_run.rs tests_session_active).
 serde_json.workspace = true
+# Schema di test del DB-progetto (migrator del set db/migrations/project):
+# i test del checkpointer girano sullo schema reale, non su una copia.
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }

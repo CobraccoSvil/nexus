@@ -32,8 +32,8 @@ use super::gcp_auth::{
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::types::{
     GeneratedImage, ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk,
-    LlmToolCall, LlmUsage, MessageContent, SensitivityTier, ToolCallDelta, ToolCallDeltaFunction,
-    ToolFunctionCall, VideoGenRequest, VideoGenResponse,
+    LlmToolCall, LlmUsage, MessageContent, PromptCacheReporting, SensitivityTier, ToolCallDelta,
+    ToolCallDeltaFunction, ToolFunctionCall, VideoGenRequest, VideoGenResponse,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -2363,11 +2363,19 @@ fn collect_candidate_parts(candidate: Option<&GoogleCandidate>) -> CandidatePart
 /// azzerando i conteggi quando il metadata e' assente. Estratto da
 /// [`from_generate_response`] (regola A). Funzione PURA.
 fn usage_from_metadata(meta: Option<GoogleUsageMetadata>) -> LlmUsage {
-    meta.map(|u| LlmUsage {
-        input_tokens: u.prompt_token_count,
-        output_tokens: u.candidates_token_count,
-        cache_read_tokens: u.cached_content_token_count,
-        cache_creation_tokens: None,
+    meta.map(|u| {
+        // `cachedContentTokenCount` e' un SOTTOINSIEME di `promptTokenCount`:
+        // convenzione inclusiva, cioe' il wire e' gia' il LORDO che il sistema
+        // vuole. `LlmUsage::normalized` non tocca il conteggio; i token di cache
+        // restano come dettaglio, per lo scorporo che fa il listino.
+        LlmUsage::normalized(
+            PromptCacheReporting::CachedIncludedInPrompt,
+            u.prompt_token_count,
+            u.candidates_token_count,
+            u.cached_content_token_count,
+            // L'implicit caching Gemini non fattura la scrittura della voce.
+            None,
+        )
     })
     .unwrap_or(LlmUsage {
         input_tokens: 0,
@@ -2578,11 +2586,14 @@ impl GoogleSseParser {
 
         let finish_reason = stream_finish_reason(candidate.as_ref(), tool_call_delta.is_some());
 
-        let usage = resp.usage_metadata.as_ref().map(|u| LlmUsage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
-            cache_read_tokens: u.cached_content_token_count,
-            cache_creation_tokens: None,
+        let usage = resp.usage_metadata.as_ref().map(|u| {
+            LlmUsage::normalized(
+                PromptCacheReporting::CachedIncludedInPrompt,
+                u.prompt_token_count,
+                u.candidates_token_count,
+                u.cached_content_token_count,
+                None,
+            )
         });
 
         // Chunk vuoto (nessun delta, nessun reasoning, nessuna tool-call, nessun
@@ -3363,6 +3374,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
 
@@ -3389,6 +3401,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3420,6 +3433,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(
@@ -3461,6 +3475,7 @@ mod tests {
             tool_choice: Some(choice),
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -3513,6 +3528,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3572,6 +3588,38 @@ mod tests {
         assert_eq!(usage.output_tokens, 2);
     }
 
+    /// Lo STREAM Google e la normalizzazione della cache.
+    ///
+    /// Il percorso non-stream ha gia' il suo test
+    /// (`input_tokens_google_resta_il_prompt_lordo`), lo stream no: gli eventi
+    /// SSE dei test esistenti portano un `usageMetadata` privo di
+    /// `cachedContentTokenCount`, e senza quel campo le due convenzioni danno lo
+    /// stesso numero — il test non potrebbe distinguerle.
+    ///
+    /// `cachedContentTokenCount` e' un SOTTOINSIEME di `promptTokenCount`
+    /// (implicit caching Gemini 2.5+): `promptTokenCount` E' gia' il lordo e
+    /// deve restare 1.200. Se lo stream dichiarasse la convenzione di Anthropic,
+    /// la normalizzazione sommerebbe i 900 una seconda volta e il prompt uscirebbe
+    /// 2.100 per un contesto di 1.200 token.
+    #[test]
+    fn sse_chunk_finale_non_somma_una_cache_gia_inclusa() {
+        let mut p = GoogleSseParser::new("gemini-x".to_string());
+        p.parse_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":30,"cachedContentTokenCount":900}}"#,
+        );
+        let chunk = p.pending.pop_back().expect("chunk finale");
+        let usage = chunk.usage.expect("usage sul chunk finale");
+
+        assert_eq!(
+            usage.input_tokens, 1_200,
+            "il wire e' gia' lordo: nessuna somma"
+        );
+        assert_eq!(usage.cache_read_tokens, Some(900));
+        // Google non distingue la scrittura di cache: nessun valore inventato.
+        assert_eq!(usage.cache_creation_tokens, None);
+        assert_eq!(usage.output_tokens, 30);
+    }
+
     #[test]
     fn sse_riga_parziale_gestita() {
         let mut p = GoogleSseParser::new("gemini-x".to_string());
@@ -3606,6 +3654,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -3736,6 +3785,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert_eq!(json["contents"][0]["role"], "model");
@@ -3763,6 +3813,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         };
         let json = serde_json::to_value(build_request_body(&req, GoogleThinking::Absent)).unwrap();
         assert!(json["contents"][0]["parts"][0]
@@ -3873,6 +3924,25 @@ mod tests {
         assert!(resp.usage.cache_read_tokens.is_none());
     }
 
+    /// `cachedContentTokenCount` e' un SOTTOINSIEME di `promptTokenCount`
+    /// (implicit caching Gemini 2.5+): il wire e' gia' il LORDO, come per i
+    /// dialetti OpenAI-compatibili e al contrario di Anthropic. I token di cache
+    /// escono come dettaglio, per lo scorporo che fa il listino.
+    #[test]
+    fn input_tokens_google_resta_il_prompt_lordo() {
+        let raw = r#"{
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 12, "candidatesTokenCount": 5,
+                              "cachedContentTokenCount": 8}
+        }"#;
+        let parsed: GenerateContentResponse = serde_json::from_str(raw).unwrap();
+        let u = from_generate_response(parsed, "gemini-x".to_string(), 0).usage;
+
+        assert_eq!(u.input_tokens, 12, "il wire e' gia' lordo: nessuna somma");
+        assert_eq!(u.cache_read_tokens, Some(8));
+        assert_eq!(u.cache_creation_tokens, None);
+    }
+
     #[test]
     fn sse_thought_emette_reasoning_delta() {
         let mut p = GoogleSseParser::new("gemini-x".to_string());
@@ -3927,6 +3997,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 
@@ -4069,6 +4140,7 @@ mod tests {
             tool_choice: None,
             pin_provider: None,
             metadata: metadata(),
+            run_timeout_secs: None,
         }
     }
 

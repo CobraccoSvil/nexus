@@ -4,6 +4,13 @@ import { type FormEvent, type KeyboardEvent, type ClipboardEvent, type RefObject
 import type { ChatAttachment } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { IconButton } from "../icon-button";
+import { AutoWidthSelect } from "../auto-width-select";
+import {
+  forceButtonView,
+  isProviderPinned,
+  providerSelectTitle,
+  PROVIDER_AUTO,
+} from "./provider-choice-logic";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -168,9 +175,15 @@ export function Composer({
     minWidth: 0,
   } as const;
 
-  // Un provider selezionato (diverso da "auto") e' gia' forzato come override,
-  // a prescindere dal toggle "Forza": il dropdown e' la fonte di verita'.
-  const isProviderLocked = selectedProvider !== "auto";
+  // Il dropdown dice QUALE provider, il pulsante "Forza" dice QUANTO vincola.
+  // Sono due stati distinti e la barra li mostra distinti: una selezione senza
+  // "Forza" e' una preferenza (il routing puo' cambiare fornitore), col pulsante
+  // attivo e' un vincolo duro. Punto unico della distinzione:
+  // provider-choice-logic.ts, lo stesso che decide cosa viaggia sul wire — cosi'
+  // il colore del bordo non puo' dire una cosa e la richiesta farne un'altra.
+  const isProviderChosen = selectedProvider !== PROVIDER_AUTO;
+  const isProviderPinnedNow = isProviderPinned(selectedProvider, forceProvider);
+  const forceButton = forceButtonView(selectedProvider, forceProvider, automationMode);
   const showAutomationRunMismatch =
     !!runAutomationMode &&
     runAutomationMode !== automationMode &&
@@ -178,13 +191,17 @@ export function Composer({
   const automationTitle = showAutomationRunMismatch
     ? `Run in corso avviato in modalita' "${runAutomationMode}" — il dropdown (${automationMode}) vale solo per i prossimi messaggi.`
     : "Automazione: Studio = solo lettura, Conferma = chiede approvazione prima di modifiche, Automatico = esegue senza fermarsi";
+  // "override -> fallback" segnala che il run NON sta rispettando la scelta.
+  // Vale solo col PIN: con la sola preferenza un provider diverso e' il
+  // comportamento promesso, non un'anomalia — segnalarlo come tale sarebbe
+  // gridare al lupo a ogni fallback riuscito.
   const showOverrideMismatch =
-    isProviderLocked &&
+    isProviderPinnedNow &&
     !!runProvider &&
     runProvider !== selectedProvider &&
     isAgentRunning;
   const showModelMismatch =
-    isProviderLocked &&
+    isProviderPinnedNow &&
     selectedModel !== "auto" &&
     !!runModel &&
     runModel !== selectedModel &&
@@ -195,6 +212,18 @@ export function Composer({
     { value: "confirm", label: "Conferma" },
     { value: "automatic", label: "Automatico" },
   ] as const;
+
+  const SUPERVISOR_OPTIONS = [
+    { value: "none", label: "👁 Supervisor off" },
+    { value: "anomaly", label: "👁 Su anomalia" },
+    { value: "interleaved", label: "👁 Ogni 5 step" },
+    { value: "continuous", label: "continuo" },
+  ] as const;
+
+  const MODEL_OPTIONS = [
+    { value: "auto", label: "Modello auto" },
+    ...providerModels.map((model) => ({ value: model, label: model })),
+  ];
 
   return (
     <form
@@ -238,7 +267,12 @@ export function Composer({
           onPaste={handlePaste}
           disabled={!hasProject}
           placeholder={hasProject ? "Chiedi a Nexus..." : "Apri un progetto per iniziare..."}
-          rows={2}
+          // UNA riga a riposo: il composta sta in fondo alla colonna della chat,
+          // quindi ogni riga che occupa qui e' una riga in meno di conversazione
+          // visibile. Resta ridimensionabile a mano (resize: vertical) e cresce
+          // comunque fino a maxHeight quando il testo lo richiede: si paga lo
+          // spazio solo quando serve davvero.
+          rows={1}
           style={{
             width: "100%",
             padding: 0,
@@ -249,7 +283,7 @@ export function Composer({
             fontSize: compact ? 13 : 14,
             resize: "vertical",
             fontFamily: "inherit",
-            minHeight: compact ? 32 : 40,
+            minHeight: compact ? 20 : 24,
             maxHeight: compact ? 200 : 340,
             boxSizing: "border-box",
             outline: "none",
@@ -370,58 +404,55 @@ export function Composer({
               )}
             </button>
           )}
-          <select
+          <AutoWidthSelect
             value={selectedProvider}
-            onChange={(e) => onProviderChange(e.target.value)}
-            title={isProviderLocked ? `Provider forzato su ${selectedProvider} — disattiva "Forza" o passa ad Auto per routing intelligente` : "Routing automatico: sceglie il modello migliore per ogni task"}
+            options={PROVIDER_OPTIONS}
+            onChange={onProviderChange}
+            title={providerSelectTitle(selectedProvider, forceProvider, automationMode)}
             style={{
               ...selectStyle,
-              border: `1px solid ${isProviderLocked ? "#f97316" : tc.border}`,
-              background: isProviderLocked ? "#f9731612" : tc.bgCard,
-              color: isProviderLocked ? "#f97316" : tc.textSecondary,
-              fontWeight: isProviderLocked ? 600 : 400,
+              // Arancione = vincolo duro. Una preferenza resta evidenziata (e'
+              // una scelta attiva) ma con l'accento, non col colore che nella
+              // barra significa "questo non si negozia".
+              border: `1px solid ${isProviderPinnedNow ? "#f97316" : isProviderChosen ? tc.accent : tc.border}`,
+              background: isProviderPinnedNow ? "#f9731612" : isProviderChosen ? `${tc.accent}12` : tc.bgCard,
+              color: isProviderPinnedNow ? "#f97316" : isProviderChosen ? tc.accent : tc.textSecondary,
+              fontWeight: isProviderChosen ? 600 : 400,
             }}
-          >
-            {PROVIDER_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-          {selectedProvider !== "auto" && (
+          />
+          {isProviderChosen && (
             <button
               type="button"
               onClick={() => onForceProviderChange(!forceProvider)}
-              title={forceProvider ? "Override attivo: il provider selezionato viene forzato" : "Override disattivo: il routing può scegliere un provider diverso"}
+              title={forceButton.title}
               style={{
                 ...selectStyle,
-                border: `1px solid ${forceProvider ? "#f97316" : tc.border}`,
-                background: forceProvider ? "#f9731612" : tc.bgCard,
-                color: forceProvider ? "#f97316" : tc.textSecondary,
-                fontWeight: forceProvider ? 700 : 500,
+                border: `1px solid ${isProviderPinnedNow ? "#f97316" : tc.border}`,
+                background: isProviderPinnedNow ? "#f9731612" : tc.bgCard,
+                color: isProviderPinnedNow ? "#f97316" : tc.textSecondary,
+                fontWeight: isProviderPinnedNow ? 700 : 500,
               }}
             >
-              {forceProvider ? "Forza ✓" : "Forza"}
+              {forceButton.label}
             </button>
           )}
-          {selectedProvider !== "auto" && forceProvider && (
-            <select
+          {isProviderPinnedNow && (
+            <AutoWidthSelect
               value={selectedModel}
-              onChange={(e) => onModelChange(e.target.value)}
+              options={MODEL_OPTIONS}
+              onChange={onModelChange}
+              ariaLabel="Modello"
               style={{
                 ...selectStyle,
                 background: tc.bgCard,
                 color: tc.textSecondary,
                 cursor: "pointer",
               }}
-            >
-              <option value="auto">Modello auto</option>
-              {providerModels.map((model) => (
-                <option key={model} value={model}>{model}</option>
-              ))}
-            </select>
+            />
           )}
           {(showOverrideMismatch || showModelMismatch) && (
             <span
-              title="La run non sta rispettando l'override. Possibili cause: provider in cooldown/quota, modello non disponibile, fallback del router."
+              title="Il run in corso non sta rispettando il pin. Cause tipiche: e' partito prima che tu pinnassi questo provider, oppure il modello pinnato non era disponibile."
               style={{
                 ...selectStyle,
                 border: "1px solid #ef4444",
@@ -430,13 +461,15 @@ export function Composer({
                 fontWeight: 700,
               }}
             >
-              ⚠ override → fallback
+              ⚠ pin non rispettato
             </span>
           )}
-          <select
+          <AutoWidthSelect
             value={automationMode}
-            onChange={(e) => onAutomationModeChange(e.target.value as "study" | "confirm" | "automatic")}
+            options={AUTOMATION_OPTIONS}
+            onChange={(value) => onAutomationModeChange(value as "study" | "confirm" | "automatic")}
             title={automationTitle}
+            ariaLabel="Modalita' automazione"
             style={{
               ...selectStyle,
               cursor: "pointer",
@@ -449,27 +482,20 @@ export function Composer({
                   }
                 : {}),
             }}
-          >
-            {AUTOMATION_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-          <select
+          />
+          <AutoWidthSelect
             value={supervisorMode}
-            onChange={(e) => onSupervisorModeChange(e.target.value as "none" | "anomaly" | "interleaved" | "continuous")}
+            options={SUPERVISOR_OPTIONS}
+            onChange={(value) => onSupervisorModeChange(value as "none" | "anomaly" | "interleaved" | "continuous")}
             title="Supervisore AI (monitora e corregge l'agente). Non sostituisce Conferma/Automatico: per saltare le approvazioni usa Automatico."
+            ariaLabel="Supervisore"
             style={{
               ...selectStyle,
               border: `1px solid ${supervisorMode !== "none" ? "#8b5cf6" : tc.border}`,
               background: supervisorMode !== "none" ? "#8b5cf611" : tc.bgCard,
               color: supervisorMode !== "none" ? "#8b5cf6" : tc.textSecondary,
             }}
-          >
-            <option value="none">👁 Supervisor off</option>
-            <option value="anomaly">👁 Su anomalia</option>
-            <option value="interleaved">👁 Ogni 5 step</option>
-            <option value="continuous">continuo</option>
-          </select>
+          />
           <IconButton
             label="Allega file"
             onClick={() => fileInputRef.current?.click()}

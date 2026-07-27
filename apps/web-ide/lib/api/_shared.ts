@@ -2,6 +2,8 @@
 // gestione errori (regola H: nessuna duplicazione della logica condivisa).
 // I moduli di dominio in lib/api/* importano da qui.
 
+import { readRenderedError, type RenderedError } from "./error-render";
+
 export const API_BASE = typeof window !== "undefined"
   ? ""
   : (process.env.NEXT_PUBLIC_API_URL || "");
@@ -30,13 +32,20 @@ export function adminServiceUrl(path: string): string {
 /** Errore HTTP tipizzato del client API (punto unico, regola M): lo status
  *  numerico e' il segnale strutturato su cui i call site decidono (409 = run
  *  concorrente, >=500 = ritentabile, ...). MAI ri-parsare lo status dal testo
- *  del messaggio. `message` resta identico al formato storico per il display. */
+ *  del messaggio. `message` resta identico al formato storico per il display.
+ *
+ *  `rendered` e' la frase gia' scritta dal backend, quando la risposta la porta
+ *  (vedi lib/api/error-render.ts). Sta QUI e non nei singoli call site perche'
+ *  `fetchJson` e' l'unico punto che vede ancora il payload: dopo, resta solo
+ *  `message`, ed e' da li' che nascevano le classificazioni per sottostringa. */
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  readonly rendered: RenderedError | null;
+  constructor(status: number, message: string, rendered: RenderedError | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.rendered = rendered;
   }
 }
 
@@ -147,8 +156,13 @@ export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 
   }
   if (!res.ok) {
     let details = "";
+    // La resa del backend, se c'e': l'UNICO punto in cui il payload e' ancora
+    // leggibile. La stringa `message` di ApiError resta INVARIATA (formato
+    // storico, letto da log e pannelli diagnostici); la frase viaggia a parte.
+    let rendered: RenderedError | null = null;
     try {
       const payload = await res.json();
+      rendered = readRenderedError(payload);
       const rawError =
         typeof payload?.error === "string"
           ? payload.error
@@ -167,7 +181,11 @@ export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 
     } catch {
       // ignore body parse errors and keep generic status details
     }
-    throw new ApiError(res.status, `API error ${res.status}: ${res.statusText}${details}`);
+    throw new ApiError(
+      res.status,
+      `API error ${res.status}: ${res.statusText}${details}`,
+      rendered,
+    );
   }
   return res.json();
 }

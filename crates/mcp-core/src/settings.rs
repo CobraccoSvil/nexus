@@ -218,33 +218,30 @@ pub async fn list_categories(State(state): State<super::AppState>) -> Json<serde
     Json(serde_json::json!({ "categories": categories }))
 }
 
-/// PUT /api/settings/:key — update a single setting
+/// PUT /api/admin/setting/:key — aggiorna una singola impostazione.
+///
+/// E' l'endpoint che serve le pagine admin (la route Next.js proxya qui, non su
+/// admin-service, che ne ha una copia gemella).
+///
+/// L'esito e' lo STATUS HTTP (regola M): 200 aggiornata, 404 chiave assente,
+/// 500 se il DB rifiuta. Prima rispondeva 200 in ogni caso, con l'esito nel solo
+/// campo `status` del body: `fetchJson` decide sullo status e quindi non
+/// sollevava, e ogni pagina admin mostrava "salvato" su una scrittura che il DB
+/// aveva rifiutato. Il caso non e' teorico: il trigger
+/// `trg_settings_guard_protected` (mig 0499) nega gli UPDATE sui setting
+/// protetti proprio contando sul fatto che l'errore risalga al client.
+///
+/// La scrittura delega al punto unico `nexus_auth::update_setting_value`
+/// (regola L), che e' anche il posto dove vive il divieto di creare chiavi
+/// implicitamente.
 pub async fn update_setting(
     State(state): State<super::AppState>,
     Path(key): Path<String>,
     Json(body): Json<UpdateSettingRequest>,
-) -> Json<serde_json::Value> {
-    let result = sqlx::query("UPDATE settings SET value = $1, updated_at = NOW() WHERE key = $2")
-        .bind(&body.value)
-        .bind(&key)
-        .execute(&state.db)
-        .await;
-
-    let status = match result {
-        Ok(r) if r.rows_affected() > 0 => "ok",
-        Ok(_) => {
-            // Key doesn't exist, insert it
-            let _ = sqlx::query(
-                "INSERT INTO settings (key, value, category, description, is_secret) VALUES ($1, $2, 'custom', '', FALSE)",
-            )
-            .bind(&key)
-            .bind(&body.value)
-            .execute(&state.db)
-            .await;
-            "created"
-        }
-        Err(e) => return Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
-    };
+) -> Result<Json<serde_json::Value>, ApiError> {
+    nexus_auth::update_setting_value(&state.db, &key, &body.value)
+        .await
+        .map_err(|e| api_error(e.status_code(), e.to_string()))?;
 
     // Notifica tutti i client connessi (evento system-wide)
     let ns = key.split('_').next().unwrap_or("admin").to_string();
@@ -261,62 +258,79 @@ pub async fn update_setting(
         crate::dlp::invalidate_dlp_cache();
     }
 
-    // Propaga impostazioni di connessione come variabili d'ambiente di processo
-    // (effetto immediato per tutti i nuovi client nexus-http, no riavvio)
-    match key.as_str() {
-        "nexus_external_proxy" => {
-            if body.value.is_empty() {
-                std::env::remove_var("NEXUS_PROXY");
-            } else {
-                std::env::set_var("NEXUS_PROXY", &body.value);
-            }
-            // Notifica il Neural Core di ricaricare le impostazioni
-            let neural_url = std::env::var("NEURAL_CORE_REST_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-            let client = nexus_http::build_client();
-            let _ = client
-                .post(format!("{}/reload-settings", neural_url))
-                .json(&serde_json::json!({}))
-                .send()
-                .await;
+    // Propaga il proxy come variabile d'ambiente di processo (effetto immediato
+    // per tutti i nuovi client nexus-http, senza riavvio).
+    //
+    // Qui partiva anche un POST `{NEURAL_CORE_REST_URL}/reload-settings` per
+    // avvisare il brain Python di rileggere la configurazione — su
+    // `nexus_external_proxy` e su `network_dns_servers`. Il brain e' stato
+    // rimosso: quella notifica non arrivava a nessuno (e l'URL veniva da una env
+    // var con fallback hardcoded a 127.0.0.1:8001, regola G). Il DNS override
+    // era una prerogativa del brain: senza brain non c'e' piu' nessuno da
+    // notificare.
+    if key.as_str() == "nexus_external_proxy" {
+        if body.value.is_empty() {
+            std::env::remove_var("NEXUS_PROXY");
+        } else {
+            std::env::set_var("NEXUS_PROXY", &body.value);
         }
-        "network_dns_servers" => {
-            // Notifica il Neural Core di ricaricare le impostazioni (applica DNS override)
-            let neural_url = std::env::var("NEURAL_CORE_REST_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-            let client = nexus_http::build_client();
-            let _ = client
-                .post(format!("{}/reload-settings", neural_url))
-                .json(&serde_json::json!({}))
-                .send()
-                .await;
-        }
-        _ => {}
     }
 
-    Json(serde_json::json!({ "status": status, "key": key }))
+    Ok(Json(serde_json::json!({ "status": "ok", "key": key })))
 }
 
-/// PUT /api/settings — bulk update
+/// Effetti collaterali di una scrittura in blocco: invalidazione della cache DLP.
+///
+/// Estratti da `bulk_update`, che altrimenti mescola la scrittura, gli effetti
+/// e la costruzione della risposta in una funzione sola. Prendeva anche `all_ok`
+/// per non notificare il brain su una scrittura parziale: il brain non c'e' piu'.
+fn apply_bulk_side_effects(body: &BulkUpdateRequest) {
+    // Se sono state cambiate chiavi DLP, invalida la cache in-process.
+    let has_dlp_key = body.settings.iter().any(|e| {
+        matches!(
+            e.key.as_str(),
+            "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"
+        )
+    });
+    if has_dlp_key {
+        crate::dlp::invalidate_dlp_cache();
+    }
+
+    // Al salvataggio di una `*_api_key` partiva anche un POST
+    // `{NEURAL_CORE_REST_URL}/reload-settings` per far rileggere le chiavi al
+    // brain Python, che le teneva in memoria. Il brain e' stato rimosso: quella
+    // chiamata non arrivava a nessuno e logava "Brain reload-settings failed" a
+    // ogni salvataggio di chiave. Chi consuma le API key oggi (gateway, provider)
+    // le legge dal DB, quindi non c'e' nessuna cache remota da invalidare.
+}
+
+/// PUT /api/admin/settings — aggiorna piu' impostazioni in un colpo.
+///
+/// Aggiorna, non crea: come il PUT singolo, delega al punto unico
+/// `nexus_auth::update_setting_value` (regola L). Prima faceva un `INSERT ...
+/// VALUES ($1, $2, 'custom', '', FALSE) ON CONFLICT (key) DO UPDATE`, cioe' il
+/// secondo vettore per le stesse scritture inefficaci in categoria 'custom'. Le
+/// chiavi che i chiamanti scrivono (routing, gerarchia provider, budget) sono
+/// tutte seedate da migrazione.
+///
+/// L'esito e' lo STATUS HTTP (regola M): 200 se tutte le chiavi sono passate,
+/// 500 se anche una sola e' stata rifiutata. Prima rispondeva 200 in ogni caso e
+/// l'esito viveva nel solo `status`/`errors` del body: `saveRouting` in
+/// routing-config leggeva solo `res.ok` e mostrava "Salvato" con il DB
+/// invariato. Il campo `error` porta il messaggio pronto per il display; il
+/// dettaglio per chiave resta in `errors`.
 pub async fn bulk_update(
     State(state): State<super::AppState>,
     Json(body): Json<BulkUpdateRequest>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
     ensure_required_settings(&state).await;
 
     let mut updated = 0;
     let mut errors = Vec::new();
 
     for entry in &body.settings {
-        match sqlx::query(
-            "INSERT INTO settings (key, value, category, description, is_secret, updated_at) VALUES ($1, $2, 'custom', '', FALSE, NOW()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-        )
-        .bind(&entry.key)
-        .bind(&entry.value)
-        .execute(&state.db)
-        .await
-        {
-            Ok(_) => {
+        match nexus_auth::update_setting_value(&state.db, &entry.key, &entry.value).await {
+            Ok(()) => {
                 updated += 1;
                 // Notifica per ogni setting aggiornato
                 let ns = entry.key.split('_').next().unwrap_or("admin").to_string();
@@ -331,65 +345,70 @@ pub async fn bulk_update(
         }
     }
 
-    // Se sono state cambiate chiavi DLP, invalida la cache in-process
-    let has_dlp_key = body.settings.iter().any(|e| {
-        matches!(
-            e.key.as_str(),
-            "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"
-        )
-    });
-    if has_dlp_key {
-        crate::dlp::invalidate_dlp_cache();
+    apply_bulk_side_effects(&body);
+
+    if errors.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok", "updated": updated, "errors": [] })),
+        );
     }
 
-    // Se è stata salvata almeno una API key, ricarica automaticamente le chiavi nel brain
-    let has_api_key = body.settings.iter().any(|e| e.key.ends_with("_api_key"));
-    if has_api_key && errors.is_empty() {
-        // Il brain REST server è su NEURAL_CORE_URL (porta 8001) o su /neural se proxied
-        // Ma per il reload interno usiamo l'URL diretto interno
-        let brain_url = std::env::var("NEURAL_CORE_REST_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
-            match client
-                .post(format!("{brain_url}/reload-settings"))
-                .json(&serde_json::json!({"mcp_core_url": "http://localhost:4000"}))
-                .send()
-                .await
-            {
-                Ok(r) => tracing::info!("Brain reload-settings: {}", r.status()),
-                Err(e) => tracing::warn!("Brain reload-settings failed: {e}"),
-            }
-        });
-    }
-
-    Json(serde_json::json!({
-        "status": if errors.is_empty() { "ok" } else { "partial" },
-        "updated": updated,
-        "errors": errors,
-    }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "status": "partial",
+            "updated": updated,
+            "errors": errors,
+            "error": format!(
+                "{} chiave/i su {} non salvate: {}",
+                errors.len(),
+                body.settings.len(),
+                errors.join(" | ")
+            ),
+        })),
+    )
 }
 
-/// GET /internal/settings/:key — get raw value (internal use, not masked)
+/// GET /internal/settings/:key — valore non mascherato delle chiavi NON segrete.
+///
+/// La rotta e' montata FUORI dal layer di auth (`routes/public.rs`) e il
+/// servizio ascolta su `0.0.0.0`: qualunque client che raggiunga la porta la
+/// interroga senza credenziali. Prima leggeva il valore RAW di qualsiasi
+/// chiave, quindi restituiva in chiaro `jwt_secret` e le API key dei provider —
+/// e con la chiave di firma si conia un token di amministratore. Ora il
+/// predicato "esponibile senza auth" sta nel punto unico
+/// `nexus_auth::get_setting_public` (regola L), che rifiuta `is_secret = TRUE`.
 pub async fn get_raw_value(
     State(state): State<super::AppState>,
     Path(key): Path<String>,
-) -> Json<serde_json::Value> {
-    // Lettura via punto unico (regola L / ADR 0026).
-    // Fix S87: uso la variante _checked che propaga errori DB invece di
-    // ingoiarli silenziosamente. Su Err logga + ritorna "".
-    let value = match nexus_auth::get_setting_checked(&state.db, &key).await {
-        Ok(opt) => opt.unwrap_or_default(),
+) -> (StatusCode, Json<serde_json::Value>) {
+    match nexus_auth::get_setting_public(&state.db, &key).await {
+        Ok(nexus_auth::PublicSettingRead::Value(value)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "key": key, "value": value })),
+        ),
+        // 403 e non 404: la chiave esiste, ma non e' leggibile da qui. Chi ha
+        // bisogno di un segreto passa dal percorso autenticato.
+        Ok(nexus_auth::PublicSettingRead::Redacted) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "key": key,
+                "error": "chiave segreta: non leggibile da una rotta senza autenticazione",
+            })),
+        ),
+        Ok(nexus_auth::PublicSettingRead::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "key": key, "error": "chiave inesistente" })),
+        ),
         Err(e) => {
-            tracing::warn!("get_raw_value({}): get_setting_checked fallito: {}", key, e);
-            String::new()
+            tracing::warn!("get_raw_value({}): lettura fallita: {}", key, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "key": key, "error": "lettura setting fallita" })),
+            )
         }
-    };
-
-    Json(serde_json::json!({ "key": key, "value": value }))
+    }
 }
 
 /// Lettura setting: punto unico in nexus-auth (regola L / ADR 0026).
@@ -406,8 +425,69 @@ pub use nexus_auth::get_setting_checked as get_setting;
 /// `qdrant=False` pur con il setting DB corretto a 6333). Ora c'e' una sola
 /// risoluzione condivisa.
 pub async fn resolve_qdrant_url(db: &sqlx::PgPool) -> String {
-    nexus_auth::get_setting(db, "qdrant_url")
+    let raw = nexus_auth::get_setting(db, "qdrant_url")
         .await
         .or_else(|| std::env::var("QDRANT_URL").ok())
-        .unwrap_or_else(|| "http://localhost:6333".to_string())
+        .unwrap_or_else(|| "http://localhost:6333".to_string());
+    disambigua_loopback(&raw)
+}
+
+/// Sostituisce l'host `localhost` con `127.0.0.1` in un URL di servizio LOCALE.
+///
+/// `localhost` non e' un indirizzo, e' un nome con DUE risposte: su Windows la
+/// risoluzione restituisce `::1` (IPv6) prima di `127.0.0.1`. Qdrant ascolta su
+/// `0.0.0.0:6333`, cioe' solo IPv4: il client tentava dunque `::1:6333`, restava
+/// in SynSent fino allo scadere del timeout TCP e mcp-core si appendeva
+/// nell'avvio per minuti. Effetto a catena misurato il 2026-07-23: web-ide
+/// partiva, non riusciva a raggiungere mcp-core (`ECONNREFUSED` ripetuti) e
+/// crashava.
+///
+/// Per un servizio sulla macchina locale `127.0.0.1` e' sempre corretto e non ha
+/// quell'ambiguita'. Gli host remoti e gli indirizzi gia' espliciti non vengono
+/// toccati: si disambigua solo il nome che ha due risposte possibili.
+///
+/// Sostituisce il workaround che viveva nel `.env` (regola H: la causa sta nel
+/// codice che risolve l'host, non nella configurazione di una macchina).
+pub fn disambigua_loopback(url: &str) -> String {
+    url.replace("://localhost:", "://127.0.0.1:")
+        .replace("://localhost/", "://127.0.0.1/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::disambigua_loopback;
+
+    /// `localhost` viene disambiguato, il resto no.
+    ///
+    /// Il difetto che cattura: con `http://localhost:6333` il client tentava
+    /// `::1` (IPv6) mentre Qdrant ascolta su IPv4, restava in SynSent e mcp-core
+    /// si appendeva nell'avvio per minuti, facendo crashare web-ide a catena.
+    #[test]
+    fn loopback_disambiguato_solo_dove_serve() {
+        // Il caso reale: e' l'unico host con due risposte possibili.
+        assert_eq!(
+            disambigua_loopback("http://localhost:6333"),
+            "http://127.0.0.1:6333"
+        );
+        assert_eq!(
+            disambigua_loopback("http://localhost:6333/collections"),
+            "http://127.0.0.1:6333/collections"
+        );
+
+        // Gia' esplicito: nulla da disambiguare.
+        assert_eq!(
+            disambigua_loopback("http://127.0.0.1:6333"),
+            "http://127.0.0.1:6333"
+        );
+        // Un host REMOTO non si tocca: la sua risoluzione non e' ambigua per noi.
+        assert_eq!(
+            disambigua_loopback("http://qdrant.interno:6333"),
+            "http://qdrant.interno:6333"
+        );
+        // `localhost` come sottostringa di un altro nome non e' l'host loopback.
+        assert_eq!(
+            disambigua_loopback("http://localhost.example.com:6333"),
+            "http://localhost.example.com:6333"
+        );
+    }
 }

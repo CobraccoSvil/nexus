@@ -6,25 +6,18 @@
 //! La proprieta' che rende `verify_profile` replay-safe NON e' "cache per hash":
 //! e' che la decisione LLM e' presa e persistita FUORI dal percorso caldo, e il
 //! percorso caldo la rilegge. Consultare il reasoner mid-superstep dentro
-//! l'executor romperebbe replay e shadow-diff (una LLM-call non prevista dalla
-//! sequenza del run primario). Per questo la sola LLM-call del reasoner vive qui,
-//! in un superstep isolato, dietro [`crate::runtime::ports::MetaReasonerPort`].
+//! l'executor introdurrebbe una LLM-call non prevista dalla sequenza del run. Per
+//! questo la sola LLM-call del reasoner vive qui, in un superstep isolato, dietro
+//! [`crate::runtime::ports::MetaReasonerPort`].
 //!
-//! ## Modello di replay del recovery (scoperta verificata sul codice)
+//! ## Idempotenza / resume
 //!
-//! ATTENZIONE: il `ReplayLlmGateway` (mcp-core) rigioca SOLO le completion con
-//! `purpose=="executor"`; ogni altra completion (planner, reflection, e questo
-//! `stall_recovery`) ottiene una risposta ausiliaria neutra VUOTA. La mossa del
-//! reasoner NON viene quindi "rigiocata bit-per-bit". La replay-safety del recovery
-//! si regge invece su tre regimi coerenti:
-//!   - **Real** (primario): la porta consulta l'LLM e la [`RecoveryMove`] validata
+//!   - **Prima esecuzione**: la porta consulta l'LLM e la [`RecoveryMove`] validata
 //!     e' PERSISTITA in `extra["stall_move::…"]` (checkpoint del nodo, punto (4-5)).
-//!   - **Resume Rust->Rust**: il checkpoint contiene gia' la mossa -> il nodo fa
-//!     CACHE-HIT dall'`extra` (0 LLM, punto (2)). Deterministico.
-//!   - **Shadow Rust<->Python**: il Python non ha il reasoner; l'impl concreta
-//!     (`PgMetaReasonerPort`) gatta su `mode` e in Replay ritorna `Ok(None)` SENZA
-//!     chiamare l'LLM -> il nodo degrada a `Fallback` -> gerarchia fissa
-//!     `progress_controller::decide` -> MATCHA il Python (parita' shadow).
+//!   - **Resume**: il checkpoint contiene gia' la mossa -> il nodo fa CACHE-HIT
+//!     dall'`extra` (0 LLM, punto (2)). Deterministico.
+//!   - **Kill-switch OFF**: la porta ritorna `Ok(None)` -> il nodo degrada a
+//!     `Fallback` -> gerarchia fissa `progress_controller::decide`.
 //!
 //! ## Flusso del nodo (`run`)
 //!
@@ -44,14 +37,18 @@
 //!   5. ritorna `StopReason::StallResolved` -> self-loop rientra nell'executor,
 //!      che al rientro consuma la mossa (blocco successivo del piano).
 //!
-//! ## Inerzia a runtime (VINCOLO)
+//! ## Quando questo nodo viene raggiunto
 //!
-//! Con la porta iniettata che ritorna `Ok(None)` (kill-switch OFF / purpose
-//! `NotFound` / stub), il nodo NON persiste alcuna mossa e ritorna comunque
-//! `StallResolved`: il rientro nell'executor ricade sulla gerarchia fissa
-//! `progress_controller::decide` (rete di sicurezza). E poiche' NESSUN detector
-//! emette ancora `StallReason` (blocco successivo), questo nodo non e' MAI
-//! raggiunto oggi: il comportamento del motore resta bit-identico.
+//! I detector che lo attivano sono `maybe_stall_reason_delta` e il gemello
+//! runaway pre-LLM nell'executor: emettono `StopReason::StallReason` solo quando
+//! `agent.stall_recovery.enabled` e' truthy in `settings` (valore nel DB, non un
+//! default di compile-time) e il budget per-sessione non e' esaurito. Senza il
+//! flag questo nodo non viene raggiunto.
+//!
+//! Anche quando lo e', se la porta iniettata ritorna `Ok(None)` (kill-switch
+//! spento / purpose `NotFound` / stub) il nodo NON persiste alcuna mossa e
+//! ritorna comunque `StallResolved`: il rientro nell'executor ricade sulla
+//! gerarchia fissa `progress_controller::decide` (rete di sicurezza).
 //!
 //! Il nodo NON instrada: l'edge `StallRecovery -> Executor` e' dichiarato fuori,
 //! in `graph.rs` (self-loop come `G1Escalated -> executor`).
@@ -170,7 +167,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for StallRecoveryNode {
         NodeId::StallRecovery
     }
 
-    async fn run(&self, state: &AgentState, ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
+    async fn run(&self, state: &AgentState, _ctx: &AgentNodeCtx) -> Result<OpaqueDelta, NodeError> {
         // (1) Contesto strutturato dell'executor. Assente/malformato -> degrado
         // sicuro (risolvi senza mossa): il rientro usa la gerarchia fissa.
         let stall = match Self::read_context(state) {
@@ -200,12 +197,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for StallRecoveryNode {
             return Ok(Self::resolved_only());
         }
 
-        // (3) Cache-miss: UNA sola LLM-call via la porta (che usa ctx.llm ->
-        // replay-safe). `mode` deriva dal flag shadow (punto unico, regola L):
-        // in Replay la porta NON consulta l'LLM e, se la mossa manca, ritorna
-        // ReplayMissing -> qui degradiamo a resolved-only (rete di sicurezza; a
-        // flag OFF/stub questo ramo non scatta).
-        let mv = match self.reasoner.recover(stall.clone(), ctx.exec_mode()).await {
+        // (3) Cache-miss: UNA sola LLM-call via la porta (che usa ctx.llm). A flag
+        // OFF/stub la porta ritorna Ok(None) e questo ramo degrada alla gerarchia
+        // fissa.
+        let mv = match self.reasoner.recover(stall.clone()).await {
             // Mossa proposta: valida col PUNTO UNICO (enum chiuso + blocker ADR
             // 0034); qualunque forma sospetta e' gia' degradata a Fallback
             // dall'impl, ma ri-validiamo qui per robustezza (idempotente).
@@ -231,9 +226,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for StallRecoveryNode {
                 );
                 return Ok(Self::resolved_only());
             }
-            // Errore di porta (provider indisponibile / DB-down / ReplayMissing):
-            // NON abortiamo il run (il recovery e' best-effort, la rete di
-            // sicurezza `pc::decide` copre lo stallo). Loggato come WARN.
+            // Errore di porta (provider indisponibile / DB-down): NON abortiamo il
+            // run (il recovery e' best-effort, la rete di sicurezza `pc::decide`
+            // copre lo stallo). Loggato come WARN.
             Err(err) => {
                 tracing::warn!(
                     target: "nexus_agent_graph::stall_recovery",
@@ -273,7 +268,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::routing::config::RoutingConfig;
-    use crate::runtime::ports::{ExecMode, PortError};
+    use crate::runtime::ports::PortError;
     use crate::runtime::ports::{OrchestrationContext, OrchestrationMove};
     use crate::runtime::ports::{ScaleContext, ScaleMove, SupervisorContext};
     use crate::runtime::{AgentNodeCtx, NullEventSink, StubMetaReasonerPort};
@@ -290,7 +285,6 @@ mod tests {
         async fn recover(
             &self,
             _ctx: StallContext,
-            _mode: ExecMode,
         ) -> Result<Option<RecoveryMove>, PortError> {
             Ok(Some(self.0.clone()))
         }
@@ -298,7 +292,6 @@ mod tests {
         async fn orchestrate(
             &self,
             _ctx: OrchestrationContext,
-            _mode: ExecMode,
         ) -> Result<Option<OrchestrationMove>, PortError> {
             Ok(None)
         }
@@ -306,7 +299,6 @@ mod tests {
         async fn assess_scale(
             &self,
             _ctx: ScaleContext,
-            _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
             Ok(None)
         }
@@ -314,7 +306,6 @@ mod tests {
         async fn supervise(
             &self,
             _ctx: SupervisorContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
             Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
@@ -329,7 +320,6 @@ mod tests {
         async fn recover(
             &self,
             _ctx: StallContext,
-            _mode: ExecMode,
         ) -> Result<Option<RecoveryMove>, PortError> {
             Err(PortError::ProviderUnavailable("test".to_string().into()))
         }
@@ -337,7 +327,6 @@ mod tests {
         async fn orchestrate(
             &self,
             _ctx: OrchestrationContext,
-            _mode: ExecMode,
         ) -> Result<Option<OrchestrationMove>, PortError> {
             Ok(None)
         }
@@ -345,7 +334,6 @@ mod tests {
         async fn assess_scale(
             &self,
             _ctx: ScaleContext,
-            _mode: ExecMode,
         ) -> Result<Option<ScaleMove>, PortError> {
             Ok(None)
         }
@@ -353,7 +341,6 @@ mod tests {
         async fn supervise(
             &self,
             _ctx: SupervisorContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
             Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
@@ -368,8 +355,8 @@ mod tests {
             .expect("connect_lazy non si connette davvero")
     }
 
-    /// Ctx Real minimale: la porta del reasoner ignora `ctx.llm` (gli stub non lo
-    /// consultano), ma `run` legge `ctx.exec_mode()` -> serve un ctx valido.
+    /// Ctx minimale: la porta del reasoner ignora `ctx.llm` (gli stub non lo
+    /// consultano), ma `run` richiede un ctx valido.
     fn real_ctx() -> AgentNodeCtx {
         let run_id = Uuid::new_v4();
         AgentNodeCtx {
@@ -383,7 +370,7 @@ mod tests {
             run_id,
             session_id: Uuid::new_v4(),
             thread_id: run_id,
-            shadow: false,
+            advisory_gate: None,
         }
     }
 
@@ -395,7 +382,6 @@ mod tests {
         async fn execute(
             &self,
             call: crate::runtime::ports::ToolCall,
-            _mode: ExecMode,
         ) -> Result<crate::runtime::ports::ToolOutcome, PortError> {
             Ok(crate::runtime::ports::ToolOutcome {
                 tool_call_id: call.id,

@@ -3,7 +3,7 @@
 //! Implementa `EventSink::emit` (sincrono, infallibile, best-effort) pubblicando
 //! l'evento sul canale SSE concreto della chat: il `broadcast::Sender<AgentStepEvent>`
 //! registrato in `state.agent_channels` per il run (lo STESSO canale che
-//! `brain_agent_client::run_via_brain` usa per ritrasmettere gli eventi del brain,
+//! `agent_turn_setup::run_via_brain` usa per ritrasmettere gli eventi del brain,
 //! regola L: nessuna seconda forma di evento). Nessun gate `mode`: lo shadow usa il
 //! sink no-op iniettato nel ctx (`NullEventSink`), l'unica fonte di verita' verso
 //! l'utente resta il run primario. Il run a cui gli eventi appartengono e' fissato
@@ -46,10 +46,18 @@ struct PendingTrace {
     model: String,
     /// Numero di tool disponibili al turno.
     tools_count: u32,
-    /// Token di prompt del turno (dall'evento `Usage`).
+    /// Token di prompt LORDI del turno (dall'evento `Usage`).
     input_tokens: u32,
     /// Token di completion del turno.
     output_tokens: u32,
+    /// Token del turno serviti da cache: sottoinsieme di `input_tokens`, con una
+    /// sua tariffa (0.1x-0.5x). Prima la traccia li scriveva a 0 fisso, e senza
+    /// quel numero il costo mostrato in UI li pagava tutti a tariffa piena.
+    cache_read_tokens: u32,
+    /// Token del turno scritti in cache: anch'essi sottoinsieme di
+    /// `input_tokens`, con la loro tariffa (1.25x). Stessa storia dello zero
+    /// fisso.
+    cache_creation_tokens: u32,
     /// Tool richiesti dal modello in questo turno (`{name, input}`), per il campo
     /// `tool_calls` dell'AITraceEvent.
     tool_calls: Vec<serde_json::Value>,
@@ -63,7 +71,7 @@ pub struct SseEventSinkAdapter {
     /// Run a cui gli eventi emessi appartengono (campo `run_id` degli eventi SSE).
     run_id: Uuid,
     /// Contatore monotono per-run dello `step_index` (parita' col path Python
-    /// `brain_agent_client::run_via_brain`, dove ogni `tool_use` incrementa
+    /// `agent_turn_setup::run_via_brain`, dove ogni `tool_use` incrementa
     /// l'indice). Senza questo ogni step usava `step_index: 0` e il frontend
     /// (upsert per `stepIndex`) sovrascriveva lo step precedente mostrandone uno
     /// solo: il progresso live spariva. `fetch_add(1)` ritorna il valore PRIMA
@@ -87,7 +95,7 @@ pub struct SseEventSinkAdapter {
     /// (`executor_call` successivo / `EndTurn` / `Done`).
     pending_trace: Mutex<Option<PendingTrace>>,
     /// Contatore monotono per-run del `seq` delle tracce (indice progressivo nel
-    /// run, parita' col `trace_seq` di `brain_agent_client::run_via_brain`).
+    /// run, parita' col `trace_seq` di `agent_turn_setup::run_via_brain`).
     next_trace_seq: AtomicI64,
 }
 
@@ -190,6 +198,8 @@ impl SseEventSinkAdapter {
                 .unwrap_or(0) as u32,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             tool_calls: Vec::new(),
         };
         *self.pending_trace.lock() = Some(pt);
@@ -222,7 +232,11 @@ impl SseEventSinkAdapter {
             timestamp: chrono::Utc::now().to_rfc3339(),
             input_tokens: pt.input_tokens,
             output_tokens: pt.output_tokens,
-            cache_read_tokens: 0,
+            // Il dettaglio di cache viaggia fino alla UI, che dal prompt lordo
+            // scorpora queste due quantita' e applica le tre tariffe del catalog.
+            // Erano hardcoded a 0: tutto a tariffa piena di input.
+            cache_read_tokens: pt.cache_read_tokens,
+            cache_creation_tokens: pt.cache_creation_tokens,
         };
 
         // Persistenza best-effort (punto unico trace_store, regola L). `emit` e'
@@ -249,11 +263,71 @@ impl SseEventSinkAdapter {
         e.trace = Some(trace);
         self.send(e);
     }
+
+    /// I token del turno: nella traccia gateway in costruzione e nel meta_step
+    /// `usage_snapshot` che alimenta la barra di contesto.
+    ///
+    /// `promptTokens` e' il LORDO: e' quello che riempie la finestra di contesto
+    /// (rapporto ctx% in UI, che legge questo campo quando manca
+    /// `lastPromptTokens`) ed e' il monte da cui chi prezza scorpora le due
+    /// quantita' di cache che viaggiano accanto — senza le quali pagherebbe tutto
+    /// a tariffa piena di input.
+    fn on_usage(
+        &self,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        cache_read_tokens: i64,
+        cache_creation_tokens: i64,
+        total_tokens: i64,
+    ) {
+        // Nella STESSA presa del lock leggo provider/model del turno (aperti
+        // dall'executor_call precedente) per attribuire i token al provider
+        // corrente nel payload usage_snapshot: cosi' il frontend ripartisce
+        // token/costo per provider SENZA aggregare le trace (ADR 0037
+        // arricchimento C, additivo). Segnale STRUTTURATO dalla PendingTrace, mai
+        // dedotto dal testo (regola M).
+        let mut provider_model: Option<(String, String)> = None;
+        if let Some(pt) = self.pending_trace.lock().as_mut() {
+            pt.input_tokens = prompt_tokens.clamp(0, u32::MAX as i64) as u32;
+            pt.output_tokens = completion_tokens.clamp(0, u32::MAX as i64) as u32;
+            pt.cache_read_tokens = cache_read_tokens.clamp(0, u32::MAX as i64) as u32;
+            pt.cache_creation_tokens = cache_creation_tokens.clamp(0, u32::MAX as i64) as u32;
+            if !pt.provider.is_empty() || !pt.model.is_empty() {
+                provider_model = Some((pt.provider.clone(), pt.model.clone()));
+            }
+        }
+        let mut payload = serde_json::json!({
+            "totalTokens": total_tokens,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "cacheReadTokens": cache_read_tokens,
+            "cacheCreationTokens": cache_creation_tokens,
+        });
+        // Campi extra additivi: presenti solo se il turno-traccia porta il
+        // provider/model (executor_call aperto). Assenti = degrado pulito.
+        if let (Some((provider, model)), Some(obj)) = (provider_model, payload.as_object_mut()) {
+            if !provider.is_empty() {
+                obj.insert("provider".to_string(), serde_json::Value::String(provider));
+            }
+            if !model.is_empty() {
+                obj.insert("model".to_string(), serde_json::Value::String(model));
+            }
+        }
+        let mut e = self.base();
+        e.meta_step = Some(AgentMetaStep {
+            kind: "usage_snapshot".to_string(),
+            title: String::new(),
+            payload,
+            correlation_id: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        self.send(e);
+    }
 }
 
 impl EventSink for SseEventSinkAdapter {
     /// Traduce un [`SseEvent`] del grafo nell'[`AgentStepEvent`] del canale chat,
-    /// 1:1 con i mapping di `brain_agent_client::run_via_brain`:
+    /// 1:1 con i mapping di `agent_turn_setup::run_via_brain`:
     /// - `ThinkingDelta`  -> `thinking_delta` (blocco "Ragionamento")
     /// - `MetaStep`       -> `meta_step` (plan/routing/clarify/fallback/usage_snapshot/...)
     /// - `Usage`          -> `meta_step` kind=`usage_snapshot` (barra contesto/TokenUsageBar)
@@ -308,50 +382,16 @@ impl EventSink for SseEventSinkAdapter {
             SseEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
                 total_tokens,
-            } => {
-                // Token del turno corrente nella traccia gateway in costruzione.
-                // Nella STESSA presa del lock leggo provider/model del turno
-                // (aperti dall'executor_call precedente) per attribuire i token al
-                // provider corrente nel payload usage_snapshot: cosi' il frontend
-                // ripartisce token/costo per provider SENZA aggregare le trace
-                // (ADR 0037 arricchimento C, additivo). Segnale STRUTTURATO dalla
-                // PendingTrace, mai dedotto dal testo (regola M).
-                let mut provider_model: Option<(String, String)> = None;
-                if let Some(pt) = self.pending_trace.lock().as_mut() {
-                    pt.input_tokens = prompt_tokens.clamp(0, u32::MAX as i64) as u32;
-                    pt.output_tokens = completion_tokens.clamp(0, u32::MAX as i64) as u32;
-                    if !pt.provider.is_empty() || !pt.model.is_empty() {
-                        provider_model = Some((pt.provider.clone(), pt.model.clone()));
-                    }
-                }
-                let mut payload = serde_json::json!({
-                    "totalTokens": total_tokens,
-                    "promptTokens": prompt_tokens,
-                    "completionTokens": completion_tokens,
-                });
-                // Campi extra additivi: presenti solo se il turno-traccia porta il
-                // provider/model (executor_call aperto). Assenti = degrado pulito.
-                if let (Some((provider, model)), Some(obj)) =
-                    (provider_model, payload.as_object_mut())
-                {
-                    if !provider.is_empty() {
-                        obj.insert("provider".to_string(), serde_json::Value::String(provider));
-                    }
-                    if !model.is_empty() {
-                        obj.insert("model".to_string(), serde_json::Value::String(model));
-                    }
-                }
-                let mut e = self.base();
-                e.meta_step = Some(AgentMetaStep {
-                    kind: "usage_snapshot".to_string(),
-                    title: String::new(),
-                    payload,
-                    correlation_id: None,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                });
-                self.send(e);
-            }
+            } => self.on_usage(
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                total_tokens,
+            ),
             SseEvent::ToolUse { id, name, input } => {
                 // Accumula la tool-call nella traccia gateway del turno corrente
                 // (campo `tool_calls` dell'AITraceEvent: name + input).
@@ -491,6 +531,8 @@ mod tests {
         sink.emit(SseEvent::Usage {
             prompt_tokens: 10,
             completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             total_tokens: 15,
         });
         let ev = rx.try_recv().expect("evento emesso");
@@ -499,6 +541,28 @@ mod tests {
         assert_eq!(ms.payload["totalTokens"], json!(15));
         assert_eq!(ms.payload["promptTokens"], json!(10));
         assert_eq!(ms.payload["completionTokens"], json!(5));
+    }
+
+    #[test]
+    fn usage_snapshot_porta_il_dettaglio_di_cache() {
+        // Il rapporto ctx% legge il prompt (lib/use-chat.ts: `lastPromptTokens`
+        // se c'e', altrimenti `promptTokens`), che e' il LORDO: la finestra la
+        // occupa anche cio' che il provider ha servito dalla propria cache.
+        // I due conteggi accanto sono cio' che permette a chi prezza di
+        // scorporare invece di pagare tutto a tariffa piena.
+        let (sink, mut rx, _) = setup();
+        sink.emit(SseEvent::Usage {
+            prompt_tokens: 41_000,
+            completion_tokens: 200,
+            cache_read_tokens: 40_000,
+            cache_creation_tokens: 0,
+            total_tokens: 41_200,
+        });
+        let ev = rx.try_recv().expect("evento emesso");
+        let ms = ev.meta_step.expect("meta_step presente");
+        assert_eq!(ms.payload["promptTokens"], json!(41_000));
+        assert_eq!(ms.payload["cacheReadTokens"], json!(40_000));
+        assert_eq!(ms.payload["cacheCreationTokens"], json!(0));
     }
 
     #[test]
@@ -643,10 +707,33 @@ mod tests {
         None
     }
 
+    /// I token del turno come li emette il produttore, `SseEvent::Usage` di
+    /// `nexus_agent_graph::nodes::executor`: prompt LORDO, e i due conteggi di
+    /// cache come suo DETTAGLIO.
+    const PROMPT_TOKENS: i64 = 100;
+    const COMPLETION_TOKENS: i64 = 30;
+    const CACHE_READ_TOKENS: i64 = 25;
+    const CACHE_CREATION_TOKENS: i64 = 5;
+    /// Il totale che il produttore mette nello stesso evento. Scritto come
+    /// LETTERALE e non come somma: l'assert qui sotto sarebbe altrimenti vero per
+    /// costruzione, e non direbbe piu' nulla.
+    const TOTAL_TOKENS: i64 = 130;
+
     #[test]
     fn executor_call_apre_turno_endturn_flusha_traccia() {
         // Turno concluso testualmente: executor_call (provider/model/iter) + Usage
         // (token) + EndTurn -> una traccia gateway end_turn ricostruita ed emessa.
+        //
+        // La fixture deve valere quanto il produttore (regola O): l'executor
+        // calcola `total = prompt + completion`, perche' i due conteggi di cache
+        // sono gia' dentro il prompt lordo. Sommarli qui (130 -> 160) dichiarerebbe
+        // una convenzione che il sistema non ha, e il test la fisserebbe.
+        assert_eq!(
+            TOTAL_TOKENS,
+            PROMPT_TOKENS + COMPLETION_TOKENS,
+            "il totale del turno e' prompt LORDO + completion: la cache e' dentro \
+             il prompt, non un addendo"
+        );
         let (sink, mut rx, run_id) = setup();
         sink.emit(SseEvent::MetaStep {
             kind: "executor_call".to_string(),
@@ -660,9 +747,11 @@ mod tests {
             correlation_id: None,
         });
         sink.emit(SseEvent::Usage {
-            prompt_tokens: 100,
-            completion_tokens: 30,
-            total_tokens: 130,
+            prompt_tokens: PROMPT_TOKENS,
+            completion_tokens: COMPLETION_TOKENS,
+            cache_read_tokens: CACHE_READ_TOKENS,
+            cache_creation_tokens: CACHE_CREATION_TOKENS,
+            total_tokens: TOTAL_TOKENS,
         });
         sink.emit(SseEvent::EndTurn);
 
@@ -672,8 +761,14 @@ mod tests {
         assert_eq!(trace.provider, "anthropic");
         assert_eq!(trace.model, "claude-x");
         assert_eq!(trace.tools_count, 5);
-        assert_eq!(trace.input_tokens, 100);
-        assert_eq!(trace.output_tokens, 30);
+        assert_eq!(trace.input_tokens, PROMPT_TOKENS as u32, "il prompt LORDO");
+        assert_eq!(trace.output_tokens, COMPLETION_TOKENS as u32);
+        // I due conteggi di cache viaggiano nella traccia come DETTAGLIO del
+        // prompt lordo: senza di loro chi prezza non ha da dove scorporare e
+        // applica la tariffa piena di input a tutto il prompt, cache compresa.
+        // Erano scritti a 0 fisso.
+        assert_eq!(trace.cache_read_tokens, CACHE_READ_TOKENS as u32);
+        assert_eq!(trace.cache_creation_tokens, CACHE_CREATION_TOKENS as u32);
         assert_eq!(trace.stop_reason, "end_turn");
         assert!(trace.tool_calls.is_empty(), "turno testuale: nessun tool");
     }
@@ -692,6 +787,8 @@ mod tests {
         sink.emit(SseEvent::Usage {
             prompt_tokens: 50,
             completion_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             total_tokens: 60,
         });
         sink.emit(SseEvent::ToolUse {
@@ -780,6 +877,8 @@ mod tests {
         sink.emit(SseEvent::Usage {
             prompt_tokens: 120,
             completion_tokens: 40,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             total_tokens: 160,
         });
 
@@ -802,6 +901,8 @@ mod tests {
         sink.emit(SseEvent::Usage {
             prompt_tokens: 10,
             completion_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             total_tokens: 15,
         });
 

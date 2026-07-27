@@ -15,7 +15,7 @@ mod agent_tools;
 mod agent_types;
 mod auth;
 mod billing;
-mod brain_agent_client;
+mod agent_turn_setup;
 pub use nexus_build_graph as build_graph;
 mod cache;
 mod capability;
@@ -43,10 +43,6 @@ mod github;
 mod http_metrics;
 mod internal_learning;
 mod internal_routing;
-// SCAFFOLD ISOLATO (Tappa 1a): porting Rust del classifier intent agentico
-// (brain/router/agentic_classifier.py). Modulo completo + testato ma NON ancora
-// cablato ai call site (intent.rs/grafo/router invariati). L'integrazione e' la
-// Tappa 1b. Vedi crate doc-comment di intent_classifier.rs.
 mod intent_classifier;
 pub(crate) use nexus_types::llm_json;
 mod governance_telemetry;
@@ -57,6 +53,8 @@ mod middleware;
 mod model_catalog_sync;
 mod model_health_probe;
 mod model_observation;
+mod model_qualification;
+mod runtime_health;
 mod models;
 mod mutations_api;
 mod native_engine;
@@ -85,6 +83,10 @@ mod learned_instructions;
 mod project_db_routes;
 mod project_files;
 mod project_git;
+mod probe_agentic_loop;
+mod probe_chain_measure;
+mod probe_latent_state;
+mod probe_world;
 mod project_workspace;
 mod projects;
 mod prompt_templates;
@@ -98,6 +100,7 @@ mod routing_config;
 mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
+mod run_lineage;
 mod run_reaper;
 pub use nexus_tool_kit::sandbox;
 mod security;
@@ -188,14 +191,6 @@ struct AppState {
             std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
         >,
     >,
-    /// Pool-cache dei DB metadati Nexus per-progetto (separazione DB, regola L).
-    /// Popolata/letta SOLO da `project_db_routes` (`project_meta_pool_core`, che
-    /// risolve/provisiona `<slug>_nexus` sotto lock per-progetto, e i suoi
-    /// chiamanti `project_data_pool*`). Lo stesso store e' condiviso con il
-    /// registry globale via `init_global_pools`, cosi' gli helper che non hanno
-    /// `&AppState` non aprono un secondo pool per progetto. Invalidazione su
-    /// re-provisioning / scadenza TTL.
-    pub(crate) project_meta_pools: nexus_cache::TtlCache<Uuid, std::sync::Arc<sqlx::PgPool>>,
     /// Istante di avvio del processo mcp-core. Usato dal boot-grace dell'observer
     /// (`service_observer_remediation::within_boot_grace`): dopo un restart da
     /// deploy i servizi del progetto sono nel transitorio di riavvio e non vanno
@@ -478,7 +473,13 @@ async fn restore_billing_cooldowns_from_redis(mut conn: redis::aio::MultiplexedC
 async fn mark_stale_project_processes_failed(db_recover: sqlx::PgPool) {
     use sqlx::Row;
     for pid in project_db_routes::list_all_project_ids(&db_recover).await {
-        let pool = project_db_routes::project_data_pool_from(&db_recover, pid).await;
+        let pool = match project_db_routes::project_data_pool_from(&db_recover, pid).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %pid, error = %e, "boot-recovery processi stale: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let stale = sqlx::query(
             "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
         )
@@ -600,39 +601,6 @@ async fn wiki_bootstrap_recompute_links(state_links: AppState) {
     }
 }
 
-/// Connette il Neural Core con retry a backoff crescente (2s -> cap 10s, fino a
-/// `MAX_ATTEMPTS` tentativi, ~9 minuti). Resilienza all'avvio (regola H): il brain
-/// puo' avere cold start lento o hang transitori; ci arrendiamo solo dopo molti
-/// tentativi. Estratta da `main` (comportamento invariato): ritorna il client o un
-/// errore che `main` propaga con `?`.
-async fn connect_neural_core_with_retry(neural_core_url: &str) -> anyhow::Result<NeuralCoreClient> {
-    let mut attempts = 0u32;
-    const MAX_ATTEMPTS: u32 = 60;
-    loop {
-        match NeuralCoreClient::connect(neural_core_url).await {
-            Ok(c) => {
-                if attempts > 0 {
-                    tracing::info!("Neural Core connesso dopo {attempts} tentativi");
-                }
-                return Ok(c);
-            }
-            Err(e) => {
-                attempts += 1;
-                if attempts >= MAX_ATTEMPTS {
-                    anyhow::bail!(
-                        "Failed to connect to Neural Core after {attempts} attempts: {e}"
-                    );
-                }
-                let backoff = std::cmp::min(2 + attempts as u64, 10);
-                tracing::warn!(
-                    "Neural Core not ready (attempt {attempts}/{MAX_ATTEMPTS}): {e} — retry in {backoff}s"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            }
-        }
-    }
-}
-
 /// Cache di routing e registro porte inizializzate all'avvio, raggruppate per
 /// non moltiplicare i valori di ritorno di `init_routing_and_port_caches`
 /// (regola: helper <=6 parametri, niente tuple lunghe illeggibili).
@@ -653,6 +621,17 @@ struct RoutingAndPortCaches {
 /// invariati). Le cache che panicano se il DB e' irraggiungibile (routing matrix,
 /// thresholds, intent) lo fanno qui, coerentemente con il comportamento pre-refactor.
 async fn init_routing_and_port_caches(db: &sqlx::PgPool) -> RoutingAndPortCaches {
+    // Listino configurato? Verifica ALL'AVVIO (regola G): la currency di
+    // piattaforma non ha piu' un default hardcoded, quindi la sua assenza va
+    // scoperta qui — dove fallire e' gratuito e rumoroso — e non a ogni chiamata
+    // LLM, dove propagare l'errore significherebbe respingere le richieste.
+    if let Err(e) = nexus_pricing::assert_configured(db).await {
+        panic!(
+            "nexus-pricing: configurazione del listino assente o illeggibile: {e}\n\
+             Applicare la migrazione 0294 (settings.billing_base_currency) prima di avviare."
+        );
+    }
+
     // Inizializza la cache routing matrix (legge da DB + spawn refresh background 60s).
     // Va inizializzata PRIMA di Orchestrator::new perche' viene clonata dentro l'orchestrator.
     let routing_matrix = routing_matrix::RoutingMatrixCache::init(db.clone()).await;
@@ -725,34 +704,40 @@ async fn build_orchestrator(
     let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
     let gw_url = format!("http://127.0.0.1:{gw_port}");
     let nexus_gw = nexus_gateway::NexusGatewayClient::from_db(db).await;
-    let orchestrator = {
-        let base = Orchestrator::new(
-            neural_client,
-            template_cache,
-            caches.routing_matrix,
-            caches.thresholds,
-            caches.intent,
-            caches.slots.clone(),
-        );
-        if nexus_gw.is_healthy().await {
-            tracing::info!("Nexus Gateway disponibile su {gw_url} — PATH A attivo");
-            base.with_gateway(nexus_gw)
-        } else {
-            tracing::warn!("Nexus Gateway non raggiungibile su {gw_url} — uso PATH B (Brain gRPC)");
-            base
-        }
-    };
+    // Il gateway si INIETTA sempre: la sua disponibilita' non si decide qui.
+    //
+    // Prima una probe `is_healthy()` all'avvio sceglieva fra PATH A (gateway) e
+    // PATH B (brain gRPC), e l'esito restava congelato per tutta la vita del
+    // processo. Il 2026-07-16 mcp-core ha sondato il gateway 1,4s prima che
+    // questo finisse di avviarsi: risultato, nessun gateway fino al riavvio
+    // successivo, classificatore sempre in fallback e dimensionamento spento —
+    // con il gateway che nel frattempo rispondeva 200. Il PATH B non esiste piu'
+    // (il brain e' stato eliminato), quindi non c'e' nulla da scegliere: se il
+    // gateway e' giu', lo dice la singola chiamata che fallisce, e al tentativo
+    // dopo puo' essere di nuovo su (regola M: lo stato si osserva quando serve,
+    // non si deduce una volta per sempre).
+    let orchestrator = Orchestrator::new(
+        neural_client,
+        template_cache,
+        nexus_gw,
+        caches.routing_matrix,
+        caches.thresholds,
+        caches.intent,
+        caches.slots.clone(),
+    );
+    tracing::info!("Nexus Gateway: client configurato su {gw_url}");
     (orchestrator, caches.port_registry)
 }
 
 /// Riconcilia i processi lasciati in stato 'running'/'starting' da un riavvio
 /// precedente (PID non piu' vivo -> status=failed; PID vivo -> resta running e si
 /// rilancia il monitoring OS-specifico). Estratta da `main` (comportamento
-/// invariato). NOTA (separazione DB): `agent_processes` e' MIGRATA al DB per-progetto.
-/// Questo blocco opera sul META (storico / progetti NON migrati); a flag ON il meta
-/// e' quasi vuoto -> no-op benigno. La riconciliazione dei processi per-progetto a
-/// flag ON e' gestita dal blocco NUOVO (mark-only) DOPO init_global_pools, che itera
-/// list_all_project_ids + project_data_pool_from. NON duplicare qui.
+/// invariato). NOTA (separazione DB, sempre attiva da mig 0527): `agent_processes`
+/// e' MIGRATA al DB per-progetto. Questo blocco opera sul META (solo righe
+/// storiche pre-migrazione): il meta e' quasi vuoto -> no-op benigno. La
+/// riconciliazione dei processi per-progetto e' gestita dal blocco mark-only in
+/// `build_app_state`, che itera list_all_project_ids + project_data_pool_from.
+/// NON duplicare qui.
 async fn reconcile_stale_processes(db: &sqlx::PgPool) {
     use sqlx::Row;
     let stale =
@@ -892,6 +877,12 @@ fn spawn_security_and_catalog_boot(state: &AppState) {
             Err(e) => tracing::warn!("boot reconcile_catalog_with_policy fallito: {e}"),
         }
     });
+
+    // Sentinella di salute del runtime: misura il ritardo di risveglio dei
+    // task. Senza, un congelamento del runtime resta invisibile e i suoi
+    // sintomi vengono attribuiti al provider/DB/gateway di turno (incidente
+    // consiglio 2026-07-15: ~287s di task fermo, tre attribuzioni sbagliate).
+    runtime_health::spawn_runtime_health_sentinel(state.db.clone());
 
     // Port enforcer: killa processi di progetto fuori dal bucket porte assegnato.
     tokio::spawn(security::port_enforcer::port_enforcer_loop(state.clone()));
@@ -1071,6 +1062,11 @@ fn spawn_infra_watchdogs(state: &AppState) {
     process_resume::spawn_process_resume_worker(state.clone());
     fanin_worker::spawn_fanin_worker(state.clone());
     crate::project_workspace::monitor_seed::spawn_monitor_seed_worker(state.clone());
+    // One-shot: chiude le diagnosi 'diagnosing' orfane di run di rimedio morti
+    // col processo precedente (la chiusura normale vive in un task in-memory).
+    crate::project_workspace::resource_violation_remediation::spawn_stale_diagnosing_reaper(
+        state.clone(),
+    );
 }
 
 /// Avvia i worker catalogo/telemetria/retention: catalog_sync (ai_price_catalog dal
@@ -1239,9 +1235,16 @@ async fn serve_http(state: AppState, mcp_http_port: u16) -> anyhow::Result<()> {
         tokio::net::TcpListener::from_std(std_listener)?
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(graceful_shutdown_signal())
-        .await?;
+    // `into_make_service_with_connect_info` porta l'indirizzo del chiamante fino
+    // ai middleware: senza, `internal_only_middleware` non puo' distinguere una
+    // chiamata locale da una che arriva dalla rete, e (per costruzione) rifiuta
+    // tutto il blocco `/internal/*`.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(graceful_shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -1398,31 +1401,29 @@ async fn build_app_state(
         watching_projects: Arc::new(DashSet::new()),
         project_channels: nexus_events::dispatcher::new_registry(),
         monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-        project_meta_pools: nexus_cache::TtlCache::new(std::time::Duration::from_secs(600)),
         boot_at: std::time::Instant::now(),
     };
     // Singleton globale per emit da contesti senza &ProjectChannels (NexusToolHandler).
     nexus_events::dispatcher::init_global(state.project_channels.clone());
-    // Registry globale dei pool per-progetto (separazione DB): condivide lo store
-    // con state.project_meta_pools, cosi' gli helper che instradano i dati
-    // per-progetto (insert_message, ...) non aprono pool doppi.
-    project_db_routes::init_global_pools(state.project_meta_pools.clone());
 
-    // Boot-recovery run/processi orfani (vedi `run_boot_recovery`), DOPO
-    // init_global_pools (regola H).
+    // Boot-recovery run/processi orfani (vedi `run_boot_recovery`). Il registro
+    // dei pool per-progetto non ha piu' un'inizializzazione da attendere: vive in
+    // `nexus_project_pools` e si popola alla prima risoluzione.
     run_boot_recovery(&state).await;
 
     state
 }
 
-/// Boot-recovery dopo `init_global_pools`: reap dei run 'running' orfani (mig 0392,
+/// Boot-recovery a `AppState` costruito: reap dei run 'running' orfani (mig 0392,
 /// await: deve concludere PRIMA del bind HTTP — ogni 'running' e' orfano del processo
 /// precedente e va marcato 'interrupted' per sbloccare il gate 409; esclude
 /// 'awaiting_confirmation' resumibile) + mark-only dei processi per-progetto stale
 /// (tokio::spawn, non blocca l'avvio; il re-attach dei processi vivi resta al
 /// watchdog periodico). Il registry pool DEVE essere gia' inizializzato, altrimenti
-/// `project_data_pool_from` ricade sul meta-DB lasciando i run per-progetto zombie
-/// (causa radice del bug "chat cieca sul run dopo restart"). Estratta da `build_app_state`.
+/// `project_data_pool_from` ritorna un errore tipizzato (`ProjectDbError`) e il
+/// progetto viene SALTATO con WARN per quel giro — niente piu' fallback silenzioso
+/// al meta-DB, che lasciava i run per-progetto zombie (causa radice del bug
+/// "chat cieca sul run dopo restart"). Estratta da `build_app_state`.
 async fn run_boot_recovery(state: &AppState) {
     let _ = run_reaper::reap_orphaned_runs_at_boot(&state.db).await;
     let db_recover = state.db.clone();
@@ -1433,15 +1434,60 @@ async fn run_boot_recovery(state: &AppState) {
 /// catalog tool globale, pool DB e NexusBridge. Ritorna il pool DB e la porta HTTP
 /// risolta dal DB (regola G). Estratta da `main` (ordine e comportamento invariati);
 /// se il DB e' irraggiungibile propaga l'errore che `main` gestisce con `?`.
-async fn init_infrastructure() -> anyhow::Result<(PgPool, u16)> {
-    dotenvy::dotenv().ok();
-
+/// Inizializza il logging. Senza la feature `tokio-console` e' la sola coppia
+/// EnvFilter + fmt di sempre.
+#[cfg(not(feature = "tokio-console"))]
+fn init_tracing() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+/// Variante con il server di diagnostica del runtime in ascolto (porta 6669).
+///
+/// Il filtro sta sul layer di FORMATTAZIONE, non sul registry: da globale
+/// scarterebbe gli eventi `tokio=trace`/`runtime=trace` su cui si regge la
+/// console, che resterebbe vuota senza dire perche' (l'errore classico di questa
+/// integrazione). Cosi' i log restano quelli di sempre e la console vede tutto.
+///
+/// Build ed uso, da PowerShell nella radice del repo:
+///
+/// ```text
+/// $env:RUSTFLAGS = "--cfg tokio_unstable"
+/// $env:CARGO_TARGET_DIR = "target-console"   # non invalida la cache normale
+/// cargo build -p mcp-core --features tokio-console
+/// # avviare il binario prodotto al posto del servizio, poi:
+/// tokio-console http://127.0.0.1:6669
+/// ```
+///
+/// Il target dir separato non e' un vezzo: `--cfg tokio_unstable` cambia la
+/// configurazione di compilazione di tokio, quindi ricompila l'intero albero e
+/// senza la separazione butterebbe via anche la cache delle build normali.
+#[cfg(feature = "tokio-console")]
+fn init_tracing() {
+    use tracing_subscriber::Layer;
+
+    tracing_subscriber::registry()
+        .with(console_subscriber::spawn())
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::EnvFilter::new(
+                std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+            )),
+        )
+        .init();
+
+    tracing::info!(
+        "tokio-console attivo su 127.0.0.1:6669 (build di diagnostica, non di esercizio)"
+    );
+}
+
+async fn init_infrastructure() -> anyhow::Result<(PgPool, u16)> {
+    dotenvy::dotenv().ok();
+
+    init_tracing();
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable".to_string()
@@ -1509,8 +1555,24 @@ async fn init_redis_and_cooldowns(
     Ok(redis)
 }
 
-#[tokio::main(worker_threads = 32)]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Builder esplicito al posto di #[tokio::main]: serve `thread_stack_size`.
+    // Tre crash STATUS_STACK_OVERFLOW (0xc00000fd, faulting __chkstk) in un
+    // giorno sui tokio-rt-worker durante run agentici con payload JSON grossi:
+    // lo stack default dei worker (2 MB) e' tarato su frame da build RELEASE,
+    // ma lo stack dev gira in DEBUG dove i frame Rust sono 10-20x piu' grandi
+    // — l'equivalente release di 2 MB debug e' ~200 KB. Gli 8 MB riallineano
+    // il margine debug a quello che release ha gia'; una ricorsione INFINITA
+    // esploderebbe comunque (piu' tardi), quindi nessun bug viene mascherato.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(32)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Orchestratore d'avvio: ogni fase e' un helper di modulo coeso (init infra,
     // riconciliazione processi, redis+cooldown, cache routing, orchestrator,
     // AppState+boot-recovery, worker background, HTTP). L'ordine di inizializzazione
@@ -1519,18 +1581,18 @@ async fn main() -> anyhow::Result<()> {
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let neural_core_url =
-        std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
 
     // Riconciliazione META dei processi 'running'/'starting' stale (vedi
-    // `reconcile_stale_processes`). Il reap dei run orfani e' in `build_app_state`,
-    // DOPO init_global_pools (regola H).
+    // `reconcile_stale_processes`). Il reap dei run orfani e' in `build_app_state`
+    // (regola H).
     reconcile_stale_processes(&db).await;
 
     // Redis + esposizione a provider_cooldown + restore cooldown billing.
     let redis = init_redis_and_cooldowns(&db, &redis_url).await?;
 
-    let neural_client = connect_neural_core_with_retry(&neural_core_url).await?;
+    // Client zero-sized: delega all'embedder ONNX in-process e al gateway. Non
+    // apre canali, quindi non c'e' nulla da connettere ne' da ritentare.
+    let neural_client = NeuralCoreClient::new();
     let template_cache = prompt_templates::TemplateCache::new();
 
     // Cache di routing/porte + singleton build graph (vedi `init_routing_and_port_caches`).
@@ -1548,7 +1610,7 @@ async fn main() -> anyhow::Result<()> {
     let (orchestrator, port_registry_cache) =
         build_orchestrator(&db, neural_client, template_cache.clone(), caches).await;
 
-    // Sandbox + AppState + init_global_pools + boot-recovery (vedi `build_app_state`).
+    // Sandbox + AppState + boot-recovery (vedi `build_app_state`).
     let state = build_app_state(db, redis, orchestrator, template_cache, port_registry_cache).await;
 
     // Worker fire-and-forget e loop periodici, nell'ordine esatto (vedi
@@ -1585,8 +1647,8 @@ async fn probe_tool_runner_grpc(state: &AppState) -> bool {
 
 /// Somma i conteggi dashboard (run ultimi 30 giorni, job attivi) su tutti i DB
 /// per-progetto e restituisce lo stato del job `shadow_db_validation` piu' recente
-/// cross-progetto. Estratta da `dashboard` (comportamento invariato): a flag OFF
-/// gli helper `project_db_routes` ritornano il meta -> stessa semantica di prima.
+/// cross-progetto. Estratta da `dashboard`. Best-effort: un progetto col DB non
+/// disponibile viene saltato con WARN (niente fallback al meta, mig 0527).
 async fn aggregate_project_dashboard_stats(
     db: &PgPool,
 ) -> (i64, i64, Option<(chrono::DateTime<chrono::Utc>, String)>) {
@@ -1594,7 +1656,13 @@ async fn aggregate_project_dashboard_stats(
     let mut active_jobs: i64 = 0;
     let mut latest_shadow: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
     for project_id in project_db_routes::list_all_project_ids(db).await {
-        let pool = project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "dashboard stats: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
 
         total_runs += sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '30 days'",

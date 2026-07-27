@@ -353,7 +353,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "working_dir": {
           "type": "string",
-          "description": "Sottodirectory in cui eseguire il comando (relativa alla root del progetto). Ometti per usare la root."
+          "description": "Sottodirectory in cui eseguire il comando (relativa alla root del progetto). Ometti per usare la root. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd <questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend + 'frontend/x' esegue in frontend/frontend/x)."
         },
         "label": {
           "type": "string",
@@ -636,7 +636,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "working_dir": {
           "type": "string",
-          "description": "Sottodirectory in cui eseguire il comando (relativa alla root). Ometti per usare la root del progetto."
+          "description": "Sottodirectory in cui eseguire il comando (relativa alla root). Ometti per usare la root del progetto. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd <questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend + 'frontend/x' esegue in frontend/frontend/x)."
         },
         "background": {
           "type": "boolean",
@@ -1596,7 +1596,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   ,
   {
     "name": "review_verdict",
-    "description": "Dichiara il VERDETTO strutturato di una code review (per i run di revisione). Chiamalo UNA SOLA VOLTA, come ULTIMISSIMA azione della review, DOPO aver letto il codice: se dopo la dichiarazione esegui altri tool, il verdetto viene invalidato. verdict=pass SOLO se non hai trovato difetti reali; fail se hai trovato almeno un difetto che rende il lavoro non accettabile; needs_changes se il lavoro e' accettabile ma richiede correzioni. Ogni finding deve avere file ed evidenza concreta: niente osservazioni vaghe. Il summary e' il resoconto umano della review. Dichiara il verdetto REALE: un pass di cortesia su codice difettoso e' il peggior esito possibile.",
+    "description": "Dichiara il VERDETTO strutturato di una code review (per i run di revisione). Chiamalo come ULTIMISSIMA azione della review, DOPO aver letto il codice. Se lo chiami piu' volte vale l'ULTIMA dichiarazione; eseguire altri tool dopo averlo chiamato NON annulla il verdetto. verdict=pass SOLO se non hai trovato difetti reali; fail se hai trovato almeno un difetto che rende il lavoro non accettabile; needs_changes se il lavoro e' accettabile ma richiede correzioni. Ogni finding deve avere file ed evidenza concreta: niente osservazioni vaghe. Il summary e' il resoconto umano della review. Dichiara il verdetto REALE: un pass di cortesia su codice difettoso e' il peggior esito possibile.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1610,7 +1610,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   ,
   {
     "name": "advisory_verdict",
-    "description": "Dichiara il PARERE strutturato di una figura del consiglio di analisi a monte (per i run di analisi, prima dell'esecuzione). Chiamalo UNA SOLA VOLTA, come ULTIMISSIMA azione, DOPO aver analizzato la richiesta con la TUA lente: se dopo la dichiarazione esegui altri tool, il parere viene invalidato. verdict=proceed se dalla tua prospettiva si puo' procedere senza vincoli aggiuntivi; proceed_with_changes se si puo' procedere rispettando i requisiti che indichi; block se la richiesta NON e' eseguibile cosi' com'e' e va corretta prima. Un block richiede almeno un rischio con evidenza concreta: niente veto senza motivo. requirements sono i vincoli che l'esecuzione DEVE rispettare secondo la tua lente; risks i rischi con la loro severity; recommendations i suggerimenti non vincolanti. Il summary e' il resoconto umano del tuo parere; il parere macchina e' SOLO quello del tool.",
+    "description": "Dichiara il PARERE strutturato di una figura del consiglio di analisi a monte (per i run di analisi, prima dell'esecuzione). Chiamalo come ULTIMISSIMA azione, DOPO aver analizzato la richiesta con la TUA lente. Se lo chiami piu' volte vale l'ULTIMA dichiarazione; eseguire altri tool dopo averlo chiamato NON annulla il parere. verdict=proceed se dalla tua prospettiva si puo' procedere senza vincoli aggiuntivi; proceed_with_changes se si puo' procedere rispettando i requisiti che indichi; block se la richiesta NON e' eseguibile cosi' com'e' e va corretta prima. Un block richiede almeno un rischio con evidenza concreta: niente veto senza motivo. requirements sono i vincoli che l'esecuzione DEVE rispettare secondo la tua lente; risks i rischi con la loro severity; recommendations i suggerimenti non vincolanti. Il summary e' il resoconto umano del tuo parere; il parere macchina e' SOLO quello del tool.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1618,9 +1618,26 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "summary": {"type": "string", "description": "Resoconto umano del parere (cosa hai analizzato e con quale conclusione)."},
         "requirements": {"type": "array", "items": {"type": "string"}, "description": "Vincoli/requisiti che l'esecuzione DEVE rispettare secondo la tua lente. Ognuno una frase azionabile."},
         "risks": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["alta", "media", "bassa"], "description": "Severita' del rischio."}, "area": {"type": "string", "description": "Ambito del rischio (es. sicurezza, dati, deploy)."}, "description": {"type": "string", "description": "Il rischio e la sua evidenza concreta."}}, "required": ["description"]}, "description": "Rischi con evidenza. Obbligatorio (non vuoto) con verdict=block: un veto senza evidenza viene rifiutato."},
-        "recommendations": {"type": "array", "items": {"type": "string"}, "description": "Suggerimenti non vincolanti dalla tua prospettiva."}
+        "recommendations": {"type": "array", "items": {"type": "string"}, "description": "Suggerimenti non vincolanti dalla tua prospettiva."},
+        "contested_decision": {"type": "object", "properties": {"topic": {"type": "string", "description": "La decisione in una riga (es. 'come isolare i sub-run che scrivono')."}, "options": {"type": "array", "items": {"type": "string"}, "description": "Le alternative REALI e mutuamente esclusive, almeno due, ognuna descritta in modo autonomo e comprensibile senza il resto del parere."}}, "required": ["topic", "options"], "description": "Dichiaralo SOLO se la richiesta nasconde una DECISIONE ARCHITETTURALE aperta: piu' strade alternative difendibili, dove la scelta cambia il progetto e nessuna e' ovviamente superiore. Non dichiararlo per un dettaglio implementativo, per una scelta gia' presa nel repo (ADR/punto unico esistente), ne' quando una strada e' chiaramente giusta: farebbe convocare un dibattito costoso su una domanda gia' risolta. Se lo dichiari, avvocati indipendenti riceveranno UNA opzione ciascuno da difendere con evidenza, e il coordinatore decidera' sul merito del confronto."}
       },
       "required": ["verdict", "summary"]
+    }
+  }
+  ,
+  {
+    "name": "debate_position",
+    "description": "Dichiara la POSIZIONE strutturata di un avvocato in un dibattito a tesi contrapposte. Chiamalo come ULTIMISSIMA azione, DOPO aver studiato il codice. Se lo chiami piu' volte vale l'ULTIMA dichiarazione; eseguire altri tool dopo averlo chiamato NON annulla la posizione. assigned_position DEVE ripetere ALLA LETTERA la posizione che ti e' stata assegnata nel task: e' la chiave con cui il tuo voto viene attribuito, una posizione riscritta o inventata non viene conteggiata. stance=support se, studiate le prove, la tua posizione REGGE ed e' preferibile alle avverse; stance=oppose se onestamente NON regge: sei un avvocato, non un tifoso — arrendere la propria tesi davanti all'evidenza e' il contributo piu' prezioso del dibattito, non una sconfitta. key_arguments sono gli argomenti concreti (con file:riga dove possibile) a sostegno della tua conclusione; risks i rischi che hai trovato, con la loro severity. Un oppose con un rischio di severity alta squalifica la posizione anche se altri avvocati la sostengono: dichiara alta solo con evidenza verificata nel codice.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "assigned_position": {"type": "string", "description": "La posizione che ti e' stata assegnata, ripetuta ALLA LETTERA come compare nel task. E' la chiave di attribuzione del voto."},
+        "stance": {"type": "string", "enum": ["support", "oppose"], "description": "support = la posizione assegnata regge ed e' preferibile; oppose = studiate le prove NON regge (resa onesta: non e' una sconfitta, e' evidenza)."},
+        "summary": {"type": "string", "description": "Resoconto umano della tua arringa (cosa hai verificato e con quale conclusione)."},
+        "key_arguments": {"type": "array", "items": {"type": "string"}, "description": "Argomenti concreti a sostegno della tua conclusione, ognuno una frase con evidenza (file:riga dove possibile). Niente retorica: prove."},
+        "risks": {"type": "array", "items": {"type": "object", "properties": {"severity": {"type": "string", "enum": ["alta", "media", "bassa"], "description": "Severita' del rischio."}, "area": {"type": "string", "description": "Ambito del rischio (es. sicurezza, dati, deploy)."}, "description": {"type": "string", "description": "Il rischio e la sua evidenza concreta."}}, "required": ["description"]}, "description": "Rischi trovati, con evidenza. Obbligatorio (non vuoto) con stance=oppose: arrendere la tesi senza spiegare perche' non e' evidenza, e viene rifiutato."}
+      },
+      "required": ["assigned_position", "stance", "summary"]
     }
   }
   ,
@@ -1631,7 +1648,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       "type": "object",
       "properties": {
         "scope": {"type": "string", "enum": ["quick", "full", "typecheck", "build", "lint", "test"], "description": "quick = typecheck+lint (rapido, dopo ogni modifica); full = catena completa typecheck+build+lint+test (prima di dichiarare done); oppure un singolo step."},
-        "working_dir": {"type": "string", "description": "Sottocartella del progetto in cui eseguire i comandi (default: root del progetto). Utile nei monorepo."}
+        "working_dir": {"type": "string", "description": "Sottocartella del progetto in cui eseguire i comandi (default: root del progetto). Utile nei monorepo. Il comando gira GIA' in questa cartella: NON ripeterla nel comando (niente 'cd <questa>' ne prefissi '<questa>/' nei path), o i percorsi si sommano (es. working_dir=frontend + 'frontend/x' esegue in frontend/frontend/x)."}
       }
     }
   }
@@ -1650,7 +1667,11 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
 /// (consiglio di figure a monte): canale dichiarativo delle figure di analisi
 /// (program_manager, software_architect, security_engineer, ...); come sopra e'
 /// esposto SOLO ai kind che lo whitelistano, mai al run principale.
-pub const SUBAGENT_ONLY_TOOLS: &[&str] = &["review_verdict", "advisory_verdict"];
+/// `debate_position` (tesi contrapposte): canale dichiarativo del kind
+/// `advocate`; il coordinatore consuma la SINTESI del dibattito, non i singoli
+/// voti, e il run principale non ha una posizione assegnata da difendere.
+pub const SUBAGENT_ONLY_TOOLS: &[&str] =
+    &["review_verdict", "advisory_verdict", "debate_position"];
 
 #[cfg(test)]
 mod tests {

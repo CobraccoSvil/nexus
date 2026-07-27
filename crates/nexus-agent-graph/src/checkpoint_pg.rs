@@ -114,27 +114,8 @@ mod tests {
         done: bool,
     }
 
-    /// Crea la tabella minimale del checkpoint nel DB di test iniettato da
-    /// `#[sqlx::test]` (stesso pattern di agent_run.rs::tests_session_active).
-    async fn create_checkpoint_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_graph_checkpoints ( \
-                 run_id     UUID NOT NULL, \
-                 superstep  BIGINT NOT NULL, \
-                 next_node  TEXT NOT NULL, \
-                 state      JSONB NOT NULL, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-                 PRIMARY KEY (run_id, superstep) \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table nexus_graph_checkpoints");
-    }
-
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn put_poi_load_ritorna_stato_identico(pool: PgPool) {
-        create_checkpoint_table(&pool).await;
         let cp = PgCheckpointer::new(pool);
         let run_id = Uuid::new_v4();
         let state = ProbeState {
@@ -156,9 +137,8 @@ mod tests {
         assert_eq!(next, NodeId::Executor, "il next_node deve round-trippare");
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn load_ritorna_il_superstep_massimo(pool: PgPool) {
-        create_checkpoint_table(&pool).await;
         let cp = PgCheckpointer::new(pool);
         let run_id = Uuid::new_v4();
 
@@ -184,9 +164,8 @@ mod tests {
         assert_eq!(next, NodeId::End);
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn load_su_run_senza_checkpoint_ritorna_none(pool: PgPool) {
-        create_checkpoint_table(&pool).await;
         let cp = PgCheckpointer::new(pool);
         let loaded: Option<(ProbeState, NodeId)> = cp
             .load(Uuid::new_v4())
@@ -195,9 +174,8 @@ mod tests {
         assert!(loaded.is_none());
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn put_idempotente_sullo_stesso_superstep(pool: PgPool) {
-        create_checkpoint_table(&pool).await;
         let cp = PgCheckpointer::new(pool);
         let run_id = Uuid::new_v4();
 

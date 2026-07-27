@@ -360,16 +360,26 @@ async fn cleanup_windows_services(db: &PgPool, project_id: Uuid) -> SystemdResul
     }
 
     // De-registrazione definitiva delle righe kind='service' del progetto sul
-    // pool del progetto (agent_processes e' tabella migrata).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
-    if let Err(e) =
-        sqlx::query("DELETE FROM agent_processes WHERE project_id = $1 AND kind = 'service'")
-            .bind(project_id)
-            .execute(&proj_pool)
-            .await
-    {
-        out.errors
-            .push(format!("de-registrazione servizi Windows: {e}"));
+    // pool del progetto (agent_processes e' tabella migrata). Cleanup
+    // best-effort: DB progetto non disponibile -> errore nel report, niente
+    // fallback al meta-DB.
+    match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(proj_pool) => {
+            if let Err(e) =
+                sqlx::query("DELETE FROM agent_processes WHERE project_id = $1 AND kind = 'service'")
+                    .bind(project_id)
+                    .execute(&proj_pool)
+                    .await
+            {
+                out.errors
+                    .push(format!("de-registrazione servizi Windows: {e}"));
+            }
+        }
+        Err(e) => {
+            tracing::warn!(project_id = %project_id, error = %e, "cleanup servizi Windows: DB progetto non disponibile, de-registrazione saltata");
+            out.errors
+                .push(format!("de-registrazione servizi Windows: DB progetto non disponibile: {e}"));
+        }
     }
 
     out
@@ -474,7 +484,9 @@ async fn cleanup_qdrant_points(db: &PgPool, project_id: Uuid) -> QdrantResult {
 
     let base_url = match get_setting(db, "qdrant_url").await {
         Ok(Some(v)) if !v.is_empty() => v,
-        _ => std::env::var("QDRANT_URL").unwrap_or_else(|_| QDRANT_DEFAULT_URL.to_string()),
+        _ => crate::settings::disambigua_loopback(
+            &std::env::var("QDRANT_URL").unwrap_or_else(|_| QDRANT_DEFAULT_URL.to_string()),
+        ),
     };
 
     for (setting_key, default_name) in QDRANT_PROJECT_COLLECTIONS {

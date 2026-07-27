@@ -19,9 +19,44 @@ pub struct ModelCatalogEntry {
     pub display_name: String,
     pub input_cost_per_million_tokens: f64,
     pub output_cost_per_million_tokens: f64,
-    pub currency: String,
+    /// Tariffa dei token letti da cache (mig 0130, popolata dalla 0403 con i
+    /// rapporti per provider). `None` = il catalog non la conosce per questo
+    /// modello: chi prezza deve dirlo, non stimarla. Senza questo campo nel wire
+    /// il frontend compensava con un `input * 0.1` scritto a mano, che e' la
+    /// stima giusta per Anthropic e sbagliata per tutti gli altri.
     #[sqlx(default)]
-    pub performance_tier: String,
+    pub cache_read_cost_per_million_tokens: Option<f64>,
+    /// Tariffa dei token SCRITTI in cache (mig 0403). `None` = il catalog non la
+    /// conosce. Serve accanto alla tariffa di lettura perche' sono due
+    /// sottoinsiemi distinti del prompt, con due prezzi (vedi
+    /// `nexus_gateway::LlmUsage`): senza questa riga il frontend non ha modo di
+    /// scorporare i token di cache_creation e li paga a tariffa piena di input.
+    #[sqlx(default)]
+    pub cache_creation_cost_per_million_tokens: Option<f64>,
+    pub currency: String,
+    /// `None` = tier ignoto: nessuna fonte si e' espressa (mig 0599/0608).
+    /// Prima era `String` con `#[sqlx(default)]`, che rendeva un NULL
+    /// indistinguibile da una stringa vuota — cioe' l'esatta ambiguita' che la
+    /// 0599 ha eliminato dal DB.
+    #[sqlx(default)]
+    pub performance_tier: Option<String>,
+    /// Chi ha stabilito il tier: `synced` (indice esterno) | `measured`
+    /// (batteria) | `manual` (curatela) | `None` (fonte ignota: il valore c'e'
+    /// ma e' un fossile, e chiunque puo' rimpiazzarlo). Senza questo campo
+    /// l'admin vede un tier e non sa se fidarsi.
+    #[sqlx(default)]
+    pub tier_source: Option<String>,
+    /// L'indice della classificazione esterna (Artificial Analysis via
+    /// OpenRouter): il numero su cui il tier `synced` si fonda. `None` = il
+    /// servizio non copre questo modello (43 su 116, il 16/07).
+    #[sqlx(default)]
+    pub agentic_index: Option<f64>,
+    /// Stato della batteria: `qualified` | `unqualified` | `disqualified` |
+    /// `probing` | `quarantined`. Col gate acceso solo i `qualified` non scaduti
+    /// entrano nel routing agentico: e' la prima cosa da guardare quando un
+    /// modello "non viene mai scelto".
+    #[sqlx(default)]
+    pub qualification_state: Option<String>,
     #[sqlx(default)]
     pub speed_tier: String,
     #[sqlx(default)]
@@ -36,6 +71,40 @@ pub struct ModelCatalogEntry {
     pub is_featured: bool,
     pub is_enabled: bool,
 }
+
+/// La `SELECT` che idrata [`ModelCatalogEntry`], con le colonne in UN posto solo
+/// (regola L). `$coda` e' la parte variabile (`WHERE ... ORDER BY ...`) e deve
+/// essere un LETTERALE: la query si compone a compile-time con `concat!`, quindi
+/// non esiste il modo di interpolarci dentro un valore a runtime (niente
+/// SQL injection possibile per costruzione, non per diligenza).
+///
+/// Perche' esiste: le query che elencavano le colonne a mano erano quattro, su
+/// due file — `/api/models` (con e senza filtro provider) e
+/// `/api/admin/provider-models` (idem). Aggiungere un campo alla struct
+/// significava ricordarsi di tutte e quattro, e dimenticarne una NON e' un
+/// errore che il compilatore veda: `#[sqlx(default)]` riempie il campo mancante
+/// col default e la riga arriva silenziosamente sbagliata. E' la stessa forma
+/// del difetto che ha tenuto la batteria in panic per un giorno
+/// (`load_profiles` leggeva una colonna che la sua SELECT non chiedeva).
+macro_rules! catalog_select {
+    ($coda:literal) => {
+        concat!(
+            "SELECT provider, model, display_name, \
+             input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens, \
+             output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens, \
+             cache_read_cost_per_million_tokens::float8 AS cache_read_cost_per_million_tokens, \
+             cache_creation_cost_per_million_tokens::float8 \
+                 AS cache_creation_cost_per_million_tokens, \
+             currency, performance_tier, tier_source, \
+             agentic_index::float8 AS agentic_index, qualification_state, speed_tier, \
+             capabilities, context_window, supports_tool_use, batch_discount_pct, \
+             is_featured, is_enabled \
+             FROM ai_price_catalog ",
+            $coda
+        )
+    };
+}
+pub(crate) use catalog_select;
 
 #[derive(Debug, Deserialize)]
 pub struct ModelsQuery {
@@ -58,32 +127,18 @@ pub async fn list_models(
     Query(params): Query<ModelsQuery>,
 ) -> Json<Value> {
     let result: Result<Vec<ModelCatalogEntry>, _> = if let Some(ref provider) = params.provider {
-        sqlx::query_as(
-            r#"SELECT provider, model, display_name,
-               input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-               output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-               currency, performance_tier, speed_tier,
-               capabilities, context_window, supports_tool_use, batch_discount_pct,
-               is_featured, is_enabled
-               FROM ai_price_catalog
-               WHERE provider = $1 AND is_enabled = TRUE
-               ORDER BY is_featured DESC, input_cost_per_million_tokens ASC"#,
-        )
+        sqlx::query_as(catalog_select!(
+            "WHERE provider = $1 AND is_enabled = TRUE \
+             ORDER BY is_featured DESC, input_cost_per_million_tokens ASC"
+        ))
         .bind(provider)
         .fetch_all(&state.db)
         .await
     } else {
-        sqlx::query_as(
-            r#"SELECT provider, model, display_name,
-               input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
-               output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
-               currency, performance_tier, speed_tier,
-               capabilities, context_window, supports_tool_use, batch_discount_pct,
-               is_featured, is_enabled
-               FROM ai_price_catalog
-               WHERE is_enabled = TRUE
-               ORDER BY provider, is_featured DESC, input_cost_per_million_tokens ASC"#,
-        )
+        sqlx::query_as(catalog_select!(
+            "WHERE is_enabled = TRUE \
+             ORDER BY provider, is_featured DESC, input_cost_per_million_tokens ASC"
+        ))
         .fetch_all(&state.db)
         .await
     };
@@ -305,40 +360,47 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             &vision_routable,
         );
 
-        // performance_tier inferito dal punto unico (regola L): prima era
-        // applicato SOLO ai nuovi insert (e solo nel path discovery API), quindi
-        // i flagship con naming recente (es. claude-opus-4-8, gpt-5.x) restavano
-        // 'medium' di default e l'auto-promoter non li trovava come 'heavy'.
-        // Qui lo (ri)calcoliamo ad ogni sync e lo propaghiamo anche alle righe
-        // esistenti 'auto' (le 'manual' restano protette dalla CASE sotto).
-        let inferred_tier = crate::model_catalog_sync::infer_tier_from_name(provider, model_id);
+        // performance_tier: qui NON si deriva. Il tier ha UN SOLO punto di
+        // derivazione (regola L): `refresh_tier_prior`, chiamato sotto dopo
+        // l'upsert.
+        //
+        // Perche' (difetto misurato il 16/07, introdotto proprio da questo blocco).
+        // Qui erano noti solo prezzo e finestra, NON l'agentic_index (che vive
+        // nella riga e lo popola sync_agentic_index): il tier veniva derivato dal
+        // solo prezzo e scritto, e `refresh_tier_prior` — l'altro punto, quello
+        // che l'indice ce l'ha — girava su un path diverso (la discovery API) e
+        // non lo correggeva. Due punti per la stessa domanda, e vinceva quello
+        // MENO informato: mistral-large-2512 (agentic 5.5) classificato 'heavy'
+        // perche' costa $0.50 con 262k di finestra, e le inversioni salite a 90
+        // (peggio del nome, che ne faceva 64). Era il difetto che stavamo curando,
+        // rifatto mentre lo curavamo.
 
         // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'
         // (le righe 'manual' curate da admin/migrazioni sono protette, ADR 0024).
         // I costi/context si aggiornano sempre.
+        //
+        // Il TIER non compare: lo scrive `refresh_tier_prior` (punto unico) dopo
+        // questo upsert, dall'agentic_index della riga (unico seme, mig 0608).
+        // All'INSERT resta NULL — un modello nuovo non ha ancora fatti su cui
+        // fondare una fascia, e NULL e' la verita' (la riga nasce comunque
+        // is_enabled=false + unqualified, quindi fuori dal pool agentico).
         let result = sqlx::query(
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
                 currency, context_window, supports_tool_use, supports_vision,
-                is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
-                performance_tier
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, $11)
+                uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
+                performance_tier, tier_source
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2, NULL, NULL)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
                 context_window = EXCLUDED.context_window,
-                performance_tier = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                        THEN EXCLUDED.performance_tier
-                                        ELSE ai_price_catalog.performance_tier END,
                 supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                          THEN EXCLUDED.supports_tool_use
                                          ELSE ai_price_catalog.supports_tool_use END,
                 supports_vision = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                        THEN EXCLUDED.supports_vision
                                        ELSE ai_price_catalog.supports_vision END,
-                is_thinking = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                   THEN EXCLUDED.is_thinking
-                                   ELSE ai_price_catalog.is_thinking END,
                 uses_thinking_mode = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                           THEN EXCLUDED.uses_thinking_mode
                                           ELSE ai_price_catalog.uses_thinking_mode END,
@@ -355,10 +417,8 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .bind(context_window)
         .bind(caps.supports_tool_use)
         .bind(caps.supports_vision)
-        .bind(caps.is_thinking)
         .bind(caps.uses_thinking_mode)
         .bind(caps.agentic_thinking_policy)
-        .bind(inferred_tier)
         .fetch_one(db)
         .await;
 
@@ -370,6 +430,10 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
                 } else {
                     updated += 1;
                 }
+                // PUNTO UNICO del tier (regola L): la riga ora ha prezzo, finestra,
+                // capability provate E agentic_index. Il prior si esprime con TUTTI
+                // i fatti, non solo col prezzo — che era il difetto di questo blocco.
+                crate::model_catalog_sync::refresh_tier_prior(db, provider, model_id).await;
             }
             Err(_) => {
                 skipped += 1;
@@ -631,10 +695,16 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
             if !crate::model_catalog_sync::model_passes_selection_policy(db, provider, m).await {
                 continue;
             }
-            let res = sqlx::query(
+            // Prezzo ignoto -> non routabile, quindi non abilitabile nemmeno per
+            // famiglia (punto unico del predicato: regola L). Senza questo guard,
+            // un solo membro della famiglia a listino noto ne trascinerebbe dentro
+            // altri a costo placeholder.
+            let res = sqlx::query(&format!(
                 "UPDATE ai_price_catalog SET is_enabled = true \
-                 WHERE provider = $1 AND model = $2 AND is_enabled = false",
-            )
+                 WHERE provider = $1 AND model = $2 AND is_enabled = false \
+                   AND NOT {price_unknown}",
+                price_unknown = crate::model_catalog_sync::price_unknown_sql(""),
+            ))
             .bind(provider)
             .bind(m)
             .execute(db)

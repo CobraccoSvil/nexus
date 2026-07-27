@@ -266,7 +266,10 @@ export function RunDebugView({
 
   return (
     <>
-      <div className="flex-row px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between" }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
+      {/* flex-row-wrap, non flex-row: in sidebar stretta titolo e comandi non
+          ci stanno in riga e, non potendo andare a capo, sfondavano il
+          contenitore (misurati 4px) che rispondeva con uno scroll orizzontale. */}
+      <div className="flex-row-wrap px-3 py-2" style={{ borderBottom: `1px solid ${tc.border}`, justifyContent: "space-between", gap: 6 }} title="Script & comandi una-tantum del progetto (build, test, lint, migrazioni, ecc.). Gli script che corrispondono a servizi del progetto installati e quelli di stop/kill vengono nascosti automaticamente — clicca '👁' per mostrarli.">
         <span style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, textTransform: "uppercase", letterSpacing: 1 }}>Script &amp; Comandi</span>
         {!editing && !suggestions && (
           <div className="flex-row" style={{ gap: 4, alignItems: "center" }}>
@@ -342,11 +345,15 @@ export function RunDebugView({
                   };
                   return (
                     <div key={group} className="mt-6 pt-2" style={{ borderTop: `1px solid ${tc.border}` }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
-                        <span className="text-xs font-bold" style={{ color: tc.textSecondary }}>
+                      {/* wrap: in sidebar stretta il nome del gruppo e i tre
+                          comandi non stanno in riga. Senza andare a capo il nome
+                          si spezzava su due righe e "nessuno" restava tagliato
+                          oltre il bordo. */}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4, flexWrap: "wrap", gap: 4 }}>
+                        <span className="text-xs font-bold" style={{ color: tc.textSecondary, minWidth: 0 }}>
                           {GROUP_ICON(group)} {group}
                         </span>
-                        <span style={{ fontSize: 10, color: tc.textMuted, display: "flex", gap: 4 }}>
+                        <span style={{ fontSize: 10, color: tc.textMuted, display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <button onClick={() => toggleGroup("all")} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title="Seleziona tutti">{allSelected ? "✓ tutti" : "tutti"}</button>
                           <button onClick={() => toggleGroup("essential")} style={{ background: "none", border: "none", color: tc.accent, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title="Solo essenziali">essenziali</button>
                           <button onClick={() => toggleGroup("none")} style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 10, padding: "0 2px" }} title="Nessuno">nessuno</button>

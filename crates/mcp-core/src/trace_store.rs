@@ -8,7 +8,7 @@
 //! dopo aver pulito lo storage il pannello tracce divergeva dal rendering live.
 //!
 //! Punto unico (regola L): l'INSERT vive qui; i call site (oggi
-//! `brain_agent_client`) delegano a [`persist_trace`], niente query SQL
+//! `agent_turn_setup`) delegano a [`persist_trace`], niente query SQL
 //! duplicate. Il getter [`get_session_traces`] raggruppa per `run_id`, stessa
 //! shape di `chat_agent::get_session_meta_steps` (`{ runs: { runId: [...] } }`).
 
@@ -66,11 +66,37 @@ pub async fn persist_trace(
 /// `run_pool` DEVE essere il pool del DB dove vivono i run della sessione
 /// (progetto a flag separazione ON), risolto dal chiamante — stessa convenzione
 /// di [`persist_trace`] (regola L: la risoluzione vive su UN solo lato).
+///
+/// ## `parentRunId`: la parentela viaggia col dato che deve essere attribuito
+///
+/// Le tracce di un sub-agente sono persistite sotto il `run_id` PROPRIO del
+/// figlio, non sotto quello del padre. Chi somma i token o compone la
+/// ripartizione per provider di un run deve quindi sapere quali run lo
+/// compongono, e finora il frontend lo deduceva dai meta-step di NARRAZIONE: un
+/// canale di presentazione, che il review panel non emette affatto. Risultato
+/// misurato: 4 cicli di review su openrouter spariti dalla barra dei costi.
+///
+/// Qui ogni traccia di un sub-run viene annotata col campo `parentRunId` letto
+/// dal PUNTO UNICO della parentela ([`crate::run_lineage`], che la prende dal
+/// DB). Il campo NON e' persistito in `nexus_agent_traces`: e' una join in
+/// lettura, quindi non puo' divergere dalla fonte. Se la lettura della parentela
+/// fallisce le tracce escono comunque (senza annotazione): la telemetria degrada,
+/// non sparisce.
 pub async fn get_session_traces(
     run_pool: &PgPool,
     session_id: Uuid,
     user_id: Uuid,
 ) -> Result<std::collections::HashMap<String, Vec<Value>>, sqlx::Error> {
+    let parent_by_child = crate::run_lineage::parent_run_by_child(run_pool, session_id, user_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "trace_store: parentela sub-run non leggibile, tracce senza parentRunId"
+            );
+            std::collections::HashMap::new()
+        });
     let rows = sqlx::query(
         "SELECT t.run_id, t.payload \
          FROM nexus_agent_traces t \
@@ -93,11 +119,18 @@ pub async fn get_session_traces(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let payload: Value = row
+        let mut payload: Value = row
             .try_get::<Option<Value>, _>("payload")
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}));
+        if let Some(parent) = parent_by_child.get(&run_id) {
+            // camelCase come il resto dell'AITraceEvent (stessa forma dell'evento
+            // SSE): il tipo TypeScript legge `parentRunId`.
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("parentRunId".to_string(), json!(parent.to_string()));
+            }
+        }
         runs.entry(run_id.to_string()).or_default().push(payload);
     }
     Ok(runs)
@@ -107,46 +140,23 @@ pub async fn get_session_traces(
 mod tests {
     use super::*;
 
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 user_id UUID NOT NULL, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
+    /// Sessione + run dell'utente indicato. Le tabelle le porta il migrator del
+    /// set project: qui si semina solo la riga, coi NOT NULL e la FK
+    /// `agent_runs.session_id -> chat_sessions(id)` che lo schema reale impone.
+    async fn seed_run(pool: &PgPool, user_id: Uuid) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(pool, project_id).await;
+        let run_id = crate::test_support::insert_agent_run_as(
+            pool, session_id, project_id, user_id, "running",
         )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE nexus_agent_traces ( \
-                 id BIGSERIAL PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 run_id UUID NOT NULL, \
-                 seq INTEGER NOT NULL DEFAULT 0, \
-                 payload JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_agent_traces");
+        .await;
+        (session_id, run_id)
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn persist_e_get_raggruppa_per_run(pool: PgPool) {
-        create_tables(&pool).await;
-        let session_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        let run_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id, user_id) VALUES ($1, $2, $3)")
-            .bind(run_id)
-            .bind(session_id)
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let (session_id, run_id) = seed_run(&pool, user_id).await;
 
         persist_trace(
             &pool,
@@ -175,20 +185,75 @@ mod tests {
         assert_eq!(traces[1]["provider"], json!("google"));
     }
 
-    #[sqlx::test]
+    /// REGRESSIONE (2026-07-26): la barra costo-per-provider di un run ometteva
+    /// il provider dei revisori. Le tracce del sub-run esistono, sotto il run_id
+    /// del figlio; mancava sul wire il fatto che quel run appartiene al padre,
+    /// perche' il frontend lo deduceva dai meta-step di NARRAZIONE (che il review
+    /// panel non emette). Qui si verifica il produttore reale del wire: la
+    /// traccia del figlio esce annotata col `parentRunId` del run che lo ha
+    /// convocato, quella del padre no.
+    ///
+    /// Mutazione: togliendo l'annotazione in `get_session_traces`, il campo e'
+    /// assente e la prima assert fallisce con `null`.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn la_traccia_del_subrun_dichiara_il_run_padre(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let session_id = crate::test_support::seed_chat_session(&pool, project_id).await;
+        let padre = crate::test_support::insert_agent_run_as(
+            &pool, session_id, project_id, user_id, "completed",
+        )
+        .await;
+        let revisore = crate::test_support::seed_subagent_run(
+            &pool,
+            session_id,
+            project_id,
+            user_id,
+            padre,
+            Some(padre),
+            "review",
+        )
+        .await;
+
+        persist_trace(
+            &pool,
+            session_id,
+            padre,
+            0,
+            &json!({"runId": padre.to_string(), "provider": "deepseek"}),
+        )
+        .await;
+        persist_trace(
+            &pool,
+            session_id,
+            revisore,
+            0,
+            &json!({"runId": revisore.to_string(), "provider": "openrouter"}),
+        )
+        .await;
+
+        let runs = get_session_traces(&pool, session_id, user_id)
+            .await
+            .expect("get ok");
+        let del_figlio = &runs.get(&revisore.to_string()).expect("sub-run presente")[0];
+        assert_eq!(
+            del_figlio["parentRunId"],
+            json!(padre.to_string()),
+            "la traccia del revisore dichiara il run che lo ha convocato"
+        );
+        let del_padre = &runs.get(&padre.to_string()).expect("run padre presente")[0];
+        assert_eq!(
+            del_padre.get("parentRunId"),
+            None,
+            "un run primario non ha un run padre"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn get_isola_per_utente(pool: PgPool) {
-        create_tables(&pool).await;
-        let session_id = Uuid::new_v4();
         let owner = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let run_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, session_id, user_id) VALUES ($1, $2, $3)")
-            .bind(run_id)
-            .bind(session_id)
-            .bind(owner)
-            .execute(&pool)
-            .await
-            .expect("insert run");
+        let (session_id, run_id) = seed_run(&pool, owner).await;
         persist_trace(&pool, session_id, run_id, 0, &json!({"x": 1})).await;
 
         // L'altro utente non vede le tracce della sessione altrui.

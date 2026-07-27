@@ -128,6 +128,17 @@ pub struct AstIndex {
     /// false se dal fallback regex.
     #[serde(default)]
     pub precise: bool,
+    /// true se la visita dell'AST si e' fermata al tetto di profondita': l'indice
+    /// e' PARZIALE e i simboli oltre quel livello mancano.
+    ///
+    /// Campo distinto da `precise`, che dice tutt'altro (tree-sitter contro
+    /// fallback regex): un indice puo' essere preciso e insieme incompleto, ed e'
+    /// esattamente il caso che si verificava. Prima il troncamento finiva solo in
+    /// un `warn!` mentre l'indice usciva con `precise: true`, quindi nessun
+    /// consumatore poteva distinguerlo da uno completo (regola M: lo stato
+    /// tecnico si legge da un segnale strutturato, non dai log).
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Rileva il linguaggio dall'estensione. Language-agnostic: i linguaggi senza
@@ -219,6 +230,9 @@ pub fn index_source(file_path: &str, source: &str) -> AstIndex {
         calls: Vec::new(),
         line_count,
         precise: false,
+        // Il fallback regex scorre le righe una volta: non ha un tetto di
+        // profondita' da superare, quindi non tronca mai.
+        truncated: false,
     }
 }
 

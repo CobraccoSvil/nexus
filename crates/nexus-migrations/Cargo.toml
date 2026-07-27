@@ -1,0 +1,20 @@
+[package]
+name = "nexus-migrations"
+edition.workspace = true
+version.workspace = true
+
+# Punto unico dell'APPLICAZIONE dei set di migrazioni (regola L). E' una
+# dipendenza di PRODUZIONE (mcp-core la usa all'avvio), quindi resta minimale:
+# niente `sqlx::migrate!`, niente include_str! dei file. Il gemello
+# compile-time vive in `nexus-migrations-embedded`, che e' solo dev-dependency
+# e dipende da questo.
+[dependencies]
+sqlx.workspace = true
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

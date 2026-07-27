@@ -149,6 +149,35 @@ pub trait LearningWorker: Send + Sync {
     }
 }
 
+/// E' ora di eseguire questo worker? PUNTO UNICO (regola L) del criterio di
+/// cadenza: `tick()` lo applica a ogni worker periodico.
+///
+/// Perche' esiste: [`LearningWorker::interval`] era dichiarato dal trait e
+/// implementato dai worker, ma NON veniva letto da nessuno —
+/// `start_periodic_loop` aveva un solo intervallo globale ed eseguiva TUTTI i
+/// worker periodici a ogni giro. Le cadenze dichiarate erano quindi
+/// configurazione morta, con danni reali: lo snapshot di sessione aveva un TTL
+/// di 600s ma veniva riscritto ogni 1800s (scaduto per due terzi del tempo,
+/// quindi il ripristino dopo un crash quasi mai disponibile), e il cleanup
+/// dichiarato "essenziale per evitare memory leak" a 60s girava 30 volte meno
+/// spesso del previsto.
+///
+/// `None` (mai eseguito) vale sempre "e' ora": ogni worker gira una volta al
+/// primo tick utile. Un `last_run` nel futuro (orologio spostato indietro)
+/// vale "e' ora" invece di bloccare il worker fino a quando il tempo lo
+/// raggiunge.
+pub(crate) fn is_worker_due(
+    last_run: Option<chrono::DateTime<chrono::Utc>>,
+    interval: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(last) = last_run else { return true };
+    match now.signed_duration_since(last).to_std() {
+        Ok(elapsed) => elapsed >= interval,
+        Err(_) => true,
+    }
+}
+
 /// Statistiche cumulate dello scheduler
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerStats {
@@ -212,6 +241,18 @@ impl LearningScheduler {
 
     /// Esegue tutti i worker periodici (chiamato dallo user loop / tokio interval)
     pub async fn tick(&self, context: LearningContext) -> Vec<WorkerOutcome> {
+        let now = chrono::Utc::now();
+        // Istantanea degli ultimi avvii: si copia sotto lock e lo si rilascia
+        // subito, perche' il filtro sotto chiama `w.interval()` sui worker e
+        // tenere due lock insieme e' un invito al deadlock.
+        let last_runs: HashMap<String, chrono::DateTime<chrono::Utc>> = {
+            let stats = self.stats.read();
+            stats
+                .per_worker
+                .iter()
+                .filter_map(|(name, s)| s.last_run.map(|t| (name.clone(), t)))
+                .collect()
+        };
         let workers: Vec<Arc<dyn LearningWorker>> = {
             self.workers
                 .read()
@@ -222,6 +263,8 @@ impl LearningScheduler {
                             w.trigger(),
                             WorkerTrigger::Periodic | WorkerTrigger::Both
                         )
+                        // Ogni worker alla SUA cadenza (vedi [`is_worker_due`]).
+                        && is_worker_due(last_runs.get(w.name()).copied(), w.interval(), now)
                 })
                 .cloned()
                 .collect()
@@ -320,17 +363,24 @@ impl LearningScheduler {
         self.stats.read().clone()
     }
 
-    /// Avvia un loop periodico in background che chiama `tick()` ogni N secondi.
+    /// Avvia il loop in background che chiama `tick()`.
     /// Ritorna un handle tokio che può essere abortito dal chiamante.
+    ///
+    /// `granularity` NON e' la cadenza dei worker: e' ogni quanto lo scheduler
+    /// si sveglia per CHIEDERSI chi e' in scadenza. La cadenza vera di ciascun
+    /// worker e' la sua [`LearningWorker::interval`], applicata da `tick()` via
+    /// [`is_worker_due`]. Va scelta piu' fine dell'intervallo del worker piu'
+    /// frequente, altrimenti quel worker slitta alla granularita'.
     ///
     /// Nota: il contesto passato non include swarm_result perché il tick
     /// è indipendente dall'esecuzione. I periodic worker lavorano su stato
     /// globale (namespace cleanup, metrics aggregation, ecc.).
     pub fn start_periodic_loop(
         self: Arc<Self>,
-        interval: Duration,
+        granularity: Duration,
         context_factory: Arc<dyn Fn() -> LearningContext + Send + Sync>,
     ) -> tokio::task::JoinHandle<()> {
+        let interval = granularity;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
@@ -350,6 +400,74 @@ impl LearningScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cadenza per-worker ──────────────────────────
+    //
+    // Il difetto che questi test presidiano: `interval()` era dichiarato dal
+    // trait e implementato dai worker, ma nessuno lo leggeva. Se `is_worker_due`
+    // tornasse a rispondere `true` sempre (com'era di fatto prima), i primi due
+    // test falliscono.
+
+    /// Cadenza dichiarata da `CleanupWorker`.
+    const CLEANUP_SECS: u64 = 60;
+    /// Cadenza dichiarata da `SessionPersistenceWorker`.
+    const SESSION_SECS: u64 = 300;
+    /// TTL dello snapshot scritto da `SessionPersistenceWorker`.
+    const SESSION_TTL_SECS: u64 = 600;
+    /// Cadenza dichiarata da `PromptOptimizerWorker`.
+    const OPTIMIZER_SECS: u64 = 1800;
+
+    /// Un worker appena registrato gira al primo tick utile.
+    #[test]
+    fn mai_eseguito_e_sempre_in_scadenza() {
+        let now = chrono::Utc::now();
+        assert!(is_worker_due(None, Duration::from_secs(OPTIMIZER_SECS), now));
+    }
+
+    /// Prima che l'intervallo sia trascorso il worker non viene eseguito.
+    #[test]
+    fn dentro_il_proprio_intervallo_non_si_esegue() {
+        let now = chrono::Utc::now();
+        let interval = Duration::from_secs(CLEANUP_SECS);
+        // A meta' dell'intervallo non tocca a lui...
+        let last = now - chrono::Duration::seconds(CLEANUP_SECS as i64 / 2);
+        assert!(!is_worker_due(Some(last), interval, now));
+        // ...e passato l'intervallo si'.
+        let last = now - chrono::Duration::seconds(CLEANUP_SECS as i64 + 1);
+        assert!(is_worker_due(Some(last), interval, now));
+    }
+
+    /// La cadenza del persistence worker deve restare sotto il TTL che scrive.
+    #[test]
+    fn snapshot_di_sessione_riscritto_prima_di_scadere() {
+        // Il danno concreto del difetto: SessionPersistenceWorker dichiara la sua
+        // cadenza e scrive uno snapshot con un TTL doppio, ma girava ogni 1800s —
+        // quindi la chiave era scaduta per due terzi del tempo e il "ripristino
+        // sessione dopo crash" quasi mai disponibile.
+        let interval = Duration::from_secs(SESSION_SECS);
+        let ttl = Duration::from_secs(SESSION_TTL_SECS);
+        assert!(
+            interval < ttl,
+            "la cadenza ({interval:?}) deve stare sotto il TTL ({ttl:?})"
+        );
+        let now = chrono::Utc::now();
+        let last = now - chrono::Duration::seconds(SESSION_SECS as i64 + 1);
+        assert!(is_worker_due(Some(last), interval, now));
+    }
+
+    /// Un `last_run` nel futuro non congela il worker.
+    #[test]
+    fn orologio_spostato_indietro_non_blocca_il_worker() {
+        // Senza questo ramo il worker resterebbe fermo finche' il tempo non
+        // raggiunge il valore registrato.
+        let now = chrono::Utc::now();
+        let last = now + chrono::Duration::seconds(CLEANUP_SECS as i64);
+        assert!(is_worker_due(
+            Some(last),
+            Duration::from_secs(CLEANUP_SECS),
+            now
+        ));
+    }
 
     struct DummyWorker {
         name: String,

@@ -2,14 +2,52 @@ import { API_BASE, fetchJson } from "./_shared";
 
 // ── Model Catalog ──────────────────────────────────────────────────────────
 
+/**
+ * Specchio ESATTO del wire di `/api/models` (punto unico, regola L): il
+ * serializzatore autoritativo e' `crates/mcp-core/src/models.rs::ModelCatalogEntry`,
+ * annotato `#[serde(rename_all = "camelCase")]` -> i campi arrivano in camelCase
+ * con il suffisso `Tokens` sui costi (`inputCostPerMillionTokens`).
+ *
+ * Ogni consumatore di `/api/models` deve usare QUESTO tipo: le copie locali
+ * divergono in silenzio dal wire e i campi mancanti diventano `undefined`, che
+ * un `?? 0` a valle trasforma in "costo zero" invece che in un errore visibile
+ * (regola G: niente magic fallback). E' esattamente il difetto che azzerava il
+ * footer costo-per-provider del nastro attivita'.
+ */
+export type PerformanceTier = "light" | "medium" | "high" | "heavy" | "frontier";
+
+/** Chi ha stabilito il tier (`ai_price_catalog.tier_source`, mig 0608).
+ *  `null` = nessuna fonte si e' espressa: il valore c'e' ma non si sa da dove
+ *  venga (un fossile), e indice o batteria possono rimpiazzarlo. */
+export type TierSource = "synced" | "measured" | "manual";
+
 export interface ModelCatalogEntry {
   provider: string;
   model: string;
   displayName: string;
-  inputCostPerMillion: number;
-  outputCostPerMillion: number;
+  inputCostPerMillionTokens: number;
+  outputCostPerMillionTokens: number;
+  /** Tariffa dei token letti da cache (`ai_price_catalog`, mig 0130/0403).
+   *  `null` = il catalog non la conosce per questo modello: la UI mostra il
+   *  costo senza sconto cache invece di inventarsi un rapporto. */
+  cacheReadCostPerMillionTokens: number | null;
+  /** Tariffa dei token SCRITTI in cache (`ai_price_catalog`, mig 0403).
+   *  `null` = il catalog non la conosce: chi prezza li lascia a tariffa piena di
+   *  input e lo dichiara (`costFromCatalog`), perche' quei token sono stati
+   *  consumati e non possono valere zero. Serve accanto alla tariffa di lettura
+   *  perche' sono due sottoinsiemi distinti del prompt, con due prezzi. */
+  cacheCreationCostPerMillionTokens: number | null;
   currency: string;
-  performanceTier: "light" | "medium" | "high" | "heavy" | "frontier";
+  /** `null` = tier ignoto (mig 0599: la colonna e' nullable, e NULL significa
+   *  "nessuna fonte lo ha stabilito" — non "medium"). */
+  performanceTier: PerformanceTier | null;
+  tierSource: TierSource | null;
+  /** Indice della classificazione esterna (Artificial Analysis via OpenRouter):
+   *  il numero su cui si fonda il tier `synced`. `null` = modello non coperto. */
+  agenticIndex: number | null;
+  /** Stato della batteria di qualificazione. Col gate acceso solo `qualified`
+   *  entra nel routing agentico. */
+  qualificationState: string | null;
   speedTier: "fast" | "medium" | "slow";
   capabilities: string[];
   contextWindow: number;
@@ -28,21 +66,11 @@ export async function getModels(provider?: string): Promise<{ models: ModelCatal
 
 // ── Model Catalog (per dropdown billing) ───────────────────────────────────
 
-export interface ModelCatalogItem {
-  provider: string;
-  model: string;
-  displayName: string;
-  inputCostPerMillionTokens: number;
-  outputCostPerMillionTokens: number;
-  currency: string;
-  performanceTier: string;
-  speedTier: string;
-  contextWindow: number;
-  isFeatured: boolean;
-  isEnabled: boolean;
-}
+/** Alias storico: `/api/models` ha UN solo wire, quindi un solo tipo (regola L).
+ *  Mantenuto per i call site che lo importano con questo nome. */
+export type ModelCatalogItem = ModelCatalogEntry;
 
-export async function listModelCatalog(): Promise<{ models: ModelCatalogItem[] }> {
+export async function listModelCatalog(): Promise<{ models: ModelCatalogEntry[] }> {
   return fetchJson(`${API_BASE}/api/models`);
 }
 
@@ -96,6 +124,23 @@ export async function setModelEnabled(
   return fetchJson(`${API_BASE}/api/admin/provider-models/enabled`, {
     method: "PUT",
     body: JSON.stringify({ provider, model, enabled }),
+  });
+}
+
+/**
+ * Curatela del tier: decide la fascia di un modello (`tier_source='manual'`,
+ * che vince su indice e batteria). `tier: null` RIMUOVE la curatela senza
+ * azzerare il tier — il valore resta e le fonti automatiche tornano a poterlo
+ * correggere.
+ */
+export async function setModelTier(
+  provider: string,
+  model: string,
+  tier: PerformanceTier | null,
+): Promise<{ ok: boolean; provider: string; model: string; tier: string | null; changed: boolean }> {
+  return fetchJson(`${API_BASE}/api/admin/provider-models/tier`, {
+    method: "PUT",
+    body: JSON.stringify({ provider, model, tier }),
   });
 }
 

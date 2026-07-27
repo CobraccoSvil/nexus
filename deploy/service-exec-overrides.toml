@@ -1,0 +1,86 @@
+# Scostamenti di esecuzione per i servizi che NON sono binari del workspace.
+#
+# Il confine, dichiarato una volta sola:
+#   - CHI sono i servizi, come si chiamano i loro manifest -> catalogo DB
+#     (`system.services_catalog`, migrazioni 0541/0601/0642);
+#   - COME si avvia un binario del workspace -> derivato dal workspace stesso
+#     (`cargo metadata`): eseguibile `target/<profilo>/<bin>`, working directory
+#     la radice del repo, nessun argomento, nessuna variabile iniettata (i
+#     servizi Rust leggono il .env da soli con dotenvy);
+#   - COME si avviano i tre processi che il workspace non costruisce -> QUESTO
+#     FILE, versionato, che passa da review e da git blame.
+#
+# Un override su un servizio che HA un package nel workspace e' un errore
+# (`OverrideSuPackage`): sarebbe il ritorno delle due fonti sovrapposte.
+# Un override su un nome che non e' nel catalogo e' un errore (`OverrideOrfano`).
+#
+# NON contiene valori di segreti: solo i NOMI delle chiavi da proiettare dal
+# .env del repo. I valori restano in D:\IDEAI\.env, fuori dal repo e fuori dal DB.
+#
+# Placeholder ammessi (qualunque altro e' `PlaceholderIgnoto`, mai sostituito
+# in silenzio):
+#   ${REPO}    radice del repository
+#   ${RUNTIME} radice runtime (D:\IDEAI-runtime o NEXUS_RUNTIME_ROOT)
+#   ${NODE}    eseguibile node risolto dal PATH
+#   ${EXE}     estensione eseguibile della piattaforma (".exe" su Windows)
+#   ${PORT}    porta risolta dal catalogo per QUESTO servizio
+
+[[servizio]]
+catalogo = "web-ide"
+# Next.js in produzione: non usa dotenvy, quindi l'ambiente va iniettato.
+executable = "${NODE}"
+arguments = ["server.js"]
+working_directory = "${REPO}/apps/web-ide"
+# "*" = proietta tutte le chiavi presenti nel .env del repo. Sono NOMI: i valori
+# vengono letti al momento della generazione e finiscono nel manifest, che percio'
+# va rigenerato quando il .env cambia (il generatore lo rileva come DotenvStantio).
+env_da_dotenv = "*"
+env_letterali = { NODE_ENV = "production" }
+# La porta dell'ambiente e quella del probe escono dalla stessa risoluzione:
+# prima PORT era 3000 scritto a mano nel generatore mentre il pannello leggeva
+# web_ide_port dal DB, quindi i due potevano parlare di porte diverse.
+env_da_porta = { PORT = "web_ide_port" }
+
+[[servizio]]
+catalogo = "redis"
+# Garnet: implementazione Redis-compatibile usata su Windows. La working
+# directory e' load-bearing (garnet.conf e le dll native accanto all'eseguibile).
+executable = "${RUNTIME}/garnet/net10.0/GarnetServer${EXE}"
+arguments = ["--port", "${PORT}", "--bind", "127.0.0.1"]
+working_directory = "${RUNTIME}/garnet/net10.0"
+
+[[servizio]]
+catalogo = "qdrant"
+# Working directory load-bearing: qdrant scrive storage/ e snapshots/ relativi
+# alla cwd. Avviarlo dalla radice del repo gli farebbe creare lo storage dentro
+# l'albero sorgente.
+executable = "${RUNTIME}/qdrant/qdrant${EXE}"
+working_directory = "${RUNTIME}/qdrant"
+
+# Ordine di avvio e attese, oggi scritti a mano in dev-start.ps1.
+#
+# Stanno qui e non nel DB perche' dipendono dalle dipendenze fra i binari (chi
+# ha bisogno di chi per partire), non da una preferenza dell'amministratore: un
+# ordine sbagliato rompe l'avvio in un modo che nessuna validazione a runtime
+# potrebbe riconoscere, mentre qui passa da una PR.
+#
+# VINCOLO che rende questa lista non-divergente: il piano FALLISCE se un id del
+# piano manca da `avvio` (`OrdineIncompleto`) o se `avvio` nomina un id che il
+# piano non contiene (`OrdineOrfano`). E' precisamente la condizione che oggi
+# non e' verificata da nessuno, e per cui nexus-browser-bridge poteva avere un
+# manifest senza comparire nell'ordine di avvio.
+[ordine]
+avvio = [
+  "nexus-garnet",
+  "nexus-qdrant",
+  "nexus-mcp-core",
+  "nexus-gateway",
+  "nexus-admin",
+  "nexus-doc",
+  "nexus-plugin",
+  "nexus-browser-bridge",
+  "nexus-web-ide",
+]
+# Millisecondi da attendere DOPO l'avvio di un id, prima del successivo.
+# I 5 secondi per mcp-core sono quelli oggi hardcoded in dev-start.ps1.
+attesa_dopo = { nexus-mcp-core = 5000 }

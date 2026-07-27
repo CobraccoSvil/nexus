@@ -64,9 +64,12 @@ const VIDEO_POLL_TIMEOUT_DB_DOWN_FALLBACK: u64 = 300;
 const VIDEO_HTTP_TIMEOUT_MARGIN_SECS: u64 = 30;
 
 /// Metadati di tracciamento/tenancy della richiesta (`RequestMetadata` del
-/// gateway). I tool interni valorizzano solo `feature`; il resto va a default
-/// (stringhe vuote, tier 0), come gli altri call site interni di mcp-core
-/// (es. `intent_classifier`).
+/// gateway).
+///
+/// I tool MEDIA (immagini, video, trascrizione, sintesi) li valorizzano con
+/// l'identita' del chiamante via [`GwMetadata::con_identita`]: senza, il gateway
+/// scarta la riga di ledger e il consumo resta invisibile. Gli altri call site
+/// interni passano ancora solo `feature`.
 #[derive(Serialize, Default)]
 struct GwMetadata {
     tenant_id: String,
@@ -74,6 +77,35 @@ struct GwMetadata {
     request_id: String,
     sensitivity_tier: u8,
     feature: String,
+}
+
+/// Identita' del chiamante, da propagare al gateway.
+///
+/// Serve perche' il gateway scarta la riga di ledger quando `tenant_id` o
+/// `user_id` sono vuoti (guard in `billing.rs`): finche' questi tool hanno
+/// mandato solo `feature`, ogni immagine generata e ogni audio trascritto sono
+/// rimasti fuori dalla contabilita'. Il dato non va inventato — e' gia' nel
+/// contesto del tool (`ToolContextCore`: `user_id`, `project_id`, `run_id`).
+#[derive(Debug, Clone, Copy)]
+pub struct GwCaller {
+    pub user_id: uuid::Uuid,
+    pub project_id: uuid::Uuid,
+    /// Run che ha invocato il tool: abilita il breakdown del costo per run.
+    pub run_id: Option<uuid::Uuid>,
+}
+
+impl GwMetadata {
+    /// Metadata con l'identita' del chiamante. `request_id` porta il run, che il
+    /// gateway riusa come `run_id` della riga di ledger.
+    fn con_identita(caller: &GwCaller, feature: &str) -> Self {
+        Self {
+            tenant_id: caller.project_id.to_string(),
+            user_id: caller.user_id.to_string(),
+            request_id: caller.run_id.map(|r| r.to_string()).unwrap_or_default(),
+            sensitivity_tier: 0,
+            feature: feature.to_string(),
+        }
+    }
 }
 
 /// Corpo di `POST /v1/complete` (sottoinsieme usato dai tool del crate).
@@ -132,7 +164,7 @@ pub async fn gateway_vision_complete(
     feature: &str,
 ) -> Result<GwVisionResult, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwRequestBody {
         // Il gateway accetta "provider/model" come pin esplicito; valorizziamo
@@ -274,9 +306,10 @@ pub async fn gateway_image_generate(
     prompt: &str,
     size: Option<String>,
     feature: &str,
+    caller: &GwCaller,
 ) -> Result<GwImageOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwImageRequestBody {
         model: model.to_string(),
@@ -285,10 +318,7 @@ pub async fn gateway_image_generate(
         n: Some(1),
         size,
         pin_provider: Some(provider.to_string()),
-        metadata: GwMetadata {
-            feature: feature.to_string(),
-            ..Default::default()
-        },
+        metadata: GwMetadata::con_identita(caller, feature),
     };
 
     let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
@@ -413,9 +443,10 @@ pub async fn gateway_generate_video(
     prompt: &str,
     duration_seconds: Option<u32>,
     feature: &str,
+    caller: &GwCaller,
 ) -> Result<GwVideoOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
     let poll_timeout = resolve_video_poll_timeout(db).await;
 
     let body = GwVideoRequestBody {
@@ -423,10 +454,7 @@ pub async fn gateway_generate_video(
         prompt: prompt.to_string(),
         duration_seconds,
         pin_provider: Some(provider.to_string()),
-        metadata: GwMetadata {
-            feature: feature.to_string(),
-            ..Default::default()
-        },
+        metadata: GwMetadata::con_identita(caller, feature),
     };
 
     // Timeout HTTP >= poll-loop lato gateway (regola H): il client non stacca
@@ -561,9 +589,10 @@ pub async fn gateway_transcribe_audio(
     mime: Option<String>,
     language: Option<String>,
     feature: &str,
+    caller: &GwCaller,
 ) -> Result<GwTranscribeOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwTranscribeRequestBody {
         model: model.to_string(),
@@ -571,10 +600,7 @@ pub async fn gateway_transcribe_audio(
         mime,
         language,
         pin_provider: Some(provider.to_string()),
-        metadata: GwMetadata {
-            feature: feature.to_string(),
-            ..Default::default()
-        },
+        metadata: GwMetadata::con_identita(caller, feature),
     };
 
     let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
@@ -688,9 +714,10 @@ pub async fn gateway_text_to_speech(
     voice: Option<String>,
     response_format: Option<String>,
     feature: &str,
+    caller: &GwCaller,
 ) -> Result<GwTtsOut, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let body = GwTtsRequestBody {
         model: model.to_string(),
@@ -698,10 +725,7 @@ pub async fn gateway_text_to_speech(
         voice,
         response_format,
         pin_provider: Some(provider.to_string()),
-        metadata: GwMetadata {
-            feature: feature.to_string(),
-            ..Default::default()
-        },
+        metadata: GwMetadata::con_identita(caller, feature),
     };
 
     let client = gateway_http_client(GATEWAY_HTTP_TIMEOUT_SECS)?;
@@ -813,7 +837,7 @@ pub async fn gateway_batch_submit(
     max_tokens: u32,
 ) -> Result<String, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let items: Vec<Value> = requests
         .iter()
@@ -883,7 +907,7 @@ pub async fn gateway_batch_status(
     batch_id: &str,
 ) -> Result<GwBatchStatus, String> {
     let base_url = resolve_gateway_url(db).await;
-    let token = resolve_gateway_token();
+    let token = resolve_gateway_token(db).await?;
 
     let client = batch_http_client()?;
     let resp = client
@@ -988,11 +1012,17 @@ async fn resolve_gateway_url(db: &PgPool) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// Token di servizio del gateway. E' un SEGRETO: vive in env
-/// `NEXUS_GATEWAY_SERVICE_TOKEN` (stessa convenzione di `main.rs`), mai nel DB.
-/// Il fallback dev e' coerente con gli altri call site interni.
-fn resolve_gateway_token() -> String {
-    std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN").unwrap_or_else(|_| "dev-internal-token".to_string())
+/// Bearer di servizio verso il gateway: JWT a vita breve firmato con la chiave
+/// di piattaforma (punto unico `nexus_auth::service_bearer`).
+///
+/// Prima era un valore STATICO letto da env con fallback `"dev-internal-token"`
+/// scritto nel sorgente. Poiche' quell'env non era impostata da nessuna parte,
+/// il valore effettivo era la costante pubblica — e il gateway la accettava
+/// come bypass totale dell'autenticazione.
+async fn resolve_gateway_token(db: &PgPool) -> Result<String, String> {
+    nexus_auth::service_bearer(db)
+        .await
+        .map_err(|e| format!("bearer di servizio non disponibile: {e}"))
 }
 
 #[cfg(test)]

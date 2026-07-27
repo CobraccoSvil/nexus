@@ -22,6 +22,14 @@ export interface PortEntry {
   url?: string;
   /** Nome corto del servizio del progetto a cui appartiene la porta (se rilevato). */
   service?: string | null;
+  /** True se la porta e' realmente in ascolto ORA (probe di sistema). */
+  live?: boolean;
+  /** True se la porta e' nel registro allocazioni del progetto. */
+  allocated?: boolean;
+  /** Modalita' di allocazione dal registro ("auto"|"manual"), se allocata. */
+  allocation_mode?: string | null;
+  /** PID del processo in ascolto, se live. */
+  pid?: number;
 }
 
 export interface PlaywrightProgress {

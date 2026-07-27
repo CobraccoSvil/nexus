@@ -423,8 +423,19 @@ pub(super) async fn list_services_windows(
     slug: &str,
 ) -> Vec<serde_json::Value> {
     // Separazione DB per-progetto: agent_processes e' tabella migrata, instrada
-    // sul pool del progetto (flag OFF -> ritorna il meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // sul pool del progetto. DB progetto non disponibile -> lista vuota con WARN
+    // (display best-effort; niente fallback al meta: li' la tabella e' vuota).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "list_services_windows: DB progetto non disponibile, elenco servizi vuoto"
+            );
+            return Vec::new();
+        }
+    };
     let rows: Vec<(
         String,
         String,
@@ -848,9 +859,11 @@ async fn control_project_service_windows(
         .to_string();
 
     // Separazione DB per-progetto: agent_processes e' migrata, instrada le query
-    // di questo handler sul pool del progetto (flag OFF -> meta-pool). Risolto una
-    // volta sola e riusato dalle 3 query sotto (stesso project_id).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // di questo handler sul pool del progetto (errore tipizzato 503/404 se non
+    // disponibile). Risolto una volta sola e riusato dalle 3 query sotto (stesso
+    // project_id).
+    let proj_pool =
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
 
     // STOP esplicito: taskkill dei soli processi running di QUESTA label (lo
     // stop richiesto dall'utente non deve toccare gli altri servizi). Per
@@ -1358,9 +1371,11 @@ fn expand_pids_with_descendants(
 async fn collect_windows_protected_pids(
     state: &AppState,
     project_id: Uuid,
-) -> std::collections::HashSet<u32> {
+) -> Result<std::collections::HashSet<u32>, ApiError> {
     let mut protected_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // DB progetto non disponibile -> propaga (503): con protected_pids vuoto
+    // il reset ucciderebbe i servizi legittimi del progetto.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let svc_pids: Vec<(Option<i32>,)> = sqlx::query_as(
         "SELECT pid FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' \
@@ -1385,7 +1400,7 @@ async fn collect_windows_protected_pids(
         parent_to_children.entry(*parent).or_default().push(*child);
     }
     expand_pids_with_descendants(&mut protected_pids, &parent_to_children);
-    protected_pids
+    Ok(protected_pids)
 }
 
 pub async fn cleanup_project_ports(
@@ -1411,7 +1426,7 @@ pub async fn cleanup_project_ports(
 
     #[cfg(windows)]
     {
-        protected_pids.extend(collect_windows_protected_pids(&state, project_id).await);
+        protected_pids.extend(collect_windows_protected_pids(&state, project_id).await?);
     }
 
     #[cfg(not(windows))]
@@ -1578,7 +1593,101 @@ pub async fn get_project_ports(
         .collect();
     assign_service_from_allocations(&mut ports, &alloc_label_by_port);
 
+    // VISTA UNIFICATA (regola L): il pannello Porte mostra TUTTE le porte del
+    // progetto — quelle realmente in ascolto (probe live sopra) E quelle
+    // registrate ma ferme (registro allocazioni, fonte autoritativa di "cosa
+    // appartiene al progetto"). Ogni voce porta `live` (in ascolto ora) e
+    // `allocated` (nel registro): il frontend le distingue con un badge
+    // attivo/fermo invece di due liste separate (endpoint /port-allocations
+    // resta per la CRUD). Sostituisce il "FIX 3b" che nascondeva le riserve.
+    let allocations = state.port_registry.ports_for_project(&project_id).await;
+    let alloc_view: Vec<(i64, String, String)> = allocations
+        .iter()
+        .map(|a| (a.port as i64, a.label.clone(), a.allocation_mode.clone()))
+        .collect();
+    let ports = merge_ports_view(ports, &alloc_view);
+
     Ok(Json(json!({ "ports": ports })))
+}
+
+/// Pura (regola L / regola O, testabile su ogni piattaforma): fonde le porte
+/// LIVE (probe, `live=true`, con pid/url) con il REGISTRO delle allocazioni
+/// (`allocs` = (port, label, mode)) in un'unica vista ordinata per porta.
+///
+/// Contratto di ogni voce:
+///   - `allocated`: la porta e' nel registro del progetto;
+///   - `live`: la porta e' realmente in ascolto ORA;
+///   - `allocation_mode`: dal registro (null se non allocata);
+///   - `url`/`pid`/`state`: presenti SOLO se live (una porta ferma non ha un
+///     endpoint raggiungibile — il pannello Servizi non deve linkarla).
+///
+/// Tre casi: allocata+live (arricchisce la voce live), allocata-ferma (voce
+/// nuova senza url), live-non-allocata (rara: resta, `allocated=false`).
+pub(super) fn merge_ports_view(
+    live: Vec<serde_json::Value>,
+    allocs: &[(i64, String, String)],
+) -> Vec<serde_json::Value> {
+    let mut live_by_port = index_live_by_port(live);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut emitted: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    // 1. Ogni allocazione: arricchisce la voce live se c'e', altrimenti voce ferma.
+    for (port, label, mode) in allocs {
+        if !emitted.insert(*port) {
+            continue;
+        }
+        match live_by_port.remove(port) {
+            Some(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("allocated".to_string(), json!(true));
+                    obj.insert("allocation_mode".to_string(), json!(mode));
+                }
+                out.push(v);
+            }
+            None => out.push(stopped_port_entry(*port, label, mode)),
+        }
+    }
+
+    // 2. Porte live non allocate (rare): restano, allocated=false.
+    for (port, v) in live_by_port {
+        if emitted.insert(port) {
+            out.push(v);
+        }
+    }
+
+    // Ordine stabile per porta: la UI non deve lampeggiare tra i polling.
+    out.sort_by_key(|v| v.get("port").and_then(serde_json::Value::as_i64).unwrap_or(0));
+    out
+}
+
+/// Indicizza le voci live per porta, marcandole `live=true`/`allocated=false`
+/// (l'allocazione viene poi impostata dal merge se la porta e' nel registro).
+fn index_live_by_port(
+    live: Vec<serde_json::Value>,
+) -> std::collections::HashMap<i64, serde_json::Value> {
+    let mut map = std::collections::HashMap::new();
+    for mut v in live {
+        if let Some(port) = v.get("port").and_then(serde_json::Value::as_i64) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.entry("live").or_insert(json!(true));
+                obj.insert("allocated".to_string(), json!(false));
+            }
+            map.insert(port, v);
+        }
+    }
+    map
+}
+
+/// Voce di una porta REGISTRATA ma non in ascolto (nessun url linkabile).
+fn stopped_port_entry(port: i64, label: &str, mode: &str) -> serde_json::Value {
+    json!({
+        "port": port,
+        "label": label,
+        "service": label,
+        "allocated": true,
+        "allocation_mode": mode,
+        "live": false,
+    })
 }
 
 /// MainPID dei servizi systemd `--user` `{slug}-*.service` vivi, con la mappa
@@ -1746,10 +1855,13 @@ pub(super) async fn detect_project_ports(
     // 1. PID dai processi agent — include sia 'running' che altri status purché il processo sia ancora vivo.
     // Lo status nel DB può essere 'failed' dopo un riavvio di mcp-core anche se il processo gira ancora.
     // Separazione DB per-progetto: agent_processes e' migrata, instrada sul pool
-    // del progetto (flag OFF -> meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // del progetto. DB progetto non disponibile -> WARN e nessun PID da
+    // agent_processes (restano le fonti systemd/cwd, che non passano dal DB).
     let agent_pids: Vec<i32> =
-        sqlx::query("SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL")
+        match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(proj_pool) => sqlx::query(
+                "SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL",
+            )
             .bind(project_id)
             .fetch_all(&proj_pool)
             .await
@@ -1758,7 +1870,16 @@ pub(super) async fn detect_project_ports(
             .filter_map(|row| row.try_get::<i32, _>("pid").ok())
             // Verifica che il processo sia ancora vivo (punto unico cross-platform).
             .filter(|pid| crate::process_util::process_alive(*pid as u32))
-            .collect();
+            .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "detect_project_ports: DB progetto non disponibile, salto agent_processes"
+                );
+                Vec::new()
+            }
+        };
 
     // 2a. MainPID dei servizi systemd --user `{slug}-*.service` + mappa pid→short_name
     let (systemd_pids, mut pid_to_service) = systemd_main_pids_by_service(slug).await;
@@ -1935,7 +2056,18 @@ async fn detect_project_ports_windows(
     use std::collections::{HashMap, HashSet};
 
     // 1. pid dei servizi vivi del progetto (agent_processes migrata -> pool progetto).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    //    DB progetto non disponibile -> nessuna porta rilevabile (WARN, best-effort).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "detect_project_ports_windows: DB progetto non disponibile, nessuna porta rilevata"
+            );
+            return Vec::new();
+        }
+    };
     let svc_rows: Vec<(Option<i32>, String)> = sqlx::query_as(
         "SELECT pid, label FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' \
@@ -1954,9 +2086,11 @@ async fn detect_project_ports_windows(
             }
         }
     }
-    if svc_pid_label.is_empty() {
-        return Vec::new();
-    }
+    // NB: `svc_pid_label` vuoto NON e' piu' un'uscita anticipata. Il pass 2 sulle
+    // allocazioni (sotto) e' una fonte AUTONOMA basata sul segnale strutturato
+    // "porta allocata + in LISTEN" (regola M): con tutti i servizi `failed` ma la
+    // porta ancora tenuta da un processo orfano/figlio, il pannello deve mostrarla
+    // lo stesso. L'early-return precedente la faceva sparire.
 
     // 2. Mappa figlio->genitore (Win32_Process) per risalire dal pid in ascolto
     //    (node/vite) fino al pid del servizio (npm/pnpm).
@@ -2020,9 +2154,17 @@ async fn detect_project_ports_windows(
 /// del progetto ricava le porte LIVE aggiuntive del pass 2 di
 /// `detect_project_ports_windows`. Una porta e' live sse: (a) e' realmente in
 /// LISTEN (`listening_ports`, segnale strutturato — regola M), (b) non gia' emessa
-/// dal pass 1 (`already_seen`), (c) appartiene a un servizio VIVO (`running_labels`),
-/// con match via il PUNTO UNICO `similar_service_labels`. Ritorna (porta, servizio)
-/// deduplicato per porta.
+/// dal pass 1 (`already_seen`), (c) e' nel range Nexus.
+///
+/// Il LABEL preferisce un servizio VIVO con nome simile (`running_labels`, punto
+/// unico `similar_service_labels`), ma NON e' piu' un requisito: se nessun
+/// servizio vivo combacia (il servizio e' `failed`/`stopped` in agent_processes
+/// mentre il suo processo tiene ancora la porta — orfano, o il pid registrato e'
+/// il wrapper morto mentre il figlio vive) si usa il LABEL DELL'ALLOCAZIONE.
+/// La porta in ascolto e' la prova strutturale che il progetto sta servendo li'
+/// (regola M): scartarla perche' lo stato registrato dice "failed" faceva sparire
+/// dal pannello Porte servizi realmente attivi (incidente vendita-immobile
+/// 21/07: frontend in LISTEN su 39804, "failed" in agent_processes, invisibile).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn allocations_to_live_ports(
     running_labels: &std::collections::HashSet<String>,
@@ -2069,9 +2211,12 @@ pub(super) fn allocations_to_live_ports(
                 })
                 .then_with(|| sa.cmp(sb))
         });
-        if let Some(service) = candidates.first() {
-            out.push((port, (*service).clone()));
-        }
+        // Label del servizio vivo se c'e', altrimenti il label dell'allocazione.
+        let service = candidates
+            .first()
+            .map(|s| (*s).clone())
+            .unwrap_or_else(|| label.clone());
+        out.push((port, service));
     }
     out
 }
@@ -2108,69 +2253,45 @@ fn resolve_service_ancestor(
 /// `looks_like_server_process` per adozione/cleanup orfani.
 #[cfg(windows)]
 pub(crate) async fn windows_listening_ports() -> Vec<(u16, u32, String)> {
-    let out = tokio::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$m=@{};Get-Process|ForEach-Object{$m[$_.Id]=$_.ProcessName};Get-NetTCPConnection -State Listen|ForEach-Object{'{0},{1},{2}' -f $_.LocalPort,$_.OwningProcess,$m[[int]$_.OwningProcess]}",
-        ])
-        .output()
-        .await;
-    let Ok(out) = out else {
-        return Vec::new();
-    };
-    parse_port_pid_program_lines(&String::from_utf8_lossy(&out.stdout))
+    // Syscall (GetExtendedTcpTable + Toolhelp32) invece di due interpreti
+    // PowerShell: misurati 6.7s per `Get-NetTCPConnection`+`Get-Process`, contro
+    // millisecondi qui. Il costo non era un dettaglio di efficienza: il
+    // `port_enforcer` scandisce ogni 5s con timeout 10s, e quei probe da soli
+    // (9.9s in due) mandavano in timeout OGNI iterazione -- l'enforcement delle
+    // porte non e' mai girato (33 "iterazione abortita" nei log del 26/07).
+    tokio::task::spawn_blocking(|| {
+        let processi = crate::process_util::windows_process_snapshot();
+        crate::process_util::windows_listening_sockets()
+            .into_iter()
+            .map(|(porta, pid)| {
+                let nome = processi
+                    .get(&pid)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                (porta, pid, nome)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
-/// Parsa le righe "porta,pid,programma" (programma opzionale, puo' contenere
-/// virgole) emesse dal comando PowerShell di `windows_listening_ports`. Pura e
-/// senza cfg: testabile su qualunque piattaforma.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn parse_port_pid_program_lines(text: &str) -> Vec<(u16, u32, String)> {
-    let mut res = Vec::new();
-    for line in text.lines() {
-        let mut fields = line.trim().splitn(3, ',');
-        let (Some(port_s), Some(pid_s)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let program = fields.next().unwrap_or("").trim().to_string();
-        if let (Ok(port), Ok(pid)) = (port_s.trim().parse::<u16>(), pid_s.trim().parse::<u32>()) {
-            if port > 0 && pid > 0 {
-                res.push((port, pid, program));
-            }
-        }
-    }
-    res
-}
-
-/// Mappa figlio->genitore di tutti i processi via `Win32_Process` (CIM).
+/// Mappa figlio->genitore di tutti i processi, proiettata dalla fotografia
+/// Toolhelp32 (punto unico `process_util::windows_process_snapshot`).
+///
+/// Prima lanciava `Get-CimInstance Win32_Process` in PowerShell: 3.2s misurati
+/// a invocazione, pagati a ogni scansione del port_enforcer (ogni 5s) e a ogni
+/// rilevazione servizi. Vedi il commento in `windows_listening_ports`.
 #[cfg(windows)]
 async fn windows_process_parents() -> std::collections::HashMap<u32, u32> {
-    let mut map = std::collections::HashMap::new();
-    let out = tokio::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process | ForEach-Object { '{0},{1}' -f $_.ProcessId, $_.ParentProcessId }",
-        ])
-        .output()
-        .await;
-    let Ok(out) = out else {
-        return map;
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let Some((child_s, parent_s)) = line.trim().split_once(',') else {
-            continue;
-        };
-        if let (Ok(child), Ok(parent)) = (
-            child_s.trim().parse::<u32>(),
-            parent_s.trim().parse::<u32>(),
-        ) {
-            map.insert(child, parent);
-        }
-    }
-    map
+    tokio::task::spawn_blocking(|| {
+        crate::process_util::windows_process_snapshot()
+            .into_iter()
+            .map(|(pid, entry)| (pid, entry.parent_pid))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Legge porte TCP in ascolto via `ss -tlnp` → Vec<(port, pid, program)>
@@ -2964,10 +3085,23 @@ async fn kill_project_port_binding(
     // su Windows taskkill /T /F. Il precedente `kill` inline era no-op
     // su Windows -> la "x" del pannello non liberava la porta.
     crate::process_util::kill_pid(pid).await;
-    // Marca agent_processes come stopped (riconciliazione).
+    // Marca agent_processes come stopped (riconciliazione best-effort: il kill
+    // e' gia' avvenuto, un DB progetto non disponibile degrada con WARN senza
+    // far fallire la richiesta).
     // Separazione DB per-progetto: agent_processes e' migrata, instrada
-    // sul pool del progetto (flag OFF -> meta-pool, behavior-preserving).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // sul pool del progetto.
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "delete_port_allocation: DB progetto non disponibile, salto la riconciliazione agent_processes"
+                );
+                return (Some(pid), false);
+            }
+        };
     let upd = sqlx::query(
         "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
          WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
@@ -3055,7 +3189,18 @@ async fn pid_to_project_from_agent_processes(
 ) -> std::collections::HashMap<u32, uuid::Uuid> {
     let mut pid_rows: Vec<(Option<i32>, uuid::Uuid)> = Vec::new();
     for proj in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        // Un DB progetto irraggiungibile degrada con WARN senza azzerare gli altri.
+        let pool = match crate::project_db_routes::project_data_pool_from(db, proj).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %proj,
+                    error = %e,
+                    "detect_all_port_bindings: DB progetto non disponibile, salto il progetto"
+                );
+                continue;
+            }
+        };
         match sqlx::query_as::<_, (Option<i32>, uuid::Uuid)>(
             "SELECT pid, project_id FROM agent_processes \
              WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
@@ -3223,7 +3368,15 @@ async fn detect_all_port_bindings_windows(db: &sqlx::PgPool) -> Result<Vec<PortB
     // Problemi con detail "processo 'lsass'/'svchost'/'postgres' terminato".
     let mut pid_to_project: HashMap<u32, uuid::Uuid> = HashMap::new();
     for proj in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, proj).await;
+        let Some(pool) = crate::project_db_routes::project_data_pool_or_warn(
+            db,
+            proj,
+            "detect_all_port_bindings_windows",
+        )
+        .await
+        else {
+            continue;
+        };
         let rows: Vec<(Option<i32>, uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
             sqlx::query_as(
                 "SELECT pid, project_id, started_at FROM agent_processes \
@@ -3421,7 +3574,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allocations_to_live_ports_emette_solo_servizi_vivi_in_ascolto() {
+    fn allocations_to_live_ports_emette_ogni_porta_allocata_in_ascolto() {
         use std::collections::HashSet;
         let running: HashSet<String> = ["frontend".to_string(), "backend".to_string()]
             .into_iter()
@@ -3430,14 +3583,90 @@ mod tests {
         // 31792 gia' emessa dal pass 1 (albero processi risolto)
         let already_seen: HashSet<u16> = [31792u16].into_iter().collect();
         let allocs = vec![
-            (31840i32, "frontend-dev".to_string()), // servizio vivo (frontend ~ frontend-dev) + in ascolto -> emesso
+            (31840i32, "frontend-dev".to_string()), // servizio vivo (frontend ~ frontend-dev) -> label del servizio
             (31792, "backend".to_string()),         // gia' vista dal pass 1 -> saltata
-            (31900, "worker".to_string()),          // in ascolto ma servizio NON vivo -> saltata
-            (31999, "frontend".to_string()),        // servizio vivo ma NON in ascolto -> saltata
+            (31900, "worker".to_string()),          // in ascolto, servizio NON vivo -> label dell'allocazione
+            (31999, "frontend".to_string()),        // NON in ascolto -> saltata (nessun listener)
             (70000, "frontend".to_string()),        // fuori range u16 -> saltata
         ];
         let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
-        assert_eq!(out, vec![(31840u16, "frontend".to_string())]);
+        assert_eq!(
+            out,
+            vec![
+                (31840u16, "frontend".to_string()),
+                (31900u16, "worker".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_ports_view_fonde_registro_e_live() {
+        // Live: 39826 (backend, in ascolto con pid/url). Registro: 39826 backend
+        // (auto) + 39804 frontend (auto, FERMO, non nel probe).
+        let live = vec![json!({
+            "port": 39826, "label": "backend", "service": "backend",
+            "pid": 26648, "state": "LISTEN", "url": "http://localhost:39826", "live": true
+        })];
+        let allocs = vec![
+            (39826i64, "backend".to_string(), "auto".to_string()),
+            (39804i64, "frontend".to_string(), "auto".to_string()),
+        ];
+        let out = merge_ports_view(live, &allocs);
+        assert_eq!(out.len(), 2);
+        // Ordinato per porta: 39804 (ferma) prima, 39826 (live) dopo.
+        let ferma = &out[0];
+        assert_eq!(ferma["port"], 39804);
+        assert_eq!(ferma["allocated"], true);
+        assert_eq!(ferma["live"], false);
+        assert!(ferma.get("url").is_none(), "porta ferma: nessun url linkabile");
+        let viva = &out[1];
+        assert_eq!(viva["port"], 39826);
+        assert_eq!(viva["allocated"], true);
+        assert_eq!(viva["live"], true);
+        assert_eq!(viva["allocation_mode"], "auto");
+        assert_eq!(viva["url"], "http://localhost:39826");
+    }
+
+    #[test]
+    fn merge_ports_view_porta_live_non_allocata_resta() {
+        // Un listener su una porta NON nel registro (raro): resta, allocated=false.
+        let live = vec![json!({
+            "port": 35500, "label": "extra", "service": "extra",
+            "url": "http://localhost:35500", "live": true
+        })];
+        let out = merge_ports_view(live, &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["port"], 35500);
+        assert_eq!(out[0]["allocated"], false);
+        assert_eq!(out[0]["live"], true);
+    }
+
+    #[test]
+    fn merge_ports_view_dedup_porta_allocata_due_volte() {
+        // Una porta duplicata nel registro non produce due voci.
+        let allocs = vec![
+            (39804i64, "frontend".to_string(), "auto".to_string()),
+            (39804i64, "frontend-old".to_string(), "manual".to_string()),
+        ];
+        let out = merge_ports_view(vec![], &allocs);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["port"], 39804);
+        assert_eq!(out[0]["label"], "frontend");
+    }
+
+    #[test]
+    fn allocations_to_live_ports_mostra_porta_di_servizio_failed_in_ascolto() {
+        use std::collections::HashSet;
+        // Scenario incidente vendita-immobile 21/07: il frontend e' `failed` in
+        // agent_processes (running_labels ha solo "backend"), ma il suo processo
+        // node tiene ancora la porta 39804 in LISTEN. Deve comparire nel pannello
+        // Porte, col label dell'ALLOCAZIONE, invece di sparire.
+        let running: HashSet<String> = ["backend".to_string()].into_iter().collect();
+        let listening: HashSet<u16> = [39804u16].into_iter().collect();
+        let already_seen: HashSet<u16> = HashSet::new();
+        let allocs = vec![(39804i32, "frontend".to_string())];
+        let out = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
+        assert_eq!(out, vec![(39804u16, "frontend".to_string())]);
     }
 
     #[test]
@@ -3485,37 +3714,6 @@ mod tests {
         assert_eq!(out, vec![(31500u16, "api-server".to_string())]);
         let out2 = allocations_to_live_ports(&running, &listening, &already_seen, &allocs);
         assert_eq!(out, out2);
-    }
-
-    #[test]
-    fn parse_port_pid_program_estrae_terne_valide() {
-        // Output tipico di Get-NetTCPConnection + mappa Get-Process: la stessa
-        // porta puo' comparire per IPv4 e IPv6 (dedup a valle, non qui).
-        let text = "31776,33052,node\r\n31776,33052,node\r\n3000,4120,node\r\n";
-        assert_eq!(
-            parse_port_pid_program_lines(text),
-            vec![
-                (31776, 33052, "node".to_string()),
-                (31776, 33052, "node".to_string()),
-                (3000, 4120, "node".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_port_pid_program_tollera_righe_sporche() {
-        // Programma assente (processo morto tra le due enumerazioni), righe
-        // vuote, garbage, pid/porta zero o non numerici: scartati senza panico.
-        let text =
-            "\n8080,0,\n0,999,x\nnon,numerico,y\n31755,5044,\n  31787,6100,node dev,extra  \n";
-        assert_eq!(
-            parse_port_pid_program_lines(text),
-            vec![
-                (31755, 5044, String::new()),
-                // il programma e' il resto della riga (splitn 3): virgole incluse
-                (31787, 6100, "node dev,extra".to_string()),
-            ]
-        );
     }
 
     #[test]

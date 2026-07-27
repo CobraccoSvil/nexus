@@ -7,7 +7,11 @@
 //!
 //! Reactive (OnTaskComplete):
 //! - `UltralearnWorker`  — estrae pattern da task results
-//! - `AuditWorker`       — scanning sicurezza post-task
+//! (Il vecchio `AuditWorker` e' stato rimosso: dichiarava "security scanning"
+//!  ma cercava otto stringhe con `contains()`, per sua stessa ammissione un
+//!  "placeholder pragmatico per dimostrare il pattern", e i suoi alert non
+//!  erano letti da nessuno. La scansione vera vive nei detector dedicati —
+//!  `secret_scan`, `sast_scan`, il rilevatore SQL unificato dell'ADR 0021.)
 //! - `MetricsAggregationWorker` — aggrega metriche batch
 //! - `VersioningWorker`  — snapshot versioni Q-table/pattern
 //!
@@ -28,7 +32,6 @@
 //!   `/agent/prompt-revise` (riusato da optimizer e alignment, regola L)
 
 pub mod anomaly;
-pub mod audit;
 pub mod cleanup;
 pub mod clustering;
 pub mod guideline_alignment;
@@ -44,7 +47,6 @@ pub mod ultralearn;
 pub mod versioning;
 
 pub use anomaly::AnomalyDetectionWorker;
-pub use audit::AuditWorker;
 pub use cleanup::CleanupWorker;
 pub use clustering::ClusteringWorker;
 pub use guideline_alignment::GuidelineAlignmentWorker;

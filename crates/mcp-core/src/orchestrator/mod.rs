@@ -37,7 +37,9 @@ mod core;
 mod intent;
 pub(crate) mod model_routing;
 mod model_selection;
-mod neural_client;
+pub(crate) mod model_service;
+pub(crate) mod neural_client;
+pub(crate) mod provider_choice;
 #[cfg(test)]
 mod tests;
 
@@ -48,6 +50,7 @@ pub(crate) use intent::*;
 pub(crate) use model_routing::*;
 pub(crate) use model_selection::*;
 pub(crate) use neural_client::*;
+pub(crate) use provider_choice::{ProviderChoice, ProviderOverrideMode};
 
 #[derive(Debug, Clone)]
 pub struct ChatAttachment {
@@ -140,7 +143,11 @@ pub struct OrchestratorRequest {
     pub active_files: Vec<String>,
     pub session_id: Option<String>,
     pub request_message_id: Option<String>,
-    pub provider_override: Option<String>,
+    /// La scelta di provider dell'utente CON la sua forza (preferenza o pin).
+    /// Era un `Option<String>` — il solo nome del provider — e chi lo leggeva
+    /// doveva dedurre quanto vincolasse: e' la deduzione che
+    /// [`ProviderChoice`] elimina.
+    pub provider_choice: ProviderChoice,
     pub model_override: Option<String>,
     pub automation_mode: AutomationMode,
     pub attachments: Vec<ChatAttachment>,
@@ -155,7 +162,18 @@ pub struct OrchestratorResult {
 pub struct Orchestrator {
     pub(crate) neural: NeuralCoreClient,
     pub(crate) template_cache: crate::prompt_templates::TemplateCache,
-    pub(crate) nexus_gateway: Option<NexusGatewayClient>,
+    /// Client del Nexus Gateway. NON e' `Option`: senza gateway non esiste alcun
+    /// modo di chiamare un LLM (il brain Python e' stato rimosso), quindi un
+    /// orchestrator senza gateway non e' uno stato valido — e il tipo lo rende
+    /// impossibile.
+    ///
+    /// Prima era `Option`, valorizzata all'avvio solo se una probe `is_healthy()`
+    /// rispondeva in quell'istante: il 2026-07-16 il gateway ha finito di nascere
+    /// 1,4s DOPO la probe e mcp-core e' rimasto senza gateway per tutta la vita
+    /// del processo, con il classificatore fermo in fallback. La disponibilita'
+    /// di un servizio e' uno stato che cambia: si scopre quando lo si chiama, non
+    /// la si congela all'avvio (regola M).
+    pub(crate) nexus_gateway: NexusGatewayClient,
     /// Cache della matrice di routing letta da DB (nexus_routing_matrix).
     /// Refresh background ogni 60s. Sostituisce i model name hardcoded
     /// che erano sparsi in `route_model_with_mode` e `default_model_for_provider`.

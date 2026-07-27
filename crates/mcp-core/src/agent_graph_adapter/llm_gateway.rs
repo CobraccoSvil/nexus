@@ -16,30 +16,21 @@
 //! Se uno dei due lati si "perdesse" il force-action anti-loop sarebbe
 //! neutralizzato: i test before/after lo coprono esplicitamente.
 //!
-//! ## Due impl coesistono per ruolo (regola L, punto unico LLM)
-//!
-//! - [`GatewayLlmAdapter`] (primario / cutover): completion REAL. IGNORA
-//!   `LlmRequest::purpose` — un turno REAL non cambia comportamento.
-//! - [`ReplayLlmGateway`] (SHADOW, read-only): NON chiama l'LLM. Per la chiamata
-//!   dell'executor RIGIOCA la sequenza di tool del run PRIMARIO letta da
-//!   `agent_steps` (cosi' `num_tool_calls` converge col primario e le divergenze
-//!   residue sono BUG VERI del grafo, non artefatti LLM); per le chiamate
-//!   ausiliarie (planner/reflection/clarify_expand) ritorna una risposta NEUTRA
-//!   deterministica (costo zero, zero RNG-divergenza). Lo switch per ruolo e' nel
-//!   PUNTO UNICO `native_engine::build_native_engine` (come per `ToolExecutor`).
+//! [`GatewayLlmAdapter`] espone la completion REAL: IGNORA `LlmRequest::purpose`
+//! quando il modello e' gia' risolto (il purpose serve solo a risolvere un modello
+//! quando quello richiesto e' vuoto, `purpose_for_empty_model`).
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use tokio::sync::{Mutex, OnceCell};
-use uuid::Uuid;
 
 use nexus_agent_graph::runtime::ports::{LlmGateway, LlmRequest, LlmResponse, LlmUsage, PortError};
 use nexus_agent_graph::state::ToolUse;
-
+// La resa di un errore del gateway vive accanto ai tipi che la sanno produrre
+// (`crate::nexus_gateway`): qui si delega, non si ri-decide.
 use crate::nexus_gateway::{
-    GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall, GwToolFunctionCall,
-    NexusGatewayClient,
+    rendered_from_error, GwMessage, GwMetadata, GwRequest, GwResponse, GwThinkingConfig, GwToolCall,
+    GwToolFunctionCall, NexusGatewayClient,
 };
 
 /// Adapter [`LlmGateway`] -> [`NexusGatewayClient`].
@@ -124,7 +115,7 @@ fn purpose_for_empty_model(req: &LlmRequest) -> Result<Option<String>, PortError
             "richiesta LLM senza modello ne' purpose: il chiamante deve risolvere \
              provider/modello a monte (routing matrix) o indicare un purpose \
              (nexus_purpose_model, regola G)"
-                .to_string(),
+                .to_string().into(),
         )),
     }
 }
@@ -141,7 +132,7 @@ impl LlmGateway for GatewayLlmAdapter {
                 crate::internal_routing::resolve_purpose_model_db(&self.db, &purpose)
                     .await
                     .into_model(&purpose)
-                    .map_err(PortError::Llm)?;
+                    .map_err(|msg| PortError::Llm(msg.into()))?;
             tracing::debug!(
                 purpose = %purpose,
                 provider = %provider,
@@ -255,13 +246,20 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
         .chain()
         .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())
     else {
-        return PortError::Llm(err.to_string());
+        // Ramo di degrado: e' qui che finisce OGNI errore non-HTTP, cioe' tutto
+        // il trasporto. Restituiva `err.to_string()`, e siccome a monte
+        // l'errore era un `anyhow!` costruito sulla riga diagnostica dei log,
+        // quella riga diventava il messaggio in chat. Ora l'errore di trasporto
+        // e' TIPIZZATO (`GatewayTransportError`) e porta la sua frase.
+        return PortError::Llm(rendered_from_error(err));
     };
     match http.code.as_deref() {
         Some("PROVIDER_ERROR") => {
-            let cause = match http
-                .details
-                .as_ref()
+            // Causa e codice si leggono dallo STESSO blocco `details`, e dallo
+            // stesso fallimento: il gateway scrive `primary_cause` e
+            // `failures[0]` insieme (`nexus-gateway/src/server/routes.rs`).
+            let details = http.details.as_ref();
+            let cause = match details
                 .and_then(|d| d.get("primary_cause"))
                 .and_then(|c| c.as_str())
             {
@@ -283,14 +281,44 @@ fn classify_gateway_error(err: &anyhow::Error) -> PortError {
                 Some("empty_completion") => ProviderFailureCause::EmptyCompletion,
                 _ => ProviderFailureCause::Unknown,
             };
-            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(cause, err.to_string()))
+            PortError::ProviderUnavailable(
+                ProviderUnavailableInfo::new(cause, rendered_from_error(err).message)
+                    .with_code(codice_del_fallimento_primario(details)),
+            )
         }
-        Some("POLICY_TIER_EXCLUDED") => PortError::ProviderUnavailable(
-            ProviderUnavailableInfo::new(ProviderFailureCause::PolicyTierExcluded, err.to_string()),
-        ),
-        _ => PortError::Llm(err.to_string()),
+        Some("POLICY_TIER_EXCLUDED") => {
+            PortError::ProviderUnavailable(ProviderUnavailableInfo::new(
+                ProviderFailureCause::PolicyTierExcluded,
+                rendered_from_error(err).message,
+            ))
+        }
+        _ => PortError::Llm(rendered_from_error(err)),
     }
 }
+
+/// Codice d'errore STRUTTURATO del fallimento PRIMARIO, dai `details` del
+/// gateway (`failures[0].code`, regola M: mai dalla prosa del messaggio).
+///
+/// E' lo stesso elemento da cui nasce `primary_cause`, quindi causa e codice
+/// descrivono sempre il medesimo fallimento.
+///
+/// Perche' esiste: il codice viaggiava gia' sul wire e il consumatore esisteva
+/// gia' ([`ProviderUnavailableInfo::allows_cross_provider_failover`], col
+/// vocabolario DB `routing.client_error_failover_codes`), ma nessuno collegava i
+/// due capi: `code` restava `None` su OGNI errore reale, e per un `ClientError`
+/// `None` significa "non recuperabile". La whitelist non veniva quindi mai
+/// consultata, e i test del gate restavano verdi perche' costruivano il codice a
+/// mano invece di riceverlo dal produttore (regola O).
+fn codice_del_fallimento_primario(details: Option<&Value>) -> Option<String> {
+    details
+        .and_then(|d| d.get("failures"))
+        .and_then(|f| f.as_array())
+        .and_then(|f| f.first())
+        .and_then(|f| f.get("code"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
 
 /// Mappa una [`LlmRequest`] (porta) nel [`GwRequest`] del client gateway.
 ///
@@ -394,6 +422,11 @@ fn build_gw_request(req: &LlmRequest) -> GwRequest {
         } else {
             Some(req.provider.clone())
         },
+        // `None` di proposito: questa e' una funzione PURA e il run non lo
+        // conosce. Lo timbra il client in `NexusGatewayClient::complete`, che e'
+        // stato costruito PER quel run (`from_db_for_run`). E' lo stesso motivo
+        // per cui il pin del provider viene applicato al momento della chiamata.
+        run_timeout_secs: None,
         metadata: GwMetadata {
             tenant_id: String::new(),
             user_id: "system".to_string(),
@@ -465,14 +498,19 @@ pub(crate) fn tools_to_openai_schema(tools: &[Value]) -> Value {
 /// `_ => EndTurn`: il turno con tool_call diventava una chiusura, il
 /// `tool_dispatch` veniva saltato (`route_after_executor` instrada al dispatch SOLO
 /// su `StopReason::ToolUse`), il run finiva a `end_turn` con 0 step e content vuoto.
-/// Lo SHADOW non lo coglieva perche' il `ReplayLlmGateway` costruisce gia'
-/// `stop_reason="tool_use"` a mano (non passa dal `finish_reason` del gateway reale).
 ///
 /// PUNTO UNICO (regola L): la traduzione wire->porta vive qui, l'unico confine fra
 /// il formato del gateway e la porta `LlmResponse`. Valori ignoti -> passthrough
 /// (robustezza: niente magic, una stringa sconosciuta cade poi sul default
 /// `end_turn` del punto unico executor, come oggi).
-fn normalize_gw_finish_reason(finish: &str) -> String {
+///
+/// `pub(crate)` perche' anche il path NEURALE ha bisogno dello stesso vocabolario:
+/// `agent_turn_value_from_gw` (neural_client) espone il `finish_reason` normalizzato
+/// nel Value del turno. Chiamare QUI e' l'unico modo di non riscrivere la mappa
+/// altrove: il loop multi-step deve poter distinguere "troncato dal nostro cap"
+/// (`max_tokens`) da "ha smesso di chiamare tool" (`end_turn`), e quella distinzione
+/// nasce dal `finish_reason` del gateway, non da un'euristica.
+pub(crate) fn normalize_gw_finish_reason(finish: &str) -> String {
     match finish {
         "tool_calls" => "tool_use".to_string(),
         "length" => "max_tokens".to_string(),
@@ -493,27 +531,39 @@ fn normalize_gw_finish_reason(finish: &str) -> String {
 /// - `finish_reason` -> `stop_reason` NORMALIZZATO al vocabolario della porta
 ///   ([`normalize_gw_finish_reason`]): `tool_calls`->`tool_use` e' load-bearing per
 ///   instradare al `tool_dispatch` (vedi nota sul bug hollow).
-/// Costo in USD del turno = `prompt_tokens * prezzo_input + completion_tokens *
-/// prezzo_output` (per milione) dal catalog (regola G/M: prezzo dal DB, token dal
-/// segnale strutturato). `None` se il prezzo e' ignoto (modello non in catalog o
-/// errore) -> nessun cap spurio. Cast a `double precision` cosi' una colonna
-/// NUMERIC arriva come `f64`. Nessuna cache: una query leggera per turno LLM, che
-/// e' gia' latente in secondi (overhead trascurabile).
+/// Costo in USD del turno, dal punto unico `nexus-pricing` (regola G/M: prezzo
+/// dal DB, token dal segnale strutturato). `None` se il prezzo e' ignoto
+/// (modello non a catalog, `pricing_state='unknown'`, currency non configurata o
+/// DB in errore) -> nessun cap spurio.
+///
+/// Qui viveva una TERZA implementazione del listino: query propria su
+/// `ai_price_catalog`, senza filtro di currency ne' di finestra `effective_*`,
+/// senza `pricing_state` e — soprattutto — cieca alla cache, cioe' con tutti i
+/// token di prompt a tariffa piena. Non era solo cosmetica: questo numero
+/// alimenta `run_cost_cumulative_usd`, il FRENO DI SPESA del run, quindi la
+/// sovrastima stringeva il freno.
 async fn turn_cost_usd(db: &PgPool, provider: &str, model: &str, usage: &LlmUsage) -> Option<f64> {
-    let (in_cost, out_cost): (f64, f64) = sqlx::query_as(
-        "SELECT input_cost_per_million_tokens::double precision, \
-                output_cost_per_million_tokens::double precision \
-         FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
-    )
-    .bind(provider)
-    .bind(model)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()?;
-    let input = usage.prompt_tokens.max(0) as f64;
-    let output = usage.completion_tokens.max(0) as f64;
-    Some((input * in_cost + output * out_cost) / 1_000_000.0)
+    let lookup = match nexus_pricing::resolve_active_price(db, provider, model).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, provider, model,
+                "turn_cost_usd: listino non leggibile -> costo del turno non calcolabile");
+            return None;
+        }
+    };
+    let nexus_pricing::PriceLookup::Priced(price) = lookup else {
+        return None;
+    };
+    // I due contratti hanno la stessa convenzione — prompt LORDO, cache come
+    // sottoinsieme — quindi i conteggi si passano com'e': lo scorporo lo fa il
+    // listino, unico punto in cui il netto serve.
+    let tokens = nexus_pricing::TokenUsage {
+        prompt_tokens: usage.prompt_tokens.max(0),
+        completion_tokens: usage.completion_tokens.max(0),
+        cache_read_tokens: usage.cache_read_tokens.unwrap_or(0).max(0),
+        cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0).max(0),
+    };
+    Some(nexus_pricing::calculate_cost_breakdown(&price, &tokens).total_cost)
 }
 
 fn map_gw_response(resp: GwResponse) -> LlmResponse {
@@ -542,8 +592,14 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         content: resp.content,
         tool_calls,
         usage: LlmUsage {
+            // `input_tokens` del gateway e' gia' il prompt LORDO (convenzione
+            // unica, normalizzata dall'adapter del provider): si copia e basta.
             prompt_tokens: resp.usage.input_tokens as i64,
             completion_tokens: resp.usage.output_tokens as i64,
+            // Totale del turno = prompt lordo + completion. I due conteggi di
+            // cache sono gia' dentro il prompt: sommarli qui li conterebbe due
+            // volte e questo totale divergerebbe da quello che l'executor scrive
+            // nello stato per lo stesso turno.
             total_tokens: (resp.usage.input_tokens + resp.usage.output_tokens) as i64,
             cache_creation_tokens: resp.usage.cache_creation_tokens.map(|v| v as i64),
             cache_read_tokens: resp.usage.cache_read_tokens.map(|v| v as i64),
@@ -565,203 +621,9 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ReplayLlmGateway — gateway di REPLAY per lo shadow (read-only, costo zero)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Una riga `agent_steps` del run PRIMARIO rilevante per il replay dell'executor.
-///
-/// `step_index` deterministico (mig 0009 / [`crate::agent_graph_adapter::
-/// agent_step_store`]): per un primario PYTHON e' `iteration*1000 + idx_locale`
-/// (lo shadow ha SEMPRE un primario Python — `run_via_brain`). `tool_name` e'
-/// LETTERALE: per i tool wrappati e' `"nexus_mcp_tool_call"` (il vero tool sta in
-/// `tool_input.tool_name`) — il replay NON lo spacchetta, restituisce la colonna
-/// `tool_name` cosi' com'e' (vedi [`ReplayLlmGateway`]).
-///
-/// `created_at_us`: timestamp di scrittura in MICROSECONDI epoch. E' il
-/// discriminante del TURNO REALE: gli step di uno stesso turno LLM del primario
-/// sono scritti nello stesso batch -> `created_at` quasi-identico (osservato:
-/// identico al microsecondo per i batch INSERT singoli, fino a ~2-3ms di jitter per
-/// INSERT separati nello stesso burst); turni/ondate diversi sono distanti >=
-/// centinaia di ms (osservato: minimo ~356ms, tipico secondi). Vedi
-/// [`group_steps_by_turn`].
-#[derive(Debug, Clone)]
-struct ReplayStep {
-    /// Indice globale dello step (`iteration*1000 + idx_locale` per i primari Python).
-    step_index: i64,
-    /// Nome del tool LETTERALE (colonna `tool_name`, non spacchettato).
-    tool_name: String,
-    /// Argomenti del tool (colonna `tool_input` JSONB).
-    tool_input: Value,
-    /// `created_at` in MICROSECONDI epoch (discriminante del turno reale).
-    created_at_us: i64,
-}
-
-/// PUNTO UNICO della lettura degli step di replay da `agent_steps` (funzione
-/// libera, testabile col solo `&PgPool`, regola L). Tutti gli step del run
-/// primario che hanno prodotto un tool_use, ordinati in modo DETERMINISTICO.
-///
-/// I nodi ausiliari (planner/reflection/clarify) NON scrivono `agent_steps`:
-/// quindi qui arrivano SOLO gli step dell'executor (1:1 con la sequenza di tool
-/// che lo shadow deve rigiocare).
-///
-/// ORDINAMENTO (FIX shadow LLM-Replay, difesa in profondita'): `created_at ASC,
-/// step_index ASC, id ASC`. Lo `step_index` del primario Python NON e' univoco
-/// per run (retry/fallback della cascade riusano lo stesso indice), quindi un
-/// ordinamento per solo `step_index` poteva MESCOLARE le ondate (gruppi-turno di
-/// `group_steps_by_turn`) e produrre divergenza ("loop"). `created_at` da' l'ordine
-/// temporale reale; `step_index` poi `id` (PK UUID) sono tiebreak deterministici
-/// quando `created_at` collide. Il raggruppamento per TURNO REALE usa lo stesso
-/// `created_at` (vedi `group_steps_by_turn`), NON il quoziente `step_index / 1000`
-/// (inaffidabile su fonte sporca con indici riusati dalle ondate).
-///
-/// `created_at` e' letto come MICROSECONDI epoch (`EXTRACT(EPOCH ...) * 1e6`) cosi'
-/// il raggruppamento per turno lavora su un intero deterministico e indipendente
-/// dal fuso/tipo Rust del timestamp.
-async fn load_replay_steps(
-    db: &PgPool,
-    primary_run_id: Uuid,
-) -> Result<Vec<ReplayStep>, PortError> {
-    let rows: Vec<(i64, String, Value, i64)> = sqlx::query_as(
-        "SELECT step_index::bigint, tool_name, tool_input, \
-                (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at_us \
-         FROM agent_steps \
-         WHERE run_id = $1 \
-         ORDER BY created_at ASC, step_index ASC, id ASC",
-    )
-    .bind(primary_run_id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| PortError::Llm(format!("replay caricamento agent_steps: {e}")))?;
-
-    Ok(rows
-        .into_iter()
-        .map(
-            |(step_index, tool_name, tool_input, created_at_us)| ReplayStep {
-                step_index,
-                tool_name,
-                tool_input,
-                created_at_us,
-            },
-        )
-        .collect())
-}
-
-/// PUNTO UNICO del fetch del messaggio finale del primario (`agent_runs.final_answer`),
-/// usato dallo shadow per chiudere come il primario quando il cursore e' esausto.
-/// `Ok(None)` se la colonna e' NULL (chiusura con content vuoto). Funzione libera,
-/// testabile col solo `&PgPool` (regola L).
-async fn load_primary_final_answer(
-    db: &PgPool,
-    primary_run_id: Uuid,
-) -> Result<Option<String>, PortError> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT final_answer FROM agent_runs WHERE id = $1")
-            .bind(primary_run_id)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| PortError::Llm(format!("replay lettura final_answer: {e}")))?;
-    Ok(row.and_then(|(fa,)| fa))
-}
-
-/// Default della tolleranza di gap (microsecondi) usata da `group_steps_by_turn`
-/// quando il setting DB `agent.shadow.replay_turn_gap_ms` non e' valorizzato.
-/// 50ms (= 50_000 us): sta nel mezzo della separazione di oltre due ordini di
-/// grandezza misurata sui dati reali (intra-turno <= ~2.6ms vs inter-turno >=
-/// ~356ms). Regola G: la soglia operativa e' nel DB; questo e' solo il fallback
-/// documentato della funzione PURA.
-const DEFAULT_TURN_GAP_US: i64 = 50_000;
-
-/// Raggruppa gli step (gia' ordinati per `created_at` ASC, `step_index` ASC, `id`
-/// ASC da [`load_replay_steps`]) per TURNO REALE del primario, usando il GAP di
-/// `created_at`: due step consecutivi nello stesso turno LLM hanno `created_at`
-/// quasi-identico (scritti nello stesso batch dal brain), mentre turni/ondate
-/// diversi sono distanti. Un gap maggiore di `gap_us` (microsecondi) apre un turno
-/// nuovo; gap minore-uguale tiene lo step nel turno corrente.
-///
-/// Sostituisce il precedente raggruppamento per quoziente `step_index / 1000`, che
-/// era INAFFIDABILE sulla fonte sporca: il brain su retry/fallback dello stesso run
-/// RIUSA gli `step_index` (es. 3000-3003 in DUE ondate con `created_at` distanti),
-/// quindi il quoziente ACCORPAVA ondate diverse in un solo mega-turno -> tool
-/// esplorativi ripetuti in un turno -> `detect_signature_loop` spurio + stop_reason
-/// "loop" + `num_tool_calls` troncato. Il GAP temporale ricostruisce i turni reali.
-///
-/// PURA (regola L): nessun I/O. `gap_us` e' iniettato dal chiamante
-/// ([`ReplayLlmGateway::groups`], DB-driven con fallback [`DEFAULT_TURN_GAP_US`]).
-/// Ogni gruppo mantiene gli step nell'ordine di ingresso (= ordine temporale).
-fn group_steps_by_turn(steps: &[ReplayStep], gap_us: i64) -> Vec<Vec<ReplayStep>> {
-    let mut groups: Vec<Vec<ReplayStep>> = Vec::new();
-    let mut prev_ts: Option<i64> = None;
-    for s in steps {
-        let new_turn = match prev_ts {
-            // Primo step, oppure salto temporale oltre la tolleranza -> turno nuovo.
-            None => true,
-            Some(prev) => s.created_at_us.saturating_sub(prev) > gap_us,
-        };
-        if new_turn {
-            groups.push(Vec::new());
-        }
-        groups
-            .last_mut()
-            .expect("almeno un gruppo creato sopra")
-            .push(s.clone());
-        prev_ts = Some(s.created_at_us);
-    }
-    groups
-}
-
-/// Costruisce la [`LlmResponse`] dell'executor da rigiocare per UN gruppo-turno
-/// del primario. PURA: emette un `tool_use` per ogni step del gruppo (id sintetico
-/// `replay-{step_index}`, name = colonna `tool_name` LETTERALE, input = `tool_input`)
-/// e ricostruisce `assistant_content` riusando la STESSA forma di [`map_gw_response`]
-/// (blocchi `{type:"tool_use", id, name, input}`), per la continuita'
-/// tool_use/tool_result attesa da `build_assistant_message` dell'executor (regola L:
-/// non duplichiamo la logica di costruzione assistant_content, usiamo l'helper
-/// condiviso [`assistant_content_for_tool_calls`]).
-///
-/// RISCHIO NOTO (design): per i tool wrappati `tool_name='nexus_mcp_tool_call'` il
-/// `name` resta la COLONNA (non spacchettiamo `tool_input.tool_name`), cosi'
-/// `num_tool_calls` combacia 1:1 col primario (che conta la stessa colonna). Se il
-/// grafo Rust ramifica diversamente su `nexus_mcp_tool_call` e' una divergenza VERA
-/// da far emergere, non da nascondere.
-fn replay_response_for_group(group: &[ReplayStep], req: &LlmRequest) -> LlmResponse {
-    let tool_calls: Vec<ToolUse> = group
-        .iter()
-        .map(|s| ToolUse {
-            id: format!("replay-{}", s.step_index),
-            name: s.tool_name.clone(),
-            input: s.tool_input.clone(),
-            thought_signature: None,
-        })
-        .collect();
-    let assistant_content = assistant_content_for_tool_calls("", &tool_calls);
-    LlmResponse {
-        content: String::new(),
-        tool_calls,
-        usage: LlmUsage::default(),
-        // provider/model EFFETTIVI = quelli del req (lo shadow non fa cascade).
-        provider_used: if req.provider.is_empty() {
-            None
-        } else {
-            Some(req.provider.clone())
-        },
-        model_used: if req.model.is_empty() {
-            None
-        } else {
-            Some(req.model.clone())
-        },
-        assistant_content,
-        stop_reason: Some("tool_use".to_string()),
-        reasoning: None,
-        thinking_signature: None,
-    }
-}
-
-/// Helper condiviso (regola L): blocchi `assistant_content` in forma
-/// `anthropic_content` da un testo opzionale + i `tool_use`. Stessa forma prodotta
-/// da [`map_gw_response`] (blocco text se non vuoto, poi i blocchi tool_use; vuoto
-/// se non c'e' alcun tool_use). Estratto per essere riusato dal replay senza
-/// duplicare la costruzione.
+/// Helper (regola L): blocchi `assistant_content` in forma `anthropic_content` da
+/// un testo opzionale + i `tool_use` (blocco text se non vuoto, poi i blocchi
+/// tool_use; vuoto se non c'e' alcun tool_use). Usato da [`map_gw_response`].
 fn assistant_content_for_tool_calls(text: &str, tool_calls: &[ToolUse]) -> Vec<Value> {
     if tool_calls.is_empty() {
         return Vec::new();
@@ -785,133 +647,6 @@ fn assistant_content_for_tool_calls(text: &str, tool_calls: &[ToolUse]) -> Vec<V
         blocks.push(block);
     }
     blocks
-}
-
-/// Risposta NEUTRA deterministica per le chiamate AUSILIARIE in shadow (purpose
-/// planner/reflection/clarify_expand o `None`): content vuoto, nessun tool_call,
-/// `stop_reason=None`, usage zero, assistant_content vuoto. NESSUNA chiamata LLM
-/// reale. Neutralizza il planner (pass-through, gia' default OFF), la reflection
-/// (no valutazione LLM, resta il reward euristico deterministico) e clarify/
-/// understanding (no-op: i nodi gestiscono gia' "nessun tool_use emesso" come skip).
-fn neutral_auxiliary_response() -> LlmResponse {
-    LlmResponse::default()
-}
-
-/// Gateway LLM di REPLAY per lo SHADOW (read-only, costo zero). NON chiama mai
-/// l'LLM reale:
-/// - per la chiamata dell'EXECUTOR (`purpose == "executor"`) consuma il prossimo
-///   gruppo-turno del primario (lazy-load di `agent_steps`, raggruppati per turno
-///   reale via gap di `created_at`) ed emette gli stessi tool_use, nello stesso
-///   ordine temporale. Esaurito il cursore, chiude con `agent_runs.final_answer`
-///   del primario (`stop_reason=end_turn`), cosi' lo shadow termina come il primario;
-/// - per le chiamate AUSILIARIE (planner/reflection/clarify_expand o `None`)
-///   ritorna [`neutral_auxiliary_response`] (deterministica, zero I/O).
-///
-/// Coesiste con [`GatewayLlmAdapter`] (Real): lo switch e' per ruolo nel punto
-/// unico `native_engine::build_native_engine`. Il design NON include un fallback
-/// `real`: in shadow puro gli ausiliari sono neutralizzati e l'executor e' replay,
-/// quindi nessuna chiamata REAL e' mai necessaria.
-pub struct ReplayLlmGateway {
-    /// Pool Postgres: lettura `agent_steps` / `agent_runs` del primario.
-    db: PgPool,
-    /// Run primario di cui RIGIOCARE le decisioni dell'executor (= thread_id).
-    primary_run_id: Uuid,
-    /// Step del primario raggruppati per TURNO REALE (lazy-load alla prima chiamata
-    /// executor). `OnceCell`: una sola lettura per run shadow.
-    groups: OnceCell<Vec<Vec<ReplayStep>>>,
-    /// Cursore sui gruppi-iterazione: indice del PROSSIMO gruppo da consumare.
-    /// Ogni `complete()` dell'executor avanza di 1 (interior mutability su `&self`).
-    cursor: Mutex<usize>,
-    /// `agent_runs.final_answer` del primario (lazy-load): chiusura dello shadow a
-    /// cursore esausto. `Some(None)` = caricato ma NULL (content vuoto).
-    final_answer: OnceCell<Option<String>>,
-}
-
-impl ReplayLlmGateway {
-    /// Costruisce il gateway di replay sul run primario dato.
-    pub fn new(db: PgPool, primary_run_id: Uuid) -> Self {
-        Self {
-            db,
-            primary_run_id,
-            groups: OnceCell::new(),
-            cursor: Mutex::new(0),
-            final_answer: OnceCell::new(),
-        }
-    }
-
-    /// Lazy-load (una sola volta) degli step del primario raggruppati per TURNO
-    /// REALE. La tolleranza di gap e' DB-driven (regola G): setting
-    /// `agent.shadow.replay_turn_gap_ms` (millisecondi), default
-    /// [`DEFAULT_TURN_GAP_US`] / 1000 se assente/non parsabile.
-    async fn groups(&self) -> Result<&Vec<Vec<ReplayStep>>, PortError> {
-        self.groups
-            .get_or_try_init(|| async {
-                let steps = load_replay_steps(&self.db, self.primary_run_id).await?;
-                let gap_us = self.turn_gap_us().await;
-                Ok(group_steps_by_turn(&steps, gap_us))
-            })
-            .await
-    }
-
-    /// Tolleranza di gap per il raggruppamento per turno, in MICROSECONDI, letta dal
-    /// setting `agent.shadow.replay_turn_gap_ms` (millisecondi nel DB). Fallback
-    /// [`DEFAULT_TURN_GAP_US`] se il setting e' assente, vuoto o non parsabile (la
-    /// lettura non deve mai far fallire lo shadow read-only). Regola G: nessun
-    /// hardcode della soglia operativa nella logica; il default e' solo la rete di
-    /// sicurezza documentata.
-    async fn turn_gap_us(&self) -> i64 {
-        crate::settings::get_setting(&self.db, "agent.shadow.replay_turn_gap_ms")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|ms| *ms >= 0)
-            .map(|ms| ms.saturating_mul(1000))
-            .unwrap_or(DEFAULT_TURN_GAP_US)
-    }
-
-    /// Lazy-load (una sola volta) del `final_answer` del primario.
-    async fn final_answer(&self) -> Result<&Option<String>, PortError> {
-        self.final_answer
-            .get_or_try_init(|| load_primary_final_answer(&self.db, self.primary_run_id))
-            .await
-    }
-
-    /// Replay della chiamata dell'executor: consuma il prossimo gruppo-turno;
-    /// se esausto, chiude con `final_answer` del primario (`stop_reason=end_turn`).
-    async fn complete_executor(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
-        let groups = self.groups().await?;
-        let idx = {
-            let mut cur = self.cursor.lock().await;
-            let i = *cur;
-            *cur += 1;
-            i
-        };
-        match groups.get(idx) {
-            Some(group) => Ok(replay_response_for_group(group, &req)),
-            None => {
-                // Cursore esausto: lo shadow chiude come il primario.
-                let final_answer = self.final_answer().await?.clone().unwrap_or_default();
-                Ok(LlmResponse {
-                    content: final_answer,
-                    stop_reason: Some("end_turn".to_string()),
-                    ..Default::default()
-                })
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl LlmGateway for ReplayLlmGateway {
-    async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, PortError> {
-        match req.purpose.as_deref() {
-            Some("executor") => self.complete_executor(req).await,
-            // Ausiliari (planner/reflection/clarify_expand) o purpose assente:
-            // risposta neutra deterministica, nessuna chiamata LLM reale.
-            _ => Ok(neutral_auxiliary_response()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1030,6 +765,86 @@ invalid request)\",\"code\":\"PROVIDER_ERROR\",\"details\":{\"primary_cause\":\"
             PortError::ProviderUnavailable(info) => {
                 assert_eq!(info.cause, ProviderFailureCause::ClientError);
                 assert!(!info.cause.is_cooldown_like());
+            }
+            other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
+        }
+    }
+
+    /// Il vocabolario REALE dei codici recuperabili, dal produttore che lo
+    /// definisce (safe-default di `ExecutorConfig`, sovrascritto dal DB in
+    /// esercizio). Ricopiarlo qui a mano renderebbe il test cieco a una modifica
+    /// del vocabolario: e' l'errore che ha tenuto verde questo gate mentre era
+    /// morto (regola O).
+    fn codici_recuperabili() -> Vec<String> {
+        nexus_agent_graph::nodes::ExecutorConfig::default().recoverable_client_error_codes
+    }
+
+    #[test]
+    fn il_codice_del_provider_arriva_al_gate_del_failover() {
+        // Un 400 PROVIDER-SPECIFICO (Google invalid_argument): un altro provider
+        // accetterebbe la stessa richiesta -> il failover DEVE essere consentito.
+        // L'asserzione e' sul VERDETTO, non sulla stringa: e' il consumatore vero
+        // del codice, ed e' l'unica cosa che prova che il dato ha attraversato
+        // tutto il percorso invece di fermarsi a meta' (regola O).
+        let err = gw_err(
+            400,
+            "{\"error\":\"tutti i provider hanno fallito -> google (google HTTP 400: \
+invalid argument)\",\"code\":\"PROVIDER_ERROR\",\"details\":{\"primary_cause\":\"client_error\",\
+\"failures\":[{\"provider\":\"google\",\"class\":\"client_error\",\"status\":400,\
+\"code\":\"invalid_argument\"}]}}",
+        );
+        match classify_gateway_error(&err) {
+            PortError::ProviderUnavailable(info) => {
+                assert_eq!(info.code.as_deref(), Some("invalid_argument"));
+                assert!(
+                    info.allows_cross_provider_failover(&codici_recuperabili()),
+                    "un 400 provider-specifico deve poter ripiegare su un altro provider"
+                );
+            }
+            other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
+        }
+    }
+
+    #[test]
+    fn il_400_di_formato_condiviso_non_apre_il_failover() {
+        // Mistral invalid_request_message_order: la history malformata e' la
+        // STESSA per ogni provider, ritentare altrove fallirebbe uguale bruciando
+        // token (incidente f0ad0337). Il codice arriva, e il verdetto e' NO.
+        let err = gw_err(
+            400,
+            "{\"error\":\"tutti i provider hanno fallito -> mistral (mistral HTTP 400: Not the \
+same number of function calls and responses)\",\"code\":\"PROVIDER_ERROR\",\
+\"details\":{\"primary_cause\":\"client_error\",\"failures\":[{\"provider\":\"mistral\",\
+\"class\":\"client_error\",\"status\":400,\"code\":\"invalid_request_message_order\"}]}}",
+        );
+        match classify_gateway_error(&err) {
+            PortError::ProviderUnavailable(info) => {
+                assert_eq!(info.code.as_deref(), Some("invalid_request_message_order"));
+                assert!(
+                    !info.allows_cross_provider_failover(&codici_recuperabili()),
+                    "un 400 di history condivisa fallirebbe su qualunque provider"
+                );
+            }
+            other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
+        }
+    }
+
+    #[test]
+    fn senza_codice_strutturato_il_failover_resta_chiuso() {
+        // Gateway che non espone `failures[].code`: nessun segnale strutturato,
+        // quindi nessun failover cieco (conservativo, regola M). E' anche lo
+        // stato in cui si trovava OGNI errore prima che il codice venisse
+        // collegato: serve a distinguere "non recuperabile" da "non misurato".
+        let err = gw_err(
+            400,
+            "{\"error\":\"tutti i provider hanno fallito -> deepseek (HTTP 400)\",\
+\"code\":\"PROVIDER_ERROR\",\"details\":{\"primary_cause\":\"client_error\",\
+\"failures\":[{\"provider\":\"deepseek\",\"class\":\"client_error\",\"status\":400}]}}",
+        );
+        match classify_gateway_error(&err) {
+            PortError::ProviderUnavailable(info) => {
+                assert_eq!(info.code, None);
+                assert!(!info.allows_cross_provider_failover(&codici_recuperabili()));
             }
             other => panic!("atteso ProviderUnavailable, avuto {other:?}"),
         }
@@ -1326,6 +1141,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         let out = map_gw_response(gw_resp_with_tool_call());
         assert_eq!(out.usage.prompt_tokens, 10);
         assert_eq!(out.usage.completion_tokens, 5);
+        // Totale = prompt LORDO (10) + completion (5). I 3+7 di cache sono gia'
+        // dentro i 10: sommarli li conterebbe due volte.
         assert_eq!(out.usage.total_tokens, 15);
         assert_eq!(out.usage.cache_read_tokens, Some(3));
         assert_eq!(out.usage.cache_creation_tokens, Some(7));
@@ -1435,400 +1252,215 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         assert!(m2.get("tool_calls").is_none());
     }
 
-    // ── ReplayLlmGateway: raggruppamento + risposta replay (PURI) ─────────────
+    // ── turn_cost_usd: il numero che stringe il freno di spesa ────────────────
+    //
+    // Questo costo alimenta `run_cost_cumulative_usd`, cioe' il cap in dollari del
+    // run: un errore qui non e' contabile, e' operativo — o si spende oltre il
+    // tetto, o il run viene fermato per un costo che non e' stato sostenuto.
+    //
+    // I test girano sullo schema META reale (regola O): il filtro di currency, la
+    // finestra `effective_*` e lo scarto su `pricing_state='unknown'` vivono nella
+    // QUERY del punto unico `nexus-pricing`, e una fixture `CREATE TABLE` ricopiata
+    // a mano non potrebbe esercitarli.
 
-    /// Step di test con `created_at` esplicito in MICROSECONDI epoch: il
-    /// raggruppamento per turno lavora sul GAP di `created_at`, quindi i test
-    /// devono controllare il timestamp (non piu' il quoziente `step_index/1000`).
-    fn step_at(step_index: i64, tool_name: &str, created_at_us: i64) -> ReplayStep {
-        ReplayStep {
-            step_index,
-            tool_name: tool_name.to_string(),
-            tool_input: json!({"k": step_index}),
-            created_at_us,
-        }
-    }
-
-    #[test]
-    fn group_steps_turno_multi_tool_resta_unito() {
-        // Un turno LLM multi-tool: stesso created_at (batch INSERT singolo) -> 1
-        // gruppo con tutti i tool, ordine preservato. Default 50ms di gap.
-        let t = 1_000_000_000;
-        let steps = vec![
-            step_at(0, "read_file", t),
-            step_at(1, "list_files", t),
-            step_at(2, "grep", t),
-        ];
-        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
-        assert_eq!(groups.len(), 1, "stesso created_at -> un solo turno");
-        assert_eq!(groups[0].len(), 3);
-        assert_eq!(groups[0][0].tool_name, "read_file");
-        assert_eq!(groups[0][1].tool_name, "list_files");
-        assert_eq!(groups[0][2].tool_name, "grep");
-    }
-
-    #[test]
-    fn group_steps_due_ondate_stessi_step_index_turni_separati() {
-        // FIX shadow: due ondate (retry/fallback) RIUSANO gli step_index (3000-3003)
-        // ma con created_at distante. Il quoziente /1000 le accorpava in un
-        // mega-turno (loop spurio); il gap temporale le tiene SEPARATE.
-        // Ondata 1: step 3000-3003 a t. Ondata 2 (stessi indici): a t + 40s.
-        let t = 1_000_000_000;
-        let ond2 = t + 40_000_000; // +40s, ben oltre i 50ms di tolleranza
-        let steps = vec![
-            step_at(3000, "read_file", t),
-            step_at(3001, "read_file", t),
-            step_at(3002, "read_file", t),
-            step_at(3003, "read_file", t),
-            step_at(3000, "list_files", ond2),
-            step_at(3001, "list_files", ond2),
-            step_at(3002, "list_files", ond2),
-            step_at(3003, "read_file", ond2),
-        ];
-        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
-        assert_eq!(
-            groups.len(),
-            2,
-            "due ondate -> due turni, NON un mega-turno"
-        );
-        assert_eq!(groups[0].len(), 4);
-        assert!(groups[0].iter().all(|s| s.tool_name == "read_file"));
-        assert_eq!(groups[1].len(), 4);
-        // Il secondo turno e' l'ondata 2 (list_files...), separata nel tempo.
-        assert_eq!(groups[1][0].tool_name, "list_files");
-    }
-
-    #[test]
-    fn group_steps_micro_jitter_intra_turno_resta_unito() {
-        // Caso reale 4531a1c7: step 1-4 stesso burst con jitter ~1.5-2ms tra loro
-        // (INSERT separati) -> DEVONO restare nello stesso turno (gap < 50ms), non
-        // spezzarsi in 4 turni-da-1-tool.
-        let base = 1_000_000_000;
-        let steps = vec![
-            step_at(1, "read_file", base),
-            step_at(2, "list_files", base + 1_974), // +1.974ms
-            step_at(3, "read_file", base + 3_479),  // +1.505ms
-            step_at(4, "list_files", base + 5_111), // +1.632ms
-        ];
-        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
-        assert_eq!(groups.len(), 1, "micro-jitter intra-turno -> un solo turno");
-        assert_eq!(groups[0].len(), 4);
-    }
-
-    #[test]
-    fn group_steps_gap_sopra_soglia_spezza_turno() {
-        // Caso reale 6cfd2e34: gap minimo inter-turno osservato ~356ms (>50ms) deve
-        // spezzare; gap intra-turno ~2ms (<50ms) deve unire.
-        let base = 1_000_000_000;
-        let steps = vec![
-            step_at(3000, "list_files", base),
-            step_at(3001, "list_files", base), // batch identico -> stesso turno
-            // +356ms: nuovo turno (step 1-5, ondata diversa)
-            step_at(1, "nexus_run_notes", base + 356_000),
-            step_at(2, "list_files", base + 358_000), // +2ms dal precedente -> stesso turno
-        ];
-        let groups = group_steps_by_turn(&steps, DEFAULT_TURN_GAP_US);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].len(), 2, "primo turno: i due list_files identici");
-        assert_eq!(groups[1].len(), 2, "secondo turno: run_notes + list_files");
-        assert_eq!(groups[1][0].tool_name, "nexus_run_notes");
-    }
-
-    #[test]
-    fn group_steps_vuoto_nessun_gruppo() {
-        let groups = group_steps_by_turn(&[], DEFAULT_TURN_GAP_US);
-        assert!(groups.is_empty());
-    }
-
-    #[test]
-    fn replay_response_emette_tool_use_letterali() {
-        // Tool wrappato: name = colonna tool_name LETTERALE (nexus_mcp_tool_call),
-        // NON spacchettato da tool_input.tool_name. id sintetico replay-{step_index}.
-        let group = vec![ReplayStep {
-            step_index: 1000,
-            tool_name: "nexus_mcp_tool_call".to_string(),
-            tool_input: json!({"tool_name": "build", "args": {}}),
-            created_at_us: 1_000_000_000,
-        }];
-        let req = LlmRequest {
-            provider: "anthropic".to_string(),
-            model: "claude-x".to_string(),
-            ..Default::default()
-        };
-        let resp = replay_response_for_group(&group, &req);
-        assert_eq!(resp.tool_calls.len(), 1);
-        assert_eq!(resp.tool_calls[0].name, "nexus_mcp_tool_call");
-        assert_eq!(resp.tool_calls[0].id, "replay-1000");
-        // input = tool_input INTEGRO (col tool vero dentro, non spacchettato).
-        assert_eq!(resp.tool_calls[0].input["tool_name"], "build");
-        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
-        assert_eq!(resp.content, "");
-        // provider/model effettivi = quelli del req (nessun cascade in shadow).
-        assert_eq!(resp.provider_used.as_deref(), Some("anthropic"));
-        assert_eq!(resp.model_used.as_deref(), Some("claude-x"));
-        // assistant_content deserializzabile in ContentBlock (continuita' tool_use).
-        for b in &resp.assistant_content {
-            serde_json::from_value::<nexus_agent_graph::state::ContentBlock>(b.clone())
-                .expect("assistant_content deserializzabile");
-        }
-    }
-
-    #[test]
-    fn risposta_ausiliaria_neutra_deterministica() {
-        // (c) purpose ausiliario -> LlmResponse neutra, nessun I/O.
-        let neutra = neutral_auxiliary_response();
-        assert_eq!(neutra.content, "");
-        assert!(neutra.tool_calls.is_empty());
-        assert_eq!(neutra.stop_reason, None);
-        assert!(neutra.assistant_content.is_empty());
-        assert_eq!(neutra.usage, LlmUsage::default());
-    }
-
-    // ── ReplayLlmGateway: end-to-end via complete() (sqlx) ─────────────────────
-
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 final_answer TEXT \
-             )",
+    /// L'usage come arriva DAVVERO al chiamante di `turn_cost_usd`: payload del
+    /// wire -> `GwResponse` -> `map_gw_response`. E' la strada di
+    /// `NexusGatewayLlmPort::complete`, che passa `&mapped.usage`. Costruire la
+    /// `LlmUsage` della porta a mano salterebbe proprio il passaggio in cui le
+    /// quantita' vengono ripartite.
+    fn usage_dal_wire() -> LlmUsage {
+        // `input_tokens` e' il prompt LORDO: i 2M letti da cache e i 0.5M scritti
+        // ne fanno parte, quindi restano 1M a tariffa piena.
+        let resp: GwResponse = serde_json::from_str(
+            r#"{
+                "content": "ok",
+                "usage": {
+                    "input_tokens": 3500000,
+                    "output_tokens": 400000,
+                    "cache_read_tokens": 2000000,
+                    "cache_creation_tokens": 500000
+                },
+                "model_used": "claude-x",
+                "provider_used": "anthropic",
+                "latency_ms": 3,
+                "finish_reason": "stop"
+            }"#,
         )
+        .expect("payload wire del gateway");
+        map_gw_response(resp).usage
+    }
+
+    /// Riga di listino con TUTTI gli assi su cui la query del punto unico
+    /// discrimina: currency, finestra di validita', stato del prezzo, tariffe.
+    struct RigaListino<'a> {
+        model: &'a str,
+        currency: &'a str,
+        pricing_state: &'a str,
+        /// Offset da `NOW()` per `effective_from` (intervallo Postgres).
+        da: &'a str,
+        /// Offset per `effective_to`; `None` = finestra ancora aperta.
+        a: Option<&'a str>,
+        /// Tariffe di input/output per milione. Quelle di cache NON si passano:
+        /// le deriva la INSERT con la stessa regola della mig 0130
+        /// (`read = input x 0.10`, `creation = input x 1.25`), cosi' una riga a
+        /// tariffe zero resta zero DOVUNQUE invece di essere un ibrido che in
+        /// catalog non esiste.
+        ///
+        /// Non sono un dettaglio della fixture: il trigger della mig 0583 promuove
+        /// a `'priced'` qualunque riga scritta con `pricing_state='unknown'` e un
+        /// costo > 0. Un "unknown" a tariffe vere in produzione NON esiste — il
+        /// placeholder ha per forza tariffe a zero, ed e' proprio li' che lo zero
+        /// "non so quanto costa" deve restare distinguibile dallo zero "gratis".
+        tariffe: (f64, f64),
+    }
+
+    /// Riga a listino tipica: tariffe distinte, currency di piattaforma, in vigore.
+    fn riga_viva(model: &str) -> RigaListino<'_> {
+        RigaListino {
+            model,
+            currency: "USD",
+            pricing_state: "priced",
+            da: "-1 hour",
+            a: None,
+            tariffe: (3.0, 15.0),
+        }
+    }
+
+    async fn seed_prezzo(pool: &PgPool, riga: RigaListino<'_>) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog ( \
+                 provider, model, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                 cache_read_cost_per_million_tokens, cache_creation_cost_per_million_tokens, \
+                 currency, pricing_state, effective_from, effective_to \
+             ) VALUES ('anthropic', $1, $6, $7, $6 * 0.10, $6 * 1.25, $2, $3, \
+                       NOW() + $4::interval, \
+                       CASE WHEN $5::text IS NULL THEN NULL \
+                            ELSE NOW() + $5::interval END)",
+        )
+        .bind(riga.model)
+        .bind(riga.currency)
+        .bind(riga.pricing_state)
+        .bind(riga.da)
+        .bind(riga.a)
+        .bind(riga.tariffe.0)
+        .bind(riga.tariffe.1)
         .execute(pool)
         .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
+        .expect("seed ai_price_catalog");
     }
 
-    async fn insert_run(pool: &PgPool, final_answer: Option<&str>) -> Uuid {
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, final_answer) VALUES ($1, $2)")
-            .bind(run)
-            .bind(final_answer)
-            .execute(pool)
+    /// Caso vivo: il prezzo c'e' e il prompt si scorpora in tre parti, ognuna
+    /// alla tariffa che le compete, non tutto alla tariffa piena di input.
+    ///
+    /// A tariffa piena sul lordo (3,5M x 3.0 = 10.50, piu' 6.00 di output) il
+    /// totale sarebbe 16.50: e' la sovrastima che stringeva il freno di spesa.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn turn_cost_usd_paga_ogni_quantita_alla_sua_tariffa(pool: PgPool) {
+        seed_prezzo(&pool, riga_viva("claude-x")).await;
+
+        let costo = turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire())
             .await
-            .expect("run");
-        run
+            .expect("prezzo a listino -> costo calcolabile");
+
+        // 1M x 3.0 + 0.4M x 15.0 + 2M x 0.3 + 0.5M x 3.75.
+        assert!(
+            (costo - 11.475).abs() < 1e-9,
+            "costo {costo}, atteso 11.475 (a tariffa piena sul lordo sarebbe 16.5)"
+        );
     }
 
-    fn executor_req() -> LlmRequest {
-        LlmRequest {
-            provider: "anthropic".to_string(),
-            model: "claude-x".to_string(),
-            purpose: Some("executor".to_string()),
-            ..Default::default()
+    /// Le tre forme in cui il listino NON si applica alla chiamata. In tutte il
+    /// costo resta `None`: un numero inventato qui e' peggio dell'assenza, perche'
+    /// il cap in dollari lo tratterebbe come speso.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn turn_cost_usd_non_applica_un_listino_che_non_e_suo(pool: PgPool) {
+        // La currency di piattaforma e' USD (mig 0294): una riga in EUR non e' il
+        // prezzo di questa chiamata.
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                currency: "EUR",
+                ..riga_viva("altra-currency")
+            },
+        )
+        .await;
+        // Finestra CHIUSA in passato: il prezzo non e' piu' in vigore.
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                da: "-2 day",
+                a: Some("-1 day"),
+                ..riga_viva("scaduto")
+            },
+        )
+        .await;
+        // Finestra che deve ancora aprirsi.
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                da: "+1 day",
+                ..riga_viva("futuro")
+            },
+        )
+        .await;
+
+        let usage = usage_dal_wire();
+        for model in ["altra-currency", "scaduto", "futuro", "mai-visto"] {
+            assert_eq!(
+                turn_cost_usd(&pool, "anthropic", model, &usage).await,
+                None,
+                "il listino di '{model}' non si applica a questa chiamata: \
+                 il costo deve restare non calcolabile"
+            );
         }
     }
 
-    /// (a) sequenza multi-turno: 2 turni (turno 1 con 2 tool, turno 2 con 1 tool,
-    /// separati nel tempo) -> 2 complete() coi tool giusti, poi la 3a complete() =
-    /// end_turn + final_answer del primario. (b) conteggio tool per turno = primario.
-    /// I turni sono discriminati dal GAP di `created_at` (turno 1 stesso timestamp,
-    /// turno 2 a +2s).
-    #[sqlx::test]
-    async fn replay_executor_sequenza_multi_turno(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool, Some("FATTO")).await;
-        // Turno 1: read_file (0) + list_files (1) stesso created_at (batch).
-        insert_step_at(&pool, run, 0, "read_file", "2026-06-27T10:00:00Z").await;
-        insert_step_at(&pool, run, 1, "list_files", "2026-06-27T10:00:00Z").await;
-        // Turno 2: edit_file (2000) a +2s (oltre la tolleranza 50ms).
-        insert_step_at(&pool, run, 2000, "edit_file", "2026-06-27T10:00:02Z").await;
-
-        let gw = ReplayLlmGateway::new(pool.clone(), run);
-
-        // 1a complete() (executor): turno 1 -> 2 tool nello stesso ordine.
-        let r1 = gw.complete(executor_req()).await.expect("turno 1");
-        assert_eq!(r1.tool_calls.len(), 2, "conteggio tool turno 1 = primario");
-        assert_eq!(r1.tool_calls[0].name, "read_file");
-        assert_eq!(r1.tool_calls[1].name, "list_files");
-        assert_eq!(r1.stop_reason.as_deref(), Some("tool_use"));
-
-        // 2a complete(): turno 2 -> 1 tool.
-        let r2 = gw.complete(executor_req()).await.expect("turno 2");
-        assert_eq!(r2.tool_calls.len(), 1, "conteggio tool turno 2 = primario");
-        assert_eq!(r2.tool_calls[0].name, "edit_file");
-
-        // (d) 3a complete(): cursore esausto -> end_turn + final_answer del primario.
-        let r3 = gw.complete(executor_req()).await.expect("turno 3");
-        assert!(r3.tool_calls.is_empty());
-        assert_eq!(r3.content, "FATTO");
-        assert_eq!(r3.stop_reason.as_deref(), Some("end_turn"));
-    }
-
-    /// FIX shadow LLM-Replay E2E (regressione del MEGA-TURNO): due ondate
-    /// retry/fallback RIUSANO gli step_index (3000-3003) con `created_at` distanti.
-    /// Il vecchio raggruppamento per quoziente /1000 le ACCORPAVA in un solo turno da
-    /// 8 tool -> signature-loop spurio. Col raggruppamento per turno reale lo shadow
-    /// vede DUE turni separati (4 + 4 tool), come il primario. Riproduce 6cfd2e34.
-    #[sqlx::test]
-    async fn replay_executor_due_ondate_non_collassano_in_mega_turno(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool, Some("done")).await;
-        // Ondata 1: step 3000-3003 stesso created_at.
-        insert_step_at(&pool, run, 3000, "read_file", "2026-06-27T10:50:53Z").await;
-        insert_step_at(&pool, run, 3001, "read_file", "2026-06-27T10:50:53Z").await;
-        insert_step_at(&pool, run, 3002, "read_file", "2026-06-27T10:50:53Z").await;
-        insert_step_at(&pool, run, 3003, "read_file", "2026-06-27T10:50:53Z").await;
-        // Ondata 2: STESSI step_index, +41s (gap enorme -> turno separato).
-        insert_step_at(&pool, run, 3000, "list_files", "2026-06-27T10:51:34Z").await;
-        insert_step_at(&pool, run, 3001, "list_files", "2026-06-27T10:51:34Z").await;
-        insert_step_at(&pool, run, 3002, "list_files", "2026-06-27T10:51:34Z").await;
-        insert_step_at(&pool, run, 3003, "read_file", "2026-06-27T10:51:34Z").await;
-
-        let gw = ReplayLlmGateway::new(pool.clone(), run);
-
-        // Turno 1: 4 tool (ondata 1), NON un mega-turno da 8.
-        let r1 = gw.complete(executor_req()).await.expect("turno 1");
-        assert_eq!(r1.tool_calls.len(), 4, "ondata 1 = un turno da 4 tool");
-        assert!(r1.tool_calls.iter().all(|t| t.name == "read_file"));
-
-        // Turno 2: gli altri 4 tool (ondata 2), turno distinto.
-        let r2 = gw.complete(executor_req()).await.expect("turno 2");
-        assert_eq!(r2.tool_calls.len(), 4, "ondata 2 = secondo turno da 4 tool");
-        assert_eq!(r2.tool_calls[0].name, "list_files");
-
-        // 3a: cursore esausto -> end_turn.
-        let r3 = gw.complete(executor_req()).await.expect("end_turn");
-        assert!(r3.tool_calls.is_empty());
-        assert_eq!(r3.stop_reason.as_deref(), Some("end_turn"));
-    }
-
-    /// (c) purpose ausiliario via complete() -> risposta neutra SENZA leggere il DB
-    /// (run_id inesistente: se toccasse il DB fallirebbe, ma e' neutralizzato prima).
-    #[sqlx::test]
-    async fn replay_purpose_ausiliario_neutro_senza_io(pool: PgPool) {
-        create_tables(&pool).await;
-        // Nessun run inserito: un purpose ausiliario NON deve leggere agent_steps.
-        let gw = ReplayLlmGateway::new(pool.clone(), Uuid::new_v4());
-        for purpose in ["planner", "reflection", "clarify_expand"] {
-            let req = LlmRequest {
-                purpose: Some(purpose.to_string()),
-                ..Default::default()
-            };
-            let resp = gw.complete(req).await.expect("ausiliario neutro");
-            assert!(resp.tool_calls.is_empty());
-            assert_eq!(resp.content, "");
-            assert_eq!(resp.stop_reason, None);
-        }
-        // purpose None -> anch'esso neutro.
-        let resp = gw
-            .complete(LlmRequest::default())
-            .await
-            .expect("none neutro");
-        assert!(resp.tool_calls.is_empty());
-        assert_eq!(resp.stop_reason, None);
-    }
-
-    /// (d) cursore esausto subito (nessuno step) -> la PRIMA complete() executor
-    /// chiude con end_turn (final_answer NULL -> content vuoto).
-    #[sqlx::test]
-    async fn replay_executor_cursore_esausto_subito(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool, None).await; // final_answer NULL
-        let gw = ReplayLlmGateway::new(pool.clone(), run);
-
-        let r = gw
-            .complete(executor_req())
-            .await
-            .expect("end_turn immediato");
-        assert!(r.tool_calls.is_empty());
-        assert_eq!(r.content, "", "final_answer NULL -> content vuoto");
-        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
-    }
-
-    /// (e) tre turni distinti (un tool ciascuno, separati nel tempo) consumati in
-    /// ordine da complete() successive. Lo `step_index` e' irrilevante per i confini
-    /// di turno: conta solo il GAP di `created_at` (qui ogni tool a +1s dal
-    /// precedente -> tre turni). Verifica anche il caso single-tool-per-turno.
-    #[sqlx::test]
-    async fn replay_executor_turni_separati_single_tool(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool, Some("done")).await;
-        insert_step_at(&pool, run, 0, "a", "2026-06-27T10:00:00Z").await;
-        insert_step_at(&pool, run, 2000, "b", "2026-06-27T10:00:01Z").await;
-        insert_step_at(&pool, run, 3000, "c", "2026-06-27T10:00:02Z").await;
-
-        let gw = ReplayLlmGateway::new(pool.clone(), run);
-        assert_eq!(
-            gw.complete(executor_req()).await.unwrap().tool_calls[0].name,
-            "a"
-        );
-        assert_eq!(
-            gw.complete(executor_req()).await.unwrap().tool_calls[0].name,
-            "b"
-        );
-        assert_eq!(
-            gw.complete(executor_req()).await.unwrap().tool_calls[0].name,
-            "c"
-        );
-        // 4a: esausto -> end_turn.
-        let last = gw.complete(executor_req()).await.unwrap();
-        assert_eq!(last.stop_reason.as_deref(), Some("end_turn"));
-        assert_eq!(last.content, "done");
-    }
-
-    /// Inserisce uno step con `created_at` ESPLICITO (per testare l'ordinamento
-    /// temporale e il raggruppamento per turno a parita'/duplicazione di
-    /// `step_index`). `tool_input` fisso a `{}` (irrilevante per questi test).
-    async fn insert_step_at(
-        pool: &PgPool,
-        run_id: Uuid,
-        step_index: i32,
-        tool_name: &str,
-        created_at_iso: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO agent_steps \
-             (id, run_id, step_index, tool_name, tool_input, status, created_at) \
-             VALUES (gen_random_uuid(), $1, $2, $3, $4, 'completed', $5::timestamptz)",
+    /// `pricing_state='unknown'` (mig 0477): la riga esiste ma il prezzo e' un
+    /// PLACEHOLDER a zero. Trattarla come un prezzo darebbe `Some(0.0)`, cioe' un
+    /// turno dichiarato gratuito: il freno di spesa lo sommerebbe come nulla e non
+    /// scatterebbe mai. La distinzione fra "costa zero" e "non so quanto costa"
+    /// vive qui, ed e' l'unica cosa che separa i due esiti.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn turn_cost_usd_scarta_il_prezzo_dichiarato_ignoto(pool: PgPool) {
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                pricing_state: "unknown",
+                tariffe: (0.0, 0.0),
+                ..riga_viva("claude-x")
+            },
         )
-        .bind(run_id)
-        .bind(step_index)
-        .bind(tool_name)
-        .bind(json!({}))
-        .bind(created_at_iso)
-        .execute(pool)
-        .await
-        .expect("insert step at");
+        .await;
+
+        assert_eq!(
+            turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire()).await,
+            None,
+            "pricing_state='unknown' non e' un prezzo: nessun costo va calcolato, \
+             nemmeno lo zero che le tariffe placeholder produrrebbero"
+        );
     }
 
-    /// FIX shadow LLM-Replay (difesa in profondita'): con `step_index` DUPLICATI
-    /// (ondate retry/fallback del primario) l'ordine di `load_replay_steps` deve
-    /// seguire `created_at` (tiebreak `step_index`, poi `id`), NON il solo
-    /// `step_index`. Un ordinamento per solo `step_index` mescolerebbe le ondate.
-    #[sqlx::test]
-    async fn load_replay_steps_ordina_per_created_at_con_step_index_duplicati(pool: PgPool) {
-        create_tables(&pool).await;
-        let run = insert_run(&pool, Some("done")).await;
-        // Ondate con step_index COLLIDENTI ma created_at crescente nell'ordine reale:
-        // ondata 1 (idx 0,1) PRIMA, poi ondata 2 (idx 0,1 di nuovo, retry) DOPO.
-        // Inserimento volutamente FUORI ordine per dimostrare che e' la query a
-        // ordinare (non l'ordine di insert).
-        insert_step_at(&pool, run, 1, "w2_b", "2026-06-27T10:00:04Z").await; // ondata 2, secondo
-        insert_step_at(&pool, run, 0, "w1_a", "2026-06-27T10:00:01Z").await; // ondata 1, primo
-        insert_step_at(&pool, run, 1, "w1_b", "2026-06-27T10:00:02Z").await; // ondata 1, secondo
-        insert_step_at(&pool, run, 0, "w2_a", "2026-06-27T10:00:03Z").await; // ondata 2, primo
+    /// Listino non leggibile (DB in errore): `None` e nessun panico. E' il ramo
+    /// che tiene il turno in piedi quando la contabilita' non e' disponibile —
+    /// far fallire la chiamata LLM per un problema di prezzo sarebbe un outage.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn turn_cost_usd_su_listino_illeggibile_resta_none(pool: PgPool) {
+        seed_prezzo(&pool, riga_viva("claude-x")).await;
+        // Il prezzo c'e' e sarebbe calcolabile: e' la lettura a rompersi.
+        assert!(turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire())
+            .await
+            .is_some());
 
-        let steps = load_replay_steps(&pool, run).await.expect("load steps");
-        let order: Vec<&str> = steps.iter().map(|s| s.tool_name.as_str()).collect();
+        sqlx::query("DROP TABLE ai_price_catalog CASCADE")
+            .execute(&pool)
+            .await
+            .expect("drop del catalog");
+
         assert_eq!(
-            order,
-            vec!["w1_a", "w1_b", "w2_a", "w2_b"],
-            "ordine = created_at, NON mescolato per solo step_index"
+            turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire()).await,
+            None,
+            "errore di lettura del listino -> costo non calcolabile, mai un numero"
         );
     }
 }

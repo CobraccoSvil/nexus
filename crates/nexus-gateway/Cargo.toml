@@ -47,5 +47,18 @@ thiserror = "1.0"
 base64.workspace = true
 nexus-cache = { path = "../nexus-cache" }
 nexus-auth = { path = "../nexus-auth" }
+nexus-pricing = { path = "../nexus-pricing" }
 # Punto unico del secret scanner su stringa (redazione prompt/output, regola L).
 nexus-tool-kit = { path = "../nexus-tool-kit" }
+# Punto unico della PRESENTAZIONE degli errori (error_presentation): il gateway
+# e' l'ultimo posto dove status, codice strutturato, provider e modello sono
+# ancora VIVI, quindi e' qui che la frase per l'utente deve nascere. Nessun ciclo:
+# nexus-gateway non e' dipendenza di nexus-types (ne' di alcun altro crate).
+nexus-types = { path = "../nexus-types" }
+
+[dev-dependencies]
+# Schema META (`db/migrations`) per i `#[sqlx::test]` della scrittura di ledger:
+# il test deve rileggere le colonne DAL database vero, non da una fixture
+# ricopiata, altrimenti non puo' dimostrare che il valore bindato in posizione N
+# finisce nella colonna N (regola O). Vedi crates/nexus-migrations-embedded.
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }

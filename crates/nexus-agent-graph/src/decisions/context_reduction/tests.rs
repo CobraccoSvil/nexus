@@ -772,3 +772,42 @@ fn contents_eligible_solo_tool_result_lunghi_sotto_cutoff() {
     let eligible = contents_eligible_for_offload(&hist, 2, 10);
     assert_eq!(eligible, vec![long]);
 }
+
+/// REGRESSIONE (26/07/2026): il cap di sicurezza del token brake teneva "primo
+/// human + ultimi 2" tagliando per INDICI, senza guardare l'accoppiamento
+/// tool_use/tool_result. Se la coda si apriva con un tool_result, il suo
+/// tool_use restava fuori e il payload usciva con piu' risposte che chiamate:
+/// Mistral rifiuta con 400 "Not the same number of function calls and
+/// responses" e il run muore per un difetto di costruzione, non per il compito.
+#[test]
+fn il_cap_hard_non_lascia_un_tool_result_orfano_in_testa() {
+    let hist = vec![
+        human_text("domanda iniziale"),
+        ai_text("ragionamento lungo"),
+        ai_text("assistant che apre le tool-call"),
+        tool_msg("call_1", "risultato del tool"),
+        ai_text("conclusione"),
+    ];
+    // Stima sempre oltre la finestra: forza il ramo del cap di sicurezza.
+    let sempre_oltre = |_: &[HistoryMessage]| 10_000_i64;
+    let cfg = TokenBrakeConfig {
+        max_context_ratio: 0.7,
+        aggressive_keep_recent: 3,
+        aggressive_max_chars: 200,
+    };
+    let out = apply_token_brake(&hist, 100, &cfg, &sempre_oltre);
+
+    assert!(
+        !out.is_empty(),
+        "il cap non deve svuotare la history: {} messaggi",
+        out.len()
+    );
+    // Il primo messaggio DOPO l'eventuale human iniziale non puo' essere un
+    // tool_result: sarebbe orfano del suo tool_use.
+    let primo_non_human = out.iter().find(|m| !m.is_human);
+    assert!(
+        primo_non_human.is_some_and(|m| !m.is_tool),
+        "la coda tenuta si apre con un tool_result orfano: {:?}",
+        out.iter().map(|m| (m.is_human, m.is_tool)).collect::<Vec<_>>()
+    );
+}

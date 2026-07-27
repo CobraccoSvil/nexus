@@ -604,6 +604,24 @@ pub fn is_skipped_dir(name: &str) -> bool {
         || name == "target"
         || name == "dist"
         || name == "build"
+        || name == "coverage"
+        || name == "__pycache__"
+        || name == "venv"
+}
+
+/// Punto unico path-based (regola L): vero se `path`, relativizzato a `root`,
+/// attraversa un componente per cui `is_skipped_dir` e' vero. Il confronto e'
+/// per COMPONENTE di path, mai per substring con '/': su Windows i separatori
+/// sono '\' e un filtro substring non matcha mai (incidente stack overflow
+/// 20/07, fix 0453c3cf). Il root stesso non viene valutato, quindi un vault
+/// chiamato `.nexus-vault` resta osservabile. Se `root` non e' prefisso di
+/// `path` viene valutato il path intero, dot-dir incluse: il chiamante deve
+/// passare un root reale.
+pub fn is_in_skipped_dir(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative
+        .components()
+        .any(|c| is_skipped_dir(&c.as_os_str().to_string_lossy()))
 }
 
 // ── Rust toolchain ────────────────────────────────────────────────────────
@@ -1168,5 +1186,53 @@ mod tests {
         assert!(ros.read_only && ros.can_execute_subproc);
         let ws = NexusToolSafety::write_subproc();
         assert!(ws.can_write_filesystem && ws.can_execute_subproc);
+    }
+
+    #[test]
+    fn is_in_skipped_dir_confronta_per_componente() {
+        use std::path::Path;
+        let root = Path::new("/vault");
+        assert!(is_in_skipped_dir(
+            Path::new("/vault/node_modules/pkg/readme.md"),
+            root
+        ));
+        assert!(is_in_skipped_dir(Path::new("/vault/.git/x.md"), root));
+        assert!(is_in_skipped_dir(Path::new("/vault/sub/.venv/lib/x.md"), root));
+        assert!(is_in_skipped_dir(
+            Path::new("/vault/api/__pycache__/m.md"),
+            root
+        ));
+        assert!(!is_in_skipped_dir(Path::new("/vault/adr/0010.md"), root));
+        // Componente esatto, non substring: "retargeting" contiene "target"
+        // ma non e' la directory "target".
+        assert!(!is_in_skipped_dir(Path::new("/vault/retargeting/x.md"), root));
+        // Il root dot-dir (.nexus-vault) non conta: si valuta solo il relativo.
+        let dotroot = Path::new("/docs/.nexus-vault");
+        assert!(!is_in_skipped_dir(
+            Path::new("/docs/.nexus-vault/adr/a.md"),
+            dotroot
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_in_skipped_dir_regressione_backslash_windows() {
+        use std::path::Path;
+        // Incidente 20/07: i filtri substring "/.git/", "/node_modules/" ecc.
+        // non matchano mai i separatori '\' e il wiki watcher reingeriva i
+        // .md di node_modules e site-packages interi.
+        let root = Path::new(r"D:\IDEAI\docs\.nexus-vault");
+        assert!(is_in_skipped_dir(
+            Path::new(r"D:\IDEAI\docs\.nexus-vault\node_modules\pkg\readme.md"),
+            root
+        ));
+        assert!(is_in_skipped_dir(
+            Path::new(r"D:\IDEAI\docs\.nexus-vault\.venv\Lib\site-packages\x.md"),
+            root
+        ));
+        assert!(!is_in_skipped_dir(
+            Path::new(r"D:\IDEAI\docs\.nexus-vault\adr\0010-porte.md"),
+            root
+        ));
     }
 }

@@ -1,4 +1,4 @@
-//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
+﻿//! Orchestrazione NATIVA dei sub-agenti (porting Rust di `/agent/subagent-run`).
 //!
 //! Verso zero-Python: prima `dispatch_subagent` (in `nexus-agent-tools`) chiamava
 //! l'endpoint REST `POST /agent/subagent-run` del brain Python, che eseguiva un
@@ -160,7 +160,7 @@ struct SubagentDefinition {
 }
 
 async fn fetch_definition(
-    ctx: &AgentToolContext,
+    db: &sqlx::PgPool,
     kind: &str,
 ) -> Result<Option<SubagentDefinition>, String> {
     let row = sqlx::query(
@@ -168,7 +168,7 @@ async fn fetch_definition(
          FROM nexus_subagent_definitions WHERE kind = $1 LIMIT 1",
     )
     .bind(kind)
-    .fetch_optional(&*ctx.core.db)
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("query definition: {e}"))?;
     let Some(row) = row else {
@@ -240,12 +240,17 @@ async fn resolve_system_text(ctx: &AgentToolContext, prompt_key: &str) -> String
 /// `declared_outcome`, cosi' il gate G1 (`route_after_executor`) onora la
 /// chiusura su `end_turn` invece di re-instradare all'executor. `task_complete`
 /// e' il canale UNIVERSALE (builtin del run principale); le figure del consiglio
-/// usano `advisory_verdict`, il revisore `review_verdict` come loro equivalente
-/// di ruolo (parere strutturato = dichiarazione d'esito).
-const COMPLETION_CHANNEL_TOOLS: [&str; 3] =
-    ["task_complete", "advisory_verdict", "review_verdict"];
+/// usano `advisory_verdict`, il revisore `review_verdict` e l'avvocato del
+/// dibattito `debate_position` come loro equivalente di ruolo (dichiarazione
+/// strutturata = dichiarazione d'esito).
+const COMPLETION_CHANNEL_TOOLS: [&str; 4] = [
+    "task_complete",
+    "advisory_verdict",
+    "review_verdict",
+    "debate_position",
+];
 
-fn build_tools_json(whitelist: &[String]) -> Value {
+pub(crate) fn build_tools_json(whitelist: &[String]) -> Value {
     if whitelist.is_empty() {
         return json!([]);
     }
@@ -339,8 +344,57 @@ async fn current_chain_depth(pool: &sqlx::PgPool, dispatcher_run_id: Uuid) -> i6
     .unwrap_or(0)
 }
 
+/// Adotta i totali AUTORITATIVI del ledger sui contatori del sub-run.
+///
+/// Un sub-run e' un run a se': il gateway gli scrive le proprie righe di
+/// `ai_usage_ledger`, una per chiamata LLM. `NativeRunOutcome` invece porta i
+/// contatori dell'ULTIMO TURNO — lo stato del grafo usa un reducer di tipo
+/// overwrite (vedi la doc dei campi in `native_engine.rs`). Pubblicarli come
+/// totale del sub-run sottostima tutte le iterazioni precedenti: misurato
+/// $0,0338 contro $0,1510 reali (4,5x) sul sub-run software_architect della
+/// chat 25, con la stessa firma su ogni sub-run multi-turno.
+///
+/// Il run di chat riconcilia gia' cosi' (`reconcile_run_cost_from_ledger`); per i
+/// sub-run la riconciliazione non era disattivata: non esisteva. La conseguenza
+/// peggiore non era cosmetica — `cumulative_cost` alimenta l'HARD CAP di spesa
+/// leggendo `nexus_subagent_runs.cost_usd`, quindi il freno vedeva $0,10 dove la
+/// spesa reale era $1,69 (16x).
+///
+/// `meta_db` DEVE essere il pool META: `ai_usage_ledger` vive li', mentre
+/// `nexus_subagent_runs`/`agent_runs` stanno sul pool del progetto.
+/// Best-effort come per il padre: senza righe contabilizzate i contatori del
+/// grafo restano invariati (nessun dato inventato).
+async fn adopt_ledger_totals(meta_db: &sqlx::PgPool, sub_run_id: Uuid, o: &mut NativeRunOutcome) {
+    let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
+    apply_ledger_to_outcome(o, &ledger);
+}
+
+/// Parte PURA di [`adopt_ledger_totals`] (testabile senza DB), speculare a
+/// `reconcile_run_cost_from_ledger` del run di chat. Ritorna `true` se ha adottato
+/// i totali del ledger.
+fn apply_ledger_to_outcome(
+    o: &mut NativeRunOutcome,
+    ledger: &crate::chat_messages::LedgerTotals,
+) -> bool {
+    if !ledger.has_rows() {
+        return false;
+    }
+    o.total_cost = ledger.total_cost;
+    o.prompt_tokens = ledger.prompt_tokens;
+    o.completion_tokens = ledger.completion_tokens;
+    o.total_tokens = ledger.coherent_total_tokens();
+    true
+}
+
 /// Costo cumulativo gia' speso dai sub-run su questo `parent_anchor` (hard cap).
-async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
+///
+/// PUNTO UNICO (regola L) dello speso di una catena di sub-run: lo usano il
+/// Guard 4 del prepare e il dimensionamento del dibattito (che deve vedere cosa
+/// il consiglio ha gia' consumato prima di finanziare gli avvocati). NB: i
+/// sub-run hanno `run_id` PROPRI nel ledger, quindi un'aggregazione per-run del
+/// padre NON li vedrebbe: la fonte e' `nexus_subagent_runs.cost_usd`, popolata
+/// alla finalizzazione di ogni figlio.
+pub(crate) async fn cumulative_cost(pool: &sqlx::PgPool, anchor: Uuid) -> f64 {
     // pool: gia' instradato sul progetto dal chiamante (nexus_subagent_runs migrata).
     sqlx::query_scalar::<_, f64>(
         "SELECT COALESCE(SUM(cost_usd), 0)::double precision \
@@ -413,17 +467,6 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
 }
 
 /// Handler del tool `dispatch_subagents` (batch parallelo di sub-run nativi).
-///
-/// DETERMINISMO/REPLAY: questo intero handler gira SOLO in `ExecMode::Real`. In
-/// Replay/Shadow il `ToolExecutorAdapter` rilegge il tool_result di
-/// `dispatch_subagents` da `agent_steps` (`execute_replay`) senza mai chiamare
-/// `execute_real`: il ramo isolato (worktree/apply, side-effect Real-only) non
-/// viene mai ricreato in shadow -> nessuna divergenza. L'apply e' l'unica fonte
-/// del commit e avviene solo qui, in Real.
-///
-/// Ramo sequenziale/condiviso: i guard per-sub (enabled/whitelist/depth/cost) sono
-/// valutati per ogni sub-run; nel batch il cost cap e' best-effort (race tollerata
-/// dato il cap conservativo).
 pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> String {
     let tasks = match input.get("tasks").and_then(|v| v.as_array()) {
         Some(a) if !a.is_empty() => a.clone(),
@@ -433,163 +476,143 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     if tasks.len() as u64 > batch_max_tasks {
         return err(&format!("troppi task in un batch (max {batch_max_tasks})"));
     }
-    let max_parallel = resolve_max_parallel(ctx, input).await;
-    let background = background_active(ctx, input).await;
-
-    let parsed = match parse_batch_tasks(&tasks) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-
-    if batch_wants_isolation(ctx, &parsed, background).await {
-        return run_batch_isolated(ctx, &parsed, max_parallel).await;
-    }
-
-    let results: Vec<Value> = if background {
-        run_batch_background(ctx, &parsed).await
-    } else {
-        run_waves(ctx, &parsed, max_parallel).await
-    };
-
-    compose_batch_output(ctx, results).await
-}
-
-/// Ondate concorrenti del batch: il valore chiesto dal chiamante, clampato al cap
-/// configurato in DB (regola G); assente -> il cap stesso.
-async fn resolve_max_parallel(ctx: &AgentToolContext, input: &Value) -> usize {
     let configured_max = read_max_parallel_subagents(ctx).await;
-    input
+    let max_parallel = input
         .get("max_parallel")
         .and_then(|v| v.as_u64())
         .unwrap_or(configured_max)
-        .clamp(1, configured_max) as usize
-}
+        .clamp(1, configured_max) as usize;
+    // Fase D fan-in: dispatch asincrono dell'intero batch, opt-in dal param
+    // `background` (ora nello schema) gattato dal kill-switch DB (regola G/H). Il
+    // ramo ISOLATO non supporta il background (l'apply serializzato dei worktree
+    // esige che i sub-run siano TERMINATI prima di promuovere): quando
+    // `background=true` il batch salta l'isolamento e va sempre sul ramo
+    // sequenziale con `is_background=true` (scelta piu' semplice e sicura). Letto
+    // come CAMPO strutturato (regola M).
+    let background = background_active(ctx, input).await;
 
-/// Gating dell'isolamento fisico (regola G + L): il ramo ISOLATO scatta SOLO se
-///  (1) il flag DB `orchestrator.subagent_isolation_enabled` e' ON (cache 60s) E la
-///      root del progetto e' isolabile (probe git fail-closed), E
-///  (2) i `write_scope` dei task sono banalmente disgiunti (funzione pura di PR1,
-///      punto unico).
-/// Altrimenti DEGRADA al ramo sequenziale/condiviso (identico a oggi). Con flag OFF
-/// (default) -> sempre sequenziale -> comportamento BIT-IDENTICO.
-///
-/// L'I/O (flag DB + probe git) resta separato dalla decisione PURA: il probe scatta
-/// solo se il flag e' ON (`compute_isolation_available` corto-circuita), poi la
-/// disgiunzione e' pura e testabile (`should_isolate_batch`).
-///
-/// Il `background` salta l'isolamento senza alcun probe: il ramo isolato esige
-/// sub-run TERMINATI per l'apply serializzato dei worktree, incompatibile col
-/// fire-and-forget. Il batch background va sempre sul ramo sequenziale con
-/// `is_background=true` (scelta piu' semplice e sicura).
-async fn batch_wants_isolation(
-    ctx: &AgentToolContext,
-    parsed: &[ParsedTask],
-    background: bool,
-) -> bool {
-    let isolation_available = !background && compute_isolation_available(ctx).await;
-    let scopes: Vec<Vec<String>> = parsed.iter().map(|p| p.write_scope.clone()).collect();
-    should_isolate_batch(isolation_available, &scopes)
-}
-
-/// PUNTO UNICO (regola L) del ramo sequenziale/condiviso: esegue i sub-run a
-/// ONDATE concorrenti di al piu' `max_parallel` (cap conservativo), in ordine di
-/// task. Condiviso dal batch principale e dal degrado dall'isolamento
-/// ([`run_batch_sequential`]) — prima le due ondate erano copie divergibili.
-/// Mai background: il fire-and-forget ha il suo ramo ([`run_batch_background`]),
-/// e il degrado dall'isolamento lo esclude per costruzione.
-async fn run_waves(
-    ctx: &AgentToolContext,
-    parsed: &[ParsedTask],
-    max_parallel: usize,
-) -> Vec<Value> {
-    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
-    for wave in parsed.chunks(max_parallel) {
-        let futs = wave.iter().map(|p| {
-            run_single_subagent(
-                ctx,
-                &p.kind,
-                &p.task,
-                &p.context_blob,
-                &p.expected,
-                None,
-                false,
-            )
-        });
-        results.extend(futures::future::join_all(futs).await);
-    }
-    results
-}
-
-/// PUNTO UNICO (regola L) del parse dei task del batch: valida i campi
-/// obbligatori e normalizza i facoltativi. `Err(String)` e' gia' il tool_result
-/// d'errore da restituire al chiamante (fail-fast sul primo task invalido, come
-/// prima: nessun task del batch parte se uno solo e' malformato).
-fn parse_batch_tasks(tasks: &[Value]) -> Result<Vec<ParsedTask>, String> {
     let mut parsed: Vec<ParsedTask> = Vec::with_capacity(tasks.len());
     for (i, t) in tasks.iter().enumerate() {
-        let kind = str_field(t, "kind");
-        let task = str_field(t, "task");
+        let kind = t
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let task = t
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if kind.is_empty() || task.trim().is_empty() {
-            return Err(err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori")));
+            return err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori"));
         }
+        let context_blob = t
+            .get("context")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let expected = t
+            .get("expected_output_format")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
+        // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false ->
+        // ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in `dispatch_wave`.
+        let write_scope = write_scope_of(t);
         parsed.push(ParsedTask {
             kind,
             task,
-            context_blob: str_field(t, "context"),
-            expected: str_field(t, "expected_output_format"),
-            // FASE 2: `write_scope` dichiarato dal task (aree file che il sub-run
-            // scrive). Assente/vuoto -> `subtasks_are_disjoint` degradera' a false
-            // -> ramo sequenziale (sicuro). Fonte: `Todo.write_scope` in
-            // `dispatch_wave`.
-            write_scope: write_scope_of(t),
+            context_blob,
+            expected,
+            write_scope,
         });
     }
-    Ok(parsed)
-}
 
-/// Campo stringa di un task del batch; assente o di tipo diverso -> stringa vuota
-/// (i campi obbligatori sono validati a parte da [`parse_batch_tasks`]).
-fn str_field(t: &Value, key: &str) -> String {
-    t.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
+    // ── Gating isolamento (regola G + L): il ramo ISOLATO scatta SOLO se
+    //    (1) il flag DB `orchestrator.subagent_isolation_enabled` e' ON (cache 60s)
+    //        E la root del progetto e' isolabile (probe git fail-closed), E
+    //    (2) i `write_scope` dei task sono banalmente disgiunti (funzione pura di
+    //        PR1, punto unico). Altrimenti DEGRADA al ramo sequenziale/condiviso
+    //        (identico a oggi). Con flag OFF (default) -> sempre sequenziale ->
+    //        comportamento BIT-IDENTICO. ─────────────────────────────────────────
+    //
+    // L'apply e' l'unica fonte del commit del sub-run isolato e avviene solo qui.
+    let scopes: Vec<Vec<String>> = parsed.iter().map(|p| p.write_scope.clone()).collect();
+    // I/O (flag DB + probe git) separato dalla decisione pura: il probe scatta solo
+    // se il flag e' ON (compute_isolation_available corto-circuita), poi la
+    // disgiunzione e' pura e testabile (should_isolate_batch).
+    // Il background salta l'isolamento (vedi doc sopra): il ramo isolato esige
+    // sub-run terminati per l'apply serializzato, incompatibile con il fire-and-forget.
+    let isolation_available = !background && compute_isolation_available(ctx).await;
+    if should_isolate_batch(isolation_available, &scopes) {
+        return run_batch_isolated(ctx, &parsed, max_parallel).await;
+    }
 
-/// tool_result del batch: conteggi + fan-in + verdetti compositi. Tutto deriva dai
-/// SEGNALI STRUTTURATI dei risultati (regola M), mai dalla prosa dei `summary`.
-///
-/// - `background_dispatched`/`child_run_ids`: i figli dispatchati in background,
-///   cosi' il padre si sospende e riprende quando terminano.
-/// - `panel_verdict` (Fase C, coordinatore avversario): se almeno un sub-run ha
-///   dichiarato un `outcome.review`, il punto unico `compose_panel_verdict` compone
-///   il verdetto aggregato. I sub-run non-review non hanno `review` e il panel non
-///   viene aggiunto. Le review sono read-only (write_scope vuoto) -> restano nel
-///   ramo sequenziale.
-/// - `advisory_synthesis` (consiglio a monte): simmetrico al panel di review su
-///   `outcome.advisory`. Il coordinatore (run padre) la legge per costruire il
-///   piano rispettando i requisiti e fermandosi sui veti (verdict=block).
-async fn compose_batch_output(ctx: &AgentToolContext, results: Vec<Value>) -> String {
+    // ── Ramo sequenziale/condiviso (invariato con background=false) ────────────
+    // Esecuzione a ondate concorrenti (cap conservativo). I guard per-sub
+    // (enabled/whitelist/depth/cost) sono valutati per ogni sub-run; nel batch
+    // il cost cap e' best-effort (race tollerata dato il cap conservativo).
+    let results: Vec<Value> = if background {
+        // BACKGROUND: PREPARE-ALL poi SPAWN-ALL (bug fan-in prematuro). Se
+        // preparassimo+spawnassimo una alla volta, il 1o figlio potrebbe terminare
+        // (task detached) mentre gli altri non sono ancora in nexus_subagent_runs
+        // -> la COUNT del fan-in vedrebbe 0 rimasti -> enqueue PREMATURO del parent.
+        // Inserendo TUTTE le row (running, is_background=true) PRIMA di spawnare
+        // qualunque esecuzione, la COUNT e' corretta gia' quando il 1o figlio
+        // chiude. I guard falliti producono un Value di errore (nessuna row
+        // inserita, nessuno spawn per quel task).
+        run_batch_background(ctx, &parsed).await
+    } else {
+        let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+        for wave in parsed.chunks(max_parallel) {
+            let futs = wave.iter().map(|p| {
+                run_single_subagent(
+                    ctx,
+                    &p.kind,
+                    &p.task,
+                    &p.context_blob,
+                    &p.expected,
+                    None,
+                    false,
+                )
+            });
+            let wave_res = futures::future::join_all(futs).await;
+            results.extend(wave_res);
+        }
+        results
+    };
+
+    // Fan-in (regola M): raccogli i figli che hanno risposto col SEGNALE
+    // STRUTTURATO `background_dispatched` (mai parsing di prosa) + i loro run_id,
+    // cosi' il padre si sospende e riprende quando i sub-run background terminano.
     let child_run_ids: Vec<Value> = results
         .iter()
         .filter(|r| r.get("background_dispatched").and_then(Value::as_bool) == Some(true))
         .filter_map(|r| r.get(K_SUB_RUN_ID).cloned())
         .collect();
+    let any_background = !child_run_ids.is_empty();
+
     let ok = results.iter().filter(|r| r.get("error").is_none()).count();
-    let outcomes: Vec<Value> = results
-        .iter()
-        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
-        .collect();
     let mut out = json!({
         "count": results.len(),
         "ok": ok,
         "failed": results.len() - ok,
         "results": results,
     });
-    if !child_run_ids.is_empty() {
+    if any_background {
         out["background_dispatched"] = json!(true);
         out["child_run_ids"] = json!(child_run_ids);
     }
+    // Fase C (coordinatore avversario, regola L/M): se il batch e' un PANEL di
+    // review (almeno un sub-run ha dichiarato un `review`), compone il verdetto
+    // aggregato dai segnali strutturati `outcome.review` — mai dalla prosa. I
+    // sub-run non-review non hanno `review` e il panel non viene aggiunto. Le
+    // review sono read-only (write_scope vuoto) -> restano nel ramo sequenziale.
+    let outcomes: Vec<Value> = results
+        .iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
     if let Some(panel) = nexus_agent_graph::decisions::compose_panel_verdict(
         &outcomes,
         &read_quorum_policy(ctx).await,
@@ -723,17 +746,6 @@ fn should_isolate_batch(isolation_available: bool, scopes: &[Vec<String>]) -> bo
 ///  7. CLEANUP GARANTITO: `remove_worktree` per OGNI handle in OGNI esito (il
 ///     cleanup e' esplicito e async — mai Drop sincrono su runtime tokio, finding
 ///     del design; teardown idempotente e tollerante ai lock Windows).
-///
-/// LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in `worktree.rs`): il passo
-/// (0) serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
-/// progetto (GC -> creazione worktree -> ondate -> apply -> cleanup). Due batch
-/// isolati concorrenti sullo STESSO progetto (session distinte, stessa
-/// project_root: la guardia 409 e' per-session, non per-progetto) vengono
-/// serializzati qui. Chiude insieme D1 (merge/commit concorrenti sulla stessa
-/// `.git` -> index corrotto) e D2 (il GC di un batch che cancella i worktree in
-/// volo di un altro: quando il secondo batch ottiene il lock, il primo ha gia'
-/// applicato e ripulito i suoi worktree). Il guard e' `OwnedMutexGuard<()>` (Send,
-/// `'static`): tenerlo attraverso i `.await` delle ondate join_all e' corretto.
 async fn run_batch_isolated(
     ctx: &AgentToolContext,
     parsed: &[ParsedTask],
@@ -742,56 +754,42 @@ async fn run_batch_isolated(
     let root = ctx.core.root_path.clone();
     let project_id = ctx.core.project_id;
     let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await;
+        match crate::project_db_routes::project_data_pool_from(&ctx.core.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                // DB progetto non disponibile: impossibile prenotare le row
+                // sub-run dell'isolamento. Stesso trattamento di head_commit
+                // fallito: degrada al ramo sequenziale (i singoli sub-run
+                // produrranno i loro rifiuti strutturati se il DB resta giu').
+                tracing::warn!(
+                    target: "mcp_core::subagent_native",
+                    project_id = %project_id,
+                    error = %e,
+                    "isolamento: DB progetto non disponibile, degrado a sequenziale"
+                );
+                return run_batch_sequential(ctx, parsed, max_parallel).await;
+            }
+        };
 
-    // (0) LOCK PER-ROOT CROSS-BATCH (vedi doc): serializza l'INTERA sezione che
-    //     tocca l'area `.git`/worktree condivisa del progetto. Rilascio naturale a
-    //     fine funzione (Drop).
+    // (0) LOCK PER-ROOT CROSS-BATCH (regola H + L, punto unico in worktree.rs):
+    //     serializza l'INTERA sezione che tocca l'area `.git`/worktree condivisa del
+    //     progetto (GC -> creazione worktree -> ondate -> apply -> cleanup). Due batch
+    //     isolati concorrenti sullo STESSO progetto (session distinte, stessa
+    //     project_root: la guardia 409 e' per-session, non per-progetto) vengono
+    //     serializzati qui. Chiude insieme D1 (merge/commit concorrenti sulla stessa
+    //     .git -> index corrotto) e D2 (il GC di un batch che cancella i worktree in
+    //     volo di un altro: quando il secondo batch ottiene il lock, il primo ha gia'
+    //     applicato e ripulito i suoi worktree). Il guard e' `OwnedMutexGuard<()>`
+    //     (Send, `'static`): tenerlo attraverso i `.await` delle ondate join_all e'
+    //     corretto. Rilascio naturale a fine funzione (Drop).
     let _root_guard = nexus_tool_kit::worktree::lock_project_root(&root).await;
 
-    // (1) GC orfani dei batch PRECEDENTI (best-effort).
-    gc_orphan_worktrees_for_batch(&proj_pool, &root, project_id).await;
-
-    // (2) base commit del batch (una volta, riusato da ogni worktree e in replay).
-    let Some(base_commit) = batch_base_commit(&root).await else {
-        return run_batch_sequential(ctx, parsed, max_parallel).await;
-    };
-
-    // (3) Crea un worktree per ogni task, PRIMA dell'esecuzione. Se la creazione di
-    //     uno fallisce, degrada l'intero batch a sequenziale (cleanup di quelli gia'
-    //     creati garantito) — mai un batch a isolamento parziale.
-    let Some(handles) = create_batch_worktrees(&root, parsed.len(), &base_commit).await else {
-        return run_batch_sequential(ctx, parsed, max_parallel).await;
-    };
-
-    // (4) Esecuzione PARALLELA a ondate, ogni sub-run sul proprio worktree.
-    let mut results = run_isolated_waves(ctx, parsed, &handles, max_parallel).await;
-
-    // (5) APPLY SERIALIZZATO + raccolta dei file promossi per il reindex-once.
-    let promoted = apply_isolated_results(&root, &mut results, &handles).await;
-
-    // (6) CLEANUP GARANTITO di OGNI worktree, in OGNI esito.
-    remove_batch_worktrees(&handles).await;
-
-    // (7) Reindex UNA volta sui soli file promossi alla root (dedup dei path: piu'
-    //     sub-run potrebbero aver toccato lo stesso file solo se non-disgiunti, che
-    //     qui non accade, ma il dedup e' innocuo e barato).
-    reindex_promoted_once(ctx, &promoted).await;
-
-    batch_counts_output(results, Some(promoted.len()))
-}
-
-/// Bonifica i worktree residui di batch PRECEDENTI (crash / remove fallito).
-/// Preserva i worktree dei sub-run ancora `running` (batch concorrente sullo stesso
-/// progetto): passa come "attivi" i loro run_id dal DB, cosi' il GC non tocca
-/// risorse legittime (regola E). Best-effort.
-async fn gc_orphan_worktrees_for_batch(
-    proj_pool: &sqlx::PgPool,
-    root: &std::path::Path,
-    project_id: Uuid,
-) {
-    let active_run_ids = running_subagent_ids(proj_pool, project_id).await;
-    let removed = nexus_tool_kit::worktree::gc_orphan_worktrees(root, &active_run_ids).await;
+    // (1) GC orfani: bonifica i worktree residui di batch PRECEDENTI (crash / remove
+    //     fallito). Preserva i worktree dei sub-run ancora `running` (batch
+    //     concorrente sullo stesso progetto): passiamo come "attivi" i loro run_id
+    //     dal DB, cosi' il GC non tocca risorse legittime (regola E). Best-effort.
+    let active_run_ids = running_subagent_ids(&proj_pool, project_id).await;
+    let removed = nexus_tool_kit::worktree::gc_orphan_worktrees(&root, &active_run_ids).await;
     if removed > 0 {
         tracing::info!(
             target: "mcp_core::subagent_native",
@@ -799,38 +797,31 @@ async fn gc_orphan_worktrees_for_batch(
             "isolamento: GC ha bonificato worktree orfani prima del batch"
         );
     }
-}
 
-/// Commit di base del batch, risolto UNA volta e riusato da ogni worktree (e in
-/// replay). `None` = HEAD non risolvibile: il chiamante degrada al ramo sequenziale
-/// (mai fallire l'intero batch per un problema di setup dell'isolamento).
-async fn batch_base_commit(root: &std::path::Path) -> Option<String> {
-    match nexus_tool_kit::worktree::head_commit(root).await {
-        Ok(b) => Some(b),
+    // (2) base commit del batch (una volta, riusato da ogni worktree e in replay).
+    let base_commit = match nexus_tool_kit::worktree::head_commit(&root).await {
+        Ok(b) => b,
         Err(e) => {
+            // Impossibile risolvere HEAD: degrada al ramo sequenziale (mai fallire
+            // l'intero batch per un problema di setup isolamento).
             tracing::warn!(
                 target: "mcp_core::subagent_native",
                 error = %e,
                 "isolamento: head_commit fallito, degrado a sequenziale"
             );
-            None
+            return run_batch_sequential(ctx, parsed, max_parallel).await;
         }
-    }
-}
+    };
 
-/// Un worktree effimero per ogni task, TUTTI creati prima di eseguire qualunque
-/// sub-run. `None` = creazione fallita: i worktree gia' creati sono rimossi e il
-/// chiamante degrada l'intero batch a sequenziale — mai un batch a isolamento
-/// parziale.
-async fn create_batch_worktrees(
-    root: &std::path::Path,
-    count: usize,
-    base_commit: &str,
-) -> Option<Vec<nexus_tool_kit::worktree::WorktreeHandle>> {
-    let mut handles: Vec<nexus_tool_kit::worktree::WorktreeHandle> = Vec::with_capacity(count);
-    for _ in 0..count {
+    // (3) Crea un worktree per ogni task, PRIMA dell'esecuzione. Se la creazione di
+    //     uno fallisce, degrada l'intero batch a sequenziale (cleanup di quelli gia'
+    //     creati garantito) — mai un batch a isolamento parziale.
+    let mut handles: Vec<nexus_tool_kit::worktree::WorktreeHandle> =
+        Vec::with_capacity(parsed.len());
+    for _ in parsed {
         let run_id = Uuid::new_v4();
-        match nexus_tool_kit::worktree::create_ephemeral_worktree(root, run_id, base_commit).await {
+        match nexus_tool_kit::worktree::create_ephemeral_worktree(&root, run_id, &base_commit).await
+        {
             Ok(h) => handles.push(h),
             Err(e) => {
                 tracing::warn!(
@@ -838,23 +829,16 @@ async fn create_batch_worktrees(
                     error = %e,
                     "isolamento: create_ephemeral_worktree fallito, degrado a sequenziale"
                 );
-                remove_batch_worktrees(&handles).await;
-                return None;
+                // Cleanup dei worktree gia' creati prima di degradare.
+                for h in &handles {
+                    let _ = nexus_tool_kit::worktree::remove_worktree(h).await;
+                }
+                return run_batch_sequential(ctx, parsed, max_parallel).await;
             }
         }
     }
-    Some(handles)
-}
 
-/// Ondate concorrenti del ramo ISOLATO: come [`run_waves`] ma ogni sub-run gira sul
-/// PROPRIO worktree (`IsolationSlot`) invece che sulla root condivisa. Mai
-/// background: l'apply serializzato esige sub-run terminati.
-async fn run_isolated_waves(
-    ctx: &AgentToolContext,
-    parsed: &[ParsedTask],
-    handles: &[nexus_tool_kit::worktree::WorktreeHandle],
-    max_parallel: usize,
-) -> Vec<Value> {
+    // (4) Esecuzione PARALLELA a ondate, ogni sub-run sul proprio worktree.
     let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
     for wave in parsed
         .iter()
@@ -876,40 +860,34 @@ async fn run_isolated_waves(
                     &p.context_blob,
                     &p.expected,
                     Some(&slot),
+                    // Ramo ISOLATO: mai background (l'apply serializzato esige
+                    // sub-run terminati).
                     false,
                 )
                 .await
             }
         });
-        results.extend(futures::future::join_all(futs).await);
+        let wave_res = futures::future::join_all(futs).await;
+        results.extend(wave_res);
     }
-    results
-}
 
-/// APPLY SERIALIZZATO dei worktree (un worktree alla volta, mai concorrente:
-/// index/refs `.git` condivisi) e raccolta dei file promossi per il reindex-once.
-/// Solo i sub-run RIUSCITI (nessun campo "error" nel result) vengono applicati; un
-/// sub-run fallito lascia il suo worktree scartato = rollback naturale.
-///
-/// L'esito e' letto dall'enum `ApplyOutcome` (regola M, mai dalla prosa): un
-/// conflitto marca FALLITO quel solo sub-run (root intatta via merge --abort) e gli
-/// altri proseguono.
-async fn apply_isolated_results(
-    root: &std::path::Path,
-    results: &mut [Value],
-    handles: &[nexus_tool_kit::worktree::WorktreeHandle],
-) -> Vec<String> {
+    // (5) APPLY SERIALIZZATO (un worktree alla volta, mai concorrente) + raccolta
+    //     dei file promossi per il reindex-once. Solo i sub-run RIUSCITI (nessun
+    //     campo "error" nel result) vengono applicati; un sub-run fallito lascia il
+    //     suo worktree scartato = rollback naturale.
     let mut promoted: Vec<String> = Vec::new();
     for (idx, (result, handle)) in results.iter_mut().zip(handles.iter()).enumerate() {
         if result.get("error").is_some() {
             continue; // sub-run fallito: niente apply (worktree scartato).
         }
-        match nexus_tool_kit::worktree::apply_worktree_atomic(root, handle).await {
+        match nexus_tool_kit::worktree::apply_worktree_atomic(&root, handle).await {
             Ok(nexus_tool_kit::worktree::ApplyOutcome::Applied) => {
                 promoted.extend(nexus_tool_kit::worktree::promoted_files(handle).await);
             }
             Ok(nexus_tool_kit::worktree::ApplyOutcome::NoChanges) => {}
             Ok(nexus_tool_kit::worktree::ApplyOutcome::Conflict { files }) => {
+                // Esito strutturato (regola M): il sub-run e' fallito per conflitto,
+                // la root e' intatta (merge --abort), gli altri proseguono.
                 tracing::warn!(
                     target: "mcp_core::subagent_native",
                     task_index = idx,
@@ -939,15 +917,11 @@ async fn apply_isolated_results(
             }
         }
     }
-    promoted
-}
 
-/// Rimozione di OGNI worktree del batch, in OGNI esito (successo, conflitto,
-/// errore). Esplicita e async (mai Drop sincrono su runtime tokio), idempotente e
-/// tollerante ai lock Windows (`remove --force` nel modulo). Un fallimento e'
-/// loggato e ignorato: lo riprende il GC orfani del batch successivo.
-async fn remove_batch_worktrees(handles: &[nexus_tool_kit::worktree::WorktreeHandle]) {
-    for handle in handles {
+    // (6) CLEANUP GARANTITO di OGNI worktree, in OGNI esito (successo, conflitto,
+    //     errore). Esplicito e async (mai Drop sincrono). Idempotente e tollerante
+    //     ai lock Windows (remove --force nel modulo).
+    for handle in &handles {
         if let Err(e) = nexus_tool_kit::worktree::remove_worktree(handle).await {
             tracing::warn!(
                 target: "mcp_core::subagent_native",
@@ -957,6 +931,22 @@ async fn remove_batch_worktrees(handles: &[nexus_tool_kit::worktree::WorktreeHan
             );
         }
     }
+
+    // (7) Reindex UNA volta sui soli file promossi alla root (dedup dei path: piu'
+    //     sub-run potrebbero aver toccato lo stesso file solo se non-disgiunti, che
+    //     qui non accade, ma il dedup e' innocuo e barato).
+    reindex_promoted_once(ctx, &promoted).await;
+
+    let ok = results.iter().filter(|r| r.get("error").is_none()).count();
+    json!({
+        "count": results.len(),
+        "ok": ok,
+        "failed": results.len() - ok,
+        "isolated": true,
+        "promoted_files": promoted.len(),
+        "results": results,
+    })
+    .to_string()
 }
 
 /// Ramo BATCH BACKGROUND (Fase D fan-in): PREPARE-ALL poi SPAWN-ALL. Insersce
@@ -977,16 +967,19 @@ async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> 
     //     errore da restituire in ordine. Nessuno spawn ancora.
     let mut prepared: Vec<Result<SubagentExecInputs, Value>> = Vec::with_capacity(parsed.len());
     for p in parsed {
-        let req = SubagentRequest {
-            kind: &p.kind,
-            task: &p.task,
-            context_blob: &p.context_blob,
-            expected_format: &p.expected,
-            isolation: None,
-            is_background: true,
-            model_pin: None,
-        };
-        prepared.push(prepare_subagent_run(ctx, &req).await);
+        prepared.push(
+            prepare_subagent_run(
+                ctx,
+                &p.kind,
+                &p.task,
+                &p.context_blob,
+                &p.expected,
+                None,
+                true,
+                None,
+            )
+            .await,
+        );
     }
     // (2) SPAWN-ALL: solo ORA che TUTTE le row sono inserite, spawna le esecuzioni.
     //     Il 1o figlio che chiude vede in nexus_subagent_runs anche gli altri
@@ -1000,40 +993,40 @@ async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> 
         .collect()
 }
 
-/// Degrado dall'isolamento al ramo sequenziale/condiviso: stesse ondate del ramo
-/// principale ([`run_waves`], punto unico), `working_root=None` -> comportamento
-/// invariato. Mai background: questo ramo e' raggiunto solo dal fallback
-/// dell'isolato, che il background esclude a monte.
+/// Ramo sequenziale/condiviso estratto per il degrado dall'isolamento (stessa
+/// logica del ramo principale di `tool_dispatch_subagents`, punto unico). `None`
+/// come `working_root` -> comportamento invariato.
 async fn run_batch_sequential(
     ctx: &AgentToolContext,
     parsed: &[ParsedTask],
     max_parallel: usize,
 ) -> String {
-    batch_counts_output(run_waves(ctx, parsed, max_parallel).await, None)
-}
-
-/// tool_result minimale del batch (conteggi + risultati), con i campi
-/// dell'isolamento quando `promoted` e' valorizzato. PUNTO UNICO (regola L) della
-/// forma condivisa dal ramo isolato e dal suo degrado a sequenziale; il ramo
-/// principale ci aggiunge fan-in e verdetti compositi via [`compose_batch_output`].
-///
-/// `results` e' inserito PER ULTIMO di proposito: `serde_json` gira con
-/// `preserve_order` (IndexMap), quindi l'ordine di inserimento e' l'ordine delle
-/// chiavi nel JSON emesso — questo riproduce esattamente quello storico dei due
-/// rami (`count, ok, failed[, isolated, promoted_files], results`).
-fn batch_counts_output(results: Vec<Value>, promoted: Option<usize>) -> String {
+    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+    for wave in parsed.chunks(max_parallel) {
+        let futs = wave.iter().map(|p| {
+            // Degrado dell'isolamento a sequenziale: mai background (questo ramo e'
+            // raggiunto solo dal fallback dell'isolato, che esclude il background).
+            run_single_subagent(
+                ctx,
+                &p.kind,
+                &p.task,
+                &p.context_blob,
+                &p.expected,
+                None,
+                false,
+            )
+        });
+        let wave_res = futures::future::join_all(futs).await;
+        results.extend(wave_res);
+    }
     let ok = results.iter().filter(|r| r.get("error").is_none()).count();
-    let mut out = json!({
+    json!({
         "count": results.len(),
         "ok": ok,
         "failed": results.len() - ok,
-    });
-    if let Some(promoted_files) = promoted {
-        out["isolated"] = json!(true);
-        out["promoted_files"] = json!(promoted_files);
-    }
-    out["results"] = json!(results);
-    out.to_string()
+        "results": results,
+    })
+    .to_string()
 }
 
 /// Reindex UNA volta i file effettivamente promossi alla root dopo l'apply
@@ -1359,10 +1352,14 @@ pub(crate) struct FigureAdvisoryReport {
 /// Esito del pre-step Consiglio delle Competenze: sintesi attiva o degrado esplicito.
 /// `None` dal call site significa che i gate pre-convocazione non sono passati
 /// (feature off, keyword miss, nessuna figura): nessun segnale UI.
+///
+/// `synthesis` e' BOXATA: la sintesi e' molto piu' grande del ramo degradato
+/// (che porta solo un enum di causa), e senza indirezione ogni valore dell'enum
+/// — anche i degradi — pagherebbe la dimensione del caso peggiore.
 #[derive(Debug, Clone)]
 pub(crate) enum CouncilConveneOutcome {
     Active {
-        synthesis: AdvisorySynthesis,
+        synthesis: Box<AdvisorySynthesis>,
         figures: Vec<String>,
         figure_reports: Vec<FigureAdvisoryReport>,
     },
@@ -1435,10 +1432,13 @@ pub(crate) struct PanelProviderEntry {
 }
 
 /// Esito del panel multi-provider: sintesi attiva oppure degrado esplicito.
+/// `synthesis` BOXATA per lo stesso motivo di [`CouncilConveneOutcome`]: il ramo
+/// degradato porta solo due contatori e non deve pagare la dimensione della
+/// sintesi.
 #[derive(Debug, Clone)]
 pub(crate) enum MultiProviderPanelOutcome {
     Active {
-        synthesis: AdvisorySynthesis,
+        synthesis: Box<AdvisorySynthesis>,
         provider_count: usize,
         panel_providers: Vec<PanelProviderEntry>,
         /// Parere INDIVIDUALE di ogni provider (prima della sintesi): provenienza
@@ -1583,6 +1583,189 @@ pub(crate) async fn read_multi_provider_config(db: &sqlx::PgPool) -> Option<Mult
     })
 }
 
+// ── Dimensionamento orchestrazione (mig 0602) ──────────────────────────────
+// Loader I/O del resolver PURO `orchestration_sizing` (regola L: la decisione
+// vive nel modulo puro di nexus-agent-graph; qui SOLO la lettura di settings,
+// definitions e listino, coi safe-default che coincidono coi seed della mig).
+
+/// Backstop ASSOLUTI del dimensionamento: le STESSE chiavi storiche dei cap
+/// (nessuna seconda fonte di verita'). Il resolver decide, questi limano.
+pub(crate) async fn read_orchestration_backstops(
+    db: &sqlx::PgPool,
+) -> nexus_agent_graph::decisions::orchestration_sizing::OrchestrationBackstops {
+    async fn usize_setting(db: &sqlx::PgPool, key: &str, default: usize) -> usize {
+        nexus_auth::get_setting(db, key)
+            .await
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+    let multi_provider_max =
+        usize_setting(db, "orchestrator.multi_provider_max_providers", 3)
+            .await
+            .max(1);
+    nexus_agent_graph::decisions::orchestration_sizing::OrchestrationBackstops {
+        council_max: usize_setting(db, "orchestrator.council_max_figures", 6)
+            .await
+            .max(1),
+        review_max: usize_setting(db, "orchestrator.review_panel_size", 2)
+            .await
+            .max(1),
+        multi_provider_min: usize_setting(db, "orchestrator.multi_provider_min_providers", 2)
+            .await
+            .max(1)
+            .min(multi_provider_max),
+        multi_provider_max,
+        debate_max: usize_setting(db, "orchestrator.debate_max_advocates", 4).await,
+        fanout_max_parallel: fanout_max_parallel(db).await,
+    }
+}
+
+/// Config del resolver di dimensionamento (chiavi mig 0602, regola G).
+pub(crate) async fn read_orchestration_sizing_config(
+    db: &sqlx::PgPool,
+) -> nexus_agent_graph::decisions::orchestration_sizing::OrchestrationSizingConfig {
+    use nexus_agent_graph::decisions::orchestration_sizing::parse_panel_priority;
+    let enabled = nexus_auth::get_bool_setting(db, "orchestrator.sizing_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let budget_share_pct = nexus_auth::get_setting(db, "orchestrator.sizing.budget_share_pct")
+        .await
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .unwrap_or(20)
+        .min(100);
+    let priority_csv = nexus_auth::get_setting(db, "orchestrator.sizing.panel_priority")
+        .await
+        .unwrap_or_default();
+    nexus_agent_graph::decisions::orchestration_sizing::OrchestrationSizingConfig {
+        enabled,
+        budget_share_pct,
+        panel_priority: parse_panel_priority(&priority_csv),
+    }
+}
+
+/// Profilo di DOMANDA per-classe (`orchestrator.sizing_profile_<class>`, JSON).
+/// Profilo assente o malformato -> `None`: il chiamante degrada al piano legacy
+/// (fail-safe, mai numeri inventati).
+pub(crate) async fn read_sizing_profile(
+    db: &sqlx::PgPool,
+    complexity: nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity,
+) -> Option<nexus_agent_graph::decisions::orchestration_sizing::PanelDemand> {
+    let key = format!("orchestrator.sizing_profile_{}", complexity.as_str());
+    let raw = nexus_auth::get_setting(db, &key).await?;
+    let v: Value = serde_json::from_str(raw.trim()).ok()?;
+    let field = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
+    Some(
+        nexus_agent_graph::decisions::orchestration_sizing::PanelDemand {
+            council_figures: field("council_figures")?,
+            reviewers: field("reviewers")?,
+            providers: field("providers")?,
+            advocates: field("advocates")?,
+        },
+    )
+}
+
+/// Stima UNITARIA di un sub-run advisory per il vincolo di budget. Il modello
+/// rappresentativo e' quello del purpose della PRIMA figura base del consiglio,
+/// risolto VIA TIER (`resolve_purpose_model_db`, mai un nome modello) e prezzato
+/// dal punto unico `nexus-pricing`. Se un anello manca (figura, purpose, tier,
+/// listino unknown) il costo resta 0.0 = vincolo NON calcolabile: il resolver
+/// non applica il cap di costo (regola M: nessun prezzo inventato).
+pub(crate) async fn read_panel_unit_estimate(
+    db: &sqlx::PgPool,
+) -> nexus_agent_graph::decisions::orchestration_sizing::PanelUnitEstimate {
+    let est_tokens = nexus_auth::get_setting(db, "orchestrator.sizing.est_subrun_tokens")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60_000);
+    let duration_s = nexus_auth::get_setting(db, "orchestrator.sizing.est_subrun_duration_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(240);
+    let cost_usd = panel_unit_cost(db, est_tokens).await.unwrap_or(0.0);
+    nexus_agent_graph::decisions::orchestration_sizing::PanelUnitEstimate {
+        cost_usd,
+        duration_s,
+    }
+}
+
+/// Tempo RESIDUO (secondi) della deadline del run primario (fase 3, mig 0604).
+/// PUNTO UNICO (regola L) usato dal clamp del timeout sub-run in prepare, dal
+/// resolver di dimensionamento pre-run e dalla review post-run. Derivato DAL DB
+/// (`agent_runs.created_at` del run ancorato + setting `agent.run_time_budget_s`):
+/// nessun threading di Instant nei ctx, vale per OGNI percorso di dispatch.
+/// `None` = deadline disattivata (setting 0/assente) o run non ancorato.
+pub(crate) async fn run_time_remaining_s(
+    meta_db: &sqlx::PgPool,
+    run_pool: &sqlx::PgPool,
+    anchor_run_id: Uuid,
+) -> Option<i64> {
+    let budget_s = nexus_auth::get_setting(meta_db, "agent.run_time_budget_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|b| *b > 0)?;
+    let started: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM agent_runs WHERE id = $1")
+            .bind(anchor_run_id)
+            .fetch_optional(run_pool)
+            .await
+            .ok()
+            .flatten()?;
+    let elapsed_s = (chrono::Utc::now() - started).num_seconds().max(0);
+    Some(budget_s - elapsed_s)
+}
+
+/// Floor del timeout sub-run sotto deadline (`orchestrator.subagent_min_timeout_s`,
+/// mig 0604): sotto questo residuo una figura NON parte (prepare_reject
+/// strutturato), un timeout ridicolo produrrebbe solo spesa senza esito.
+pub(crate) async fn subagent_min_timeout_s(db: &sqlx::PgPool) -> i64 {
+    nexus_auth::get_setting(db, "orchestrator.subagent_min_timeout_s")
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30)
+}
+
+/// Costo atteso di UN sub-run advisory dal listino (tier-only + nexus-pricing).
+async fn panel_unit_cost(db: &sqlx::PgPool, est_tokens: i64) -> Option<f64> {
+    let figures_csv = nexus_auth::get_setting(db, "orchestrator.council_figures").await?;
+    let first_figure = figures_csv
+        .split(',')
+        .map(str::trim)
+        .find(|s| !s.is_empty())?
+        .to_string();
+    let purpose: String = sqlx::query_scalar(
+        "SELECT model_purpose FROM nexus_subagent_definitions \
+          WHERE kind = $1 AND is_enabled = true",
+    )
+    .bind(&first_figure)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    let (provider, model) = crate::internal_routing::resolve_purpose_model_db(db, &purpose)
+        .await
+        .into_model(&purpose)
+        .ok()?;
+    let lookup = nexus_pricing::resolve_active_price(db, &provider, &model)
+        .await
+        .ok()?;
+    let nexus_pricing::PriceLookup::Priced(price) = lookup else {
+        // Unknown/NotInCatalog: prezzo ignoto NON e' prezzo zero (mig 0477).
+        return None;
+    };
+    // Ripartizione DETERMINISTICA del budget token atteso: i sub-run advisory
+    // sono read-heavy (contesto + tool_result >> risposta). Derivazione di
+    // calcolo, non config di business (come le soglie di orchestration_reason).
+    let prompt_tokens = est_tokens * 4 / 5;
+    let completion_tokens = est_tokens - prompt_tokens;
+    let (_, _, total) = nexus_pricing::calculate_cost(&price, prompt_tokens, completion_tokens);
+    Some(total)
+}
+
 /// Segnale strutturato di rifiuto in fase PREPARE (regola M): il coordinatore
 /// legge `error_code`, non il testo di `error`.
 fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value {
@@ -1594,162 +1777,143 @@ fn prepare_reject(error_code: &'static str, message: impl Into<String>) -> Value
     })
 }
 
-/// Identita' e provenienza di UNA figura del consiglio: i campi che ogni
-/// [`FigureAdvisoryReport`] porta identici qualunque sia l'esito. Estratti una
-/// volta sola dal tool_result e riusati dai costruttori qui sotto (regola L: prima
-/// erano sei struct literal copiati, che divergevano al primo campo nuovo).
-struct FigureIdentity {
-    kind: String,
-    /// Provenienza EFFETTIVA della figura (stampata dai `finalize_*` nel result):
-    /// assente per le figure respinte a monte (guard depth/whitelist) che non hanno
-    /// mai risolto un modello.
-    provider: Option<String>,
-    model: Option<String>,
-    subagent_run_id: Option<String>,
-}
-
-impl FigureIdentity {
-    fn from_result(kind: &str, result: &Value) -> Self {
-        let field = |k: &str| result.get(k).and_then(Value::as_str).map(str::to_owned);
-        Self {
-            kind: kind.to_string(),
-            provider: field(K_PROVIDER),
-            model: field(K_MODEL),
-            subagent_run_id: field(K_SUB_RUN_ID),
-        }
-    }
-
-    /// Report di una figura che NON ha prodotto un parere (respinta, in timeout,
-    /// fallita, o completata senza chiamare `advisory_verdict`).
-    fn no_advisory(
-        &self,
-        status: FigureAdvisoryStatus,
-        detail_code: impl Into<String>,
-        detail_message: impl Into<String>,
-    ) -> FigureAdvisoryReport {
-        FigureAdvisoryReport {
-            kind: self.kind.clone(),
-            status,
-            detail_code: detail_code.into(),
-            detail_message: detail_message.into(),
-            advisory_verdict: None,
-            advisory: None,
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            subagent_run_id: self.subagent_run_id.clone(),
-        }
-    }
-
-    /// Report di una figura che ha prodotto un blocco `advisory` (verdetto valido
-    /// o meno: lo discrimina `status`).
-    fn with_advisory(
-        &self,
-        status: FigureAdvisoryStatus,
-        detail_code: &str,
-        detail_message: &str,
-        verdict: Option<&str>,
-        advisory: &Value,
-    ) -> FigureAdvisoryReport {
-        FigureAdvisoryReport {
-            kind: self.kind.clone(),
-            status,
-            detail_code: detail_code.to_string(),
-            detail_message: detail_message.to_string(),
-            advisory_verdict: verdict.map(str::to_owned),
-            advisory: Some(advisory.clone()),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            subagent_run_id: self.subagent_run_id.clone(),
-        }
-    }
-}
-
-/// Codice d'errore di una figura dal blocco `outcome` (regola M: `error_class`,
-/// poi `verdict`, mai la prosa). Nessuno dei due -> `run_failed`.
-fn outcome_error_code(outcome: &Value) -> String {
-    outcome
-        .get("error_class")
-        .or_else(|| outcome.get("verdict"))
-        .and_then(Value::as_str)
-        .unwrap_or("run_failed")
-        .to_string()
-}
-
 /// Classifica l'esito di UNA figura del consiglio dal tool_result strutturato.
 fn classify_council_figure_result(kind: &str, result: &Value) -> FigureAdvisoryReport {
-    let id = FigureIdentity::from_result(kind, result);
-    if let Some(report) = classify_figure_failure(&id, result) {
-        return report;
-    }
-    let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
-    if outcome.get("success").and_then(Value::as_bool) != Some(true) {
-        return id.no_advisory(
-            FigureAdvisoryStatus::RunFailed,
-            outcome_error_code(&outcome),
-            "Sub-run terminato senza esito positivo",
-        );
-    }
-    let advisory = match outcome.get("advisory") {
-        Some(a) if !a.is_null() => a,
-        _ => {
-            return id.no_advisory(
-                FigureAdvisoryStatus::CompletedNoAdvisory,
-                "no_advisory",
-                "Sub-run completato senza chiamare advisory_verdict",
-            )
-        }
-    };
-    let verdict = advisory.get("verdict").and_then(Value::as_str);
-    let valid_verdict =
-        verdict.is_some_and(|v| matches!(v, "proceed" | "proceed_with_changes" | "block"));
-    if !valid_verdict {
-        return id.with_advisory(
-            FigureAdvisoryStatus::InvalidAdvisory,
-            "invalid_advisory",
-            "Parere advisory presente ma verdetto non valido",
-            verdict,
-            advisory,
-        );
-    }
-    id.with_advisory(
-        FigureAdvisoryStatus::AdvisoryOk,
-        "advisory_ok",
-        "Parere advisory valido",
-        verdict,
-        advisory,
-    )
-}
-
-/// Esiti in cui la figura non e' MAI arrivata a un parere: respinta in PREPARE
-/// (`error_code`, regola M), in timeout o fallita nel lifecycle. `None` = il
-/// sub-run e' arrivato a termine, l'esito va letto dal blocco `outcome`.
-fn classify_figure_failure(id: &FigureIdentity, result: &Value) -> Option<FigureAdvisoryReport> {
+    let subagent_run_id = result
+        .get(K_SUB_RUN_ID)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    // Provenienza EFFETTIVA della figura (stampata dai finalize_* nel result):
+    // assente per le figure respinte a monte (guard depth/whitelist) che non hanno
+    // mai risolto un modello.
+    let provider = result.get(K_PROVIDER).and_then(Value::as_str).map(str::to_owned);
+    let model = result.get(K_MODEL).and_then(Value::as_str).map(str::to_owned);
     if let Some(code) = result.get("error_code").and_then(Value::as_str) {
-        let message = result.get("error").and_then(Value::as_str).unwrap_or(code);
-        return Some(id.no_advisory(FigureAdvisoryStatus::PrepareFailed, code, message));
-    }
-    let lifecycle = result.get("status").and_then(Value::as_str).unwrap_or("");
-    if lifecycle == "timeout" {
         let message = result
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("Sub-agent in timeout");
-        return Some(id.no_advisory(FigureAdvisoryStatus::RunTimeout, "run_timeout", message));
+            .unwrap_or(code)
+            .to_string();
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::PrepareFailed,
+            detail_code: code.to_string(),
+            detail_message: message,
+            advisory_verdict: None,
+            advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
+            subagent_run_id,
+        };
+    }
+    let lifecycle = result.get("status").and_then(Value::as_str).unwrap_or("");
+    if lifecycle == "timeout" {
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::RunTimeout,
+            detail_code: "run_timeout".to_string(),
+            detail_message: result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Sub-agent in timeout")
+                .to_string(),
+            advisory_verdict: None,
+            advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
+            subagent_run_id,
+        };
     }
     if lifecycle == "failed" || lifecycle == "prepare_failed" {
         let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
+        let code = outcome
+            .get("error_class")
+            .or_else(|| outcome.get("verdict"))
+            .and_then(Value::as_str)
+            .unwrap_or("run_failed")
+            .to_string();
         let message = result
             .get("error")
             .or_else(|| result.get(K_SUMMARY))
             .and_then(Value::as_str)
-            .unwrap_or("Sub-run fallito");
-        return Some(id.no_advisory(
-            FigureAdvisoryStatus::RunFailed,
-            outcome_error_code(&outcome),
-            message,
-        ));
+            .unwrap_or("Sub-run fallito")
+            .to_string();
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::RunFailed,
+            detail_code: code,
+            detail_message: message,
+            advisory_verdict: None,
+            advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
+            subagent_run_id,
+        };
     }
-    None
+    let outcome = result.get("outcome").cloned().unwrap_or(Value::Null);
+    if outcome.get("success").and_then(Value::as_bool) != Some(true) {
+        let code = outcome
+            .get("error_class")
+            .or_else(|| outcome.get("verdict"))
+            .and_then(Value::as_str)
+            .unwrap_or("run_failed")
+            .to_string();
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::RunFailed,
+            detail_code: code,
+            detail_message: "Sub-run terminato senza esito positivo".to_string(),
+            advisory_verdict: None,
+            advisory: None,
+            provider: provider.clone(),
+            model: model.clone(),
+            subagent_run_id,
+        };
+    }
+    let advisory = match outcome.get("advisory") {
+        Some(a) if !a.is_null() => a,
+        _ => {
+            return FigureAdvisoryReport {
+                kind: kind.to_string(),
+                status: FigureAdvisoryStatus::CompletedNoAdvisory,
+                detail_code: "no_advisory".to_string(),
+                detail_message: "Sub-run completato senza chiamare advisory_verdict".to_string(),
+                advisory_verdict: None,
+                advisory: None,
+                provider: provider.clone(),
+                model: model.clone(),
+                subagent_run_id,
+            };
+        }
+    };
+    let verdict = advisory.get("verdict").and_then(Value::as_str);
+    let valid_verdict = verdict.is_some_and(|v| {
+        matches!(v, "proceed" | "proceed_with_changes" | "block")
+    });
+    if !valid_verdict {
+        return FigureAdvisoryReport {
+            kind: kind.to_string(),
+            status: FigureAdvisoryStatus::InvalidAdvisory,
+            detail_code: "invalid_advisory".to_string(),
+            detail_message: "Parere advisory presente ma verdetto non valido".to_string(),
+            advisory_verdict: verdict.map(str::to_owned),
+            advisory: Some(advisory.clone()),
+            provider: provider.clone(),
+            model: model.clone(),
+            subagent_run_id,
+        };
+    }
+    FigureAdvisoryReport {
+        kind: kind.to_string(),
+        status: FigureAdvisoryStatus::AdvisoryOk,
+        detail_code: "advisory_ok".to_string(),
+        detail_message: "Parere advisory valido".to_string(),
+        advisory_verdict: verdict.map(str::to_owned),
+        advisory: Some(advisory.clone()),
+        provider: provider.clone(),
+        model: model.clone(),
+        subagent_run_id,
+    }
 }
 
 /// Esito della convocazione parallela: report per-figura + sintesi opzionale.
@@ -1757,6 +1921,186 @@ fn classify_figure_failure(id: &FigureIdentity, result: &Value) -> Option<Figure
 pub(crate) struct CouncilConvokeResult {
     pub figure_reports: Vec<FigureAdvisoryReport>,
     pub synthesis: Option<AdvisorySynthesis>,
+}
+
+/// Setting DB (regola G) del tetto di sub-run REALMENTE concorrenti di un
+/// fan-out (consiglio, panel di review, panel multi-provider). Mig 0596.
+const KEY_FANOUT_MAX_PARALLEL: &str = "orchestrator.subagent_fanout_max_parallel";
+/// Default se la riga manca: nessun tetto artificiale sotto il fan-out nominale
+/// del consiglio (6 figure). Non e' un "numero magico" di comportamento: e' il
+/// valore che conserva la semantica storica (tutte insieme) quando il DB tace.
+const DEFAULT_FANOUT_MAX_PARALLEL: usize = 6;
+
+/// Tetto di concorrenza del fan-out dal DB (regola G), clampato a >=1.
+async fn fanout_max_parallel(db: &sqlx::PgPool) -> usize {
+    crate::settings::get_setting(db, KEY_FANOUT_MAX_PARALLEL)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FANOUT_MAX_PARALLEL)
+        .max(1)
+}
+
+/// Setting DB (regola G) del tetto di sub-run concorrenti dell'INTERO processo
+/// (mig 0603). Serve da quando i panel girano in parallelo (`tokio::join!` di
+/// consiglio + multi-provider): ogni fan-out ha il suo semaforo locale, quindi
+/// K panel insieme = K x permits senza un tetto globale — questo lo mette.
+const KEY_FANOUT_PROCESS_MAX_PARALLEL: &str = "orchestrator.fanout_process_max_parallel";
+/// Default se la riga manca: 2 panel pieni (2 x 6) come i due panel pre-run.
+const DEFAULT_FANOUT_PROCESS_MAX_PARALLEL: usize = 12;
+
+/// Semaforo di PROCESSO dei fan-out top-level. Dimensionato UNA volta al primo
+/// uso (riavvio del servizio per applicare una modifica del setting: un semaforo
+/// non e' ridimensionabile a caldo senza reintrodurre stati transitori).
+static PROCESS_FANOUT_SEM: tokio::sync::OnceCell<std::sync::Arc<tokio::sync::Semaphore>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn process_fanout_semaphore(db: &sqlx::PgPool) -> std::sync::Arc<tokio::sync::Semaphore> {
+    PROCESS_FANOUT_SEM
+        .get_or_init(|| async {
+            let permits = crate::settings::get_setting(db, KEY_FANOUT_PROCESS_MAX_PARALLEL)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_FANOUT_PROCESS_MAX_PARALLEL)
+                .max(1);
+            std::sync::Arc::new(tokio::sync::Semaphore::new(permits))
+        })
+        .await
+        .clone()
+}
+
+/// Ambito del fan-out rispetto al governo della concorrenza, DICHIARATO dal
+/// call site (regola M: segnale esplicito, non inferito dal ctx — il ctx del
+/// consiglio ha `parent_run_id` valorizzato pur essendo del coordinatore).
+///
+/// - `TopLevel`: convocazione del COORDINATORE (consiglio, review panel,
+///   multi-provider, debate). Acquisisce ANCHE il semaforo di processo.
+/// - `Nested`: fan-out dentro un sub-run. SOLO semaforo locale: un membro
+///   padre che tenesse un permesso di processo mentre il figlio ne attende un
+///   altro dallo stesso semaforo creerebbe hold-and-wait (deadlock di classe);
+///   la concorrenza dei nested resta bounded dal semaforo locale + depth guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FanoutScope {
+    TopLevel,
+    Nested,
+}
+
+/// PUNTO UNICO (regola L) del FAN-OUT di sub-run: esegue `n` sub-run
+/// CONCORRENTI, ognuno nel PROPRIO task tokio, con un tetto di parallelismo.
+///
+/// Perche' esiste (incidente consiglio 2026-07-15, difetto D3 PROVATO):
+/// i tre fan-out (consiglio, review panel, multi-provider) usavano
+/// `FuturesUnordered` e pushavano le future DENTRO il task chiamante — nessun
+/// `tokio::spawn`. Le N figure erano quindi concorrenza COOPERATIVA su UN SOLO
+/// task, e con loro i loro `tokio::time::timeout`: un `Timeout` ritorna
+/// `Elapsed` solo quando viene POLLATO, quindi bastava un membro che bloccasse
+/// il thread dentro il proprio `poll()` per congelare TUTTI gli altri e i loro
+/// timer. Firma misurata sul campo: 4 sub-run con `t0` DIVERSI (10:30:28 e
+/// 10:32:10) e `timeout_s=240` uguale, morti tutti allo STESSO millisecondo
+/// (10:37:00.157) dopo 408s — impossibile per 4 timer indipendenti.
+/// Con `spawn` ogni sub-run ha il proprio task: un panic resta confinato e i
+/// timer non dipendono piu' dal poll di un membro vicino. Da qui NON segue la
+/// garanzia che il timer scatti al suo valore quando un altro membro blocca il
+/// thread: non scatta, e il test `spawn_non_protegge_dal_blocking_sincrono_
+/// limite_dichiarato` lo dimostra. `spawn` toglie l'accoppiamento cooperativo
+/// dentro un task, non toglie il blocking dal path.
+///
+/// Semaforo (mai `chunks()` + `join_all`): il permesso si libera appena UN
+/// sub-run finisce, quindi il successivo parte subito. Una barriera a ondate
+/// riprodurrebbe proprio la firma "tutti insieme" che stiamo eliminando.
+///
+/// `JoinError` (panic dentro un sub-run) e' catturato e tradotto in `Value`
+/// d'errore: dentro il vecchio `FuturesUnordered` un panic avrebbe abbattuto
+/// l'INTERO fan-out in silenzio.
+async fn spawn_fanout<F, Fut>(db: &sqlx::PgPool, n: usize, scope: FanoutScope, make: F) -> Vec<Value>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Value> + Send + 'static,
+{
+    let permits = fanout_max_parallel(db).await;
+    let local = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let process = match scope {
+        FanoutScope::TopLevel => Some(process_fanout_semaphore(db).await),
+        FanoutScope::Nested => None,
+    };
+    spawn_fanout_with(local, process, n, make).await
+}
+
+/// Corpo del fan-out con semafori ESPLICITI (testabile senza stato globale).
+/// Ordine di acquisizione FISSO e uniforme: LOCALE -> PROCESSO. Il grafo delle
+/// attese resta aciclico: chi tiene un permesso di processo non attende mai un
+/// semaforo locale altrui (ogni fan-out ha il proprio), quindi niente cicli.
+async fn spawn_fanout_with<F, Fut>(
+    local: std::sync::Arc<tokio::sync::Semaphore>,
+    process: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    n: usize,
+    make: F,
+) -> Vec<Value>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Value> + Send + 'static,
+{
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let fut = make(i);
+        let local = local.clone();
+        let process = process.clone();
+        handles.push(tokio::spawn(async move {
+            // I permessi vivono quanto il sub-run; si liberano al drop (fine
+            // del task), non a fine "ondata".
+            let _local_permit = match local.acquire_owned().await {
+                Ok(p) => p,
+                // Semaforo chiuso: non succede (mai `close()`), ma non si
+                // inventa un esito -> errore strutturato.
+                Err(e) => {
+                    return json!({
+                        "error": format!("fanout: semaforo chiuso: {e}"),
+                        "error_code": "fanout_semaphore_closed",
+                        "status": "prepare_failed",
+                        "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                    })
+                }
+            };
+            let _process_permit = match process {
+                Some(sem) => match sem.acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        return json!({
+                            "error": format!("fanout: semaforo di processo chiuso: {e}"),
+                            "error_code": "fanout_semaphore_closed",
+                            "status": "prepare_failed",
+                            "outcome": terminal_verdict("failed", "fanout_semaphore_closed"),
+                        })
+                    }
+                },
+                None => None,
+            };
+            fut.await
+        }));
+    }
+    let mut out = Vec::with_capacity(n);
+    for h in handles {
+        match h.await {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                // Panic o cancellazione del sub-run: esito STRUTTURATO (regola
+                // M), il fan-out prosegue con gli altri.
+                tracing::error!(error = %e, "fanout: sub-run terminato da panic/cancellazione");
+                out.push(json!({
+                    "error": format!("sub-run interrotto: {e}"),
+                    "error_code": "subrun_panicked",
+                    "status": "failed",
+                    "outcome": terminal_verdict("failed", "subrun_panicked"),
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// Convoca le figure `kinds` in PARALLELO (sub-run read-only, sincroni) e compone la
@@ -1782,60 +2126,37 @@ pub(crate) async fn convene_council(
     // qui ribadiamo il formato atteso come promemoria operativo.
     let expected = "Concludi la tua analisi chiamando il tool advisory_verdict \
                     (verdict, requirements, risks[severity+description], recommendations).";
-    let pairs = run_council_figures(ctx, task, kinds, expected, progress_tx).await;
+    // Fan-out sul PUNTO UNICO (regola L): ogni figura nel proprio task tokio,
+    // col proprio timer (difetto D3). Il progresso UI viene emesso appena il
+    // singolo sub-run rientra, senza attendere gli altri.
+    let owned_kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
+    // Provider DISTINTI decisi PRIMA del fan-out (sequenziale, quindi
+    // accumulabile): in parallelo ogni figura sceglieva da sola e il piu'
+    // economico eleggibile era lo stesso per tutte -- due figure sullo stesso
+    // provider+modello non sono due pareri. `None` = percorso storico.
+    let assignments = council_assignments(ctx, &owned_kinds).await;
+    let results = {
+        let kinds_for_make = owned_kinds.clone();
+        spawn_fanout(&ctx.core.db, kinds_for_make.len(), FanoutScope::TopLevel, |i| {
+            let ctx = ctx.clone();
+            let task = task.to_string();
+            let expected = expected.to_string();
+            let kind = kinds_for_make[i].clone();
+            let pin = assignments[i].clone();
+            async move { run_council_figure(&ctx, &kind, &task, &expected, pin).await }
+        })
+        .await
+    };
+    let pairs = classify_and_stream_reports(&owned_kinds, results, progress_tx.as_ref()).await;
     let figure_reports: Vec<FigureAdvisoryReport> = pairs.iter().map(|(r, _)| r.clone()).collect();
     let raw_results: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     // Roster esplicito = figure CONVOCATE (regola M): una figura in timeout/errore
     // e' un'astensione che pesa nel quorum, non una riga che sparisce dal conteggio.
-    // `kinds.len()`, non `raw_results.len()`: chi non ha risposto deve contare.
     let synthesis = compose_council_synthesis(&raw_results, policy, kinds.len());
     CouncilConvokeResult {
         figure_reports,
         synthesis,
     }
-}
-
-/// Esegue le figure `kinds` in PARALLELO e ne raccoglie le coppie (report
-/// classificato, tool_result grezzo). Ogni figura che chiude e' notificata SUBITO
-/// su `progress_tx` (la UI mostra il consiglio che si popola invece di attendere
-/// l'ultima); best-effort, un canale chiuso non ferma il consiglio.
-///
-/// Le coppie tornano nell'ORDINE DI `kinds`, non in quello d'arrivo: il consiglio
-/// non deve dipendere da chi finisce prima.
-async fn run_council_figures(
-    ctx: &AgentToolContext,
-    task: &str,
-    kinds: &[&str],
-    expected: &str,
-    progress_tx: Option<tokio::sync::mpsc::Sender<FigureAdvisoryReport>>,
-) -> Vec<(FigureAdvisoryReport, Value)> {
-    use futures::stream::{FuturesUnordered, StreamExt};
-    let mut futs = FuturesUnordered::new();
-    for kind in kinds {
-        let ctx = ctx.clone();
-        let task = task.to_string();
-        let expected = expected.to_string();
-        let kind = kind.to_string();
-        futs.push(async move {
-            let result = run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await;
-            let report = classify_council_figure_result(&kind, &result);
-            (report, result)
-        });
-    }
-    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(kinds.len());
-    while let Some((report, result)) = futs.next().await {
-        if let Some(ref tx) = progress_tx {
-            let _ = tx.send(report.clone()).await;
-        }
-        pairs.push((report, result));
-    }
-    pairs.sort_by_key(|(report, _)| {
-        kinds
-            .iter()
-            .position(|k| *k == report.kind)
-            .unwrap_or(usize::MAX)
-    });
-    pairs
 }
 
 /// Convoca un PANEL di revisori (kind=review) in PARALLELO e compone il verdetto
@@ -1846,31 +2167,196 @@ async fn run_council_figures(
 /// un verdetto valido. Best-effort: i guard di `prepare_subagent_run` restano
 /// attivi; il routing esclude il provider del padre (indipendenza avversaria,
 /// review). `reviewers` e' clampato a >=1.
+/// Purpose da cui il panel di review pesca i provider dei revisori. E' una
+/// CHIAVE di configurazione, non un modello: provider e modello concreti stanno
+/// in `nexus_purpose_model` ed e' li' che si cambiano (regola G).
+const REVIEW_PANEL_PURPOSE: &str = "reviewer";
+
+/// Cosa rende due revisori "diversi" per questo panel. Costante NOMINATA, non
+/// un argomento scritto nel punto di chiamata: cosi' il test la legge da qui
+/// invece di ricopiarla, e mutarla in `PerProvider` — il difetto del 26/07 —
+/// fa rosseggiare il test invece di lasciarlo verde su un criterio suo
+/// (regola O).
+const REVIEW_PANEL_DIVERSITY: crate::internal_routing::CandidateDiversity =
+    crate::internal_routing::CandidateDiversity::PerProviderAndModel;
+
+/// Lancia gli `n` revisori, ciascuno pinnato su un GIUDICE distinto.
+///
+/// Senza pin il routing instrada tutti gli N revisori allo stesso
+/// provider/modello: non e' un quorum, e' UN solo giudizio contato N volte, e
+/// quando quel modello sbaglia il run viene rimandato in correzione fino al cap
+/// dei tentativi con l'apparenza di una verifica plurale. I candidati arrivano
+/// dal purpose, come nel panel multi-provider (regola L).
+/// Giudici distinti su cui pinnare i revisori. Vuoto se il purpose non e'
+/// risolvibile: il panel prosegue senza pin, con un WARN che nomina il rischio.
+///
+/// Chiede `PerProviderAndModel`, non `PerProvider`: quando un solo provider e'
+/// sano — il 2026-07-26 openai e anthropic erano in cooldown billing — la dedup
+/// per provider lasciava UN candidato e il panel a due si riduceva a un giudice
+/// solo, benche' quel provider offrisse dieci modelli qualificati nello stesso
+/// tier. Due modelli diversi non sono due provider, ma sono due pareri; uno
+/// solo, riconvocato a ogni ciclo, non lo e' mai.
+async fn candidati_revisori(
+    ctx: &AgentToolContext,
+    n: usize,
+) -> Vec<crate::internal_routing::PurposeProviderCandidate> {
+    crate::internal_routing::resolve_purpose_provider_candidates_db_by(
+        &ctx.core.db,
+        REVIEW_PANEL_PURPOSE,
+        n,
+        1,
+        REVIEW_PANEL_DIVERSITY,
+    )
+    .await
+    .unwrap_or_else(|resolution| {
+        tracing::warn!(
+            purpose = %REVIEW_PANEL_PURPOSE,
+            resolution = ?resolution,
+            "review panel: purpose non risolvibile, revisori senza pin (giudizio unico replicato)"
+        );
+        Vec::new()
+    })
+}
+
+/// Chi convoca davvero il panel: al piu' `richiesti` GIUDICI distinti, presi
+/// nell'ordine di preferenza dei candidati.
+///
+/// Mai due revisori sulla stessa coppia (provider, model): non sono un quorum,
+/// sono un giudizio unico contato due volte, e il panel li conteggerebbe come
+/// due pareri indipendenti. Meglio un panel piu' piccolo e onesto che uno grande
+/// e finto.
+///
+/// La garanzia sta QUI, dove il panel si compone, e delega la nozione di "stesso
+/// giudice" al punto unico `giudici_distinti` (regola L). Non si assume che la
+/// selezione abbia gia' deduplicato come serve a un panel (regola O: era proprio
+/// l'assunzione sbagliata — si contava `candidates.len()` credendolo il numero
+/// dei giudici distinti, mentre la fonte deduplicava per solo provider).
+///
+/// Lista vuota = purpose non risolvibile: nessun pin da assegnare, e il numero
+/// dei revisori resta quello richiesto (li instrada il routing).
+fn panel_revisori(
+    candidati: &[crate::internal_routing::PurposeProviderCandidate],
+    richiesti: usize,
+) -> Vec<crate::internal_routing::PurposeProviderCandidate> {
+    crate::internal_routing::giudici_distinti(candidati, richiesti)
+}
+
+/// Chi votera', nell'ordine degli slot. E' l'unico punto che lo sa: gli outcome
+/// dei revisori non portano la propria provenienza, quindi senza questa
+/// dichiarazione la pluralita' del panel resta invisibile a valle.
+///
+/// Provider e modello restano SEPARATI fino al consumatore (regola L): il
+/// modello puo' contenere `/` e ricomporli qui costringerebbe il frontend a
+/// indovinare dove tagliare. `auto` quando nessun candidato e' stato risolto
+/// (revisore senza pin: lo instrada il routing, e a priori non sappiamo dove).
+fn riferimenti_revisori(
+    candidates: &[crate::internal_routing::PurposeProviderCandidate],
+    n: usize,
+) -> Vec<nexus_agent_graph::decisions::ReviewerRef> {
+    (0..n)
+        .map(|i| match candidates.get(i) {
+            Some(c) => nexus_agent_graph::decisions::ReviewerRef {
+                provider: c.provider.clone(),
+                model: c.model.clone(),
+            },
+            None => nexus_agent_graph::decisions::ReviewerRef {
+                provider: "auto".to_string(),
+                model: String::new(),
+            },
+        })
+        .collect()
+}
+
+/// Dichiara il taglio del panel: quanti revisori si volevano, quanti ne restano
+/// e soprattutto CHI sono. Il taglio e' dichiarato, non silenzioso.
+///
+/// I nomi non sono decorazione: `convocati=1` da solo non distingue un catalog
+/// povero da un cooldown del giorno, e il 26/07 quella riga di log e' comparsa
+/// sei volte senza far sospettare che dietro ci fosse sempre lo stesso giudice.
+fn dichiara_taglio_panel(
+    panel: &[crate::internal_routing::PurposeProviderCandidate],
+    richiesti: usize,
+    convocati: usize,
+) {
+    if convocati >= richiesti {
+        return;
+    }
+    let giudici: Vec<String> = panel
+        .iter()
+        .map(|c| format!("{}/{}", c.provider, c.model))
+        .collect();
+    tracing::warn!(
+        richiesti,
+        convocati,
+        giudici = ?giudici,
+        purpose = %REVIEW_PANEL_PURPOSE,
+        "review panel ridotto: giudici distinti insufficienti, meglio meno \
+         revisori che due voti dallo stesso provider+modello contati come \
+         indipendenti"
+    );
+}
+
+async fn spawn_reviewers(
+    ctx: &AgentToolContext,
+    richiesti: usize,
+    task: &str,
+    expected: &str,
+    assegnati: &mut Vec<nexus_agent_graph::decisions::ReviewerRef>,
+) -> Vec<Value> {
+    let candidates = candidati_revisori(ctx, richiesti).await;
+    // Mai due revisori sullo stesso (provider, model): si riduce il panel invece
+    // di duplicare.
+    let panel = panel_revisori(&candidates, richiesti);
+    let n = if panel.is_empty() {
+        richiesti
+    } else {
+        panel.len()
+    };
+    dichiara_taglio_panel(&panel, richiesti, n);
+    assegnati.extend(riferimenti_revisori(&panel, n));
+
+    // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
+    spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, move |i| {
+        let ctx = ctx.clone();
+        let task = task.to_string();
+        let expected = expected.to_string();
+        // Lo stesso `panel` che ha prodotto i riferimenti dichiarati a valle:
+        // chi vota e chi risulta aver votato non possono divergere.
+        let pin = panel.get(i).map(|c| (c.provider.clone(), c.model.clone()));
+        async move {
+            match pin {
+                Some((provider, model)) => {
+                    run_single_subagent_with_model_pin(
+                        &ctx, "review", &task, "", &expected, &provider, &model,
+                    )
+                    .await
+                }
+                None => {
+                    run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await
+                }
+            }
+        }
+    })
+    .await
+}
+
 pub(crate) async fn convene_review_panel(
     ctx: &AgentToolContext,
     task: &str,
     reviewers: usize,
     policy: &nexus_agent_graph::decisions::QuorumPolicy,
 ) -> Option<nexus_agent_graph::decisions::PanelOutcome> {
-    let n = reviewers.max(1);
     let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
-    use futures::stream::{FuturesUnordered, StreamExt};
-    let mut futs = FuturesUnordered::new();
-    for _ in 0..n {
-        let ctx = ctx.clone();
-        let task = task.to_string();
-        let expected = expected.to_string();
-        futs.push(async move {
-            run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await
-        });
-    }
-    let mut outcomes: Vec<Value> = Vec::with_capacity(n);
-    while let Some(r) = futs.next().await {
-        outcomes.push(r.get("outcome").cloned().unwrap_or(Value::Null));
-    }
+    let mut assegnati: Vec<nexus_agent_graph::decisions::ReviewerRef> = Vec::new();
+    let results = spawn_reviewers(ctx, reviewers.max(1), task, expected, &mut assegnati).await;
+    let outcomes: Vec<Value> = results
+        .into_iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
     nexus_agent_graph::decisions::compose_panel_verdict(&outcomes, policy)
+        .map(|p| p.con_reviewers(assegnati))
 }
 
 /// Convoca lo stesso analista read-only su provider diversi, scelti dal catalog
@@ -1885,11 +2371,90 @@ pub(crate) async fn convene_multi_provider_panel(
     if !cfg.enabled {
         return None;
     }
-    let candidates = match resolve_panel_candidates(ctx, cfg).await {
+    // Tetto e soglia arrivano ENTRAMBI alla selezione: `max_providers` e' quanti
+    // se ne vorrebbero, `min_providers` sotto quanti il panel non ha senso. Con
+    // la sola prima la tier-chain usciva al primo tier non vuoto e il quorum
+    // veniva giudicato su un pool mai cercato davvero.
+    let candidates = match crate::internal_routing::resolve_purpose_provider_candidates_db(
+        &ctx.core.db,
+        &cfg.purpose,
+        cfg.max_providers,
+        cfg.min_providers,
+    )
+    .await
+    {
         Ok(c) => c,
-        Err(degraded) => return Some(degraded),
+        Err(e) => {
+            tracing::warn!(
+                purpose = %cfg.purpose,
+                resolution = ?e,
+                "multi-provider panel: purpose non risolvibile"
+            );
+            return Some(MultiProviderPanelOutcome::Degraded {
+                reason: MultiProviderDegradeReason::PurposeUnavailable,
+                got: 0,
+                min: cfg.min_providers,
+            });
+        }
     };
-    let results = run_provider_analysts(ctx, task, cfg, &candidates).await;
+    if candidates.len() < cfg.min_providers {
+        tracing::warn!(
+            purpose = %cfg.purpose,
+            got = candidates.len(),
+            min = cfg.min_providers,
+            "multi-provider panel: provider distinti insufficienti"
+        );
+        return Some(MultiProviderPanelOutcome::Degraded {
+            reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
+            got: candidates.len(),
+            min: cfg.min_providers,
+        });
+    }
+    let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
+                    e chiudi chiamando advisory_verdict (verdict, requirements, \
+                    risks[severity+description], recommendations).";
+    // Stesso punto unico di fan-out (regola L, difetto D3): un task per
+    // analista. Prima era `join_all` — stessa trappola del FuturesUnordered:
+    // tutte le future in UN task, quindi tutti i timer ostaggio del membro
+    // piu' sfortunato.
+    let cands: Vec<PanelProviderEntry> = candidates
+        .iter()
+        .map(|c| PanelProviderEntry {
+            provider: c.provider.clone(),
+            model: c.model.clone(),
+        })
+        .collect();
+    let results = {
+        let cands_for_make = cands.clone();
+        let kind = cfg.kind.clone();
+        spawn_fanout(&ctx.core.db, cands_for_make.len(), FanoutScope::TopLevel, |i| {
+            let ctx = ctx.clone();
+            let task = task.to_string();
+            let expected = expected.to_string();
+            let kind = kind.clone();
+            let c = cands_for_make[i].clone();
+            let context = format!(
+                "Provider assegnato a questa analisi: {}. Modello assegnato: {}. \
+                 Confronta la richiesta dalla prospettiva dei trade-off e dei failure-mode \
+                 tipici del provider/modello assegnato, senza assumere che gli altri \
+                 provider arrivino alla stessa conclusione.",
+                c.provider, c.model
+            );
+            async move {
+                run_single_subagent_with_model_pin(
+                    &ctx,
+                    &kind,
+                    &task,
+                    &context,
+                    &expected,
+                    &c.provider,
+                    &c.model,
+                )
+                .await
+            }
+        })
+        .await
+    };
     let provider_count = candidates.len();
     let panel_providers: Vec<PanelProviderEntry> = candidates
         .iter()
@@ -1906,100 +2471,12 @@ pub(crate) async fn convene_multi_provider_panel(
         .collect();
     compose_multi_provider_synthesis(&results, policy, provider_count).map(|synthesis| {
         MultiProviderPanelOutcome::Active {
-            synthesis,
+            synthesis: Box::new(synthesis),
             provider_count,
             panel_providers,
             provider_reports,
         }
     })
-}
-
-/// Provider DISTINTI del panel, dal catalog via purpose tier-aware (punto unico
-/// `resolve_purpose_provider_candidates_db`: nessun provider/modello hardcoded,
-/// stessi filtri/cooldown del routing live).
-///
-/// `Err` = il panel non e' eseguibile e DEGRADA, con la ragione in forma
-/// STRUTTURATA (regola M): purpose non risolvibile, oppure meno provider distinti
-/// del minimo richiesto. Il degrado e' un esito dichiarato, non un fallimento
-/// silenzioso.
-async fn resolve_panel_candidates(
-    ctx: &AgentToolContext,
-    cfg: &MultiProviderConfig,
-) -> Result<
-    Vec<crate::internal_routing::PurposeProviderCandidate>,
-    MultiProviderPanelOutcome,
-> {
-    let candidates = crate::internal_routing::resolve_purpose_provider_candidates_db(
-        &ctx.core.db,
-        &cfg.purpose,
-        cfg.max_providers,
-    )
-    .await
-    .map_err(|e| {
-        tracing::warn!(
-            purpose = %cfg.purpose,
-            resolution = ?e,
-            "multi-provider panel: purpose non risolvibile"
-        );
-        MultiProviderPanelOutcome::Degraded {
-            reason: MultiProviderDegradeReason::PurposeUnavailable,
-            got: 0,
-            min: cfg.min_providers,
-        }
-    })?;
-    if candidates.len() < cfg.min_providers {
-        tracing::warn!(
-            purpose = %cfg.purpose,
-            got = candidates.len(),
-            min = cfg.min_providers,
-            "multi-provider panel: provider distinti insufficienti"
-        );
-        return Err(MultiProviderPanelOutcome::Degraded {
-            reason: MultiProviderDegradeReason::InsufficientProviderDiversity,
-            got: candidates.len(),
-            min: cfg.min_providers,
-        });
-    }
-    Ok(candidates)
-}
-
-/// Esegue lo STESSO analista read-only su ogni provider candidato, in PARALLELO,
-/// con provider/model PINNATI dal catalog (nessuna chiamata diretta ai provider:
-/// sono sub-run nativi). A ciascuno il contesto dichiara il proprio provider/modello
-/// e gli chiede di ragionare sui trade-off e failure-mode TIPICI di quello, senza
-/// assumere che gli altri arrivino alla stessa conclusione: e' la diversita' il
-/// punto del panel. Ordine dei risultati = ordine dei candidati.
-async fn run_provider_analysts(
-    ctx: &AgentToolContext,
-    task: &str,
-    cfg: &MultiProviderConfig,
-    candidates: &[crate::internal_routing::PurposeProviderCandidate],
-) -> Vec<Value> {
-    let expected = "Analizza la richiesta dalla prospettiva del tuo provider/modello \
-                    e chiudi chiamando advisory_verdict (verdict, requirements, \
-                    risks[severity+description], recommendations).";
-    let futs = candidates.iter().map(|c| {
-        let context = format!(
-            "Provider assegnato a questa analisi: {}. Modello assegnato: {}. \
-             Confronta la richiesta dalla prospettiva dei trade-off e dei failure-mode \
-             tipici del provider/modello assegnato, senza assumere che gli altri \
-             provider arrivino alla stessa conclusione.",
-            c.provider, c.model
-        );
-        async move {
-            run_single_subagent_with_model_pin(
-                ctx,
-                &cfg.kind,
-                task,
-                &context,
-                expected,
-                &c.provider,
-                &c.model,
-            )
-            .await
-        }
-    });
-    futures::future::join_all(futs).await
 }
 
 /// Parte PURA (regola L, testabile senza DB) di [`convene_council`]: estrae i blocchi
@@ -2029,6 +2506,245 @@ fn compose_multi_provider_synthesis(
     convened: usize,
 ) -> Option<AdvisorySynthesis> {
     compose_council_synthesis(results, policy, convened)
+}
+
+/// Config del DIBATTITO a tesi contrapposte (mig 0605, regola G). `None` se il
+/// dibattito e' spento o il kind non e' configurato: il coordinatore non convoca
+/// (fail-closed, come il multi-provider).
+pub(crate) struct DebateConfig {
+    pub kind: String,
+    pub max_advocates: usize,
+}
+
+pub(crate) async fn read_debate_config(db: &sqlx::PgPool) -> Option<DebateConfig> {
+    let enabled = nexus_auth::get_bool_setting(db, "orchestrator.debate_enabled")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let kind = nexus_auth::get_setting(db, "orchestrator.debate_advocate_kind")
+        .await?
+        .trim()
+        .to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    let max_advocates = nexus_auth::get_setting(db, "orchestrator.debate_max_advocates")
+        .await
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4);
+    Some(DebateConfig {
+        kind,
+        max_advocates,
+    })
+}
+
+/// Esito della convocazione del dibattito (segnali strutturati per il meta-step).
+pub(crate) struct DebatePanelOutcome {
+    pub topic: String,
+    pub assignments: Vec<nexus_agent_graph::decisions::debate_panel::DebateAssignment>,
+    pub synthesis: nexus_agent_graph::decisions::debate_panel::DebateSynthesis,
+}
+
+/// Task di UN avvocato: la posizione assegnata e' dichiarata nella PRIMA riga in
+/// forma canonica (`POSIZIONE ASSEGNATA: <testo>`), perche' e' la stringa che
+/// l'avvocato deve ripetere alla lettera in `assigned_position` — la chiave con
+/// cui `compose_debate_synthesis` attribuisce il voto. Funzione PURA: testabile
+/// senza DB (regola L: unica sede della forma del task avvocato).
+pub(crate) fn build_advocate_task(
+    topic: &str,
+    assignment: &nexus_agent_graph::decisions::debate_panel::DebateAssignment,
+    user_task: &str,
+) -> String {
+    let opposing = assignment
+        .opposing_positions
+        .iter()
+        .map(|o| format!("- {o}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "POSIZIONE ASSEGNATA: {assigned}\n\n\
+         Sei un avvocato in un dibattito a tesi contrapposte su una decisione \
+         architetturale del progetto.\n\n\
+         DECISIONE IN DISCUSSIONE: {topic}\n\n\
+         POSIZIONI AVVERSE (difese da altri avvocati, in parallelo a te):\n{opposing}\n\n\
+         RICHIESTA ORIGINALE DELL'UTENTE (contesto):\n{user_task}\n\n\
+         Il tuo compito: studia il codice del progetto e costruisci il caso PIU' \
+         FORTE possibile per la tua posizione assegnata, con evidenza concreta \
+         (file:riga). Attacca i punti deboli delle posizioni avverse con prove, \
+         non con retorica. Se studiando scopri che la tua posizione NON regge, \
+         dichiaralo onestamente con stance=oppose e i rischi che l'hanno demolita: \
+         e' il contributo piu' prezioso che puoi dare, non una sconfitta.\n\n\
+         Chiudi OBBLIGATORIAMENTE con il tool debate_position, ripetendo in \
+         assigned_position ESATTAMENTE la posizione assegnata qui sopra.",
+        assigned = assignment.assigned_position,
+    )
+}
+
+/// Fan-out degli avvocati: un task tokio per assegnazione, col proprio timer,
+/// sotto il governor di processo. Stesso punto unico del consiglio (regola L,
+/// difetto D3 dell'incidente fan-out congelato). L'ordine dei risultati segue
+/// quello delle assegnazioni: e' l'ancora dell'attribuzione posizionale.
+async fn spawn_advocates(
+    ctx: &AgentToolContext,
+    cfg: &DebateConfig,
+    topic: &str,
+    assignments: &[nexus_agent_graph::decisions::debate_panel::DebateAssignment],
+    user_task: &str,
+) -> Vec<Value> {
+    let expected = "Chiudi chiamando debate_position (assigned_position ripetuta alla \
+                    lettera, stance support|oppose, key_arguments con evidenza, risks \
+                    con severity). Un oppose richiede almeno un rischio con evidenza.";
+    let assignments_for_make = assignments.to_vec();
+    let topic_owned = topic.to_string();
+    let kind = cfg.kind.clone();
+    spawn_fanout(
+        &ctx.core.db,
+        assignments_for_make.len(),
+        FanoutScope::TopLevel,
+        |i| {
+            let ctx = ctx.clone();
+            let expected = expected.to_string();
+            let kind = kind.clone();
+            let task = build_advocate_task(&topic_owned, &assignments_for_make[i], user_task);
+            async move { run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await }
+        },
+    )
+    .await
+}
+
+/// Convoca gli AVVOCATI del dibattito in PARALLELO (sub-run read-only) e compone
+/// l'esito col punto unico PURO `compose_debate_synthesis` (regola L/M: legge i
+/// segnali strutturati `outcome.debate`, mai la prosa).
+///
+/// `None` se il piano e' vuoto (meno di 2 opzioni o meno di 2 avvocati: senza
+/// contraddittorio non e' un dibattito) o se nessun avvocato produce una
+/// posizione valida.
+pub(crate) async fn convene_debate_panel(
+    ctx: &AgentToolContext,
+    cfg: &DebateConfig,
+    topic: &str,
+    // Opzioni dichiarate dal consiglio: `plan_debate` le taglia a quelle che
+    // avranno davvero un difensore (mai un'opzione indifesa in gara).
+    options: &[String],
+    advocates: usize,
+    user_task: &str,
+    // Tipo GENERICO del quorum (`panel_quorum::QuorumPolicy`, path esplicito): il
+    // re-export `decisions::QuorumPolicy` e' quello della review, con vocabolario
+    // proprio (min_valid_verdicts/fail_on_high_severity). I due non sono
+    // ri-esportati insieme di proposito.
+    policy: &nexus_agent_graph::decisions::panel_quorum::QuorumPolicy,
+    quorum_pct: u8,
+) -> Option<DebatePanelOutcome> {
+    use nexus_agent_graph::decisions::debate_panel::{compose_debate_synthesis, plan_debate};
+    let n = advocates.min(cfg.max_advocates);
+    let assignments = plan_debate(options, n);
+    if assignments.is_empty() {
+        return None;
+    }
+    let results = spawn_advocates(ctx, cfg, topic, &assignments, user_task).await;
+    let outcomes: Vec<Value> = results
+        .into_iter()
+        .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
+        .collect();
+    // `outcomes[i]` e' il sub-run di `assignments[i]`: spawn_fanout preserva
+    // l'ordine (awaita gli handle in sequenza). E' su questa corrispondenza che
+    // poggia l'attribuzione POSIZIONALE del voto (regola M): la posizione difesa
+    // e' un fatto deciso da noi, non una stringa che il modello ricopia.
+    // Il roster (denominatore del quorum) e' assignments.len(): un avvocato
+    // morto e' un'astensione che pesa (lezione mig 0589).
+    let synthesis = compose_debate_synthesis(&outcomes, &assignments, policy, quorum_pct)?;
+    Some(DebatePanelOutcome {
+        topic: topic.to_string(),
+        assignments,
+        synthesis,
+    })
+}
+
+/// Corpo del blocco dibattito: sostegno per opzione, argomenti e rischi.
+fn render_debate_tally(
+    s: &nexus_agent_graph::decisions::debate_panel::DebateSynthesis,
+) -> String {
+    let mut out = String::from("Sostegno per opzione:\n");
+    for t in &s.tally {
+        let flag = if t.disqualified {
+            " [SQUALIFICATA: arresa dal suo stesso avvocato con evidenza grave]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "- {}: {} a favore, {} arrese{}\n",
+            t.option, t.support, t.surrendered, flag
+        ));
+    }
+    if !s.key_arguments.is_empty() {
+        out.push_str("Argomenti chiave emersi:\n");
+        for a in &s.key_arguments {
+            out.push_str(&format!("- {a}\n"));
+        }
+    }
+    if !s.risks.is_empty() {
+        out.push_str("Rischi emersi (per severity):\n");
+        for risk in &s.risks {
+            let sev = risk.get("severity").and_then(Value::as_str).unwrap_or("?");
+            let desc = risk.get("description").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&format!("- [{sev}] {desc}\n"));
+        }
+    }
+    out
+}
+
+/// Rende l'esito del dibattito in un blocco `<dibattito_sintesi>` da anteporre al
+/// primo messaggio del run. Deriva dai campi STRUTTURATI (regola M). Dichiara
+/// SEMPRE la base dei voti: un esito senza base dichiarata e' il proxy che ha
+/// prodotto l'incidente "proceed con 1 parere su 5" (mig 0589).
+pub(crate) fn render_debate_synthesis(o: &DebatePanelOutcome) -> String {
+    use nexus_agent_graph::decisions::debate_panel::DebatePanelVerdict;
+    let s = &o.synthesis;
+    let mut out = String::from("<dibattito_sintesi>\n");
+    out.push_str(&format!("Decisione in discussione: {}\n", o.topic));
+    out.push_str(&format!("Esito del dibattito: {}\n", s.verdict.as_str()));
+    out.push_str(&format!(
+        "Posizioni valide: {} su {} avvocati convocati (quorum minimo: {}); opzioni \
+         effettivamente discusse: {}\n",
+        s.valid, s.convened, s.required_valid, s.options_heard
+    ));
+    if s.misattributed > 0 {
+        out.push_str(&format!(
+            "NB: {} avvocati hanno argomentato una posizione diversa da quella assegnata: \
+             i loro voti sono stati scartati.\n",
+            s.misattributed
+        ));
+    }
+    out.push_str(&render_debate_tally(s));
+    // Coda decisa dal VERDETTO con match ESAUSTIVO (regola M): un esito nuovo non
+    // compila finche' non ne viene dichiarata la semantica testuale.
+    let closing = match s.verdict {
+        DebatePanelVerdict::OptionSelected => format!(
+            "(Il dibattito ha selezionato: {}. Non e' un ordine: e' l'opzione che ha \
+             retto al contraddittorio. Se decidi diversamente, dichiara perche'.)\n",
+            s.selected_option.as_deref().unwrap_or("?")
+        ),
+        DebatePanelVerdict::Split => String::from(
+            "(Il dibattito NON ha un vincitore: le posizioni si equivalgono o sono state \
+             tutte demolite. Decidi tu sul merito degli argomenti qui sopra, dichiarando \
+             il criterio che usi.)\n",
+        ),
+        DebatePanelVerdict::Inconclusive => format!(
+            "(ATTENZIONE: il dibattito NON ha deliberato — {} posizioni valide su {} \
+             avvocati convocati (minimo {}), e solo {} opzioni hanno avuto voce. Quanto \
+             sopra e' parziale, NON un confronto concluso: se una sola posizione e' stata \
+             difesa, il fatto che regga non dice nulla sulle alternative, che nessuno ha \
+             sostenuto. Non trattarlo come una scelta.)\n",
+            s.valid, s.convened, s.required_valid, s.options_heard
+        ),
+    };
+    out.push_str(&closing);
+    out.push_str("</dibattito_sintesi>");
+    out
 }
 
 /// Coda del blocco sintesi, decisa dal VERDETTO con match ESAUSTIVO (regola M):
@@ -2200,14 +2916,11 @@ impl ParentNarrator {
     }
 
     /// Emette (live) + persiste (storico) UN meta-step della narrazione,
-    /// correlato al sub-run. Best-effort: mai un errore al chiamante. Il tool
-    /// gira SOLO in `ExecMode::Real` (in Replay il tool_result e' riletto da
-    /// `agent_steps` senza eseguire l'handler), quindi il mode e' fissato.
+    /// correlato al sub-run. Best-effort: mai un errore al chiamante.
     async fn say(&self, kind: &str, title: String, payload: Value, subagent_run_id: Uuid) {
         nexus_agent_graph::nodes::emit_phase_meta_correlated(
             &self.sink,
             &self.store,
-            nexus_agent_graph::runtime::ports::ExecMode::Real,
             kind,
             Some(subagent_run_id.to_string()),
             title,
@@ -2476,7 +3189,8 @@ async fn run_single_subagent_inner(
 ) -> Value {
     // FASE PREPARE (guard + INSERT + ensure_child, tutto SINCRONO fail-fast): il
     // punto unico condiviso dal ramo singolo e dal batch background (regola L).
-    let req = SubagentRequest {
+    let exec = match prepare_subagent_run(
+        ctx,
         kind,
         task,
         context_blob,
@@ -2484,8 +3198,9 @@ async fn run_single_subagent_inner(
         isolation,
         is_background,
         model_pin,
-    };
-    let exec = match prepare_subagent_run(ctx, &req).await {
+    )
+    .await
+    {
         Ok(exec) => exec,
         Err(err) => return err,
     };
@@ -2517,126 +3232,47 @@ async fn run_single_subagent_inner(
 /// del fan-in vedrebbe 0 rimasti -> enqueue PREMATURO del parent (riesumato senza
 /// i risultati degli altri figli). Inserendo tutte le row prima, la COUNT e'
 /// corretta appena il 1o figlio chiude.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_subagent_run(
     ctx: &AgentToolContext,
-    req: &SubagentRequest<'_>,
-) -> Result<SubagentExecInputs, Value> {
-    let Some(session_id) = ctx.core.session_id else {
-        return Err(prepare_reject(
-            "session_missing",
-            "sub-agent richiede una sessione chat (session_id assente)",
-        ));
-    };
-    // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
-    // del progetto. Risolvo una volta il pool per_progetto e lo riuso per la catena
-    // depth/costo, l'INSERT e le mark_run (a flag OFF ritorna il meta-DB).
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
-
-    let plan = build_subagent_plan(ctx, &proj_pool, req, session_id).await?;
-    register_subagent_run(ctx, &proj_pool, req, &plan, session_id).await
-}
-
-/// COSA eseguire in un sub-run, come lo descrive il chiamante (singolo o batch).
-/// Raggruppa in una struct di contesto i parametri che attraversano l'intera fase
-/// PREPARE, distinti dal PIANO che il DB risolve ([`SubagentPlan`]).
-struct SubagentRequest<'a> {
-    kind: &'a str,
-    task: &'a str,
-    context_blob: &'a str,
-    expected_format: &'a str,
-    /// `Some` = ramo ISOLATO (worktree effimero gia' creato dal batch). Il ramo
-    /// background non lo supporta ed e' sempre `None`.
-    isolation: Option<&'a IsolationSlot>,
+    kind: &str,
+    task: &str,
+    context_blob: &str,
+    expected_format: &str,
+    isolation: Option<&IsolationSlot>,
     is_background: bool,
-    /// Provider/model imposti dal chiamante (panel multi-provider): scavalcano la
-    /// risoluzione del `model_purpose` della definition.
-    model_pin: Option<(&'a str, &'a str)>,
-}
-
-/// Sub-run con TUTTI i guard superati e tutto il DB-driven risolto (definition,
-/// prompt, tools, provider/model, depth, timeout), prima di qualunque scrittura.
-struct SubagentPlan {
-    anchor: Uuid,
-    /// Run CORRENTE che dispatcha ([`fanin_target_run_id`]): isola i figli DIRETTI
-    /// per COUNT/fetch del fan-in (mig project 0010) ed e' il run da RIPRENDERE
-    /// (quello marcato `awaiting_subagents`, che il CAS del worker cerca in
-    /// `agent_runs`). Distinto dall'`anchor` (depth-chain di famiglia, che degenera
-    /// in session_id): la COUNT sui figli con questo dispatcher e la coda che punta
-    /// a questo run coincidono per costruzione.
-    dispatcher: Uuid,
-    current_depth: i64,
-    provider: String,
-    model: String,
-    system_text: String,
-    tools_json: Value,
-    timeout_s: i64,
-    narration_enabled: bool,
-    narration_heartbeat_s: i64,
-}
-
-/// Guard + risoluzione DB-driven del sub-run, senza alcuna scrittura: se un guard
-/// non passa si esce con `Err(Value)` PRIMA che esista qualunque row (regola M: il
-/// coordinatore legge `error_code`, non il testo).
-///
-/// Guard, nell'ordine: settings (enabled/whitelist), definition del kind,
-/// anti-ricorsione + cost cap, prompt non vuoto.
-async fn build_subagent_plan(
-    ctx: &AgentToolContext,
-    proj_pool: &sqlx::PgPool,
-    req: &SubagentRequest<'_>,
-    session_id: Uuid,
-) -> Result<SubagentPlan, Value> {
-    let kind = req.kind;
-    let settings = check_subagent_settings(ctx, kind).await?;
-    let definition = fetch_definition_checked(ctx, kind).await?;
-    let anchor = parent_anchor(ctx);
-    let dispatcher = fanin_target_run_id(ctx, anchor);
-    let current_depth = check_depth_and_cost(proj_pool, &settings, anchor, dispatcher).await?;
-
-    let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
-    if system_text.trim().is_empty() {
-        return Err(prepare_reject(
-            "prompt_missing",
-            format!("prompt '{}' non trovato o vuoto", definition.prompt_key),
-        ));
-    }
-    let (provider, model) = match req.model_pin {
-        Some((provider, model)) => (provider.to_string(), model.to_string()),
+    model_pin: Option<(&str, &str)>,
+) -> Result<SubagentExecInputs, Value> {
+    let db = &*ctx.core.db;
+    let project_id = ctx.core.project_id;
+    let session_id = match ctx.core.session_id {
+        Some(s) => s,
         None => {
-            resolve_worker_model(&ctx.core.db, proj_pool, kind, &definition, anchor, session_id)
-                .await
+            return Err(prepare_reject(
+                "session_missing",
+                "sub-agent richiede una sessione chat (session_id assente)",
+            ))
         }
     };
-    Ok(SubagentPlan {
-        anchor,
-        dispatcher,
-        current_depth,
-        provider,
-        model,
-        system_text,
-        tools_json: build_tools_json(&definition.tool_whitelist),
-        timeout_s: if definition.timeout_s > 0 {
-            definition.timeout_s
-        } else {
-            settings.default_timeout_s
-        },
-        narration_enabled: settings.narration_enabled,
-        narration_heartbeat_s: settings.narration_heartbeat_s,
-    })
-}
+    // Routing separazione DB: nexus_subagent_runs e' tabella migrata, vive nel DB
+    // del progetto. Risolvo una volta il pool per-progetto e lo riuso per la catena
+    // depth/costo, l'INSERT e le mark_run. DB non disponibile -> rifiuto
+    // strutturato del prepare (regola M: il codice macchina, non la prosa).
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => return Err(prepare_reject(e.error_code(), e.to_string())),
+    };
 
-/// Guard 1: soglie sub-agent dal DB (regola G) + kind abilitato e in whitelist.
-async fn check_subagent_settings(
-    ctx: &AgentToolContext,
-    kind: &str,
-) -> Result<SubagentSettings, Value> {
-    let settings = read_subagent_settings(ctx).await.map_err(|e| {
-        prepare_reject(
-            "settings_read_failed",
-            format!("lettura settings fallita: {e}"),
-        )
-    })?;
+    // ── Guard 1: settings (enabled / whitelist / depth / cost) ────────────────
+    let settings = match read_subagent_settings(ctx).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(prepare_reject(
+                "settings_read_failed",
+                format!("lettura settings fallita: {e}"),
+            ))
+        }
+    };
     if !settings.enabled {
         return Err(prepare_reject(
             "subagents_disabled",
@@ -2649,38 +3285,26 @@ async fn check_subagent_settings(
             format!("kind '{kind}' non in whitelist: {:?}", settings.whitelist),
         ));
     }
-    Ok(settings)
-}
 
-/// Guard 2: definition del kind in `nexus_subagent_definitions`.
-async fn fetch_definition_checked(
-    ctx: &AgentToolContext,
-    kind: &str,
-) -> Result<SubagentDefinition, Value> {
-    match fetch_definition(ctx, kind).await {
-        Ok(Some(d)) => Ok(d),
-        Ok(None) => Err(prepare_reject(
-            "kind_not_found",
-            format!("kind '{kind}' non trovato in nexus_subagent_definitions"),
-        )),
-        Err(e) => Err(prepare_reject("definition_fetch_failed", e)),
-    }
-}
+    // ── Guard 2: definition del kind ──────────────────────────────────────────
+    let definition = match fetch_definition(db, kind).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return Err(prepare_reject(
+                "kind_not_found",
+                format!("kind '{kind}' non trovato in nexus_subagent_definitions"),
+            ))
+        }
+        Err(e) => return Err(prepare_reject("definition_fetch_failed", e)),
+    };
 
-/// Guard 3+4: anti-ricorsione (depth DB-driven dalla catena ANTENATI) e cost cap
-/// cumulativo per parent. Ritorna la profondita' del nuovo figlio.
-///
-/// La profondita' del figlio = depth del DISPATCHER (padre immediato) + 1, NON il
-/// MAX tra i fratelli running sotto l'anchor: i fratelli paralleli (es. le 6 figure
-/// del consiglio) non devono contarsi a vicenda come annidamento. Il cost cap
-/// resta invece per FAMIGLIA (anchor).
-async fn check_depth_and_cost(
-    proj_pool: &sqlx::PgPool,
-    settings: &SubagentSettings,
-    anchor: Uuid,
-    dispatcher: Uuid,
-) -> Result<i64, Value> {
-    let current_depth = current_chain_depth(proj_pool, dispatcher).await + 1;
+    // ── Guard 3: anti-ricorsione (depth DB-driven dalla catena ANTENATI) ──────
+    // La profondita' del figlio = depth del DISPATCHER (padre immediato) + 1, NON
+    // il MAX tra i fratelli running sotto l'anchor: i fratelli paralleli (es. le 6
+    // figure del consiglio) non devono contarsi a vicenda come annidamento.
+    let anchor = parent_anchor(ctx);
+    let dispatcher = fanin_target_run_id(ctx, anchor);
+    let current_depth = current_chain_depth(&proj_pool, dispatcher).await + 1;
     if current_depth > settings.max_depth {
         return Err(prepare_reject(
             "depth_exceeded",
@@ -2690,7 +3314,9 @@ async fn check_depth_and_cost(
             ),
         ));
     }
-    let spent = cumulative_cost(proj_pool, anchor).await;
+
+    // ── Guard 4: cost cap cumulativo per parent ───────────────────────────────
+    let spent = cumulative_cost(&proj_pool, anchor).await;
     if spent >= settings.cost_cap_usd {
         return Err(prepare_reject(
             "cost_cap_reached",
@@ -2700,124 +3326,143 @@ async fn check_depth_and_cost(
             ),
         ));
     }
-    Ok(current_depth)
-}
 
-/// Prenota il sub-run nel DB e ne fa un run TRACCIATO, poi ne costruisce gli input
-/// d'esecuzione.
-///
-/// La row `nexus_subagent_runs` nasce gia' `status='running'`: la catena depth si
-/// basa sui 'running' e il sub-run e' bloccante, non c'e' fase 'pending'
-/// osservabile.
-///
-/// La riga `agent_runs` del SUB-run e' l'osservabilita' (regola M): senza, il guard
-/// "untracked_run" di `PgAgentStepStore` scartava in SILENZIO ogni tool_result del
-/// figlio (agent_steps vuoto -> errori dei tool illeggibili, incidente 2026-07-06).
-/// Con la riga, gli step (input+result+esito) sono persistiti e ispezionabili;
-/// `nexus_agent_type='subagent'` discrimina i sub-run nelle query UI top-level
-/// (active-run, timeline, guard 409) e `parent_run_id` e' valorizzato solo se
-/// l'ancora e' a sua volta un run tracciato (FK su agent_runs).
-async fn register_subagent_run(
-    ctx: &AgentToolContext,
-    proj_pool: &sqlx::PgPool,
-    req: &SubagentRequest<'_>,
-    plan: &SubagentPlan,
-    session_id: Uuid,
-) -> Result<SubagentExecInputs, Value> {
-    let project_id = ctx.core.project_id;
-    let insert = NewSubagentRun {
-        anchor: plan.anchor,
-        dispatcher_run_id: plan.dispatcher,
-        project_id,
-        kind: req.kind,
-        task: req.task,
-        context_blob: req.context_blob,
-        expected_format: req.expected_format,
-        depth: plan.current_depth as i32,
-        is_background: req.is_background,
+    // ── Risoluzione system_text + tools + modello worker (DB-driven) ──────────
+    let system_text = resolve_system_text(ctx, &definition.prompt_key).await;
+    if system_text.trim().is_empty() {
+        return Err(prepare_reject(
+            "prompt_missing",
+            format!("prompt '{}' non trovato o vuoto", definition.prompt_key),
+        ));
+    }
+    let tools_json = build_tools_json(&definition.tool_whitelist);
+
+    let (provider, model) = if let Some((provider, model)) = model_pin {
+        (provider.to_string(), model.to_string())
+    } else {
+        resolve_worker_model(db, &proj_pool, kind, &definition, anchor, session_id).await
     };
-    let subagent_run_id = insert_subagent_run(proj_pool, &insert, req.isolation)
-        .await
-        .map_err(|e| {
-            prepare_reject(
+
+    let timeout_s = if definition.timeout_s > 0 {
+        definition.timeout_s
+    } else {
+        settings.default_timeout_s
+    };
+    // Clamp alla DEADLINE del run primario (fase 3, mig 0604): un sub-run non
+    // vive oltre il tempo residuo del run che lo ha convocato. Sotto il floor
+    // (`subagent_min_timeout_s`) la figura NON parte: rifiuto strutturato
+    // (regola M), un timeout ridicolo produrrebbe solo spesa senza esito.
+    let timeout_s = match run_time_remaining_s(&ctx.core.db, &proj_pool, anchor).await {
+        Some(remaining_s) => {
+            let floor_s = subagent_min_timeout_s(&ctx.core.db).await;
+            if remaining_s < floor_s {
+                return Err(prepare_reject(
+                    "deadline_exhausted",
+                    format!(
+                        "deadline del run quasi esaurita per parent={anchor} \
+                         (residuo {remaining_s}s < floor {floor_s}s)"
+                    ),
+                ));
+            }
+            timeout_s.min(remaining_s)
+        }
+        None => timeout_s,
+    };
+
+    // Embedding del context/expected nel task (parita' col brain `run_subagent`).
+    let mut initial_msg = task.trim().to_string();
+    if !context_blob.trim().is_empty() {
+        initial_msg.push_str("\n\n## Contesto aggiuntivo\n");
+        initial_msg.push_str(context_blob.trim());
+    }
+    if !expected_format.trim().is_empty() {
+        initial_msg.push_str("\n\n## Formato output atteso\n");
+        initial_msg.push_str(expected_format.trim());
+    }
+
+    // ── Crea row in nexus_subagent_runs (status='running' subito: la catena depth
+    //    si basa sui 'running'; il sub-run e' bloccante, non c'e' fase 'pending'
+    //    osservabile). ────────────────────────────────────────────────────────────
+    let insert = NewSubagentRun {
+        anchor,
+        // Run CORRENTE che dispatcha: isola i figli DIRETTI per COUNT/fetch del
+        // fan-in (mig project 0010). E' lo STESSO id che finisce in
+        // `fanin_parent_run_id` (il target del resume): la COUNT sui figli con
+        // dispatcher = questo run e la coda che punta a questo run coincidono.
+        dispatcher_run_id: fanin_target_run_id(ctx, anchor),
+        project_id,
+        kind,
+        task,
+        context_blob,
+        expected_format,
+        depth: current_depth as i32,
+        is_background,
+    };
+    let subagent_run_id: Uuid = match insert_subagent_run(&proj_pool, &insert, isolation).await {
+        Ok(id) => id,
+        Err(e) => {
+            return Err(prepare_reject(
                 "insert_failed",
                 format!("creazione riga nexus_subagent_runs fallita: {e}"),
-            )
-        })?;
+            ))
+        }
+    };
+
+    // ── Riga agent_runs del SUB-run (osservabilita', regola M) ────────────────
+    // Il sub-run gira sul grafo nativo con run_id=subagent_run_id ma non aveva
+    // alcuna riga in agent_runs: il guard "untracked_run" di PgAgentStepStore
+    // scartava in SILENZIO ogni tool_result del figlio (agent_steps vuoto ->
+    // errori dei tool illeggibili, incidente 2026-07-06). La riga rende il
+    // figlio un run TRACCIATO: step (input+result+esito) persistiti e
+    // ispezionabili. `nexus_agent_type='subagent'` e' il discriminatore per le
+    // query UI top-level (active-run, timeline, guard 409); `parent_run_id` e'
+    // valorizzato solo se l'ancora e' un run tracciato (FK su agent_runs).
     ensure_child_agent_run(
-        proj_pool,
+        &proj_pool,
         subagent_run_id,
         session_id,
         project_id,
         ctx.core.user_id,
-        plan.anchor,
-        &plan.provider,
-        &plan.model,
+        anchor,
+        &provider,
+        &model,
     )
     .await;
-    Ok(build_exec_inputs(
-        ctx,
-        proj_pool,
-        req,
-        plan,
-        session_id,
-        subagent_run_id,
-    ))
-}
 
-/// Input OWNED della parte "execute" (regola L: punto unico condiviso dai due rami
-/// sync/background). Tutto e' `'static` (String/Uuid/Value/PgPool clonabile):
-/// `execute_subagent_run` puo' essere `await`ato inline oppure spostato in un task
-/// detached senza catturare riferimenti allo stack del chiamante.
-fn build_exec_inputs(
-    ctx: &AgentToolContext,
-    proj_pool: &sqlx::PgPool,
-    req: &SubagentRequest<'_>,
-    plan: &SubagentPlan,
-    session_id: Uuid,
-    subagent_run_id: Uuid,
-) -> SubagentExecInputs {
-    SubagentExecInputs {
+    // ── Input OWNED della parte "execute" (regola L: punto unico condiviso dai
+    //    due rami sync/background). Tutto e' `'static` (String/Uuid/Value/PgPool
+    //    clonabile): l'helper puo' essere `await`ato inline oppure spostato in un
+    //    task detached senza catturare riferimenti allo stack del chiamante. ─────
+    Ok(SubagentExecInputs {
         ctx: ctx.clone(),
-        proj_pool: proj_pool.clone(),
+        proj_pool,
         subagent_run_id,
         session_id,
-        anchor: plan.anchor,
-        kind: req.kind.to_string(),
-        task: req.task.to_string(),
-        provider: plan.provider.clone(),
-        model: plan.model.clone(),
-        system_text: plan.system_text.clone(),
-        initial_msg: compose_initial_message(req),
-        tools_json: plan.tools_json.clone(),
-        current_depth: plan.current_depth,
-        timeout_s: plan.timeout_s,
-        narration_enabled: plan.narration_enabled,
-        narration_heartbeat_s: plan.narration_heartbeat_s,
+        anchor,
+        kind: kind.to_string(),
+        task: task.to_string(),
+        provider,
+        model,
+        system_text,
+        prompt_key: definition.prompt_key.clone(),
+        initial_msg,
+        tools_json,
+        current_depth,
+        timeout_s,
+        narration_enabled: settings.narration_enabled,
+        narration_heartbeat_s: settings.narration_heartbeat_s,
         // Il ramo background NON supporta isolamento (vedi doc su tool_dispatch_*):
         // qui `working_root` porta il worktree solo per il ramo sequenziale isolato.
-        working_root: req.isolation.map(|s| s.worktree_path.clone()),
-        isolated: req.isolation.is_some(),
+        working_root: isolation.map(|s| s.worktree_path.clone()),
+        isolated: isolation.is_some(),
         // Fase D fan-in: il ramo background enqueue il parent al termine se e'
         // l'ultimo figlio background terminale (vedi execute_subagent_run).
-        is_background: req.is_background,
-        fanin_parent_run_id: plan.dispatcher,
-    }
-}
-
-/// Messaggio iniziale del sub-run: il task con context/expected embeddati (parita'
-/// col brain `run_subagent`). Le sezioni assenti/vuote non compaiono.
-fn compose_initial_message(req: &SubagentRequest<'_>) -> String {
-    let mut initial_msg = req.task.trim().to_string();
-    if !req.context_blob.trim().is_empty() {
-        initial_msg.push_str("\n\n## Contesto aggiuntivo\n");
-        initial_msg.push_str(req.context_blob.trim());
-    }
-    if !req.expected_format.trim().is_empty() {
-        initial_msg.push_str("\n\n## Formato output atteso\n");
-        initial_msg.push_str(req.expected_format.trim());
-    }
-    initial_msg
+        is_background,
+        // Run da riprendere nel fan-in: il run CORRENTE (sospeso su
+        // awaiting_subagents), NON l'anchor depth-chain (bug: il CAS del worker
+        // cerca agent_runs.id = questo id).
+        fanin_parent_run_id: fanin_target_run_id(ctx, anchor),
+    })
 }
 
 /// Spawna l'esecuzione DETACHED di un sub-run gia' preparato (row inserita) e
@@ -2855,6 +3500,11 @@ struct SubagentExecInputs {
     provider: String,
     model: String,
     system_text: String,
+    /// Chiave del template di sistema del sub-run
+    /// (`nexus_subagent_definitions.prompt_key`): viaggia fino allo stato del
+    /// grafo perche' il ReflectionNode attribuisca la reflection al prompt
+    /// giusto invece che a quello del run principale.
+    prompt_key: String,
     initial_msg: String,
     tools_json: Value,
     current_depth: i64,
@@ -2884,178 +3534,239 @@ struct SubagentExecInputs {
 /// allo stack del chiamante. Ritorna il `Value` tool_result del sub-run (summary /
 /// timeout / failure); nel ramo background il valore e' scartato (il fan-in legge
 /// la row DB), ma tutti gli effetti (mark_run, narrazione) avvengono comunque.
-///
-/// ORDINE DEL PONTE (race chiusa alla radice, regola H): in OGNI esito il ponte di
-/// narrazione e' fermato e ATTESO (`stop_bridge`) PRIMA del meta-step di chiusura.
-/// Senza l'await, `abort()` e' cooperativo (cancella al prossimo poll) e un
-/// progress/heartbeat gia' dentro `persist_meta_step` potrebbe ottenere un NOW() >
-/// del completed -> ordine invertito nella timeline storica (ordinata per
-/// `created_at`). L'await del handle garantisce che nessuna INSERT del ponte segua
-/// quella di chiusura.
 async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
-    let narrator = ParentNarrator::from_ctx(
-        &exec.ctx,
-        &exec.proj_pool,
-        exec.narration_enabled,
-        &exec.provider,
-        &exec.model,
-    );
-    narrate_subagent_started(narrator.as_deref(), &exec).await;
+    let SubagentExecInputs {
+        ctx,
+        proj_pool,
+        subagent_run_id,
+        session_id,
+        anchor,
+        kind,
+        task,
+        provider,
+        model,
+        system_text,
+        prompt_key,
+        initial_msg,
+        tools_json,
+        current_depth,
+        timeout_s,
+        narration_enabled,
+        narration_heartbeat_s,
+        working_root,
+        isolated,
+        is_background,
+        fanin_parent_run_id,
+    } = exec;
 
-    let deps = build_native_deps_for_tool(&exec.ctx).await;
+    // ── NARRAZIONE sul run PADRE (ADR 0037): avvio ────────────────────────────
+    // Il dispatch (sincrono) e' bloccante e puo' durare minuti: senza questi
+    // meta-step la chat resta muta e il run padre sembra bloccato mentre il figlio
+    // lavora. Nel ramo background la narrazione racconta il progresso del figlio
+    // sul run padre gia' sospeso (il fan-in arrivera' via poll).
+    let narrator = ParentNarrator::from_ctx(&ctx, &proj_pool, narration_enabled, &provider, &model);
+    if let Some(n) = &narrator {
+        let task_head: String = task.trim().chars().take(160).collect();
+        n.say(
+            "subagent_started",
+            format!("Subagente {kind} avviato — {task_head}"),
+            n.with_pin(json!({
+                K_SUB_RUN_ID: subagent_run_id.to_string(),
+                K_SUB_KIND: kind,
+                "task": task_head,
+                "depth": current_depth,
+                K_TIMEOUT_S: timeout_s,
+                "isolated": isolated,
+            })),
+            subagent_run_id,
+        )
+        .await;
+    }
+
+    // ── Esecuzione sul GRAFO NATIVO (in-process, niente brain) ────────────────
+    // Il sub-run e' un run a se': run_id = subagent_run_id (= thread del grafo),
+    // STESSA session_id del parent (eredita root/permessi/canali). Lo stato porta
+    // parent_run_id + subagent_depth -> il grafo applica i guard di annidamento
+    // (UnderstandingNode salta il fan-out explore se depth>=1).
+    let deps = build_native_deps_for_tool(&ctx, timeout_s).await;
+    // Canale SSE proprio del sub-run: NON instrada al frontend (l'output utente
+    // resta quello del main, che riceve solo il summary). Il receiver alimenta
+    // il PONTE narrazione verso il padre (prima era scartato: feature muta);
+    // senza narratore il receiver e' droppato e il comportamento e' lo storico.
     let (sub_tx, sub_rx) = tokio::sync::broadcast::channel(256);
     let bridge = narrator.as_ref().map(|n| {
         spawn_narration_bridge(
             n.clone(),
             sub_rx,
-            exec.subagent_run_id,
-            exec.kind.clone(),
-            exec.narration_heartbeat_s,
+            subagent_run_id,
+            kind.clone(),
+            narration_heartbeat_s,
         )
     });
-    let native_input = build_subagent_native_input(&exec, sub_tx);
 
-    let run_fut = crate::native_engine::run_native(&deps, &native_input);
-    let budget = std::time::Duration::from_secs(exec.timeout_s as u64);
-    let outcome = tokio::time::timeout(budget, run_fut).await;
-    stop_bridge(bridge).await;
-
-    let out = finalize_subagent_outcome(&exec, narrator.as_deref(), outcome).await;
-    maybe_enqueue_fanin_resume(
-        &exec.ctx,
-        &exec.proj_pool,
-        exec.anchor,
-        exec.fanin_parent_run_id,
-        exec.session_id,
-        exec.is_background,
-    )
-    .await;
-    out
-}
-
-/// Meta-step di AVVIO del sub-run sul run PADRE (ADR 0037). Il dispatch sincrono
-/// e' bloccante e puo' durare minuti: senza questo meta-step la chat resta muta e
-/// il run padre sembra bloccato mentre il figlio lavora. Nel ramo background
-/// racconta il progresso del figlio sul padre gia' sospeso (il fan-in arriva via
-/// poll). Senza narratore (kill-switch OFF) e' un no-op: chat muta, storico.
-async fn narrate_subagent_started(narrator: Option<&ParentNarrator>, exec: &SubagentExecInputs) {
-    let Some(n) = narrator else { return };
-    let kind = &exec.kind;
-    let task_head: String = exec.task.trim().chars().take(160).collect();
-    n.say(
-        "subagent_started",
-        format!("Subagente {kind} avviato — {task_head}"),
-        n.with_pin(json!({
-            K_SUB_RUN_ID: exec.subagent_run_id.to_string(),
-            K_SUB_KIND: kind,
-            "task": task_head,
-            "depth": exec.current_depth,
-            K_TIMEOUT_S: exec.timeout_s,
-            "isolated": exec.isolated,
-        })),
-        exec.subagent_run_id,
-    )
-    .await;
-}
-
-/// Input del GRAFO NATIVO per un sub-run (in-process, niente brain). Il sub-run e'
-/// un run a se': `run_id = subagent_run_id` (= thread del grafo), STESSA
-/// `session_id` del parent (eredita root/permessi/canali). Lo stato porta
-/// `parent_run_id` + `subagent_depth` -> il grafo applica i guard di annidamento
-/// (UnderstandingNode salta il fan-out explore se depth>=1).
-///
-/// Nessuna scelta qui: i campi variabili arrivano da `exec`, gli altri sono
-/// COSTANTI del sub-run — niente history del main (parita' col brain
-/// `run_subagent`, che parte da `messages=[Human(task)]`), nessun intent_hint ne'
-/// giudizio del classifier (il task e' gia' descritto: decide il RouterNode),
-/// autonomia piena (parita' col brain: behavior_mode "automatico", approved=true).
-fn build_subagent_native_input(
-    exec: &SubagentExecInputs,
-    step_tx: tokio::sync::broadcast::Sender<crate::agent_types::AgentStepEvent>,
-) -> NativeRunInput {
-    NativeRunInput {
-        run_id: exec.subagent_run_id,
-        session_id: exec.session_id,
-        provider: exec.provider.clone(),
-        model: exec.model.clone(),
-        system_text: exec.system_text.clone(),
-        initial_msg: exec.initial_msg.clone(),
+    // provider/model risolti: clonati per i rami finalize timeout/failure, che
+    // girano DOPO che `native_input` prende possesso degli originali. Il ramo
+    // success usa invece la provenienza EFFETTIVA da `o` (post-failover).
+    let provider_resolved = provider.clone();
+    let model_resolved = model.clone();
+    let native_input = NativeRunInput {
+        run_id: subagent_run_id,
+        session_id,
+        provider,
+        model,
+        system_text,
+        // Il sub-run porta la chiave della PROPRIA definizione, cosi' le sue
+        // reflection sono attribuite al prompt giusto e non a quello del run
+        // principale.
+        prompt_key: Some(prompt_key.clone()),
+        initial_msg,
+        // Sub-run isolato: NIENTE history del main (parita' col brain `run_subagent`,
+        // che parte da messages=[Human(task)]).
         conversation_history: Vec::new(),
-        tools_json: exec.tools_json.clone(),
+        tools_json,
+        // Sub-agente auto-approvato e DIRETTO: nessun intent_hint, nessun giudizio
+        // del classifier (il task e' gia' descritto). Il RouterNode decide.
         intent_hint: None,
         requires_tools: None,
         agentic_score: None,
         authorizes_changes: None,
         classifier_resolved: false,
         action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
+        // Sub-agente eseguito in autonomia (parita' col brain: behavior_mode
+        // "automatico", approved=true).
         automation_mode: "automatic".to_string(),
         supervisor_mode: nexus_agent_graph::SupervisorMode::None,
-        step_tx,
-        parent_run_id: Some(exec.anchor),
-        subagent_depth: Some(exec.current_depth),
+        step_tx: sub_tx,
+        parent_run_id: Some(anchor),
+        subagent_depth: Some(current_depth),
+        sizing_complexity: None,
+        sizing_scope_system_wide: false,
+        classifier_intent: None,
+        // Il tetto REALE di questa figura (lo stesso del `tokio::time::timeout`
+        // esterno qui sotto) entra nel motore: senza, il gate a tempo dell'executor
+        // userebbe il setting globale `agent.run_time_budget_s` (0 per policy) e
+        // resterebbe inerte, lasciando la figura morire muta allo scadere.
+        run_time_budget_s: Some(timeout_s.max(0) as u64),
         // FASE 2: override root del sub-run. `None` (ramo sequenziale/condiviso o
         // background) -> scrive sulla root del progetto, comportamento invariato.
         // `Some(worktree)` (ramo ISOLATO, valorizzato dal batch parallelo di
         // `tool_dispatch_subagents`) -> scrive nel worktree effimero, ctx isolato
         // (autocommit/reindex soppressi, PR3). L'apply serializzato e' del batch.
-        working_root: exec.working_root.clone(),
+        working_root,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
-    }
-}
+        // Un SUB-RUN non ha barriera: i panel a monte sono del coordinatore, non
+        // suoi. Un figlio che attendesse il consiglio del padre sarebbe un'attesa
+        // circolare (il padre sta aspettando lui).
+        advisory_gate: None,
+    };
 
-/// Chiusura del sub-run dal risultato del grafo, letta come SEGNALE STRUTTURATO
-/// (regola M): `Err(Elapsed)` = timeout duro scaduto (parita' col brain
-/// `asyncio.wait_for`), `Ok(Ok)` = esito nativo, `Ok(Err)` = errore d'esecuzione.
-/// Il ramo timeout marca comunque la riga TERMINALE (`status='timeout'`) e torna
-/// al chiamante, che lo fa passare per l'enqueue fan-in come gli altri rami: senza,
-/// un parent con l'ultimo figlio in timeout resterebbe sospeso per sempre.
-///
-/// `provider`/`model` di `exec` sono quelli RISOLTI a monte, usati dai rami
-/// timeout/failure; il ramo success usa invece la provenienza EFFETTIVA da `o`
-/// (post-failover).
-async fn finalize_subagent_outcome(
-    exec: &SubagentExecInputs,
-    narrator: Option<&ParentNarrator>,
-    outcome: Result<anyhow::Result<NativeRunOutcome>, tokio::time::error::Elapsed>,
-) -> Value {
-    match outcome {
-        Err(_) => {
-            finalize_timeout(
-                &exec.proj_pool,
-                narrator,
-                exec.subagent_run_id,
-                &exec.kind,
-                exec.timeout_s,
-                &exec.provider,
-                &exec.model,
-            )
-            .await
-        }
-        Ok(Ok(o)) => {
+    // Timeout duro sull'esecuzione del sub-run (parita' col brain `asyncio.wait_for`).
+    // In OGNI ramo il ponte e' fermato e ATTESO (`stop_bridge`) prima del meta-step
+    // di chiusura: senza l'await, abort() e' cooperativo (cancella al prossimo poll)
+    // e un progress/heartbeat gia' dentro persist_meta_step potrebbe ottenere un
+    // NOW() > del completed -> ordine invertito nella timeline storica (ordinata
+    // per created_at). L'await del handle garantisce che nessuna INSERT del ponte
+    // segua quella di chiusura (race chiusa alla radice, regola H).
+    let run_fut = crate::native_engine::run_native(&deps, &native_input);
+    // L'istante da cui il budget decorre, in Rust. Serve al ramo di scadenza:
+    // `completed_at` sulla riga del sub-run e' il NOW() del server Postgres,
+    // scritto DOPO stop_bridge + fetch_ledger_totals + mark_run, cioe' misura la
+    // CHIUSURA e non lo scatto. Finche' i due erano indistinguibili, un ritardo
+    // nella scrittura (pool esaurito) somigliava a un timer che scatta tardi:
+    // due cause opposte con la stessa faccia.
+    let t_budget_start = std::time::Instant::now();
+    let outcome: anyhow::Result<NativeRunOutcome> =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_s as u64), run_fut).await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                // Misurato PRIMA di ogni await successivo: da qui in poi qualunque
+                // attesa (il ponte, il ledger, una connessione dal pool) sposta
+                // solo la scrittura, non lo scatto.
+                let scatto_ms = t_budget_start.elapsed().as_millis() as u64;
+                let ritardo_ms = ritardo_scatto_ms(scatto_ms, timeout_s);
+                tracing::warn!(
+                    sub_run_id = %subagent_run_id,
+                    kind = %kind,
+                    timeout_s,
+                    scatto_ms,
+                    ritardo_ms,
+                    "sub-run scaduto: ritardo dello scatto rispetto al budget"
+                );
+                stop_bridge(bridge).await;
+                // Il timeout marca comunque la riga TERMINALE (status='timeout'):
+                // deve passare per l'enqueue fan-in come gli altri rami (senza,
+                // un parent con l'ultimo figlio andato in timeout resterebbe
+                // sospeso per sempre). Non esce con return diretto.
+                let out = finalize_timeout(
+                    &proj_pool,
+                    &ctx.core.db,
+                    narrator.as_deref(),
+                    subagent_run_id,
+                    &kind,
+                    timeout_s,
+                    &provider_resolved,
+                    &model_resolved,
+                )
+                .await;
+                maybe_enqueue_fanin_resume(
+                    &ctx,
+                    &proj_pool,
+                    anchor,
+                    fanin_parent_run_id,
+                    session_id,
+                    is_background,
+                )
+                .await;
+                return out;
+            }
+        };
+    stop_bridge(bridge).await;
+
+    let out = match outcome {
+        Ok(mut o) => {
+            // Costo/token del sub-run INTERO dal ledger (punto unico), non
+            // dell'ultimo turno: intercetto qui, cosi' mark_run, la narrazione e
+            // il tool_result al padre vedono tutti lo stesso numero onesto.
+            adopt_ledger_totals(&ctx.core.db, subagent_run_id, &mut o).await;
             finalize_success(
-                &exec.proj_pool,
-                narrator,
-                exec.subagent_run_id,
-                &exec.kind,
-                exec.current_depth,
+                &proj_pool,
+                narrator.as_deref(),
+                subagent_run_id,
+                &kind,
+                current_depth,
                 &o,
             )
             .await
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             finalize_failure(
-                &exec.proj_pool,
-                narrator,
-                exec.subagent_run_id,
-                &exec.kind,
+                &proj_pool,
+                &ctx.core.db,
+                narrator.as_deref(),
+                subagent_run_id,
+                &kind,
                 &e,
-                &exec.provider,
-                &exec.model,
+                &provider_resolved,
+                &model_resolved,
             )
             .await
         }
-    }
+    };
+    // Fan-in (Fase D): il figlio si e' marcato TERMINALE nel finalize sopra. Se e'
+    // il ramo background e nessun altro figlio background del parent e' ancora
+    // attivo, accoda il parent nella coda META (il worker fan-in lo riprende).
+    maybe_enqueue_fanin_resume(
+        &ctx,
+        &proj_pool,
+        anchor,
+        fanin_parent_run_id,
+        session_id,
+        is_background,
+    )
+    .await;
+    out
 }
 
 /// Enqueue idempotente del parent nella coda fan-in META
@@ -3240,59 +3951,38 @@ async fn resolve_worker_model(
     // padre da escludere (astensione da auto-certificazione).
     if kind == "review" {
         let exclude: Vec<String> = parent_provider(db, anchor).await.into_iter().collect();
-        return resolve_review_model(db, purpose, kind, &exclude).await;
+        return resolve_model_excluding(db, purpose, kind, &exclude).await;
     }
 
     // Ramo WORKER: se l'utente ha pinnato un provider sulla chat, prova a risolvere
     // il purpose RISTRETTO a quel provider (preferenza-forte tier-aware).
     if let Some(pinned) = session_pinned_provider(proj_pool, session_id).await {
-        if let Some(resolved) = resolve_pinned_worker_model(db, purpose, kind, &pinned).await {
-            return resolved;
+        match crate::internal_routing::resolve_purpose_model_db_pinned(db, purpose, Some(&pinned))
+            .await
+        {
+            crate::internal_routing::PurposeResolution::Resolved {
+                provider, model, ..
+            } => return (provider, model),
+            // NoCapableModel/NotFound col pin: il provider pinnato non offre un
+            // modello capable del tier (o e' in cooldown). FALLBACK senza pin
+            // (regola H fail-loud: il figlio non resta bloccato). WARN strutturato
+            // (regola M: la decisione e' sull'enum PurposeResolution, il testo e'
+            // solo display).
+            other => {
+                tracing::warn!(
+                    kind = %kind,
+                    purpose = %purpose,
+                    pinned = %pinned,
+                    resolution = ?other,
+                    "subagent_native: pin provider non risolvibile per il tier del purpose, \
+                     fallback senza pin"
+                );
+            }
         }
     }
 
     // Nessun pin (o pin degradato): risoluzione worker standard (parita' col
     // comportamento pre-pin).
-    resolve_default_worker_model(db, purpose, kind).await
-}
-
-/// Risoluzione del purpose RISTRETTA al provider pinnato dall'utente sulla chat.
-/// `None` = pin non risolvibile (il provider pinnato non offre un modello capable
-/// del tier, o e' in cooldown): il chiamante RIPIEGA sulla risoluzione senza pin
-/// (regola H fail-loud: il figlio non resta bloccato, il pin e' una preferenza
-/// forte non un hard filter). Il WARN e' strutturato (regola M: la decisione e'
-/// sull'enum `PurposeResolution`, il testo e' solo display).
-async fn resolve_pinned_worker_model(
-    db: &sqlx::PgPool,
-    purpose: &str,
-    kind: &str,
-    pinned: &str,
-) -> Option<(String, String)> {
-    match crate::internal_routing::resolve_purpose_model_db_pinned(db, purpose, Some(pinned)).await {
-        crate::internal_routing::PurposeResolution::Resolved {
-            provider, model, ..
-        } => Some((provider, model)),
-        other => {
-            tracing::warn!(
-                kind = %kind,
-                purpose = %purpose,
-                pinned = %pinned,
-                resolution = ?other,
-                "subagent_native: pin provider non risolvibile per il tier del purpose, \
-                 fallback senza pin"
-            );
-            None
-        }
-    }
-}
-
-/// Risoluzione worker standard del purpose (nessun vincolo di provider). Non
-/// risolto -> `("", "")`: nessun override, l'executor usa il routing di default.
-async fn resolve_default_worker_model(
-    db: &sqlx::PgPool,
-    purpose: &str,
-    kind: &str,
-) -> (String, String) {
     match crate::internal_routing::resolve_purpose_model_db(db, purpose).await {
         crate::internal_routing::PurposeResolution::Resolved {
             provider, model, ..
@@ -3309,12 +3999,17 @@ async fn resolve_default_worker_model(
     }
 }
 
-/// Risoluzione del modello per un sub-run di `kind == "review"`: ESCLUDE il
-/// provider del padre (`exclude`), con fallback SENZA esclusione + WARN se il pool
-/// si svuota (unico provider capable). Estratto da `resolve_worker_model` per
-/// tenere il ramo review distinto dal ramo pin-worker (leggibilita'); la logica
-/// del vincolo giudice != worker e' invariata.
-async fn resolve_review_model(
+/// Risoluzione del modello di un sub-run con ESCLUSIONE di provider, e fallback
+/// SENZA esclusione + WARN se il pool si svuota (unico provider capable).
+///
+/// Punto unico (regola L) per due vincoli della stessa natura:
+///   - review: giudice != worker (esclude il provider del padre);
+///   - consiglio: figure su provider DISTINTI (esclude i provider gia'
+///     assegnati alle figure precedenti, vedi `resolve_council_assignments`).
+/// In entrambi i casi l'esclusione e' una PREFERENZA forte, non un vincolo che
+/// lascia il posto vuoto: meglio un duplicato dichiarato (WARN) che una figura
+/// in meno.
+async fn resolve_model_excluding(
     db: &sqlx::PgPool,
     purpose: &str,
     kind: &str,
@@ -3372,6 +4067,130 @@ async fn parent_provider(db: &sqlx::PgPool, anchor: Uuid) -> Option<String> {
 /// `agent_runs`. `None` se la sessione non ha pin, il valore e' NULL/vuoto, o la
 /// query fallisce (fail-open: nessun pin -> routing worker standard). Il pin e'
 /// SOLO il provider: il modello si deriva sempre dal tier via catalog (regola G).
+/// Classifica l'esito di ogni figura e lo emette sul canale di progresso UI
+/// appena disponibile (estratto da `convene_council`, comportamento invariato).
+async fn classify_and_stream_reports(
+    kinds: &[String],
+    results: Vec<Value>,
+    progress_tx: Option<&tokio::sync::mpsc::Sender<FigureAdvisoryReport>>,
+) -> Vec<(FigureAdvisoryReport, Value)> {
+    let mut pairs: Vec<(FigureAdvisoryReport, Value)> = Vec::with_capacity(kinds.len());
+    for (kind, result) in kinds.iter().zip(results.into_iter()) {
+        let report = classify_council_figure_result(kind, &result);
+        if let Some(tx) = progress_tx {
+            let _ = tx.send(report.clone()).await;
+        }
+        pairs.push((report, result));
+    }
+    pairs
+}
+
+/// Risolve il pool del progetto e delega a [`resolve_council_assignments`]
+/// (che resta parametrica sui pool per i test, regola O).
+async fn council_assignments(
+    ctx: &AgentToolContext,
+    kinds: &[String],
+) -> Vec<Option<(String, String)>> {
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(
+        &ctx.core.db,
+        ctx.core.project_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            // Pre-assegnazione best-effort: senza DB progetto non si legge il
+            // pin di sessione -> nessuna pre-assegnazione, ogni figura segue il
+            // percorso storico (None), che produce i suoi rifiuti strutturati.
+            tracing::warn!(
+                project_id = %ctx.core.project_id,
+                error = %e,
+                "council_assignments: DB progetto non disponibile, nessuna pre-assegnazione"
+            );
+            return vec![None; kinds.len()];
+        }
+    };
+    resolve_council_assignments(&ctx.core.db, &proj_pool, ctx.core.session_id, kinds).await
+}
+
+/// Esegue UNA figura del Consiglio: pinnata sul provider pre-assegnato
+/// ([`resolve_council_assignments`]) quando c'e', percorso storico altrimenti.
+async fn run_council_figure(
+    ctx: &AgentToolContext,
+    kind: &str,
+    task: &str,
+    expected: &str,
+    pin: Option<(String, String)>,
+) -> Value {
+    match pin {
+        Some((provider, model)) => {
+            run_single_subagent_with_model_pin(ctx, kind, task, "", expected, &provider, &model)
+                .await
+        }
+        None => run_single_subagent(ctx, kind, task, "", expected, None, false).await,
+    }
+}
+
+/// Pre-assegna alle figure del Consiglio provider DISTINTI (preferenza forte).
+///
+/// Difetto misurato il 20/07: `software_architect` e `security_engineer`
+/// (stesso purpose tier) hanno ricevuto lo STESSO provider e lo STESSO modello
+/// (openrouter/qwen3-235b), perche' ogni figura risolveva il proprio modello in
+/// parallelo e in isolamento -- il piu' economico eleggibile e' uguale per
+/// tutte. Due pareri dello stesso modello non sono due pareri: la diversita'
+/// che il Consiglio promette va decisa PRIMA del fan-out, quando l'assegnazione
+/// e' ancora sequenziale.
+///
+/// Regole:
+///   - ogni figura risolve col SUO purpose (nessun purpose condiviso imposto),
+///     escludendo i provider gia' assegnati alle figure precedenti;
+///   - pool esaurito -> la figura tiene il provider duplicato (WARN dentro
+///     `resolve_model_excluding`): meglio un parere in piu' che una figura in
+///     meno;
+///   - pin di sessione presente -> nessuna pre-assegnazione (il pin si propaga
+///     ai subagenti per scelta deliberata; la diversita' non si applica);
+///   - ogni esito non risolvibile -> `None`: la figura segue il percorso
+///     storico (`resolve_worker_model` dentro il prepare), che produce i suoi
+///     rifiuti strutturati.
+async fn resolve_council_assignments(
+    db: &sqlx::PgPool,
+    proj_pool: &sqlx::PgPool,
+    session_id: Option<Uuid>,
+    kinds: &[String],
+) -> Vec<Option<(String, String)>> {
+    let nessuna: Vec<Option<(String, String)>> = vec![None; kinds.len()];
+    let Some(session_id) = session_id else {
+        return nessuna;
+    };
+    if session_pinned_provider(proj_pool, session_id).await.is_some() {
+        return nessuna;
+    }
+    let mut exclude: Vec<String> = Vec::new();
+    let mut out: Vec<Option<(String, String)>> = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let Ok(Some(definition)) = fetch_definition(db, kind).await else {
+            out.push(None);
+            continue;
+        };
+        let purpose = resolve_worker_model_purpose(db, kind, &definition).await;
+        if purpose.trim().is_empty() {
+            out.push(None);
+            continue;
+        }
+        let (provider, model) = resolve_model_excluding(db, &purpose, kind, &exclude).await;
+        if provider.is_empty() || model.is_empty() {
+            out.push(None);
+            continue;
+        }
+        let pl = provider.to_lowercase();
+        if !exclude.contains(&pl) {
+            exclude.push(pl);
+        }
+        out.push(Some((provider, model)));
+    }
+    out
+}
+
 async fn session_pinned_provider(proj_pool: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
     let pinned: Option<String> =
         sqlx::query_scalar("SELECT preferred_provider FROM chat_sessions WHERE id = $1")
@@ -3440,6 +4259,17 @@ async fn insert_subagent_run(
 
 /// Ferma il ponte narrazione e ATTENDE che sia davvero finito (vedi commento
 /// sul timeout in `run_single_subagent`: chiude la race abort/INSERT-in-volo).
+/// Quanto lo scatto del timeout ha ecceduto il budget, in millisecondi.
+///
+/// Un valore vicino a zero dice che il timer e' stato puntuale e che un eventuale
+/// ritardo osservato a valle (su `completed_at`) sta nella scrittura, non nello
+/// scatto. Un valore grande dice il contrario: sono due diagnosi opposte, e senza
+/// questa misura si distinguono solo per congettura.
+fn ritardo_scatto_ms(scatto_ms: u64, timeout_s: i64) -> u64 {
+    let budget_ms = (timeout_s.max(0) as u64).saturating_mul(1_000);
+    scatto_ms.saturating_sub(budget_ms)
+}
+
 async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
     if let Some(b) = bridge {
         b.abort();
@@ -3450,6 +4280,7 @@ async fn stop_bridge(bridge: Option<tokio::task::JoinHandle<()>>) {
 /// Chiusura del sub-run in TIMEOUT: mark_run + narrazione + tool_result.
 async fn finalize_timeout(
     pool: &sqlx::PgPool,
+    meta_db: &sqlx::PgPool,
     narrator: Option<&ParentNarrator>,
     sub_run_id: Uuid,
     kind: &str,
@@ -3458,10 +4289,12 @@ async fn finalize_timeout(
     model: &str,
 ) -> Value {
     let verdict = terminal_verdict("timed_out", "timeout");
+    // Un timeout non azzera la spesa gia' fatturata: la prendo dal ledger (META).
+    let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
     let _ = mark_run(
         pool,
         sub_run_id,
-        SubRunClosure::without_metrics("timeout", "[Sub-agent timeout]", verdict.clone()),
+        SubRunClosure::from_ledger("timeout", "[Sub-agent timeout]", verdict.clone(), &ledger),
     )
     .await;
     if let Some(n) = narrator {
@@ -3566,35 +4399,21 @@ async fn finalize_success(
         "subagent_native: sub-run eseguito sul grafo nativo"
     );
     narrate_completed(narrator, sub_run_id, kind, status, &summary, o).await;
-    subagent_success_result(sub_run_id, kind, status, &summary, o, verdict)
-}
-
-/// tool_result del ramo OK: il main riceve SOLO questo summary compattato, non
-/// l'intera conversazione del figlio.
-///
-/// `outcome` porta il verdetto ESITO strutturato (regola M): il coordinatore legge
-/// success/verdict da li' invece di dedurre l'esito dalla prosa di `summary`.
-/// `provider`/`model` sono la provenienza EFFETTIVA dal grafo (post-eventuale
-/// failover), non il risolto a monte: il report di figura
-/// (`classify_council_figure_result`) la rilegge per mostrarla in UI.
-fn subagent_success_result(
-    sub_run_id: Uuid,
-    kind: &str,
-    status: &str,
-    summary: &str,
-    o: &NativeRunOutcome,
-    verdict: Value,
-) -> Value {
     let mut out = json!({
         K_SUB_RUN_ID: sub_run_id.to_string(),
         "kind": kind,
         "status": status,
-        K_SUMMARY: compact_summary(summary),
+        K_SUMMARY: compact_summary(&summary),
         "iterations": o.iterations,
         "cost_usd": o.total_cost,
         "tokens": { "prompt": o.prompt_tokens, "completion": o.completion_tokens },
+        // Verdetto ESITO strutturato (regola M): il coordinatore legge
+        // success/verdict qui invece di dedurre l'esito dalla prosa di `summary`.
         "outcome": verdict,
     });
+    // Provenienza EFFETTIVA (regola M): provider/model realmente usati dal grafo
+    // (post-eventuale failover), non solo il risolto a monte. Letta dal report di
+    // figura (classify_council_figure_result) per mostrarla in UI.
     put_model_fields(
         &mut out,
         o.provider_used.as_deref().unwrap_or_default(),
@@ -3606,6 +4425,7 @@ fn subagent_success_result(
 /// Chiusura del ramo ERRORE del sub-run (fallback onesto: errore al chiamante).
 async fn finalize_failure(
     pool: &sqlx::PgPool,
+    meta_db: &sqlx::PgPool,
     narrator: Option<&ParentNarrator>,
     sub_run_id: Uuid,
     kind: &str,
@@ -3615,10 +4435,13 @@ async fn finalize_failure(
 ) -> Value {
     let msg = format!("[errore grafo nativo: {e}]");
     let verdict = terminal_verdict("failed", "engine_error");
+    // Come per il timeout: un errore del grafo non cancella le chiamate gia'
+    // fatturate prima del guasto.
+    let ledger = crate::chat_messages::fetch_ledger_totals(meta_db, sub_run_id).await;
     let _ = mark_run(
         pool,
         sub_run_id,
-        SubRunClosure::without_metrics("failed", &msg, verdict.clone()),
+        SubRunClosure::from_ledger("failed", &msg, verdict.clone(), &ledger),
     )
     .await;
     tracing::warn!(
@@ -3716,16 +4539,33 @@ struct SubRunClosure<'a> {
 }
 
 impl<'a> SubRunClosure<'a> {
-    /// Chiusura senza metriche: il run e' morto prima di produrre usage
-    /// (timeout, errore del grafo) — contatori a zero.
-    fn without_metrics(status: &'a str, summary: &'a str, verdict: Value) -> Self {
+    /// Chiusura dei rami TERMINALI senza [`NativeRunOutcome`] (timeout, errore del
+    /// grafo): le metriche vengono dal ledger, l'unica fonte che sopravvive alla
+    /// morte del run.
+    ///
+    /// Sostituisce una `without_metrics` che azzerava i contatori sulla premessa
+    /// "il run e' morto prima di produrre usage". Premessa misuratamente FALSA: un
+    /// sub-run va in timeout DOPO aver bruciato iterazioni, e il gateway le ha gia'
+    /// fatturate (misurati 3 sub-run con iterations=0 e ledger $0,80 / $0,37 /
+    /// $0,04; sulla chat 25, 19 run in timeout dichiaravano $0 contro $1,28 reali).
+    /// Azzerare qui non "non contava": sottraeva spesa reale al cap.
+    ///
+    /// `iterations` resta 0: il conteggio vive solo nello stato del grafo, che qui
+    /// non c'e'. Il ledger conosce il costo, non le iterazioni — meglio un
+    /// contatore onestamente ignoto che un costo inventato.
+    fn from_ledger(
+        status: &'a str,
+        summary: &'a str,
+        verdict: Value,
+        ledger: &crate::chat_messages::LedgerTotals,
+    ) -> Self {
         Self {
             status,
             summary,
             iterations: 0,
-            tokens_prompt: 0,
-            tokens_completion: 0,
-            cost_usd: 0.0,
+            tokens_prompt: ledger.prompt_tokens,
+            tokens_completion: ledger.completion_tokens,
+            cost_usd: ledger.total_cost,
             verdict,
         }
     }
@@ -3748,6 +4588,7 @@ fn terminal_verdict(verdict: &str, error_class: &str) -> Value {
         k::DECLARED: Value::Null,
         k::REVIEW: Value::Null,
         k::ADVISORY: Value::Null,
+        k::DEBATE: Value::Null,
         k::FINAL_GATE_PASSED: Value::Null,
         k::FINAL_GATE_UNVERIFIED: Value::Null,
         k::FINAL_GATE_FAILED_PENDING: false,
@@ -3825,7 +4666,12 @@ fn compact_summary(text: &str) -> String {
 /// `AgentToolContext`. Specchio di `build_native_deps` (agent_run.rs) ma a partire
 /// dal ctx del tool (che non porta `AppState`): riusa il PUNTO UNICO del cablaggio
 /// gateway (`NexusGatewayClient::from_db`, regola L).
-async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
+///
+/// `run_timeout_s` e' il timeout REALE della figura (gia' clampato dalla
+/// deadline del padre): da li' nasce il budget d'attesa verso il gateway. Prima
+/// il budget veniva derivato dal default globale (300s) anche per una figura che
+/// vive 240s.
+async fn build_native_deps_for_tool(ctx: &AgentToolContext, run_timeout_s: i64) -> NativeDeps {
     let db = (*ctx.core.db).clone();
     let tool_runner_deps = crate::tool_runner_server::ToolRunnerDeps {
         db: db.clone(),
@@ -3836,7 +4682,11 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
         monitor_registry: ctx.core.monitor_registry.clone(),
         port_registry: ctx.port_registry.clone(),
     };
-    let gateway = crate::nexus_gateway::NexusGatewayClient::from_db(&db).await;
+    let gateway = crate::nexus_gateway::NexusGatewayClient::from_db_for_run(
+        &db,
+        u64::try_from(run_timeout_s).ok().filter(|&s| s > 0),
+    )
+    .await;
     NativeDeps {
         db,
         tool_runner_deps,
@@ -3846,6 +4696,16 @@ async fn build_native_deps_for_tool(ctx: &AgentToolContext) -> NativeDeps {
 
 /// `nexus_subagent_poll` — stato di una sub-run da `nexus_subagent_runs` (DB-only,
 /// niente brain). Il main lo usa per i kind background.
+/// Pool del progetto per i tool sub-agent (poll/resume), o messaggio d'errore
+/// gia' formattato col marker del tool (il contratto dei tool_result e' la
+/// stringa). Punto unico locale del pattern (regola L): i due tool condividono
+/// identica risoluzione e identico esito di indisponibilita'.
+async fn subagent_tool_pool(ctx: &AgentToolContext, tool: &str) -> Result<sqlx::PgPool, String> {
+    crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id)
+        .await
+        .map_err(|e| format!("\u{274C} [{tool}] DB progetto non disponibile: {e}"))
+}
+
 pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
     let run_id = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -3856,8 +4716,10 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
     };
     // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run e' nel DB
     // del progetto corrente (stesso project_id che lo ha dispatchato).
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
+    let proj_pool = match subagent_tool_pool(ctx, "nexus_subagent_poll").await {
+        Ok(p) => p,
+        Err(msg) => return msg,
+    };
     let row = sqlx::query(
         "SELECT id::text, status, kind, final_summary, artifacts, iterations,
                 tokens_prompt, tokens_completion, cost_usd, depth, source, is_background,
@@ -3900,15 +4762,28 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
 /// su `nexus_graph_checkpoints`, ma la ripresa nativa qui ri-esegue il sub-run dal
 /// suo `run_id`: la stessa thread del grafo riprende dal checkpoint persistente).
 pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
-    let (run_id, run_id_str) = match parse_resume_run_id(input) {
-        Ok(v) => v,
-        Err(e) => return e,
+    let run_id_str = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
+                .to_string()
+        }
+    };
+    let run_id = match Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return format!(
+                "\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}"
+            )
+        }
     };
 
     // Routing separazione DB: nexus_subagent_runs e' migrata; il sub-run da riprendere
     // e' nel DB del progetto corrente (stesso project_id che lo ha dispatchato).
-    let proj_pool =
-        crate::project_db_routes::project_data_pool_from(&ctx.core.db, ctx.core.project_id).await;
+    let proj_pool = match subagent_tool_pool(ctx, "nexus_subagent_resume").await {
+        Ok(p) => p,
+        Err(msg) => return msg,
+    };
     let row = sqlx::query(
         "SELECT kind, task_description, context_blob, expected_format, status, depth, parent_run_id
          FROM nexus_subagent_runs WHERE id = $1",
@@ -3930,8 +4805,16 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     }
     let kind: String = row.get("kind");
     let task: String = row.get("task_description");
-    let context_blob = optional_text(&row, "context_blob");
-    let expected = optional_text(&row, "expected_format");
+    let context_blob: String = row
+        .try_get::<Option<String>, _>("context_blob")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let expected: String = row
+        .try_get::<Option<String>, _>("expected_format")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     // Ripresa = ri-esecuzione del sub-run sul kind dato. Riusa lo stesso percorso
     // del dispatch (guard + grafo nativo): semantica onesta, niente notifica brain.
@@ -3943,50 +4826,321 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     res.to_string()
 }
 
-/// `subagent_run_id` dell'input del resume, in forma tipizzata e testuale (il
-/// tool_result `noop` riporta la stringa originale). `Err` e' gia' il tool_result
-/// d'errore da restituire al chiamante.
-fn parse_resume_run_id(input: &Value) -> Result<(Uuid, String), String> {
-    let run_id_str = match input.get(K_SUB_RUN_ID).and_then(Value::as_str) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            return Err(
-                "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
-                    .to_string(),
-            )
-        }
-    };
-    match Uuid::parse_str(&run_id_str) {
-        Ok(u) => Ok((u, run_id_str)),
-        Err(_) => Err(format!(
-            "\u{274C} [nexus_subagent_resume] subagent_run_id non valido: {run_id_str}"
-        )),
-    }
-}
-
-/// Colonna testuale NULLABLE di una row: NULL, tipo inatteso o colonna assente ->
-/// stringa vuota.
-fn optional_text(row: &sqlx::postgres::PgRow, column: &str) -> String {
-    row.try_get::<Option<String>, _>(column)
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSIONE (2026-07-26, osservata sul progetto e2e-todo): con openai e
+    /// anthropic in cooldown billing restava il solo openrouter, la selezione
+    /// deduplicava PER PROVIDER e consegnava UN candidato. Il panel a due si
+    /// riduceva onestamente a uno — e il gate lo riconvocava a ogni ciclo,
+    /// sempre `openrouter/z-ai/glm-4.7-flash`: sei sub-run di review, sei volte
+    /// lo stesso giudice, mentre quel provider offriva DIECI modelli qualificati
+    /// nello stesso tier che nessuno guardava.
+    ///
+    /// Il test parte dai candidati come li produce la produzione
+    /// (`resolve_purpose_provider_candidates_db_by` sul purpose reale, letto
+    /// dalle migrazioni reali), non da una lista scritta a mano: la lista esiste
+    /// gia' altrove, e fabbricarla qui fisserebbe proprio l'assunto in esame
+    /// (regola O).
+    ///
+    /// MUTAZIONE: rimettendo `CandidateDiversity::PerProvider` la selezione
+    /// torna a un solo candidato e l'asserzione fallisce nominando il giudice
+    /// unico.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn un_solo_provider_sano_da_comunque_giudici_distinti(pool: sqlx::PgPool) {
+        // Il tier del purpose reale, letto dal seed invece che ricopiato.
+        let tier: String = sqlx::query_scalar(
+            "SELECT tier FROM nexus_purpose_model WHERE purpose = $1 AND tier IS NOT NULL",
+        )
+        .bind(REVIEW_PANEL_PURPOSE)
+        .fetch_one(&pool)
+        .await
+        .expect("il purpose dei revisori deve avere un tier");
+
+        // La condizione del 26/07: openai e anthropic in cooldown billing, un
+        // solo provider eleggibile. Il cooldown non e' riproducibile qui, ma il
+        // suo EFFETTO sul pool si': quei provider non sono selezionabili.
+        sqlx::query("UPDATE ai_price_catalog SET is_enabled = false WHERE provider <> 'openrouter'")
+            .execute(&pool)
+            .await
+            .expect("cooldown degli altri provider");
+
+        // Due modelli distinti dello stesso provider, entrambi idonei al tier
+        // del purpose. Upsert: il catalog seminato dalle migrazioni li contiene
+        // gia', e quello che serve al test e' che siano eleggibili — non che
+        // siano suoi. `last_probe_healthy_at` NON e' decorazione: senza, il
+        // trigger `ai_price_catalog_enforce_probe_before_enable` rimette
+        // `is_enabled=false` con reason `unverified_no_probe`, e il catalog
+        // resterebbe vuoto senza che nulla lo dica. La fixture a mano usata
+        // altrove quel trigger non ce l'ha (regola O: il migratore reale e' piu'
+        // severo dello schema ricopiato).
+        for (model, costo) in [("z-ai/glm-4.7-flash", 0.07), ("qwen/qwen3-235b-a22b-2507", 0.071)] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                    performance_tier, capabilities, input_cost_per_million_tokens, \
+                    output_cost_per_million_tokens, currency, qualification_state, \
+                    last_probe_healthy_at, supports_image_gen, supports_audio_in, \
+                    supports_audio_out, supports_video_gen) \
+                 VALUES ('openrouter', $1, true, true, 'none', $2, '[\"reasoning\"]'::jsonb, \
+                         $3, $3, 'USD', 'qualified', NOW(), false, false, false, false) \
+                 ON CONFLICT (provider, model) DO UPDATE SET \
+                   is_enabled = true, supports_tool_use = true, \
+                   agentic_thinking_policy = 'none', performance_tier = EXCLUDED.performance_tier, \
+                   capabilities = EXCLUDED.capabilities, \
+                   qualified_capabilities = EXCLUDED.capabilities, \
+                   input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens, \
+                   qualification_state = 'qualified', qualification_expires_at = NULL, \
+                   last_probe_healthy_at = NOW(), \
+                   supports_image_gen = false, supports_audio_in = false, \
+                   supports_audio_out = false, supports_video_gen = false, \
+                   auto_disabled_at = NULL, auto_disabled_reason = NULL",
+            )
+            .bind(model)
+            .bind(&tier)
+            .bind(costo)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+
+        let candidati = crate::internal_routing::resolve_purpose_provider_candidates_db_by(
+            &pool,
+            REVIEW_PANEL_PURPOSE,
+            2,
+            1,
+            // Il criterio della PRODUZIONE, non uno scelto qui.
+            REVIEW_PANEL_DIVERSITY,
+        )
+        .await
+        .expect("candidati revisori");
+
+        let panel = panel_revisori(&candidati, 2);
+        let giudici: Vec<String> = panel
+            .iter()
+            .map(|c| format!("{}/{}", c.provider, c.model))
+            .collect();
+        assert_eq!(
+            panel.len(),
+            2,
+            "un provider solo ma piu' modelli qualificati deve dare DUE giudici: \
+             ridursi a uno e riconvocarlo ogni ciclo non e' un quorum piu' piccolo, \
+             e' nessun quorum. Convocati: {giudici:?}"
+        );
+        assert_eq!(
+            panel[0].judge_key().1,
+            "z-ai/glm-4.7-flash",
+            "l'ordine di preferenza (costo) resta quello della selezione: {giudici:?}"
+        );
+    }
+
+    /// La garanzia del panel non dipende da come la fonte ha ordinato o filtrato:
+    /// da candidati che ripetono lo stesso giudice esce un panel RIDOTTO, e i
+    /// convocati sono esattamente le coppie (provider, model) distinte.
+    ///
+    /// Qui la lista e' costruita a mano di proposito: e' l'input patologico che
+    /// la selezione NON produce (il catalog ha un indice unico su provider+model),
+    /// quindi non esiste altrove da cui prenderlo. E' la difesa del punto unico,
+    /// non una riproduzione del percorso di produzione.
+    #[test]
+    fn due_istanze_dello_stesso_modello_non_sono_due_giudici() {
+        use crate::internal_routing::PurposeProviderCandidate as C;
+        let c = |p: &str, m: &str| C {
+            provider: p.to_string(),
+            model: m.to_string(),
+            tier: Some("high".to_string()),
+        };
+
+        // Tre slot, tre candidati, ma due sono lo stesso giudice: si convoca in due.
+        let panel = panel_revisori(
+            &[
+                c("openrouter", "z-ai/glm-4.7-flash"),
+                c("openrouter", "z-ai/glm-4.7-flash"),
+                c("openrouter", "z-ai/glm-5.2"),
+            ],
+            3,
+        );
+        assert_eq!(panel.len(), 2, "convocati = giudici distinti: {panel:?}");
+        assert_eq!(panel[1].model, "z-ai/glm-5.2");
+
+        // Stesso modello, provider diverso: sono due giudici (infrastrutture,
+        // quote e versioni distinte), non una duplicazione.
+        let cross = panel_revisori(
+            &[c("openrouter", "z-ai/glm-5.2"), c("zai", "z-ai/glm-5.2")],
+            2,
+        );
+        assert_eq!(cross.len(), 2);
+
+        // Il confronto e' insensibile al caso: la stessa coppia scritta in due
+        // modi resta lo stesso giudice.
+        let maiuscole = panel_revisori(
+            &[c("OpenRouter", "Z-AI/GLM-5.2"), c("openrouter", "z-ai/glm-5.2")],
+            2,
+        );
+        assert_eq!(maiuscole.len(), 1, "{maiuscole:?}");
+
+        // Candidati in abbondanza: si tiene la dimensione richiesta.
+        assert_eq!(
+            panel_revisori(&[c("a", "m1"), c("b", "m2"), c("c", "m3")], 2).len(),
+            2
+        );
+        // Nessun candidato: nessun pin da assegnare (i revisori partono senza,
+        // e li instrada il routing).
+        assert!(panel_revisori(&[], 3).is_empty());
+    }
+
+    /// REGRESSIONE (2026-07-26): tutti i revisori giravano sullo STESSO
+    /// provider/modello, perche' `convene_review_panel` li lanciava senza pin e
+    /// il routing li instradava identici. N revisori identici non sono un
+    /// quorum: sono un giudizio unico contato N volte, e quando quel modello
+    /// sbaglia il run viene bocciato fino al cap dei tentativi con l'apparenza
+    /// di una verifica plurale (osservato: 8 sub-run di review, tutti
+    /// mistral/mistral-small-latest, 4 review consecutive non superate).
+    ///
+    /// Se il purpose sparisce dal seed il pin non viene applicato e il difetto
+    /// torna in silenzio: questo test lo impedisce, girando sulle migrazioni
+    /// reali invece che su uno schema ricopiato (regola O).
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_purpose_dei_revisori_esiste_nel_seed(pool: sqlx::PgPool) {
+        let presente: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM nexus_purpose_model WHERE purpose = $1)",
+        )
+        .bind(REVIEW_PANEL_PURPOSE)
+        .fetch_one(&pool)
+        .await
+        .expect("query purpose");
+        assert!(
+            presente,
+            "il purpose '{REVIEW_PANEL_PURPOSE}' deve esistere in nexus_purpose_model: \
+             senza di esso i revisori tornano tutti sullo stesso provider e il panel \
+             smette di essere un quorum"
+        );
+    }
 
     // Nomi fixture ricorrenti dei test del ponte narrazione.
     const T_EDIT: &str = "edit_file";
     const T_RUN: &str = "run_command";
     const FIX_PATH: &str = "src/a.rs";
 
+    /// La misura che distingue "il timer e' scattato tardi" da "la scrittura di
+    /// chiusura e' arrivata tardi": nell'incidente del 19/07 le due cause erano
+    /// indistinguibili perche' l'unico timestamp disponibile era quello della
+    /// scrittura, e il ritardo era in realta' l'attesa di una connessione.
+    #[test]
+    fn il_ritardo_dello_scatto_e_l_eccesso_sul_budget() {
+        // Timer puntuale: nessun ritardo da segnalare.
+        assert_eq!(ritardo_scatto_ms(300_000, 300), 0);
+        assert_eq!(ritardo_scatto_ms(300_120, 300), 120);
+        // Il caso dell'incidente, se lo scatto fosse davvero tardato.
+        assert_eq!(ritardo_scatto_ms(427_000, 300), 127_000);
+        // Scatto anticipato (clock non monotono altrove): mai negativo.
+        assert_eq!(ritardo_scatto_ms(299_000, 300), 0);
+        // Budget non valorizzato: l'intero tempo trascorso e' l'eccesso, e non
+        // si moltiplica un negativo.
+        assert_eq!(ritardo_scatto_ms(5_000, 0), 5_000);
+        assert_eq!(ritardo_scatto_ms(5_000, -7), 5_000);
+    }
+
     #[test]
     fn err_ha_marker_errore() {
         let m = err("boom");
         assert!(m.starts_with('\u{274C}'));
         assert!(m.contains("dispatch_subagent"));
+    }
+
+    /// Outcome minimo per i test dei contatori: tutti i campi a zero/None.
+    fn outcome_zero() -> crate::native_engine::NativeRunOutcome {
+        crate::native_engine::NativeRunOutcome {
+            completed: true,
+            awaiting_subagents: false,
+            final_answer: None,
+            stop_reason: None,
+            provider_used: None,
+            model_used: None,
+            resume_at: None,
+            iterations: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            user_intent: None,
+            reasoning: None,
+            messages_json: None,
+            declared_outcome: None,
+            review_verdict: None,
+            advisory_verdict: None,
+            debate_position: None,
+            error_class: None,
+            forced_close_unverified: false,
+            final_gate_passed: None,
+            final_gate_unverified: None,
+            final_gate_failed_pending: false,
+            review_panel_rejected: false,
+            review_panel_last: None,
+            pending_actions: Vec::new(),
+        }
+    }
+
+    /// REGRESSIONE (misurata, chat 25): il sub-run pubblicava i contatori
+    /// dell'ULTIMO TURNO come totale — $0,0338 contro $0,1510 reali (4,5x). Lo
+    /// stesso numero alimenta l'hard cap di spesa via nexus_subagent_runs.cost_usd.
+    #[test]
+    fn sub_run_adotta_i_totali_del_ledger_non_quelli_dell_ultimo_turno() {
+        let mut o = outcome_zero();
+        // Contatori del grafo = ultima chiamata (openrouter/x-ai/grok-4.5).
+        o.total_cost = 0.033842;
+        o.prompt_tokens = 13_780;
+        o.completion_tokens = 1_047;
+        o.total_tokens = 14_827;
+        let ledger = crate::chat_messages::LedgerTotals {
+            total_cost: 0.150972,
+            prompt_tokens: 63_177,
+            completion_tokens: 4_103,
+            total_tokens: 67_280,
+            rows: 8,
+        };
+        assert!(super::apply_ledger_to_outcome(&mut o, &ledger));
+        assert!(
+            (o.total_cost - 0.150972).abs() < 1e-9,
+            "costo del sub-run INTERO"
+        );
+        assert_eq!(o.prompt_tokens, 63_177);
+        assert_eq!(o.total_tokens, 67_280);
+    }
+
+    #[test]
+    fn sub_run_senza_righe_ledger_conserva_i_contatori_del_grafo() {
+        // Nessuna chiamata contabilizzata (provider che non scrive ledger):
+        // non inventare, lascia quello che il grafo ha misurato.
+        let mut o = outcome_zero();
+        o.total_cost = 0.02;
+        o.prompt_tokens = 900;
+        let vuoto = crate::chat_messages::LedgerTotals::default();
+        assert!(!super::apply_ledger_to_outcome(&mut o, &vuoto));
+        assert!((o.total_cost - 0.02).abs() < 1e-9);
+        assert_eq!(o.prompt_tokens, 900);
+    }
+
+    /// Il ramo TIMEOUT azzerava i contatori sulla premessa "il run e' morto prima
+    /// di produrre usage": falsa (misurati 3 sub-run con iterations=0 e ledger
+    /// $0,80 / $0,37 / $0,04). La spesa reale va al cap, non persa.
+    #[test]
+    fn chiusura_terminale_prende_la_spesa_dal_ledger() {
+        let ledger = crate::chat_messages::LedgerTotals {
+            total_cost: 0.801292,
+            prompt_tokens: 120_000,
+            completion_tokens: 3_400,
+            total_tokens: 123_400,
+            rows: 5,
+        };
+        let c = super::SubRunClosure::from_ledger("timeout", "[Sub-agent timeout]", json!({}), &ledger);
+        assert!(
+            (c.cost_usd - 0.801292).abs() < 1e-9,
+            "il timeout non cancella la spesa gia' fatturata"
+        );
+        assert_eq!(c.tokens_prompt, 120_000);
+        assert_eq!(c.status, "timeout");
     }
 
     #[test]
@@ -4013,6 +5167,317 @@ mod tests {
             .collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
+    }
+
+    // ── Fan-out: un task per sub-run (difetto D3, incidente 2026-07-15) ──────
+
+    /// Cio' che `spawn` GARANTISCE (difetto D3): un sub-run che PANICA non
+    /// abbatte piu' il fan-out. Col vecchio `FuturesUnordered` senza spawn i
+    /// membri vivevano nel task del chiamante: un panic in uno di essi
+    /// propagava e uccideva l'INTERO consiglio, in silenzio.
+    /// La rete di sicurezza (`tokio::time::timeout`) e' FUORI dalla funzione
+    /// sotto esame: una regressione fallisce netta invece di appendere la suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn un_membro_che_panica_non_abbatte_il_fanout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let conclusi = Arc::new(AtomicUsize::new(0));
+        let n = 4usize;
+        let sem = Arc::new(tokio::sync::Semaphore::new(n));
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let sem = sem.clone();
+            let conclusi = conclusi.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire_owned().await.expect("permit");
+                if i == 0 {
+                    panic!("sub-run esploso (simulato)");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                conclusi.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let mut panicati = 0usize;
+        for h in handles {
+            // JoinError = panic del sub-run: spawn_fanout lo traduce in un
+            // Value d'errore strutturato e prosegue (regola M).
+            if h.await.is_err() {
+                panicati += 1;
+            }
+        }
+        assert_eq!(panicati, 1, "il panic resta CONFINATO al suo task");
+        assert_eq!(
+            conclusi.load(Ordering::SeqCst),
+            n - 1,
+            "gli altri membri devono concludere: col FuturesUnordere il panic              avrebbe abbattuto l'intero fan-out"
+        );
+    }
+
+    /// `spawn_fanout` REALE: un membro che panica diventa un esito STRUTTURATO
+    /// (regola M) e il fan-out ritorna comunque N risultati, uno per membro.
+    /// Senza la traduzione del `JoinError` il consiglio perderebbe una figura
+    /// IN SILENZIO: il roster direbbe 6, i risultati sarebbero 5, e il quorum
+    /// (b152ef0d) conterebbe su un denominatore sbagliato.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn spawn_fanout_traduce_il_panic_in_esito_strutturato(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        // Scope Nested: il test resta ermetico (non tocca il semaforo di
+        // processo globale OnceCell, condiviso tra i test).
+        let out = spawn_fanout(&pool, 3, FanoutScope::Nested, |i| async move {
+            if i == 1 {
+                panic!("sub-run esploso (simulato)");
+            }
+            json!({ "status": "completed", "outcome": { "success": true, "i": i } })
+        })
+        .await;
+        assert_eq!(out.len(), 3, "un risultato per membro, sempre");
+        assert_eq!(
+            out[1]["error_code"], "subrun_panicked",
+            "il panic deve diventare un esito strutturato, non una riga persa"
+        );
+        assert_eq!(out[0]["outcome"]["success"], json!(true));
+        assert_eq!(out[2]["outcome"]["success"], json!(true));
+    }
+
+    /// GOVERNOR (mig 0603): due fan-out top-level CONCORRENTI condividono il
+    /// semaforo di processo — la concorrenza TOTALE non supera mai il suo tetto,
+    /// anche se i semafori locali permetterebbero di piu'. Semafori ESPLICITI
+    /// via `spawn_fanout_with`: niente stato globale nel test (regola F).
+    #[tokio::test]
+    async fn fanout_process_semaphore_limita_la_concorrenza_totale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let process = Arc::new(tokio::sync::Semaphore::new(4));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let make = |in_flight: Arc<AtomicUsize>, peak: Arc<AtomicUsize>| {
+            move |_i: usize| {
+                let in_flight = in_flight.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    json!({ "ok": true })
+                }
+            }
+        };
+        // Due panel da 6 con semafori locali larghi (6): senza il semaforo di
+        // processo la concorrenza arriverebbe a 12.
+        let (a, b) = tokio::join!(
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(6)),
+                Some(process.clone()),
+                6,
+                make(in_flight.clone(), peak.clone()),
+            ),
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(6)),
+                Some(process.clone()),
+                6,
+                make(in_flight.clone(), peak.clone()),
+            ),
+        );
+        assert_eq!(a.len(), 6);
+        assert_eq!(b.len(), 6);
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "picco {} oltre il tetto di processo 4",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    /// GOVERNOR: un fan-out `Nested` NON tocca il semaforo di processo — anche
+    /// con il processo SATURO (zero permessi) i nested completano. E' la
+    /// proprieta' anti-deadlock: un figlio non attende mai un permesso tenuto
+    /// dal proprio padre.
+    #[tokio::test]
+    async fn fanout_nested_non_attende_il_semaforo_di_processo() {
+        use std::sync::Arc;
+        let process = Arc::new(tokio::sync::Semaphore::new(1));
+        // Satura il processo: un top-level fittizio tiene l'unico permesso.
+        let _held = process.clone().acquire_owned().await.expect("permesso");
+        // Il nested (process=None) deve completare comunque, entro un timeout
+        // stretto: se per errore acquisisse il semaforo saturo, appenderebbe.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawn_fanout_with(
+                Arc::new(tokio::sync::Semaphore::new(2)),
+                None,
+                3,
+                |i| async move { json!({ "i": i }) },
+            ),
+        )
+        .await
+        .expect("il nested non deve attendere il semaforo di processo");
+        assert_eq!(out.len(), 3);
+    }
+
+    /// Il tetto di concorrenza viene dal DB (regola G) e clampa a >=1.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn fanout_max_parallel_dal_db(pool: sqlx::PgPool) {
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings");
+        // Riga assente -> default storico (nessun tetto piu' stretto del
+        // fan-out nominale del consiglio).
+        assert_eq!(fanout_max_parallel(&pool).await, DEFAULT_FANOUT_MAX_PARALLEL);
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('orchestrator.subagent_fanout_max_parallel', '2')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert");
+        // Scrittura diretta: lettura cache-ata, il test invalida esplicitamente.
+        nexus_auth::invalidate_setting_cache(&pool, "orchestrator.subagent_fanout_max_parallel");
+        assert_eq!(fanout_max_parallel(&pool).await, 2, "il DB governa (regola G)");
+        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'orchestrator.subagent_fanout_max_parallel'")
+            .execute(&pool)
+            .await
+            .expect("update");
+        nexus_auth::invalidate_setting_cache(&pool, "orchestrator.subagent_fanout_max_parallel");
+        assert_eq!(
+            fanout_max_parallel(&pool).await,
+            DEFAULT_FANOUT_MAX_PARALLEL,
+            "0 non e' un tetto valido: si ricade sul default, mai su zero permessi"
+        );
+    }
+
+    /// LIMITE MISURATO E DICHIARATO (non un difetto del test, non una scusa):
+    /// il timer di un sub-run NON e' protetto dal blocking sincrono di un altro
+    /// sub-run, nemmeno dando a ognuno il proprio task con `spawn`.
+    ///
+    /// Meccanica, misurata il 16/07 (e diversa da quella che questa nota
+    /// affermava prima): tokio non ha un thread dedicato ai timer. La scadenza
+    /// viene consegnata da un worker che polla il time driver, e un worker fermo
+    /// dentro un `poll()` bloccante non polla nulla. Quando nessun worker libero
+    /// raccoglie il driver, slittano insieme TUTTI i timer del runtime: la firma
+    /// e' che le vittime riportano lo STESSO ritardo al millisecondo (5 su 5 a
+    /// 1571ms), mai un ritardo a macchia di leopardo. E' un fattore globale del
+    /// runtime, non la vicinanza al bloccante: la spiegazione precedente (i task
+    /// nella coda locale del worker bloccato, non salvati dal work-stealing) e'
+    /// falsificata da quella firma e dal fatto che qui i task nascono dal thread
+    /// del test, quindi dalla coda globale, non da un worker.
+    ///
+    /// Perche' `worker_threads = 1` e non gli 8 di prima: con un worker i worker
+    /// liberi sono zero PER COSTRUZIONE e il limite si riproduce sempre. Con piu'
+    /// worker il fenomeno e' lo stesso, ma il suo manifestarsi diventa un lancio
+    /// di dadi: dipende da quale worker parcheggia (e quindi raccoglie il driver)
+    /// dopo che il blocco e' cominciato. Gradiente misurato, stessa macchina,
+    /// 6 task di cui 1 bloccante:
+    ///   1 worker -> 5/5 riprodotto      2 worker  -> 6/6
+    ///   8 worker -> 7/8 a vuoto, 3/6 sotto carico leggero, 1/8 a CPU sature
+    ///   32 worker -> 0/5 a vuoto (i timer restano puntuali)
+    /// La versione a 8 worker falliva ~1 volta su 3 nella suite (regola F): non
+    /// per una misura imprecisa, ma perche' asseriva un esito che lo scheduler
+    /// non garantisce. Quella flakiness ERA il limite: se il trascinamento fosse
+    /// garantito `spawn` sarebbe inutile, se lo fosse la puntualita' `spawn`
+    /// sarebbe la cura; non e' ne' l'uno ne' l'altro. Il test tiene quindi il
+    /// caso limite (zero worker liberi), che e' deterministico e dimostra la
+    /// non-garanzia; il gradiente qui sopra resta come misura, non come assert.
+    ///
+    /// Conseguenza, da dire senza giri di parole: `spawn_fanout` da' isolamento
+    /// dei panic e un timer per sub-run, e resta igiene strutturale necessaria,
+    /// ma NON e' la cura del blocco collettivo del 15/07. La cura e' togliere
+    /// il blocking dal path (misura che lo nomina: tokio-console).
+    ///
+    /// Come e' costruito: le figure sane armano il timer e lo DICHIARANO su un
+    /// canale (`send` e arm stanno nello stesso poll, senza await in mezzo:
+    /// quando la conferma parte il timer c'e' gia'); il bloccante comincia solo
+    /// quando TUTTE hanno dichiarato. E' l'ordine dell'incidente — le altre
+    /// figure erano gia' partite — ottenuto pero' con una barriera causale e non
+    /// con uno sleep di cortesia che il carico puo' sfasare: un test in cui il
+    /// bloccante viene pollato per primo sarebbe CIECO, le vittime armerebbero i
+    /// timer a danno gia' fatto. L'assert e' sull'ORDINE degli eventi e non su
+    /// soglie dell'orologio: i timer scadono a 200ms dentro un blocco da 800ms
+    /// cominciato dopo che erano armati, quindi se il blocking non li
+    /// trascinasse il primo evento osservato sarebbe un TimerScattato. Che non
+    /// sia cieco e' verificato per mutation: sostituendo il blocco con
+    /// `tokio::time::sleep`, che cede il worker invece di rubarlo, il test
+    /// diventa rosso 10 volte su 10.
+    ///
+    /// Un rosso qui significa che il blocking sincrono non trascina piu' i timer
+    /// nemmeno a worker liberi zero: tokio ha cambiato meccanica, o il blocco di
+    /// questo test non blocca piu'. Aggiornare questa nota e quella su
+    /// `spawn_fanout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn spawn_non_protegge_dal_blocking_sincrono_limite_dichiarato() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Evento {
+            Sbloccato,
+            TimerScattato,
+        }
+        const SANI: usize = 5;
+        const TIMER: std::time::Duration = std::time::Duration::from_millis(200);
+        const BLOCCO: std::time::Duration = std::time::Duration::from_millis(800);
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Evento>();
+        let (armato_tx, mut armato_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        for _ in 0..SANI {
+            let ev_tx = ev_tx.clone();
+            let armato_tx = armato_tx.clone();
+            tokio::spawn(async move {
+                armato_tx.send(()).expect("conferma armato");
+                let _ = tokio::time::timeout(TIMER, std::future::pending::<()>()).await;
+                let _ = ev_tx.send(Evento::TimerScattato);
+            });
+        }
+
+        tokio::spawn(async move {
+            for _ in 0..SANI {
+                armato_rx.recv().await.expect("timer armato");
+            }
+            std::thread::sleep(BLOCCO);
+            ev_tx.send(Evento::Sbloccato).expect("sblocco");
+        });
+
+        let mut sequenza = Vec::with_capacity(SANI + 1);
+        for _ in 0..(SANI + 1) {
+            sequenza.push(ev_rx.recv().await.expect("evento"));
+        }
+        assert_eq!(
+            sequenza[0],
+            Evento::Sbloccato,
+            "LIMITE CAMBIATO: un timer da {TIMER:?} e' scattato durante un blocco \
+             sincrono da {BLOCCO:?} ({sequenza:?}). Se e' voluto (blocking rimosso \
+             o isolato in spawn_blocking), aggiornare questo test e la nota su \
+             spawn_fanout."
+        );
+    }
+
+    /// Il semaforo NON e' una barriera a ondate: con 1 permesso i membri sono
+    /// seriali, ma il successivo parte appena il precedente finisce (nessun
+    /// allineamento delle conclusioni, che ricreerebbe la firma "tutti insieme").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn il_semaforo_libera_il_permesso_a_ogni_conclusione() {
+        use std::sync::Arc;
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let t0 = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let sem = sem.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire_owned().await.expect("permit");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                t0.elapsed().as_millis()
+            }));
+        }
+        let mut fine = Vec::new();
+        for h in handles {
+            fine.push(h.await.expect("task"));
+        }
+        fine.sort();
+        // Conclusioni SCAGLIONATE (~100/200/300ms), non allineate.
+        assert!(
+            fine[1] - fine[0] >= 50 && fine[2] - fine[1] >= 50,
+            "le conclusioni devono scaglionarsi, non allinearsi: {fine:?}"
+        );
     }
 
     #[test]
@@ -4262,25 +5727,6 @@ mod tests {
         assert!(!should_isolate_batch(true, &[ws2]));
     }
 
-    /// Tabella minima per i test di `insert_subagent_run` (colonne toccate
-    /// dall'INSERT; `id` col DEFAULT reale della mig 0151, worktree senza default
-    /// come la mig project 0005).
-    async fn create_subagent_runs_min(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, project_id UUID NOT NULL, \
-                 kind TEXT NOT NULL, task_description TEXT NOT NULL, \
-                 context_blob TEXT, expected_format TEXT, status TEXT NOT NULL, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 depth INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'db', \
-                 worktree_path TEXT, base_commit TEXT, dispatcher_run_id UUID )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs");
-    }
-
     async fn fetch_worktree_cols(
         pool: &sqlx::PgPool,
         id: Uuid,
@@ -4297,9 +5743,8 @@ mod tests {
     /// (regola H): ramo sequenziale -> id generato dal DB (DEFAULT) + colonne
     /// worktree NULL; ramo isolato -> id = run_id del worktree + worktree_path/
     /// base_commit persistiti.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn insert_subagent_run_equivalenza_rami(pool: sqlx::PgPool) {
-        create_subagent_runs_min(&pool).await;
         let row = NewSubagentRun {
             anchor: Uuid::new_v4(),
             dispatcher_run_id: Uuid::new_v4(),
@@ -4359,50 +5804,6 @@ mod tests {
         assert!(vuoto.get(K_MODEL).is_none());
     }
 
-    /// Schema minimo per i test del run TRACCIATO del figlio (senza FK di
-    /// sessione: qui interessa il contratto insert/close, non lo schema pieno).
-    async fn create_child_run_tables(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 project_id UUID NOT NULL, \
-                 user_id UUID NOT NULL, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 automation_mode TEXT NOT NULL DEFAULT 'confirm', \
-                 provider TEXT, \
-                 model TEXT, \
-                 nexus_agent_type TEXT, \
-                 parent_run_id UUID REFERENCES agent_runs(id) ON DELETE SET NULL, \
-                 iteration_count INT NOT NULL DEFAULT 0, \
-                 final_answer TEXT, \
-                 prompt_tokens INT NOT NULL DEFAULT 0, \
-                 completion_tokens INT NOT NULL DEFAULT 0, \
-                 total_tokens INT NOT NULL DEFAULT 0, \
-                 total_cost DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 completed_at TIMESTAMPTZ, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 final_summary TEXT, \
-                 iterations INT NOT NULL DEFAULT 0, \
-                 tokens_prompt INT NOT NULL DEFAULT 0, \
-                 tokens_completion INT NOT NULL DEFAULT 0, \
-                 cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, \
-                 verdict JSONB, \
-                 completed_at TIMESTAMPTZ )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs (chiusura)");
-    }
-
     /// Helper: crea il run TRACCIATO del figlio con ids freschi (punto unico
     /// dei call-site di test, evita blocchi duplicati).
     async fn ensure_child(
@@ -4412,11 +5813,16 @@ mod tests {
         provider: &str,
         model: &str,
     ) {
+        // La sessione dev'essere REALE: `agent_runs.session_id` e' vincolato da
+        // una FK verso `chat_sessions(id)` (la vecchia fixture, dichiaratamente
+        // "senza FK di sessione", accettava run appesi al nulla).
+        let project = Uuid::new_v4();
+        let session = crate::test_support::seed_chat_session(pool, project).await;
         ensure_child_agent_run(
             pool,
             child,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
+            session,
+            project,
             Uuid::new_v4(),
             anchor,
             provider,
@@ -4430,9 +5836,8 @@ mod tests {
     /// silenzio ogni tool_result del figlio (incidente 2026-07-06). L'ancora
     /// NON tracciata (sessione) NON deve violare la FK: parent_run_id resta
     /// NULL via subquery.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ensure_child_agent_run_traccia_il_figlio(pool: sqlx::PgPool) {
-        create_child_run_tables(&pool).await;
         let child = Uuid::new_v4();
         let anchor_non_tracciato = Uuid::new_v4(); // sessione: NON in agent_runs
         ensure_child(
@@ -4470,21 +5875,9 @@ mod tests {
 
     /// Con l'ancora TRACCIATA (run padre reale) parent_run_id viene valorizzato:
     /// e' il collegamento padre<->figlio per audit e query.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ensure_child_agent_run_collega_il_padre_tracciato(pool: sqlx::PgPool) {
-        create_child_run_tables(&pool).await;
-        let parent = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, user_id) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(parent)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .execute(&pool)
-        .await
-        .expect("padre");
+        let parent = crate::test_support::seed_agent_run(&pool).await;
         let child = Uuid::new_v4();
         ensure_child(&pool, child, parent, "google", "gemini-2.5-flash").await;
         let linked: Option<Uuid> =
@@ -4504,7 +5897,6 @@ mod tests {
         parent_provider: &str,
         catalog: &[(&str, &str)],
     ) -> (Uuid, SubagentDefinition) {
-        create_child_run_tables(pool).await;
         // Il DB di test di questo modulo e' bare (#[sqlx::test] non applica le
         // migrazioni meta): creo le tabelle di routing come fanno gli altri test.
         crate::test_support::create_ai_price_catalog_table(pool).await;
@@ -4519,31 +5911,17 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
-        // `chat_sessions` (pin provider) vive nel DB PROGETTO. Nei test il pool e'
-        // unico, quindi la creo qui: senza pin i test review/worker-standard
-        // leggono NULL -> nessun pin (parita').
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS chat_sessions ( \
-                 id UUID PRIMARY KEY, \
-                 preferred_provider TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create chat_sessions");
-        let parent = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, user_id, provider, model) \
-             VALUES ($1, $2, $3, $4, $5, 'pm')",
-        )
-        .bind(parent)
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(Uuid::new_v4())
-        .bind(parent_provider)
-        .execute(pool)
-        .await
-        .expect("padre");
+        // Padre TRACCIATO su una sessione reale (FK agent_runs.session_id).
+        let project = Uuid::new_v4();
+        let session = crate::test_support::seed_chat_session(pool, project).await;
+        let parent =
+            crate::test_support::insert_agent_run(pool, session, project, "running").await;
+        sqlx::query("UPDATE agent_runs SET provider = $2, model = 'pm' WHERE id = $1")
+            .bind(parent)
+            .bind(parent_provider)
+            .execute(pool)
+            .await
+            .expect("provider/model del padre");
         for (prov, model) in catalog {
             sqlx::query(
                 "INSERT INTO ai_price_catalog \
@@ -4575,7 +5953,7 @@ mod tests {
 
     /// C2: un sub-run `kind == "review"` risolve il modello ESCLUDENDO il provider
     /// del padre (worker) -> il giudice gira su un provider diverso.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn review_esclude_il_provider_del_worker(pool: sqlx::PgPool) {
         let (parent, def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
@@ -4589,7 +5967,7 @@ mod tests {
 
     /// C2 fallback: se il provider del worker e' l'UNICO capable, il review gira
     /// comunque su quel provider (preferenza forte, non hard filter).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn review_fallback_se_unico_provider_capable(pool: sqlx::PgPool) {
         let (parent, def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
         let (provider, _model) =
@@ -4602,7 +5980,7 @@ mod tests {
 
     /// C2 parita': un kind NON review non esclude nulla (il provider del padre e'
     /// ammesso, comportamento invariato).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn non_review_non_esclude_il_provider_del_padre(pool: sqlx::PgPool) {
         // Solo 'alpha' capable; un worker (kind implement) risolve su 'alpha'
         // senza alcuna esclusione anche se il padre e' 'alpha'.
@@ -4611,6 +5989,111 @@ mod tests {
         let (provider, _model) =
             resolve_worker_model(&pool, &pool, "implement", &def, parent, Uuid::new_v4()).await;
         assert_eq!(provider, "alpha", "kind non-review: nessuna esclusione");
+    }
+
+    // ── DIVERSITA' PROVIDER FRA LE FIGURE DEL CONSIGLIO ───────────────────────
+    //
+    // Difetto 20/07: due figure con lo stesso purpose tier risolvevano in
+    // parallelo e in isolamento -> stesso provider E stesso modello
+    // (openrouter/qwen3-235b su software_architect + security_engineer).
+    // `resolve_council_assignments` decide PRIMA del fan-out, in sequenza.
+
+    /// Tabella `nexus_subagent_definitions` per i kind delle figure (il DB dei
+    /// test e' bare). Tutte sul MEDESIMO purpose: e' il caso del difetto.
+    async fn seed_figure_definitions(pool: &sqlx::PgPool, kinds: &[&str], purpose: &str) {
+        sqlx::query(
+            "CREATE TABLE nexus_subagent_definitions ( \
+                 kind TEXT PRIMARY KEY, \
+                 prompt_key TEXT NOT NULL, \
+                 tool_whitelist TEXT[] NOT NULL DEFAULT '{}', \
+                 model_purpose TEXT, \
+                 timeout_s INTEGER NOT NULL DEFAULT 0, \
+                 is_enabled BOOLEAN NOT NULL DEFAULT true \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create nexus_subagent_definitions");
+        for kind in kinds {
+            sqlx::query(
+                "INSERT INTO nexus_subagent_definitions (kind, prompt_key, model_purpose) \
+                 VALUES ($1, 'p', $2)",
+            )
+            .bind(kind)
+            .bind(purpose)
+            .execute(pool)
+            .await
+            .expect("definition");
+        }
+    }
+
+    /// Due figure, due provider capable -> assegnazioni DISTINTE: la seconda
+    /// figura esclude il provider gia' dato alla prima.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn figure_del_consiglio_su_provider_distinti(pool: sqlx::PgPool) {
+        let (_parent, _def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
+            .await;
+        let kinds = vec![
+            "software_architect".to_string(),
+            "security_engineer".to_string(),
+        ];
+        let out = resolve_council_assignments(&pool, &pool, Some(Uuid::new_v4()), &kinds).await;
+        let providers: Vec<String> = out
+            .iter()
+            .map(|o| o.as_ref().expect("figura assegnata").0.clone())
+            .collect();
+        assert_ne!(
+            providers[0], providers[1],
+            "due figure devono girare su provider DISTINTI: {providers:?} \
+             (era il difetto: entrambe sul piu' economico eleggibile)"
+        );
+    }
+
+    /// Pool monoprovider: la seconda figura tiene il DUPLICATO invece di saltare
+    /// (preferenza forte, non hard filter: meglio un parere in piu' che una
+    /// figura in meno).
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn consiglio_monoprovider_duplica_invece_di_perdere_figure(pool: sqlx::PgPool) {
+        let (_parent, _def) = seed_review_routing(&pool, "alpha", &[("alpha", "a1")]).await;
+        seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
+            .await;
+        let kinds = vec![
+            "software_architect".to_string(),
+            "security_engineer".to_string(),
+        ];
+        let out = resolve_council_assignments(&pool, &pool, Some(Uuid::new_v4()), &kinds).await;
+        let providers: Vec<String> = out
+            .iter()
+            .map(|o| o.as_ref().expect("figura assegnata").0.clone())
+            .collect();
+        assert_eq!(
+            providers,
+            vec!["alpha".to_string(), "alpha".to_string()],
+            "unico provider capable -> entrambe su alpha, nessuna figura persa"
+        );
+    }
+
+    /// Pin di sessione presente -> NESSUNA pre-assegnazione: il pin si propaga
+    /// ai subagenti per scelta deliberata e la diversita' non si applica.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn pin_di_sessione_disattiva_la_diversita(pool: sqlx::PgPool) {
+        let (_parent, _def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        seed_figure_definitions(&pool, &["software_architect", "security_engineer"], "reviewer")
+            .await;
+        let session = Uuid::new_v4();
+        seed_session_pin(&pool, session, Some("alpha")).await;
+        let kinds = vec![
+            "software_architect".to_string(),
+            "security_engineer".to_string(),
+        ];
+        let out = resolve_council_assignments(&pool, &pool, Some(session), &kinds).await;
+        assert!(
+            out.iter().all(Option::is_none),
+            "col pin di sessione le figure seguono il percorso storico: {out:?}"
+        );
     }
 
     // ── PROPAGAZIONE PIN PROVIDER AI SUB-AGENTI WORKER ────────────────────────
@@ -4663,15 +6146,6 @@ mod tests {
         .execute(pool)
         .await
         .expect("create nexus_purpose_model");
-        sqlx::query(
-            "CREATE TABLE chat_sessions ( \
-                 id UUID PRIMARY KEY, \
-                 preferred_provider TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create chat_sessions");
         for (prov, model, tier, cost) in catalog {
             seed_catalog_row(pool, prov, model, tier, *cost).await;
         }
@@ -4691,20 +6165,24 @@ mod tests {
         (Uuid::new_v4(), def)
     }
 
-    /// Inserisce una sessione con `preferred_provider` = pin.
+    /// Inserisce una sessione con `preferred_provider` = pin. `project_id` e'
+    /// NOT NULL nello schema reale (la vecchia fixture a due colonne lo ignorava).
     async fn seed_session_pin(pool: &sqlx::PgPool, session_id: Uuid, pin: Option<&str>) {
-        sqlx::query("INSERT INTO chat_sessions (id, preferred_provider) VALUES ($1, $2)")
-            .bind(session_id)
-            .bind(pin)
-            .execute(pool)
-            .await
-            .expect("session pin");
+        sqlx::query(
+            "INSERT INTO chat_sessions (id, project_id, preferred_provider) \
+             VALUES ($1, gen_random_uuid(), $2)",
+        )
+        .bind(session_id)
+        .bind(pin)
+        .execute(pool)
+        .await
+        .expect("session pin");
     }
 
     /// TEST 1 — pin propagato felice: pin='deepseek' + purpose worker medium/code/
     /// tool_use -> ritorna il modello DEEPSEEK del tier (non mistral, non il light).
     /// Senza pin vincerebbe mistral (piu' economico): il pin sposta la scelta.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_propagato_sceglie_provider_pinnato(pool: sqlx::PgPool) {
         let (session, def) = seed_pin_routing(
             &pool,
@@ -4731,7 +6209,7 @@ mod tests {
     /// TEST 2 — pin non-capable -> degrado: il provider pinnato non ha un modello
     /// medium+code+tool_use -> NoCapableModel col pin -> fallback SENZA pin ->
     /// modello purpose normale (mistral). MAI ("","").
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_non_capable_degrada_al_purpose_normale(pool: sqlx::PgPool) {
         // deepseek ha solo un modello 'light' (tier sbagliato): non capable per
         // il tier 'medium' del purpose. mistral ha il medium capable.
@@ -4760,7 +6238,7 @@ mod tests {
     /// TEST 3 — pin in cooldown -> degrado: il provider pinnato e' capable ma in
     /// cooldown (escluso dalla query) -> query pinnata vuota -> fallback senza pin
     /// (il figlio non resta bloccato).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn pin_in_cooldown_degrada_senza_bloccare(pool: sqlx::PgPool) {
         // Provider con nomi DEDICATI: il cooldown e' uno snapshot GLOBALE in-memory
         // condiviso tra i test paralleli, quindi non riuso 'deepseek'/'mistral'
@@ -4788,7 +6266,7 @@ mod tests {
 
     /// TEST 5 — Auto (nessun pin) bit-identico: preferred_provider NULL -> stesso
     /// (provider, model) del comportamento pre-pin (il cost-first sceglie mistral).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn nessun_pin_bit_identico_al_comportamento_attuale(pool: sqlx::PgPool) {
         let (session, def) = seed_pin_routing(
             &pool,
@@ -4809,7 +6287,7 @@ mod tests {
     /// TEST 4 — review ignora il pin: kind='review', pin = provider del padre ->
     /// il modello risolto NON e' del provider padre (l'esclusione giudice != worker
     /// vince sul pin). Nota: qui il purpose e' tier-only agentico su due provider.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn review_ignora_il_pin_esclusione_vince(pool: sqlx::PgPool) {
         let (parent, def) =
             seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
@@ -4827,15 +6305,19 @@ mod tests {
 
     /// `mark_run` chiude ENTRAMBE le righe del figlio (nexus_subagent_runs +
     /// gemella agent_runs) nella stessa statement, con status/metriche coerenti.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn mark_run_chiude_anche_la_riga_agent_runs(pool: sqlx::PgPool) {
-        create_child_run_tables(&pool).await;
         let child = Uuid::new_v4();
-        sqlx::query("INSERT INTO nexus_subagent_runs (id) VALUES ($1)")
-            .bind(child)
-            .execute(&pool)
-            .await
-            .expect("sub-run");
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs \
+                 (id, parent_run_id, project_id, kind, task_description, status) \
+             VALUES ($1, gen_random_uuid(), gen_random_uuid(), 'coder', 'task di test', \
+                     'running')",
+        )
+        .bind(child)
+        .execute(&pool)
+        .await
+        .expect("sub-run");
         ensure_child(&pool, child, Uuid::new_v4(), "mistral", "mistral-medium-3").await;
         mark_run(
             &pool,
@@ -4911,11 +6393,14 @@ mod tests {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            review_panel_rejected: false,
+            review_panel_last: None,
             pending_actions: Vec::new(),
         };
         let keys = |v: &Value| -> BTreeSet<String> {
@@ -4938,17 +6423,6 @@ mod tests {
     /// entrambi: la funzione riceve i due handle separati e il test passa lo
     /// stesso, cosi' si verifica la meccanica SQL (COUNT + INSERT ON CONFLICT).
     async fn create_fanin_tables(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs");
         sqlx::query(
             "CREATE TABLE subagent_fanin_resume_queue ( \
                  parent_run_id UUID PRIMARY KEY, \
@@ -4979,8 +6453,10 @@ mod tests {
         status: &str,
     ) {
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO nexus_subagent_runs \
+                 (parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                  is_background, status) \
+             VALUES ($1, $2, gen_random_uuid(), 'coder', 'task di test', $3, $4)",
         )
         .bind(anchor)
         .bind(dispatcher)
@@ -5003,7 +6479,7 @@ mod tests {
 
     /// Con un figlio background ancora `running`, l'enqueue NON scatta: si aspetta
     /// l'ULTIMO. Quando tutti i background sono terminali, accoda (idempotente).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_enqueue_solo_quando_tutti_background_terminali(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
         let parent = Uuid::new_v4();
@@ -5059,32 +6535,24 @@ mod tests {
     /// Senza il fix `fanin_enqueue_if_last` accodava `parent_run_id` (unico id, =
     /// anchor): questo test — con anchor != resume_run_id — fallirebbe perche' in
     /// coda ci sarebbe l'anchor e il CAS sul run corrente non lo troverebbe.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_enqueue_usa_run_corrente_non_anchor(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
-        // Tabella agent_runs minima per simulare il CAS del worker.
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create agent_runs");
 
         // anchor (famiglia figli) e run corrente (sospeso) DISTINTI: e' il caso del
-        // run principale (anchor = session_id, run corrente = agent_runs.id).
-        let anchor = Uuid::new_v4();
-        let resume_run_id = Uuid::new_v4();
+        // run principale (anchor = session_id, run corrente = agent_runs.id). La
+        // sessione e' reale: `agent_runs.session_id` ha una FK verso `chat_sessions`.
         let project = Uuid::new_v4();
-        let session = anchor; // per un run di primo livello l'anchor E' la sessione
-
+        let session = crate::test_support::seed_chat_session(&pool, project).await;
+        let anchor = session; // per un run di primo livello l'anchor E' la sessione
         // Il run corrente e' sospeso su awaiting_subagents (lo marca il finalize).
-        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'awaiting_subagents')")
-            .bind(resume_run_id)
-            .execute(&pool)
-            .await
-            .expect("insert run corrente");
+        let resume_run_id = crate::test_support::insert_agent_run(
+            &pool,
+            session,
+            project,
+            "awaiting_subagents",
+        )
+        .await;
 
         // Un solo figlio background, gia' terminale: e' l'ultimo -> accoda. Il
         // figlio ha anchor (session_id) DISTINTO dal dispatcher (run corrente):
@@ -5139,7 +6607,7 @@ mod tests {
     /// (scenario insert-one-at-a-time) l'enqueue scatta (rischio); con TUTTE le row
     /// inserite PRIMA (come fa `run_batch_background` prepare-all/spawn-all) il 1o
     /// che termina NON accoda (ne restano 2).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_batch_background_no_enqueue_prematuro(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
         let anchor = Uuid::new_v4();
@@ -5201,7 +6669,7 @@ mod tests {
     /// Cp1) NON entra nella COUNT di P. Senza il fix (COUNT su `parent_run_id =
     /// anchor = session`) Cs1 conterebbe come figlio di P -> P NON si accoderebbe
     /// (solo il backstop lo salverebbe) e il fetch inietterebbe il nipote.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_annidamento_count_isolata_per_dispatcher(pool: sqlx::PgPool) {
         create_fanin_tables(&pool).await;
         let session = Uuid::new_v4(); // anchor condiviso da TUTTI i sub-run
@@ -5426,20 +6894,8 @@ mod tests {
     /// dalla CATENA ANTENATI (depth del dispatcher), NON dal MAX tra i fratelli
     /// paralleli sotto l'anchor. Le 6 figure convocate dal run principale sono
     /// tutte figlie DIRETTE -> depth 1, non 1/2/3 (che faceva rifiutare le ultime).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn chain_depth_immune_ai_fratelli_paralleli(pool: sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 depth INTEGER, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create nexus_subagent_runs");
-
         let main = Uuid::new_v4(); // run principale (dispatcher figure): NON ha row
         let anchor = Uuid::new_v4(); // anchor condiviso dalle figure
 
@@ -5448,8 +6904,10 @@ mod tests {
         // 4a figura avrebbe preso 1 -> depth 2, poi 3 -> rifiuto.
         for _ in 0..3 {
             sqlx::query(
-                "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, depth, status) \
-                 VALUES ($1, $2, 1, 'running')",
+                "INSERT INTO nexus_subagent_runs \
+                     (parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                      depth, status) \
+                 VALUES ($1, $2, gen_random_uuid(), 'coder', 'task di test', 1, 'running')",
             )
             .bind(anchor)
             .bind(main)
@@ -5468,8 +6926,10 @@ mod tests {
         // Catena reale: un dispatcher che E' un sub-run a depth 1 -> figlio depth 2.
         let d1 = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, depth, status) \
-             VALUES ($1, $2, $3, 1, 'running')",
+            "INSERT INTO nexus_subagent_runs \
+                 (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                  depth, status) \
+             VALUES ($1, $2, $3, gen_random_uuid(), 'coder', 'task di test', 1, 'running')",
         )
         .bind(d1)
         .bind(anchor)
@@ -5670,7 +7130,7 @@ mod tests {
     }
 
     /// Mig 0555: purpose ultracode da settings con fallback a model_purpose.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn ultracode_purpose_da_settings_con_fallback(pool: sqlx::PgPool) {
         sqlx::query(
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",

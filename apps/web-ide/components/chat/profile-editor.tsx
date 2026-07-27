@@ -5,7 +5,7 @@ import type { CreateProfilePayload, UpdateProfilePayload, UserProfile } from "..
 import { generateSystemPrompt } from "../../lib/api-client";
 import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
-import { PROVIDER_MODELS } from "../../lib/model-catalog";
+import { usePricingCatalog, providerLabel } from "./provider-badge";
 
 interface ProfileEditorProps {
   profile?: UserProfile;
@@ -23,18 +23,12 @@ const AUTOMATION_OPTIONS = [
   { value: "study", label: "Studio" },
 ];
 
-const PROVIDER_OPTIONS = [
-  { value: "",         label: "Provider globale" },
-  { value: "auto",     label: "Auto" },
-  { value: "anthropic",label: "Anthropic" },
-  { value: "openai",   label: "OpenAI" },
-  { value: "google",   label: "Google" },
-  { value: "deepseek", label: "DeepSeek" },
-  { value: "mistral",  label: "Mistral" },
+/** Le due voci che non sono un provider ma una politica di scelta. Tutto il
+ *  resto viene dal catalogo (`/api/models`), non da una lista scritta qui. */
+const PROVIDER_META_OPTIONS = [
+  { value: "",     label: "Provider globale" },
+  { value: "auto", label: "Auto" },
 ];
-
-// PROVIDER_MODELS migrato in lib/model-catalog.ts (single source frontend;
-// TODO: rimpiazzare con fetch da nexus_routing_matrix/ai_price_catalog).
 
 export function ProfileEditor({
   profile,
@@ -61,12 +55,27 @@ export function ProfileEditor({
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const availableModels = PROVIDER_MODELS[defaultProvider] ?? [];
+  // Catalogo reale (`ai_price_catalog` via /api/models): elenca solo i modelli
+  // ABILITATI, quindi il dropdown non puo' piu' proporre un modello che il
+  // provider ha nel frattempo deprecato. Prima la lista era scritta a mano in
+  // lib/model-catalog.ts e conteneva ancora `mistral-small-4`: sceglierlo
+  // significava un 400 alla prima chiamata.
+  const catalog = usePricingCatalog();
+  const providerOptions = [
+    ...PROVIDER_META_OPTIONS,
+    ...Array.from(new Set(catalog.map((e) => e.provider)))
+      .sort()
+      .map((p) => ({ value: p, label: providerLabel(p) })),
+  ];
+  const availableModels = catalog
+    .filter((e) => e.provider === defaultProvider)
+    .map((e) => e.model)
+    .sort();
 
   const handleProviderChange = (value: string) => {
     setDefaultProvider(value);
     // Auto-seleziona il primo modello del provider
-    const models = PROVIDER_MODELS[value] ?? [];
+    const models = catalog.filter((e) => e.provider === value).map((e) => e.model).sort();
     setDefaultModel(models[0] ?? "");
   };
 
@@ -282,7 +291,7 @@ export function ProfileEditor({
                 onChange={(e) => handleProviderChange(e.target.value)}
                 style={{ ...inputStyle, cursor: "pointer" }}
               >
-                {PROVIDER_OPTIONS.map((o) => (
+                {providerOptions.map((o) => (
                   <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
               </select>

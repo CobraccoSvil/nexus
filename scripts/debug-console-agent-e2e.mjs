@@ -6,8 +6,8 @@
  * 1. Legge jwt_secret da GET {CORE_URL}/internal/settings/jwt_secret
  * 2. Mints JWT HS256 come apps/web-ide/app/api/dev-login/route.ts (sub + role + exp)
  * 3. Registra sessions.token_hash via INSERT diretto in Postgres (E2E_PSQL_CONN).
- *    NOTA: l'ex dev_login_server :9999 (Python) e' stato RIMOSSO; oggi la via
- *    canonica e' E2E_PSQL_CONN. Il tentativo a :9999 resta solo come best-effort.
+ *    NOTA: l'ex dev_login_server :9999 (Python) e' stato RIMOSSO; l'INSERT via
+ *    psql e' oggi l'unica via di registrazione della sessione.
  * 4. Chiama POST /api/chat/... come il browser (header Cookie: token=...)
  *
  * Env:
@@ -15,8 +15,7 @@
  *   E2E_USER_ID=uuid utente Nexus (opzionale se E2E_PSQL_CONN: si usa il primo admin)
  *   E2E_USER_ROLE=admin
  *   E2E_PROJECT_ID=uuid progetto (opzionale; altrimenti primo da /api/projects/mine)
- *   SESSION_INSERT_URL=http://127.0.0.1:9999 — legacy (dev_login_server rimosso), best-effort
- *   E2E_PSQL_CONN=postgresql://user:pass@host:5432/db — via canonica: INSERT diretto in sessions
+ *   E2E_PSQL_CONN=postgresql://user:pass@host:5432/db — INSERT diretto in sessions (richiesto)
  *   POLL_MS=800
  *   RUN_TIMEOUT_MS=180000
  *   SKIP_TOOL_ASSERT=0 — assert sui tool SSE/DB (legacy; oggi agent_steps spesso non viene popolato)
@@ -27,7 +26,6 @@ import crypto from "crypto";
 import { spawnSync } from "child_process";
 
 const CORE_URL = (process.env.CORE_URL || "http://127.0.0.1:4000").replace(/\/$/, "");
-const SESSION_INSERT_URL = (process.env.SESSION_INSERT_URL || "http://127.0.0.1:9999").replace(/\/$/, "");
 const USER_ID_ENV = process.env.E2E_USER_ID?.trim() || "";
 const ROLE = process.env.E2E_USER_ROLE || "admin";
 const PROJECT_ID_OVERRIDE = process.env.E2E_PROJECT_ID?.trim() || "";
@@ -158,23 +156,14 @@ function insertSessionViaPsql(hash, userId) {
   return true;
 }
 
-async function registerSession(token, userId) {
+function registerSession(token, userId) {
   const hash = tokenHash(token);
-  const u = `${SESSION_INSERT_URL}/insert-session?user_id=${encodeURIComponent(userId)}&hash=${encodeURIComponent(hash)}`;
   try {
-    const res = await fetch(u, { method: "GET", signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`insert-session HTTP ${res.status}`);
-    return;
-  } catch (_) {
-    try {
-      if (insertSessionViaPsql(hash, userId)) return;
-    } catch (dbErr) {
-      bail(`insert-session su ${SESSION_INSERT_URL} irraggiungibile e psql fallito (${process.env.E2E_PSQL_CONN || "imposta E2E_PSQL_CONN"})`, dbErr);
-    }
-    bail(
-      `Nessuna sessione DB registrata: esporta E2E_PSQL_CONN (URI postgres completo per psql). Il vecchio dev_login_server :9999 e' stato rimosso.`,
-    );
+    if (insertSessionViaPsql(hash, userId)) return;
+  } catch (dbErr) {
+    bail(`INSERT sessione via psql fallito (E2E_PSQL_CONN=${process.env.E2E_PSQL_CONN || "non impostato"})`, dbErr);
   }
+  bail("Nessuna sessione DB registrata: esporta E2E_PSQL_CONN (URI postgres completo per psql).");
 }
 
 async function pollRun(cookie, runId, start) {
@@ -195,7 +184,7 @@ async function pollRun(cookie, runId, start) {
 
 async function main() {
   const userId = resolveUserId();
-  console.log("[e2e] CORE_URL=%s SESSION_INSERT_URL=%s USER=%s", CORE_URL, SESSION_INSERT_URL, userId);
+  console.log("[e2e] CORE_URL=%s USER=%s", CORE_URL, userId);
 
   const secretBody = await fetchJson(`${CORE_URL}/internal/settings/jwt_secret`).catch((e) => bail("cannot read jwt_secret from core", e));
   const jwtSecret = secretBody?.value;
@@ -204,7 +193,7 @@ async function main() {
   const token = mintJwt(jwtSecret, userId, ROLE);
   const cookie = `token=${encodeURIComponent(token)}`;
 
-  await registerSession(token, userId);
+  registerSession(token, userId);
 
   const mine = await fetchJson(`${CORE_URL}/api/projects/mine`, { cookie }).catch((e) => bail("/api/projects/mine failed — user id o cookie/sessione non validi?", e));
   const projects = mine?.projects || [];

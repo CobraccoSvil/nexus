@@ -49,8 +49,8 @@
 //! l'esecuzione primaria; restano da chiudere per parita' piena col brain legacy:
 //! 1. CHIUSO (F5a). `build_initial_state` valorizza `behavior_mode` con la STESSA
 //!    fonte del primario Python (`PRIMARY_BEHAVIOR_MODE`, costante riusata dal
-//!    client brain): lo shadow attraversa il grafo col mode IDENTICO. Conta dal
-//!    momento in cui il planner e' eleggibile (`plan_phase_enabled=true`).
+//!    client brain). Conta dal momento in cui il planner e' eleggibile
+//!    (`plan_phase_enabled=true`).
 //! 2. CHIUSO (F5a). `PlannerConfig`/`FinalGateConfig`/`VerifierConfig` sono LETTE
 //!    dal DB (`load_*_config`, punto unico `get_setting`, regola G piena), 1:1 con
 //!    le chiavi `orchestrator.*`/`agent.*` del brain; il `Default` resta solo come
@@ -74,23 +74,20 @@
 //! 5. CLASSIFIER LLM nel `RouterNode` (TODO `router.rs`, FIX A): la
 //!    classificazione intent via LLM (`AgenticIntentClassifier`) NON e' ancora
 //!    portata. Senza `intent_hint` il RouterNode cade nel fallback
-//!    `agentic_default`/`action_oriented=true`. Per lo SHADOW questo divergeva dal
-//!    primario (g1 sui run 0-tool, loop sui run con tool): mitigato derivando
-//!    `action_oriented`/`user_intent` dall'`intent_hint` in `build_initial_state`
-//!    (ramo Shadow, punto unico `decisions::action_oriented_for_intent`). Resta da
-//!    portare il classifier completo come debito residuo: senza, i turni shadow
-//!    SENZA `intent_hint` non hanno l'intent reale del primario.
+//!    `agentic_default`/`action_oriented=true`. Mitigato derivando
+//!    `action_oriented`/`user_intent` dai dati del classifier del turno in
+//!    `build_initial_state` quando disponibili. Resta da portare il classifier
+//!    completo come debito residuo.
 //!
-//! ## Stato (PRIMARIO, instradato globalmente)
+//! ## Stato: unico motore
 //!
-//! `select_engine` ritorna `rust` sulla riga jolly `*`=rust (regola G, tabella
-//! `nexus_orchestrator_engine`): il motore nativo Rust e' il PRIMARIO in
-//! produzione e questo path e' quello effettivamente eseguito per i nuovi run.
-//! `Engine::Python` resta solo come rollback per-scope esplicito (INERTE: il
-//! servizio brain e' stato rimosso, mig 0462/0532) e valore storico dei run
-//! `agent_runs.engine='python'`; il default difensivo (riga DB assente / DB down
-//! / valore non riconosciuto) e' `Engine::Rust`. L'instradamento e' un dato nel
-//! DB, non codice.
+//! Questo path esegue OGNI run agentico. Non c'e' piu' un instradamento da
+//! decidere: `select_engine` e la tabella `nexus_orchestrator_engine`
+//! sceglievano fra `Engine::{Rust, Python, Shadow}`, ma il brain Python e' stato
+//! rimosso (mig 0462/0532) e con lui gli altri due rami — Shadow incluso, il cui
+//! PRIMARIO era proprio Python. Enum, selettore e tabella sono spariti (mig
+//! 0609). `agent_runs.engine` resta valorizzato per il recovery, e i run storici
+//! conservano il valore che avevano davvero.
 
 use std::sync::Arc;
 
@@ -106,18 +103,17 @@ use nexus_agent_graph::decisions::supervisor::{
 };
 use nexus_agent_graph::nodes::{
     ExecutorConfig, ExecutorNode, ScaleConfig, ScaleControlNode, StallRecoveryNode, SupervisorNode,
-    VerifierConfig, VerifierNode,
+    TodoCriteriaMode, VerifierConfig, VerifierNode,
 };
 use nexus_agent_graph::runtime::ports::{
     AgentStepStore, BillingCooldownPort, ContextOffload, CriteriaRunner, EscalationPort, EventSink,
     LlmGateway, MetaReasonerPort, MetaStepStore, ModelUpscalePort, NextActionsDeriver,
     RunControlStore, SummaryStore, TodoStore, ToolExecutor, VerifierRunStore,
 };
-use nexus_agent_graph::runtime::NullEventSink;
 use nexus_agent_graph::{
     build_agent_graph, AgentGraphEngine, AgentGraphNodes, AgentNodeCtx, AgentState, ClarifyConfig,
-    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict, LearnerConfig,
-    LearnerNode, Message,
+    ClarifyOrExpandNode, FinalGateConfig, FinalGateNode, FinalGateVerdict,
+    LearnerNode, Message, OnFailure, ReviewGateConfig, ReviewGateNode, ReviewGateVerdict,
     PlannerConfig, PlannerNode, ReflectionConfig, ReflectionNode, RouterNode, StopReason,
     TodoRunnerConfig, TodoRunnerNode, ToolDispatchConfig, ToolDispatchNode, UnderstandingConfig,
     UnderstandingNode, SupervisorMode,
@@ -126,14 +122,14 @@ use nexus_graph::outcome::StepOutcome;
 
 use crate::agent_graph_adapter::{
     agent_step_store::PgAgentStepStore,
-    billing_cooldown_port::{CooldownBillingPort, NullBillingCooldownPort},
+    billing_cooldown_port::CooldownBillingPort,
     clarify_history_store::PgClarifyHistoryStore,
     context_offload::RagContextOffloadAdapter,
     criteria_runner::FinalGateCriteriaRunnerAdapter,
     embedding_store::PgEmbeddingStore,
     escalation_port::PgEscalationPort,
     event_sink::SseEventSinkAdapter,
-    llm_gateway::{GatewayLlmAdapter, ReplayLlmGateway},
+    llm_gateway::GatewayLlmAdapter,
     meta_step_store::PgMetaStepStore,
     model_upscale_port::CatalogModelUpscalePort,
     next_actions_deriver::NextActionsDeriverAdapter,
@@ -190,6 +186,19 @@ pub struct NativeRunInput {
     pub model: String,
     /// System prompt completo del run.
     pub system_text: String,
+    /// CHIAVE del template di sistema usato (`nexus_prompt_templates.key`), es.
+    /// `system.nexus_base` per il run principale o la `prompt_key` della
+    /// definizione subagente per un sub-run.
+    ///
+    /// Non e' cosmetica: e' la chiave con cui il ReflectionNode persiste in
+    /// `nexus_agent_reflections`, e senza di essa la persistenza esce subito.
+    /// Il campo era gia' previsto nello stato (`profile_name`) ma nessuno lo
+    /// valorizzava — l'unica assegnazione in tutto il workspace era una fixture
+    /// di test — quindi quella tabella era a ZERO righe e con lei
+    /// `prompt_ab_experiments`. A digiuno restavano cinque consumatori vivi: il
+    /// `PromptOptimizerWorker`, registrato e con `optimizer_enabled=true`, e le
+    /// tre rotte `/prompt-experiments` di admin-service.
+    pub prompt_key: Option<String>,
     /// Messaggio iniziale dell'utente (con blocco allegati gia' inline).
     pub initial_msg: String,
     /// History conversazione in forma LangChain (`Vec<Value>`): convertita in
@@ -200,13 +209,11 @@ pub struct NativeRunInput {
     /// Intent gia' risolto (es. risposta a disambiguazione). `None` -> il router
     /// classifica normalmente.
     pub intent_hint: Option<String>,
-    /// Dati COMPLETI del classifier del turno (Tappa 1b, punto B). Popolati SOLO
-    /// nel ramo Shadow (`build_initial_state` li usa per derivare
-    /// `action_oriented`/`report_only` FEDELI al primario Python via
-    /// `intent_classifier::derive_*`, sostituendo la mappa grossolana
-    /// `action_oriented_for_intent`). Per il primario restano ai default
-    /// (`None`/`false`): il primario NON forza `action_oriented` (decide il
-    /// RouterNode), comportamento INVARIATO.
+    /// Dati COMPLETI del classifier del turno (Tappa 1b, punto B).
+    /// `build_initial_state` li usa per derivare `action_oriented`/`report_only`
+    /// FEDELI al primario Python via `intent_classifier::derive_*`. Se assenti
+    /// restano ai default (`None`/`false`): il grafo NON forza `action_oriented`
+    /// (decide il RouterNode), comportamento INVARIATO.
     ///
     /// `requires_tools`: il turno richiede tool? (giudizio LLM del classifier).
     pub requires_tools: Option<bool>,
@@ -238,13 +245,24 @@ pub struct NativeRunInput {
     /// grafo nativo lo usa per il guard anti-esplosione del fan-out explore
     /// (`UnderstandingNode`, `subagent_depth >= 1 -> skip`) e per l'anti-ricorsione.
     pub subagent_depth: Option<i64>,
+    /// Budget in secondi del run CORRENTE, quando il chiamante lo conosce meglio
+    /// del setting globale. `None` (run principale) -> vale `agent.run_time_budget_s`
+    /// letto da `load_executor_config` (regola G). `Some(s)` (SUB-RUN/figura) -> e'
+    /// il `timeout_s` gia' risolto in `prepare_subagent_run`, cioe' il tetto REALE
+    /// applicato dal `tokio::time::timeout` esterno.
+    ///
+    /// Perche' serve: senza questo canale il motore della figura non conosce il
+    /// proprio tetto (il setting globale e' `0` per policy, mig 0604/0607), quindi
+    /// ogni gate a tempo dell'executor e' codice morto e la figura scade MUTA —
+    /// uccisa dall'esterno senza mai poter dichiarare il proprio parere.
+    pub run_time_budget_s: Option<u64>,
     /// Override della root di lavoro per un SUB-RUN ISOLATO (FASE 2 orchestrazione:
     /// git worktree effimero). Threadato fino al `ToolRunnerExecutorAdapter` ->
     /// `build_ctx_with_root`, che quando presente sovrascrive `root_path` e imposta
     /// `isolated_subrun=true` (soppressione autocommit/reindex). `None` (default per
-    /// il run principale, il resume, lo shadow e i sub-run non isolati) ->
-    /// comportamento invariato: il ctx usa la root del progetto. In PR3 TUTTI i
-    /// call site lasciano `None`; l'accensione (passare `Some`) e' PR4.
+    /// il run principale, il resume e i sub-run non isolati) -> comportamento
+    /// invariato: il ctx usa la root del progetto. In PR3 TUTTI i call site
+    /// lasciano `None`; l'accensione (passare `Some`) e' PR4.
     pub working_root: Option<std::path::PathBuf>,
     /// Sintesi advisory strutturata prodotta PRIMA del run (panel multi-provider
     /// o consiglio a monte). Seed in `AgentState.extra` per il coordinatore
@@ -252,19 +270,39 @@ pub struct NativeRunInput {
     pub pre_run_advisory_synthesis: Option<serde_json::Value>,
     /// Fonte del segnale pre-run (`multi_provider_synthesis` | `advisory_synthesis`).
     pub pre_run_advisory_source: Option<&'static str>,
+    /// Barriera di scrittura advisory (overlap consiglio ∥ run, mig 0606).
+    /// `Some(rx)` = il run parte SUBITO mentre i panel deliberano: la prima
+    /// modifica attendera' il loro verdetto (gate nel ToolDispatchNode). `None`
+    /// (default) = ramo classico, i verdetti sono gia' in
+    /// `pre_run_advisory_synthesis` -> gate inerte, comportamento bit-identico.
+    /// Alternativi per costruzione: o si attende prima, o si attende alla prima
+    /// scrittura.
+    pub advisory_gate:
+        Option<tokio::sync::watch::Receiver<nexus_agent_graph::nodes::AdvisoryGateState>>,
+    /// Dimensionamento del turno (dal classifier): il ReviewGate lo usa per
+    /// stringere il panel coi budget residui (stesso punto unico del pre-run).
+    /// `None` nei percorsi senza classifier (sub-run, resume): vale il backstop.
+    pub sizing_complexity:
+        Option<nexus_agent_graph::decisions::orchestration_sizing::TaskComplexity>,
+    pub sizing_scope_system_wide: bool,
+    /// Intent del CLASSIFIER del turno (mcp-core `intent_classifier`), propagato
+    /// nello stato come `user_intent` cosi' il RouterNode del grafo lo USA invece
+    /// del fallback stub `agentic_default` (la classificazione LLM del grafo non
+    /// e' ancora portata). `None` nei percorsi senza classifier (sub-run, resume)
+    /// -> il router applica il neutro (comportamento invariato). Sblocca
+    /// `is_eligible` (intent reale in `plan_intents`, es. `scaffold_app`) e da' al
+    /// gate d'orchestrazione un segnale d'intento vero, non il catch-all.
+    pub classifier_intent: Option<String>,
 }
 
 /// Campi del classifier del turno necessari a `build_initial_state` per derivare
 /// `action_oriented`/`report_only` FEDELI al primario Python (Tappa 1b).
 ///
-/// PUNTO UNICO (regola L) della loro RISOLUZIONE: sia il ramo Shadow sia il ramo
-/// PRIMARY-Rust del call site (`agent_run.rs`) duplicavano la stessa sequenza
-/// (classifica il turno col porting 1:1 `intent_classifier::classify` -> mappa
-/// `requires_tools`/`agentic_score`/`authorizes_changes`/`classifier_resolved` +
-/// legge la soglia DB `routing.action_oriented_min_agentic_score`). Ora entrambi
-/// chiamano [`resolve_classifier_fields`]: la derivazione e' identica, niente
-/// logica copiata-e-adattata. Per il primario PYTHON (`run_via_brain`) questo NON
-/// si applica: continua a ri-classificare internamente nel `router_node`.
+/// PUNTO UNICO (regola L) della loro RISOLUZIONE: il call site (`agent_run.rs`)
+/// chiama [`resolve_classifier_fields`] (classifica il turno col porting 1:1
+/// `intent_classifier::classify` -> mappa `requires_tools`/`agentic_score`/
+/// `authorizes_changes`/`classifier_resolved` + legge la soglia DB
+/// `routing.action_oriented_min_agentic_score`), senza logica copiata-e-adattata.
 #[derive(Debug, Clone, Copy)]
 pub struct ClassifierFields {
     /// `requires_tools` del classifier (None = classifier non interrogato/degradato).
@@ -283,32 +321,28 @@ pub struct ClassifierFields {
 /// PORTING 1:1 (`intent_classifier::classify`, regola L) e leggendo la soglia DB
 /// `routing.action_oriented_min_agentic_score` (regola G, mig 0387).
 ///
-/// PUNTO UNICO (regola L) condiviso dai rami Shadow e PRIMARY-Rust di
-/// `spawn_agent_run`: prima ciascuno re-implementava questa sequenza. Senza
-/// gateway o su fallback del classifier i campi del giudizio restano neutri
-/// (`None`/`false`); la soglia DB e' comunque risolta (fallback al default
-/// tecnico `DEFAULT_ACTION_ORIENTED_MIN_SCORE` se la chiave manca). Indipendente
-/// dal flag `routing.classifier_engine`: usa SEMPRE il classifier rust (sia per
-/// lo shadow-replay sia per il primario nativo, che e' il motore Rust stesso).
+/// PUNTO UNICO (regola L) di `spawn_agent_run`. Su fallback del classifier i
+/// campi del giudizio restano neutri (`None`/`false`); la soglia DB e' comunque
+/// risolta (fallback al default tecnico `DEFAULT_ACTION_ORIENTED_MIN_SCORE` se la
+/// chiave manca).
+///
+/// Il `gateway` non e' piu' `Option`: era il residuo di quando l'orchestrator
+/// poteva nascere senza: quel ramo produceva `classifier_resolved=false` in
+/// silenzio, che a valle spegneva il dimensionamento senza dire perche'.
 pub(crate) async fn resolve_classifier_fields(
     db: &PgPool,
-    gateway: Option<&NexusGatewayClient>,
+    gateway: &NexusGatewayClient,
     classifier_input: &str,
 ) -> ClassifierFields {
-    let (requires_tools, agentic_score, authorizes_changes, classifier_resolved) = match gateway {
-        Some(gw) => {
-            let ai = crate::intent_classifier::classify(db, gw, classifier_input).await;
-            // classifier_resolved = il classifier ha prodotto un giudizio (NON un
-            // fallback di sistema). Parita' col `_classifier_resolved` del brain.
-            (
-                Some(ai.requires_tools),
-                Some(ai.agentic_score),
-                Some(ai.authorizes_changes),
-                !ai.fallback_used,
-            )
-        }
-        None => (None, None, None, false),
-    };
+    let ai = crate::intent_classifier::classify(db, gateway, classifier_input).await;
+    // classifier_resolved = il classifier ha prodotto un giudizio (NON un
+    // fallback di sistema).
+    let (requires_tools, agentic_score, authorizes_changes, classifier_resolved) = (
+        Some(ai.requires_tools),
+        Some(ai.agentic_score),
+        Some(ai.authorizes_changes),
+        !ai.fallback_used,
+    );
     // Soglia DB action_oriented_min_agentic_score (regola G, mig 0387).
     let action_oriented_min_score =
         nexus_auth::get_setting(db, "routing.action_oriented_min_agentic_score")
@@ -354,17 +388,30 @@ pub struct NativeRunOutcome {
     pub resume_at: Option<String>,
     /// Numero di iterazioni dell'executor (campo `iterations` dello stato finale).
     pub iterations: i64,
-    /// Token di prompt dell'ULTIMA iterazione: lo stato del grafo e' last-write
-    /// per-turno (reducer overwrite in executor.rs), NON cumulativo. Il valore
-    /// cumulativo per il billing viene riconciliato a valle dal ledger
-    /// (`reconcile_run_cost_from_ledger`). Questo valore alimenta
-    /// `last_prompt_tokens` (context ratio della UI).
+    /// Token di prompt LORDI dell'ULTIMA iterazione (contesto inviato, cache
+    /// compresa): lo stato del grafo e' last-write per-turno (reducer overwrite
+    /// in executor.rs), NON cumulativo. Il valore cumulativo per il billing
+    /// viene riconciliato a valle dal ledger (`reconcile_run_cost_from_ledger`).
+    ///
+    /// Alimenta `last_prompt_tokens` (context ratio della UI): la finestra la
+    /// occupa il prompt intero, i token serviti da cache compresi — la cache
+    /// risparmia denaro, non spazio.
     pub prompt_tokens: i64,
     /// Token di completion dell'ultima iterazione (stesso reducer last-write).
     pub completion_tokens: i64,
     /// Token totali dell'ultima iterazione (stesso reducer last-write).
     pub total_tokens: i64,
-    /// Costo totale stimato in USD (0.0 se non calcolato a monte).
+    /// Costo CUMULATIVO del run in USD (`run_cost_cumulative_usd` dello stato:
+    /// somma dei costi di tutti i turni). 0.0 se non calcolato a monte.
+    ///
+    /// ASIMMETRIA VOLUTA rispetto ai token qui sopra, che sono dell'ULTIMO turno:
+    /// il costo serve al billing (che vuole il run intero), i token servono al
+    /// context ratio (che vuole l'ultima iterazione). Non e' un'incoerenza da
+    /// "uniformare": rendere cumulativi i token romperebbe `last_prompt_tokens`
+    /// (badge "5046% ctx"). Nel percorso normale entrambi vengono comunque
+    /// sovrascritti dal ledger, che e' la fonte autoritativa
+    /// (`reconcile_run_cost_from_ledger`); questi valori restano quelli pubblicati
+    /// solo quando il gateway non ha contabilizzato nulla per il run.
     pub total_cost: f64,
     /// Intent del turno (campo `user_intent` dello stato): pilota la decisione
     /// hollow/conversational del finalizzatore (parita' col `nexus_task_type`
@@ -404,6 +451,12 @@ pub struct NativeRunOutcome {
     /// confine sub-run dentro [`Self::structured_verdict`] (campo `advisory`) cosi'
     /// il coordinatore compone la sintesi dei pareri senza parsare prosa (regola M).
     pub advisory_verdict: Option<serde_json::Value>,
+    /// Posizione strutturata dell'AVVOCATO via tool `debate_position` (tesi
+    /// contrapposte): dict normalizzato {assigned_position, stance, summary,
+    /// key_arguments[], risks[]}. `None` nei run che non sono avvocati.
+    /// Propagato oltre il confine sub-run in `structured_verdict` (campo
+    /// `debate`, regola M) e letto dal punto unico `compose_debate_synthesis`.
+    pub debate_position: Option<serde_json::Value>,
     /// Classe d'errore STRUTTURATA del run (`extra.error_class` dello stato, es.
     /// `context_overflow` — ADR 0016 D2): segnale MACCHINA per il finalizzatore
     /// (regola M: mai dedotta dal testo). `None` se il run non ha classificato.
@@ -458,6 +511,18 @@ pub struct NativeRunOutcome {
     ///
     /// Letto dal finalizzatore: mai `Completed` con una bocciatura pendente.
     pub final_gate_failed_pending: bool,
+    /// `true` quando la review adversariale del ReviewGate (nodo del grafo,
+    /// prima della chiusura) NON ha approvato (Fail/NeedsChanges) su codice
+    /// modificato: segnale STRUTTURATO (regola M) che il run non e' un successo
+    /// pulito. Letto da `classify_status` (punto unico, regola L) per mappare
+    /// FailedDiagnosed invece di Completed. `Inconclusive` (quorum non
+    /// raggiunto) NON e' un rifiuto: limite infra, non difetto del codice ->
+    /// resta `false`.
+    pub review_panel_rejected: bool,
+    /// Esito dell'ultimo panel (`PanelOutcome::to_value`, trasportato dal
+    /// ReviewGate in `extra.review_panel_last`): alimenta la nota onesta nel
+    /// resoconto. `None` = panel mai convocato.
+    pub review_panel_last: Option<serde_json::Value>,
     /// Azioni in attesa di conferma utente (HITL modalita' Conferma), serializzate
     /// dal grafo in `extra.hitl_pending_actions`. Vuoto se nessuna sospensione HITL.
     pub pending_actions: Vec<serde_json::Value>,
@@ -482,6 +547,10 @@ pub(crate) mod verdict_keys {
     /// ({verdict, summary, requirements[], risks[], recommendations[]}); null nei
     /// run che non sono figure di analisi.
     pub const ADVISORY: &str = "advisory";
+    /// Posizione strutturata di un AVVOCATO del dibattito via `debate_position`
+    /// ({assigned_position, stance, summary, key_arguments[], risks[]}); null nei
+    /// run che non sono avvocati.
+    pub const DEBATE: &str = "debate";
     /// Segnali strutturati grezzi del final_gate / chiusura (ADR 0036).
     pub const FINAL_GATE_PASSED: &str = "final_gate_passed";
     pub const FINAL_GATE_UNVERIFIED: &str = "final_gate_unverified";
@@ -515,44 +584,35 @@ impl NativeRunOutcome {
     /// che un coordinatore legge da un sub-run e' lo STESSO che il run padre
     /// otterrebbe. L'ordine dei rami e' significativo (dichiarazione onesta del
     /// modello > forced_close > verdetto oggettivo del gate).
+    /// True se il run ha consegnato un verdetto di RUOLO: il suo prodotto e' un
+    /// giudizio, non una modifica al codice.
+    ///
+    /// Gemello di `nexus_agent_graph::routing::declared_role_channel`, che sullo
+    /// stato del grafo risponde alla stessa domanda per instradare il turno alla
+    /// chiusura; qui la si pone sull'esito del run.
+    fn ha_dichiarato_verdetto_di_ruolo(&self) -> bool {
+        self.review_verdict.is_some()
+            || self.advisory_verdict.is_some()
+            || self.debate_position.is_some()
+    }
+
     pub fn classify_status(&self) -> crate::agent_types::AgentRunStatus {
         use crate::agent_types::AgentRunStatus;
 
-        if !self.completed && self.resume_at.is_some() {
-            // Ramo INTERROTTO (run SOSPESO, resumibile): due motivi di
-            // interrupt-resume oggi. Il fan-in dei sub-run background (Fase D)
-            // porta il segnale strutturato `awaiting_subagents` (regola M); il
-            // resto e' l'attesa di conferma umana (HITL). Discriminati qui cosi'
-            // il worker fan-in seleziona SOLO i propri run (CAS su questo status).
-            return if self.awaiting_subagents {
-                AgentRunStatus::AwaitingSubagents
-            } else {
-                AgentRunStatus::AwaitingConfirmation
-            };
-        }
-        if matches!(self.stop_reason, Some(StopReason::Error)) {
-            return AgentRunStatus::Failed;
-        }
-        // La dichiarazione del modello ha precedenza sul forced_close: una
-        // dichiarazione onesta (es. blocked su credenziale mancante) e' piu'
-        // specifica del segnale generico di chiusura coordinata.
-        if let Some(status) = self.declared_status() {
-            return status;
-        }
-        if self.is_forced_close() {
-            return AgentRunStatus::FailedDiagnosed;
-        }
-        // Verdetto OGGETTIVO del gate; in sua assenza il run e' completo.
-        self.final_gate_status().unwrap_or(AgentRunStatus::Completed)
-    }
-
-    /// Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
-    /// MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
-    /// (regola M). `None` = il modello non ha dichiarato nulla di discriminante
-    /// -> decidono i segnali successivi in [`Self::classify_status`].
-    fn declared_status(&self) -> Option<crate::agent_types::AgentRunStatus> {
-        use crate::agent_types::AgentRunStatus;
-
+        // `forced_close_unverified` e' il segnale AUTORITATIVO (mig 0386):
+        // sopravvive alla riscrittura di `stop_reason` operata dal final_gate
+        // sul ramo forced_close (senza, un abort anti-loop ripulito dal
+        // final_gate finiva "completed" col testo di sistema come risposta —
+        // run b833a83d).
+        let forced_close = self.forced_close_unverified
+            || self
+                .stop_reason
+                .is_some_and(|s| FORCED_CLOSE_STOPS.contains(&s));
+        // Esito DICHIARATO dal modello via task_complete (ADR 0034): segnale
+        // MACCHINA (enum/bool), letto dal dict normalizzato — mai dalla prosa
+        // (regola M). Ha precedenza sul forced_close: una dichiarazione onesta
+        // (es. blocked su credenziale mancante) e' piu' specifica del segnale
+        // generico di chiusura coordinata.
         let declared_kind = self
             .declared_outcome
             .as_ref()
@@ -564,60 +624,69 @@ impl NativeRunOutcome {
             .and_then(|v| v.get("refusal"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-
-        if declared_refusal || matches!(declared_kind, Some("blocked") | Some("needs_input")) {
+        if !self.completed && self.resume_at.is_some() {
+            // Ramo INTERROTTO (run SOSPESO, resumibile): due motivi di
+            // interrupt-resume oggi. Il fan-in dei sub-run background (Fase D)
+            // porta il segnale strutturato `awaiting_subagents` (regola M); il
+            // resto e' l'attesa di conferma umana (HITL). Discriminati qui cosi'
+            // il worker fan-in seleziona SOLO i propri run (CAS su questo status).
+            if self.awaiting_subagents {
+                AgentRunStatus::AwaitingSubagents
+            } else {
+                AgentRunStatus::AwaitingConfirmation
+            }
+        } else if matches!(self.stop_reason, Some(StopReason::Error)) {
+            AgentRunStatus::Failed
+        } else if declared_refusal || matches!(declared_kind, Some("blocked") | Some("needs_input"))
+        {
             // Bloccato per causa esterna / serve input umano / rifiuto safety:
             // esito canonico BlockedNeedsInput (parita' WAVE 3.2 del path brain).
-            Some(AgentRunStatus::BlockedNeedsInput)
+            AgentRunStatus::BlockedNeedsInput
         } else if matches!(declared_kind, Some("partial")) {
             // Lavoro dichiarato PARZIALE: onesto, non un successo (mai
             // "completed" su una dichiarazione esplicita di incompletezza).
-            Some(AgentRunStatus::FailedDiagnosed)
-        } else {
-            None
-        }
-    }
-
-    /// `forced_close_unverified` e' il segnale AUTORITATIVO (mig 0386):
-    /// sopravvive alla riscrittura di `stop_reason` operata dal final_gate sul
-    /// ramo forced_close (senza, un abort anti-loop ripulito dal final_gate
-    /// finiva "completed" col testo di sistema come risposta — run b833a83d).
-    fn is_forced_close(&self) -> bool {
-        self.forced_close_unverified
-            || self
-                .stop_reason
-                .is_some_and(|s| FORCED_CLOSE_STOPS.contains(&s))
-    }
-
-    /// Verdetto OGGETTIVO del final_gate (regola M). `None` = il gate non ha
-    /// nulla da obiettare -> il run e' `Completed`. L'ordine dei rami e'
-    /// significativo (bocciatura esplicita > bocciatura pendente > non
-    /// verificato).
-    fn final_gate_status(&self) -> Option<crate::agent_types::AgentRunStatus> {
-        use crate::agent_types::AgentRunStatus;
-
-        if self.final_gate_passed == Some(false) {
+            AgentRunStatus::FailedDiagnosed
+        } else if forced_close {
+            AgentRunStatus::FailedDiagnosed
+        } else if self.final_gate_passed == Some(false) && !self.ha_dichiarato_verdetto_di_ruolo() {
             // Verifica oggettiva pre-chiusura NON superata (final_gate al
             // cap/forced): il verdetto STRUTTURATO del gate (regola M) prevale
             // su una dichiarazione "done" ottimista del modello -> mai
             // "completed" su un task la cui verifica e' fallita. Difesa in
             // profondita' rispetto a `forced_close`: il cap del final_gate NON
             // imposta forced_close_unverified.
-            Some(AgentRunStatus::FailedDiagnosed)
+            //
+            // ECCEZIONE: chi ha dichiarato un verdetto di RUOLO (revisore,
+            // advisor, avvocato) non produce codice, lo giudica. Il final_gate
+            // verifica il codice del progetto, quindi bocciarlo significa
+            // squalificare il giudice perche' cio' che sta giudicando e' rotto:
+            // piu' il codice e' guasto, meno voti restano validi. Nell'incidente
+            // del 26/07 entrambi i revisori avevano votato (uno `fail` con
+            // evidenza grave, uno `pass`) e il panel li ha scartati entrambi
+            // -> "inconclusive (0/2 voti validi)" -> review mai superata fino al
+            // cap. Il loro lavoro E' il verdetto, ed e' stato consegnato.
+            AgentRunStatus::FailedDiagnosed
+        } else if self.review_panel_rejected {
+            // Review adversariale programmatica NON approvata (Fail/NeedsChanges)
+            // su codice modificato: il verdetto STRUTTURATO del panel (regola M)
+            // prevale sulla dichiarazione "done" ottimista del modello. Mai
+            // "completed" su un lavoro che un panel indipendente ha bocciato con
+            // difetti bloccanti. Stessa classe di `final_gate_passed == false`.
+            AgentRunStatus::FailedDiagnosed
         } else if self.final_gate_failed_pending {
             // L'ULTIMO verdetto del final_gate e' una BOCCIATURA di ciclo
             // intermedio (correzione rimandata all'executor) e il run e' morto
             // PRIMA della ri-verifica (run a5db0985): il lavoro post-bocciatura
             // non e' mai stato verificato e l'ultimo esito oggettivo noto e' un
             // fallimento — mai `Completed` (regola M).
-            Some(AgentRunStatus::FailedDiagnosed)
+            AgentRunStatus::FailedDiagnosed
         } else if self.final_gate_unverified == Some(true) {
             // Lavoro SVOLTO ma verifica tecnica NON eseguita (gate entrato
             // senza profilo di verifica dell'ambiente): esito ONESTO distinto
             // da un "completato" pieno (is_success=true ma etichettato).
-            Some(AgentRunStatus::CompletedUnverified)
+            AgentRunStatus::CompletedUnverified
         } else {
-            None
+            AgentRunStatus::Completed
         }
     }
 
@@ -645,6 +714,9 @@ impl NativeRunOutcome {
             // Parere della FIGURA (consiglio a monte): presente solo nei run di
             // analisi col tool `advisory_verdict` whitelistato; `null` altrove.
             k::ADVISORY: self.advisory_verdict,
+            // Posizione dell'AVVOCATO (dibattito): presente solo nei run col tool
+            // `debate_position` whitelistato; `null` altrove.
+            k::DEBATE: self.debate_position,
             k::FINAL_GATE_PASSED: self.final_gate_passed,
             k::FINAL_GATE_UNVERIFIED: self.final_gate_unverified,
             k::FINAL_GATE_FAILED_PENDING: self.final_gate_failed_pending,
@@ -715,9 +787,9 @@ async fn resolve_purpose(db: &PgPool, purpose: &str) -> (String, String) {
 // nel tipo del default: bool da `{true,1,yes,on}` (case-insensitive); CSV ->
 // `list[str]` con strip + scarto dei vuoti; int/float con parse e fallback al
 // default. Replichiamo qui la STESSA semantica perche' le config nodi Rust devono
-// coincidere coi valori che il brain calcola dalle medesime chiavi (presupposto
-// del confronto shadow). `get_setting` (punto unico, regola L) gia' fa trim +
-// scarto dei vuoti -> una chiave assente/vuota torna `None` e si usa il default.
+// coincidere coi valori che il brain calcola dalle medesime chiavi. `get_setting`
+// (punto unico, regola L) gia' fa trim + scarto dei vuoti -> una chiave
+// assente/vuota torna `None` e si usa il default.
 
 /// `value` -> bool con la semantica `_coerce` del brain (`{true,1,yes,on}` truthy).
 fn coerce_bool(raw: &str) -> bool {
@@ -827,84 +899,95 @@ pub fn graph_supervisor_mode(mode: crate::agent_types::SupervisorMode) -> Superv
 /// Costruisce la [`PlannerConfig`] DB-driven (regola G), 1:1 con le chiavi
 /// `orchestrator.*` lette dal brain (`orchestrator_config.py`). I campi che il
 /// brain NON popola da `orchestrator_config` restano al loro `Default`:
-/// - `planner_system_text`: prompt RISOLTO A MONTE dal registry (regola G) — non
-///   ancora portato nella cablatura nativa, resta vuoto (`prompt_missing` -> skip,
-///   parita' col safe-default);
-/// - `turn_focus_enabled`: viene dalla CONTINUITY config (`agent.context.turn_focus_enabled`),
-///   non da `orchestrator_config` — TODO wiring continuity (default true).
+/// - `planner_system_text`: prompt del planner RISOLTO dal registry (regola G/L):
+///   chiave da `orchestrator.planner_prompt_key` (default `agent.planner.base`),
+///   testo via il punto unico `get_template_or_default`. Prima restava vuoto
+///   (`prompt_missing` -> skip): innocuo finche' la plan-phase non si attivava mai,
+///   diventato bloccante quando i segnali del classifier (task_complexity/
+///   agentic_score) propagati nello stato hanno reso il planner eleggibile davvero.
+/// - `turn_focus_enabled`: letto da `agent.context.turn_focus_enabled`, la STESSA
+///   chiave che legge l'executor. Restava al default hardcoded, quindi spegnere
+///   il setting spegneva il turn-focus per l'executor e non per il planner.
 async fn load_planner_config(db: &PgPool) -> PlannerConfig {
-    // Parte dai `Default` e i due gruppi DB-driven sovrascrivono i campi di loro
-    // competenza leggendo il default dal campo stesso (stessa invariante di
-    // `load_executor_config`): `planner_system_text`/`turn_focus_enabled`, che il
-    // brain NON popola da `orchestrator_config`, restano cosi' al `Default`.
-    let mut c = PlannerConfig::default();
-    load_planner_plan_phase(db, &mut c).await;
-    load_planner_interaction(db, &mut c).await;
-    c
-}
-
-/// Eleggibilita' e ampiezza della plan-phase (regola G), 1:1 con le chiavi
-/// `orchestrator.*` lette dal brain.
-async fn load_planner_plan_phase(db: &PgPool, c: &mut PlannerConfig) {
-    c.plan_phase_enabled = setting_bool(
-        db,
-        "orchestrator.plan_phase_enabled",
-        c.plan_phase_enabled,
-    )
-    .await;
-    let modes = std::mem::take(&mut c.plan_behavior_modes);
-    c.plan_behavior_modes = setting_csv(db, "orchestrator.plan_behavior_modes", modes).await;
-    let intents = std::mem::take(&mut c.plan_intents);
-    c.plan_intents = setting_csv(db, "orchestrator.plan_intents", intents).await;
-    c.plan_min_token_budget = setting_i64(
-        db,
-        "orchestrator.plan_min_token_budget",
-        c.plan_min_token_budget,
-    )
-    .await;
-    let prompt_key = std::mem::take(&mut c.planner_prompt_key);
-    c.planner_prompt_key = nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
+    let d = PlannerConfig::default();
+    // Prompt del planner risolto dal registry (vedi nota sopra): chiave -> testo.
+    // Senza questo il planner, quando eleggibile, salta con "prompt non trovato".
+    let planner_prompt_key = nexus_auth::get_setting(db, "orchestrator.planner_prompt_key")
         .await
-        .unwrap_or(prompt_key);
-    c.dag_topological_enabled = setting_bool(
+        .unwrap_or_else(|| d.planner_prompt_key.clone());
+    let planner_system_text = crate::prompt_templates::get_template_or_default(
         db,
-        "orchestrator.dag_topological_enabled",
-        c.dag_topological_enabled,
+        &crate::prompt_templates::TemplateCache::new(),
+        &planner_prompt_key,
     )
     .await;
-    // Gate orchestrazione LLM-driven della plan-phase (Fase 1). DEFAULT SAFE
-    // FALSE (regola G): il setting sara' seminato dalla migrazione del
-    // sotto-blocco successivo; finche' assente o false il gate ricade sempre
-    // su is_eligible -> comportamento bit-identico a oggi.
-    c.orchestration_enabled = setting_bool(
-        db,
-        "agent.orchestration.enabled",
-        c.orchestration_enabled,
-    )
-    .await;
-}
-
-/// Interazione col richiedente durante la plan-phase (regola G): domande di
-/// chiarimento e razionale del piano.
-async fn load_planner_interaction(db: &PgPool, c: &mut PlannerConfig) {
-    c.clarifying_questions_enabled = setting_bool(
-        db,
-        "orchestrator.clarifying_questions_enabled",
-        c.clarifying_questions_enabled,
-    )
-    .await;
-    c.clarifying_questions_max = setting_i64(
-        db,
-        "orchestrator.clarifying_questions_max",
-        c.clarifying_questions_max,
-    )
-    .await;
-    c.plan_rationale_enabled = setting_bool(
-        db,
-        "orchestrator.plan_rationale_enabled",
-        c.plan_rationale_enabled,
-    )
-    .await;
+    PlannerConfig {
+        plan_phase_enabled: setting_bool(
+            db,
+            "orchestrator.plan_phase_enabled",
+            d.plan_phase_enabled,
+        )
+        .await,
+        plan_behavior_modes: setting_csv(
+            db,
+            "orchestrator.plan_behavior_modes",
+            d.plan_behavior_modes,
+        )
+        .await,
+        plan_intents: setting_csv(db, "orchestrator.plan_intents", d.plan_intents).await,
+        plan_min_token_budget: setting_i64(
+            db,
+            "orchestrator.plan_min_token_budget",
+            d.plan_min_token_budget,
+        )
+        .await,
+        planner_prompt_key,
+        clarifying_questions_enabled: setting_bool(
+            db,
+            "orchestrator.clarifying_questions_enabled",
+            d.clarifying_questions_enabled,
+        )
+        .await,
+        clarifying_questions_max: setting_i64(
+            db,
+            "orchestrator.clarifying_questions_max",
+            d.clarifying_questions_max,
+        )
+        .await,
+        plan_rationale_enabled: setting_bool(
+            db,
+            "orchestrator.plan_rationale_enabled",
+            d.plan_rationale_enabled,
+        )
+        .await,
+        dag_topological_enabled: setting_bool(
+            db,
+            "orchestrator.dag_topological_enabled",
+            d.dag_topological_enabled,
+        )
+        .await,
+        // Gate orchestrazione LLM-driven della plan-phase. La chiave vive in
+        // `settings` (regola G): con chiave assente o non truthy il gate ricade
+        // su `is_eligible`; quando e' truthy la decisione LLM lo SCAVALCA.
+        orchestration_enabled: setting_bool(
+            db,
+            "agent.orchestration.enabled",
+            d.orchestration_enabled,
+        )
+        .await,
+        // Risolto a monte (vedi doc della funzione): default.
+        planner_system_text,
+        // Stessa chiave che legge l'executor: prima qui restava al default
+        // hardcoded, quindi mettere il setting a `false` spegneva il turn-focus
+        // solo per l'executor e lo lasciava acceso per il planner. Un flag che
+        // vale a meta' e' peggio di un flag assente (regola G).
+        turn_focus_enabled: setting_bool(
+            db,
+            "agent.context.turn_focus_enabled",
+            d.turn_focus_enabled,
+        )
+        .await,
+    }
 }
 
 /// Costruisce la [`FinalGateConfig`] DB-driven (regola G), 1:1 con le chiavi che
@@ -919,7 +1002,18 @@ async fn load_planner_interaction(db: &PgPool, c: &mut PlannerConfig) {
 /// `None`/vuoto il criterio corrispondente NON si aggiunge (non blocca, niente
 /// toppa). `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
+/// Config del ReviewGate (gemella del loader del final_gate). Le chiavi sono
+/// quelle della review programmatica gia' esistenti + il cap dei rimandi
+/// (mig 0625). Regola G: tutto dal DB, il default e' solo safe-default.
+async fn load_review_gate_config(db: &PgPool) -> ReviewGateConfig {
+    ReviewGateConfig {
+        enabled: setting_bool(db, "orchestrator.review_panel_autoconvene_enabled", true).await,
+        max_cycles: setting_i64(db, "orchestrator.review_max_correction_cycles", 1).await,
+    }
+}
+
 async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
+    let d = FinalGateConfig::default();
     // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
     // inferito da LLM (`verify_profile::ensure_profile`), risolta in
     // `run_engine` e innestata in `verify_steps` DOPO questo loader (serve
@@ -927,88 +1021,78 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
     // `agent.final_gate.build_command` generico e' stato RIMOSSO (mig 0508,
     // decisione utente: nessuna conoscenza d'ambiente fissa — era proprio il
     // "npm run build" cieco che per Vite non type-checka).
-    //
-    // Parte dai `Default` e i gruppi DB-driven sovrascrivono i campi di loro
-    // competenza leggendo il default dal campo stesso (stessa invariante di
-    // `load_executor_config`). Restano cosi' al `Default` i campi risolti
-    // ALTROVE: `verify_steps`/`verify_profile_missing` (innestati in
-    // `run_engine`) e `log_command`/`endpoint_criterion` (per-progetto a monte,
-    // non ancora portati: vuoto/None -> niente criterio, non blocca).
-    let mut c = FinalGateConfig::default();
-    load_final_gate_build_criteria(db, &mut c).await;
-    load_final_gate_structural_criteria(db, &mut c).await;
-    load_final_gate_escalation(db, &mut c).await;
-    c
-}
-
-/// Kill-switch, cap di cicli e criteri BUILD/runtime del final_gate (regola G),
-/// 1:1 con le chiavi che il brain legge da `orchestrator_config`.
-async fn load_final_gate_build_criteria(db: &PgPool, c: &mut FinalGateConfig) {
-    c.enabled = setting_bool(db, "agent.final_gate.enabled", c.enabled).await;
-    c.max_cycles = setting_i64(db, "agent.final_gate.max_cycles", c.max_cycles).await;
-    c.runtime_check_enabled = setting_bool(
-        db,
-        "agent.final_gate.runtime_check_enabled",
-        c.runtime_check_enabled,
-    )
-    .await;
-    // `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
-    // quando `build_command` e' risolto: si leggono comunque per fedelta'.
-    c.build_timeout_s =
-        setting_f64(db, "agent.final_gate.build_timeout_s", c.build_timeout_s).await;
-    c.build_output_max_chars = setting_i64(
-        db,
-        "agent.final_gate.build_output_max_chars",
-        c.build_output_max_chars,
-    )
-    .await;
-    let patterns = std::mem::take(&mut c.runtime_error_patterns);
-    c.runtime_error_patterns =
-        setting_csv(db, "agent.final_gate.runtime_error_patterns", patterns).await;
-    c.criteria_timeout_s =
-        setting_f64(db, "orchestrator.verifier_timeout_s", c.criteria_timeout_s).await;
-}
-
-/// Criteri STRUTTURALI (no-orphan / import staging) + verifica design del
-/// final_gate (regola G). ADR 0018 leva 3 (mig 0503): kill-switch dei criteri
-/// strutturali.
-async fn load_final_gate_structural_criteria(db: &PgPool, c: &mut FinalGateConfig) {
-    c.no_orphan_min_ratio =
-        setting_f64(db, "agent.no_orphan.min_ratio", c.no_orphan_min_ratio).await;
-    let staging = std::mem::take(&mut c.import_staging_dirs);
-    c.import_staging_dirs = setting_csv(db, "agent.import_staging_dirs", staging).await;
-    c.design_verify_enabled = setting_bool(
-        db,
-        "agent.final_gate.design_verify_enabled",
-        c.design_verify_enabled,
-    )
-    .await;
-    c.design_verify_min_score = setting_i64(
-        db,
-        "agent.final_gate.design_verify_min_score",
-        c.design_verify_min_score,
-    )
-    .await;
-    c.structural_criteria_enabled = setting_bool(
-        db,
-        "agent.final_gate.structural_criteria_enabled",
-        c.structural_criteria_enabled,
-    )
-    .await;
-}
-
-/// Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
-/// criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
-/// un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
-/// chiave dell'executor (stesso budget `auto_escalations` condiviso, regola L/G).
-async fn load_final_gate_escalation(db: &PgPool, c: &mut FinalGateConfig) {
-    c.escalate_on_nonconvergence = setting_bool(
-        db,
-        "agent.final_gate.escalate_on_nonconvergence",
-        c.escalate_on_nonconvergence,
-    )
-    .await;
-    c.max_escalations = setting_i64(db, "agent.executor.max_escalations", c.max_escalations).await;
+    FinalGateConfig {
+        enabled: setting_bool(db, "agent.final_gate.enabled", d.enabled).await,
+        max_cycles: setting_i64(db, "agent.final_gate.max_cycles", d.max_cycles).await,
+        runtime_check_enabled: setting_bool(
+            db,
+            "agent.final_gate.runtime_check_enabled",
+            d.runtime_check_enabled,
+        )
+        .await,
+        build_timeout_s: setting_f64(db, "agent.final_gate.build_timeout_s", d.build_timeout_s)
+            .await,
+        build_output_max_chars: setting_i64(
+            db,
+            "agent.final_gate.build_output_max_chars",
+            d.build_output_max_chars,
+        )
+        .await,
+        runtime_error_patterns: setting_csv(
+            db,
+            "agent.final_gate.runtime_error_patterns",
+            d.runtime_error_patterns,
+        )
+        .await,
+        no_orphan_min_ratio: setting_f64(db, "agent.no_orphan.min_ratio", d.no_orphan_min_ratio)
+            .await,
+        import_staging_dirs: setting_csv(db, "agent.import_staging_dirs", d.import_staging_dirs)
+            .await,
+        criteria_timeout_s: setting_f64(
+            db,
+            "orchestrator.verifier_timeout_s",
+            d.criteria_timeout_s,
+        )
+        .await,
+        // verify_steps/verify_profile_missing innestati in run_engine (profilo
+        // per-ambiente, ADR 0036). log_command / endpoint_criterion restano
+        // risolti per-progetto a monte (non ancora portati): default
+        // vuoto/None (niente criterio, non blocca).
+        verify_steps: d.verify_steps,
+        verify_profile_missing: d.verify_profile_missing,
+        log_command: d.log_command,
+        endpoint_criterion: d.endpoint_criterion,
+        design_verify_enabled: setting_bool(
+            db,
+            "agent.final_gate.design_verify_enabled",
+            d.design_verify_enabled,
+        )
+        .await,
+        design_verify_min_score: setting_i64(
+            db,
+            "agent.final_gate.design_verify_min_score",
+            d.design_verify_min_score,
+        )
+        .await,
+        // ADR 0018 leva 3 (mig 0503): kill-switch dei criteri strutturali.
+        structural_criteria_enabled: setting_bool(
+            db,
+            "agent.final_gate.structural_criteria_enabled",
+            d.structural_criteria_enabled,
+        )
+        .await,
+        // Escalation su non-convergenza del gate (mig 0577): al cap di max_cycles con
+        // criteri oggettivi ancora falliti, cede il turno all'executor per promuovere
+        // un modello piu' capace invece di chiudere secco. `max_escalations` RIUSA la
+        // chiave dell'executor (stesso budget `auto_escalations` condiviso, regola L/G).
+        escalate_on_nonconvergence: setting_bool(
+            db,
+            "agent.final_gate.escalate_on_nonconvergence",
+            d.escalate_on_nonconvergence,
+        )
+        .await,
+        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
+    }
 }
 
 /// Costruisce la [`VerifierConfig`] DB-driven (regola G), 1:1 con le chiavi che il
@@ -1020,6 +1104,12 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
     let d = VerifierConfig::default();
     VerifierConfig {
         enabled: setting_bool(db, "orchestrator.verifier_enabled", d.enabled).await,
+        // Modo criteri: stringa a tre valori, parse dal punto unico
+        // `TodoCriteriaMode::try_parse` (un valore ignoto ricade su `off` con un
+        // WARN, non accende un enforcement per caso).
+        todo_criteria_mode: TodoCriteriaMode::try_parse(
+            &setting_string(db, "agent.verifier.todo_criteria_mode", "off").await,
+        ),
         max_verify_cycles: setting_i64(db, "orchestrator.max_verify_cycles", d.max_verify_cycles)
             .await,
         fail_closed: setting_bool(db, "agent.verifier.fail_closed", d.fail_closed).await,
@@ -1044,16 +1134,49 @@ async fn load_verifier_config(db: &PgPool) -> VerifierConfig {
 /// irraggiungibile, mai come magic fallback nella logica).
 async fn load_routing_config(db: &PgPool) -> RoutingConfig {
     let d = RoutingConfig::default();
+    let db_floor: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(d.recursion_limit);
+    let iteration_cap = setting_i64(
+        db,
+        "agent.executor.iteration_cap",
+        ExecutorConfig::default().iteration_cap,
+    )
+    .await;
+    let stall_recovery_enabled =
+        setting_bool(db, "agent.stall_recovery.enabled", false).await;
+    let stall_max_moves = setting_i64(
+        db,
+        "agent.stall_recovery.max_moves_per_session",
+        6,
+    )
+    .await;
     let g1_max_nudges = setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await;
     let final_gate_max_cycles =
         setting_i64(db, "agent.final_gate.max_cycles", d.final_gate_max_cycles).await;
-    let recursion_limit = resolve_recursion_limit(
-        db,
-        d.recursion_limit,
-        g1_max_nudges,
-        final_gate_max_cycles,
-    )
-    .await;
+    let recursion_limit = nexus_agent_graph::routing::effective_recursion_limit(
+        &nexus_agent_graph::routing::GraphTopologyLimits {
+            db_floor,
+            iteration_cap,
+            stall_recovery_enabled,
+            stall_max_moves,
+            g1_max_nudges,
+            final_gate_max_cycles,
+        },
+    );
+    if recursion_limit > db_floor {
+        tracing::debug!(
+            db_floor,
+            effective = recursion_limit,
+            iteration_cap,
+            stall_recovery_enabled,
+            stall_max_moves,
+            g1_max_nudges,
+            final_gate_max_cycles,
+            "recursion_limit scalato sulla topologia del grafo agentico"
+        );
+    }
     RoutingConfig {
         recursion_limit,
         g1_max_nudges,
@@ -1088,56 +1211,23 @@ async fn load_routing_config(db: &PgPool) -> RoutingConfig {
             d.fs_mutator_tools,
         )
         .await,
+        // Rete di sicurezza della plan-phase (regola G): senza questo cablaggio
+        // `RoutingConfig.verifier_enabled` restava al default `false`, quindi il
+        // gate `route_after_executor` (`plan_phase_active && verifier_enabled ->
+        // Verifier`) era CODICE MORTO e i todo del piano non venivano MAI avanzati
+        // a `completed` (il Verifier e' l'unico nodo che li avanza in esecuzione
+        // inline). `orchestrator.verifier_enabled=true` era gia' letto per il NODO
+        // Verifier (cosa fa) ma non per il ROUTING (se ci si arriva). NB: NON
+        // cablare qui `dag_parallel_enabled`: l'Executor non ha ancora il dispatch
+        // DAG (executor.rs placeholder), abilitarlo lascerebbe i todo orfani.
+        verifier_enabled: setting_bool(
+            db,
+            "orchestrator.verifier_enabled",
+            d.verifier_enabled,
+        )
+        .await,
         ..RoutingConfig::default()
     }
-}
-
-/// `recursion_limit` EFFETTIVO del grafo: `max(pavimento DB, topologia)` via il
-/// punto unico [`nexus_agent_graph::routing::effective_recursion_limit`] (regola
-/// L). Il pavimento e' `agent.graph.recursion_limit`; la topologia si ricava da
-/// `iteration_cap` + i giri aggiuntivi di stall-recovery / G1 / final_gate.
-/// `db_floor_default` e' il safe-default (chiave assente / DB irraggiungibile).
-async fn resolve_recursion_limit(
-    db: &PgPool,
-    db_floor_default: u32,
-    g1_max_nudges: i64,
-    final_gate_max_cycles: i64,
-) -> u32 {
-    let db_floor: u32 = nexus_auth::get_setting(db, "agent.graph.recursion_limit")
-        .await
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(db_floor_default);
-    let iteration_cap = setting_i64(
-        db,
-        "agent.executor.iteration_cap",
-        ExecutorConfig::default().iteration_cap,
-    )
-    .await;
-    let stall_recovery_enabled = setting_bool(db, "agent.stall_recovery.enabled", false).await;
-    let stall_max_moves = setting_i64(db, "agent.stall_recovery.max_moves_per_session", 6).await;
-    let recursion_limit = nexus_agent_graph::routing::effective_recursion_limit(
-        &nexus_agent_graph::routing::GraphTopologyLimits {
-            db_floor,
-            iteration_cap,
-            stall_recovery_enabled,
-            stall_max_moves,
-            g1_max_nudges,
-            final_gate_max_cycles,
-        },
-    );
-    if recursion_limit > db_floor {
-        tracing::debug!(
-            db_floor,
-            effective = recursion_limit,
-            iteration_cap,
-            stall_recovery_enabled,
-            stall_max_moves,
-            g1_max_nudges,
-            final_gate_max_cycles,
-            "recursion_limit scalato sulla topologia del grafo agentico"
-        );
-    }
-    recursion_limit
 }
 
 /// Costruisce la [`ExecutorConfig`] DB-driven (regola G): provider/model sono
@@ -1154,521 +1244,527 @@ async fn resolve_recursion_limit(
 /// `Default` valgono SOLO se la chiave manca o il DB e' irraggiungibile). Le chiavi
 /// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
 /// usano l'underscore: e' la chiave reale del setting nel DB.
+/// Attesa massima della barriera di scrittura advisory (mig 0606), CLAMPATA
+/// alla deadline residua del run (fase 3, mig 0604).
+///
+/// Perche' il clamp: se la barriera potesse attendere oltre la deadline, un run
+/// col tempo scaduto verrebbe chiuso dall'executor con reason `time_budget`
+/// mentre in realta' stava aspettando il consiglio — la causa vera sparirebbe
+/// dietro un sintomo (regola M: il motivo dichiarato dev'essere quello reale).
+/// Senza deadline configurata (`run_time_budget_s=0`) resta il timeout nudo.
+async fn advisory_gate_timeout(db: &PgPool) -> u64 {
+    let configured = setting_i64(
+        db,
+        "orchestrator.advisory_gate_timeout_s",
+        ToolDispatchConfig::default().advisory_gate_timeout_s as i64,
+    )
+    .await
+    .max(0) as u64;
+    let deadline_s = setting_i64(db, "agent.run_time_budget_s", 0).await;
+    if deadline_s <= 0 {
+        return configured;
+    }
+    // Il run e' appena partito: il residuo e' l'intera deadline meno il tempo
+    // gia' speso dai panel (che qui e' ~0: nel ramo overlap partono INSIEME).
+    configured.min(deadline_s as u64)
+}
+
+/// Budget di tempo EFFETTIVO del run: l'override del chiamante vince sul setting
+/// globale letto dal DB. PUNTO UNICO (regola L) della precedenza, cosi' non vive
+/// inline in mezzo alla costruzione della config.
+///
+/// Perche' esiste: `agent.run_time_budget_s` e' `0` per policy (mig 0604/0607),
+/// quindi per un SUB-RUN il valore dal DB e' inservibile — il tetto reale della
+/// figura e' il `timeout_s` risolto in `prepare_subagent_run` e applicato dal
+/// `tokio::time::timeout` esterno. Senza questa precedenza il gate a tempo
+/// dell'executor resta codice morto per le figure e nessun sollecito di chiusura
+/// puo' scattare: la figura muore muta.
+fn effective_run_time_budget_s(from_db: u64, from_caller: Option<u64>) -> u64 {
+    from_caller.unwrap_or(from_db)
+}
+
 async fn load_executor_config(
     db: &PgPool,
     provider: &str,
     model: &str,
     context_window: i64,
 ) -> ExecutorConfig {
-    // La config nasce dai `Default` (safe-default valido SOLO a chiave assente o
-    // DB irraggiungibile, regola G) e i gruppi DB-driven qui sotto sovrascrivono
-    // i campi di loro competenza. INVARIANTE che rende la lettura per gruppi
-    // equivalente al vecchio struct-literal: ogni gruppo legge il default dal
-    // CAMPO STESSO (`c.<campo>` prima della sua assegnazione E' il default, dato
-    // che `c` parte da `ExecutorConfig::default()`) e nessun campo e' assegnato
-    // due volte, quindi chiave letta, default applicato e clamp restano 1:1.
-    let mut c = ExecutorConfig {
+    let d = ExecutorConfig::default();
+    ExecutorConfig {
         routing_provider: provider.to_string(),
         routing_model: model.to_string(),
+        g1_max_nudges: setting_i64(db, "agent.g1_max_nudges", d.g1_max_nudges).await,
+        // Safety net finale del run: il doc di ExecutorConfig la dichiarava
+        // DB-driven ma il loader NON la leggeva (restava la costante 60).
+        // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
+        // censimento anti-loop / ADR 0035).
+        iteration_cap: setting_i64(db, "agent.executor.iteration_cap", d.iteration_cap).await,
+        // Ex costanti hardcoded portate in DB (regola G): offset forced-text,
+        // budget escalation unico, soglie loop-by-signature.
+        forced_text_offset: setting_i64(
+            db,
+            "agent.executor.forced_text_offset",
+            d.forced_text_offset,
+        )
+        .await,
+        max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
+        // Limiti anti-runaway basati sui TOKEN (mig 0520, regola G): budget token
+        // cumulativo per run + fast-fail su turni solo-testo consecutivi. `0` =
+        // disabilitato -> bit-identico. Complementari a iteration_cap (che conta
+        // ITERAZIONI): chiudono il buco del modello che ignora force_tool_choice e
+        // brucia token in turni solo-testo (osservato 1.8M token / $2.42 senza
+        // convergere). Lettura via setting_i64 (punto unico) + clamp non-negativo.
+        // Budget token PER-TURNO: TRIGGER del giudice/escalation (si resetta
+        // all'escalation). Il freno di SPESA del run e' separato e in dollari
+        // (run_cost_budget_usd sotto): il costo cumulativo reale, esatto anche dopo
+        // un'escalation cross-tier, senza convertire $ in token sul modello iniziale.
+        run_token_budget: setting_i64(db, "agent.run_token_budget", d.run_token_budget as i64)
+            .await
+            .max(0) as u64,
+        // BACKSTOP di catastrofe (mig 0521, regola G): col meta-reasoner acceso il
+        // run_token_budget diventa il TRIGGER del giudice, questo hard-cap e' la rete
+        // di sicurezza non-negoziabile che chiude d'autorita' senza consultarlo.
+        run_token_hard_cap: setting_i64(db, "agent.run_token_hard_cap", d.run_token_hard_cap as i64)
+            .await
+            .max(0) as u64,
+        // Freno di SPESA in dollari dell'intero run (mig 0533, regola G): 0 =
+        // disabilitato. Confrontato col costo cumulativo reale accumulato per-turno.
+        run_cost_budget_usd: setting_f64(db, "agent.run_cost_budget_usd", d.run_cost_budget_usd)
+            .await
+            .max(0.0),
+        // Deadline dell'intero run in secondi (mig 0604, fase 3 paradigma
+        // orchestrazione): 0 = disabilitato (bit-identico).
+        run_time_budget_s: setting_i64(db, "agent.run_time_budget_s", d.run_time_budget_s as i64)
+            .await
+            .max(0) as u64,
+        // Soglia del turno di grazia a tempo (mig 0614): percentuale del budget
+        // oltre cui un canale di ruolo ancora muto viene SOLLECITATO a chiudere,
+        // invece di morire n/d allo scadere. 0 = disabilitato.
+        time_grace_pct: setting_i64(db, "agent.time_grace_pct", d.time_grace_pct as i64)
+            .await
+            .clamp(0, 100) as u64,
+        // Tetto sui turni consecutivi falliti al gateway con causa deterministica
+        // (mig 0619): oltre, si chiude con esito onesto invece di ritentare la
+        // stessa chiamata fino al budget. 0 = disabilitato.
+        gateway_deterministic_streak_max: setting_i64(
+            db,
+            "agent.gateway_deterministic_streak_max",
+            d.gateway_deterministic_streak_max as i64,
+        )
+        .await
+        .max(0) as u64,
+        max_consecutive_text_only_turns: setting_i64(
+            db,
+            "agent.max_consecutive_text_only_turns",
+            d.max_consecutive_text_only_turns as i64,
+        )
+        .await
+        .max(0) as u32,
+        // 3.4 (provider-no-progress switch): DB-driven, default OFF (bit-identico).
+        provider_no_progress_switch_enabled: setting_bool(
+            db,
+            "agent.provider_no_progress.enabled",
+            d.provider_no_progress_switch_enabled,
+        )
+        .await,
+        loop_thresholds: LoopThresholds {
+            signature: setting_i64(
+                db,
+                "agent.loop.signature_threshold",
+                d.loop_thresholds.signature as i64,
+            )
+            .await
+            .max(1) as usize,
+            cap: setting_i64(
+                db,
+                "agent.loop.recent_signatures_cap",
+                d.loop_thresholds.cap as i64,
+            )
+            .await
+            .max(1) as usize,
+        },
+        // Anti repetition-collapse del testo (mig 0531, regola G): soglie della
+        // rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
+        // `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
+        // lunghezze minime >=1 (0 sarebbe insensato).
+        repetition: RepetitionThresholds {
+            min_unit_len: setting_i64(
+                db,
+                "agent.anti_repetition.min_unit_len",
+                d.repetition.min_unit_len as i64,
+            )
+            .await
+            .max(1) as usize,
+            max_unit_len: setting_i64(
+                db,
+                "agent.anti_repetition.max_unit_len",
+                d.repetition.max_unit_len as i64,
+            )
+            .await
+            .max(1) as usize,
+            min_repeats: setting_i64(
+                db,
+                "agent.anti_repetition.min_repeats",
+                d.repetition.min_repeats as i64,
+            )
+            .await
+            .max(0) as usize,
+            min_total_len: setting_i64(
+                db,
+                "agent.anti_repetition.min_total_len",
+                d.repetition.min_total_len as i64,
+            )
+            .await
+            .max(0) as usize,
+            scan_tail_cap: setting_i64(
+                db,
+                "agent.anti_repetition.scan_tail_cap",
+                d.repetition.scan_tail_cap as i64,
+            )
+            .await
+            .max(0) as usize,
+        },
+        // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
+        repeated_user_question_threshold: setting_i64(
+            db,
+            "agent.loop.repeated_user_question_threshold",
+            d.repeated_user_question_threshold,
+        )
+        .await,
+        // ── Meta-reasoner di recovery-da-stallo (mig 0510, opt-in DB, regola G) ─
+        // Con enabled=false (default) il gate di emissione StallReason nell'executor
+        // non scatta mai -> comportamento bit-identico a oggi. Il budget per-sessione
+        // e' il cap duro anti meta-loop/costo del gate.
+        stall_recovery_enabled: setting_bool(
+            db,
+            "agent.stall_recovery.enabled",
+            d.stall_recovery_enabled,
+        )
+        .await,
+        stall_recovery_max_moves_per_session: setting_i64(
+            db,
+            "agent.stall_recovery.max_moves_per_session",
+            d.stall_recovery_max_moves_per_session,
+        )
+        .await,
+        // ── Scale-controller (mig 0516, opt-in DB, regola G) ──────────────────
+        // Con enabled=false (default) il detector-emissione dell'executor salta
+        // PRIMA di ogni lavoro -> nessun ScaleReason -> nodo ScaleControl mai
+        // raggiunto -> BIT-IDENTICO. Tutte le soglie dai settings agent.scale.*.
+        scale: ScaleConfig {
+            enabled: setting_bool(db, "agent.scale.enabled", d.scale.enabled).await,
+            downscale_enabled: setting_bool(
+                db,
+                "agent.scale.downscale_enabled",
+                d.scale.downscale_enabled,
+            )
+            .await,
+            eval_every_iters: setting_i64(
+                db,
+                "agent.scale.eval_every_iters",
+                d.scale.eval_every_iters,
+            )
+            .await,
+            min_tail_iters: setting_i64(db, "agent.scale.min_tail_iters", d.scale.min_tail_iters)
+                .await,
+            min_confidence: setting_f64(db, "agent.scale.min_confidence", d.scale.min_confidence)
+                .await,
+            change_cooldown_turns: setting_i64(
+                db,
+                "agent.scale.change_cooldown_turns",
+                d.scale.change_cooldown_turns,
+            )
+            .await,
+            downscale_clean_window: setting_i64(
+                db,
+                "agent.scale.downscale_clean_window",
+                d.scale.downscale_clean_window,
+            )
+            .await,
+            max_reversals: setting_i64(db, "agent.scale.max_reversals", d.scale.max_reversals)
+                .await,
+            max_tier_changes_per_run: setting_i64(
+                db,
+                "agent.scale.max_tier_changes_per_run",
+                d.scale.max_tier_changes_per_run,
+            )
+            .await,
+            max_evals_per_run: setting_i64(
+                db,
+                "agent.scale.max_evals_per_run",
+                d.scale.max_evals_per_run,
+            )
+            .await,
+            window_overhead_ratio: setting_f64(
+                db,
+                "agent.scale.window_overhead_ratio",
+                d.scale.window_overhead_ratio,
+            )
+            .await,
+            // ── Sizing agentico (mig 0524, kill-switch nested, opt-in DB, regola G) ─
+            // Con sizing_enabled=false (default) il detector non popola i segnali
+            // sizing e il gate degrada ogni AdjustSizing a KeepTier -> flusso tier
+            // BIT-IDENTICO anche con scale ON.
+            sizing_enabled: setting_bool(db, "agent.scale.sizing_enabled", d.scale.sizing_enabled)
+                .await,
+            sizing_cooldown_turns: setting_i64(
+                db,
+                "agent.scale.sizing_cooldown_turns",
+                d.scale.sizing_cooldown_turns,
+            )
+            .await,
+            sizing_aggressiveness: setting_f64(
+                db,
+                "agent.scale.sizing_aggressiveness",
+                d.scale.sizing_aggressiveness,
+            )
+            .await,
+        },
+        progress_controller_enabled: setting_bool(
+            db,
+            "agent.progress_controller_enabled",
+            d.progress_controller_enabled,
+        )
+        .await,
+        repeated_action_threshold: setting_i64(
+            db,
+            "agent.repeated_action_threshold",
+            d.repeated_action_threshold,
+        )
+        .await,
+        repeated_action_threshold_read_only: setting_i64(
+            db,
+            "agent.repeated_action_threshold.read_only",
+            d.repeated_action_threshold_read_only,
+        )
+        .await,
+        recoverable_client_error_codes: setting_csv(
+            db,
+            "routing.client_error_failover_codes",
+            d.recoverable_client_error_codes.clone(),
+        )
+        .await,
+        repeated_action_force_diagnose_enabled: setting_bool(
+            db,
+            "agent.repeated_action_force_diagnose_enabled",
+            d.repeated_action_force_diagnose_enabled,
+        )
+        .await,
+        reallocation_threshold: setting_i64(
+            db,
+            "agent.loop.resource_reallocation_threshold",
+            d.reallocation_threshold,
+        )
+        .await,
+        upscale_enabled: setting_bool(db, "agent.upscale.enabled", d.upscale_enabled).await,
+        upscale_overhead_ratio: setting_f64(
+            db,
+            "agent.upscale.target_overhead_ratio",
+            d.upscale_overhead_ratio,
+        )
+        .await,
+        verification_directive_enabled: setting_bool(
+            db,
+            "agent.verification_directive_enabled",
+            d.verification_directive_enabled,
+        )
+        .await,
+        // ── tool_choice forcing (ADR 0018 leva 2, mig 0300) ───────────────────
+        // Il porting Rust aveva PERSO questi tre campi: restavano ai Default del
+        // nodo (enabled=false, style=None) -> il force-action era INERTE per ogni
+        // provider (force_now sempre false). Ora il DB e' di nuovo l'unica fonte
+        // (regola G): i flag dai settings (default-DB-down nel `Default`), lo
+        // stile dal catalog via punto unico `capability::resolve_tool_choice_style`.
+        tool_choice_forcing_enabled: setting_bool(
+            db,
+            "agent.tool_choice_forcing_enabled",
+            d.tool_choice_forcing_enabled,
+        )
+        .await,
+        tool_choice_forcing_max_iteration: setting_i64(
+            db,
+            "agent.tool_choice_forcing_max_iteration",
+            d.tool_choice_forcing_max_iteration,
+        )
+        .await,
+        tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
         // ── context management (mig 0199/0429): il bug + l'inerzia ────────────
         // context_window (passato come parametro): senza questo era 0 -> token_brake
         // / forced_rag / smart-upscale tutti no-op (gate `if context_window > 0`).
         context_window,
-        // ── tool_choice forcing (ADR 0018 leva 2, mig 0300) ───────────────────
-        // Il porting Rust aveva PERSO questo campo: restava al Default del nodo
-        // (style=None) -> il force-action era INERTE per ogni provider (force_now
-        // sempre false). Lo stile viene dal catalog via punto unico
-        // `capability::resolve_tool_choice_style` (i due flag gemelli sono
-        // DB-driven in `load_executor_progress`).
-        tool_choice_style: crate::capability::resolve_tool_choice_style(db, provider, model).await,
+        // Fasi di compressione DB-driven: i valori AGGRESSIVI (mig 0429,
+        // compress_start_iter=3, boundaries [3,7,15,30], keep_recent [5,3,2,1],
+        // max_chars [1200,600,300,100]) erano IGNORATI perche' load_executor_config
+        // chiudeva con `..Default::default()` (safe-default permissivi). Ora dal DB.
+        ctx_mgmt: CtxMgmtConfig {
+            compress_start_iter: setting_i64(
+                db,
+                "agent.context.compress_start_iter",
+                d.ctx_mgmt.compress_start_iter,
+            )
+            .await,
+            compress_phase_boundaries: setting_i64_csv(
+                db,
+                "agent.context.compress_phase_boundaries",
+                d.ctx_mgmt.compress_phase_boundaries.clone(),
+            )
+            .await,
+            compress_phase_keep_recent: setting_i64_csv(
+                db,
+                "agent.context.compress_phase_keep_recent",
+                d.ctx_mgmt.compress_phase_keep_recent.clone(),
+            )
+            .await,
+            compress_phase_max_chars: setting_i64_csv(
+                db,
+                "agent.context.compress_phase_max_chars",
+                d.ctx_mgmt.compress_phase_max_chars.clone(),
+            )
+            .await,
+        },
+        // Freno token: la soglia hard (0.55 in DB vs 0.70 default) e i parametri
+        // aggressivi, ora dal DB.
+        token_brake: TokenBrakeConfig {
+            max_context_ratio: setting_f64(
+                db,
+                "agent.context.max_context_ratio",
+                d.token_brake.max_context_ratio,
+            )
+            .await,
+            aggressive_keep_recent: setting_i64(
+                db,
+                "agent.context.aggressive_keep_recent",
+                d.token_brake.aggressive_keep_recent as i64,
+            )
+            .await
+            .max(0) as usize,
+            aggressive_max_chars: setting_i64(
+                db,
+                "agent.context.aggressive_max_chars",
+                d.token_brake.aggressive_max_chars as i64,
+            )
+            .await
+            .max(0) as usize,
+        },
+        // Forced-RAG reminder: ratio + testo dal DB (erano vuoti/0.0 -> reminder mai
+        // iniettato anche con offload attivo).
+        forced_rag_ratio: setting_f64(
+            db,
+            "agent.context.forced_rag_threshold_ratio",
+            d.forced_rag_ratio,
+        )
+        .await,
+        forced_rag_reminder_text: setting_string(
+            db,
+            "agent.context.forced_rag_reminder_text",
+            &d.forced_rag_reminder_text,
+        )
+        .await,
+        turn_focus_enabled: setting_bool(
+            db,
+            "agent.context.turn_focus_enabled",
+            d.turn_focus_enabled,
+        )
+        .await,
+        discovery_max_injected: setting_i64(
+            db,
+            "agent.tools.discovery_max_injected",
+            d.discovery_max_injected as i64,
+        )
+        .await
+        .max(0) as usize,
+        // ── rolling-summary (intervento 3): RIASSUME i vecchi via LLM economico ─
+        // Flag + keep_recent dal DB (regola G). Il MODELLO economico vive nell'impl
+        // della porta PgSummaryStore (agent.context.rolling_summary_model).
+        rolling_summary_enabled: setting_bool(
+            db,
+            "agent.context.rolling_summary_enabled",
+            d.rolling_summary_enabled,
+        )
+        .await,
+        rolling_keep_recent: setting_i64(
+            db,
+            "agent.context.rolling_keep_recent_turns",
+            d.rolling_keep_recent,
+        )
+        .await,
+        // Governance costo/beneficio del rolling-summary (opt-in, mig 0523). OFF di
+        // default -> il gate non si applica (comportamento storico bit-identico).
+        governance_rolling_summary_adaptive: setting_bool(
+            db,
+            "agent.governance.rolling_summary_adaptive",
+            d.governance_rolling_summary_adaptive,
+        )
+        .await,
+        governance_rolling_summary_min_prefix: setting_i64(
+            db,
+            "agent.governance.rolling_summary_min_prefix",
+            d.governance_rolling_summary_min_prefix,
+        )
+        .await,
+        // ── continuity-trim SEMANTICO + offload retrievabile (EmbeddingStore) ──
+        // Tutti OFF di default (regola G): con questi valori il comportamento e'
+        // bit-identico a oggi. La porta embedding/offload e' iniettata dal wiring.
+        continuity_trim_enabled: setting_bool(
+            db,
+            "agent.context.continuity_trim_enabled",
+            d.continuity_trim_enabled,
+        )
+        .await,
+        continuity_trim_min_score: setting_f64(
+            db,
+            "agent.context.continuity_trim_min_score",
+            d.continuity_trim_min_score as f64,
+        )
+        .await as f32,
+        continuity_trim_max_drop: setting_i64(
+            db,
+            "agent.context.continuity_trim_max_drop",
+            d.continuity_trim_max_drop,
+        )
+        .await,
+        compress_offload_enabled: setting_bool(
+            db,
+            "agent.context.compress_offload_enabled",
+            d.compress_offload_enabled,
+        )
+        .await,
+        rolling_summary_offload_enabled: setting_bool(
+            db,
+            "agent.context.rolling_summary_offload_enabled",
+            d.rolling_summary_offload_enabled,
+        )
+        .await,
+        // ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
+        // dell'executor (stesse chiavi della RoutingConfig, regola L).
+        pending_steps_detection_enabled: setting_bool(
+            db,
+            "agent.closure.pending_steps_detection_enabled",
+            d.pending_steps_detection_enabled,
+        )
+        .await,
+        pending_steps_min_items: setting_i64(
+            db,
+            "agent.closure.pending_steps_min_items",
+            d.pending_steps_min_items,
+        )
+        .await,
+        // ── hard cap post-brake (ADR 0016 fase D2, mig 0286) ──────────────────
+        // Ratio dal DB (0.95 in produzione; il Default 0.0 = gate OFF vale SOLO
+        // a DB irraggiungibile) + template del messaggio overflow risolto qui
+        // (regola G: il testo redazionale vive SOLO in nexus_prompt_templates).
+        hard_cap_ratio: setting_f64(db, "agent.context.hard_cap_ratio", d.hard_cap_ratio).await,
+        overflow_message_template: {
+            let key = setting_string(
+                db,
+                "agent.context.overflow_message_key",
+                "system.context_overflow",
+            )
+            .await;
+            resolve_prompt_template(db, &key).await.unwrap_or_default()
+        },
         ..ExecutorConfig::default()
-    };
-    load_executor_run_limits(db, &mut c).await;
-    load_executor_token_budgets(db, &mut c).await;
-    load_executor_loop_guards(db, &mut c).await;
-    load_executor_scale(db, &mut c).await;
-    load_executor_progress(db, &mut c).await;
-    load_executor_context(db, &mut c).await;
-    load_executor_rolling_summary(db, &mut c).await;
-    load_executor_closure(db, &mut c).await;
-    c
-}
-
-/// Limiti di ITERAZIONE del run (regola G): nudge G1, cap iterazioni, offset
-/// forced-text, budget escalation. Complementari ai budget a TOKEN
-/// ([`load_executor_token_budgets`]).
-async fn load_executor_run_limits(db: &PgPool, c: &mut ExecutorConfig) {
-    c.g1_max_nudges = setting_i64(db, "agent.g1_max_nudges", c.g1_max_nudges).await;
-    // Safety net finale del run: il doc di ExecutorConfig la dichiarava
-    // DB-driven ma il loader NON la leggeva (restava la costante 60).
-    // Chiave seminata dalla mig 0506 (regola G, incoerenza rilevata dal
-    // censimento anti-loop / ADR 0035).
-    c.iteration_cap = setting_i64(db, "agent.executor.iteration_cap", c.iteration_cap).await;
-    // Ex costanti hardcoded portate in DB (regola G): offset forced-text +
-    // budget escalation unico.
-    c.forced_text_offset = setting_i64(
-        db,
-        "agent.executor.forced_text_offset",
-        c.forced_text_offset,
-    )
-    .await;
-    c.max_escalations = setting_i64(db, "agent.executor.max_escalations", c.max_escalations).await;
-}
-
-/// Limiti anti-runaway basati sui TOKEN (mig 0520, regola G): budget token
-/// cumulativo per run + fast-fail su turni solo-testo consecutivi. `0` =
-/// disabilitato -> bit-identico. Complementari a `iteration_cap` (che conta
-/// ITERAZIONI): chiudono il buco del modello che ignora force_tool_choice e
-/// brucia token in turni solo-testo (osservato 1.8M token / $2.42 senza
-/// convergere). Lettura via setting_i64 (punto unico) + clamp non-negativo.
-async fn load_executor_token_budgets(db: &PgPool, c: &mut ExecutorConfig) {
-    // Budget token PER-TURNO: TRIGGER del giudice/escalation (si resetta
-    // all'escalation). Il freno di SPESA del run e' separato e in dollari
-    // (run_cost_budget_usd sotto): il costo cumulativo reale, esatto anche dopo
-    // un'escalation cross-tier, senza convertire $ in token sul modello iniziale.
-    c.run_token_budget = setting_i64(db, "agent.run_token_budget", c.run_token_budget as i64)
-        .await
-        .max(0) as u64;
-    // BACKSTOP di catastrofe (mig 0521, regola G): col meta-reasoner acceso il
-    // run_token_budget diventa il TRIGGER del giudice, questo hard-cap e' la rete
-    // di sicurezza non-negoziabile che chiude d'autorita' senza consultarlo.
-    c.run_token_hard_cap = setting_i64(db, "agent.run_token_hard_cap", c.run_token_hard_cap as i64)
-        .await
-        .max(0) as u64;
-    // Freno di SPESA in dollari dell'intero run (mig 0533, regola G): 0 =
-    // disabilitato. Confrontato col costo cumulativo reale accumulato per-turno.
-    c.run_cost_budget_usd = setting_f64(db, "agent.run_cost_budget_usd", c.run_cost_budget_usd)
-        .await
-        .max(0.0);
-    c.max_consecutive_text_only_turns = setting_i64(
-        db,
-        "agent.max_consecutive_text_only_turns",
-        c.max_consecutive_text_only_turns as i64,
-    )
-    .await
-    .max(0) as u32;
-}
-
-/// Rilevatori di LOOP dell'executor (regola G): switch provider su no-progress,
-/// soglie loop-by-signature, anti repetition-collapse del testo, asse
-/// RepeatedUserQuestion e meta-reasoner di recovery-da-stallo.
-async fn load_executor_loop_guards(db: &PgPool, c: &mut ExecutorConfig) {
-    // 3.4 (provider-no-progress switch): DB-driven, default OFF (bit-identico).
-    c.provider_no_progress_switch_enabled = setting_bool(
-        db,
-        "agent.provider_no_progress.enabled",
-        c.provider_no_progress_switch_enabled,
-    )
-    .await;
-    load_loop_thresholds(db, &mut c.loop_thresholds).await;
-    load_repetition_thresholds(db, &mut c.repetition).await;
-    // Soglia dell'asse RepeatedUserQuestion (loop clarify cross-run, mig 0510).
-    c.repeated_user_question_threshold = setting_i64(
-        db,
-        "agent.loop.repeated_user_question_threshold",
-        c.repeated_user_question_threshold,
-    )
-    .await;
-    // ── Meta-reasoner di recovery-da-stallo (mig 0510, opt-in DB, regola G) ─
-    // Con enabled=false (default) il gate di emissione StallReason nell'executor
-    // non scatta mai -> comportamento bit-identico a oggi. Il budget per-sessione
-    // e' il cap duro anti meta-loop/costo del gate.
-    c.stall_recovery_enabled = setting_bool(
-        db,
-        "agent.stall_recovery.enabled",
-        c.stall_recovery_enabled,
-    )
-    .await;
-    c.stall_recovery_max_moves_per_session = setting_i64(
-        db,
-        "agent.stall_recovery.max_moves_per_session",
-        c.stall_recovery_max_moves_per_session,
-    )
-    .await;
-}
-
-/// Soglie loop-by-signature (mig 0520, regola G). Clamp >=1: una soglia 0
-/// scatterebbe su ogni turno.
-async fn load_loop_thresholds(db: &PgPool, t: &mut LoopThresholds) {
-    t.signature = setting_i64(db, "agent.loop.signature_threshold", t.signature as i64)
-        .await
-        .max(1) as usize;
-    t.cap = setting_i64(db, "agent.loop.recent_signatures_cap", t.cap as i64)
-        .await
-        .max(1) as usize;
-}
-
-/// Anti repetition-collapse del testo (mig 0531, regola G): soglie della
-/// rilevazione del turno degenere (stessa sottostringa ripetuta N+ volte).
-/// `scan_tail_cap=0` disabilita -> bit-identico. Clamp non-negativo; le
-/// lunghezze minime >=1 (0 sarebbe insensato).
-async fn load_repetition_thresholds(db: &PgPool, t: &mut RepetitionThresholds) {
-    t.min_unit_len = setting_i64(
-        db,
-        "agent.anti_repetition.min_unit_len",
-        t.min_unit_len as i64,
-    )
-    .await
-    .max(1) as usize;
-    t.max_unit_len = setting_i64(
-        db,
-        "agent.anti_repetition.max_unit_len",
-        t.max_unit_len as i64,
-    )
-    .await
-    .max(1) as usize;
-    t.min_repeats = setting_i64(db, "agent.anti_repetition.min_repeats", t.min_repeats as i64)
-        .await
-        .max(0) as usize;
-    t.min_total_len = setting_i64(
-        db,
-        "agent.anti_repetition.min_total_len",
-        t.min_total_len as i64,
-    )
-    .await
-    .max(0) as usize;
-    t.scan_tail_cap = setting_i64(
-        db,
-        "agent.anti_repetition.scan_tail_cap",
-        t.scan_tail_cap as i64,
-    )
-    .await
-    .max(0) as usize;
-}
-
-/// Scale-controller (mig 0516, opt-in DB, regola G): kill-switch + cadenza di
-/// valutazione. Con `enabled=false` (default) il detector-emissione dell'executor
-/// salta PRIMA di ogni lavoro -> nessun ScaleReason -> nodo ScaleControl mai
-/// raggiunto -> BIT-IDENTICO. Tutte le soglie dai settings `agent.scale.*`.
-async fn load_executor_scale(db: &PgPool, c: &mut ExecutorConfig) {
-    let s = &mut c.scale;
-    s.enabled = setting_bool(db, "agent.scale.enabled", s.enabled).await;
-    s.downscale_enabled =
-        setting_bool(db, "agent.scale.downscale_enabled", s.downscale_enabled).await;
-    s.eval_every_iters =
-        setting_i64(db, "agent.scale.eval_every_iters", s.eval_every_iters).await;
-    s.min_tail_iters = setting_i64(db, "agent.scale.min_tail_iters", s.min_tail_iters).await;
-    s.min_confidence = setting_f64(db, "agent.scale.min_confidence", s.min_confidence).await;
-    s.change_cooldown_turns = setting_i64(
-        db,
-        "agent.scale.change_cooldown_turns",
-        s.change_cooldown_turns,
-    )
-    .await;
-    s.downscale_clean_window = setting_i64(
-        db,
-        "agent.scale.downscale_clean_window",
-        s.downscale_clean_window,
-    )
-    .await;
-    load_executor_scale_caps(db, s).await;
-    load_executor_scale_sizing(db, s).await;
-}
-
-/// Cap anti-oscillazione per-run dello scale-controller (mig 0516, regola G).
-async fn load_executor_scale_caps(db: &PgPool, s: &mut ScaleConfig) {
-    s.max_reversals = setting_i64(db, "agent.scale.max_reversals", s.max_reversals).await;
-    s.max_tier_changes_per_run = setting_i64(
-        db,
-        "agent.scale.max_tier_changes_per_run",
-        s.max_tier_changes_per_run,
-    )
-    .await;
-    s.max_evals_per_run =
-        setting_i64(db, "agent.scale.max_evals_per_run", s.max_evals_per_run).await;
-    s.window_overhead_ratio = setting_f64(
-        db,
-        "agent.scale.window_overhead_ratio",
-        s.window_overhead_ratio,
-    )
-    .await;
-}
-
-/// Sizing agentico (mig 0524, kill-switch nested, opt-in DB, regola G). Con
-/// `sizing_enabled=false` (default) il detector non popola i segnali sizing e il
-/// gate degrada ogni AdjustSizing a KeepTier -> flusso tier BIT-IDENTICO anche
-/// con scale ON.
-async fn load_executor_scale_sizing(db: &PgPool, s: &mut ScaleConfig) {
-    s.sizing_enabled = setting_bool(db, "agent.scale.sizing_enabled", s.sizing_enabled).await;
-    s.sizing_cooldown_turns = setting_i64(
-        db,
-        "agent.scale.sizing_cooldown_turns",
-        s.sizing_cooldown_turns,
-    )
-    .await;
-    s.sizing_aggressiveness = setting_f64(
-        db,
-        "agent.scale.sizing_aggressiveness",
-        s.sizing_aggressiveness,
-    )
-    .await;
-}
-
-/// Progress-controller e reazione alle AZIONI RIPETUTE (regola G): soglie
-/// distinte per azioni mutative e read-only, codici d'errore client ritentabili,
-/// force-diagnose e riallocazione risorse. La chiave
-/// `agent.progress_controller_enabled` / `agent.repeated_action_force_diagnose_enabled`
-/// usa l'underscore: e' la chiave reale del setting nel DB.
-async fn load_executor_progress(db: &PgPool, c: &mut ExecutorConfig) {
-    c.progress_controller_enabled = setting_bool(
-        db,
-        "agent.progress_controller_enabled",
-        c.progress_controller_enabled,
-    )
-    .await;
-    c.repeated_action_threshold = setting_i64(
-        db,
-        "agent.repeated_action_threshold",
-        c.repeated_action_threshold,
-    )
-    .await;
-    c.repeated_action_threshold_read_only = setting_i64(
-        db,
-        "agent.repeated_action_threshold.read_only",
-        c.repeated_action_threshold_read_only,
-    )
-    .await;
-    let codes = std::mem::take(&mut c.recoverable_client_error_codes);
-    c.recoverable_client_error_codes =
-        setting_csv(db, "routing.client_error_failover_codes", codes).await;
-    c.repeated_action_force_diagnose_enabled = setting_bool(
-        db,
-        "agent.repeated_action_force_diagnose_enabled",
-        c.repeated_action_force_diagnose_enabled,
-    )
-    .await;
-    c.reallocation_threshold = setting_i64(
-        db,
-        "agent.loop.resource_reallocation_threshold",
-        c.reallocation_threshold,
-    )
-    .await;
-    load_executor_upscale(db, c).await;
-}
-
-/// Smart-upscale, direttiva di verifica e forcing del tool_choice (regola G). I
-/// due flag `tool_choice_forcing_*` erano persi dal porting Rust (restavano al
-/// Default `enabled=false` -> force-action INERTE per ogni provider): ora il DB
-/// e' di nuovo l'unica fonte, lo stile arriva dal catalog in
-/// [`load_executor_config`] (ADR 0018 leva 2, mig 0300).
-async fn load_executor_upscale(db: &PgPool, c: &mut ExecutorConfig) {
-    c.upscale_enabled = setting_bool(db, "agent.upscale.enabled", c.upscale_enabled).await;
-    c.upscale_overhead_ratio = setting_f64(
-        db,
-        "agent.upscale.target_overhead_ratio",
-        c.upscale_overhead_ratio,
-    )
-    .await;
-    c.verification_directive_enabled = setting_bool(
-        db,
-        "agent.verification_directive_enabled",
-        c.verification_directive_enabled,
-    )
-    .await;
-    c.tool_choice_forcing_enabled = setting_bool(
-        db,
-        "agent.tool_choice_forcing_enabled",
-        c.tool_choice_forcing_enabled,
-    )
-    .await;
-    c.tool_choice_forcing_max_iteration = setting_i64(
-        db,
-        "agent.tool_choice_forcing_max_iteration",
-        c.tool_choice_forcing_max_iteration,
-    )
-    .await;
-}
-
-/// Context management (mig 0199/0429, regola G): fasi di compressione, freno
-/// token, forced-RAG, continuity-trim/offload e hard cap post-brake. I valori
-/// AGGRESSIVI del DB erano IGNORATI perche' il loader chiudeva con
-/// `..Default::default()` (safe-default permissivi).
-async fn load_executor_context(db: &PgPool, c: &mut ExecutorConfig) {
-    load_ctx_mgmt_config(db, &mut c.ctx_mgmt).await;
-    load_token_brake_config(db, &mut c.token_brake).await;
-    // Forced-RAG reminder: ratio + testo dal DB (erano vuoti/0.0 -> reminder mai
-    // iniettato anche con offload attivo).
-    c.forced_rag_ratio = setting_f64(
-        db,
-        "agent.context.forced_rag_threshold_ratio",
-        c.forced_rag_ratio,
-    )
-    .await;
-    let reminder = std::mem::take(&mut c.forced_rag_reminder_text);
-    c.forced_rag_reminder_text = setting_string(
-        db,
-        "agent.context.forced_rag_reminder_text",
-        &reminder,
-    )
-    .await;
-    c.turn_focus_enabled = setting_bool(
-        db,
-        "agent.context.turn_focus_enabled",
-        c.turn_focus_enabled,
-    )
-    .await;
-    c.discovery_max_injected = setting_i64(
-        db,
-        "agent.tools.discovery_max_injected",
-        c.discovery_max_injected as i64,
-    )
-    .await
-    .max(0) as usize;
-    load_executor_continuity_trim(db, c).await;
-    load_executor_hard_cap(db, c).await;
-}
-
-/// Fasi di compressione DB-driven (mig 0429: compress_start_iter=3, boundaries
-/// [3,7,15,30], keep_recent [5,3,2,1], max_chars [1200,600,300,100]).
-async fn load_ctx_mgmt_config(db: &PgPool, m: &mut CtxMgmtConfig) {
-    m.compress_start_iter = setting_i64(
-        db,
-        "agent.context.compress_start_iter",
-        m.compress_start_iter,
-    )
-    .await;
-    let boundaries = std::mem::take(&mut m.compress_phase_boundaries);
-    m.compress_phase_boundaries = setting_i64_csv(
-        db,
-        "agent.context.compress_phase_boundaries",
-        boundaries,
-    )
-    .await;
-    let keep_recent = std::mem::take(&mut m.compress_phase_keep_recent);
-    m.compress_phase_keep_recent = setting_i64_csv(
-        db,
-        "agent.context.compress_phase_keep_recent",
-        keep_recent,
-    )
-    .await;
-    let max_chars = std::mem::take(&mut m.compress_phase_max_chars);
-    m.compress_phase_max_chars =
-        setting_i64_csv(db, "agent.context.compress_phase_max_chars", max_chars).await;
-}
-
-/// Freno token: la soglia hard (0.55 in DB vs 0.70 default) e i parametri
-/// aggressivi, ora dal DB.
-async fn load_token_brake_config(db: &PgPool, b: &mut TokenBrakeConfig) {
-    b.max_context_ratio = setting_f64(
-        db,
-        "agent.context.max_context_ratio",
-        b.max_context_ratio,
-    )
-    .await;
-    b.aggressive_keep_recent = setting_i64(
-        db,
-        "agent.context.aggressive_keep_recent",
-        b.aggressive_keep_recent as i64,
-    )
-    .await
-    .max(0) as usize;
-    b.aggressive_max_chars = setting_i64(
-        db,
-        "agent.context.aggressive_max_chars",
-        b.aggressive_max_chars as i64,
-    )
-    .await
-    .max(0) as usize;
-}
-
-/// Continuity-trim SEMANTICO + offload retrievabile (EmbeddingStore). Tutti OFF
-/// di default (regola G): con questi valori il comportamento e' bit-identico a
-/// oggi. La porta embedding/offload e' iniettata dal wiring.
-async fn load_executor_continuity_trim(db: &PgPool, c: &mut ExecutorConfig) {
-    c.continuity_trim_enabled = setting_bool(
-        db,
-        "agent.context.continuity_trim_enabled",
-        c.continuity_trim_enabled,
-    )
-    .await;
-    c.continuity_trim_min_score = setting_f64(
-        db,
-        "agent.context.continuity_trim_min_score",
-        c.continuity_trim_min_score as f64,
-    )
-    .await as f32;
-    c.continuity_trim_max_drop = setting_i64(
-        db,
-        "agent.context.continuity_trim_max_drop",
-        c.continuity_trim_max_drop,
-    )
-    .await;
-    c.compress_offload_enabled = setting_bool(
-        db,
-        "agent.context.compress_offload_enabled",
-        c.compress_offload_enabled,
-    )
-    .await;
-    c.rolling_summary_offload_enabled = setting_bool(
-        db,
-        "agent.context.rolling_summary_offload_enabled",
-        c.rolling_summary_offload_enabled,
-    )
-    .await;
-}
-
-/// Hard cap post-brake (ADR 0016 fase D2, mig 0286): ratio dal DB (0.95 in
-/// produzione; il Default 0.0 = gate OFF vale SOLO a DB irraggiungibile) +
-/// template del messaggio overflow risolto qui (regola G: il testo redazionale
-/// vive SOLO in nexus_prompt_templates).
-async fn load_executor_hard_cap(db: &PgPool, c: &mut ExecutorConfig) {
-    c.hard_cap_ratio = setting_f64(db, "agent.context.hard_cap_ratio", c.hard_cap_ratio).await;
-    let key = setting_string(
-        db,
-        "agent.context.overflow_message_key",
-        "system.context_overflow",
-    )
-    .await;
-    c.overflow_message_template = resolve_prompt_template(db, &key).await.unwrap_or_default();
-}
-
-/// Rolling-summary (intervento 3): RIASSUME i vecchi via LLM economico. Flag +
-/// keep_recent dal DB (regola G); il MODELLO economico vive nell'impl della porta
-/// PgSummaryStore (`agent.context.rolling_summary_model`). La governance
-/// costo/beneficio (opt-in, mig 0523) e' OFF di default -> il gate non si applica
-/// (comportamento storico bit-identico).
-async fn load_executor_rolling_summary(db: &PgPool, c: &mut ExecutorConfig) {
-    c.rolling_summary_enabled = setting_bool(
-        db,
-        "agent.context.rolling_summary_enabled",
-        c.rolling_summary_enabled,
-    )
-    .await;
-    c.rolling_keep_recent = setting_i64(
-        db,
-        "agent.context.rolling_keep_recent_turns",
-        c.rolling_keep_recent,
-    )
-    .await;
-    c.governance_rolling_summary_adaptive = setting_bool(
-        db,
-        "agent.governance.rolling_summary_adaptive",
-        c.governance_rolling_summary_adaptive,
-    )
-    .await;
-    c.governance_rolling_summary_min_prefix = setting_i64(
-        db,
-        "agent.governance.rolling_summary_min_prefix",
-        c.governance_rolling_summary_min_prefix,
-    )
-    .await;
-}
-
-/// ADR 0018 fase 3: rilevamento report passi pendenti nei rami G1/report
-/// dell'executor (stesse chiavi della RoutingConfig, regola L).
-async fn load_executor_closure(db: &PgPool, c: &mut ExecutorConfig) {
-    c.pending_steps_detection_enabled = setting_bool(
-        db,
-        "agent.closure.pending_steps_detection_enabled",
-        c.pending_steps_detection_enabled,
-    )
-    .await;
-    c.pending_steps_min_items = setting_i64(
-        db,
-        "agent.closure.pending_steps_min_items",
-        c.pending_steps_min_items,
-    )
-    .await;
+    }
 }
 
 /// Tokenizer selezionato per le stime contesto (ADR 0016 D1).
@@ -1719,18 +1815,45 @@ async fn resolve_prompt_template(db: &PgPool, key: &str) -> Option<String> {
 }
 
 /// Costruisce la [`TodoRunnerConfig`] DB-driven (regola G): legge dal DB il kind
-/// del sub-agent e il numero massimo di retry col PUNTO UNICO
-/// `nexus_auth::get_setting` (per `todo_isolation_kind`, campo String, il pattern
-/// `get_setting().unwrap_or(default)` come `planner_prompt_key`). Gli ALTRI campi
-/// (on_failure, dag_topological_enabled, summary_max_chars) restano al `Default`
-/// (safe-default identico ai `_SAFE_DEFAULTS` del brain: valgono SOLO se la chiave
-/// manca o il DB e' irraggiungibile, mai come magic fallback nella logica).
+/// del sub-agent, la POLITICA AL FALLIMENTO e il numero massimo di retry col
+/// PUNTO UNICO `nexus_auth::get_setting`. I restanti campi
+/// (dag_topological_enabled, summary_max_chars) restano al `Default`
+/// (safe-default: vale SOLO se la chiave manca o il DB e' irraggiungibile, mai
+/// come magic fallback nella logica).
+///
+/// `on_failure` era un SETTING FANTASMA: la migrazione 0431 semina
+/// `agent.continuous.todo_isolation_on_failure` e ne documenta le tre politiche,
+/// ma nessuno la leggeva e il nodo restava inchiodato a `stop`. Conseguenza vista
+/// sul campo (2026-07-22): un fallimento sul backend chiudeva l'intero piano e
+/// lasciava `pending` frontend e README, che non ne dipendevano affatto; scegliere
+/// `continue` dal DB non aveva alcun effetto.
 async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
     let d = TodoRunnerConfig::default();
     TodoRunnerConfig {
         todo_isolation_kind: nexus_auth::get_setting(db, "agent.continuous.todo_isolation_kind")
             .await
             .unwrap_or(d.todo_isolation_kind),
+        on_failure: match nexus_auth::get_setting(
+            db,
+            "agent.continuous.todo_isolation_on_failure",
+        )
+        .await
+        {
+            Some(raw) => match OnFailure::try_parse(&raw) {
+                Some(p) => p,
+                None => {
+                    // Refuso nel DB: non si degrada in silenzio a una politica
+                    // che l'operatore non ha scelto (regola M).
+                    tracing::warn!(
+                        valore = %raw,
+                        "agent.continuous.todo_isolation_on_failure: valore ignoto \
+                         (attesi stop|retry|continue), uso il default"
+                    );
+                    d.on_failure
+                }
+            },
+            None => d.on_failure,
+        },
         max_retries: setting_i64(
             db,
             "agent.continuous.todo_isolation_max_retries",
@@ -1753,33 +1876,10 @@ async fn load_todo_runner_config(db: &PgPool) -> TodoRunnerConfig {
     }
 }
 
-/// Ruolo del run nel motore nativo: distingue il run PRIMARIO (side-effect
-/// reali, output SSE, checkpoint persistente) dal run SHADOW (read-only).
-///
-/// PUNTO UNICO (regola L) della differenza primario/shadow: `build_native_engine`
-/// e `run_engine` leggono SOLO questo enum per decidere tools/emit/checkpointer
-/// e il flag `shadow` del ctx; non c'e' alcun altro `if shadow` sparso. Lo shadow
-/// porta con se' il `primary_run_id` da cui rileggere i tool_result in Replay.
-#[derive(Clone, Copy)]
-enum RunRole {
-    /// Run primario: tool REALI, SSE verso il frontend, checkpoint Postgres.
-    Primary,
-    /// Run shadow read-only: tool in Replay dal primario (`primary_run_id`),
-    /// EventSink no-op, checkpointer in-memory (niente scritture).
-    Shadow { primary_run_id: Uuid },
-}
-
-impl RunRole {
-    /// `true` se questo e' un run shadow (read-only).
-    fn is_shadow(&self) -> bool {
-        matches!(self, RunRole::Shadow { .. })
-    }
-}
-
 /// Modalita' di ingresso del motore nativo (punto unico, regola L): distingue
 /// l'avvio nuovo dal resume HITL. Estrae la decisione "init Some/None +
-/// resume_delta" da `run_engine` in un solo enum, cosi' i tre call site
-/// (run nuovo, resume HITL, shadow) la esprimono in modo esplicito.
+/// resume_delta" da `run_engine` in un solo enum, cosi' i due call site
+/// (run nuovo, resume HITL) la esprimono in modo esplicito.
 enum RunMode {
     /// Avvio nuovo: `build_initial_state` dal prompt -> parte da `entry`.
     New,
@@ -1868,18 +1968,66 @@ async fn probe_gate_steps(
 }
 
 /// Misura gli step gate del profilo di verifica PRIMA che l'executor tocchi i
-/// file, e persiste il profilo solo se qualcosa e' cambiato. Da chiamare solo
-/// nel primario (in shadow niente inferenza: zero side-effect e zero costo).
+/// file, e persiste il profilo solo se qualcosa e' cambiato.
 /// Entrambe le misure passano dal PUNTO UNICO del runner criteri (regola L/M:
 /// exit code strutturato), e questo e' l'unico posto che esegue i comandi gate
 /// ad albero pulito.
+///
+/// # Mutua esclusione per ROOT (difetto D2, incidente consiglio 2026-07-15)
+///
+/// Il probe PIANTA un file rotto nell'albero e ri-esegue il comando
+/// ([`crate::verify_probe`]). Con 6 figure concorrenti sulla STESSA root le
+/// misure si corrompevano a vicenda: A pianta il file, B misura la baseline e
+/// vede exit=1; A rimuove, B misura il probe e lo dichiara `Blind`.
+/// Serializzare e' la CORRETTEZZA della misura, non una preferenza: due misure
+/// sovrapposte sullo stesso albero non misurano niente.
+///
+/// Il guard e' per ROOT (non per progetto): e' l'albero la risorsa condivisa. E
+/// sta DENTRO questa funzione, non al call site, perche' e' il lavoro
+/// sull'albero a dover essere serializzato: chi la ri-estrae domani non deve
+/// poter dimenticare il guard restandone fuori. E' esattamente cosi' che si era
+/// perso (il refactor `1207a229` l'ha estratta da una versione che non l'aveva
+/// ancora, e main e' rimasto scoperto finche' non e' rientrato il ramo).
+///
+/// # Ri-lettura dopo il guard (doppio controllo)
+///
+/// Chi ha atteso in coda ha in mano la copia letta PRIMA di entrare, con
+/// `baseline_exit_code`/`probe` ancora a `None`: i filtri `is_none()` delle due
+/// misure rifarebbero da capo il typecheck e il probe che chi era davanti ha
+/// appena eseguito e persistito. Senza la ri-lettura il guard non CONDIVIDE il
+/// lavoro, lo mette in FILA (6 figure = 6 baseline + 6 probe in sequenza sullo
+/// stesso albero): e' l'altra meta' del difetto D2, lo spreco che occupava la
+/// finestra prima che le figure raggiungessero il loro modello. Il razionale di
+/// `PROFILE_LOCKS` avverte esattamente di questo: un lock che serializza N
+/// misure invece di condividerne una sarebbe solo un altro difetto.
+///
+/// Due sottigliezze del contratto, entrambe mutation-checked:
+/// - `steps` vuoto e' anche il modo in cui `ensure_profile` segnala il
+///   kill-switch `agent.verify_infer.enabled` OFF -> si esce PRIMA del guard,
+///   altrimenti la ri-lettura ripescherebbe dal DB il profilo appena escluso;
+/// - una ri-lettura VUOTA non e' un profilo svuotato: `profile_steps` inghiotte
+///   l'errore DB e ritorna il default, quindi il `Vec` non distingue "nessuna
+///   riga" da "il DB non ha risposto" (regola M). Su un segnale che non
+///   discrimina si tiene la copia in mano.
 async fn measure_gate_steps(
     meta_db: &PgPool,
     project_id: Uuid,
     root: &str,
-    steps: &mut [crate::verify_profile::VerifyProfileStep],
+    steps: &mut Vec<crate::verify_profile::VerifyProfileStep>,
     criteria_adapter: &FinalGateCriteriaRunnerAdapter,
 ) {
+    // Kill-switch OFF o profilo assente: niente da misurare, niente guard.
+    if steps.is_empty() {
+        return;
+    }
+    let _tree_guard = crate::verify_profile::project_tree_lock(root)
+        .lock_owned()
+        .await;
+    // Doppio controllo: chi era davanti puo' aver gia' misurato tutto.
+    let persisted = crate::verify_profile::profile_steps(meta_db, project_id).await;
+    if !persisted.is_empty() {
+        *steps = persisted;
+    }
     // `|` e non `||`: la seconda misura va eseguita comunque, non e' un
     // cortocircuito.
     let measured = measure_gate_baselines(steps, criteria_adapter).await
@@ -1889,18 +2037,11 @@ async fn measure_gate_steps(
     }
 }
 
-/// Il `role` decide le sole tre porte che cambiano fra primario e shadow (regola
-/// L: un solo punto): `tools` (Real vs Replay), `emit` (SSE vs no-op),
-/// `checkpointer` (Postgres vs in-memory). Tutto il resto (nodi, config DB-driven,
-/// purpose model) e' IDENTICO -> lo shadow attraversa la STESSA topologia del
-/// primario, presupposto del confronto di parita'.
-///
-/// Ritorna anche la `RoutingConfig` risolta (serve a popolare il ctx, il cui
+/// Ritorna la `RoutingConfig` risolta (serve a popolare il ctx, il cui
 /// `recursion_limit` viene letto dal motore) + le porte gateway/tools per il ctx.
 async fn build_native_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
-    role: RunRole,
 ) -> anyhow::Result<(
     AgentGraphEngine,
     RoutingConfig,
@@ -1928,111 +2069,86 @@ async fn build_native_engine(
     // ── Pool del dominio run (separazione DB per-progetto, punto unico regola L) ─
     // Tutte le porte che PERSISTONO dati per-progetto del run (agent_runs,
     // agent_steps, nexus_agent_*, nexus_graph_checkpoints, nexus_agent_traces,
-    // todos/plans) girano su QUESTO pool: il DB del progetto (`<slug>_nexus`) a
-    // flag separazione ON, il meta-DB a flag OFF / sessione non mappata
-    // (comportamento storico). Risolto UNA volta dal session_id via la directory
-    // di routing. Le porte che leggono SOLO config/catalogo GLOBALI (settings,
-    // ai_price_catalog, nexus_prompt_templates, routing matrix) restano su `db`.
+    // todos/plans) girano su QUESTO pool: il DB del progetto (`<slug>_nexus`).
+    // Risolto UNA volta dal session_id via la directory di routing; se il DB del
+    // progetto non e' disponibile il run NON parte (errore tipizzato propagato,
+    // niente fallback al meta-DB). Le porte che leggono SOLO config/catalogo
+    // GLOBALI (settings, ai_price_catalog, nexus_prompt_templates, routing
+    // matrix) restano su `db`.
     let run_db =
-        crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&db, input.session_id).await?;
 
     // Fase C3 Part B: disponibilita' dell'isolamento fisico (worktree git) per
     // questo run, calcolata UNA volta qui e passata al ctx (i nodi puri non fanno
     // I/O). Corto-circuito su flag OFF (default) -> nessun probe git: zero costo
     // aggiunto al percorso normale. Vedi `compute_run_isolation_available`.
     let isolation_available =
-        compute_run_isolation_available(&db, &run_db, input.session_id, role).await;
+        compute_run_isolation_available(&db, &run_db, input.session_id).await;
 
-    // ── Porte I/O concrete (14 impl FASE 2) ──────────────────────────────────
-    // Gateway LLM: dipende dal ruolo (regola L, punto unico, stesso switch del
-    // `tools` sotto).
-    //  - Primary: GatewayLlmAdapter REAL (provider/model gia' risolti, il client
-    //    non re-instrada).
-    //  - Shadow: ReplayLlmGateway (executor rigioca le decisioni del primario da
-    //    agent_steps, ausiliari neutralizzati): nessuna chiamata LLM reale ->
-    //    num_tool_calls converge col primario, costo zero, zero RNG-divergenza.
-    let llm: Arc<dyn LlmGateway> = match role {
-        RunRole::Primary => {
-            // Identita' del run per il ledger di billing: ricavata dalla sessione
-            // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
-            // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
-            // il costo risulta sempre 0. Lettura puntuale (una volta per run).
-            let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
-                "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+    // ── Porte I/O concrete ────────────────────────────────────────────────────
+    // Gateway LLM: GatewayLlmAdapter REAL (provider/model gia' risolti, il client
+    // non re-instrada).
+    let llm: Arc<dyn LlmGateway> = {
+        // Identita' del run per il ledger di billing: ricavata dalla sessione
+        // (chat_sessions.project_id/user_id). Senza, il gateway scarta la
+        // registrazione usage (record_usage_to_ledger esce su tenant vuoto) e
+        // il costo risulta sempre 0. Lettura puntuale (una volta per run).
+        let (proj_id, usr_id) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+            "SELECT project_id, user_id FROM chat_sessions WHERE id = $1",
+        )
+        .bind(input.session_id)
+        .fetch_optional(&run_db)
+        .await
+        .ok()
+        .flatten()
+        .map(|(p, u)| {
+            (
+                p.map(|x| x.to_string()).unwrap_or_default(),
+                u.map(|x| x.to_string()).unwrap_or_default(),
             )
-            .bind(input.session_id)
-            .fetch_optional(&run_db)
-            .await
-            .ok()
-            .flatten()
-            .map(|(p, u)| {
-                (
-                    p.map(|x| x.to_string()).unwrap_or_default(),
-                    u.map(|x| x.to_string()).unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
-            Arc::new(GatewayLlmAdapter::new(
-                deps.gateway.clone(),
-                deps.db.clone(),
-                proj_id,
-                usr_id,
-            ))
-        }
-        RunRole::Shadow { primary_run_id } => {
-            Arc::new(ReplayLlmGateway::new(run_db.clone(), primary_run_id))
-        }
-    };
-
-    // ToolExecutor: dipende dal ruolo (regola L, punto unico).
-    //  - Primary: ToolRunner in-process REALE (mcp-core E' il ToolRunner, no gRPC
-    //    su se' stesso). `primary_run_id=None`.
-    //  - Shadow: Replay-only by-construction (nessun `ToolRunnerDeps`): rilegge i
-    //    tool_result del primario da `agent_steps`, ZERO side-effect.
-    let tools: Arc<dyn ToolExecutor> = match role {
-        RunRole::Primary => Arc::new(ToolRunnerExecutorAdapter::new(
-            deps.tool_runner_deps.clone(),
-            input.session_id,
-            None,
-            // Override root del sub-run isolato (FASE 2). `None` per default (run
-            // principale/sub-run non isolato) -> ctx sulla root del progetto,
-            // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
-            input.working_root.clone(),
-            // Narrazione verso QUESTO run: i tool a lunga durata (dispatch_
-            // subagents) emettono meta-step di avvio/progresso/chiusura sul
-            // canale SSE del run invocante mentre lavorano. Vale anche per i
-            // sub-run (il loro canale e' il ponte verso il padre): la
-            // narrazione risale la catena in modo ricorsivo.
-            Some(crate::agent_tools::context::ParentNarration {
-                run_id: input.run_id,
-                session_id: input.session_id,
-                step_tx: input.step_tx.clone(),
-            }),
-        )),
-        RunRole::Shadow { primary_run_id } => Arc::new(
-            ToolRunnerExecutorAdapter::from_db_for_replay(run_db.clone(), Some(primary_run_id)),
-        ),
-    };
-
-    // Canale eventi: dipende dal ruolo.
-    //  - Primary: STESSO broadcast SSE del run (parita' 1:1 con run_via_brain).
-    //  - Shadow: NullEventSink (no-op): il run shadow non emette NULLA verso il
-    //    frontend (l'output all'utente resta quello del primario).
-    let emit: Arc<dyn EventSink> = if role.is_shadow() {
-        Arc::new(NullEventSink)
-    } else {
-        // Primario: oltre a emettere gli eventi LIVE, l'adapter ricostruisce e
-        // PERSISTE le tracce gateway (`AITraceEvent`) su `nexus_agent_traces` cosi'
-        // il trace panel sopravvive al refresh (FIX persistenza tracing nativo:
-        // prima il ramo nativo non scriveva mai questa tabella). Best-effort,
-        // punto unico `trace_store::persist_trace` (regola L).
-        Arc::new(SseEventSinkAdapter::with_persistence(
-            input.step_tx.clone(),
-            input.run_id,
-            input.session_id,
-            run_db.clone(),
+        })
+        .unwrap_or_default();
+        Arc::new(GatewayLlmAdapter::new(
+            deps.gateway.clone(),
+            deps.db.clone(),
+            proj_id,
+            usr_id,
         ))
     };
+
+    // ToolExecutor: ToolRunner in-process REALE (mcp-core E' il ToolRunner, no gRPC
+    // su se' stesso).
+    let tools: Arc<dyn ToolExecutor> = Arc::new(ToolRunnerExecutorAdapter::new(
+        deps.tool_runner_deps.clone(),
+        input.session_id,
+        // Override root del sub-run isolato (FASE 2). `None` per default (run
+        // principale/sub-run non isolato) -> ctx sulla root del progetto,
+        // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
+        input.working_root.clone(),
+        // Narrazione verso QUESTO run: i tool a lunga durata (dispatch_
+        // subagents) emettono meta-step di avvio/progresso/chiusura sul
+        // canale SSE del run invocante mentre lavorano. Vale anche per i
+        // sub-run (il loro canale e' il ponte verso il padre): la
+        // narrazione risale la catena in modo ricorsivo.
+        Some(crate::agent_tools::context::ParentNarration {
+            run_id: input.run_id,
+            session_id: input.session_id,
+            step_tx: input.step_tx.clone(),
+        }),
+    ));
+
+    // Canale eventi: STESSO broadcast SSE del run (parita' 1:1 con run_via_brain).
+    // Oltre a emettere gli eventi LIVE, l'adapter ricostruisce e PERSISTE le tracce
+    // gateway (`AITraceEvent`) su `nexus_agent_traces` cosi' il trace panel
+    // sopravvive al refresh (FIX persistenza tracing nativo: prima il ramo nativo
+    // non scriveva mai questa tabella). Best-effort, punto unico
+    // `trace_store::persist_trace` (regola L).
+    let emit: Arc<dyn EventSink> = Arc::new(SseEventSinkAdapter::with_persistence(
+        input.step_tx.clone(),
+        input.run_id,
+        input.session_id,
+        run_db.clone(),
+    ));
 
     // Store DB + porte ausiliarie. Le store del dominio run (agent_runs,
     // agent_steps, nexus_agent_meta_steps, nexus_agent_todos/plans,
@@ -2045,29 +2161,39 @@ async fn build_native_engine(
     let steps: Arc<dyn AgentStepStore> = Arc::new(PgAgentStepStore::new(run_db.clone()));
     let meta_steps: Arc<dyn MetaStepStore> =
         Arc::new(PgMetaStepStore::new(run_db.clone(), input.run_id));
-    let todos: Arc<dyn TodoStore> = Arc::new(PgTodoStore::new(run_db.clone(), db.clone()));
+    // `project_id` della sessione: serve SOLO per l'evento live `TodoUpdated`,
+    // che fa spuntare le voci della checklist del piano in chat mentre il lavoro
+    // procede. Lettura puntuale (una volta per run), come quella del ledger qui
+    // sopra. Se manca, lo store resta quello senza eventi: i todo si aggiornano
+    // comunque nel DB, semplicemente la checklist non si muove da sola.
+    let project_id_per_eventi: Option<Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM chat_sessions WHERE id = $1")
+            .bind(input.session_id)
+            .fetch_optional(&run_db)
+            .await
+            .ok()
+            .flatten();
+    let todos: Arc<dyn TodoStore> = match project_id_per_eventi {
+        Some(pid) => Arc::new(PgTodoStore::with_events(
+            run_db.clone(),
+            db.clone(),
+            deps.tool_runner_deps.project_channels.clone(),
+            pid,
+        )),
+        None => Arc::new(PgTodoStore::new(run_db.clone(), db.clone())),
+    };
     let verifier_runs: Arc<dyn VerifierRunStore> =
         Arc::new(PgVerifierRunStore::new(run_db.clone()));
     let offload: Arc<dyn ContextOffload> = Arc::new(RagContextOffloadAdapter::new(db.clone()));
     let escalation: Arc<dyn EscalationPort> = Arc::new(PgEscalationPort::new(db.clone()));
     let next_actions: Arc<dyn NextActionsDeriver> =
         Arc::new(NextActionsDeriverAdapter::new(db.clone()));
-    // Porta billing: dipende dal ruolo (FIX shadow LLM-Replay).
-    //  - Primary: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
-    //    esplorazione riflette lo stato reale dei provider.
-    //  - Shadow: NO-OP (lista vuota). Lo shadow rigioca la DECISIONE del primario,
-    //    non rivaluta il billing corrente: leggere lo snapshot LIVE introdurrebbe
-    //    non-determinismo e un fail-fast SPURIO (-> canonical "loop") da stato
-    //    esterno evoluto dopo il primario. Allineata agli altri ausiliari shadow
-    //    gia' neutralizzati (NullEventSink, MemoryCheckpointer).
-    let billing: Arc<dyn BillingCooldownPort> = if role.is_shadow() {
-        Arc::new(NullBillingCooldownPort::new())
-    } else {
-        Arc::new(CooldownBillingPort::new())
-    };
+    // Porta billing: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
+    // esplorazione riflette lo stato reale dei provider.
+    let billing: Arc<dyn BillingCooldownPort> = Arc::new(CooldownBillingPort::new());
     let upscale: Arc<dyn ModelUpscalePort> = Arc::new(CatalogModelUpscalePort::new(db.clone()));
     // Rolling-summary (intervento 3): riassume i vecchi via LLM economico (modello
-    // da `agent.context.rolling_summary_model`, regola G). Gata Real (no-op shadow).
+    // da `agent.context.rolling_summary_model`, regola G).
     let summary_store: Arc<dyn SummaryStore> = Arc::new(PgSummaryStore::new(db.clone()));
 
     // Motore criteri del final_gate / verifier: delega al tool_executor (punto
@@ -2080,42 +2206,47 @@ async fn build_native_engine(
     ));
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
+    // Porta del panel di review (ReviewGate).
+    let review_panel: Arc<dyn nexus_agent_graph::runtime::ports::ReviewPanelPort> =
+        Arc::new(crate::agent_graph_adapter::review_panel::ReviewPanelAdapter::new(
+            db.clone(),
+            run_db.clone(),
+            deps.tool_runner_deps.clone(),
+            input.session_id,
+            input.sizing_complexity,
+            input.sizing_scope_system_wide,
+        ));
+
     // ── Config dei nodi (DB-driven, regola G piena) ──────────────────────────
     // DEBITO 2 chiuso (TODO Fase 5): le config dei nodi che il brain Python legge
     // da `orchestrator_config.get()` (`orchestrator_config.py`) vengono ora LETTE
     // dal DB col PUNTO UNICO `nexus_auth::get_setting` (regola L), 1:1 con le chiavi
     // settings del brain. Il `Default` di ciascuna config resta SOLO come
     // safe-default se la chiave manca (identico ai `_SAFE_DEFAULTS` del brain): mai
-    // come magic fallback (regola G). Copre SIA il primario nativo (run_native) SIA
-    // lo shadow (run_shadow): entrambi passano di qui (punto unico).
+    // come magic fallback (regola G).
     let planner_cfg = load_planner_config(&db).await;
     let mut final_gate_cfg = load_final_gate_config(&db).await;
+    let review_gate_cfg = load_review_gate_config(&db).await;
     let verifier_cfg = load_verifier_config(&db).await;
 
     // ── Catena di verifica per-AMBIENTE (ADR 0036) ───────────────────────────
     // Il profilo del progetto e' INFERITO da un LLM che osserva l'ambiente
     // reale (verify_profile::ensure_profile: sceglie lui i file da leggere e
     // definisce step liberi con flag gate). Qui, risolto a monte del grafo
-    // (regola G), si innestano nel final_gate gli step gate=true. In SHADOW
-    // niente inferenza (zero side-effect/costo): sola lettura del persistito.
+    // (regola G), si innestano nel final_gate gli step gate=true.
     if final_gate_cfg.enabled {
         if let Some((pid, root)) =
             resolve_session_project_root(&run_db, &db, input.session_id).await
         {
-            let mut steps = if role.is_shadow() {
-                crate::verify_profile::profile_steps(&db, pid).await
-            } else {
-                crate::verify_profile::ensure_profile(
-                    &db,
-                    &deps.tool_runner_deps.neural,
-                    pid,
-                    std::path::Path::new(&root),
-                )
-                .await
-            };
-            if !role.is_shadow() {
-                measure_gate_steps(&db, pid, &root, &mut steps, &criteria_adapter).await;
-            }
+            let mut steps = crate::verify_profile::ensure_profile(
+                &db,
+                &deps.tool_runner_deps.neural,
+                pid,
+                std::path::Path::new(&root),
+            )
+            .await;
+
+            measure_gate_steps(&db, pid, &root, &mut steps, &criteria_adapter).await;
             final_gate_cfg.verify_steps = steps
                 .into_iter()
                 // Uno step PROVATO CIECO non e' una verifica, qualunque cosa
@@ -2148,11 +2279,24 @@ async fn build_native_engine(
         }
     }
 
-    let exec_cfg = load_executor_config(&db, &input.provider, &input.model, context_window).await;
+    let mut exec_cfg =
+        load_executor_config(&db, &input.provider, &input.model, context_window).await;
+    // Budget del run CORRENTE. `load_executor_config` resta il punto unico DB-driven
+    // (regola G) e legge il setting GLOBALE `agent.run_time_budget_s`; qui vince il
+    // tetto che il chiamante conosce meglio: per un SUB-RUN e' il `timeout_s` della
+    // figura, l'unico orologio che la governa davvero (il `tokio::time::timeout`
+    // esterno). Senza questo override il gate a tempo dell'executor resta codice
+    // morto per le figure e il sollecito di chiusura non scatterebbe mai.
+    exec_cfg.run_time_budget_s =
+        effective_run_time_budget_s(exec_cfg.run_time_budget_s, input.run_time_budget_s);
 
     let tool_dispatch_cfg = ToolDispatchConfig {
         context_window,
         fs_mutator_tools: routing_cfg.fs_mutator_tools.clone(),
+        // Barriera advisory (mig 0606): attesa massima della prima scrittura.
+        // CLAMP alla deadline residua del run (fase 3): una barriera che attende
+        // oltre la deadline produrrebbe un `time_budget` mascherato da gate.
+        advisory_gate_timeout_s: advisory_gate_timeout(&db).await,
         ..ToolDispatchConfig::default()
     };
 
@@ -2201,6 +2345,7 @@ async fn build_native_engine(
             load_todo_runner_config(&db).await,
             todos.clone(),
             tools.clone(),
+            run_control.clone(),
         )),
         executor: {
             let mut executor = ExecutorNode::new(
@@ -2292,22 +2437,19 @@ async fn build_native_engine(
             criteria,
             meta_steps.clone(),
         )),
+        review_gate: Arc::new(ReviewGateNode::new(
+            review_gate_cfg,
+            review_panel,
+            meta_steps.clone(),
+        )),
         reflection: Arc::new(ReflectionNode::new(reflection_cfg)),
-        learner: Arc::new(LearnerNode::new(LearnerConfig::default())),
+        learner: Arc::new(LearnerNode::new()),
     };
 
-    // Checkpointer: dipende dal ruolo.
-    //  - Primary: Postgres (persistenza per-superstep su nexus_graph_checkpoints,
-    //    serve al recovery di un run interrotto).
-    //  - Shadow: IN-MEMORY. Lo shadow gira UNA volta fino a End e NON deve scrivere
-    //    su nexus_graph_checkpoints (i checkpoint Python e Rust hanno topologie
-    //    diverse: persisterli inquinerebbe la tabella di recovery del primario).
+    // Checkpointer: Postgres (persistenza per-superstep su nexus_graph_checkpoints,
+    // serve al recovery di un run interrotto).
     let checkpointer: Arc<dyn nexus_graph::checkpoint::Checkpointer<AgentState>> =
-        if role.is_shadow() {
-            Arc::new(nexus_graph::MemoryCheckpointer::<AgentState>::new())
-        } else {
-            Arc::new(nexus_agent_graph::PgCheckpointer::new(run_db.clone()))
-        };
+        Arc::new(nexus_agent_graph::PgCheckpointer::new(run_db.clone()));
 
     let supervisor_cfg = load_supervisor_config(&db).await;
     let engine = build_agent_graph(
@@ -2350,11 +2492,10 @@ async fn resolve_session_project_root(
 
 /// Isolamento fisico DISPONIBILE per questo run (Fase C3 Part B). Ordine dei
 /// corto-circuiti scelto per NON aggiungere I/O al percorso normale:
-///   1. run SHADOW -> `false` (nessuna orchestrazione delegata in replay);
-///   2. flag `orchestrator.subagent_isolation_enabled` OFF (default) -> `false`
+///   1. flag `orchestrator.subagent_isolation_enabled` OFF (default) -> `false`
 ///      SENZA risolvere la root ne' fare il probe git (costo zero);
-///   3. root del progetto non risolvibile -> `false`;
-///   4. `probe_isolatable` (FAIL-CLOSED) sulla root: `git worktree` utilizzabile.
+///   2. root del progetto non risolvibile -> `false`;
+///   3. `probe_isolatable` (FAIL-CLOSED) sulla root: `git worktree` utilizzabile.
 /// Riusa gli STESSI punti unici del batch tool (`isolation_flag_enabled`,
 /// `probe_isolatable`), cosi' il gate del planner e l'esecuzione reale
 /// dell'isolamento vedono lo stesso verdetto.
@@ -2370,11 +2511,7 @@ async fn compute_run_isolation_available(
     meta_db: &PgPool,
     run_db: &PgPool,
     session_id: Uuid,
-    role: RunRole,
 ) -> bool {
-    if role.is_shadow() {
-        return false;
-    }
     // Flag GLOBALE -> meta_db (NON run_db: li' `settings` non esiste a
     // separazione DB ON e la query fallirebbe mascherandosi come flag OFF).
     if !crate::agent_tools::subagent_native::isolation_flag_enabled(meta_db).await {
@@ -2427,112 +2564,56 @@ fn history_entry_to_message(v: &serde_json::Value) -> Option<Message> {
 /// in `Message` + il messaggio utente del turno in coda,
 /// system/session/intent/automation/provider override valorizzati.
 ///
-/// `role` distingue primario da shadow. Sia il ramo Shadow sia il PRIMARIO RUST
-/// (`RunRole::Primary`, usato SOLO da `run_via_native`/`Engine::Rust`, non
-/// instradato globalmente) valorizzano `user_intent`/`action_oriented`/
-/// `report_only` derivandoli dai dati del classifier del turno (`requires_tools`/
+/// Il PRIMARIO RUST valorizza `user_intent`/`action_oriented`/`report_only`
+/// derivandoli dai dati del classifier del turno (`requires_tools`/
 /// `agentic_score`/`authorizes_changes`) col PUNTO UNICO `intent_classifier::
-/// derive_*` (regola L): cosi' il primario Rust converge col primario Python (no
-/// G1 spurio sui turni read-only, tool sui turni d'azione). Quando i dati del
-/// classifier sono ASSENTI il primario resta INTATTO (None -> il `RouterNode`
-/// decide come oggi), comportamento INVARIATO. Il primario PYTHON
-/// (`run_via_brain`) NON passa di qui: ri-classifica internamente nel router_node.
-fn build_initial_state(input: &NativeRunInput, role: RunRole) -> AgentState {
-    let (initial_intent, initial_action_oriented, initial_report_only) =
-        derive_classifier_signals(input, role);
-    let (extra, declared_outcome, stop_reason, result) = build_initial_extra(input);
-    let graph_automation_mode = parse_automation_mode(&input.automation_mode);
-
-    AgentState {
-        messages: build_initial_messages(input),
-        thread_id: Some(input.run_id.to_string()),
-        session_id: Some(input.session_id.to_string()),
-        system_text: Some(input.system_text.clone()),
-        intent_hint: input.intent_hint.clone(),
-        user_intent: initial_intent,
-        action_oriented: initial_action_oriented,
-        report_only: initial_report_only,
-        provider_override: Some(input.provider.clone()),
-        model_override: Some(input.model.clone()),
-        // Tools al modello: l'array (se presente). Qualunque forma non-array
-        // (incluso null) -> None: lo stato tratta None come "nessun tool dichiarato".
-        tools_json: input.tools_json.as_array().cloned(),
-        automation_mode: graph_automation_mode,
-        approved: automation_mode_skips_hitl(graph_automation_mode).then_some(true),
-        supervisor_mode: Some(input.supervisor_mode),
-        declared_outcome,
-        stop_reason,
-        result,
-        extra,
-        // DEBITO 1 chiuso (TODO Fase 5): `behavior_mode` valorizzato con la STESSA
-        // fonte del primario Python, il quale lo riceve dal payload
-        // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
-        // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
-        // costante `PRIMARY_BEHAVIOR_MODE` (`brain_agent_client.rs`): la riusiamo
-        // qui (punto unico, regola L) cosi' lo shadow confronta un grafo col mode
-        // IDENTICO. Conta sul serio dal momento in cui il planner e' eleggibile
-        // (`plan_phase_enabled=true`, mig 0426/0439): `PlannerConfig::is_eligible`
-        // gata su questo mode; senza valorizzarlo, lo shadow divergerebbe (None vs
-        // "bilanciata"). Il valore-vero-dal-turno (derivarlo dall'automation_mode/
-        // routing) e' un miglioramento separato, valido per ENTRAMBI i motori
-        // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
-        behavior_mode: Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE.to_string()),
-        // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
-        // stato cosi' il grafo applica i guard di annidamento (UnderstandingNode skip
-        // del fan-out explore se depth>=1). `None` per il run principale -> stato
-        // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
-        parent_run_id: input.parent_run_id.map(|u| u.to_string()),
-        subagent_depth: input.subagent_depth,
-        ..Default::default()
-    }
-}
-
-/// Conversazione iniziale del run: la history pregressa nel formato compatto
-/// `{"role","content"}` prodotto da `build_recent_conversation_history` (lo
-/// STESSO che riceve il brain endpoint /agent/run/stream, regola L), col
-/// messaggio utente del turno corrente in coda. Le entry malformate sono saltate
-/// (best-effort, non bloccano il run).
-fn build_initial_messages(input: &NativeRunInput) -> Vec<Message> {
+/// derive_*` (regola L): cosi' converge col primario Python (no G1 spurio sui
+/// turni read-only, tool sui turni d'azione). Quando i dati del classifier sono
+/// ASSENTI resta INTATTO (None -> il `RouterNode` decide come oggi), comportamento
+/// INVARIATO. Il primario PYTHON (`run_via_brain`) NON passa di qui: ri-classifica
+/// internamente nel router_node.
+fn build_initial_state(input: &NativeRunInput) -> AgentState {
     use nexus_agent_graph::state::MessageContent;
 
+    // History pregressa nel formato compatto `{"role","content"}` prodotto da
+    // `build_recent_conversation_history` (lo STESSO che riceve il brain endpoint
+    // /agent/run/stream, regola L). Le entry malformate sono saltate (best-effort,
+    // non bloccano il run).
     let mut messages: Vec<Message> = input
         .conversation_history
         .iter()
         .filter_map(history_entry_to_message)
         .collect();
+
+    // Messaggio utente del turno corrente in coda.
     messages.push(Message::Human {
         content: MessageContent::text(input.initial_msg.clone()),
     });
-    messages
-}
 
-/// Tappa 1b (B) + parita' PRIMARIO RUST: deriva `(user_intent, action_oriented,
-/// report_only)` dai dati del classifier del turno.
-///
-/// RADICE della divergenza stop_reason (g1 sui run 0-tool, loop sui run con
-/// tool): il `RouterNode` del grafo Rust NON riclassifica (classifier LLM
-/// delegato a un PR successivo), quindi senza dati cade nel fallback
-/// `agentic_default` con `action_oriented=true` SEMPRE. Il primario Python invece
-/// deriva `action_oriented` dal classifier del turno: per i turni conversazionali
-/// read-only e' `false` -> niente G1.
-///
-/// Per far CONVERGERE sia lo SHADOW sia il PRIMARIO RUST col primario Python si
-/// derivano `action_oriented`/`report_only` dagli STESSI dati del classifier del
-/// turno (`requires_tools`/`agentic_score`/`authorizes_changes`) col PUNTO UNICO
-/// `intent_classifier::derive_*` (regola L: porting 1:1 di
-/// `brain/agents/nodes/__init__.py:686-739`). Il call site popola questi campi in
-/// `NativeRunInput` via [`resolve_classifier_fields`] (helper condiviso, regola
-/// L) in ENTRAMBI i rami Shadow e PRIMARY-Rust; il fix precedente grossolano
-/// (`action_oriented_for_intent(intent_hint)`) resta SOLO come fallback (ramo
-/// shadow) quando i dati del classifier non sono disponibili. Quando NESSUN dato
-/// del classifier e' presente il primario resta None -> il RouterNode decide
-/// (comportamento INVARIATO). Il primario PYTHON NON passa di qui.
-fn derive_classifier_signals(
-    input: &NativeRunInput,
-    role: RunRole,
-) -> (Option<String>, Option<bool>, Option<bool>) {
-    // I dati del classifier sono presenti (popolati dal call site). Sia per
-    // Shadow sia per Primary la derivazione FEDELE e' identica.
+    // Tools al modello: l'array (se presente). Qualunque forma non-array
+    // (incluso null) -> None: lo stato tratta None come "nessun tool dichiarato".
+    let tools = input.tools_json.as_array().cloned();
+
+    // ── Tappa 1b (B) + parita' PRIMARIO RUST: action_oriented/report_only FEDELI ─
+    // RADICE della divergenza stop_reason (g1 sui run 0-tool, loop sui run con
+    // tool): il `RouterNode` del grafo Rust NON riclassifica (classifier LLM
+    // delegato a un PR successivo), quindi senza dati cade nel fallback
+    // `agentic_default` con `action_oriented=true` SEMPRE. Il primario Python
+    // invece deriva `action_oriented` dal classifier del turno: per i turni
+    // conversazionali read-only e' `false` -> niente G1.
+    //
+    // Per far CONVERGERE il PRIMARIO RUST col primario Python deriviamo
+    // `action_oriented`/`report_only` dagli STESSI dati del classifier del turno
+    // (`requires_tools`/`agentic_score`/`authorizes_changes`) col PUNTO UNICO
+    // `intent_classifier::derive_*` (regola L: porting 1:1 di
+    // `brain/agents/nodes/__init__.py:686-739`). Il call site popola questi campi
+    // in `NativeRunInput` via [`resolve_classifier_fields`] (helper condiviso,
+    // regola L). Quando NESSUN dato del classifier e' presente lo stato resta None
+    // -> il RouterNode decide (comportamento INVARIATO). Il primario PYTHON NON
+    // passa di qui.
+    //
+    // `derive_from_classifier`: i dati del classifier sono presenti (popolati dal
+    // call site).
     let derive_from_classifier = input.classifier_resolved
         || input.requires_tools.is_some()
         || input.agentic_score.is_some();
@@ -2542,114 +2623,62 @@ fn derive_classifier_signals(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (initial_intent, initial_action_oriented) =
-        derive_intent_and_action(input, role, intent_hint, derive_from_classifier);
-    let initial_report_only = derive_report_only_signal(
-        input,
-        role,
-        intent_hint,
-        derive_from_classifier,
-        initial_action_oriented,
-    );
-    (initial_intent, initial_action_oriented, initial_report_only)
-}
+    let (initial_intent, initial_action_oriented): (Option<String>, Option<bool>) =
+        if derive_from_classifier {
+            // Derivazione FEDELE (Primary-Rust), identica al primario Python.
+            let action_oriented = crate::intent_classifier::derive_action_oriented(
+                intent_hint,
+                input.requires_tools,
+                input.agentic_score,
+                input.action_oriented_min_score,
+            );
+            // user_intent = intent del classifier del turno (propagato dal call
+            // site) cosi' il RouterNode lo preserva invece del neutro; fallback
+            // all'intent_hint (disambiguazione risolta) se il classifier manca.
+            (
+                input
+                    .classifier_intent
+                    .clone()
+                    .or_else(|| intent_hint.map(str::to_string)),
+                Some(action_oriented),
+            )
+        } else {
+            // Primario Rust senza dati classifier: INTATTO (None -> RouterNode).
+            (None, None)
+        };
 
-/// `(user_intent, action_oriented)` del turno. Vedi [`derive_classifier_signals`]
-/// per il razionale della derivazione fedele.
-fn derive_intent_and_action(
-    input: &NativeRunInput,
-    role: RunRole,
-    intent_hint: Option<&str>,
-    derive_from_classifier: bool,
-) -> (Option<String>, Option<bool>) {
-    if derive_from_classifier {
-        // Derivazione FEDELE (Shadow o Primary-Rust), identica al primario Python.
-        let action_oriented = crate::intent_classifier::derive_action_oriented(
+    // report_only FEDELE (porting `__init__.py:736-739`), CABLATO nello stato del
+    // grafo: l'executor lo consuma per NON strippare i tool read-only sui turni
+    // di sola lettura (incidente 2026-07-02: "elenca i file" ha requires_tools=true
+    // -> action_oriented=true, ma authorizes_changes=false -> report_only=true; lo
+    // strip lasciava solo tool di scrittura e il run degenerava in edit-loop).
+    // Vale quando i dati del classifier sono presenti; senza dati resta None
+    // (guard inerti solo su Some(true)).
+    let initial_report_only: Option<bool> = if derive_from_classifier {
+        let report_only = crate::intent_classifier::derive_report_only(
+            input.classifier_resolved,
             intent_hint,
-            input.requires_tools,
-            input.agentic_score,
-            input.action_oriented_min_score,
+            input.authorizes_changes.unwrap_or(true),
         );
-        // user_intent: l'intent del primario se noto (intent_hint), altrimenti
-        // None (l'intent vive nel routing, non e' richiesto dal grafo per
-        // action_oriented).
-        (intent_hint.map(str::to_string), Some(action_oriented))
-    } else if role.is_shadow() {
-        // Fallback grossolano SOLO shadow (classifier non disponibile): deriva
-        // dall'intent_hint con la mappa deterministica. Quando manca anche
-        // l'hint, None -> il RouterNode shadow applica il fallback del Python
-        // degradato. Il PRIMARIO RUST senza dati resta None (decide il
-        // RouterNode), comportamento INVARIATO.
-        match intent_hint {
-            Some(intent) => (
-                Some(intent.to_string()),
-                Some(nexus_agent_graph::decisions::action_oriented_for_intent(
-                    intent,
-                )),
-            ),
-            None => (None, None),
-        }
+        tracing::debug!(
+            run_id = %input.run_id,
+            report_only,
+            action_oriented = ?initial_action_oriented,
+            "native: derivazione fedele action_oriented/report_only dal classifier"
+        );
+        Some(report_only)
     } else {
-        // Primario Rust senza dati classifier: INTATTO (None -> RouterNode).
-        (None, None)
-    }
-}
+        None
+    };
 
-/// `report_only` FEDELE (porting `__init__.py:736-739`), CABLATO nello stato del
-/// grafo: l'executor lo consuma per NON strippare i tool read-only sui turni di
-/// sola lettura (incidente 2026-07-02: "elenca i file" ha requires_tools=true ->
-/// action_oriented=true, ma authorizes_changes=false -> report_only=true; lo
-/// strip lasciava solo tool di scrittura e il run degenerava in edit-loop).
-/// Vale per ENTRAMBI Shadow e Primary-Rust quando i dati del classifier sono
-/// presenti; senza dati resta None (guard inerti solo su Some(true)).
-fn derive_report_only_signal(
-    input: &NativeRunInput,
-    role: RunRole,
-    intent_hint: Option<&str>,
-    derive_from_classifier: bool,
-    action_oriented: Option<bool>,
-) -> Option<bool> {
-    if !derive_from_classifier {
-        return None;
-    }
-    let report_only = crate::intent_classifier::derive_report_only(
-        input.classifier_resolved,
-        intent_hint,
-        input.authorizes_changes.unwrap_or(true),
-    );
-    tracing::debug!(
-        run_id = %input.run_id,
-        role_shadow = role.is_shadow(),
-        report_only,
-        action_oriented = ?action_oriented,
-        "native: derivazione fedele action_oriented/report_only dal classifier"
-    );
-    Some(report_only)
-}
-
-/// Costruisce il blocco `extra` dello stato iniziale + l'eventuale esito GIA'
-/// terminale imposto dal consiglio a monte.
-///
-/// `ORIGINAL_TASK_KEY`: task del turno CORRENTE fissato all'origine (punto unico,
-/// regola L). Il supervisore lo legge da qui (`extract_original_task`) invece di
-/// ri-derivarlo dalla cronologia, che in una sessione multi-turno contiene i task
-/// dei turni PRECEDENTI. Senza questo, il supervisore inseguiva il primo Human del
-/// run — spesso un auto-debug di crash iniettato dall'observer — invece del task
-/// reale (incidente Chat 11 Beaty-Book: 60 iterazioni sul crash frontend al posto
-/// del task di sicurezza auth).
-///
-/// Quando la sintesi del consiglio porta un enforcement TERMINALE, il run nasce
-/// gia' chiuso: `(declared_outcome, stop_reason=EndTurn, result)` valorizzati.
-/// Altrimenti restano `None` e il grafo parte normalmente.
-fn build_initial_extra(
-    input: &NativeRunInput,
-) -> (
-    serde_json::Map<String, Value>,
-    Option<Value>,
-    Option<nexus_agent_graph::state::StopReason>,
-    Option<String>,
-) {
     let mut extra = serde_json::Map::new();
+    // Task del turno CORRENTE fissato all'origine (punto unico, regola L): il
+    // supervisore lo legge da qui (`extract_original_task`) invece di ri-derivarlo
+    // dalla cronologia, che in una sessione multi-turno contiene i task dei turni
+    // PRECEDENTI. Senza questo, il supervisore inseguiva il primo Human del run —
+    // spesso un auto-debug di crash iniettato dall'observer — invece del task reale
+    // (incidente Chat 11 Beaty-Book: 60 iterazioni sul crash frontend al posto del
+    // task di sicurezza auth).
     extra.insert(
         nexus_agent_graph::decisions::ORIGINAL_TASK_KEY.to_string(),
         serde_json::Value::String(input.initial_msg.clone()),
@@ -2686,7 +2715,76 @@ fn build_initial_extra(
             }
         }
     }
-    (extra, declared_outcome, stop_reason, result)
+
+    let graph_automation_mode = parse_automation_mode(&input.automation_mode);
+    let skip_hitl = automation_mode_skips_hitl(graph_automation_mode);
+
+    AgentState {
+        messages,
+        thread_id: Some(input.run_id.to_string()),
+        session_id: Some(input.session_id.to_string()),
+        system_text: Some(input.system_text.clone()),
+        // Chiave del prompt di sistema: la usa il ReflectionNode come
+        // `prompt_key` per persistere in `nexus_agent_reflections`. Senza,
+        // `spawn_persist` esce subito e la tabella resta vuota (com'era).
+        profile_name: input.prompt_key.clone(),
+        intent_hint: input.intent_hint.clone(),
+        user_intent: initial_intent,
+        action_oriented: initial_action_oriented,
+        report_only: initial_report_only,
+        provider_override: Some(input.provider.clone()),
+        model_override: Some(input.model.clone()),
+        tools_json: tools,
+        automation_mode: graph_automation_mode,
+        approved: skip_hitl.then_some(true),
+        supervisor_mode: Some(input.supervisor_mode),
+        declared_outcome,
+        stop_reason,
+        result,
+        extra,
+        // DEBITO 1 chiuso (TODO Fase 5): `behavior_mode` valorizzato con la STESSA
+        // fonte del primario Python, il quale lo riceve dal payload
+        // `/agent/run/stream` (campo `behavior_mode`) e lo copia in
+        // `initial_state["behavior_mode"]` (`agent.py:621`). mcp-core invia la
+        // costante `PRIMARY_BEHAVIOR_MODE` (`agent_turn_setup.rs`): la riusiamo
+        // qui (punto unico, regola L). Conta sul serio dal momento in cui il
+        // planner e' eleggibile (`plan_phase_enabled=true`, mig 0426/0439):
+        // `PlannerConfig::is_eligible` gata su questo mode; senza valorizzarlo lo
+        // stato divergerebbe (None vs "bilanciata"). Il valore-vero-dal-turno
+        // (derivarlo dall'automation_mode/routing) e' un miglioramento separato
+        // (fuori scope: andrebbe cambiato PRIMA lato Python, vedi nota costante).
+        behavior_mode: Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE.to_string()),
+        // Sub-agente nativo (porting di `run_subagent`): valorizza parent/depth nello
+        // stato cosi' il grafo applica i guard di annidamento (UnderstandingNode skip
+        // del fan-out explore se depth>=1). `None` per il run principale -> stato
+        // INVARIATO (default None). Solo `dispatch_subagent` popola questi campi.
+        parent_run_id: input.parent_run_id.map(|u| u.to_string()),
+        subagent_depth: input.subagent_depth,
+        // Epoch di avvio per la deadline di run (fase 3): scritto UNA volta qui
+        // e checkpointato — un resume riparte dal checkpoint, quindi la deadline
+        // misura il run INTERO. I sub-run hanno il proprio epoch ma il loro
+        // tetto effettivo resta il tokio timeout clampato in prepare.
+        run_started_at_epoch_s: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64),
+        // Segnali del classifier del TURNO nello stato del grafo (regola O: la
+        // misura deve raggiungere il suo oggetto). Sono gia' RISOLTI al call site
+        // (`agent_run.rs`: `sizing_complexity` = classe del classifier del turno,
+        // `agentic_score` = punteggio 0..1) ma finora `..Default::default()` li
+        // scartava -> il grafo primario nativo girava CIECO: `is_complex`
+        // (UnderstandingNode) sempre false e il GATE ORCHESTRAZIONE del planner
+        // (`orchestration_gate`, consulta il MetaReasoner con `task_complexity`/
+        // `agentic_score`) decideva su valori a ZERO -> RunInline -> plan-phase
+        // SALTATA anche per "crea un'app". Seminandoli il reasoner vede la
+        // complessita' reale e la plan-phase si attiva sui task complessi. Sub-run
+        // e resume NON risolvono il classifier (input a `None`) -> restano `None`,
+        // comportamento INVARIATO. `agentic_score` di stato e' f64 (il campo del
+        // classifier e' f32): cast diretto, nessuna perdita significativa.
+        task_complexity: input.sizing_complexity.map(Into::into),
+        agentic_score: input.agentic_score.map(|s| s as f64),
+        ..Default::default()
+    }
 }
 
 /// Parsing della modalita' automazione nel enum del grafo. Delega al punto unico
@@ -2713,13 +2811,12 @@ fn automation_mode_skips_hitl(mode: Option<nexus_agent_graph::AutomationMode>) -
 /// `initial_state` dal prompt, gira `run_until_interrupt` e mappa l'esito.
 ///
 /// `init` distingue nuovo run (Some) da resume (None, riparte dal checkpoint).
-/// Per il path primario `shadow=false` (`ExecMode::Real`): i tool hanno
-/// side-effect reali sul progetto.
+/// I tool hanno side-effect reali sul progetto.
 pub async fn run_native(
     deps: &NativeDeps,
     input: &NativeRunInput,
 ) -> anyhow::Result<NativeRunOutcome> {
-    let outcome = run_engine(deps, input, RunMode::New, RunRole::Primary).await?;
+    let outcome = run_engine(deps, input, RunMode::New).await?;
     Ok(map_outcome(outcome))
 }
 
@@ -2748,7 +2845,6 @@ pub async fn resume_native(
         deps,
         input,
         RunMode::Resume { resume_delta },
-        RunRole::Primary,
     )
     .await?;
     Ok(map_outcome(outcome))
@@ -2872,29 +2968,25 @@ pub async fn resume_native_fanin(
         deps,
         input,
         RunMode::Resume { resume_delta },
-        RunRole::Primary,
     )
     .await?;
     Ok(map_outcome(outcome))
 }
 
 /// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
-/// stato finale, non solo il sommario): il run shadow ne ha bisogno per la
-/// proiezione canonica (conteggio tool, produced_work). Punto unico (regola L)
-/// dell'esecuzione del motore: sia il primario che lo shadow passano di qui,
-/// distinti solo dal `role` (e dal `mode`).
+/// stato finale, non solo il sommario). Punto unico (regola L) dell'esecuzione
+/// del motore.
 ///
 /// `mode` distingue avvio nuovo (`RunMode::New`, initial_state dal prompt) da
 /// resume HITL (`RunMode::Resume`, riparte dal checkpoint applicando il delta di
-/// approvazione). `role` decide tools/emit/checkpointer + il flag `shadow` del ctx.
+/// approvazione).
 async fn run_engine(
     deps: &NativeDeps,
     input: &NativeRunInput,
     mode: RunMode,
-    role: RunRole,
 ) -> anyhow::Result<StepOutcome<AgentState>> {
     let (engine, routing_cfg, llm, tools, emit, isolation_available) =
-        build_native_engine(deps, input, role).await?;
+        build_native_engine(deps, input).await?;
 
     let ctx = AgentNodeCtx {
         db: deps.db.clone(),
@@ -2906,20 +2998,102 @@ async fn run_engine(
         run_id: input.run_id,
         session_id: input.session_id,
         thread_id: input.run_id,
-        // `shadow` deriva dal ruolo: in Shadow i nodi usano ExecMode::Replay (punto
-        // unico AgentNodeCtx::exec_mode) -> tutti gli store gatati no-op, zero
-        // side-effect. Il primario e' Real.
-        shadow: role.is_shadow(),
         // Fase C3 Part B: isolamento fisico dei sub-run disponibile (calcolato in
         // build_native_engine, flag-gated). Alimenta il gate di orchestrazione.
         isolation_available,
+        // Barriera di scrittura advisory (overlap, mig 0606): presente solo se il
+        // chiamante ha avviato il run PRIMA dei panel. `None` = ramo classico
+        // (verdetti gia' nello stato iniziale) -> gate inerte, bit-identico.
+        advisory_gate: input.advisory_gate.clone(),
     };
 
     // Avvio nuovo: parte da `entry` con l'initial_state dal prompt.
     // Resume HITL: nessun init (carica il checkpoint), applica il resume_delta.
     match mode {
         RunMode::New => {
-            let init = Some(prepare_new_run_state(deps, input, role).await);
+            let mut init_state = build_initial_state(input);
+            // ── ROUTING INIZIALE tier (FIX-A scale-controller) ───────────────────
+            // Il primo modello del run e' `(input.provider, input.model)` risolto dal
+            // routing a monte (il primo turno dell'executor lo usa via
+            // provider_override/model_override, sticky ancora assente). La
+            // RoutingMatrix::lookup non porta il tier; lo risolviamo qui dal catalog
+            // (punto unico `resolve_initial_tier`, percorso Real all'avvio) e lo
+            // scriviamo nel checkpoint iniziale. Cosi' `current_tier` e' popolato dal
+            // primo turno, non solo dopo un'escalation/upscale. INERTE (PR-A): nessun
+            // decisore lo legge ancora -> bit-identico. Determinismo: la query e'
+            // FUORI dal loop del grafo; il tier vive poi nello stato checkpointato.
+            init_state.current_tier =
+                Some(resolve_initial_tier(&deps.db, &input.provider, &input.model).await);
+            // Playbook matcher (punto unico, regola L): popola i passi del playbook
+            // che matcha il task, cosi' il planner genera i todo deterministici
+            // (es. nexus_visual_compare per la verifica figma) e il final_gate puo'
+            // applicare design_verify. Senza, `playbook_steps` resta vuoto: era
+            // l'anello mancante del porting (il matcher viveva nel brain Python).
+            // project_root None: i trigger con `project_markers` non sono valutati
+            // qui (root non risolta nel punto di costruzione dello state); i
+            // playbook senza markers — es. verify.design_align — matchano comunque.
+            if let Some(pm) = crate::playbook_engine::match_playbook(
+                &deps.db,
+                input.intent_hint.as_deref(),
+                &input.initial_msg,
+                None,
+            )
+            .await
+            {
+                tracing::info!(
+                    target: "mcp_core::native_engine",
+                    playbook = %pm.key,
+                    steps = pm.steps.len(),
+                    "playbook matchato -> playbook_steps popolati"
+                );
+                init_state.playbook_steps = Some(pm.steps);
+                init_state.playbook_key = Some(pm.key);
+            }
+
+            // ── Detector clarification CROSS-RUN (loop email, blocco #5) ─────────
+            // Calcolato UNA volta all'avvio del run, FUORI dal grafo: il valore e'
+            // checkpointato in `AgentState`, cosi' il grafo lo rilegge dallo stato
+            // senza re-interrogare il DB (la decisione e' presa fuori dal percorso
+            // caldo, il percorso caldo la rilegge).
+            //
+            // FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della
+            // sessione. Il pool e' quello del DOMINIO RUN (agent_runs/meta_steps
+            // migrati al DB progetto), risolto col PUNTO UNICO per-sessione.
+            // Fail-open: DB progetto non disponibile -> detector saltato con WARN
+            // (asse mai attivo, invariato); niente fallback al meta-DB.
+            match crate::project_db_routes::project_data_pool_by_session_from(
+                &deps.db,
+                input.session_id,
+            )
+            .await
+            {
+                Ok(run_db) => {
+                    let clarify_history = PgClarifyHistoryStore::new(run_db);
+                    let (sig, repeat_count) = clarify_history
+                        .latest_signature_and_repeat_count(input.session_id)
+                        .await;
+                    if repeat_count > 0 {
+                        tracing::info!(
+                            target: "mcp_core::native_engine",
+                            session_id = %input.session_id,
+                            repeated_clarify_count = repeat_count,
+                            signature = sig.as_deref().unwrap_or(""),
+                            "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
+                        );
+                    }
+                    init_state.repeated_clarify_count = Some(repeat_count);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mcp_core::native_engine",
+                        session_id = %input.session_id,
+                        error = %e,
+                        "detector clarify cross-run: DB progetto non disponibile, detector saltato"
+                    );
+                }
+            }
+
+            let init = Some(init_state);
             engine
                 .run_until_interrupt(input.run_id, init, &ctx)
                 .await
@@ -2932,109 +3106,23 @@ async fn run_engine(
     }
 }
 
-/// Stato iniziale di un avvio nuovo: lo stato puro da prompt/history
-/// ([`build_initial_state`]) arricchito coi segnali risolti UNA volta all'avvio,
-/// FUORI dal loop del grafo (replay-safe: finiscono nel checkpoint, il percorso
-/// caldo li rilegge senza re-interrogare il DB).
-async fn prepare_new_run_state(
-    deps: &NativeDeps,
-    input: &NativeRunInput,
-    role: RunRole,
-) -> AgentState {
-    let mut init_state = build_initial_state(input, role);
-    // ── ROUTING INIZIALE tier (FIX-A scale-controller) ───────────────────
-    // Il primo modello del run e' `(input.provider, input.model)` risolto dal
-    // routing a monte (il primo turno dell'executor lo usa via
-    // provider_override/model_override, sticky ancora assente). La
-    // RoutingMatrix::lookup non porta il tier; lo risolviamo qui dal catalog
-    // (punto unico `resolve_initial_tier`, percorso Real all'avvio) e lo
-    // scriviamo nel checkpoint iniziale. Cosi' `current_tier` e' popolato dal
-    // primo turno, non solo dopo un'escalation/upscale. INERTE (PR-A): nessun
-    // decisore lo legge ancora -> bit-identico. Determinismo: la query e'
-    // FUORI dal loop del grafo (non nel path di Replay); il tier vive poi
-    // nello stato checkpointato, condiviso da Primary e Shadow (convergono).
-    init_state.current_tier =
-        Some(resolve_initial_tier(&deps.db, &input.provider, &input.model).await);
-    apply_playbook_steps(deps, input, &mut init_state).await;
-    if !role.is_shadow() {
-        apply_repeated_clarify_count(deps, input, &mut init_state).await;
-    }
-    init_state
-}
-
-/// Playbook matcher (punto unico, regola L): popola i passi del playbook che
-/// matcha il task, cosi' il planner genera i todo deterministici (es.
-/// nexus_visual_compare per la verifica figma) e il final_gate puo' applicare
-/// design_verify. Senza, `playbook_steps` resta vuoto: era l'anello mancante del
-/// porting (il matcher viveva nel brain Python).
-///
-/// `project_root` None: i trigger con `project_markers` non sono valutati qui
-/// (root non risolta nel punto di costruzione dello state); i playbook senza
-/// markers — es. verify.design_align — matchano comunque.
-async fn apply_playbook_steps(deps: &NativeDeps, input: &NativeRunInput, state: &mut AgentState) {
-    if let Some(pm) = crate::playbook_engine::match_playbook(
-        &deps.db,
-        input.intent_hint.as_deref(),
-        &input.initial_msg,
-        None,
-    )
-    .await
-    {
-        tracing::info!(
-            target: "mcp_core::native_engine",
-            playbook = %pm.key,
-            steps = pm.steps.len(),
-            "playbook matchato -> playbook_steps popolati"
-        );
-        state.playbook_steps = Some(pm.steps);
-        state.playbook_key = Some(pm.key);
-    }
-}
-
-/// Detector clarification CROSS-RUN (loop email, blocco #5). Solo PRIMARIO: nello
-/// shadow (Replay) NON leggiamo stato live che evolve (come
-/// `NullBillingCooldownPort`) — lo shadow rigioca lo stato del primario, che
-/// porta gia' `repeated_clarify_count` checkpointato.
-///
-/// FONTE STRUTTURATA (regola M): i meta_step `kind='clarify'` della sessione. Il
-/// pool e' quello del DOMINIO RUN (agent_runs/meta_steps migrati al DB progetto),
-/// risolto col PUNTO UNICO per-sessione. Fail-open: guasto DB -> conteggio 0
-/// (asse mai attivo, invariato).
-async fn apply_repeated_clarify_count(
-    deps: &NativeDeps,
-    input: &NativeRunInput,
-    state: &mut AgentState,
-) {
-    let run_db =
-        crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
-            .await;
-    let clarify_history = PgClarifyHistoryStore::new(run_db);
-    let (sig, repeat_count) = clarify_history
-        .latest_signature_and_repeat_count(input.session_id)
-        .await;
-    if repeat_count > 0 {
-        tracing::info!(
-            target: "mcp_core::native_engine",
-            session_id = %input.session_id,
-            repeated_clarify_count = repeat_count,
-            signature = sig.as_deref().unwrap_or(""),
-            "detector clarify cross-run: domande-chiarimento ripetute nella sessione"
-        );
-    }
-    state.repeated_clarify_count = Some(repeat_count);
-}
-
 /// Mappa lo [`StepOutcome`] del motore nel [`NativeRunOutcome`] del chiamante.
 /// Estrae anche usage/iterazioni/intent dallo stato finale (servono al
 /// finalizzatore condiviso, regola L).
-fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
+///
+/// `pub(crate)` perche' e' l'UNICO produttore del `NativeRunOutcome` che il
+/// finalizzatore consuma: i test del consumatore
+/// (`chat_messages::agent_run::tests_native_mapping`) devono raggiungerlo per la
+/// stessa strada della produzione, non fabbricarsi l'outcome a mano (regola O).
+/// Finche' era privato, quei test partivano da un outcome costruito su misura e
+/// una mutazione qui dentro li lasciava tutti verdi.
+pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
     let (state, completed, resume_at) = match outcome {
         StepOutcome::Completed(state) => (state, true, None),
         StepOutcome::Interrupted { state, resume_at } => {
             (state, false, Some(resume_at.as_label().to_string()))
         }
     };
-    let (error_class, pending_actions) = extra_signals(&state);
     NativeRunOutcome {
         completed,
         // Fan-in (Fase D): l'interrupt e' l'attesa dei sub-run background se lo
@@ -3050,347 +3138,85 @@ fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
         prompt_tokens: state.prompt_tokens.unwrap_or(0),
         completion_tokens: state.completion_tokens.unwrap_or(0),
         total_tokens: state.total_tokens.unwrap_or(0),
-        total_cost: state.total_cost_usd.unwrap_or(0.0),
+        // Costo del RUN, non del turno: `total_cost_usd` ha un reducer overwrite e
+        // vale l'ULTIMA iterazione, mentre `run_cost_cumulative_usd` somma i costi
+        // di tutti i turni (executor.rs, "Costo cumulativo REALE del run") ed e' lo
+        // STESSO campo su cui gia' decide il freno di spesa. Asimmetria VOLUTA coi
+        // token qui sopra, che restano dell'ultimo turno by design (alimentano
+        // `last_prompt_tokens` = riempimento contesto): non "uniformarli".
+        total_cost: state.run_cost_cumulative_usd.unwrap_or(0.0),
         user_intent: state.user_intent.clone(),
         reasoning: state.reasoning_acc.clone().filter(|s| !s.trim().is_empty()),
-        messages_json: serialize_messages_json(&state.messages),
+        // Conversazione finale serializzata per agent_runs.messages_json (resume +
+        // trace panel). `Message` serializza in `{role, content, [tool_calls|
+        // tool_call_id]}`, la forma attesa dal resume. Conversazione vuota o
+        // serializzazione fallita -> None (la colonna resta NULL, nessun valore
+        // spurio).
+        messages_json: if state.messages.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&state.messages).ok()
+        },
         declared_outcome: state.declared_outcome.clone(),
         review_verdict: state.review_verdict.clone(),
         advisory_verdict: state.advisory_verdict.clone(),
-        error_class,
+        debate_position: state.debate_position.clone(),
+        error_class: state
+            .extra
+            .get("error_class")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         forced_close_unverified: state.forced_close_unverified.unwrap_or(false),
+        // Esito della review adversariale dal SEGNALE del ReviewGate (regola M),
+        // match esaustivo: un ramo nuovo del nodo non compila finche' non
+        // dichiara cosa significa qui. `PendingCorrection` a fine run e' vero
+        // per costruzione: la review aveva bocciato e la ri-review non e'
+        // avvenuta (run morto prima di rientrare).
+        review_panel_rejected: match state.review_gate_verdict {
+            Some(ReviewGateVerdict::PendingCorrection | ReviewGateVerdict::RejectedFinal) => true,
+            Some(
+                ReviewGateVerdict::Approved
+                | ReviewGateVerdict::NotApplicable
+                | ReviewGateVerdict::Inconclusive
+                | ReviewGateVerdict::Unavailable,
+            )
+            | None => false,
+        },
+        review_panel_last: state.extra.get("review_panel_last").cloned(),
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
-        final_gate_failed_pending: final_gate_failed_pending(&state),
-        // Stesso valore che main calcolava qui inline: ora arriva da `extra_signals`,
-        // che lo estrae con `error_class` (identica catena su `state.extra`).
-        pending_actions,
-    }
-}
-
-/// Conversazione finale serializzata per `agent_runs.messages_json` (resume +
-/// trace panel). `Message` serializza in `{role, content, [tool_calls|
-/// tool_call_id]}`, la forma attesa dal resume. Conversazione vuota o
-/// serializzazione fallita -> `None` (la colonna resta NULL, nessun valore
-/// spurio).
-fn serialize_messages_json(messages: &[Message]) -> Option<String> {
-    if messages.is_empty() {
-        None
-    } else {
-        serde_json::to_string(messages).ok()
-    }
-}
-
-/// Bocciatura del gate rimasta pendente a fine run: letta dal SEGNALE del gate
-/// (regola M), non dedotta dal CONTATORE `final_gate_cycle`.
-///
-/// Il `match` e' esaustivo di proposito: un ramo nuovo del gate non compila finche'
-/// non dichiara cosa significa qui.
-fn final_gate_failed_pending(state: &AgentState) -> bool {
-    match state.final_gate_verdict {
-        // L'unico caso vero: bocciato con ri-verifica ATTESA e mai avvenuta.
-        // In plan-phase il gate e' one-shot (`final_gate_eligible` la esclude):
-        // nessuna ri-verifica era prevista, quindi non e' "pendente".
-        Some(FinalGateVerdict::FailedPendingCorrection) => !state.plan_phase_active.unwrap_or(false),
-        // Grazia: criteri oggettivi TUTTI passati, manca solo la firma. Era questo
-        // il falso positivo: lascia `cycle = max_cycles` e veniva letto come
-        // "verifica fallita e non ripetuta".
-        Some(FinalGateVerdict::ObjectivePassedSignatureMissing) => false,
-        // Verdetti espliciti: l'esito lo portano `final_gate_passed` /
-        // `final_gate_unverified`, non questo flag.
-        Some(FinalGateVerdict::Passed | FinalGateVerdict::FailedFinal) => false,
-        // Il run e' proseguito su un modello promosso: non e' un esito.
-        Some(FinalGateVerdict::EscalationHandoff) => false,
-        // Il gate non e' mai entrato: niente da dichiarare fallito.
-        None => false,
-    }
-}
-
-/// Segnali che il grafo deposita in `AgentState::extra` invece che in un campo
-/// tipizzato: classe d'errore del gateway e azioni HITL rimaste pendenti.
-/// Entrambi assenti -> `(None, vec![])`, come i rispettivi default dell'outcome.
-fn extra_signals(state: &AgentState) -> (Option<String>, Vec<Value>) {
-    let error_class = state
-        .extra
-        .get("error_class")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let pending_actions = state
-        .extra
-        .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    (error_class, pending_actions)
-}
-
-// ===========================================================================
-// SHADOW (F4): driver di confronto STATO FINALE primario Python <-> shadow Rust.
-//
-// Modello STRADA B (confronto stato finale, NON per-nodo): il grafo Python e
-// quello Rust hanno topologie DIVERSE (i nodi non corrispondono 1:1), quindi un
-// confronto per-nodo e' inutile. Si esegue l'INTERO grafo Rust in shadow (Replay
-// dei tool_result del primario, LlmGateway REAL) e si confronta la PROIEZIONE
-// CANONICA dell'esito (segnali STRUTTURALI), NON il testo della risposta (con
-// LLM Real il testo diverge sempre -> rumore inutile). Si persiste UN solo record
-// in nexus_shadow_telemetry con node_name "__final_state__".
-// ===========================================================================
-
-/// Pseudo-nodo della telemetria shadow: il confronto e' sullo STATO FINALE, non
-/// per-nodo (le topologie Python/Rust differiscono). Un solo record per run.
-const SHADOW_FINAL_STATE_NODE: &str = "__final_state__";
-
-/// Tool che producono LAVORO concreto sul progetto (scrittura/modifica/esecuzione).
-/// Se il run ne ha invocato almeno uno, `has_produced_work=true` nella proiezione
-/// canonica. Lista MINIMA estendibile (e' una proiezione, non un enforcement).
-const MUTATING_TOOLS: &[&str] = &[
-    "write_file",
-    "edit_file",
-    "create_file",
-    "apply_patch",
-    "rename_file",
-    "fs_move",
-    "run_command",
-];
-
-/// Canonicalizza un `stop_reason` (Rust o Python) al VOCABOLARIO COMUNE della
-/// proiezione: `end_turn` / `tool_use` / `failed` / `interrupted` / `loop` /
-/// `superseded` / `other`. Punto unico (regola L): sia il primario (stringa dal
-/// DB) sia lo shadow (enum Rust mappato a stringa via serde) passano di qui, cosi'
-/// i due lati sono confrontabili anche se nascono da rappresentazioni diverse.
-///
-/// `None` (nessun stop_reason) -> `"none"`. Stringhe Python note (es. lo status
-/// `agent_runs.status` quando lo stop_reason non e' separato) sono mappate ai
-/// valori del vocabolario; le ignote ricadono su `"other"` (esplicito, niente
-/// magic fallback su un valore di business — regola G).
-fn canonical_stop_reason(raw: Option<&str>) -> &'static str {
-    match raw.map(|s| s.trim().to_ascii_lowercase()) {
-        None => "none",
-        Some(s) => match s.as_str() {
-            // Vocabolario comune diretto.
-            "end_turn"
-            | "endturn"
-            | "stop"
-            | "completed"
-            | "completed_verified"
-            | "completed_unverified" => "end_turn",
-            "tool_use" | "tooluse" => "tool_use",
-            "error" | "failed" | "failed_diagnosed" => "failed",
-            "interrupted" | "awaiting_confirmation" | "blocked_needs_input" => "interrupted",
-            "loop_detected" | "loop_abort" | "loopdetected" | "loopabort" => "loop",
-            "superseded" => "superseded",
-            "g1_escalated" | "g1_cap_reached" | "g1escalated" | "g1capreached" => "g1",
-            "" => "none",
-            _ => "other",
+        // Bocciatura del gate rimasta pendente a fine run: letta dal SEGNALE del
+        // gate (regola M), non piu' dedotta dal CONTATORE `final_gate_cycle`.
+        // Il `match` e' esaustivo di proposito: un ramo nuovo del gate non
+        // compila finche' non dichiara cosa significa qui.
+        final_gate_failed_pending: match state.final_gate_verdict {
+            // L'unico caso vero: bocciato con ri-verifica ATTESA e mai avvenuta.
+            // In plan-phase il gate e' one-shot (`final_gate_eligible` la esclude):
+            // nessuna ri-verifica era prevista, quindi non e' "pendente".
+            Some(FinalGateVerdict::FailedPendingCorrection) => {
+                !state.plan_phase_active.unwrap_or(false)
+            }
+            // Grazia: criteri oggettivi TUTTI passati, manca solo la firma. Era
+            // questo il falso positivo: lascia `cycle = max_cycles` e veniva
+            // letto come "verifica fallita e non ripetuta".
+            Some(FinalGateVerdict::ObjectivePassedSignatureMissing) => false,
+            // Verdetti espliciti: l'esito lo portano `final_gate_passed` /
+            // `final_gate_unverified`, non questo flag.
+            Some(FinalGateVerdict::Passed | FinalGateVerdict::FailedFinal) => false,
+            // Il run e' proseguito su un modello promosso: non e' un esito.
+            Some(FinalGateVerdict::EscalationHandoff) => false,
+            // Il gate non e' mai entrato: niente da dichiarare fallito.
+            None => false,
         },
+        pending_actions: state
+            .extra
+            .get(HITL_PENDING_ACTIONS_EXTRA_KEY)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
     }
 }
 
-/// Serializza lo `StopReason` Rust nella sua forma snake_case (la stessa del
-/// `#[serde(rename_all = "snake_case")]` dell'enum) per poi canonicalizzarla con
-/// lo STESSO `canonical_stop_reason` del primario (un solo vocabolario, regola L).
-fn stop_reason_label(sr: Option<StopReason>) -> Option<String> {
-    sr.and_then(|r| match serde_json::to_value(r) {
-        Ok(Value::String(s)) => Some(s),
-        _ => None,
-    })
-}
-
-/// Proiezione canonica MINIMA dell'esito di un run (chiavi STRUTTURALI, NON il
-/// testo della risposta). E' il punto unico del confronto shadow (regola L):
-/// sia il primario sia lo shadow producono questa stessa forma, cosi'
-/// `compute_diff` opera su chiavi omogenee. Estendibile con altre chiavi
-/// strutturali (es. files_touched) senza toccare il confronto.
-///
-/// Chiavi:
-/// - `completed` (bool): il grafo e' arrivato a completare?
-/// - `stop_reason` (string): vocabolario comune (vedi `canonical_stop_reason`).
-/// - `num_tool_calls` (int): quanti tool sono stati invocati.
-/// - `has_produced_work` (bool): almeno un tool mutativo (write/edit/run/...)?
-fn make_canonical(
-    completed: bool,
-    stop_reason: &str,
-    num_tool_calls: i64,
-    has_produced_work: bool,
-) -> Value {
-    serde_json::json!({
-        "completed": completed,
-        "stop_reason": stop_reason,
-        "num_tool_calls": num_tool_calls,
-        "has_produced_work": has_produced_work,
-    })
-}
-
-/// Proiezione canonica dell'esito del run SHADOW dal suo `AgentState` finale.
-///
-/// - `completed`: lo `StepOutcome` e' `Completed` (passato dal driver).
-/// - `stop_reason`: canonicalizzato dall'enum Rust.
-/// - tool calls: contati dai `Message` dello stato (forma OpenAI-compat
-///   `Ai.tool_calls` + forma Anthropic `ContentBlock::ToolUse` inline). Per
-///   `has_produced_work` si guarda il NOME del tool contro `MUTATING_TOOLS`.
-fn shadow_canonical(state: &AgentState, completed: bool) -> Value {
-    use nexus_agent_graph::state::{ContentBlock, MessageContent};
-
-    let mut num_tool_calls: i64 = 0;
-    let mut produced = false;
-    let mut note_tool = |name: &str| {
-        num_tool_calls += 1;
-        if MUTATING_TOOLS.contains(&name) {
-            produced = true;
-        }
-    };
-
-    for m in &state.messages {
-        if let Message::Ai {
-            content,
-            tool_calls,
-            ..
-        } = m
-        {
-            // Forma OpenAI-compat: tool_calls fuori dal contenuto.
-            for tc in tool_calls {
-                note_tool(&tc.name);
-            }
-            // Forma Anthropic: ToolUse come blocco di contenuto inline.
-            if let MessageContent::Blocks(blocks) = content {
-                for b in blocks {
-                    if let ContentBlock::ToolUse { name, .. } = b {
-                        note_tool(name);
-                    }
-                }
-            }
-        }
-    }
-
-    let sr_label = stop_reason_label(state.stop_reason);
-    make_canonical(
-        completed,
-        canonical_stop_reason(sr_label.as_deref()),
-        num_tool_calls,
-        produced,
-    )
-}
-
-/// Proiezione canonica dell'esito del run PRIMARIO (Python) letta dal DB.
-///
-/// - `completed`: lo `status` di `agent_runs` e' uno stato di successo
-///   (completed / completed_verified).
-/// - `stop_reason`: canonicalizzato dallo `status` (il primario Python non
-///   persiste uno `stop_reason` separato in agent_runs: lo status e' il segnale
-///   strutturale di chiusura).
-/// - tool calls: contati da `agent_steps` (gli step del run = i tool invocati);
-///   `has_produced_work` se almeno un `tool_name` e' mutativo.
-async fn primary_canonical(db: &PgPool, primary_run_id: Uuid) -> anyhow::Result<Value> {
-    // status e' TEXT NOT NULL (mig 0009): fetch_optional -> Option<String> (None
-    // solo se il run non esiste, caso anomalo nel flusso shadow).
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
-        .bind(primary_run_id)
-        .fetch_optional(db)
-        .await?;
-
-    let tool_names: Vec<String> =
-        sqlx::query_scalar("SELECT tool_name FROM agent_steps WHERE run_id = $1")
-            .bind(primary_run_id)
-            .fetch_all(db)
-            .await?;
-
-    let num_tool_calls = tool_names.len() as i64;
-    let has_produced_work = tool_names
-        .iter()
-        .any(|n| MUTATING_TOOLS.contains(&n.as_str()));
-    let status_lc = status.as_deref().map(|s| s.to_ascii_lowercase());
-    let completed = matches!(
-        status_lc.as_deref(),
-        Some("completed") | Some("completed_verified") | Some("completed_unverified")
-    );
-
-    Ok(make_canonical(
-        completed,
-        canonical_stop_reason(status.as_deref()),
-        num_tool_calls,
-        has_produced_work,
-    ))
-}
-
-/// Driver SHADOW: dato un run PRIMARIO Python gia' concluso, ri-esegue l'intero
-/// grafo Rust in modalita' shadow (read-only) e persiste UN record di telemetria
-/// con il confronto della proiezione canonica.
-///
-/// Shadow-safety (zero side-effect, regola E/F): `ExecMode::Replay` (tool e store
-/// gatati no-op), `ToolExecutor::from_db_for_replay` (rilegge i tool_result del
-/// primario), `NullEventSink` (niente SSE), `MemoryCheckpointer` (niente scritture
-/// su nexus_graph_checkpoints), criterio http del final_gate gatato in Replay
-/// (niente reqwest). L'LLM e' in REPLAY sullo shadow (`ReplayLlmGateway`):
-/// l'executor RIGIOCA la sequenza di tool del primario letta da `agent_steps` (cosi'
-/// `num_tool_calls` converge col primario e le divergenze residue sono BUG VERI del
-/// grafo, non artefatti LLM), gli ausiliari (planner/reflection/clarify) sono
-/// neutralizzati con una risposta neutra deterministica (costo token ZERO). REAL
-/// coesiste sul PRIMARIO via `RunRole` (switch nel punto unico `build_native_engine`).
-///
-/// Su QUALUNQUE errore lo shadow ritorna `Err` ma il chiamante lo tratta come
-/// WARN: lo shadow non deve MAI impattare il run primario.
-pub async fn run_shadow(
-    deps: &NativeDeps,
-    input: &NativeRunInput,
-    primary_run_id: Uuid,
-) -> anyhow::Result<()> {
-    // Esegue il grafo Rust in shadow: nuovo run (initial_state dal prompt del
-    // primario), tools in Replay sul primario, checkpointer in-memory.
-    let outcome = run_engine(
-        deps,
-        input,
-        RunMode::New,
-        RunRole::Shadow { primary_run_id },
-    )
-    .await?;
-
-    let (shadow_state, completed) = match &outcome {
-        StepOutcome::Completed(s) => (s, true),
-        StepOutcome::Interrupted { state, .. } => (state, false),
-    };
-
-    // Proiezioni canoniche: primario dal DB, shadow dallo stato finale.
-    // Separazione DB: agent_runs/agent_steps del primario vivono nel DB del
-    // progetto -> stesso pool risolto dalla sessione usato da run_engine, non il
-    // meta (dove la proiezione uscirebbe vuota: 0 tool calls, completed=false).
-    let primary_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
-            .await;
-    let primary = primary_canonical(&primary_pool, primary_run_id).await?;
-    let shadow = shadow_canonical(shadow_state, completed);
-
-    persist_shadow_diff(&deps.db, primary_run_id, &primary, &shadow).await
-}
-
-/// Persiste UN record "__final_state__" col diff (punto unico shadow, regola L:
-/// NESSUN uso di `DiffCollector::record` per-nodo). `persist_node_diff` ricalcola
-/// internamente i divergent_keys via `compute_diff`.
-async fn persist_shadow_diff(
-    db: &PgPool,
-    primary_run_id: Uuid,
-    primary: &Value,
-    shadow: &Value,
-) -> anyhow::Result<()> {
-    let divergent = nexus_agent_graph::compute_diff(primary, shadow);
-    nexus_agent_graph::persist_node_diff(
-        db,
-        primary_run_id,
-        SHADOW_FINAL_STATE_NODE,
-        primary,
-        shadow,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("persistenza telemetria shadow: {e}"))?;
-
-    // Niente leak (regola F): si logga la convergenza strutturale, non il testo.
-    tracing::info!(
-        primary_run_id = %primary_run_id,
-        converged = divergent.is_empty(),
-        divergent_keys = ?divergent,
-        "shadow: confronto stato finale persistito (__final_state__)"
-    );
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -3422,6 +3248,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "claude-x".to_string(),
             system_text: "sei un assistente".to_string(),
+            prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),
             conversation_history: vec![serde_json::json!({
                 "role": "user",
@@ -3444,17 +3271,24 @@ mod tests {
             // Run principale di test: nessun annidamento sub-agente.
             parent_run_id: None,
             subagent_depth: None,
+            sizing_complexity: None,
+            sizing_scope_system_wide: false,
+            classifier_intent: None,
+            run_time_budget_s: None,
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
+            // Nessun overlap nei test di costruzione dello stato: la barriera e'
+            // esercitata dai test del ToolDispatchNode.
+            advisory_gate: None,
         }
     }
 
     #[test]
     fn initial_state_da_prompt_history_e_override() {
         let input = sample_input();
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(state.messages.len(), 2, "history (1) + turno corrente (1)");
         // L'ULTIMO messaggio e' il prompt utente del turno.
         match state.messages.last().expect("almeno un messaggio") {
@@ -3478,8 +3312,8 @@ mod tests {
         // Python (la costante del client brain), non None.
         assert_eq!(
             state.behavior_mode.as_deref(),
-            Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE),
-            "behavior_mode = fonte primario (bilanciata), per parita' con lo shadow"
+            Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE),
+            "behavior_mode = fonte primario (bilanciata)"
         );
 
         // Tools propagati (array non vuoto).
@@ -3487,8 +3321,8 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "read_file");
 
-        // FIX shadow: il PRIMARIO non forza action_oriented/user_intent: restano
-        // None e il RouterNode reale decide come oggi (zero impatto sul Real).
+        // Senza dati del classifier il PRIMARIO non forza action_oriented/
+        // user_intent: restano None e il RouterNode reale decide come oggi.
         assert_eq!(
             state.action_oriented, None,
             "primario: action_oriented non forzato (decide il RouterNode)"
@@ -3507,7 +3341,7 @@ mod tests {
             "requirements": ["punto unico routing"],
         }));
         input.pre_run_advisory_source = Some("multi_provider_synthesis");
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert!(state
             .extra
             .contains_key(nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY));
@@ -3538,7 +3372,7 @@ mod tests {
             "risks": [{"severity": "high", "description": "x"}],
         }));
         input.pre_run_advisory_source = Some("council");
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         // Il segnale advisory c'e' (il coordinatore lo LEGGE)...
         assert!(state
             .extra
@@ -3570,7 +3404,7 @@ mod tests {
     fn initial_state_tools_null_diventa_none() {
         let mut input = sample_input();
         input.tools_json = serde_json::Value::Null;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert!(state.tools_json.is_none(), "tools null -> None");
     }
 
@@ -3578,7 +3412,7 @@ mod tests {
     #[test]
     fn initial_state_principale_senza_parent_depth() {
         let input = sample_input();
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(state.parent_run_id, None, "run principale: nessun parent");
         assert_eq!(state.subagent_depth, None, "run principale: nessun depth");
     }
@@ -3591,7 +3425,7 @@ mod tests {
         let parent = Uuid::new_v4();
         input.parent_run_id = Some(parent);
         input.subagent_depth = Some(2);
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.parent_run_id.as_deref(),
             Some(parent.to_string().as_str()),
@@ -3601,114 +3435,6 @@ mod tests {
             state.subagent_depth,
             Some(2),
             "sub-run: subagent_depth propagato (anti-ricorsione/guard fan-out)"
-        );
-    }
-
-    /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` OPERATIVO
-    /// (`code_write`), lo stato iniziale deriva `user_intent` + `action_oriented`
-    /// (true) col punto unico, cosi' il grafo shadow non parte da `action_oriented`
-    /// forzato dal fallback del RouterNode.
-    #[test]
-    fn initial_state_shadow_intent_operativo_deriva_action() {
-        let input = sample_input(); // intent_hint = "code_write"
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.user_intent.as_deref(), Some("code_write"));
-        assert_eq!(
-            state.action_oriented,
-            Some(true),
-            "intent operativo -> azione"
-        );
-    }
-
-    /// FIX shadow LLM-Replay: nel ramo Shadow, con `intent_hint` CONVERSAZIONALE
-    /// (`chat`), `action_oriented` deriva a `false` -> niente G1 sui turni 0-tool
-    /// (questa era la RADICE della divergenza `g1`).
-    #[test]
-    fn initial_state_shadow_intent_chat_action_false() {
-        let mut input = sample_input();
-        input.intent_hint = Some("chat".to_string());
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.user_intent.as_deref(), Some("chat"));
-        assert_eq!(
-            state.action_oriented,
-            Some(false),
-            "intent conversazionale -> NON azione (niente G1)"
-        );
-    }
-
-    /// FIX shadow (fallback grossolano): nel ramo Shadow SENZA `intent_hint` E
-    /// senza dati del classifier, lo stato resta a None (il RouterNode shadow
-    /// applichera' il fallback del Python degradato).
-    #[test]
-    fn initial_state_shadow_senza_intent_resta_none() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(state.user_intent, None);
-        assert_eq!(state.action_oriented, None);
-    }
-
-    // ── Tappa 1b (B): derivazione FEDELE dal classifier completo ─────────────
-
-    /// Shadow + classifier RISOLTO su un turno read-only (requires_tools=false,
-    /// agentic_score sotto soglia, niente intent_hint): action_oriented=false
-    /// FEDELE al primario Python -> niente G1Continue -> stop_reason converge.
-    /// Questa e' la RADICE della divergenza g1 che la Tappa 1b chiude.
-    #[test]
-    fn initial_state_shadow_classifier_read_only_action_false() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        input.classifier_resolved = true;
-        input.requires_tools = Some(false);
-        input.agentic_score = Some(0.10);
-        input.authorizes_changes = Some(false);
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(
-            state.action_oriented,
-            Some(false),
-            "turno read-only (classifier risolto) -> NON azione, niente G1"
-        );
-    }
-
-    /// Shadow + classifier RISOLTO su un turno d'azione (requires_tools=true):
-    /// action_oriented=true FEDELE, anche se l'agentic_score e' basso.
-    #[test]
-    fn initial_state_shadow_classifier_azione_action_true() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        input.classifier_resolved = true;
-        input.requires_tools = Some(true);
-        input.agentic_score = Some(0.20);
-        input.authorizes_changes = Some(true);
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(
-            state.action_oriented,
-            Some(true),
-            "requires_tools=true -> azione (fedele al primario)"
-        );
-    }
-
-    /// Shadow + classifier RISOLTO con requires_tools assente ma agentic_score
-    /// SOPRA la soglia: action_oriented=true via soglia (porting __init__.py:699).
-    #[test]
-    fn initial_state_shadow_classifier_score_sopra_soglia_action_true() {
-        let mut input = sample_input();
-        input.intent_hint = None;
-        input.classifier_resolved = true;
-        input.requires_tools = None;
-        input.agentic_score = Some(0.80);
-        input.action_oriented_min_score = 0.5;
-        let primary_run_id = Uuid::new_v4();
-        let state = build_initial_state(&input, RunRole::Shadow { primary_run_id });
-        assert_eq!(
-            state.action_oriented,
-            Some(true),
-            "score 0.80 >= 0.5 -> azione"
         );
     }
 
@@ -3727,7 +3453,7 @@ mod tests {
         input.requires_tools = Some(false);
         input.agentic_score = Some(0.10);
         input.authorizes_changes = Some(false);
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented,
             Some(false),
@@ -3737,6 +3463,32 @@ mod tests {
 
     /// PRIMARIO RUST + classifier RISOLTO su turno d'azione (requires_tools=true):
     /// action_oriented=true FEDELE -> l'agente usa i tool, come il primario Python.
+    /// La chiave del prompt arriva nello stato: senza, il ReflectionNode esce
+    /// subito da `spawn_persist` e `nexus_agent_reflections` resta a zero righe —
+    /// com'e' stata finora, lasciando a digiuno il PromptOptimizerWorker (che e'
+    /// registrato e abilitato) e le rotte `/prompt-experiments`.
+    #[test]
+    fn prompt_key_arriva_nello_stato_del_run() {
+        let input = sample_input();
+        let state = build_initial_state(&input);
+        assert_eq!(
+            state.profile_name.as_deref(),
+            Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY),
+            "il prompt_key deve arrivare allo stato: e' la chiave con cui la \
+             reflection viene persistita e attribuita al template"
+        );
+    }
+
+    /// Un run senza chiave non persiste, e va bene cosi': meglio nessuna riga
+    /// che una riga attribuita al prompt sbagliato.
+    #[test]
+    fn prompt_key_assente_resta_assente() {
+        let mut input = sample_input();
+        input.prompt_key = None;
+        let state = build_initial_state(&input);
+        assert_eq!(state.profile_name, None);
+    }
+
     #[test]
     fn initial_state_primary_classifier_azione_action_true() {
         let mut input = sample_input();
@@ -3745,7 +3497,7 @@ mod tests {
         input.requires_tools = Some(true);
         input.agentic_score = Some(0.20);
         input.authorizes_changes = Some(true);
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented,
             Some(true),
@@ -3755,7 +3507,7 @@ mod tests {
 
     /// PRIMARIO RUST + classifier RISOLTO con requires_tools assente ma agentic_score
     /// SOPRA soglia: action_oriented=true via soglia (porting __init__.py:699),
-    /// identico allo shadow e al primario Python.
+    /// identico al primario Python.
     #[test]
     fn initial_state_primary_classifier_score_sopra_soglia_action_true() {
         let mut input = sample_input();
@@ -3764,7 +3516,7 @@ mod tests {
         input.requires_tools = None;
         input.agentic_score = Some(0.80);
         input.action_oriented_min_score = 0.5;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented,
             Some(true),
@@ -3782,7 +3534,7 @@ mod tests {
         input.classifier_resolved = false;
         input.requires_tools = None;
         input.agentic_score = None;
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented, None,
             "primario Rust senza dati classifier: decide il RouterNode (invariato)"
@@ -3797,7 +3549,7 @@ mod tests {
     #[test]
     fn initial_state_primary_intent_hint_senza_classifier_resta_none() {
         let input = sample_input(); // intent_hint="code_write", classifier_resolved=false
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         assert_eq!(
             state.action_oriented, None,
             "primario Rust: senza dati classifier non deriva (RouterNode passthrough)"
@@ -3814,7 +3566,7 @@ mod tests {
             serde_json::json!({"role": "system", "content": "system da scartare"}),
             serde_json::json!({"role": "assistant", "content": "ok"}),
         ];
-        let state = build_initial_state(&input, RunRole::Primary);
+        let state = build_initial_state(&input);
         // Malformata + system saltate (best-effort): resta la valida + il turno.
         assert_eq!(state.messages.len(), 2);
         // La entry valida e' l'assistant pregresso (penultimo), poi il turno Human.
@@ -4218,271 +3970,16 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_client_costruibile() {
-        // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza I/O).
-        let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), "tok".to_string());
         // Pool lazy: nessuna connessione al DB, ma la costruzione del pool sqlx
         // spawna un task di manutenzione -> serve il runtime tokio del test.
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nexus@localhost:1/na")
             .expect("connect_lazy non fa I/O");
+        // Sanity: il client gateway e' costruibile (l'adapter lo avvolge senza
+        // I/O). Tiene il pool perche' il bearer di servizio si conia per
+        // richiesta, non e' piu' una stringa statica passata al costruttore.
+        let gw = NexusGatewayClient::new("http://127.0.0.1:1".to_string(), pool.clone());
         let _adapter = GatewayLlmAdapter::new(gw, pool, String::new(), String::new());
-    }
-
-    // ── SHADOW (F4): proiezione canonica + persistenza telemetria ─────────────
-    //
-    // Il driver completo `run_shadow` esegue il grafo via `build_native_engine`,
-    // che costruisce un `GatewayLlmAdapter` su `NexusGatewayClient` HTTP: non
-    // scriptabile in unit test (l'E2E del grafo con gateway stub vive in
-    // `nexus_agent_graph::graph`). Qui copriamo la parte SPECIFICA del driver che
-    // quel test non tocca: la PROIEZIONE CANONICA (vocabolario comune Python/Rust)
-    // e la PERSISTENZA del singolo record "__final_state__". Le garanzie di
-    // zero-scrittura (Replay, MemoryCheckpointer, NullEventSink, gate http in
-    // Replay) sono testate ognuna nel proprio modulo.
-
-    use serde_json::json;
-
-    #[test]
-    fn canonical_stop_reason_mappa_vocabolario_comune() {
-        // Python (status agent_runs) -> vocabolario comune.
-        assert_eq!(canonical_stop_reason(Some("completed")), "end_turn");
-        assert_eq!(
-            canonical_stop_reason(Some("completed_verified")),
-            "end_turn"
-        );
-        assert_eq!(
-            canonical_stop_reason(Some("completed_unverified")),
-            "end_turn"
-        );
-        assert_eq!(canonical_stop_reason(Some("failed")), "failed");
-        assert_eq!(canonical_stop_reason(Some("failed_diagnosed")), "failed");
-        assert_eq!(
-            canonical_stop_reason(Some("awaiting_confirmation")),
-            "interrupted"
-        );
-        // Rust (StopReason snake_case) -> stesso vocabolario.
-        assert_eq!(canonical_stop_reason(Some("end_turn")), "end_turn");
-        assert_eq!(canonical_stop_reason(Some("tool_use")), "tool_use");
-        assert_eq!(canonical_stop_reason(Some("error")), "failed");
-        assert_eq!(canonical_stop_reason(Some("loop_abort")), "loop");
-        assert_eq!(canonical_stop_reason(Some("superseded")), "superseded");
-        assert_eq!(canonical_stop_reason(Some("g1_escalated")), "g1");
-        // None / ignoto.
-        assert_eq!(canonical_stop_reason(None), "none");
-        assert_eq!(canonical_stop_reason(Some("qualcosa-di-strano")), "other");
-    }
-
-    #[test]
-    fn stop_reason_label_serializza_snake_case() {
-        // L'enum Rust serializza nella forma snake_case poi canonicalizzata uguale
-        // al primario (un solo vocabolario, regola L).
-        let lbl = stop_reason_label(Some(StopReason::EndTurn));
-        assert_eq!(lbl.as_deref(), Some("end_turn"));
-        assert_eq!(canonical_stop_reason(lbl.as_deref()), "end_turn");
-        assert!(stop_reason_label(None).is_none());
-    }
-
-    #[test]
-    fn shadow_canonical_conta_tool_e_produced_work() {
-        use nexus_agent_graph::state::{ContentBlock, MessageContent, ToolUse};
-
-        let state = AgentState {
-            stop_reason: Some(StopReason::EndTurn),
-            messages: vec![
-                Message::Human {
-                    content: MessageContent::text("scrivi e leggi"),
-                },
-                // Forma OpenAI-compat: un read_file (non mutativo).
-                Message::Ai {
-                    content: MessageContent::text(""),
-                    tool_calls: vec![ToolUse {
-                        id: "t1".to_string(),
-                        name: "read_file".to_string(),
-                        input: json!({}),
-                        thought_signature: None,
-                    }],
-                    reasoning: None,
-                    thinking_signature: None,
-                },
-                // Forma Anthropic: un edit_file inline (mutativo) -> produced_work.
-                Message::Ai {
-                    content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                        id: "t2".to_string(),
-                        name: "edit_file".to_string(),
-                        input: json!({}),
-                        thought_signature: None,
-                    }]),
-                    tool_calls: vec![],
-                    reasoning: None,
-                    thinking_signature: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let c = shadow_canonical(&state, true);
-        assert_eq!(c["completed"], json!(true));
-        assert_eq!(c["stop_reason"], json!("end_turn"));
-        assert_eq!(c["num_tool_calls"], json!(2), "read_file + edit_file");
-        assert_eq!(c["has_produced_work"], json!(true), "edit_file e' mutativo");
-    }
-
-    #[test]
-    fn shadow_canonical_solo_testo_nessun_lavoro() {
-        let state = AgentState {
-            stop_reason: Some(StopReason::EndTurn),
-            messages: vec![Message::Ai {
-                content: nexus_agent_graph::state::MessageContent::text("risposta testuale"),
-                tool_calls: vec![],
-                reasoning: None,
-                thinking_signature: None,
-            }],
-            ..Default::default()
-        };
-        let c = shadow_canonical(&state, true);
-        assert_eq!(c["num_tool_calls"], json!(0));
-        assert_eq!(c["has_produced_work"], json!(false));
-    }
-
-    /// Tabelle minimali per `primary_canonical`: agent_runs (status) + agent_steps.
-    async fn create_primary_tables(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 status TEXT NOT NULL DEFAULT 'running' \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'completed' \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
-
-    async fn create_shadow_telemetry_table(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE nexus_shadow_telemetry ( \
-                 id UUID PRIMARY KEY, \
-                 run_id UUID NOT NULL, \
-                 node_name TEXT NOT NULL, \
-                 primary_output JSONB NOT NULL, \
-                 shadow_output JSONB NOT NULL, \
-                 divergent_keys TEXT[] NOT NULL DEFAULT '{}', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_shadow_telemetry");
-    }
-
-    #[sqlx::test]
-    async fn primary_canonical_legge_status_e_step(pool: sqlx::PgPool) {
-        create_primary_tables(&pool).await;
-        let run = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'completed')")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
-        // Due step: un read_file (non mutativo) + un write_file (mutativo).
-        for (i, name) in [(1000, "read_file"), (2000, "write_file")] {
-            sqlx::query(
-                "INSERT INTO agent_steps (id, run_id, step_index, tool_name) \
-                 VALUES (gen_random_uuid(), $1, $2, $3)",
-            )
-            .bind(run)
-            .bind(i)
-            .bind(name)
-            .execute(&pool)
-            .await
-            .expect("insert step");
-        }
-
-        let c = primary_canonical(&pool, run).await.expect("canonical");
-        assert_eq!(c["completed"], json!(true));
-        assert_eq!(c["stop_reason"], json!("end_turn"), "completed -> end_turn");
-        assert_eq!(c["num_tool_calls"], json!(2));
-        assert_eq!(c["has_produced_work"], json!(true), "write_file mutativo");
-    }
-
-    #[sqlx::test]
-    async fn shadow_persiste_un_solo_record_final_state(pool: sqlx::PgPool) {
-        // Replica la parte finale di run_shadow (dopo l'esecuzione del grafo): il
-        // confronto canonico primario(DB)<->shadow(stato) e la persistenza del
-        // SINGOLO record "__final_state__". Verifica che ci sia ESATTAMENTE una
-        // riga, sul nodo "__final_state__", con i divergent_keys attesi.
-        create_primary_tables(&pool).await;
-        create_shadow_telemetry_table(&pool).await;
-        let run = Uuid::new_v4();
-        // Primario: completed, 0 step (nessun tool, nessun lavoro).
-        sqlx::query("INSERT INTO agent_runs (id, status) VALUES ($1, 'completed')")
-            .bind(run)
-            .execute(&pool)
-            .await
-            .expect("insert run");
-
-        let primary = primary_canonical(&pool, run).await.expect("primary");
-        // Shadow: completato ma con un write_file (diverge su num_tool_calls +
-        // has_produced_work rispetto al primario a 0 tool).
-        let shadow_state = AgentState {
-            stop_reason: Some(StopReason::EndTurn),
-            messages: vec![Message::Ai {
-                content: nexus_agent_graph::state::MessageContent::text(""),
-                tool_calls: vec![nexus_agent_graph::state::ToolUse {
-                    id: "t".to_string(),
-                    name: "write_file".to_string(),
-                    input: json!({}),
-                    thought_signature: None,
-                }],
-                reasoning: None,
-                thinking_signature: None,
-            }],
-            ..Default::default()
-        };
-        let shadow = shadow_canonical(&shadow_state, true);
-
-        nexus_agent_graph::persist_node_diff(
-            &pool,
-            run,
-            SHADOW_FINAL_STATE_NODE,
-            &primary,
-            &shadow,
-        )
-        .await
-        .expect("persist telemetria shadow");
-
-        // ESATTAMENTE un record, sul nodo __final_state__.
-        let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
-            "SELECT node_name, divergent_keys FROM nexus_shadow_telemetry WHERE run_id = $1",
-        )
-        .bind(run)
-        .fetch_all(&pool)
-        .await
-        .expect("select telemetria");
-        assert_eq!(rows.len(), 1, "un solo record per run shadow");
-        assert_eq!(rows[0].0, "__final_state__");
-        // Divergenze attese: num_tool_calls (0 vs 1) + has_produced_work (false vs true).
-        let mut keys = rows[0].1.clone();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "has_produced_work".to_string(),
-                "num_tool_calls".to_string()
-            ]
-        );
     }
 
     /// Tabella `settings` minimale (key, value) per i test DB-driven delle config.
@@ -4541,7 +4038,7 @@ mod tests {
         // sufficiente, il planner Rust e' eleggibile (accoppiamento debito 1+2).
         assert!(
             cfg.is_eligible(
-                Some(crate::brain_agent_client::PRIMARY_BEHAVIOR_MODE),
+                Some(crate::agent_turn_setup::PRIMARY_BEHAVIOR_MODE),
                 Some("code"),
                 1000
             ),
@@ -4664,11 +4161,14 @@ mod tests {
         create_settings_table(&pool).await;
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
         set_setting(&pool, "agent.context.tokenizer", "cl100k_base").await;
+        // Scrittura diretta: lettura cache-ata, il test invalida esplicitamente.
+        nexus_auth::invalidate_setting_cache(&pool, "agent.context.tokenizer");
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Cl100k);
         sqlx::query("UPDATE settings SET value = 'chars' WHERE key = 'agent.context.tokenizer'")
             .execute(&pool)
             .await
             .expect("update setting");
+        nexus_auth::invalidate_setting_cache(&pool, "agent.context.tokenizer");
         assert_eq!(resolve_tokenizer_kind(&pool).await, TokenizerKind::Chars);
     }
 
@@ -4796,11 +4296,14 @@ mod tests {
             declared_outcome: None,
             review_verdict: None,
             advisory_verdict: None,
+            debate_position: None,
             error_class: None,
             forced_close_unverified: false,
             final_gate_passed: None,
             final_gate_unverified: None,
             final_gate_failed_pending: false,
+            review_panel_rejected: false,
+            review_panel_last: None,
             pending_actions: Vec::new(),
         }
     }
@@ -4808,6 +4311,63 @@ mod tests {
     #[test]
     fn classify_status_completed_pulito() {
         assert_eq!(base_outcome().classify_status(), AgentRunStatus::Completed);
+    }
+
+    /// REGRESSIONE (incidente "0/2 voti validi", 26/07/2026): un revisore che
+    /// aveva votato veniva declassato a FailedDiagnosed dal final_gate, quindi
+    /// il suo outcome usciva con `success: false` e `extract_vote` lo scartava.
+    /// Il panel restava senza voti e la review non poteva passare fino al cap.
+    ///
+    /// Il cortocircuito: il final_gate verifica il CODICE DEL PROGETTO, ma il
+    /// revisore quel codice lo giudica, non lo scrive. Bocciarlo significava
+    /// squalificare il giudice perche' cio' che stava giudicando era rotto: piu'
+    /// il codice era guasto, meno voti restavano validi.
+    #[test]
+    fn il_verdetto_di_ruolo_sopravvive_al_final_gate_fallito() {
+        let mut o = base_outcome();
+        o.final_gate_passed = Some(false);
+        o.review_verdict = Some(serde_json::json!({
+            "verdict": "fail",
+            "findings": [{"file": "backend/src/server.ts", "severity": "high"}],
+        }));
+
+        assert_eq!(
+            o.classify_status(),
+            AgentRunStatus::Completed,
+            "il revisore ha consegnato il suo verdetto: il gate sul codice altrui \
+             non deve declassarlo"
+        );
+        // La conseguenza che conta: l'esito strutturato dichiara success, unica
+        // condizione per cui extract_vote accetta il voto.
+        assert_eq!(
+            o.structured_verdict().get("success").and_then(|v| v.as_bool()),
+            Some(true),
+            "senza success=true il voto viene scartato dal panel"
+        );
+    }
+
+    /// Il gate resta pieno per chi il codice lo SCRIVE: senza un verdetto di
+    /// ruolo dichiarato, una verifica fallita continua a declassare.
+    #[test]
+    fn senza_verdetto_di_ruolo_il_final_gate_declassa_ancora() {
+        let mut o = base_outcome();
+        o.final_gate_passed = Some(false);
+        assert_eq!(o.classify_status(), AgentRunStatus::FailedDiagnosed);
+    }
+
+    /// Un run bocciato dalla review adversariale programmatica non e' un
+    /// successo: il verdetto strutturato del panel prevale sul "done" ottimista
+    /// del modello (run reale 20/07 10:03:30: Fail 2/2, restava `completed` con
+    /// i difetti bloccanti sepolti in una nota del resoconto).
+    #[test]
+    fn classify_status_review_bocciata_non_e_completed() {
+        let o = NativeRunOutcome {
+            review_panel_rejected: true,
+            ..base_outcome()
+        };
+        // Mutazione che rende rosso: togliere il ramo `review_panel_rejected`
+        // da classify_status -> torna Completed, cioe' il difetto originale.
+        assert_eq!(o.classify_status(), AgentRunStatus::FailedDiagnosed);
     }
 
     #[test]
@@ -4978,5 +4538,211 @@ mod tests {
         assert_eq!(vk["final_gate_passed"], serde_json::json!(false));
         assert_eq!(vk["error_class"], serde_json::json!("context_overflow"));
         assert_eq!(vk["declared"]["outcome"], serde_json::json!("done"));
+    }
+
+    /// Esecutore che CONTA i comandi eseguiti: il numero di `run_command` in
+    /// arrivo e' la misura dello spreco (un typecheck reale dura secondi).
+    struct ContaComandi {
+        eseguiti: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for ContaComandi {
+        async fn execute(
+            &self,
+            call: nexus_agent_graph::runtime::ports::ToolCall,
+        ) -> Result<
+            nexus_agent_graph::runtime::ports::ToolOutcome,
+            nexus_agent_graph::runtime::ports::PortError,
+        > {
+            self.eseguiti
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(nexus_agent_graph::runtime::ports::ToolOutcome {
+                tool_call_id: call.id,
+                // `measure_command_exit` estrae l'exit dal marker del testo.
+                content: serde_json::json!("tutto verde\nEXIT CODE: 0"),
+                exit_code: Some(0),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Le N figure del consiglio entrano insieme sulla STESSA root con la stessa
+    /// copia del profilo, letta PRIMA di mettersi in coda sul guard dell'albero.
+    /// La misura deve essere fatta UNA volta e CONDIVISA: e' il senso del doppio
+    /// controllo dopo il guard. Senza la ri-lettura il guard non condivide il
+    /// lavoro, lo mette in fila — e questo test conta 6 typecheck invece di 1
+    /// (difetto D2, meta' spreco, persa nel refactor e nel merge 9dd68341).
+    #[sqlx::test]
+    async fn misure_gate_condivise_fra_figure_concorrenti(pool: PgPool) {
+        // Come gli altri test del crate: la tabella che serve, senza la FK su
+        // `projects` (qui il progetto non e' il soggetto della prova).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS project_verify_profiles (
+                project_id    UUID PRIMARY KEY,
+                steps         JSONB NOT NULL DEFAULT '[]'::jsonb,
+                environment   JSONB NOT NULL DEFAULT '{}'::jsonb,
+                manifest_hash TEXT NOT NULL DEFAULT '',
+                source        TEXT NOT NULL DEFAULT 'llm',
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tabella profili");
+
+        let pid = Uuid::new_v4();
+        // UNO step gate con la baseline da misurare e il probe GIA' fatto: cosi'
+        // un giro di misure costa ESATTAMENTE un'esecuzione e il conteggio non
+        // dipende dal probe (che pianterebbe un file vero nell'albero).
+        let profilo = vec![crate::verify_profile::VerifyProfileStep {
+            step: "typecheck".to_string(),
+            command: "pnpm typecheck".to_string(),
+            working_dir: None,
+            timeout_s: None,
+            gate: true,
+            rationale: None,
+            baseline_exit_code: None,
+            probe: Some(crate::verify_probe::ProbeOutcome::Discriminating),
+        }];
+        sqlx::query(
+            "INSERT INTO project_verify_profiles (project_id, steps, manifest_hash) \
+             VALUES ($1, $2, 'h')",
+        )
+        .bind(pid)
+        .bind(serde_json::to_value(&profilo).expect("json"))
+        .execute(&pool)
+        .await
+        .expect("profilo persistito");
+
+        let eseguiti = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = Arc::new(FinalGateCriteriaRunnerAdapter::new(
+            Arc::new(ContaComandi {
+                eseguiti: eseguiti.clone(),
+            }),
+            pool.clone(),
+        ));
+        // Root UNICA per questo test: la chiave di TREE_LOCKS e' globale al
+        // processo e i test girano in parallelo (nessun albero viene toccato:
+        // il probe e' gia' risolto).
+        let root = format!("D:/test-albero/{pid}");
+
+        let mut figure = Vec::new();
+        for _ in 0..6 {
+            let (pool, adapter, root) = (pool.clone(), adapter.clone(), root.clone());
+            // Ogni figura ha la PROPRIA copia, letta prima della coda: e' la
+            // copia stantia che i filtri `is_none()` userebbero per rifare tutto.
+            let mut steps = profilo.clone();
+            figure.push(tokio::spawn(async move {
+                measure_gate_steps(&pool, pid, &root, &mut steps, &adapter).await;
+                steps
+            }));
+        }
+        let mut esiti = Vec::new();
+        for f in figure {
+            esiti.push(f.await.expect("figura"));
+        }
+
+        assert_eq!(
+            eseguiti.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "il comando gate si misura UNA volta per albero, non una per figura \
+             (D2: erano 6 typecheck in fila)"
+        );
+        for steps in &esiti {
+            assert_eq!(
+                steps[0].baseline_exit_code,
+                Some(0),
+                "la misura e' CONDIVISA: chi ha atteso il guard esce con la \
+                 baseline letta dal persistito, non senza"
+            );
+        }
+    }
+
+    /// Il kill-switch `agent.verify_infer.enabled` OFF si presenta qui come
+    /// `steps` vuoto: la ri-lettura dopo il guard non deve ripescare dal DB il
+    /// profilo che l'interruttore ha appena escluso.
+    #[sqlx::test]
+    async fn profilo_escluso_dal_killswitch_non_torna_dalla_rilettura(pool: PgPool) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS project_verify_profiles (
+                project_id    UUID PRIMARY KEY,
+                steps         JSONB NOT NULL DEFAULT '[]'::jsonb,
+                environment   JSONB NOT NULL DEFAULT '{}'::jsonb,
+                manifest_hash TEXT NOT NULL DEFAULT '',
+                source        TEXT NOT NULL DEFAULT 'llm',
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("tabella profili");
+
+        let pid = Uuid::new_v4();
+        let persistito = vec![crate::verify_profile::VerifyProfileStep {
+            step: "typecheck".to_string(),
+            command: "pnpm typecheck".to_string(),
+            working_dir: None,
+            timeout_s: None,
+            gate: true,
+            rationale: None,
+            baseline_exit_code: None,
+            probe: Some(crate::verify_probe::ProbeOutcome::Discriminating),
+        }];
+        sqlx::query(
+            "INSERT INTO project_verify_profiles (project_id, steps, manifest_hash) \
+             VALUES ($1, $2, 'h')",
+        )
+        .bind(pid)
+        .bind(serde_json::to_value(&persistito).expect("json"))
+        .execute(&pool)
+        .await
+        .expect("profilo persistito");
+
+        let eseguiti = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = FinalGateCriteriaRunnerAdapter::new(
+            Arc::new(ContaComandi {
+                eseguiti: eseguiti.clone(),
+            }),
+            pool.clone(),
+        );
+        let mut steps: Vec<crate::verify_profile::VerifyProfileStep> = Vec::new();
+        measure_gate_steps(
+            &pool,
+            pid,
+            &format!("D:/test-albero/{pid}"),
+            &mut steps,
+            &adapter,
+        )
+        .await;
+
+        assert!(
+            steps.is_empty(),
+            "kill-switch OFF: nessuno step rientra dalla ri-lettura"
+        );
+        assert_eq!(
+            eseguiti.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "kill-switch OFF: nessun comando eseguito"
+        );
+    }
+
+    /// Il caso REALE che rende utile la precedenza: `agent.run_time_budget_s` e' `0`
+    /// per policy (mig 0604/0607), quindi per una FIGURA il valore dal DB e'
+    /// inservibile. Se vincesse il DB, il gate a tempo dell'executor resterebbe
+    /// codice morto e la figura morirebbe muta allo scadere, senza mai ricevere il
+    /// sollecito di chiusura. Mutazione: far vincere `from_db` -> questo assert
+    /// rosseggia con `0`, cioe' col valore esatto del difetto.
+    #[test]
+    fn budget_della_figura_vince_sul_setting_globale_a_zero() {
+        assert_eq!(effective_run_time_budget_s(0, Some(300)), 300);
+    }
+
+    /// Run principale (nessun override): comanda il setting globale, comportamento
+    /// invariato.
+    #[test]
+    fn senza_override_vale_il_setting_globale() {
+        assert_eq!(effective_run_time_budget_s(900, None), 900);
+        assert_eq!(effective_run_time_budget_s(0, None), 0);
     }
 }

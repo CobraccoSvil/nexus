@@ -1,57 +1,20 @@
 //! Classificazione intent: SOLO interpretazione semantica via classifier LLM
-//! (endpoint brain `/classify-intent-agentic`). Niente piu' keyword matching /
-//! promozione / fallback deterministico: quando l'LLM non risponde si usa
-//! l'intent di sistema neutro `agentic_default`.
+//! in-process (`intent_classifier::classify`, che parla col Nexus Gateway).
+//! Niente keyword matching / promozione / fallback deterministico: quando l'LLM
+//! non risponde si usa l'intent di sistema neutro `agentic_default` e lo si
+//! DICHIARA (`fallback_used`), cosi' i consumatori a valle sanno che la classe
+//! non e' attendibile.
+//!
+//! Non esiste piu' una scelta di motore: il ramo storico chiamava l'endpoint
+//! brain `/classify-intent-agentic` e il brain e' stato eliminato (mig
+//! 0462/0532). Il flag `routing.classifier_engine` (mig 0458/0460) e' rimosso.
 
 use sqlx::PgPool;
-use std::sync::atomic::Ordering;
 
 use crate::nexus_gateway::NexusGatewayClient;
 
-use super::*;
-
-/// Chiave DB (regola G/L): motore di classificazione intent. Valori ammessi
-/// `'python'` (default, endpoint brain `/classify-intent-agentic`) e `'rust'`
-/// (in-process `crate::intent_classifier::classify`). Punto unico di scelta:
-/// [`select_classifier_engine`]. Migrazione 0458.
-const KEY_CLASSIFIER_ENGINE: &str = "routing.classifier_engine";
-
-/// Motore di classificazione intent selezionato dal DB (flag mig 0458). Verso
-/// la rimozione della dipendenza HTTP `/classify-intent-agentic`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClassifierEngine {
-    /// Path STORICO: chiamata HTTP all'endpoint brain `/classify-intent-agentic`.
-    Python,
-    /// Path NATIVO: `crate::intent_classifier::classify` in-process.
-    Rust,
-}
-
-/// Punto unico (regola L): legge `routing.classifier_engine` dal DB e decide il
-/// motore. Default difensivo `Rust` (il motore primario, in-process) per chiave
-/// assente o valore ignoto: il brain Python e' stato rimosso (mig 0462/0532),
-/// quindi un default 'python' punterebbe a un endpoint HTTP inesistente. Il
-/// valore esplicito 'python' resta rispettato (rollback storico, inerte) e il
-/// degrado e' loggato — niente magic-fallback nascosto.
-pub(crate) async fn select_classifier_engine(db: &PgPool) -> ClassifierEngine {
-    match nexus_auth::get_setting(db, KEY_CLASSIFIER_ENGINE).await {
-        Some(v) => match v.trim().to_lowercase().as_str() {
-            "rust" => ClassifierEngine::Rust,
-            "python" => ClassifierEngine::Python,
-            other => {
-                tracing::warn!(
-                    value = %other,
-                    "{KEY_CLASSIFIER_ENGINE}: valore non riconosciuto -> motore primario (rust)"
-                );
-                ClassifierEngine::Rust
-            }
-        },
-        None => ClassifierEngine::Rust,
-    }
-}
-
-/// Mappa l'output del classifier RUST (`AgenticIntent`) sulla stessa
-/// `ClassifiedIntent` prodotta dal path Python, cosi' i call site di routing non
-/// distinguono il motore (regola L). Gli intent fuori enum della matrix cadono
+/// Mappa l'output del classifier (`AgenticIntent`) sulla `ClassifiedIntent`
+/// attesa dai call site di routing. Gli intent fuori enum della matrix cadono
 /// sul neutro `agentic_default` (stesso contratto di `intent_str_to_static`).
 fn classified_from_rust(ai: crate::intent_classifier::AgenticIntent) -> ClassifiedIntent {
     let intent_static = intent_str_to_static(&ai.intent).unwrap_or("agentic_default");
@@ -161,8 +124,10 @@ pub struct ClassifiedIntent {
     pub candidates: Vec<IntentCandidate>,
     pub is_ambiguous: bool,
     /// Slot canonici (action_verb, target_type, framework, scope) estratti
-    /// dal classifier LLM. Vuoto se il classifier keyword fallback e' stato
-    /// usato. Quando `slots.is_complete()` E `slots.confidence >= 0.60`, il
+    /// dal classifier LLM. Vuoto quando il classifier non ha risolto (fallback
+    /// di sistema): il "classifier keyword fallback" che li lasciava vuoti non
+    /// esiste piu' da quando l'interpretazione e' solo semantica.
+    /// Quando `slots.is_complete()` E `slots.confidence >= 0.60`, il
     /// router prova prima la `nexus_routing_slots_matrix` (mig 0133), e
     /// cade sul routing classico (intent, behavior_mode) se non c'e' match.
     pub slots: crate::routing_slots::ActionSlots,
@@ -226,24 +191,24 @@ pub(crate) fn spawn_routing_decision_insert(
         let res = sqlx::query(
             r#"INSERT INTO nexus_routing_decisions
                (prompt_hash, estimated_tokens, behavior_mode,
-                intent, classifier_source, classifier_confidence, classifier_cached,
+                intent, classifier_source, classifier_confidence,
                 selected_provider, selected_model, decision_source, rationale,
                 no_capable_provider, providers_in_cooldown, fallback_triggered)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
         )
         .bind(&p_hash)
         .bind(estimated_tokens)
         .bind(&behavior_mode)
         .bind(&intent)
-        // classifier_source: per ora derivato (LLM se confidence > soglia,
-        // altrimenti keyword/promotion). Fase 4 separera' i flussi esplicitamente.
+        // classifier_source e' DEDOTTO dalla soglia di confidenza, non ricevuto
+        // dal classificatore: due soli valori possibili, e quello sotto soglia
+        // non sa distinguere il percorso keyword dalla promozione agentica.
         .bind(if classifier_confidence >= 0.85 {
             "llm"
         } else {
             "keyword_or_promotion"
         })
         .bind(classifier_confidence)
-        .bind::<Option<bool>>(None) // classifier_cached: non noto a questo livello
         .bind(&selected_provider)
         .bind(&selected_model)
         .bind(&decision_source)
@@ -284,230 +249,9 @@ pub(crate) fn intent_str_to_static(intent: &str) -> Option<&'static str> {
     }
 }
 
-/// Classifier asincrono: prova prima il classifier LLM (gemini-flash via brain
-/// REST `/classify-intent-agentic`), poi cade su keyword + promozione agentic.
-///
-/// **Feature flag**: env var `NEXUS_LLM_CLASSIFIER_ENABLED` (default: `true`).
-/// Settarla a `false` disabilita la chiamata HTTP e usa solo le keyword
-/// (utile per smoke test o se il brain e' down).
-///
-/// **Timeout**: 3 secondi per la chiamata HTTP. In caso di timeout/errore, il
-/// classifier LLM e' cache-first quindi una richiesta precedente identica
-/// risponde in <50ms; ma se la cache e' fredda accettiamo il keyword fallback
-/// per non bloccare il routing.
-///
-/// **Trust criteria**: usiamo il risultato LLM solo se:
-///   1. La risposta e' arrivata entro il timeout
-///   2. `confidence >= LLM_CLASSIFIER_MIN_CONFIDENCE` (default 0.60)
-///   3. `fallback_used == false` (il brain stesso non ha fallato)
-///   4. L'intent ritornato e' tra quelli noti alla matrix
-pub(crate) async fn classify_intent_async_with_threshold(
-    message: &str,
-    min_confidence: f32,
-    timeout_seconds: f32,
-) -> (&'static str, f32) {
-    // Priorita': env var override > AtomicBool inizializzato dal DB in main.rs.
-    let llm_enabled = match std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").as_deref() {
-        Ok(v) => !matches!(
-            v.trim().to_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
-    };
 
-    // Niente interpretazione keyword: se non otteniamo una classificazione
-    // semantica dall'LLM, ritorniamo l'intent di sistema neutro `agentic_default`.
-    // Attiva lato agente il _LAZY_MINIMAL_TOOLKIT (discovery + lettura) + modelli
-    // tool-robust, cosi' e' l'LLM dell'agente a interpretare e agire da se'.
-    const NEUTRAL: (&str, f32) = ("agentic_default", 0.5);
 
-    if !llm_enabled || message.trim().is_empty() {
-        return NEUTRAL;
-    }
 
-    let brain_url =
-        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let url = format!(
-        "{}/classify-intent-agentic",
-        brain_url.trim_end_matches('/')
-    );
-
-    // Timeout configurabile via routing.llm_classifier_timeout_seconds (mig 0111).
-    // Il classifier Python ha cache TTL 24h, request ripetuta risponde in <50ms.
-    let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
-    let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
-        Ok(c) => c,
-        Err(_) => return NEUTRAL,
-    };
-
-    let body = serde_json::json!({ "message": message });
-    let resp = match http.post(&url).json(&body).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            tracing::debug!(
-                "classifier LLM: HTTP {} — fallback agentic_default",
-                r.status()
-            );
-            return NEUTRAL;
-        }
-        Err(e) => {
-            tracing::debug!("classifier LLM: rete fallita ({e}) — fallback agentic_default");
-            return NEUTRAL;
-        }
-    };
-
-    let parsed: AgenticIntentResponse = match resp.json().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("classifier LLM: JSON malformato ({e}) — fallback agentic_default");
-            return NEUTRAL;
-        }
-    };
-
-    if parsed.fallback_used || parsed.confidence < min_confidence {
-        tracing::debug!(
-            "classifier LLM: scarso (fallback={}, conf={}, threshold={}) — agentic_default",
-            parsed.fallback_used,
-            parsed.confidence,
-            min_confidence
-        );
-        return NEUTRAL;
-    }
-
-    let intent_static = match intent_str_to_static(&parsed.intent) {
-        Some(s) => s,
-        None => {
-            tracing::warn!(
-                "classifier LLM: intent sconosciuto '{}' — agentic_default",
-                parsed.intent
-            );
-            return NEUTRAL;
-        }
-    };
-
-    tracing::info!(
-        "classifier LLM: intent={} agentic_score={:.2} confidence={:.2} cached={}",
-        intent_static,
-        parsed.agentic_score,
-        parsed.confidence,
-        parsed.cached
-    );
-
-    (intent_static, parsed.confidence)
-}
-
-/// Variante "full" che ritorna `ClassifiedIntent` (con candidati e flag
-/// ambiguita') invece del solo `(intent, confidence)`.
-///
-/// Best practice NLU: quando `is_ambiguous=true` il caller deve chiedere
-/// disambiguazione all'utente prima di scegliere un provider/modello.
-///
-/// Stesso flusso di `classify_intent_async_with_threshold` ma propaga
-/// i campi aggiuntivi del classifier LLM (`candidates`, `is_ambiguous`).
-pub(crate) async fn classify_intent_async_full_with_threshold(
-    message: &str,
-    min_confidence: f32,
-    timeout_seconds: f32,
-) -> ClassifiedIntent {
-    let llm_enabled = match std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").as_deref() {
-        Ok(v) => !matches!(
-            v.trim().to_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
-    };
-
-    // Helper: ClassifiedIntent "secco" per l'intent di sistema neutro
-    // `agentic_default` (un solo candidato, niente ambiguita'). Usato quando NON
-    // otteniamo una classificazione semantica dall'LLM (down/timeout/JSON/brain
-    // in fallback). L'agente parte col _LAZY_MINIMAL_TOOLKIT e interpreta da se'.
-    let neutral_full = || -> ClassifiedIntent {
-        ClassifiedIntent {
-            intent: "agentic_default",
-            confidence: 0.5,
-            candidates: vec![IntentCandidate {
-                intent: "agentic_default".to_string(),
-                confidence: 0.5,
-            }],
-            is_ambiguous: false,
-            classifier_resolved: false,
-            complexity: "medium".to_string(),
-            slots: crate::routing_slots::ActionSlots::default(),
-        }
-    };
-
-    if !llm_enabled || message.trim().is_empty() {
-        return neutral_full();
-    }
-
-    let brain_url =
-        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let url = format!(
-        "{}/classify-intent-agentic",
-        brain_url.trim_end_matches('/')
-    );
-
-    let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
-    let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
-        Ok(c) => c,
-        Err(_) => return neutral_full(),
-    };
-
-    let body = serde_json::json!({ "message": message });
-    let resp = match http.post(&url).json(&body).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return neutral_full(),
-    };
-
-    let parsed: AgenticIntentResponse = match resp.json().await {
-        Ok(p) => p,
-        Err(_) => return neutral_full(),
-    };
-
-    // Il brain stesso non e' riuscito a classificare con l'LLM: niente keyword,
-    // si va sul neutro di sistema.
-    if parsed.fallback_used {
-        return neutral_full();
-    }
-
-    let intent_static = match intent_str_to_static(&parsed.intent) {
-        Some(s) => s,
-        None => return neutral_full(),
-    };
-
-    // Confidence sotto soglia: l'LLM HA interpretato ma e' incerto. Conserviamo
-    // intent + candidati e segnaliamo is_ambiguous=true cosi' l'agente chiede
-    // disambiguazione (ADR ambiguity), invece di degradare a keyword.
-    if parsed.confidence < min_confidence {
-        let candidates = if parsed.candidates.is_empty() {
-            vec![IntentCandidate {
-                intent: intent_static.to_string(),
-                confidence: parsed.confidence,
-            }]
-        } else {
-            parsed.candidates
-        };
-        return ClassifiedIntent {
-            intent: intent_static,
-            confidence: parsed.confidence,
-            candidates,
-            is_ambiguous: true,
-            classifier_resolved: true,
-            complexity: parsed.complexity,
-            slots: parsed.slots,
-        };
-    }
-
-    ClassifiedIntent {
-        intent: intent_static,
-        confidence: parsed.confidence,
-        candidates: parsed.candidates,
-        is_ambiguous: parsed.is_ambiguous,
-        classifier_resolved: true,
-        complexity: parsed.complexity,
-        slots: parsed.slots,
-    }
-}
 
 #[cfg(test)]
 mod tests_classifier_engine {
@@ -558,64 +302,4 @@ mod tests_classifier_engine {
         assert!(!c.is_ambiguous, "fallback di sistema -> non ambiguo");
     }
 
-    /// Tabella settings minimale (gli `#[sqlx::test]` del crate creano lo schema
-    /// a mano: le migrazioni non sono applicate automaticamente).
-    async fn create_settings_table(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS settings ( \
-                 key      TEXT PRIMARY KEY, \
-                 value    TEXT NOT NULL, \
-                 category TEXT \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create table settings");
-    }
-
-    #[sqlx::test]
-    async fn select_engine_default_rust_se_setting_assente(pool: sqlx::PgPool) {
-        create_settings_table(&pool).await;
-        // Nessuna riga settings -> default difensivo rust (il classifier Python
-        // e' stato rimosso, mig 0462/0532: il path HTTP non ha piu' un backend).
-        assert_eq!(
-            select_classifier_engine(&pool).await,
-            ClassifierEngine::Rust
-        );
-    }
-
-    #[sqlx::test]
-    async fn select_engine_legge_rust_e_python_dal_db(pool: sqlx::PgPool) {
-        create_settings_table(&pool).await;
-        sqlx::query(
-            "INSERT INTO settings (key, value, category) \
-             VALUES ('routing.classifier_engine', 'rust', 'routing')",
-        )
-        .execute(&pool)
-        .await
-        .expect("insert setting rust");
-        assert_eq!(
-            select_classifier_engine(&pool).await,
-            ClassifierEngine::Rust
-        );
-
-        sqlx::query("UPDATE settings SET value = 'python' WHERE key = 'routing.classifier_engine'")
-            .execute(&pool)
-            .await
-            .expect("update setting python");
-        assert_eq!(
-            select_classifier_engine(&pool).await,
-            ClassifierEngine::Python
-        );
-
-        // Valore ignoto -> default difensivo rust (loggato).
-        sqlx::query("UPDATE settings SET value = 'boh' WHERE key = 'routing.classifier_engine'")
-            .execute(&pool)
-            .await
-            .expect("update setting ignoto");
-        assert_eq!(
-            select_classifier_engine(&pool).await,
-            ClassifierEngine::Rust
-        );
-    }
 }

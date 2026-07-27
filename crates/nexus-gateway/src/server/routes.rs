@@ -1,4 +1,4 @@
-//! Handler HTTP del gateway e pipeline di routing.
+﻿//! Handler HTTP del gateway e pipeline di routing.
 //!
 //! Porting delle route di `server.ts`. La pipeline `/v1/complete` (e `/v1/stream`)
 //! replica il flusso di `LLMGateway`:
@@ -38,7 +38,7 @@ use crate::batch::{
 };
 use crate::cooldown::{CooldownManager, RetryPolicy};
 use crate::history_sanitizer::{self, SanitizeMode};
-use crate::model_alias_resolver::ModelAliasResolver;
+use crate::model_alias_resolver::{strip_provider_prefix, ModelAliasResolver};
 use crate::provider::LlmProvider;
 use crate::providers::{classify_provider_error, ProviderErrorKind, ProviderHttpError};
 use crate::redaction::pipeline::{RedactionOptions, RedactionPipeline};
@@ -48,7 +48,12 @@ use crate::types::{
     TranscribeResponse, TtsRequest, TtsResponse, VideoGenRequest, VideoGenResponse,
 };
 
-use super::billing::{enforce_quota, record_usage_to_ledger, QuotaExceeded};
+use super::billing::{
+    enforce_quota, record_media_usage_to_ledger, record_usage_to_ledger, MediaKind, MediaUsage,
+    QuotaEstimate, QuotaExceeded,
+};
+use nexus_pricing::UsageUnit;
+use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts};
 use super::bootstrap::{build_http_client, build_runtime, GatewayConfig};
 use nexus_auth::llm_timeouts::LlmTimeouts;
 use super::AppState;
@@ -60,6 +65,14 @@ use super::AppState;
 /// risposta, accanto a `error`/`code`. Il chiamante (motore agentico) decide
 /// dalla struttura — classe del fallimento per-provider, tier rilevato,
 /// provider ammessi — mai dal testo umano di `message`.
+///
+/// `facts`: gli stessi segnali, nella forma che il PUNTO UNICO di presentazione
+/// (`nexus_types::error_presentation`) sa tradurre in una frase. Nasce QUI e non
+/// a valle perche' qui provider, modello, status e codice del provider esistono
+/// ancora: dopo il confine HTTP resta solo `message`, che per contratto porta i
+/// body grezzi ("mistral HTTP 429: {\"error\":{...}}") — ed e' il testo che
+/// l'utente si e' visto in chat finche' nessuno ha reso leggibile l'errore alla
+/// fonte.
 #[derive(Debug)]
 struct PipelineError {
     status: StatusCode,
@@ -68,14 +81,34 @@ struct PipelineError {
     // Boxed: tiene la Err-variant dei Result della pipeline sotto la soglia
     // clippy `result_large_err` (il details e' raro, il Result e' ovunque).
     details: Option<Box<Value>>,
+    // Boxed per la stessa ragione di `details`: ErrorFacts e' largo e questo
+    // Result attraversa l'intera pipeline.
+    facts: Box<ErrorFacts>,
+}
+
+/// I fatti di un errore APPLICATIVO del gateway (guardie, quota, risoluzione
+/// provider): dominio Gateway, codice del gateway, e la frase scritta a mano dal
+/// codice come `upstream_message`.
+///
+/// La distinzione con [`provider_facts_from_error`] non e' formale: li' il testo
+/// e' il body di un fornitore esterno (mai una frase), qui e' una riga scritta da
+/// noi per un umano, quindi puo' essere concatenata al messaggio.
+fn gateway_facts(code: &str, message: &str) -> Box<ErrorFacts> {
+    Box::new(
+        ErrorFacts::opaque(ErrorDomain::Gateway, message)
+            .with_code(code)
+            .with_upstream(message),
+    )
 }
 
 impl PipelineError {
     fn blocked(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::FORBIDDEN,
             code: "TIER_BLOCKED".to_string(),
-            message: message.into(),
+            facts: gateway_facts("TIER_BLOCKED", &message),
+            message,
             details: None,
         }
     }
@@ -90,10 +123,12 @@ impl PipelineError {
         allowed: &[String],
         message: impl Into<String>,
     ) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::FORBIDDEN,
             code: "POLICY_TIER_EXCLUDED".to_string(),
-            message: message.into(),
+            facts: gateway_facts("POLICY_TIER_EXCLUDED", &message),
+            message,
             details: Some(Box::new(json!({
                 "provider": provider,
                 "detected_tier": detected_tier,
@@ -102,38 +137,151 @@ impl PipelineError {
         }
     }
     fn quota(scope: &str, reason: &str) -> Self {
+        let message = format!("quota_exceeded:{scope}:{reason}");
         Self {
             status: StatusCode::FORBIDDEN,
             code: "QUOTA_EXCEEDED".to_string(),
-            message: format!("quota_exceeded:{scope}:{reason}"),
+            // `message` e' un identificatore macchina (`quota_exceeded:scope:reason`),
+            // non una frase: come upstream verrebbe letto da un umano come gergo.
+            // Il motivo leggibile e' il solo `reason`.
+            facts: Box::new(
+                ErrorFacts::opaque(ErrorDomain::Gateway, &message)
+                    .with_code("QUOTA_EXCEEDED")
+                    .with_upstream(reason),
+            ),
+            message,
             details: None,
         }
     }
+    /// Errore applicativo del gateway sul percorso dei provider (quota check
+    /// fallito, nessun provider capace, alias non risolvibile): il testo e'
+    /// scritto da noi, non e' il body di un fornitore.
     fn provider(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "PROVIDER_ERROR".to_string(),
-            message: message.into(),
+            facts: gateway_facts("PROVIDER_ERROR", &message),
+            message,
             details: None,
         }
     }
     /// Variante di [`Self::provider`] col dettaglio strutturato dei fallimenti
-    /// per-provider (`details.failures` + `details.primary_cause`).
-    fn provider_with_details(message: impl Into<String>, details: Value) -> Self {
+    /// per-provider (`details.failures` + `details.primary_cause`) e i FATTI del
+    /// fallimento primario, che sono l'unica cosa da cui puo' nascere una frase
+    /// che nomini il fornitore e il motivo.
+    fn provider_with_details(message: impl Into<String>, details: Value, facts: ErrorFacts) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "PROVIDER_ERROR".to_string(),
             message: message.into(),
             details: Some(Box::new(details)),
+            facts: Box::new(facts),
+        }
+    }
+    /// Fallimento di una chiamata a UN provider quando l'errore tipizzato e'
+    /// ancora nella catena (media-gen, stream SSE): i fatti si estraggono dal
+    /// [`ProviderHttpError`], non dal suo `Display`.
+    fn provider_call_failed(provider: &str, model: &str, err: &anyhow::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "PROVIDER_ERROR".to_string(),
+            message: err.to_string(),
+            details: None,
+            facts: Box::new(provider_facts_from_error(err, provider, Some(model))),
         }
     }
     fn invalid_request(message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_REQUEST".to_string(),
-            message: message.into(),
+            facts: gateway_facts("INVALID_REQUEST", &message),
+            message,
             details: None,
         }
+    }
+    /// Budget END-TO-END della richiesta esaurito (504). Il codice sul wire e'
+    /// minuscolo per ragioni storiche: e' quello su cui il motore agentico
+    /// decide gia' oggi, e cambiarlo romperebbe il failover.
+    fn request_budget_exceeded() -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "request_budget_exceeded".to_string(),
+            message: "request budget exceeded".to_string(),
+            details: None,
+            facts: Box::new(
+                ErrorFacts::opaque(ErrorDomain::Gateway, "request budget exceeded")
+                    .with_code("request_budget_exceeded")
+                    .with_status(StatusCode::GATEWAY_TIMEOUT.as_u16()),
+            ),
+        }
+    }
+
+    /// PUNTO UNICO (regola L) del corpo d'errore del gateway.
+    ///
+    /// `error`/`code`/`details` restano INVARIATI: li leggono gia' mcp-core
+    /// (`nexus_gateway.rs`), l'adapter del motore e il neural client. Le tre
+    /// chiavi additive portano la RESA: `user_message` e' la frase,
+    /// `user_code` l'identificatore su cui il frontend sceglie icona e azione
+    /// (mai il testo, regola M), `user_detail` il tecnico integrale.
+    ///
+    /// Si chiama `user_detail` e non `detail` perche' `details` esiste gia' su
+    /// questo stesso oggetto con significato opposto: due chiavi a un carattere
+    /// di distanza sono la trappola che qui ha gia' prodotto il bug dei costi a
+    /// $0.00.
+    fn to_body(&self) -> Value {
+        let mut body = json!({ "error": self.message, "code": self.code });
+        // Il NOME delle tre chiavi vive nel punto unico insieme al suo lettore
+        // (`RenderedError::from_wire`, usato da mcp-core): scriverle qui a mano
+        // le renderebbe rinominabili da un solo lato.
+        render_user_error(&self.facts).write_into(&mut body);
+        if let Some(details) = &self.details {
+            body["details"] = (**details).clone();
+        }
+        body
+    }
+}
+
+/// Corpo del 504 di budget esaurito: il punto unico ([`PipelineError::to_body`])
+/// piu' le due chiavi TOP-LEVEL storiche che i chiamanti cercano gia'
+/// (`primary_cause` per il failover del motore, `budget_seconds` per la
+/// diagnosi). Funzione e non codice inline nel handler perche' il handler
+/// richiede un `AppState` con DB: cosi' il test attraversa il produttore vero
+/// invece di ricomporre il body a modo suo (regola O).
+fn request_budget_exceeded_body(budget_seconds: u64) -> (StatusCode, Value) {
+    let err = PipelineError::request_budget_exceeded();
+    let mut body = err.to_body();
+    body["primary_cause"] = json!("request_budget_exceeded");
+    body["budget_seconds"] = json!(budget_seconds);
+    (err.status, body)
+}
+
+/// I fatti STRUTTURATI di un fallimento provider a partire dall'errore anyhow
+/// che lo trasporta (punto unico nel gateway, regola L+M): status e codice dal
+/// [`ProviderHttpError`] della catena, classe dal classificatore, `error.message`
+/// del provider come frase upstream, body integrale in `detail`.
+fn provider_facts_from_error(err: &anyhow::Error, provider: &str, model: Option<&str>) -> ErrorFacts {
+    let http = err.chain().find_map(|c| c.downcast_ref::<ProviderHttpError>());
+    let class = match classify_provider_error(err) {
+        ProviderErrorKind::Billing => "billing",
+        ProviderErrorKind::ClientError => "client_error",
+        ProviderErrorKind::ContextTooLong => "context_too_long",
+        ProviderErrorKind::Transient => "transient",
+    };
+    ErrorFacts {
+        domain: ErrorDomain::Provider,
+        http_status: http.map(|h| h.status),
+        code: http.and_then(|h| h.code.clone()),
+        class: Some(class.to_string()),
+        provider: Some(provider.to_string()),
+        model: model.map(str::to_string),
+        transport: None,
+        // `error.message` del contratto d'errore del provider: e' l'unico pezzo
+        // di testo che sia davvero una frase (dice COSA e' invalido). Il body
+        // integrale resta in `detail`.
+        upstream_message: http.and_then(|h| h.structured_message()),
+        detail: err.to_string(),
     }
 }
 
@@ -161,11 +309,7 @@ fn validate_logical_model(model: &str) -> Result<(), PipelineError> {
 
 impl IntoResponse for PipelineError {
     fn into_response(self) -> Response {
-        let mut body = json!({ "error": self.message, "code": self.code });
-        if let Some(details) = self.details {
-            body["details"] = *details;
-        }
-        (self.status, Json(body)).into_response()
+        (self.status, Json(self.to_body())).into_response()
     }
 }
 
@@ -176,11 +320,114 @@ struct ResolvedProvider {
     model: String,
 }
 
+/// Margine sottratto al budget per la DEADLINE INTERNA della pipeline: la
+/// chain deve arrendersi PRIMA che il wrapper esterno (`timeout(budget, ...)`)
+/// spari il 504 anonimo, cosi' il chiamante riceve l'ULTIMO errore STRUTTURATO
+/// del provider (classe/status/codice) e puo' fare failover mirato (regola M).
+/// Non e' configurazione di comportamento: e' il tempo di risposta/serializzazione
+/// riservato alla pipeline stessa.
+const BUDGET_RESPONSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// I timeout DI QUESTA richiesta: quelli per-processo, ri-derivati sul run che
+/// il chiamante dichiara (`run_timeout_secs`).
+///
+/// I budget del gateway nascono dal run — `budget = run / min_turns` — ma erano
+/// derivati una volta sola all'avvio dal default globale (300s), mentre il run
+/// vero e' per figura: `review` ne ha 240. Il gateway prometteva quindi turni
+/// che il cronometro del chiamante non poteva mantenere.
+///
+/// Il doppio `min` e' il vincolo: puo' solo STRINGERE. Un chiamante non deve
+/// poter allungare i propri budget oltre quelli configurati dichiarando un run
+/// lunghissimo — il tetto di trasporto e' comunque congelato nel client HTTP
+/// all'avvio (`client_http_timeout`), e sforarlo trasformerebbe un
+/// `attempt_timeout` strutturato in un errore di trasporto opaco (regola M).
+fn request_timeouts(base: &LlmTimeouts, run_timeout_secs: Option<u64>) -> LlmTimeouts {
+    let per_run = base.for_run(run_timeout_secs);
+    LlmTimeouts {
+        request_budget: per_run.request_budget.min(base.request_budget),
+        per_attempt: per_run.per_attempt.min(base.per_attempt),
+        ..per_run
+    }
+}
+
+#[cfg(test)]
+mod test_request_timeouts {
+    use super::*;
+
+    fn base() -> LlmTimeouts {
+        // I valori LIVE: run 300 (default globale), complete 120, 4 turni.
+        LlmTimeouts::derive(300, 120, 300, 4)
+    }
+
+    /// Il caso che ha motivato il lavoro: la figura `review` vive 240s, non 300.
+    /// I suoi turni valgono 60s, non 75.
+    #[test]
+    fn un_run_piu_corto_stringe_il_budget() {
+        let t = request_timeouts(&base(), Some(240));
+        assert_eq!(t.request_budget, std::time::Duration::from_secs(60));
+        assert!(
+            t.request_budget.as_secs() * t.min_guaranteed_turns <= 240,
+            "i turni promessi devono starci nel run vero"
+        );
+    }
+
+    /// L'INVARIANTE del doppio `min`: un chiamante non deve poter allungare i
+    /// budget del gateway dichiarando un run lunghissimo. Il tetto di trasporto
+    /// e' congelato nel client HTTP all'avvio: sforarlo trasformerebbe un
+    /// `attempt_timeout` strutturato in un errore di trasporto opaco (regola M).
+    ///
+    /// Mutazione che rende rosso: togliere i due `.min(base...)`.
+    #[test]
+    fn nessun_run_dichiarato_puo_allungare_i_budget() {
+        let b = base();
+        for run in [600_u64, 3_600, 86_400, u64::MAX] {
+            let t = request_timeouts(&b, Some(run));
+            assert!(
+                t.request_budget <= b.request_budget,
+                "run {run}: il budget e' cresciuto ({:?} > {:?})",
+                t.request_budget,
+                b.request_budget
+            );
+            assert!(t.per_attempt <= b.per_attempt, "run {run}: per_attempt cresciuto");
+        }
+    }
+
+    /// Chiamante che non dichiara nulla (client vecchio): comportamento storico.
+    #[test]
+    fn senza_dichiarazione_i_budget_sono_quelli_di_sempre() {
+        let b = base();
+        assert_eq!(request_timeouts(&b, None).request_budget, b.request_budget);
+        assert_eq!(request_timeouts(&b, Some(0)).request_budget, b.request_budget);
+    }
+}
+
 /// Esegue la pipeline completa di completion (classify -> route -> fallback ->
 /// rehydrate -> ledger). Ritorna la risposta o un errore tradotto in HTTP.
-async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse, PipelineError> {
+///
+/// `timeouts` arriva dal chiamante GIA' risolto e non viene riletto qui: prima
+/// c'erano due `runtime_snapshot()` distinti, uno per il wrapper esterno e uno
+/// per la deadline interna. Ri-derivandoli separatamente sul run della richiesta
+/// avrebbero potuto divergere, e il wrapper esterno sarebbe scaduto PRIMA della
+/// deadline interna: la pipeline verrebbe troncata senza mai produrre l'errore
+/// strutturato su cui il motore fa failover, e il chiamante riceverebbe il 504
+/// anonimo -- esattamente il difetto che `BUDGET_RESPONSE_MARGIN` esiste per
+/// evitare. Un solo calcolo, passato per parametro.
+async fn run_complete(
+    state: &AppState,
+    req: &LlmRequest,
+    timeouts: LlmTimeouts,
+) -> Result<LlmResponse, PipelineError> {
     validate_logical_model(&req.model)?;
     let runtime = state.runtime_snapshot().await;
+    // DEADLINE della richiesta (incidente figure 2026-07-14): le ATTESE della
+    // chain (cooldown-in-testa, backoff, Retry-After) non erano confrontate col
+    // budget e potevano dormire OLTRE la deadline esterna: il chiamante moriva
+    // di timeout senza mai ricevere un errore strutturato su cui failovare.
+    let deadline = tokio::time::Instant::now()
+        + timeouts
+            .request_budget
+            .saturating_sub(BUDGET_RESPONSE_MARGIN)
+            .max(std::time::Duration::from_secs(1));
 
     // Classify + decide.
     let classifier = SensitivityClassifier::new(runtime.presidio.clone());
@@ -292,7 +539,13 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
 
     // Guardrail quota PRIMA della chiamata: usa il primo provider+modello (preview).
     let preview = &resolved[0];
-    enforce_quota(&state.db, req, preview.provider.name(), &preview.model)
+    enforce_quota(
+        &state.db,
+        req,
+        preview.provider.name(),
+        &preview.model,
+        QuotaEstimate::Testuale,
+    )
         .await
         .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
@@ -312,7 +565,8 @@ async fn run_complete(state: &AppState, req: &LlmRequest) -> Result<LlmResponse,
         &state.cooldown,
         &redacted_req,
         strict,
-        runtime.timeouts.per_attempt,
+        timeouts.per_attempt,
+        deadline,
     )
     .await?;
 
@@ -421,20 +675,11 @@ fn resolve_pinned_provider(
     };
     Ok(ResolvedProvider {
         provider: provider.clone(),
-        // Strip del prefisso "provider/" se presente; modello as-is altrimenti.
-        model: strip_model_prefix(logical_model),
+        // Strip del prefisso SOLO se e' davvero il provider di destinazione: la
+        // slash in `openai/gpt-oss-120b` (groq) o `z-ai/glm-5.2` (openrouter)
+        // e' parte del NOME, non un separatore nostro.
+        model: strip_provider_prefix(logical_model, pin),
     })
-}
-
-/// Rimuove il prefisso `provider/` da `provider/modello`, ritornando tutto cio'
-/// che segue il primo `/`. Senza `/` ritorna la stringa invariata. Allineato a
-/// `strip_provider_prefix` del resolver alias, qui in locale per il path pin
-/// (non passa dall'alias resolver).
-fn strip_model_prefix(model: &str) -> String {
-    match model.split_once('/') {
-        Some((_, rest)) => rest.to_string(),
-        None => model.to_string(),
-    }
 }
 
 /// Esegue il fallback sui provider risolti: prova in ordine, con retry sullo
@@ -456,6 +701,7 @@ async fn run_fallback(
     base_req: &LlmRequest,
     strict: bool,
     per_attempt: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<LlmResponse, PipelineError> {
     let mut failures: Vec<ProviderFailure> = Vec::new();
     let policy = cooldown.retry_policy();
@@ -471,10 +717,12 @@ async fn run_fallback(
                 // lungo invece di riprovare a ogni iterazione.
                 failures.push(ProviderFailure {
                     provider: name.to_string(),
+                    model: Some(rp.model.clone()),
                     class: "cooldown_billing",
                     status: None,
                     code: None,
                     message: format!("cooldown billing, {secs}s rimanenti"),
+                    upstream: None,
                 });
                 continue;
             }
@@ -484,7 +732,15 @@ async fn run_fallback(
             // (cooldown 21s)"). Oltre il tetto, propaga. NB: `secs` e' troncato a
             // interi, quindi un residuo sub-secondo vale 0: attendere 0s = procedi
             // subito (il cooldown e' di fatto scaduto), non e' un caso di hard-fail.
-            if strict && secs <= policy.wait_short_cooldown_cap_s {
+            // L'attesa deve STARE nel budget della richiesta (incidente figure
+            // 2026-07-14): dormire oltre la deadline consegna al chiamante un 504
+            // anonimo (o un timeout client) invece del fallimento strutturato su
+            // cui failovare subito.
+            let residual = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if strict
+                && secs <= policy.wait_short_cooldown_cap_s
+                && std::time::Duration::from_secs(secs as u64) <= residual
+            {
                 tracing::info!(
                     provider = name,
                     wait_s = secs,
@@ -494,10 +750,12 @@ async fn run_fallback(
             } else {
                 failures.push(ProviderFailure {
                     provider: name.to_string(),
+                    model: Some(rp.model.clone()),
                     class: "cooldown",
                     status: None,
                     code: None,
                     message: format!("in cooldown, {secs}s rimanenti"),
+                    upstream: None,
                 });
                 continue;
             }
@@ -515,6 +773,7 @@ async fn run_fallback(
             &policy,
             strict,
             per_attempt,
+            deadline,
         )
         .await
         {
@@ -524,7 +783,7 @@ async fn run_fallback(
                 cooldown.clear(name);
                 return Ok(resp);
             }
-            Err(f) => failures.push(f.into_provider_failure(name)),
+            Err(f) => failures.push(f.into_provider_failure(name, &rp.model)),
         }
     }
 
@@ -542,10 +801,41 @@ async fn run_fallback(
         "primary_cause": primary_cause,
         "failures": failures.iter().map(ProviderFailure::to_json).collect::<Vec<_>>(),
     });
-    Err(PipelineError::provider_with_details(
-        format!("tutti i provider hanno fallito -> {human}"),
-        details,
-    ))
+    // Lo STATUS verso il chiamante riflette la classe (regola M al confine):
+    // se OGNI provider ha rifiutato con un errore client deterministico, la
+    // stessa richiesta non andra' mai bene e ritentarla e' inutile -> 400.
+    // Prima era sempre 500: un 400 del provider usciva dal gateway come
+    // "errore server, riprovabile", e i chiamanti fuori dal motore agentico
+    // (worker, wiki, probe: decidono su `is_success`/5xx, non leggono
+    // `details`) erano autorizzati a insistere su richieste gia' condannate
+    // (misurato il 20/07: burst di 400 mistral rilanciati come 500).
+    // Il motore agentico non cambia: decide su `code` + `primary_cause`
+    // (classify_gateway_error), non sullo status. Ogni altra composizione
+    // (transiente, cooldown, billing, mista) resta 500: ritentare puo' avere
+    // senso, e il contratto coi client esistenti non si muove.
+    let all_deterministic =
+        !failures.is_empty() && failures.iter().all(|f| f.class == "client_error");
+    // La FRASE nasce dal PRIMO fallimento, con dominio Provider: e' l'unico
+    // punto in cui provider, modello, status e codice esistono ancora. A valle
+    // resterebbe solo l'aggregato "tutti i provider hanno fallito -> mistral
+    // (mistral HTTP 429: {...})", da cui nessuno puo' piu' ricavare CHI ha
+    // fallito e PERCHE' senza una regex sulla prosa (regola M).
+    let message = format!("tutti i provider hanno fallito -> {human}");
+    let facts = match failures.first() {
+        Some(f) => f.facts(&message),
+        // Chain vuota (nessun provider risolto): niente da nominare.
+        None => ErrorFacts::opaque(ErrorDomain::Gateway, &message).with_code("PROVIDER_ERROR"),
+    };
+    if all_deterministic {
+        return Err(PipelineError {
+            status: StatusCode::BAD_REQUEST,
+            code: "PROVIDER_ERROR".to_string(),
+            message,
+            details: Some(Box::new(details)),
+            facts: Box::new(facts),
+        });
+    }
+    Err(PipelineError::provider_with_details(message, details, facts))
 }
 
 /// Fallimento di UN provider della chain, in forma STRUTTURATA (regola M).
@@ -557,21 +847,51 @@ async fn run_fallback(
 /// `status`/`code` arrivano dal [`ProviderHttpError`] quando disponibili.
 struct ProviderFailure {
     provider: String,
+    /// Modello REALE tentato su questo provider (l'alias e' gia' risolto). Senza,
+    /// il messaggio puo' dire "mistral ha rifiutato" ma non QUALE modello, che e'
+    /// la prima cosa da cambiare quando un modello viene deprecato.
+    model: Option<String>,
     class: &'static str,
     status: Option<u16>,
     code: Option<String>,
     message: String,
+    /// `error.message` del provider, quando il body lo espone: una frase, non il
+    /// body. Alimenta la resa; NON entra in `to_json` (i `details` restano il
+    /// canale delle decisioni macchina, regola M).
+    upstream: Option<String>,
 }
 
 impl ProviderFailure {
     fn to_json(&self) -> Value {
         json!({
             "provider": self.provider,
+            "model": self.model,
             "class": self.class,
             "status": self.status,
             "code": self.code,
             "message": self.message,
         })
+    }
+
+    /// I fatti da cui nasce la frase per l'utente. `detail` arriva da fuori: e'
+    /// il testo tecnico AGGREGATO di tutta la cascata, non solo di questo
+    /// fallimento — chi debugga vuole sapere anche cosa hanno fatto gli altri.
+    fn facts(&self, detail: &str) -> ErrorFacts {
+        let mut facts = ErrorFacts {
+            domain: ErrorDomain::Provider,
+            http_status: self.status,
+            code: self.code.clone(),
+            class: Some(self.class.to_string()),
+            provider: Some(self.provider.clone()),
+            model: self.model.clone(),
+            transport: None,
+            upstream_message: None,
+            detail: detail.to_string(),
+        };
+        if let Some(u) = &self.upstream {
+            facts = facts.with_upstream(u.clone());
+        }
+        facts
     }
 }
 
@@ -583,6 +903,11 @@ struct CallFailure {
     status: Option<u16>,
     code: Option<String>,
     message: String,
+    /// `error.message` del body del provider (`structured_message`). Esisteva
+    /// gia' come segnale, ma finiva in UN solo campo di tracing: la frase che
+    /// dice COSA e' invalido moriva nei log mentre all'utente arrivava il body
+    /// grezzo. Ora viaggia fino alla resa.
+    upstream: Option<String>,
 }
 
 impl CallFailure {
@@ -598,6 +923,7 @@ impl CallFailure {
             status: http.map(|h| h.status),
             code: http.and_then(|h| h.code.clone()),
             message: err.to_string(),
+            upstream: http.and_then(|h| h.structured_message()),
         }
     }
 
@@ -614,6 +940,7 @@ impl CallFailure {
             message: format!(
                 "risposta degenere: nessun testo ne' tool-call (finish_reason={finish_reason})"
             ),
+            upstream: None,
         }
     }
 
@@ -632,16 +959,19 @@ impl CallFailure {
                 "nessuna risposta entro il cap per-tentativo ({}s)",
                 per_attempt.as_secs()
             ),
+            upstream: None,
         }
     }
 
-    fn into_provider_failure(self, provider: &str) -> ProviderFailure {
+    fn into_provider_failure(self, provider: &str, model: &str) -> ProviderFailure {
         ProviderFailure {
             provider: provider.to_string(),
+            model: Some(model.to_string()),
             class: self.class,
             status: self.status,
             code: self.code,
             message: self.message,
+            upstream: self.upstream,
         }
     }
 }
@@ -650,7 +980,8 @@ impl CallFailure {
 /// transitori (Fase B1, strict pin). Classifica l'errore col punto unico
 /// [`classify_provider_error`] (regola L):
 ///   - Billing   -> `mark_billing`, niente retry, errore (ricarica necessaria);
-///   - ClientError history-related -> sanificazione aggressiva + 1 retry;
+///   - ClientError history-related -> 1 retry con sanificazione aggressiva, ma
+///     SOLO se quella sanificazione cambia davvero la richiesta;
 ///   - ClientError invalid_model -> errore immediato (niente cooldown provider);
 ///   - ClientError altro -> errore (colpa config/modello singolo);
 ///   - Transient -> retry con backoff+jitter; dopo l'ultimo tentativo
@@ -661,6 +992,7 @@ impl CallFailure {
 /// `per_attempt` limita OGNI singolo `provider.complete()`: senza, un provider
 /// appeso consumava tutto il budget della richiesta e la chain non arrivava mai
 /// al provider successivo.
+#[allow(clippy::too_many_arguments)]
 async fn complete_with_retry(
     provider: &dyn LlmProvider,
     req: &LlmRequest,
@@ -669,25 +1001,50 @@ async fn complete_with_retry(
     policy: &RetryPolicy,
     strict: bool,
     per_attempt: std::time::Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<LlmResponse, CallFailure> {
     let max_attempts = if strict { policy.max_attempts.max(1) } else { 1 };
     let mut attempt = 0u32;
-    let mut history_aggressive_retry = true;
+    // "Il retry aggressivo e' ANCORA DISPONIBILE", non "lo sto facendo": si parte
+    // in Standard e si passa ad Aggressive solo dopo un client_error di formato.
+    // Il nome precedente (`history_aggressive_retry`) diceva il contrario di cio'
+    // che il valore significa, e faceva leggere il ramo come invertito.
+    let mut retry_aggressivo_disponibile = true;
     loop {
         attempt += 1;
-        let mut call_req = req.clone();
-        let sanitize_mode = if history_aggressive_retry {
+        // Cap EFFETTIVO del tentativo = min(cap per-tentativo, budget residuo
+        // della richiesta): un tentativo che non puo' completarsi entro la
+        // deadline non va nemmeno avviato — meglio l'errore strutturato subito
+        // (il chiamante failova) che il 504 anonimo del wrapper esterno.
+        let residual = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if residual < std::time::Duration::from_millis(500) {
+            // Budget esaurito senza aver potuto tentare: NESSUN cooldown (il
+            // provider non ha colpe), solo il fallimento strutturato.
+            return Err(CallFailure::attempt_timeout(residual));
+        }
+        let attempt_cap = per_attempt.min(residual);
+        let sanitize_mode = if retry_aggressivo_disponibile {
             SanitizeMode::Standard
         } else {
             SanitizeMode::Aggressive
         };
-        let sanitize_report =
-            history_sanitizer::sanitize_history(&mut call_req.messages, name, sanitize_mode);
+        let mut call_req = req.clone();
+        let (messages, sanitize_report) =
+            history_sanitizer::sanitized_for_attempt(&req.messages, name, sanitize_mode);
+        call_req.messages = messages;
         if sanitize_report != history_sanitizer::SanitizeReport::default() {
-            tracing::debug!(
+            // A `info`, non `debug`: quando un 400 di formato arriva in chat,
+            // questa e' la sola riga che dice cosa e' stato tolto dalla history
+            // e in quale modalita'. A `debug` non compariva nei log di esercizio,
+            // e "il sanitizer non ha toccato niente" era indistinguibile da "ha
+            // tolto un campo obbligatorio e non lo vediamo" (regola O).
+            tracing::info!(
                 provider = name,
                 mode = ?sanitize_mode,
+                attempt,
                 stripped_reasoning = sanitize_report.stripped_reasoning,
+                stripped_thinking_signature = sanitize_report.stripped_thinking_signature,
+                stripped_thought_signature = sanitize_report.stripped_thought_signature,
                 stripped_trailing = sanitize_report.stripped_trailing_assistant,
                 orphan_tools = sanitize_report.removed_orphan_tool_results,
                 synthetic_tools = sanitize_report.injected_synthetic_tool_results,
@@ -695,7 +1052,7 @@ async fn complete_with_retry(
             );
         }
 
-        let call = match tokio::time::timeout(per_attempt, provider.complete(&call_req)).await {
+        let call = match tokio::time::timeout(attempt_cap, provider.complete(&call_req)).await {
             Ok(r) => r,
             Err(_) => {
                 // Il cap e' scaduto: nessuna risposta da classificare. Il
@@ -703,11 +1060,11 @@ async fn complete_with_retry(
                 // transient) e la chain prova il prossimo dentro il budget.
                 tracing::warn!(
                     provider = name,
-                    per_attempt_s = per_attempt.as_secs(),
+                    attempt_cap_s = attempt_cap.as_secs(),
                     attempt,
                     "gateway: cap per-tentativo scaduto -> transient, passo oltre"
                 );
-                let failure = CallFailure::attempt_timeout(per_attempt);
+                let failure = CallFailure::attempt_timeout(attempt_cap);
                 cooldown.mark_transient(name, Some(failure.message.clone()));
                 return Err(failure);
             }
@@ -766,14 +1123,33 @@ async fn complete_with_retry(
                             );
                             return Err(failure);
                         }
-                        if history_aggressive_retry
+                        if retry_aggressivo_disponibile
                             && history_sanitizer::is_history_related_client_error(code)
                         {
-                            history_aggressive_retry = false;
+                            retry_aggressivo_disponibile = false;
+                            if !history_sanitizer::retry_changes_history(
+                                &req.messages,
+                                &call_req.messages,
+                                name,
+                                SanitizeMode::Aggressive,
+                            ) {
+                                tracing::warn!(
+                                    provider = name,
+                                    status = failure.status,
+                                    code = code,
+                                    dettaglio = %failure.message,
+                                    retry_saltato = "sanificazione_aggressiva_senza_effetto",
+                                    "gateway: client_error history, ma la sanificazione \
+                                     aggressiva lascia la richiesta IDENTICA -> niente retry \
+                                     (stessa richiesta, stesso rifiuto)"
+                                );
+                                return Err(failure);
+                            }
                             tracing::warn!(
                                 provider = name,
                                 status = failure.status,
                                 code = code,
+                                dettaglio = %failure.message,
                                 "gateway: client_error history -> sanificazione aggressiva e retry"
                             );
                             continue;
@@ -782,6 +1158,11 @@ async fn complete_with_retry(
                             provider = name,
                             status = failure.status,
                             code = code,
+                            // Il `code` dei provider OpenAI-compat e' spesso il generico
+                            // `invalid_request_error`: cosa sia davvero invalido sta solo
+                            // nel messaggio. Senza, diagnosticare un 400 e' congetturare.
+                            // Resta display/diagnosi: le decisioni leggono status e code.
+                            dettaglio = %failure.message,
                             "gateway: il provider ha rifiutato la richiesta \
                              (errore client, niente retry/cooldown)"
                         );
@@ -804,19 +1185,27 @@ async fn complete_with_retry(
                     }
                     ProviderErrorKind::Transient => {
                         let cap_s = policy.wait_short_cooldown_cap_s.max(0) as u64;
-                        // Se il provider chiede un'attesa piu' lunga del tetto, non
-                        // bloccare la richiesta cosi' a lungo: arrenditi (cooldown
-                        // breve; la riprova successiva o il re-probe recuperano).
-                        if attempt >= max_attempts || retry_after.is_some_and(|s| s > cap_s) {
-                            cooldown.mark_transient(name, Some(msg));
-                            return Err(failure);
-                        }
                         // Onora `Retry-After` (autoritativo) se presente e sotto il
                         // tetto; altrimenti backoff esponenziale+jitter calcolato.
                         let delay = match retry_after {
                             Some(s) => s.saturating_mul(1000),
                             None => policy.backoff_ms(attempt, jitter_seed()),
                         };
+                        let residual =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        // Arrenditi se: tentativi esauriti, il provider chiede
+                        // un'attesa oltre il tetto, o l'attesa NON sta nel budget
+                        // residuo della richiesta (incidente figure 2026-07-14:
+                        // dormire oltre la deadline nega al chiamante l'errore
+                        // strutturato su cui failovare, e il client muore di
+                        // timeout mentre il gateway lavora per nessuno).
+                        if attempt >= max_attempts
+                            || retry_after.is_some_and(|s| s > cap_s)
+                            || std::time::Duration::from_millis(delay) > residual
+                        {
+                            cooldown.mark_transient(name, Some(msg));
+                            return Err(failure);
+                        }
                         tracing::warn!(
                             provider = name,
                             attempt,
@@ -962,7 +1351,24 @@ pub async fn models_for_provider(
                 .into_response()
         }
         Err(e) => {
-            tracing::warn!(provider = %provider, "gateway: list_models singolo fallita");
+            // Il 502 e' corretto (il chiamante ha chiesto QUESTO provider), ma
+            // senza status/codice il log non distingue una chiave scaduta da un
+            // timeout o da un endpoint sbagliato: nei log del 26/07 c'e' un
+            // "list_models singolo fallita provider=perplexity" che non dice
+            // niente a chi deve ripararlo. I segnali strutturati esistono gia'
+            // sull'errore (regola M): vanno emessi, non ri-dedotti dal testo.
+            let http = e
+                .chain()
+                .find_map(|c| c.downcast_ref::<ProviderHttpError>());
+            tracing::warn!(
+                provider = %provider,
+                status = http.map(|h| h.status),
+                code = http.and_then(|h| h.code.as_deref()),
+                dettaglio = %http
+                    .and_then(|h| h.structured_message())
+                    .unwrap_or_else(|| e.to_string()),
+                "gateway: list_models singolo fallita"
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "provider": provider, "error": e.to_string() })),
@@ -980,11 +1386,10 @@ pub async fn complete(
     Json(body): Json<LlmRequest>,
 ) -> Response {
     if body.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "messages required" })),
-        )
-            .into_response();
+        // Delega al corpo d'errore unico: anche una guardia d'ingresso deve
+        // uscire con la stessa forma del resto della pipeline, o il frontend
+        // trova `user_message` a volte si' e a volte no.
+        return PipelineError::invalid_request("messages required").into_response();
     }
     // DEADLINE END-TO-END (retry e chain inclusi). Senza di essa una singola
     // completion poteva correre quanto il TRASPORTO concedeva (300s) — cioe'
@@ -992,29 +1397,27 @@ pub async fn complete(
     // consumava il 100% della vita del run, che moriva con `it=0`, e la colpa
     // finiva ogni volta sul modello di turno. Il budget garantisce invece
     // `min_guaranteed_turns` turni per run (punto unico: nexus_auth::llm_timeouts).
-    let budget = state.runtime_snapshot().await.timeouts.request_budget;
-    match tokio::time::timeout(budget, run_complete(&state, &body)).await {
+    // I timeout di QUESTA richiesta, dal run che il chiamante dichiara. Calcolati
+    // UNA volta e passati a `run_complete`: wrapper esterno e deadline interna
+    // devono venire dallo stesso numero, o il primo scade prima della seconda.
+    let base = state.runtime_snapshot().await.timeouts;
+    let timeouts = request_timeouts(&base, body.run_timeout_secs);
+    let budget = timeouts.request_budget;
+    match tokio::time::timeout(budget, run_complete(&state, &body, timeouts)).await {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err(e)) => e.into_response(),
         Err(_) => {
             tracing::warn!(
                 budget_s = budget.as_secs(),
+                // Da quale run e' nato il budget: senza, un 504 con budget 60s
+                // sembra una configurazione sbagliata invece di una figura corta.
+                run_timeout_s = body.run_timeout_secs.unwrap_or(0),
                 model = %body.model,
                 feature = %body.metadata.feature,
                 "gateway: budget della richiesta esaurito -> 504, il motore fara' failover"
             );
-            // 504 con codice STRUTTURATO (regola M): il chiamante decide sul
-            // codice, non sul testo.
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({
-                    "error": "request budget exceeded",
-                    "code": "request_budget_exceeded",
-                    "primary_cause": "request_budget_exceeded",
-                    "budget_seconds": budget.as_secs(),
-                })),
-            )
-                .into_response()
+            let (status, body) = request_budget_exceeded_body(budget.as_secs());
+            (status, Json(body)).into_response()
         }
     }
 }
@@ -1031,11 +1434,7 @@ pub async fn stream(
     Json(body): Json<LlmRequest>,
 ) -> Response {
     if body.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "messages required" })),
-        )
-            .into_response();
+        return PipelineError::invalid_request("messages required").into_response();
     }
     // Stessa guardia del path non-streaming (punto unico validate_logical_model):
     // un modello vuoto non deve mai aprire uno stream verso i provider.
@@ -1074,15 +1473,12 @@ async fn build_sse_stream(
             match pinned {
                 Ok(rp) => vec![rp],
                 Err(e) => {
-                    // Parita' col body JSON del path non-streaming: `code` (e
-                    // `details` se presenti) accanto al testo, cosi' il
-                    // consumer SSE decide dalla struttura (regola M).
-                    let mut payload = json!({ "error": e.message, "code": e.code });
-                    if let Some(d) = e.details {
-                        payload["details"] = *d;
-                    }
+                    // Parita' col body JSON del path non-streaming: stesso punto
+                    // unico, quindi `code`, `details` E la resa leggibile. Qui
+                    // il body era ricostruito a mano ed e' rimasto indietro ogni
+                    // volta che il non-streaming e' cambiato.
                     let _ = tx
-                        .send(Ok(Event::default().data(payload.to_string())))
+                        .send(Ok(Event::default().data(e.to_body().to_string())))
                         .await;
                     let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                     return;
@@ -1091,20 +1487,22 @@ async fn build_sse_stream(
         } else {
             let decision = runtime.policy.decide(tier, &body.metadata.feature, &HashMap::new());
             if decision.blocked {
-                let code = if decision.dlp_blocked {
-                    "POLICY_TIER_EXCLUDED"
+                let reason = decision.reason.clone().unwrap_or_default();
+                let mut err = if decision.dlp_blocked {
+                    PipelineError::policy_tier_excluded(None, tier, &decision.providers, reason)
                 } else {
-                    "TIER_BLOCKED"
+                    PipelineError::blocked(reason)
                 };
+                // `TIER_BLOCKED` non porta details dal suo costruttore, ma il
+                // path SSE li ha sempre emessi: il consumer legge detected_tier
+                // e allowed_providers.
+                err.details.get_or_insert_with(|| {
+                    Box::new(
+                        json!({ "detected_tier": tier, "allowed_providers": decision.providers }),
+                    )
+                });
                 let _ = tx
-                    .send(Ok(Event::default().data(
-                        json!({
-                            "error": decision.reason.unwrap_or_default(),
-                            "code": code,
-                            "details": { "detected_tier": tier, "allowed_providers": decision.providers },
-                        })
-                        .to_string(),
-                    )))
+                    .send(Ok(Event::default().data(err.to_body().to_string())))
                     .await;
                 let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                 return;
@@ -1135,7 +1533,15 @@ async fn build_sse_stream(
         };
 
         // Quota guardrail (non blocca lo stream se passa).
-        if let Err(e) = enforce_quota(&state.db, &body, rp.provider.name(), &rp.model).await {
+        if let Err(e) = enforce_quota(
+            &state.db,
+            &body,
+            rp.provider.name(),
+            &rp.model,
+            QuotaEstimate::Testuale,
+        )
+        .await
+        {
             let msg = e
                 .downcast_ref::<QuotaExceeded>()
                 .map(|q| q.to_string())
@@ -1205,8 +1611,16 @@ async fn build_sse_stream(
                         state.cooldown.mark_transient(name, Some(msg.clone()))
                     }
                 }
+                // Stesso corpo del path non-streaming: qui usciva il solo
+                // `err.to_string()`, cioe' il body grezzo del provider — la
+                // sorgente esatta dei blob letti in chat, sul canale che nessuno
+                // guardava perche' lo streaming e' l'eccezione.
                 let _ = tx
-                    .send(Ok(Event::default().data(json!({ "error": msg }).to_string())))
+                    .send(Ok(Event::default().data(
+                        PipelineError::provider_call_failed(name, &req.model, &err)
+                            .to_body()
+                            .to_string(),
+                    )))
                     .await;
             }
         }
@@ -1229,11 +1643,11 @@ async fn build_sse_stream(
 /// il primo provider image-capable non in cooldown. Nessun fallback cross-provider
 /// in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e non
-/// si applica all'image-gen, il cui costo e' per-immagine (non riportato in token
-/// dai provider). Per non INVENTARE costi (regola G/H: niente fallback nascosto),
-/// in questo PR il ledger NON viene scritto per le immagini. TODO PR successiva:
-/// estendere il billing con un costo per-immagine censito in `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` con la quantita' di immagini
+/// prodotte (`usage_kind='image'`, `quantity_unit='image'`, contate sulla
+/// risposta). Il costo si applica se `ai_price_catalog_unit` ha un prezzo
+/// per-immagine per questo (provider, model); finche' non ce l'ha la riga porta
+/// costo 0 con `details.price_state='not_in_catalog'` — dichiarato, non dedotto.
 pub async fn generate_image(
     State(state): State<AppState>,
     Json(body): Json<ImageGenRequest>,
@@ -1265,14 +1679,22 @@ async fn run_generate_image(
         body.pin_provider.as_deref(),
         &state.cooldown,
     )?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L): stima dal prompt come singolo messaggio user.
     let quota_req = image_gen_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1284,10 +1706,25 @@ async fn run_generate_image(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .generate_image(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        // I fatti dal ProviderHttpError, non il suo Display: qui usciva il body
+        // grezzo del provider come unico testo disponibile.
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+
+    // Consumo: le immagini prodotte si CONTANO sulla risposta, quindi la
+    // quantita' e' misurata, non stimata.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        MediaUsage::misurata(MediaKind::Image, UsageUnit::Image, resp.images.len() as f64),
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per l'image-gen (punto unico, regola L). Con `pin`:
@@ -1354,6 +1791,7 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -1374,12 +1812,11 @@ fn image_gen_to_llm_request(body: &ImageGenRequest, model: &str) -> LlmRequest {
 /// quel provider; senza pin sceglie il primo provider video-capable non in
 /// cooldown. Nessun fallback cross-provider in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
-/// non si applica al video-gen, il cui costo e' al secondo di video (non
-/// riportato in token dal provider, non censito in `ai_price_catalog`). Per non
-/// INVENTARE costi (regola G/H: niente fallback nascosto), in questo PR il ledger
-/// NON viene scritto per i video, allineato al pattern image-gen / audio. TODO PR
-/// successiva: costo per-secondo-video in `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` (`usage_kind='video'`,
+/// `quantity_unit='second'`). La durata PRODOTTA non e' riportata dal provider,
+/// quindi si registra quella richiesta con `quantity_source='request'`; se il
+/// chiamante non la indica (default lato provider) la quantita' resta NULL con
+/// `quantity_source='none'`, invece di un numero inventato.
 pub async fn generate_video(
     State(state): State<AppState>,
     Json(body): Json<VideoGenRequest>,
@@ -1409,14 +1846,22 @@ async fn run_generate_video(
     // primo video-capable non in cooldown.
     let provider =
         select_video_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L): stima dal prompt come singolo messaggio user.
     let quota_req = video_gen_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1428,10 +1873,28 @@ async fn run_generate_video(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .generate_video(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+
+    // Consumo: la risposta NON riporta la durata prodotta, quindi al massimo si
+    // registra quella richiesta. Se il chiamante non l'ha indicata (il default e'
+    // lato provider) la quantita' resta ignota: meglio una riga senza numero che
+    // un numero inventato.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        match body.duration_seconds {
+            Some(s) => MediaUsage::da_richiesta(MediaKind::Video, UsageUnit::Second, s as f64),
+            None => MediaUsage::non_quantificabile(MediaKind::Video, UsageUnit::Second),
+        },
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per il video-gen (punto unico, regola L). Gemello di
@@ -1498,6 +1961,7 @@ fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -1513,13 +1977,12 @@ fn video_gen_to_llm_request(body: &VideoGenRequest, model: &str) -> LlmRequest {
 /// quel provider; senza pin sceglie il primo provider audio-capable non in
 /// cooldown. Nessun fallback cross-provider in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
-/// non si applica alla trascrizione, il cui costo e' al minuto/secondo di audio
-/// (non riportato in token dal provider) e il testo risultante non e' noto a
-/// priori. Per non INVENTARE costi (regola G/H: niente fallback nascosto), in
-/// questo PR il ledger NON viene scritto per le trascrizioni, allineato al
-/// pattern image-gen. TODO PR successiva: costo per-durata-audio in
-/// `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` (`usage_kind='audio_in'`).
+/// La durata dell'audio non e' nota a nessuna delle due parti — la richiesta
+/// porta i byte codificati e la risposta gira con `response_format=json`, che non
+/// include `duration` — quindi la riga registra CHI ha consumato e con quale
+/// modello, con `quantity` NULL e `quantity_source='none'`. Registrare il fatto
+/// senza il numero e' piu' onesto che non registrarlo affatto.
 pub async fn transcribe_audio(
     State(state): State<AppState>,
     Json(body): Json<TranscribeRequest>,
@@ -1548,7 +2011,9 @@ async fn run_transcribe_audio(
     // primo audio-capable non in cooldown.
     let provider =
         select_audio_in_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L). Il testo risultante non e' noto a priori e
@@ -1556,9 +2021,15 @@ async fn run_transcribe_audio(
     // messaggio user vuoto). Coerente col pattern image-gen, che NON scrive
     // ledger: niente costo inventato (regola G/H).
     let quota_req = transcribe_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1570,10 +2041,27 @@ async fn run_transcribe_audio(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .transcribe_audio(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+
+    // Consumo: la trascrizione si paga al secondo di audio, ma la durata non e'
+    // nota da nessuna delle due parti — la richiesta porta i byte codificati (da
+    // cui i secondi non si ricavano senza decodificare il contenitore) e la
+    // risposta gira con `response_format=json`, che non include `duration`.
+    // La riga si scrive comunque: chi ha consumato, con quale modello e quando
+    // sono fatti utili anche senza il numero.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        MediaUsage::non_quantificabile(MediaKind::AudioIn, UsageUnit::Second),
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per la trascrizione audio (punto unico, regola L).
@@ -1640,6 +2128,7 @@ fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmReques
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -1655,12 +2144,9 @@ fn transcribe_to_llm_request(body: &TranscribeRequest, model: &str) -> LlmReques
 /// `pin_provider` esegue quel provider; senza pin sceglie il primo provider
 /// audio-out-capable non in cooldown. Nessun fallback cross-provider in questo PR.
 ///
-/// Ledger: la `record_usage_to_ledger` esistente e' per-token (input/output) e
-/// non si applica al TTS, il cui costo e' al carattere di input (non riportato in
-/// token dal provider). Per non INVENTARE costi (regola G/H: niente fallback
-/// nascosto), in questo PR il ledger NON viene scritto per la sintesi vocale,
-/// allineato al pattern image-gen / transcribe. TODO PR successiva: costo
-/// per-carattere-audio in `ai_price_catalog`.
+/// Ledger: scritto da `record_media_usage_to_ledger` (`usage_kind='audio_out'`,
+/// `quantity_unit='character'`). Qui la quantita' e' esatta: il testo di input lo
+/// conosciamo, e si contano i CARATTERI, non i byte.
 pub async fn text_to_speech(
     State(state): State<AppState>,
     Json(body): Json<TtsRequest>,
@@ -1689,7 +2175,9 @@ async fn run_text_to_speech(
     // primo audio-out-capable non in cooldown.
     let provider =
         select_audio_out_provider(&providers, body.pin_provider.as_deref(), &state.cooldown)?;
-    let model = strip_model_prefix(&body.model);
+    // Il prefisso si toglie solo se e' il provider: per groq/openrouter la
+    // slash e' parte del nome del modello (regola L: unica funzione).
+    let model = strip_provider_prefix(&body.model, provider.name());
 
     // Quota guardrail PRIMA della chiamata (riusa la fn parametrica su
     // provider+model, regola L). A differenza di transcribe, qui l'input testuale
@@ -1697,9 +2185,15 @@ async fn run_text_to_speech(
     // dell'input. Coerente col pattern image-gen, NON scrive ledger: niente costo
     // inventato (regola G/H).
     let quota_req = tts_to_llm_request(body, &model);
-    enforce_quota(&state.db, &quota_req, provider.name(), &model)
-        .await
-        .map_err(|e| {
+    enforce_quota(
+        &state.db,
+        &quota_req,
+        provider.name(),
+        &model,
+        QuotaEstimate::NonTestuale,
+    )
+    .await
+    .map_err(|e| {
             if let Some(q) = e.downcast_ref::<QuotaExceeded>() {
                 PipelineError::quota(&q.scope, &q.reason)
             } else {
@@ -1711,10 +2205,28 @@ async fn run_text_to_speech(
     let mut req = body.clone();
     req.model = model;
 
-    provider
+    let resp = provider
         .text_to_speech(&req)
         .await
-        .map_err(|e| PipelineError::provider(e.to_string()))
+        .map_err(|e| PipelineError::provider_call_failed(provider.name(), &req.model, &e))?;
+
+    // Consumo: il TTS si paga al carattere di input, e l'input lo conosciamo
+    // esattamente. `chars()` e non `len()`: i byte UTF-8 non sono caratteri, e
+    // fatturare un testo accentato piu' di uno ASCII sarebbe un errore silenzioso.
+    record_media_usage_to_ledger(
+        &state.db,
+        &quota_req,
+        &resp.provider_used,
+        &resp.model_used,
+        MediaUsage::da_richiesta(
+            MediaKind::AudioOut,
+            UsageUnit::Character,
+            body.input.chars().count() as f64,
+        ),
+    )
+    .await;
+
+    Ok(resp)
 }
 
 /// Seleziona il provider per la sintesi vocale (punto unico, regola L). Gemello di
@@ -1782,6 +2294,7 @@ fn tts_to_llm_request(body: &TtsRequest, model: &str) -> LlmRequest {
             sensitivity_tier: body.metadata.sensitivity_tier,
             feature: body.metadata.feature.clone(),
         },
+        run_timeout_secs: None,
     }
 }
 
@@ -2100,14 +2613,27 @@ mod tests {
     /// restano su cio' che vogliono verificare. Il cap ha i suoi test dedicati.
     const TEST_PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(30);
 
+    /// Deadline LONTANA per i test che non esercitano il budget: il vincolo
+    /// non deve mai scattare (il budget ha i suoi test dedicati).
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(600)
+    }
+
     // ── Provider finto (no rete) ────────────────────────────────────────────
     enum Behaviour {
         Ok,
         ErrBilling,
         /// Errore lato client (400 invalid_request): non ritentabile, non da cooldown.
         ErrClient,
-        /// Primo tentativo: 400 history-related; secondo tentativo: OK (sanificazione).
-        ErrHistoryThenOk,
+        /// 400 history-related finche' la richiesta porta ancora un
+        /// `thinking_signature`, OK quando la sanificazione l'ha tolto.
+        ///
+        /// L'esito dipende da CIO' CHE ARRIVA, come nel provider vero: un fake
+        /// che rispondesse "ok al secondo giro" qualunque cosa riceva
+        /// fossilizzerebbe l'assunto sotto esame (che il retry mandi qualcosa di
+        /// diverso) e resterebbe verde anche se il gateway rispedisse due volte
+        /// la stessa identica richiesta — che e' il difetto misurato (regola O).
+        ErrHistoryUntilSanitized,
         /// Non risponde mai: simula la chiamata APPESA che ha originato il fix
         /// (misurata sul campo: 197s senza alcun log, con le figure ferme).
         Hang,
@@ -2132,6 +2658,10 @@ mod tests {
         /// TRANSITORIO (503) prima di comportarsi secondo `behaviour`. Serve ai
         /// test del retry strict-pin. Default 0 (nessun fallimento transitorio).
         transient_fail_calls: usize,
+        /// Se `Some(s)`: OGNI chiamata fallisce 429 con `Retry-After: s` (il caso
+        /// Vertex RESOURCE_EXHAUSTED dell'incidente figure 2026-07-14). Serve ai
+        /// test del budget della richiesta.
+        transient_retry_after: Option<u64>,
     }
 
     impl FakeProvider {
@@ -2141,6 +2671,25 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
+                models_result: None,
+                image_capable: false,
+                audio_capable: false,
+                audio_out_capable: false,
+                video_capable: false,
+            })
+        }
+
+        /// Variante che risponde SEMPRE 429 con `Retry-After` esplicito: il caso
+        /// Vertex RESOURCE_EXHAUSTED dell'incidente figure 2026-07-14 (quota
+        /// esaurita, il provider chiede un'attesa che non sta nel budget).
+        fn always_rate_limited(name: &str, retry_after_s: u64) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                behaviour: Behaviour::Ok,
+                calls: AtomicUsize::new(0),
+                transient_fail_calls: 0,
+                transient_retry_after: Some(retry_after_s),
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2157,6 +2706,7 @@ mod tests {
                 behaviour: Behaviour::Ok,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: fail_n,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2172,6 +2722,7 @@ mod tests {
                 behaviour: Behaviour::Ok,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: Some(models_result),
                 image_capable: false,
                 audio_capable: false,
@@ -2187,6 +2738,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: true,
                 audio_capable: false,
@@ -2202,6 +2754,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: true,
@@ -2217,6 +2770,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2232,6 +2786,7 @@ mod tests {
                 behaviour,
                 calls: AtomicUsize::new(0),
                 transient_fail_calls: 0,
+                transient_retry_after: None,
                 models_result: None,
                 image_capable: false,
                 audio_capable: false,
@@ -2260,6 +2815,18 @@ mod tests {
         }
         async fn complete(&self, req: &LlmRequest) -> anyhow::Result<LlmResponse> {
             let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            // Rate-limit permanente con Retry-After (429 quota): come Vertex
+            // RESOURCE_EXHAUSTED. Ha precedenza su tutto: la quota non "torna".
+            if let Some(secs) = self.transient_retry_after {
+                return Err(crate::providers::ProviderHttpError {
+                    provider: self.name.clone(),
+                    status: 429,
+                    code: Some("rate_limit_exceeded".into()),
+                    retry_after_seconds: Some(secs),
+                    message: "resource exhausted (quota test)".into(),
+                }
+                .into());
+            }
             // Prime `transient_fail_calls` chiamate: errore transitorio (503),
             // emesso come ProviderHttpError (status certo) come i provider reali.
             if idx < self.transient_fail_calls {
@@ -2314,15 +2881,17 @@ mod tests {
                 }
                 .into()),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: il sleep precede il match"),
-                Behaviour::ErrHistoryThenOk => {
-                    if idx == 0 {
-                        Err(crate::providers::ProviderHttpError {
-                            provider: self.name.clone(),
-                            status: 400,
-                            code: Some("invalid_request_message_order".into()),
-                            retry_after_seconds: None,
-                            message: "invalid message order".into(),
-                        }
+                Behaviour::ErrHistoryUntilSanitized => {
+                    // Corpo VERBATIM di Anthropic quando la history porta una
+                    // firma di thinking che il turno non ammette: il codice
+                    // strutturato nasce da `from_response`, non e' dettato qui.
+                    if req.messages.iter().any(|m| m.thinking_signature.is_some()) {
+                        Err(ProviderHttpError::from_response(
+                            &self.name,
+                            400,
+                            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.1: Expected `thinking` or `redacted_thinking`, but found `text`"}}"#
+                                .to_string(),
+                        )
                         .into())
                     } else {
                         Ok(LlmResponse {
@@ -2381,7 +2950,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2403,7 +2972,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2423,7 +2992,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2447,7 +3016,7 @@ mod tests {
                 }),
                 Behaviour::ErrBilling => anyhow::bail!("HTTP 402 insufficient_quota"),
                 Behaviour::Hang => unreachable!("Behaviour::Hang: usato solo da complete"),
-                Behaviour::ErrClient | Behaviour::ErrHistoryThenOk => {
+                Behaviour::ErrClient | Behaviour::ErrHistoryUntilSanitized => {
                     anyhow::bail!("HTTP 400 invalid_request: bad field")
                 }
             }
@@ -2481,6 +3050,7 @@ mod tests {
                 sensitivity_tier: 0,
                 feature: "chat".into(),
             },
+            run_timeout_secs: None,
         }
     }
 
@@ -2517,7 +3087,7 @@ mod tests {
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.unwrap();
         assert_eq!(resp.provider_used, "openai");
         assert_eq!(resp.model_used, "gpt-x");
     }
@@ -2566,7 +3136,7 @@ mod tests {
             },
         ];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.unwrap();
+        let resp = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.unwrap();
         assert_eq!(resp.provider_used, "mistral");
         assert!(cooldown.is_in_cooldown("openai"));
     }
@@ -2582,7 +3152,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -2601,7 +3171,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2621,7 +3191,7 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2641,29 +3211,144 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
         assert!(err.message.contains("tutti i provider hanno fallito"));
-        // history-related client_error: 1 retry con sanificazione aggressiva, poi errore
-        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        // Su questa history (un solo messaggio user) la sanificazione aggressiva
+        // non ha NIENTE da togliere: il retry manderebbe la stessa richiesta e
+        // otterrebbe lo stesso 400. Un solo tentativo.
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
         assert!(!cooldown.is_in_cooldown("google")); // niente cooldown
+    }
+
+    /// History che la sanificazione aggressiva CAMBIA davvero: un assistant con
+    /// `thinking_signature`, che la modalita' Standard conserva su Anthropic (il
+    /// dialetto la richiede nei turni con tool) e che solo Aggressive rimuove.
+    fn req_con_firma_thinking() -> LlmRequest {
+        let mut r = req();
+        r.messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: MessageContent::Text("penso".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: Some("sig-di-un-altro-turno".into()),
+            reasoning: None,
+        });
+        r
     }
 
     #[tokio::test]
     async fn history_client_error_sanitize_retry_poi_successo() {
-        let p = FakeProvider::new("mistral", Behaviour::ErrHistoryThenOk);
+        // Il retry aggressivo resta quando serve: qui la firma di thinking c'e',
+        // Aggressive la toglie, la richiesta cambia e il provider accetta.
+        let p = FakeProvider::new("anthropic", Behaviour::ErrHistoryUntilSanitized);
         let resolved = vec![ResolvedProvider {
             provider: p.clone(),
-            model: "mistral-small-latest".into(),
+            model: "claude-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
-            .await
-            .unwrap();
+        let resp = run_fallback(
+            &resolved,
+            &cooldown,
+            &req_con_firma_thinking(),
+            true,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.content, "ok-after-sanitize");
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Corpo VERBATIM del 400 DeepSeek misurato il 2026-07-26 sui log del
+    /// gateway: e' da qui che nascono status e codice strutturato, non da un
+    /// `ProviderHttpError` compilato a mano nel test (regola O).
+    const BODY_400_DEEPSEEK: &str = r#"{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#;
+
+    /// History in thinking mode DeepSeek: un assistant che porta il proprio
+    /// `reasoning`. Il sanitizer lo CONSERVA in entrambe le modalita' (DeepSeek
+    /// lo esige) e non c'e' nessuna tool-call pendente da riconciliare: e' il
+    /// caso in cui Aggressive non ha nulla da fare.
+    fn req_deepseek_con_reasoning() -> LlmRequest {
+        let mut r = req();
+        r.messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: MessageContent::Text("ecco".into()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+            thinking_signature: None,
+            reasoning: Some("catena di pensiero deepseek".into()),
+        });
+        r
+    }
+
+    #[tokio::test]
+    async fn history_client_error_senza_effetto_della_sanificazione_non_ritenta() {
+        // IL DIFETTO MISURATO (log gateway 2026-07-26, 13:29:04.314 -> .809): su
+        // un 400 di formato il gateway annunciava "sanificazione aggressiva e
+        // retry", la sanificazione non toglieva NIENTE, e mezzo secondo dopo la
+        // stessa identica richiesta tornava rifiutata. Una chiamata pagata a
+        // vuoto a ogni ciclo (5 occorrenze in 20 minuti su deepseek e anthropic).
+        //
+        // Un 400 e' deterministico: a input uguale, esito uguale. Se la
+        // sanificazione aggressiva non cambia la richiesta, il retry non puo'
+        // avere un esito diverso e non va speso.
+        let richiesta = req_deepseek_con_reasoning();
+
+        // PREMESSA DICHIARATA (regola O): su questa history le due modalita'
+        // coincidono davvero. Se un domani Aggressive iniziasse a toccarla, il
+        // test deve dirlo qui invece di fallire piu' sotto per un motivo oscuro.
+        let (spedita_al_primo_tentativo, _) = history_sanitizer::sanitized_for_attempt(
+            &richiesta.messages,
+            "deepseek",
+            SanitizeMode::Standard,
+        );
+        assert!(
+            !history_sanitizer::retry_changes_history(
+                &richiesta.messages,
+                &spedita_al_primo_tentativo,
+                "deepseek",
+                SanitizeMode::Aggressive,
+            ),
+            "premessa del test decaduta: su questa history Aggressive ora cambia qualcosa"
+        );
+
+        let p = RealBodyProvider::new("deepseek", 400, BODY_400_DEEPSEEK);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "deepseek-chat".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &richiesta,
+            true,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        // LA CONSEGUENZA: una sola chiamata al provider. Mutazione: rimettendo il
+        // retry incondizionato (il `continue` senza confronto) qui si legge 2.
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            1,
+            "seconda chiamata al provider con una richiesta identica alla prima"
+        );
+        // Il rifiuto resta quello onesto del provider, non degrada in altro.
+        let details = err.details.expect("details presenti");
+        assert_eq!(details["failures"][0]["class"], "client_error");
+        assert_eq!(details["failures"][0]["status"], 400);
+        assert!(!cooldown.is_in_cooldown("deepseek")); // il provider e' sano
     }
 
     // ── Body d'errore strutturato (regola M): classe per-provider nei details ──
@@ -2681,11 +3366,17 @@ mod tests {
         }];
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
-        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
         assert_eq!(err.code, "PROVIDER_ERROR");
+        // Cascata TUTTA deterministica -> lo status verso il chiamante e' 400,
+        // non 500: ritentare la stessa richiesta e' inutile e i chiamanti fuori
+        // dal motore (decidono su 4xx/5xx, non leggono details) non devono piu'
+        // essere invitati a insistere (burst mistral del 20/07, otto 400
+        // rilanciati come 500).
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
         let details = err.details.expect("details strutturati presenti");
         assert_eq!(details["primary_cause"], "client_error");
         let f = &details["failures"][0];
@@ -2693,6 +3384,248 @@ mod tests {
         assert_eq!(f["class"], "client_error");
         assert_eq!(f["status"], 400);
         assert_eq!(f["code"], "invalid_request_error");
+    }
+
+    // ── Resa dell'errore al confine HTTP (le tre chiavi user_*) ──────────────
+
+    /// Provider che fallisce con un body d'errore REALE, costruito
+    /// dall'estrattore di PRODUZIONE ([`ProviderHttpError::from_response`]).
+    ///
+    /// Il [`FakeProvider`] scrive `code` a mano nella struct: comodo, ma un test
+    /// che parte da li' fissa l'assunto che vuole verificare (regola O). Qui il
+    /// codice strutturato e la frase upstream nascono dal body, come sul campo:
+    /// se domani l'estrattore smettesse di trovare `error.code`, il test se ne
+    /// accorge invece di restare verde.
+    struct RealBodyProvider {
+        name: String,
+        status: u16,
+        body: String,
+        calls: AtomicUsize,
+    }
+
+    impl RealBodyProvider {
+        fn new(name: &str, status: u16, body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                status,
+                body: body.to_string(),
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RealBodyProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn supports_tools(&self) -> bool {
+            true
+        }
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+        fn max_context_tokens(&self) -> u32 {
+            1000
+        }
+        fn tier_compatibility(&self) -> &[u8] {
+            &[0, 1, 2]
+        }
+        async fn complete(&self, _req: &LlmRequest) -> anyhow::Result<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(
+                ProviderHttpError::from_response(&self.name, self.status, self.body.clone())
+                    .into(),
+            )
+        }
+        async fn stream(&self, _req: &LlmRequest) -> anyhow::Result<crate::provider::ChunkStream> {
+            anyhow::bail!("non usato")
+        }
+        async fn healthcheck(&self) -> bool {
+            true
+        }
+    }
+
+    /// Body 429 REALE di un provider OpenAI-compat (Mistral), con `error.code`
+    /// macchina e `error.message` leggibile accanto a campi di contorno.
+    const BODY_429: &str = r#"{"error":{"message":"Requests rate limit exceeded","type":"invalid_request_error","code":"rate_limit_exceeded","param":null},"request_id":"1f0c9e"}"#;
+
+    #[tokio::test]
+    async fn il_corpo_derrore_porta_la_frase_e_conserva_il_contratto_storico() {
+        // LA CONSEGUENZA: dal body grezzo del provider, lungo la catena vera
+        // (complete -> CallFailure -> ProviderFailure -> PipelineError -> JSON),
+        // deve uscire un corpo in cui `user_message` e' una FRASE che nomina
+        // provider, modello e motivo — e in cui il blob e' confinato in
+        // `user_detail`. Prima esisteva solo `error`, che il blob lo portava
+        // dentro.
+        let p = RealBodyProvider::new("mistral", 429, BODY_429);
+        let resolved = vec![ResolvedProvider {
+            provider: p,
+            model: "mistral-small-latest".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(
+            &resolved,
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .err()
+        .unwrap();
+        let body = err.to_body();
+
+        let user = body["user_message"].as_str().expect("user_message presente");
+        assert!(
+            !user.contains('{') && !user.contains("request_id"),
+            "il blob e' rientrato nella frase: {user}"
+        );
+        assert!(
+            user.contains("mistral") && user.contains("mistral-small-latest"),
+            "la frase non nomina provider e modello: {user}"
+        );
+        // `error.message` del provider: esisteva gia' come segnale
+        // (`structured_message`) ma finiva solo in un campo di tracing.
+        assert!(
+            user.contains("Requests rate limit exceeded"),
+            "la frase del provider si perde per strada: {user}"
+        );
+        // Il codice macchina del provider, non lo status: e' su questo che il
+        // frontend sceglie icona e azione (mai sul testo, regola M).
+        assert_eq!(body["user_code"], "provider_rate_limited");
+        let detail = body["user_detail"].as_str().expect("user_detail presente");
+        assert!(
+            detail.contains("429") && detail.contains("request_id"),
+            "il tecnico integrale non deve perdersi: {detail}"
+        );
+
+        // Contratto storico INVARIATO: `error`, `code` e `details` sono letti da
+        // mcp-core (nexus_gateway.rs), dall'adapter del motore e dal neural client.
+        assert_eq!(body["code"], "PROVIDER_ERROR");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("tutti i provider hanno fallito"));
+        assert_eq!(body["details"]["primary_cause"], "transient");
+        assert_eq!(body["details"]["failures"][0]["status"], 429);
+        // Il modello tentato viaggia anche nei details: senza, un modello
+        // deprecato resta invisibile a chi legge la struttura.
+        assert_eq!(
+            body["details"]["failures"][0]["model"],
+            "mistral-small-latest"
+        );
+    }
+
+    #[tokio::test]
+    async fn ogni_corpo_derrore_del_gateway_ha_le_tre_chiavi() {
+        // L'INVARIANTE del confine: se anche UNA superficie risponde senza
+        // `user_message`, il frontend torna a doversela cavare col testo tecnico
+        // — cioe' a classificare per sottostringa. Qui si fissa che non accada,
+        // guardia d'ingresso e 504 di budget inclusi.
+        let p = RealBodyProvider::new("mistral", 429, BODY_429);
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let cascata = run_fallback(
+            &[ResolvedProvider {
+                provider: p,
+                model: "mistral-small-latest".into(),
+            }],
+            &cooldown,
+            &req(),
+            false,
+            TEST_PER_ATTEMPT,
+            far_deadline(),
+        )
+        .await
+        .err()
+        .unwrap();
+
+        let (_, budget_body) = request_budget_exceeded_body(240);
+        let corpi = [
+            PipelineError::invalid_request("messages required").to_body(),
+            PipelineError::quota("project", "monthly_limit").to_body(),
+            PipelineError::blocked("contenuto riservato").to_body(),
+            PipelineError::policy_tier_excluded(Some("openai"), 3, &["ollama".into()], "escluso")
+                .to_body(),
+            PipelineError::provider("nessun provider sano supporta la trascrizione audio")
+                .to_body(),
+            cascata.to_body(),
+            budget_body.clone(),
+        ];
+        for body in corpi {
+            let user = body["user_message"].as_str().unwrap_or_default();
+            assert!(!user.is_empty(), "corpo senza user_message: {body}");
+            assert!(
+                !user.contains('{'),
+                "una struttura e' finita nella frase: {user}"
+            );
+            assert!(
+                !body["user_code"].as_str().unwrap_or_default().is_empty(),
+                "corpo senza user_code: {body}"
+            );
+            assert!(body["error"].is_string(), "`error` storico perso: {body}");
+        }
+
+        // Il 504 conserva le due chiavi TOP-LEVEL su cui il motore agentico
+        // decide gia' il failover: aggiungere la resa non doveva spostarle.
+        assert_eq!(budget_body["code"], "request_budget_exceeded");
+        assert_eq!(budget_body["primary_cause"], "request_budget_exceeded");
+        assert_eq!(budget_body["budget_seconds"], 240);
+        assert_eq!(budget_body["user_code"], "gateway_timeout");
+    }
+
+    #[test]
+    fn il_fallimento_di_una_singola_chiamata_provider_nomina_chi_e_perche() {
+        // Path media/SSE: nessuna cascata, un solo provider. I fatti si estraggono
+        // dal ProviderHttpError ancora nella catena anyhow — non dal suo Display,
+        // che e' il blob.
+        let err: anyhow::Error =
+            ProviderHttpError::from_response("openai", 402, r#"{"error":{"message":"Your credit balance is too low","type":"insufficient_quota"}}"#.to_string())
+                .into();
+        let body = PipelineError::provider_call_failed("openai", "gpt-image-1", &err).to_body();
+        assert_eq!(body["user_code"], "provider_quota");
+        let user = body["user_message"].as_str().unwrap();
+        assert!(
+            user.contains("openai") && user.contains("gpt-image-1") && !user.contains('{'),
+            "frase inutilizzabile: {user}"
+        );
+        assert!(user.contains("credit balance"), "la frase del provider si perde: {user}");
+    }
+
+    #[tokio::test]
+    async fn cascata_mista_resta_500_riprovabile() {
+        // CONTRO-CASO del 400 deterministico: basta UN fallimento non-client
+        // nella cascata (qui billing) e l'aggregato resta 500 -- un retry o un
+        // failover piu' tardi possono avere senso, e il contratto storico coi
+        // client non si muove. Mutazione: se la condizione all_deterministic
+        // degenerasse in "il primo e' client_error", questo test rosseggia.
+        let a = FakeProvider::new("deepseek", Behaviour::ErrClient);
+        let b: Arc<dyn LlmProvider> = FakeProvider::new("mistral", Behaviour::ErrBilling);
+        let resolved = vec![
+            ResolvedProvider {
+                provider: a,
+                model: "deepseek-chat".into(),
+            },
+            ResolvedProvider {
+                provider: b,
+                model: "mistral-small-latest".into(),
+            },
+        ];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, "PROVIDER_ERROR");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let details = err.details.expect("details presenti");
+        // La classe per-provider resta integra nei details (regola M).
+        assert_eq!(details["failures"][0]["class"], "client_error");
+        assert_eq!(details["failures"][1]["class"], "billing");
     }
 
     #[tokio::test]
@@ -2707,7 +3640,7 @@ mod tests {
         let cooldown = CooldownManager::new();
         cooldown.set_fast_for_test();
         cooldown.mark_billing("openai", Some("insufficient_quota".into()));
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
             .await
             .err()
             .unwrap();
@@ -2795,7 +3728,7 @@ aliases:
             chrono::Utc::now(),
             2,
         );
-        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT)
+        let resp = run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, far_deadline())
             .await
             .unwrap();
         assert_eq!(resp.provider_used, "google");
@@ -2838,7 +3771,7 @@ aliases:
             model: "gpt-x".into(),
         }];
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT).await.err().unwrap();
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline()).await.err().unwrap();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("openai"));
     }
@@ -2900,7 +3833,7 @@ aliases:
         let cooldown = CooldownManager::new();
         cooldown.mark_billing("anthropic", Some("credit balance too low".into()));
 
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
             .await
             .expect_err("provider pinnato in cooldown deve fallire");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -2921,7 +3854,7 @@ aliases:
         let resolved = vec![rp];
 
         let cooldown = CooldownManager::new();
-        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT)
+        let err = run_fallback(&resolved, &cooldown, &req(), false, TEST_PER_ATTEMPT, far_deadline())
             .await
             .expect_err("provider pinnato fallito deve dare errore, non fallback");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3298,7 +4231,16 @@ aliases:
         // (un test che si blocca inchioda la CI e non dice cosa e' rotto).
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            complete_with_retry(p.as_ref(), &req(), "slow", &cooldown, &policy, true, cap),
+            complete_with_retry(
+                p.as_ref(),
+                &req(),
+                "slow",
+                &cooldown,
+                &policy,
+                true,
+                cap,
+                far_deadline(),
+            ),
         )
         .await
         .expect("cap per-tentativo NON applicato: la chiamata e' rimasta appesa");
@@ -3337,11 +4279,103 @@ aliases:
                 &req(),
                 false,
                 std::time::Duration::from_millis(50),
+                far_deadline(),
             ),
         )
         .await
         .expect("il provider appeso ha bloccato la chain: cap non applicato")
         .expect("la chain deve raggiungere il provider sano");
         assert_eq!(resp.provider_used, "sano");
+    }
+
+    // ── Budget della richiesta: le attese della chain non possono sforarlo ────
+    // (incidente figure 2026-07-14: Vertex 429 RESOURCE_EXHAUSTED con Retry-After
+    // dentro il tetto ma oltre il budget -> il gateway dormiva, il client moriva
+    // di timeout senza MAI ricevere l'errore strutturato su cui failovare.)
+
+    #[tokio::test]
+    async fn retry_after_dentro_il_tetto_ma_oltre_il_budget_fallisce_subito() {
+        // 429 con Retry-After=40s: sotto il tetto (45s) quindi il SOLO check
+        // storico avrebbe dormito 40s. Budget residuo 3s -> deve arrendersi al
+        // primo tentativo con l'errore strutturato del provider.
+        let p = FakeProvider::always_rate_limited("google", 40);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Rete di sicurezza FUORI dalla funzione sotto esame: se il fix viene
+        // neutralizzato il test fallisce NETTO qui (niente sleep di 40s).
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+        )
+        .await
+        .expect("il gateway ha dormito oltre il budget della richiesta")
+        .err()
+        .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(
+            p.calls.load(Ordering::SeqCst),
+            1,
+            "un solo tentativo: l'attesa di 40s non sta nel budget di 3s"
+        );
+        assert!(cooldown.is_in_cooldown("google"));
+    }
+
+    #[tokio::test]
+    async fn budget_esaurito_niente_tentativo_e_niente_cooldown() {
+        // Deadline gia' scaduta: nessun tentativo va nemmeno avviato e il
+        // provider NON va punito con un cooldown (non ha colpe).
+        let p = FakeProvider::new("google", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        let deadline = tokio::time::Instant::now();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+        )
+        .await
+        .expect("budget esaurito: la chain deve rispondere subito")
+        .err()
+        .unwrap();
+        assert!(err.message.contains("tutti i provider hanno fallito"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 0, "nessuna chiamata al provider");
+        assert!(
+            !cooldown.is_in_cooldown("google"),
+            "budget nostro esaurito != colpa del provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_breve_strict_oltre_il_budget_non_attende() {
+        // Provider in cooldown transitorio (residuo ~30s, sotto il tetto 45s):
+        // il SOLO check storico avrebbe dormito il residuo. Budget 2s -> deve
+        // propagare subito la failure "cooldown" senza attendere.
+        let p = FakeProvider::new("google", Behaviour::Ok);
+        let resolved = vec![ResolvedProvider {
+            provider: p.clone(),
+            model: "gemini".into(),
+        }];
+        let cooldown = CooldownManager::new();
+        cooldown.set_fast_for_test();
+        cooldown.mark_transient("google", Some("test".into()));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_fallback(&resolved, &cooldown, &req(), true, TEST_PER_ATTEMPT, deadline),
+        )
+        .await
+        .expect("il gateway ha atteso un cooldown oltre il budget della richiesta")
+        .err()
+        .unwrap();
+        assert!(err.message.contains("cooldown"));
+        assert_eq!(p.calls.load(Ordering::SeqCst), 0);
     }
 }

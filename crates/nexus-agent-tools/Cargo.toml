@@ -10,9 +10,17 @@ lru = "0.12"
 mcp-db = { path = "../mcp-db" }
 mcp-quality = { path = "../mcp-quality" }
 nexus-auth = { path = "../nexus-auth" }
+# Preflight ADR 0020 dei tool di scrittura (era `crate::build_graph` in
+# mcp-core, che e' gia' solo un re-export di questo crate).
+nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-events = { path = "../nexus-events" }
 nexus-http = { path = "../nexus-http" }
+# Punto unico delle esclusioni di walk (`is_skipped_dir`) usato dalla ricerca.
+nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-types = { path = "../nexus-types" }
+# Vault e content points della knowledge base (erano `crate::wiki::vault` e
+# `crate::vector_memory`, entrambi re-export di questo crate).
+nexus-wiki = { path = "../nexus-wiki" }
 parking_lot = "0.12"
 pdf-extract = "0.7"
 quick-xml = "0.36"
@@ -30,6 +38,11 @@ sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# Costruzione del ProjectChannels reale nel contesto dei test dei tool file.
+dashmap.workspace = true
 
 [lints]
 workspace = true

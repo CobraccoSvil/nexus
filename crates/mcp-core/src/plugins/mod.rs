@@ -9,6 +9,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use reqwest::Client;
+use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -185,17 +186,19 @@ pub(super) fn can_manage_instance(row: &sqlx::postgres::PgRow, user_id: Uuid, ro
     owner == Some(user_id) || (scope == "global" && role == "admin")
 }
 
-pub(super) fn format_compact_error(message: &str) -> String {
-    let compact = message
-        .replace(['\n', '\r'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.chars().count() > 300 {
-        format!("{}...", compact.chars().take(300).collect::<String>())
-    } else {
-        compact
-    }
+/// Messaggio d'errore di un plugin, dal punto unico di presentazione.
+///
+/// Qui viveva `format_compact_error`, uno dei due gemelli (l'altro in
+/// `plugin-service`) che collassavano gli spazi e troncavano a 300: la stessa
+/// normalizzazione scritta due volte, e nessuna traduzione — il `Display` di
+/// reqwest e l'oggetto JSON-RPC passavano interi, solo compressi. Ora la
+/// normalizzazione vive una sola volta dentro `render_user_error`, e il testo
+/// del plugin viaggia come `upstream_message`: e' una frase, non una struttura.
+pub(super) fn plugin_error_message(message: &str) -> String {
+    render_user_error(
+        &ErrorFacts::opaque(ErrorDomain::Plugin, message).with_upstream(message),
+    )
+    .message
 }
 
 pub(super) fn sanitize_return_to(value: Option<&str>) -> String {

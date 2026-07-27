@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   useCallback,
@@ -27,6 +28,7 @@ import { AgentStepsPanel } from "./chat/agent-steps-panel";
 import { extractLatestNextActions } from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
+import { providerChoiceForSend } from "./chat/provider-choice-logic";
 import { MemoryPanel } from "./chat/memory-panel";
 import { TokenUsageBar } from "./chat/token-usage-bar";
 import {
@@ -366,7 +368,10 @@ export function ChatPanel({
   const runStartedAt = agentRun?.createdAt
     ? new Date(agentRun.createdAt).getTime()
     : Date.now();
-  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - runStartedAt) / 1000));
+  // Nome allineato a cio' che misura: si chiamava `secondsSinceLastStep` anche
+  // dopo essere stato spostato sull'avvio run, e la barra attivita' ci scriveva
+  // sopra "Forza stop" facendo leggere una lunga elaborazione come un blocco.
+  const runElapsedSeconds = Math.max(0, Math.floor((nowTick - runStartedAt) / 1000));
   // "Stuck" calcolato sul tempo dall'ULTIMO step (non dall'inizio run): se
   // l'agente non emette step da >60s e' in attesa di qualcosa (LLM lento).
   // Meta-step live del run corrente: arrivano via SSE in tempo reale, a
@@ -375,14 +380,29 @@ export function ChatPanel({
   // scatta mentre l'agente sta lavorando (emette meta_step), e (b) mostrare
   // l'attivita' corrente (titolo dell'ultimo meta_step).
   const liveMetaSteps = (agentRun?.runId ? metaStepsMap.get(agentRun.runId) : undefined) ?? [];
+  // Refinement P13: compone il nastro del run LIVE UNA sola volta (stesso
+  // foldThreshold del pannello). La STESSA istanza alimenta sia la campanella
+  // (deriva notifiche + anchorId) sia il renderer del nastro (AgentStepsPanel):
+  // gli anchorId del deep-link coincidono per costruzione, non per determinismo.
+  const liveRunId = agentRun?.runId;
+  const liveActivityStream = useMemo(() => {
+    if (!activityStreamEnabled || !liveRunId) return null;
+    const meta = metaStepsMap.get(liveRunId) ?? [];
+    return composeActivityStream(
+      meta,
+      agentStepsMap.get(liveRunId) ?? [],
+      tracesForRun(traces, liveRunId),
+      foldThreshold,
+    );
+  }, [activityStreamEnabled, liveRunId, metaStepsMap, agentStepsMap, traces, foldThreshold]);
   const lastMetaStep = liveMetaSteps.length > 0 ? liveMetaSteps[liveMetaSteps.length - 1] : null;
   const lastMetaStepAt = lastMetaStep ? new Date(lastMetaStep.createdAt).getTime() : 0;
   const lastAgentStepAt = agentSteps.length > 0
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
     : runStartedAt;
   const lastStepAt = Math.max(lastAgentStepAt, lastMetaStepAt);
-  const secondsSinceLastStepInternal = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
-  const isAgentStuck = isAgentRunning && secondsSinceLastStepInternal > 60;
+  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
+  const isAgentStuck = isAgentRunning && secondsSinceLastStep > 60;
 
   // Auto-abort rimosso: il client non puo' sapere se "nessun nuovo step da Xs"
   // significa "bloccato" o "legittimamente lento" (provider in fallback dopo
@@ -398,7 +418,7 @@ export function ChatPanel({
   // Lato client conserviamo solo:
   //   - pulsante Stop rosso sempre visibile (cancellazione esplicita utente)
   //   - banner informativo nella timeline se isAgentStuck (gia' presente:
-  //     calcolo `secondsSinceLastStepInternal > 60` poco sopra)
+  //     calcolo `secondsSinceLastStep > 60` poco sopra)
 
   const timelineSteps = [...agentSteps]
     .sort((a, b) => a.stepIndex - b.stepIndex)
@@ -646,11 +666,15 @@ export function ChatPanel({
     // dall'auto-send (via ref) oppure prop esterna. Strutturale, mai dedotto dal testo.
     const agentTypeHint = agentTypeHintOverride ?? externalAgentTypeHint;
     // ADR 0023: provider e modello sono override indipendenti.
-    // Provider: forzato solo se selezionato esplicitamente (diverso da "auto");
-    // altrimenti lascia decidere al routing (eventuale hint esterno).
-    const effectiveProvider = selectedProvider !== "auto"
-      ? selectedProvider
-      : hint?.provider;
+    // Provider: dal punto unico (provider-choice-logic). Il dropdown dice QUALE
+    // provider, il pulsante "Forza" dice QUANTO vincola — e ora entrambi
+    // viaggiano: senza il secondo il backend vedeva solo il nome e doveva
+    // dedurre la forza del vincolo, trasformando ogni selezione in un pin duro.
+    const providerChoice = providerChoiceForSend({
+      selectedProvider,
+      forceProvider,
+      hintProvider: hint?.provider,
+    });
     // Modello: un modello scelto esplicitamente va SEMPRE inviato come override,
     // anche se il provider e' "auto". Un modello identifica univocamente il suo
     // provider (il backend lo ricava dal catalogo), quindi "auto" sul provider
@@ -665,7 +689,10 @@ export function ChatPanel({
     const sendOpts = {
       profileId,
       activeFiles,
-      providerOverride: effectiveProvider,
+      // Spread e non due assegnazioni a mano: la scelta di provider e' UN
+      // oggetto (quale provider + quanto vincola) e va passata intera. Ricopiare
+      // i campi uno a uno e' il punto in cui il pulsante "Forza" si era perso.
+      ...providerChoice,
       modelOverride: effectiveModel,
       automationMode: modeForSend,
       supervisorMode: supervisorMode !== "none" ? supervisorMode : undefined,
@@ -930,6 +957,22 @@ export function ChatPanel({
     [messages, resend, profileId, activeFiles, scrollToBottom],
   );
 
+  // Riattivazione di una chat sospesa dal riavvio del backend: invia un messaggio
+  // SINTETICO (nascosto nella UI) con resume=true. Il backend continua l'ultimo run
+  // `interrupted` dallo stato salvato (messages_json), NON riparte da zero. Nessun
+  // auto-riavvio: parte solo dal click sul pulsante "Riattiva" del banner.
+  const handleResume = useCallback(() => {
+    void (async () => {
+      await send("Riprendi l'elaborazione interrotta", {
+        profileId,
+        activeFiles,
+        synthetic: true,
+        resume: true,
+      });
+      setTimeout(scrollToBottom, 40);
+    })();
+  }, [send, profileId, activeFiles, scrollToBottom]);
+
   const handleDelete = useCallback(
     (messageId: string) => {
       void (async () => {
@@ -990,6 +1033,24 @@ export function ChatPanel({
     return () => ro.disconnect();
   }, []);
   const isCompactPanel = panelWidth < 340;
+
+  // ADR 0037: centro notifiche del run (campanella). Definito QUI, e non dentro
+  // il blocco della barra contesto, perche' ha due possibili ospiti e nessuno dei
+  // due deve costargli una riga: mentre il run gira viaggia in coda alla barra di
+  // stato (che e' gia' a schermo); a run concluso torna accanto alla barra
+  // contesto, che a quel punto ha i suoi dati e occupa comunque la sua riga.
+  const runNotifications =
+    activityStreamEnabled && agentRun?.runId && liveActivityStream ? (
+      <RunNotifications
+        stream={liveActivityStream}
+        runStatus={agentRun.status}
+        runId={agentRun.runId}
+        pendingActions={agentRun.pendingActions}
+        onConfirm={handleConfirmAgent}
+        isConfirming={confirmingRunId === agentRun.runId}
+        tc={tc}
+      />
+    ) : null;
 
   /* ---- Render ---- */
 
@@ -1166,6 +1227,7 @@ export function ChatPanel({
             t={t as (key: string) => string}
             onCopy={copyMessage}
             onResend={handleResend}
+            onResume={handleResume}
             onDelete={handleDelete}
             onFeedback={handleFeedback}
             onFeedbackPositive={feedbackPositive}
@@ -1202,6 +1264,9 @@ export function ChatPanel({
                 background: tc.accentBg,
                 alignSelf: "flex-end",
                 maxWidth: "96%",
+                // Il 96% non comprende padding e bordo: senza questo il preview
+                // sfonda la lista come faceva il bubble dei messaggi.
+                boxSizing: "border-box",
                 minWidth: "30%",
               }}
             >
@@ -1257,6 +1322,7 @@ export function ChatPanel({
               traces={traces}
               activityStreamEnabled={activityStreamEnabled}
               foldThreshold={foldThreshold}
+              mainRunStream={liveActivityStream ?? undefined}
             />
           )}
 
@@ -1359,7 +1425,9 @@ export function ChatPanel({
       {isChatBusy && (
         <AgentActivityBar
           tc={tc}
+          trailing={runNotifications}
           isAgentStuck={isAgentStuck}
+          runElapsedSeconds={runElapsedSeconds}
           secondsSinceLastStep={secondsSinceLastStep}
           busyLabel={busyLabel}
           isAgentRunning={isAgentRunning}
@@ -1391,27 +1459,6 @@ export function ChatPanel({
           selectedModel,
           modelCatalog,
         );
-        // ADR 0037: col flag ON, accanto alla barra contesto compare il centro
-        // notifiche del run attivo (campanella): eventi salienti del turno
-        // (cambio provider, step fallito, attesa conferma). Auto-apertura solo
-        // per eventi bloccanti.
-        const runNotifications =
-          activityStreamEnabled && agentRun?.runId ? (
-            <RunNotifications
-              stream={composeActivityStream(
-                metaStepsMap.get(agentRun.runId) ?? [],
-                agentStepsMap.get(agentRun.runId) ?? [],
-                tracesForRun(traces, agentRun.runId),
-                foldThreshold,
-              )}
-              runStatus={agentRun.status}
-              runId={agentRun.runId}
-              pendingActions={agentRun.pendingActions}
-              onConfirm={handleConfirmAgent}
-              isConfirming={confirmingRunId === agentRun.runId}
-              tc={tc}
-            />
-          ) : null;
         const usageBar = (
           <TokenUsageBar
             totalTokens={tokenUsage.totalTokens}
@@ -1421,9 +1468,13 @@ export function ChatPanel({
             modelLabel={fill.activeModel}
           />
         );
-        // Flag OFF: rendering IDENTICO a oggi (barra nuda, nessun wrapper). Flag
-        // ON: affianca il centro notifiche del run alla barra contesto.
-        return runNotifications ? (
+        // Mentre il run gira la campanella viaggia gia' in coda alla barra di
+        // stato (prop `trailing`): qui NON va aggiunta, altrimenti nasce una riga
+        // che esiste solo per lei -- a inizio run la barra contesto e' vuota,
+        // quindi si vedeva una fascia alta 28px col solo badge (difetto
+        // segnalato). A run concluso invece la barra contesto ha i suoi dati e
+        // occupa comunque la riga: li' affiancarla non costa nulla.
+        return runNotifications && !isChatBusy ? (
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
             <div style={{ flex: 1, minWidth: 0 }}>{usageBar}</div>
             {runNotifications}

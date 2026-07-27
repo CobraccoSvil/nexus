@@ -16,11 +16,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Riusa il binario gia' compilato da `cargo check --workspace` se presente,
-# altrimenti compila al volo. La scansione legge path relativi a ROOT_DIR (cwd).
-XTASK_BIN="$ROOT_DIR/target/debug/xtask"
-if [ -x "$XTASK_BIN" ]; then
-  exec "$XTASK_BIN" quality-scan "$@"
-else
-  exec cargo run --quiet -p xtask -- quality-scan "$@"
-fi
+# Ambiente comune dei gate (CARGO_INCREMENTAL=0 e simili): punto unico.
+# shellcheck source=scripts/gate-env.sh
+source "$ROOT_DIR/scripts/gate-env.sh"
+
+# SEMPRE via cargo (regola O: lo strumento misura il codice CORRENTE).
+# Il vecchio shortcut `target/debug/xtask` riusava un binario possibilmente
+# STANTIO: dopo una modifica ai detector (mcp-quality) misurava con la logica
+# vecchia contro la baseline nuova -- il gate mentiva in entrambe le direzioni.
+# cargo garantisce la freschezza da se' (a target caldo il costo e' ~1s) e
+# rispetta CARGO_TARGET_DIR (ogni albero il suo target, mai cache incrociate).
+exec cargo run --quiet -p xtask -- quality-scan "$@"

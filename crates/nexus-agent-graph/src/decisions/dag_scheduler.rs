@@ -85,14 +85,43 @@ pub struct Todo {
     #[serde(default)]
     pub seq: Option<i64>,
     /// Aree file (path/prefissi relativi alla root) che il todo DICHIARA di voler
-    /// scrivere. Popolato in un PR successivo dalla colonna `nexus_agent_todos`
-    /// quando `dispatch_wave` la consuma per verificare la DISGIUNZIONE della wave
-    /// parallela via [`crate::decisions::orchestration_reason::subtasks_are_disjoint`]
-    /// (punto unico, regola L). In PR1 e' solo il campo Rust (nessuna persistenza):
-    /// resta vuoto -> il comportamento e' invariato. `#[serde(default)]` per
-    /// retrocompat (golden/checkpoint pre-esistenti non hanno il campo).
+    /// scrivere. Persistito nella colonna `nexus_agent_todos.write_scope`
+    /// (`TEXT[] NOT NULL DEFAULT '{}'`) e riletto dall'adapter `TodoStore`:
+    /// `dispatch_wave` lo usa per verificare la DISGIUNZIONE della wave parallela
+    /// via [`crate::decisions::orchestration_reason::subtasks_are_disjoint`]
+    /// (punto unico, regola L). Vuoto = nessuna area dichiarata, quindi nessun
+    /// vincolo di disgiunzione da imporre. `#[serde(default)]` per retrocompat
+    /// (golden/checkpoint pre-esistenti non hanno il campo).
     #[serde(default)]
     pub write_scope: Vec<String>,
+    /// Testo del todo (`nexus_agent_todos.content`). TRASPORTATO per la
+    /// presentazione (il meta-step "plan" del nastro lo pubblica in chat), NON
+    /// usato dallo scheduling DAG (che ordina per dipendenze/seq): stesso spirito
+    /// di `seq`/`write_scope`, campo portato non decisionale. Senza, il piano nel
+    /// nastro appariva come righe vuote "[ ] -" (content=null nel payload).
+    /// `#[serde(default)]` per retrocompat golden/checkpoint pre-esistenti.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Priorita' del todo (`nexus_agent_todos.priority`), trasportata per il
+    /// meta-step di presentazione; non usata dallo scheduling.
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Criteri di accettazione (`nexus_agent_todos.acceptance_criteria`, JSONB).
+    /// TRASPORTATI come `content`/`priority`, e come loro non usati dallo
+    /// scheduling: li consuma il `VerifierNode`.
+    ///
+    /// Senza questo campo il verifier non ne eseguiva MAI uno. Il dato c'era —
+    /// la colonna esiste dalla migrazione project 0002 e il tool `todos` la
+    /// scrive — ma il verifier lo cercava dentro la ri-serializzazione di questo
+    /// tipo (`todo_value_of`), che non lo portava: risultato, lista sempre vuota
+    /// e ramo "nessun criterion" a ogni giro. La prova indipendente e' che
+    /// `nexus_agent_verifier_runs` era a zero righe su 104 todo con criteri.
+    ///
+    /// `Vec<Value>` e non un tipo strutturato: la forma la normalizza il
+    /// verifier (`normalize_criteria`), che e' il punto unico dove il
+    /// vocabolario dei criteri viene interpretato.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<serde_json::Value>,
 }
 
 /// Config del DAG parallelo (PARAMETRO esplicito, no lettura DB: regola G).
@@ -180,6 +209,32 @@ pub fn pick_next_todo(todos: &[Todo], dag_topological_enabled: bool) -> Option<&
     }
 }
 
+/// `true` se il piano dei todo e' PIENAMENTE RISOLTO CON LAVORO REALE: OGNI todo
+/// e' in uno stato terminale che soddisfa una dipendenza
+/// ([`TodoStatus::satisfies_dependency`], cioe' `completed`/`skipped`) E almeno
+/// uno e' `completed`.
+///
+/// Punto unico (regola L) del criterio "il piano si e' concluso avendo prodotto
+/// lavoro". NON e' equivalente a `pick_next_todo(..) == None`: quello ritorna
+/// `None` anche quando restano todo `blocked` (piano FERMO, non completato) e
+/// non distingue un piano tutto `skipped` (nessun lavoro reale) da uno eseguito.
+///
+/// A COSA SERVE (regola M, falso positivo hollow su todo-isolation): quando
+/// `supervisor_mode=continuous` i todo vengono eseguiti come SUB-RUN isolati e il
+/// run PRINCIPALE e' un semplice dispatcher: `route_after_todo_runner` lo manda a
+/// FinalGate/Learner e MAI all'Executor, percio' non scrive `agent_steps` sul
+/// proprio `run_id` e non produce un `final_answer` (nessun turno di sintesi).
+/// La detection "hollow completion" del finalizzatore vedrebbe quindi 0 step +
+/// risposta vuota e lo scambierebbe per un completamento allucinato: questo
+/// predicato e' il SEGNALE STRUTTURATO che distingue "lavoro svolto per delega"
+/// da "nessun lavoro". Un piano vuoto, con `pending`/`in_progress`/`blocked`, o
+/// tutto `skipped`, NON lo soddisfa: quei run restano soggetti alla detection.
+pub fn plan_todos_all_completed(todos: &[Todo]) -> bool {
+    !todos.is_empty()
+        && todos.iter().all(|t| t.status.satisfies_dependency())
+        && todos.iter().any(|t| matches!(t.status, TodoStatus::Completed))
+}
+
 /// Insieme dei todo che dipendono (diretta o transitivamente) da `todo_id`
 /// (1:1 con `dag_scheduler._descendants`, `dag_scheduler.py:76-90`). Usato per
 /// il cascade-skip: se un todo fallisce, tutti i suoi discendenti vengono
@@ -242,6 +297,9 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             seq: None,
             write_scope: Vec::new(),
+            content: None,
+            priority: None,
+            acceptance_criteria: Vec::new(),
         }
     }
 
@@ -281,6 +339,90 @@ mod tests {
         let todos = vec![todo("a", TodoStatus::Pending, &[])];
         let ready = compute_ready_layer(&todos);
         assert!(!should_parallelize(&ready, &todos, &DagConfig::default()));
+    }
+
+    // --- plan_todos_all_completed: segnale "piano concluso con lavoro" -------
+    // Boundary del predicato che salva i run dispatcher di todo-isolation dal
+    // falso positivo "hollow completion" (0 step + risposta vuota per delega).
+
+    #[test]
+    fn piano_tutto_completed_e_concluso_con_lavoro() {
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Completed, &["a"]),
+        ];
+        assert!(plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_completed_piu_skipped_resta_concluso_con_lavoro() {
+        // `skipped` soddisfa una dipendenza (cascade-skip legittimo): finche'
+        // ALMENO UNO e' completed il piano ha prodotto lavoro reale.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Skipped, &["a"]),
+        ];
+        assert!(plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_tutto_skipped_non_e_lavoro() {
+        // Nessun todo eseguito davvero: il run NON va esentato dalla detection
+        // hollow, altrimenti si inghiottirebbe un dispatch a vuoto.
+        let todos = vec![
+            todo("a", TodoStatus::Skipped, &[]),
+            todo("b", TodoStatus::Skipped, &[]),
+        ];
+        assert!(!plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_con_blocked_non_e_concluso() {
+        // Dispatch parzialmente FALLITO: deve restare hollow-eligible, cosi' il
+        // fallimento vero emerge invece di essere mascherato.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Blocked, &["a"]),
+        ];
+        assert!(!plan_todos_all_completed(&todos));
+    }
+
+    #[test]
+    fn piano_con_pending_o_in_progress_non_e_concluso() {
+        let con_pending = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Pending, &[]),
+        ];
+        assert!(!plan_todos_all_completed(&con_pending));
+        let con_in_progress = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::InProgress, &[]),
+        ];
+        assert!(!plan_todos_all_completed(&con_in_progress));
+    }
+
+    #[test]
+    fn piano_vuoto_non_e_concluso() {
+        // Run SENZA piano (la maggioranza): nessuna esenzione, detection hollow
+        // invariata (nessuna regressione sull'incidente 0-step b07c7e78).
+        assert!(!plan_todos_all_completed(&[]));
+    }
+
+    #[test]
+    fn non_e_equivalente_a_pick_next_todo_none() {
+        // TRANELLO da non reintrodurre: `pick_next_todo == None` NON e' il
+        // segnale giusto. Qui non c'e' alcun pending (quindi pick_next -> None)
+        // ma il piano e' FERMO su un blocked, non concluso.
+        let todos = vec![
+            todo("a", TodoStatus::Completed, &[]),
+            todo("b", TodoStatus::Blocked, &["a"]),
+        ];
+        assert!(pick_next_todo(&todos, true).is_none());
+        assert!(
+            !plan_todos_all_completed(&todos),
+            "un piano con todo blocked non e' concluso: usare pick_next_todo==None \
+             come proxy esenterebbe un dispatch fallito"
+        );
     }
 
     #[test]

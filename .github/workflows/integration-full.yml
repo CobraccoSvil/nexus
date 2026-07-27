@@ -1,0 +1,271 @@
+name: integration-full
+
+# Job che PRETENDE l'ambiente completo: `REQUIRE_INTEGRATION_TESTS=1`.
+#
+# PERCHE'. Gli integration test del repo sono opportunistici: senza DB, senza
+# servizio in ascolto o senza JWT saltano. Da quando lo skip passa dal punto
+# unico (`nexus-test-preconditions`) il salto e' almeno VISIBILE, ma un ambiente
+# che non c'e' resta un contratto non verificato. Questo job allestisce
+# l'ambiente per davvero e capovolge il default: qui una precondizione mancante
+# non e' uno skip, e' un FALLIMENTO che la nomina.
+#
+# Il gate `verify.yml` di ogni push resta com'e' (nessun servizio da avviare,
+# nessuna chiamata esterna): questo job e' piu' lento — compila mcp-core in
+# release — e gira di notte o a mano.
+#
+# COME NASCE IL JWT. Non si conia a mano nel workflow: si abilita
+# `auth.dev_login_enabled` e si chiama `POST /internal/dev-login-token`, cioe' lo
+# STESSO percorso che il frontend usa in sviluppo. Un token fabbricato nello
+# script sarebbe firmato da noi con una chiave che ci siamo scelti: proverebbe
+# che sappiamo firmare, non che il servizio accetta i suoi token (regola O).
+#
+# COSA COPRE. Gli obiettivi sono elencati uno per uno nello step finale, non con
+# un `cargo test --workspace`: cosi' l'elenco e' leggibile e nessuno crede che il
+# job copra piu' di quanto copre.
+#
+# `m71_cost_breakdown` e `chat_history_run_anchor` sono INCLUSI. Erano scritti
+# contro il meta-DB, dove la migrazione 0507 ha decommissionato il dominio
+# chat/run; riscritti per seminare nel DB-progetto (fixture `tests/progetto`,
+# nella forma che scrive la produzione), sono stati verificati E2E in locale il
+# 2026-07-26 contro un mcp-core in ascolto: entrambi verdi, contro-caso compreso.
+#
+# Perche' il seed sotto imposta `owner_user_id`: gli handler chiamano
+# `ensure_project_access`, che pretende che l'utente sia owner del progetto o
+# membro. Con un progetto di qualcun altro la risposta e' 403, e il test
+# misurerebbe la propria scelta sbagliata invece del contratto.
+
+# SOLO A MANO, nessuno schedule. Il job costa ~25 minuti (build release di
+# mcp-core) e su un account Free il budget e' 2000 minuti/mese: una esecuzione
+# notturna ne consumerebbe 750, meta' del totale, anche nei giorni in cui nessuno
+# tocca il codice. La stessa lista di test gira in locale a costo zero con
+# `scripts/integration-full-local.ps1`; questo job serve per cio' che la' non si
+# puo' verificare — Linux, DB usa-e-getta, artefatto compilato da zero — e lo si
+# lancia quando quella differenza conta (prima di un rilascio, dopo aver toccato
+# migrazioni o lo script del cluster app).
+on:
+  workflow_dispatch:
+
+jobs:
+  integration-full:
+    name: "Integrazione con ambiente completo"
+    runs-on: ubuntu-latest
+
+    services:
+      # Cluster Nexus: meta-DB. Stessa immagine di verify.yml.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: nexus
+          POSTGRES_PASSWORD: nexus
+          POSTGRES_DB: nexus
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      # Cluster APP, separato: e' l'oggetto stesso di postgres_app_isolation, che
+      # verifica che i due cluster non siano lo stesso (system_identifier) e che
+      # il role nexus_app esista di qua e non di la'. Con un solo Postgres il
+      # test non avrebbe niente da misurare.
+      postgres-app:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: nexus_admin
+          POSTGRES_PASSWORD: nexus_admin_secret
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U nexus_admin"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5434:5432
+
+      # mcp-core non si avvia senza Redis: `init_redis_and_cooldowns` propaga
+      # l'errore e il processo esce.
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    env:
+      DATABASE_URL: postgres://nexus:nexus@localhost:5432/nexus
+      NEXUS_APP_ADMIN_URL: postgres://nexus_admin:nexus_admin_secret@localhost:5434/postgres
+      REDIS_URL: redis://localhost:6379
+      # Il capovolgimento: senza questa riga il job sarebbe un altro verde muto.
+      REQUIRE_INTEGRATION_TESTS: "1"
+      # MCP_CORE_URL non e' qui: la porta la decide il DB
+      # (`settings.mcp_core_http_port`, regola G) e mcp-core la legge da li' con
+      # `nexus_auth::resolve_port`. Scriverla a mano nel workflow significherebbe
+      # tenere due valori per la stessa decisione: al primo cambio nel DB il job
+      # busserebbe a una porta dove non c'e' nessuno e lo leggeremmo come
+      # "servizio non raggiungibile". Viene letta dal DB nello step di avvio.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (da rust-toolchain.toml)
+        run: rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # mcp-proto usa prost-build: senza protoc, mcp-core non compila.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Stesso motore della produzione (`Migrator` in mcp-core/src/db.rs) e stesso
+      # exit code: un set che non si applica ferma il job.
+      - name: Apply DB migrations
+        run: cargo run --locked -p xtask -- migrate --set meta --apply
+
+      # Il role nexus_app lo crea LO SCRIPT DELLA PRODUZIONE, quello che il
+      # compose monta come init del container: se un domani cambiano i privilegi,
+      # cambiano qui e nel test insieme. Ricopiare il SQL nel workflow avrebbe
+      # creato una seconda verita' destinata a divergere (regole L e O).
+      - name: Bootstrap del cluster app (script di produzione)
+        env:
+          PGHOST: localhost
+          PGPORT: 5434
+          PGPASSWORD: nexus_admin_secret
+          POSTGRES_USER: nexus_admin
+          POSTGRES_DB: postgres
+          NEXUS_APP_DB_PASSWORD: nexus_app_dev_secret
+        run: bash infra/sql/init-postgres-app.sh
+
+      # Seed minimo: `project_db_config_contract` pretende almeno un progetto, e
+      # `projects.team_id` e' NOT NULL con FK su teams. Nient'altro: i test
+      # inclusi non hanno bisogno di altre righe, e un seed piu' grande sarebbe
+      # solo un'occasione in piu' di divergere dallo schema.
+      - name: Seed minimo (un team, un progetto)
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO teams (name, slug) VALUES ('CI', 'ci-integration')
+            ON CONFLICT (slug) DO NOTHING;
+          INSERT INTO projects (team_id, name, slug)
+          SELECT id, 'CI integration', 'ci-integration' FROM teams WHERE slug = 'ci-integration'
+            ON CONFLICT (team_id, slug) DO NOTHING;
+          SQL
+
+      # Release e non debug: `agent_tools_safety` cerca `target/release/mcp-core`
+      # e ne legge le stringhe compilate, quindi il binario che serve il traffico
+      # e quello che il test ispeziona sono lo STESSO artefatto.
+      - name: Build mcp-core (release)
+        run: cargo build --release -p mcp-core
+
+      - name: Avvia mcp-core e attendi /health
+        run: |
+          # La porta dalla stessa fonte che usa il servizio: settings nel DB.
+          port="$(psql "$DATABASE_URL" -tAc "SELECT value FROM settings WHERE key = 'mcp_core_http_port'")"
+          if [ -z "$port" ]; then
+            echo "::error::settings.mcp_core_http_port assente: le migrazioni non sono complete"
+            exit 1
+          fi
+          url="http://localhost:$port"
+          echo "MCP_CORE_URL=$url" >> "$GITHUB_ENV"
+          echo "mcp-core atteso su $url (porta letta dal DB)"
+
+          ./target/release/mcp-core > /tmp/mcp-core.log 2>&1 &
+          echo $! > /tmp/mcp-core.pid
+          for i in $(seq 1 60); do
+            if curl -fsS "$url/health" >/dev/null 2>&1; then
+              echo "mcp-core in ascolto dopo ${i}s"
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/mcp-core.pid)" 2>/dev/null; then
+              echo "::error::mcp-core e' morto durante l'avvio"
+              tail -50 /tmp/mcp-core.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::mcp-core non risponde su $url dopo 60s"
+          tail -50 /tmp/mcp-core.log
+          exit 1
+
+      # Il token viene dal backend, con la chiave di firma della piattaforma: e'
+      # il percorso del dev-login, non una firma fabbricata qui.
+      #
+      # La riga in `sessions` va aggiunta a parte: `validate_token` verifica
+      # SEMPRE che il token abbia una sessione viva (`check_session_exists`), e
+      # `dev_login_token` firma soltanto — la scrittura in `sessions` la fa il
+      # callback OAuth (`crates/mcp-core/src/auth.rs`), che qui non passa. Senza
+      # questo INSERT ogni chiamata autenticata prende 401 con una firma
+      # perfettamente valida.
+      - name: Conia il JWT e aprigli la sessione
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -c "UPDATE settings SET value = 'true' WHERE key = 'auth.dev_login_enabled';"
+          token="$(curl -fsS -X POST "$MCP_CORE_URL/internal/dev-login-token" | jq -r '.token // empty')"
+          if [ -z "$token" ]; then
+            echo "::error::dev-login-token non ha restituito un token: l'ambiente NON e' completo"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+
+          # `sessions.token_hash` e' lo sha256 esadecimale del token (hash_token
+          # in crates/nexus-auth). L'utente e' quello che il token DICHIARA: e'
+          # l'unico che gli handler accetteranno.
+          hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+
+          # Il payload di un JWT e' base64url SENZA padding, e `base64 -d` di
+          # coreutils lo rifiuta ("invalid input") quando la lunghezza non e'
+          # multipla di 4 — cioe' in 2 casi su 4, a seconda del claim `exp` e
+          # dell'id utente. Verificato prima di lanciare il job: senza il padding
+          # qui sotto, `sub` sarebbe vuoto e lo step morirebbe con "claim 'sub'
+          # non leggibile", un rosso che parla del workflow e non dell'ambiente.
+          payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          sub="$(printf '%s' "$payload" | base64 -d | jq -r '.sub')"
+          if [ -z "$sub" ] || [ "$sub" = "null" ]; then
+            echo "::error::il token non porta un claim 'sub' leggibile"
+            exit 1
+          fi
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
+          INSERT INTO users (id, email, display_name, role)
+          VALUES ('$sub', 'ci-integration@nexus.local', 'CI integration', 'admin')
+            ON CONFLICT (id) DO NOTHING;
+          INSERT INTO sessions (user_id, token_hash, expires_at)
+          VALUES ('$sub', '$hash', NOW() + INTERVAL '2 hours');
+          -- Owner del progetto di prova: senza, ensure_project_access risponde 403
+          -- e i test del dominio chat/run non arrivano al contratto.
+          UPDATE projects SET owner_user_id = '$sub' WHERE slug = 'ci-integration';
+          SQL
+          echo "NEXUS_TEST_JWT=$token" >> "$GITHUB_ENV"
+
+      # Un obiettivo per riga: l'elenco E' la dichiarazione di copertura. La
+      # sentinella `precondizioni_integrazione` gira per prima e, con REQUIRE=1,
+      # fallisce subito se una delle quattro precondizioni non c'e': meglio un
+      # rosso che dice "manca il JWT" di sette rossi che dicono ciascuno la sua.
+      - name: Test di integrazione (ambiente preteso completo)
+        run: |
+          cargo test -p mcp-core \
+            --test precondizioni_integrazione \
+            --test orchestrator_db_schema \
+            --test project_db_config_contract \
+            --test postgres_app_isolation \
+            --test settings_update_contract \
+            --test agent_runs_endpoints \
+            --test agent_tools_safety \
+            --test chat_history_run_anchor \
+            --test m71_cost_breakdown \
+            -- --nocapture
+          cargo test -p nexus-auth --test settings_write -- --nocapture
+          cargo test -p nexus-project-pools --test pool_routing -- --nocapture
+
+      # I log del servizio sono la prima cosa che serve quando un contratto cade,
+      # e dopo il job la macchina non esiste piu'.
+      - name: Log di mcp-core (sempre)
+        if: always()
+        run: tail -200 /tmp/mcp-core.log || true
+
+      - name: Ferma mcp-core
+        if: always()
+        run: kill "$(cat /tmp/mcp-core.pid)" 2>/dev/null || true

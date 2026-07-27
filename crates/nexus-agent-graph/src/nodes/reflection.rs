@@ -41,7 +41,7 @@
 //!   `TEMPLATE_UTENTE` (safe-default, replica del fallback Python).
 //! - La **persistenza** in `nexus_agent_reflections` (`_persist_reflection`,
 //!   `__init__.py:4426`) e' delegata a `ctx.db` come task best-effort
-//!   fire-and-forget, GATED su shadow (in shadow NON scrive: zero side-effect).
+//!   fire-and-forget.
 //! - Il **reasoning_bank** (`maybe_store_reflection_example`, embedding pesante):
 //!   NON portato in questo PR -> TODO esplicito dietro porta dedicata.
 //!
@@ -562,17 +562,14 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReflectionNode {
             None => (None, None),
         };
 
-        // ── Persistenza best-effort (gated su shadow) + reasoning_bank TODO ───
-        // GATING OBBLIGATORIO: in shadow NON scrive (zero side-effect).
+        // ── Persistenza best-effort + reasoning_bank TODO ─────────────────────
         if let Some(rd) = &reflection_data {
-            if !ctx.shadow {
-                self.spawn_persist(ctx, state, rd);
-            }
+            self.spawn_persist(ctx, state, rd);
             // TODO porting: reasoning_bank dietro porta dedicata.
             // (`maybe_store_reflection_example`, __init__.py:4404-4415): bridge
             // verso reasoning_bank quando score>=reasoning_bank_min_score &&
             // suggestions presenti. NON portato in questo PR (embedding pesante,
-            // porta dedicata assente). Gated su shadow quando verra' stubbato.
+            // porta dedicata assente).
             let _bank_eligible = reflection_score
                 .map(|s| s >= self.cfg.reasoning_bank_min_score)
                 .unwrap_or(false)
@@ -618,18 +615,6 @@ impl ReflectionNode {
     /// single-string `sys + "\n\n" + user` (`__init__.py:4325`) sulla forma
     /// `messages` del gateway: system->role system, user->role user (parita' con
     /// gli altri nodi gia' portati). Best-effort: errore -> None.
-    ///
-    /// PENDENZA NOTA (LLM-shadow, da chiudere con l'integrazione del gateway
-    /// concreto, Fase 3 PR2): a differenza di `ToolExecutor`, il trait
-    /// `LlmGateway::complete` (`runtime/ports.rs`) NON ha un `ExecMode`, quindi
-    /// in modalita' shadow questa chiamata NON e' gated e spenderebbe token
-    /// reali. OGGI e' latente perche' nessun gateway concreto e' cablato (i test
-    /// usano double scriptati) ed e' allineata al Python, che a sua volta NON
-    /// gata l'LLM in shadow. Il fix architetturale (ExecMode/Replay su
-    /// `LlmGateway`) appartiene all'integrazione del gateway concreto e NON tocca
-    /// il contratto `ports.rs` in questo PR. Vedi anche il gating shadow gia'
-    /// presente sulla PERSISTENZA (`run`: `if !ctx.shadow`), che e' un side-effect
-    /// distinto e gia' coperto.
     async fn call_evaluator(
         &self,
         ctx: &AgentNodeCtx,
@@ -659,9 +644,8 @@ impl ReflectionNode {
             ],
             // Nessun tool: la reflection ritorna JSON testuale.
             tools: None,
-            // Nodo chiamante = reflection: in shadow il decorator di replay
-            // neutralizza questo purpose (nessuna valutazione LLM, resta il reward
-            // euristico deterministico). Il gateway concreto lo IGNORA (regola L).
+            // Nodo chiamante = reflection. Il gateway concreto lo IGNORA quando il
+            // modello e' gia' risolto (regola L).
             purpose: Some("reflection".into()),
             ..Default::default()
         };
@@ -696,9 +680,6 @@ impl ReflectionNode {
     /// `prompt_key` deriva dal profilo (I/O profile_loader) — finche' quella
     /// porta non esiste lo deriviamo dal `profile_name` dello stato come chiave
     /// di tracciamento; assente -> niente persistenza (parita' col gate Python).
-    ///
-    /// GATING SHADOW: chiamata SOLO quando `!ctx.shadow` (il gate e' nel
-    /// chiamante `run`): in shadow zero scritture.
     fn spawn_persist(&self, ctx: &AgentNodeCtx, state: &AgentState, rd: &ReflectionData) {
         // prompt_key: il brain lo prende dal profilo (prof.prompt_key). La porta
         // profile_loader non c'e' ancora -> usiamo il profile_name come chiave di
@@ -819,7 +800,7 @@ mod tests {
     #[async_trait]
     impl LlmGateway for FailingLlm {
         async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, PortError> {
-            Err(PortError::Llm("simulato".to_string()))
+            Err(PortError::Llm("simulato".to_string().into()))
         }
     }
 
@@ -831,7 +812,7 @@ mod tests {
     /// Ctx di test con LLM iniettabile; PgPool lazy (nessuna query DB reale: i
     /// test che NON innescano persistenza non toccano il DB; quelli con
     /// persistenza la spawnano fire-and-forget e non attendono l'esito).
-    fn ctx_with(llm: Arc<dyn LlmGateway>, shadow: bool) -> AgentNodeCtx {
+    fn ctx_with(llm: Arc<dyn LlmGateway>) -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy non si connette");
@@ -846,7 +827,7 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
+            advisory_gate: None,
         }
     }
 
@@ -886,7 +867,7 @@ mod tests {
         };
         let node = ReflectionNode::new(cfg);
         let llm = Arc::new(ScriptedLlm::with_content(VALID_JSON));
-        let ctx = ctx_with(llm.clone(), false);
+        let ctx = ctx_with(llm.clone());
         let st = passing_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.reflection_score, None);
@@ -898,7 +879,7 @@ mod tests {
     async fn gate_no_reflection_tag_passthrough() {
         let node = ReflectionNode::new(cfg_always());
         let llm = Arc::new(ScriptedLlm::with_content(VALID_JSON));
-        let ctx = ctx_with(llm.clone(), false);
+        let ctx = ctx_with(llm.clone());
         let mut st = passing_state();
         st.system_text = Some("prompt senza tag".to_string());
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -916,7 +897,7 @@ mod tests {
         };
         let node = ReflectionNode::new(cfg);
         let llm = Arc::new(ScriptedLlm::with_content(VALID_JSON));
-        let ctx = ctx_with(llm.clone(), false);
+        let ctx = ctx_with(llm.clone());
         let st = passing_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.reflection_score, None);
@@ -931,7 +912,7 @@ mod tests {
     async fn gate_result_vuoto_passthrough() {
         let node = ReflectionNode::new(cfg_always());
         let llm = Arc::new(ScriptedLlm::with_content(VALID_JSON));
-        let ctx = ctx_with(llm.clone(), false);
+        let ctx = ctx_with(llm.clone());
         let mut st = passing_state();
         st.result = Some(String::new());
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
@@ -946,7 +927,7 @@ mod tests {
     async fn happy_path_delta_completo() {
         let node = ReflectionNode::new(cfg_always());
         let llm = Arc::new(ScriptedLlm::with_content(VALID_JSON));
-        let ctx = ctx_with(llm.clone(), false);
+        let ctx = ctx_with(llm.clone());
         let st = passing_state(); // iterations 3, end_turn, result presente -> heuristic 1.0
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
 
@@ -965,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn llm_fallito_solo_euristico() {
         let node = ReflectionNode::new(cfg_always());
-        let ctx = ctx_with(Arc::new(FailingLlm), false);
+        let ctx = ctx_with(Arc::new(FailingLlm));
         let st = passing_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         // reflection_data None -> score None, final_reward None (solo euristico).
@@ -977,28 +958,13 @@ mod tests {
     async fn parsing_fallito_solo_euristico() {
         let node = ReflectionNode::new(cfg_always());
         let llm = Arc::new(ScriptedLlm::with_content("non e' json"));
-        let ctx = ctx_with(llm, false);
+        let ctx = ctx_with(llm);
         let st = passing_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
         assert_eq!(out.reflection_score, None);
         assert_eq!(out.final_reward, None);
     }
 
-    /// Shadow: la persistenza NON deve partire (gate `!ctx.shadow`). Verifichiamo
-    /// che il run non vada in errore (la query DB su pool lazy fallirebbe se
-    /// spawnata, ma e' fire-and-forget e in shadow non si spawna affatto).
-    #[tokio::test]
-    async fn shadow_non_persiste() {
-        let node = ReflectionNode::new(cfg_always());
-        let llm = Arc::new(ScriptedLlm::with_content(VALID_JSON));
-        let ctx = ctx_with(llm, true); // shadow
-        let mut st = passing_state();
-        st.profile_name = Some("core".to_string()); // prompt_key non vuoto
-        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
-        // Il delta e' comunque completo (la valutazione gira; solo la scrittura
-        // e' soppressa).
-        assert_eq!(out.reflection_score, Some(0.8));
-    }
 
     // ── Funzioni deterministiche unitarie ──────────────────────────────────────
 

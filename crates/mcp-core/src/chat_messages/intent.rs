@@ -5,6 +5,41 @@ pub(crate) fn parse_automation_mode(value: Option<&str>) -> AutomationMode {
     AutomationMode::parse(value)
 }
 
+/// La scelta di provider di una richiesta di chat, letta dal corpo HTTP.
+///
+/// Confine HTTP dei due handler che accettano un `SendChatMessageRequest`
+/// (invio e resend): validazione dell'identificatore canonico — un valore
+/// scritto male e' 400, non un silenzioso ripiego sul default — e risoluzione
+/// col provider che una fonte persistita ricorda. Sta qui e non in ciascun
+/// handler perche' e' la stessa domanda: due copie divergerebbero, e quella che
+/// divergesse sul MODO deciderebbe di nascosto se la richiesta ha il fallback.
+///
+/// `remembered_provider`: preferenza di sessione (invio) o provider del
+/// messaggio originale (resend). Vale come preferenza e mai come pin — la
+/// regola vive in [`ProviderChoice::resolve`], qui non si duplica.
+pub(crate) fn provider_choice_from_body(
+    body: &SendChatMessageRequest,
+    remembered_provider: Option<&str>,
+) -> Result<ProviderChoice, ApiError> {
+    let mode = ProviderOverrideMode::try_parse(body.provider_override_mode.as_deref()).map_err(
+        |_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "provider_override_mode non valido: '{}'. Valori ammessi: {}",
+                    body.provider_override_mode.as_deref().unwrap_or(""),
+                    ProviderOverrideMode::CANONICAL.join(", ")
+                ),
+            )
+        },
+    )?;
+    Ok(ProviderChoice::resolve(
+        body.provider_override.as_deref(),
+        mode,
+        remembered_provider,
+    ))
+}
+
 /// Legge la modalita' di automazione persistita sulla sessione (mig 0371).
 /// Usata dai run che NON ricevono un body HTTP (process_resume, service_observer):
 /// ereditano la modalita' scelta dall'utente invece di hardcodare Confirm.
@@ -67,35 +102,14 @@ pub(crate) fn model_belongs_to_provider(provider: &str, model: &str) -> bool {
 // Per leggere il default per provider usare:
 //   crate::orchestrator::default_model_for_provider(matrix, provider)
 // con matrix ottenuta da state.orchestrator.routing_matrix.current().
-pub(crate) fn humanize_ai_error(raw: &str) -> String {
-    let lower = raw.to_lowercase();
-    if lower.contains("429")
-        || lower.contains("529")
-        || lower.contains("rate_limit")
-        || lower.contains("rate limit")
-        || lower.contains("overloaded")
-        || lower.contains("quota")
-        || lower.contains("resource_exhausted")
-        || lower.contains("service unavailable")
-        || lower.contains("503")
-    {
-        return "Il provider AI è temporaneamente sovraccarico (overloaded). Sto ritentando automaticamente con backoff; riprova tra poco se persiste.".to_string();
-    }
-    if lower.contains("timeout") {
-        return "La richiesta AI e' scaduta per timeout. Riprova con un prompt piu' corto o tra qualche secondo.".to_string();
-    }
+// `humanize_ai_error` viveva qui. Cercava "429", "quota", "timeout" DENTRO il
+// testo dell'errore per scegliere la frase (regola M: lo stato tecnico non si
+// deduce dalla prosa — quel "429" poteva essere un numero qualsiasi del body) e,
+// quando non trovava nulla, incollava la prima riga troncata a 220 caratteri:
+// il blob mozzato che si leggeva in chat. Rimossa insieme al suo unico call site
+// (`fallback_assistant_after_run_turn_error`), che ora usa il punto unico
+// `nexus_types::error_presentation`.
 
-    let first_line = raw
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("Richiesta AI non completata");
-    let trimmed = first_line.trim();
-    if trimmed.chars().count() > 220 {
-        format!("{}...", trimmed.chars().take(220).collect::<String>())
-    } else {
-        trimmed.to_string()
-    }
-}
 /// Azzera la preferenza di provider della sessione e segna l'evento privacy.
 /// Va chiamato ogni volta che il gateway ha re-instradato su un provider locale per privacy.
 /// Al messaggio successivo il sistema userà il routing automatico invece della preferenza precedente.
@@ -103,8 +117,22 @@ pub(crate) async fn clear_session_preferred_provider_after_privacy(
     db: &sqlx::PgPool,
     session_id: uuid::Uuid,
 ) {
-    // separazione DB: chat_sessions e' una tabella migrata, instrada sul pool del progetto
-    let pool = crate::project_db_routes::project_data_pool_by_session_from(db, session_id).await;
+    // separazione DB: chat_sessions e' una tabella migrata, instrada sul pool del
+    // progetto. Best-effort (contratto della funzione, esito gia' ignorato):
+    // DB progetto non disponibile -> WARN e si salta l'azzeramento.
+    let pool = match crate::project_db_routes::project_data_pool_by_session_from(db, session_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "azzeramento preferred_provider post-privacy: DB progetto non disponibile, salto"
+            );
+            return;
+        }
+    };
     let _ = sqlx::query(
         "UPDATE chat_sessions \
          SET preferred_provider = NULL, preferred_model = NULL, privacy_rerouted_at = NOW() \

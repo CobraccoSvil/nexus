@@ -87,7 +87,10 @@ impl ModelAliasResolver {
             if let Some((model_provider, _)) = logical_model.split_once('/') {
                 if model_provider == provider {
                     // Stesso provider: rimuovi il prefisso, ritorna il resto.
-                    return Ok(strip_provider_prefix(logical_model));
+                    // Il confronto lo rifa' la funzione (e' li' che vive la
+                    // regola): qui resta per scegliere il RAMO, non per decidere
+                    // lo strip.
+                    return Ok(strip_provider_prefix(logical_model, provider));
                 }
                 // Provider diverso: cerca un alias di fallback cross-provider.
                 let fallback_key = format!("{model_provider}-flash-fallback");
@@ -168,13 +171,35 @@ impl ModelAliasResolver {
     }
 }
 
-/// Rimuove il prefisso `provider/` da un identificatore `provider/modello`,
-/// ritornando tutto cio' che segue il primo `/`. Se non c'e' `/`, ritorna la
-/// stringa invariata. Coerente con `logicalModel.split("/").slice(1).join("/")`.
-fn strip_provider_prefix(model: &str) -> String {
+/// Rimuove il prefisso `provider/` SOLO se quel prefisso e' davvero il provider
+/// di destinazione. PUNTO UNICO (regola L): e' l'unica funzione che tocca la
+/// slash nel nome di un modello.
+///
+/// # Il nome di un modello e' OPACO
+///
+/// Una slash nel nome NON significa `provider/modello`: e' quella la nostra
+/// convenzione interna, non una regola del mondo. Per groq e openrouter la
+/// slash e' parte del NOME che il provider pubblica — `openai/gpt-oss-120b` e'
+/// un modello di groq, `z-ai/glm-5.2` e' un modello di openrouter — e `openai`
+/// o `z-ai` li' dentro non sono provider: sono marketing.
+///
+/// Misurato il 2026-07-16 contro l'API reale di groq:
+///   `openai/gpt-oss-120b` -> HTTP 200 | `gpt-oss-120b` -> HTTP 404
+/// Il 404 nei log del gateway non veniva da un modello inesistente nel catalog
+/// (groq espone tutti e 4 i nostri): veniva da noi, che gli passavamo un nome
+/// mutilato. Il chiamante di questa funzione faceva gia' il confronto giusto
+/// (`if model_provider == provider`), mentre la sua copia in `routes.rs`
+/// strippava alla cieca: due formulazioni della stessa regola, una sbagliata.
+///
+/// Il confronto e' case-insensitive perche' i nomi provider viaggiano in forme
+/// diverse fra registry, catalog e richiesta.
+pub(crate) fn strip_provider_prefix(model: &str, provider: &str) -> String {
     match model.split_once('/') {
-        Some((_, rest)) => rest.to_string(),
-        None => model.to_string(),
+        Some((prefisso, resto)) if prefisso.eq_ignore_ascii_case(provider.trim()) => {
+            resto.to_string()
+        }
+        // Il prefisso NON e' il provider: fa parte del nome. Si passa intero.
+        _ => model.to_string(),
     }
 }
 
@@ -288,5 +313,69 @@ aliases:
             .resolve("anthropic/claude-x", "openai", 0)
             .unwrap_err();
         assert!(matches!(err, AliasError::Unavailable { .. }));
+    }
+
+    // ── Il nome del modello e' OPACO ────────────────────────────────────────
+
+    /// IL CASO REALE (2026-07-16). I log del gateway mostravano 404 ripetuti su
+    /// groq e la diagnosi corrente era "modello inesistente nel catalog".
+    /// Verificato contro l'API vera di groq: espone 17 modelli e li contiene
+    /// TUTTI e 4 i nostri. Il 404 lo producevamo noi:
+    ///   `openai/gpt-oss-120b` -> HTTP 200 | `gpt-oss-120b` -> HTTP 404
+    /// Su groq `openai/` non e' un provider: e' parte del nome.
+    #[test]
+    fn il_prefisso_che_non_e_il_provider_resta_nel_nome() {
+        // groq: modelli con la slash nel nome pubblicato.
+        assert_eq!(
+            strip_provider_prefix("openai/gpt-oss-120b", "groq"),
+            "openai/gpt-oss-120b",
+            "REGRESSIONE: e' il 404 dei log. Su groq il nome va passato INTERO"
+        );
+        assert_eq!(
+            strip_provider_prefix("openai/gpt-oss-20b", "groq"),
+            "openai/gpt-oss-20b"
+        );
+        assert_eq!(
+            strip_provider_prefix("meta-llama/llama-4-scout-17b-16e-instruct", "groq"),
+            "meta-llama/llama-4-scout-17b-16e-instruct"
+        );
+        // openrouter: idem, ed e' il modello che il consiglio usa per le figure
+        // heavy dopo la mig 0608 (agentic_index 43.1).
+        assert_eq!(
+            strip_provider_prefix("z-ai/glm-5.2", "openrouter"),
+            "z-ai/glm-5.2"
+        );
+        assert_eq!(
+            strip_provider_prefix("x-ai/grok-4.5", "openrouter"),
+            "x-ai/grok-4.5"
+        );
+    }
+
+    /// Quando il prefisso E' il provider, si toglie: e' la convenzione interna
+    /// `provider/modello` con cui la routing matrix e i pin viaggiano.
+    #[test]
+    fn il_prefisso_che_e_il_provider_si_toglie() {
+        assert_eq!(strip_provider_prefix("openai/gpt-4o", "openai"), "gpt-4o");
+        assert_eq!(
+            strip_provider_prefix("anthropic/claude-opus-4-7", "anthropic"),
+            "claude-opus-4-7"
+        );
+        // Case-insensitive: i nomi provider viaggiano in forme diverse fra
+        // registry, catalog e richiesta.
+        assert_eq!(strip_provider_prefix("OpenAI/gpt-4o", "openai"), "gpt-4o");
+        assert_eq!(strip_provider_prefix("openai/gpt-4o", " openai "), "gpt-4o");
+        // Solo il PRIMO segmento: il resto del nome non si tocca.
+        assert_eq!(
+            strip_provider_prefix("openai/openai/strano", "openai"),
+            "openai/strano"
+        );
+    }
+
+    /// Senza slash non c'e' niente da togliere.
+    #[test]
+    fn un_nome_senza_slash_resta_se_stesso() {
+        assert_eq!(strip_provider_prefix("gpt-4o", "openai"), "gpt-4o");
+        assert_eq!(strip_provider_prefix("deepseek-v4-pro", "deepseek"), "deepseek-v4-pro");
+        assert_eq!(strip_provider_prefix("", "openai"), "");
     }
 }

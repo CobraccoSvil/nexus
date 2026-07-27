@@ -74,17 +74,11 @@ const NOTIFY_EXTENSIONS: &[&str] = &[
     "d.ts",
 ];
 
-/// Directory da ignorare.
-const EXCLUDED_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    ".next",
-    "dist",
-    "coverage",
-    ".turbo",
-    "__pycache__",
-];
+// Le directory da ignorare vengono dal punto unico `nexus_tool_kit::is_skipped_dir`
+// (regola L, S24): la copia locale era INCOMPLETA — mancava `.venv`, e il watcher
+// indicizzava l'intero site-packages del virtualenv appena creato da un run
+// (incidente vendita-immobile 20/07: stack overflow di un worker tokio durante
+// la re-indicizzazione di backend/.venv, mcp-core morto).
 
 /// Avvia un file watcher per `root` associato al progetto `project_id`.
 ///
@@ -317,15 +311,33 @@ fn is_code_file(path: &Path) -> bool {
 }
 
 fn is_in_excluded_dir(path: &Path, root: &Path) -> bool {
-    let relative = match path.strip_prefix(root) {
-        Ok(r) => r,
-        Err(_) => path,
-    };
-    for component in relative.components() {
-        let name = component.as_os_str().to_string_lossy();
-        if EXCLUDED_DIRS.contains(&name.as_ref()) {
-            return true;
+    // Delega al punto unico path-based (regola L): confronto per COMPONENTE
+    // relativo al root, condiviso col wiki watcher e il reingest.
+    nexus_tool_kit::is_in_skipped_dir(path, root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn venv_e_pycache_esclusi_dal_watcher() {
+        // Regressione stack overflow 20/07: la skip-list locale del watcher non
+        // conteneva `.venv` e la re-indicizzazione del virtualenv creato da un
+        // run agentico ha abbattuto mcp-core. La delega al punto unico
+        // is_skipped_dir copre .venv (dot-prefix), venv e __pycache__.
+        let root = Path::new(r"D:\IDEAI-projects\vendita-immobile");
+        for dentro in [
+            r"D:\IDEAI-projects\vendita-immobile\backend\.venv\Lib\site-packages\x.py",
+            r"D:\IDEAI-projects\vendita-immobile\backend\venv\Lib\site-packages\x.py",
+            r"D:\IDEAI-projects\vendita-immobile\backend\__pycache__\m.pyc",
+            r"D:\IDEAI-projects\vendita-immobile\node_modules\a\b.js",
+        ] {
+            assert!(is_in_excluded_dir(Path::new(dentro), root), "{dentro}");
         }
+        assert!(!is_in_excluded_dir(
+            Path::new(r"D:\IDEAI-projects\vendita-immobile\backend\src\main.py"),
+            root
+        ));
     }
-    false
 }

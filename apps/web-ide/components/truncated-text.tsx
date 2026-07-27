@@ -22,6 +22,11 @@ export function TruncatedText({
 }) {
   const [showTooltip, setShowTooltip] = useState(false);
 
+  // Il tetto e' un MASSIMO che non puo' superare il contenitore. Un numero da
+  // solo non basta: `maxWidth: 300` in una colonna da 204 sfonda comunque, ed e'
+  // il difetto che questo componente causava (26 elementi fuori dalla sidebar).
+  const tettoReale = typeof maxWidth === "number" ? `min(${maxWidth}px, 100%)` : maxWidth;
+
   // Se non c'è theme colors, fallback a title nativo
   if (!tc) {
     return (
@@ -31,7 +36,7 @@ export function TruncatedText({
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
-          maxWidth,
+          maxWidth: tettoReale,
           display: "inline-block",
           ...style,
         }}
@@ -47,7 +52,11 @@ export function TruncatedText({
       style={{
         position: "relative",
         display: "inline-block",
-        width: typeof maxWidth === "number" ? maxWidth : "auto",
+        // Era `width: maxWidth`: una LARGHEZZA FISSA, non un tetto. Il componente
+        // occupava 300px anche per "pnpm run dev" e sfondava ogni contenitore piu'
+        // stretto — il nome dice maxWidth, il codice imponeva width.
+        maxWidth: tettoReale,
+        minWidth: 0,
       }}
       onMouseEnter={() => setShowTooltip(true)}
       onMouseLeave={() => setShowTooltip(false)}
@@ -58,7 +67,9 @@ export function TruncatedText({
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
-          maxWidth,
+          // 100% del wrapper, che porta gia' il tetto: cosi' l'ellipsis scatta al
+          // bordo reale invece che a un numero che il contenitore non ha.
+          maxWidth: "100%",
           display: "block",
           ...style,
         }}

@@ -477,15 +477,12 @@ export function EditorArea({
         style={{
           display: "flex",
           alignItems: "center",
-          justifyContent: "space-between",
+          justifyContent: "flex-end",
           padding: "0 12px 0 8px",
           borderBottom: `1px solid ${tc.border}`,
           background: tc.bgHeader,
         }}
       >
-        <div style={{ color: tc.text, fontSize: 13, fontWeight: 700 }}>
-          Editor Workspace
-        </div>
         <div style={{ display: "flex", gap: 6 }}>
           <button
             type="button"

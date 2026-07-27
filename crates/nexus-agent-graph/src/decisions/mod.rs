@@ -30,6 +30,18 @@
 //!     l'I/O (catena DB + cooldown) e' la porta [`crate::runtime::ports::EscalationPort`].
 //!   - [`helpers`]: tool_choice forcing, segnale strutturale, action-oriented,
 //!     stima complessita' e budget iterazioni.
+//!   - [`severity`]: PUNTO UNICO del vocabolario di gravita' (alta/media/bassa)
+//!     degli elementi di evidenza dei panel e del test "evidenza grave" che
+//!     abilita il veto della minoranza. Advisory, review e debate delegano qui.
+//!   - [`debate_panel`]: PUNTO UNICO delle TESI CONTRAPPOSTE (assegnazione delle
+//!     posizioni agli avvocati + selezione dell'opzione). Disgiunto da
+//!     `advisory_panel` (lenti diverse sullo stesso oggetto -> approva/veta): qui
+//!     posizioni AVVERSE su opzioni alternative -> selezione.
+//!   - [`orchestration_sizing`]: PUNTO UNICO del dimensionamento dei panel
+//!     multi-agente (consiglio/review/multi-provider/debate) dalla classe di
+//!     complessita' + profili admin + budget residuo costo/tempo; i cap storici
+//!     restano backstop. DISGIUNTO da `orchestration_reason` (mosse a run
+//!     avviato) e `scale_reason` (tier/contesto del singolo agente).
 //!   - [`tiers`]: PUNTO UNICO del vocabolario performance-tier (scala a 5 livelli
 //!     light<medium<high<heavy<frontier): ordinamento (`tier_rank`) e validazione
 //!     (`is_performance_tier`). I due `tier_rank` storici (escalation qui,
@@ -67,6 +79,7 @@ pub mod advisory_panel;
 pub mod clarify_signature;
 pub mod context_reduction;
 pub mod dag_scheduler;
+pub mod debate_panel;
 pub mod end_turn;
 pub mod escalation;
 pub mod g1_accounting;
@@ -77,19 +90,22 @@ pub mod loop_signatures;
 pub mod m16;
 pub mod meta_reason;
 pub mod orchestration_reason;
+pub mod orchestration_sizing;
 pub mod panel_quorum;
+pub mod severity;
 pub mod predictive_cap;
 pub mod progress_controller;
 pub mod reward;
 pub mod scale_reason;
 pub mod supervisor;
+pub mod switch_reason;
 pub mod text_repetition;
 pub mod tiers;
 pub mod tool_dispatch;
 pub mod turn_focus;
 
 pub use adversarial_review::{
-    compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict,
+    compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict, ReviewerRef,
 };
 pub use advisory_panel::{
     compose_advisory_synthesis, AdvisoryPanelVerdict, AdvisoryPolicy, AdvisoryRoster,

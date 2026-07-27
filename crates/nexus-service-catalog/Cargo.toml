@@ -1,0 +1,27 @@
+[package]
+name = "nexus-service-catalog"
+edition.workspace = true
+version.workspace = true
+
+# Punto unico del catalogo servizi (regola L). Dipendenze minime di proposito:
+# i consumatori sono mcp-core (che serve il pannello e il watchdog) e xtask
+# (che genera i manifest). Niente axum, niente mcp-core: un crate che tirasse
+# dentro il server non sarebbe usabile da uno strumento a riga di comando, ed e'
+# il motivo per cui finora chiunque volesse leggere il catalogo doveva
+# ricopiarne la struttura.
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror = "1.0"
+nexus-auth = { path = "../nexus-auth" }
+
+[dev-dependencies]
+# Schema META ricostruito dalle migrazioni vere: i test leggono il catalogo che
+# la produzione legge, non una copia scritta nel test (regola O).
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

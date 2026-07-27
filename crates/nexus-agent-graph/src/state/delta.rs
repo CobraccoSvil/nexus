@@ -187,7 +187,7 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub closure_verdict: Option<Option<Value>>,
-    /// Vedi `AgentState::review_verdict`.
+    /// Vedi `AgentState::review_gate_verdict`.
     #[serde(
         default,
         deserialize_with = "double_option",
@@ -201,6 +201,14 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub advisory_verdict: Option<Option<Value>>,
+    /// Vedi `AgentState::debate_position`. Reducer overwrite last-wins come i due
+    /// gemelli: l'ultima dichiarazione valida del turno vince.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub debate_position: Option<Option<Value>>,
     /// Vedi `AgentState::tool_infra_error`.
     #[serde(
         default,
@@ -683,6 +691,27 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub final_gate_verdict: Option<Option<crate::state::FinalGateVerdict>>,
+    /// Vedi `AgentState::review_gate_cycle`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_gate_cycle: Option<Option<i64>>,
+    /// Vedi `AgentState::review_gate_verdict`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub review_gate_verdict: Option<Option<crate::state::ReviewGateVerdict>>,
+    /// Vedi `AgentState::gate_routing`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gate_routing: Option<Option<crate::state::GateRouting>>,
     /// Vedi `AgentState::final_gate_passed`.
     #[serde(
         default,
@@ -828,6 +857,15 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub run_cost_cumulative_usd: Option<Option<f64>>,
+    /// Vedi `AgentState::run_started_at_epoch_s`. Scritto solo alla costruzione
+    /// dello stato iniziale (nessun nodo lo muta a run avviato); presente qui
+    /// perche' il derive GraphState genera il merge per NOME su ogni campo.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub run_started_at_epoch_s: Option<Option<i64>>,
     /// Vedi `AgentState::consecutive_text_only_turns`. Reducer overwrite: `0` al
     /// primo tool_use, `prev + 1` su turno solo-testo.
     #[serde(

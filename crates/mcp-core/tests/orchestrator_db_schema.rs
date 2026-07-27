@@ -1,25 +1,18 @@
 //! Contract test (PR-4 Livello 3): schema DB delle tabelle del piano.
 //!
 //! Verifica che le tabelle e i prompt keys necessari a PR-1/PR-2/PR-3 esistano
-//! in DB. Skip se `DATABASE_URL` non impostata.
+//! in DB. Salta se `DATABASE_URL` non impostata, ma lo skip passa dal punto
+//! unico `support::salta`: prima quattro dei cinque stampavano il solo `"skip"`.
 //!
 //! Eseguire con:
 //!   DATABASE_URL=postgres://nexus:nexus@localhost:5433/nexus cargo test --test orchestrator_db_schema
 
 use sqlx::{PgPool, Row};
-use std::env;
-
-async fn pool_or_skip() -> Option<PgPool> {
-    let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
-}
+use nexus_test_preconditions::db_o_salta;
 
 #[tokio::test]
 async fn tabelle_plan_act_verify_esistono() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip: DATABASE_URL non impostata");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     // Tabelle di PIATTAFORMA: vivono nel meta-DB (DATABASE_URL).
     let attese_meta = [
         "nexus_subagent_definitions",
@@ -37,18 +30,21 @@ async fn tabelle_plan_act_verify_esistono() {
             "tabella '{t}' NON ESISTE - applicare migration"
         );
     }
-    // Tabelle del dominio run: migrate ai DB-progetto (decommissionate nel
-    // meta dalla 0507) — la fonte di verita' e' il set db/migrations/project.
-    // Verifica sui file del set: un DB-progetto effimero richiederebbe
-    // credenziali del cluster app non garantite in CI.
-    let project_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../db/migrations/project");
-    let mut project_sql = String::new();
-    for entry in std::fs::read_dir(project_dir).expect("dir db/migrations/project") {
-        let path = entry.expect("entry").path();
-        if path.extension().and_then(|e| e.to_str()) == Some("sql") {
-            project_sql.push_str(&std::fs::read_to_string(&path).expect("read sql"));
-        }
-    }
+}
+
+/// Tabelle del dominio run: migrate ai DB-progetto (decommissionate nel meta
+/// dalla 0507). La verifica APPLICA il set `db/migrations/project` a un DB
+/// effimero e interroga lo schema risultante.
+///
+/// Prima cercava `CREATE TABLE <nome>` nel testo dei file: quel controllo
+/// imitava il parser invece di chiedere al DB (regola O), quindi passava anche
+/// se la CREATE era dentro un blocco che non veniva mai eseguito e falliva su
+/// una tabella creata in modo diverso da come la stringa se l'aspettava. Il
+/// dubbio storico ("un DB-progetto effimero richiederebbe credenziali del
+/// cluster app") non regge: il migrator gira su qualunque DB vuoto, ed e' lo
+/// stesso che la produzione applica a `<slug>_nexus`.
+#[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
+async fn tabelle_dominio_run_esistono_dopo_le_migrazioni(pool: PgPool) {
     let attese_project = [
         "nexus_agent_plans",
         "nexus_agent_todos",
@@ -56,25 +52,24 @@ async fn tabelle_plan_act_verify_esistono() {
         "nexus_subagent_runs",
     ];
     for t in attese_project {
-        // Il set project e' generato da pg_dump: le tabelle sono qualificate con
-        // lo schema (`public.<t>`). Il match accetta sia la forma qualificata sia
-        // quella nuda (robustezza al prefisso schema).
+        let row = sqlx::query(
+            "SELECT 1 AS x FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(t)
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
         assert!(
-            project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS {t}"))
-                || project_sql.contains(&format!("CREATE TABLE {t}"))
-                || project_sql.contains(&format!("CREATE TABLE IF NOT EXISTS public.{t}"))
-                || project_sql.contains(&format!("CREATE TABLE public.{t}")),
-            "tabella '{t}' non definita nel set db/migrations/project - dominio run incompleto"
+            row.is_some(),
+            "tabella '{t}' assente dopo db/migrations/project - dominio run incompleto"
         );
     }
 }
 
 #[tokio::test]
 async fn prompt_keys_orchestrator_seedati() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let attese = [
         "agent.planner.base",
         "agent.plan_revision.tpl",
@@ -106,10 +101,7 @@ async fn prompt_keys_orchestrator_seedati() {
 
 #[tokio::test]
 async fn settings_orchestrator_eligibility_consistente() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     // Numeric/CSV settings: presenti e parseabili.
     let pairs = [
         ("orchestrator.plan_phase_enabled", "bool"),
@@ -150,10 +142,7 @@ async fn settings_orchestrator_eligibility_consistente() {
 
 #[tokio::test]
 async fn subagent_kinds_seedati_con_purpose_validi() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let rows = sqlx::query(
         "SELECT kind, model_purpose FROM nexus_subagent_definitions WHERE is_enabled = true",
     )
@@ -191,10 +180,7 @@ async fn subagent_kinds_seedati_con_purpose_validi() {
 
 #[tokio::test]
 async fn ai_usage_ledger_schema_supporta_breakdown_m71() {
-    let Some(pool) = pool_or_skip().await else {
-        eprintln!("skip");
-        return;
-    };
+    let Some(pool) = db_o_salta().await else { return };
     let cols = [
         "provider",
         "model",

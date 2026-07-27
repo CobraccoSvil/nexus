@@ -112,29 +112,16 @@ pub(crate) fn write_timestamped_sql_migration(
 }
 
 /// Genera un timestamp per il nome del file migration: `YYYYMMDD_HHMMSS`.
+///
+/// Qui c'era una conversione da unix timestamp scritta a mano, con anni da 365
+/// giorni e mesi da 30, dichiarata "approssimazione: non gestiamo anni bisestili
+/// perfettamente". L'errore non era un caso limite: a luglio 2026 la data
+/// prodotta sbagliava di circa DUE SETTIMANE, e cresceva di un giorno ogni anno
+/// bisestile piu' quanto accumulato dai mesi finti. Su un nome di file che
+/// ordina le migrazioni lessicograficamente, una data sbagliata puo' invertire
+/// l'ordine di applicazione a cavallo d'anno.
+///
+/// `chrono` era gia' una dipendenza del crate: l'aritmetica a mano non serviva.
 pub(crate) fn migration_timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Conversione manuale da unix timestamp a YYYYMMDD_HHMMSS
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-    // Approssimazione: non gestiamo anni bisestili perfettamente
-    let year = 1970 + days / 365;
-    let day_of_year = days % 365;
-    let month = (day_of_year / 30) + 1;
-    let day = (day_of_year % 30) + 1;
-    format!(
-        "{:04}{:02}{:02}_{:02}{:02}{:02}",
-        year,
-        month.min(12),
-        day.min(31),
-        h,
-        m,
-        s
-    )
+    chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
 }

@@ -22,6 +22,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::postgres::PgArguments;
+use sqlx::Arguments as _;
 use uuid::Uuid;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1640,23 +1642,96 @@ pub async fn list_triples(
         next_idx,
         acl_param_used,
         &acl_projects,
-        binds,
+        &binds,
         limit,
         offset,
     )
     .await?;
 
-    // NB: ritorniamo sia `total` (atteso dal frontend per la paginazione) sia
-    // `count` (alias storico). Per ora `total = items.len()` (non e' una vera
-    // COUNT(*) con i filtri applicati — il client comunque paginando ne ottiene
-    // solo gli items del lotto corrente). Una COUNT separata e' debito noto.
+    // `total` e' il conteggio COMPLETO con gli stessi filtri (senza LIMIT/OFFSET):
+    // e' quello che il frontend usa per sapere quante pagine esistono. `count`
+    // resta l'alias storico (dimensione del lotto corrente). La COUNT riusa le
+    // stesse `where_parts` e gli stessi bind della pagina (bind_triple_filters,
+    // punto unico del predicato, regola L).
+    let total =
+        count_triples(&state, &where_parts, acl_param_used, &acl_projects, &binds).await?;
+
     Ok(Json(json!({
         "items": items,
         "limit": limit,
         "offset": offset,
         "count": items.len(),
-        "total": items.len(),
+        "total": total,
     })))
+}
+
+/// Punto unico (regola L) dei bind dei filtri della lista triple: la lista ACL
+/// piu' i filtri opzionali, nell'ordine ESATTO in cui `build_triple_filters`
+/// assegna i placeholder `$N`. La query di pagina e la COUNT la chiamano entrambe,
+/// cosi' la sequenza dei bind vive in un solo posto e non puo' divergere fra le
+/// due (era duplicata: 9 `.bind()` ripetuti riga per riga).
+fn bind_triple_filters(
+    args: &mut PgArguments,
+    acl_param_used: bool,
+    acl_projects: &[Uuid],
+    binds: &TripleListBinds,
+) -> Result<(), sqlx::error::BoxDynError> {
+    if acl_param_used {
+        args.add(acl_projects.to_vec())?;
+    }
+    if let Some(v) = &binds.predicate {
+        args.add(v.clone())?;
+    }
+    if let Some(v) = &binds.source {
+        args.add(v.clone())?;
+    }
+    if let Some(v) = &binds.min_conf {
+        args.add(*v)?;
+    }
+    if let Some(v) = &binds.subj {
+        args.add(*v)?;
+    }
+    if let Some(v) = &binds.obj {
+        args.add(*v)?;
+    }
+    if let Some(v) = &binds.q {
+        args.add(v.clone())?;
+    }
+    if let Some(v) = &binds.scope {
+        args.add(v.clone())?;
+    }
+    if let Some(v) = &binds.project {
+        args.add(*v)?;
+    }
+    Ok(())
+}
+
+/// Conteggio totale delle triple che soddisfano gli stessi filtri della pagina,
+/// senza LIMIT/OFFSET. Condivide `where_parts` e i bind con
+/// [`fetch_triples_page`] via [`bind_triple_filters`]: i placeholder `$N` dei
+/// filtri restano validi perche' la COUNT non aggiunge limit/offset in coda.
+async fn count_triples(
+    state: &AppState,
+    where_parts: &[String],
+    acl_param_used: bool,
+    acl_projects: &[Uuid],
+    binds: &TripleListBinds,
+) -> Result<i64, (StatusCode, String)> {
+    let sql = format!(
+        "SELECT COUNT(*) \
+         FROM wiki_concept_triples t \
+         JOIN wiki_docs ON wiki_docs.id = t.subj_doc_id \
+         WHERE {}",
+        where_parts.join(" AND "),
+    );
+
+    let mut args = PgArguments::default();
+    bind_triple_filters(&mut args, acl_param_used, acl_projects, binds).map_err(err500)?;
+
+    sqlx::query_scalar_with::<_, i64, _>(&sql, args)
+        .fetch_one(&state.db)
+        .await
+        .map_err(err500)
 }
 
 /// Compone la SQL finale (con LIMIT/OFFSET agli indici `next_idx`/`next_idx+1`),
@@ -1670,7 +1745,7 @@ async fn fetch_triples_page(
     next_idx: usize,
     acl_param_used: bool,
     acl_projects: &[Uuid],
-    binds: TripleListBinds,
+    binds: &TripleListBinds,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Value>, (StatusCode, String)> {
@@ -1687,37 +1762,17 @@ async fn fetch_triples_page(
         next_idx + 1,
     );
 
-    let mut query = sqlx::query(&sql);
-    if acl_param_used {
-        query = query.bind(acl_projects.to_vec());
-    }
-    if let Some(v) = binds.predicate {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.source {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.min_conf {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.subj {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.obj {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.q {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.scope {
-        query = query.bind(v);
-    }
-    if let Some(v) = binds.project {
-        query = query.bind(v);
-    }
-    query = query.bind(limit).bind(offset);
+    // Stessi bind della COUNT (bind_triple_filters, punto unico), poi limit/offset
+    // in coda agli ultimi due placeholder.
+    let mut args = PgArguments::default();
+    bind_triple_filters(&mut args, acl_param_used, acl_projects, binds).map_err(err500)?;
+    args.add(limit).map_err(err500)?;
+    args.add(offset).map_err(err500)?;
 
-    let rows = query.fetch_all(&state.db).await.map_err(err500)?;
+    let rows = sqlx::query_with(&sql, args)
+        .fetch_all(&state.db)
+        .await
+        .map_err(err500)?;
     Ok(rows.into_iter().map(map_triple_list_row).collect())
 }
 

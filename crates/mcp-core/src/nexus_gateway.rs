@@ -1,4 +1,7 @@
 use anyhow::Result;
+use nexus_types::error_presentation::{
+    render_user_error, ErrorDomain, ErrorFacts, HasErrorFacts, RenderedError, TransportFacts,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,7 +10,19 @@ use serde_json::Value;
 pub struct NexusGatewayClient {
     http: reqwest::Client,
     base_url: String,
-    service_token: String,
+    /// Pool su cui coniare il bearer di servizio a ogni richiesta.
+    ///
+    /// Prima qui c'era un `service_token: String` STATICO, letto da un'env che
+    /// non era impostata da nessuna parte e quindi sempre pari alla costante
+    /// `"dev-internal-token"` scritta nel sorgente — che il gateway accettava
+    /// come bypass dell'autenticazione. Ora il token e' un JWT a vita breve
+    /// firmato con la chiave di piattaforma: va coniato al momento dell'uso,
+    /// non conservato, perche' scade.
+    db: sqlx::PgPool,
+    /// Il run per cui questo client e' stato costruito, se noto: viene timbrato
+    /// su ogni richiesta cosi' il gateway dimensiona i propri budget sullo stesso
+    /// cronometro del chiamante.
+    run_timeout_secs: Option<u64>,
 }
 
 /// Messaggio della conversazione inviato al gateway.
@@ -116,15 +131,31 @@ pub struct GwRequest {
     /// un secondo routing divergente (regola G).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pin_provider: Option<String>,
+    /// Durata del run che ha originato la richiesta: da qui il gateway deriva i
+    /// budget di QUESTA chiamata invece di usare il default globale.
+    ///
+    /// Non si valorizza a mano nei costruttori: lo timbra il client in
+    /// [`NexusGatewayClient::complete`], che e' l'unico a sapere per quale run e'
+    /// stato costruito. Chi compone la richiesta (funzioni pure come
+    /// `build_gw_request`) il run non lo conosce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_timeout_secs: Option<u64>,
     pub metadata: GwMetadata,
 }
 
+/// Usage come lo riporta il gateway sul wire: `input_tokens` e' il prompt LORDO
+/// (il contesto inviato, cache compresa) e i due campi di cache ne sono il
+/// DETTAGLIO. Il gateway normalizza a questa convenzione prima di rispondere,
+/// qualunque sia il formato del provider
+/// (`nexus_gateway::LlmUsage::normalized`).
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GwUsage {
+    /// Token di prompt LORDI: comprendono i due conteggi di cache qui sotto.
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// Token serviti da prompt cache (Anthropic `cache_read_input_tokens`).
-    /// `None` se il provider non li riporta.
+    /// Token serviti da prompt cache (Anthropic `cache_read_input_tokens`):
+    /// sottoinsieme di `input_tokens`, con la sua tariffa. `None` se il provider
+    /// non li riporta.
     #[serde(default)]
     pub cache_read_tokens: Option<u32>,
     /// Token scritti in cache (creazione voce). Vedi sopra.
@@ -230,6 +261,15 @@ pub struct GatewayHttpError {
     pub code: Option<String>,
     /// Blocco `details` del body (failures classificate, tier, ammessi).
     pub details: Option<Value>,
+    /// La FRASE gia' resa dal gateway (`user_message`), quando la risposta la
+    /// porta. Il gateway l'ha scritta mentre provider, modello e status del
+    /// fornitore erano ancora vivi: qui quei fatti non esistono piu', quindi
+    /// questa frase si TRASPORTA, non si ri-deriva.
+    pub user_message: Option<String>,
+    /// L'identificatore canonico della classe deciso dal gateway (`user_code`).
+    /// Piu' specifico di quello che si puo' dedurre da questo lato del confine
+    /// (dove tutto e' "errore del gateway").
+    pub user_code: Option<String>,
     /// Body grezzo: solo display/log, mai per decidere.
     pub body: String,
 }
@@ -237,17 +277,25 @@ pub struct GatewayHttpError {
 impl GatewayHttpError {
     pub fn from_response(status: reqwest::StatusCode, body: String) -> Self {
         let parsed: Option<Value> = serde_json::from_str(&body).ok();
-        let code = parsed
-            .as_ref()
-            .and_then(|v| v.get("code"))
-            .and_then(|c| c.as_str())
-            .map(str::to_string);
+        let stringa = |chiave: &str| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(chiave))
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        };
         let details = parsed.as_ref().and_then(|v| v.get("details")).cloned();
+        // La resa si rilegge dal punto unico che la scrive dall'altro lato: cosi'
+        // un rename delle chiavi non puo' rompere il solo trasporto lasciando
+        // verdi i test dei due estremi.
+        let rendered = parsed.as_ref().and_then(RenderedError::from_wire);
         Self {
             status: status.as_u16(),
             status_text: status.to_string(),
-            code,
+            code: stringa("code"),
             details,
+            user_message: rendered.as_ref().map(|r| r.message.clone()),
+            user_code: rendered.as_ref().map(|r| r.code.clone()),
             body,
         }
     }
@@ -315,6 +363,146 @@ fn transport_error_detail(e: &reqwest::Error) -> String {
     format!("{e} [kind={}] <- {}", kinds.join("+"), chain.join(" <- "))
 }
 
+/// I segnali STRUTTURATI del fallimento di trasporto, dai predicati tipizzati di
+/// reqwest e dal primo `io::Error` della catena (regola M).
+///
+/// Gemello strutturato di [`transport_error_detail`]: quello produce la riga
+/// diagnostica per i log, questo i FATTI da cui nasce la frase per l'utente. La
+/// stessa catena serve due canali diversi, e nessuno dei due deriva dall'altro
+/// leggendone il testo.
+fn transport_facts(e: &reqwest::Error, target: &str) -> TransportFacts {
+    let mut io_kind = None;
+    let mut os_error = None;
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            io_kind = Some(format!("{:?}", io.kind()));
+            os_error = io.raw_os_error();
+            break;
+        }
+        src = std::error::Error::source(s);
+    }
+    TransportFacts {
+        is_connect: e.is_connect(),
+        is_timeout: e.is_timeout(),
+        io_kind,
+        os_error,
+        target: Some(target.to_string()),
+    }
+}
+
+/// Errore di TRASPORTO verso il gateway, tipizzato (regole L+M).
+///
+/// Qui viveva `anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e))`:
+/// una stringa opaca che a valle nessuno poteva piu' interrogare. Il ramo di
+/// classificazione (`classify_gateway_error`) cercava solo `GatewayHttpError`,
+/// non lo trovava, e ripiegava su `err.to_string()` — cioe' la riga diagnostica
+/// nata per i log finiva TALE E QUALE nella bolla di chat:
+/// "error sending request for url (...) [kind=connect] <- io(ConnectionRefused,
+/// os_error=10061)".
+///
+/// Ora l'errore porta i suoi fatti. `Display` da' la frase umana, `detail` (nei
+/// fatti) conserva la catena INTATTA per i log: il segnale diagnostico non si
+/// perde, cambia canale.
+#[derive(Debug)]
+pub struct GatewayTransportError {
+    facts: ErrorFacts,
+}
+
+impl GatewayTransportError {
+    pub fn from_reqwest(e: &reqwest::Error, target: &str) -> Self {
+        let mut facts = ErrorFacts::opaque(ErrorDomain::Transport, transport_error_detail(e));
+        facts.transport = Some(transport_facts(e, target));
+        Self { facts }
+    }
+}
+
+impl HasErrorFacts for GatewayTransportError {
+    fn error_facts(&self) -> ErrorFacts {
+        self.facts.clone()
+    }
+}
+
+impl std::fmt::Display for GatewayTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.rendered().message)
+    }
+}
+
+impl std::error::Error for GatewayTransportError {}
+
+/// I fatti di un errore HTTP del gateway: `code` e `details` sono gia' estratti
+/// dal body al punto di costruzione, e il body integrale scende a `detail`.
+///
+/// `upstream_message` e' la frase che il gateway ha gia' reso. Qui cablava
+/// `None`, e non poteva essere altrimenti: da questo lato del confine i fatti
+/// del fornitore — quale provider, quale modello, quale status — non esistono
+/// piu', quindi il messaggio poteva solo dire "il servizio AI interno ha
+/// risposto con un errore". Ora la frase viaggia col suo errore.
+impl HasErrorFacts for GatewayHttpError {
+    fn error_facts(&self) -> ErrorFacts {
+        let class = self
+            .details
+            .as_ref()
+            .and_then(|d| d.get("primary_cause"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        let mut facts = ErrorFacts {
+            domain: ErrorDomain::Gateway,
+            http_status: Some(self.status),
+            code: self.code.clone(),
+            class,
+            provider: None,
+            model: None,
+            transport: None,
+            upstream_message: None,
+            detail: self.body.clone(),
+        };
+        if let Some(m) = &self.user_message {
+            facts = facts.with_upstream(m.clone());
+        }
+        facts
+    }
+}
+
+/// Il [`RenderedError`] di un errore che arriva dal client gateway.
+///
+/// PUNTO DI RACCORDO (regola L) fra i produttori tipizzati di questo modulo e il
+/// punto unico di presentazione: cerca nella catena il primo errore che sa
+/// dichiarare i propri fatti e delega la frase a `render_user_error`. Nessuna
+/// ispezione del testo: se nessuno dei tipi noti e' presente, i fatti sono
+/// onestamente opachi e il messaggio resta generico, ma il dettaglio tecnico
+/// finisce dove va — in `detail`, non nella bolla di chat.
+///
+/// Vive QUI, accanto ai due tipi di cui fa il downcast, e non nell'adapter del
+/// motore: la stessa domanda ("che frase mostro per questo errore?") se la pone
+/// anche il confine HTTP della chat, e due copie divergerebbero.
+pub fn rendered_from_error(err: &anyhow::Error) -> RenderedError {
+    // Una resa GIA' FATTA non si ri-deriva: chi l'ha prodotta aveva i fatti
+    // ancora vivi, ed eventualmente sapeva cose che qui non esistono piu' (che
+    // il provider era pinnato dall'utente, per esempio). Senza questo ramo
+    // ri-passerebbe dal `to_string()`, cioe' dal solo `message`, e i rami sotto
+    // — che cercano tipi ormai assenti dalla catena — la degraderebbero al
+    // generico "il servizio AI interno ha risposto con un errore".
+    if let Some(r) = err.chain().find_map(|c| c.downcast_ref::<RenderedError>()) {
+        return r.clone();
+    }
+    if let Some(t) = err.chain().find_map(|c| c.downcast_ref::<GatewayTransportError>()) {
+        return t.rendered();
+    }
+    if let Some(h) = err.chain().find_map(|c| c.downcast_ref::<GatewayHttpError>()) {
+        let mut rendered = h.rendered();
+        // Il verdetto del gateway VINCE su quello locale: e' stato deciso dove
+        // status e codice del fornitore erano ancora leggibili. Da qui, ogni
+        // errore del gateway sarebbe indistinguibile da ogni altro.
+        if let Some(code) = h.user_code.clone().filter(|c| !c.trim().is_empty()) {
+            rendered.code = code;
+        }
+        return rendered;
+    }
+    render_user_error(&ErrorFacts::opaque(ErrorDomain::Gateway, err.to_string()))
+}
+
 /// Budget HTTP mcp-core -> gateway per `/v1/complete`, dal punto unico
 /// (`nexus_auth::llm_timeouts`, regola L).
 ///
@@ -324,23 +512,36 @@ fn transport_error_detail(e: &reqwest::Error) -> String {
 /// 120 non era applicato da nessuno): il risultato era che mcp-core attendeva
 /// una singola chiamata piu' a lungo (435s) di quanto vivesse l'intero run che
 /// l'aveva chiesta (300s). Ora il budget e' DERIVATO dal run, non moltiplicato.
-async fn resolve_client_timeout_secs(db: &sqlx::PgPool) -> u64 {
-    nexus_auth::llm_timeouts::LlmTimeouts::resolve(db)
+async fn resolve_client_timeout_secs(db: &sqlx::PgPool, run_timeout_secs: Option<u64>) -> u64 {
+    nexus_auth::llm_timeouts::LlmTimeouts::resolve_for_run(db, run_timeout_secs)
         .await
         .client_budget
         .as_secs()
 }
 
 impl NexusGatewayClient {
-    pub fn new(base_url: String, service_token: String) -> Self {
+    /// Bearer di servizio per questa richiesta: JWT a vita breve firmato con la
+    /// chiave di piattaforma. Il conio e' cachato in `nexus_auth` (TTL piu'
+    /// corta della vita del token), quindi non firma a ogni chiamata.
+    async fn bearer(&self) -> Result<String> {
+        nexus_auth::service_bearer(&self.db).await
+    }
+
+    pub fn new(base_url: String, db: sqlx::PgPool) -> Self {
         let timeout_secs = nexus_auth::llm_timeouts::LlmTimeouts::defaults()
             .client_budget
             .as_secs();
-        Self::with_timeout(base_url, service_token, timeout_secs)
+        Self::with_timeout(base_url, db, timeout_secs, None)
     }
 
-    fn with_timeout(base_url: String, service_token: String, timeout_secs: u64) -> Self {
+    fn with_timeout(
+        base_url: String,
+        db: sqlx::PgPool,
+        timeout_secs: u64,
+        run_timeout_secs: Option<u64>,
+    ) -> Self {
         Self {
+            run_timeout_secs,
             // Resilienza connessioni morte post-sleep (regola H): niente riuso di
             // socket idle dal pool + keepalive. Il default keep-alive faceva fallire
             // le chiamate mcp-core -> gateway con "error sending request" dopo che la
@@ -353,7 +554,7 @@ impl NexusGatewayClient {
                 .build()
                 .expect("reqwest client"),
             base_url,
-            service_token,
+            db,
         }
     }
 
@@ -364,25 +565,49 @@ impl NexusGatewayClient {
     /// nativa (`agent_tools::subagent_native`): prima la sequenza
     /// `resolve_port -> format url -> NexusGatewayClient::new` era duplicata.
     pub async fn from_db(db: &sqlx::PgPool) -> Self {
+        Self::from_db_for_run(db, None).await
+    }
+
+    /// Come [`from_db`], ma per un run di durata NOTA (il `timeout_s` della
+    /// figura sub-agente).
+    ///
+    /// Il budget d'attesa nasceva sempre dal default globale di 300s anche
+    /// quando il run che lo conteneva ne durava 240 (`review`): mcp-core poteva
+    /// restare appeso a una singola chiamata oltre la vita del sub-run che
+    /// l'aveva chiesta, ed e' il timeout che uccideva i review. Passando qui la
+    /// durata reale, l'attesa del client resta dentro il cronometro della figura.
+    pub async fn from_db_for_run(db: &sqlx::PgPool, run_timeout_secs: Option<u64>) -> Self {
         let gw_port = nexus_auth::resolve_port(db, "nexus_gateway_port").await;
         let gw_url = format!("http://127.0.0.1:{gw_port}");
-        let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
-            .unwrap_or_else(|_| "dev-internal-token".to_string());
-        let timeout_secs = resolve_client_timeout_secs(db).await;
-        Self::with_timeout(gw_url, gw_token, timeout_secs)
+        let timeout_secs = resolve_client_timeout_secs(db, run_timeout_secs).await;
+        Self::with_timeout(
+            gw_url,
+            db.clone(),
+            timeout_secs,
+            nexus_auth::llm_timeouts::run_secs_utile(run_timeout_secs),
+        )
+    }
+
+    /// Timbra sulla richiesta il run per cui il client e' stato costruito.
+    ///
+    /// Sta QUI e non nei costruttori di [`GwRequest`] perche' chi compone la
+    /// richiesta e' una funzione pura che il run non lo conosce: lo conosce il
+    /// client, che e' stato creato per quel sub-run. Stesso precedente del pin
+    /// provider applicato in `agent_graph_adapter::llm_gateway`.
+    fn body_for(&self, mut req: GwRequest) -> GwRequest {
+        req.run_timeout_secs = self.run_timeout_secs;
+        req
     }
 
     pub async fn complete(&self, req: GwRequest) -> Result<GwResponse> {
         let resp = self
             .http
             .post(format!("{}/v1/complete", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.service_token))
-            .json(&req)
+            .header("Authorization", format!("Bearer {}", self.bearer().await?))
+            .json(&self.body_for(req))
             .send()
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e))
-            })?;
+            .map_err(|e| anyhow::Error::new(GatewayTransportError::from_reqwest(&e, &self.base_url)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -421,11 +646,11 @@ impl NexusGatewayClient {
         let resp = self
             .http
             .get(format!("{}/v1/models/{provider}", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.service_token))
+            .header("Authorization", format!("Bearer {}", self.bearer().await?))
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Nexus Gateway HTTP error: {}", transport_error_detail(&e)))?;
+            .map_err(|e| anyhow::Error::new(GatewayTransportError::from_reqwest(&e, &self.base_url)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -599,5 +824,132 @@ mod tests {
             dettaglio.len() > display_solo.len(),
             "il dettaglio non aggiunge nulla al Display: {dettaglio}"
         );
+    }
+
+    /// LA REGRESSIONE, dal produttore vero (regola O): un fallimento reqwest
+    /// REALE verso una porta chiusa, non un errore fabbricato a mano.
+    ///
+    /// E' il testo che l'utente ha visto in chat. Il test non asserisce una
+    /// stringa intermedia ma la CONSEGUENZA: cosa esce dal `Display`, cioe' cio'
+    /// che ogni `format!("{e}")` a valle produrra'.
+    ///
+    /// Mutazione che rende rosso: far tornare `Display` a stampare
+    /// `self.facts.detail`, o ricostruire l'errore con `anyhow!("...{}",
+    /// transport_error_detail(&e))`.
+    #[tokio::test]
+    async fn l_errore_di_trasporto_si_presenta_da_solo_in_modo_leggibile() {
+        let c = reqwest::Client::new();
+        let e = c
+            .post("http://127.0.0.1:59999/v1/complete")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("porta chiusa: deve fallire");
+
+        let err = GatewayTransportError::from_reqwest(&e, "127.0.0.1:59999");
+        let mostrato = err.to_string();
+
+        assert!(
+            !mostrato.contains("os_error") && !mostrato.contains("kind="),
+            "gergo di sistema nel messaggio mostrato: {mostrato}"
+        );
+        assert!(
+            !mostrato.contains("error sending request"),
+            "il Display di reqwest e' arrivato all'utente: {mostrato}"
+        );
+        assert!(
+            mostrato.contains("127.0.0.1:59999"),
+            "il messaggio non dice CHI non risponde: {mostrato}"
+        );
+
+        // Il segnale diagnostico non si perde: cambia canale.
+        let facts = err.error_facts();
+        assert!(
+            facts.detail.contains("kind=") && facts.detail.contains("<-"),
+            "la catena diagnostica deve restare INTATTA nel detail: {}",
+            facts.detail
+        );
+        let t = facts.transport.expect("i fatti di trasporto");
+        assert!(t.is_connect, "porta chiusa: reqwest lo dichiara con is_connect");
+        assert!(
+            t.os_error.is_some(),
+            "il codice OS e' il segnale piu' specifico e va estratto"
+        );
+    }
+
+    /// La frase del gateway ATTRAVERSA il confine HTTP.
+    ///
+    /// Il body non e' scritto a mano: lo compone `write_into`, cioe' lo stesso
+    /// produttore che lo scrive nel gateway (regola O). Se un giorno le chiavi
+    /// cambiassero nome, questo test non resterebbe verde per costruzione.
+    ///
+    /// La CONSEGUENZA che si asserisce: da questo lato del confine i fatti del
+    /// fornitore non esistono piu' (nessun provider, nessun modello, nessuno
+    /// status del provider), quindi senza trasporto il messaggio sarebbe il
+    /// generico "il servizio AI interno ha risposto con un errore" — vero e
+    /// inutile.
+    #[test]
+    fn la_frase_del_gateway_arriva_intera_dopo_il_confine_http() {
+        let reso = nexus_types::error_presentation::render_user_error(
+            &ErrorFacts::opaque(
+                ErrorDomain::Provider,
+                "tutti i provider hanno fallito -> mistral (mistral HTTP 429: {\"error\":{}})",
+            )
+            .with_provider("mistral")
+            .with_status(429)
+            .with_code("rate_limit_exceeded"),
+        );
+        let mut body = serde_json::json!({
+            "error": "tutti i provider hanno fallito -> mistral (...)",
+            "code": "PROVIDER_ERROR",
+            "details": { "primary_cause": "transient" },
+        });
+        reso.write_into(&mut body);
+
+        let err: anyhow::Error =
+            GatewayHttpError::from_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, body.to_string())
+                .into();
+        let rendered = rendered_from_error(&err);
+
+        assert!(
+            rendered.message.contains("mistral"),
+            "la frase del gateway non e' stata trasportata: {}",
+            rendered.message
+        );
+        assert!(
+            !rendered.message.contains('{'),
+            "il body grezzo e' rientrato nella frase: {}",
+            rendered.message
+        );
+        // Il codice del gateway VINCE: da qui ogni errore sarebbe indistinguibile
+        // ("gateway_all_providers_failed") e il frontend non potrebbe proporre
+        // l'azione giusta.
+        assert_eq!(rendered.code, "provider_rate_limited");
+        assert!(
+            rendered.detail.contains("HTTP 429"),
+            "il tecnico integrale non deve perdersi: {}",
+            rendered.detail
+        );
+    }
+
+    /// Gateway che NON porta la resa (versione vecchia, o errore emesso da un
+    /// path non ancora migrato): nessuna frase inventata, nessuna deduzione dal
+    /// testo. Il messaggio resta generico e il body integrale finisce in detail.
+    #[test]
+    fn senza_resa_trasportata_si_ripiega_onestamente() {
+        let body = r#"{"error":"boom {\"raw\":1}","code":"PROVIDER_ERROR"}"#;
+        let err: anyhow::Error = GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            body.to_string(),
+        )
+        .into();
+        let rendered = rendered_from_error(&err);
+        assert_eq!(rendered.code, "gateway_all_providers_failed");
+        assert!(
+            !rendered.message.contains('{'),
+            "il blob non deve mai entrare nella frase: {}",
+            rendered.message
+        );
+        assert!(rendered.detail.contains("boom"), "il tecnico resta intero");
     }
 }

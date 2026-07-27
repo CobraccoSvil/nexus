@@ -6,6 +6,7 @@ export const es: PartialDictionary = {
     "admin.appearance": "Apariencia",
     "admin.appearance.desc": "Elige cómo se ve Nexus. Los cambios se guardan automáticamente.",
     "admin.council": "Consejo de Competencias",
+    "admin.sizing.nav": "Dimensionamiento",
     "admin.users": "Usuarios",
     "admin.users.desc": "Gestionar usuarios del sistema.",
     "admin.users.placeholder": "Los usuarios que hayan iniciado sesión con GitHub aparecerán aquí.",
@@ -355,7 +356,7 @@ export const es: PartialDictionary = {
     "knowledge.detail.files": "Archivos relacionados",
     "knowledge.detail.created": "Creada el",
     "knowledge.detail.updated": "Actualizada el",
-    "knowledge.graph.placeholder": "Vista de grafo disponible en una version futura",
+    "knowledge.graph.placeholder": "Aún no hay notas — crea notas para ver el grafo",
     // Knowledge Base (ADR 0017 v2)
     "wiki.title": "Knowledge Base",
     "wiki.title.meta": "Knowledge Nexus (meta)",

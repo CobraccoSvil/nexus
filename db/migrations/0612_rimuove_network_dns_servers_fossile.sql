@@ -1,0 +1,22 @@
+-- 0612: rimuove `network_dns_servers`, fossile del brain Python.
+--
+-- La chiave nasce in 0325 e la sua stessa descrizione dichiara chi la usava:
+-- "Usato dal Neural Core per risolvere i nomi host verso API AI esterne".
+-- Il Neural Core (brain Python) e' stato rimosso: nessun lettore e' rimasto nel
+-- codice (l'unica occorrenza superstite e' un commento in
+-- crates/mcp-core/src/settings.rs che spiega proprio questo). L'override DNS era
+-- una prerogativa del brain.
+--
+-- Lasciarla nel DB non e' neutro: resta configurabile dall'admin sotto
+-- `infrastructure`, quindi promette un effetto che nessun codice produce piu'.
+-- Una chiave che si puo' impostare senza che cambi nulla e' peggio di una chiave
+-- assente: nasconde il difetto invece di dichiararlo (regola H).
+--
+-- `nexus_external_proxy`, sua vicina in 0325, NON viene toccata: quella e' viva
+-- e letta da settings.rs, che la propaga come variabile d'ambiente NEXUS_PROXY.
+--
+-- Il gate `scripts/audit-settings.sh --gate` la contava come 'morta' (1 contro
+-- baseline 0): la regressione era reale e la chiusura corretta e' togliere il
+-- fossile, non alzare la baseline.
+
+DELETE FROM settings WHERE key = 'network_dns_servers';

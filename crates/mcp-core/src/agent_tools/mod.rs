@@ -15,7 +15,6 @@
 //! - `semantic_tools` — ricerca semantica (codebase, recall, in-file)
 //!
 //! Sottomoduli per dominio operativo:
-//! - `files`   — operazioni su filesystem (read/write/edit/delete/list/search)
 //! - `git`     — comandi Git
 //! - `service` — gestione processi long-running e build immagine progetto
 //! - `sandbox` — configurazione sandbox del progetto
@@ -29,9 +28,7 @@ pub use nexus_agent_tools::*;
 pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
-pub(crate) mod files;
 pub(crate) mod helpers;
-pub(crate) mod knowledge;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
 pub(crate) mod privileged;
@@ -65,15 +62,13 @@ pub(crate) use std::path::{Path, PathBuf};
 
 pub(crate) use serde_json::Value;
 pub(crate) use sqlx::Row;
-pub(crate) use tokio::process::Command;
 pub(crate) use uuid::Uuid;
 
 pub(crate) use crate::projects::resolve_relative_path;
 
 pub(crate) use helpers::{
-    classify_command_error, extract_file_structure, format_process_output, is_long_oneshot,
-    is_protected_path, looks_like_long_running_command, READ_FILE_LINES_MAX,
-    READ_FILE_STRUCTURE_HINT_LINES,
+    classify_command_error, format_process_output, is_long_oneshot,
+    looks_like_long_running_command,
 };
 
 #[cfg(test)]
@@ -157,6 +152,82 @@ mod adr0034_contract_tests {
             set(&schema["findings"]["items"]["properties"]["severity"]["enum"]),
             valid(nexus_agent_graph::decisions::tool_dispatch::VALID_FINDING_SEVERITIES),
             "enum severity dello schema divergente da VALID_FINDING_SEVERITIES"
+        );
+    }
+
+    /// Helper condiviso dai test di coerenza: enum dichiarato nello schema di un
+    /// tool del catalogo.
+    fn schema_enum(tool: &str, path: &[&str]) -> std::collections::BTreeSet<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(super::AGENT_TOOLS_JSON).expect("catalogo parsa");
+        let t = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(tool))
+            .unwrap_or_else(|| panic!("{tool} nel catalogo"));
+        let mut node = &t["input_schema"]["properties"];
+        for p in path {
+            node = &node[p];
+        }
+        node["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool}: enum array atteso in {path:?}"))
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn as_set(vals: &[&str]) -> std::collections::BTreeSet<String> {
+        vals.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Il legame cross-crate mancava per il canale delle FIGURE del consiglio
+    /// (esisteva solo per il revisore): un valore aggiunto allo schema di
+    /// `advisory_verdict` ma non a `VALID_ADVISORY_VERDICTS` verrebbe dichiarato
+    /// dal modello e scartato in silenzio dal normalizzatore.
+    #[test]
+    fn enum_advisory_verdict_coerenti_con_normalize() {
+        assert_eq!(
+            schema_enum("advisory_verdict", &["verdict"]),
+            as_set(nexus_agent_graph::decisions::tool_dispatch::VALID_ADVISORY_VERDICTS),
+            "enum verdict dello schema divergente da VALID_ADVISORY_VERDICTS"
+        );
+        assert_eq!(
+            schema_enum("advisory_verdict", &["risks", "items", "properties", "severity"]),
+            as_set(nexus_agent_graph::decisions::tool_dispatch::VALID_FINDING_SEVERITIES),
+            "enum severity dei risks divergente da VALID_FINDING_SEVERITIES"
+        );
+    }
+
+    /// Stesso legame per il canale dell'AVVOCATO del dibattito: `stance` guida
+    /// la selezione dell'opzione (un `oppose` con evidenza grave squalifica una
+    /// posizione), quindi una divergenza schema/normalizzatore falserebbe
+    /// l'esito del confronto in silenzio.
+    #[test]
+    fn enum_debate_position_coerenti_con_normalize() {
+        assert_eq!(
+            schema_enum("debate_position", &["stance"]),
+            as_set(nexus_agent_graph::decisions::tool_dispatch::VALID_DEBATE_STANCES),
+            "enum stance dello schema divergente da VALID_DEBATE_STANCES"
+        );
+        assert_eq!(
+            schema_enum("debate_position", &["risks", "items", "properties", "severity"]),
+            as_set(nexus_agent_graph::decisions::tool_dispatch::VALID_FINDING_SEVERITIES),
+            "enum severity dei risks divergente da VALID_FINDING_SEVERITIES"
+        );
+    }
+
+    /// I tool a canale di chiusura di RUOLO non devono finire nel catalogo del
+    /// run principale (il coordinatore non ha una posizione assegnata da
+    /// difendere): `debate_position` deve stare fra i SUBAGENT_ONLY_TOOLS come i
+    /// due gemelli.
+    #[test]
+    fn debate_position_e_subagent_only() {
+        assert!(
+            nexus_agent_tools::tool_schema::SUBAGENT_ONLY_TOOLS.contains(&"debate_position"),
+            "debate_position deve essere riservato ai sub-agenti"
         );
     }
 }

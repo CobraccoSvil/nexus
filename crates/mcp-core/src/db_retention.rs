@@ -74,14 +74,20 @@ async fn run_cycle(db: &PgPool) -> Result<(), sqlx::Error> {
 /// il checkpoint di un run sospeso-vivo lo renderebbe non piu' resumibile
 /// (`resume_native_fanin`/HITL ripartono PROPRIO da quel checkpoint).
 /// `blocked_needs_input` e' TERMINALE (ADR 0034: run concluso
-/// con dichiarazione "serve input", nessun resume) -> potabile. A flag OFF tutti
-/// i pool sono il meta: la prima iterazione pota, le successive sono no-op
-/// (idempotente).
+/// con dichiarazione "serve input", nessun resume) -> potabile. Un progetto col
+/// DB non disponibile viene saltato con WARN per questo giro (niente fallback al
+/// meta-DB); la retention e' idempotente, riprova al ciclo successivo.
 async fn prune_checkpoints(db: &PgPool) {
     let grace_hours = setting_i64(db, "db.retention.checkpoint_grace_hours", 168, 1).await; // 7 giorni
     let mut total: u64 = 0;
     for project_id in crate::project_db_routes::list_all_project_ids(db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+        let pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e, "db_retention: DB progetto non disponibile, progetto saltato per questo giro");
+                continue;
+            }
+        };
         let deleted = sqlx::query(
             &format!(
                 r#"

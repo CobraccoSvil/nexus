@@ -18,6 +18,9 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Solo con la feature `tokio-console` (vedi [features]): richiede anche
+# --cfg tokio_unstable al momento della compilazione.
+console-subscriber = { version = "0.4", optional = true }
 uuid.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
@@ -33,11 +36,19 @@ nexus-wiki = { path = "../nexus-wiki" }
 mcp-db = { path = "../mcp-db" }
 mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }
+nexus-pricing = { path = "../nexus-pricing" }
+nexus-model-eligibility = { path = "../nexus-model-eligibility" }
 nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
 nexus-cache = { path = "../nexus-cache" }
 nexus-project-db = { path = "../nexus-project-db" }
 nexus-project-pools = { path = "../nexus-project-pools" }
+# Forma e lettura del catalogo servizi: punto unico condiviso con xtask, che
+# genera i manifest dallo stesso dato (regola L).
+nexus-service-catalog = { path = "../nexus-service-catalog" }
+# Applicazione dei set di migrazioni: punto unico condiviso con il provisioning
+# dei DB-progetto e con `xtask migrate` (regola L).
+nexus-migrations = { path = "../nexus-migrations" }
 nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-agent-tools = { path = "../nexus-agent-tools" }
@@ -74,6 +85,14 @@ tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# Schema di test del DB-progetto: il migrator del set db/migrations/project
+# (punto unico, regola O). Vedi crates/nexus-migrations-embedded.
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
+# Precondizioni degli integration test e skip VISIBILE: punto unico di
+# `salta(Motivo)` + REQUIRE_INTEGRATION_TESTS (regole L e O). Vive in un crate
+# perche' mcp-core e' bin-only e nexus-auth/nexus-project-pools sono sue
+# dipendenze: nessuno dei tre poteva ospitarlo per gli altri due.
+nexus-test-preconditions = { path = "../nexus-test-preconditions" }
 
 [features]
 # default: include onnx — l'ambiente locale canonico (WSL, regola "Esecuzione
@@ -83,6 +102,19 @@ default = ["onnx"]
 # onnx: abilita OnnxMiniLmEmbedder (384-dim) in nexus-orchestrator per semantic tool search
 # Richiede CPU con AVX2 per libonnxruntime (Haswell e successivi) a runtime.
 onnx = ["nexus-orchestrator/onnx"]
+
+# tokio-console: apre il server di diagnostica del runtime (porta 6669) per
+# ispezionare le task vive con la CLI `tokio-console`. Serve a una domanda sola,
+# che nessun altro strumento risponde: QUALE task non viene pollata.
+#
+# Non e' attiva per default e non deve esserlo: la strumentazione ha un costo per
+# ogni task creata, e la build richiede comunque `--cfg tokio_unstable`, che
+# invalida la cache di compilazione. Vedi il commento in `init_infrastructure`
+# per il comando esatto.
+#
+# Prima di ricorrere a questa: `runtime_health` (sentinella del ritardo di
+# risveglio) e i WARN `sqlx::pool::acquire` sono gia' nei log e costano zero.
+tokio-console = ["dep:console-subscriber"]
 
 # libc: usata in sandbox.rs::build_sandboxed_command per leggere uid/gid
 # del processo host (cosi' i container Docker non scrivono file root-owned
@@ -96,8 +128,14 @@ libc = "0.2"
 #   IO_COUNTERS (metriche CPU/IO del processo servizio).
 # - Win32_System_ProcessStatus: K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS
 #   (WorkingSetSize -> RSS del processo servizio).
+# - Win32_System_Diagnostics_ToolHelp: CreateToolhelp32Snapshot + Process32NextW
+#   (albero processi e nomi, ex `Get-CimInstance Win32_Process`: 3.2s -> ms).
+# - Win32_NetworkManagement_IpHelper + Win32_Networking_WinSock:
+#   GetExtendedTcpTable con TCP_TABLE_OWNER_PID_LISTENER (porte in ascolto con
+#   PID proprietario, ex `Get-NetTCPConnection`: 6.7s -> ms). Vedi
+#   process_util::windows_process_snapshot / listening_ports.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 
 [lints]
 workspace = true

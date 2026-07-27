@@ -156,7 +156,7 @@ pub(super) fn parse_service_ports(compose: &str) -> Vec<ServicePorts> {
                 .trim_start_matches('-')
                 .trim()
                 .trim_matches(['"', '\'']);
-            // Mapping host:container (ignora la forma a 3 campi ip:host:container per ora).
+            // Mapping host:container, incluse le forme `ip:host:container`.
             if let Some((host, container)) = split_mapping(item) {
                 if let Some(s) = cur.as_mut() {
                     s.mappings.push((host.to_string(), container.to_string()));
@@ -168,28 +168,41 @@ pub(super) fn parse_service_ports(compose: &str) -> Vec<ServicePorts> {
     out
 }
 
-/// Divide un mapping `host:container` rispettando le `${...}`. Ritorna None se
-/// non c'e' esattamente un separatore `:` di primo livello.
+/// Divide un mapping di porta nelle due componenti che ci interessano, host e
+/// container, rispettando le `${...}`. Riconosce le due forme di Docker Compose:
+///   - `host:container`         (2 campi)
+///   - `ip:host:container`      (3 campi: l'IP di bind si scarta)
+/// Ritorna None per qualunque altro numero di campi o se host/container sono
+/// vuoti.
 fn split_mapping(item: &str) -> Option<(&str, &str)> {
-    // Trova il ':' che NON e' dentro `${...}`.
+    // Posizioni dei ':' che NON sono dentro `${...}`.
     let bytes = item.as_bytes();
     let mut depth = 0i32;
+    let mut seps: Vec<usize> = Vec::new();
     for (i, &b) in bytes.iter().enumerate() {
         match b {
             b'{' => depth += 1,
             b'}' => depth -= 1,
-            b':' if depth == 0 => {
-                let host = item[..i].trim();
-                let container = item[i + 1..].trim();
-                if host.is_empty() || container.is_empty() {
-                    return None;
-                }
-                return Some((host, container));
-            }
+            b':' if depth == 0 => seps.push(i),
             _ => {}
         }
     }
-    None
+    // host:container -> un separatore; ip:host:container -> il primo delimita
+    // l'IP, che scartiamo, e usiamo gli ultimi due campi.
+    let (host_start, sep) = match seps.as_slice() {
+        [only] => (0, *only),
+        [_ip_sep, host_sep] => {
+            let ip_sep = seps[0];
+            (ip_sep + 1, *host_sep)
+        }
+        _ => return None,
+    };
+    let host = item[host_start..sep].trim();
+    let container = item[sep + 1..].trim();
+    if host.is_empty() || container.is_empty() {
+        return None;
+    }
+    Some((host, container))
 }
 
 /// True se il mapping va riscritto da Nexus: la porta HOST e' una variabile
@@ -364,5 +377,39 @@ volumes:
             split_mapping("${PORT_FRONTEND:-20001}:${PORT_FRONTEND:-20001}"),
             Some(("${PORT_FRONTEND:-20001}", "${PORT_FRONTEND:-20001}"))
         );
+    }
+
+    #[test]
+    fn split_mapping_gestisce_ip_host_container() {
+        // Forma a 3 campi: l'IP di bind si scarta, restano host e container.
+        assert_eq!(
+            split_mapping("127.0.0.1:8080:80"),
+            Some(("8080", "80")),
+            "ip:host:container -> (host, container)"
+        );
+        // Con variabile nella porta host, sempre a 3 campi.
+        assert_eq!(
+            split_mapping("127.0.0.1:${PORT_API:-20005}:3000"),
+            Some(("${PORT_API:-20005}", "3000"))
+        );
+        // Un solo campo o quattro campi non sono un mapping valido.
+        assert_eq!(split_mapping("8080"), None);
+        assert_eq!(split_mapping("a:b:c:d"), None);
+    }
+
+    #[test]
+    fn parse_vede_il_servizio_pubblicato_su_ip_esplicito() {
+        // Il caso del finding: un servizio che pubblica su 127.0.0.1 non deve
+        // sparire dal pannello Porte / enforcement.
+        let compose = "\
+services:
+  api:
+    ports:
+      - \"127.0.0.1:8080:80\"
+";
+        let out = parse_service_ports(compose);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "api");
+        assert_eq!(out[0].mappings, vec![("8080".to_string(), "80".to_string())]);
     }
 }

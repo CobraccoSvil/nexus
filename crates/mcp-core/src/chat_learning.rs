@@ -197,6 +197,10 @@ async fn upsert_project_routing_setting(
     .execute(db)
     .await
     .map_err(internal_err)?;
+    // Questa scrittura ha una query propria (upsert con categoria) e quindi non
+    // passa dal punto unico che invalida: senza, la lettura continuerebbe a
+    // servire il vecchio valore per tutto il TTL della cache dei settings.
+    nexus_auth::invalidate_setting_cache(db, project_key);
     Ok(())
 }
 
@@ -351,14 +355,14 @@ async fn load_rollback_candidate(
 }
 
 /// Conta i feedback registrati per il progetto/intent a partire da `since`.
-/// separazione DB: ai_response_feedback vive nel pool del progetto (flag ON).
+/// separazione DB: ai_response_feedback vive nel pool del progetto.
 async fn count_feedback_since(
     db: &PgPool,
     project_id: Uuid,
     intent: &str,
     since: DateTime<Utc>,
 ) -> Result<i64, ApiError> {
-    let feedback_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let feedback_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -769,9 +773,9 @@ pub(crate) async fn apply_project_learning(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "chat".to_string());
 
-    // separazione DB: ai_response_feedback vive nel pool del progetto (flag ON);
+    // separazione DB: ai_response_feedback vive nel pool del progetto;
     // pool riusato per le query feedback successive nello stesso scope
-    let feedback_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let feedback_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     let gate = match evaluate_learning_gate(db, &feedback_pool, project_id, &intent, &config, force)
         .await?
     {
@@ -1055,11 +1059,11 @@ async fn run_vector_compaction(
 
     // Separazione DB: prompt_corrections vive nel pool del progetto quando
     // project_id e' noto; vector_compaction_runs (sopra/sotto) NON e' migrata e
-    // resta sul meta. NB: con project_id=None (compaction GLOBALE) al flag ON
-    // questo processa solo il meta (vuoto) -> la compaction globale va triggerata
-    // per-progetto (project_id valorizzato). A flag OFF -> meta, invariato.
+    // resta sul meta. NB: con project_id=None (compaction GLOBALE) questo
+    // processa solo il meta (vuoto) -> la compaction globale va triggerata
+    // per-progetto (project_id valorizzato).
     let cpool = match project_id {
-        Some(pid) => crate::project_db_routes::project_data_pool_from(db, pid).await,
+        Some(pid) => crate::project_db_routes::project_data_pool_from(db, pid).await?,
         None => db.clone(),
     };
 
@@ -1173,9 +1177,9 @@ pub(crate) async fn dedup_on_write(
     normalized_hint_hash: &str,
     keep_id: Uuid,
 ) -> Result<i64, ApiError> {
-    // separazione DB: prompt_corrections vive nel pool del progetto (flag ON);
+    // separazione DB: prompt_corrections vive nel pool del progetto;
     // pool riusato per la UPDATE di dedup nello stesso scope
-    let corrections_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let corrections_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await?;
     let (ids_to_prune, points_to_prune) = load_dedup_siblings(
         &corrections_pool,
         project_id,
@@ -1214,7 +1218,19 @@ async fn collect_global_feedback_rows(state: &AppState) -> Vec<sqlx::postgres::P
     let mut rows: Vec<sqlx::postgres::PgRow> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        // Aggregazione best-effort: un DB-progetto non disponibile non deve
+        // oscurare i feedback degli altri progetti (WARN + skip del progetto).
+        let pool = match crate::project_db_routes::project_data_pool_from(&state.db, pid).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %pid,
+                    error = %e,
+                    "collect_global_feedback_rows: DB progetto non disponibile, salto il progetto"
+                );
+                continue;
+            }
+        };
         let batch = sqlx::query(
             r#"
             SELECT f.id, f.project_id, f.session_id, f.message_id, f.user_id, f.intent,
@@ -1436,7 +1452,7 @@ pub async fn admin_review_feedback(
     // prompt_corrections (stesso progetto) vivono nel DB del progetto -> pool via
     // directory di routing (fallback ricerca), riusato per entrambe.
     let corrections_pool =
-        crate::project_db_routes::project_data_pool_by_feedback_from(&state.db, feedback_id).await;
+        crate::project_db_routes::project_data_pool_by_feedback_from(&state.db, feedback_id).await?;
     let Some(project_id) = update_feedback_status(
         &corrections_pool,
         feedback_id,
@@ -1824,9 +1840,9 @@ pub async fn admin_create_prompt_correction(
     embed_and_upsert_correction(&state, &text, &intent, project_id, &point_id).await?;
 
     // Persiste in PostgreSQL.
-    // separazione DB: prompt_corrections vive nel pool del progetto (flag ON)
+    // separazione DB: prompt_corrections vive nel pool del progetto
     let corrections_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let correction_id = insert_prompt_correction_row(
         &corrections_pool,
         project_id,
@@ -1867,7 +1883,19 @@ async fn collect_global_corrections(state: &AppState) -> Vec<CorrRow> {
     let mut rows: Vec<CorrRow> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for pid in crate::project_db_routes::list_all_project_ids(&state.db).await {
-        let pool = crate::project_db_routes::project_data_pool_from(&state.db, pid).await;
+        // Aggregazione best-effort: un DB-progetto non disponibile non deve
+        // oscurare le correzioni degli altri progetti (WARN + skip del progetto).
+        let pool = match crate::project_db_routes::project_data_pool_from(&state.db, pid).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %pid,
+                    error = %e,
+                    "collect_global_corrections: DB progetto non disponibile, salto il progetto"
+                );
+                continue;
+            }
+        };
         let batch: Vec<CorrRow> = sqlx::query_as(
             r#"
             SELECT id, project_id, intent, correction_text, qdrant_point_id,
@@ -1896,8 +1924,8 @@ async fn collect_global_corrections(state: &AppState) -> Vec<CorrRow> {
 /// Lista le correzioni attive.
 ///
 /// Vista admin GLOBALE: prompt_corrections e' migrata -> aggrega iterando i
-/// DB-progetto. A flag OFF tutti i pool sono il meta (dedup per id evita i
-/// duplicati); a flag ON ogni progetto ha le sue righe. Top 100 globale.
+/// DB-progetto (ogni progetto ha le sue righe; dedup per id come cintura di
+/// sicurezza). Top 100 globale.
 pub async fn admin_list_prompt_corrections(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
@@ -1929,8 +1957,9 @@ pub async fn admin_delete_prompt_correction(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // separazione DB: endpoint keyed solo dalla correzione -> pool del progetto via
-    // directory di routing (fallback ricerca). A flag OFF -> meta-DB.
-    let cpool = crate::project_db_routes::project_data_pool_by_correction_from(&state.db, id).await;
+    // directory di routing (fallback ricerca). Niente fallback al meta (mig 0527).
+    let cpool =
+        crate::project_db_routes::project_data_pool_by_correction_from(&state.db, id).await?;
     let affected = sqlx::query(
         "UPDATE prompt_corrections SET deleted_at = NOW(), active = false, updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
     )

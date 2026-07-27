@@ -45,6 +45,21 @@ pub struct ToolRunnerService {
     deps: ToolRunnerDeps,
 }
 
+/// Mappa l'errore del punto unico pool-progetto sullo `Status` gRPC del
+/// contratto ToolRunner: `NotFound` solo quando l'assenza dell'entita' e'
+/// dimostrata su tutti i DB-progetto, `Unavailable` per ogni indisponibilita'
+/// (condizione transitoria: il chiamante ritenta). Niente fallback al meta:
+/// a separazione attiva le tabelle chat sul meta sono vuote e la sessione
+/// "sparirebbe" in silenzio (regola M).
+fn project_db_status(e: crate::project_db_routes::ProjectDbError) -> Status {
+    match &e {
+        crate::project_db_routes::ProjectDbError::EntityNotFound { .. } => {
+            Status::not_found(e.to_string())
+        }
+        _ => Status::unavailable(e.to_string()),
+    }
+}
+
 impl ToolRunnerService {
     pub fn new(deps: ToolRunnerDeps) -> Self {
         Self { deps }
@@ -56,13 +71,15 @@ impl ToolRunnerService {
     /// (avviene gia' a monte negli handler chat di mcp-core al momento
     /// dell'invio del messaggio utente).
     async fn resolve_session(&self, session_id: Uuid) -> Result<SessionInfo, Status> {
-        // Separazione DB (flag ON): `chat_sessions` vive nel DB per-progetto, mentre
-        // `projects`/`project_members`/`workspaces`/`repositories` restano nel meta.
-        // Il JOIN cross-DB non e' eseguibile su un solo pool: lo spezziamo e ricomponiamo
-        // in Rust preservando la semantica del JOIN originale.
+        // Separazione DB (sempre attiva, mig 0527): `chat_sessions` vive nel DB
+        // per-progetto, mentre `projects`/`project_members`/`workspaces`/
+        // `repositories` restano nel meta. Il JOIN cross-DB non e' eseguibile su
+        // un solo pool: lo spezziamo e ricomponiamo in Rust preservando la
+        // semantica del JOIN originale.
         let project_pool =
             crate::project_db_routes::project_data_pool_by_session_from(&self.deps.db, session_id)
-                .await;
+                .await
+                .map_err(project_db_status)?;
 
         // (1) Parte migrata: sessione dal pool per-progetto (nessun JOIN).
         let session_row = sqlx::query(
@@ -185,7 +202,8 @@ impl ToolRunnerService {
         // dominio run (plans/todos/worklog); `db` resta il meta per la config.
         let run_db =
             crate::project_db_routes::project_data_pool_by_session_from(&self.deps.db, session_id)
-                .await;
+                .await
+                .map_err(project_db_status)?;
         // Root effettiva del ctx + flag isolamento: decisi dal PUNTO UNICO puro
         // `resolve_ctx_root` (testabile senza DB) — override del sub-run isolato
         // quando presente, altrimenti la root del progetto (path invariato).
@@ -211,10 +229,11 @@ impl ToolRunnerService {
                 is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
                 project_channels: self.deps.project_channels.clone(),
                 monitor_registry: self.deps.monitor_registry.clone(),
-                reindexer: Arc::new(crate::agent_tools::context::NeuralFileReindexer {
+                hooks: Arc::new(crate::agent_tools::context::NeuralFileReindexer {
                     db: Arc::new(self.deps.db.clone()),
                     neural: self.deps.neural.clone(),
                 }),
+                embedder: Arc::new(self.deps.neural.clone()),
                 isolated_subrun,
             },
             playwright_channels: self.deps.playwright_channels.clone(),

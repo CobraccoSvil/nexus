@@ -19,6 +19,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # PATH: la shell degli hook lefthook su Windows puo' non avere cargo nel PATH.
 export PATH="$HOME/.cargo/bin:$PATH"
+# Ambiente comune dei gate (CARGO_INCREMENTAL=0 e simili): punto unico.
+# shellcheck source=scripts/gate-env.sh
+source scripts/gate-env.sh
 
 if [ -z "${DATABASE_URL:-}" ]; then
   env_file="$(git rev-parse --show-toplevel 2>/dev/null)/.env"

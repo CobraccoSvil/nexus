@@ -38,6 +38,11 @@ export type ToolOutcome = "ok" | "err" | "running";
 export interface EventProvenance {
   provider?: string;
   model?: string;
+  /** Ancora strutturale dell'evento nel nastro (posizione canonica segmento/
+   *  evento), assegnata UNA volta a fine composeActivityStream. Consumata dal
+   *  renderer (id DOM) e dalla campanella (deep-link). Formato definito dagli
+   *  helper esportati activityLocalAnchorId/runScopedAnchorId (regola L). */
+  anchorId?: string;
 }
 
 export interface RoutingEvent extends EventProvenance {
@@ -93,7 +98,18 @@ export interface SwitchEvent {
   fromModel?: string;
   toProvider: string;
   toModel?: string;
+  /** Identificatore canonico del motivo (`final_gate_nonconvergence`,
+   *  `signature_loop`, ...): serve alla logica e ai test, NON all'occhio. */
   reason?: string;
+  /** La frase che spiega il motivo, composta dal backend dove il vocabolario e'
+   *  definito (`decisions::switch_reason::SwitchReason::descrizione`).
+   *
+   *  Additiva: senza di essa il renderer degradava al codice grezzo dentro un
+   *  `<code>`, e nella card si leggeva `Motivo: final_gate_nonconvergence`. La
+   *  descrizione NON viene tenuta qui in una tabella parallela: sarebbe la copia
+   *  scritta a mano che diverge al primo motivo nuovo -- e' esattamente cio' che
+   *  era gia' successo con SWITCH_CAUSE_LABELS. */
+  reasonDescription?: string;
   /** Causa STRUTTURATA dello switch (vocabolario chiuso del backend,
    *  ProviderFailureCause: cooldown | billing | client_error |
    *  policy_tier_excluded | unknown). Il renderer la mappa in etichetta umana
@@ -116,6 +132,28 @@ export interface VerifyEvent extends EventProvenance {
 export interface ContextOverflowEvent extends EventProvenance {
   type: "context_overflow";
   detail?: string;
+}
+
+/** Esito del ReviewGate del grafo (kind=review_gate, nodo review_gate.rs):
+ *  rimando in correzione, chiusura bocciata al cap, o verdetto di chiusura
+ *  (pass/inconclusive). Il `title` e' gia' composto dal backend; phase e
+ *  verdict sono i segnali strutturati del payload (regola M). */
+export interface ReviewGateEvent extends EventProvenance {
+  type: "review_gate";
+  /** fase strutturata: closed | failed | rejected_final. */
+  phase?: string;
+  /** verdetto del panel: pass | fail | needs_changes | inconclusive. */
+  verdict?: string;
+  cycle?: number;
+  maxCycles?: number;
+  /** titolo leggibile del meta-step (composto dal backend). */
+  title: string;
+  /** Chi ha votato. Stessa forma di `panelProviders` (provider e modello
+   *  SEPARATI): il nome del modello puo' contenere `/` (`z-ai/glm-4.7-flash`),
+   *  quindi una stringa `provider/modello` costringerebbe a indovinare dove
+   *  tagliare. Senza questo campo la riga REVIEW mostra l'icona del run PADRE,
+   *  e un panel su piu' provider sembra girato tutto sullo stesso. */
+  reviewers?: PanelProviderEntry[];
 }
 
 /** Sequenza di tool consecutivi tutti ok, compressa oltre soglia densita'.
@@ -258,6 +296,7 @@ export type ActivityEvent =
   | ToolEvent
   | SwitchEvent
   | VerifyEvent
+  | ReviewGateEvent
   | ContextOverflowEvent
   | FoldedToolsEvent
   | SubagentEvent
@@ -276,6 +315,16 @@ export interface ActivitySegment {
   openedBySwitch: boolean;
   /** dati dello switch che ha aperto il segmento (per la banda). */
   switch?: SwitchEvent;
+  /** Eventi non-switch di QUESTO segmento nascosti dal cap live (`capStreamToRecent`).
+   *  > 0 -> il renderer mostra "N passi precedenti" cosi' il provider non sparisce
+   *  del tutto dalla vista live (i suoi step sono nello storico, visibili al refresh). */
+  cappedCount?: number;
+  /** Ancora strutturale del SEGMENTO (posizione canonica), assegnata a fine
+   *  composeActivityStream su OGNI segmento. Il renderer la stampa sulla banda
+   *  "Cambio provider" e sul placeholder "N passi precedenti"; la campanella la
+   *  usa come fallback quando l'evento puntato e' stato cappato dalla vista live
+   *  (il segmento resta sempre nel DOM, l'evento no). */
+  anchorId?: string;
 }
 
 export interface ActivityStream {
@@ -372,6 +421,68 @@ function readFigureReports(
   return out.length > 0 ? out : undefined;
 }
 
+/** Tono visivo del parere di una figura; il componente lo mappa a un colore
+ *  concreto (la palette resta presentazione, la decisione resta qui). */
+export type FigureVerdictTone =
+  | "proceed"
+  | "changes"
+  | "block"
+  | "invalid"
+  | "technical"
+  | "unknown";
+
+/** Etichetta + tono del parere di UNA figura, pronti per il tag del display. */
+export interface FigureVerdictDisplay {
+  tone: FigureVerdictTone;
+  label: string;
+}
+
+/** Etichetta di un parere `advisory_ok` dal verdetto canonico (regola N:
+ *  proceed | proceed_with_changes | block). `advisory_ok` GARANTISCE alla fonte
+ *  un verdetto canonico: se manca e' un'incoerenza del backend, non un'astensione
+ *  tecnica, e resta "n/d" (tono unknown) senza fingere un parere. */
+function advisoryOkDisplay(verdict: string | undefined): FigureVerdictDisplay {
+  switch (verdict) {
+    case "proceed":
+      return { tone: "proceed", label: "procede" };
+    case "proceed_with_changes":
+      return { tone: "changes", label: "procede con modifiche" };
+    case "block":
+      return { tone: "block", label: "blocca" };
+    default:
+      return { tone: "unknown", label: "n/d" };
+  }
+}
+
+/** Etichetta + tono del parere di UNA figura del consiglio a partire dal SEGNALE
+ *  STRUTTURATO `report.status` (enum backend), MAI dalla prosa (regola M).
+ *  Distingue un parere ESPRESSO (procede / con modifiche / blocca) da
+ *  un'astensione TECNICA con causa nota (tempo scaduto, errore, nessun parere,
+ *  non avviata) e da un parere INVALIDO. Cosi' il display non collassa cause
+ *  diverse in un opaco "n/d": una figura in timeout dice "tempo scaduto", una che
+ *  veta dice "blocca", e le due non si confondono. Un `block` con evidenza NON e'
+ *  declassato: arriva qui come `advisory_ok` con `advisory.verdict = "block"`.
+ *  Punto unico (regola L) letto sia dai report di figura sia da quelli di
+ *  provider del panel multi-provider. */
+export function figureVerdictDisplay(report: FigureAdvisoryReport): FigureVerdictDisplay {
+  switch (report.status) {
+    case "advisory_ok":
+      return advisoryOkDisplay(report.advisory?.verdict ?? report.advisory_verdict);
+    case "run_timeout":
+      return { tone: "technical", label: "tempo scaduto" };
+    case "run_failed":
+      return { tone: "technical", label: "errore" };
+    case "prepare_failed":
+      return { tone: "technical", label: "non avviata" };
+    case "completed_no_advisory":
+      return { tone: "technical", label: "nessun parere" };
+    case "invalid_advisory":
+      return { tone: "invalid", label: "parere non valido" };
+    default:
+      return { tone: "unknown", label: "n/d" };
+  }
+}
+
 function readCouncilFigureTasks(
   payload: Record<string, unknown>,
 ): CouncilFigureTask[] | undefined {
@@ -397,10 +508,14 @@ function readCouncilFigureTasks(
   return out.length > 0 ? out : undefined;
 }
 
+/** Legge una lista "chi ha eseguito" dal payload. Una sola funzione per due
+ *  chiavi (`panel_providers` del panel multi-provider, `reviewers` del review
+ *  gate): stesso concern, stessa forma `{provider, model}`, stesso lettore. */
 function readPanelProviders(
   payload: Record<string, unknown>,
+  key: string = "panel_providers",
 ): PanelProviderEntry[] | undefined {
-  const raw = payload.panel_providers;
+  const raw = payload[key];
   if (!Array.isArray(raw) || raw.length === 0) return undefined;
   const out: PanelProviderEntry[] = [];
   for (const item of raw) {
@@ -677,6 +792,7 @@ export function composeActivityStream(
             toProvider,
             toModel,
             reason: asString(p.reason),
+            reasonDescription: asString(p.reason_description),
             // Causa strutturata dello switch (regola M): vocabolario chiuso
             // emesso dall'executor (payload.cause), mai dedotta dal titolo.
             cause: asString(p.cause),
@@ -694,6 +810,19 @@ export function composeActivityStream(
             phase: asString(p.phase),
             cycle: asNumber(p.cycle),
             maxCycles: asNumber(p.max_cycles),
+          });
+          break;
+        }
+        case "review_gate": {
+          const seg = ensureSegment(undefined, undefined);
+          seg.events.push({
+            type: "review_gate",
+            phase: asString(p.phase),
+            verdict: asString(p.verdict),
+            reviewers: readPanelProviders(p, "reviewers"),
+            cycle: asNumber(p.cycle),
+            maxCycles: asNumber(p.max_cycles),
+            title: m.title,
           });
           break;
         }
@@ -906,7 +1035,48 @@ export function composeActivityStream(
     }
   }
 
+  // ── Ancoraggio (regola L) ──────────────────────────────────────────────────
+  // ULTIMO passo, dopo il folding: assegna l'ancora canonica UNA sola volta su
+  // ogni segmento e ogni evento (posizione strutturale, mai dedotta dal testo,
+  // regola M). L'id STORATO qui e' letto identico dal renderer (attributo DOM) e
+  // dalla campanella (deep-link), quindi le due letture coincidono per
+  // costruzione. Sopravvive a `capStreamToRecent` (spread dei segmenti + stessi
+  // ref evento): l'ancora resta il valore pre-cap, mai l'indice del render.
+  for (let si = 0; si < segments.length; si++) {
+    const seg = segments[si];
+    seg.anchorId = segmentAnchorId(si);
+    for (let ei = 0; ei < seg.events.length; ei++) {
+      const ev = seg.events[ei];
+      // Gli switch vivono in `seg.switch` (banda a livello segmento), non negli
+      // `events` resi come riga: la loro ancora e' quella del segmento.
+      if (ev.type === "switch") continue;
+      ev.anchorId = activityLocalAnchorId(si, ei);
+    }
+  }
+
   return { segments, empty: segments.length === 0 };
+}
+
+// ── Ancoraggio: formato canonico degli id (regola L, punto unico) ────────────
+// Il TEMPLATE degli id vive SOLO qui: renderer e campanella li leggono da questi
+// helper, mai ricodificano la stringa altrove. `activityLocalAnchorId`/
+// `segmentAnchorId` sono le ancore LOCALI storate sugli oggetti; `runScopedAnchorId`
+// le combina col runId al confine DOM (in cronologia coesistono piu' nastri, gli
+// id vanno scopati per run per non colpire il turno sbagliato).
+
+/** Ancora locale di UN evento: posizione canonica (segmento, evento). */
+export function activityLocalAnchorId(segIndex: number, evIndex: number): string {
+  return `seg${segIndex}-ev${evIndex}`;
+}
+
+/** Ancora locale di UN segmento (banda switch / placeholder passi cappati). */
+export function segmentAnchorId(segIndex: number): string {
+  return `seg${segIndex}`;
+}
+
+/** Id DOM completo: ancora locale scopata per run. */
+export function runScopedAnchorId(runId: string, local: string): string {
+  return `nx-as-${runId}-${local}`;
 }
 
 /** true se il segmento ha gia' ESEGUITO lavoro (tool/folded), non solo eventi
@@ -1028,6 +1198,13 @@ export function foldConsecutiveOkTools(
         lastIteration: run[run.length - 1].iteration,
         // Conserva i ToolEvent originali per l'espansione (niente scarto).
         tools: run,
+        // La provenienza viene dai passi compressi: senza, il blocco perdeva
+        // provider e modello e il suo tooltip nominava un provider senza dire
+        // su quale modello fossero girati i passi. I tool raccolti sono
+        // consecutivi nello stesso segmento, quindi condividono la provenienza:
+        // il primo la rappresenta tutta.
+        provider: run[0].provider,
+        model: run[0].model,
       });
     } else {
       out.push(...run);
@@ -1047,9 +1224,108 @@ export function foldConsecutiveOkTools(
   return out;
 }
 
-/** Filtra le trace di un singolo run (le trace in useChat sono per-sessione). */
+/**
+ * Eventi che producono una riga. Gli `switch` non ne producono (diventano la
+ * banda di intestazione del segmento), percio' restano fuori dal tipo: cosi' il
+ * compilatore garantisce cio' che il raggruppamento gia' fa a runtime.
+ */
+export type EventoConRiga = Exclude<ActivityEvent, SwitchEvent>;
+
+/** Una riga del nastro, con la sua posizione originale nel segmento. */
+export interface RigaNastro {
+  tipo: "riga";
+  ev: EventoConRiga;
+  indice: number;
+}
+
+/** Righe CONSECUTIVE dello stesso sub-run, raccolte per poterle collassare. */
+export interface GruppoSubagente {
+  tipo: "gruppo_subagente";
+  subagentRunId: string;
+  /**
+   * Indice del primo evento del gruppo. Serve come chiave stabile: con il
+   * dispatch parallelo gli eventi di sub-run diversi si interlacciano, quindi
+   * lo stesso `subagentRunId` puo' aprire piu' gruppi distinti nel segmento e
+   * l'id da solo non li distinguerebbe.
+   */
+  indice: number;
+  eventi: RigaNastro[];
+}
+
+export type BloccoNastro = RigaNastro | GruppoSubagente;
+
+/**
+ * Divide gli eventi di un segmento in blocchi: le righe consecutive dello
+ * stesso sub-agente formano un gruppo, tutto il resto resta una riga a se'.
+ *
+ * Raggruppa per CONSECUTIVITA' e non per sola chiave, cosi' l'ordine mostrato
+ * resta quello reale degli eventi: se due sub-run procedono in parallelo e si
+ * interlacciano, si formano piu' gruppi: mostrarli fusi mentirebbe sull'ordine.
+ *
+ * Gli eventi `switch` non producono una riga (il render li salta), percio' non
+ * spezzano la continuita' di un gruppo: e' lo stesso criterio con cui il nastro
+ * decideva gia' se ripetere l'intestazione del sub-agente.
+ */
+export function raggruppaBlocchiNastro(events: ActivityEvent[]): BloccoNastro[] {
+  const out: BloccoNastro[] = [];
+  events.forEach((ev, indice) => {
+    if (ev.type === "switch") return;
+    const riga: RigaNastro = { tipo: "riga", ev, indice };
+    const id = ev.type === "subagent" ? ev.subagentRunId : undefined;
+    if (!id) {
+      out.push(riga);
+      return;
+    }
+    const ultimo = out[out.length - 1];
+    if (ultimo && ultimo.tipo === "gruppo_subagente" && ultimo.subagentRunId === id) {
+      ultimo.eventi.push(riga);
+      return;
+    }
+    out.push({ tipo: "gruppo_subagente", subagentRunId: id, indice, eventi: [riga] });
+  });
+  return out;
+}
+
+/**
+ * Trace di un run (le trace in useChat sono per-sessione), INCLUSE quelle dei
+ * suoi sub-run, a qualunque profondita'.
+ *
+ * Un subagente e' un run a se': le sue trace sono persistite sotto il PROPRIO
+ * `run_id` (nexus_agent_traces), non sotto quello del padre. Filtrando per il
+ * solo `runId` del padre, i token e il costo dei subagenti sparivano dal footer
+ * costo-per-provider, e provider usati SOLO dal figlio non comparivano affatto.
+ *
+ * La parentela viene dal campo `parentRunId` che il backend annota su ogni
+ * traccia di sub-run leggendolo dal DB (punto unico
+ * `crates/mcp-core/src/run_lineage.rs`, regola L). Prima veniva dedotta dai
+ * META-STEP di narrazione del padre: un canale di PRESENTAZIONE, che il review
+ * panel non emette affatto. Da li' il difetto misurato il 26/07/2026 — la barra
+ * dichiarava la ripartizione per provider di un run e ometteva i 4 cicli di
+ * review su openrouter, che pure avevano girato 21 iterazioni. La misura
+ * raggiungeva il suo oggetto per una strada diversa da quella della produzione
+ * (regola O).
+ *
+ * La chiusura e' transitiva: un sub-run che ne convoca un altro porta con se'
+ * anche i nipoti, che appartengono comunque al lavoro del run.
+ */
 export function tracesForRun(traces: AITraceEvent[], runId: string): AITraceEvent[] {
-  return traces.filter((t) => t.runId === runId);
+  const ids = new Set<string>([runId]);
+  // Punto fisso: si aggiunge ogni run il cui padre e' gia' nell'insieme, finche'
+  // l'insieme non smette di crescere. L'ordine delle trace non e' garantito
+  // (arrivano raggruppate per run), quindi un solo passaggio perderebbe i nipoti
+  // elencati prima dei genitori.
+  let cresciuto = true;
+  while (cresciuto) {
+    cresciuto = false;
+    for (const t of traces) {
+      if (!t.parentRunId || ids.has(t.runId)) continue;
+      if (ids.has(t.parentRunId)) {
+        ids.add(t.runId);
+        cresciuto = true;
+      }
+    }
+  }
+  return traces.filter((t) => ids.has(t.runId));
 }
 
 // ── Cap live (anti-verbosita') ──────────────────────────────────────────────
@@ -1087,6 +1363,7 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
   const cappedSegments: ActivitySegment[] = [];
   for (const seg of stream.segments) {
     const keptEvents: ActivityEvent[] = [];
+    let cappedInSeg = 0;
     for (const ev of seg.events) {
       if (ev.type === "switch") {
         // le bande switch vivono nel campo `seg.switch`, non negli events resi;
@@ -1095,13 +1372,25 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
         continue;
       }
       if (globalIndex >= keepFromGlobalIndex) keptEvents.push(ev);
+      else cappedInSeg += 1;
       globalIndex += 1;
     }
     const hasVisibleEvent = keptEvents.some((e) => e.type !== "switch");
-    // Un segmento resta se: e' aperto da switch (banda sempre visibile) OPPURE
-    // ha almeno un evento non nascosto.
-    if (seg.openedBySwitch || hasVisibleEvent) {
-      cappedSegments.push({ ...seg, events: keptEvents });
+    // Un segmento resta se ha eventi visibili OPPURE ne ha di nascosti dal cap:
+    // cosi' NESSUN provider che ha lavorato sparisce dalla vista live. Se ha solo
+    // eventi cappati, il renderer mostra "N passi precedenti" (il dettaglio e'
+    // nello storico). Prima il segmento veniva DROPPATO se non openedBySwitch ->
+    // gli step di un provider intermedio (es. deepseek) sparivano, riapparendo
+    // solo al refresh (che non cappa).
+    if (hasVisibleEvent || cappedInSeg > 0 || seg.openedBySwitch) {
+      // Lo spread `...seg` preserva `anchorId` del segmento; `keptEvents` sono i
+      // ref evento ORIGINALI, quindi conservano il proprio `anchorId` (canonico,
+      // pre-cap): il deep-link della campanella resta valido dopo il cap.
+      cappedSegments.push({
+        ...seg,
+        events: keptEvents,
+        cappedCount: cappedInSeg > 0 ? cappedInSeg : undefined,
+      });
     }
   }
 
@@ -1120,11 +1409,56 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
 export interface ProviderTokenBucket {
   provider: string;
   model: string;
+  /** Token di prompt LORDI: comprendono i due conteggi di cache qui sotto. */
   inputTokens: number;
   outputTokens: number;
+  /** Token serviti da cache: SOTTOINSIEME di `inputTokens`, con la sua tariffa.
+   *  Senza questo campo il bucket non lo portava affatto e chi prezzava pagava
+   *  tutto il prompt a tariffa piena di input. */
+  cacheReadTokens: number;
+  /** Token scritti in cache: stessa storia, tariffa ancora diversa. */
+  cacheCreationTokens: number;
 }
 
-/** Somma input/output token per coppia provider/model dalle trace del run. */
+/** Una voce della ripartizione: il bucket con il suo costo in USD. */
+export interface ProviderCostRow extends ProviderTokenBucket {
+  costUsd: number;
+}
+
+/** Ripartizione per provider di un run: le voci, i token e il costo totali. */
+export interface ProviderCostBreakdown {
+  voci: ProviderCostRow[];
+  totalTokens: number;
+  totalCostUsd: number;
+}
+
+/**
+ * Ripartizione costo-per-provider di un insieme di trace: PUNTO UNICO (regola L)
+ * di cio' che la barra dei costi dichiara.
+ *
+ * Il prezzo arriva come funzione perche' il listino non e' qui (regola G: viene
+ * dal catalogo `/api/models`); quello che vive qui e' la COMPOSIZIONE — quali
+ * voci esistono e come si sommano — cioe' esattamente cio' che il difetto del
+ * 26/07/2026 sbagliava. Le trace da passare sono quelle di `tracesForRun`, che
+ * include i sub-run: una barra composta sulle sole trace del run padre dichiara
+ * una ripartizione e ne omette i provider usati solo dai figli.
+ */
+export function providerCostBreakdown(
+  traces: AITraceEvent[],
+  prezzo: (bucket: ProviderTokenBucket) => number,
+): ProviderCostBreakdown {
+  const voci = aggregateTokensByProvider(traces).map((b) => ({ ...b, costUsd: prezzo(b) }));
+  return {
+    voci,
+    // `inputTokens` e' il prompt LORDO: i token di cache sono gia' dentro, e
+    // sommarli qui li conterebbe due volte.
+    totalTokens: voci.reduce((s, v) => s + v.inputTokens + v.outputTokens, 0),
+    totalCostUsd: voci.reduce((s, v) => s + v.costUsd, 0),
+  };
+}
+
+/** Somma i token per coppia provider/model dalle trace del run, tenendo il
+ *  DETTAGLIO di cache separato dal prompt lordo (ha tariffe diverse). */
 export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderTokenBucket[] {
   const map = new Map<string, ProviderTokenBucket>();
   for (const t of traces) {
@@ -1134,9 +1468,13 @@ export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderToken
       model: t.model,
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
     };
     bucket.inputTokens += t.inputTokens ?? 0;
     bucket.outputTokens += t.outputTokens ?? 0;
+    bucket.cacheReadTokens += t.cacheReadTokens ?? 0;
+    bucket.cacheCreationTokens += t.cacheCreationTokens ?? 0;
     map.set(key, bucket);
   }
   return Array.from(map.values());

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, type CSSProperties } from "react";
-import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
+import { selectTodoStatuses, useProjectStore } from "../../lib/project-dispatcher/hooks";
 import { useThemeColors } from "../../lib/theme";
 import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { toolLabel } from "./tool-labels";
@@ -170,6 +170,9 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   strategy_shift: { icon: "↷", label: "Cambio strategia", accent: "#8b5cf6", defaultOpen: true },
   loop_break: { icon: "◼", label: "Interruzione", accent: "#ef4444", defaultOpen: true },
   final_gate: { icon: "✓", label: "Verifica", accent: "#22c55e", defaultOpen: true },
+  // ReviewGate del grafo (review_gate.rs): rimando in correzione su bocciatura,
+  // chiusura bocciata al cap, o verdetto di chiusura (pass/inconclusive).
+  review_gate: { icon: "▣", label: "Review", accent: "#f43f5e", defaultOpen: true },
   declaration_request: { icon: "…", label: "Richiesta esito", accent: "#f59e0b", defaultOpen: false },
   outcome_declared: { icon: "◆", label: "Esito dichiarato", accent: "#22c55e", defaultOpen: true },
   // Narrazione del sub-agente sul run padre (ponte subagent_native.rs, mig
@@ -192,7 +195,13 @@ const DEFAULT_DESC: KindDescriptor = {
  *  card: `usage_snapshot` (token del turno, consumato dalla barra contesto) ed
  *  `end_turn` (chiusura turno). Senza questo filtro comparivano come card
  *  "Step" senza titolo. Punto unico: usato da MessageMetaSteps (regola L). */
-export const HIDDEN_META_KINDS: ReadonlySet<string> = new Set(["usage_snapshot", "end_turn"]);
+export const HIDDEN_META_KINDS: ReadonlySet<string> = new Set([
+  "usage_snapshot",
+  "end_turn",
+  // Contabilita' tecnica dello stall-recovery (meta-reasoner): title vuoto,
+  // payload solo session_id — non e' una decisione da mostrare come card.
+  "stall_budget",
+]);
 
 /** Traduzioni delle chiavi di payload piu' comuni per la resa tabellare dei
  *  meta-step senza renderer dedicato. Le chiavi ignote degradano a
@@ -214,6 +223,10 @@ const PAYLOAD_KEY_LABELS: Record<string, string> = {
   strategy: "Strategia",
   tools_count: "Tool disponibili",
   intent: "Intent",
+  verdict: "Verdetto",
+  findings: "Findings",
+  valid: "Voti validi",
+  total: "Review totali",
 };
 
 /** Valori del payload in forma leggibile: booleani "si'"/"no", primitivi as-is,
@@ -314,28 +327,57 @@ type PlanTodo = { id?: string; seq?: number; content?: string; status?: string; 
 // nastro attivita' (activity-stream.tsx) per non duplicare la logica di
 // aggiornamento TodoUpdated via SSE.
 export function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
-  // overrides[todo_id] = status piu' recente ricevuto via SSE.
-  const [overrides, setOverrides] = useState<Record<string, string>>({});
-  useEventOfKind(
-    "TodoUpdated",
-    (env) => {
-      const p = env.payload as { todo_id: string; status: string };
-      setOverrides((prev) => (prev[p.todo_id] === p.status ? prev : { ...prev, [p.todo_id]: p.status }));
-    },
-    [],
-  );
+  // Gli status aggiornati arrivano dallo store del dispatcher, non da uno stato
+  // locale: questo componente si smonta di continuo durante un run (la card
+  // `plan` nasce chiusa, la finestra live del nastro tiene solo gli ultimi
+  // eventi, e le key posizionali ne rimpiazzano il sottoalbero quando la
+  // finestra scorre). Poiche' la consegna degli eventi non ha replay, ogni
+  // TodoUpdated arrivato a componente smontato era perso per sempre e i marker
+  // restavano a [ ] fino al refresh, che li rileggeva dal backend.
+  const overrides = useProjectStore(selectTodoStatuses);
   if (!todos.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessun todo</em>;
   const MARK: Record<string, string> = {
     completed: "[x]", in_progress: "[~]", blocked: "[!]", skipped: "[-]", pending: "[ ]",
   };
+  // I marker sono compatti per stare in una colonna stretta, ma da soli non si
+  // spiegano: `[~]` e `[!]` non dicono cosa sono. Il tooltip nomina lo stato
+  // della voce e riporta la legenda completa, cosi' la si impara passando il
+  // mouse invece di doverla cercare altrove.
+  const NOME_STATO: Record<string, string> = {
+    completed: "Completato",
+    in_progress: "In corso",
+    blocked: "Bloccato",
+    skipped: "Saltato",
+    pending: "Da fare",
+  };
+  const LEGENDA = Object.keys(MARK)
+    .map((k) => `${MARK[k]} ${NOME_STATO[k].toLowerCase()}`)
+    .join("   ");
   return (
     <ol style={{ listStyle: "none", paddingLeft: 0, margin: 0, display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
       {todos.map((t, i) => {
         const status = (t.id ? overrides[t.id] : undefined) ?? t.status ?? "pending";
         return (
           <li key={t.id ?? i} style={{ lineHeight: 1.4, display: "flex", alignItems: "flex-start", gap: 6 }}>
-            <span style={{ fontFamily: "var(--font-mono)", opacity: 0.7 }}>{MARK[status] ?? MARK.pending}</span>
-            <span>
+            {/* Il marker e' un flex item: senza flexShrink:0 + nowrap, in un
+                pannello stretto viene compresso e "[ ]" si spezza sullo spazio
+                interno, mandando "]" a capo (checklist illeggibile). */}
+            <span
+              title={`${NOME_STATO[status] ?? NOME_STATO.pending}\n\nLegenda:  ${LEGENDA}`}
+              style={{
+                fontFamily: "var(--font-mono)",
+                opacity: 0.7,
+                flex: "0 0 auto",
+                whiteSpace: "nowrap",
+                cursor: "help",
+              }}
+            >
+              {MARK[status] ?? MARK.pending}
+            </span>
+            {/* minWidth:0 : un flex item non si restringe sotto il proprio
+                contenuto minimo, quindi senza questo un path lungo sfonderebbe
+                la colonna invece di andare a capo. */}
+            <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
               {t.content ?? "—"}
               {t.priority && t.priority !== "normal" ? <span style={{ opacity: 0.6 }}> ({t.priority})</span> : null}
             </span>
@@ -396,7 +438,11 @@ function renderPayload(
     return (
       <div style={grid}>
         <DefRow k="A" v={`${String(payload.to_provider ?? "?")} / ${String(payload.to_model ?? "?")}`} tc={tc} />
-        <DefRow k="Motivo" v={String(payload.reason ?? "—")} tc={tc} />
+        <DefRow
+          k="Motivo"
+          v={String(payload.reason_description ?? payload.reason ?? "—")}
+          tc={tc}
+        />
         <DefRow k="Tentativo" v={`#${String(payload.attempt ?? "?")}`} tc={tc} />
       </div>
     );
@@ -406,7 +452,12 @@ function renderPayload(
     // strutturata (punto unico switchCauseLabel, regola L/M) invece del codice
     // grezzo `provider_failover`, che resta il degrado per cause ignote.
     const cause = payload.cause as string | undefined;
-    const reason = switchCauseLabel(cause) ?? String(payload.reason ?? cause ?? "—");
+    // La descrizione arriva dal backend (`SwitchReason::descrizione`), dove il
+    // vocabolario dei motivi e' definito: qui non si tiene una tabella parallela.
+    // Il codice grezzo resta l'ultimo ripiego, per gli eventi gia' in DB.
+    const reason =
+      switchCauseLabel(cause) ??
+      String(payload.reason_description ?? payload.reason ?? cause ?? "—");
     return (
       <div style={grid}>
         <DefRow k="Da" v={`${String(payload.from_provider ?? "?")}`} tc={tc} />

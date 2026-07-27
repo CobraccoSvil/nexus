@@ -30,6 +30,7 @@ pub mod search;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use nexus_types::purpose::PurposeUnresolved;
 use serde_json::Value;
 
 /// Impl mcp-core dei servizi AI del wiki: embedding/completion via
@@ -79,12 +80,12 @@ impl WikiAiServices for AppStateWikiAi {
     fn resolve_purpose_model(
         &self,
         purpose: &str,
-    ) -> BoxFuture<'_, Result<(String, String), String>> {
+    ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>> {
         let purpose = purpose.to_string();
         Box::pin(async move {
             crate::internal_routing::resolve_purpose_model(&self.state, &purpose)
                 .await
-                .into_model(&purpose)
+                .try_model(&purpose)
         })
     }
 
@@ -92,7 +93,7 @@ impl WikiAiServices for AppStateWikiAi {
         &self,
         purpose: &str,
         exclude_providers: &[String],
-    ) -> BoxFuture<'_, Result<(String, String), String>> {
+    ) -> BoxFuture<'_, Result<(String, String), PurposeUnresolved>> {
         let purpose = purpose.to_string();
         let exclude = exclude_providers.to_vec();
         Box::pin(async move {
@@ -102,7 +103,7 @@ impl WikiAiServices for AppStateWikiAi {
                 &exclude,
             )
             .await
-            .into_model(&purpose)
+            .try_model(&purpose)
         })
     }
 
@@ -116,7 +117,7 @@ impl WikiAiServices for AppStateWikiAi {
         let error_class = error_class.map(str::to_string);
         let message = message.to_string();
         Box::pin(async move {
-            crate::brain_agent_client::handle_provider_llm_failure(
+            crate::agent_turn_setup::handle_provider_llm_failure(
                 &provider,
                 error_class.as_deref(),
                 &message,
@@ -130,10 +131,12 @@ impl WikiAiServices for AppStateWikiAi {
 /// instrada sul pool di `<slug>_nexus` e vi aggiunge il layer che il crate
 /// read-only `nexus-project-pools` non puo' offrire: provisioning al primo
 /// accesso, migrazioni `db/migrations/project` sotto lock per-progetto e cache
-/// pool condivisa con AppState. Ritorna il meta solo per resilienza (registry
-/// non inizializzato o provisioning fallito), mai per configurazione: il flag
-/// separazione e' stato rimosso (mig 0527). Tiene solo il meta pool (i worker
-/// girano in background, senza AppState vivo).
+/// pool condivisa con AppState. Registry non inizializzato o provisioning
+/// fallito -> `Err` (l'errore tipizzato `ProjectDbError` appiattito a stringa
+/// per il contratto cross-crate), MAI il meta: il flag separazione e' stato
+/// rimosso (mig 0527) e il fallback silenzioso con esso — il worker salta il
+/// progetto per quel giro. Tiene solo il meta pool (i worker girano in
+/// background, senza AppState vivo).
 #[derive(Clone)]
 pub(crate) struct AppStateProjectPool {
     meta: sqlx::PgPool,
@@ -146,10 +149,15 @@ impl std::fmt::Debug for AppStateProjectPool {
 }
 
 impl nexus_wiki::ProjectPoolResolver for AppStateProjectPool {
-    fn project_pool(&self, project_id: uuid::Uuid) -> BoxFuture<'_, sqlx::PgPool> {
+    fn project_pool(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> BoxFuture<'_, Result<sqlx::PgPool, String>> {
         let meta = self.meta.clone();
         Box::pin(async move {
-            crate::project_db_routes::project_data_pool_from(&meta, project_id).await
+            crate::project_db_routes::project_data_pool_from(&meta, project_id)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 }

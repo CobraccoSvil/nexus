@@ -23,8 +23,9 @@
 //!   ancora servito dal brain: il .docx viene ora assemblato interamente in
 //!   Rust (ZIP + OOXML), senza round-trip di rete (verso zero-Python).
 //!
-//! Restano sul gRPC al brain solo gli RPC batch/model-sync non toccati da questo
-//! refactoring.
+//! Al brain non resta NULLA: il servizio e' stato eliminato e il proto rimosso.
+//! Questo tipo e' ormai una facciata zero-sized che tiene in piedi le firme
+//! storiche dei call site — non un client di rete.
 
 use serde_json::{json, Value};
 
@@ -51,12 +52,16 @@ impl std::fmt::Debug for NeuralCoreClient {
 }
 
 impl NeuralCoreClient {
-    /// Costruisce il client. Non apre piu' alcun canale gRPC (il brain non e' nel
-    /// percorso): l'`url` e' accettato per compatibilita' di firma coi call site
-    /// che ancora leggono `settings.neural_core_url`, ma e' ignorato. Resta
-    /// `async`/`Result` per non toccare i ~5 call site esistenti.
-    pub async fn connect(_url: &str) -> anyhow::Result<Self> {
-        Ok(Self)
+    /// Costruisce il client.
+    ///
+    /// Prima era `connect(url) -> Result`: accettava un URL, lo IGNORAVA e non
+    /// falliva mai. Attorno a quella firma erano cresciuti un setting
+    /// (`neural_core_url`), una env var (`NEURAL_CORE_URL`), tre punti che li
+    /// leggevano e un retry-loop da 60 tentativi che ritentava una funzione
+    /// infallibile. Una firma che mente si porta dietro del lavoro inutile: ora
+    /// dice il vero, e quel lavoro non ha piu' motivo di esistere.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Variante per i test unit. Identica a `connect` ora che non c'e' piu' un
@@ -199,6 +204,35 @@ impl NeuralCoreClient {
         max_tokens: u32,
         system_text: &str,
     ) -> anyhow::Result<Value> {
+        self.generate_agent_turn_with_thinking(
+            provider,
+            model,
+            messages_json,
+            tools_json,
+            max_tokens,
+            system_text,
+            None,
+        )
+        .await
+    }
+
+    /// Variante di [`Self::generate_agent_turn`] con configurazione THINKING
+    /// esplicita (punto unico interno, regola L: i call site storici delegano
+    /// con `None` = comportamento DB-driven del gateway invariato). Usata dalla
+    /// `thinking_matrix` del qualificatore (fase 5): la matrice deve PROVARE il
+    /// modello con thinking off e on, non ereditare la policy del catalog che
+    /// sta proprio cercando di derivare.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn generate_agent_turn_with_thinking(
+        &self,
+        provider: &str,
+        model: &str,
+        messages_json: &str,
+        tools_json: &str,
+        max_tokens: u32,
+        system_text: &str,
+        thinking: Option<crate::nexus_gateway::GwThinkingConfig>,
+    ) -> anyhow::Result<Value> {
         let gw = self.gateway().await?;
 
         // Messaggi grezzi -> GwMessage. I call site passano sempre
@@ -251,6 +285,7 @@ impl NeuralCoreClient {
             max_tokens: Some(max_tokens),
             tools,
             pin_provider: Some(provider.to_string()),
+            thinking,
             metadata: GwMetadata {
                 feature: "neural_agent_turn".to_string(),
                 ..Default::default()
@@ -268,13 +303,7 @@ impl NeuralCoreClient {
                 // `e.to_string()` e la classe veniva ri-dedotta con una regex sul
                 // Display: il segnale moriva qui. Ora si legge il codice strutturato e
                 // il testo resta solo per display/log.
-                let structured = structured_error_class(&e);
-                Ok(error_agent_turn_value_with_class(
-                    provider,
-                    model,
-                    &e.to_string(),
-                    structured,
-                ))
+                Ok(error_agent_turn_from_error(provider, model, &e))
             }
         }
     }
@@ -455,7 +484,31 @@ fn tool_blocks_from_gw(resp: &GwResponse) -> (Vec<Value>, Vec<Value>) {
 /// usage, error:null, error_class:null}`. `stop_reason` = "tool_use" se ci sono
 /// tool-call, altrimenti "end_turn" (come il brain, che NON propaga il
 /// finish_reason grezzo qui ma lo deriva dalla presenza di tool-call).
-fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
+///
+/// # Cio' che deve sopravvivere al giro di andata e ritorno
+///
+/// `tool_use_blocks` e' una forma COMODA (`{id, name, input}` gia' parsato) ma
+/// LOSSY: non e' il turno che il provider vuole indietro. Chi rimanda la
+/// conversazione al turno successivo (il loop multi-step di
+/// [`crate::probe_agentic_loop`]) deve poter riprodurre l'assistant VERBATIM, e
+/// tre cose non passavano da qui:
+///
+/// - `tool_calls`: le tool-call ORIGINALI, con la `thought_signature` per-call che
+///   Gemini 3 esige di ritorno sulla stessa `functionCall` (HTTP 400
+///   INVALID_ARGUMENT se manca). Ricostruirle dai blocchi le normalizza (gli
+///   `arguments` verrebbero ri-serializzati) e la firma non c'e' proprio piu';
+/// - `finish_reason` (normalizzato al vocabolario della porta dal punto unico
+///   [`crate::agent_graph_adapter::llm_gateway::normalize_gw_finish_reason`]): senza
+///   di esso "troncato dal cap" e "ha smesso di chiamare tool" sono indistinguibili,
+///   perche' `stop_reason` qui e' DERIVATO dalla presenza di tool-call e non puo'
+///   valere `max_tokens` per costruzione;
+/// - `thinking_signature` (Anthropic, per-messaggio) e `reasoning` (DeepSeek): stesso
+///   vincolo di round-trip, gia' onorato dal path del grafo (`map_gw_response`).
+///
+/// I campi sono ADDITIVI e omessi quando assenti: `stop_reason`, `tool_use_blocks` e
+/// `assistant_content` non cambiano forma, quindi i consumatori esistenti
+/// (`read_turn_signals`, `evaluate_tool_probe`) non vedono differenza.
+pub(crate) fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> Value {
     let used_provider = if resp.provider_used.is_empty() {
         provider
     } else {
@@ -482,17 +535,44 @@ fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
         "tool_use"
     };
 
-    json!({
+    let mut turn = json!({
         "provider": used_provider,
         "model": used_model,
         "content": resp.content,
         "stop_reason": stop_reason,
+        // Vocabolario della porta dal punto unico (regola L): "length" -> "max_tokens".
+        "finish_reason": crate::agent_graph_adapter::llm_gateway::normalize_gw_finish_reason(
+            &resp.finish_reason,
+        ),
         "tool_use_blocks": tool_use_blocks,
         "assistant_content": assistant_content,
         "usage": usage_value_from_gw(resp),
         "error": Value::Null,
         "error_class": Value::Null,
-    })
+    });
+    aggiungi_campi_di_round_trip(&mut turn, resp);
+    turn
+}
+
+/// I campi che il turno deve portare con se' per poter essere RIMANDATO INDIETRO
+/// identico: le tool-call verbatim (con la firma per-call di Gemini 3) e le firme
+/// per-messaggio. Additivi: assenti dal Value quando il provider non li emette, cosi'
+/// un turno testuale resta esattamente com'era.
+fn aggiungi_campi_di_round_trip(turn: &mut Value, resp: &GwResponse) {
+    // VERBATIM: la forma serializzata di `GwToolCall` E' quella che il gateway
+    // riaccetta in richiesta (`Serialize`+`Deserialize`, contratto bidirezionale).
+    // Ri-costruirla a mano dai blocchi la normalizzerebbe.
+    if let Some(tool_calls) = &resp.tool_calls {
+        if let Ok(v) = serde_json::to_value(tool_calls) {
+            turn["tool_calls"] = v;
+        }
+    }
+    if let Some(sig) = &resp.thinking_signature {
+        turn["thinking_signature"] = json!(sig);
+    }
+    if let Some(reasoning) = &resp.reasoning {
+        turn["reasoning"] = json!(reasoning);
+    }
 }
 
 /// Forma `Value` d'errore di `generate_agent_turn`, paritetica al ramo `except`
@@ -506,16 +586,66 @@ fn agent_turn_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
 /// PUNTO UNICO del ponte segnale-strutturato -> `error_class` per il path neural: la
 /// mappa cause->classe vive in `provider_error_classifier` (regola L), qui c'e' solo
 /// l'estrazione.
+///
+/// Questo e' il ponte VIVO: e' l'unico punto in cui un errore del provider viene
+/// classificato, perche' `generate_agent_turn_with_thinking` non ritorna mai `Err`
+/// su un fallimento del provider — lo impacchetta in un `Ok(turn)` con dentro
+/// `error_class`. Un gemello di questa funzione viveva in
+/// `model_qualification::error_class_from_gateway` e disambiguava anche lo status
+/// (404 -> modello inesistente), ma stava sul ramo `Ok(Err(_))`, che riceve solo
+/// errori LOCALI (bridge non configurato, JSON invalido): mai un `GatewayHttpError`.
+/// Era codice morto con tre test verdi che lo chiamavano a mano, mentre il sintomo
+/// che diceva di aver curato era vivo nel DB — 28/28 evidence di `agentic_longctx`
+/// e 56 righe google con `error_class='error'` su 404 conclamati. Ora il ramo dello
+/// status e' QUI, dove l'errore passa davvero.
 fn structured_error_class(err: &anyhow::Error) -> Option<&'static str> {
     let gw_err = err
         .chain()
         .find_map(|c| c.downcast_ref::<crate::nexus_gateway::GatewayHttpError>())?;
-    let cause = gw_err
-        .details
-        .as_ref()?
-        .get("primary_cause")?
-        .as_str()?;
-    crate::provider_error_classifier::error_class_from_primary_cause(cause)
+    let details = gw_err.details.as_ref()?;
+    let cause = details.get("primary_cause")?.as_str()?;
+    if let Some(mapped) = crate::provider_error_classifier::error_class_from_primary_cause(cause) {
+        return Some(mapped);
+    }
+    // `client_error` e' l'unica causa che la sola stringa non basta a decidere: la
+    // disambigua lo status del PRIMO fallimento (col pin la chain ne ha uno solo).
+    if cause == "client_error" {
+        return Some(crate::provider_error_classifier::client_error_class_from_status(
+            first_failure_status(details),
+        ));
+    }
+    None
+}
+
+/// Lo status del primo fallimento nei `details` del gateway: segnale strutturato
+/// (regola M), mai ri-parsato dal testo del messaggio.
+fn first_failure_status(details: &Value) -> Option<i64> {
+    details
+        .get("failures")?
+        .as_array()?
+        .first()?
+        .get("status")?
+        .as_i64()
+}
+
+/// PUNTO UNICO (regola L) del turno d'ERRORE per il path neural: dall'errore
+/// TIPIZZATO del gateway al `Value` che i consumatori leggono davvero
+/// (`evaluate_tool_probe`, `evaluate_attempt`).
+///
+/// Esiste come funzione a se' per la regola O: il ramo `Err` di
+/// `generate_agent_turn_with_thinking` delega QUI, quindi un test che parte da
+/// questa funzione raggiunge il suo oggetto per la STESSA strada della
+/// produzione — estrazione del segnale strutturato inclusa. Prima il ramo `Err`
+/// era codice inline dentro un metodo `async` che richiede un gateway vivo:
+/// irraggiungibile da un test, che quindi fabbricava il turno a mano e fissava
+/// l'assunto che avrebbe dovuto verificare.
+pub(crate) fn error_agent_turn_from_error(
+    provider: &str,
+    model: &str,
+    err: &anyhow::Error,
+) -> Value {
+    let structured = structured_error_class(err);
+    error_agent_turn_value_with_class(provider, model, &err.to_string(), structured)
 }
 
 /// Come [`error_agent_turn_value`] ma con la classe gia' derivata da un segnale
@@ -533,7 +663,12 @@ fn error_agent_turn_value_with_class(
     }
 }
 
-fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
+/// Il turno d'errore quando NON c'e' un segnale strutturato e la classe va dedotta
+/// dal testo. `pub(crate)` come cucitura per i test: chi deve esercitare un turno
+/// d'errore parte DA QUI invece di fabbricarne uno a mano (regola O). Vale lo stesso
+/// motivo di [`error_agent_turn_from_error`]: un ramo che nessun test puo'
+/// raggiungere se lo costruisce da se', e cosi' fissa l'assunto che dovrebbe provare.
+pub(crate) fn error_agent_turn_value(provider: &str, model: &str, raw_error: &str) -> Value {
     let class = crate::provider_error_classifier::classify_text(raw_error).stop_reason;
     error_agent_turn_value_inner(provider, model, raw_error, class)
 }
@@ -561,7 +696,15 @@ fn error_agent_turn_value_inner(
 /// in `GwMessage`. I call site passano sempre `{role, content}` testuali; i campi
 /// tool sono preservati se presenti (robustezza, retrocompatibile col contratto
 /// gateway). `role`/`content` mancanti -> default difensivi.
-fn gw_message_from_value(v: Value) -> GwMessage {
+///
+/// E' l'ULTIMO cancello prima del wire: cio' che non viene letto qui non parte, per
+/// quanto correttamente il chiamante l'abbia messo nel messaggio. `tool_calls` passa
+/// per `GwToolCall`, che porta con se' la `thought_signature` per-call (Gemini 3).
+///
+/// `pub(crate)` perche' un round-trip si prova solo arrivando fin qui: asserire che
+/// la firma sia nel messaggio dimostra che l'abbiamo scritta, non che parte davvero
+/// (regola O: si asserisce la conseguenza, non la stringa).
+pub(crate) fn gw_message_from_value(v: Value) -> GwMessage {
     let role = v
         .get("role")
         .and_then(Value::as_str)
@@ -582,13 +725,143 @@ fn gw_message_from_value(v: Value) -> GwMessage {
         .get("reasoning")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Round-trip firma thinking Anthropic: era inchiodata a `None`, quindi la firma
+    // moriva QUI anche quando il chiamante la portava. Speculare al `reasoning`
+    // DeepSeek sopra; il server la inoltra solo ad Anthropic.
+    let thinking_signature = v
+        .get("thinking_signature")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     GwMessage {
         role,
         content,
         tool_calls,
         tool_call_id,
         reasoning,
-        thinking_signature: None,
+        thinking_signature,
+    }
+}
+
+/// Il ponte structured -> `error_class`, provato lungo la catena INTERA: dal body
+/// che il gateway manda davvero fino al verdetto che ne consegue.
+///
+/// Il ponte precedente aveva tre test verdi e non funzionava, per due rotture
+/// indipendenti che nessuno dei tre poteva vedere: viveva su un ramo mai eseguito,
+/// e ritornava una stringa (`model_not_found`) che nessun consumatore conosce. Il
+/// primo difetto sfuggiva perche' i test chiamavano la funzione a mano invece di
+/// passare dal produttore; il secondo perche' si fermavano alla stringa senza mai
+/// chiedere che verdetto ne uscisse. Questi test chiudono entrambi i buchi.
+#[cfg(test)]
+mod ponte_errore_tests {
+    use super::*;
+    use crate::model_health_probe::{Classification, classification_from_error_class};
+
+    /// Il body VERBATIM che il gateway produce su un 404 pinnato. Non e' inventato:
+    /// e' la forma che `provider_with_details` costruisce (500 + `details` con
+    /// `primary_cause` e `failures[].status`), asserita dall'altra sponda dal test
+    /// `nexus-gateway::server::routes` (`details["primary_cause"] == "client_error"`,
+    /// `failures[0]["status"]`), e osservata sul vivo il 2026-07-16 21:23 UTC:
+    /// "gateway: modello invalido/deprecato (client_error, niente cooldown provider)
+    ///  provider=google status=404 code=not_found".
+    fn errore_404_dal_gateway() -> anyhow::Error {
+        crate::nexus_gateway::GatewayHttpError::from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": "tutti i provider hanno fallito -> google (google HTTP 404: ...)",
+                "code": "PROVIDER_ERROR",
+                "details": {
+                    "primary_cause": "client_error",
+                    "failures": [{"provider": "google", "class": "client_error",
+                                  "status": 404, "code": "not_found",
+                                  "message": "Publisher Model not found"}]
+                }
+            })
+            .to_string(),
+        )
+        .into()
+    }
+
+    /// PRIMA ROTTURA: il 404 deve diventare una causa NOMINATA, non 'error'.
+    #[test]
+    fn il_ponte_derrore_classifica_un_404_pinnato() {
+        assert_eq!(
+            structured_error_class(&errore_404_dal_gateway()),
+            Some("not_found")
+        );
+    }
+
+    /// Il turno che il ramo d'errore consegna al chiamante: la classe struttura il
+    /// verdetto, il testo resta solo da leggere. Attraversa il produttore vero
+    /// (`error_agent_turn_value_with_class`), che e' cio' che i tre test rimossi
+    /// non facevano.
+    #[test]
+    fn il_404_arriva_al_turno_come_classe_e_non_come_testo() {
+        let e = errore_404_dal_gateway();
+        let turn = error_agent_turn_value_with_class(
+            "google",
+            "gemini-2.0-flash-lite-001",
+            &e.to_string(),
+            structured_error_class(&e),
+        );
+        assert_eq!(turn["error_class"], "not_found");
+        assert_eq!(turn["stop_reason"], "error");
+    }
+
+    /// SECONDA ROTTURA: la classe deve produrre un verdetto CONCLUSIVO. Era qui che
+    /// il ponte vecchio si sarebbe rotto anche da vivo, e nessun test guardava.
+    #[test]
+    fn la_classe_del_404_produce_un_verdetto_conclusivo() {
+        assert!(matches!(
+            classification_from_error_class("not_found"),
+            Classification::ModelSpecific(..)
+        ));
+    }
+
+    /// La prova della seconda rottura: `model_not_found` — la stringa che il ponte
+    /// morto ritornava — non appartiene al vocabolario e cade nel catch-all, cioe'
+    /// nello stesso `Transient` ("stato invariato, ritento") da cui il ponte doveva
+    /// far uscire il 404. Anche raggiungendolo, non avrebbe curato nulla.
+    #[test]
+    fn la_stringa_del_ponte_morto_non_esiste_nel_vocabolario() {
+        assert!(matches!(
+            classification_from_error_class("model_not_found"),
+            Classification::Transient(..)
+        ));
+    }
+
+    /// Gli altri 4xx che `client_error` appiattisce: conseguenze diverse, nessuna
+    /// indovinata. Un 400 e' colpa della richiesta, un 401 di tutto il provider.
+    #[test]
+    fn ogni_4xx_ha_la_sua_conseguenza() {
+        use crate::provider_error_classifier::client_error_class_from_status as classe;
+        assert!(matches!(
+            classification_from_error_class(classe(Some(401))),
+            Classification::ProviderWide(..)
+        ));
+        assert!(matches!(
+            classification_from_error_class(classe(Some(403))),
+            Classification::ModelSpecific(..)
+        ));
+        assert!(matches!(
+            classification_from_error_class(classe(Some(400))),
+            Classification::ModelSpecific(..)
+        ));
+        // Status assente o 4xx ignoto: OPACO -> Transient, mai una punizione a caso.
+        assert!(matches!(
+            classification_from_error_class(classe(None)),
+            Classification::Transient(..)
+        ));
+        assert!(matches!(
+            classification_from_error_class(classe(Some(409))),
+            Classification::Transient(..)
+        ));
+    }
+
+    /// Un errore che non viene dal gateway non ha segnale strutturato da leggere:
+    /// nessuna classe inventata.
+    #[test]
+    fn un_errore_locale_non_ha_segnale_strutturato() {
+        assert_eq!(structured_error_class(&anyhow::anyhow!("boom")), None);
     }
 }
 
@@ -634,6 +907,47 @@ mod gateway_mapping_tests {
         // provider/model "usati" dal gateway prevalgono.
         assert_eq!(v["provider"], "anthropic");
         assert_eq!(v["model"], "m-real");
+    }
+
+    /// Il giro completo produttore -> consumatore sui token di cache.
+    ///
+    /// Il JSON lo costruisce il produttore VERO (`completion_value_from_gw`) e lo
+    /// legge il consumatore VERO (`billing::extract_usage_numbers`): e' la strada
+    /// della produzione. Le due chiavi di cache erano gia' scritte qui e venivano
+    /// scartate dall'altro capo, dove `UsageNumbers` non aveva dove metterle.
+    #[test]
+    fn i_token_di_cache_sopravvivono_al_giro_completion_usage_numbers() {
+        let mut resp = base_resp();
+        // `input_tokens` e' il prompt LORDO: i 900 letti da cache e i 50 scritti
+        // ne fanno parte, quindi 12 restano a tariffa piena.
+        resp.usage.input_tokens = 962;
+        resp.usage.cache_read_tokens = Some(900);
+        resp.usage.cache_creation_tokens = Some(50);
+        let v = completion_value_from_gw("anthropic", "claude-x", &resp);
+
+        // Il produttore le scrive.
+        assert_eq!(v["metadata"]["usage"]["cache_read_tokens"], 900);
+        assert_eq!(v["metadata"]["usage"]["cache_creation_tokens"], 50);
+
+        // Il consumatore le legge (prima si fermavano qui).
+        let n = crate::billing::extract_usage_numbers(&v, 0, 0);
+        assert_eq!(n.prompt_tokens, 962);
+        assert_eq!(n.completion_tokens, 34);
+        assert_eq!(n.cache_read_tokens, 900);
+        assert_eq!(n.cache_creation_tokens, 50);
+        // Il totale e' prompt lordo + completion: la cache e' gia' dentro.
+        assert_eq!(n.total_tokens, 996);
+    }
+
+    /// Senza cache nulla cambia: le chiavi non compaiono e i conteggi restano 0.
+    #[test]
+    fn senza_cache_le_chiavi_non_compaiono_e_i_conteggi_sono_zero() {
+        let v = completion_value_from_gw("openai", "gpt-x", &base_resp());
+        assert!(v["metadata"]["usage"].get("cache_read_tokens").is_none());
+        let n = crate::billing::extract_usage_numbers(&v, 0, 0);
+        assert_eq!(n.cache_read_tokens, 0);
+        assert_eq!(n.cache_creation_tokens, 0);
+        assert_eq!(n.total_tokens, 46);
     }
 
     #[test]

@@ -4,29 +4,33 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { useThemeColors } from "../../lib/theme";
 import type { AITraceEvent } from "../../lib/api-client";
-import { calcModelCost as calcCost, formatCostUsd as formatCost } from "../../lib/model-catalog";
+import { formatCostUsd as formatCost, traceCost } from "../../lib/model-catalog";
+import { usePricingCatalog, type ModelPricingEntry } from "./provider-badge";
 
-function humanizeTraceText(raw: string | undefined | null): string {
+// Il costo di una trace lo calcola `traceCost` (lib/model-catalog.ts), dove un
+// test puo' raggiungerlo: scritto qui dentro nessuno lo misurerebbe, perche' il
+// modulo tira dentro React (regola O). `null` = modello non a catalogo, e la UI
+// nasconde la cella invece di mostrare uno zero.
+
+/// Il testo di una trace, scartando solo il wrapper `[Error: ...]`.
+///
+/// Qui viveva `humanizeTraceText`, che sceglieva la frase da mostrare cercando
+/// "429", "timeout", "MetadataMap" DENTRO il testo. Due difetti opposti nello
+/// stesso posto: quando indovinava buttava via l'informazione vera (qualunque
+/// blob tecnico diventava "Errore del provider AI.", senza provider ne' status),
+/// e quando non indovinava lasciava passare il blob intero.
+///
+/// Ora nessuno indovina. Il messaggio leggibile nasce alla fonte, dal punto
+/// unico `nexus-types::error_presentation`, dove status, codice e natura del
+/// trasporto sono ancora vivi. Questo e' un pannello DIAGNOSTICO: il testo
+/// tecnico che ci arriva e' al suo posto, ed e' gia' dentro un blocco
+/// espandibile.
+function traceText(raw: string | undefined | null): string {
   if (!raw) return "";
   const text = raw.trim();
   if (!text) return "";
   const errMatch = text.match(/^\[Error:\s*([\s\S]*?)\]?\s*$/);
-  const isError = !!errMatch;
-  const inner = errMatch ? errMatch[1].trim() : text;
-  const low = inner.toLowerCase();
-  if (/request too large|too large for|tokens? per min|tpm.*limit|input.*tokens?.*reduced/i.test(inner))
-    return "Richiesta troppo grande per il modello (limite token al minuto superato).";
-  if (/resourceexhausted|message larger than|larger than max/i.test(inner))
-    return "Il provider AI ha rifiutato un payload troppo grande.";
-  if (/unauthenticated|invalid api key|401/.test(low)) return "Credenziali del provider AI non valide.";
-  if (/deadlineexceeded|timed? ?out|timeout/.test(low)) return "Il provider AI non ha risposto in tempo.";
-  if (/rate ?limit|429|quota/.test(low)) return "Limite di richieste del provider AI raggiunto.";
-  if (/unavailable|connection refused|503/.test(low)) return "Provider AI momentaneamente non disponibile.";
-  const looksTechnical =
-    /MetadataMap|status:\s*\w+|details:\s*\[|grpc[\s_-]?status|^\s*[[{]/i.test(inner) ||
-    /\borg-[a-z0-9]{10,}/i.test(inner);
-  if (looksTechnical) return isError ? "Errore del provider AI." : text;
-  return isError ? `${inner}` : text;
+  return errMatch ? errMatch[1].trim() : text;
 }
 
 function stopReasonColor(reason: string, tc: ReturnType<typeof useThemeColors>): string {
@@ -41,21 +45,20 @@ function stopReasonColor(reason: string, tc: ReturnType<typeof useThemeColors>):
 function CompactTraceCard({
   trace,
   tc,
+  catalog,
 }: {
   trace: AITraceEvent;
   tc: ReturnType<typeof useThemeColors>;
+  /** Catalogo prezzi risolto UNA volta dal padre: l'hook qui dentro girerebbe
+   *  per ogni riga della lista. */
+  catalog: ModelPricingEntry[];
 }) {
   const [textExpanded, setTextExpanded] = useState(false);
-  const safeText = humanizeTraceText(trace.responseText);
+  const safeText = traceText(trace.responseText);
   // "lungo" = più di una riga logica (contiene \n o supera ~90 char)
   const isLong = safeText.length > 90 || safeText.includes("\n");
   const firstLine = safeText.split("\n")[0].slice(0, 90) + (safeText.split("\n")[0].length > 90 ? "…" : "");
-  const cost = calcCost(
-    trace.model,
-    trace.inputTokens ?? 0,
-    trace.outputTokens ?? 0,
-    trace.cacheReadTokens ?? 0,
-  );
+  const cost = traceCost(trace, catalog);
   const toolNames = (trace.toolCalls ?? []).map((tc) => tc.name).join(", ");
 
   return (
@@ -81,8 +84,11 @@ function CompactTraceCard({
         {(trace.inputTokens ?? 0) > 0 && (
           <span style={{ color: tc.textMuted, fontFamily: 'var(--font-mono)' }}>
             ↑{trace.inputTokens} ↓{trace.outputTokens}
-            {(trace.cacheReadTokens ?? 0) > 0 && (
-              <span style={{ color: tc.success }}> ⚡{trace.cacheReadTokens}</span>
+            {((trace.cacheReadTokens ?? 0) + (trace.cacheCreationTokens ?? 0)) > 0 && (
+              <span style={{ color: tc.success }}>
+                {" "}
+                ⚡{(trace.cacheReadTokens ?? 0) + (trace.cacheCreationTokens ?? 0)}
+              </span>
             )}
           </span>
         )}
@@ -224,14 +230,24 @@ function CompactTraceCard({
 export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
   const tc = useThemeColors();
   const [open, setOpen] = useState(false);
+  // Hook PRIMA dell'early return: le regole degli hook non ammettono rami.
+  const catalog = usePricingCatalog();
 
   if (traces.length === 0) return null;
 
   const totalInput  = traces.reduce((s, t) => s + (t.inputTokens ?? 0), 0);
   const totalOutput = traces.reduce((s, t) => s + (t.outputTokens ?? 0), 0);
-  const totalCache  = traces.reduce((s, t) => s + (t.cacheReadTokens ?? 0), 0);
+  // Token di cache del run: lettura + scrittura. E' una QUOTA di `totalInput`
+  // (il prompt lordo), mostrata accanto per dire quanta parte del contesto e'
+  // costata meno — non un terzo addendo.
+  const totalCache  = traces.reduce(
+    (s, t) => s + (t.cacheReadTokens ?? 0) + (t.cacheCreationTokens ?? 0),
+    0,
+  );
+  // Somma solo le trace che il catalog copre; se non ne copre nessuna resta
+  // `null` e il totale non si mostra (mai uno zero che sembra "gratis").
   const totalCost   = traces.reduce<number | null>((acc, t) => {
-    const c = calcCost(t.model, t.inputTokens ?? 0, t.outputTokens ?? 0, t.cacheReadTokens ?? 0);
+    const c = traceCost(t, catalog);
     if (c === null) return acc;
     return (acc ?? 0) + c;
   }, null);
@@ -293,7 +309,12 @@ export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
           }}
         >
           {traces.map((t) => (
-            <CompactTraceCard key={`${t.runId}-${t.iteration}`} trace={t} tc={tc} />
+            <CompactTraceCard
+              key={`${t.runId}-${t.iteration}`}
+              trace={t}
+              tc={tc}
+              catalog={catalog}
+            />
           ))}
         </div>
       )}

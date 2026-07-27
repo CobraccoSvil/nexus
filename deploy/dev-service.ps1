@@ -24,6 +24,9 @@ $WINSW   = Join-Path $RUNTIME 'winsw'
 $LOGDIR  = Join-Path $RUNTIME 'dev-logs'
 $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
+# Kill + verifica del fatto: punto unico condiviso con dev-stop.ps1/deploy-local.ps1.
+. (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
+
 function Write-Info([string]$msg) { Write-Output $msg }
 function Fail([string]$msg) { [Console]::Error.WriteLine($msg); exit 1 }
 
@@ -51,11 +54,6 @@ function Write-PidMap([hashtable]$map) {
   if ($json -and $json -notmatch '^\s*\[') { $json = "[`n$json`n]" }
   if (-not $json) { $json = '[]' }
   Set-Content -Path $PIDFILE -Value $json -Encoding utf8
-}
-
-function Test-Alive([int]$processId) {
-  if (-not $processId) { return $false }
-  return [bool](Get-Process -Id $processId -ErrorAction SilentlyContinue)
 }
 
 # ── Rotazione log (3 generazioni), come dev-start.ps1 ─────────────────────────
@@ -123,17 +121,23 @@ function Start-FromManifest([string]$id) {
 # mcp-core (nexus-mcp-core) viene terminato SENZA /T: nel self-restart questo
 # script e' figlio detached di mcp-core e /T (che uccide l'intero albero)
 # abbatterebbe anche questo processo prima del rilancio. Gli altri servizi usano
-# /T per non lasciare orfani (es. dev-server figli). taskkill via cmd /c: in
-# PS 5.1 il redirect stderr di un exe nativo genera un NativeCommandError.
+# /T per non lasciare orfani (es. dev-server figli).
+#
+# Il kill e la VERIFICA che il processo sia davvero morto stanno in
+# Stop-NexusProcessTree (lib\nexus-process.ps1). Qui si decide solo cosa fare
+# dell'esito, e un kill fallito e' FATALE: exit 1 con il motivo su stderr, che
+# mcp-core restituisce come `stderr` dell'endpoint (system_services.rs).
+# Il PID resta nel pidfile se il processo e' vivo: rimuoverlo lo renderebbe un
+# orfano non piu' rintracciabile, e il pidfile mentirebbe come mentiva l'output.
 function Stop-ProcessModel([string]$id, [hashtable]$map) {
   $processId = $map[$id]
-  if (Test-Alive $processId) {
-    $treeFlag = if ($id -eq 'nexus-mcp-core') { '' } else { '/T' }
-    cmd /c "taskkill /PID $processId $treeFlag /F >nul 2>nul"
-    Write-Info "fermato $id (pid $processId)"
+  if (-not $processId) {
+    Write-Info "$id gia' fermo (nessun pid registrato)"
   }
   else {
-    Write-Info "$id gia' fermo"
+    $res = Stop-NexusProcessTree -ProcessId $processId -Label $id -KillTree:($id -ne 'nexus-mcp-core')
+    if (-not $res.Stopped) { Fail $res.Message }
+    Write-Info $res.Message
   }
   $map.Remove($id) | Out-Null
   Write-PidMap $map
@@ -165,7 +169,7 @@ try {
       Stop-ProcessModel $Service $map
     }
     'start' {
-      if (Test-Alive $map[$Service]) {
+      if (Test-NexusProcessAlive $map[$Service]) {
         Write-Info "$Service gia' in esecuzione (pid $($map[$Service]))"
       }
       else {

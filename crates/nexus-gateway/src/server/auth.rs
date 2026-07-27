@@ -31,24 +31,28 @@ pub fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 }
 
 /// Decide se un token e' valido per lo stato corrente. Logica pura e testabile:
-///   - se `jwt_secret` e' `None` (dev): qualunque richiesta passa;
+///   - senza token: rifiuta;
 ///   - se il token coincide col service token: passa (bypass interno);
-///   - altrimenti il token deve essere un JWT firmato col secret.
+///   - altrimenti il token deve essere un JWT firmato col secret di piattaforma.
+///
+/// NON esiste piu' il ramo "nessun secret configurato -> passa tutto". Era
+/// raggiungibile per costruzione (`jwt_secret` e' seminata vuota e generata al
+/// primo login, mentre il gateway ne prendeva uno snapshot all'avvio), e in
+/// quello stato il gateway accettava qualunque richiesta anche SENZA header.
+/// Ora `AppState::jwt_secret` e' una `String` garantita dal bootstrap: lo stato
+/// permissivo non e' rappresentabile.
 pub fn token_is_valid(state: &AppState, token: Option<&str>) -> bool {
-    let Some(secret) = state.jwt_secret.as_deref() else {
-        // Dev mode: nessun JWT configurato -> auth disabilitata (come il server.ts).
-        return true;
-    };
+    let secret = state.jwt_secret.as_str();
 
     let Some(token) = token else {
         return false;
     };
 
-    // Bypass JWT per le chiamate interne (mcp-core -> gateway).
-    if token == state.service_token {
-        return true;
-    }
-
+    // Non esiste piu' un confronto con un bearer STATICO condiviso. Le chiamate
+    // interne (mcp-core -> gateway) presentano un JWT a vita breve firmato con
+    // la stessa chiave di piattaforma (`nexus_auth::service_bearer`), quindi
+    // passano dalla validazione ordinaria qui sotto: un percorso solo, nessun
+    // ramo privilegiato da tenere allineato.
     decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
@@ -101,7 +105,7 @@ routing:
     /// interrogato dai test di auth (la logica e' pura). `connect_lazy` richiede
     /// un contesto tokio per costruire il pool, quindi i test che lo usano sono
     /// `#[tokio::test]` (anche se la validazione e' sincrona e non tocca il DB).
-    fn state(jwt_secret: Option<String>, service_token: &str) -> Option<AppState> {
+    fn state(jwt_secret: String) -> Option<AppState> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nobody:nopass@127.0.0.1:1/none")
             .ok()?;
@@ -120,7 +124,6 @@ routing:
         };
         Some(AppState {
             db: pool,
-            service_token: service_token.to_string(),
             jwt_secret,
             mcp_core_url: "http://localhost:4000".to_string(),
             cooldown: CooldownManager::new(),
@@ -142,28 +145,76 @@ routing:
         .unwrap()
     }
 
+    /// Al posto del vecchio `dev_mode_senza_secret_passa_sempre`, che asseriva
+    /// come CORRETTO il bypass poi rivelatosi il difetto: con `jwt_secret =
+    /// None` il gateway accettava qualunque richiesta, anche senza header, e
+    /// quello stato era raggiungibile per costruzione (chiave seminata vuota,
+    /// generata al primo login, snapshot preso dal gateway all'avvio).
+    ///
+    /// Oggi `AppState::jwt_secret` e' una `String`: lo stato permissivo non e'
+    /// rappresentabile e questo test lo fissa dal lato osservabile — nessuna
+    /// richiesta passa senza una credenziale valida.
     #[tokio::test]
-    async fn dev_mode_senza_secret_passa_sempre() {
-        let Some(st) = state(None, "svc-token") else {
+    async fn nessuna_richiesta_passa_senza_credenziale() {
+        let Some(st) = state("a".repeat(40)) else {
             return; // ambiente senza supporto pool lazy: skip
         };
-        assert!(token_is_valid(&st, None));
-        assert!(token_is_valid(&st, Some("qualunque-cosa")));
+        assert!(
+            !token_is_valid(&st, None),
+            "senza token non si passa: era il bypass dell'auth"
+        );
+        assert!(
+            !token_is_valid(&st, Some("qualunque-cosa")),
+            "un token arbitrario non deve passare"
+        );
+        assert!(
+            !token_is_valid(&st, Some("")),
+            "il token vuoto non deve coincidere con nulla"
+        );
     }
 
+    /// Il bearer statico condiviso non esiste piu': una stringa nota non e' piu'
+    /// una credenziale. Prima `"dev-internal-token"` — un valore scritto nel
+    /// sorgente — apriva il gateway; questo test lo fissa come rifiutato.
     #[tokio::test]
-    async fn service_token_valido_passa() {
-        let secret = "a".repeat(40);
-        let Some(st) = state(Some(secret), "svc-token") else {
+    async fn il_vecchio_bearer_statico_non_e_piu_una_credenziale() {
+        let Some(st) = state("a".repeat(40)) else {
             return;
         };
-        assert!(token_is_valid(&st, Some("svc-token")));
+        assert!(
+            !token_is_valid(&st, Some("dev-internal-token")),
+            "il bearer statico e' stato eliminato: deve essere rifiutato come \
+             qualunque altra stringa"
+        );
+    }
+
+    /// Le chiamate interne (mcp-core -> gateway) ora presentano un JWT di
+    /// servizio firmato con la stessa chiave di piattaforma, quindi passano dal
+    /// percorso di validazione ORDINARIO: nessun ramo privilegiato.
+    #[tokio::test]
+    async fn il_jwt_di_servizio_passa_dalla_validazione_ordinaria() {
+        let secret = "a".repeat(40);
+        let Some(st) = state(secret.clone()) else {
+            return;
+        };
+        let claims = Claims {
+            sub: nexus_auth::SERVICE_SUBJECT.to_string(),
+            role: "service".to_string(),
+            exp: 9_999_999_999,
+        };
+        let bearer = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        assert!(token_is_valid(&st, Some(&bearer)));
     }
 
     #[tokio::test]
     async fn token_assente_o_sbagliato_fallisce() {
         let secret = "a".repeat(40);
-        let Some(st) = state(Some(secret), "svc-token") else {
+        let Some(st) = state(secret) else {
             return;
         };
         assert!(!token_is_valid(&st, None));
@@ -173,7 +224,7 @@ routing:
     #[tokio::test]
     async fn jwt_valido_passa_jwt_firmato_diverso_fallisce() {
         let secret = "s".repeat(40);
-        let Some(st) = state(Some(secret.clone()), "svc-token") else {
+        let Some(st) = state(secret.clone()) else {
             return;
         };
         let good = make_jwt(&secret);

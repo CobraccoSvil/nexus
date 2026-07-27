@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     billing::{self, UsageNumbers},
     domain::OrchestratorAudit,
-    nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
+    nexus_gateway::NexusGatewayClient,
     provider_cooldown::is_provider_in_cooldown,
     vector_memory,
 };
@@ -21,9 +21,15 @@ use super::*;
 type LlmExecution = (String, String, serde_json::Value, UsageNumbers, f64, String);
 
 impl Orchestrator {
+    /// Il gateway e' un parametro OBBLIGATORIO: senza non si puo' chiamare alcun
+    /// LLM. Era iniettato da un `with_gateway` opzionale, chiamato solo se una
+    /// probe all'avvio trovava il gateway gia' sano — e chi perdeva quella corsa
+    /// restava senza gateway per sempre. Ora la firma non lo consente.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         neural: NeuralCoreClient,
         template_cache: crate::prompt_templates::TemplateCache,
+        nexus_gateway: NexusGatewayClient,
         routing_matrix: crate::routing_matrix::RoutingMatrixCache,
         routing_thresholds: crate::routing_config::RoutingThresholdsCache,
         intent_capability: crate::routing_config::IntentCapabilityCache,
@@ -32,7 +38,7 @@ impl Orchestrator {
         Self {
             neural,
             template_cache,
-            nexus_gateway: None,
+            nexus_gateway,
             routing_matrix,
             routing_thresholds,
             intent_capability,
@@ -40,72 +46,42 @@ impl Orchestrator {
         }
     }
 
-    pub fn with_gateway(mut self, gw: NexusGatewayClient) -> Self {
-        self.nexus_gateway = Some(gw);
-        self
-    }
-
     pub async fn neural_healthy(&self) -> bool {
         self.neural.is_healthy().await
     }
 
-    /// Classifier intent che usa le soglie da DB (mig 0111) e delega al punto
-    /// unico di scelta motore [`select_classifier_engine`] (regola L, flag mig
-    /// 0458): `python` -> endpoint brain `/classify-intent-agentic` (path vivo
-    /// INVARIATO), `rust` -> `intent_classifier::classify` in-process. Se la
-    /// cache `routing_thresholds` non e' disponibile, fallback ai default.
+    /// Classifica l'intent restituendo solo `(intent, confidence)`.
+    ///
+    /// Delega a [`Self::classify_intent_full`] (punto unico, regola L): prima le
+    /// due funzioni ripetevano la stessa scelta di motore, e una modifica a una
+    /// sola avrebbe fatto divergere in silenzio i due chiamanti.
     async fn classify_intent_with_db_thresholds(
         &self,
         db: &PgPool,
         message: &str,
     ) -> (&'static str, f32) {
-        // Path RUST in-process quando il flag DB lo dice E il gateway e'
-        // disponibile (senza gateway non si puo' chiamare l'LLM: si resta sul
-        // path Python, comportamento stabile).
-        if let (ClassifierEngine::Rust, Some(gw)) = (
-            select_classifier_engine(db).await,
-            self.nexus_gateway.as_ref(),
-        ) {
-            let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
-            return (classified.intent, classified.confidence);
-        }
-        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
-            Ok(t) => (
-                t.llm_classifier_min_confidence,
-                t.llm_classifier_timeout_seconds,
-            ),
-            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
-        };
-        classify_intent_async_with_threshold(message, min_conf, timeout_s).await
+        let classified = self.classify_intent_full(db, message).await;
+        (classified.intent, classified.confidence)
     }
 
     /// Variante "full" che ritorna `ClassifiedIntent` con candidati + flag
     /// ambiguita'. Usata da `spawn_agent_run` per decidere se chiedere
     /// disambiguazione all'utente (best practice NLU).
+    ///
+    /// Il motore e' UNO: `intent_classifier::classify` in-process via gateway.
+    /// Non c'e' piu' una scelta rust-vs-python (`routing.classifier_engine`,
+    /// mig 0458/0460) ne' un ripiego sull'endpoint brain `/classify-intent-agentic`:
+    /// il brain e' stato eliminato (mig 0462/0532), quindi quel ramo non
+    /// classificava piu' nulla — restituiva l'intent neutro e spegneva in
+    /// silenzio il dimensionamento. Un'alternativa che non puo' funzionare non e'
+    /// un fallback: e' un buco in cui cadere.
+    ///
+    /// Se il gateway non risponde, `classify_intent_full_rust` lo DICHIARA
+    /// (`fallback_used=true` -> `classifier_resolved=false`) e i consumatori a
+    /// valle sanno di non potersi fidare della classe.
     pub async fn classify_intent_full(&self, db: &PgPool, message: &str) -> ClassifiedIntent {
-        // Punto unico di scelta motore (regola L, flag mig 0458): `rust` ->
-        // classificatore in-process; `python` (default) -> endpoint brain. Il
-        // path rust richiede il gateway; senza, si resta sul path Python.
-        if let (ClassifierEngine::Rust, Some(gw)) = (
-            select_classifier_engine(db).await,
-            self.nexus_gateway.as_ref(),
-        ) {
-            let (classified, _ai) = classify_intent_full_rust(db, gw, message).await;
-            return classified;
-        }
-        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
-            Ok(t) => (
-                t.llm_classifier_min_confidence,
-                t.llm_classifier_timeout_seconds,
-            ),
-            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
-        };
-
-        // Solo interpretazione semantica LLM: niente piu' pre-check ne' fallback
-        // keyword/deterministico. Quando l'LLM non e' disponibile, la funzione
-        // ritorna l'intent di sistema neutro `agentic_default`, che attiva lato
-        // agente il _LAZY_MINIMAL_TOOLKIT (l'LLM dell'agente interpreta da se').
-        classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await
+        let (classified, _ai) = classify_intent_full_rust(db, &self.nexus_gateway, message).await;
+        classified
     }
 
     /// Routing slot-first (Livello 4 NLU): se il classifier ha estratto slot
@@ -531,11 +507,39 @@ impl Orchestrator {
         // l'intent non e' mappato (helper unico, regola L).
         let estimated_tokens = estimate_complexity(message);
         let (tier, capability) = self.intent_tier_capability(intent, estimated_tokens).await;
-        match select_tool_capable_fallback(db, &tier, &capability).await {
+        // Fallback deterministico: miglior modello tool-capable del tier
+        // (degradazione di tier controllata nel selettore).
+        //
+        // RILASSO CAPABILITY (fix incidente UI 2026-06-04): prima prova
+        // con la capability dell'intent (es. "reasoning"); se nessun
+        // modello NON-thinking tool-capable la possiede — caso reale:
+        // i modelli con capability "reasoning" hanno policy thinking
+        // che li esclude dal gate (mig 0317/0319) — rilassa la capability e
+        // prende il miglior non-thinking tool-capable del tier. Un modello
+        // non-thinking senza quel tag e' comunque MOLTO meglio di un
+        // thinking model che fallirebbe il loop agentico (deepseek-v4-pro
+        // -> reasoning_content 400). Senza questo rilassamento il gate
+        // teneva il modello thinking originale (override/slot), vanificando
+        // l'esclusione su tutti i path che forzano un modello.
+        // SERVIZIO UNICO (regola L): Degrade + Agentic. Il gate segue il
+        // profilo (I2) invece di dipendere da questo call site.
+        use crate::orchestrator::model_service::{select_model, ModelRequest};
+        let fallback = match select_model(
+            db,
+            &ModelRequest::agentic(&tier).capability(Some(&capability)),
+        )
+        .await
+        {
+            Ok(c) => Some((c.provider, c.model)),
+            Err(_) => select_model(db, &ModelRequest::agentic(&tier))
+                .await
+                .ok()
+                .map(|c| (c.provider, c.model)),
+        };
+        match fallback {
             Some((alt_provider, alt_model)) => {
                 tracing::info!(
-                    "routing: {}/{} scartato per run agente (non tool-capable o thinking) \
-                     -> fallback {}/{} (intent={}, tier={}, capability={})",
+                    "routing: {}/{} scartato per run agente (non tool-capable o thinking)                      -> fallback {}/{} (intent={}, tier={}, capability={})",
                     provider,
                     model,
                     alt_provider,
@@ -552,11 +556,7 @@ impl Orchestrator {
                 // NESSUNA capability del tier: fail visibile. Non sostituiamo
                 // silenziosamente con qualcosa di sbagliato.
                 tracing::warn!(
-                    "routing: {}/{} non utilizzabile per run agente (intent={}) ma \
-                     nessun modello non-thinking tool-capable disponibile nel catalog \
-                     (tier={}, neppure rilassando la capability). Run proseguira' col \
-                     modello originale — verifica ai_price_catalog (supports_tool_use, \
-                     is_thinking) e i provider in cooldown.",
+                    "routing: {}/{} non utilizzabile per run agente (intent={}) ma                      nessun modello non-thinking tool-capable disponibile nel catalog                      (tier={}, neppure rilassando la capability). Run proseguira' col                      modello originale — verifica ai_price_catalog (supports_tool_use,                      agentic_thinking_policy) e i provider in cooldown.",
                     provider,
                     model,
                     intent,
@@ -617,15 +617,15 @@ impl Orchestrator {
 
     /// Ramo `NeedsVisionModel` del gate vision, estratto da
     /// [`Orchestrator::apply_vision_capability_gate`] per contenerne la
-    /// lunghezza. Selezione (selettore unico `best_model_for_tier` con
-    /// capability `'vision'`), sostituzione in-place e logging sono invariati:
-    /// se nessun modello vision e' disponibile NON sostituisce e logga un WARN.
+    /// lunghezza. Selezione (servizio unico `select_model` con capability
+    /// `'vision'`), sostituzione in-place e logging sono invariati: se nessun
+    /// modello vision e' disponibile NON sostituisce e logga un WARN.
     ///
     /// Il tier dell'intent arriva dalla cache (mig 0110), stesso meccanismo del
     /// gate tool-use; default light/chat se l'intent non e' mappato (helper
     /// unico, regola L): qui serve solo il tier. Run agentico (intent != "chat")
-    /// -> serve un modello vision CHE sia anche tool-capable: passiamo
-    /// `requires_tool_use` al selettore unico, cosi' non vanifichiamo il gate
+    /// -> serve un modello vision CHE sia anche tool-capable: passiamo il
+    /// profilo agentico al selettore unico, cosi' non vanifichiamo il gate
     /// tool-use applicato prima.
     async fn override_with_vision_model(
         &self,
@@ -638,11 +638,25 @@ impl Orchestrator {
         let estimated_tokens = estimate_complexity(message);
         let (tier, _capability) = self.intent_tier_capability(intent, estimated_tokens).await;
         let requires_tool_use = intent != "chat";
-        match best_model_for_tier(db, &tier, Some("vision"), requires_tool_use).await {
-            Some((vp, vm)) => {
+        // SERVIZIO UNICO (regola L). Il profilo decide i filtri e il gate
+        // (I2); la degradazione e' esplicita: con un'immagine allegata e
+        // il tier vision esaurito, meglio un modello vision di un gradino
+        // sotto che un turno CIECO — che era il comportamento reale
+        // (WARN + prosegue col modello senza occhi). La capability resta
+        // un filtro: il ripiego VEDE sempre.
+        let vreq = if requires_tool_use {
+            crate::orchestrator::model_service::ModelRequest::agentic(&tier)
+        } else {
+            crate::orchestrator::model_service::ModelRequest::non_agentic(&tier)
+        }
+        .capability(Some("vision"));
+        match crate::orchestrator::model_service::select_model(db, &vreq)
+            .await
+            .map(|c| (c.provider, c.model))
+        {
+            Ok((vp, vm)) => {
                 tracing::info!(
-                    "routing(vision): {}/{} senza vision ma il turno ha un'immagine \
-                     -> override {}/{} (intent={}, tier={}, tool_use={})",
+                    "routing(vision): {}/{} senza vision ma il turno ha un'immagine                      -> override {}/{} (intent={}, tier={}, tool_use={})",
                     provider,
                     model,
                     vp,
@@ -654,16 +668,17 @@ impl Orchestrator {
                 *provider = vp;
                 *model = vm;
             }
-            None => {
-                // Nessun modello vision disponibile per quel tier (run
+            Err(motivo) => {
+                // Nessun modello vision in NESSUN tier della catena (run
                 // agentico: nemmeno vision+tool-capable). Fail visibile:
-                // non sostituiamo con un modello non-vision.
+                // non sostituiamo con un modello non-vision. Il motivo e'
+                // TIPIZZATO (I6): `GateEmpty` dice "il worker di
+                // qualificazione e' fermo", `ChainExhausted` dice "il
+                // parco vision e' giu'" — due azioni opposte, che prima
+                // collassavano nello stesso warning.
                 tracing::warn!(
-                    "routing(vision): il turno ha un'immagine ma {}/{} non supporta la \
-                     vision e nessun modello supports_vision=TRUE e' disponibile \
-                     (intent={}, tier={}, tool_use={}). L'immagine resta investigabile \
-                     via nexus_describe_image_attachment — verifica ai_price_catalog \
-                     (supports_vision) e i provider in cooldown.",
+                    motivo = ?motivo,
+                    "routing(vision): il turno ha un'immagine ma {}/{} non supporta la                      vision e nessun modello supports_vision=TRUE e' disponibile                      (intent={}, tier={}, tool_use={}). L'immagine resta investigabile                      via nexus_describe_image_attachment — verifica ai_price_catalog                      (supports_vision) e i provider in cooldown.",
                     provider,
                     model,
                     intent,
@@ -1132,16 +1147,22 @@ impl Orchestrator {
         base_tier: &str,
         capability: &str,
     ) -> (Option<String>, Option<String>) {
-        let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(base_tier);
-        let catalog_alt = select_agentic_model(
+        // SERVIZIO UNICO (regola L): `Degrade` — stesso tier fra i provider
+        // sani, poi un gradino sotto.
+        //
+        // NB: qui l'ORDER BY era `input_cost ASC` SENZA il tie-break
+        // `is_featured DESC` di AGENTIC_COST_FIRST_ORDER — un'altra
+        // micro-divergenza della stessa famiglia, e per giunta un ordine NON
+        // deterministico a parita' di costo. `CostFirst` allinea al resto del
+        // routing e rende la scelta stabile.
+        let catalog_alt = crate::orchestrator::model_service::select_model(
             db,
-            &tiers_to_try,
-            Some(capability),
-            0,
-            &[],
-            "input_cost_per_million_tokens ASC",
+            &crate::orchestrator::model_service::ModelRequest::agentic(base_tier)
+                .capability(Some(capability)),
         )
         .await
+        .ok()
+        .map(|c| (c.provider, c.model))
         .map(|(p, m)| {
             tracing::info!(
                 "Dynamic catalog routing (cooldown-fallback, selettore unico): → {}/{}",
@@ -1226,7 +1247,7 @@ impl Orchestrator {
         input: &OrchestratorRequest,
         routing: &RoutingConfig,
         intent: &str,
-        forced_provider: Option<&str>,
+        provider_choice: &ProviderChoice,
         forced_model: Option<&str>,
         suggested_provider: Option<&str>,
         suggested_model: Option<&str>,
@@ -1237,62 +1258,34 @@ impl Orchestrator {
         user_id: Uuid,
         project_uuid: Uuid,
     ) -> anyhow::Result<LlmExecution> {
-        let alias = intent_to_alias(intent, &routing.behavior_mode, forced_model);
-        let gw_model = if let Some(fp) = forced_provider {
-            format!("{fp}/{}", forced_model.unwrap_or(&alias))
-        } else {
-            alias
-        };
-        let gw_req = GwRequest {
-            model: gw_model,
-            messages: vec![GwMessage {
-                role: "user".to_string(),
-                content: serde_json::Value::String(composed_prompt.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning: None,
-                thinking_signature: None,
-            }],
-            max_tokens: Some(token_budget),
-            temperature: None,
-            metadata: GwMetadata {
-                tenant_id: input.project_id.clone(),
-                user_id: input.user_id.clone(),
-                request_id: run_id.to_string(),
-                // Claim locale di sensibilita' (punto unico dlp, regola L).
-                // L'enforcement resta nel gateway, che ri-classifica e usa
-                // max(claim, classificazione) + validate_tier_claim: il claim
-                // onesto evita di dichiarare 'pubblico' (0) un prompt che il
-                // DLP locale sa gia' essere sensibile.
-                sensitivity_tier: crate::dlp::classify_sensitivity(composed_prompt) as u8,
-                feature: intent.to_string(),
-            },
-            ..Default::default()
-        };
+        // Richiesta e coppia da prenotare nascono dal PUNTO UNICO (regola L):
+        // il pin del provider forzato, il modello non prefissato e il modello
+        // riallineato a quel provider sono decisi tutti li'.
+        let call = build_chat_gateway_call(ChatCallSpec {
+            routing,
+            matrix,
+            intent,
+            provider_choice,
+            forced_model,
+            suggested_provider,
+            suggested_model,
+            composed_prompt,
+            token_budget,
+            tenant_id: &input.project_id,
+            user_id: &input.user_id,
+            request_id: run_id.to_string(),
+        });
+        // Il pin serve ancora DOPO che la richiesta e' stata consumata dalla
+        // chiamata: e' cio' che rende leggibile il fallimento (nessun ripiego).
+        let pin_provider = call.request.pin_provider.clone();
         let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
         let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
-        // Fallback provider/model letti da DB (matrice routing) invece che hardcoded.
-        let fallback_provider: String = match matrix.lookup("chat", "bilanciata") {
-            Some((p, _)) => p,
-            None => "openai".to_string(),
-        };
-        let hint_provider_owned: String = forced_provider
-            .or(suggested_provider)
-            .map(String::from)
-            .unwrap_or(fallback_provider);
-        let fallback_model: String = default_model_for_provider(matrix, &hint_provider_owned);
-        let hint_model_owned: String = forced_model
-            .or(suggested_model)
-            .map(String::from)
-            .unwrap_or(fallback_model);
-        let hint_provider = hint_provider_owned.as_str();
-        let hint_model = hint_model_owned.as_str();
         let reservation = billing::reserve_usage(
             db,
             user_id,
             project_uuid,
-            hint_provider,
-            hint_model,
+            &call.ledger_provider,
+            &call.ledger_model,
             prompt_tokens,
             estimated_completion,
             json!({"intent": intent, "profile_id": input.profile_id,
@@ -1302,18 +1295,31 @@ impl Orchestrator {
         .await
         .map_err(|e| anyhow::anyhow!("billing_rejected: {e}"))?;
 
-        let gw_resp = match gw.complete(gw_req).await {
+        let gw_resp = match gw.complete(call.request).await {
             Ok(r) => r,
             Err(e) => {
                 billing::release_usage(db, &reservation, "gateway_error").await;
-                anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
+                // La resa nasce QUI, dove si sa ancora che il provider era
+                // forzato, e viaggia come errore tipizzato: il confine HTTP
+                // della chat la rilegge invece di ri-derivarla da una stringa
+                // gia' appiattita (`chat_messages::run` -> rendered_from_error).
+                let rendered = rendered_chat_gateway_error(&e, pin_provider.as_deref());
+                tracing::warn!(
+                    intent = %intent,
+                    // Lo stato del vincolo si DICHIARA (regola M): "auto",
+                    // "preferred" o "pinned" dice subito se il fallback c'era e
+                    // non e' bastato, oppure se non c'era per scelta dell'utente.
+                    provider_choice = %provider_choice.label(),
+                    pin_provider = ?pin_provider,
+                    "chat: chiamata al gateway fallita: {}",
+                    rendered.log_line()
+                );
+                return Err(anyhow::Error::new(rendered));
             }
         };
-        let actual_usage = UsageNumbers {
-            prompt_tokens: gw_resp.usage.input_tokens as i32,
-            completion_tokens: gw_resp.usage.output_tokens as i32,
-            total_tokens: (gw_resp.usage.input_tokens + gw_resp.usage.output_tokens) as i32,
-        };
+        // Dal punto unico: la costruzione a mano scartava i campi di cache che
+        // `GwUsage` porta gia' (era il terzo percorso che li perdeva).
+        let actual_usage = UsageNumbers::from_gateway(&gw_resp.usage);
         let (_, _, cost, cur) =
             billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
         let gw_completion = json!({"content": gw_resp.content, "metadata": {
@@ -1355,191 +1361,7 @@ impl Orchestrator {
         ))
     }
 
-    /// Esecuzione LLM via Brain gRPC legacy (PATH B): itera i provider candidati,
-    /// salta quelli non sani / rate-limited / falliti, e ritorna il primo che
-    /// completa. Estratta da `run` per contenerne lunghezza e complessita':
-    /// logica di fallback, billing e logging invariati.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_via_neural(
-        &self,
-        db: &PgPool,
-        matrix: &crate::routing_matrix::RoutingMatrix,
-        input: &OrchestratorRequest,
-        routing: &RoutingConfig,
-        intent: &str,
-        forced_provider: Option<&str>,
-        forced_model: Option<&str>,
-        suggested_provider: Option<&str>,
-        suggested_model: Option<&str>,
-        composed_prompt: &str,
-        prompt_corrections: &[Value],
-        token_budget: u32,
-        run_id: Uuid,
-        user_id: Uuid,
-        project_uuid: Uuid,
-    ) -> anyhow::Result<LlmExecution> {
-        let mut selected_provider: Option<String> = None;
-        let mut selected_model: Option<String> = None;
-        let mut completion: Option<serde_json::Value> = None;
-        let mut usage: Option<UsageNumbers> = None;
-        let mut usage_cost: Option<(f64, f64, f64, String)> = None;
-        let mut skip_reasons = Vec::new();
 
-        // In modalità dinamico la scelta del catalogo è autoritativa
-        let provider_candidates = if let Some(provider) = forced_provider {
-            vec![provider.to_string()]
-        } else if routing.behavior_mode == "dinamico" {
-            if let Some(p) = suggested_provider {
-                vec![p.to_string()]
-            } else {
-                routing.candidates(intent, suggested_provider)
-            }
-        } else {
-            routing.candidates(intent, suggested_provider)
-        };
-        for provider in provider_candidates {
-            let health = match self.neural.provider_health(&provider).await {
-                Ok(health) => health,
-                Err(error) => {
-                    skip_reasons.push(format!("{provider}:health_check_failed:{error}"));
-                    continue;
-                }
-            };
-
-            let status = health["status"].as_str().unwrap_or("unknown");
-            if !matches!(status, "ready" | "ok") {
-                let reason = health["reason"]
-                    .as_str()
-                    .or_else(|| health["skipReasons"].get(0).and_then(Value::as_str))
-                    .unwrap_or(status);
-                skip_reasons.push(format!("{provider}:skipped:{reason}"));
-                continue;
-            }
-
-            let model = if forced_provider == Some(provider.as_str()) {
-                forced_model.map(str::to_string).unwrap_or_else(|| {
-                    routing.resolve_model(matrix, &provider, Some(provider.as_str()), None)
-                })
-            } else if routing.behavior_mode == "dinamico"
-                && suggested_provider == Some(provider.as_str())
-                && suggested_model.is_some()
-            {
-                // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
-                // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
-                suggested_model.map(str::to_string).unwrap_or_default()
-            } else {
-                routing.resolve_model(matrix, &provider, suggested_provider, suggested_model)
-            };
-            let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
-            let estimated_completion_tokens = token_budget as i32 - prompt_tokens;
-            let reservation = match billing::reserve_usage(
-                db,
-                user_id,
-                project_uuid,
-                &provider,
-                &model,
-                prompt_tokens,
-                estimated_completion_tokens.max(0),
-                json!({
-                    "intent": intent,
-                    "profile_id": input.profile_id,
-                    "corrections_count": prompt_corrections.len(),
-                    "request_message_id": input.request_message_id,
-                    "automation_mode": input.automation_mode.as_str(),
-                    "provider_override": forced_provider,
-                    "model_override": forced_model,
-                    "attachments_count": input.attachments.len(),
-                }),
-            )
-            .await
-            {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    skip_reasons.push(format!("{provider}:billing_rejected:{error}"));
-                    continue;
-                }
-            };
-
-            let provider_completion = match self
-                .neural
-                .generate_completion(&provider, &model, composed_prompt)
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    billing::release_usage(db, &reservation, "provider_error").await;
-                    let error_msg = error.to_string();
-                    // Distingui rate limit da altri errori
-                    if error_msg.contains("429")
-                        || error_msg.to_lowercase().contains("rate_limit")
-                        || error_msg.to_lowercase().contains("quota")
-                        || error_msg.to_lowercase().contains("too_many_requests")
-                    {
-                        skip_reasons.push(format!("{provider}:rate_limited:{error_msg}"));
-                        tracing::warn!(
-                            "Provider {provider} è rate-limited, provo il prossimo candidato"
-                        );
-                    } else {
-                        skip_reasons.push(format!("{provider}:execution_error:{error_msg}"));
-                    }
-                    continue;
-                }
-            };
-
-            if completion_has_error(&provider_completion) {
-                billing::release_usage(db, &reservation, "provider_failed").await;
-                let error = provider_completion["metadata"]["error"]
-                    .as_str()
-                    .unwrap_or("generation_failed");
-                // Distingui rate limit da altri errori anche nella risposta
-                if error.contains("429")
-                    || error.to_lowercase().contains("rate_limit")
-                    || error.to_lowercase().contains("quota")
-                    || error.to_lowercase().contains("too_many_requests")
-                {
-                    skip_reasons.push(format!("{provider}:rate_limited:{error}"));
-                    tracing::warn!(
-                        "Provider {provider} segnala rate limit nella risposta, provo il prossimo"
-                    );
-                } else {
-                    skip_reasons.push(format!("{provider}:failed:{error}"));
-                }
-                continue;
-            }
-
-            let usage_numbers = billing::extract_usage_numbers(
-                &provider_completion,
-                prompt_tokens,
-                estimated_completion_tokens,
-            );
-            let finalized_cost =
-                billing::finalize_usage(db, &reservation, run_id, &usage_numbers).await?;
-
-            selected_provider = Some(provider);
-            selected_model = Some(model);
-            completion = Some(provider_completion);
-            usage = Some(usage_numbers);
-            usage_cost = Some(finalized_cost);
-            break;
-        }
-
-        let provider = selected_provider.ok_or_else(|| {
-            anyhow::anyhow!(
-                "No AI provider available for intent '{intent}'. Skip reasons: {}",
-                skip_reasons.join(", ")
-            )
-        })?;
-        let model = selected_model
-            .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
-        let completion = completion.ok_or_else(|| anyhow::anyhow!("No completion generated"))?;
-        let usage = usage.unwrap_or(UsageNumbers {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        });
-        let (_, _, cost, cur) = usage_cost.unwrap_or((0.0, 0.0, 0.0, "EUR".to_string()));
-        Ok((provider, model, completion, usage, cost, cur))
-    }
 
     pub async fn run(
         &self,
@@ -1595,12 +1417,10 @@ impl Orchestrator {
                 .intent_provider_hierarchy
                 .insert(intent.clone(), project_chain);
         }
-        let forced_provider = input
-            .provider_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_lowercase());
+        // La scelta di provider arriva GIA' risolta (provider + forza del
+        // vincolo) dal punto unico `ProviderChoice::resolve`, chiamato al
+        // confine HTTP: qui non si deduce piu' niente dal solo nome, e la
+        // normalizzazione (trim/lowercase) vive li' invece che in ogni lettore.
         let forced_model = input
             .model_override
             .as_deref()
@@ -1635,49 +1455,30 @@ impl Orchestrator {
         .await;
 
         // ── Step 4: LLM Execution ─────────────────────────────────────────────────
-        // PATH A: Nexus Gateway (routing, DLP, rate limiting, fallback automatico)
-        // PATH B: Brain gRPC diretto (legacy, usato se il gateway non è disponibile)
-        let (provider, model, completion, usage, total_cost, currency) =
-            if let Some(gw) = &self.nexus_gateway {
-                self.execute_via_gateway(
-                    db,
-                    gw,
-                    matrix,
-                    &input,
-                    &routing,
-                    &intent,
-                    forced_provider.as_deref(),
-                    forced_model.as_deref(),
-                    suggested_provider.as_deref(),
-                    suggested_model.as_deref(),
-                    &composed_prompt,
-                    token_budget,
-                    prompt_corrections.len(),
-                    run_id,
-                    user_id,
-                    project_uuid,
-                )
-                .await?
-            } else {
-                self.execute_via_neural(
-                    db,
-                    matrix,
-                    &input,
-                    &routing,
-                    &intent,
-                    forced_provider.as_deref(),
-                    forced_model.as_deref(),
-                    suggested_provider.as_deref(),
-                    suggested_model.as_deref(),
-                    &composed_prompt,
-                    &prompt_corrections,
-                    token_budget,
-                    run_id,
-                    user_id,
-                    project_uuid,
-                )
-                .await?
-            };
+        // Un solo path: il Nexus Gateway (routing, DLP, rate limiting, fallback
+        // automatico). Il "PATH B" storico era il brain gRPC, usato quando il
+        // gateway risultava assente: il brain non esiste piu' e il gateway ora e'
+        // obbligatorio per costruzione, quindi l'alternativa non c'e'.
+        let (provider, model, completion, usage, total_cost, currency) = self
+            .execute_via_gateway(
+                db,
+                &self.nexus_gateway,
+                matrix,
+                &input,
+                &routing,
+                &intent,
+                &input.provider_choice,
+                forced_model.as_deref(),
+                suggested_provider.as_deref(),
+                suggested_model.as_deref(),
+                &composed_prompt,
+                token_budget,
+                prompt_corrections.len(),
+                run_id,
+                user_id,
+                project_uuid,
+            )
+            .await?;
 
         // Step 5: Build audit record
         let audit = OrchestratorAudit {
@@ -1700,26 +1501,36 @@ impl Orchestrator {
             .and_then(|value| Uuid::parse_str(value).ok());
         let profile_uuid = Uuid::parse_str(&input.profile_id).ok();
         // orchestrator_runs e' migrata: vive nel DB del progetto (separazione DB).
-        // A flag OFF / project_id non parsabile ricade sul meta-DB.
+        // project_id non parsabile (id legacy non-UUID) -> meta-DB (comportamento
+        // storico); DB progetto non disponibile -> insert saltato con WARN
+        // (l'audit e' best-effort, vedi `.ok()` sotto — niente fallback al meta).
         let orch_pool = match Uuid::parse_str(&input.project_id) {
-            Ok(pid) => crate::project_db_routes::project_data_pool_from(db, pid).await,
-            Err(_) => db.clone(),
+            Ok(pid) => match crate::project_db_routes::project_data_pool_from(db, pid).await {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    tracing::warn!(project_id = %pid, error = %e, "orchestrator audit: DB progetto non disponibile, insert orchestrator_runs saltato");
+                    None
+                }
+            },
+            Err(_) => Some(db.clone()),
         };
-        sqlx::query(
-            r#"
-            INSERT INTO orchestrator_runs (id, project_id, user_id, session_id, profile_id, status, audit_json)
-            VALUES ($1, $2::uuid, $3, $4, $5, 'completed', $6)
-            "#,
-        )
-        .bind(run_id)
-        .bind(&input.project_id)
-        .bind(user_id)
-        .bind(session_uuid)
-        .bind(profile_uuid)
-        .bind(&audit_json)
-        .execute(&orch_pool)
-        .await
-        .ok(); // Non-fatal: log but don't fail the request
+        if let Some(orch_pool) = orch_pool {
+            sqlx::query(
+                r#"
+                INSERT INTO orchestrator_runs (id, project_id, user_id, session_id, profile_id, status, audit_json)
+                VALUES ($1, $2::uuid, $3, $4, $5, 'completed', $6)
+                "#,
+            )
+            .bind(run_id)
+            .bind(&input.project_id)
+            .bind(user_id)
+            .bind(session_uuid)
+            .bind(profile_uuid)
+            .bind(&audit_json)
+            .execute(&orch_pool)
+            .await
+            .ok(); // Non-fatal: log but don't fail the request
+        }
 
         let payload = json!({
             "run_id": run_id.to_string(),
@@ -1862,15 +1673,19 @@ async fn resolve_web_search_model(
     base_tier: &str,
     model_override: Option<&str>,
 ) -> Option<(String, String)> {
-    let found = best_model_for_tier_pinned(
+    // SERVIZIO UNICO (regola L). Pin su perplexity -> per I5 e'
+    // `Exact{PinnedProvider}`: se perplexity non ha il tier/capability,
+    // l'esito e' vuoto e il chiamante cade nel routing normale (il piano B
+    // c'e' gia'), invece di degradare pur di onorare il pin.
+    let found = crate::orchestrator::model_service::select_model(
         db,
-        base_tier,
-        Some("web_search"),
-        false,
-        &[],
-        Some("perplexity"),
+        &crate::orchestrator::model_service::ModelRequest::non_agentic(base_tier)
+            .capability(Some("web_search"))
+            .pinned("perplexity"),
     )
-    .await;
+    .await
+    .ok()
+    .map(|c| (c.provider, c.model));
     if let Some((provider, model)) = found {
         if !is_provider_in_cooldown(&provider) {
             let model = model_override
@@ -1970,7 +1785,15 @@ fn collect_corrections_from_hits(
 /// (separazione DB). `settings` / `project_learning_config` restano su meta
 /// (globale/non migrata); la ricerca Qdrant e' multi-tenant per payload.
 async fn bump_correction_retrieval(db: &PgPool, project_id: Uuid, correction_ids: &[Uuid]) {
-    let cpool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // Il bump dei contatori e' telemetria best-effort: DB progetto non
+    // disponibile -> update saltato con WARN (niente fallback al meta).
+    let cpool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(project_id = %project_id, error = %e, "prompt_corrections: DB progetto non disponibile, bump retrieved_count saltato");
+            return;
+        }
+    };
     let _ = sqlx::query(
         r#"
         UPDATE prompt_corrections
@@ -2115,16 +1938,20 @@ async fn select_catalog_fallback_model(
     tier: &str,
     cap: &str,
 ) -> Option<(String, String)> {
-    let tiers_to_try = crate::orchestrator::model_routing::agentic_tier_chain(tier);
-    select_agentic_model(
+    // SERVIZIO UNICO (regola L): `Degrade` — il tier e' un requisito, e se e'
+    // vuoto si scende lungo `agentic_tier_chain`. Provider-agnostico: cerca
+    // tra TUTTI i provider non in cooldown. `CostFirst` perche' il tier gia'
+    // garantisce la fascia di capacita': dentro il tier si prende il piu'
+    // ECONOMICO (obiettivo costi). I modelli economici problematici li
+    // retrocede la governance telemetria-aware sugli esiti reali, non un flag
+    // `is_featured` statico.
+    crate::orchestrator::model_service::select_model(
         db,
-        &tiers_to_try,
-        Some(cap),
-        0,
-        &[],
-        crate::orchestrator::model_routing::AGENTIC_COST_FIRST_ORDER,
+        &crate::orchestrator::model_service::ModelRequest::agentic(tier).capability(Some(cap)),
     )
     .await
+    .ok()
+    .map(|c| (c.provider, c.model))
 }
 
 /// Ultima spiaggia del fallback di routing: hierarchy classica (candidates +
@@ -2196,30 +2023,6 @@ async fn fetch_tool_capability_row(
     .await
     .ok()
     .flatten()
-}
-
-/// Fallback deterministico del gate tool-use: miglior modello tool-capable del
-/// tier (degradazione di tier controllata in `best_model_for_tier`).
-///
-/// RILASSO CAPABILITY (fix incidente UI 2026-06-04): prima prova con la
-/// capability dell'intent (es. "reasoning"); se nessun modello NON-thinking
-/// tool-capable la possiede — caso reale: tutti i modelli con capability
-/// "reasoning" sono is_thinking=true ed esclusi dal gate (mig 0317/0318) —
-/// rilassa la capability e prende il miglior non-thinking tool-capable del tier.
-/// Un modello non-thinking senza quel tag e' comunque MOLTO meglio di un
-/// thinking model che fallirebbe il loop agentico (deepseek-v4-pro ->
-/// reasoning_content 400). Senza questo rilassamento il gate teneva il modello
-/// thinking originale (override/slot), vanificando l'esclusione su tutti i path
-/// che forzano un modello.
-async fn select_tool_capable_fallback(
-    db: &PgPool,
-    tier: &str,
-    capability: &str,
-) -> Option<(String, String)> {
-    match best_model_for_tier(db, tier, Some(capability), true).await {
-        Some(x) => Some(x),
-        None => best_model_for_tier(db, tier, None, true).await,
-    }
 }
 
 /// Blocco "Correzioni note" del prompt composto: `None` quando non c'e' nessuna

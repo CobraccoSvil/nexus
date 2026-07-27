@@ -63,6 +63,67 @@ pub enum FinalGateVerdict {
     /// caso in cui l'esito "verifica fallita e non ripetuta" e' VERO.
     FailedPendingCorrection,
 }
+
+/// ESITO dell'ultimo passaggio dal ReviewGate (gemello di [`FinalGateVerdict`],
+/// regola M: l'esito e' un campo proprio, mai dedotto dal contatore
+/// `review_cycle`). Lo scrive OGNI ramo del nodo; i consumatori fanno `match`
+/// esaustivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewGateVerdict {
+    /// Il panel ha approvato (Pass): il run chiude con review superata.
+    Approved,
+    /// Il gate non si applicava (disabilitato, nessun codice modificato,
+    /// dichiarazione non-done, run gia' bocciato dal final_gate, panel
+    /// azzerato dal dimensionamento): nessun giudizio emesso.
+    NotApplicable,
+    /// Panel convocato ma quorum non raggiunto: limite infrastrutturale, non un
+    /// difetto del codice (mai trattato come rifiuto).
+    Inconclusive,
+    /// La convocazione e' fallita a monte (ctx non costruibile, porta in
+    /// errore): il giudizio non e' stato possibile.
+    Unavailable,
+    /// Bocciatura con correzione RIMANDATA all'executor: la ri-review era
+    /// prevista. Se il run muore prima di rientrare nel gate, la bocciatura
+    /// resta VERA (nessuna ri-verifica avvenuta).
+    PendingCorrection,
+    /// Bocciatura DEFINITIVA: cap dei rimandi raggiunto, il run chiude bocciato.
+    RejectedFinal,
+}
+
+/// DECISIONE DI ROUTING dichiarata da un gate di chiusura (final_gate,
+/// review_gate): l'UNICO segnale su cui i loro edge instradano.
+///
+/// Perche' esiste (regola M: lo stato tecnico si legge da un segnale
+/// strutturato, mai dedotto). Prima gli edge dei due gate deducevano il rimando
+/// da `stop_reason == ToolUse`, un campo CONDIVISO che il gate non possiede: lo
+/// scrive anche l'executor a ogni turno con tool pendenti. Il final_gate
+/// riscrive `stop_reason` su OGNI ramo (`EndTurn` quando chiude), quindi la
+/// deduzione per lui tornava; il ReviewGate lo riscriveva solo sul rimando e sui
+/// rami di CHIUSURA (approvazione, bocciatura definitiva, pass-through del
+/// guard) lasciava in piedi il `ToolUse` del turno precedente. L'edge lo leggeva
+/// come "rimanda" e rispediva all'executor un run che il gate aveva appena
+/// dichiarato chiuso.
+///
+/// Misurato sul run 609000c1 (26/07/2026): il checkpoint
+/// alterna `review_gate -> executor -> review_gate` per 107 superstep con
+/// `stop_reason=tool_use` costante, verdetto `approved` ai cicli 4-7 e
+/// `rejected_final` dal ciclo 8 in poi. Nessuno dei due esiti chiude. Il ciclo
+/// si e' rotto solo quando l'utente ha premuto Stop e `stop_reason` e' diventato
+/// `superseded` — cioe' quando il campo su cui l'edge instradava ha smesso, per
+/// una causa ESTERNA al gate, di valere `ToolUse`.
+///
+/// Il default (`None`) e' il ramo SICURO: un gate che non dichiara nulla fa
+/// chiudere il run, non ciclare. L'assenza di dichiarazione puo' al piu'
+/// anticipare una chiusura; non puo' produrre un loop a spesa illimitata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateRouting {
+    /// Il gate ha finito: il run prosegue verso la chiusura (reflection).
+    Chiude,
+    /// Il gate restituisce il turno all'executor per una correzione.
+    RimandaInCorrezione,
+}
 pub use message::{ContentBlock, Message, MessageContent, ToolUse};
 
 /// Modalita' supervisore worker (UI: off / su anomalia / ogni N step / continuo).
@@ -162,10 +223,12 @@ pub enum StopReason {
     /// `NodeTarget::StallRecovery`. Il `StallContext` serializzato viaggia in
     /// `extra` (chiave [`crate::nodes::stall_recovery::STALL_CONTEXT_KEY`]).
     ///
-    /// INERTE a oggi: nessun nodo lo emette ancora (l'innesto nei detector
-    /// dell'executor e' un blocco successivo del piano). La variante esiste per il
-    /// wiring del nodo/routing; con `agent.stall_recovery.enabled=false` (default)
-    /// il motore resta bit-identico a oggi.
+    /// Prodotto dai gate di emissione dell'executor — `maybe_stall_reason_delta`
+    /// per gli assi di stallo, piu' il gemello per gli assi runaway pre-LLM — solo
+    /// quando `agent.stall_recovery.enabled` e' truthy in `settings` (il valore
+    /// vive nel DB e cambia a caldo: qui non c'e' un default di compile-time) e il
+    /// budget per-sessione non e' esaurito. Senza il flag nulla lo produce e
+    /// decide la sola gerarchia fissa di `progress_controller::decide`.
     StallReason,
     /// Il nodo `StallRecovery` ha risolto lo stallo (mossa scelta o fallback) e
     /// rientra nell'executor (self-loop, come `G1Escalated -> executor`).
@@ -179,17 +242,19 @@ pub enum StopReason {
     /// e' un segnale di ROUTING interno; il `ScaleContext` serializzato viaggia in
     /// `extra`.
     ///
-    /// INERTE in PR-A: nessun detector lo emette ancora (il nodo `ScaleControl` e
-    /// l'innesto nell'executor sono PR-B). La variante esiste per il futuro wiring;
-    /// con `agent.scale.enabled=false` (default) nulla la produce -> bit-identico.
-    /// `route_after_executor` la instradera' in PR-B (in PR-A cade sul ramo default
-    /// come qualunque stop non gestito, ma non e' mai prodotta).
+    /// Prodotto dal detector di scala dell'executor (`maybe_scale_reason_delta`,
+    /// pre-LLM) solo quando `agent.scale.enabled` e' truthy in `settings`, il tetto
+    /// dei cambi-tier non e' raggiunto e il budget `max_evals_per_run` non e'
+    /// esaurito. `route_after_executor` lo instrada su `NodeTarget::ScaleControl`;
+    /// senza il flag nulla lo produce.
     ScaleReason,
     /// Il nodo `ScaleControl` ha risolto la scala (mossa scelta o `KeepTier`) e
     /// rientra nell'executor (self-loop, come `StallResolved`). Gemello di
     /// [`StopReason::StallResolved`].
     ///
-    /// INERTE in PR-A: nessun nodo la produce (il nodo `ScaleControl` e' PR-B).
+    /// La produce il nodo `ScaleControl` al termine del suo superstep: compare
+    /// quindi solo nei run in cui e' stato emesso uno
+    /// [`StopReason::ScaleReason`], che ha per gate `agent.scale.enabled`.
     ScaleResolved,
     /// Il nodo `Supervisor` ha completato il check (continue/redirect) e rientra
     /// nell'executor.
@@ -305,6 +370,11 @@ pub struct AgentState {
     /// risks[], recommendations[]}. Propagato oltre il confine sub-run in
     /// `structured_verdict` (campo `advisory`, regola M).
     pub advisory_verdict: Option<Value>,
+    /// Posizione strutturata di un AVVOCATO del dibattito a tesi contrapposte via
+    /// tool debate_position: dict normalizzato {assigned_position, stance,
+    /// summary, key_arguments[], risks[]}. Propagato oltre il confine sub-run in
+    /// `structured_verdict` (campo `debate`, regola M).
+    pub debate_position: Option<Value>,
     /// `true` se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
     pub tool_infra_error: Option<bool>,
     /// Passi strutturati del playbook matchato.
@@ -383,13 +453,20 @@ pub struct AgentState {
     pub profile_name: Option<String>,
 
     // ── Metriche AI estese ────────────────────────────────────────────────────
-    /// Token di prompt.
+    /// Token di prompt LORDI dell'ultimo turno: quanto contesto e' stato
+    /// inviato, cache compresa (convenzione unica del sistema, vedi
+    /// `nexus_gateway::LlmUsage`).
+    ///
+    /// E' il lordo perche' e' l'unica quantita' monotona rispetto alla crescita
+    /// della history: la quota servita da cache la decide il provider turno per
+    /// turno. Alimenta il delta anti-runaway (`executor`) e il riempimento della
+    /// finestra di contesto (`last_prompt_tokens` in UI).
     pub prompt_tokens: Option<i64>,
     /// Token di completion.
     pub completion_tokens: Option<i64>,
-    /// Token di creazione cache.
+    /// Token di creazione cache: sottoinsieme di `prompt_tokens`, non un addendo.
     pub cache_creation_tokens: Option<i64>,
-    /// Token letti da cache.
+    /// Token letti da cache: sottoinsieme di `prompt_tokens`, non un addendo.
     pub cache_read_tokens: Option<i64>,
     /// Token totali.
     pub total_tokens: Option<i64>,
@@ -476,6 +553,26 @@ pub struct AgentState {
     ///
     /// `None` = il gate non e' mai entrato in questo run.
     pub final_gate_verdict: Option<FinalGateVerdict>,
+    /// Ciclo del ReviewGate (CONTATORE dei rimandi in correzione della review
+    /// adversariale; gemello di `final_gate_cycle`; `review_gate_*` e non
+    /// `review_*`: `review_verdict` e' gia' il CANALE DI RUOLO del revisore, mai riusato quello: il
+    /// residuo di un contatore altrui e' gia' stato causa di un falso
+    /// `FailedDiagnosed`, vedi doc di `final_gate_verdict`).
+    #[serde(default)]
+    pub review_gate_cycle: Option<i64>,
+    /// ESITO dell'ultimo passaggio dal ReviewGate (regola M): il segnale che il
+    /// finalizzatore legge per `review_panel_rejected`. `None` = nodo mai
+    /// raggiunto (motore vecchio o run chiuso per altra via).
+    #[serde(default)]
+    pub review_gate_verdict: Option<ReviewGateVerdict>,
+    /// DECISIONE DI ROUTING dell'ultimo gate di chiusura eseguito (regola M):
+    /// il segnale, di PROPRIETA' del gate, su cui instradano gli edge di
+    /// final_gate e review_gate. Lo scrive OGNI ramo di uscita dei due nodi.
+    /// `None` = nessun gate ancora eseguito -> si chiude (ramo sicuro).
+    /// Vedi [`GateRouting`] per il difetto che ha reso necessario il campo.
+    #[serde(default)]
+    pub gate_routing: Option<GateRouting>,
+
     /// `true` quando il final gate ha PASSATO la verifica E2E (esito canonico
     /// CompletedVerified lato mcp-core). Settato solo sul ramo PASSED del
     /// `final_gate_node`; il ramo forced_close/cap NON lo imposta (resta
@@ -537,8 +634,11 @@ pub struct AgentState {
     /// Token di LAVORO INCREMENTALE cumulati sul run (regola M: segnale
     /// strutturato dal gateway, mai stima dal testo): per ogni turno si somma il
     /// DELTA del prompt rispetto al turno precedente (solo contesto nuovo, non la
-    /// history ri-inviata) + completion + cache_creation. La vecchia semantica
-    /// (somma dei `total_tokens` lordi per-turno) condannava i run con contesto
+    /// history ri-inviata) + completion. I token di cache NON sono addendi: sono
+    /// un SOTTOINSIEME del prompt lordo, quindi il delta li comprende gia' e
+    /// sommarli li conterebbe due volte (vedi `executor.rs`, ramo del delta).
+    /// La vecchia semantica (somma dei `total_tokens` lordi per-turno)
+    /// condannava i run con contesto
     /// grande: history ~50k -> ~8 turni sani esaurivano il budget -> cascata di
     /// escalation fino al cap. Safety net anti-runaway per-run: quando
     /// `>= ExecutorConfig::run_token_budget` (se il budget e' `> 0`) l'executor
@@ -559,6 +659,13 @@ pub struct AgentState {
     /// (come `tokens_used_total`). `None` = nessun costo noto ancora (turno senza
     /// prezzo in catalog o run appena avviato).
     pub run_cost_cumulative_usd: Option<f64>,
+    /// Epoch UNIX (secondi) di AVVIO del run primario, valorizzato UNA volta da
+    /// `build_initial_state` e CHECKPOINTATO: la deadline di run
+    /// (`ExecutorConfig::run_time_budget_s`) misura il tempo di parete del run
+    /// INTERO anche dopo un resume/recovery, non dell'ultimo spezzone. `None` =
+    /// run avviato prima della fase 3: nessun enforcement (mai un default
+    /// inventato). Reducer overwrite come gli altri contatori.
+    pub run_started_at_epoch_s: Option<i64>,
     /// Turni solo-testo CONSECUTIVI del run (la risposta LLM non conteneva tool_use
     /// mentre il loop si aspettava azioni; segnale strutturato `LlmResponse.tool_calls`,
     /// regola M). Azzerato appena il modello emette un tool_use, incrementato quando

@@ -13,15 +13,24 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   composeActivityStream,
+  figureVerdictDisplay,
   foldConsecutiveOkTools,
   aggregateTokensByProvider,
+  providerCostBreakdown,
   tracesForRun,
   capStreamToRecent,
+  raggruppaBlocchiNastro,
+  activityLocalAnchorId,
+  segmentAnchorId,
   type ActivityEvent,
   type ToolEvent,
+  type ReviewGateEvent,
+  type ProviderTokenBucket,
 } from "./activity-stream.ts";
+import { bucketCost } from "../model-catalog.ts";
 import type { MetaStepEntry } from "./types.ts";
 import type { AgentStep, AITraceEvent } from "../api/agent.ts";
+import type { ModelCatalogEntry } from "../api/models.ts";
 
 // ── Costruttori di fixture ──────────────────────────────────────────────────
 
@@ -49,6 +58,38 @@ function step(
     toolResult: extra.toolResult,
     status,
     createdAt: ts(),
+  };
+}
+
+/** Riga di listino: le sole tariffe variano, il resto e' il contratto reale di
+ *  `ModelCatalogEntry` (niente cast: un fixture che aggira il tipo smette di
+ *  misurare il codice vero appena il contratto cambia). */
+function listino(
+  provider: string,
+  model: string,
+  inputPerMln: number,
+  outputPerMln: number,
+): ModelCatalogEntry {
+  return {
+    provider,
+    model,
+    displayName: model,
+    inputCostPerMillionTokens: inputPerMln,
+    outputCostPerMillionTokens: outputPerMln,
+    cacheReadCostPerMillionTokens: null,
+    cacheCreationCostPerMillionTokens: null,
+    currency: "USD",
+    performanceTier: null,
+    tierSource: null,
+    agenticIndex: null,
+    qualificationState: null,
+    speedTier: "medium",
+    capabilities: [],
+    contextWindow: 128_000,
+    supportsToolUse: true,
+    batchDiscountPct: 0,
+    isFeatured: false,
+    isEnabled: true,
   };
 }
 
@@ -356,6 +397,97 @@ test("consiglio competenze propaga il parere advisory completo di ogni figura", 
   assert.deepEqual(report.advisory.recommendations, ["Aggiungere audit log"]);
 });
 
+test("etichetta figura distingue veto e cause tecniche, mai un opaco n/d", () => {
+  // Regola O: si parte dai figure_reports (shape del backend) e si attraversa il
+  // produttore reale (composeActivityStream -> readFigureReports), poi il punto
+  // unico figureVerdictDisplay. Scenario del run reale 2026-07-18 04:42: un
+  // block con evidenza (NON declassato) + quattro astensioni tecniche distinte.
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "council_of_competencies",
+      {
+        product_name: "Consiglio delle Competenze",
+        signal: "council_synthesis_present",
+        activated: true,
+        figure_count: 6,
+        figure_reports: [
+          {
+            kind: "provider_analyst",
+            status: "advisory_ok",
+            detail_code: "advisory_ok",
+            detail_message: "Parere advisory valido",
+            advisory_verdict: "block",
+            advisory: {
+              verdict: "block",
+              risks: [{ severity: "alta", description: "manca request_port" }],
+            },
+          },
+          {
+            kind: "project_manager",
+            status: "run_timeout",
+            detail_code: "run_timeout",
+            detail_message: "Sub-agent in timeout",
+          },
+          {
+            kind: "sysadmin",
+            status: "run_failed",
+            detail_code: "billing_error",
+            detail_message: "Sub-run terminato senza esito positivo",
+          },
+          {
+            kind: "software_architect",
+            status: "completed_no_advisory",
+            detail_code: "no_advisory",
+            detail_message: "Sub-run completato senza chiamare advisory_verdict",
+          },
+          {
+            kind: "security_engineer",
+            status: "invalid_advisory",
+            detail_code: "invalid_advisory",
+            detail_message: "Parere advisory presente ma verdetto non valido",
+            advisory_verdict: "reject",
+            advisory: { verdict: "reject" },
+          },
+        ],
+      },
+      "Consiglio delle Competenze",
+    ),
+  ];
+
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  const event = stream.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is Extract<ActivityEvent, { type: "council_of_competencies" }> =>
+      e.type === "council_of_competencies",
+    );
+  assert.ok(event, "evento Consiglio atteso");
+  const reports = event.figureReports;
+  assert.equal(reports?.length, 5);
+
+  const byKind = new Map(reports!.map((r) => [r.kind, figureVerdictDisplay(r)]));
+
+  // Il veto con evidenza NON e' un'astensione: e' "blocca", tono block.
+  assert.deepEqual(byKind.get("provider_analyst"), { tone: "block", label: "blocca" });
+  // Le cause tecniche hanno etichette PROPRIE e distinte, non un unico "n/d".
+  assert.deepEqual(byKind.get("project_manager"), { tone: "technical", label: "tempo scaduto" });
+  assert.deepEqual(byKind.get("sysadmin"), { tone: "technical", label: "errore" });
+  assert.deepEqual(byKind.get("software_architect"), {
+    tone: "technical",
+    label: "nessun parere",
+  });
+  assert.deepEqual(byKind.get("security_engineer"), {
+    tone: "invalid",
+    label: "parere non valido",
+  });
+
+  // Nessuna figura di questo scenario cade sull'opaco "n/d": il difetto era
+  // proprio questo collasso. Il veto in particolare non deve mai sembrare muto.
+  for (const d of byKind.values()) {
+    assert.notEqual(d.label, "n/d");
+  }
+});
+
 test("consiglio competenze degradato espone segnale strutturato", () => {
   beforeEach();
   const metaSteps: MetaStepEntry[] = [
@@ -601,11 +733,158 @@ test("aggregateTokensByProvider somma i token per coppia provider/model", () => 
   assert.equal(anthropic?.inputTokens, 200);
 });
 
+test("i token di cache entrano nel bucket e nel costo della ripartizione", () => {
+  beforeEach();
+  // Il difetto: la traccia porta il DETTAGLIO di cache accanto al prompt lordo,
+  // ma il bucket aggregava solo prompt e output e il footer prezzava solo
+  // quelli. Senza i due conteggi, i token serviti da cache restavano nel monte
+  // a tariffa piena di input: il footer dichiarava PIU' del ledger, e il divario
+  // era massimo proprio sui run che la cache serve meglio.
+  //
+  // Il prezzatore e' quello DI PRODUZIONE (`bucketCost`, la funzione che
+  // `ActivityCostFooter` passa a `providerCostBreakdown`), non una sua copia:
+  // finche' il test ne iniettava una propria, togliere le quantita' di cache
+  // dalla chiamata reale lasciava verde l'intera suite.
+  //
+  // MUTAZIONE che rende rosso: smettere di passare le quantita' di cache a
+  // `costFromCatalog` dentro `bucketCost` -> 500k token tornano a tariffa piena,
+  // il costo sale da 1.995 a 3.0.
+  const catalogo: ModelCatalogEntry[] = [listino("anthropic", "claude-x", 3.0, 15.0)];
+  catalogo[0].cacheReadCostPerMillionTokens = 0.3;
+  catalogo[0].cacheCreationCostPerMillionTokens = 3.75;
+  const prezzo = (b: ProviderTokenBucket) => bucketCost(b, catalogo);
+
+  const traces = [
+    // `inputTokens` e' il prompt LORDO: i 400k letti da cache e i 100k scritti
+    // ne fanno parte, quindi 500k restano a tariffa piena.
+    trace("padre", 1, "anthropic", "claude-x", {
+      inputTokens: 1_000_000,
+      outputTokens: 0,
+      cacheReadTokens: 400_000,
+      cacheCreationTokens: 100_000,
+    }),
+  ];
+  const r = providerCostBreakdown(traces, prezzo);
+  const voce = r.voci[0];
+  assert.equal(voce.cacheReadTokens, 400_000);
+  assert.equal(voce.cacheCreationTokens, 100_000);
+  // I token totali sono prompt lordo + output: 1M, non 1.5M (i token di cache
+  // sono gia' dentro il prompt e non si contano due volte).
+  assert.equal(r.totalTokens, 1_000_000);
+  assert.ok(
+    Math.abs(r.totalCostUsd - (1.5 + 0.12 + 0.375)) < 1e-9,
+    `atteso 1.995, ottenuto ${r.totalCostUsd}`,
+  );
+});
+
 test("tracesForRun filtra per runId", () => {
   beforeEach();
   const traces = [trace("a", 1, "google", "gemini"), trace("b", 1, "openai", "gpt")];
   assert.equal(tracesForRun(traces, "a").length, 1);
   assert.equal(tracesForRun(traces, "a")[0].provider, "google");
+});
+
+test("tracesForRun include le trace dei sub-run, dichiarate dal parentRunId del wire", () => {
+  beforeEach();
+  // Il subagente e' un run a se': le sue trace stanno sotto il PROPRIO run_id.
+  // Filtrando per il solo run del padre sparivano dal footer costo-per-provider,
+  // insieme ai provider usati SOLO dal figlio. La parentela e' quella che il
+  // backend annota sulla traccia leggendola dal DB (run_lineage.rs), non quella
+  // dedotta dai meta-step di narrazione (che il review panel non emette).
+  const traces = [
+    trace("padre", 1, "mistral", "mistral-large-2512", { inputTokens: 100, outputTokens: 20 }),
+    trace("sub-1", 1, "groq", "gpt-oss-120b", {
+      inputTokens: 300,
+      outputTokens: 50,
+      parentRunId: "padre",
+    }),
+    trace("altro-run", 1, "openai", "gpt", { inputTokens: 999, outputTokens: 999 }),
+  ];
+
+  const conFigli = tracesForRun(traces, "padre");
+  assert.equal(conFigli.length, 2);
+  // Il run NON correlato resta fuori: si includono solo i sub-run dichiarati.
+  assert.equal(conFigli.some((t) => t.runId === "altro-run"), false);
+  // Il figlio, guardato come run a se', porta solo le proprie trace.
+  assert.equal(tracesForRun(traces, "sub-1").length, 1);
+
+  const buckets = aggregateTokensByProvider(conFigli);
+  const groq = buckets.find((b) => b.provider === "groq");
+  assert.equal(groq?.inputTokens, 300, "i token del subagente sono contabilizzati");
+  assert.equal(groq?.outputTokens, 50);
+});
+
+// ── Il difetto misurato il 26/07/2026 sul progetto e2e-todo ────────────────
+// La barra dichiarava la ripartizione per provider di un run e mostrava una sola
+// voce, "deepseek": i 4 cicli di review su openrouter/z-ai/glm-4.7-flash (21
+// iterazioni complessive, costo registrato in nexus_subagent_runs) non c'erano.
+// Non un'approssimazione: un provider intero omesso.
+//
+// Il test attraversa la stessa composizione che usa il footer
+// (`providerCostBreakdown`) e lo stesso prezzatore (`bucketCost`), e parte dalle
+// trace nella forma in cui arrivano dal wire.
+// MUTAZIONE: se `tracesForRun` torna a ignorare `parentRunId`, la voce openrouter
+// sparisce e il totale cala esattamente del costo del revisore.
+test("la ripartizione elenca il provider del revisore e il totale ne contiene il costo", () => {
+  beforeEach();
+  const catalogo: ModelCatalogEntry[] = [
+    listino("deepseek", "deepseek-v4-flash", 0.28, 0.42),
+    listino("openrouter", "z-ai/glm-4.7-flash", 0.1, 0.3),
+  ];
+  const prezzo = (b: ProviderTokenBucket) => bucketCost(b, catalogo);
+
+  // Token del ciclo di review piu' lungo misurato (12 iterazioni).
+  const REV_IN = 30_991;
+  const REV_OUT = 3_544;
+  const traces = [
+    trace("padre", 1, "deepseek", "deepseek-v4-flash", { inputTokens: 200_000, outputTokens: 9_000 }),
+    trace("review-1", 1, "openrouter", "z-ai/glm-4.7-flash", {
+      inputTokens: REV_IN,
+      outputTokens: REV_OUT,
+      parentRunId: "padre",
+    }),
+  ];
+
+  const ripartizione = providerCostBreakdown(tracesForRun(traces, "padre"), prezzo);
+  const providers = ripartizione.voci.map((v) => v.provider).sort();
+  assert.deepEqual(providers, ["deepseek", "openrouter"], "il revisore ha una sua voce");
+
+  // I dollari si confrontano a meno dell'ultimo bit di virgola mobile: sommare
+  // in ordine diverso cambia il risultato oltre la 15a cifra, e un'uguaglianza
+  // esatta renderebbe il test fragile su una differenza che non esiste.
+  const quasiUguale = (a: number, b: number, msg: string) =>
+    assert.ok(Math.abs(a - b) < 1e-12, `${msg}: ${a} != ${b}`);
+
+  const costoRevisore = (REV_IN * 0.1 + REV_OUT * 0.3) / 1_000_000;
+  const voceRevisore = ripartizione.voci.find((v) => v.provider === "openrouter");
+  quasiUguale(voceRevisore?.costUsd ?? 0, costoRevisore, "costo della voce revisore");
+  assert.equal(voceRevisore?.inputTokens, REV_IN);
+
+  // Il totale CONTIENE il contributo del revisore: la differenza con la
+  // ripartizione del solo run padre e' esattamente il suo costo (e i suoi token).
+  const soloPadre = providerCostBreakdown(
+    traces.filter((t) => t.runId === "padre"),
+    prezzo,
+  );
+  quasiUguale(
+    ripartizione.totalCostUsd - soloPadre.totalCostUsd,
+    costoRevisore,
+    "quota del revisore nel totale",
+  );
+  assert.equal(ripartizione.totalTokens - soloPadre.totalTokens, REV_IN + REV_OUT);
+});
+
+test("tracesForRun risale la catena: anche i nipoti appartengono al run", () => {
+  beforeEach();
+  // Un sub-run che ne convoca un altro: il nipote e' elencato PRIMA del padre
+  // intermedio, cosi' un solo passaggio di filtro lo perderebbe.
+  const traces = [
+    trace("nipote", 1, "openrouter", "glm", { inputTokens: 10, outputTokens: 5, parentRunId: "figlio" }),
+    trace("figlio", 1, "groq", "oss", { inputTokens: 20, outputTokens: 5, parentRunId: "padre" }),
+    trace("padre", 1, "deepseek", "v4", { inputTokens: 30, outputTokens: 5 }),
+  ];
+  const ids = tracesForRun(traces, "padre").map((t) => t.runId).sort();
+  assert.deepEqual(ids, ["figlio", "nipote", "padre"]);
 });
 
 test("stream vuoto: nessun segnale -> empty true", () => {
@@ -659,6 +938,49 @@ test("unwrap: step SSE con toolName presente non viene alterato", () => {
   assert.ok(tool);
   assert.equal(tool.name, "edit_file");
   assert.deepEqual(tool.input, { path: "a.ts", content: "x" });
+});
+
+// ── ReviewGate nel nastro (kind=review_gate, nodo review_gate.rs) ───────────
+
+test("review_gate: il rimando in correzione compare nel nastro col titolo del backend", () => {
+  beforeEach();
+  // Payload del ramo boccia() non-definitivo di review_gate.rs (phase=failed).
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "review_gate",
+      { cycle: 1, max_cycles: 1, findings: 3, phase: "failed", verdict: "needs_changes" },
+      "Review NON superata: rimando in correzione (1/1)",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const ev = s.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is ReviewGateEvent => e.type === "review_gate");
+  assert.ok(ev, "l'evento review_gate NON deve essere scartato dal parser");
+  assert.equal(ev.title, "Review NON superata: rimando in correzione (1/1)");
+  assert.equal(ev.phase, "failed");
+  assert.equal(ev.verdict, "needs_changes");
+  assert.equal(ev.cycle, 1);
+  assert.equal(ev.maxCycles, 1);
+});
+
+test("review_gate: la chiusura approvata porta il verdetto pass", () => {
+  beforeEach();
+  // Payload del ramo close_not_rejected() (phase=closed).
+  const metaSteps: MetaStepEntry[] = [
+    meta(
+      "review_gate",
+      { cycle: 2, phase: "closed", valid: 2, total: 2, verdict: "pass" },
+      "Review adversariale: pass (2/2 voti validi)",
+    ),
+  ];
+  const s = composeActivityStream(metaSteps, [], [], 3);
+  const ev = s.segments
+    .flatMap((seg) => seg.events)
+    .find((e): e is ReviewGateEvent => e.type === "review_gate");
+  assert.ok(ev);
+  assert.equal(ev.verdict, "pass");
+  assert.equal(ev.title, "Review adversariale: pass (2/2 voti validi)");
 });
 
 // ── Stamping provider/model per riga (icona provider) ───────────────────────
@@ -799,6 +1121,40 @@ test("cap: le bande switch restano SEMPRE visibili anche se cappate", () => {
   assert.ok(switchSeg, "il segmento aperto da switch e' preservato");
   assert.ok(switchSeg.switch, "la banda switch e' preservata");
   assert.equal(switchSeg.switch?.toProvider, "anthropic");
+});
+
+test("cap: un provider con soli eventi cappati resta visibile col conteggio, non sparisce", () => {
+  beforeEach();
+  // deepseek fa 2 step, poi switch a mistral che ne fa 3: il cap stretto nasconde
+  // TUTTI gli step di deepseek. Reclamo utente: "non si vedono piu' gli step di
+  // deepseek, dopo il refresh ricompaiono". deepseek NON deve sparire dalla vista
+  // live: resta col conteggio dei passi compressi.
+  // Ordine di creazione INTERLACCIATO: l'associazione step->segmento e' per
+  // createdAt, quindi gli step di deepseek vanno creati tra il suo executor_call
+  // e l'escalation, altrimenti finirebbero tutti nell'ultimo segmento.
+  const m0 = meta("executor_call", { iteration: 0, provider: "deepseek", model: "v4" });
+  const sd0 = step("run", "failed", 0, { toolResult: "e" });
+  const sd1 = step("run", "failed", 1, { toolResult: "e" });
+  const mEsc = meta("escalation", {
+    from_provider: "deepseek",
+    to_provider: "mistral",
+    to_model: "small",
+    reason: "loop",
+  });
+  const mM = meta("executor_call", { iteration: 10, provider: "mistral", model: "small" });
+  const sm0 = step("run", "failed", 10, { toolResult: "e" });
+  const sm1 = step("run", "failed", 11, { toolResult: "e" });
+  const sm2 = step("run", "failed", 12, { toolResult: "e" });
+  const s = composeActivityStream([m0, mEsc, mM], [sd0, sd1, sm0, sm1, sm2], [], 3);
+  const capped = capStreamToRecent(s, 2); // tiene solo gli ultimi 2 (mistral)
+  const deepseekSeg = capped.stream.segments.find((seg) => seg.provider === "deepseek");
+  assert.ok(deepseekSeg, "il segmento deepseek NON deve sparire dalla vista live");
+  assert.equal(deepseekSeg.cappedCount, 2, "mostra i 2 passi compressi di deepseek");
+  assert.equal(
+    deepseekSeg.events.filter((e) => e.type !== "switch").length,
+    0,
+    "gli eventi di deepseek sono cappati (dettaglio nello storico)",
+  );
 });
 
 // ── 8. Narrazione sub-agente (subagent_started/progress/completed) ──────────
@@ -1019,4 +1375,127 @@ test("il pin allo start (model_purpose) e l'escalation del figlio restano per-ev
   assert.equal(subs[1].provider, "anthropic", "il progress conserva il provider corrente");
   assert.equal(subs[2].provider, "anthropic");
   assert.equal(subs[2].model, "claude-sonnet");
+});
+
+// ── Ancoraggio deep-link (regola O) ─────────────────────────────────────────
+// L'ancora del deep-link (campanella -> riga del nastro) e' assegnata da
+// composeActivityStream: la verifichiamo sul PRODUTTORE reale, mai su uno stream
+// costruito a mano (fabbricare un anchorId fossilizzerebbe un valore che il
+// produttore non emette). Test di mutazione: se l'assegnazione si rompe, gli
+// anchorId diventano undefined e gli assert falliscono.
+
+test("anchoring: composeActivityStream assegna l'ancora canonica a segmenti ed eventi", () => {
+  beforeEach();
+  const metaSteps: MetaStepEntry[] = [
+    meta("routing", { intent: "code_fix", provider: "deepseek", model: "deepseek-chat" }),
+    meta("executor_call", { iteration: 1, provider: "deepseek", model: "deepseek-chat" }),
+    meta("escalation", {
+      from_provider: "deepseek",
+      to_provider: "google",
+      to_model: "gemini-2.5-flash",
+      reason: "x",
+      cause: "cooldown",
+    }),
+    meta("executor_call", { iteration: 3, provider: "google", model: "gemini-2.5-flash" }),
+  ];
+  const stream = composeActivityStream(metaSteps, [], [], 3);
+  assert.ok(stream.segments.length >= 2, "escalation apre un secondo segmento");
+
+  let eventsChecked = 0;
+  for (let si = 0; si < stream.segments.length; si++) {
+    const seg = stream.segments[si];
+    assert.equal(seg.anchorId, segmentAnchorId(si), `ancora del segmento ${si}`);
+    for (let ei = 0; ei < seg.events.length; ei++) {
+      const ev = seg.events[ei];
+      if (ev.type === "switch") continue;
+      assert.equal(ev.anchorId, activityLocalAnchorId(si, ei), `ancora evento ${si}/${ei}`);
+      eventsChecked += 1;
+    }
+  }
+  // Guardia: il loop deve aver esercitato davvero il ramo evento (altrimenti il
+  // test passerebbe a vuoto senza verificare nulla).
+  assert.ok(eventsChecked >= 1, "almeno un evento non-switch con ancora verificato");
+});
+
+// Raggruppamento dei passi di un sub-agente in blocchi collassabili.
+// Il difetto che questi test bloccano: le righe erano una lista piatta, percio'
+// i comandi di un sub-agente non si potevano chiudere e restavano tutti a
+// schermo anche quando ne partiva un altro.
+test("raggruppaBlocchiNastro raccoglie i passi consecutivi dello stesso sub-agente", () => {
+  const sub = (id: string, title: string): ActivityEvent =>
+    ({ type: "subagent", phase: "tool", subagentRunId: id, title }) as ActivityEvent;
+  const blocchi = raggruppaBlocchiNastro([
+    sub("run-a", "primo"),
+    sub("run-a", "secondo"),
+    sub("run-a", "terzo"),
+    sub("run-b", "altro sub-agente"),
+  ]);
+  assert.equal(blocchi.length, 2, "due sub-run distinti, due blocchi");
+  assert.equal(blocchi[0].tipo, "gruppo_subagente");
+  assert.equal(blocchi[1].tipo, "gruppo_subagente");
+  if (blocchi[0].tipo !== "gruppo_subagente" || blocchi[1].tipo !== "gruppo_subagente") return;
+  assert.equal(blocchi[0].subagentRunId, "run-a");
+  assert.equal(blocchi[0].eventi.length, 3, "i tre passi di run-a stanno in un solo blocco");
+  assert.equal(blocchi[1].subagentRunId, "run-b");
+  // L'indice e' quello ORIGINALE nel segmento: le key di React restano stabili
+  // e il deep-link continua a puntare alla riga giusta.
+  assert.equal(blocchi[1].indice, 3);
+});
+
+test("raggruppaBlocchiNastro non fonde sub-run interlacciati e salta gli switch", () => {
+  const sub = (id: string): ActivityEvent =>
+    ({ type: "subagent", phase: "tool", subagentRunId: id, title: id }) as ActivityEvent;
+  const blocchi = raggruppaBlocchiNastro([
+    sub("run-a"),
+    { type: "switch" } as ActivityEvent,
+    sub("run-a"),
+    sub("run-b"),
+    sub("run-a"),
+  ]);
+  // Lo switch non produce una riga, quindi non spezza il gruppo che attraversa.
+  assert.equal(blocchi.length, 3, "a, b, poi di nuovo a: l'ordine reale e' preservato");
+  if (blocchi[0].tipo !== "gruppo_subagente") return assert.fail("primo blocco");
+  assert.equal(blocchi[0].eventi.length, 2, "lo switch non spezza il gruppo");
+  if (blocchi[2].tipo !== "gruppo_subagente") return assert.fail("terzo blocco");
+  assert.equal(blocchi[2].subagentRunId, "run-a");
+  assert.equal(
+    blocchi[2].indice,
+    4,
+    "run-a che ritorna dopo run-b apre un blocco NUOVO: fonderli mentirebbe sull'ordine",
+  );
+});
+
+test("raggruppaBlocchiNastro lascia riga singola cio' che non e' sub-agente", () => {
+  const blocchi = raggruppaBlocchiNastro([
+    { type: "tool", title: "un tool" } as ActivityEvent,
+    { type: "subagent", phase: "tool", title: "senza id" } as ActivityEvent,
+  ]);
+  assert.equal(blocchi.length, 2);
+  assert.equal(blocchi[0].tipo, "riga");
+  // Un evento subagente SENZA id non e' raggruppabile: non si sa a chi appartiene.
+  assert.equal(blocchi[1].tipo, "riga");
+});
+
+// Il blocco dei passi compressi nasceva senza provenienza: il suo tooltip
+// nominava un provider senza dire su quale modello i passi fossero girati.
+test("il blocco compresso eredita provider e modello dai passi che contiene", () => {
+  const tool = (i: number): ActivityEvent =>
+    ({
+      type: "tool",
+      outcome: "ok",
+      iteration: i,
+      title: `passo ${i}`,
+      provider: "mistral",
+      model: "magistral-small-latest",
+    }) as ActivityEvent;
+  const out = foldConsecutiveOkTools([tool(1), tool(2), tool(3)], 3);
+  assert.equal(out.length, 1, "tre tool ok consecutivi si comprimono in un blocco");
+  const blocco = out[0];
+  assert.equal(blocco.type, "folded_tools");
+  assert.equal(blocco.provider, "mistral");
+  assert.equal(
+    blocco.model,
+    "magistral-small-latest",
+    "senza il modello il tooltip del blocco resta monco: nomina il provider ma non su cosa e' girato",
+  );
 });

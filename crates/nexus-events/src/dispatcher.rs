@@ -144,23 +144,21 @@ pub fn replay_since(
     result
 }
 
-/// Rimuove dal registry i canali con 0 receiver da almeno `_grace_secs`
-/// secondi. Da chiamare in background ogni ~60s. Per ora rimuove
-/// immediatamente quelli a 0 receiver: ci pensa il bootstrap a ricreare.
-///
-/// Ritorna il numero di canali rimossi.
-pub fn cleanup_idle(channels: &ProjectChannels) -> usize {
-    let mut removed = 0;
-    channels.retain(|_, ch| {
-        if ch.receiver_count() == 0 {
-            removed += 1;
-            false
-        } else {
-            true
-        }
-    });
-    removed
-}
+// `cleanup_idle` e' stata RIMOSSA. Prometteva di togliere i canali "con 0
+// receiver da almeno `_grace_secs` secondi", ma quel parametro non e' mai
+// esistito nella firma: rimuoveva SUBITO ogni canale senza receiver.
+//
+// Non e' mai stata cablata — l'unico chiamante era il suo stesso test — ed e'
+// stata una fortuna, perche' in produzione avrebbe fatto danno: fra una
+// disconnessione SSE e il reconnect il conteggio dei receiver passa per zero, e
+// un canale rimosso in quell'istante si porta via il ring buffer di replay,
+// cioe' esattamente gli eventi che il client sta per richiedere con
+// Last-Event-ID.
+//
+// Non serve rimpiazzarla: i canali sono uno per progetto (mappa project_id ->
+// canale), quindi il loro numero e' limitato dai progetti esistenti, non dal
+// traffico. Se un giorno servisse, va scritta CON il grace period che il vecchio
+// doc dava per fatto, e va misurato che il periodo copra un reconnect.
 
 // ── Singleton globale per emit da contesti senza &ProjectChannels ────────
 
@@ -272,16 +270,36 @@ mod tests {
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
+    /// Un canale senza receiver NON sparisce: e' cio' che serve al reconnect.
+    ///
+    /// Sostituisce il test di `cleanup_idle`, che verificava l'opposto (rimozione
+    /// immediata) su una funzione che nessuno chiamava. Il ring di replay deve
+    /// restare disponibile proprio nell'istante in cui i receiver sono zero,
+    /// perche' e' quello fra una disconnessione SSE e la richiesta di replay.
     #[tokio::test]
-    async fn cleanup_removes_idle_channels() {
+    async fn un_canale_senza_receiver_sopravvive_al_reconnect() {
         let reg = new_registry();
         let pid = Uuid::new_v4();
-        register(&reg, pid); // handle scope drops -> no subscribers
-        // Subito drop dell'handle non chiude i receiver perche' RegistryHandle
-        // tiene un Arc al ProjectChannel ma il broadcast::Sender ha receiver=0.
-        // (Il sender stesso non e' un receiver.)
-        let removed = cleanup_idle(&reg);
-        assert_eq!(removed, 1);
-        assert!(reg.is_empty());
+        let h = register(&reg, pid);
+        drop(h.subscribe()); // il receiver se ne va: conteggio a zero
+        emit(
+            &reg,
+            pid,
+            ProjectEvent::ProjectCreated {
+                name: "p".into(),
+                slug: "p".into(),
+            },
+        );
+
+        assert!(
+            !reg.is_empty(),
+            "il canale non deve sparire coi receiver a zero"
+        );
+        // Il replay funziona: e' cio' che chiede un client che si riconnette.
+        let eventi = replay_since(&reg, pid, 0).expect("il canale deve esistere");
+        assert!(
+            !eventi.is_empty(),
+            "il ring di replay deve sopravvivere alla disconnessione"
+        );
     }
 }

@@ -20,13 +20,20 @@
 
 import { useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { withAlpha } from "../../lib/color";
 import { ProviderBadge, providerBaseColor } from "./provider-badge";
 import { PlanChecklist } from "./agent-meta-step-card";
 import { toolLabel } from "./tool-labels";
 import { MarkdownBlock } from "./markdown-renderer";
 import { InlineTruncated, formatStepInput, humanizeToolResult } from "./step-detail";
 import { ProviderIcon } from "./provider-icon";
-import { capStreamToRecent, switchCauseLabel } from "../../lib/use-chat/activity-stream";
+import {
+  capStreamToRecent,
+  figureVerdictDisplay,
+  raggruppaBlocchiNastro,
+  runScopedAnchorId,
+  switchCauseLabel,
+} from "../../lib/use-chat/activity-stream";
 import type {
   ActivityStream,
   ActivitySegment,
@@ -37,20 +44,14 @@ import type {
   FoldThreshold,
   FigureAdvisory,
   FigureAdvisoryReport,
+  FigureVerdictTone,
+  GruppoSubagente,
 } from "../../lib/use-chat/activity-stream";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
-/** Converte hex (#RRGGBB) + alpha in rgba. */
-function withAlpha(hex: string, alpha: number): string {
-  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
-  if (!m) return hex;
-  const v = m[1];
-  const r = parseInt(v.slice(0, 2), 16);
-  const g = parseInt(v.slice(2, 4), 16);
-  const b = parseInt(v.slice(4, 6), 16);
-  return `rgba(${r},${g},${b},${alpha})`;
-}
+// `withAlpha` e' consolidata in lib/color (regola L): era duplicata qui e in
+// run-notifications.tsx.
 
 // Glifi monospaziati per tipo evento (coerenti col mockup v3). Non-emoji.
 const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
@@ -60,6 +61,7 @@ const EVENT_GLYPH: Record<ActivityEvent["type"], string> = {
   tool: "◆", // rombo pieno
   switch: "▲", // triangolo su (mai reso qui: la banda ha il suo header)
   verify: "✓", // check
+  review_gate: "▣", // quadrato con riquadro (review adversariale)
   context_overflow: "!",
   folded_tools: "…", // ellissi
   subagent: "◈", // rombo con centro (attivita' delegata)
@@ -75,6 +77,7 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
   tool: "Tool",
   switch: "Cambio provider",
   verify: "Verifica",
+  review_gate: "Review",
   context_overflow: "Contesto",
   folded_tools: "Passi",
   subagent: "Subagente",
@@ -88,6 +91,8 @@ const EVENT_KIND_LABEL: Record<ActivityEvent["type"], string> = {
 const SUBAGENT_ACCENT = "#8b5cf6";
 const COUNCIL_ACCENT = "#0ea5e9";
 const MULTI_PROVIDER_ACCENT = "#6366f1";
+/** Accent del ReviewGate (rosa: gate adversariale, distinto dal verde verify). */
+const REVIEW_GATE_ACCENT = "#f43f5e";
 
 const FINAL_GATE_PHASES: Record<string, string> = {
   start: "avviata",
@@ -191,12 +196,13 @@ function ThoughtBlock({ text, tc }: { text: string; tc: ThemeColors }) {
  *  umana della causa strutturata quando nota (punto unico switchCauseLabel,
  *  regola L/M): un rifiuto 4xx o un'esclusione di policy non vanno raccontati
  *  come cooldown ne' come codice grezzo `provider_failover`. */
-function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
+function SwitchBand({ sw, tc, domId }: { sw: SwitchEvent; tc: ThemeColors; domId?: string }) {
   const fromColor = providerBaseColor(sw.fromProvider);
   const toColor = providerBaseColor(sw.toProvider);
   const causeLabel = switchCauseLabel(sw.cause);
   return (
     <div
+      id={domId}
       style={{
         margin: "6px 10px 6px 22px",
         borderRadius: 10,
@@ -205,6 +211,7 @@ function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
         background: `linear-gradient(90deg, ${withAlpha(fromColor, 0.16)}, ${withAlpha(toColor, 0.24)})`,
         border: `1px solid ${withAlpha(toColor, 0.45)}`,
         minWidth: 0,
+        scrollMarginTop: 12,
       }}
     >
       <div
@@ -229,15 +236,18 @@ function SwitchBand({ sw, tc }: { sw: SwitchEvent; tc: ThemeColors }) {
         <span style={{ fontSize: 15, color: toColor, flexShrink: 0 }}>{"→"}</span>
         <ProviderBadge provider={sw.toProvider} model={sw.toModel ?? null} />
       </div>
-      {(causeLabel || sw.reason || sw.cooldown) && (
+      {(causeLabel || sw.reasonDescription || sw.reason || sw.cooldown) && (
         <div style={{ marginTop: 4, fontSize: 11.5, color: tc.textSecondary }}>
-          {(causeLabel || sw.reason) && (
+          {(causeLabel || sw.reasonDescription || sw.reason) && (
             <>
               Motivo:{" "}
-              {causeLabel ? (
-                // Causa strutturata nota: etichetta umana onesta al posto del
-                // codice tecnico (che resta nel payload per gli sviluppatori).
-                <span>{causeLabel}</span>
+              {/* Una frase, non un identificatore. La causa strutturata (quando
+                  c'e') e' piu' specifica del motivo generico; a seguire la
+                  descrizione composta dal backend. Il codice grezzo resta come
+                  ultimo ripiego per gli eventi vecchi in DB, che la descrizione
+                  non ce l'hanno. */}
+              {(causeLabel ?? sw.reasonDescription) ? (
+                <span>{causeLabel ?? sw.reasonDescription}</span>
               ) : (
                 <code style={codeStyle}>{sw.reason}</code>
               )}
@@ -268,17 +278,38 @@ function EventRow({
   event,
   segColor,
   tc,
+  runId,
+  continuaSubagente,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
   tc: ThemeColors;
+  /** run del nastro: scopa l'id DOM dell'evento per il deep-link (undefined nel
+   *  percorso storico, che non e' bersaglio della campanella). */
+  runId?: string;
+  /** La riga precedente e' dello stesso sub-run: si aggrega sotto l'intestazione
+   *  gia' mostrata, invece di ripeterla. */
+  continuaSubagente?: boolean;
 }) {
+  const domId =
+    runId && event.anchorId ? runScopedAnchorId(runId, event.anchorId) : undefined;
+  // Chi ha ESEGUITO la riga, quando gli esecutori sono piu' d'uno. Due eventi
+  // sono in questo caso: il panel multi-provider e il review gate. Stessa forma
+  // {provider, model}, stessa resa a colonna, un solo ramo (regola L).
+  const esecutori =
+    event.type === "multi_provider_panel"
+      ? event.panelProviders
+      : event.type === "review_gate"
+        ? event.reviewers
+        : undefined;
   return (
     <div
+      id={domId}
       style={{
         position: "relative",
         padding: "7px 34px 7px 42px",
         minWidth: 0,
+        scrollMarginTop: 12,
       }}
     >
       {/* Spina neutra */}
@@ -325,9 +356,7 @@ function EventRow({
       {/* Icona provider/model che ha ESEGUITO la riga (tooltip = modello). In
           alto a destra, compatta: scorrendo il nastro si vede chi ha fatto cosa.
           Panel multi-provider: una icona per ogni provider del panel. */}
-      {event.type === "multi_provider_panel" &&
-      event.panelProviders &&
-      event.panelProviders.length > 0 ? (
+      {esecutori && esecutori.length > 0 ? (
         <span
           style={{
             position: "absolute",
@@ -341,9 +370,9 @@ function EventRow({
             flexShrink: 0,
           }}
         >
-          {event.panelProviders.map((p) => (
+          {esecutori.map((p, i) => (
             <ProviderIcon
-              key={`${p.provider}:${p.model ?? ""}`}
+              key={`${p.provider}:${p.model ?? ""}:${i}`}
               provider={p.provider}
               model={p.model}
               size={18}
@@ -357,13 +386,24 @@ function EventRow({
         // icona. I provider effettivi si vedono nei sub-agenti delle singole figure.
         null
       ) : (
-        event.provider && (
+        // Solo sulla PRIMA riga del sub-agente: dentro un sub-run il provider e'
+        // costante (una figura gira su un solo modello), quindi ripetere l'icona a
+        // ogni riga e' rumore. `continuaSubagente` e' gia' il segnale usato sopra per
+        // non ripetere l'intestazione del sub-run; qui deduplica anche l'icona.
+        // Sul run principale (ev.type != subagent) continuaSubagente e' sempre false:
+        // li' il provider PUO' cambiare tra step e l'icona per riga resta informativa.
+        event.provider && !continuaSubagente && (
           <span style={{ position: "absolute", right: 8, top: 9, zIndex: 2 }}>
             <ProviderIcon provider={event.provider} model={event.model} />
           </span>
         )
       )}
-      <EventBody event={event} segColor={segColor} tc={tc} />
+      <EventBody
+        event={event}
+        segColor={segColor}
+        tc={tc}
+        continuaSubagente={continuaSubagente}
+      />
     </div>
   );
 }
@@ -537,14 +577,12 @@ function FoldedToolsBody({
             minWidth: 0,
           }}
         >
+          {/* Niente logo provider sulle righe interne: il blocco appartiene a
+              un solo segmento, quindi a un solo provider, gia' dichiarato
+              dall'intestazione. Ripeterlo a ogni passo aggiunge una colonna di
+              icone identiche che compete con il contenuto vero (il tool). */}
           {event.tools.map((tool, i) => (
-            <ToolEventBody
-              key={`folded-tool-${i}`}
-              event={tool}
-              segColor={segColor}
-              tc={tc}
-              showProviderIcon
-            />
+            <ToolEventBody key={`folded-tool-${i}`} event={tool} segColor={segColor} tc={tc} />
           ))}
         </div>
       )}
@@ -552,14 +590,30 @@ function FoldedToolsBody({
   );
 }
 
+/** Toglie dal titolo il prefisso "subagente <kind>:" con cui arriva dal backend.
+ *
+ *  Il ponte lo compone cosi' (`subagent_native.rs`: `subagente {kind}: {tool} —
+ *  {target}`) perche' serve dove il titolo viaggia da solo. Nel nastro invece il
+ *  kind e' gia' scritto nell'etichetta accanto, mostrata una volta in testa al
+ *  sub-run: ripeterlo su OGNI riga ruba larghezza al contenuto vero (il tool e il
+ *  file su cui lavora) e manda a capo le righe lunghe. Se il prefisso non c'e',
+ *  il titolo torna invariato. */
+function senzaPrefissoSubagente(title: string): string {
+  return title.replace(/^\s*subagente\s+[^:]+:\s*/i, "");
+}
+
 function EventBody({
   event,
   segColor,
   tc,
+  continuaSubagente,
 }: {
   event: Exclude<ActivityEvent, SwitchEvent>;
   segColor: string;
   tc: ThemeColors;
+  /** La riga precedente e' dello STESSO sub-run: l'intestazione e' gia' a
+   *  schermo poche righe sopra, qui si mostra solo il contenuto. */
+  continuaSubagente?: boolean;
 }) {
   switch (event.type) {
     case "routing":
@@ -613,6 +667,37 @@ function EventBody({
           )}
         </div>
       );
+    case "review_gate": {
+      // Colore dal verdetto STRUTTURATO del panel (regola M), mai dal titolo.
+      const verdictColor =
+        event.verdict === "pass"
+          ? "#22c55e"
+          : event.verdict === "inconclusive" || event.verdict === undefined
+            ? tc.textMuted
+            : tc.error;
+      return (
+        <div style={rowStyle}>
+          <span className="nx-as-kind-label" style={kindLabelStyle(REVIEW_GATE_ACCENT)}>
+            {EVENT_KIND_LABEL.review_gate}
+          </span>
+          <span style={{ fontSize: 12.5, color: tc.text }}>{event.title}</span>
+          {event.verdict && <span style={tagStyle(verdictColor)}>{event.verdict}</span>}
+          {/* Chi ha votato. Il badge nomina il modello, l'icona in alto a destra
+              e' quella dei revisori (vedi il ramo dedicato in EventRow): senza,
+              mostrerebbe il provider del run PADRE e un panel su piu' provider
+              sembrerebbe girato tutto sullo stesso. */}
+          {event.reviewers?.map((r, i) => (
+            <span
+              key={`rev-${r.provider}:${r.model ?? ""}:${i}`}
+              style={tagStyle(tc.textMuted)}
+              title={`Revisore: ${r.provider}${r.model ? ` / ${r.model}` : ""}`}
+            >
+              {r.model ? `${r.provider}/${r.model}` : r.provider}
+            </span>
+          ))}
+        </div>
+      );
+    }
     case "context_overflow":
       return (
         <div style={rowStyle}>
@@ -636,10 +721,15 @@ function EventBody({
       return (
         <div style={{ minWidth: 0 }}>
           <div style={rowStyle}>
-            <span className="nx-as-kind-label" style={kindLabelStyle(accent)}>
-              {EVENT_KIND_LABEL.subagent}
-            </span>
-            {shortId && (
+            {/* Intestazione mostrata solo sulla PRIMA riga del sub-run: le
+                successive si aggregano sotto, cosi' a colpo d'occhio si legge
+                cosa sta facendo invece di una colonna di etichette uguali. */}
+            {!continuaSubagente && (
+              <span className="nx-as-kind-label" style={kindLabelStyle(accent)}>
+                {EVENT_KIND_LABEL.subagent}
+              </span>
+            )}
+            {!continuaSubagente && shortId && (
               <span
                 style={{
                   fontFamily: "var(--font-mono)",
@@ -652,23 +742,26 @@ function EventBody({
               </span>
             )}
             <span style={{ fontSize: 12.5, color: isErr ? tc.error : tc.text }}>
-              {event.title}
+              {senzaPrefissoSubagente(event.title)}
             </span>
             {event.phase === "completed" && typeof event.costUsd === "number" && event.costUsd > 0 && (
               <span style={metaStyle(tc)}>${event.costUsd.toFixed(4)}</span>
             )}
           </div>
           {(event.phase === "completed" || event.phase === "failed") && event.summary && (
+            // Il sommario del subagente e' Markdown (lo scrive un modello:
+            // heading, liste, **bold**, `code`). Reso con MarkdownBlock come
+            // ogni altro testo di modello nel nastro (ThoughtBlock, reflection):
+            // in chiaro mostrava "## Analisi" e "**bold**" verbatim.
             <div
               style={{
                 marginTop: 3,
                 fontSize: 12,
                 color: tc.textMuted,
-                whiteSpace: "pre-wrap",
                 overflowWrap: "anywhere",
               }}
             >
-              {event.summary}
+              <MarkdownBlock content={event.summary} />
             </div>
           )}
         </div>
@@ -869,21 +962,21 @@ function EventBody({
   }
 }
 
-/** Verdetto strutturato della figura -> colore + etichetta umana (identificatori
- *  canonici backend, regola N: proceed|proceed_with_changes|block). */
-function verdictMeta(
-  v: string | undefined,
-  tc: ThemeColors,
-): { color: string; label: string } {
-  switch (v) {
+/** Tono del parere (deciso dal punto unico `figureVerdictDisplay` sul segnale
+ *  strutturato `status`) -> colore della palette. La DECISIONE su cosa mostrare
+ *  vive in lib (testata); qui resta solo la presentazione. */
+function verdictToneColor(tone: FigureVerdictTone, tc: ThemeColors): string {
+  switch (tone) {
     case "proceed":
-      return { color: "#22c55e", label: "procede" };
-    case "proceed_with_changes":
-      return { color: "#f59e0b", label: "procede con modifiche" };
+      return "#22c55e";
+    case "changes":
+    case "invalid":
+      return "#f59e0b";
     case "block":
-      return { color: tc.error, label: "blocca" };
+      return tc.error;
     default:
-      return { color: tc.textMuted, label: v ?? "n/d" };
+      // technical (timeout/errore/nessun parere/non avviata) e unknown: neutro.
+      return tc.textMuted;
   }
 }
 
@@ -966,8 +1059,10 @@ function AdvisoryBody({ advisory, tc }: { advisory: FigureAdvisory; tc: ThemeCol
 }
 
 /** Riga espandibile per il parere di UNA figura del consiglio. Il testo completo
- *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione. */
-function FigureReportRow({
+ *  (advisory) e' sempre leggibile su click, non solo in caso di degradazione.
+ *  Esportata (regola L): il centro notifiche del run la RIUSA per mostrare i
+ *  pareri di Consiglio/multi-provider, invece di ricomporli. */
+export function FigureReportRow({
   report,
   tc,
   titleByProvider = false,
@@ -980,8 +1075,8 @@ function FigureReportRow({
 }) {
   const [open, setOpen] = useState(false);
   const advisory = report.advisory;
-  const verdict = advisory?.verdict ?? report.advisory_verdict;
-  const vm = verdictMeta(verdict, tc);
+  const vd = figureVerdictDisplay(report);
+  const vm = { color: verdictToneColor(vd.tone, tc), label: vd.label };
   const failed = report.status !== "advisory_ok";
   const hasBody =
     !!advisory &&
@@ -1090,16 +1185,170 @@ function metaStyle(tc: ThemeColors): React.CSSProperties {
   return { color: tc.textMuted, fontSize: 11.5 };
 }
 
-/** Un segmento: eventuale banda switch in testa, poi la spina di eventi. */
-function SegmentView({ segment, tc }: { segment: ActivitySegment; tc: ThemeColors }) {
-  const segColor = providerBaseColor(segment.provider);
+/**
+ * I passi di UN sub-agente, collassabili. La prima riga resta sempre visibile
+ * (porta l'intestazione con kind e id corto); le successive stanno sotto un
+ * toggle.
+ *
+ * `espansoDiDefault` e' DERIVATO dai dati (e' vero solo per il sub-agente piu'
+ * recente del segmento), non impostato da un evento: cosi' quando ne parte un
+ * altro il precedente si chiude da se', senza bisogno di reagire a un segnale
+ * di avvio e senza stato che possa restare indietro. L'override manuale vince
+ * finche' l'utente non lo azzera, percio' un blocco aperto a mano non si
+ * richiude sotto le mani.
+ */
+function GruppoSubagenteView({
+  gruppo,
+  espansoDiDefault,
+  segColor,
+  tc,
+  runId,
+}: {
+  gruppo: GruppoSubagente;
+  espansoDiDefault: boolean;
+  segColor: string;
+  tc: ThemeColors;
+  runId?: string;
+}) {
+  const [override, setOverride] = useState<boolean | null>(null);
+  const espanso = override ?? espansoDiDefault;
+  const [prima, ...resto] = gruppo.eventi;
   return (
     <div style={{ minWidth: 0 }}>
-      {segment.openedBySwitch && segment.switch && <SwitchBand sw={segment.switch} tc={tc} />}
+      <EventRow
+        event={prima.ev}
+        segColor={segColor}
+        tc={tc}
+        runId={runId}
+        continuaSubagente={false}
+      />
+      {resto.length > 0 && (
+        <>
+          <div
+            onClick={() => setOverride(!espanso)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 11.5,
+              color: tc.textMuted,
+              cursor: "pointer",
+              minWidth: 0,
+              // Stesse tacche orizzontali di EventRow: il toggle appartiene al
+              // blocco del sub-agente, quindi si allinea alla colonna del suo
+              // testo invece di sporgere a filo del nastro.
+              padding: "2px 34px 4px 42px",
+            }}
+          >
+            <span
+              aria-hidden
+              style={{ fontFamily: "var(--font-mono)", fontSize: 9, flexShrink: 0 }}
+            >
+              {espanso ? "▾" : "▸"}
+            </span>
+            <span>
+              {resto.length === 1 ? "1 passo" : `${resto.length} passi`}
+              {espanso ? "" : " · nascosti"}
+            </span>
+          </div>
+          {espanso && (
+            <div
+              style={{
+                marginLeft: 8,
+                paddingLeft: 8,
+                borderLeft: `2px solid ${withAlpha(segColor, 0.35)}`,
+                minWidth: 0,
+              }}
+            >
+              {resto.map((r) => (
+                <EventRow
+                  key={`ev-${r.indice}`}
+                  event={r.ev}
+                  segColor={segColor}
+                  tc={tc}
+                  runId={runId}
+                  continuaSubagente
+                />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Un segmento: eventuale banda switch in testa, poi la spina di eventi. */
+function SegmentView({
+  segment,
+  tc,
+  runId,
+}: {
+  segment: ActivitySegment;
+  tc: ThemeColors;
+  runId?: string;
+}) {
+  const segColor = providerBaseColor(segment.provider);
+  // Le righe consecutive di uno stesso sub-agente diventano un blocco: e'
+  // espanso solo quello del sub-agente piu' recente, cosi' i precedenti si
+  // chiudono da soli quando ne parte un altro.
+  const blocchi = raggruppaBlocchiNastro(segment.events);
+  const indiceGruppoPiuRecente = blocchi.reduce<number | null>(
+    (acc, b) => (b.tipo === "gruppo_subagente" ? b.indice : acc),
+    null,
+  );
+  // Id DOM del SEGMENTO (fallback per l'evento cappato). Applicato alla banda
+  // switch se il segmento la ha, altrimenti al placeholder "N passi precedenti":
+  // mutuamente esclusivi per non emettere due nodi con lo stesso id.
+  const segDomId =
+    runId && segment.anchorId ? runScopedAnchorId(runId, segment.anchorId) : undefined;
+  const hasSwitchBand = segment.openedBySwitch && !!segment.switch;
+  return (
+    <div style={{ minWidth: 0 }}>
+      {hasSwitchBand && segment.switch && (
+        <SwitchBand sw={segment.switch} tc={tc} domId={segDomId} />
+      )}
       <div style={{ position: "relative", padding: "4px 10px 8px 0", minWidth: 0 }}>
-        {segment.events.map((ev, i) =>
-          ev.type === "switch" ? null : (
-            <EventRow key={`ev-${i}`} event={ev} segColor={segColor} tc={tc} />
+        {segment.cappedCount ? (
+          // Passi di questo provider compressi dal cap live: il provider resta
+          // visibile (non sparisce), il dettaglio e' nello storico. Se il
+          // segmento non ha banda switch, questo placeholder porta l'ancora di
+          // segmento (bersaglio del fallback deep-link).
+          <div
+            id={hasSwitchBand ? undefined : segDomId}
+            style={{
+              fontSize: 11,
+              color: tc.textMuted,
+              fontStyle: "italic",
+              padding: "2px 0",
+              scrollMarginTop: 12,
+            }}
+          >
+            ·{" "}
+            {segment.cappedCount === 1
+              ? "1 passo precedente"
+              : `${segment.cappedCount} passi precedenti`}
+          </div>
+        ) : null}
+        {blocchi.map((b) =>
+          b.tipo === "riga" ? (
+            <EventRow
+              key={`ev-${b.indice}`}
+              event={b.ev}
+              segColor={segColor}
+              tc={tc}
+              runId={runId}
+              continuaSubagente={false}
+            />
+          ) : (
+            <GruppoSubagenteView
+              key={`sub-${b.subagentRunId}-${b.indice}`}
+              gruppo={b}
+              espansoDiDefault={b.indice === indiceGruppoPiuRecente}
+              segColor={segColor}
+              tc={tc}
+              runId={runId}
+            />
           ),
         )}
       </div>
@@ -1121,11 +1370,15 @@ export function ActivityStreamView({
   stream,
   tc,
   liveCap,
+  runId,
 }: {
   stream: ActivityStream;
   tc: ThemeColors;
   foldThreshold?: FoldThreshold;
   liveCap?: number;
+  /** run del nastro: scopa gli id DOM per il deep-link della campanella. Passato
+   *  solo dal nastro LIVE (AgentStepsPanel); lo storico lo omette. */
+  runId?: string;
 }) {
   const [showAll, setShowAll] = useState(false);
   if (stream.empty) return null;
@@ -1140,6 +1393,7 @@ export function ActivityStreamView({
   return (
     <div
       data-testid="activity-stream"
+      data-run-id={runId}
       style={{
         marginTop: 6,
         border: `1px solid ${tc.border}`,
@@ -1177,7 +1431,7 @@ export function ActivityStreamView({
         </button>
       )}
       {renderStream.segments.map((seg, i) => (
-        <SegmentView key={`seg-${i}`} segment={seg} tc={tc} />
+        <SegmentView key={`seg-${i}`} segment={seg} tc={tc} runId={runId} />
       ))}
     </div>
   );

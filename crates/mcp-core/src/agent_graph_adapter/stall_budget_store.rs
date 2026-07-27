@@ -25,15 +25,14 @@
 //! [`StallBudgetPort::consultations_in_session`] ritorna `Ok(0)` su guasto DB
 //! (budget non esaurito -> il meta-reasoner resta consultabile, degrado al solo cap
 //! per-run), MAI un `PortError`. [`StallBudgetPort::record_consultation`] e'
-//! best-effort e gata `Real` (no-op in `Replay`: lo shadow non incrementa il budget
-//! del primario). CONFINE (regola L): qui SOLO l'I/O; la DECISIONE (cap raggiunto?)
+//! best-effort. CONFINE (regola L): qui SOLO l'I/O; la DECISIONE (cap raggiunto?)
 //! resta nel gate di emissione dell'executor.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{ExecMode, PortError, StallBudgetPort};
+use nexus_agent_graph::runtime::ports::{PortError, StallBudgetPort};
 
 /// `kind` della riga `nexus_agent_meta_steps` usata come contatore append-only
 /// delle consultazioni del meta-reasoner. Distinto dagli altri kind del canale
@@ -96,13 +95,9 @@ impl StallBudgetPort for PgStallBudgetStore {
     }
 
     /// Appende UNA riga `kind='stall_budget'` per il run corrente (una
-    /// consultazione effettiva). Gata `Real` (no-op in `Replay`: lo shadow non
-    /// incrementa il budget del primario). Best-effort: errore DB loggato,
-    /// `Ok(())` ritornato (il `PortError` resta per un contratto rotto).
-    async fn record_consultation(&self, session_id: Uuid, mode: ExecMode) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
+    /// consultazione effettiva). Best-effort: errore DB loggato, `Ok(())` ritornato
+    /// (il `PortError` resta per un contratto rotto).
+    async fn record_consultation(&self, session_id: Uuid) -> Result<(), PortError> {
         let res = sqlx::query(
             "INSERT INTO nexus_agent_meta_steps (run_id, kind, title, payload) \
              VALUES ($1, $2, '', $3)",
@@ -129,70 +124,41 @@ impl StallBudgetPort for PgStallBudgetStore {
 mod tests {
     use super::*;
 
-    /// Ricrea lo schema minimale (agent_runs + nexus_agent_meta_steps) per i test:
-    /// solo le colonne che le query usano.
-    async fn create_schema(pool: &PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE nexus_agent_meta_steps ( \
-                 id BIGSERIAL PRIMARY KEY, \
-                 run_id UUID NOT NULL, \
-                 kind TEXT NOT NULL, \
-                 title TEXT NOT NULL DEFAULT '', \
-                 payload JSONB NOT NULL DEFAULT '{}'::jsonb, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_agent_meta_steps");
+    /// Sessione chat reale su cui appendere i run del test: `agent_runs.session_id`
+    /// e' vincolato da una FK verso `chat_sessions(id)`.
+    async fn seed_sessione(pool: &PgPool) -> Uuid {
+        crate::test_support::seed_chat_session(pool, Uuid::new_v4()).await
     }
 
-    /// Registra un run della sessione (per il join).
-    async fn insert_run(pool: &PgPool, run_id: Uuid, session_id: Uuid) {
-        sqlx::query("INSERT INTO agent_runs (id, session_id) VALUES ($1, $2)")
-            .bind(run_id)
-            .bind(session_id)
-            .execute(pool)
-            .await
-            .expect("insert run");
+    /// Registra un run della sessione (per il join) e ne ritorna l'id. Le tabelle
+    /// le porta il migrator del set `db/migrations/project`.
+    async fn insert_run(pool: &PgPool, session_id: Uuid) -> Uuid {
+        crate::test_support::insert_agent_run(pool, session_id, Uuid::new_v4(), "running").await
     }
 
     /// CROSS-RUN: consultazioni registrate in run DIVERSI della stessa sessione
     /// sommano; run di altre sessioni no.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn conta_cross_run_per_sessione(pool: PgPool) {
-        create_schema(&pool).await;
-        let session = Uuid::new_v4();
-        let altra_sessione = Uuid::new_v4();
+        let session = seed_sessione(&pool).await;
+        let altra_sessione = seed_sessione(&pool).await;
 
         // Run 1 e Run 2 della stessa sessione: una consultazione ciascuno.
-        let run1 = Uuid::new_v4();
-        let run2 = Uuid::new_v4();
-        insert_run(&pool, run1, session).await;
-        insert_run(&pool, run2, session).await;
+        let run1 = insert_run(&pool, session).await;
+        let run2 = insert_run(&pool, session).await;
         PgStallBudgetStore::new(pool.clone(), run1)
-            .record_consultation(session, ExecMode::Real)
+            .record_consultation(session)
             .await
             .expect("ok");
         PgStallBudgetStore::new(pool.clone(), run2)
-            .record_consultation(session, ExecMode::Real)
+            .record_consultation(session)
             .await
             .expect("ok");
 
         // Run di un'ALTRA sessione: non deve contare per `session`.
-        let run_alieno = Uuid::new_v4();
-        insert_run(&pool, run_alieno, altra_sessione).await;
+        let run_alieno = insert_run(&pool, altra_sessione).await;
         PgStallBudgetStore::new(pool.clone(), run_alieno)
-            .record_consultation(altra_sessione, ExecMode::Real)
+            .record_consultation(altra_sessione)
             .await
             .expect("ok");
 
@@ -209,29 +175,11 @@ mod tests {
         assert_eq!(count_altra, 1, "l'altra sessione conta la propria");
     }
 
-    /// Gate shadow (regola L): in Replay `record_consultation` e' no-op.
+    /// FAIL-OPEN: se la lettura fallisce -> conteggio 0, mai un errore. E' l'UNICO
+    /// test del modulo che gira su un DB SENZA schema (nessun migrator): simula il
+    /// guasto infrastrutturale che il fail-open deve assorbire.
     #[sqlx::test]
-    async fn replay_e_no_op(pool: PgPool) {
-        create_schema(&pool).await;
-        let session = Uuid::new_v4();
-        let run = Uuid::new_v4();
-        insert_run(&pool, run, session).await;
-        let store = PgStallBudgetStore::new(pool.clone(), run);
-        store
-            .record_consultation(session, ExecMode::Replay)
-            .await
-            .expect("ok");
-        let count = store
-            .consultations_in_session(session)
-            .await
-            .expect("fail-open");
-        assert_eq!(count, 0, "in Replay nessuna scrittura -> conteggio 0");
-    }
-
-    /// FAIL-OPEN: senza le tabelle la lettura fallisce -> conteggio 0, mai un errore.
-    #[sqlx::test]
-    async fn fail_open_su_tabelle_assenti(pool: PgPool) {
-        // NON creiamo lo schema: la query fallira'.
+    async fn fail_open_su_query_fallita(pool: PgPool) {
         let store = PgStallBudgetStore::new(pool.clone(), Uuid::new_v4());
         let count = store
             .consultations_in_session(Uuid::new_v4())
@@ -242,10 +190,9 @@ mod tests {
 
     /// Nessuna consultazione registrata -> conteggio 0 (budget mai esaurito,
     /// comportamento invariato).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn nessuna_consultazione_conteggio_zero(pool: PgPool) {
-        create_schema(&pool).await;
-        let session = Uuid::new_v4();
+        let session = seed_sessione(&pool).await;
         let store = PgStallBudgetStore::new(pool.clone(), Uuid::new_v4());
         let count = store
             .consultations_in_session(session)

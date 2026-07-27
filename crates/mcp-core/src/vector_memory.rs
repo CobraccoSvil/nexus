@@ -863,18 +863,6 @@ async fn send_doc_point_upsert(url: &str, body: &Value) -> bool {
     }
 }
 
-/// Risolve l'URL del Neural Core (setting `neural_core_url`, poi env
-/// `NEURAL_CORE_URL`, infine default locale) e apre la connessione. Estratta da
-/// [`vectorize_document`]; comportamento invariato.
-async fn connect_neural_core(db: &PgPool) -> anyhow::Result<crate::orchestrator::NeuralCoreClient> {
-    let neural_url = crate::settings::get_setting(db, "neural_core_url")
-        .await?
-        .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
-        });
-    crate::orchestrator::NeuralCoreClient::connect(&neural_url).await
-}
 
 /// Fa embedding e upsert di tutte le sezioni gia' appiattite, ritornando i
 /// `point_id` upsertati con successo. Estratta dal corpo di
@@ -925,7 +913,7 @@ pub async fn vectorize_document(
     // ma serve come difesa per i tokio::spawn fire-and-forget che non hanno accesso allo stato.
     ensure_docs_collection(db).await?;
 
-    let neural = connect_neural_core(db).await?;
+    let neural = crate::orchestrator::NeuralCoreClient::new();
 
     // Delete old points for this document
     delete_doc_points(db, project_id, document_id).await.ok();

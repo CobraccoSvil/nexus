@@ -18,6 +18,7 @@ import { ActivityStreamView } from "./activity-stream";
 import { ActivityCostFooter } from "./activity-cost-footer";
 import { ActivityHistoryRow } from "./activity-history-row";
 import { InlineTruncated, formatStepInput } from "./step-detail";
+import { usageBadgeView } from "./usage-badge-logic";
 import { useResolvedRunSteps } from "../../lib/use-chat/use-run-steps";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -247,16 +248,18 @@ function groupMessages(messages: ChatMessage[]): GroupedItem[] {
   return result;
 }
 
+/// Token e modello di un messaggio, dai SOLI campi strutturati (regola M).
+///
+/// Prima esisteva un fallback che li estraeva dalla PROSA del messaggio con due
+/// regex (`/(\d[\d\s]*)\s*token totali/` e `/\(([^/]+\/[^)]+)\)/`). Era rotto due
+/// volte: la prima regex non ammette il separatore delle migliaia italiano, quindi
+/// su "20.665 token totali" catturava `665`; e la stringa che cercava era prodotta
+/// dal badge accanto, per cui un cambio di etichetta lo spegneva in silenzio.
+/// I token sono un dato del DB: si leggono dal campo, non si rileggono da come
+/// sono stati stampati.
 function getRunInfo(msg: ChatMessage): { tokens: number; model: string } {
-  if (msg.totalTokens && msg.totalTokens > 0) {
-    const model = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : msg.model ?? "";
-    return { tokens: msg.totalTokens, model };
-  }
-  const tokenMatch = /(\d[\d\s]*)\s*token totali/.exec(msg.content ?? "");
-  const tokens = tokenMatch ? parseInt(tokenMatch[1].replace(/\s/g, ""), 10) : 0;
-  const modelMatch = /\(([^/]+\/[^)]+)\)/.exec(msg.content ?? "");
-  const model = modelMatch ? modelMatch[1] : "";
-  return { tokens, model };
+  const model = msg.provider && msg.model ? `${msg.provider}/${msg.model}` : msg.model ?? "";
+  return { tokens: msg.totalTokens ?? 0, model };
 }
 
 function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeColors }) {
@@ -271,6 +274,9 @@ function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeC
       style={{
         alignSelf: "flex-start",
         maxWidth: "96%",
+        // Come il bubble dei messaggi: il 96% non comprende il bordo, che si
+        // sommerebbe sfondando la lista.
+        boxSizing: "border-box",
         border: `1px solid ${tc.border}`,
         borderRadius: 8,
         background: tc.bgCard,
@@ -476,6 +482,13 @@ function SystemWakeupBanner({
         border: `1px solid ${accent}55`,
         background: `${accent}12`,
         minWidth: 0,
+        // flex-shrink:0 (fix "riga coperta"): la card e' un flex item della colonna
+        // messaggi scrollabile (flex-direction:column, overflow:auto). Col default
+        // flex-shrink:1 il flexbox la COMPRIMEVA a ~0 quando il contenuto totale
+        // eccedeva l'altezza (invece di lasciar scrollare), e con overflow:hidden
+        // restava una fascia illeggibile coperta dal messaggio successivo. Con
+        // flex-shrink:0 mantiene l'altezza del contenuto e la colonna scrolla.
+        flexShrink: 0,
         overflow: "hidden",
       }}
     >
@@ -1066,6 +1079,10 @@ export interface MessageListProps {
   t: (key: string) => string;
   onCopy: (messageId: string, content: string) => Promise<boolean> | boolean;
   onResend: (messageId: string) => void;
+  /** Riattivazione di una chat sospesa dal riavvio del backend: continua l'ultimo
+   *  run `interrupted` dallo stato salvato (invia un messaggio sintetico con
+   *  resume=true). Assente => il banner "Riattiva" non compare. */
+  onResume?: () => void;
   onDelete: (messageId: string) => void;
   onFeedback: (messageId: string, content: string) => void;
   /** Feedback positivo: conferma esplicita che la risposta e' corretta (Q-learning reward=1.0). */
@@ -1143,6 +1160,7 @@ export function MessageList({
   t,
   onCopy,
   onResend,
+  onResume,
   onDelete,
   onFeedback,
   onFeedbackPositive,
@@ -1245,6 +1263,11 @@ export function MessageList({
               opacity: isDeleted ? 0.6 : 1,
               alignSelf: isUser ? "flex-end" : "flex-start",
               maxWidth: "96%",
+              // Il 96% vale sul content box: senza questo, padding (20) e bordo
+              // (2) si sommavano e il bubble arrivava a 442px contro i 438
+              // disponibili, facendo scrollare in orizzontale tutta la lista
+              // messaggi per 4px (misurato).
+              boxSizing: "border-box",
               minWidth: "auto",
               wordBreak: "break-word",
               overflowWrap: "anywhere",
@@ -1454,6 +1477,54 @@ export function MessageList({
                 </div>
               )}
 
+            {/* Avviso "chat sospesa" + Riattiva: un run interrotto dal riavvio del
+                backend conserva lo stato (agent_runs.messages_json) ed e'
+                RIPRISTINABILE, ma resta un vicolo cieco nella UI (solo testo
+                passivo). Mostriamo un banner azionabile SOLO sull'ultimo run
+                interrotto (l'unico che il resume backend riprende) e SOLO se il
+                chiamante ha fornito onResume. Nessun auto-riavvio: l'utente decide
+                (scelta "sempre col pulsante"). */}
+            {!isUser &&
+              message.runStatus === "interrupted" &&
+              message.id === lastAssistantRunMessageId &&
+              onResume && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    border: `1px solid #f59e0b55`,
+                    background: "#f59e0b14",
+                    fontSize: 12,
+                  }}
+                >
+                  <span style={{ color: tc.text }}>
+                    Chat sospesa dal riavvio del backend. Il lavoro e&apos; stato salvato.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onResume()}
+                    style={{
+                      marginLeft: "auto",
+                      fontWeight: 600,
+                      fontSize: 12,
+                      color: "#fff",
+                      background: "#f59e0b",
+                      border: "none",
+                      borderRadius: 6,
+                      padding: "4px 12px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Riattiva
+                  </button>
+                </div>
+              )}
+
             {/* ADR 0037: quando il flag activity_stream_enabled e' ON, il
                 messaggio assistant con runId mostra il NASTRO ATTIVITA' al posto
                 di "Decisioni del turno" + "Mostra step agente". Sorgente:
@@ -1558,33 +1629,19 @@ export function MessageList({
                 color: tc.textMuted,
                 flexWrap: "wrap",
               }}>
-                {message.provider && message.model && (
-                  <span style={{ fontWeight: 600 }}>
-                    {message.provider}/{message.model}
-                  </span>
-                )}
                 {(() => {
-                  const total = message.totalTokens ?? 0;
-                  const lastIn = message.promptTokens ?? 0;
-                  const lastOut = message.completionTokens ?? 0;
-                  // total e' cumulativo sull'intero run (tutte le iterazioni),
-                  // mentre in/out sono dell'ULTIMA chiamata: senza etichetta
-                  // "212K (47K in / 332 out)" sembra incongruente (47K+332 != 212K).
-                  const cumulative = total > lastIn + lastOut + 50;
+                  // Etichette dal punto unico (usage-badge-logic): fisse, mai
+                  // dedotte da confronti di grandezze.
+                  const v = usageBadgeView(message);
                   return (
                     <>
-                      <span>{total.toLocaleString("it-IT")} token{cumulative ? " totali" : ""}</span>
-                      {lastIn > 0 && (
-                        <span>({cumulative ? "ultima chiamata: " : ""}{lastIn.toLocaleString("it-IT")} in / {lastOut.toLocaleString("it-IT")} out)</span>
-                      )}
+                      {v.modelLabel && <span style={{ fontWeight: 600 }}>{v.modelLabel}</span>}
+                      {v.tokensLabel && <span>{v.tokensLabel}</span>}
+                      {v.breakdownLabel && <span>({v.breakdownLabel})</span>}
+                      {v.costLabel && <span style={{ color: tc.warning }}>{v.costLabel}</span>}
                     </>
                   );
                 })()}
-                {(message.totalCost ?? 0) > 0 && (
-                  <span style={{ color: tc.warning }}>
-                    ${message.totalCost!.toFixed(4)} {message.currency ?? "USD"}
-                  </span>
-                )}
               </div>
             )}
           </div>

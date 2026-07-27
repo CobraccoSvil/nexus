@@ -1,15 +1,15 @@
-//! PromptOptimizerWorker — Fase 3 del piano Nexus
+//! PromptOptimizerWorker — loop di auto-miglioramento dei prompt.
 //!
-//! Worker periodico che chiude il loop di auto-miglioramento dei prompt:
+//! Worker periodico:
 //!
 //! 1. **Aggregate**: raccoglie metriche da `nexus_agent_reflections` per ogni
 //!    `(prompt_key, version)`. Richiede >= `min_runs` run per cohort.
 //! 2. **Identify candidates**: prompt con `avg_reflection_score < threshold`
 //!    o `feedback_rate < success_threshold` sono candidati all'ottimizzazione.
-//! 3. **Generate variants**: chiama il brain `POST /agent/prompt-revise`
-//!    (mode `evaluate_and_revise`). Il brain sceglie il modello via routing
-//!    tier-only e valida la conformita' XML lato server. Usa il campo
-//!    `revised_template` della risposta come variante.
+//! 3. **Generate variants**: `prompt_variants::call_prompt_revise` in modo
+//!    `evaluate_and_revise` — risolve il modello dal purpose `prompt_revise`
+//!    (regola G) e chiama il gateway. Usa il campo `revised_template` della
+//!    risposta come variante.
 //! 4. **Insert as inactive**: nuove versioni in `nexus_prompt_templates`
 //!    con `is_active=FALSE`, `experimental=TRUE`.
 //! 5. **Register canary**: inserisce in `prompt_ab_experiments` (status=running).
@@ -25,11 +25,15 @@
 //! - Auto-rollback: monitorato separatamente nella logica di promozione.
 
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
+
+/// Cadenza del worker: 30 minuti. Vedi [`PromptOptimizerWorker::interval`] per
+/// il perche' (vincolo di costo, non preferenza).
+const OPTIMIZER_INTERVAL_SECS: u64 = 1800;
 use crate::workers::prompt_variants;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Metriche aggregate per un singolo (prompt_key, version).
@@ -102,7 +106,14 @@ impl PromptOptimizerWorker {
                AND r.prompt_version = t.version
                AND r.created_at >= NOW() - INTERVAL '7 days'
             WHERE t.is_active = TRUE
-              AND t.key LIKE 'agent.%'
+              -- Prompt degli AGENTI: i template dei subagenti (agent.*) e il
+              -- system del run principale (system.nexus_base). Il filtro era il
+              -- solo 'agent.%', che escludeva proprio il prompt su cui passa la
+              -- quasi totalita' del volume: nell'ultima settimana 575 delle 579
+              -- interazioni erano del run principale. Con quel filtro il worker
+              -- non avrebbe MAI raggiunto min_runs su nessuna chiave, restando a
+              -- zero con l'aria di funzionare (regola O).
+              AND (t.key LIKE 'agent.%' OR t.key = 'system.nexus_base')
             GROUP BY t.key, t.version, t.content
             HAVING COUNT(r.id) >= $1
             ORDER BY avg_reflection_score ASC
@@ -149,12 +160,9 @@ impl PromptOptimizerWorker {
         count.unwrap_or(0) > 0
     }
 
-    /// Genera una variante migliorata del prompt via brain `/agent/prompt-revise`.
-    ///
-    /// Il brain valuta e riscrive il template (mode `evaluate_and_revise`),
-    /// scegliendo il modello via routing tier-only e validando la conformita'
-    /// XML lato server (la validazione locale dei tag e' stata rimossa: e' ora
-    /// responsabilita' del conformance check del brain).
+    /// Genera una variante migliorata del prompt delegando al punto unico
+    /// `prompt_variants::call_prompt_revise` (mode `evaluate_and_revise`), che
+    /// risolve il modello dal purpose e chiama il gateway.
     ///
     /// Restituisce il contenuto della variante (revised_template) o None se la
     /// generazione fallisce o non c'e' `revised_template`.
@@ -417,6 +425,20 @@ impl LearningWorker for PromptOptimizerWorker {
 
     fn trigger(&self) -> WorkerTrigger {
         WorkerTrigger::Periodic
+    }
+
+    /// 30 minuti, ed e' un vincolo di COSTO, non una preferenza: questo worker
+    /// chiama il modello per ogni prompt candidato a ogni esecuzione. Al default
+    /// del trait (60s) arriverebbe a ~1440 chiamate al giorno; qui sono al piu'
+    /// 48.
+    ///
+    /// Il numero viveva nel chiamante, come intervallo globale dello scheduler:
+    /// conteneva la spesa di questo worker rallentando pero' tutti gli altri
+    /// (cleanup e session_persistence compresi, che ne uscivano storpiati).
+    /// Ora il vincolo sta dove nasce, e gli altri worker corrono alla loro
+    /// cadenza. Per spegnerlo del tutto resta il flag DB `optimizer_enabled`.
+    fn interval(&self) -> Duration {
+        Duration::from_secs(OPTIMIZER_INTERVAL_SECS)
     }
 
     async fn run(&self, _context: &LearningContext) -> WorkerOutcome {

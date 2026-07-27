@@ -4,35 +4,6 @@
 //! Estratto da mod.rs (refactor god-file). Visibilita pub(super) perche i
 //! sottomoduli che fanno use super::* continuano a vederli via re-export in mod.rs.
 
-/// Soglia oltre la quale `read_file` antepone una mappa strutturale del file
-/// per orientare l'agente. NON tronca mai: il file viene comunque restituito
-/// INTEGRALE (politica "mai troncare-e-buttare").
-pub(crate) const READ_FILE_STRUCTURE_HINT_LINES: usize = 300;
-/// Numero massimo di righe leggibili con read_file_lines in una singola chiamata.
-/// read_file_lines e' un tool a RANGE esplicito (start/end), quindi non perde
-/// dati: il chiamante itera i range. Valore molto alto per non spezzare
-/// inutilmente letture ampie volute.
-pub(crate) const READ_FILE_LINES_MAX: usize = 100_000;
-
-/// File e pattern che l'agente non può mai modificare, indipendentemente dai permessi.
-/// Proteggono secrets, configurazioni ambiente e il binario in produzione.
-pub(crate) const PROTECTED_PATTERNS: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.staging",
-    ".env.development",
-    "nexus.env", // env specifico di Nexus
-    "secrets",   // qualsiasi file con "secrets" nel nome
-    "credentials",
-    "id_rsa",
-    "id_ed25519",
-    ".pem",
-    ".key",
-    "Cargo.lock", // non modificare il lockfile manualmente
-    "pnpm-lock.yaml",
-];
-
 /// True se il comando e' un one-shot LUNGO che TERMINA (install/build/compile/
 /// test/migrate) — da attendere in sincrono, non da instradare a run_service.
 /// PUNTO UNICO (regola L): usato dal probe di `run_command` e dal declassamento
@@ -53,6 +24,92 @@ pub(crate) fn is_long_oneshot(command: &str) -> bool {
         || c.contains("npm add")
         || c.contains("pnpm add")
         || c.contains("yarn add")
+}
+
+/// Exit code di un processo ucciso da SIGPIPE (128 + 13).
+///
+/// Con `pipefail` una pipeline riporta il PRIMO stadio fallito: se il consumatore
+/// a valle chiude presto (il caso tipico e' `... | head -N`), il produttore riceve
+/// SIGPIPE e la pipeline riporterebbe 141. Non e' un fallimento del comando — e'
+/// il consumatore che ha smesso di leggere — quindi va trattato come successo.
+pub(crate) const EXIT_SIGPIPE: i32 = 141;
+
+/// Avvolge il comando dell'agente nella riga di shell effettivamente eseguita.
+///
+/// PUNTO UNICO (regola L): entrambi i punti che lanciano la shell (`run_command` e
+/// `run_tests`) passano da qui, cosi' la semantica di esecuzione e' una sola.
+///
+/// Aggiunge `set -o pipefail`. Senza, l'exit code di una pipeline e' quello
+/// dell'ULTIMO stadio: `npm install 2>&1 | tail -5` riportava l'esito di `tail`
+/// (sempre 0) e un install FALLITO risultava riuscito. E' il segnale strutturato
+/// su cui l'anti-loop e la diagnostica decidono, mascherato alla fonte (regola M).
+/// Misurato: su verifica-wd 38 comandi su 183 usano una pipe, e tutti e 6 gli
+/// `npm install ... | tail` risultavano exit 0 mentre l'ambiente restava rotto.
+///
+/// Il costo noto e' [`EXIT_SIGPIPE`], gestito dal chiamante.
+pub(crate) fn shell_line(command: &str) -> String {
+    format!("set -o pipefail; {command}")
+}
+
+/// True se il comando MUTA l'albero delle dipendenze di un package manager
+/// (install/add/remove/update di npm, pnpm, yarn, bun, pip, poetry, composer,
+/// gem, bundle, go mod).
+///
+/// Serve a SERIALIZZARE quei comandi per progetto: npm & co. non sono
+/// concurrency-safe sulla stessa directory di dipendenze. Due install simultanei
+/// si sovrascrivono a vicenda — uno rimuove cio' che l'altro sta scrivendo — e
+/// lasciano lo stato interno del package manager (`node_modules/.package-lock.json`)
+/// incoerente col disco: da quel momento `npm install <pkg>` risponde "up to date"
+/// senza installare nulla, il binario atteso (tsc, vite, ...) non c'e', il build
+/// fallisce e il lavoro non converge.
+///
+/// Misurato sul progetto verifica-wd (2026-07-23): 11 coppie di `npm install` da
+/// run_id DIVERSI entro 60s sulla stessa area, di cui una a distanza ZERO secondi
+/// (un sub-agente con working_dir=backend e un altro con `cd backend && npm
+/// install`), 13 run distinti coinvolti e fino a 12 sub-agenti sovrapposti.
+///
+/// `cargo` e' ESCLUSO di proposito: ha gia' un file-lock interno sul registry e su
+/// target/, quindi serializzarlo qui aggiungerebbe attesa senza togliere rischio.
+///
+/// Inclusivo per scelta: un falso positivo costa solo un po' di serializzazione,
+/// un falso negativo costa un ambiente corrotto.
+pub(crate) fn is_package_manager_mutation(command: &str) -> bool {
+    /// Package manager che mutano una directory di dipendenze condivisa.
+    const PM: &[&str] = &[
+        "npm", "pnpm", "yarn", "bun", "pip", "pip3", "poetry", "composer", "gem", "bundle", "go",
+    ];
+    /// Sotto-comandi che SCRIVONO nell'albero delle dipendenze.
+    const MUT: &[&str] = &[
+        "install",
+        "ci",
+        "add",
+        "remove",
+        "uninstall",
+        "update",
+        "upgrade",
+        "prune",
+        "dedupe",
+        "link",
+        "require",
+        "rebuild",
+        "get",
+        "mod",
+    ];
+    // Segmenta su &&, ||, ;, | e newline: in `cd frontend && npm install` il
+    // package manager sta nel SECONDO segmento, e senza segmentazione il `cd`
+    // iniziale maschererebbe la posizione del comando vero.
+    command
+        .to_lowercase()
+        .split(['&', '|', ';', '\n'])
+        .any(|seg| {
+            let toks: Vec<&str> = seg.split_whitespace().collect();
+            match toks.iter().position(|t| PM.contains(t)) {
+                // Il sotto-comando mutante deve venire DOPO il package manager:
+                // `npm install` si', `install npm` (frase qualsiasi) no.
+                Some(i) => toks[i + 1..].iter().any(|t| MUT.contains(t)),
+                None => false,
+            }
+        })
 }
 
 /// Controlla se il comando corrisponde a uno dei pattern long-running caricati dal DB.
@@ -97,163 +154,6 @@ pub(crate) fn looks_like_long_running_command(command: &str, patterns: &[String]
         }
     }
     false
-}
-
-/// Estrae una mappa strutturale del file: funzioni, classi, componenti con numero di riga.
-/// Supporta Rust, TypeScript/JavaScript, Python, C#, Go.
-/// Usa corrispondenza su prefisso di parola chiave — nessuna regex, O(n) per riga.
-pub(crate) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
-    let mut entries: Vec<(usize, String)> = Vec::new();
-
-    for (line_idx, raw_line) in content.lines().enumerate() {
-        let line_num = line_idx + 1;
-        let line = raw_line.trim();
-
-        // Salta righe vuote e commenti
-        if line.is_empty()
-            || line.starts_with("//")
-            || line.starts_with("/*")
-            || line.starts_with('#')
-        {
-            continue;
-        }
-
-        // Helper: estrai nome identificatore dopo una keyword
-        let ident_after = |s: &str, kw: &str| -> Option<String> {
-            let rest = s.strip_prefix(kw)?.trim_start();
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if name.is_empty() {
-                None
-            } else {
-                Some(name)
-            }
-        };
-
-        // Normalizza spazi multipli per matching keyword composte
-        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
-
-        // TypeScript/JavaScript — export function, async function, function
-        if let Some(name) = [
-            "export async function ",
-            "export function ",
-            "async function ",
-            "function ",
-        ]
-        .iter()
-        .find_map(|kw| ident_after(&normalized, kw))
-        {
-            entries.push((line_num, format!("fn {name}")));
-            continue;
-        }
-
-        // TypeScript/JavaScript — export const X = (...) => / = async (
-        if normalized.starts_with("export const ") || normalized.starts_with("const ") {
-            // Solo se è assegnazione a funzione/arrow
-            if normalized.contains("= (")
-                || normalized.contains("= async (")
-                || normalized.contains(": React.")
-                || normalized.contains("FC =")
-            {
-                if let Some(name) = ident_after(&normalized, "export const ")
-                    .or_else(|| ident_after(&normalized, "const "))
-                {
-                    entries.push((line_num, format!("const {name}")));
-                    continue;
-                }
-            }
-        }
-
-        // class (TS/JS/Python/C#)
-        if let Some(name) = ["export default class ", "export class ", "class "]
-            .iter()
-            .find_map(|kw| ident_after(&normalized, kw))
-        {
-            entries.push((line_num, format!("class {name}")));
-            continue;
-        }
-
-        // Rust — pub async fn, pub fn, async fn, fn
-        if let Some(name) = ["pub async fn ", "pub fn ", "async fn ", "fn "]
-            .iter()
-            .find_map(|kw| ident_after(&normalized, kw))
-        {
-            entries.push((line_num, format!("fn {name}")));
-            continue;
-        }
-
-        // Rust — impl, struct, enum
-        if let Some(name) = ident_after(&normalized, "impl ") {
-            entries.push((line_num, format!("impl {name}")));
-            continue;
-        }
-        if let Some(name) = ["pub struct ", "struct "]
-            .iter()
-            .find_map(|kw| ident_after(&normalized, kw))
-        {
-            entries.push((line_num, format!("struct {name}")));
-            continue;
-        }
-        if let Some(name) = ["pub enum ", "enum "]
-            .iter()
-            .find_map(|kw| ident_after(&normalized, kw))
-        {
-            entries.push((line_num, format!("enum {name}")));
-            continue;
-        }
-
-        // Python — def, async def
-        if let Some(name) = ["async def ", "def "]
-            .iter()
-            .find_map(|kw| ident_after(&normalized, kw))
-        {
-            entries.push((line_num, format!("def {name}")));
-            continue;
-        }
-
-        // C# — public/private/protected method or class
-        if normalized.starts_with("public ")
-            || normalized.starts_with("private ")
-            || normalized.starts_with("protected ")
-        {
-            if normalized.contains(" class ")
-                || normalized.contains(" interface ")
-                || normalized.contains(" enum ")
-            {
-                let short: String = normalized.chars().take(60).collect();
-                entries.push((line_num, format!("class {short}")));
-                continue;
-            }
-            // method: ha parentesi aperta e non è una property semplice
-            if normalized.contains('(') && !normalized.ends_with(';') {
-                let short: String = normalized.chars().take(60).collect();
-                entries.push((line_num, format!("method {short}")));
-                continue;
-            }
-        }
-    }
-
-    entries
-}
-
-/// Ritorna true se il path è protetto e non deve essere modificato dall'agente.
-pub(crate) fn is_protected_path(path_str: &str) -> Option<&'static str> {
-    let lower = path_str.to_lowercase();
-    // Controlla nome file esatto o pattern nel path
-    for pattern in PROTECTED_PATTERNS {
-        let pat_lower = pattern.to_lowercase();
-        // Match esatto del nome file o estensione
-        if lower.ends_with(&pat_lower)
-            || lower.contains(&format!("/{}", pat_lower))
-            || lower.contains(&format!("\\{}", pat_lower))
-            || lower == pat_lower
-        {
-            return Some(pattern);
-        }
-    }
-    None
 }
 
 pub(crate) fn format_process_output(info: &crate::agent_processes::ProcessOutput) -> String {
@@ -345,6 +245,58 @@ pub(crate) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str)
         return "exit code 1 senza output — per grep/find significa 'nessuna corrispondenza': prova un pattern diverso";
     }
     "errore generico — leggi stderr per la causa specifica, poi usa un approccio alternativo o un comando diverso"
+}
+
+/// Rileva quando il comando DUPLICA il `working_dir` gia' applicato come CWD.
+///
+/// Causa radice di ambiente incoerente (misurata sul test pulito diag-deps,
+/// 2026-07-23): `run_command` esegue con CWD = <root>/<working_dir>. Se il comando
+/// RIPETE quel segmento (`cd frontend`, path `frontend/...`) mentre working_dir e'
+/// gia' `frontend`, i path si SOMMANO (`frontend/frontend`): il `rm -rf
+/// frontend/node_modules` non tocca il vero node_modules, l'`npm install` scrive
+/// altrove, e l'ambiente resta incoerente (typescript/@types assenti -> build
+/// impossibile -> todo bloccato -> run che non converge). E' generale, non
+/// npm-specifico: spiega anche node_modules creato nella root e i path assoluti
+/// errati (`/app/backend`).
+///
+/// Ritorna `Some(spiegazione)` se il comando duplica il working_dir, `None`
+/// altrimenti. Conservativo per evitare falsi positivi: blocca SOLO `cd <wd>` e i
+/// path con prefisso `<wd>/` (segno inequivocabile di path); un `<wd>` nudo (es.
+/// `echo frontend`) NON e' bloccato. Root (`""`, `"."`, `"./"`) non ha segmento da
+/// duplicare. `wd_rel` e' il valore grezzo del parametro `working_dir`.
+pub(crate) fn detect_workdir_path_duplication(wd_rel: &str, command: &str) -> Option<String> {
+    let wd = wd_rel
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_lowercase();
+    if wd.is_empty() || wd == "." {
+        return None;
+    }
+    let prefix = format!("{wd}/");
+    let toks: Vec<String> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | ';' | '|' | '(' | ')'))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.trim_start_matches("./").to_lowercase())
+        .collect();
+    for (i, tok) in toks.iter().enumerate() {
+        // Duplica se: path con prefisso `<wd>/` (percorso inequivocabile) oppure
+        // `cd <wd>` esatto (naviga nella CWD gia' impostata). Il caso `cd <wd>/sub`
+        // ricade gia' nel prefisso, quindi non serve una condizione a parte.
+        let cd_into_wd = i > 0 && toks[i - 1] == "cd" && *tok == wd;
+        if tok.starts_with(&prefix) || cd_into_wd {
+            return Some(format!(
+                "[working_dir gia' applicato] Il comando gira GIA' dentro '{wd_rel}' \
+                 (working_dir E' la directory di lavoro corrente). Il token '{tok}' ripete \
+                 quel percorso: la directory diventerebbe '<...>/{wd}/{wd}', che non esiste, \
+                 e rm/install/build opererebbero sulla dir sbagliata lasciando l'ambiente \
+                 incoerente. Correggi il comando: togli 'cd {wd}' e i prefissi '{wd}/' dai \
+                 path (usa ad es. 'node_modules', non '{wd}/node_modules'). In alternativa \
+                 ometti 'working_dir' e usa i percorsi completi dalla root del progetto."
+            ));
+        }
+    }
+    None
 }
 
 /// Hint platform-aware per i comandi agente che falliscono perche' usano sintassi
@@ -504,5 +456,107 @@ mod tests {
             hint.contains("comando non trovato"),
             "command not found deve avere priorita' sul ramo build: {hint}"
         );
+    }
+
+    /// La riga di shell riporta l'esito del comando che CONTA, non dell'ultimo
+    /// stadio della pipe.
+    ///
+    /// Esegue davvero la shell dell'agente (`sandbox::agent_shell`, la stessa
+    /// della produzione) invece di simulare: il difetto misurato e' proprio che
+    /// `npm install ... | tail` tornava 0 mentre l'install falliva, e un test che
+    /// non attraversa una shell vera non lo vedrebbe.
+    #[test]
+    fn shell_line_non_lascia_che_la_pipe_mascheri_il_fallimento() {
+        let esegui = |cmd: String| -> i32 {
+            std::process::Command::new(crate::sandbox::agent_shell())
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .expect("shell agente")
+                .status
+                .code()
+                .unwrap_or(-1)
+        };
+
+        // Il caso reale: un comando che FALLISCE dietro una pipe.
+        assert_eq!(
+            esegui("exit 7 | tail -5".to_string()),
+            0,
+            "premessa del difetto: senza pipefail la pipe riporta l'esito di tail"
+        );
+        assert_ne!(
+            esegui(shell_line("exit 7 | tail -5")),
+            0,
+            "con pipefail il fallimento dietro la pipe deve emergere"
+        );
+
+        // Un comando che riesce resta riuscito (nessun falso allarme).
+        assert_eq!(esegui(shell_line("echo ok | tail -1")), 0);
+    }
+
+    #[test]
+    fn pkg_mutation_riconosce_i_comandi_misurati_e_non_gli_innocui() {
+        // I DUE comandi realmente concorrenti misurati su verifica-wd (07:33:29,
+        // run_id diversi, distanza ZERO secondi): entrambi devono entrare in
+        // sezione critica, altrimenti si sovrascrivono node_modules a vicenda.
+        assert!(is_package_manager_mutation("npm install"));
+        assert!(is_package_manager_mutation(
+            "cd backend && npm install typescript --no-save"
+        ));
+        // Altre forme viste nei run reali.
+        assert!(is_package_manager_mutation("npm install --legacy-peer-deps"));
+        assert!(is_package_manager_mutation("npm install -D typescript"));
+        assert!(is_package_manager_mutation(
+            "cd frontend && rm -rf node_modules package-lock.json && npm install"
+        ));
+        assert!(is_package_manager_mutation("npm ci"));
+        // Altri ecosistemi: la corruzione da concorrenza non e' specifica di npm.
+        assert!(is_package_manager_mutation("pnpm add -D vite"));
+        assert!(is_package_manager_mutation("yarn install --frozen-lockfile"));
+        assert!(is_package_manager_mutation("pip install -r requirements.txt"));
+        assert!(is_package_manager_mutation("poetry add fastapi"));
+        assert!(is_package_manager_mutation("go mod download"));
+
+        // NON deve serializzare cio' che non tocca le dipendenze: sarebbe
+        // parallelismo perso per nulla.
+        assert!(!is_package_manager_mutation("npm run build"));
+        assert!(!is_package_manager_mutation("npm run dev"));
+        assert!(!is_package_manager_mutation("npx tsc --noEmit"));
+        assert!(!is_package_manager_mutation("ls node_modules/.bin"));
+        assert!(!is_package_manager_mutation("cat package.json"));
+        // `cargo` e' escluso di proposito (ha un file-lock interno).
+        assert!(!is_package_manager_mutation("cargo build"));
+        // Il sotto-comando mutante deve venire DOPO il package manager.
+        assert!(!is_package_manager_mutation("echo install npm"));
+    }
+
+    #[test]
+    fn detect_workdir_dup_blocca_solo_la_vera_duplicazione() {
+        // Caso reale misurato (diag-deps 2026-07-23): working_dir=frontend +
+        // 'rm -rf frontend/node_modules...' -> frontend/frontend -> il rm non tocca
+        // il vero node_modules, l'ambiente resta incoerente. DEVE bloccare.
+        let d = detect_workdir_path_duplication(
+            "frontend",
+            "rm -rf frontend/node_modules/.package-lock.json frontend/package-lock.json",
+        );
+        assert!(d.is_some(), "path 'frontend/...' con working_dir=frontend deve bloccare");
+        assert!(d.unwrap().contains("working_dir"), "il messaggio spiega il working_dir");
+        // 'cd <wd>' = navigazione nella CWD gia' impostata -> blocca.
+        assert!(detect_workdir_path_duplication("frontend", "cd frontend && npm install").is_some());
+        // 'cd <wd>/sub' idem.
+        assert!(detect_workdir_path_duplication("backend", "cd backend/src && ls").is_some());
+        // './frontend' normalizzato = frontend.
+        assert!(detect_workdir_path_duplication("./frontend", "cat frontend/tsconfig.json").is_some());
+
+        // NESSUN falso positivo:
+        // - comando senza duplicazione del working_dir.
+        assert!(detect_workdir_path_duplication("frontend", "npm install").is_none());
+        // - '<wd>' NUDO (non un path) non e' bloccato (es. echo/grep della parola).
+        assert!(detect_workdir_path_duplication("frontend", "echo frontend build ok").is_none());
+        // - riferimento a un'ALTRA dir (non il working_dir) non e' duplicazione.
+        assert!(detect_workdir_path_duplication("backend", "cat frontend/package.json").is_none());
+        // - working_dir root/vuoto: nessun segmento da duplicare.
+        assert!(detect_workdir_path_duplication("", "cd frontend && npm install").is_none());
+        assert!(detect_workdir_path_duplication(".", "cd frontend && npm install").is_none());
     }
 }

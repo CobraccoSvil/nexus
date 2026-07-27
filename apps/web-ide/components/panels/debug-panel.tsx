@@ -9,6 +9,7 @@ import {
   selectServiceLogsRecent,
   selectServicesRefreshAt,
 } from "../../lib/project-dispatcher";
+import { AutoWidthSelect } from "../auto-width-select";
 
 export type DebugLevel = "ERROR" | "WARN" | "INFO" | "DEBUG";
 
@@ -381,9 +382,16 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
         {allSources.length > 0 && (
           <>
             <span style={{ color: tc.border, fontSize: 11 }}>|</span>
-            <select
+            <AutoWidthSelect
               value={sourceFilter}
-              onChange={(e) => setSourceFilter(e.target.value)}
+              options={[
+                { value: "all", label: "Tutte le sorgenti" },
+                { value: "terminal", label: "Terminale" },
+                ...allSources
+                  .filter((s) => s !== "terminal")
+                  .map((s) => ({ value: s, label: s })),
+              ]}
+              onChange={(value) => setSourceFilter(value)}
               style={{
                 background: tc.bgInput,
                 color: tc.text,
@@ -393,17 +401,7 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
                 padding: "2px 6px",
                 cursor: "pointer",
               }}
-            >
-              <option value="all">Tutte le sorgenti</option>
-              <option value="terminal">Terminale</option>
-              {allSources
-                .filter((s) => s !== "terminal")
-                .map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-            </select>
+            />
           </>
         )}
 

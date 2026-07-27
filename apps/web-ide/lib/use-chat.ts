@@ -37,6 +37,43 @@ import { UUID_RE, type BusyAction, type MetaStepEntry } from "./use-chat/types";
 import { upsertSyntheticAssistantMessage, isStatusTerminal, mergeIncomingStep } from "./use-chat/helpers";
 import { createTerminalMessage } from "./use-chat/run-summary";
 import { formatChatError } from "./use-chat/errors";
+import { childRunIdsFromToolResult } from "./use-chat/subagent-runs";
+
+/**
+ * Rilegge dal DB le tracce gateway della sessione e le installa come timeline
+ * autoritativa. Punto unico (regola L) dei due momenti in cui serve: il
+ * bootstrap della sessione e la CHIUSURA di un run.
+ *
+ * Alla chiusura serve perche' le tracce dei sub-agenti non passano dal canale
+ * SSE del padre (ogni sub-run ha un canale proprio, che non viene instradato al
+ * frontend): finche' non si rilegge il DB, la ripartizione costo-per-provider del
+ * run appena concluso non conosce i provider usati solo dai figli — la si vedeva
+ * comparire solo dopo un reload della pagina.
+ *
+ * Le tracce arrivano raggruppate per runId (ordine non garantito tra run):
+ * appiattite in un'unica timeline ordinata per timestamp, la stessa forma
+ * prodotta live dall'accumulo SSE. Cap a 100 (FIFO) come il path live.
+ * Best-effort: un errore lascia in piedi quello che c'e' gia'.
+ */
+async function ricaricaTracceDalDb(
+  sessionId: string,
+  setTraces: (t: AITraceEvent[]) => void,
+): Promise<void> {
+  try {
+    const { runs } = await getSessionTraces(sessionId);
+    const runEntries = runs ? Object.values(runs) : [];
+    if (runEntries.length === 0) return;
+    const flat = runEntries
+      .flat()
+      .filter((tr): tr is AITraceEvent => Boolean(tr && tr.runId))
+      .sort(
+        (a, b) => new Date(a.timestamp ?? 0).getTime() - new Date(b.timestamp ?? 0).getTime(),
+      );
+    setTraces(flat.length > 100 ? flat.slice(flat.length - 100) : flat);
+  } catch {
+    // best-effort: resta la timeline corrente (cache sessionStorage o accumulo SSE)
+  }
+}
 
 export function useChat(
   projectId = "default",
@@ -197,8 +234,9 @@ export function useChat(
   // - ChatSessionCompacted: il backend invia totali freschi dopo compact;
   //   riallineiamo subito la barra (caso bug "percentuale solo dopo F5").
   // - ChatMessageAdded: il backend invia totali assoluti aggiornati ad ogni
-  //   INSERT messaggio (TODO: cablare emit lato chat_messages.rs); per ora
-  //   resta inattivo finche' il cablaggio backend e' completo.
+  //   INSERT messaggio (emesso da chat_messages/run.rs, con i totali del
+  //   payload). Sui messaggi senza contabilita' i totali sono null e la barra
+  //   resta sull'ultimo valore noto.
   const lastCompact = useProjectStore(selectChatLastCompact(sessionId ?? null));
   const lastMessage = useProjectStore(selectChatLastMessage(sessionId ?? null));
 
@@ -233,8 +271,11 @@ export function useChat(
 
   useEffect(() => {
     if (!lastMessage || !sessionId) return;
-    // Totali assoluti dal backend (idempotente, non incrementale)
-    if (lastMessage.totalTokens !== undefined && lastMessage.totalCostUsd !== undefined) {
+    // Totali assoluti dal backend (idempotente, non incrementale).
+    // Il test e' sul TIPO, non su `!== undefined`: il backend manda `null` per i
+    // messaggi senza contabilita' (disambiguazione), e un null passava il vecchio
+    // controllo azzerando la barra a meta' conversazione.
+    if (typeof lastMessage.totalTokens === "number" && typeof lastMessage.totalCostUsd === "number") {
       setTokenUsage({
         totalTokens: lastMessage.totalTokens,
         totalCostUsd: lastMessage.totalCostUsd,
@@ -296,27 +337,7 @@ export function useChat(
           }
         }
       } catch { /* ignore */ }
-      try {
-        const { runs } = await getSessionTraces(activeSessionId);
-        const runEntries = runs ? Object.values(runs) : [];
-        if (runEntries.length > 0) {
-          // Le tracce arrivano raggruppate per runId (ordine HashMap non
-          // garantito tra run). Appiattiamo in un'unica timeline ordinata per
-          // timestamp dell'AITraceEvent: e' la stessa forma di `traces` prodotta
-          // live dall'accumulo SSE. Cap a 100 (FIFO) come il path live.
-          const flat = runEntries
-            .flat()
-            .filter((tr): tr is AITraceEvent => Boolean(tr && tr.runId))
-            .sort(
-              (a, b) =>
-                new Date(a.timestamp ?? 0).getTime() - new Date(b.timestamp ?? 0).getTime(),
-            );
-          const capped = flat.length > 100 ? flat.slice(flat.length - 100) : flat;
-          setTraces(capped);
-        }
-      } catch {
-        // best-effort: il pannello resta sull'eventuale cache sessionStorage
-      }
+      await ricaricaTracceDalDb(activeSessionId, setTraces);
       const history = await getChatMessages(activeSessionId);
       setMessages(history.messages ?? []);
       // Ripristina la timeline meta_step persistita (plan/routing/clarify/
@@ -365,17 +386,43 @@ export function useChat(
   // tracciate qui: vivono legate al ciclo del run padre.
   const primarySubCleanupRef = useRef<(() => void) | null>(null);
 
+  /** Cleanup delle subscription FIGLIE (una per sub-agente), per runId.
+   *
+   *  Prima venivano semplicemente scartate (`if (isPrimary)`), quindi ogni
+   *  EventSource figlio sopravviveva al componente col proprio loop di reconnect.
+   *  Un batch di sub-agenti ne apre 8 di default (fino a 32), e ogni riaggancio
+   *  del padre li ri-sottoscriveva TUTTI senza chiudere i precedenti: su un
+   *  budget di 6 connessioni per origine (HTTP/1.1) questo affamava le fetch
+   *  normali, e il bootstrap della chat non completava (pulsante Invia muto).
+   *  Tenerli qui permette di chiuderli e di non riaprirli due volte. */
+  const childSubCleanupsRef = useRef<Map<string, () => void>>(new Map());
+
+  /** Chiude TUTTE le subscription figlie ancora aperte. */
+  const stopChildAgentStreams = useCallback(() => {
+    for (const cleanup of childSubCleanupsRef.current.values()) {
+      try {
+        cleanup();
+      } catch {
+        // best-effort: un cleanup che fallisce non deve impedire gli altri
+      }
+    }
+    childSubCleanupsRef.current.clear();
+  }, []);
+
   /** Chiude la subscription SSE primaria e azzera il banner "Connessione persa".
    *  Punto unico (regola L): ogni chiusura del canale run (watchdog, reattach,
    *  cancel, cambio run) deve passare da qui, altrimenti il loop di reconnect
-   *  resta attivo con isReconnecting=true anche senza agentRun in UI. */
+   *  resta attivo con isReconnecting=true anche senza agentRun in UI.
+   *  Chiude anche le figlie: vivono legate al ciclo del run padre, quindi quando
+   *  il padre se ne va non hanno piu' motivo di restare aperte. */
   const stopPrimaryAgentStream = useCallback(() => {
     if (primarySubCleanupRef.current) {
       primarySubCleanupRef.current();
       primarySubCleanupRef.current = null;
     }
+    stopChildAgentStreams();
     setIsReconnecting(false);
-  }, []);
+  }, [stopChildAgentStreams]);
 
   // Sottoscrive a un run (primario o figlio) e aggiorna le map di stato
   const subscribeToRun = useCallback(
@@ -384,6 +431,12 @@ export function useChat(
       // (idempotenza del riaggancio: mai due EventSource primari attivi).
       if (isPrimary) {
         stopPrimaryAgentStream();
+      } else if (childSubCleanupsRef.current.has(runId)) {
+        // Stesso principio per i figli: a ogni riaggancio del padre arrivano di
+        // nuovo gli stessi child_run_ids, e senza questo controllo si apriva un
+        // secondo EventSource sullo stesso sub-run lasciando aperto il primo --
+        // il moltiplicatore che portava le connessioni ben oltre il budget.
+        return;
       }
       const cleanup = subscribeAgentStream(
         sid,
@@ -419,30 +472,58 @@ export function useChat(
               // toolResult non e' JSON parseabile, skip silenzioso
             }
           }
-          // Se lo step contiene un sub-run lanciato da dispatch_subtask, sottoscriviti
-          if (event.step.toolName === "dispatch_subtask" && event.step.toolResult) {
-            const match = event.step.toolResult.match(/ID:\s*([0-9a-f-]{36})/i);
-            if (match) {
-              const childRunId = match[1];
-              const childRun: AgentRunInfo = {
-                runId: childRunId,
-                sessionId: sid,
-                status: "running",
-                automationMode: "automatic",
-                provider: "auto",  // placeholder: aggiornato da getAgentRun()
-                model: "auto",     // placeholder: aggiornato da getAgentRun()
-                iterationCount: 0,
-                pendingActions: [],
-                steps: [],
-                createdAt: new Date().toISOString(),
-              };
-              setAgentRuns((prev) => new Map(prev).set(childRunId, childRun));
-              setAgentStepsMap((prev) => new Map(prev).set(childRunId, []));
-              subscribeToRun(sid, childRunId, false);
-            }
+          // Sub-run avviati da questo step: gli id arrivano dal campo
+          // strutturato `subagent_run_id` del tool_result (punto unico
+          // childRunIdsFromToolResult), mai dal testo del messaggio.
+          for (const childRunId of childRunIdsFromToolResult(
+            event.step.toolName,
+            event.step.toolResult,
+          )) {
+            const childRun: AgentRunInfo = {
+              runId: childRunId,
+              sessionId: sid,
+              status: "running",
+              automationMode: "automatic",
+              provider: "auto",  // placeholder: aggiornato da getAgentRun()
+              model: "auto",     // placeholder: aggiornato da getAgentRun()
+              iterationCount: 0,
+              pendingActions: [],
+              steps: [],
+              createdAt: new Date().toISOString(),
+            };
+            setAgentRuns((prev) => new Map(prev).set(childRunId, childRun));
+            setAgentStepsMap((prev) => new Map(prev).set(childRunId, []));
+            // NIENTE EventSource dedicato per il figlio. Aprirne uno per ogni
+            // sub-agente costava fino a 8 connessioni (cap 32) su un budget di 6
+            // per origine in HTTP/1.1: le fetch normali restavano in coda e
+            // scadevano, il bootstrap della chat non completava e il pulsante
+            // Invia diventava muto. Il progresso dei sub-agenti resta visibile
+            // nel nastro del padre (meta-step subagent_started/progress/
+            // completed, mig 0535) e i loro step si leggono dal DB quando si apre
+            // il tab del sub-agente (agent-steps-panel -> useResolvedRunSteps).
+            // Il run e' comunque registrato qui sopra, quindi il tab compare.
           }
         },
         async () => {
+          // Un sub-run CONCLUSO non ha piu' nulla da trasmettere: il suo stream
+          // resta pero' agganciato fino alla fine del padre, e con un batch di
+          // sub-agenti quegli slot pesano sul budget di 6 connessioni per origine
+          // proprio mentre il lavoro e' al massimo. I sub-agenti finiscono a
+          // scaglioni, quindi liberare qui abbassa il PICCO, che e' la grandezza
+          // che conta. Gli step gia' ricevuti restano in agentStepsMap: il tab del
+          // sub-agente continua a mostrarli. Il primario NON si tocca (il suo
+          // ciclo di vita e' governato da stopPrimaryAgentStream).
+          if (!isPrimary) {
+            const chiudi = childSubCleanupsRef.current.get(runId);
+            if (chiudi) {
+              childSubCleanupsRef.current.delete(runId);
+              try {
+                chiudi();
+              } catch {
+                // best-effort: la chiusura non deve impedire la finalizzazione
+              }
+            }
+          }
           try {
             // Polling con retry: se l'evento agent_final SSE e' arrivato MA
             // il DB risponde ancora "running", potrebbe esserci una race
@@ -525,6 +606,11 @@ export function useChat(
                     );
                   }
                 } catch {}
+                // Tracce dal DB: il run e' chiuso, quindi anche i suoi sub-run
+                // hanno finito di scrivere. E' il momento in cui la ripartizione
+                // costo-per-provider puo' conoscere i provider usati SOLO dai
+                // figli (le loro tracce non passano dal canale SSE del padre).
+                await ricaricaTracceDalDb(sid, setTraces);
                 // Refresh dei messaggi dal DB con RETRY: il backend salva il
                 // messaggio assistant ASYNC dopo l'emissione di `agent_final`,
                 // quindi al primo getChatMessages potrebbe non essere ancora
@@ -791,9 +877,13 @@ export function useChat(
           }
         },
       );
-      // Conserva il cleanup della sola subscription primaria (vedi ref sopra).
+      // Conserva il cleanup: quello primario nel suo ref, quelli figli nella
+      // mappa per runId. Scartare i cleanup figli (com'era) lasciava un
+      // EventSource orfano per ogni sub-agente, col suo loop di reconnect.
       if (isPrimary) {
         primarySubCleanupRef.current = cleanup;
+      } else {
+        childSubCleanupsRef.current.set(runId, cleanup);
       }
     },
     [projectId, refreshSessionUsage, stopPrimaryAgentStream],
@@ -1153,7 +1243,12 @@ export function useChat(
             setAgentRun(null);
             setAgentSteps([]);
             setIsLoading(false);
-            setError(formatChatError(new Error(finalRun.finalAnswer ?? "Run fallito dopo conferma."), "Conferma fallita."));
+            // `finalAnswer` NON e' un errore JS: e' l'esito che il run ha
+            // dichiarato, gia' prosa. Farlo passare da formatChatError significava
+            // fabbricare un Error attorno a un testo per poi troncarlo — e da
+            // quando la frase si legge da un CAMPO (mai dal testo), quel testo
+            // verrebbe scartato del tutto e l'utente perderebbe il motivo vero.
+            setError(finalRun.finalAnswer?.trim() || "Conferma fallita: il run e' terminato con errore.");
           } catch {
             setAgentRun(null);
             setAgentSteps([]);

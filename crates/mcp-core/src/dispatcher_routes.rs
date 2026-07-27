@@ -200,32 +200,21 @@ pub async fn project_snapshot(
     });
 
     // ── Playwright runs ───────────────────────────────────────────────
+    // Delega al punto unico (regola L). `jobs` e' tabella MIGRATA: vive nel DB
+    // del progetto, non sul meta. Questo ramo ne teneva una copia della query
+    // letta da `state.db`, rimasta indietro alla separazione: ogni snapshot
+    // rispondeva 500 ("la relazione jobs non esiste") e il dispatcher partiva
+    // senza stato iniziale. Il formato ora e' lo stesso dell'endpoint REST
+    // (`command`, `exitCode`, `progress`, `updatedAt` inclusi), quindi il
+    // pannello vede gli stessi campi da entrambe le fonti.
     if want(nexus_events::event::TOPIC_PLAYWRIGHT) {
-        let rows = sqlx::query(
-            r#"SELECT id, kind, status, input, created_at
-               FROM jobs
-               WHERE project_id = $1 AND kind ILIKE '%playwright%'
-               ORDER BY created_at DESC LIMIT 50"#,
+        let proj_pool =
+            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
+        let runs = crate::project_workspace::logs::playwright_runs_for_project(
+            &proj_pool, project_id,
         )
-        .bind(project_id)
-        .fetch_all(&state.db)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let runs: Vec<Value> = rows
-            .into_iter()
-            .map(|row| {
-                let input = row.get::<Value, _>("input");
-                json!({
-                    "id": row.get::<Uuid, _>("id").to_string(),
-                    "label": input.get("label").and_then(Value::as_str).unwrap_or("Playwright run"),
-                    "status": row.get::<String, _>("status"),
-                    "summary": input.get("message").and_then(Value::as_str),
-                    "artifacts": input.get("artifacts").cloned().unwrap_or_else(|| json!([])),
-                    "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-                })
-            })
-            .collect();
         snapshot["playwright"] = json!({ "runs": runs });
     }
 

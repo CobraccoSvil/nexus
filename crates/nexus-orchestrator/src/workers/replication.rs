@@ -25,10 +25,28 @@
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Prefissi di chiave prioritari da replicare
 const PRIORITY_PREFIXES: &[&str] = &["session:", "metrics:", "version:", "pattern:"];
+
+/// Prefisso delle chiavi di batch in attesa di replica. PUNTO UNICO (regola L)
+/// condiviso con il consumatore (`mcp-core::nexus_bridge::flush_replication_pending`):
+/// produttore e consumatore devono concordare sul nome, e concordare per
+/// costruzione e' l'unico modo di non divergere.
+///
+/// Ogni batch ha la SUA chiave (`replication:pending:<istante>-<seq>`). Prima
+/// esisteva una chiave sola, `replication:pending`, riscritta a ogni giro: il
+/// worker prepara un batch ogni 180s mentre il consumatore svuota su tutt'altra
+/// cadenza, quindi ogni batch non ancora consumato veniva sovrascritto e perso —
+/// in silenzio, per giunta, perche' il worker dichiarava comunque successo.
+pub const REPLICATION_PENDING_PREFIX: &str = "replication:pending:";
+
+/// Chiave singola usata prima delle chiavi per-batch. Il consumatore la legge
+/// ancora per non perdere un batch preparato dalla versione precedente e rimasto
+/// in memoria durante l'aggiornamento.
+pub const REPLICATION_PENDING_LEGACY_KEY: &str = "replication:pending";
 
 /// Batch serializzato da replicare
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +68,10 @@ pub struct ReplicationWorker {
     interval: Duration,
     /// Max entry per batch (evita batch troppo grandi)
     max_batch_size: usize,
+    /// Discriminante dei batch preparati nello stesso istante: `prepared_at` ha
+    /// risoluzione al secondo, e due batch nello stesso secondo si
+    /// sovrascriverebbero a vicenda proprio come faceva la chiave unica.
+    seq: AtomicU64,
 }
 
 impl Default for ReplicationWorker {
@@ -57,6 +79,7 @@ impl Default for ReplicationWorker {
         Self {
             interval: Duration::from_secs(180), // ogni 3 minuti
             max_batch_size: 100,
+            seq: AtomicU64::new(0),
         }
     }
 }
@@ -98,7 +121,7 @@ impl LearningWorker for ReplicationWorker {
             Some(ns) => ns,
             None => {
                 return WorkerOutcome::ok(self.name(), start.elapsed().as_millis() as u64)
-                    .with_metric("entries_replicated", 0.0);
+                    .with_metric("entries_queued", 0.0);
             }
         };
 
@@ -123,7 +146,7 @@ impl LearningWorker for ReplicationWorker {
 
         if priority_keys.is_empty() {
             return WorkerOutcome::ok(self.name(), start.elapsed().as_millis() as u64)
-                .with_metric("entries_replicated", 0.0);
+                .with_metric("entries_queued", 0.0);
         }
 
         // Costruisce il batch
@@ -146,21 +169,44 @@ impl LearningWorker for ReplicationWorker {
             entries,
         };
 
-        // Tentativo 1: usa il router per persistere (se disponibile)
-        // In futuro: router.persist_namespace_batch(&batch)
-        // Per ora: serializza il batch nel namespace come `replication:pending`
-        // Un consumer esterno (es. un microservizio Nexus) può leggere questa chiave e
-        // fare la scrittura su PostgreSQL.
-        let value = serde_json::to_value(&batch).unwrap_or(serde_json::Value::Null);
+        // Il batch viene ACCODATO nel namespace sotto una chiave propria; a
+        // scriverlo su PostgreSQL e' il consumatore
+        // (`nexus_bridge::flush_replication_pending`), che legge tutte le chiavi
+        // col prefisso e le rimuove una per una.
+        let value = match serde_json::to_value(&batch) {
+            Ok(v) => v,
+            Err(e) => {
+                // Serializzazione fallita: nessun batch accodato. Prima un
+                // `unwrap_or(Value::Null)` scriveva `null` sotto la chiave e il
+                // worker dichiarava ugualmente le entry come replicate; il
+                // consumatore trovava un valore non deserializzabile e lo
+                // scartava. Le entry sparivano senza che nulla lo dicesse.
+                return WorkerOutcome::fail(
+                    self.name(),
+                    format!("serializzazione del batch fallita: {e}"),
+                    start.elapsed().as_millis() as u64,
+                )
+                .with_metric("entries_queued", 0.0);
+            }
+        };
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let key = format!(
+            "{REPLICATION_PENDING_PREFIX}{}-{seq}",
+            batch.prepared_at
+        );
         ns.set_with_ttl(
-            "replication:pending",
+            &key,
             value,
             self.name(),
             Duration::from_secs(600), // TTL 10 minuti — deve essere consumato entro allora
         );
 
+        // `entries_queued`, non `entries_replicated`: questo worker accoda, non
+        // replica. La metrica diceva "replicate" su entry che potevano non
+        // arrivare mai a destinazione (regola M: l'esito deve riflettere il
+        // fatto, non l'intenzione).
         WorkerOutcome::ok(self.name(), start.elapsed().as_millis() as u64)
-            .with_metric("entries_replicated", entry_count as f32)
+            .with_metric("entries_queued", entry_count as f32)
     }
 }
 
@@ -182,9 +228,12 @@ mod tests {
         let outcome = worker.run(&ctx).await;
 
         assert!(outcome.success);
-        assert_eq!(outcome.metrics.get("entries_replicated"), Some(&3.0));
+        assert_eq!(outcome.metrics.get("entries_queued"), Some(&3.0));
 
-        let pending = ns.get("replication:pending").expect("pending batch must exist");
+        let key = pending_keys(&ns)
+            .pop()
+            .expect("un batch accodato deve esistere");
+        let pending = ns.get(&key).expect("pending batch must exist");
         let batch: ReplicationBatch = serde_json::from_value(pending.value).unwrap();
         assert_eq!(batch.entry_count, 3);
         // pattern: e metrics: devono essere prima degli altri
@@ -193,13 +242,57 @@ mod tests {
         assert!(first_keys.contains(&"metrics:latest"));
     }
 
+    /// Chiavi dei batch accodati, ordinate.
+    fn pending_keys(ns: &MemoryNamespace) -> Vec<String> {
+        let mut k: Vec<String> = ns
+            .keys()
+            .into_iter()
+            .filter(|k| k.starts_with(REPLICATION_PENDING_PREFIX))
+            .collect();
+        k.sort();
+        k
+    }
+
+    #[tokio::test]
+    async fn due_giri_accodano_due_batch_distinti() {
+        // IL difetto: la chiave era una sola (`replication:pending`) e ogni giro
+        // sovrascriveva il batch precedente. Il worker prepara un batch ogni
+        // 180s mentre il consumatore svuota su un'altra cadenza, quindi ogni
+        // batch non ancora consumato spariva — senza che nulla lo segnalasse,
+        // visto che il worker dichiarava comunque successo.
+        let ns = Arc::new(MemoryNamespace::new("due-giri"));
+        let worker = ReplicationWorker::new();
+        let ctx = LearningContext::new().with_namespace(ns.clone());
+
+        ns.set("pattern:primo", serde_json::json!({"giro": 1}), "ul");
+        assert!(worker.run(&ctx).await.success);
+
+        ns.set("pattern:secondo", serde_json::json!({"giro": 2}), "ul");
+        assert!(worker.run(&ctx).await.success);
+
+        let keys = pending_keys(&ns);
+        assert_eq!(
+            keys.len(),
+            2,
+            "ogni giro deve accodare il suo batch, non sovrascrivere: {keys:?}"
+        );
+
+        // Il primo batch e' ancora integro e contiene quello che aveva allora.
+        let primo: ReplicationBatch =
+            serde_json::from_value(ns.get(&keys[0]).unwrap().value).unwrap();
+        assert!(
+            primo.entries.iter().any(|e| e.key == "pattern:primo"),
+            "il batch del primo giro non deve essere stato perso"
+        );
+    }
+
     #[tokio::test]
     async fn test_replication_no_namespace() {
         let worker = ReplicationWorker::new();
         let ctx = LearningContext::new();
         let outcome = worker.run(&ctx).await;
         assert!(outcome.success);
-        assert_eq!(outcome.metrics.get("entries_replicated"), Some(&0.0));
+        assert_eq!(outcome.metrics.get("entries_queued"), Some(&0.0));
     }
 
     #[tokio::test]
@@ -218,6 +311,6 @@ mod tests {
         let outcome = worker.run(&ctx).await;
 
         assert!(outcome.success);
-        assert_eq!(outcome.metrics.get("entries_replicated"), Some(&3.0));
+        assert_eq!(outcome.metrics.get("entries_queued"), Some(&3.0));
     }
 }

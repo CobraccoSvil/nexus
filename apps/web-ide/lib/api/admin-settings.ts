@@ -22,10 +22,30 @@ export async function listAdminSettingsByCategory(
   );
 }
 
+/** L'unico esito di SUCCESSO di una scrittura su settings: la chiave esisteva
+ *  ed e' stata aggiornata. Il fallimento non e' un valore di questa unione — il
+ *  backend lo dice con lo status HTTP e `fetchJson` solleva `ApiError` (regola M
+ *  — lo status e' il segnale, il messaggio serve solo per il display): 404 se la
+ *  chiave non esiste, 500 se il DB rifiuta la scrittura.
+ *
+ *  Il PUT aggiorna, non crea: una chiave nuova si dichiara alla fonte (una
+ *  migrazione per i default, `plugins::integrate::publish` per i secret dei
+ *  plugin), dove categoria e `is_secret` sono veri. Prima il backend ripiegava
+ *  su un INSERT in categoria 'custom' e rispondeva `created`: un refuso nel nome
+ *  creava una riga nuova invece di dare errore, e la pagina diceva "salvato" a
+ *  una scrittura senza effetto — il sistema legge la chiave giusta, mai quella
+ *  col refuso. */
+export type AdminSettingUpdateStatus = "ok";
+
+export interface AdminSettingUpdateResult {
+  status: AdminSettingUpdateStatus;
+  key: string;
+}
+
 export async function updateAdminSetting(
   key: string,
   value: string,
-): Promise<{ status: string; key: string }> {
+): Promise<AdminSettingUpdateResult> {
   return fetchJson(`${API_BASE}/api/admin/setting/${key}`, {
     method: "PUT",
     body: JSON.stringify({ value }),
@@ -33,8 +53,20 @@ export async function updateAdminSetting(
 }
 
 // --- Admin Routing: Purpose models ---
+/** La risoluzione LIVE di un purpose: chi risponde ADESSO, e perche'.
+ *  `rationale` e' il segnale strutturato del servizio (regola M):
+ *  `tier=medium:auto` | `tier=medium:degraded_to=light` | `...:upgraded_to=high`. */
+export interface ResolvedPurposeModel {
+  provider: string;
+  model: string;
+  rationale: string;
+}
+
 export interface PurposeModelEntry {
   purpose: string;
+  /** Il valore in tabella. Quando `tier` e' valorizzato NON viene usato: il
+   *  resolver e' tier-only. Mostrare questo campo come "il modello del purpose"
+   *  e' la bugia che il pannello raccontava (vedi `resolved`). */
   provider: string;
   model_id: string;
   notes?: string | null;
@@ -42,6 +74,9 @@ export interface PurposeModelEntry {
   required_capability?: string | null;
   requires_tool_use?: boolean;
   updated_at: string;
+  /** Cosa risolve davvero. `null` = purpose statico (senza tier: allora
+   *  provider/model_id SONO la risposta) oppure non risolvibile ora. */
+  resolved?: ResolvedPurposeModel | null;
 }
 
 export async function listAdminPurposeModels(): Promise<{ items: PurposeModelEntry[] }> {

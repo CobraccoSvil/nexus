@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use super::profile_tools::{tool_create_profile, tool_dispatch_subtask, tool_update_profile};
+use super::profile_tools::{tool_create_profile, tool_update_profile};
 use super::quality_tools::{tool_batch_analyze_code, tool_scan_code_quality};
 use super::semantic_tools::{
     tool_recall_context, tool_search_codebase_semantic, tool_search_file_semantic,
@@ -74,7 +74,6 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
         // timeout esteso (raccomandato dai prompt al posto di run_command).
         "run_tests" => command::tool_run_tests(ctx, input).await,
-        "dispatch_subtask" => tool_dispatch_subtask(ctx.core.clone(), input.clone()).await,
         "create_profile" => tool_create_profile(ctx, input).await,
         "update_profile" => tool_update_profile(ctx, input).await,
         "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
@@ -321,7 +320,8 @@ mod tests {
                 monitor_registry: Arc::new(parking_lot::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
-                reindexer: Arc::new(nexus_agent_tools::context_core::NoopReindexer),
+                hooks: Arc::new(nexus_agent_tools::context_core::NoopMutationHooks),
+                embedder: Arc::new(nexus_agent_tools::context_core::NoopEmbedder),
                 isolated_subrun: false,
             },
             playwright_channels: crate::playwright_live::new_channels(),

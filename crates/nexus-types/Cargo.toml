@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+thiserror = "1.0"
 regex.workspace = true
 axum.workspace = true
 chrono.workspace = true

@@ -6,6 +6,7 @@ import {
   selectMonitors,
   useProjectStore,
 } from "../../lib/project-dispatcher";
+import { formatMonitorValue } from "../../lib/monitor-format";
 
 export interface MonitorPanelProps {
   onSendToChat?: (message: string) => void;
@@ -84,10 +85,4 @@ export function MonitorPanel(_props: MonitorPanelProps) {
       </section>
     </div>
   );
-}
-
-function formatMonitorValue(v: unknown): string {
-  if (v === null || v === undefined) return "—";
-  if (typeof v === "object") return JSON.stringify(v);
-  return String(v);
 }

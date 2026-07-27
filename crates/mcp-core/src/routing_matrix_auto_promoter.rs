@@ -36,6 +36,11 @@ struct IntentRequirement {
     intent: String,
     behavior_mode: String,
     required_capabilities: Vec<String>,
+    /// Capability BASE dell'intent (`nexus_intent_capability`), gia' inclusa fra
+    /// le `required_capabilities`. Tenuta a parte perche' non e' una richiesta
+    /// come le altre: e' cio' che definisce il compito, e chi non la possiede non
+    /// puo' svolgerlo per quanto bene copra il resto.
+    base_capability: Option<String>,
     requires_tool_use: bool,
     preferred_tier: String,
     weight_tier: f32,
@@ -513,14 +518,40 @@ pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
     Ok(healed_total)
 }
 
+/// Le capability richieste da uno slot sono l'UNIONE fra la capability BASE
+/// dell'intent (`nexus_intent_capability`, contratto invariante del compito) e
+/// quelle dichiarate per il singolo modo (`required_capabilities`).
+///
+/// PUNTO UNICO della domanda "quali capability servono per (intent, mode)"
+/// (regola L). Prima le due tabelle rispondevano separatamente e potevano
+/// divergere: su `agentic_default` i modi `economica` e `veloce` chiedevano solo
+/// `{code}` mentre l'intent dichiara `reasoning`, cosi' il promoter sceglieva il
+/// modello piu' economico del tier SENZA reasoning e il turno agentico con
+/// tool-loop chiudeva a vuoto (`empty_completion`). L'unione si fa QUI, in
+/// lettura, percio' un dato che tornasse a divergere resta innocuo: il
+/// comportamento non dipende dall'allineamento della tabella.
+///
+/// L'unione NON e' un filtro rigido: la base entra fra le richieste e pesa nel
+/// `cap_score`, ma la soglia di rilevanza resta `capability_match_pct >= 0.5`.
+/// Irrigidirla causerebbe starvation sugli intent la cui base non ha offerta nel
+/// catalog (oggi `web_search`: zero modelli), incidente gia' visto in ADR 0025.
 async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> {
     let rows = sqlx::query(
-        "SELECT intent, behavior_mode, required_capabilities, requires_tool_use,
-                preferred_tier, weight_tier, weight_cost, weight_context,
-                weight_capabilities, cost_direction
-           FROM nexus_intent_routing_requirements
-          WHERE intent <> '*'
-          ORDER BY intent, behavior_mode",
+        "SELECT r.intent, r.behavior_mode,
+                CASE
+                  WHEN COALESCE(c.base_capability, '') <> ''
+                       AND NOT (c.base_capability = ANY(r.required_capabilities))
+                    THEN r.required_capabilities || ARRAY[c.base_capability]
+                  ELSE r.required_capabilities
+                END AS required_capabilities,
+                NULLIF(c.base_capability, '') AS base_capability,
+                r.requires_tool_use,
+                r.preferred_tier, r.weight_tier, r.weight_cost, r.weight_context,
+                r.weight_capabilities, r.cost_direction
+           FROM nexus_intent_routing_requirements r
+           LEFT JOIN nexus_intent_capability c ON c.intent = r.intent
+          WHERE r.intent <> '*'
+          ORDER BY r.intent, r.behavior_mode",
     )
     .fetch_all(db)
     .await?;
@@ -532,6 +563,7 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
             required_capabilities: r
                 .try_get::<Vec<String>, _>("required_capabilities")
                 .unwrap_or_default(),
+            base_capability: r.try_get::<Option<String>, _>("base_capability").unwrap_or(None),
             requires_tool_use: r.try_get("requires_tool_use").unwrap_or(false),
             preferred_tier: r
                 .try_get("preferred_tier")
@@ -546,6 +578,18 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
 }
 
 async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
+    let gate = crate::orchestrator::qualification_gate(db).await;
+    load_catalog_with_gate(db, gate).await
+}
+
+/// Come [`load_catalog`] ma col gate ESPLICITO. La cache di `qualification_gate`
+/// (60s, statica e in-process) renderebbe i test dipendenti dall'ordine di
+/// esecuzione (regola F): il primo test che la popola deciderebbe per tutti.
+/// Stesso pattern del servizio unico; l'ingresso reale resta `load_catalog`.
+async fn load_catalog_with_gate(
+    db: &PgPool,
+    gate: crate::orchestrator::QualificationGate,
+) -> sqlx::Result<Vec<CatalogModel>> {
     // FASE 2b (regola L, allineamento al routing live / ADR 0025): si carica il
     // catalog SANO con il solo `is_enabled = true`. Il filtro
     // `consecutive_failures = 0` e' stato RIMOSSO: la salute e' gia' garantita da
@@ -553,16 +597,45 @@ async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
     // causava starvation (un modello con 1 fail transitorio sparito dal pool e
     // mai piu' scelto -> counter mai resettato). Identica scelta di
     // select_models_tierchain (path live).
-    let rows = sqlx::query(
+    //
+    // GATE DI QUALIFICAZIONE (fase 3b del consolidamento, censimento 2026-07-15).
+    // Questo selettore alimenta `route_by_slots`, che e' il PRIMO routing tentato
+    // per ogni run con slot completi: era l'unico path agentico vivo che
+    // scavalcava il gate (mig 0591/0595) e l'esclusione pre-GA, quindi poteva
+    // instradare un modello non qualificato o preview proprio dove una chain
+    // agentica muore su un singolo errore. Il gate lo applica ora la stessa
+    // sorgente di verita' del routing live (`qualification_gate`), non una
+    // seconda copia di regole.
+    //
+    // Escluso anche il modello marcato MORTO dal probe (`auto_disabled_reason`
+    // invalid_model/model_not_found): un 404 riabilitato a mano risalirebbe lo
+    // scoring senza che nessuno se ne accorga.
+    //
+    // NB: qui NON si tocca l'ALGORITMO (scoring pesato con il tier come
+    // preferenza morbida, peso ~0.35): consolidarlo col servizio unico
+    // cambierebbe il comportamento del routing slot-based e non sarebbe una
+    // migrazione 1:1. E' una decisione di prodotto separata, non un fix.
+    let mut sql = String::from(
         "SELECT provider, model, performance_tier,
                 input_cost_per_million_tokens::float8 AS input_cost,
                 context_window, supports_tool_use,
                 capabilities, agentic_thinking_policy, pricing_state
            FROM ai_price_catalog
-          WHERE is_enabled = true",
-    )
-    .fetch_all(db)
-    .await?;
+          WHERE is_enabled = true
+            AND (auto_disabled_reason IS NULL
+                 OR (auto_disabled_reason NOT LIKE 'invalid_model%'
+                     AND auto_disabled_reason NOT LIKE 'model_not_found%'))",
+    );
+    if gate.require_qualified {
+        sql.push_str(
+            " AND qualification_state = 'qualified'
+              AND (qualification_expires_at IS NULL OR qualification_expires_at > now())",
+        );
+    }
+    if gate.exclude_preview {
+        sql.push_str(" AND model !~* '(preview|experimental|[-_]exp([-_.]|$))'");
+    }
+    let rows = sqlx::query(&sql).fetch_all(db).await?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -597,37 +670,83 @@ async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
         .collect())
 }
 
+/// Candidati che possiedono la capability BASE dell'intent.
+///
+/// `None` quando il vincolo non e' applicabile — nessuna base dichiarata, oppure
+/// nessun modello la possiede — e il chiamante deve aprire la selezione a tutti.
+/// Distinguere "vincolo non applicabile" da "nessun candidato" e' il punto:
+/// restituire un elenco vuoto lascerebbe l'intent senza modelli invece che senza
+/// vincolo.
+fn filtra_per_capability_base<'a>(
+    req: &IntentRequirement,
+    catalog: &'a [CatalogModel],
+) -> Option<Vec<&'a CatalogModel>> {
+    let base = req.base_capability.as_ref()?.to_lowercase();
+    let con_base: Vec<&CatalogModel> = catalog
+        .iter()
+        .filter(|m| m.capabilities.iter().any(|c| c.to_lowercase() == base))
+        .collect();
+    if con_base.is_empty() {
+        tracing::warn!(
+            intent = %req.intent,
+            behavior_mode = %req.behavior_mode,
+            base_capability = %base,
+            "routing: nessun modello possiede la capability base dell'intent, \
+             vincolo aperto per non lasciare lo slot senza candidati"
+        );
+        return None;
+    }
+    Some(con_base)
+}
+
+/// Filtri di eleggibilita' che non ammettono compromessi (a differenza dello
+/// scoring, dove una carenza si compensa con un pregio).
+fn passa_filtri_obbligatori(req: &IntentRequirement, m: &CatalogModel) -> bool {
+    if req.requires_tool_use && !m.supports_tool_use {
+        return false;
+    }
+    // FASE 2b: per gli slot che richiedono tool_use, escludi i modelli con
+    // agentic_thinking_policy='exclude' (allineamento al routing live, ADR 0025):
+    // cosi' la matrix non pinna modelli che il live scarta.
+    if req.requires_tool_use && m.agentic_thinking_policy == "exclude" {
+        return false;
+    }
+    if req.required_capabilities.is_empty() || m.capabilities.is_empty() {
+        return true;
+    }
+    let required_lc: Vec<String> = req
+        .required_capabilities
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
+    // Almeno 50% delle capability richieste devono essere presenti.
+    capability_match_pct(&required_lc, &cap_lc) >= 0.5
+}
+
 /// Per un (intent, behavior_mode) ritorna top-N candidati distinti per provider
 /// (max 3, uno per provider). Score 0..1.
 fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> Vec<ScoredModel> {
-    let mut scored: Vec<ScoredModel> = catalog
-        .iter()
-        .filter(|m| {
-            // Filtri obbligatori.
-            if req.requires_tool_use && !m.supports_tool_use {
-                return false;
-            }
-            // FASE 2b: per gli slot che richiedono tool_use, escludi i modelli
-            // con agentic_thinking_policy='exclude' (allineamento al routing live,
-            // ADR 0025): cosi' la matrix non pinna modelli che il live scarta.
-            if req.requires_tool_use && m.agentic_thinking_policy == "exclude" {
-                return false;
-            }
-            if !req.required_capabilities.is_empty() && !m.capabilities.is_empty() {
-                let required_lc: Vec<String> = req
-                    .required_capabilities
-                    .iter()
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
-                let pct = capability_match_pct(&required_lc, &cap_lc);
-                // Almeno 50% delle capability richieste devono essere presenti.
-                if pct < 0.5 {
-                    return false;
-                }
-            }
-            true
-        })
+    // La capability BASE dell'intent e' cio' che definisce il compito: chi non la
+    // possiede ne resta fuori, per quanto copra il resto e per quanto costi poco.
+    // Il solo punteggio non bastava: il peso capability (0.20) e' inferiore a
+    // quello del costo (0.25), quindi un modello molto economico privo della base
+    // poteva vincere lo stesso. Su `debug` accadeva esattamente questo.
+    //
+    // La degradazione evita la starvation (ADR 0025): se NESSUN candidato possiede
+    // la base — oggi `web_search`, zero modelli nel catalog — il vincolo si apre e
+    // si sceglie fra tutti, dichiarandolo nei log invece di restare senza
+    // candidati in silenzio.
+    // Il pool di NORMALIZZAZIONE del costo resta il catalogo intero: restringerlo
+    // ai soli candidati cambierebbe il significato del punteggio di costo a ogni
+    // filtro, rendendo i punteggi non confrontabili fra slot.
+    let candidati = match filtra_per_capability_base(req, catalog) {
+        Some(ridotto) => ridotto,
+        None => catalog.iter().collect(),
+    };
+    let mut scored: Vec<ScoredModel> = candidati
+        .into_iter()
+        .filter(|m| passa_filtri_obbligatori(req, m))
         .map(|m| ScoredModel {
             score: score_model(req, m, catalog),
             catalog: m.clone(),
@@ -691,6 +810,9 @@ pub(crate) async fn select_models_for_requirement(
         intent: String::new(),
         behavior_mode: String::new(),
         required_capabilities: required_capabilities.to_vec(),
+        // Il chiamante slot-based esprime gia' tier+capability senza distinguere
+        // una base: nessuna capability e' privilegiata qui.
+        base_capability: None,
         requires_tool_use,
         preferred_tier: preferred_tier.to_string(),
         weight_tier: weights.tier,
@@ -707,21 +829,42 @@ pub(crate) async fn select_models_for_requirement(
 
 /// Calcola lo score 0..1 per un modello dato un requirement.
 /// Esposto per testabilita'.
+/// Punteggio capability di un modello, 0..1.
+///
+/// La capability BASE dell'intent non e' una richiesta come le altre: e' cio'
+/// che definisce il compito. Chi non la possiede prende 0, per quanto copra il
+/// resto. Senza questa distinzione un modello poteva PAREGGIARE il punteggio
+/// coprendo capability diverse da quella che conta e vincere sul prezzo: su
+/// `debug` ({code, fix, reasoning}) un modello con code+fix ma senza reasoning
+/// pareggiava 2/3 contro uno con code+reasoning, e passava perche' costava meno.
+///
+/// Non e' un filtro: chi manca della base resta candidabile. Se NESSUN modello
+/// la possiede — oggi `web_search`, zero modelli nel catalog — tutti prendono 0
+/// e la scelta torna a tier, costo e finestra, senza starvation (ADR 0025).
+fn capability_score(req: &IntentRequirement, m: &CatalogModel) -> f32 {
+    if req.required_capabilities.is_empty() {
+        return 1.0;
+    }
+    let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
+    if let Some(base) = req.base_capability.as_ref() {
+        let base_lc = base.to_lowercase();
+        if !cap_lc.contains(&base_lc) {
+            return 0.0;
+        }
+    }
+    let required_lc: Vec<String> = req
+        .required_capabilities
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    capability_match_pct(&required_lc, &cap_lc)
+}
+
 fn score_model(req: &IntentRequirement, m: &CatalogModel, full_catalog: &[CatalogModel]) -> f32 {
     let tier_score = tier_score(&req.preferred_tier, &m.performance_tier);
     let cost_score = cost_score(req, m, full_catalog);
     let context_score = context_score(m.context_window);
-    let cap_score = if req.required_capabilities.is_empty() {
-        1.0
-    } else {
-        let required_lc: Vec<String> = req
-            .required_capabilities
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
-        let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
-        capability_match_pct(&required_lc, &cap_lc)
-    };
+    let cap_score = capability_score(req, m);
 
     req.weight_tier * tier_score
         + req.weight_cost * cost_score
@@ -880,6 +1023,7 @@ mod tests {
             intent: intent.into(),
             behavior_mode: behavior.into(),
             required_capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            base_capability: None,
             requires_tool_use: tools,
             preferred_tier: tier.into(),
             weight_tier: 0.35,
@@ -1339,6 +1483,184 @@ mod tests {
         assert_eq!(
             pick_best_replacement("deadfamily-2411", &cands).as_deref(),
             Some("other-b")
+        );
+    }
+    /// REGRESSIONE (censimento punti unici, 2026-07-15): `route_by_slots` e' il
+    /// PRIMO routing tentato per ogni run con slot completi, e passa da qui.
+    /// Era l'unico path agentico VIVO che scavalcava il gate di qualificazione
+    /// (mig 0591/0595) e l'esclusione pre-GA: instradava modelli non qualificati
+    /// proprio dove una chain agentica muore su un singolo errore.
+    ///
+    /// Il gate va applicato dalla STESSA sorgente del routing live
+    /// (`qualification_gate`), non da una seconda copia di regole.
+    #[sqlx::test]
+    async fn load_catalog_applica_il_gate_di_qualificazione(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO ai_price_catalog              (provider, model, is_enabled, supports_tool_use, performance_tier,               capabilities, qualification_state, qualification_expires_at,               input_cost_per_million_tokens, auto_disabled_reason) VALUES              ('p', 'qualificato',      true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 1.0, NULL),              ('p', 'non-qualificato',  true, true, 'medium', '[\"code\"]'::jsonb, 'unqualified', NULL, 0.1, NULL),              ('p', 'scaduto',          true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() - interval '1 day', 0.1, NULL),              ('p', 'gemini-preview',   true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, NULL),              ('p', 'morto-404',        true, true, 'medium', '[\"code\"]'::jsonb, 'qualified',   now() + interval '30 days', 0.1, 'invalid_model: 404')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+
+        let gate = crate::orchestrator::QualificationGate {
+            require_qualified: true,
+            exclude_preview: true,
+        };
+        let caricati: Vec<String> = load_catalog_with_gate(&pool, gate)
+            .await
+            .expect("load_catalog")
+            .into_iter()
+            .map(|m| m.model)
+            .collect();
+        assert_eq!(
+            caricati,
+            vec!["qualificato".to_string()],
+            "col gate acceso il selettore slot-based deve caricare SOLO il modello              qualificato e non scaduto: i non qualificati, gli scaduti, i preview e              i modelli marcati morti dal probe sono tutti piu' economici e              vincerebbero lo scoring se il gate mancasse"
+        );
+    }
+
+    /// REGRESSIONE (2026-07-26, seguito del fix `agentic_default`): con tutte le
+    /// capability trattate alla pari, su `debug` ({code, fix, reasoning}) un
+    /// modello con code+fix ma SENZA reasoning pareggiava 2/3 contro uno con
+    /// code+reasoning, e vinceva perche' costava molto meno. La capability BASE
+    /// dell'intent non e' una richiesta come le altre: chi non ce l'ha non puo'
+    /// svolgere il compito, per quanto copra il resto.
+    #[test]
+    fn senza_la_capability_base_il_punteggio_capability_e_nullo() {
+        let mut requisito = req(
+            "debug",
+            "economica",
+            vec!["code", "fix", "reasoning"],
+            true,
+            "medium",
+            "asc",
+        );
+        requisito.base_capability = Some("reasoning".into());
+
+        // Copre due richieste su tre, ma non quella che definisce il compito.
+        let senza_base = model("mistral", "piccolo", "medium", 0.06, 128_000, true, vec!["code", "fix"]);
+        // Copre due richieste su tre, fra cui la base.
+        let con_base = model(
+            "mistral",
+            "ragionante",
+            "medium",
+            0.50,
+            128_000,
+            true,
+            vec!["code", "reasoning"],
+        );
+
+        assert_eq!(
+            capability_score(&requisito, &senza_base),
+            0.0,
+            "senza la capability base il punteggio capability deve azzerarsi, \
+             altrimenti il pareggio con chi la possiede lascia decidere il prezzo"
+        );
+        assert!(
+            capability_score(&requisito, &con_base) > 0.0,
+            "chi possiede la base mantiene il punteggio delle altre capability"
+        );
+
+        // La conseguenza che conta e' la SELEZIONE, non il punteggio: il peso
+        // capability (0.20) e' inferiore a quello del costo (0.25), quindi il
+        // solo punteggio azzerato lascerebbe vincere il modello molto piu'
+        // economico. Chi non ha la base va escluso dai candidati.
+        let catalogo = vec![senza_base.clone(), con_base.clone()];
+        let scelti: Vec<String> = select_top_candidates(&requisito, &catalogo)
+            .into_iter()
+            .map(|s| s.catalog.model)
+            .collect();
+        assert_eq!(
+            scelti,
+            vec!["ragionante".to_string()],
+            "il piu' economico privo della capability base non deve essere candidabile"
+        );
+    }
+
+    /// Nessuna starvation quando la base non ha offerta: se NESSUN modello la
+    /// possiede (oggi `web_search`, zero modelli nel catalog) tutti prendono 0 e
+    /// la scelta torna a tier, costo e finestra. E' l'incidente dell'ADR 0025.
+    #[test]
+    fn base_senza_offerta_non_azzera_la_selezione() {
+        let mut requisito = req(
+            "ricerca_web",
+            "veloce",
+            vec!["chat", "web_search"],
+            true,
+            "medium",
+            "asc",
+        );
+        requisito.base_capability = Some("web_search".into());
+        let a = model("p", "a", "medium", 0.10, 128_000, true, vec!["chat"]);
+        let b = model("p", "b", "medium", 0.20, 128_000, true, vec!["chat"]);
+        let catalogo = vec![a.clone(), b.clone()];
+
+        assert_eq!(capability_score(&requisito, &a), 0.0);
+        assert_eq!(capability_score(&requisito, &b), 0.0);
+        // Il punteggio complessivo resta non nullo e ordinabile: la selezione
+        // continua a scegliere, non resta senza candidati.
+        assert!(score_model(&requisito, &a, &catalogo) > 0.0);
+        assert!(
+            score_model(&requisito, &a, &catalogo) > score_model(&requisito, &b, &catalogo),
+            "a parita' di capability decide il costo, come prima"
+        );
+    }
+
+    /// REGRESSIONE (incidente empty_completion su `agentic_default`, 2026-07-26):
+    /// due tabelle rispondevano alla stessa domanda "quali capability servono per
+    /// questo intent" e potevano divergere. `nexus_intent_capability` dichiarava
+    /// `reasoning` per `agentic_default`, ma i modi `economica` e `veloce` di
+    /// `nexus_intent_routing_requirements` chiedevano solo `{code}`: il promoter
+    /// sceglieva quindi il modello piu' economico del tier privo di reasoning
+    /// (mistral-small-latest, 0.06/M) e il turno agentico con tool-loop chiudeva
+    /// a vuoto, facendo fallire il run.
+    ///
+    /// Il test attraversa `load_requirements`, cioe' la STESSA funzione che il
+    /// promoter usa in produzione (regola O), e gira sulle migrazioni reali:
+    /// verifica prima che il seed non diverga, poi REINTRODUCE la divergenza
+    /// esatta dell'incidente per provare che il codice la sana in lettura.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn i_requisiti_includono_sempre_la_capability_base_dell_intent(pool: sqlx::PgPool) {
+        let divergenti: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM nexus_intent_routing_requirements r
+               JOIN nexus_intent_capability c ON c.intent = r.intent
+              WHERE COALESCE(c.base_capability, '') <> ''
+                AND NOT (c.base_capability = ANY(r.required_capabilities))",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("conteggio divergenze sul seed");
+        assert_eq!(
+            divergenti, 0,
+            "il seed delle migrazioni non deve piu' contenere slot che chiedono \
+             meno della capability base dichiarata per il loro intent (mig 0641)"
+        );
+
+        // Mutazione: rimette esattamente la divergenza che causo' l'incidente.
+        sqlx::query(
+            "UPDATE nexus_intent_routing_requirements
+                SET required_capabilities = ARRAY['code']
+              WHERE intent = 'agentic_default' AND behavior_mode = 'economica'",
+        )
+        .execute(&pool)
+        .await
+        .expect("reintroduce la divergenza");
+
+        let slot = load_requirements(&pool)
+            .await
+            .expect("load_requirements")
+            .into_iter()
+            .find(|r| r.intent == "agentic_default" && r.behavior_mode == "economica")
+            .expect("slot agentic_default/economica");
+
+        assert!(
+            slot.required_capabilities.iter().any(|c| c == "reasoning"),
+            "anche con la tabella tornata a divergere, il promoter deve chiedere \
+             la capability base dell'intent: l'unione avviene in lettura, percio' \
+             il comportamento non dipende dall'allineamento del dato. \
+             Capability lette: {:?}",
+            slot.required_capabilities
         );
     }
 }

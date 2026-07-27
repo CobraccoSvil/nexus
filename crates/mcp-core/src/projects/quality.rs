@@ -1931,6 +1931,125 @@ async fn emit_findings_updated_for_project(
     );
 }
 
+/// Lo schema META su cui gira la scansione qualita', ricostruito da zero dalle
+/// migrazioni — non il DB di sviluppo.
+///
+/// Perche' esiste (regola O): `nexus_quality_scans` e le quattro colonne
+/// vettoriali di `project_quality_findings` erano dichiarate da due migrazioni
+/// il cui corpo e' `SELECT 1;`. Nessuno se n'e' accorto per anni perche' ogni
+/// strumento che avrebbe potuto vederlo guardava altrove: i contract test si
+/// connettono a `DATABASE_URL` (il DB gia' migrato, l'unico in cui il difetto
+/// non esiste), la CI applicava le migrazioni con `psql -f ... || true`
+/// buttando via gli exit code, e uno stub `SELECT 1;` non fallisce comunque —
+/// lascia un buco. Questi test partono da un DB vergine e chiamano le funzioni
+/// che scrivono davvero, non una loro imitazione.
+#[cfg(test)]
+mod schema_meta {
+    use super::*;
+    use sqlx::{PgPool, Row};
+    use uuid::Uuid;
+
+    /// Righe minime perche' la FK `project_id -> projects(id)` sia soddisfatta.
+    /// Sono INSERT su tabelle create dalle migrazioni, non `CREATE TABLE` a mano.
+    async fn semina_progetto(db: &PgPool) -> Uuid {
+        let team_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1, 'team di prova', $2)")
+            .bind(team_id)
+            .bind(format!("team-{team_id}"))
+            .execute(db)
+            .await
+            .expect("insert teams");
+        sqlx::query(
+            "INSERT INTO users (id, email, display_name, role) \
+             VALUES ($1, $2, 'utente di prova', 'member')",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@example.test"))
+        .execute(db)
+        .await
+        .expect("insert users");
+        sqlx::query(
+            "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+             VALUES ($1, $2, 'progetto di prova', $3, $4)",
+        )
+        .bind(project_id)
+        .bind(team_id)
+        .bind(format!("progetto-{project_id}"))
+        .bind(user_id)
+        .execute(db)
+        .await
+        .expect("insert projects");
+        project_id
+    }
+
+    /// `insert_running_scan` e' l'unico punto della pipeline che propaga
+    /// l'errore invece di ingoiarlo: su uno schema privo di
+    /// `nexus_quality_scans` e' il 500 che l'utente vede quando avvia una
+    /// scansione. Il test parte da li'.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_scansione_qualita_ha_la_sua_tabella(db: PgPool) {
+        let project_id = semina_progetto(&db).await;
+
+        let scan_id = insert_running_scan(&db, project_id)
+            .await
+            .expect("insert_running_scan su schema ricostruito dalle migrazioni");
+
+        let (status, letto_project): (String, Uuid) =
+            sqlx::query_as("SELECT status, project_id FROM nexus_quality_scans WHERE id = $1")
+                .bind(scan_id)
+                .fetch_one(&db)
+                .await
+                .expect("la riga appena inserita si rilegge");
+        assert_eq!(status, "running", "la scansione nasce in stato running");
+        assert_eq!(letto_project, project_id);
+    }
+
+    /// `insert_findings_batch` scrive in fire-and-forget (`let _ = ...`): su uno
+    /// schema privo delle colonne vettoriali non fallisce, semplicemente non
+    /// scrive nulla. Per questo il test asserisce sulle RIGHE e sui VALORI
+    /// riletti, mai sull'assenza di errore — e li rilegge con la stessa query
+    /// che alimenta il pannello Ottimizzazione.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn i_finding_conservano_i_campi_della_passata_vettoriale(db: PgPool) {
+        let project_id = semina_progetto(&db).await;
+
+        let batch = vec![FindingRow {
+            file: "src/lib.rs".to_string(),
+            category: "performance".to_string(),
+            severity: "high".to_string(),
+            title: "query in ciclo".to_string(),
+            detail: "N+1 sospetta".to_string(),
+            line_number: Some(42),
+            confidence: Some("high".to_string()),
+            context_snippet: Some("for x in rows { db.query(..) }".to_string()),
+            related_files: Some(vec!["src/altro.rs".to_string()]),
+            is_auto_suppressed: false,
+        }];
+        insert_findings_batch(&db, project_id, &batch).await;
+
+        let righe = query_findings_all_severities(&db, project_id, 10)
+            .await
+            .expect("la query del pannello gira sullo schema ricostruito");
+        assert_eq!(righe.len(), 1, "il finding e' stato scritto");
+
+        let r = &righe[0];
+        assert_eq!(
+            r.try_get::<Option<String>, _>("confidence").unwrap(),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            r.try_get::<Option<String>, _>("context_snippet").unwrap(),
+            Some("for x in rows { db.query(..) }".to_string())
+        );
+        assert_eq!(
+            r.try_get::<Option<Vec<String>>, _>("related_files").unwrap(),
+            Some(vec!["src/altro.rs".to_string()])
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

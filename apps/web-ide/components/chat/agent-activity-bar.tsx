@@ -1,7 +1,14 @@
 "use client";
 
+import type { ReactNode } from "react";
 import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
 import { stepLabel } from "./tool-labels";
+import {
+  activityStatusView,
+  formatDuration,
+  interruptButtonView,
+  RUN_LONG_THRESHOLD_SECONDS,
+} from "./interrupt-button-logic";
 
 /**
  * Barra di stato "AI in esecuzione": riassume lo stato del run agente in corso
@@ -13,6 +20,7 @@ import { stepLabel } from "./tool-labels";
 export function AgentActivityBar({
   tc,
   isAgentStuck,
+  runElapsedSeconds,
   secondsSinceLastStep,
   busyLabel,
   isAgentRunning,
@@ -29,9 +37,18 @@ export function AgentActivityBar({
   latestOutputSnippet,
   latestStepWithOutputResult,
   timelineSteps,
+  trailing,
 }: {
   tc: Record<string, string>;
   isAgentStuck: boolean;
+  /**
+   * Secondi dall'AVVIO del run: e' il timer che la barra mostra e la grandezza
+   * su cui scattano l'evidenza arancione e il pulsante di interruzione. Si
+   * chiamava `secondsSinceLastStep` pur misurando l'avvio run, ed e' cosi' che
+   * la comparsa del pulsante veniva letta come "agente bloccato".
+   */
+  runElapsedSeconds: number;
+  /** Secondi dall'ultimo step o meta-step: l'inattivita' vera, per i tooltip. */
   secondsSinceLastStep: number;
   busyLabel: string;
   isAgentRunning: boolean;
@@ -48,7 +65,23 @@ export function AgentActivityBar({
   latestOutputSnippet: string | undefined;
   latestStepWithOutputResult: string | undefined;
   timelineSteps: AgentStep[];
+  /** Contenuto agganciato in coda alla riga di stato (es. centro notifiche del
+   *  run). Sta QUI e non in una riga propria: la barra esiste gia' per l'intera
+   *  durata del run, quindi ospitarlo non costa altezza. */
+  trailing?: ReactNode;
 }) {
+  const interrupt = interruptButtonView({
+    runElapsedSeconds,
+    secondsSinceLastStep,
+    isAgentStuck,
+  });
+  const status = activityStatusView({
+    runElapsedSeconds,
+    secondsSinceLastStep,
+    isAgentStuck,
+    busyLabel,
+  });
+  const runIsLong = runElapsedSeconds > RUN_LONG_THRESHOLD_SECONDS;
   return (
     <div
       style={{
@@ -56,16 +89,35 @@ export function AgentActivityBar({
         borderRadius: 8,
         border: `1px solid ${tc.border}`,
         background: tc.bgCard,
+        // I due blocchi (riga di stato + dettagli) si IMPILANO. Era `flex` in
+        // direzione riga di default: stavano quindi affiancati, la riga di stato
+        // si dimensionava sul proprio contenuto e sfondava la card, spingendo
+        // fuori dal bordo lo slot in coda (il centro notifiche del run). Che i
+        // dettagli vadano sotto lo dice il loro stesso `borderTop`.
         display: "flex",
-        alignItems: "center",
-        gap: 8,
+        flexDirection: "column",
+        alignItems: "stretch",
         flexShrink: 0,
+        // Nessun gap: i dettagli sono gia' separati dal proprio borderTop, e uno
+        // spazio qui aprirebbe una fessura nel bordo della card.
+        overflow: "hidden",
         boxShadow: "0 2px 8px rgba(0,0,0,0.10)",
       }}
       aria-live="polite"
     >
-      {/* Riga principale */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px" }}>
+      {/* Riga principale. `minWidth: 0` e' cio' che permette ai figli con
+          ellipsis (l'attivita' corrente) di restringersi davvero: senza, un flex
+          item non scende sotto il proprio contenuto minimo e la riga cresce oltre
+          la card invece di troncare il testo. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "7px 10px",
+          minWidth: 0,
+        }}
+      >
         <span
           style={{
             width: 8,
@@ -77,8 +129,11 @@ export function AgentActivityBar({
             flexShrink: 0,
           }}
         />
-        <strong style={{ color: isAgentStuck ? "#f97316" : tc.text, fontSize: 12 }}>
-          {secondsSinceLastStep > 120 ? "⚠ AI in elaborazione" : isAgentStuck ? "⚠ Agente in attesa" : busyLabel}
+        <strong
+          title={status.title}
+          style={{ color: status.warn ? "#f97316" : tc.text, fontSize: 12 }}
+        >
+          {status.text}
         </strong>
         {isAgentRunning && runningAgentStep ? (
           <span style={{ color: tc.textMuted, fontSize: 11 }}>
@@ -103,28 +158,30 @@ export function AgentActivityBar({
           </span>
         ) : null}
         {isAgentRunning && (
-          <span style={{
-            fontSize: 10,
-            color: secondsSinceLastStep > 120 ? "#f97316" : tc.textMuted,
-            fontVariantNumeric: "tabular-nums",
-            marginLeft: 4,
-          }}>
-            {secondsSinceLastStep < 60
-              ? `${secondsSinceLastStep}s`
-              : `${Math.floor(secondsSinceLastStep / 60)}m ${secondsSinceLastStep % 60}s`}
+          <span
+            title="Tempo trascorso dall'avvio del run"
+            style={{
+              fontSize: 10,
+              color: runIsLong ? "#f97316" : tc.textMuted,
+              fontVariantNumeric: "tabular-nums",
+              marginLeft: 4,
+            }}
+          >
+            {formatDuration(runElapsedSeconds)}
           </span>
         )}
-        {secondsSinceLastStep > 120 && agentRun?.runId && (
+        {interrupt.visible && agentRun?.runId && (
           <button
             type="button"
             onClick={() => onCancelRun(agentRun.runId)}
+            title={interrupt.title}
             style={{
               fontSize: 10, padding: "2px 8px", borderRadius: 4,
               border: "1px solid #f9731680", background: "#f9731618",
               color: "#f97316", cursor: "pointer", fontWeight: 600,
             }}
           >
-            Forza stop
+            {interrupt.label}
           </button>
         )}
         {isAgentRunning && (
@@ -142,6 +199,21 @@ export function AgentActivityBar({
             {agentStatusExpanded ? "▾" : "▸"}
           </button>
         )}
+        {/* Slot in coda: ospita il centro notifiche del run. Se il toggle sopra
+            e' presente, il suo marginLeft:auto ha gia' spinto il gruppo a destra
+            e qui basta un piccolo distacco; altrimenti ci si spinge da soli. */}
+        {trailing ? (
+          <span
+            style={{
+              marginLeft: isAgentRunning ? 4 : "auto",
+              display: "inline-flex",
+              alignItems: "center",
+              flex: "0 0 auto",
+            }}
+          >
+            {trailing}
+          </span>
+        ) : null}
       </div>
       {/* Dettagli espandibili */}
       {isAgentRunning && agentStatusExpanded && (
@@ -150,6 +222,38 @@ export function AgentActivityBar({
           padding: "6px 10px 8px",
           display: "flex", flexDirection: "column", gap: 4,
         }}>
+          {/* Metriche del run in corso. Stavano in una card separata del pannello
+              step (`agent-steps-panel`), adiacente a questa e con le STESSE cifre:
+              qui appartengono, perche' questa e' la card del run attivo. Il
+              pannello le mostra ora solo per i run gia' conclusi. */}
+          {(agentRun?.usage?.totalTokens || agentRun?.totalCostUsd) && (
+            <div style={{ color: tc.textMuted, fontSize: 11, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {agentRun?.usage?.totalTokens ? (
+                <span>
+                  Token totali:{" "}
+                  <strong style={{ fontFamily: "var(--font-mono)", color: tc.text }}>
+                    {agentRun.usage.totalTokens.toLocaleString()}
+                  </strong>
+                </span>
+              ) : null}
+              {agentRun?.totalCostUsd ? (
+                <span>
+                  Costo:{" "}
+                  <strong style={{ fontFamily: "var(--font-mono)", color: tc.text }}>
+                    ${agentRun.totalCostUsd.toFixed(6)}
+                  </strong>
+                </span>
+              ) : null}
+              {agentRun?.createdAt ? (
+                <span>
+                  Inizio:{" "}
+                  <strong style={{ fontFamily: "var(--font-mono)", color: tc.textMuted }}>
+                    {new Date(agentRun.createdAt).toLocaleTimeString()}
+                  </strong>
+                </span>
+              ) : null}
+            </div>
+          )}
           <div style={{ color: tc.textMuted, fontSize: 11 }}>
             Step completati: {completedSteps}
             {runningSteps > 0 ? ` • in corso: ${runningSteps}` : ""}

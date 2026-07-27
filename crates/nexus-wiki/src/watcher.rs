@@ -302,7 +302,7 @@ async fn run(state: Arc<WikiDeps>) -> anyhow::Result<()> {
                 match maybe_event {
                     None => break, // canale chiuso (shutdown)
                     Some(Ok(event)) => {
-                        enqueue_event(&mut pending, &event);
+                        enqueue_event(&mut pending, &event, &roots);
                         // ADR 0020: se l'evento tocca un file di config build
                         // graph dentro una project root, invalida la cache.
                         maybe_invalidate_build_graph(&event, &project_root_map).await;
@@ -324,7 +324,12 @@ async fn run(state: Arc<WikiDeps>) -> anyhow::Result<()> {
 }
 
 /// Aggiunge i path dell'evento al buffer (solo .md, solo Create/Modify).
-fn enqueue_event(pending: &mut HashMap<PathBuf, Instant>, event: &Event) {
+/// Il filtro delle cartelle escluse delega al punto unico
+/// `nexus_tool_kit::is_in_skipped_dir` per COMPONENTE relativo al vault root
+/// (regola L, S24): il vecchio filtro substring con '/' non matchava mai i
+/// separatori '\' di Windows e il watcher reingeriva i .md di
+/// .git/node_modules/.venv interi (incidente stack overflow 20/07).
+fn enqueue_event(pending: &mut HashMap<PathBuf, Instant>, event: &Event, roots: &[WatchedRoot]) {
     match &event.kind {
         EventKind::Create(_) => {}
         EventKind::Modify(notify::event::ModifyKind::Data(_)) => {}
@@ -339,13 +344,13 @@ fn enqueue_event(pending: &mut HashMap<PathBuf, Instant>, event: &Event) {
             .map(|e| e.eq_ignore_ascii_case("md"))
             .unwrap_or(false)
         {
-            // Salta cartelle escluse (best-effort: `.git`, `.obsidian`, `node_modules`).
-            let lossy = p.to_string_lossy();
-            if lossy.contains("/.git/")
-                || lossy.contains("/.obsidian/")
-                || lossy.contains("/node_modules/")
-                || lossy.contains("/target/")
-            {
+            // Path fuori da ogni vault root (es. i watch non-ricorsivi sulle
+            // project root per ADR 0020): mai reingeribili, scarta subito —
+            // il flush li avrebbe comunque scartati in resolve_root.
+            let Some(root) = resolve_root(p, roots) else {
+                continue;
+            };
+            if nexus_tool_kit::is_in_skipped_dir(p, &root.path) {
                 continue;
             }
             pending.insert(p.clone(), now);
@@ -490,6 +495,14 @@ mod tests {
         assert!(resolve_root(Path::new("/elsewhere/x.md"), &roots).is_none());
     }
 
+    fn roots_di_test(vault: &str) -> Vec<WatchedRoot> {
+        vec![WatchedRoot {
+            path: PathBuf::from(vault),
+            scope: WikiScope::Meta,
+            project_id: None,
+        }]
+    }
+
     #[test]
     fn enqueue_event_filters_non_md_and_excluded() {
         let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
@@ -502,12 +515,45 @@ mod tests {
                 PathBuf::from("/tmp/vault/b.txt"),
                 PathBuf::from("/tmp/vault/.git/c.md"),
                 PathBuf::from("/tmp/vault/sub/.obsidian/d.md"),
+                PathBuf::from("/tmp/vault/node_modules/pkg/e.md"),
+                PathBuf::from("/tmp/vault/api/.venv/lib/site-packages/f.md"),
+                PathBuf::from("/elsewhere/fuori-da-ogni-root.md"),
             ],
             attrs: Default::default(),
         };
-        enqueue_event(&mut pending, &event);
+        enqueue_event(&mut pending, &event, &roots_di_test("/tmp/vault"));
         assert_eq!(pending.len(), 1);
         assert!(pending.contains_key(&PathBuf::from("/tmp/vault/a.md")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enqueue_event_regressione_backslash_windows() {
+        // Incidente 20/07: il filtro substring "/.git/" ecc. non matchava mai
+        // i path Windows (separatore '\') e il watcher accodava i .md di
+        // node_modules e site-packages (migliaia per virtualenv). Il vault
+        // root e' esso stesso una dot-dir (.nexus-vault) e NON deve essere
+        // scartato: si valutano solo i componenti relativi al root.
+        let roots = roots_di_test(r"D:\IDEAI\docs\.nexus-vault");
+        let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![
+                PathBuf::from(r"D:\IDEAI\docs\.nexus-vault\adr\0010-porte.md"),
+                PathBuf::from(r"D:\IDEAI\docs\.nexus-vault\node_modules\pkg\readme.md"),
+                PathBuf::from(r"D:\IDEAI\docs\.nexus-vault\.venv\Lib\site-packages\pkg\doc.md"),
+                PathBuf::from(r"D:\IDEAI\docs\.nexus-vault\.git\x.md"),
+                PathBuf::from(r"D:\IDEAI\docs\.nexus-vault\target\doc\y.md"),
+            ],
+            attrs: Default::default(),
+        };
+        enqueue_event(&mut pending, &event, &roots);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&PathBuf::from(
+            r"D:\IDEAI\docs\.nexus-vault\adr\0010-porte.md"
+        )));
     }
 
     #[test]
@@ -530,7 +576,7 @@ mod tests {
             paths: vec![PathBuf::from("/tmp/vault/a.md")],
             attrs: Default::default(),
         };
-        enqueue_event(&mut pending, &event);
+        enqueue_event(&mut pending, &event, &roots_di_test("/tmp/vault"));
         assert!(pending.is_empty());
     }
 }

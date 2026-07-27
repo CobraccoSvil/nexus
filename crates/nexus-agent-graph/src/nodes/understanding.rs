@@ -305,7 +305,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for UnderstandingNode {
 
         let session_id = state.session_id.clone().unwrap_or_default();
         let topk = self.cfg.topk.max(0) as usize;
-        let mode = ctx.exec_mode();
 
         // ── 1. Grounding semantico via nexus_search_semantic (:98-124) ────────
         // I/O dietro la porta `ToolExecutor`. Best-effort: errore -> block vuoto.
@@ -320,7 +319,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for UnderstandingNode {
                 }),
                 thought_signature: None,
             };
-            match ctx.tools.execute(call, mode).await {
+            match ctx.tools.execute(call).await {
                 Ok(outcome) => {
                     let raw = Self::outcome_result_json(&outcome.content);
                     Self::render_grounding(&raw, topk)
@@ -353,7 +352,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for UnderstandingNode {
                     input: json!({ "kind": "explore", "task": sq }),
                     thought_signature: None,
                 };
-                futs.push(ctx.tools.execute(call, mode));
+                futs.push(ctx.tools.execute(call));
             }
             let results = futures::future::join_all(futs).await;
             let summaries: Vec<String> = results
@@ -455,7 +454,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::ports::{
-        EventSink, ExecMode, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
+        EventSink, PortError, SseEvent, ToolCall, ToolExecutor, ToolOutcome,
     };
     use crate::runtime::test_doubles::{NullEventSink, StubLlmGateway};
     use crate::runtime::AgentNodeCtx;
@@ -475,15 +474,12 @@ mod tests {
     }
 
     /// Esecutore di tool programmabile per-nome: ritorna un `result_json`
-    /// (stringa) diverso a seconda del nome del tool richiesto. Registra anche le
-    /// modalita' usate (per verificare lo shadow -> Replay).
+    /// (stringa) diverso a seconda del nome del tool richiesto.
     struct ScriptedTools {
         /// JSON ritornato (come stringa) per `nexus_search_semantic`.
         grounding_json: String,
         /// JSON ritornato per ogni `dispatch_subagent`.
         explore_json: String,
-        /// Modalita' osservate.
-        modes: std::sync::Mutex<Vec<ExecMode>>,
         /// Nomi tool osservati.
         names: std::sync::Mutex<Vec<String>>,
     }
@@ -493,7 +489,6 @@ mod tests {
             Self {
                 grounding_json: grounding_json.to_string(),
                 explore_json: explore_json.to_string(),
-                modes: std::sync::Mutex::new(vec![]),
                 names: std::sync::Mutex::new(vec![]),
             }
         }
@@ -501,8 +496,7 @@ mod tests {
 
     #[async_trait]
     impl ToolExecutor for ScriptedTools {
-        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
-            self.modes.lock().unwrap().push(mode);
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             self.names.lock().unwrap().push(call.name.clone());
             let rj = match call.name.as_str() {
                 "nexus_search_semantic" => self.grounding_json.clone(),
@@ -527,13 +521,12 @@ mod tests {
         async fn execute(
             &self,
             _call: ToolCall,
-            _mode: ExecMode,
         ) -> Result<ToolOutcome, PortError> {
-            Err(PortError::Tool("simulato".to_string()))
+            Err(PortError::Tool("simulato".to_string().into()))
         }
     }
 
-    /// Sink eventi no-op riusabile (lo shadow non emette).
+    /// Sink eventi no-op riusabile.
     struct Sink;
     impl EventSink for Sink {
         fn emit(&self, _ev: SseEvent) {}
@@ -541,7 +534,7 @@ mod tests {
 
     /// Costruisce un ctx di test con tool programmabili; il `PgPool` e' lazy
     /// (`connect_lazy` non apre connessioni: il nodo non interroga il DB).
-    fn ctx_with_tools(tools: Arc<dyn ToolExecutor>, shadow: bool) -> AgentNodeCtx {
+    fn ctx_with_tools(tools: Arc<dyn ToolExecutor>) -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("connect_lazy non si connette");
@@ -556,7 +549,7 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
+            advisory_gate: None,
         }
     }
 
@@ -590,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn flag_off_pass_through_totale() {
         let node = UnderstandingNode::new(UnderstandingConfig::default()); // enabled=false
-        let ctx = ctx_with_tools(Arc::new(FailingTools), false);
+        let ctx = ctx_with_tools(Arc::new(FailingTools));
         let delta = node.run(&complex_state(), &ctx).await.expect("run ok");
         assert_eq!(
             delta.as_map().len(),
@@ -605,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn gate_skip_in_subagent() {
         let node = UnderstandingNode::new(cfg_active());
-        let ctx = ctx_with_tools(Arc::new(FailingTools), false);
+        let ctx = ctx_with_tools(Arc::new(FailingTools));
         let mut state = complex_state();
         state.subagent_depth = Some(1);
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
@@ -620,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn gate_budget_too_low() {
         let node = UnderstandingNode::new(cfg_active());
-        let ctx = ctx_with_tools(Arc::new(FailingTools), false);
+        let ctx = ctx_with_tools(Arc::new(FailingTools));
         let mut state = complex_state();
         state.token_budget = Some(100); // < 3000
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
@@ -634,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn gate_not_complex() {
         let node = UnderstandingNode::new(cfg_active());
-        let ctx = ctx_with_tools(Arc::new(FailingTools), false);
+        let ctx = ctx_with_tools(Arc::new(FailingTools));
         let mut state = complex_state();
         state.task_complexity = Some(TaskComplexity::Low);
         state.is_ambiguous = Some(false);
@@ -666,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn gate_query_too_short() {
         let node = UnderstandingNode::new(cfg_active());
-        let ctx = ctx_with_tools(Arc::new(FailingTools), false);
+        let ctx = ctx_with_tools(Arc::new(FailingTools));
         let mut state = complex_state();
         state.messages = vec![human("corto")]; // 5 char < 10
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
@@ -683,7 +676,7 @@ mod tests {
         let node = UnderstandingNode::new(cfg_active());
         // grounding: nessuna hit; explore: nessun summary.
         let tools = ScriptedTools::new(r#"{"hits": []}"#, r#"{"summary": ""}"#);
-        let ctx = ctx_with_tools(Arc::new(tools), false);
+        let ctx = ctx_with_tools(Arc::new(tools));
         let state = complex_state();
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
         assert_eq!(
@@ -702,7 +695,7 @@ mod tests {
         ]}"#;
         let explore = r#"{"summary": "Il modulo auth usa JWT e bcrypt."}"#;
         let tools = ScriptedTools::new(grounding, explore);
-        let ctx = ctx_with_tools(Arc::new(tools), false);
+        let ctx = ctx_with_tools(Arc::new(tools));
         let state = complex_state();
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
 
@@ -724,7 +717,7 @@ mod tests {
         let node = UnderstandingNode::new(cfg);
         let grounding = r#"{"hits": [{"source_kind": "code", "chunk_text": "x", "score": 0.5}]}"#;
         let tools = ScriptedTools::new(grounding, r#"{"summary": "non usato"}"#);
-        let ctx = ctx_with_tools(Arc::new(tools), false);
+        let ctx = ctx_with_tools(Arc::new(tools));
         let state = complex_state();
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
         let brief = out.context_brief.expect("brief");
@@ -747,10 +740,9 @@ mod tests {
             async fn execute(
                 &self,
                 call: ToolCall,
-                _mode: ExecMode,
             ) -> Result<ToolOutcome, PortError> {
                 if call.name == "nexus_search_semantic" {
-                    return Err(PortError::Tool("grounding giu".to_string()));
+                    return Err(PortError::Tool("grounding giu".to_string().into()));
                 }
                 Ok(ToolOutcome {
                     tool_call_id: call.id,
@@ -761,7 +753,7 @@ mod tests {
             }
         }
         let node = UnderstandingNode::new(cfg_active());
-        let ctx = ctx_with_tools(Arc::new(PartialFail), false);
+        let ctx = ctx_with_tools(Arc::new(PartialFail));
         let state = complex_state();
         let out = apply(state.clone(), node.run(&state, &ctx).await.unwrap());
         assert_eq!(out.understanding_active, Some(true));
@@ -771,25 +763,6 @@ mod tests {
             "grounding fallito -> assente"
         );
         assert!(brief.contains("<explore>trovato qualcosa</explore>"));
-    }
-
-    /// Shadow: i tool sono eseguiti in modalita' Replay (zero side-effect).
-    #[tokio::test]
-    async fn shadow_usa_replay() {
-        let node = UnderstandingNode::new(cfg_active());
-        let tools = Arc::new(ScriptedTools::new(
-            r#"{"hits": [{"source_kind": "code", "chunk_text": "x", "score": 0.5}]}"#,
-            r#"{"summary": "s"}"#,
-        ));
-        let ctx = ctx_with_tools(tools.clone(), true);
-        let state = complex_state();
-        let _ = node.run(&state, &ctx).await.unwrap();
-        let modes = tools.modes.lock().unwrap();
-        assert!(!modes.is_empty(), "almeno una chiamata tool");
-        assert!(
-            modes.iter().all(|m| *m == ExecMode::Replay),
-            "shadow -> tutte le chiamate in Replay"
-        );
     }
 
     /// Rendering grounding: troncamento a 300 char e scarto delle hit vuote.

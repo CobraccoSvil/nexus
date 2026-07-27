@@ -14,9 +14,9 @@
 // registrata solo se `record_revision` rileva un body_hash nuovo (dedup
 // automatico via CTE in `storage::record_revision`).
 //
-// Embedding + upsert Qdrant: best-effort. Se il brain e' down il documento
-// viene comunque salvato in `wiki_docs` ma senza `qdrant_point_id`; un re-run
-// successivo lo completera'.
+// Embedding + upsert Qdrant: best-effort. Se l'embedder o Qdrant non
+// rispondono il documento viene comunque salvato in `wiki_docs` ma senza
+// `qdrant_point_id`; un re-run successivo lo completera'.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::model::WikiScope;
@@ -185,7 +185,11 @@ async fn reingest_scope(
 
 /// Camminata ricorsiva di una directory raccogliendo tutti i file `.md`.
 /// BFS deterministica (ordine alfabetico per leggibilita' dei log).
-/// Saltati: file nascosti (`.`), directory `node_modules`, `target`, `.git`.
+/// Salta ogni entry (directory E file) per cui la skip-list canonica
+/// `nexus_tool_kit::is_skipped_dir` e' vera (regola L, S24): dot-entry,
+/// node_modules, target, dist, build, coverage, __pycache__, venv. La BFS
+/// parte DENTRO il vault root, quindi un root chiamato `.nexus-vault` non
+/// passa mai dal filtro.
 fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
@@ -203,15 +207,7 @@ fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') && name != "." && name != ".." {
-                    // Permetti `.nexus-vault` root, ma salta `.git`, `.obsidian`, ecc.
-                    if path == root {
-                        // root stesso: continue normalmente
-                    } else if name == ".git" || name == ".obsidian" {
-                        continue;
-                    }
-                }
-                if name == "node_modules" || name == "target" {
+                if nexus_tool_kit::is_skipped_dir(name) {
                     continue;
                 }
             }
@@ -542,14 +538,26 @@ mod tests {
 
     #[test]
     fn collect_skips_hidden_and_target() {
+        // La BFS usa il filesystem reale: su Windows i path hanno separatori
+        // '\' veri, quindi il test copre anche la regressione dell'incidente
+        // 20/07 (skip-list che non matchava i path Windows). La skip-list e'
+        // quella canonica: anche venv/__pycache__/node_modules sono esclusi.
         let tmp = std::env::temp_dir().join(format!("wiki-reingest-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(tmp.join("adr")).unwrap();
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
         std::fs::create_dir_all(tmp.join("target")).unwrap();
+        std::fs::create_dir_all(tmp.join(".venv/lib/site-packages")).unwrap();
+        std::fs::create_dir_all(tmp.join("venv")).unwrap();
+        std::fs::create_dir_all(tmp.join("__pycache__")).unwrap();
+        std::fs::create_dir_all(tmp.join("node_modules/pkg")).unwrap();
         std::fs::write(tmp.join("adr/a.md"), "# a").unwrap();
         std::fs::write(tmp.join(".git/b.md"), "# b").unwrap();
         std::fs::write(tmp.join("target/c.md"), "# c").unwrap();
         std::fs::write(tmp.join("d.md"), "# d").unwrap();
+        std::fs::write(tmp.join(".venv/lib/site-packages/e.md"), "# e").unwrap();
+        std::fs::write(tmp.join("venv/f.md"), "# f").unwrap();
+        std::fs::write(tmp.join("__pycache__/g.md"), "# g").unwrap();
+        std::fs::write(tmp.join("node_modules/pkg/h.md"), "# h").unwrap();
 
         let files = collect_markdown_files(&tmp).unwrap();
         let names: Vec<String> = files
@@ -560,6 +568,10 @@ mod tests {
         assert!(names.iter().any(|n| n.ends_with("d.md")));
         assert!(!names.iter().any(|n| n.contains(".git")));
         assert!(!names.iter().any(|n| n.contains("target")));
+        assert!(!names.iter().any(|n| n.contains("venv")));
+        assert!(!names.iter().any(|n| n.contains("__pycache__")));
+        assert!(!names.iter().any(|n| n.contains("node_modules")));
+        assert_eq!(files.len(), 2, "{names:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

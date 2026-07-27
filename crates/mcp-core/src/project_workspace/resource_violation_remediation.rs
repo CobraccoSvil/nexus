@@ -22,7 +22,9 @@ use nexus_events::event::ProjectEvent;
 use uuid::Uuid;
 
 use crate::agent_types::SupervisorMode;
-use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams, SpawnOutcome};
+use crate::chat_messages::{
+    insert_message, session_has_active_run, spawn_agent_run, SpawnAgentParams, SpawnOutcome,
+};
 use crate::AppState;
 
 /// Riga di violazione aperta (subset di service_diagnoses).
@@ -110,6 +112,19 @@ pub(crate) fn build_remediation_content(
 /// lo consente, avvia UN solo run di riparazione che le copre tutte. Chiusura:
 /// a fine run re-lint dei file coinvolti -> resolved / ri-open / failed.
 pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) {
+    // Boot-grace (punto unico dell'osservazione servizi, regola L): dopo un
+    // restart di mcp-core il re-lint rivede le violazioni note e questo worker
+    // risvegliava la chat entro pochi minuti dal deploy ("la chat riparte da
+    // sola a ogni ricompilazione": risvegli 19:48/19:53 attorno al restart
+    // 19:50 del 20/07). Il gemello service_observer_remediation aveva gia' la
+    // guardia; qui mancava.
+    if super::service_observer_remediation::within_boot_grace(state).await {
+        tracing::info!(
+            project_id = %project_id,
+            "resource_violation_remediation: boot-grace attivo, giro saltato"
+        );
+        return;
+    }
     // Solo regole con auto_remediate=true nel catalogo (le altre restano
     // visibili nel pannello, azionabili a mano col pulsante chat).
     let enabled_flag =
@@ -200,19 +215,26 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     .await
     .unwrap_or(0);
 
-    // Cap tentativi per firma su 24h CROSS-ROW (immune al re-open): si valuta
-    // sulla firma piu' "consumata" del batch.
+    // Cap tentativi su 24h CROSS-ROW, contato PER FILE e non per firma puntuale
+    // (regola M): la firma include il VALUE (porta/URL) e un rimedio parziale che
+    // sposta la porta genera una firma NUOVA a ogni giro -> il cap non convergeva
+    // mai (provato sul progetto vendita-immobile: 07:25 e 07:30, due run su
+    // frontend/vite.config.ts con firme diverse). La remediation e' by-edit sul
+    // FILE: se quel file ha gia' consumato i tentativi, altri run identici non
+    // aggiungono nulla, comunque si sia spostato il valore.
     let mut max_sig_attempts: i64 = 0;
     for v in &violations {
-        if v.signature.is_empty() {
+        let Some(fp) = v.file_path.as_deref().filter(|p| !p.is_empty()) else {
             continue;
-        }
+        };
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM service_diagnoses \
-              WHERE error_signature_hash = $1 AND triggered_run_id IS NOT NULL \
+              WHERE project_id = $1 AND signal_kind = 'policy_violation' \
+                AND file_path = $2 AND triggered_run_id IS NOT NULL \
                 AND ts > NOW() - INTERVAL '24 hours'",
         )
-        .bind(&v.signature)
+        .bind(project_id)
+        .bind(fp)
         .fetch_one(&state.db)
         .await
         .unwrap_or(0);
@@ -251,8 +273,20 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
             .flatten();
     let Some(owner) = owner else { return };
     // Separazione DB: chat_sessions e' una tabella migrata -> instrada sul pool
-    // del progetto (a flag OFF ritorna il meta-DB, comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // del progetto. Non disponibile -> niente remediation per questo giro
+    // (trigger best-effort, WARN + return).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "resource_remediation: DB progetto non disponibile, skip riparazione"
+                );
+                return;
+            }
+        };
     let session: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM chat_sessions WHERE project_id = $1 ORDER BY updated_at DESC LIMIT 1",
     )
@@ -267,6 +301,21 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         );
         return;
     };
+
+    // Un run e' GIA' attivo sulla sessione (tipico: la creazione dell'app che sta
+    // SCRIVENDO il codice con una porta hardcoded -> apre la violazione): NON
+    // spawnare la riparazione, la supererebbe via supersede (last-wins) uccidendo
+    // il run in corso mentre progrediva (incidente ricreazione vendita-immobile:
+    // il run di creazione cancellato da `superseded_by_new_run` a meta' lavoro).
+    // Gemello del guard di process_resume:377 e service_observer_remediation:151;
+    // qui MANCAVA. La violazione resta aperta e la riparazione ritenta a sessione
+    // libera. proj_pool: agent_runs e' tabella per-progetto (separazione DB).
+    if session_has_active_run(&proj_pool, session).await {
+        tracing::debug!(
+            "resource_remediation: run gia' attivo sulla sessione {session}, riparazione rimandata a sessione libera"
+        );
+        return;
+    }
 
     // Template fuori-chat (regola D) + contesto porte.
     let template = crate::prompt_templates::get_template_or_default(
@@ -317,6 +366,15 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     )
     .await;
 
+    // Modello del rimedio dal purpose tier-aware 'auto_remediation' (mig 0626,
+    // regola G): vedi service_observer_remediation, stesso punto unico.
+    // Se non risolvibile -> (None, None): routing di default, rimedio mai bloccato.
+    let (provider_override, model_override) = crate::internal_routing::purpose_override_or_default(
+        state,
+        crate::internal_routing::PURPOSE_AUTO_REMEDIATION,
+    )
+    .await;
+
     let params = SpawnAgentParams {
         user_id: owner,
         session_id: session,
@@ -330,8 +388,8 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
-        provider_override: None,
-        model_override: None,
+        provider_override,
+        model_override,
         profile_provider: None,
         profile_model: None,
         attachments: Vec::new(),
@@ -387,10 +445,24 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
             let state_cl = state.clone();
             tokio::spawn(async move {
                 // Separazione DB: agent_runs e' migrata -> pool del progetto
-                // (project_id in scope; a flag OFF ritorna il meta-DB).
-                let runs_pool =
-                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id)
-                        .await;
+                // (project_id in scope). Non disponibile -> il task best-effort
+                // termina con WARN (niente attesa/re-lint per questo run).
+                let runs_pool = match crate::project_db_routes::project_data_pool_from(
+                    &state_cl.db,
+                    project_id,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %e,
+                            "resource_remediation: DB progetto non disponibile, salto attesa e re-lint post-run"
+                        );
+                        return;
+                    }
+                };
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let status: Option<String> =
@@ -418,6 +490,67 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
     }
 }
 
+/// Reaper one-shot all'avvio: chiude le diagnosi rimaste `diagnosing` da un
+/// run di rimedio MORTO. La chiusura normale (attesa fine run -> re-lint in
+/// `close_after_remediation`) vive in un task IN MEMORIA: se mcp-core viene
+/// riavviato/crasha con un run di rimedio in volo, il task sparisce e la
+/// diagnosi resta `diagnosing` per sempre (zombie osservati sul progetto
+/// vendita-immobile, ferme al 20/07 dopo il crash). Il criterio e' il segnale
+/// strutturato dello stato del run (regola M: `is_active_run_status`, punto
+/// unico), mai l'eta' della riga; la chiusura passa dallo STESSO punto unico
+/// del flusso normale (`close_after_remediation` -> re-lint reale, regola L/O).
+pub(crate) fn spawn_stale_diagnosing_reaper(state: AppState) {
+    tokio::spawn(async move {
+        // Breve attesa: lascia stabilizzare pool e registry dopo il boot.
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        reap_stale_diagnosing(&state).await;
+    });
+}
+
+async fn reap_stale_diagnosing(state: &AppState) {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT project_id, triggered_run_id FROM service_diagnoses \
+          WHERE signal_kind = 'policy_violation' AND status = 'diagnosing' \
+            AND triggered_run_id IS NOT NULL",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (project_id, run_id) in rows {
+        if remediation_run_is_active(state, project_id, run_id).await {
+            continue; // il task di chiusura del run corrente se ne occupera'
+        }
+        tracing::info!(project_id = %project_id, run_id = %run_id,
+            "diagnosing_reaper: run di rimedio terminato/assente, chiudo via re-lint");
+        close_after_remediation(state, project_id, run_id).await;
+    }
+}
+
+/// True se il run di rimedio e' ancora ATTIVO sul pool del progetto (segnale
+/// strutturato `is_active_run_status`, regola M). DB progetto non disponibile
+/// -> true prudente (non chiudere: al prossimo boot si rivaluta).
+async fn remediation_run_is_active(state: &AppState, project_id: Uuid, run_id: Uuid) -> bool {
+    let runs_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(project_id = %project_id, error = %e,
+                    "diagnosing_reaper: DB progetto non disponibile, salto");
+                return true;
+            }
+        };
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(&runs_pool)
+            .await
+            .ok()
+            .flatten();
+    status
+        .as_deref()
+        .is_some_and(crate::agent_types::is_active_run_status)
+}
+
 /// Re-lint post-run: per ogni diagnosi `diagnosing` di questo run, verifica se
 /// la violazione e' sparita dai sorgenti -> resolved; altrimenti ri-open (il
 /// cap tentativi al prossimo giro decide l'eventuale failed_remediation).
@@ -440,6 +573,7 @@ async fn close_after_remediation(state: &AppState, project_id: Uuid, run_id: Uui
         crate::security::resource_linter::lint_tree(&root_path, &alloc_clone)
     })
     .await
+    .map(|t| t.findings)
     .unwrap_or_default();
 
     let open_rows: Vec<(Uuid, String, Option<String>, f64)> = sqlx::query_as(

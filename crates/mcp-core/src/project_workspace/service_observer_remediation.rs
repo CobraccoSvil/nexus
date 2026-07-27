@@ -99,8 +99,20 @@ pub(crate) async fn maybe_trigger_debugger(
     };
 
     // Pool dati del progetto (separazione DB): chat_sessions e' migrata, va letta
-    // sul DB del progetto. A flag OFF ritorna il meta-pool (comportamento storico).
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // sul DB del progetto. Non disponibile -> niente auto-debug per questo giro
+    // (trigger best-effort, WARN + return).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    error = %e,
+                    "service_observer: DB progetto non disponibile, skip auto-debug"
+                );
+                return;
+            }
+        };
 
     // Sessione chat esistente del progetto (non ne creiamo: l'auto-debug e'
     // opt-in e ha senso solo dove l'utente vede la conversazione).
@@ -177,6 +189,16 @@ pub(crate) async fn maybe_trigger_debugger(
     )
     .await;
 
+    // Modello del rimedio dal purpose tier-aware 'auto_remediation' (mig 0626,
+    // regola G): un run di debug affidato al default piccolo del routing
+    // fallisce e brucia i tentativi. Se il purpose non e' risolvibile ->
+    // (None, None): decide il routing di default, il rimedio non si blocca.
+    let (provider_override, model_override) = crate::internal_routing::purpose_override_or_default(
+        state,
+        crate::internal_routing::PURPOSE_AUTO_REMEDIATION,
+    )
+    .await;
+
     let params = SpawnAgentParams {
         user_id: owner,
         session_id: session,
@@ -192,8 +214,8 @@ pub(crate) async fn maybe_trigger_debugger(
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
-        provider_override: None,
-        model_override: None,
+        provider_override,
+        model_override,
         profile_provider: None,
         profile_model: None,
         attachments: Vec::new(),
@@ -237,10 +259,24 @@ pub(crate) async fn maybe_trigger_debugger(
             tokio::spawn(async move {
                 // Pool dati del progetto (separazione DB): agent_runs e' migrata.
                 // project_id e' in scope (catturato dalla closure), quindi instradiamo
-                // sul DB del progetto. A flag OFF ritorna il meta-pool.
-                let proj_pool =
-                    crate::project_db_routes::project_data_pool_from(&state_cl.db, project_id)
-                        .await;
+                // sul DB del progetto. Non disponibile -> il task best-effort termina
+                // con WARN (niente attesa/riavvio per questo trigger).
+                let proj_pool = match crate::project_db_routes::project_data_pool_from(
+                    &state_cl.db,
+                    project_id,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %e,
+                            "service_observer: DB progetto non disponibile, salto attesa e riavvio post-debug"
+                        );
+                        return;
+                    }
+                };
                 // Attende la fine del run debugger (max ~5 min), poi riavvia.
                 for _ in 0..60u32 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;

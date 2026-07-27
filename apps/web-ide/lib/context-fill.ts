@@ -15,7 +15,6 @@
  */
 
 import type { AgentRunInfo, ChatMessage, ModelCatalogEntry } from "./api-client";
-import { fallbackContextWindow } from "./model-catalog";
 
 export interface ContextFill {
   /** Modello attivo risolto (run in corso > ultimo assistant > selezione manuale). */
@@ -53,12 +52,16 @@ export function computeContextFill(
   const catalogEntry = activeModel
     ? modelCatalog.find((m) => m.model === activeModel)
     : null;
-  // `?? fallback` non basta: un contextWindow 0 dal catalog (colonna NULL lato
-  // DB serializzata a 0) deve comunque ricadere sulla stima locale.
+  // Solo il catalog (`ai_price_catalog`): un contextWindow 0 o assente vale
+  // "sconosciuto" e la percentuale si nasconde, com'e' gia' la regola di questo
+  // modulo per gli altri dati mancanti. Qui c'era una tabella di finestre
+  // scritta a mano come rete di sicurezza: copriva 22 modelli su un parco che
+  // ne conta oltre 100, quindi per la maggioranza dei casi non era una rete —
+  // e per i modelli che elencava rischiava di contraddire il catalog.
   const ctxWindow =
     catalogEntry?.contextWindow && catalogEntry.contextWindow > 0
       ? catalogEntry.contextWindow
-      : fallbackContextWindow(activeModel);
+      : null;
   // Live (eventi agent_usage, per-turno) > messaggio persistito. MAI
   // usage.totalPromptTokens: dal DB e' il cumulativo di billing del run.
   const lastInputTokens =

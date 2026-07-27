@@ -8,9 +8,11 @@
 //! sottomodulo [`signals`] e riusano le funzioni decisionali della Fase 2a
 //! (`super::decisions`, regola L: niente re-implementazione).
 //!
-//! NB: questo modulo NON e' ancora cablato nel runtime (`agent_run.rs` resta
-//! sul path Python). E' il pezzo a rischio massimo del porting e va validato
-//! 1:1 col golden-test (`/tmp/golden_phase2b.json`) PRIMA di imboccare il path.
+//! NB: questo modulo E' il routing del runtime. `graph.rs` (`build_edges`) cabla
+//! ogni edge condizionale del grafo sulle `route_after_*`, e mcp-core costruisce
+//! ed esegue quel grafo in `native_engine.rs`: e' l'unico motore agentico
+//! esistente. L'ordine dei branch-path e' load-bearing ed e' coperto dai test
+//! del modulo.
 
 pub mod config;
 pub mod signals;
@@ -21,7 +23,7 @@ mod golden_tests;
 pub use config::{effective_recursion_limit, GraphTopologyLimits, RoutingConfig};
 
 use crate::decisions::{structural_unfulfilled_signal, turn_action_oriented};
-use crate::state::{AgentState, AutomationMode, StopReason};
+use crate::state::{AgentState, AutomationMode, GateRouting, StopReason};
 
 /// Nodo-bersaglio di una decisione di routing. Le label serializzate (snake_case)
 /// sono ESATTAMENTE i nomi-nodo che le `route_after_*` Python ritornano come
@@ -117,21 +119,26 @@ pub fn route_after_executor(state: &AgentState, cfg: &RoutingConfig) -> NodeTarg
     }
     // (2-bis) Stallo che richiede META-RAGIONAMENTO -> nodo dedicato StallRecovery
     // (superstep isolato, ADR 0036-style). L'executor emette questo stop_reason
-    // (blocco successivo del piano) dopo il livello-1 GUIDE cheap e prima delle
-    // mosse costose; il nodo consulta la porta MetaReasonerPort (UNA LLM-call via
-    // ctx.llm, replay-safe) e rientra nell'executor via self-loop (StallResolved).
-    // INERTE finche' nessun detector emette StallReason (flag OFF di default).
+    // dopo il livello-1 GUIDE cheap e prima delle mosse costose; il nodo consulta
+    // la porta MetaReasonerPort (UNA LLM-call via ctx.llm, replay-safe) e rientra
+    // nell'executor via self-loop (StallResolved). Lo emettono
+    // `maybe_stall_reason_delta` e il gemello runaway pre-LLM, entrambi gated su
+    // `agent.stall_recovery.enabled` truthy e budget per-sessione non esaurito.
+    // Quel valore vive in `settings` e cambia a caldo: qui non c'e' un default di
+    // compile-time. Senza il flag questo ramo non e' preso e decide la gerarchia
+    // fissa di `progress_controller::decide`.
     if stop_reason == Some(StopReason::StallReason) {
         return NodeTarget::StallRecovery;
     }
     // (2-ter) Valutazione di SCALA-TIER (up/down del modello, pre-crisi) -> nodo
     // dedicato ScaleControl (superstep isolato, gemello di StallRecovery). L'executor
-    // emette questo stop_reason (detector-emissione, PR-B3) quando il break-even e i
-    // trigger strutturali autorizzano la valutazione; il nodo consulta la porta
+    // emette questo stop_reason quando il break-even e i trigger strutturali
+    // autorizzano la valutazione; il nodo consulta la porta
     // MetaReasonerPort::assess_scale (UNA LLM-call via ctx.llm, replay-safe) e rientra
     // nell'executor via self-loop (ScaleResolved). Segue subito il ramo StallReason
-    // perche' lo stallo REATTIVO ha precedenza sulla scala PRE-EMPTIVA (FIX-E). INERTE
-    // finche' nessun detector emette ScaleReason (flag agent.scale.enabled OFF).
+    // perche' lo stallo REATTIVO ha precedenza sulla scala PRE-EMPTIVA (FIX-E). Lo
+    // emette `maybe_scale_reason_delta` (pre-LLM), gated su `agent.scale.enabled`
+    // truthy in `settings`, tetto cambi-tier non raggiunto e budget non esaurito.
     if stop_reason == Some(StopReason::ScaleReason) {
         return NodeTarget::ScaleControl;
     }
@@ -247,6 +254,40 @@ pub(crate) fn declared_outcome_kind(state: &AgentState) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Nome del canale di ruolo su cui la figura ha gia' DICHIARATO il proprio
+/// deliverable, se ce n'e' uno.
+///
+/// PUNTO UNICO (regola L) della chiusura per ruolo, gemello di
+/// [`declared_outcome_kind`]: quello copre `task_complete` (l'esito di chi
+/// ESEGUE), questo copre le figure il cui deliverable NON e' un task completato
+/// ma un giudizio — il revisore (`review_verdict`), la figura del consiglio
+/// (`advisory_verdict`), l'avvocato del dibattito (`debate_position`).
+///
+/// Perche' esiste: senza, l'edge post-ToolDispatch riconosceva terminale solo
+/// `task_complete` e per una figura ricadeva sempre sull'executor. La figura
+/// aveva pero' gia' prodotto l'UNICA cosa che le era chiesta, quindi continuava a
+/// girare a vuoto fino allo scadere del wall-clock, e `finalize_timeout`
+/// scartava il verdetto sostituendolo con "[Sub-agent timeout]". Misurato su
+/// verifica-wd (2026-07-23): 10 sub-run in timeout con durate ESATTAMENTE pari al
+/// budget del proprio kind (600/300/240s), tutti con il tool terminale gia'
+/// emesso e `acknowledged: true` molto prima (un `task_complete` a 21s su 600,
+/// seguito da 419s di silenzio totale: nessuno step, nessuna chiamata LLM).
+///
+/// Solo le figure hanno questi tool in whitelist, quindi un run generico non
+/// puo' chiudersi per questa via.
+pub(crate) fn declared_role_channel(state: &AgentState) -> Option<&'static str> {
+    if state.review_verdict.is_some() {
+        return Some("review_verdict");
+    }
+    if state.advisory_verdict.is_some() {
+        return Some("advisory_verdict");
+    }
+    if state.debate_position.is_some() {
+        return Some("debate_position");
+    }
+    None
+}
+
 /// Decide post-verifier: re-iterare (executor) o chiudere (learner).
 /// Porting 1:1 di `route_after_verifier` (routing.py:294-311).
 pub fn route_after_verifier(state: &AgentState, _cfg: &RoutingConfig) -> NodeTarget {
@@ -305,11 +346,28 @@ pub fn route_after_todo_runner(state: &AgentState, cfg: &RoutingConfig) -> NodeT
     NodeTarget::Executor
 }
 
+/// Predicato UNICO del "gate rimanda in correzione" (regola L): un gate di
+/// chiusura (final_gate, review_gate) che vuole restituire il turno
+/// all'executor lo DICHIARA con `gate_routing = RimandaInCorrezione` nel proprio
+/// delta; gli edge decidono da qui, non ognuno con la propria copia del
+/// confronto.
+///
+/// La fonte e' un campo di PROPRIETA' del gate (regola M), non piu'
+/// `stop_reason == ToolUse`: quello e' un campo CONDIVISO che scrive anche
+/// l'executor a ogni turno con tool pendenti, e un gate che chiudeva senza
+/// riscriverlo vedeva la propria chiusura letta come un rimando (loop
+/// `review_gate -> executor` del run 609000c1, vedi [`GateRouting`]).
+///
+/// `None` -> `false`: nessuna dichiarazione significa CHIUDI, il ramo sicuro.
+pub fn gate_rimanda_in_correzione(state: &AgentState) -> bool {
+    state.gate_routing == Some(GateRouting::RimandaInCorrezione)
+}
+
 /// Dopo il final_gate: re-executor se il gate ha rimandato all'executor
 /// (stop_reason tool_use), altrimenti chiusura (learner).
 /// Porting 1:1 di `route_after_final_gate` (final_gate.py:549-551).
 pub fn route_after_final_gate(state: &AgentState) -> NodeTarget {
-    if state.stop_reason == Some(StopReason::ToolUse) {
+    if gate_rimanda_in_correzione(state) {
         NodeTarget::Executor
     } else {
         NodeTarget::Learner
@@ -592,22 +650,29 @@ mod tests {
         );
     }
 
-    /// `route_after_final_gate` (final_gate.py:549-551): tool_use -> executor,
-    /// qualunque altro stop_reason (e None) -> learner.
+    /// `route_after_final_gate`: rimando DICHIARATO dal gate -> executor.
     #[test]
-    fn final_gate_tool_use_va_a_executor() {
+    fn final_gate_rimando_dichiarato_va_a_executor() {
         let mut s = base();
-        s.stop_reason = Some(StopReason::ToolUse);
+        s.gate_routing = Some(GateRouting::RimandaInCorrezione);
         assert_eq!(route_after_final_gate(&s), NodeTarget::Executor);
     }
 
+    /// Chiusura dichiarata (e assenza di dichiarazione) -> learner.
+    ///
+    /// Lo `stop_reason = ToolUse` qui e' il RUMORE che l'executor lascia a ogni
+    /// turno con tool pendenti: la sua presenza non deve piu' instradare nulla.
+    /// Finche' l'instradamento lo leggeva, un gate che chiudeva senza riscriverlo
+    /// veniva rispedito all'executor (loop del run 609000c1).
     #[test]
-    fn final_gate_end_turn_va_a_learner() {
+    fn final_gate_chiusura_va_a_learner_anche_con_tool_use_residuo() {
         let mut s = base();
-        s.stop_reason = Some(StopReason::EndTurn);
+        s.gate_routing = Some(GateRouting::Chiude);
+        s.stop_reason = Some(StopReason::ToolUse);
         assert_eq!(route_after_final_gate(&s), NodeTarget::Learner);
-        // stop_reason assente -> learner (parita': != "tool_use").
-        let none = base();
+        // Nessuna dichiarazione -> learner (ramo sicuro: chiudere, non ciclare).
+        let mut none = base();
+        none.stop_reason = Some(StopReason::ToolUse);
         assert_eq!(route_after_final_gate(&none), NodeTarget::Learner);
     }
 }

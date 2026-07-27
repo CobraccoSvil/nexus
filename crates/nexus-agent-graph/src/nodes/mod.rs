@@ -14,6 +14,7 @@
 pub mod clarify_or_expand;
 pub mod executor;
 pub mod final_gate;
+pub mod review_gate;
 pub mod learner;
 pub mod planner;
 pub mod reflection;
@@ -30,11 +31,12 @@ pub use clarify_or_expand::{
     ClarifyConfig, ClarifyMode, ClarifyOrExpandNode, DecisionCategory, GateOutcome, LlmDecision,
 };
 pub use executor::{ExecutorConfig, ExecutorNode, ScaleConfig};
+pub use review_gate::{ReviewGateConfig, ReviewGateNode};
 pub use final_gate::{
     build_error_files, count_build_errors, error_file_matches_touched, FinalGateConfig,
     FinalGateNode, FINAL_GATE_ESCALATION_KEY,
 };
-pub use learner::{LearnerConfig, LearnerNode, QdrantPayload};
+pub use learner::LearnerNode;
 pub use planner::{
     clarifying_branch, plan_reuse_decision, ClarifyingBranch, PlanReuse, PlannerConfig,
     PlannerNode, ToolResultOutcome,
@@ -46,26 +48,26 @@ pub use stall_recovery::{stall_move_key, StallRecoveryNode, STALL_CONTEXT_KEY};
 pub use supervisor::{SupervisorNode, SUPERVISOR_ABANDON_KEY};
 pub use todo_runner::{OnFailure, TodoRunnerConfig, TodoRunnerNode};
 pub use tool_dispatch::{
-    panel_enforcement_from_advisory_synthesis, tool_target_from_input, ToolDispatchConfig,
-    ToolDispatchNode, PANEL_ENFORCEMENT_KEY, PRE_RUN_ADVISORY_SYNTHESIS_KEY,
+    panel_enforcement_from_advisory_synthesis, tool_target_from_input, AdvisoryGateState,
+    ToolDispatchConfig, ToolDispatchNode, ADVISORY_GATE_KEY, PANEL_ENFORCEMENT_KEY,
+    PRE_RUN_ADVISORY_SYNTHESIS_KEY,
 };
 pub use understanding::{UnderstandingConfig, UnderstandingNode};
 
 /// NARRAZIONE LIVE di una FASE semantica del run (punto unico, regola L):
-/// emette il meta-step verso la chat (`EventSink`, no-op in shadow) e lo
-/// persiste per il ripristino post-reload (`MetaStepStore`, gata Real).
+/// emette il meta-step verso la chat (`EventSink`) e lo persiste per il
+/// ripristino post-reload (`MetaStepStore`).
 /// Best-effort: non fallisce mai il turno. Usato da executor / tool_dispatch /
 /// final_gate / planner — i due canali (live vs storico) restano trait separati
 /// per contratto (vedi doc di `MetaStepStore`), qui si compongono UNA volta.
 pub(crate) async fn emit_phase_meta(
     emit: &dyn crate::runtime::ports::EventSink,
     store: &dyn crate::runtime::ports::MetaStepStore,
-    mode: crate::runtime::ports::ExecMode,
     kind: &str,
     title: String,
     payload: serde_json::Value,
 ) {
-    emit_phase_meta_correlated(emit, store, mode, kind, None, title, payload).await;
+    emit_phase_meta_correlated(emit, store, kind, None, title, payload).await;
 }
 
 /// Variante CORRELATA del punto unico di narrazione (stessa composizione
@@ -78,7 +80,6 @@ pub(crate) async fn emit_phase_meta(
 pub async fn emit_phase_meta_correlated(
     emit: &dyn crate::runtime::ports::EventSink,
     store: &dyn crate::runtime::ports::MetaStepStore,
-    mode: crate::runtime::ports::ExecMode,
     kind: &str,
     correlation_id: Option<String>,
     title: String,
@@ -96,6 +97,6 @@ pub async fn emit_phase_meta_correlated(
         "payload": payload,
         "correlation_id": correlation_id,
     });
-    let _ = store.persist_meta_step(meta, mode).await;
+    let _ = store.persist_meta_step(meta).await;
 }
-pub use verifier::{suggest_remediation, VerifierConfig, VerifierNode};
+pub use verifier::{suggest_remediation, TodoCriteriaMode, VerifierConfig, VerifierNode};

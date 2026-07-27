@@ -10,7 +10,11 @@ pub(crate) async fn run_turn(
     request_message_id: Uuid,
     active_files: Vec<String>,
     system_context: Option<String>,
-    provider_override: Option<String>,
+    // Provider scelto dall'utente CON la forza del vincolo (preferenza o pin),
+    // risolto dal punto unico `ProviderChoice::resolve` al confine HTTP: qui
+    // viaggia gia' deciso, cosi' nessun livello intermedio puo' promuovere una
+    // preferenza a vincolo duro.
+    provider_choice: ProviderChoice,
     model_override: Option<String>,
     automation_mode: AutomationMode,
     attachments: Vec<ChatAttachment>,
@@ -31,14 +35,24 @@ pub(crate) async fn run_turn(
                 active_files,
                 session_id: Some(session_id.to_string()),
                 request_message_id: Some(request_message_id.to_string()),
-                provider_override,
+                provider_choice,
                 model_override,
                 automation_mode,
                 attachments,
             },
         )
         .await
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+        // E' QUI che la resa moriva: la catena anyhow contiene ancora
+        // GatewayHttpError / GatewayTransportError — cioe' status, codice e la
+        // frase gia' scritta dal gateway — e `e.to_string()` li appiattiva tutti
+        // in una riga tecnica. Da questo punto in poi nessuno poteva piu'
+        // ricostruire nulla se non con una regex sulla prosa (regola M).
+        .map_err(|e| {
+            nexus_types::api_error_rendered(
+                StatusCode::BAD_REQUEST,
+                &crate::nexus_gateway::rendered_from_error(&e),
+            )
+        })?;
 
     let payload = &orchestrator_output.payload;
     let raw_content = payload["completion"]["content"]
@@ -109,7 +123,7 @@ pub(crate) async fn run_turn(
 
     // separazione DB: chat_sessions e' migrata, instrada sul pool del progetto
     let project_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     sqlx::query(
         r#"
         UPDATE chat_sessions

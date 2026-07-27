@@ -5,6 +5,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
+use crate::nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest};
+
 use super::*;
 
 #[derive(Debug)]
@@ -168,7 +170,7 @@ const AGENTIC_MIN_TIER_DEFAULT: &str = "medium";
 /// ai_price_catalog). Qualunque valore non riconosciuto o assenza del setting ->
 /// [`AGENTIC_MIN_TIER_DEFAULT`]. Best-effort: un errore DB non fa fallire il
 /// routing, degrada al default.
-async fn agentic_min_tier(db: &PgPool) -> String {
+pub(crate) async fn agentic_min_tier(db: &PgPool) -> String {
     let raw = crate::settings::get_setting(db, AGENTIC_MIN_TIER_KEY)
         .await
         .ok()
@@ -275,31 +277,41 @@ pub(crate) async fn route_model_from_catalog(
     let floor = agentic_min_tier(db).await;
     let required_tier = floor_tier_for_agentic(is_agentic_turn, mode_tier, &floor);
 
-    // Query al catalogo: trova il modello più economico che soddisfa tier+capability.
-    // "veloce" ordina per speed_tier, "economica"/dinamico per costo (il tier gia'
-    // garantisce la capacita', regola costi: AGENTIC_COST_FIRST_ORDER), "approfondita"
-    // preferisce il piu' capace/caro DENTRO il tier gia' promosso.
-    let order_clause = match mode {
-        "veloce"    => "CASE speed_tier WHEN 'fast' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, input_cost_per_million_tokens ASC",
-        "economica" => "input_cost_per_million_tokens ASC",
-        "approfondita" => "is_featured DESC, input_cost_per_million_tokens DESC",
-        _           => AGENTIC_COST_FIRST_ORDER,
+    // L'ordinamento per behavior_mode. `Rank` e' un enum CHIUSO: prima erano 4
+    // stringhe SQL scritte qui, e da un `order_by: &str` libero e' entrata (e
+    // sopravvissuta per mesi) la scala tier a 3 livelli di agent_run.rs.
+    // "veloce" ordina per speed_tier; "economica"/dinamico per costo (il tier gia'
+    // garantisce la capacita', regola costi); "approfondita" preferisce il piu'
+    // capace/caro DENTRO il tier gia' promosso.
+    let rank = match mode {
+        "veloce" => crate::orchestrator::model_service::Rank::Fastest,
+        "economica" => crate::orchestrator::model_service::Rank::CostFirst,
+        "approfondita" => crate::orchestrator::model_service::Rank::MostCapable,
+        _ => crate::orchestrator::model_service::Rank::CostFirst,
     };
 
-    // Selezione tramite il PUNTO UNICO (regola L): l'eleggibilita' agentica
-    // (tool_use, agentic_thinking_policy<>'exclude', consecutive_failures, cooldown)
-    // e' definita una sola volta in select_agentic_model. Degradazione di tier
-    // GRACEFUL: il primo tier con un candidato eleggibile vince; se il tier
-    // minimo (incluso il pavimento agentico) e' tutto in cooldown, scende verso
-    // il basso fino a 'light' invece di fallire (heavy->medium->light).
-    let tier_chain = agentic_tier_chain(required_tier);
-    // Branch: catalog dynamic routing (selettore agentico unico). Variante
-    // GOVERNATA telemetria-aware (opt-in `agent.governance.telemetry_aware`, OFF =
-    // bit-identico al selettore standard). Riordina i candidati ammissibili per
-    // probabilita' di successo (regola M) senza toccare tier/capability/gate.
-    select_agentic_model_governed(db, &tier_chain, Some(capability), 0, &[], order_clause)
-        .await
-        .map(|(provider, model)| DynamicRoutingDecision { provider, model })
+    // SERVIZIO UNICO (regola L). `Degrade`: il primo tier con un candidato
+    // eleggibile vince; se il tier minimo (incluso il pavimento agentico) e' tutto
+    // in cooldown si scende fino a 'light' invece di fallire — e' il path che
+    // sopravviveva all'incidente del consiglio, ora e' lo STESSO codice per tutti.
+    //
+    // `governed`: riordino telemetria-aware (ADR 0030, opt-in dal flag DB; OFF =
+    // bit-identico). Vive QUI e non ovunque perche' e' la selezione DINAMICA del
+    // turno primario, l'unico posto dove ha senso: il modello scelto viene poi
+    // pinnato per il run.
+    crate::orchestrator::model_service::select_model(
+        db,
+        &crate::orchestrator::model_service::ModelRequest::agentic(required_tier)
+            .capability(Some(capability))
+            .rank(rank)
+            .governed(true),
+    )
+    .await
+    .ok()
+    .map(|c| DynamicRoutingDecision {
+        provider: c.provider,
+        model: c.model,
+    })
 }
 
 /// Catena di degradazione graceful dei tier da `top` fino a `light` sulla scala a
@@ -358,24 +370,40 @@ pub(crate) async fn agentic_failover_candidates(
     exclude: &[String],
     min_context_window: i64,
 ) -> Vec<(String, String, Option<String>)> {
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: true,
-        require_thinking_non_exclude: true,
-        capability: None,
-        min_context_window,
-        exclude_providers: exclude,
-        apply_cooldown: true,
-        only_provider: None,
-    };
-    // tier_chain VUOTA = nessun filtro tier (query singola su tutti i tier).
-    match crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        &[],
-        AGENTIC_FAILOVER_ORDER,
-        FAILOVER_CANDIDATE_POOL,
-    )
-    .await
+    // SERVIZIO UNICO (regola L). `AnyTier`: il tier non ORDINA qui — si ENUMERA
+    // l'eleggibilita' e la SCELTA spetta al modulo puro `pick_failover_model`
+    // (salute -> likelihood). Una tier-chain sottrarrebbe la decisione al modulo.
+    //
+    // Ma il PAVIMENTO e' un'altra cosa: non e' una preferenza fra alternative, e'
+    // la soglia sotto la quale un modello NON E' un'alternativa. Misurato il
+    // 16/07: con openai e anthropic senza credito, il failover — che trattava il
+    // tier come "semplice indicazione" — e' sceso fino a `groq/gpt-oss-20b`
+    // (agentic_index 3.1, il peggiore del parco). Il run non e' fallito: ha
+    // prodotto una risposta FUORI TEMA (parlava del modello invece del task) e
+    // l'ha dichiarata `completed`. Un esito bugiardo e' peggio di un fallimento,
+    // perche' l'utente ci si fida.
+    //
+    // Prima questa scelta era difendibile: il tier era dedotto dal NOME, quindi
+    // inaffidabile come vincolo. Ora il tier viene dai FATTI (mig 0599/0600), e la
+    // premessa e' cambiata: il pavimento e' esprimibile e va rispettato.
+    //
+    // Resta GRACEFUL rispetto all'incidente del 15/07 (il consiglio che moriva):
+    // li' il difetto era non scendere da `heavy` a tier SANI (high/medium); qui si
+    // toglie solo l'ultimo gradino, quello sotto il pavimento agentico.
+    let floor = agentic_min_tier(db).await;
+    let req = crate::orchestrator::model_service::ModelRequest::agentic("")
+        .tier_policy(crate::orchestrator::model_service::TierPolicy::AnyTier)
+        .rank(crate::orchestrator::model_service::Rank::FailoverSafe)
+        .min_context_window(min_context_window)
+        .min_tier(&floor)
+        .exclude(exclude);
+    match crate::orchestrator::model_service::select_models(db, &req, FAILOVER_CANDIDATE_POOL, 1)
+        .await
+        .map(|v| {
+            v.into_iter()
+                .map(|c| (c.provider, c.model, c.effective_tier))
+                .collect::<Vec<_>>()
+        })
     {
         Ok(v) => {
             if v.len() as i64 >= FAILOVER_CANDIDATE_POOL {
@@ -398,222 +426,13 @@ pub(crate) async fn agentic_failover_candidates(
     }
 }
 
-/// Seleziona il miglior modello del catalog per un dato `tier`, opzionalmente
-/// filtrato per `capability` e `requires_tool_use`. Usato dalla risoluzione
-/// tier-based dei purpose (mig 0203): es. il purpose 'planner' -> tier 'heavy'
-/// + capability 'reasoning' sceglie dinamicamente il miglior modello heavy
-///   disponibile (esclusi i provider in cooldown), il piu' economico tra i
-///   featured. Ritorna None se nessun candidato soddisfa i criteri (il chiamante
-///   cade sul fallback statico del purpose).
-pub async fn best_model_for_tier(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-) -> Option<(String, String)> {
-    // Vista senza esclusioni sul PUNTO UNICO parametrico (regola L): estende
-    // automaticamente tutti i ~20 chiamanti storici senza toccarli.
-    best_model_for_tier_excluding(db, tier, capability, requires_tool_use, &[]).await
-}
 
-/// Variante di [`best_model_for_tier`] che ESCLUDE un insieme di provider dalla
-/// selezione (oltre al cooldown). PUNTO UNICO (regola L): `best_model_for_tier`
-/// vi delega con `exclude_providers = &[]`. Usata per il vincolo giudice != worker
-/// (Fase C2): un sub-run di review risolve il proprio modello ESCLUDENDO il
-/// provider del run padre (worker), cosi' la verifica avversaria gira su un
-/// provider diverso — indipendenza reale, non due modelli dello stesso provider
-/// con bias/failure-mode condivisi. Se l'esclusione svuota il pool il chiamante
-/// applica il fallback (preferenza forte, non hard filter).
-pub async fn best_model_for_tier_excluding(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-    exclude_providers: &[String],
-) -> Option<(String, String)> {
-    // Vista senza PIN sul punto unico parametrico (regola L): tutti i chiamanti
-    // storici (`best_model_for_tier`, review-excluding, ...) restano invariati.
-    best_model_for_tier_pinned(
-        db,
-        tier,
-        capability,
-        requires_tool_use,
-        exclude_providers,
-        None,
-    )
-    .await
-}
 
-/// Variante di [`best_model_for_tier_excluding`] che RESTRINGE la selezione a un
-/// SOLO provider (`only_provider`) oltre alle esclusioni. PUNTO UNICO (regola L):
-/// `best_model_for_tier_excluding` vi delega con `only_provider = None`. Usata per
-/// la propagazione del PIN del provider ai sub-agenti worker: il pin e' una
-/// preferenza-forte tier-aware (tier + capability + tool_use INVARIATI, solo il
-/// provider e' vincolato). Ritorna `None` se nessun modello del provider pinnato
-/// soddisfa il tier/capability (o e' in cooldown): il chiamante applica il
-/// fallback SENZA pin (preferenza forte, non hard filter — regola H fail-loud lato
-/// chiamante). Il filtro provider passa da [`EligibilityFilter::only_provider`],
-/// UNICA sorgente del vincolo (regola L): niente seconda query dedicata.
-pub async fn best_model_for_tier_pinned(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    requires_tool_use: bool,
-    exclude_providers: &[String],
-    only_provider: Option<&str>,
-) -> Option<(String, String)> {
-    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
-    // applica l'eleggibilita' agentica + cooldown in un solo posto. L'esclusione
-    // provider passa da `exclude_providers`; il pin da `only_provider`.
-    if requires_tool_use {
-        return select_agentic_model_pinned(
-            db,
-            &[tier],
-            capability,
-            0,
-            exclude_providers,
-            AGENTIC_COST_FIRST_ORDER,
-            only_provider,
-        )
-        .await;
-    }
-    best_non_agentic_model(db, tier, capability, exclude_providers, only_provider).await
-}
 
-/// Ramo NON-agentico di [`best_model_for_tier_excluding`] (purpose
-/// vision/chat/embedding): vista sottile sul punto unico (FASE 2).
-/// `require_tool_use=false` e `require_thinking_non_exclude=false` -> nessun
-/// filtro tool_use/policy e nessun pre-ordinamento non-thinking. La vision e' via
-/// `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
-/// TERZO selettore duplicato) e' stato eliminato (regola L).
-async fn best_non_agentic_model(
-    db: &PgPool,
-    tier: &str,
-    capability: Option<&str>,
-    exclude_providers: &[String],
-    only_provider: Option<&str>,
-) -> Option<(String, String)> {
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: false,
-        require_thinking_non_exclude: false,
-        capability,
-        min_context_window: 0,
-        exclude_providers,
-        apply_cooldown: true,
-        only_provider,
-    };
-    // Pre-ordinamento anti "reasoner puro" (incidente 2026-06-10): i modelli
-    // con uses_thinking_mode=TRUE e supports_tool_use=FALSE (es. deepseek-v4-flash)
-    // nelle chiamate TESTUALI senza tool bruciano l'intero budget di output in
-    // reasoning (content vuoto sistematico, finish_reason=length, reasoning 7-8K
-    // su completion 2000) e non hanno un percorso adapter per spegnere il
-    // thinking (la policy 'disable_for_tools' agisce solo nelle richieste con
-    // tool). Con i provider forti in cooldown risalivano la classifica del tier
-    // e avvelenavano i 41 purpose non-agentici. NON esclusi (il pool non si
-    // svuota: restano ultima spiaggia se tutto il resto e' giu'), solo
-    // retrocessi in coda. I thinking CON tool_use (gemini-2.5, claude) non sono
-    // toccati: i loro adapter governano il thinking budget.
-    match crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        &[tier],
-        "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
-         input_cost_per_million_tokens ASC, is_featured DESC",
-        1,
-    )
-    .await
-    {
-        Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
-        Err(e) => {
-            tracing::warn!("best_model_for_tier (non-agentico): {e}");
-            None
-        }
-    }
-}
 
-/// PUNTO UNICO di selezione di un modello AGENTICO dal catalog (CLAUDE.md, regola L).
-///
-/// Tutte le selezioni/fallback di un modello per un run a tool DEVONO passare di
-/// qui: niente query SQL duplicate sparse (best_model_for_tier, cooldown-fallback,
-/// re-route context-aware, cascade, dynamic catalog) con filtri copiati a mano.
-///
-/// Eleggibilita' SEMPRE applicata (definita una volta sola):
-///   - `is_enabled = TRUE`
-///   - `supports_tool_use = TRUE`
-///   - `agentic_thinking_policy <> 'exclude'` (i dual-mode sono ammessi; l'adapter
-///     forza il non-thinking nei tool-loop, ADR 0025)
-///   - NB: la salute del modello e' gia' garantita da `is_enabled = TRUE`. Il
-///     `model_health_probe` fa AUTO-DISABLE (`is_enabled=false`) quando
-///     `consecutive_failures >= failure_threshold`; quindi un modello enabled ha
-///     per costruzione `consecutive_failures < threshold`. NON filtriamo qui
-///     `consecutive_failures = 0`: era ridondante con is_enabled e DANNOSO ->
-///     creava starvation (un modello con 1 fail transitorio veniva escluso dai
-///     run reali, quindi mai piu' scelto, quindi il counter mai resettato -> fuori
-///     dal pool per sempre). Vedi ADR 0025.
-///   - provider NON in cooldown (snapshot in-memory) e NON in `exclude_providers`
-///
-/// Filtri opzionali:
-///   - `tier_chain`: tier provati in ordine (degradazione); il primo tier con un
-///     match vince. `&[]` = qualunque tier (singola query, ordinata da `order_by`).
-///   - `capability`: `capabilities @> ["cap"]`.
-///   - `min_context_window`: `context_window >= N` (0 = nessun filtro).
-///   - `order_by`: clausola ORDER BY SQL (UNICA variazione per call site; valori
-///     costanti dal codice, mai input utente).
-pub(crate) async fn select_agentic_model(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-) -> Option<(String, String)> {
-    // Vista SENZA pin sul punto unico interno: i ~6 call site storici non cambiano.
-    select_agentic_model_pinned(
-        db,
-        tier_chain,
-        capability,
-        min_context_window,
-        exclude_providers,
-        order_by,
-        None,
-    )
-    .await
-}
 
-/// Variante di [`select_agentic_model`] che RESTRINGE la selezione a un solo
-/// provider (`only_provider`), propagato a [`EligibilityFilter::only_provider`].
-/// PUNTO UNICO interno (regola L): `select_agentic_model` vi delega con
-/// `only_provider = None` (comportamento bit-identico). Usata dalla risoluzione
-/// pinnata dei purpose worker (propagazione del PIN provider ai sub-agenti). La
-/// WHERE di eleggibilita' resta definita una sola volta in `select_models_tierchain`.
-async fn select_agentic_model_pinned(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-    only_provider: Option<&str>,
-) -> Option<(String, String)> {
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: true,
-        require_thinking_non_exclude: true,
-        capability,
-        min_context_window,
-        exclude_providers,
-        apply_cooldown: true,
-        only_provider,
-    };
-    match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
-        Ok(mut v) => v.drain(..).next().map(|(p, m, _)| (p, m)),
-        Err(e) => {
-            // Regola H: l'errore SQL viene loggato, non silenziato come "nessun
-            // modello" (prima `.ok().flatten()` lo inghiottiva).
-            tracing::warn!("select_agentic_model: {e}");
-            None
-        }
-    }
-}
+
+
 
 /// Numero di candidati recuperati per il riordino telemetria-aware della
 /// selezione dinamica (governance). Un pool piccolo del PRIMO tier con candidati:
@@ -621,85 +440,6 @@ async fn select_agentic_model_pinned(
 /// selezione ad altri tier (la degradazione graceful resta di `select_models_tierchain`).
 const GOVERNED_CANDIDATE_POOL: i64 = 8;
 
-/// Variante GOVERNATA (telemetria-aware) di [`select_agentic_model`] per la
-/// selezione dinamica dal catalog. Opt-in (regola G, flag
-/// `agent.governance.telemetry_aware`, default OFF): a flag OFF DELEGA a
-/// [`select_agentic_model`] -> comportamento BIT-IDENTICO (top-1 per `order_by`).
-///
-/// A flag ON recupera i primi [`GOVERNED_CANDIDATE_POOL`] candidati AMMISSIBILI del
-/// primo tier con match (stessa WHERE del punto unico `select_models_tierchain`,
-/// regola L) e li RIORDINA per probabilita' di successo derivata da telemetria
-/// strutturata (regola M) col modulo PURO
-/// [`nexus_agent_graph::decisions::governance::rank_candidates`]: un modello con
-/// error-rate/timeout alto negli ultimi N check viene retrocesso, l'alternativa
-/// sana promossa. L'ordinamento e' STABILE: con telemetria uniforme il top-1 resta
-/// quello per `order_by` (retro-compat anche nel ramo ON).
-///
-/// REPLAY: la selezione dinamica e' una risoluzione del turno PRIMARIO; il modello
-/// scelto viene PINNATO/sticky per il run, quindi il replay/shadow riusa il pin
-/// checkpointato (nessuna ri-derivazione divergente). FAIL-OPEN: errore di lettura
-/// telemetria -> punteggi neutri -> ordine invariato.
-pub(crate) async fn select_agentic_model_governed(
-    db: &PgPool,
-    tier_chain: &[&str],
-    capability: Option<&str>,
-    min_context_window: i64,
-    exclude_providers: &[String],
-    order_by: &str,
-) -> Option<(String, String)> {
-    // Flag OFF (default): comportamento bit-identico al selettore standard.
-    if !crate::governance_telemetry::governance_enabled(db).await {
-        return select_agentic_model(
-            db,
-            tier_chain,
-            capability,
-            min_context_window,
-            exclude_providers,
-            order_by,
-        )
-        .await;
-    }
-
-    // Stessa eleggibilita' del punto unico (regola L): NON re-implemento la WHERE.
-    let filter = crate::orchestrator::EligibilityFilter {
-        require_tool_use: true,
-        require_thinking_non_exclude: true,
-        capability,
-        min_context_window,
-        exclude_providers,
-        apply_cooldown: true,
-        only_provider: None,
-    };
-    let candidates: Vec<(String, String)> = match crate::orchestrator::select_models_tierchain(
-        db,
-        &filter,
-        tier_chain,
-        order_by,
-        GOVERNED_CANDIDATE_POOL,
-    )
-    .await
-    {
-        Ok(v) => v.into_iter().map(|(p, m, _)| (p, m)).collect(),
-        Err(e) => {
-            tracing::warn!("select_agentic_model_governed: {e}");
-            return None;
-        }
-    };
-    // 0/1 candidati: nulla da riordinare (evita I/O telemetria inutile).
-    if candidates.len() < 2 {
-        return candidates.into_iter().next();
-    }
-
-    let telemetry = crate::governance_telemetry::load_model_telemetry(db, &candidates).await;
-    let policy = crate::governance_telemetry::load_governance_policy(db).await;
-    let ranked = nexus_agent_graph::decisions::governance::rank_candidates(
-        &candidates,
-        &telemetry,
-        &[],
-        &policy,
-    );
-    ranked.into_iter().next()
-}
 
 /// Mapping intent classificato -> intent_key per il lookup nella routing matrix.
 ///
@@ -1079,6 +819,206 @@ pub fn default_model_for_provider(
             );
             format!("unknown-provider-{}", provider)
         })
+}
+
+/// Cosa una richiesta di chat sta per chiedere al gateway: la richiesta gia'
+/// costruita e la coppia (provider, modello) su cui il ledger la prenota.
+///
+/// I due pezzi nascono INSIEME, da una sola risoluzione del modello. Prima
+/// vivevano in due calcoli distinti dentro `execute_via_gateway` e divergevano:
+/// la prenotazione portava la coppia `(deepseek, gemini-3.1-flash-lite)`,
+/// misurata nel ledger il 27/07/2026 — un modello che appartiene a google
+/// prenotato su deepseek.
+pub(crate) struct ChatGatewayCall {
+    pub(crate) request: GwRequest,
+    /// Provider su cui si prenota il credito. Col pin e' quello che eseguira'
+    /// davvero; senza pin e' la STIMA (il gateway instrada per policy).
+    pub(crate) ledger_provider: String,
+    /// Modello su cui si prenota. Col pin coincide con `request.model`; senza
+    /// pin `request.model` e' un alias logico che il gateway risolve, e questo
+    /// e' il modello concreto atteso per `ledger_provider`.
+    pub(crate) ledger_model: String,
+}
+
+/// Gli ingressi di [`build_chat_gateway_call`]. Struct e non 12 parametri: la
+/// funzione e' il punto in cui provider, modello e pin devono restare coerenti,
+/// e una lista posizionale lunga e' il modo piu' facile per scambiarne due.
+pub(crate) struct ChatCallSpec<'a> {
+    pub(crate) routing: &'a RoutingConfig,
+    pub(crate) matrix: &'a crate::routing_matrix::RoutingMatrix,
+    pub(crate) intent: &'a str,
+    /// La scelta di provider dell'utente e QUANTO vincola
+    /// ([`ProviderChoice`], punto unico): col pin duro la richiesta viaggia
+    /// pinnata, con la sola preferenza il provider entra come suggerimento e il
+    /// fallback resta. Non e' `Option<&str>` proprio perche' il solo nome del
+    /// provider costringeva a dedurre la forza del vincolo.
+    pub(crate) provider_choice: &'a ProviderChoice,
+    pub(crate) forced_model: Option<&'a str>,
+    pub(crate) suggested_provider: Option<&'a str>,
+    pub(crate) suggested_model: Option<&'a str>,
+    pub(crate) composed_prompt: &'a str,
+    pub(crate) token_budget: u32,
+    pub(crate) tenant_id: &'a str,
+    pub(crate) user_id: &'a str,
+    pub(crate) request_id: String,
+}
+
+/// PUNTO UNICO (regola L) della richiesta che la chat manda al gateway.
+///
+/// Tre regole, tutte conseguenza di un difetto misurato:
+///
+/// 1. **Il pin viaggia come pin — e SOLO il pin.** Il provider PINNATO
+///    dall'utente (dropdown + pulsante "Forza", [`ProviderChoice::Pinned`])
+///    finisce in `GwRequest::pin_provider`, il campo che esiste per questo: il
+///    gateway esegue ESATTAMENTE quel provider, senza `policy.decide` ne'
+///    fallback cross-provider. Prima il pin non veniva valorizzato e la
+///    forzatura era solo un prefisso nel nome del modello: il gateway
+///    re-instradava e rispondeva con un ALTRO provider (27/07/2026: forzato
+///    deepseek, ha risposto google).
+///    La sola PREFERENZA ([`ProviderChoice::Preferred`]: dropdown senza
+///    "Forza", o provider ricordato dalla sessione) NON pinna: entra come
+///    suggerimento — decide da dove parte il routing e su cosa il ledger
+///    prenota — e la richiesta conserva il fallback, esattamente cio' che i
+///    tooltip del composer promettono. Senza questa distinzione ogni selezione
+///    dal dropdown diventerebbe un vincolo duro e i tooltip direbbero il falso:
+///    lo stesso difetto di partenza col segno invertito.
+/// 2. **Il modello non si prefissa col provider.** `"deepseek/coder-large"` non
+///    e' un modello: il prefisso distruggeva la risoluzione dell'alias e il
+///    fornitore rifiutava il nome letterale ("you passed coder-large") con un
+///    400, da cui la cascata di policy che finiva altrove. Col pin il gateway
+///    non risolve alias, quindi qui si manda un modello CONCRETO; senza pin si
+///    manda l'alias logico e lo risolve lui.
+/// 3. **Il modello segue il provider forzato.** Il modello si risolve UNA volta
+///    sola, delegando a [`RoutingConfig::resolve_model`] (lo stesso punto unico
+///    del ramo `(Some(provider), None)` di `resolve_agent_provider`): il modello
+///    suggerito dal routing vale solo se e' del provider su cui si sta per
+///    chiedere, altrimenti si scende al default di QUEL provider. E' cio' che
+///    impedisce la coppia mista che il ledger registrava.
+///
+/// CONSEGUENZA DA CONOSCERE: col pin il gateway va in `strict` e non ripiega su
+/// un altro fornitore. Se il provider forzato fallisce, la chiamata fallisce —
+/// ed e' corretto (l'utente ha chiesto QUEL provider e deve saperlo). Non e' il
+/// "pin senza fallback" che mandava i run in abort: quello era il pin sui
+/// TRANSITORI, chiuso in ADR 0033 (col pin il gateway ritenta lo stesso modello
+/// con backoff e attende i cooldown brevi invece di fallire subito). Qui il
+/// fallimento residuo e' quello vero, e la sua frase la scrive
+/// [`rendered_chat_gateway_error`].
+pub(crate) fn build_chat_gateway_call(spec: ChatCallSpec<'_>) -> ChatGatewayCall {
+    let target = resolve_chat_target(&spec);
+    ChatGatewayCall {
+        request: GwRequest {
+            model: target.gw_model,
+            messages: vec![GwMessage {
+                role: "user".to_string(),
+                content: Value::String(spec.composed_prompt.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                thinking_signature: None,
+            }],
+            max_tokens: Some(spec.token_budget),
+            temperature: None,
+            pin_provider: target.pin_provider,
+            metadata: GwMetadata {
+                tenant_id: spec.tenant_id.to_string(),
+                user_id: spec.user_id.to_string(),
+                request_id: spec.request_id.clone(),
+                // Claim locale di sensibilita' (punto unico dlp, regola L).
+                // L'enforcement resta nel gateway, che ri-classifica e usa
+                // max(claim, classificazione) + validate_tier_claim: il claim
+                // onesto evita di dichiarare 'pubblico' (0) un prompt che il
+                // DLP locale sa gia' essere sensibile.
+                sensitivity_tier: crate::dlp::classify_sensitivity(spec.composed_prompt) as u8,
+                feature: spec.intent.to_string(),
+            },
+            ..Default::default()
+        },
+        ledger_provider: target.ledger_provider,
+        ledger_model: target.ledger_model,
+    }
+}
+
+/// Le decisioni di [`build_chat_gateway_call`] che riguardano il modello,
+/// separate dal confezionamento della richiesta.
+struct ChatTarget {
+    gw_model: String,
+    pin_provider: Option<String>,
+    ledger_provider: String,
+    ledger_model: String,
+}
+
+fn resolve_chat_target(spec: &ChatCallSpec<'_>) -> ChatTarget {
+    // Provider su cui la chiamata verra' prenotata (e, se forzato, pinnata).
+    // Fallback letto dalla matrice DB, non hardcoded (regola G).
+    let fallback_provider = spec
+        .matrix
+        .lookup("chat", "bilanciata")
+        .map(|(provider, _)| provider)
+        .unwrap_or_else(|| "openai".to_string());
+    let provider = spec
+        .provider_choice
+        .provider()
+        .or(spec.suggested_provider)
+        .map(str::to_string)
+        .unwrap_or(fallback_provider);
+
+    // UNA sola risoluzione del modello, dal punto unico. `resolve_model` onora
+    // il modello suggerito solo quando appartiene al provider passato: per
+    // questo il modello FORZATO dall'utente viaggia dichiarandolo di quel
+    // provider (scelta esplicita, vale sempre), mentre il suggerito conserva il
+    // proprio provider di provenienza e viene scartato se non combacia.
+    let provider_del_suggerito = if spec.forced_model.is_some() {
+        Some(provider.as_str())
+    } else {
+        spec.suggested_provider
+    };
+    let model = spec.routing.resolve_model(
+        spec.matrix,
+        &provider,
+        provider_del_suggerito,
+        spec.forced_model.or(spec.suggested_model),
+    );
+
+    // Col pin il gateway NON risolve alias: deve ricevere il modello concreto.
+    // Senza pin — quindi anche con la sola preferenza — resta l'alias logico,
+    // che il gateway risolve per il provider che sceglie: e' cio' che tiene in
+    // vita il fallback cross-provider promesso dai tooltip del composer.
+    let (gw_model, pin_provider) = match spec.provider_choice.pinned_provider() {
+        Some(pinned) => (model.clone(), Some(pinned.to_string())),
+        None => (
+            intent_to_alias(spec.intent, &spec.routing.behavior_mode, spec.forced_model),
+            None,
+        ),
+    };
+    ChatTarget {
+        gw_model,
+        pin_provider,
+        ledger_provider: provider,
+        ledger_model: model,
+    }
+}
+
+/// La frase da mostrare quando una chiamata chat al gateway fallisce.
+///
+/// Delega al punto unico della presentazione
+/// (`nexus_types::error_presentation` via [`crate::nexus_gateway::rendered_from_error`]):
+/// qui si aggiunge solo il fatto che il punto unico non puo' conoscere, cioe'
+/// che il provider era FORZATO — e quindi che nessun altro fornitore e' stato
+/// tentato.
+///
+/// Prima questo path chiudeva con `bail!("Nexus Gateway failed ...: {e}")`, che
+/// APPIATTIVA la catena: `GatewayHttpError` spariva e il confine HTTP della chat
+/// (`chat_messages::run`), che cerca proprio quel tipo per rendere l'errore,
+/// trovava solo una stringa. L'utente leggeva il body grezzo del 400.
+pub(crate) fn rendered_chat_gateway_error(
+    err: &anyhow::Error,
+    pin_provider: Option<&str>,
+) -> nexus_types::error_presentation::RenderedError {
+    let rendered = crate::nexus_gateway::rendered_from_error(err);
+    match pin_provider {
+        Some(provider) => rendered.con_provider_forzato(provider),
+        None => rendered,
+    }
 }
 
 pub(crate) fn completion_has_error(completion: &Value) -> bool {

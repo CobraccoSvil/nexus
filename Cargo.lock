@@ -262,26 +262,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "billing-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "dotenvy",
- "nexus-auth",
- "nexus-project-pools",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -343,6 +323,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "dashmap",
+ "dotenvy",
  "futures",
  "nexus-auth",
  "pkcs1",
@@ -523,6 +504,45 @@ name = "connection-string"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
+
+[[package]]
+name = "console-api"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8030735ecb0d128428b64cd379809817e620a40e5001c54465b99ec5feec2857"
+dependencies = [
+ "futures-core",
+ "prost",
+ "prost-types",
+ "tonic",
+ "tracing-core",
+]
+
+[[package]]
+name = "console-subscriber"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6539aa9c6a4cd31f4b1c040f860a1eac9aa80e7df6b05d506a6e7179936d6a01"
+dependencies = [
+ "console-api",
+ "crossbeam-channel",
+ "crossbeam-utils",
+ "futures-task",
+ "hdrhistogram",
+ "humantime",
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thread_local",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "const-oid"
@@ -1300,6 +1320,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "base64 0.22.1",
+ "byteorder",
+ "flate2",
+ "nom 8.0.0",
+ "num-traits",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1394,6 +1427,12 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hyper"
@@ -1884,7 +1923,7 @@ dependencies = [
  "itoa",
  "log",
  "md-5",
- "nom",
+ "nom 7.1.3",
  "rangemap",
  "time",
  "weezl",
@@ -1958,6 +1997,7 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
+ "tracing",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",
@@ -1975,6 +2015,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "console-subscriber",
  "dashmap",
  "dotenvy",
  "futures",
@@ -1996,9 +2037,15 @@ dependencies = [
  "nexus-graph",
  "nexus-http",
  "nexus-mcp-client",
+ "nexus-migrations",
+ "nexus-migrations-embedded",
+ "nexus-model-eligibility",
  "nexus-orchestrator",
+ "nexus-pricing",
  "nexus-project-db",
  "nexus-project-pools",
+ "nexus-service-catalog",
+ "nexus-test-preconditions",
  "nexus-tool-kit",
  "nexus-types",
  "nexus-wiki",
@@ -2206,6 +2253,8 @@ dependencies = [
  "futures",
  "nexus-graph",
  "nexus-graph-derive",
+ "nexus-migrations-embedded",
+ "nexus-types",
  "rand 0.8.5",
  "regex",
  "ryu",
@@ -2227,6 +2276,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "dashmap",
  "flate2",
  "futures",
  "infer",
@@ -2234,9 +2284,12 @@ dependencies = [
  "mcp-db",
  "mcp-quality",
  "nexus-auth",
+ "nexus-build-graph",
  "nexus-events",
  "nexus-http",
+ "nexus-tool-kit",
  "nexus-types",
+ "nexus-wiki",
  "once_cell",
  "parking_lot",
  "pdf-extract",
@@ -2247,6 +2300,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tar",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -2259,13 +2313,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "jsonwebtoken",
+ "nexus-cache",
+ "nexus-test-preconditions",
  "rand 0.8.5",
  "serde",
  "sha2",
  "sqlx",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2326,7 +2385,10 @@ dependencies = [
  "jsonwebtoken",
  "nexus-auth",
  "nexus-cache",
+ "nexus-migrations-embedded",
+ "nexus-pricing",
  "nexus-tool-kit",
+ "nexus-types",
  "regex",
  "reqwest",
  "serde",
@@ -2389,6 +2451,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-migrations"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "nexus-migrations-embedded"
+version = "0.1.0"
+dependencies = [
+ "nexus-migrations",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nexus-model-eligibility"
+version = "0.1.0"
+
+[[package]]
 name = "nexus-orchestrator"
 version = "0.1.0"
 dependencies = [
@@ -2400,6 +2486,7 @@ dependencies = [
  "nexus-auth",
  "nexus-events",
  "nexus-http",
+ "nexus-types",
  "ort",
  "parking_lot",
  "rand 0.8.5",
@@ -2413,6 +2500,16 @@ dependencies = [
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nexus-pricing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nexus-auth",
+ "sqlx",
+ "tracing",
 ]
 
 [[package]]
@@ -2436,12 +2533,26 @@ name = "nexus-project-pools"
 version = "0.1.0"
 dependencies = [
  "nexus-auth",
- "nexus-cache",
+ "nexus-test-preconditions",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "nexus-service-catalog"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nexus-auth",
+ "nexus-migrations-embedded",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -2452,6 +2563,13 @@ dependencies = [
  "regex",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "nexus-test-preconditions"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
 ]
 
 [[package]]
@@ -2496,6 +2614,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
@@ -2512,6 +2631,7 @@ dependencies = [
  "nexus-build-graph",
  "nexus-http",
  "nexus-project-pools",
+ "nexus-tool-kit",
  "nexus-types",
  "notify",
  "once_cell",
@@ -2545,6 +2665,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -4017,7 +4146,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5851699c4033c63636f7ea4cf7b7c1f1bf06d0cc03cfb42e711de5a5c46cf326"
 dependencies = [
  "base64 0.13.1",
- "nom",
+ "nom 7.1.3",
  "serde",
  "unicode-segmentation",
 ]
@@ -4517,6 +4646,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2 0.6.3",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -5684,11 +5814,17 @@ dependencies = [
  "anyhow",
  "dotenvy",
  "mcp-quality",
+ "nexus-auth",
+ "nexus-migrations",
+ "nexus-migrations-embedded",
+ "nexus-model-eligibility",
+ "nexus-service-catalog",
  "regex",
  "serde",
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
 ]
 
 [[package]]

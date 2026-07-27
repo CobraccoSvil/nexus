@@ -74,7 +74,21 @@ pub async fn stop_similar_running_services(
     label: &str,
 ) -> Vec<String> {
     // agent_processes e' tabella migrata: instrada sul pool del progetto.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // Best-effort (il contratto e' "ferma cio' che vedi"): DB progetto non
+    // disponibile -> nessuna dedup possibile, si salta con WARN. L'eventuale
+    // occupante residuo viene comunque intercettato da find_or_allocate
+    // (porta occupata), e lo spawn successivo fallira' sullo stesso DB.
+    let proj_pool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %e,
+                "stop_similar_running_services: DB progetto non disponibile, salto la dedup"
+            );
+            return Vec::new();
+        }
+    };
     let rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, label FROM agent_processes \
          WHERE project_id = $1 AND kind = 'service' AND status IN ('running','starting')",
@@ -157,8 +171,10 @@ pub async fn spawn_agent_process(
 
     // Separazione DB: agent_processes e' una tabella migrata; con project_id in
     // scope instradiamo tutte le scritture/letture di questa funzione (e del task
-    // di background) sul pool del progetto. A flag OFF ritorna il meta-pool.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // di background) sul pool del progetto. DB non disponibile -> Err esplicito.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Insert initial DB row
     sqlx::query(
@@ -478,9 +494,11 @@ pub async fn read_process_output(
     process_id: Uuid,
     max_chars: usize,
 ) -> Result<ProcessOutput, String> {
-    // Separazione DB: agent_processes vive nel pool del progetto (flag ON),
-    // risolto dal project_id passato dal chiamante. A flag OFF -> meta-DB.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // Separazione DB: agent_processes vive nel pool del progetto,
+    // risolto dal project_id passato dal chiamante.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let row = sqlx::query(
         "SELECT status, exit_code, output, error_output, command, pid FROM agent_processes WHERE id=$1",
     )
@@ -555,9 +573,11 @@ pub async fn stop_process(
     project_id: Uuid,
     process_id: Uuid,
 ) -> Result<String, String> {
-    // Separazione DB: agent_processes vive nel pool del progetto (flag ON),
-    // risolto dal project_id passato dal chiamante. A flag OFF -> meta-DB.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    // Separazione DB: agent_processes vive nel pool del progetto,
+    // risolto dal project_id passato dal chiamante.
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let row = sqlx::query("SELECT pid, status, label FROM agent_processes WHERE id=$1")
         .bind(process_id)
         .fetch_optional(&proj_pool)
@@ -622,7 +642,9 @@ pub async fn stop_process(
 /// List recent processes for a project
 pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<ProcessSummary>, String> {
     // Separazione DB: tabella migrata, project_id in scope -> pool del progetto.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id).await;
+    let proj_pool = crate::project_db_routes::project_data_pool_from(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let rows = sqlx::query(
         r#"SELECT id, label, command, pid, status, exit_code, created_at
            FROM agent_processes

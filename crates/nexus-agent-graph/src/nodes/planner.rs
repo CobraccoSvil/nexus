@@ -67,18 +67,16 @@
 //! - **Chiamata LLM planner + fallback + `_detect_clarifications`**: I/O dietro
 //!   [`crate::runtime::LlmGateway`] (`ctx.llm`); provider/model/prompt RISOLTI A
 //!   MONTE (regola G), passati nella [`PlannerConfig`] / via la `LlmRequest`.
-//!   In shadow l'LLM segue il pattern del crate (oggi latente come negli altri
-//!   nodi: vedi `clarify_or_expand`/`understanding`).
 //! - **`nexus_todo_write` + `knowledge_create_note`**: I/O dietro
 //!   [`crate::runtime::ToolExecutor`] (`ctx.tools`); `knowledge_create_note` e' il
-//!   ramo rationale OFF (non portato). In shadow `ctx.exec_mode() -> Replay`.
+//!   ramo rationale OFF (non portato).
 //! - **`fetch_plan` / `list_todos`**: dietro [`crate::runtime::TodoStore`]
 //!   (`fetch_plan` aggiunto come punto unico todo store, regola L).
 //! - **`_persist_clarifications`** (INSERT `nexus_agent_clarifications`, `:862`):
-//!   SCRITTURA DB best-effort. Non esiste una porta dedicata; e' gated shadow
-//!   (no-op in Replay) e best-effort lato Python. TODO impl concreta in mcp-core
-//!   (oggi il delta clarifying viaggia comunque nello stato, la INSERT e' solo
-//!   telemetria). Il nodo NON la richiede per funzionare.
+//!   SCRITTURA DB best-effort. Non esiste una porta dedicata; e' best-effort lato
+//!   Python. TODO impl concreta in mcp-core (oggi il delta clarifying viaggia
+//!   comunque nello stato, la INSERT e' solo telemetria). Il nodo NON la richiede
+//!   per funzionare.
 //! - **`meta_steps.persist_async`** (`:562`): la persistenza best-effort del
 //!   meta_step `plan` su `nexus_agent_meta_steps` e' un side-effect del brain; nel
 //!   runtime Rust il meta_step viaggia gia' nel delta (`meta_steps`, reducer
@@ -100,7 +98,7 @@ use nexus_graph::StateDelta as OpaqueDelta;
 use crate::decisions::orchestration_reason::build_orchestration_context;
 use crate::decisions::turn_focus::build_turn_focus_directive;
 use crate::runtime::ports::{
-    Coordination, ExecMode, LlmMessage, LlmRequest, OrchPhase, OrchestrationMove, PlanRow, SubTask,
+    Coordination, LlmMessage, LlmRequest, OrchPhase, OrchestrationMove, PlanRow, SubTask,
     TodoStore,
 };
 use crate::runtime::AgentNodeCtx;
@@ -160,7 +158,7 @@ pub struct PlannerConfig {
     pub dag_topological_enabled: bool,
     /// Gate ORCHESTRAZIONE LLM-driven della plan-phase abilitato
     /// (`agent.orchestration.enabled`, **default false**, regola G). Fase 1
-    /// dell'orchestrazione (piano design v2): quando ON e NON in Replay, il gate
+    /// dell'orchestrazione (piano design v2): quando ON, il gate
     /// plan-phase consulta [`crate::runtime::ports::MetaReasonerPort::orchestrate`]
     /// PRIMA di [`PlannerConfig::is_eligible`] e ne mappa l'esito; qualunque
     /// degrado (`Fallback`/`Ok(None)`/errore porta) RICADE su `is_eligible`
@@ -599,12 +597,12 @@ pub fn build_tool_input(
 /// il `bool` non poteva trasportare i `tasks`/`coordination` della delega (TODO
 /// storico "esecuzione decompose/delega", PR5 lo chiude).
 ///
-/// Con `orchestration_enabled=false` (default) / Replay / Fallback il gate
+/// Con `orchestration_enabled=false` (default) / Fallback il gate
 /// ritorna [`PlanGateOutcome::Heuristic`] -> comportamento bit-identico a oggi.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanGateOutcome {
     /// Il gate NON decide: ricadi su `is_eligible` (euristica, rete di sicurezza).
-    /// Flag OFF (default), Replay, `Fallback`, `Ok(None)`, errore di porta.
+    /// Flag OFF (default), `Fallback`, `Ok(None)`, errore di porta.
     Heuristic,
     /// Procedi alla plan-phase (generazione LLM dei todo): `PlanPhase`/`Decompose`.
     ProceedPlanPhase,
@@ -683,8 +681,8 @@ pub struct PlannerNode {
     /// L: mcp-core la costruisce UNA volta e la condivide tra i due nodi). Il
     /// planner usa SOLO [`MetaReasonerPort::orchestrate`] per il gate plan-phase
     /// (Fase 1 dell'orchestrazione); il metodo `recover` e' consumato dal nodo
-    /// `StallRecovery`. Con `orchestration_enabled=false` (default) o in Replay il
-    /// gate NON la consulta -> comportamento bit-identico a oggi.
+    /// `StallRecovery`. Con `orchestration_enabled=false` (default) il gate NON la
+    /// consulta -> comportamento bit-identico a oggi.
     reasoner: Arc<dyn crate::runtime::ports::MetaReasonerPort>,
 }
 
@@ -759,13 +757,8 @@ impl PlannerNode {
     ///     todo-runner li esegue a valle con l'isolamento deciso da PR4);
     ///   - `Fallback`      -> [`PlanGateOutcome::Heuristic`] (ricadi su `is_eligible`).
     ///
-    /// REPLAY (opzione A, come per il recovery): in [`ExecMode::Replay`] il gate
-    /// NON consulta `orchestrate` (il `ReplayLlmGateway` non rigioca il purpose
-    /// orchestrazione: darebbe una risposta vuota che divergerebbe) -> ritorna
-    /// SEMPRE [`PlanGateOutcome::Heuristic`], forzando il ramo euristico
-    /// `is_eligible`. Cosi' lo shadow resta bit-identico al Python (che non ha
-    /// l'orchestratore). REGOLA G: con `orchestration_enabled=false` (default)
-    /// ritorna `Heuristic` senza consultare nulla (comportamento bit-identico a oggi).
+    /// REGOLA G: con `orchestration_enabled=false` (default) ritorna `Heuristic`
+    /// senza consultare nulla (comportamento bit-identico a oggi).
     ///
     /// I segnali per [`build_orchestration_context`] sono raccolti dai campi
     /// STRUTTURATI di [`AgentState`] (regola M): user_intent, behavior_mode,
@@ -780,15 +773,6 @@ impl PlannerNode {
     async fn orchestration_gate(&self, state: &AgentState, ctx: &AgentNodeCtx) -> PlanGateOutcome {
         // Regola G: gate OFF di default -> ricadi su is_eligible (bit-identico).
         if !self.cfg.orchestration_enabled {
-            return PlanGateOutcome::Heuristic;
-        }
-        // Replay (opzione A): non consultare l'LLM (divergerebbe dallo shadow) ->
-        // forza il ramo euristico. Vale anche per il run shadow read-only.
-        if ctx.exec_mode() == ExecMode::Replay {
-            tracing::debug!(
-                target: "nexus_agent_graph::planner",
-                "orchestration gate: Replay -> ricado su is_eligible (opzione A)"
-            );
             return PlanGateOutcome::Heuristic;
         }
 
@@ -831,7 +815,7 @@ impl PlannerNode {
             ctx.isolation_available,
         );
 
-        match self.reasoner.orchestrate(orch_ctx, ctx.exec_mode()).await {
+        match self.reasoner.orchestrate(orch_ctx).await {
             // PlanPhase / Decompose -> procedi alla generazione LLM dei todo.
             // Decompose e' trattata come PlanPhase (la scomposizione in blocchi
             // multipli non e' ancora materializzata; la delega si', sotto).
@@ -1002,9 +986,8 @@ impl PlannerNode {
             model: model.to_string(),
             messages: msgs,
             tools: Some(tool_catalog()),
-            // Nodo chiamante = planner (sia primario sia fallback tool-robust): in
-            // shadow il decorator di replay neutralizza questo purpose (pass-through,
-            // planner gia' default OFF). Il gateway concreto lo IGNORA (regola L).
+            // Nodo chiamante = planner (sia primario sia fallback tool-robust). Il
+            // gateway concreto lo IGNORA quando il modello e' gia' risolto (regola L).
             purpose: Some("planner".into()),
             ..Default::default()
         }
@@ -1214,9 +1197,9 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         // Regola L: l'euristica `is_eligible` resta il PUNTO UNICO dell'ingresso
         // plan-phase; il gate orchestrazione la SCAVALCA solo se il reasoner decide
         // in modo esplicito (Some(true)/Some(false)), altrimenti (None: flag OFF /
-        // Replay / Fallback / Ok(None) / errore) ricade su di essa INVARIATA (rete
-        // di sicurezza). Con `orchestration_enabled=false` (default) e in Replay
-        // ritorna sempre None -> comportamento bit-identico a oggi.
+        // Fallback / Ok(None) / errore) ricade su di essa INVARIATA (rete di
+        // sicurezza). Con `orchestration_enabled=false` (default) ritorna sempre
+        // None -> comportamento bit-identico a oggi.
         // `delegation` non-None -> il gate ha deciso di MATERIALIZZARE la delega:
         // il todo_block e' costruito DAI TASK (non generato dall'LLM), riusando il
         // punto unico nexus_todo_write (regola L). Propagato fino al ramo di
@@ -1421,7 +1404,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
             input: call.input.clone(),
             thought_signature: None,
         };
-        let outcome = match ctx.tools.execute(call, ctx.exec_mode()).await {
+        let outcome = match ctx.tools.execute(call).await {
             Ok(o) => o,
             Err(err) => {
                 tracing::error!(
@@ -1473,7 +1456,6 @@ impl GraphNode<AgentState, AgentNodeCtx> for PlannerNode {
         crate::nodes::emit_phase_meta(
             ctx.emit.as_ref(),
             self.meta_steps.as_ref(),
-            ctx.exec_mode(),
             &plan_meta.kind,
             plan_meta.title.clone(),
             plan_meta.payload.clone(),
@@ -1576,8 +1558,8 @@ impl PlannerNode {
                 ..Default::default()
             }],
             tools: Some(vec![tool]),
-            // Clarifying-detect del planner: stesso purpose "planner" (neutralizzato
-            // in shadow). Il gateway concreto lo IGNORA (regola L).
+            // Clarifying-detect del planner: stesso purpose "planner". Il gateway
+            // concreto lo IGNORA quando il modello e' gia' risolto (regola L).
             purpose: Some("planner".into()),
             ..Default::default()
         };
@@ -1677,7 +1659,7 @@ mod tests {
     use super::*;
     use crate::decisions::dag_scheduler::{Todo, TodoStatus};
     use crate::runtime::ports::{
-        ExecMode, LlmResponse, LlmUsage, PortError, ToolCall, ToolOutcome,
+        LlmResponse, LlmUsage, PortError, ToolCall, ToolOutcome,
     };
     use crate::runtime::test_doubles::{NullEventSink, StubTodoStore};
     use crate::runtime::AgentNodeCtx;
@@ -1783,11 +1765,11 @@ mod tests {
     }
 
     /// ToolExecutor scriptato: ritorna un `result_json` fisso e registra le
-    /// chiamate + modalita' (per verificare shadow -> Replay).
+    /// chiamate ricevute.
     struct ScriptedTools {
         result_json: String,
         is_error: bool,
-        seen: Mutex<Vec<(ToolCall, ExecMode)>>,
+        seen: Mutex<Vec<ToolCall>>,
     }
     impl ScriptedTools {
         fn ok(result_json: &str) -> Self {
@@ -1800,9 +1782,9 @@ mod tests {
     }
     #[async_trait]
     impl crate::runtime::ports::ToolExecutor for ScriptedTools {
-        async fn execute(&self, call: ToolCall, mode: ExecMode) -> Result<ToolOutcome, PortError> {
+        async fn execute(&self, call: ToolCall) -> Result<ToolOutcome, PortError> {
             let id = call.id.clone();
-            self.seen.lock().unwrap().push((call, mode));
+            self.seen.lock().unwrap().push(call);
             Ok(ToolOutcome {
                 tool_call_id: id,
                 content: Value::String(self.result_json.clone()),
@@ -1866,7 +1848,6 @@ mod tests {
         async fn recover(
             &self,
             _ctx: crate::runtime::ports::StallContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::runtime::ports::RecoveryMove>, PortError> {
             Ok(None)
         }
@@ -1874,7 +1855,6 @@ mod tests {
         async fn orchestrate(
             &self,
             ctx: crate::runtime::ports::OrchestrationContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::runtime::ports::OrchestrationMove>, PortError> {
             *self.orchestrate_calls.lock().unwrap() += 1;
             *self.isolation_seen.lock().unwrap() = Some(ctx.isolation_available);
@@ -1884,7 +1864,6 @@ mod tests {
         async fn assess_scale(
             &self,
             _ctx: crate::runtime::ports::ScaleContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::runtime::ports::ScaleMove>, PortError> {
             Ok(None)
         }
@@ -1892,7 +1871,6 @@ mod tests {
         async fn supervise(
             &self,
             _ctx: crate::runtime::ports::SupervisorContext,
-            _mode: ExecMode,
         ) -> Result<Option<crate::decisions::supervisor::SupervisorDecision>, PortError> {
             Ok(Some(crate::decisions::supervisor::SupervisorDecision::Continue))
         }
@@ -1903,7 +1881,6 @@ mod tests {
     fn ctx_with(
         llm: Arc<dyn crate::runtime::ports::LlmGateway>,
         tools: Arc<dyn crate::runtime::ports::ToolExecutor>,
-        shadow: bool,
     ) -> AgentNodeCtx {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
@@ -1919,7 +1896,7 @@ mod tests {
             run_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             thread_id: Uuid::new_v4(),
-            shadow,
+            advisory_gate: None,
         }
     }
 
@@ -1930,6 +1907,9 @@ mod tests {
             depends_on: vec![],
             seq: Some(seq),
             write_scope: Vec::new(),
+            content: None,
+            priority: None,
+            acceptance_criteria: Vec::new(),
         }
     }
 
@@ -1969,7 +1949,6 @@ mod tests {
         let ctx = ctx_with(
             Arc::new(ScriptedLlm::never_tool()),
             Arc::new(ScriptedTools::ok("{}")),
-            false,
         );
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
@@ -1979,13 +1958,11 @@ mod tests {
 
     // ── Gate orchestrazione LLM-driven (Fase 1) ─────────────────────────────
 
-    /// Ctx Real minimale (LLM/tool non consultati dal solo gate): il gate legge
-    /// solo `ctx.exec_mode()`.
-    fn gate_ctx(shadow: bool) -> AgentNodeCtx {
+    /// Ctx minimale (LLM/tool non consultati dal solo gate).
+    fn gate_ctx() -> AgentNodeCtx {
         ctx_with(
             Arc::new(ScriptedLlm::never_tool()),
             Arc::new(ScriptedTools::ok("{}")),
-            shadow,
         )
     }
 
@@ -2009,7 +1986,7 @@ mod tests {
         let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::RunInline)));
         // cfg_active: plan_phase_enabled=true, orchestration_enabled=false.
         let node = node_with_reasoner(cfg_active(), store_reusable(), spy.clone());
-        let ctx = gate_ctx(false);
+        let ctx = gate_ctx();
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         // orchestrate NON chiamato (flag OFF): comportamento bit-identico a oggi.
@@ -2027,7 +2004,7 @@ mod tests {
         })));
         let store = Arc::new(StubTodoStore::with_todos(vec![]));
         let node = node_with_reasoner(PlannerConfig::default(), store, spy.clone());
-        let ctx = gate_ctx(false);
+        let ctx = gate_ctx();
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 0);
@@ -2047,7 +2024,7 @@ mod tests {
             ..Default::default()
         };
         let node = node_with_reasoner(cfg, store, spy.clone());
-        let ctx = gate_ctx(false);
+        let ctx = gate_ctx();
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         // orchestrate consultato una volta (Real, flag ON).
@@ -2070,7 +2047,7 @@ mod tests {
                 ..Default::default()
             };
             let node = node_with_reasoner(cfg, store, spy.clone());
-            let mut ctx = gate_ctx(false); // Real (non shadow)
+            let mut ctx = gate_ctx();
             ctx.isolation_available = iso;
             let st = eligible_state();
             let _ = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
@@ -2081,26 +2058,6 @@ mod tests {
                 "l'OrchestrationContext deve rispecchiare ctx.isolation_available"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn orchestration_replay_non_consulta_forza_is_eligible() {
-        // Flag ON ma REPLAY (shadow): opzione A. orchestrate NON consultato ->
-        // forza il ramo euristico is_eligible (bit-identico al Python). cfg_active
-        // (plan_phase ON) + stato eligible -> procede via is_eligible.
-        let spy = Arc::new(SpyReasoner::new(Some(OrchestrationMove::RunInline)));
-        let mut cfg = cfg_active();
-        cfg.orchestration_enabled = true;
-        let node = node_with_reasoner(cfg, store_reusable(), spy.clone());
-        // shadow=true -> ExecMode::Replay.
-        let ctx = gate_ctx(true);
-        let st = eligible_state();
-        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
-        // In Replay orchestrate NON e' chiamato (opzione A): la RunInline dello spy
-        // e' ignorata, governa is_eligible.
-        assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 0);
-        // is_eligible=true -> plan-phase (riuso), la RunInline dello spy NON ha effetto.
-        assert_eq!(out.plan_phase_active, Some(true));
     }
 
     #[tokio::test]
@@ -2125,7 +2082,6 @@ mod tests {
                 json!({"action": "create", "todos": [{"content": "step 1"}]}),
             )),
             Arc::new(ScriptedTools::ok(r#"{"ok":true}"#)),
-            false,
         );
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
@@ -2143,7 +2099,7 @@ mod tests {
         let mut cfg = cfg_active();
         cfg.orchestration_enabled = true;
         let node = node_with_reasoner(cfg, store, spy.clone());
-        let ctx = gate_ctx(false);
+        let ctx = gate_ctx();
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
@@ -2211,10 +2167,10 @@ mod tests {
     /// Cattura la `ToolCall` `nexus_todo_write` emessa dal planner (ultima seen).
     fn last_todo_write_input(tools: &ScriptedTools) -> Value {
         let seen = tools.seen.lock().unwrap();
-        let (call, _mode) = seen
+        let call = seen
             .iter()
             .rev()
-            .find(|(c, _)| c.name == "nexus_todo_write")
+            .find(|c| c.name == "nexus_todo_write")
             .expect("nexus_todo_write chiamato");
         call.input.clone()
     }
@@ -2247,7 +2203,7 @@ mod tests {
         let node = node_with_reasoner(cfg, store, spy.clone());
         let llm = Arc::new(ScriptedLlm::never_tool());
         let tools = Arc::new(ScriptedTools::ok(r#"{"ok":true}"#));
-        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let ctx = ctx_with(llm.clone(), tools.clone());
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(*spy.orchestrate_calls.lock().unwrap(), 1);
@@ -2290,7 +2246,7 @@ mod tests {
         let node = node_with_reasoner(cfg, store, spy.clone());
         let llm = Arc::new(ScriptedLlm::never_tool());
         let tools = Arc::new(ScriptedTools::ok(r#"{"ok":true}"#));
-        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let ctx = ctx_with(llm.clone(), tools.clone());
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(*llm.calls.lock().unwrap(), 0);
@@ -2318,7 +2274,7 @@ mod tests {
         let node = node_with_reasoner(cfg_active(), store_reusable(), spy.clone());
         let llm = Arc::new(ScriptedLlm::never_tool());
         let tools = Arc::new(ScriptedTools::ok(r#"{"ok":true}"#));
-        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let ctx = ctx_with(llm.clone(), tools.clone());
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         // Flag OFF: orchestrate MAI consultato (bit-identico).
@@ -2326,7 +2282,7 @@ mod tests {
         // Riuso del piano esistente: nessuna materializzazione (nessun tool write).
         let seen = tools.seen.lock().unwrap();
         assert!(
-            !seen.iter().any(|(c, _)| c.name == "nexus_todo_write"),
+            !seen.iter().any(|c| c.name == "nexus_todo_write"),
             "flag OFF: nessun todo_write materializzato (riuso)"
         );
         assert_eq!(out.plan_phase_active, Some(true));
@@ -2350,7 +2306,7 @@ mod tests {
         ));
         let llm = Arc::new(ScriptedLlm::never_tool());
         let node = node_with(cfg_active(), store);
-        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok("{}")), false);
+        let ctx = ctx_with(llm.clone(), Arc::new(ScriptedTools::ok("{}")));
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(true));
@@ -2385,7 +2341,6 @@ mod tests {
         let ctx = ctx_with(
             llm.clone(),
             Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)),
-            false,
         );
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
@@ -2413,7 +2368,7 @@ mod tests {
                 {"id": "q1", "question": "Quale DB?", "suggested_default": "postgres"}
             ]}),
         ));
-        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")));
         let mut st = eligible_state();
         st.behavior_mode = Some("confirm".to_string());
         // Il branching clarifying (clarifying_branch) decide HALT vs ApplyDefaults
@@ -2459,7 +2414,6 @@ mod tests {
         let ctx = ctx_with(
             llm.clone(),
             Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)),
-            false,
         );
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
@@ -2488,7 +2442,7 @@ mod tests {
         let node = node_with(cfg, store);
         let llm = Arc::new(ScriptedLlm::never_tool());
         let tools = Arc::new(ScriptedTools::ok(r#"{"ok": true}"#));
-        let ctx = ctx_with(llm.clone(), tools.clone(), false);
+        let ctx = ctx_with(llm.clone(), tools.clone());
         let mut st = eligible_state();
         st.playbook_steps = Some(vec!["passo 1".to_string(), "passo 2".to_string()]);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
@@ -2498,7 +2452,7 @@ mod tests {
         // Il tool nexus_todo_write e' stato eseguito coi todos del playbook.
         let seen = tools.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        let todos = seen[0].0.input["todos"].as_array().expect("todos");
+        let todos = seen[0].input["todos"].as_array().expect("todos");
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0]["content"], json!("passo 1"));
     }
@@ -2511,7 +2465,7 @@ mod tests {
         cfg.clarifying_questions_enabled = false;
         let node = node_with(cfg, store);
         let llm = Arc::new(ScriptedLlm::never_tool());
-        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")));
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(false));
@@ -2538,7 +2492,7 @@ mod tests {
             Arc::new(crate::runtime::StubMetaReasonerPort),
         );
         let llm = Arc::new(ScriptedLlm::never_tool());
-        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")), false);
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok("{}")));
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(false));
@@ -2560,38 +2514,13 @@ mod tests {
             "nexus_todo_write",
             json!({"action": "create", "todos": [{"content": "X"}]}),
         ));
-        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": false}"#)), false);
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": false}"#)));
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(
             out.plan_phase_skip_reason.as_deref(),
             Some("tool_returned_error")
         );
-    }
-
-    // ── Shadow: tool in Replay ──────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn shadow_usa_replay() {
-        let store = Arc::new(StubTodoStore::with_todos(vec![todo(
-            "t1",
-            TodoStatus::Pending,
-            1,
-        )]));
-        let mut cfg = cfg_active();
-        cfg.clarifying_questions_enabled = false;
-        let node = node_with(cfg, store);
-        let llm = Arc::new(ScriptedLlm::always_tool(
-            "nexus_todo_write",
-            json!({"action": "create", "todos": [{"content": "X"}]}),
-        ));
-        let tools = Arc::new(ScriptedTools::ok(r#"{"ok": true}"#));
-        let ctx = ctx_with(llm, tools.clone(), true); // shadow
-        let st = eligible_state();
-        let _ = node.run(&st, &ctx).await.expect("run");
-        let seen = tools.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].1, ExecMode::Replay, "shadow -> Replay");
     }
 
     // ── Continuita' tool_use/tool_result (planner_node.py:586-602) ───────────
@@ -2647,7 +2576,7 @@ mod tests {
             "nexus_todo_write",
             json!({"action": "create", "todos": [{"content": "X"}]}),
         ));
-        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)));
         let st = eligible_state();
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));
         assert_eq!(out.plan_phase_active, Some(true));
@@ -2670,7 +2599,7 @@ mod tests {
         )]));
         let node = node_with(cfg, store);
         let llm = Arc::new(ScriptedLlm::never_tool());
-        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)), false);
+        let ctx = ctx_with(llm, Arc::new(ScriptedTools::ok(r#"{"ok": true}"#)));
         let mut st = eligible_state();
         st.playbook_steps = Some(vec!["passo 1".to_string(), "passo 2".to_string()]);
         let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run"));

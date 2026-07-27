@@ -71,7 +71,6 @@ import {
   EMPTY_GROUPS,
   basename,
   hydrateGroups,
-  iconButton,
   makeTab,
   normalizeWorkbenchState,
   type ProviderHealthState,
@@ -84,8 +83,15 @@ import { StatusBar } from "./shell/status-bar";
 import { FirstAnalysisOverlay } from "./shell/first-analysis-overlay";
 import { ShellOverlays } from "./shell/shell-overlays";
 import { BottomPanelHeader } from "./shell/bottom-panel-header";
-import { RightViewTabs } from "./shell/panel-tabs";
-import { rightSidebarBounds } from "./shell/panel-sizing-logic";
+import { RightColumn } from "./shell/right-column";
+import { ChatHead } from "./chat/chat-head";
+import {
+  activityBarWidth as activityBarWidthFor,
+  clampLeftWidth,
+  leftSidebarBounds,
+  mainAreaAvailableWidth,
+  rightSidebarBounds,
+} from "./shell/panel-sizing-logic";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -98,18 +104,6 @@ const EditorArea = dynamic(() => import("./editor/editor-area.lazy"), {
   ssr: false,
 });
 
-const SqlQueryPanel = dynamic(
-  () => import("./sql/sql-query-panel").then((m) => m.SqlQueryPanel),
-  {
-    loading: () => (
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>
-        Caricamento pannello SQL…
-      </div>
-    ),
-    ssr: false,
-  },
-);
-
 const SidebarManager = dynamic(() => import("./sidebar/sidebar-manager.lazy"), {
   loading: () => <div style={{ width: 300 }} />,
   ssr: false,
@@ -117,11 +111,6 @@ const SidebarManager = dynamic(() => import("./sidebar/sidebar-manager.lazy"), {
 
 const BottomPanelManager = dynamic(() => import("./panels/bottom-panel-manager.lazy"), {
   loading: () => <div style={{ height: 250 }} />,
-  ssr: false,
-});
-
-const ProfileSelector = dynamic(() => import("./chat/profile-selector.lazy"), {
-  loading: () => <div>Loading...</div>,
   ssr: false,
 });
 
@@ -310,18 +299,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
 
   const isNarrowViewport = viewportWidth < 1280;
   const isMobileViewport = viewportWidth < 980;
-  const activityBarWidth = isMobileViewport ? 46 : 52;
   const activityButtonSize = isMobileViewport ? 32 : 36;
-  const leftSidebarMinWidth = isMobileViewport ? 160 : isNarrowViewport ? 190 : 220;
-  const leftSidebarMaxWidth = Math.max(
-    leftSidebarMinWidth,
-    Math.min(520, Math.floor(viewportWidth * 0.46)),
+  // Larghezze orizzontali: punto unico in panel-sizing-logic (regola L).
+  const activityBarWidth = activityBarWidthFor(viewportWidth);
+  const { min: leftSidebarMinWidth, max: leftSidebarMaxWidth } = leftSidebarBounds(viewportWidth);
+  const effectiveLeftWidth = clampLeftWidth(leftWidth, viewportWidth);
+  // I vincoli del pannello a larghezza fissa dipendono dallo spazio che resta
+  // DAVVERO, non dal solo viewport: la chrome lo consuma prima. Il tetto e' piu'
+  // generoso sotto la soglia narrow/mobile; sotto lo spazio per due pannelli, la
+  // colonna fissa cede tutto e ne resta uno solo.
+  const availableMainWidth = mainAreaAvailableWidth(viewportWidth, leftWidth, primarySidebarVisible);
+  const { min: rightSidebarMinWidth, max: rightSidebarMaxWidth } = rightSidebarBounds(
+    viewportWidth,
+    availableMainWidth,
   );
-  // Vincoli pannello destro: punto unico in panel-sizing-logic (regola L). Il
-  // tetto e' piu' generoso sotto la soglia narrow/mobile.
-  const { min: rightSidebarMinWidth, max: rightSidebarMaxWidth } = rightSidebarBounds(viewportWidth);
-  const effectiveLeftWidth = Math.max(leftSidebarMinWidth, Math.min(leftSidebarMaxWidth, leftWidth));
   const effectiveRightWidth = Math.max(rightSidebarMinWidth, Math.min(rightSidebarMaxWidth, rightWidth));
+  // Niente spazio per due colonne: il divisorio non avrebbe nulla da trascinare.
+  const rightPanelCollapsed = rightSidebarMaxWidth === 0;
 
   // Bottom panel: altezza proporzionale al viewport (min 120, max 50% dello spazio disponibile)
   const bottomPanelMinHeight = isMobileViewport ? 120 : 160;
@@ -572,7 +566,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     [allOpenTabs],
   );
   const currentBranch = activeProject?.currentBranch || gitState?.currentBranch || "n/a";
-  const showSecondaryAi = layoutMode === "editor-center" && secondarySidebarVisible;
+  // Col pannello singolo la secondary non ci sta: renderla a 0px la mostrerebbe
+  // come "aperta" senza che si veda nulla.
+  const showSecondaryAi =
+    layoutMode === "editor-center" && secondarySidebarVisible && !rightPanelCollapsed;
   const activeGroup =
     editorGroups.find((group) => group.id === activeEditorGroupId) ?? editorGroups[0];
   const activeEditorTab =
@@ -1309,6 +1306,11 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     <div
       style={{
         display: "grid",
+        // La colonna va dichiarata: quella implicita vale `auto`, cioe' max-content,
+        // e non e' vincolata dal container. Senza questa riga il grid resta largo
+        // quanto il messaggio piu' largo (misurati 614px in una colonna da 312) e
+        // header, messaggi e composer venivano tagliati dall'overflow del padre.
+        gridTemplateColumns: "minmax(0, 1fr)",
         gridTemplateRows: "36px 1fr",
         minHeight: 0,
         minWidth: 0,
@@ -1328,177 +1330,80 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           gap: 8,
         }}
       >
-        <div style={{ color: tc.text, fontSize: 13, fontWeight: 700, whiteSpace: "nowrap" }}>AI Workspace</div>
-        <ProfileSelector
-          profiles={profilesMgr.profiles}
-          selectedProfileId={selectedProfileId}
-          onSelect={(id) => setSelectedProfileId(id)}
-          onCreateNew={() => { setEditingProfile(undefined); setShowProfileEditor(true); }}
-          style={{ flexShrink: 0 }}
-        />
+        {/* Il titolo e' decorativo: cede per primo (flexShrink alto) e si tronca,
+            cosi' lo spazio resta ai controlli. */}
         <div
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
+            color: tc.text,
+            fontSize: 13,
+            fontWeight: 700,
+            whiteSpace: "nowrap",
             minWidth: 0,
             overflow: "hidden",
-            flexShrink: 1,
+            textOverflow: "ellipsis",
+            flexShrink: 8,
           }}
-          title="Comandi multi-chat"
         >
-          <select
-            value={multiChat.activeTabId ?? ""}
-            onChange={(e) => {
-              const next = e.target.value;
-              if (!next) return;
-              if (!multiChat.openTabs.includes(next)) {
-                multiChat.openTab(next);
-              } else {
-                multiChat.setActiveTab(next);
+          AI Workspace
+        </div>
+        {/* Testata della chat: distesa in riga quando i controlli ci stanno,
+            raccolta nel popover (l'hamburger) quando non ci stanno. ChatHead
+            misura sul DOM vivo e sceglie; il popover non e' piu' mostrato sempre. */}
+        <ChatHead
+          tc={tc}
+          profiles={profilesMgr.profiles}
+          selectedProfileId={selectedProfileId}
+          onSelectProfile={(id) => setSelectedProfileId(id)}
+          onCreateProfile={() => { setEditingProfile(undefined); setShowProfileEditor(true); }}
+          sessions={multiChat.allSessions}
+          activeSessionId={multiChat.activeTabId ?? null}
+          onSelectSession={(id) => {
+            if (!multiChat.openTabs.includes(id)) {
+              multiChat.openTab(id);
+            } else {
+              multiChat.setActiveTab(id);
+            }
+          }}
+          onNewSession={() => void multiChat.newSession()}
+          onRenameSession={() => {
+            const currentId = multiChat.activeTabId;
+            if (!currentId) return;
+            const currentTitle =
+              multiChat.allSessions.find((session) => session.id === currentId)?.title ?? "";
+            void (async () => {
+              const next = await promptDialog("Nuovo nome chat", currentTitle, "Rinomina chat");
+              if (next?.trim()) {
+                await multiChat.renameSession(currentId, next.trim());
               }
-            }}
-            title="Seleziona sessione chat"
-            style={{
-              borderRadius: 999,
-              border: `1px solid ${tc.border}`,
-              background: tc.bgInput,
-              color: tc.textSecondary,
-              padding: "2px 8px",
-              fontSize: 11,
-              fontFamily: "inherit",
-              minWidth: 0,
-              maxWidth: 210,
-              flexShrink: 1,
-            }}
-          >
-            {multiChat.allSessions.length === 0 ? (
-              <option value="">Nessuna chat</option>
-            ) : (
-              multiChat.allSessions.map((session) => (
-                <option key={session.id} value={session.id}>
-                  {session.title}
-                </option>
-              ))
-            )}
-          </select>
-          <button
-            type="button"
-            onClick={() => void multiChat.newSession()}
-            title="Nuova chat"
-            aria-label="Nuova chat"
-            style={iconButton(tc)}
-          >
-            ＋
-          </button>
-          <button
-            type="button"
-            disabled={!multiChat.activeTabId}
-            onClick={() => {
-              const currentId = multiChat.activeTabId;
-              if (!currentId) return;
-              const currentTitle =
-                multiChat.allSessions.find((session) => session.id === currentId)?.title ?? "";
-              void (async () => {
-                const next = await promptDialog("Nuovo nome chat", currentTitle, "Rinomina chat");
-                if (next?.trim()) {
-                  await multiChat.renameSession(currentId, next.trim());
-                }
-              })();
-            }}
-            title="Rinomina chat"
-            aria-label="Rinomina chat"
-            style={iconButton(tc, !multiChat.activeTabId)}
-          >
-            ✎
-          </button>
-          <button
-            type="button"
-            disabled={!multiChat.activeTabId}
-            onClick={() => {
-              const currentId = multiChat.activeTabId;
-              if (!currentId) return;
-              void (async () => {
-                const ok = await confirmDialog("Eliminare questa chat? Tutti i messaggi saranno rimossi.");
-                if (ok) {
-                  await multiChat.deleteSession(currentId);
-                }
-              })();
-            }}
-            title="Elimina chat"
-            aria-label="Elimina chat"
-            style={iconButton(tc, !multiChat.activeTabId)}
-          >
-            🗑
-          </button>
-          {(() => {
-            // % di riempimento context_window dell'ultimo turno della chat attiva.
-            // Aggiornata da ChatPanel via onCtxRatioChange → multiChat.setCtxRatio.
-            // Mostriamo il valore sul bottone "Compatta chat" cosi' l'utente vede
-            // a colpo d'occhio quando e' opportuno compattare (>70% giallo, >=90% rosso).
+            })();
+          }}
+          onDeleteSession={() => {
+            const currentId = multiChat.activeTabId;
+            if (!currentId) return;
+            void (async () => {
+              const ok = await confirmDialog("Eliminare questa chat? Tutti i messaggi saranno rimossi.");
+              if (ok) {
+                await multiChat.deleteSession(currentId);
+              }
+            })();
+          }}
+          onCompactSession={() => {
+            const currentId = multiChat.activeTabId;
+            if (!currentId) return;
+            // compactSession aggiorna la barra token dalla risposta HTTP e mostra
+            // un toast (successo/errore): non dipende dall'evento SSE
+            // ChatSessionCompacted, che puo' perdersi se subscribers=0.
+            // .catch: l'errore e' gia' notificato via toast dentro compactSession.
+            void multiChat.compactSession(currentId).catch(() => {});
+          }}
+          ctxPct={(() => {
+            // % di riempimento context_window dell'ultimo turno della chat attiva,
+            // aggiornata da ChatPanel via onCtxRatioChange.
             const activeId = multiChat.activeTabId;
             const ratio = activeId ? multiChat.ctxRatio.get(activeId) : undefined;
-            const pct = ratio != null ? Math.round(ratio * 100) : null;
-            const ratioColor = pct == null
-              ? tc.textMuted
-              : pct >= 90 ? tc.error
-              : pct >= 70 ? tc.warning
-              : tc.textMuted;
-            return (
-              <button
-                type="button"
-                disabled={!multiChat.activeTabId}
-                onClick={() => {
-                  const currentId = multiChat.activeTabId;
-                  if (!currentId) return;
-                  // compactSession aggiorna la barra token dalla risposta HTTP e
-                  // mostra un toast (successo/errore): non dipende piu' dall'evento
-                  // SSE ChatSessionCompacted, che puo' perdersi se subscribers=0.
-                  // .catch: l'errore e' gia' notificato via toast dentro compactSession.
-                  void multiChat.compactSession(currentId).catch(() => {});
-                }}
-                title={pct != null
-                  ? `Compatta chat — context usato: ${pct}%`
-                  : "Compatta chat"}
-                aria-label={pct != null
-                  ? `Compatta chat (context ${pct}%)`
-                  : "Compatta chat"}
-                style={{
-                  ...iconButton(tc, !multiChat.activeTabId),
-                  // Larghezza dinamica: il bottone si allarga per contenere
-                  // l'icona + badge percentuale senza tagliare il testo,
-                  // anche per valori a 4 cifre (es. 1952%).
-                  width: "auto",
-                  height: 30,
-                  minWidth: 30,
-                  maxWidth: "none",
-                  flex: "0 0 auto",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: 4,
-                  paddingInline: pct != null ? 10 : 0,
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                }}
-              >
-                <span>⌁</span>
-                {pct != null && (
-                  <span
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 600,
-                      color: ratioColor,
-                      lineHeight: 1,
-                    }}
-                  >
-                    {pct}%
-                  </span>
-                )}
-              </button>
-            );
+            return ratio != null ? Math.round(ratio * 100) : null;
           })()}
-        </div>
+        />
       </div>
       <div
         style={{
@@ -1513,6 +1418,57 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           boxSizing: "border-box",
         }}
       >
+        {/* Stati del bootstrap sessioni (useMultiChat): prima il pannello
+            renderizzava null sia durante il caricamento sia su errore, e un
+            bootstrap fallito (es. progetto appena creato col DB in
+            provisioning) lasciava un vuoto senza rimedio fino al reload. */}
+        {!multiChat.activeTabId && multiChat.isLoading ? (
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: tc.textMuted,
+              fontSize: 13,
+            }}
+          >
+            Caricamento chat...
+          </div>
+        ) : null}
+        {!multiChat.activeTabId && !multiChat.isLoading && multiChat.error ? (
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 10,
+              color: tc.textMuted,
+              fontSize: 13,
+              textAlign: "center",
+              padding: 16,
+            }}
+          >
+            <div>Impossibile caricare le chat del progetto: {multiChat.error}</div>
+            <button
+              type="button"
+              onClick={() => multiChat.retryBootstrap()}
+              style={{
+                borderRadius: 6,
+                border: `1px solid ${tc.border}`,
+                background: tc.bgCard,
+                color: tc.text,
+                padding: "6px 14px",
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              Riprova
+            </button>
+          </div>
+        ) : null}
         {multiChat.activeTabId ? (
           <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", width: "100%" }}>
             <ChatPanel
@@ -1526,8 +1482,11 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               selectedProvider={chatProvider}
               setSelectedProvider={(v) => {
                 setChatProvider(v);
-                // Pin per-sessione lato server (sopravvive al refresh e vale
-                // per tutti i run successivi). Cambiare provider azzera il pin
+                // PREFERENZA per-sessione lato server: sopravvive al refresh e
+                // ripropone il provider ai messaggi successivi, ma non li
+                // vincola — il pin duro nasce solo dal pulsante "Forza" e vale
+                // per la richiesta in cui lo si da' (vedi provider-choice-logic
+                // e ProviderChoice::resolve). Cambiare provider azzera la scelta
                 // del modello: la lista modelli viene ricaricata da zero.
                 const sid = multiChat.activeTabId;
                 if (sid) multiChat.setSessionPrefs(sid, { preferredProvider: v, preferredModel: "auto" });
@@ -1627,6 +1586,64 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         >
           <div style={{ minWidth: 0, minHeight: 0, height: "100%", display: "flex", overflow: "hidden", borderRight: `1px solid ${tc.border}`, position: "relative" }}>
             {renderAiWorkspace()}
+            {/* Col pannello singolo il divisorio non ha nulla da trascinare. */}
+            {!rightPanelCollapsed && (
+              <div
+                {...resizeRight}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  right: -3,
+                  bottom: 0,
+                  width: 6,
+                  cursor: "col-resize",
+                  background: "transparent",
+                  zIndex: 10,
+                  transition: "background 0.15s",
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
+              />
+            )}
+          </div>
+          <RightColumn
+            rightView={rightView}
+            setRightView={setRightView}
+            tc={tc}
+            project={activeProject}
+            editor={editorPanel}
+          />
+        </div>
+      );
+    }
+
+    if (layoutMode === "editor-center") {
+      return (
+        <RightColumn
+          rightView={rightView}
+          setRightView={setRightView}
+          tc={tc}
+          project={activeProject}
+          editor={editorPanel}
+        />
+      );
+    }
+
+    // split-ai-editor
+    return (
+      <div
+        style={{
+          minHeight: 0,
+          height: "100%",
+          display: "grid",
+          gridTemplateColumns: `minmax(0, 1fr) ${effectiveRightWidth}px`,
+        }}
+      >
+        <div style={{ minWidth: 0, minHeight: 0, height: "100%", display: "flex", overflow: "hidden", borderRight: `1px solid ${tc.border}`, position: "relative" }}>
+          {renderAiWorkspace()}
+          {/* Resize handle sovrapposto al bordo destro del pannello AI: sparisce
+              col pannello singolo, dove non avrebbe nulla da trascinare. */}
+          {!rightPanelCollapsed && (
             <div
               {...resizeRight}
               style={{
@@ -1643,73 +1660,15 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
               onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
             />
-          </div>
-          <div
-            style={{
-              minWidth: 0,
-              minHeight: 0,
-              height: "100%",
-              overflow: "hidden",
-              display: "grid",
-              gridTemplateRows: "26px minmax(0, 1fr)",
-            }}
-          >
-            <RightViewTabs
-              rightView={rightView}
-              setRightView={setRightView}
-              tc={tc}
-            />
-            {rightView === "editor" ? (
-              editorPanel
-            ) : (
-              <SqlQueryPanel project={activeProject} />
-            )}
-          </div>
+          )}
         </div>
-      );
-    }
-
-    if (layoutMode === "editor-center") {
-      return (
-        <div style={{ minHeight: 0, height: "100%" }}>
-          {editorPanel}
-        </div>
-      );
-    }
-
-    // split-ai-editor
-    return (
-      <div
-        style={{
-          minHeight: 0,
-          height: "100%",
-          display: "grid",
-          gridTemplateColumns: `minmax(0, 1fr) ${effectiveRightWidth}px`,
-        }}
-      >
-        <div style={{ minWidth: 0, minHeight: 0, height: "100%", display: "flex", overflow: "hidden", borderRight: `1px solid ${tc.border}`, position: "relative" }}>
-          {renderAiWorkspace()}
-          {/* Resize handle sovrapposto al bordo destro del pannello AI */}
-          <div
-            {...resizeRight}
-            style={{
-              position: "absolute",
-              top: 0,
-              right: -3,
-              bottom: 0,
-              width: 6,
-              cursor: "col-resize",
-              background: "transparent",
-              zIndex: 10,
-              transition: "background 0.15s",
-            }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.accent + "44"; }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
-          />
-        </div>
-        <div style={{ minWidth: 0, minHeight: 0, height: "100%", overflow: "hidden" }}>
-          {editorPanel}
-        </div>
+        <RightColumn
+          rightView={rightView}
+          setRightView={setRightView}
+          tc={tc}
+          project={activeProject}
+          editor={editorPanel}
+        />
       </div>
     );
   };
@@ -1738,6 +1697,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         bottomPanelVisible={bottomPanelVisible}
         isFullscreen={isFullscreen}
         providerStatus={providerStatus}
+        // In editor-center il pannello unico e' voluto, non subito: niente avviso.
+        fixedPanelHidden={rightPanelCollapsed && layoutMode !== "editor-center"}
         onTogglePrimarySidebar={() => setPrimarySidebarVisible((current) => !current)}
         onToggleBottomPanel={() => setBottomPanelVisible((current) => !current)}
         onCycleLayoutMode={cycleLayoutMode}
@@ -1977,7 +1938,6 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           activePanelTab={activePanelTab}
           activeProject={activeProject}
           onSelectTab={(tab) => setActivePanelTab(tab)}
-          onHide={() => setBottomPanelVisible(false)}
         />
         <div style={{ minHeight: 0, overflow: "hidden" }}>
           <BottomPanelManager

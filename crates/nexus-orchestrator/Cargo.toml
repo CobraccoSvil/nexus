@@ -21,6 +21,7 @@ sha2.workspace = true
 ruvector = { path = "../ruvector" }
 nexus-events = { path = "../nexus-events" }
 nexus-auth = { path = "../nexus-auth" }
+nexus-types = { path = "../nexus-types" }
 nexus-http.workspace = true
 
 # Orchestrator specific

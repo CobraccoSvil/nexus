@@ -65,8 +65,9 @@ async fn fetch_owned_run_row(
 ) -> Result<(sqlx::postgres::PgRow, sqlx::PgPool), ApiError> {
     // Separazione DB: endpoint keyed solo dal run_id. agent_runs (+ eventuale JOIN
     // chat_sessions) vive nel DB del progetto -> pool via directory di routing
-    // (fallback ricerca). A flag OFF -> meta-DB.
-    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(db, run_id).await;
+    // (fallback ricerca). Niente fallback al meta (mig 0527): DB progetto non
+    // disponibile -> 503 propagato al client.
+    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(db, run_id).await?;
     let run_row = sqlx::query(sql)
         .bind(run_id)
         .fetch_optional(&run_pool)
@@ -208,9 +209,22 @@ async fn replay_final_event(proj_pool: &sqlx::PgPool, rid: Uuid) -> Option<Event
 /// stream prosegue col live broadcast.
 async fn collect_replay_events(meta_db: &sqlx::PgPool, session_id: Uuid, rid: Uuid) -> Vec<Event> {
     // Separazione DB: agent_steps/agent_runs sono tabelle migrate, instradate
-    // sul pool del progetto risolto via session_id (flag OFF -> meta-DB).
+    // sul pool del progetto risolto via session_id. Il replay e' best-effort:
+    // se il DB del progetto non e' disponibile si salta il replay (WARN) e lo
+    // stream prosegue col solo live broadcast, senza fallback al meta (mig 0527).
     let proj_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(meta_db, session_id).await;
+        match crate::project_db_routes::project_data_pool_by_session_from(meta_db, session_id).await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "agent_stream: DB progetto non disponibile, salto il replay degli step"
+                );
+                return Vec::new();
+            }
+        };
     let mut events = replay_step_events(&proj_pool, rid).await;
     events.extend(replay_meta_step_events(&proj_pool, rid).await);
     events.extend(replay_final_event(&proj_pool, rid).await);
@@ -347,10 +361,10 @@ pub async fn get_active_run_for_session(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
     // Separazione DB: agent_runs/agent_steps sono tabelle migrate -> pool del
-    // progetto risolto dalla sessione (flag OFF -> meta-DB). Sul meta le tabelle
-    // sono vuote a flag ON: leggerle li' faceva sparire il run attivo al refresh.
+    // progetto risolto dalla sessione. Sul meta le tabelle sono vuote: leggerle
+    // li' faceva sparire il run attivo al refresh. Niente fallback (mig 0527).
     let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
     let run_row = sqlx::query(&format!(
         "SELECT id, session_id, project_id, user_id, status, automation_mode, provider, model,
                 iteration_count, final_answer, pending_actions_json, created_at, completed_at
@@ -438,7 +452,33 @@ pub async fn get_agent_run(
     let prompt_tokens = run.try_get::<i32, _>("prompt_tokens").unwrap_or(0);
     let completion_tokens = run.try_get::<i32, _>("completion_tokens").unwrap_or(0);
     let total_tokens = run.try_get::<i32, _>("total_tokens").unwrap_or(0);
-    let total_cost = run.try_get::<f64, _>("total_cost").unwrap_or(0.0);
+    // Costo del run INCLUSI i suoi sub-run (figure del consiglio, revisori,
+    // sub-agenti dispatchati): girano su provider PROPRI e con run_id propri,
+    // quindi il solo `agent_runs.total_cost` del padre ne ignorava la spesa.
+    // Misurato su verifica-wd: card a "mistral $0.0986" mentre il costo reale del
+    // run era $0.1337 su 6 run (openrouter 0.0170, google 0.0085, deepseek
+    // 0.0048, mistral figli 0.0048) -- il 26% mancava, ed era esattamente il
+    // lavoro delle figure che l'utente vedeva elencate sopra la card.
+    let costo_figli: f64 = sqlx::query_scalar::<_, f64>(
+        "SELECT COALESCE(SUM(total_cost), 0)::float8 FROM agent_runs WHERE parent_run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&run_pool)
+    .await
+    .unwrap_or(0.0);
+    let total_cost = run.try_get::<f64, _>("total_cost").unwrap_or(0.0) + costo_figli;
+
+    // Gli id su cui contare la spesa: il run e i suoi sub-run. Serve al breakdown
+    // per elencare anche i provider delle figure, che altrimenti comparivano
+    // nella narrazione ma non nel riepilogo dei costi.
+    let mut run_ids_con_figli: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM agent_runs WHERE parent_run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_all(&run_pool)
+    .await
+    .unwrap_or_default();
+    run_ids_con_figli.push(run_id);
 
     // M71: breakdown per coppia provider/model dalla ai_usage_ledger.
     // Mostriamo una riga per ogni provider/modello effettivamente usato nel run
@@ -455,11 +495,11 @@ pub async fn get_agent_run(
                 MIN(created_at)                AS first_call_at,
                 MAX(created_at)                AS last_call_at
          FROM ai_usage_ledger
-         WHERE run_id = $1 AND status = 'finalized'
+         WHERE run_id = ANY($1) AND status = 'finalized'
          GROUP BY provider, model
          ORDER BY MIN(created_at) ASC",
     )
-    .bind(run_id)
+    .bind(&run_ids_con_figli)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -520,7 +560,7 @@ pub async fn get_session_worklog(
     // Worklog nel DB del progetto (separazione DB): pool risolto dalla sessione.
     let wpool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
-            .await;
+            .await?;
     let block = crate::session_worklog::fetch_rendered_block(&state.db, &wpool, context.session_id)
         .await
         .unwrap_or_default();
@@ -543,8 +583,9 @@ pub async fn get_agent_run_next_actions(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
     // Separazione DB: nexus_agent_meta_steps + agent_runs vivono nel DB del
-    // progetto -> pool risolto dal run (flag OFF -> meta-DB).
-    let run_pool = crate::project_db_routes::project_data_pool_by_run_from(&state.db, run_id).await;
+    // progetto -> pool risolto dal run. Niente fallback al meta (mig 0527).
+    let run_pool =
+        crate::project_db_routes::project_data_pool_by_run_from(&state.db, run_id).await?;
     // Ownership verificata via join su agent_runs.user_id: nessun leak cross-utente.
     let row = sqlx::query(
         "SELECT m.payload
@@ -591,10 +632,10 @@ pub async fn get_session_meta_steps(
     // run, cioe' il caso d'uso del refresh. I meta_step tornano in ordine
     // cronologico per la ricostruzione fedele della timeline.
     // Separazione DB: nexus_agent_meta_steps + agent_runs vivono nel DB del
-    // progetto -> pool risolto dalla sessione. Sul meta le tabelle sono vuote a
-    // flag ON: la timeline narrativa spariva al reload della chat.
+    // progetto -> pool risolto dalla sessione. Sul meta le tabelle sono vuote:
+    // la timeline narrativa spariva al reload della chat. Niente fallback (mig 0527).
     let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
     let rows = sqlx::query(
         "SELECT m.run_id, m.kind, m.title, m.payload, m.correlation_id, m.created_at
          FROM nexus_agent_meta_steps m
@@ -613,6 +654,39 @@ pub async fn get_session_meta_steps(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // STATO REALE DEI TODO del piano. Il payload del meta-step "plan" e' la
+    // FOTOGRAFIA scattata quando il piano e' stato creato: tutti i todo
+    // `pending`. Gli aggiornamenti live (`TodoUpdated`) vivono solo in memoria
+    // nel client, quindi bastava un reload -- o un run finito male, che e'
+    // proprio il momento in cui si vuole sapere cosa e' stato fatto -- perche' la
+    // checklist tornasse a mostrare TUTTO da fare a lavoro svolto.
+    // Qui il payload viene servito con lo stato CORRENTE letto da
+    // `nexus_agent_todos`, cosi' la vista non racconta piu' un piano fermo.
+    // Best-effort: se la lettura fallisce si serve la fotografia, come prima.
+    let plan_runs: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| {
+            r.try_get::<String, _>("kind")
+                .map(|k| k == "plan")
+                .unwrap_or(false)
+        })
+        .filter_map(|r| r.try_get::<Uuid, _>("run_id").ok())
+        .collect();
+    let mut stato_todo: std::collections::HashMap<(Uuid, String), String> =
+        std::collections::HashMap::new();
+    if !plan_runs.is_empty() {
+        let righe: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT run_id, id::text, status FROM nexus_agent_todos WHERE run_id = ANY($1)",
+        )
+        .bind(&plan_runs)
+        .fetch_all(&run_pool)
+        .await
+        .unwrap_or_default();
+        for (r, id, st) in righe {
+            stato_todo.insert((r, id), st);
+        }
+    }
+
     // Raggruppa per run_id nel formato MetaStepEntry atteso dal frontend.
     let mut runs: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
     for row in rows {
@@ -622,11 +696,24 @@ pub async fn get_session_meta_steps(
         };
         let kind: String = row.try_get("kind").unwrap_or_default();
         let title: String = row.try_get("title").unwrap_or_default();
-        let payload: Value = row
+        let mut payload: Value = row
             .try_get::<Option<Value>, _>("payload")
             .ok()
             .flatten()
             .unwrap_or_else(|| json!({}));
+        // Sovrascrive lo status di ogni todo con quello attuale (vedi sopra). I
+        // todo assenti dalla mappa restano com'erano: un piano di cui non si
+        // trovano piu' le righe si serve invariato, non azzerato.
+        if kind == "plan" {
+            if let Some(todos) = payload.get_mut("todos").and_then(|t| t.as_array_mut()) {
+                for t in todos.iter_mut() {
+                    let id = t.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                    if let Some(st) = id.and_then(|i| stato_todo.get(&(run_id, i))) {
+                        t["status"] = json!(st);
+                    }
+                }
+            }
+        }
         let correlation_id: Option<String> = row.try_get("correlation_id").ok().flatten();
         let created_at: chrono::DateTime<chrono::Utc> = row
             .try_get("created_at")
@@ -662,7 +749,7 @@ pub async fn get_session_traces(
     // Separazione DB: nexus_agent_traces vive nel DB del progetto (scritta dal
     // motore nativo sul run_db) -> pool risolto dalla sessione.
     let run_pool =
-        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await;
+        crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id).await?;
     // Punto unico (regola L): ownership + raggruppamento per run nel trace_store,
     // speculare a get_session_meta_steps.
     let runs = crate::trace_store::get_session_traces(&run_pool, session_id, user_id)
@@ -762,70 +849,41 @@ pub async fn confirm_agent_run(
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let engine: String = run
-        .try_get::<Option<String>, _>("engine")
+    // Resume nativo in BACKGROUND: la POST risponde subito con `running` cosi' il
+    // client non va in timeout HTTP mentre il grafo riprende dal checkpoint.
+    // Finalizzazione + is_final SSE dentro `confirm_native_run`.
+    //
+    // Qui si leggeva `agent_runs.engine` e, se non era 'rust', si mandava la
+    // conferma al brain Python. La colonna e' NULLABLE e i run legacy hanno NULL
+    // (mig 0451): per quelle righe la conferma HITL finiva su un servizio rimosso
+    // e l'utente vedeva "Brain non raggiungibile". Il motore e' uno solo: il
+    // valore della colonna non decide piu' nulla.
+    let session_id: Uuid = run.get::<Uuid, _>("session_id");
+    let provider: String = run.try_get("provider").unwrap_or_default();
+    let model: String = run.try_get("model").unwrap_or_default();
+    let automation_mode: String = run
+        .try_get::<Option<String>, _>("automation_mode")
         .ok()
         .flatten()
         .unwrap_or_default();
-
-    if engine.eq_ignore_ascii_case("rust") {
-        // Resume nativo in BACKGROUND (parita' col path brain e collo spawn
-        // primario in agent_run.rs): la POST risponde subito con `running` cosi'
-        // il client non va in timeout HTTP mentre il grafo riprende dal checkpoint.
-        // Finalizzazione + is_final SSE dentro `confirm_native_run`.
-        let session_id: Uuid = run.get::<Uuid, _>("session_id");
-        let provider: String = run.try_get("provider").unwrap_or_default();
-        let model: String = run.try_get("model").unwrap_or_default();
-        let automation_mode: String = run
-            .try_get::<Option<String>, _>("automation_mode")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let state_bg = state.clone();
-        let resume_message_bg = resume_message.clone();
-        tokio::spawn(async move {
-            let _ = crate::chat_messages::confirm_native_run(
-                &state_bg,
-                run_id,
-                session_id,
-                provider,
-                model,
-                automation_mode,
-                &resume_message_bg,
-            )
-            .await;
-        });
-        Ok(Json(json!({
-            "runId": run_id.to_string(),
-            "status": "running",
-        })))
-    } else {
-        // Resume LEGACY sul brain Python (engine='python' o NULL). Il brain
-        // mantiene lo state del thread ed e' l'unica sorgente del loop per quei run.
-        match crate::brain_agent_client::resume_run(run_id, true, Some(resume_message)).await {
-            Ok(()) => Ok(Json(json!({
-                "runId": run_id.to_string(),
-                "status": "running",
-            }))),
-            Err(e) => {
-                tracing::error!(
-                    "confirm_agent_run: brain resume_run fallito run_id={} err={}",
-                    run_id,
-                    e
-                );
-                // Riporta il run a awaiting_confirmation per non lasciarlo appeso.
-                let _ =
-                    sqlx::query("UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1")
-                        .bind(run_id)
-                        .execute(&run_pool)
-                        .await;
-                Err(api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Brain non raggiungibile per approve: {e}"),
-                ))
-            }
-        }
-    }
+    let state_bg = state.clone();
+    let resume_message_bg = resume_message.clone();
+    tokio::spawn(async move {
+        let _ = crate::chat_messages::confirm_native_run(
+            &state_bg,
+            run_id,
+            session_id,
+            provider,
+            model,
+            automation_mode,
+            &resume_message_bg,
+        )
+        .await;
+    });
+    Ok(Json(json!({
+        "runId": run_id.to_string(),
+        "status": "running",
+    })))
 }
 
 /// POST /api/chat/agent-runs/:run_id/cancel -- interrompe un run in corso.
@@ -850,14 +908,14 @@ pub async fn cancel_agent_run(
     let status: String = run.get::<String, _>("status");
     if status != "running" && status != "awaiting_confirmation" {
         // Anche se il run target e' gia' terminale, sblocchiamo eventuali ALTRI
-        // run rimasti stuck sulla stessa sessione (vedi fix cascade sotto): il
-        // 'Forza Stop' lato utente deve sempre liberare la sessione.
+        // run rimasti stuck sulla stessa sessione (vedi fix cascade sotto):
+        // l'interruzione richiesta dall'utente deve sempre liberare la sessione.
     }
 
     // Cancel CASCADING per sessione (fix architetturale): l'invariante "max 1
     // run attivo per sessione" che assume la guardia 409 (handlers.rs) puo'
     // venire violata da path "resume", auto-continuation o race condition tra
-    // INSERT e cleanup. Senza cascade, un singolo Forza Stop lascia un secondo
+    // INSERT e cleanup. Senza cascade, una singola interruzione lascia un secondo
     // run "running" stuck nel DB per fino a 15 min (sintomo osservato: dopo
     // Stop, la POST successiva sulla stessa sessione torna 409 ripetuto).
     // Cancellando TUTTI i run attivi della sessione si ristabilisce

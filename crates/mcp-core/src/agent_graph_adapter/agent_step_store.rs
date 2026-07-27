@@ -6,21 +6,15 @@
 //! `WHERE EXISTS (run in agent_runs)` (no FK orfane) `AND NOT EXISTS (step gia'
 //! presente per run_id+step_index)` (equivale a `ON CONFLICT DO NOTHING`, ma
 //! `agent_steps` ha solo un INDEX non-UNIQUE su `(run_id, step_index)` — mig 0009 —
-//! quindi non esiste un constraint su cui fare `ON CONFLICT`). Gata `Real` (no-op in
-//! `ExecMode::Replay`, punto unico del gate shadow). Best-effort: errore DB loggato,
-//! `Ok(())`.
-//!
-//! NB: questa e' anche la fonte Replay (F3): la riga porta `run_id`, `step_index`,
-//! `tool_name`, `tool_input` (block), `tool_result` (result) e `status`. F3
-//! rileggera' il `tool_result` del run primario da qui filtrando per `run_id` +
-//! `step_index` (ordinamento globale stabile).
+//! quindi non esiste un constraint su cui fare `ON CONFLICT`). Best-effort: errore
+//! DB loggato, `Ok(())`.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_agent_graph::runtime::ports::{AgentStepStore, ExecMode, PortError};
+use nexus_agent_graph::runtime::ports::{AgentStepStore, PortError};
 
 /// Adapter [`AgentStepStore`] -> `agent_steps` via `sqlx`.
 pub struct PgAgentStepStore {
@@ -38,7 +32,7 @@ impl PgAgentStepStore {
 #[async_trait]
 impl AgentStepStore for PgAgentStepStore {
     /// Persiste UN blocco di un'iterazione su `agent_steps`. Vedi il mapping in
-    /// testa al modulo. Gata `Real` (regola L); best-effort.
+    /// testa al modulo. Best-effort.
     async fn persist_step(
         &self,
         run_id: &str,
@@ -46,11 +40,7 @@ impl AgentStepStore for PgAgentStepStore {
         idx: i64,
         block: Value,
         result: Option<Value>,
-        mode: ExecMode,
     ) -> Result<(), PortError> {
-        if mode != ExecMode::Real {
-            return Ok(());
-        }
         let run_uuid = match Uuid::parse_str(run_id) {
             Ok(u) => u,
             Err(e) => {
@@ -146,42 +136,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// agent_runs minimale (guard untracked_run) + agent_steps (mig 0009).
-    async fn create_tables(pool: &PgPool) {
-        sqlx::query("CREATE TABLE agent_runs (id UUID PRIMARY KEY DEFAULT gen_random_uuid())")
-            .execute(pool)
-            .await
-            .expect("create agent_runs");
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INT NOT NULL, \
-                 tool_name TEXT NOT NULL, \
-                 tool_input JSONB NOT NULL, \
-                 tool_result TEXT, \
-                 status TEXT NOT NULL DEFAULT 'running', \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
-             )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
-    }
-
+    /// Run reale su cui appendere gli step: `agent_steps.run_id` e' vincolato da
+    /// una FK verso `agent_runs(id)`. Le tabelle le porta il migrator del set
+    /// `db/migrations/project`.
     async fn insert_run(pool: &PgPool) -> Uuid {
-        let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (id) VALUES ($1)")
-            .bind(id)
-            .execute(pool)
-            .await
-            .expect("insert run");
-        id
+        crate::test_support::seed_agent_run(pool).await
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn real_inserisce_con_step_index_deterministico(pool: PgPool) {
-        create_tables(&pool).await;
         let run_id = insert_run(&pool).await;
         let store = PgAgentStepStore::new(pool.clone());
         // iteration=3, idx=2 -> step_index = 3*1000+2 = 3002.
@@ -192,7 +155,6 @@ mod tests {
                 2,
                 json!({"name": "edit_file", "input": {"p": "x"}}),
                 Some(json!("done")),
-                ExecMode::Real,
             )
             .await
             .expect("ok");
@@ -208,9 +170,8 @@ mod tests {
         assert_eq!(row.2.as_deref(), Some("done"));
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn idempotente_sui_retry(pool: PgPool) {
-        create_tables(&pool).await;
         let run_id = insert_run(&pool).await;
         let store = PgAgentStepStore::new(pool.clone());
         let block = json!({"name": "read_file"});
@@ -222,7 +183,6 @@ mod tests {
                     0,
                     block.clone(),
                     None,
-                    ExecMode::Real,
                 )
                 .await
                 .expect("ok");
@@ -238,9 +198,8 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn untracked_run_non_inserisce(pool: PgPool) {
-        create_tables(&pool).await;
         // run_id NON presente in agent_runs: il guard EXISTS impedisce la FK orfana.
         let store = PgAgentStepStore::new(pool.clone());
         store
@@ -250,7 +209,6 @@ mod tests {
                 0,
                 json!({}),
                 None,
-                ExecMode::Real,
             )
             .await
             .expect("best-effort Ok");
@@ -259,21 +217,5 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 0, "run non tracciato -> nessuno step");
-    }
-
-    #[sqlx::test]
-    async fn replay_e_no_op(pool: PgPool) {
-        create_tables(&pool).await;
-        let run_id = insert_run(&pool).await;
-        let store = PgAgentStepStore::new(pool.clone());
-        store
-            .persist_step(&run_id.to_string(), 1, 0, json!({}), None, ExecMode::Replay)
-            .await
-            .expect("ok");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_steps")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(count, 0, "in Replay (shadow) nessuna scrittura");
     }
 }

@@ -12,9 +12,20 @@ async fn load_session_message_views(
         r#"
         SELECT cm.id, cm.session_id, cm.project_id, cm.role, cm.content, cm.metadata,
                cm.request_message_id, cm.deleted_at, cm.created_at,
-               ar.status AS run_status
+               ar.id AS run_id, ar.status AS run_status
         FROM chat_messages cm
-        LEFT JOIN agent_runs ar ON ar.run_message_id = cm.id
+        -- Ancora del run: `agent_runs.run_message_id` punta al messaggio UTENTE
+        -- che ha innescato il run, mai alla risposta. Agganciare l'assistant
+        -- passa quindi dal suo `request_message_id` (il messaggio utente a cui
+        -- risponde); per lo user vale l'id stesso. Con il JOIN su `cm.id` secco
+        -- l'assistant non riceveva NE' `run_id` NE' `run_status`: dopo un
+        -- reload `message.runId` era undefined, e message-list.tsx apre con
+        -- `if (!message.runId) return null` -- l'intero nastro attivita'
+        -- spariva, Consiglio delle Competenze incluso, pur essendo tutto nel DB
+        -- (difetto osservato il 20/07: "la sezione consiglio scompare quando si
+        -- aggiorna"). Nessun messaggio utente ha `request_message_id`, quindi
+        -- il COALESCE non altera l'aggancio gia' funzionante su quel lato.
+        LEFT JOIN agent_runs ar ON ar.run_message_id = COALESCE(cm.request_message_id, cm.id)
         WHERE cm.session_id = $1
         ORDER BY cm.created_at ASC
         "#,
@@ -108,10 +119,10 @@ pub async fn list_chat_messages(
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
     let context = load_session_context(&state, session_id, user_id).await?;
-    // Cutover separazione DB: messaggi + agent_runs ora nel DB del progetto (il
-    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool e' il
-    // punto unico (flag off -> meta-DB, comportamento storico).
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await;
+    // Separazione DB: messaggi + agent_runs vivono nel DB del progetto (il
+    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool
+    // e' il punto unico; DB non disponibile -> 503 strutturato (regola M).
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await?;
 
     let mut messages = load_session_message_views(&chat_pool, context.session_id).await?;
     let mut attachments_by_msg =
@@ -497,10 +508,11 @@ pub async fn send_chat_message(
     let context = load_session_context(&state, session_id, user_id).await?;
     // Separazione DB: chat_sessions/agent_runs migrate nel DB del progetto.
     // Risolvo una volta il pool del progetto per sessione e lo riuso per tutte
-    // le scritture di questo handler (flag off -> meta-DB, comportamento storico).
+    // le scritture di questo handler. DB non disponibile -> 503: scrivere il
+    // messaggio sul meta lo farebbe "sparire" alla riapertura del DB progetto.
     let session_pool =
         crate::project_db_routes::project_data_pool_by_session_from(&state.db, context.session_id)
-            .await;
+            .await?;
 
     let content = body.content.trim();
     if content.is_empty() {
@@ -729,11 +741,11 @@ pub async fn send_chat_message(
         } else {
             (None, None)
         };
-    // Override effettivo: esplicito dal client > preferenza di sessione
-    let effective_provider_override = body
-        .provider_override
-        .clone()
-        .or(session_preferred_provider);
+    // Scelta di provider dal PUNTO UNICO (regola L): provider esplicito del
+    // client > preferenza di sessione, e — soprattutto — con la sua FORZA.
+    // Il pulsante "Forza" del composer viaggia qui dentro; la preferenza
+    // persistita sulla sessione resta sempre morbida (vedi ProviderChoice).
+    let provider_choice = provider_choice_from_body(&body, session_preferred_provider.as_deref())?;
     let effective_model_override = body.model_override.clone().or(session_preferred_model);
 
     let profile_id = body
@@ -814,6 +826,7 @@ pub async fn send_chat_message(
         &session_pool,
         content,
         automation_mode,
+        body.resume,
         user_id,
         user_message_id,
         &user_message,
@@ -829,7 +842,7 @@ pub async fn send_chat_message(
         &context,
         user_message_id,
         content,
-        effective_provider_override.as_deref(),
+        provider_choice.provider(),
     )
     .await?
     {
@@ -856,7 +869,11 @@ pub async fn send_chat_message(
                 supervisor_mode,
                 profile_prompt_block,
                 system_context: system_context.clone(),
-                provider_override: effective_provider_override.clone(),
+                // Il path agentico non pinna (nessun `pin_provider`): il
+                // provider scelto e' il punto di partenza del routing e il
+                // failover cross-provider resta possibile. Gli basta quindi il
+                // NOME, quale che sia la forza del vincolo.
+                provider_override: provider_choice.provider().map(str::to_string),
                 model_override: effective_model_override.clone(),
                 profile_provider: profile_provider.clone(),
                 profile_model: profile_model.clone(),
@@ -912,7 +929,7 @@ pub async fn send_chat_message(
         user_message_id,
         body.active_files.clone(),
         Some(system_context),
-        effective_provider_override,
+        provider_choice,
         effective_model_override,
         automation_mode,
         enrich_attachments_with_ids(
@@ -987,6 +1004,7 @@ async fn try_resume_interrupted_run(
     session_pool: &PgPool,
     content: &str,
     automation_mode: AutomationMode,
+    force_resume: bool,
     user_id: Uuid,
     user_message_id: Uuid,
     user_message: &ChatMessageView,
@@ -996,7 +1014,10 @@ async fn try_resume_interrupted_run(
         return None;
     }
 
-    let is_resume_request = {
+    // `force_resume` (regola N): segnale STRUTTURATO dal pulsante "Riattiva" del
+    // banner chat-sospesa, indipendente dal testo. La stringa magica ("riprendi"/
+    // "continua") resta come scorciatoia digitabile ma non e' piu' l'unico canale.
+    let is_resume_request = force_resume || {
         let lower = content.trim().to_lowercase();
         lower == "riprendi"
             || lower == "continua"
@@ -1100,7 +1121,6 @@ async fn try_resume_interrupted_run(
     let automation_r = automation_mode;
     let supervisor_r = prev_supervisor;
     let template_cache_r = state.template_cache.clone();
-    let routing_thresholds_for_resume = state.orchestrator.routing_thresholds.clone();
     let user_role_r = claims.role.clone();
 
     let _ = (
@@ -1116,9 +1136,27 @@ async fn try_resume_interrupted_run(
         // Separazione DB: chat_messages/agent_runs sono migrate -> pool del
         // progetto risolto UNA volta e riusato per history, UPDATE, INSERT,
         // finalize e worklog. db_clone2 resta il meta SOLO per template,
-        // ledger e catalogo tool (domini di piattaforma).
-        let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r).await;
+        // ledger e catalogo tool (domini di piattaforma). Senza il DB del
+        // progetto il resume non puo' ne' leggere la history ne' finalizzare
+        // il run: si abortisce il task con ERROR (regola M), mai sul meta.
+        let proj_pool = match crate::project_db_routes::project_data_pool_from(
+            &db_clone2,
+            project_id_r,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    run_id = %new_run_id,
+                    project_id = %project_id_r,
+                    error = %e,
+                    "resume: DB progetto non disponibile, task di resume abortito"
+                );
+                channels2.remove(&new_run_id);
+                return;
+            }
+        };
         let resume_tpl = crate::prompt_templates::get_template_or_default(
             &db_clone2,
             &template_cache_r,
@@ -1131,7 +1169,7 @@ async fn try_resume_interrupted_run(
         // ON e il run ripreso ripartiva senza contesto conversazionale.
         let resume_history = build_recent_conversation_history(&proj_pool, session_id_r, 8).await;
 
-        let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
+        let tools_for_resume = crate::agent_turn_setup::build_tools_json_for_agent(
             &db_clone2,
             user_id,
             project_id_r,
@@ -1141,29 +1179,92 @@ async fn try_resume_interrupted_run(
         )
         .await;
 
-        // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
-        let sse_silence_resume: u64 = match routing_thresholds_for_resume.current_async().await {
-            Ok(t) => t.sse_heartbeat_max_silence_secs,
-            Err(_) => 120,
+        // Il resume gira sul motore NATIVO, come ogni altro run.
+        //
+        // Qui si chiamava `run_via_brain` SENZA alcun controllo del motore: era
+        // l'unico call site non gated da `select_engine`, quindi dal giorno della
+        // rimozione del brain ogni "riprendi" dell'utente e' finito su un
+        // servizio inesistente. Non era una configurazione esotica: e' il flusso
+        // normale di chi scrive "continua" in chat.
+        let native_input = crate::native_engine::NativeRunInput {
+            run_id: new_run_id,
+            session_id: session_id_r,
+            provider: provider_r.clone(),
+            model: model_r.clone(),
+            system_text: String::new(),
+            prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
+            initial_msg: resume_prompt,
+            conversation_history: resume_history,
+            tools_json: tools_for_resume,
+            // Resume di un run interrotto: nessuna disambiguazione da risolvere.
+            intent_hint: None,
+            // Il classifier non ha girato per questo turno: i campi restano
+            // neutri e `classifier_resolved=false` lo DICHIARA, cosi' il
+            // RouterNode decide invece di fidarsi di valori inventati.
+            requires_tools: None,
+            agentic_score: None,
+            authorizes_changes: None,
+            classifier_resolved: false,
+            action_oriented_min_score: crate::intent_classifier::DEFAULT_ACTION_ORIENTED_MIN_SCORE,
+            automation_mode: automation_r.as_str().to_string(),
+            supervisor_mode: crate::native_engine::graph_supervisor_mode(supervisor_r),
+            step_tx: tx,
+            parent_run_id: None,
+            subagent_depth: None,
+            sizing_complexity: None,
+            sizing_scope_system_wide: false,
+            classifier_intent: None,
+            run_time_budget_s: None,
+            working_root: None,
+            // I panel a monte hanno gia' deliberato sul run originale: il resume
+            // riprende il lavoro, non riapre la deliberazione.
+            pre_run_advisory_synthesis: None,
+            pre_run_advisory_source: None,
+            advisory_gate: None,
         };
-
-        let mut result = crate::brain_agent_client::run_via_brain(
-            new_run_id,
-            session_id_r,
-            provider_r,
-            model_r,
-            String::new(),
-            resume_prompt,
-            tx,
-            resume_history,
-            tools_for_resume,
-            sse_silence_resume,
-            true, // emit_final_event: caller singolo-shot, nessun retry loop
-            automation_r.as_str().to_string(),
-            None, // intent_hint: resume di conferma, nessuna disambiguazione risolta
-            db_clone2.clone(),
+        let mut result = match crate::chat_messages::agent_run::run_via_native(
+            &state_for_task,
+            &native_input,
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => {
+                match crate::project_db_routes::project_data_pool_from(&db_clone2, project_id_r)
+                    .await
+                {
+                    Ok(steps_pool) => {
+                        crate::chat_messages::agent_run::native_outcome_to_run_result(
+                            &steps_pool,
+                            new_run_id,
+                            outcome,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            run_id = %new_run_id,
+                            error = %e,
+                            "resume: DB progetto non disponibile al finalize"
+                        );
+                        crate::chat_messages::agent_run::native_engine_failure_result(
+                            new_run_id,
+                            &provider_r,
+                            &model_r,
+                            format!("DB del progetto non disponibile al finalize: {e}"),
+                        )
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(run_id = %new_run_id, error = %e, "resume: motore nativo fallito");
+                crate::chat_messages::agent_run::native_engine_failure_result(
+                    new_run_id,
+                    &provider_r,
+                    &model_r,
+                    format!("Il resume non e' riuscito: {e}"),
+                )
+            }
+        };
         channels2.remove(&new_run_id);
 
         // Riconciliazione costo/token dal ledger (punto unico,
@@ -1173,15 +1274,18 @@ async fn try_resume_interrupted_run(
         // reale invece di $0.00.
         let ledger_totals =
             crate::chat_messages::agent_run::fetch_ledger_totals(&db_clone2, new_run_id).await;
-        let _ = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
+        let cost_reconciled = crate::chat_messages::agent_run::reconcile_run_cost_from_ledger(
             &mut result,
             &ledger_totals,
         );
-        // finalize_agent_run NON scrive token/costo: se il brain non
-        // li ha persistiti su agent_runs ma il ledger li ha, allinea
-        // qui (idempotente: tocca solo i run rimasti a 0, non
-        // sovrascrive un valore gia' corretto del path Python).
-        if result.total_cost > 0.0 {
+        // finalize_agent_run NON scrive token/costo: se il ledger li ha, allinea
+        // qui (idempotente: la WHERE tocca solo i run rimasti a 0).
+        //
+        // La condizione e' il SEGNALE di riconciliazione, non `total_cost > 0`
+        // (regola M, gemello di `agent_run.rs`): un run contabilizzato a costo 0
+        // perche' il prezzo del modello e' ignoto ha comunque token reali da
+        // allineare, e la vecchia soglia lo saltava.
+        if cost_reconciled {
             // agent_runs e' migrata: instrada sul pool del progetto
             // (risolto in-task da db_clone2 + project_id_r, come la
             // INSERT chat_messages piu' sotto). ai_usage_ledger (sopra)
@@ -1330,9 +1434,9 @@ pub async fn resend_chat_message(
     // nel DB del progetto. Risolvo una volta il pool del progetto a partire dal
     // message_id (Path param) e lo riuso per tutte le SELECT su queste tabelle. Il
     // JOIN chat_messages+chat_sessions e' su un solo pool perche' entrambe vivono
-    // nello stesso <slug>_nexus (flag off -> meta-DB, comportamento storico).
+    // nello stesso <slug>_nexus. DB non disponibile -> 503 strutturato.
     let msg_pool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -1449,12 +1553,18 @@ pub async fn resend_chat_message(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
-    let provider_override = body.provider_override.clone().or_else(|| {
+    // Stesso punto unico del path di invio: il provider del client vale con la
+    // forza che il client dichiara, quello RICORDATO dal messaggio originale
+    // vale come preferenza. Il pulsante "Forza" non e' uno stato del messaggio
+    // ma dell'invio: chi rilancia un messaggio di ieri non sta ridando l'ordine
+    // "solo questo fornitore" — se lo vuole, lo rida' dal composer e viaggia in
+    // `providerOverrideMode`.
+    let provider_choice = provider_choice_from_body(
+        &body,
         source_metadata
             .get("providerOverride")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    });
+            .and_then(Value::as_str),
+    )?;
     let model_override = body.model_override.clone().or_else(|| {
         source_metadata
             .get("modelOverride")
@@ -1514,7 +1624,12 @@ pub async fn resend_chat_message(
         "user",
         &source_prompt,
         json!({
-            "providerOverride": provider_override.clone(),
+            // Il NOME del provider, non la forza del vincolo: quel che il
+            // messaggio ricorda vale come preferenza per un eventuale resend
+            // successivo (vedi ProviderChoice::resolve). Scriverci "pinned"
+            // creerebbe la catena che il pin non deve avere: un ordine dato una
+            // volta che si ripete da solo.
+            "providerOverride": provider_choice.provider(),
             "modelOverride": model_override.clone(),
             "automationMode": automation_mode.as_str(),
             "attachments": attachments_metadata,
@@ -1547,7 +1662,6 @@ pub async fn resend_chat_message(
                  - \"service\": run_service, read_service_output, stop_service\n\
                  - \"files_advanced\": delete_file, rename_file\n\
                  - \"profile\": create_profile, update_profile\n\
-                 - \"subtask\": dispatch_subtask\n\
                  - \"mcp\": tool da server MCP esterni\n\
                  Autonomia: NON chiedere mai struttura, tecnologia, OS, comandi — ricava tutto dal contesto progetto o con list_files/read_file.\n\
                  PERO' SE ti mancano informazioni che NON puoi ricavare autonomamente (connection string, API keys, credenziali, \
@@ -1603,7 +1717,7 @@ pub async fn resend_chat_message(
                 supervisor_mode: SupervisorMode::default(),
                 profile_prompt_block,
                 system_context: system_context_str,
-                provider_override: provider_override.clone(),
+                provider_override: provider_choice.provider().map(str::to_string),
                 model_override: model_override.clone(),
                 profile_provider: None,
                 profile_model: None,
@@ -1653,7 +1767,7 @@ pub async fn resend_chat_message(
         resent_user_message_id,
         body.active_files.clone(),
         None,
-        provider_override,
+        provider_choice,
         model_override,
         automation_mode,
         attachments,
@@ -1714,12 +1828,24 @@ async fn fallback_assistant_after_run_turn_error(
     error: &(StatusCode, Json<Value>),
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let err_text = error.1["error"].as_str().unwrap_or("generation_error");
+    // La frase gia' resa a monte, quando i fatti erano vivi (`api_error_rendered`
+    // su run_turn). Quando c'e' si USA: ri-renderla da `err_text` darebbe il
+    // messaggio generico del dominio Gateway, perche' da qui provider, modello e
+    // status non sono piu' leggibili.
+    let user_message = error.1["user_message"].as_str().map(str::to_string);
+    let user_code = error.1["user_code"].as_str().unwrap_or("");
     let fallback_metadata = json!({
         "provider": "none",
         "model": "none",
         "intent": "chat",
         "runId": "",
         "error": err_text,
+        // Identificatore canonico della classe: e' il campo su cui la UI puo'
+        // decidere un'azione (riprova, cambia modello, ricarica credito) senza
+        // guardare il testo (regola M). CamelCase come i vicini di questo
+        // metadata (promptTokens, totalCost), non snake_case come sul wire del
+        // gateway: la convenzione locale vince sulla coerenza cross-confine.
+        "userCode": user_code,
         "promptTokens": 0,
         "completionTokens": 0,
         "totalTokens": 0,
@@ -1732,7 +1858,26 @@ async fn fallback_assistant_after_run_turn_error(
         session_id,
         project_id,
         "assistant",
-        &format!("Operazione non completata: {}", humanize_ai_error(err_text)),
+        // Il testo tecnico NON entra nel corpo del messaggio: e' gia' in
+        // `fallback_metadata["error"]`, da cui il pannello diagnostico lo legge.
+        // Qui viveva `humanize_ai_error`, che decideva la frase cercando "429" o
+        // "timeout" DENTRO il testo (regola M) e, quando non li trovava, ci
+        // incollava la prima riga troncata a 220 caratteri — cioe' il blob
+        // mozzato che si leggeva in chat.
+        //
+        // I fatti opachi restano il RIPIEGO onesto: valgono per gli errori che
+        // non attraversano il gateway (validazione, DB, permessi), dove non c'e'
+        // nessuna resa da trasportare.
+        &format!(
+            "Operazione non completata: {}",
+            user_message.unwrap_or_else(|| nexus_types::error_presentation::render_user_error(
+                &nexus_types::error_presentation::ErrorFacts::opaque(
+                    nexus_types::error_presentation::ErrorDomain::Gateway,
+                    err_text,
+                ),
+            )
+            .message)
+        ),
         fallback_metadata,
         Some(user_message_id),
     )
@@ -1755,7 +1900,7 @@ pub async fn delete_chat_message(
     // Separazione DB: endpoint keyed solo dal message_id. chat_messages/chat_sessions
     // vivono nel DB del progetto -> pool via directory di routing (fallback ricerca).
     let mpool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
 
     let row = sqlx::query(
         r#"
@@ -1892,8 +2037,12 @@ async fn load_feedback_target(
     user_id: Uuid,
     role_error: &str,
 ) -> Result<FeedbackTarget, ApiError> {
+    // Separazione DB: endpoint keyed solo dal message_id. Risolvo il pool del
+    // progetto dalla directory di routing (fallback ricerca + auto-registrazione);
+    // chat_messages/chat_sessions/ai_response_feedback/prompt_corrections vivono
+    // li'. DB non disponibile -> 503. ensure_project_access resta sul meta (globale).
     let pool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await;
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
     let row = fetch_authorized_feedback_row(&pool, message_id, user_id, role_error).await?;
     let session_id: Uuid = row
         .try_get("session_id")
@@ -2472,8 +2621,11 @@ pub async fn legacy_chat(
     let project_id = parse_project_id(&body.project_id)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
+    // Separazione DB: chat_sessions e' migrata -> pool del progetto risolto una
+    // volta per ricerca E creazione. Sul meta la ricerca rispondeva sempre
+    // vuoto e ogni chiamata legacy creava una NUOVA sessione.
     let session_pool =
-        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+        crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
     let session_id = legacy_session_id(&session_pool, project_id, user_id).await?;
 
     let user_message_id = insert_message(
@@ -2500,7 +2652,9 @@ pub async fn legacy_chat(
         user_message_id,
         body.active_files.clone(),
         None,
-        None,
+        // Rotta legacy senza dropdown provider: nessuna scelta dell'utente,
+        // decide il routing.
+        ProviderChoice::Auto,
         None,
         AutomationMode::Confirm,
         Vec::new(),

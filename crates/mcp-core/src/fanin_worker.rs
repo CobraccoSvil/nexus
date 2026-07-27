@@ -278,7 +278,13 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
     let mut requeued = 0u64;
     for project_id in crate::project_db_routes::list_all_project_ids(&state.db).await {
         let proj_pool =
-            crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+            match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+                Ok(pool) => pool,
+                Err(e) => {
+                    tracing::warn!(project_id = %project_id, error = %e, "fan-in backstop: DB progetto non disponibile, progetto saltato per questo giro");
+                    continue;
+                }
+            };
         requeued +=
             backstop_project(&state.db, &proj_pool, orphan_timeout_s as i64, no_progress).await;
     }
@@ -290,6 +296,33 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Esegue una marcatura del backstop gia' bindata dal chiamante e ne traccia
+/// l'eventuale errore. `false` = fallita, il giro va interrotto e ritentato.
+///
+/// Punto unico (regola L) del "prova a marcare, se fallisce logga e rinuncia al
+/// giro": i tre rami di [`backstop_project`] ripetevano lo stesso blocco parola
+/// per parola, e ogni nuovo criterio di marcatura ne aggiungeva una copia.
+/// `cosa` nomina la marcatura nel log, cosi' il WARN dice QUALE dei tre e' andata
+/// storta invece di un generico "marcatura fallita".
+async fn marca_o_rinuncia(
+    q: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    proj: &PgPool,
+    cosa: &str,
+) -> bool {
+    match q.execute(proj).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "mcp_core::fanin_worker",
+                error = %e,
+                cosa,
+                "fan-in backstop: marcatura fallita (ritento al prossimo giro)"
+            );
+            false
+        }
+    }
 }
 
 /// Backstop di UN progetto: marca gli orfani, trova i padri recuperabili, accoda.
@@ -313,7 +346,7 @@ async fn backstop_project(
     //      mentre quello a 0 token/0 iter/0 step per >timeout_s viene abortito e la
     //      COUNT del fan-in scende, liberando il padre. Gated dal kill-switch.
     if no_progress.enabled {
-        if let Err(e) = sqlx::query(
+        let q = sqlx::query(
             "UPDATE nexus_subagent_runs s SET status = 'timeout', completed_at = NOW() \
              WHERE s.is_background = true AND s.status IN ('running', 'paused') \
                AND s.created_at < NOW() - make_interval(secs => $1) \
@@ -321,15 +354,8 @@ async fn backstop_project(
                AND NOT EXISTS ( \
                      SELECT 1 FROM agent_steps st WHERE st.run_id = s.id)",
         )
-        .bind(no_progress.timeout_s as f64)
-        .execute(proj)
-        .await
-        {
-            tracing::warn!(
-                target: "mcp_core::fanin_worker",
-                error = %e,
-                "fan-in backstop: marcatura sub-run no-progress fallita (ritento al prossimo giro)"
-            );
+        .bind(no_progress.timeout_s as f64);
+        if !marca_o_rinuncia(q, proj, "background no-progress").await {
             return 0;
         }
     }
@@ -341,20 +367,65 @@ async fn backstop_project(
     //     Complementare al check no-progress: questo colpisce QUALSIASI sub-run
     //     vecchia (anche una che aveva fatto progressi ma e' poi morta), con
     //     timeout piu' lungo.
-    if let Err(e) = sqlx::query(
+    let q = sqlx::query(
         "UPDATE nexus_subagent_runs SET status = 'timeout', completed_at = NOW() \
          WHERE is_background = true AND status IN ('running', 'paused') \
            AND created_at < NOW() - make_interval(secs => $1)",
     )
-    .bind(orphan_timeout_s as f64)
-    .execute(proj)
-    .await
-    {
-        tracing::warn!(
-            target: "mcp_core::fanin_worker",
-            error = %e,
-            "fan-in backstop: marcatura sub-run orfane fallita (ritento al prossimo giro)"
-        );
+    .bind(orphan_timeout_s as f64);
+    if !marca_o_rinuncia(q, proj, "background orfane").await {
+        return 0;
+    }
+
+    // (1c) Sub-run SINCRONI (non background) il cui PADRE e' gia' in stato
+    //      TERMINALE: nessuno li chiudera' mai piu'.
+    //
+    //      I due rami sopra filtrano `is_background = true` — giustamente, per il
+    //      problema che risolvono: liberare un padre sospeso dal fan-in, e un
+    //      figlio sincrono non sospende nessuno. Ma quel filtro lascia scoperto un
+    //      caso diverso: il sincrono e' eseguito DENTRO il turno del padre, quindi
+    //      se il processo muore (deploy, restart) la sua riga resta `running` PER
+    //      SEMPRE. Il `run_reaper` non la salva: riconcilia `agent_runs`, mai
+    //      `nexus_subagent_runs`. Misurati il 27/07 due zombie in produzione: un
+    //      `review` il cui padre risultava `interrupted` DUE SECONDI prima che il
+    //      figlio fosse creato, e un `implement` da 26 ore. Falsano ogni conta di
+    //      "sub-run attivi".
+    //
+    //      Il criterio e' il SEGNALE STRUTTURATO del padre (regola M), non
+    //      l'anzianita' del figlio: un sincrono lento ma con il padre VIVO non
+    //      viene toccato, per quanto vecchio sia. La lista degli stati arriva dal
+    //      punto unico `AgentRunStatus::stati_non_terminali_db` (regola L): qui
+    //      NON si enumerano i terminali, che sono una lista aperta.
+    //
+    //      `orphan_timeout_s` misura da quanto il PADRE e' chiuso, ed e' solo una
+    //      guardia anti-race: senza, un figlio che sta scrivendo il proprio esito
+    //      nello stesso istante in cui il padre viene marcato verrebbe dichiarato
+    //      scaduto un attimo prima di riuscirci. Marcare la riga non uccide alcun
+    //      processo: se il figlio e' vivo e completa, il suo `mark_run` vince.
+    //
+    //      `COALESCE(p.updated_at, p.created_at)`: `agent_runs.updated_at` e'
+    //      NULLABLE SENZA DEFAULT (solo `created_at` ha `now()`), quindi un padre
+    //      mai aggiornato dopo l'INSERT la lascia NULL — e un confronto con NULL
+    //      e' NULL, cioe' la riga non verrebbe MAI selezionata e i suoi figli
+    //      sarebbero immuni al backstop proprio nel caso in cui serve. Il fallback
+    //      su `created_at` (NOT NULL) rende la guardia sempre valutabile.
+    // Legato a una variabile: la query PRESTA l'array e un temporaneo morirebbe
+    // prima dell'`execute` (E0716).
+    let non_terminali = AgentRunStatus::stati_non_terminali_db();
+    let q = sqlx::query(
+        "UPDATE nexus_subagent_runs s SET status = 'timeout', completed_at = NOW() \
+         WHERE s.is_background = false \
+           AND s.status IN ('running', 'paused') \
+           AND EXISTS ( \
+                 SELECT 1 FROM agent_runs p \
+                 WHERE p.id = COALESCE(s.dispatcher_run_id, s.parent_run_id) \
+                   AND p.status <> ALL($1) \
+                   AND COALESCE(p.updated_at, p.created_at) \
+                       < NOW() - make_interval(secs => $2))",
+    )
+    .bind(&non_terminali[..])
+    .bind(orphan_timeout_s as f64);
+    if !marca_o_rinuncia(q, proj, "sincroni col padre terminale").await {
         return 0;
     }
 
@@ -460,7 +531,22 @@ async fn process_queue_row(state: &AppState, row: QueueRow) {
     } = row;
 
     // Pool del progetto (separazione DB): agent_runs e' migrata per-progetto.
-    let proj_pool = crate::project_db_routes::project_data_pool_from(&state.db, project_id).await;
+    // Se il DB del progetto non e' disponibile la riga resta in coda e viene
+    // ritentata al prossimo giro (niente fallback al meta-DB).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_from(&state.db, project_id).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mcp_core::fanin_worker",
+                    parent_run_id = %parent_run_id,
+                    project_id = %project_id,
+                    error = %e,
+                    "fan-in: DB progetto non disponibile, riga saltata per questo giro"
+                );
+                return;
+            }
+        };
 
     // CAS: transizione atomica awaiting_subagents -> running. RETURNING id ->
     // vince UN solo consumer/giro (idempotenza del resume, regola H: e' il CAS a
@@ -644,50 +730,12 @@ mod tests {
         );
     }
 
-    /// Crea le tabelle minime per i test del backstop: `agent_runs` +
-    /// `nexus_subagent_runs` + la coda. Un solo pool fa da project e da meta (in
-    /// prod i primi due sono sul PROJECT pool, la coda sul META): il backstop
-    /// riceve i due handle separati, qui coincidono.
-    async fn create_backstop_tables(pool: &sqlx::PgPool) {
-        sqlx::query(
-            "CREATE TABLE agent_runs ( \
-                 id UUID PRIMARY KEY, \
-                 session_id UUID NOT NULL, \
-                 project_id UUID NOT NULL, \
-                 parent_run_id UUID, \
-                 status TEXT NOT NULL )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_runs");
-        sqlx::query(
-            // `iterations` (mig project 0002) e' il segnale strutturato di progresso
-            // letto dal check no-progress; `agent_steps` (sotto) e' l'altro segnale.
-            "CREATE TABLE nexus_subagent_runs ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 parent_run_id UUID NOT NULL, \
-                 dispatcher_run_id UUID, \
-                 is_background BOOLEAN NOT NULL DEFAULT false, \
-                 status TEXT NOT NULL, \
-                 iterations INTEGER DEFAULT 0, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-                 completed_at TIMESTAMPTZ )",
-        )
-        .execute(pool)
-        .await
-        .expect("create nexus_subagent_runs");
-        // agent_steps: il figlio ha lo stesso id in agent_runs, gli step si
-        // correlano su run_id (persistiti incrementalmente). Il check no-progress
-        // usa NOT EXISTS su questa tabella come segnale primario di progresso.
-        sqlx::query(
-            "CREATE TABLE agent_steps ( \
-                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
-                 run_id UUID NOT NULL, \
-                 step_index INTEGER NOT NULL )",
-        )
-        .execute(pool)
-        .await
-        .expect("create agent_steps");
+    /// Coda di risveglio: e' una tabella META (mig 0542), FUORI dal set
+    /// `db/migrations/project`, quindi resta a carico del test. Le tabelle del
+    /// dominio run (`agent_runs`, `nexus_subagent_runs`, `agent_steps`) le porta
+    /// il migrator. Un solo pool fa da project e da meta (in prod sono distinti):
+    /// il backstop riceve i due handle separati, qui coincidono.
+    async fn crea_coda_meta(pool: &sqlx::PgPool) {
         sqlx::query(
             "CREATE TABLE subagent_fanin_resume_queue ( \
                  parent_run_id UUID PRIMARY KEY, \
@@ -698,6 +746,60 @@ mod tests {
         .execute(pool)
         .await
         .expect("create queue");
+    }
+
+    /// Sessione chat reale (FK di `agent_runs.session_id`) col suo progetto.
+    async fn crea_sessione(pool: &sqlx::PgPool, project: Uuid) -> Uuid {
+        crate::test_support::seed_chat_session(pool, project).await
+    }
+
+    /// Padre `awaiting_subagents` di primo livello (anchor = session_id).
+    async fn insert_padre(pool: &sqlx::PgPool, session: Uuid, project: Uuid) -> Uuid {
+        crate::test_support::insert_agent_run(pool, session, project, "awaiting_subagents")
+            .await
+    }
+
+    /// Figlio background: `project_id`, `kind` e `task_description` sono NOT NULL
+    /// nello schema reale, che la vecchia fixture ometteva. `eta_min` retrodata
+    /// `created_at` (l'orfano si misura sull'eta').
+    async fn insert_figlio(
+        pool: &sqlx::PgPool,
+        anchor: Uuid,
+        dispatcher: Uuid,
+        status: &str,
+        eta_min: i64,
+    ) -> Uuid {
+        insert_figlio_con(pool, anchor, dispatcher, status, eta_min, true).await
+    }
+
+    /// Gemello parametrico: `background=false` semina un sub-run SINCRONO, quello
+    /// che i rami (1a)/(1b) non toccano per costruzione.
+    async fn insert_figlio_con(
+        pool: &sqlx::PgPool,
+        anchor: Uuid,
+        dispatcher: Uuid,
+        status: &str,
+        eta_min: i64,
+        background: bool,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nexus_subagent_runs \
+                 (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
+                  is_background, status, iterations, created_at) \
+             VALUES ($1, $2, $3, gen_random_uuid(), 'coder', 'task di test', $6, $4, 0, \
+                     NOW() - make_interval(secs => $5))",
+        )
+        .bind(id)
+        .bind(anchor)
+        .bind(dispatcher)
+        .bind(status)
+        .bind((eta_min * 60) as f64)
+        .bind(background)
+        .execute(pool)
+        .await
+        .expect("insert figlio");
+        id
     }
 
     /// Guardia no-progress DISABILITATA: per i test che esercitano l'orphan_timeout
@@ -712,37 +814,18 @@ mod tests {
     /// dell'enqueue, o restart) resterebbe appeso per sempre. Il backstop lo
     /// recupera: lo trova (figli tutti terminali) e lo ACCODA. Senza il backstop
     /// la coda resterebbe vuota (il test fallirebbe: 0 righe accodate).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn backstop_accoda_padre_orfano(pool: sqlx::PgPool) {
-        create_backstop_tables(&pool).await;
-        let parent = Uuid::new_v4();
-        let session = Uuid::new_v4();
+        crea_coda_meta(&pool).await;
         let project = Uuid::new_v4();
+        let session = crea_sessione(&pool, project).await;
+        let parent = insert_padre(&pool, session, project).await;
         // Padre di primo livello: anchor = session_id (parent_run_id NULL).
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
-             VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
-        )
-        .bind(parent)
-        .bind(session)
-        .bind(project)
-        .execute(&pool)
-        .await
-        .expect("insert padre");
         // Due figli background, entrambi TERMINALI, ancorati alla session (anchor
         // depth-chain) ma DISPATCHATI dal run `parent` (dispatcher_run_id). La coda
         // e' VUOTA (l'enqueue non e' mai avvenuto).
         for st in ["completed", "timeout"] {
-            sqlx::query(
-                "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-                 VALUES ($1, $2, true, $3)",
-            )
-            .bind(session)
-            .bind(parent)
-            .bind(st)
-            .execute(&pool)
-            .await
-            .expect("insert figlio");
+            insert_figlio(&pool, session, parent, st, 0).await;
         }
 
         // Precondizione: coda vuota.
@@ -769,38 +852,86 @@ mod tests {
         assert_eq!(requeued2, 0, "backstop idempotente: nessun duplicato");
     }
 
+    /// REGRESSIONE (misurata in produzione il 27/07): un sub-run SINCRONO il cui
+    /// padre e' gia' terminale resta `running` per sempre — i rami (1a)/(1b)
+    /// filtrano `is_background = true` e il `run_reaper` non tocca
+    /// `nexus_subagent_runs`. Trovati un `review` da 3 ore (padre `interrupted`
+    /// due secondi PRIMA della creazione del figlio) e un `implement` da 26.
+    ///
+    /// Il test attraversa il backstop REALE sullo schema REALE (PROJECT_MIGRATOR):
+    /// non asserisce la query, asserisce la CONSEGUENZA sullo stato della riga.
+    /// Il caso di controllo e' quello che rende il fix sicuro: padre VIVO ->
+    /// il figlio non si tocca, per quanto vecchio sia.
+    ///
+    /// Test di mutazione: rimuovendo il ramo (1c) il primo assert rosseggia
+    /// ("running"), che e' esattamente lo zombie visto in produzione.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn backstop_chiude_i_sincroni_col_padre_terminale(pool: sqlx::PgPool) {
+        crea_coda_meta(&pool).await;
+        let project = Uuid::new_v4();
+        let session = crea_sessione(&pool, project).await;
+
+        // Padre TERMINALE (lo stato che il run_reaper scrive sui run orfani di un
+        // restart) e figlio SINCRONO rimasto running.
+        let padre_morto = crate::test_support::insert_agent_run(&pool, session, project, "interrupted").await;
+        let orfano = insert_figlio_con(&pool, session, padre_morto, "running", 30, false).await;
+
+        // Padre VIVO e figlio sincrono altrettanto vecchio: il controllo.
+        let padre_vivo = crate::test_support::insert_agent_run(&pool, session, project, "running").await;
+        let al_lavoro = insert_figlio_con(&pool, session, padre_vivo, "running", 30, false).await;
+
+        // Soglia 0: la guardia anti-race non deve mascherare l'effetto misurato.
+        // NB il seeder NON scrive `updated_at` (nullable senza default, come in
+        // produzione per un run mai aggiornato dopo l'INSERT): e' esattamente il
+        // caso che ha scoperto il buco del primo tentativo di fix, dove il
+        // confronto con NULL rendeva i figli immuni. Non si semina il campo per
+        // far passare il test — il codice usa `COALESCE(updated_at, created_at)`.
+        backstop_project(&pool, &pool, 0, NO_PROGRESS_OFF).await;
+
+        let stato = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM nexus_subagent_runs WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("select stato")
+            }
+        };
+
+        assert_eq!(
+            stato(orfano).await,
+            "timeout",
+            "il sincrono col padre TERMINALE va chiuso: senza, resta 'running' per sempre"
+        );
+        assert_eq!(
+            stato(al_lavoro).await,
+            "running",
+            "il sincrono col padre VIVO non si tocca: sta lavorando, l'eta' non e' il criterio"
+        );
+
+        // Idempotente: un secondo giro non riapre nulla.
+        backstop_project(&pool, &pool, 0, NO_PROGRESS_OFF).await;
+        assert_eq!(stato(orfano).await, "timeout");
+        assert_eq!(stato(al_lavoro).await, "running");
+    }
+
     /// BUG #3 (parte 2): una sub-run background rimasta `running` orfana (figlio
     /// detached morto senza mark_run) oltre il timeout viene marcata `timeout` dal
     /// backstop, cosi' la COUNT scende a 0 e il padre viene accodato. Con timeout
     /// alto (figlio "giovane") il backstop NON tocca nulla (il figlio potrebbe
     /// ancora vivere).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn backstop_marca_orfani_solo_oltre_timeout(pool: sqlx::PgPool) {
-        create_backstop_tables(&pool).await;
-        let parent = Uuid::new_v4();
-        let session = Uuid::new_v4();
+        crea_coda_meta(&pool).await;
         let project = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
-             VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
-        )
-        .bind(parent)
-        .bind(session)
-        .bind(project)
-        .execute(&pool)
-        .await
-        .expect("insert padre");
+        let session = crea_sessione(&pool, project).await;
+        let parent = insert_padre(&pool, session, project).await;
         // Figlio background RUNNING vecchio (created_at 30 min fa): orfano.
         // Ancorato a session (anchor), dispatchato dal run `parent`.
-        sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status, created_at) \
-             VALUES ($1, $2, true, 'running', NOW() - interval '30 minutes')",
-        )
-        .bind(session)
-        .bind(parent)
-        .execute(&pool)
-        .await
-        .expect("insert figlio orfano");
+        insert_figlio(&pool, session, parent, "running", 30).await;
 
         // Timeout ALTO (1h): il figlio (30 min) e' sotto soglia -> NON marcato, NON
         // accodato (potrebbe ancora vivere).
@@ -836,57 +967,39 @@ mod tests {
     /// agent_step) NON viene toccato dal check no-progress anche se oltre la stessa
     /// soglia (l'orphan_timeout, piu' lungo, non e' ancora scattato). Con la guardia
     /// DISABILITATA il check non agisce (solo l'orphan_timeout storico).
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn backstop_no_progress_marca_solo_impantanati(pool: sqlx::PgPool) {
-        create_backstop_tables(&pool).await;
-        let session = Uuid::new_v4();
+        crea_coda_meta(&pool).await;
         let project = Uuid::new_v4();
+        let session = crea_sessione(&pool, project).await;
 
         // Padre A: figlio bg IMPANTANATO (running 10 min, 0 step, 0 iter).
-        let parent_stuck = Uuid::new_v4();
-        let child_stuck = Uuid::new_v4();
+        let parent_stuck = insert_padre(&pool, session, project).await;
         // Padre B: figlio bg che HA PROGREDITO (running 10 min, 1 step).
-        let parent_working = Uuid::new_v4();
-        let child_working = Uuid::new_v4();
-        for p in [parent_stuck, parent_working] {
-            sqlx::query(
-                "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
-                 VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
-            )
-            .bind(p)
-            .bind(session)
-            .bind(project)
-            .execute(&pool)
-            .await
-            .expect("insert padre");
-        }
+        let parent_working = insert_padre(&pool, session, project).await;
         // Figlio impantanato: running da 10 min, iterations 0, nessun agent_step.
-        sqlx::query(
-            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, is_background, status, iterations, created_at) \
-             VALUES ($1, $2, $3, true, 'running', 0, NOW() - interval '10 minutes')",
-        )
-        .bind(child_stuck)
-        .bind(session)
-        .bind(parent_stuck)
-        .execute(&pool)
-        .await
-        .expect("insert figlio impantanato");
+        let child_stuck = insert_figlio(&pool, session, parent_stuck, "running", 10).await;
         // Figlio che lavora: running da 10 min ma con 1 agent_step gia' persistito.
+        // Lo step si correla all'id del figlio in `agent_runs` (FK reale): il
+        // sub-run ha la stessa identita' nelle due tabelle, come in produzione.
+        let child_working = insert_figlio(&pool, session, parent_working, "running", 10).await;
+        crate::test_support::insert_agent_run_with_id(
+            &pool,
+            child_working,
+            session,
+            project,
+            Uuid::new_v4(),
+            "running",
+        )
+        .await;
         sqlx::query(
-            "INSERT INTO nexus_subagent_runs (id, parent_run_id, dispatcher_run_id, is_background, status, iterations, created_at) \
-             VALUES ($1, $2, $3, true, 'running', 0, NOW() - interval '10 minutes')",
+            "INSERT INTO agent_steps (run_id, step_index, tool_name, tool_input) \
+             VALUES ($1, 0, 'read_file', '{}'::jsonb)",
         )
         .bind(child_working)
-        .bind(session)
-        .bind(parent_working)
         .execute(&pool)
         .await
-        .expect("insert figlio che lavora");
-        sqlx::query("INSERT INTO agent_steps (run_id, step_index) VALUES ($1, 0)")
-            .bind(child_working)
-            .execute(&pool)
-            .await
-            .expect("insert agent_step del figlio che lavora");
+        .expect("insert agent_step del figlio che lavora");
 
         // Guardia DISABILITATA: nessun figlio viene toccato dal check no-progress.
         // orphan_timeout ALTO (1h): neanche l'orphan scatta -> 0 accodati.
@@ -1014,46 +1127,20 @@ mod tests {
     /// (dispatcher = parent). Il figlio diventa terminale -> l'enqueue (dispatcher-
     /// based) accoda il PARENT -> il worker vince il CAS -> il fetch dei figli
     /// (dispatcher = parent) ritorna SOLO i figli di quel dispatcher.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_ciclo_completo_dispatcher_based(pool: sqlx::PgPool) {
-        create_backstop_tables(&pool).await;
-        let parent = Uuid::new_v4();
-        let session = Uuid::new_v4();
+        crea_coda_meta(&pool).await;
         let project = Uuid::new_v4();
+        let session = crea_sessione(&pool, project).await;
+        let parent = insert_padre(&pool, session, project).await;
         let altro_run = Uuid::new_v4(); // un ALTRO run della stessa sessione
 
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
-             VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
-        )
-        .bind(parent)
-        .bind(session)
-        .bind(project)
-        .execute(&pool)
-        .await
-        .expect("insert padre");
 
         // Figlio bg del PARENT (dispatcher=parent), ancora running.
-        sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-             VALUES ($1, $2, true, 'running')",
-        )
-        .bind(session) // anchor degenere
-        .bind(parent)
-        .execute(&pool)
-        .await
-        .expect("insert figlio del parent");
+        insert_figlio(&pool, session, parent, "running", 0).await;
         // Un figlio di un ALTRO run della stessa sessione (dispatcher=altro_run),
         // running: NON deve influenzare la COUNT/fetch del parent (isolamento).
-        sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-             VALUES ($1, $2, true, 'running')",
-        )
-        .bind(session)
-        .bind(altro_run)
-        .execute(&pool)
-        .await
-        .expect("insert figlio altro run");
+        insert_figlio(&pool, session, altro_run, "running", 0).await;
 
         // Figlio del parent ancora running -> NON accoda.
         assert!(
@@ -1116,34 +1203,16 @@ mod tests {
     /// padre finche' la 2a ondata non e' terminale (solo il loro completamento crea
     /// una riga FRESCA). Col vecchio keep-row la riga vecchia resterebbe e ri-
     /// vincerebbe il CAS con la 2a ondata `running` -> resume PARZIALE.
-    #[sqlx::test]
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
     async fn fanin_no_ripresa_prematura_seconda_ondata(pool: sqlx::PgPool) {
-        create_backstop_tables(&pool).await;
-        let parent = Uuid::new_v4();
-        let session = Uuid::new_v4();
+        crea_coda_meta(&pool).await;
         let project = Uuid::new_v4();
+        let session = crea_sessione(&pool, project).await;
+        let parent = insert_padre(&pool, session, project).await;
 
-        sqlx::query(
-            "INSERT INTO agent_runs (id, session_id, project_id, parent_run_id, status) \
-             VALUES ($1, $2, $3, NULL, 'awaiting_subagents')",
-        )
-        .bind(parent)
-        .bind(session)
-        .bind(project)
-        .execute(&pool)
-        .await
-        .expect("insert padre");
 
         // 1a ONDATA: un figlio bg del parent, gia' terminale -> enqueue.
-        sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-             VALUES ($1, $2, true, 'completed')",
-        )
-        .bind(session)
-        .bind(parent)
-        .execute(&pool)
-        .await
-        .expect("insert figlio 1a ondata");
+        insert_figlio(&pool, session, parent, "completed", 0).await;
         assert!(enqueue_if_all_direct_terminal(&pool, parent, project, session).await);
 
         // Il worker vince il CAS e CANCELLA la riga (fix ALTA 2), poi (simulato) il
@@ -1155,15 +1224,7 @@ mod tests {
             .await
             .expect("resume ri-sospende");
         // 2a ondata: figlio del parent ANCORA running (spawnato dopo il resume).
-        sqlx::query(
-            "INSERT INTO nexus_subagent_runs (parent_run_id, dispatcher_run_id, is_background, status) \
-             VALUES ($1, $2, true, 'running')",
-        )
-        .bind(session)
-        .bind(parent)
-        .execute(&pool)
-        .await
-        .expect("insert figlio 2a ondata");
+        insert_figlio(&pool, session, parent, "running", 0).await;
 
         // INVARIANTE (ALTA 2): la coda e' VUOTA (la riga vecchia e' stata cancellata
         // al CAS e la 2a ondata non ha ancora accodato: il suo figlio e' running).

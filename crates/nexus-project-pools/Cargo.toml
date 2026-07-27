@@ -5,14 +5,20 @@ version.workspace = true
 
 [dependencies]
 nexus-auth = { path = "../nexus-auth" }
-nexus-cache = { path = "../nexus-cache" }
 sqlx.workspace = true
 thiserror = "1.0"
+# Lock per-progetto sull'APERTURA del pool: senza, due task che non trovano il
+# pool in registro ne aprono uno ciascuno verso lo stesso database.
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+# Precondizioni degli integration test e skip VISIBILE: punto unico di
+# `salta(Motivo)` + REQUIRE_INTEGRATION_TESTS (regole L e O). Vive in un crate
+# perche' mcp-core e' bin-only e nexus-auth/nexus-project-pools sono sue
+# dipendenze: nessuno dei tre poteva ospitarlo per gli altri due.
+nexus-test-preconditions = { path = "../nexus-test-preconditions" }
 
 [lints]
 workspace = true
