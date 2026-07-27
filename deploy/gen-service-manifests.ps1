@@ -48,6 +48,24 @@ if (-not $DryRun) { $argomenti += @('--out-dir', $OutDir) }
 
 Push-Location $RepoRoot
 try {
+  # PRECONDIZIONE: il catalogo che stiamo per leggere e' esattamente cio' che le
+  # migrazioni scrivono. Se il DB e' indietro, il piano verrebbe costruito su un
+  # catalogo vecchio e i manifest sarebbero sbagliati in un modo che nessuno
+  # noterebbe fino all'avvio. `migrate --check` esce 3 quando ci sono pendenti,
+  # codice distinto da "non ho potuto guardare": qui la differenza conta.
+  & cargo run --quiet -p xtask -- migrate --set meta --check
+  if ($LASTEXITCODE -eq 3) {
+    Write-Host ''
+    Write-Host 'Il database e'' indietro rispetto al set di migrazioni.' -ForegroundColor Yellow
+    Write-Host 'Il catalogo dei servizi si legge da li'', quindi i manifest sarebbero costruiti su dati vecchi.'
+    Write-Host 'Applicale prima:  cargo xtask migrate --set meta --apply'
+    exit 3
+  }
+  elseif ($LASTEXITCODE -ne 0) {
+    Write-Host 'Impossibile verificare lo stato delle migrazioni: vedi l''errore sopra.' -ForegroundColor Yellow
+    exit $LASTEXITCODE
+  }
+
   # Il binario gia' compilato se c'e', altrimenti cargo: stesso criterio di
   # scripts/quality-scan.sh, che pero' passa SEMPRE da cargo per non riusare un
   # binario stantio. Qui vale la stessa preoccupazione, quindi cargo sempre.

@@ -30,6 +30,9 @@ nexus-auth = { path = "../nexus-auth" }
 # service-manifests: il catalogo servizi si legge dal punto unico condiviso con
 # mcp-core, e gli scostamenti di esecuzione da un TOML versionato.
 nexus-service-catalog = { path = "../nexus-service-catalog" }
+# `migrate` non porta un motore proprio: delega al punto unico che mcp-core
+# esegue all'avvio (regola L).
+nexus-migrations = { path = "../nexus-migrations" }
 toml = { version = "0.8", features = ["parse"] }
 
 [dev-dependencies]

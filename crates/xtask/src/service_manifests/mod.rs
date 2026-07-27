@@ -78,15 +78,6 @@ fn porta_di(url: &str) -> Option<u16> {
     hostport.rsplit(':').next()?.parse().ok()
 }
 
-/// URL con la password sostituita, per dichiarare la premessa senza esporre un
-/// segreto: un numero senza la sua premessa e' un'opinione, ma la premessa non
-/// deve essere una credenziale.
-fn url_redatto(url: &str) -> String {
-    match (url.find("://"), url.rfind('@')) {
-        (Some(i), Some(j)) if j > i => format!("{}://***@{}", &url[..i], &url[j + 1..]),
-        _ => url.to_string(),
-    }
-}
 
 struct Opzioni {
     out_dir: Option<PathBuf>,
@@ -248,7 +239,7 @@ async fn costruisci_piano(
         .with_context(|| {
             format!(
                 "connessione a {} per leggere il catalogo servizi",
-                url_redatto(db_url)
+                crate::premessa::db_dichiarato(db_url)
             )
         })?;
     let piano = piano_da_pool(&pool, repo, profilo, Some(db_url)).await;
@@ -282,7 +273,7 @@ async fn piano_da_pool(
     println!(
         "xtask service-manifests: catalogo da {} chiave system.services_catalog, \
          {} voci, albero {}, profilo {}, ordine di avvio {} id (attese: {})",
-        db_url.map(url_redatto).unwrap_or_else(|| "pool fornito".into()),
+        db_url.map(crate::premessa::db_dichiarato).unwrap_or_else(|| "pool fornito".into()),
         catalogo.len(),
         amb.repo_root,
         profilo,
@@ -458,7 +449,7 @@ mod tests {
 
     #[test]
     fn la_premessa_non_espone_la_password() {
-        let r = url_redatto("postgres://utente:segretissimo@host:5433/nexus");
+        let r = crate::premessa::db_dichiarato("postgres://utente:segretissimo@host:5433/nexus");
         assert!(!r.contains("segretissimo"), "password esposta: {r}");
         assert!(r.contains("host:5433"), "premessa illeggibile: {r}");
     }
