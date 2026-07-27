@@ -2930,7 +2930,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
-            ledger_entry: None,
+            ledger: None,
         };
         let turn = crate::orchestrator::neural_client::agent_turn_value_from_gw(
             "mistral",
@@ -4119,7 +4119,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
-            ledger_entry: None,
+            ledger: None,
         };
         crate::orchestrator::neural_client::agent_turn_value_from_gw("p", "m", &resp)
     }

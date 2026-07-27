@@ -810,7 +810,7 @@ fn from_anthropic_message(
         },
         thinking_signature,
         citations: None,
-        ledger_entry: None,
+        ledger: None,
     }
 }
 

@@ -402,7 +402,7 @@ fn result_line_to_item(line: AnthropicResultLine) -> BatchResultItem {
                 reasoning: None,
                 thinking_signature: None,
                 citations: None,
-                ledger_entry: None,
+                ledger: None,
             };
             return BatchResultItem {
                 custom_id: line.custom_id,

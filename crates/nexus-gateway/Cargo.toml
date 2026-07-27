@@ -48,6 +48,9 @@ base64.workspace = true
 nexus-cache = { path = "../nexus-cache" }
 nexus-auth = { path = "../nexus-auth" }
 nexus-pricing = { path = "../nexus-pricing" }
+# Punto unico della contabilita' di ai_usage_ledger (regola L): qui restano solo
+# gli adapter dai tipi del gateway (identita' e token da LlmRequest/LlmResponse).
+nexus-ledger = { path = "../nexus-ledger" }
 # Punto unico del secret scanner su stringa (redazione prompt/output, regola L).
 nexus-tool-kit = { path = "../nexus-tool-kit" }
 # Punto unico della PRESENTAZIONE degli errori (error_presentation): il gateway

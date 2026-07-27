@@ -1062,7 +1062,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
             reasoning: None,
             thinking_signature: None,
             citations: None,
-            ledger_entry: None,
+            ledger: None,
         }
     }
 

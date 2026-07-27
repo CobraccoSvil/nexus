@@ -242,28 +242,38 @@ pub struct GwResponse {
     /// provider (regola M: campo strutturato, mai estratto dal testo).
     #[serde(default)]
     pub citations: Option<Vec<String>>,
-    /// Riga di `ai_usage_ledger` che il GATEWAY ha gia' scritto per questa
-    /// chiamata (`nexus_gateway::types::LedgerEntry` sull'altro lato del wire).
+    /// Cosa ha fatto il GATEWAY della contabilita' di questa chiamata
+    /// (`nexus_gateway::types::LlmResponse::ledger` sull'altro lato del wire).
     ///
-    /// E' il permesso strutturato di NON addebitare una seconda volta: chi ha
-    /// prenotato (`billing::reserve_usage`) rilascia invece di finalizzare, e
-    /// l'addebito resta uno solo. `None` significa "nessuno ha addebitato": il
-    /// gateway non scrive quando la richiesta arriva senza identita' o quando la
-    /// INSERT fallisce, e in quei casi la prenotazione DEVE essere finalizzata.
-    /// Il punto unico che decide e' `billing::settle_usage` (regola L).
+    /// `Written` e' il permesso strutturato di NON addebitare una seconda volta:
+    /// chi ha prenotato (`billing::reserve_usage`) rilascia invece di
+    /// finalizzare, e l'addebito resta uno solo. `NoIdentity` e `WriteFailed`
+    /// sono "non ho scritto" detti con precisione, e obbligano a finalizzare.
+    ///
+    /// `None` NON significa "non ho scritto": significa che il gateway non ha
+    /// dichiarato nulla, cioe' che non parla questa versione del contratto. Su
+    /// una chiamata partita con identita' contabile valida e' un sospetto — quel
+    /// gateway la riga potrebbe averla scritta lo stesso — e chi legge lo scopre
+    /// da `nexus_ledger::Declaration::audit`, non da qui. Il punto unico che
+    /// decide chi addebita resta `billing::settle_usage` (regola L).
     #[serde(default)]
-    pub ledger_entry: Option<GwLedgerEntry>,
+    pub ledger: Option<GwLedgerOutcome>,
 }
 
-/// Riga di ledger dichiarata dal gateway. Specchio di
-/// `nexus_gateway::types::LedgerEntry` (stessi nomi di campo: e' il contratto
-/// wire).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GwLedgerEntry {
-    pub id: uuid::Uuid,
-    pub total_cost: f64,
-    pub currency: String,
-}
+/// Vocabolario contabile del wire, dal punto unico (`nexus-ledger`).
+///
+/// E' lo STESSO tipo che il gateway serializza, non uno specchio: entrambi i
+/// lati del wire lo importano da li'. Finche' erano struct gemelle — una per
+/// lato, "stessi nomi di campo" per convenzione — nessun compilatore le teneva
+/// allineate, e il segnale su cui si decide chi addebita sarebbe silenziosamente
+/// diventato illeggibile al primo campo rinominato da una parte sola.
+///
+/// Il tipo condiviso non basta pero' a tenere allineati i due CONTENITORI
+/// (`LlmResponse` di la', `GwResponse` di qua): quelli restano due struct
+/// specchiate a mano, e a tenerle allineate e' il test di confine in fondo a
+/// questo file, che serializza la risposta col produttore vero e la rilegge di
+/// qua.
+pub use nexus_ledger::LedgerOutcome as GwLedgerOutcome;
 
 /// Errore HTTP del Nexus Gateway coi segnali STRUTTURATI del body JSON estratti
 /// al punto di costruzione (regola M): `code` (`PROVIDER_ERROR`,
@@ -972,5 +982,253 @@ mod tests {
             rendered.message
         );
         assert!(rendered.detail.contains("boom"), "il tecnico resta intero");
+    }
+}
+
+// ── Il CONFINE: cio' che il gateway serializza, mcp-core lo legge ──────────
+//
+// `GwResponse` e' la struct specchiata A MANO di `nexus_gateway::types::LlmResponse`.
+// I due processi vivono in due crate che non si vedono e si aggiornano in momenti
+// diversi; a tenerli allineati non c'era ne' un tipo condiviso, ne' uno schema,
+// ne' un test. Il campo su cui poggia l'intero fix del doppio addebito
+// attraversa proprio quel confine: se un rename, un `rename_all` o un proxy che
+// ri-serializza spostano la chiave, `settle` riceve `None` a ogni chiamata e il
+// doppio addebito torna identico — silenzioso, verde, invisibile.
+//
+// Il test parte dal PRODUTTORE di produzione (`server::billing::record_and_declare`,
+// la stessa funzione che chiama la pipeline HTTP), serializza con `serde_json`
+// come fa axum e rilegge di qua con `GwResponse`. Costruire a mano la struct di
+// arrivo non chiuderebbe niente: e' esattamente la forma che ha lasciato passare
+// il difetto (regola O).
+//
+// Vive qui, e non in un crate terzo, perche' mcp-core e' bin-only: nessun altro
+// puo' vedere `GwResponse`. La strada alternativa — un contratto condiviso, cioe'
+// spostare anche i due CONTENITORI in un crate comune — tocca molta piu'
+// struttura di quanta ne serva, e collide con il consolidamento del ledger in
+// corso. Il tipo del CAMPO e' gia' condiviso (`nexus_ledger::LedgerOutcome`); qui
+// si tiene il resto, che nessun tipo puo' tenere: il nome della chiave e la forma
+// del contenitore.
+#[cfg(test)]
+mod confine_wire_tests {
+    use super::*;
+    // `::` esplicito: dentro questo file `nexus_gateway` e' anche il nome del
+    // MODULO di mcp-core, e la confusione fra i due lati del wire e' proprio cio'
+    // che questo test esiste per impedire.
+    use ::nexus_gateway::server::billing::record_and_declare;
+    use ::nexus_gateway::types::{
+        LlmMessage, LlmRequest, LlmResponse, LlmUsage, MessageContent, PromptCacheReporting,
+        RequestMetadata,
+    };
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Listino con le quattro tariffe distinte (forma della mig 0403): serve a
+    /// far nascere un costo NON nullo, cosi' l'importo dichiarato e' osservabile.
+    async fn seed_listino(pool: &PgPool) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog ( \
+                 provider, model, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                 cache_read_cost_per_million_tokens, cache_creation_cost_per_million_tokens, \
+                 currency, pricing_state \
+             ) VALUES ('anthropic', 'claude-x', 3.0, 15.0, 0.3, 3.75, 'USD', 'priced')",
+        )
+        .execute(pool)
+        .await
+        .expect("seed ai_price_catalog");
+    }
+
+    /// La richiesta come la manda mcp-core: con l'identita' contabile nei
+    /// metadata (`tenant_id` = progetto, `user_id` = utente).
+    fn richiesta_con_identita(project: Uuid, user: Uuid, run: Uuid) -> LlmRequest {
+        LlmRequest {
+            model: "claude-x".into(),
+            messages: vec![LlmMessage {
+                role: "user".into(),
+                content: MessageContent::Text("ciao".into()),
+                tool_call_id: None,
+                tool_calls: None,
+                name: None,
+                thinking_signature: None,
+                reasoning: None,
+            }],
+            temperature: None,
+            max_tokens: Some(64),
+            tools: None,
+            response_format: None,
+            stream: None,
+            thinking: None,
+            tool_choice: None,
+            pin_provider: None,
+            metadata: RequestMetadata {
+                tenant_id: project.to_string(),
+                user_id: user.to_string(),
+                request_id: run.to_string(),
+                sensitivity_tier: 0,
+                feature: "chat".into(),
+            },
+            run_timeout_secs: None,
+        }
+    }
+
+    /// La risposta come esce dal fallback dei provider: l'usage nasce dal suo
+    /// produttore (`LlmUsage::normalized`), il campo contabile e' ancora vuoto —
+    /// lo valorizza la pipeline, ed e' il passaggio sotto esame.
+    fn risposta_dal_provider() -> LlmResponse {
+        LlmResponse {
+            content: "ok".into(),
+            tool_calls: None,
+            usage: LlmUsage::normalized(
+                PromptCacheReporting::CachedIncludedInPrompt,
+                1_000_000,
+                400_000,
+                None,
+                None,
+            ),
+            model_used: "claude-x".into(),
+            provider_used: "anthropic".into(),
+            latency_ms: 7,
+            finish_reason: "stop".into(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+            citations: None,
+            ledger: None,
+        }
+    }
+
+    /// Il JSON che il gateway mette sul wire per questa risposta.
+    ///
+    /// E' `serde_json::to_string` sulla struct del gateway: la stessa cosa che fa
+    /// `axum::Json` nel handler. Nessuna chiave scritta a mano.
+    fn sul_wire(resp: &LlmResponse) -> String {
+        serde_json::to_string(resp).expect("il gateway serializza la risposta")
+    }
+
+    /// La riga scritta dal gateway arriva a mcp-core, e ci arriva INTERA.
+    ///
+    /// Attraversa i due produttori veri: `record_and_declare` scrive nel ledger e
+    /// dichiara sulla risposta (e' la riga di `routes.rs` che pubblica il
+    /// segnale), poi la risposta viene serializzata come sul wire e riletta da
+    /// `GwResponse`, che e' cio' che il client di mcp-core deserializza davvero.
+    ///
+    /// MUTAZIONE — la piu' importante di tutte, ed e' quella temuta: mettere
+    /// `#[serde(rename = "ledger_entry")]` sul campo `ledger` di UNO dei due lati
+    /// (o rinominarlo del tutto) fa fallire questo test con "il gateway ha
+    /// dichiarato una riga: mcp-core deve vederla". Prima di oggi quel rename
+    /// lasciava tutto verde e riportava il doppio addebito in produzione.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn la_riga_dichiarata_dal_gateway_sopravvive_al_wire(pool: PgPool) {
+        let (user, project) = nexus_test_schema::seed_identita_meta(&pool).await;
+        seed_listino(&pool).await;
+        let run = Uuid::new_v4();
+
+        // Lato gateway: si scrive e si dichiara, con la funzione della pipeline.
+        let mut resp = risposta_dal_provider();
+        record_and_declare(&pool, &richiesta_con_identita(project, user, run), &mut resp).await;
+
+        // Il wire, e la rilettura dal lato di mcp-core.
+        let letta: GwResponse =
+            serde_json::from_str(&sul_wire(&resp)).expect("mcp-core deve saper leggere la risposta");
+
+        // 1. Il segnale ha attraversato il confine.
+        let dichiarazione = letta
+            .ledger
+            .as_ref()
+            .expect("il gateway ha dichiarato un esito: mcp-core deve vederlo");
+        assert_eq!(dichiarazione.as_str(), "written");
+        let letto = dichiarazione
+            .entry()
+            .expect("il gateway ha dichiarato una riga: mcp-core deve vederla");
+
+        // 2. Ed e' arrivato INTERO. Un campo che si perde per strada e' un id
+        //    nullo o un costo a zero: la correlazione punterebbe altrove e
+        //    l'importo mostrato all'utente divergerebbe dal ledger.
+        let scritta = resp.ledger.as_ref().and_then(|o| o.entry()).expect("scritta");
+        assert_eq!(letto.id, scritta.id);
+        assert_eq!(letto.currency, scritta.currency);
+        assert!((letto.total_cost - scritta.total_cost).abs() < 1e-12);
+
+        // 3. E la riga dichiarata e' quella che sta NEL DATABASE, non un numero
+        //    che si e' propagato coerente fra due strutture entrambe sbagliate.
+        let riga: (Uuid, f64, String) = sqlx::query_as(
+            "SELECT id, total_cost::float8, currency FROM ai_usage_ledger WHERE run_id = $1",
+        )
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .expect("la riga scritta dal gateway");
+        assert_eq!(letto.id, riga.0);
+        assert!((letto.total_cost - riga.1).abs() < 1e-9);
+        assert_eq!(letto.currency, riga.2);
+        // 1M x 3.0 + 0.4M x 15.0 = 9.0: un costo vero, non uno zero che
+        // combacerebbe con qualunque cosa.
+        assert!((riga.1 - 9.0).abs() < 1e-9, "costo scritto {}", riga.1);
+
+        // 4. E la decisione che ne consegue: con la riga dichiarata, chi ha
+        //    prenotato NON deve finalizzare.
+        let dichiarazione = nexus_ledger::Declaration::dal_wire(letta.ledger);
+        assert!(dichiarazione.entry().is_some());
+        assert_eq!(
+            dichiarazione.audit(true),
+            nexus_ledger::DeclarationAudit::Coerente
+        );
+    }
+
+    /// Anche il "non ho scritto" attraversa il confine, e resta distinguibile dal
+    /// silenzio.
+    ///
+    /// Sono i due casi che prima collassavano entrambi in `None`. Qui il gateway
+    /// non scrive perche' la richiesta non porta identita' (`GwMetadata::default`,
+    /// il percorso di `NeuralCoreClient`), e lo DICE: chi legge sa che nessuno ha
+    /// addebitato e finalizza, senza doverlo indovinare.
+    ///
+    /// MUTAZIONE: facendo tacere la pipeline (`resp.ledger` lasciato a `None`
+    /// invece che `Some(NoIdentity)`), il verdetto diventa `NonDichiarata` e
+    /// l'asserzione sul codice fallisce — ed e' il verdetto giusto, perche' un
+    /// gateway muto e' indistinguibile da uno di build vecchia che ha scritto.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn il_non_ho_scritto_attraversa_il_wire_e_non_e_silenzio(pool: PgPool) {
+        seed_listino(&pool).await;
+
+        let mut resp = risposta_dal_provider();
+        let mut req = richiesta_con_identita(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        req.metadata.tenant_id = String::new();
+        req.metadata.user_id = String::new();
+        record_and_declare(&pool, &req, &mut resp).await;
+
+        let letta: GwResponse =
+            serde_json::from_str(&sul_wire(&resp)).expect("mcp-core deve saper leggere la risposta");
+        let dichiarazione = nexus_ledger::Declaration::dal_wire(letta.ledger);
+        assert_eq!(dichiarazione.as_str(), "no_identity");
+        assert!(
+            dichiarazione.entry().is_none(),
+            "nessuna riga scritta: la prenotazione DEVE essere finalizzata"
+        );
+
+        // Senza identita' mandata, il "non ho scritto" e' la risposta giusta e
+        // nessuno deve essere svegliato...
+        assert_eq!(
+            dichiarazione.audit(false),
+            nexus_ledger::DeclarationAudit::Coerente
+        );
+        // ...ma la stessa frase su una chiamata partita CON identita' significa
+        // che l'identita' si e' persa fra i due processi, e allora si', va detto.
+        assert_eq!(
+            dichiarazione.audit(true),
+            nexus_ledger::DeclarationAudit::IdentitaPersa
+        );
+
+        // E il silenzio resta una TERZA cosa: un gateway che non dichiara nulla.
+        let muta: GwResponse = serde_json::from_str(r#"{"content":"ok",
+            "usage":{"input_tokens":1,"output_tokens":1},
+            "model_used":"m","provider_used":"p","latency_ms":0,"finish_reason":"stop"}"#)
+            .expect("risposta di un gateway che non parla questo contratto");
+        assert!(muta.ledger.is_none());
+        assert_eq!(
+            nexus_ledger::Declaration::dal_wire(muta.ledger).audit(true),
+            nexus_ledger::DeclarationAudit::NonDichiarata,
+            "un gateway muto su una chiamata con identita' e' un sospetto di doppio addebito"
+        );
     }
 }
