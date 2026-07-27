@@ -531,27 +531,39 @@ pub(crate) fn normalize_gw_finish_reason(finish: &str) -> String {
 /// - `finish_reason` -> `stop_reason` NORMALIZZATO al vocabolario della porta
 ///   ([`normalize_gw_finish_reason`]): `tool_calls`->`tool_use` e' load-bearing per
 ///   instradare al `tool_dispatch` (vedi nota sul bug hollow).
-/// Costo in USD del turno = `prompt_tokens * prezzo_input + completion_tokens *
-/// prezzo_output` (per milione) dal catalog (regola G/M: prezzo dal DB, token dal
-/// segnale strutturato). `None` se il prezzo e' ignoto (modello non in catalog o
-/// errore) -> nessun cap spurio. Cast a `double precision` cosi' una colonna
-/// NUMERIC arriva come `f64`. Nessuna cache: una query leggera per turno LLM, che
-/// e' gia' latente in secondi (overhead trascurabile).
+/// Costo in USD del turno, dal punto unico `nexus-pricing` (regola G/M: prezzo
+/// dal DB, token dal segnale strutturato). `None` se il prezzo e' ignoto
+/// (modello non a catalog, `pricing_state='unknown'`, currency non configurata o
+/// DB in errore) -> nessun cap spurio.
+///
+/// Qui viveva una TERZA implementazione del listino: query propria su
+/// `ai_price_catalog`, senza filtro di currency ne' di finestra `effective_*`,
+/// senza `pricing_state` e — soprattutto — cieca alla cache, cioe' con tutti i
+/// token di prompt a tariffa piena. Non era solo cosmetica: questo numero
+/// alimenta `run_cost_cumulative_usd`, il FRENO DI SPESA del run, quindi la
+/// sovrastima stringeva il freno.
 async fn turn_cost_usd(db: &PgPool, provider: &str, model: &str, usage: &LlmUsage) -> Option<f64> {
-    let (in_cost, out_cost): (f64, f64) = sqlx::query_as(
-        "SELECT input_cost_per_million_tokens::double precision, \
-                output_cost_per_million_tokens::double precision \
-         FROM ai_price_catalog WHERE provider = $1 AND model = $2 LIMIT 1",
-    )
-    .bind(provider)
-    .bind(model)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()?;
-    let input = usage.prompt_tokens.max(0) as f64;
-    let output = usage.completion_tokens.max(0) as f64;
-    Some((input * in_cost + output * out_cost) / 1_000_000.0)
+    let lookup = match nexus_pricing::resolve_active_price(db, provider, model).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, provider, model,
+                "turn_cost_usd: listino non leggibile -> costo del turno non calcolabile");
+            return None;
+        }
+    };
+    let nexus_pricing::PriceLookup::Priced(price) = lookup else {
+        return None;
+    };
+    // I due contratti hanno la stessa convenzione — prompt LORDO, cache come
+    // sottoinsieme — quindi i conteggi si passano com'e': lo scorporo lo fa il
+    // listino, unico punto in cui il netto serve.
+    let tokens = nexus_pricing::TokenUsage {
+        prompt_tokens: usage.prompt_tokens.max(0),
+        completion_tokens: usage.completion_tokens.max(0),
+        cache_read_tokens: usage.cache_read_tokens.unwrap_or(0).max(0),
+        cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0).max(0),
+    };
+    Some(nexus_pricing::calculate_cost_breakdown(&price, &tokens).total_cost)
 }
 
 fn map_gw_response(resp: GwResponse) -> LlmResponse {
@@ -580,8 +592,14 @@ fn map_gw_response(resp: GwResponse) -> LlmResponse {
         content: resp.content,
         tool_calls,
         usage: LlmUsage {
+            // `input_tokens` del gateway e' gia' il prompt LORDO (convenzione
+            // unica, normalizzata dall'adapter del provider): si copia e basta.
             prompt_tokens: resp.usage.input_tokens as i64,
             completion_tokens: resp.usage.output_tokens as i64,
+            // Totale del turno = prompt lordo + completion. I due conteggi di
+            // cache sono gia' dentro il prompt: sommarli qui li conterebbe due
+            // volte e questo totale divergerebbe da quello che l'executor scrive
+            // nello stato per lo stesso turno.
             total_tokens: (resp.usage.input_tokens + resp.usage.output_tokens) as i64,
             cache_creation_tokens: resp.usage.cache_creation_tokens.map(|v| v as i64),
             cache_read_tokens: resp.usage.cache_read_tokens.map(|v| v as i64),
@@ -1123,6 +1141,8 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         let out = map_gw_response(gw_resp_with_tool_call());
         assert_eq!(out.usage.prompt_tokens, 10);
         assert_eq!(out.usage.completion_tokens, 5);
+        // Totale = prompt LORDO (10) + completion (5). I 3+7 di cache sono gia'
+        // dentro i 10: sommarli li conterebbe due volte.
         assert_eq!(out.usage.total_tokens, 15);
         assert_eq!(out.usage.cache_read_tokens, Some(3));
         assert_eq!(out.usage.cache_creation_tokens, Some(7));
@@ -1230,5 +1250,217 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
         assert_eq!(m2["tool_call_id"], "call_X");
         // Il messaggio tool NON serializza tool_calls (None -> omesso).
         assert!(m2.get("tool_calls").is_none());
+    }
+
+    // ── turn_cost_usd: il numero che stringe il freno di spesa ────────────────
+    //
+    // Questo costo alimenta `run_cost_cumulative_usd`, cioe' il cap in dollari del
+    // run: un errore qui non e' contabile, e' operativo — o si spende oltre il
+    // tetto, o il run viene fermato per un costo che non e' stato sostenuto.
+    //
+    // I test girano sullo schema META reale (regola O): il filtro di currency, la
+    // finestra `effective_*` e lo scarto su `pricing_state='unknown'` vivono nella
+    // QUERY del punto unico `nexus-pricing`, e una fixture `CREATE TABLE` ricopiata
+    // a mano non potrebbe esercitarli.
+
+    /// L'usage come arriva DAVVERO al chiamante di `turn_cost_usd`: payload del
+    /// wire -> `GwResponse` -> `map_gw_response`. E' la strada di
+    /// `NexusGatewayLlmPort::complete`, che passa `&mapped.usage`. Costruire la
+    /// `LlmUsage` della porta a mano salterebbe proprio il passaggio in cui le
+    /// quantita' vengono ripartite.
+    fn usage_dal_wire() -> LlmUsage {
+        // `input_tokens` e' il prompt LORDO: i 2M letti da cache e i 0.5M scritti
+        // ne fanno parte, quindi restano 1M a tariffa piena.
+        let resp: GwResponse = serde_json::from_str(
+            r#"{
+                "content": "ok",
+                "usage": {
+                    "input_tokens": 3500000,
+                    "output_tokens": 400000,
+                    "cache_read_tokens": 2000000,
+                    "cache_creation_tokens": 500000
+                },
+                "model_used": "claude-x",
+                "provider_used": "anthropic",
+                "latency_ms": 3,
+                "finish_reason": "stop"
+            }"#,
+        )
+        .expect("payload wire del gateway");
+        map_gw_response(resp).usage
+    }
+
+    /// Riga di listino con TUTTI gli assi su cui la query del punto unico
+    /// discrimina: currency, finestra di validita', stato del prezzo, tariffe.
+    struct RigaListino<'a> {
+        model: &'a str,
+        currency: &'a str,
+        pricing_state: &'a str,
+        /// Offset da `NOW()` per `effective_from` (intervallo Postgres).
+        da: &'a str,
+        /// Offset per `effective_to`; `None` = finestra ancora aperta.
+        a: Option<&'a str>,
+        /// Tariffe di input/output per milione. Quelle di cache NON si passano:
+        /// le deriva la INSERT con la stessa regola della mig 0130
+        /// (`read = input x 0.10`, `creation = input x 1.25`), cosi' una riga a
+        /// tariffe zero resta zero DOVUNQUE invece di essere un ibrido che in
+        /// catalog non esiste.
+        ///
+        /// Non sono un dettaglio della fixture: il trigger della mig 0583 promuove
+        /// a `'priced'` qualunque riga scritta con `pricing_state='unknown'` e un
+        /// costo > 0. Un "unknown" a tariffe vere in produzione NON esiste — il
+        /// placeholder ha per forza tariffe a zero, ed e' proprio li' che lo zero
+        /// "non so quanto costa" deve restare distinguibile dallo zero "gratis".
+        tariffe: (f64, f64),
+    }
+
+    /// Riga a listino tipica: tariffe distinte, currency di piattaforma, in vigore.
+    fn riga_viva(model: &str) -> RigaListino<'_> {
+        RigaListino {
+            model,
+            currency: "USD",
+            pricing_state: "priced",
+            da: "-1 hour",
+            a: None,
+            tariffe: (3.0, 15.0),
+        }
+    }
+
+    async fn seed_prezzo(pool: &PgPool, riga: RigaListino<'_>) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog ( \
+                 provider, model, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                 cache_read_cost_per_million_tokens, cache_creation_cost_per_million_tokens, \
+                 currency, pricing_state, effective_from, effective_to \
+             ) VALUES ('anthropic', $1, $6, $7, $6 * 0.10, $6 * 1.25, $2, $3, \
+                       NOW() + $4::interval, \
+                       CASE WHEN $5::text IS NULL THEN NULL \
+                            ELSE NOW() + $5::interval END)",
+        )
+        .bind(riga.model)
+        .bind(riga.currency)
+        .bind(riga.pricing_state)
+        .bind(riga.da)
+        .bind(riga.a)
+        .bind(riga.tariffe.0)
+        .bind(riga.tariffe.1)
+        .execute(pool)
+        .await
+        .expect("seed ai_price_catalog");
+    }
+
+    /// Caso vivo: il prezzo c'e' e il prompt si scorpora in tre parti, ognuna
+    /// alla tariffa che le compete, non tutto alla tariffa piena di input.
+    ///
+    /// A tariffa piena sul lordo (3,5M x 3.0 = 10.50, piu' 6.00 di output) il
+    /// totale sarebbe 16.50: e' la sovrastima che stringeva il freno di spesa.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn turn_cost_usd_paga_ogni_quantita_alla_sua_tariffa(pool: PgPool) {
+        seed_prezzo(&pool, riga_viva("claude-x")).await;
+
+        let costo = turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire())
+            .await
+            .expect("prezzo a listino -> costo calcolabile");
+
+        // 1M x 3.0 + 0.4M x 15.0 + 2M x 0.3 + 0.5M x 3.75.
+        assert!(
+            (costo - 11.475).abs() < 1e-9,
+            "costo {costo}, atteso 11.475 (a tariffa piena sul lordo sarebbe 16.5)"
+        );
+    }
+
+    /// Le tre forme in cui il listino NON si applica alla chiamata. In tutte il
+    /// costo resta `None`: un numero inventato qui e' peggio dell'assenza, perche'
+    /// il cap in dollari lo tratterebbe come speso.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn turn_cost_usd_non_applica_un_listino_che_non_e_suo(pool: PgPool) {
+        // La currency di piattaforma e' USD (mig 0294): una riga in EUR non e' il
+        // prezzo di questa chiamata.
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                currency: "EUR",
+                ..riga_viva("altra-currency")
+            },
+        )
+        .await;
+        // Finestra CHIUSA in passato: il prezzo non e' piu' in vigore.
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                da: "-2 day",
+                a: Some("-1 day"),
+                ..riga_viva("scaduto")
+            },
+        )
+        .await;
+        // Finestra che deve ancora aprirsi.
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                da: "+1 day",
+                ..riga_viva("futuro")
+            },
+        )
+        .await;
+
+        let usage = usage_dal_wire();
+        for model in ["altra-currency", "scaduto", "futuro", "mai-visto"] {
+            assert_eq!(
+                turn_cost_usd(&pool, "anthropic", model, &usage).await,
+                None,
+                "il listino di '{model}' non si applica a questa chiamata: \
+                 il costo deve restare non calcolabile"
+            );
+        }
+    }
+
+    /// `pricing_state='unknown'` (mig 0477): la riga esiste ma il prezzo e' un
+    /// PLACEHOLDER a zero. Trattarla come un prezzo darebbe `Some(0.0)`, cioe' un
+    /// turno dichiarato gratuito: il freno di spesa lo sommerebbe come nulla e non
+    /// scatterebbe mai. La distinzione fra "costa zero" e "non so quanto costa"
+    /// vive qui, ed e' l'unica cosa che separa i due esiti.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn turn_cost_usd_scarta_il_prezzo_dichiarato_ignoto(pool: PgPool) {
+        seed_prezzo(
+            &pool,
+            RigaListino {
+                pricing_state: "unknown",
+                tariffe: (0.0, 0.0),
+                ..riga_viva("claude-x")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire()).await,
+            None,
+            "pricing_state='unknown' non e' un prezzo: nessun costo va calcolato, \
+             nemmeno lo zero che le tariffe placeholder produrrebbero"
+        );
+    }
+
+    /// Listino non leggibile (DB in errore): `None` e nessun panico. E' il ramo
+    /// che tiene il turno in piedi quando la contabilita' non e' disponibile —
+    /// far fallire la chiamata LLM per un problema di prezzo sarebbe un outage.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn turn_cost_usd_su_listino_illeggibile_resta_none(pool: PgPool) {
+        seed_prezzo(&pool, riga_viva("claude-x")).await;
+        // Il prezzo c'e' e sarebbe calcolabile: e' la lettura a rompersi.
+        assert!(turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire())
+            .await
+            .is_some());
+
+        sqlx::query("DROP TABLE ai_price_catalog CASCADE")
+            .execute(&pool)
+            .await
+            .expect("drop del catalog");
+
+        assert_eq!(
+            turn_cost_usd(&pool, "anthropic", "claude-x", &usage_dal_wire()).await,
+            None,
+            "errore di lettura del listino -> costo non calcolabile, mai un numero"
+        );
     }
 }

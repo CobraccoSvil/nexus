@@ -1110,13 +1110,16 @@ fn apply_end_turn_effective(evt: &Value, out: &mut EndTurnOutputs<'_>) {
     }
 }
 
-/// FIX D7: costruisce l'`AITraceEvent` con provider/model EFFETTIVI (post
-/// cascade/escalation), token e stop_reason del turno, lo PERSISTE su
-/// nexus_agent_traces (best-effort, punto unico trace_store — regola L) e lo
-/// ri-emette LIVE cosi' il trace panel sopravvive al refresh. response_text
-/// troncato (regola F: niente leak di contenuti integri nel payload persistito).
-async fn persist_and_emit_turn_trace(ctx: &EndTurnCtx<'_>, out: &mut EndTurnOutputs<'_>) {
-    let trace = AITraceEvent {
+/// La traccia del turno da provider/model EFFETTIVI (post cascade/escalation),
+/// token e stop_reason accumulati. response_text troncato (regola F: niente leak
+/// di contenuti integri nel payload persistito).
+///
+/// I due conteggi di cache restano a zero: gli accumulatori di questo percorso
+/// portano i soli prompt/completion, e le quantita' di cache qui non hanno una
+/// fonte. Il produttore di tracce che le porta e' l'`SseEventSinkAdapter` del
+/// motore nativo, che le legge dall'evento `Usage` del grafo.
+fn build_turn_trace(ctx: &EndTurnCtx<'_>, out: &EndTurnOutputs<'_>) -> AITraceEvent {
+    AITraceEvent {
         run_id: ctx.run_id_str.to_string(),
         iteration: ctx.iteration,
         provider: out.effective_provider.clone(),
@@ -1130,7 +1133,15 @@ async fn persist_and_emit_turn_trace(ctx: &EndTurnCtx<'_>, out: &mut EndTurnOutp
         input_tokens: *out.acc_prompt_tokens,
         output_tokens: *out.acc_completion_tokens,
         cache_read_tokens: 0,
-    };
+        cache_creation_tokens: 0,
+    }
+}
+
+/// FIX D7: costruisce l'`AITraceEvent` del turno, lo PERSISTE su
+/// nexus_agent_traces (best-effort, punto unico trace_store — regola L) e lo
+/// ri-emette LIVE cosi' il trace panel sopravvive al refresh.
+async fn persist_and_emit_turn_trace(ctx: &EndTurnCtx<'_>, out: &mut EndTurnOutputs<'_>) {
+    let trace = build_turn_trace(ctx, out);
     // Separazione DB: nexus_agent_traces vive nel DB del progetto; qui `db` e' il
     // meta -> risolvi by_session (directory O(1)), trace_store NON ri-risolve
     // (convenzione: pool gia' risolto).

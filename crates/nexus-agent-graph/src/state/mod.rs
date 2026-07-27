@@ -419,13 +419,20 @@ pub struct AgentState {
     pub profile_name: Option<String>,
 
     // ── Metriche AI estese ────────────────────────────────────────────────────
-    /// Token di prompt.
+    /// Token di prompt LORDI dell'ultimo turno: quanto contesto e' stato
+    /// inviato, cache compresa (convenzione unica del sistema, vedi
+    /// `nexus_gateway::LlmUsage`).
+    ///
+    /// E' il lordo perche' e' l'unica quantita' monotona rispetto alla crescita
+    /// della history: la quota servita da cache la decide il provider turno per
+    /// turno. Alimenta il delta anti-runaway (`executor`) e il riempimento della
+    /// finestra di contesto (`last_prompt_tokens` in UI).
     pub prompt_tokens: Option<i64>,
     /// Token di completion.
     pub completion_tokens: Option<i64>,
-    /// Token di creazione cache.
+    /// Token di creazione cache: sottoinsieme di `prompt_tokens`, non un addendo.
     pub cache_creation_tokens: Option<i64>,
-    /// Token letti da cache.
+    /// Token letti da cache: sottoinsieme di `prompt_tokens`, non un addendo.
     pub cache_read_tokens: Option<i64>,
     /// Token totali.
     pub total_tokens: Option<i64>,
@@ -585,8 +592,11 @@ pub struct AgentState {
     /// Token di LAVORO INCREMENTALE cumulati sul run (regola M: segnale
     /// strutturato dal gateway, mai stima dal testo): per ogni turno si somma il
     /// DELTA del prompt rispetto al turno precedente (solo contesto nuovo, non la
-    /// history ri-inviata) + completion + cache_creation. La vecchia semantica
-    /// (somma dei `total_tokens` lordi per-turno) condannava i run con contesto
+    /// history ri-inviata) + completion. I token di cache NON sono addendi: sono
+    /// un SOTTOINSIEME del prompt lordo, quindi il delta li comprende gia' e
+    /// sommarli li conterebbe due volte (vedi `executor.rs`, ramo del delta).
+    /// La vecchia semantica (somma dei `total_tokens` lordi per-turno)
+    /// condannava i run con contesto
     /// grande: history ~50k -> ~8 turni sani esaurivano il budget -> cascata di
     /// escalation fino al cap. Safety net anti-runaway per-run: quando
     /// `>= ExecutorConfig::run_token_budget` (se il budget e' `> 0`) l'executor

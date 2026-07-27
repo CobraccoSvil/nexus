@@ -26,7 +26,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{LlmRequest, LlmResponse, LlmToolCall, LlmUsage, ToolFunctionCall};
+use crate::types::{
+    LlmRequest, LlmResponse, LlmToolCall, LlmUsage, PromptCacheReporting, ToolFunctionCall,
+};
 
 /// Versione API Messages richiesta dall'header `anthropic-version`. Allineata al
 /// provider Anthropic non-batch ([`crate::providers::anthropic`]).
@@ -382,12 +384,16 @@ fn result_line_to_item(line: AnthropicResultLine) -> BatchResultItem {
                 } else {
                     Some(tool_calls)
                 },
-                usage: LlmUsage {
-                    input_tokens: message.usage.input_tokens,
-                    output_tokens: message.usage.output_tokens,
-                    cache_read_tokens: message.usage.cache_read_input_tokens,
-                    cache_creation_tokens: message.usage.cache_creation_input_tokens,
-                },
+                // Batch Anthropic: stessa convenzione del percorso sincrono
+                // (`input_tokens` gia' netto, cache a parte), quindi stessa
+                // normalizzazione verso il lordo.
+                usage: LlmUsage::normalized(
+                    PromptCacheReporting::CachedReportedSeparately,
+                    message.usage.input_tokens,
+                    message.usage.output_tokens,
+                    message.usage.cache_read_input_tokens,
+                    message.usage.cache_creation_input_tokens,
+                ),
                 model_used: message.model.unwrap_or_default(),
                 provider_used: "anthropic".to_string(),
                 latency_ms: 0,
@@ -681,6 +687,33 @@ mod tests {
         assert_eq!(calls[0].id, "tu_1");
         assert_eq!(calls[0].function.name, "calc");
         assert_eq!(calls[0].function.arguments, r#"{"x":2}"#);
+    }
+
+    /// Il batch Anthropic dichiara la convenzione `CachedReportedSeparately`, e
+    /// finche' il JSONL non porta i campi di cache le DUE convenzioni producono
+    /// numeri identici: i tre test qui sopra sono ciechi per costruzione, perche'
+    /// il loro `usage` ha solo `input_tokens`/`output_tokens`.
+    ///
+    /// Qui il payload ha la forma REALE del risultato batch, con
+    /// `cache_read_input_tokens` e `cache_creation_input_tokens`. Su Anthropic
+    /// `input_tokens` e' al netto, quindi la normalizzazione deve SOMMARE per
+    /// arrivare al lordo: se la convenzione dichiarata fosse quella inclusiva,
+    /// il prompt del batch resterebbe 100 dove il percorso sincrono ne dichiara
+    /// 1.050 per lo stesso contesto.
+    #[test]
+    fn parse_results_batch_con_cache_normalizza_al_lordo() {
+        let jsonl = r#"{"custom_id":"doc-cache","result":{"type":"succeeded","message":{"model":"claude-x","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":900,"cache_creation_input_tokens":50}}}}"#;
+        let items = parse_anthropic_results(jsonl);
+        assert_eq!(items.len(), 1);
+        let u = items[0].response.as_ref().expect("response").usage;
+
+        assert_eq!(
+            u.input_tokens, 1_050,
+            "Anthropic riporta il prompt al NETTO: il lordo e' 100 + 900 + 50"
+        );
+        assert_eq!(u.cache_read_tokens, Some(900));
+        assert_eq!(u.cache_creation_tokens, Some(50));
+        assert_eq!(u.output_tokens, 20);
     }
 
     #[test]

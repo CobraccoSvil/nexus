@@ -6,10 +6,10 @@
 // soglia: `const cumulative = total > lastIn + lastOut + 50`. Da li' decideva se
 // scrivere "N token" oppure "N token totali (ultima chiamata: ...)".
 // Tre difetti, tutti misurati:
-//   1. Non misurava affatto la cumulativita': `total` include anche i token di
-//      cache (prompt + completion + cache_creation + cache_read), quindi la
-//      soglia scattava sui run con molta cache e taceva sugli altri. Sui dati
-//      reali: 0% di precisione.
+//   1. Non misurava affatto la cumulativita': `total` conta anche i token di
+//      cache (sono dentro il prompt, che e' LORDO), quindi la soglia scattava
+//      sui run con molta cache e taceva sugli altri. Sui dati reali: 0% di
+//      precisione.
 //   2. I due campi confrontati contenevano lo STESSO valore (la riconciliazione
 //      col ledger non avveniva mai), quindi il ramo "totali" era di fatto morto.
 //   3. Appena la riconciliazione si riattiva, `promptTokens` diventa il
@@ -50,7 +50,9 @@ function it(n: number): string {
  * SEMANTICA DEI CAMPI (dal backend, non dedotta qui):
  * `totalTokens`/`promptTokens`/`completionTokens` sono i totali del RUN INTERO,
  * riconciliati da `ai_usage_ledger` (una riga per chiamata LLM). Sono quindi
- * coerenti tra loro: in + out = total, e nessuna etichetta condizionale serve.
+ * coerenti tra loro: in + out = total — il ledger scrive `total_tokens` come
+ * `prompt_tokens + completion_tokens`, col prompt LORDO — e nessuna etichetta
+ * condizionale serve.
  * Il riempimento del contesto (prompt dell'ULTIMA iterazione) e' un dato diverso,
  * vive in `lastPromptTokens` e ha gia' il suo indicatore dedicato: NON si mescola
  * qui.

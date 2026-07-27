@@ -34,9 +34,17 @@ export interface AITraceEvent {
   toolCalls: AITraceToolCall[];
   stopReason: string;
   timestamp: string;
+  /** Token di prompt LORDI (convenzione di `nexus_gateway::LlmUsage`,
+   *  normalizzata alla fonte): comprendono i due campi di cache qui sotto. Chi
+   *  prezza scorpora — tariffa piena sul residuo, poi ogni quantita' di cache
+   *  alla sua tariffa — e non somma mai. */
   inputTokens?: number;
   outputTokens?: number;
+  /** Token del turno serviti da cache: sottoinsieme di `inputTokens`. */
   cacheReadTokens?: number;
+  /** Token scritti in cache nel turno. Assente sulle tracce persistite prima
+   *  dell'introduzione del campo: in quel caso non c'e' nulla da tariffare. */
+  cacheCreationTokens?: number;
 }
 
 export interface AgentPendingAction {

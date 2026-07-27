@@ -1409,8 +1409,15 @@ export function capStreamToRecent(stream: ActivityStream, cap: number): CappedSt
 export interface ProviderTokenBucket {
   provider: string;
   model: string;
+  /** Token di prompt LORDI: comprendono i due conteggi di cache qui sotto. */
   inputTokens: number;
   outputTokens: number;
+  /** Token serviti da cache: SOTTOINSIEME di `inputTokens`, con la sua tariffa.
+   *  Senza questo campo il bucket non lo portava affatto e chi prezzava pagava
+   *  tutto il prompt a tariffa piena di input. */
+  cacheReadTokens: number;
+  /** Token scritti in cache: stessa storia, tariffa ancora diversa. */
+  cacheCreationTokens: number;
 }
 
 /** Una voce della ripartizione: il bucket con il suo costo in USD. */
@@ -1443,12 +1450,15 @@ export function providerCostBreakdown(
   const voci = aggregateTokensByProvider(traces).map((b) => ({ ...b, costUsd: prezzo(b) }));
   return {
     voci,
+    // `inputTokens` e' il prompt LORDO: i token di cache sono gia' dentro, e
+    // sommarli qui li conterebbe due volte.
     totalTokens: voci.reduce((s, v) => s + v.inputTokens + v.outputTokens, 0),
     totalCostUsd: voci.reduce((s, v) => s + v.costUsd, 0),
   };
 }
 
-/** Somma input/output token per coppia provider/model dalle trace del run. */
+/** Somma i token per coppia provider/model dalle trace del run, tenendo il
+ *  DETTAGLIO di cache separato dal prompt lordo (ha tariffe diverse). */
 export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderTokenBucket[] {
   const map = new Map<string, ProviderTokenBucket>();
   for (const t of traces) {
@@ -1458,9 +1468,13 @@ export function aggregateTokensByProvider(traces: AITraceEvent[]): ProviderToken
       model: t.model,
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
     };
     bucket.inputTokens += t.inputTokens ?? 0;
     bucket.outputTokens += t.outputTokens ?? 0;
+    bucket.cacheReadTokens += t.cacheReadTokens ?? 0;
+    bucket.cacheCreationTokens += t.cacheCreationTokens ?? 0;
     map.set(key, bucket);
   }
   return Array.from(map.values());

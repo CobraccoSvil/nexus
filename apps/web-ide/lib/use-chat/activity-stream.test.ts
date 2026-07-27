@@ -25,8 +25,9 @@ import {
   type ActivityEvent,
   type ToolEvent,
   type ReviewGateEvent,
+  type ProviderTokenBucket,
 } from "./activity-stream.ts";
-import { costFromCatalog, findCatalogEntry } from "../model-catalog.ts";
+import { bucketCost } from "../model-catalog.ts";
 import type { MetaStepEntry } from "./types.ts";
 import type { AgentStep, AITraceEvent } from "../api/agent.ts";
 import type { ModelCatalogEntry } from "../api/models.ts";
@@ -76,6 +77,7 @@ function listino(
     inputCostPerMillionTokens: inputPerMln,
     outputCostPerMillionTokens: outputPerMln,
     cacheReadCostPerMillionTokens: null,
+    cacheCreationCostPerMillionTokens: null,
     currency: "USD",
     performanceTier: null,
     tierSource: null,
@@ -731,6 +733,50 @@ test("aggregateTokensByProvider somma i token per coppia provider/model", () => 
   assert.equal(anthropic?.inputTokens, 200);
 });
 
+test("i token di cache entrano nel bucket e nel costo della ripartizione", () => {
+  beforeEach();
+  // Il difetto: la traccia porta il DETTAGLIO di cache accanto al prompt lordo,
+  // ma il bucket aggregava solo prompt e output e il footer prezzava solo
+  // quelli. Senza i due conteggi, i token serviti da cache restavano nel monte
+  // a tariffa piena di input: il footer dichiarava PIU' del ledger, e il divario
+  // era massimo proprio sui run che la cache serve meglio.
+  //
+  // Il prezzatore e' quello DI PRODUZIONE (`bucketCost`, la funzione che
+  // `ActivityCostFooter` passa a `providerCostBreakdown`), non una sua copia:
+  // finche' il test ne iniettava una propria, togliere le quantita' di cache
+  // dalla chiamata reale lasciava verde l'intera suite.
+  //
+  // MUTAZIONE che rende rosso: smettere di passare le quantita' di cache a
+  // `costFromCatalog` dentro `bucketCost` -> 500k token tornano a tariffa piena,
+  // il costo sale da 1.995 a 3.0.
+  const catalogo: ModelCatalogEntry[] = [listino("anthropic", "claude-x", 3.0, 15.0)];
+  catalogo[0].cacheReadCostPerMillionTokens = 0.3;
+  catalogo[0].cacheCreationCostPerMillionTokens = 3.75;
+  const prezzo = (b: ProviderTokenBucket) => bucketCost(b, catalogo);
+
+  const traces = [
+    // `inputTokens` e' il prompt LORDO: i 400k letti da cache e i 100k scritti
+    // ne fanno parte, quindi 500k restano a tariffa piena.
+    trace("padre", 1, "anthropic", "claude-x", {
+      inputTokens: 1_000_000,
+      outputTokens: 0,
+      cacheReadTokens: 400_000,
+      cacheCreationTokens: 100_000,
+    }),
+  ];
+  const r = providerCostBreakdown(traces, prezzo);
+  const voce = r.voci[0];
+  assert.equal(voce.cacheReadTokens, 400_000);
+  assert.equal(voce.cacheCreationTokens, 100_000);
+  // I token totali sono prompt lordo + output: 1M, non 1.5M (i token di cache
+  // sono gia' dentro il prompt e non si contano due volte).
+  assert.equal(r.totalTokens, 1_000_000);
+  assert.ok(
+    Math.abs(r.totalCostUsd - (1.5 + 0.12 + 0.375)) < 1e-9,
+    `atteso 1.995, ottenuto ${r.totalCostUsd}`,
+  );
+});
+
 test("tracesForRun filtra per runId", () => {
   beforeEach();
   const traces = [trace("a", 1, "google", "gemini"), trace("b", 1, "openai", "gpt")];
@@ -775,8 +821,8 @@ test("tracesForRun include le trace dei sub-run, dichiarate dal parentRunId del 
 // Non un'approssimazione: un provider intero omesso.
 //
 // Il test attraversa la stessa composizione che usa il footer
-// (`providerCostBreakdown`, con il prezzo calcolato dal punto unico
-// `costFromCatalog`) e parte dalle trace nella forma in cui arrivano dal wire.
+// (`providerCostBreakdown`) e lo stesso prezzatore (`bucketCost`), e parte dalle
+// trace nella forma in cui arrivano dal wire.
 // MUTAZIONE: se `tracesForRun` torna a ignorare `parentRunId`, la voce openrouter
 // sparisce e il totale cala esattamente del costo del revisore.
 test("la ripartizione elenca il provider del revisore e il totale ne contiene il costo", () => {
@@ -785,8 +831,7 @@ test("la ripartizione elenca il provider del revisore e il totale ne contiene il
     listino("deepseek", "deepseek-v4-flash", 0.28, 0.42),
     listino("openrouter", "z-ai/glm-4.7-flash", 0.1, 0.3),
   ];
-  const prezzo = (b: { provider: string; model: string; inputTokens: number; outputTokens: number }) =>
-    costFromCatalog(findCatalogEntry(catalogo, b.provider, b.model), b.inputTokens, b.outputTokens) ?? 0;
+  const prezzo = (b: ProviderTokenBucket) => bucketCost(b, catalogo);
 
   // Token del ciclo di review piu' lungo misurato (12 iterazioni).
   const REV_IN = 30_991;

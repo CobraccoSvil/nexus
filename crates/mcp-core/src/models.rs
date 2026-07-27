@@ -26,6 +26,13 @@ pub struct ModelCatalogEntry {
     /// stima giusta per Anthropic e sbagliata per tutti gli altri.
     #[sqlx(default)]
     pub cache_read_cost_per_million_tokens: Option<f64>,
+    /// Tariffa dei token SCRITTI in cache (mig 0403). `None` = il catalog non la
+    /// conosce. Serve accanto alla tariffa di lettura perche' sono due
+    /// sottoinsiemi distinti del prompt, con due prezzi (vedi
+    /// `nexus_gateway::LlmUsage`): senza questa riga il frontend non ha modo di
+    /// scorporare i token di cache_creation e li paga a tariffa piena di input.
+    #[sqlx(default)]
+    pub cache_creation_cost_per_million_tokens: Option<f64>,
     pub currency: String,
     /// `None` = tier ignoto: nessuna fonte si e' espressa (mig 0599/0608).
     /// Prima era `String` con `#[sqlx(default)]`, che rendeva un NULL
@@ -86,6 +93,8 @@ macro_rules! catalog_select {
              input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens, \
              output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens, \
              cache_read_cost_per_million_tokens::float8 AS cache_read_cost_per_million_tokens, \
+             cache_creation_cost_per_million_tokens::float8 \
+                 AS cache_creation_cost_per_million_tokens, \
              currency, performance_tier, tier_source, \
              agentic_index::float8 AS agentic_index, qualification_state, speed_tier, \
              capabilities, context_window, supports_tool_use, batch_discount_pct, \

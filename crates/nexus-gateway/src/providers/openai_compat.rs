@@ -23,7 +23,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::ChunkStream;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
-    LlmUsage, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall, TranscribeResponse,
+    LlmUsage, PromptCacheReporting, ToolCallDelta, ToolCallDeltaFunction, ToolFunctionCall,
+    TranscribeResponse,
 };
 
 /// Dialetto di reasoning di un endpoint OpenAI-compatibile. Centralizza (regola
@@ -886,22 +887,20 @@ fn from_chat_completion(
             .collect()
     });
 
-    let usage = LlmUsage {
-        input_tokens: resp
-            .usage
-            .as_ref()
-            .map(|u| u.prompt_tokens)
-            .unwrap_or(0),
-        output_tokens: resp
-            .usage
-            .as_ref()
-            .map(|u| u.completion_tokens)
-            .unwrap_or(0),
-        // Prompt caching automatico (DeepSeek `prompt_cache_hit_tokens`, OpenAI
-        // `prompt_tokens_details.cached_tokens`): sottoinsieme dell'input.
-        cache_read_tokens: resp.usage.as_ref().and_then(|u| u.cached_input_tokens()),
-        cache_creation_tokens: None,
-    };
+    // Prompt caching automatico (DeepSeek `prompt_cache_hit_tokens`, OpenAI
+    // `prompt_tokens_details.cached_tokens`): il dialetto li conta DENTRO
+    // `prompt_tokens`, che e' quindi gia' il LORDO voluto dal sistema. Il punto
+    // unico `LlmUsage::normalized` (regola L) non tocca il conteggio; qui si
+    // dichiara solo la convenzione del formato.
+    let usage = LlmUsage::normalized(
+        PromptCacheReporting::CachedIncludedInPrompt,
+        resp.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+        resp.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+        resp.usage.as_ref().and_then(|u| u.cached_input_tokens()),
+        // Nessun dialetto OpenAI-compatibile espone un costo di SCRITTURA della
+        // cache: il caching e' automatico e il miss paga la tariffa input piena.
+        None,
+    );
 
     // Citazioni top-level (Perplexity): estratte prima di costruire la risposta.
     let citations = resp.citations.filter(|c| !c.is_empty());
@@ -939,11 +938,14 @@ fn chunk_from_sse(
     provider_name: &str,
     model_used: &str,
 ) -> Option<LlmStreamChunk> {
-    let usage = chunk.usage.map(|u| LlmUsage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        cache_read_tokens: u.cached_input_tokens(),
-        cache_creation_tokens: None,
+    let usage = chunk.usage.map(|u| {
+        LlmUsage::normalized(
+            PromptCacheReporting::CachedIncludedInPrompt,
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.cached_input_tokens(),
+            None,
+        )
     });
 
     let choice = chunk.choices.into_iter().next();
@@ -1991,6 +1993,73 @@ mod tests {
         let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
         let resp = from_chat_completion(parsed, "m".to_string(), "openai", 1).unwrap();
         assert_eq!(resp.usage.cache_read_tokens, Some(12));
+    }
+
+    /// La RELAZIONE fra i conteggi, non solo la loro presenza.
+    ///
+    /// I dialetti OpenAI-compatibili contano i cache hit DENTRO `prompt_tokens`,
+    /// che e' quindi gia' il LORDO: `LlmUsage.input_tokens` deve uscire IDENTICO
+    /// al wire. Sommare qui i token di cache — la normalizzazione dell'altro
+    /// verso, quella di Anthropic — li conterebbe due volte, gonfiando il
+    /// contesto misurato e il monte da cui il listino scorpora. Nessun test
+    /// fissava questa premessa: si poteva invertire il verso e restare verdi.
+    #[test]
+    fn input_tokens_resta_il_lordo_nei_dialetti_openai_compat() {
+        // Forma reale DeepSeek.
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5,
+                      "prompt_cache_hit_tokens": 4, "prompt_cache_miss_tokens": 6}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let u = from_chat_completion(parsed, "m".to_string(), "deepseek", 1)
+            .unwrap()
+            .usage;
+        assert_eq!(u.cache_read_tokens, Some(4));
+        assert_eq!(u.input_tokens, 10, "il wire e' gia' lordo: nessuna somma");
+        assert_eq!(u.cache_creation_tokens, None);
+
+        // Forma reale OpenAI.
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3,
+                      "prompt_tokens_details": {"cached_tokens": 12}}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let u = from_chat_completion(parsed, "m".to_string(), "openai", 1)
+            .unwrap()
+            .usage;
+        assert_eq!(u.input_tokens, 20, "il wire e' gia' lordo: nessuna somma");
+        assert_eq!(u.cache_read_tokens, Some(12));
+
+        // Senza cache nulla cambia (nessuna regressione).
+        let raw = r#"{
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        }"#;
+        let parsed: ChatCompletion = serde_json::from_str(raw).unwrap();
+        let u = from_chat_completion(parsed, "m".to_string(), "openai", 1)
+            .unwrap()
+            .usage;
+        assert_eq!(u.input_tokens, 20);
+        assert_eq!(u.cache_read_tokens, None);
+    }
+
+    /// Lo streaming e' un secondo percorso di produzione dello stesso usage: se
+    /// normalizza diversamente, la stessa chiamata dichiara un contesto diverso
+    /// e costa cifre diverse a seconda che sia stata servita in streaming o no.
+    #[test]
+    fn anche_lo_streaming_lascia_il_prompt_lordo() {
+        let raw = r#"{
+            "choices": [{"delta": {"content": ""}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 7,
+                      "prompt_tokens_details": {"cached_tokens": 90}}
+        }"#;
+        let parsed: ChatCompletionChunk = serde_json::from_str(raw).unwrap();
+        let chunk = chunk_from_sse(parsed, "openai", "m").expect("chunk con usage");
+        let u = chunk.usage.expect("usage presente nel chunk finale");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.cache_read_tokens, Some(90));
     }
 
     // ── Content tollerante (contratto Mistral: string | ContentChunk[]) ─────

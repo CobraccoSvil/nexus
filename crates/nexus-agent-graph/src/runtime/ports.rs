@@ -339,9 +339,16 @@ pub struct ThinkingConfig {
 /// l'usage gia' normalizzato; vedi memoria progetto "Token usage stream + live"
 /// per la normalizzazione cross-provider `extract_usage_tokens`). `Eq` rimosso
 /// perche' `total_cost_usd` e' un `f64` (non `Eq`); `PartialEq` basta per i test.
+///
+/// `prompt_tokens` e' il prompt LORDO — il contesto inviato al modello, cache
+/// compresa — perche' e' la convenzione unica del sistema
+/// (`nexus_gateway::LlmUsage`) ed e' cio' che serve a chi misura: crescita della
+/// history, riempimento della finestra, freno anti-runaway. `cache_read_tokens`
+/// e `cache_creation_tokens` ne sono il DETTAGLIO, mai addendi: servono al
+/// listino, che scorpora al momento di tariffare.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LlmUsage {
-    /// Token di prompt (input).
+    /// Token di prompt LORDI: il contesto inviato, cache compresa.
     pub prompt_tokens: i64,
     /// Token di completion (output).
     pub completion_tokens: i64,
@@ -640,13 +647,26 @@ pub enum SseEvent {
         /// step non correlati (default storico).
         correlation_id: Option<String>,
     },
-    /// Consumo token aggiornato (barra contesto).
+    /// Consumo token aggiornato (barra contesto + traccia del turno).
+    ///
+    /// Porta il prompt LORDO piu' il DETTAGLIO di quanta parte l'ha servita la
+    /// cache. Chi misura il riempimento della finestra usa `prompt_tokens` e
+    /// basta; chi prezza scorpora dal lordo le due quantita' di cache e applica
+    /// le tre tariffe. Prima l'evento portava il solo prompt e la traccia
+    /// scriveva i token di cache a 0 fisso: la UI non aveva modo di applicare la
+    /// tariffa ridotta, e pagava tutto a prezzo pieno di input.
     Usage {
-        /// Token di prompt.
+        /// Token di prompt LORDI: il contesto inviato, cioe' il numeratore del
+        /// rapporto ctx%.
         prompt_tokens: i64,
         /// Token di completion.
         completion_tokens: i64,
-        /// Token totali.
+        /// Token del prompt serviti da cache in questo turno, sottoinsieme di
+        /// `prompt_tokens` (0 se il provider non ne ha riportati).
+        cache_read_tokens: i64,
+        /// Token del prompt scritti in cache in questo turno, stessa convenzione.
+        cache_creation_tokens: i64,
+        /// Token totali del turno (prompt lordo + completion).
         total_tokens: i64,
     },
     /// Il modello ha richiesto un tool.

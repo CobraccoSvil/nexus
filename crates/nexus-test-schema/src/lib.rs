@@ -51,3 +51,51 @@ pub static PROJECT_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../db/
 /// sviluppo: e' l'unico modo per accorgersi che una migrazione dichiara un
 /// oggetto che non crea.
 pub static META_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../db/migrations");
+
+/// Semina l'identita' minima dello schema META — `teams`, `users`, `projects` —
+/// e ritorna `(user_id, project_id)`.
+///
+/// PUNTO UNICO (regola L) del seeding di identita' per i `#[sqlx::test]` che
+/// scrivono su tabelle vincolate a `users(id)` / `projects(id)`: oggi
+/// `ai_usage_ledger`, che le referenzia entrambe NOT NULL, dai due lati opposti
+/// del wire (`nexus_gateway::server::billing` per l'INSERT,
+/// `mcp_core::billing` per la UPDATE di finalizzazione). Sono due crate che non
+/// si vedono fra loro, e due seeder scritti a mano divergerebbero alla prima
+/// colonna aggiunta.
+///
+/// Non e' teoria: `projects.owner_user_id` e' NOT NULL da una migrazione
+/// successiva alla 0001 e nessuna delle due copie iniziali lo valorizzava —
+/// l'ha scoperto il primo run, perche' lo schema arriva dalla migrazione vera e
+/// non da un `CREATE TABLE` ricopiato (regola O).
+pub async fn seed_identita_meta(pool: &sqlx::PgPool) -> (uuid::Uuid, uuid::Uuid) {
+    let team = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO teams (id, name, slug) VALUES ($1, 'team di test', $2)")
+        .bind(team)
+        .bind(team.to_string())
+        .execute(pool)
+        .await
+        .expect("seed teams");
+
+    let user = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO users (id, email, display_name) VALUES ($1, $2, 'utente di test')")
+        .bind(user)
+        .bind(format!("{user}@test.local"))
+        .execute(pool)
+        .await
+        .expect("seed users");
+
+    let project = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO projects (id, team_id, name, slug, owner_user_id) \
+         VALUES ($1, $2, 'progetto di test', $3, $4)",
+    )
+    .bind(project)
+    .bind(team)
+    .bind(project.to_string())
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("seed projects");
+
+    (user, project)
+}

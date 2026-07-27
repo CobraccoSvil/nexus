@@ -313,6 +313,11 @@ pub struct AgentRunResult {
     /// Usato dal frontend per calcolare il context ratio (% di occupazione
     /// della context_window del modello). `prompt_tokens` resta il valore
     /// cumulativo di tutte le iterazioni, corretto per il billing.
+    ///
+    /// E' il prompt LORDO come tutti i conteggi di prompt del sistema: la
+    /// finestra di contesto la occupa tutto il prompt inviato, compresi i token
+    /// che il provider ha servito dalla propria cache (che risparmiano DENARO,
+    /// non SPAZIO).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_prompt_tokens: Option<u32>,
     /// Classe errore propagata dal brain (es. "billing_error", "rate_limit",
@@ -383,9 +388,20 @@ pub struct AITraceEvent {
     pub tool_calls: Vec<Value>, // tool call names + inputs
     pub stop_reason: String,
     pub timestamp: String,
+    /// Token di prompt LORDI del turno (convenzione di
+    /// `nexus_gateway::LlmUsage`): comprendono i due conteggi di cache qui sotto.
+    /// Chi prezza la traccia scorpora — tariffa piena su
+    /// `input_tokens - cache_read - cache_creation`, poi ciascuna quantita' di
+    /// cache alla sua tariffa.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Token del turno serviti da cache (tariffa ridotta): sottoinsieme di
+    /// `input_tokens`.
     pub cache_read_tokens: u32,
+    /// Token del turno scritti in cache (tariffa maggiorata). Assente nelle
+    /// tracce persistite prima dell'introduzione del campo: il frontend lo legge
+    /// come opzionale e in quel caso non ha nulla da tariffare.
+    pub cache_creation_tokens: u32,
 }
 
 /// Meta-step pubblicato in chat per dare visibilità a passaggi interni del

@@ -12,40 +12,23 @@
 // omette i provider usati solo dai figli (difetto misurato il 26/07/2026 —
 // vedi `crates/mcp-core/src/run_lineage.rs`).
 //
-// La formula del costo vive in lib/model-catalog.ts (costFromCatalog): quel file
-// non contiene piu' il listino scritto a mano da cui l'ADR prendeva le distanze
-// — ora e' solo il calcolo, alimentato dal catalogo del DB.
+// La formula del costo vive in lib/model-catalog.ts (costFromCatalog) e con essa
+// il prezzatore del bucket (bucketCost): quel file non contiene piu' il listino
+// scritto a mano da cui l'ADR prendeva le distanze — ora e' solo il calcolo,
+// alimentato dal catalogo del DB. Qui NON si ricalcola nulla: un prezzatore
+// scritto in questo file non sarebbe raggiungibile da alcun test (il modulo tira
+// dentro React) e potrebbe divergere in silenzio da quello misurato.
 //
 // Densita': a larghezze strette il NOME provider nei costi cede (classe
 // nx-as-cost-provider-name); restano barra + numeri.
 
 import { useThemeColors } from "../../lib/theme";
-import {
-  providerBaseColor,
-  usePricingCatalog,
-  type ModelPricingEntry,
-} from "./provider-badge";
-import {
-  providerCostBreakdown,
-  type ProviderTokenBucket,
-} from "../../lib/use-chat/activity-stream";
+import { providerBaseColor, usePricingCatalog } from "./provider-badge";
+import { providerCostBreakdown } from "../../lib/use-chat/activity-stream";
 import type { AITraceEvent } from "../../lib/api/agent";
-import { costFromCatalog, findCatalogEntry } from "../../lib/model-catalog";
+import { bucketCost } from "../../lib/model-catalog";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
-
-/** Costo USD di un bucket dato il catalogo prezzi (0 se entry assente).
- *
- *  Il calcolo e' quello del punto unico `costFromCatalog` (regola L): questa
- *  funzione era una seconda implementazione della stessa formula, e sarebbe
- *  divergente dall'altra alla prima modifica (i token di cache, per esempio,
- *  qui non erano tariffati affatto). Qui resta solo l'adattamento del bucket
- *  alla firma comune e la scelta — voluta, locale a questo footer — di trattare
- *  un modello non a catalogo come contributo zero anziche' nasconderlo. */
-function bucketCost(bucket: ProviderTokenBucket, catalog: ModelPricingEntry[]): number {
-  const entry = findCatalogEntry(catalog, bucket.provider, bucket.model);
-  return costFromCatalog(entry, bucket.inputTokens, bucket.outputTokens) ?? 0;
-}
 
 export function ActivityCostFooter({
   traces,
@@ -97,6 +80,8 @@ export function ActivityCostFooter({
         }}
       >
         {voci.map((b, i) => {
+          // Stessa misura del totale (`providerCostBreakdown.totalTokens`):
+          // prompt LORDO + output, coi token di cache gia' dentro il primo.
           const frac = (b.inputTokens + b.outputTokens) / totalForBar;
           return (
             <span

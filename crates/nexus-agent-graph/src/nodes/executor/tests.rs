@@ -4322,9 +4322,27 @@ async fn scale_pinned_heavy_disattiva_detector() {
 //  Limiti anti-runaway basati sui TOKEN (mig 0520)
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Stub LLM che ritorna un turno SOLO-TESTO con un `usage` dato (input+output):
-/// esercita il conteggio `tokens_used_total` dal segnale strutturato dell'usage.
+/// Stub LLM che ritorna un turno SOLO-TESTO con un `usage` dato (input+output),
+/// senza token di cache: esercita il conteggio `tokens_used_total` dal segnale
+/// strutturato dell'usage.
 fn llm_text_usage(text: &str, prompt: i64, completion: i64) -> Arc<StubLlmGateway> {
+    llm_text_usage_cache(text, prompt, completion, 0, 0)
+}
+
+/// Come [`llm_text_usage`] ma con i token di cache del turno.
+///
+/// `prompt` e' il LORDO e i due conteggi di cache ne sono SOTTOINSIEMI: e' la
+/// convenzione che l'adapter di produzione garantisce (`map_gw_response` in
+/// mcp-core copia `input_tokens`, gia' normalizzato al lordo dal gateway). Uno
+/// stub che sommasse la cache al prompt costruirebbe un usage che il gateway non
+/// puo' produrre.
+fn llm_text_usage_cache(
+    text: &str,
+    prompt: i64,
+    completion: i64,
+    cache_read: i64,
+    cache_creation: i64,
+) -> Arc<StubLlmGateway> {
     Arc::new(StubLlmGateway {
         canned: LlmResponse {
             content: text.to_string(),
@@ -4332,6 +4350,8 @@ fn llm_text_usage(text: &str, prompt: i64, completion: i64) -> Arc<StubLlmGatewa
             usage: LlmUsage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
+                cache_read_tokens: (cache_read > 0).then_some(cache_read),
+                cache_creation_tokens: (cache_creation > 0).then_some(cache_creation),
                 total_tokens: prompt + completion,
                 ..LlmUsage::default()
             },
@@ -4458,6 +4478,109 @@ async fn budget_conta_prompt_incrementale_non_la_history_ripetuta() {
     let out = apply(state, delta);
     // 2000 + (51000-50000) + 200 = 3200 — NON 2000+51200=53200.
     assert_eq!(out.tokens_used_total, Some(3_200));
+}
+
+#[tokio::test]
+async fn budget_segue_il_contesto_anche_quando_la_cache_serve_gran_parte_del_prompt() {
+    // Con i provider a caching AUTOMATICO (openai/deepseek/google/mistral) la
+    // quota servita da cache la decide il provider, turno per turno. Il delta
+    // regge solo perche' `prompt_tokens` e' il LORDO: comprende quella quota.
+    //
+    // Qui il contesto CRESCE (50_000 -> 51_000) e il provider ne serve 40_000
+    // dalla cache. Se il prompt arrivasse "al netto" varrebbe 11_000, il delta
+    // sarebbe 11_000-50_000 < 0 -> clamp a 0 -> il budget avanzerebbe del solo
+    // output (200): `tokens_used_total` smetterebbe di seguire la crescita del
+    // contesto e i due cap (`run_token_budget`, `run_token_hard_cap`) non
+    // scatterebbero piu'.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_text_usage_cache("risposta", 51_000, 200, 40_000, 0);
+    let ctx = ctx_with(llm);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        tokens_used_total: Some(2_000),
+        prompt_tokens: Some(50_000),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // 2000 + (51000-50000) + 200 = 3200. Su un prompt al netto sarebbe 2200.
+    assert_eq!(out.tokens_used_total, Some(3_200));
+    // Lo stato porta il lordo, coi conteggi di cache come dettaglio.
+    assert_eq!(out.prompt_tokens, Some(51_000));
+    assert_eq!(out.cache_read_tokens, Some(40_000));
+}
+
+#[tokio::test]
+async fn budget_non_conta_due_volte_i_token_scritti_in_cache() {
+    // I token di cache_creation sono GIA' dentro il prompt lordo: sommarli a
+    // parte al delta li conterebbe due volte. Primo turno del run (nessun prompt
+    // precedente): 10_000 lordi, di cui 4_000 scritti in cache.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_text_usage_cache("risposta", 10_000, 300, 0, 4_000);
+    let ctx = ctx_with(llm);
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        tokens_used_total: Some(0),
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run");
+    let out = apply(state, delta);
+    // 10_000 (lordo, cache_creation compresa) + 300 = 10_300, non 14_300.
+    assert_eq!(out.tokens_used_total, Some(10_300));
+}
+
+#[tokio::test]
+async fn usage_emesso_porta_il_lordo_e_il_dettaglio_di_cache() {
+    // Il contratto SSE `Usage` e' cio' che il pannello trace e il footer costi
+    // prezzano: deve portare il prompt LORDO e, accanto, quanta parte l'ha
+    // servita la cache. Finche' i due conteggi non c'erano, il consumatore li
+    // scriveva a 0 e pagava tutto a tariffa piena di input.
+    let rc = Arc::new(StubRunControlStore::default());
+    let (n, _m, _s) = node(cfg_resolved(), rc);
+    let llm = llm_text_usage_cache("risposta", 1_350, 200, 300, 50);
+    let sink = Arc::new(RecordingEventSink::default());
+    let ctx = ctx_with_emit(llm, sink.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("dammi un dato")],
+        action_oriented: Some(false),
+        tools_json: Some(vec![json!({"name": "read_file"})]),
+        ..Default::default()
+    };
+    let _ = n.run(&state, &ctx).await.expect("run");
+    let ev = sink
+        .events
+        .lock()
+        .expect("lock events")
+        .iter()
+        .find_map(|e| match e {
+            SseEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                total_tokens,
+            } => Some((
+                *prompt_tokens,
+                *completion_tokens,
+                *cache_read_tokens,
+                *cache_creation_tokens,
+                *total_tokens,
+            )),
+            _ => None,
+        })
+        .expect("evento Usage emesso");
+    // Il totale e' prompt lordo + completion: i 350 di cache sono gia' dentro
+    // i 1.350 e non si sommano una seconda volta.
+    assert_eq!(ev, (1_350, 200, 300, 50, 1_550));
 }
 
 #[tokio::test]

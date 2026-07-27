@@ -143,12 +143,19 @@ pub struct GwRequest {
     pub metadata: GwMetadata,
 }
 
+/// Usage come lo riporta il gateway sul wire: `input_tokens` e' il prompt LORDO
+/// (il contesto inviato, cache compresa) e i due campi di cache ne sono il
+/// DETTAGLIO. Il gateway normalizza a questa convenzione prima di rispondere,
+/// qualunque sia il formato del provider
+/// (`nexus_gateway::LlmUsage::normalized`).
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct GwUsage {
+    /// Token di prompt LORDI: comprendono i due conteggi di cache qui sotto.
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// Token serviti da prompt cache (Anthropic `cache_read_input_tokens`).
-    /// `None` se il provider non li riporta.
+    /// Token serviti da prompt cache (Anthropic `cache_read_input_tokens`):
+    /// sottoinsieme di `input_tokens`, con la sua tariffa. `None` se il provider
+    /// non li riporta.
     #[serde(default)]
     pub cache_read_tokens: Option<u32>,
     /// Token scritti in cache (creazione voce). Vedi sopra.

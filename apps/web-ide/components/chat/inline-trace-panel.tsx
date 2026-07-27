@@ -4,24 +4,13 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { useThemeColors } from "../../lib/theme";
 import type { AITraceEvent } from "../../lib/api-client";
-import {
-  costFromCatalog,
-  findCatalogEntry,
-  formatCostUsd as formatCost,
-} from "../../lib/model-catalog";
+import { formatCostUsd as formatCost, traceCost } from "../../lib/model-catalog";
 import { usePricingCatalog, type ModelPricingEntry } from "./provider-badge";
 
-/** Costo di una singola trace col catalogo prezzi di `/api/models`.
- *  `null` = modello non nel catalog: la UI nasconde la cella invece di
- *  mostrare zero (prima il listino era hardcoded in lib/model-catalog.ts). */
-function traceCost(trace: AITraceEvent, catalog: ModelPricingEntry[]): number | null {
-  return costFromCatalog(
-    findCatalogEntry(catalog, trace.provider, trace.model),
-    trace.inputTokens ?? 0,
-    trace.outputTokens ?? 0,
-    trace.cacheReadTokens ?? 0,
-  );
-}
+// Il costo di una trace lo calcola `traceCost` (lib/model-catalog.ts), dove un
+// test puo' raggiungerlo: scritto qui dentro nessuno lo misurerebbe, perche' il
+// modulo tira dentro React (regola O). `null` = modello non a catalogo, e la UI
+// nasconde la cella invece di mostrare uno zero.
 
 /// Il testo di una trace, scartando solo il wrapper `[Error: ...]`.
 ///
@@ -95,8 +84,11 @@ function CompactTraceCard({
         {(trace.inputTokens ?? 0) > 0 && (
           <span style={{ color: tc.textMuted, fontFamily: 'var(--font-mono)' }}>
             ↑{trace.inputTokens} ↓{trace.outputTokens}
-            {(trace.cacheReadTokens ?? 0) > 0 && (
-              <span style={{ color: tc.success }}> ⚡{trace.cacheReadTokens}</span>
+            {((trace.cacheReadTokens ?? 0) + (trace.cacheCreationTokens ?? 0)) > 0 && (
+              <span style={{ color: tc.success }}>
+                {" "}
+                ⚡{(trace.cacheReadTokens ?? 0) + (trace.cacheCreationTokens ?? 0)}
+              </span>
             )}
           </span>
         )}
@@ -245,7 +237,13 @@ export function InlineTracePanel({ traces }: { traces: AITraceEvent[] }) {
 
   const totalInput  = traces.reduce((s, t) => s + (t.inputTokens ?? 0), 0);
   const totalOutput = traces.reduce((s, t) => s + (t.outputTokens ?? 0), 0);
-  const totalCache  = traces.reduce((s, t) => s + (t.cacheReadTokens ?? 0), 0);
+  // Token di cache del run: lettura + scrittura. E' una QUOTA di `totalInput`
+  // (il prompt lordo), mostrata accanto per dire quanta parte del contesto e'
+  // costata meno — non un terzo addendo.
+  const totalCache  = traces.reduce(
+    (s, t) => s + (t.cacheReadTokens ?? 0) + (t.cacheCreationTokens ?? 0),
+    0,
+  );
   // Somma solo le trace che il catalog copre; se non ne copre nessuna resta
   // `null` e il totale non si mostra (mai uno zero che sembra "gratis").
   const totalCost   = traces.reduce<number | null>((acc, t) => {

@@ -71,6 +71,38 @@ This guarantees each AI execution attempt leaves a billing trail.
   - quota insertion
   - live overview of configured prices/quotas
 
+## Convenzione dei token di prompt (e stacco Anthropic del 2026-07-27)
+
+`ai_usage_ledger.prompt_tokens` e' il prompt **LORDO**: i due conteggi
+`cache_read_tokens` e `cache_creation_tokens` ne sono un dettaglio, mai addendi.
+Lo scorporo (a quanti token si applica la tariffa piena) avviene in un posto solo,
+`nexus_pricing::calculate_cost_breakdown`. Chi aggrega:
+
+- input lordo della chiamata = `prompt_tokens`
+- input a tariffa piena = `prompt_tokens - cache_read_tokens - cache_creation_tokens`
+  (clamp a >= 0)
+- cache hit-rate = `cache_read_tokens / prompt_tokens`
+
+La vista `ai_usage_analytics_view` applica queste formule dalla migrazione
+`db/migrations/0644_ai_usage_analytics_view_prompt_lordo.sql`; la 0405 le
+calcolava sulla premessa opposta (prompt netto) e da li' doppio-contava i
+`cache_read`.
+
+**Discontinuita' per Anthropic, dal 2026-07-27.** Fino a quella data l'adapter
+Anthropic scriveva nel ledger `usage.input_tokens` del wire, che per Anthropic e'
+il NETTO (le quantita' di cache arrivano come campi separati). Ora le somma, come
+per ogni altro provider. Conseguenze:
+
+- le righe Anthropic anteriori allo stacco hanno `prompt_tokens` e `total_tokens`
+  piu' bassi a parita' di chiamata, quindi i trend che attraversano la data
+  mostrano un gradino che non e' un aumento di consumo;
+- sulle righe anteriori l'hit-rate calcolato dalla vista risulta sovrastimato
+  (denominatore piccolo). Il dato non e' ricostruibile: i token veri di quelle
+  chiamate non sono nel ledger;
+- le quote (`ai_quota_policies`) dal deploy misurano per Anthropic il consumo
+  reale invece di quello sottostimato: i limiti a token si raggiungono prima di
+  quanto la serie storica lasciasse prevedere.
+
 ## Notes for Other AI Agents
 
 - Base currency setting key: `billing_base_currency`

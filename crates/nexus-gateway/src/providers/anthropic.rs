@@ -31,7 +31,7 @@ use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::parse_models_response;
 use crate::types::{
     LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall, LlmUsage, MessageContent,
-    SensitivityTier, ToolFunctionCall,
+    PromptCacheReporting, SensitivityTier, ToolFunctionCall,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -777,12 +777,27 @@ fn from_anthropic_message(
         } else {
             Some(tool_calls)
         },
-        usage: LlmUsage {
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
-            cache_read_tokens: resp.usage.cache_read_input_tokens,
-            cache_creation_tokens: resp.usage.cache_creation_input_tokens,
-        },
+        // Anthropic riporta `input_tokens` gia' al NETTO: cache_read e
+        // cache_creation sono campi separati e NON vi sono compresi. La
+        // convenzione del sistema e' il LORDO, quindi qui si SOMMA — lo fa il
+        // punto unico `LlmUsage::normalized`, a cui l'adapter dichiara soltanto
+        // la convenzione del proprio formato.
+        //
+        // STACCO DELLA SERIE STORICA (2026-07-27): prima di questa somma il
+        // valore del wire finiva verbatim nel ledger, quindi per Anthropic - e
+        // solo per Anthropic - `prompt_tokens` e `total_tokens` erano
+        // SOTTOSTIMATI di quanto il contesto arrivava dalla cache. Dal deploy le
+        // stesse chiamate registrano numeri piu' alti: non e' una regressione ma
+        // il consumo vero, e vale sia per i report (vista analitica, mig 0644)
+        // sia per le quote di spesa, che d'ora in poi misurano il contesto
+        // intero. I trend che attraversano la data hanno un gradino.
+        usage: LlmUsage::normalized(
+            PromptCacheReporting::CachedReportedSeparately,
+            resp.usage.input_tokens,
+            resp.usage.output_tokens,
+            resp.usage.cache_read_input_tokens,
+            resp.usage.cache_creation_input_tokens,
+        ),
         model_used,
         provider_used: "anthropic".to_string(),
         latency_ms,
@@ -990,12 +1005,13 @@ impl AnthropicSseParser {
                     delta: String::new(),
                     tool_call_delta: None,
                     finish_reason: Some(self.finish_reason.clone().unwrap_or_else(|| "stop".to_string())),
-                    usage: Some(LlmUsage {
-                        input_tokens: self.input_tokens,
-                        output_tokens: self.output_tokens,
-                        cache_read_tokens: self.cache_read_tokens,
-                        cache_creation_tokens: self.cache_creation_tokens,
-                    }),
+                    usage: Some(LlmUsage::normalized(
+                        PromptCacheReporting::CachedReportedSeparately,
+                        self.input_tokens,
+                        self.output_tokens,
+                        self.cache_read_tokens,
+                        self.cache_creation_tokens,
+                    )),
                     provider_used: Some("anthropic".to_string()),
                     model_used: Some(self.model_used.clone()),
                     reasoning_delta: None,
@@ -1671,6 +1687,58 @@ mod tests {
         let resp = from_anthropic_message(parsed, "m".to_string(), 0);
         assert!(resp.reasoning.is_none());
         assert!(resp.thinking_signature.is_none());
+    }
+
+    /// Convenzione OPPOSTA a quella dei dialetti OpenAI-compatibili: Anthropic
+    /// riporta `input_tokens` gia' al netto, quindi qui i token di cache si
+    /// SOMMANO per arrivare al lordo, che e' la convenzione del sistema. Senza
+    /// la somma il prompt di Anthropic uscirebbe 100 dove un provider inclusivo
+    /// scriverebbe 1.050 per lo stesso contesto: due numeri non confrontabili,
+    /// e il costo della cache non sarebbe piu' scorporabile a valle (non c'e' un
+    /// monte da cui scorporarlo).
+    #[test]
+    fn input_tokens_anthropic_e_normalizzato_al_lordo() {
+        // Forma reale: le tre quantita' arrivano come campi SEPARATI.
+        let raw = r#"{
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 20,
+                      "cache_read_input_tokens": 900,
+                      "cache_creation_input_tokens": 50}
+        }"#;
+        let parsed: AnthropicMessage = serde_json::from_str(raw).unwrap();
+        let u = from_anthropic_message(parsed, "claude-x".to_string(), 0).usage;
+
+        // Il prompt REALE e' la somma: 1.050 token, non i 100 del wire.
+        assert_eq!(
+            u.input_tokens, 1_050,
+            "il wire e' al netto: il lordo e' 100 + 900 + 50"
+        );
+        assert_eq!(u.cache_read_tokens, Some(900));
+        assert_eq!(u.cache_creation_tokens, Some(50));
+    }
+
+    /// Anche il percorso streaming, che accumula gli eventi SSE, deve emettere
+    /// la stessa forma del non-stream.
+    #[test]
+    fn lo_streaming_anthropic_normalizza_al_lordo() {
+        let mut p = AnthropicSseParser::new("claude-x".to_string());
+        p.parse_line(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":900,"cache_creation_input_tokens":50}}}"#,
+        );
+        p.parse_line(r#"data: {"type":"message_delta","usage":{"output_tokens":20}}"#);
+        p.parse_line(r#"data: {"type":"message_stop"}"#);
+
+        let u = p
+            .pending
+            .pop_back()
+            .expect("chunk finale")
+            .usage
+            .expect("il chunk finale porta l'usage");
+        assert_eq!(u.input_tokens, 1_050);
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.cache_read_tokens, Some(900));
+        assert_eq!(u.cache_creation_tokens, Some(50));
     }
 
     #[test]

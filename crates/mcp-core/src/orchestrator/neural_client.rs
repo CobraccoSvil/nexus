@@ -909,6 +909,47 @@ mod gateway_mapping_tests {
         assert_eq!(v["model"], "m-real");
     }
 
+    /// Il giro completo produttore -> consumatore sui token di cache.
+    ///
+    /// Il JSON lo costruisce il produttore VERO (`completion_value_from_gw`) e lo
+    /// legge il consumatore VERO (`billing::extract_usage_numbers`): e' la strada
+    /// della produzione. Le due chiavi di cache erano gia' scritte qui e venivano
+    /// scartate dall'altro capo, dove `UsageNumbers` non aveva dove metterle.
+    #[test]
+    fn i_token_di_cache_sopravvivono_al_giro_completion_usage_numbers() {
+        let mut resp = base_resp();
+        // `input_tokens` e' il prompt LORDO: i 900 letti da cache e i 50 scritti
+        // ne fanno parte, quindi 12 restano a tariffa piena.
+        resp.usage.input_tokens = 962;
+        resp.usage.cache_read_tokens = Some(900);
+        resp.usage.cache_creation_tokens = Some(50);
+        let v = completion_value_from_gw("anthropic", "claude-x", &resp);
+
+        // Il produttore le scrive.
+        assert_eq!(v["metadata"]["usage"]["cache_read_tokens"], 900);
+        assert_eq!(v["metadata"]["usage"]["cache_creation_tokens"], 50);
+
+        // Il consumatore le legge (prima si fermavano qui).
+        let n = crate::billing::extract_usage_numbers(&v, 0, 0);
+        assert_eq!(n.prompt_tokens, 962);
+        assert_eq!(n.completion_tokens, 34);
+        assert_eq!(n.cache_read_tokens, 900);
+        assert_eq!(n.cache_creation_tokens, 50);
+        // Il totale e' prompt lordo + completion: la cache e' gia' dentro.
+        assert_eq!(n.total_tokens, 996);
+    }
+
+    /// Senza cache nulla cambia: le chiavi non compaiono e i conteggi restano 0.
+    #[test]
+    fn senza_cache_le_chiavi_non_compaiono_e_i_conteggi_sono_zero() {
+        let v = completion_value_from_gw("openai", "gpt-x", &base_resp());
+        assert!(v["metadata"]["usage"].get("cache_read_tokens").is_none());
+        let n = crate::billing::extract_usage_numbers(&v, 0, 0);
+        assert_eq!(n.cache_read_tokens, 0);
+        assert_eq!(n.cache_creation_tokens, 0);
+        assert_eq!(n.total_tokens, 46);
+    }
+
     #[test]
     fn completion_errore_ha_prefisso_error_e_classe() {
         let v = error_completion_value("anthropic", "claude-x", "HTTP 401 invalid api key");

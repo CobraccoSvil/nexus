@@ -388,11 +388,14 @@ pub struct NativeRunOutcome {
     pub resume_at: Option<String>,
     /// Numero di iterazioni dell'executor (campo `iterations` dello stato finale).
     pub iterations: i64,
-    /// Token di prompt dell'ULTIMA iterazione: lo stato del grafo e' last-write
-    /// per-turno (reducer overwrite in executor.rs), NON cumulativo. Il valore
-    /// cumulativo per il billing viene riconciliato a valle dal ledger
-    /// (`reconcile_run_cost_from_ledger`). Questo valore alimenta
-    /// `last_prompt_tokens` (context ratio della UI).
+    /// Token di prompt LORDI dell'ULTIMA iterazione (contesto inviato, cache
+    /// compresa): lo stato del grafo e' last-write per-turno (reducer overwrite
+    /// in executor.rs), NON cumulativo. Il valore cumulativo per il billing
+    /// viene riconciliato a valle dal ledger (`reconcile_run_cost_from_ledger`).
+    ///
+    /// Alimenta `last_prompt_tokens` (context ratio della UI): la finestra la
+    /// occupa il prompt intero, i token serviti da cache compresi — la cache
+    /// risparmia denaro, non spazio.
     pub prompt_tokens: i64,
     /// Token di completion dell'ultima iterazione (stesso reducer last-write).
     pub completion_tokens: i64,
@@ -3106,7 +3109,14 @@ async fn run_engine(
 /// Mappa lo [`StepOutcome`] del motore nel [`NativeRunOutcome`] del chiamante.
 /// Estrae anche usage/iterazioni/intent dallo stato finale (servono al
 /// finalizzatore condiviso, regola L).
-fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
+///
+/// `pub(crate)` perche' e' l'UNICO produttore del `NativeRunOutcome` che il
+/// finalizzatore consuma: i test del consumatore
+/// (`chat_messages::agent_run::tests_native_mapping`) devono raggiungerlo per la
+/// stessa strada della produzione, non fabbricarsi l'outcome a mano (regola O).
+/// Finche' era privato, quei test partivano da un outcome costruito su misura e
+/// una mutazione qui dentro li lasciava tutti verdi.
+pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome {
     let (state, completed, resume_at) = match outcome {
         StepOutcome::Completed(state) => (state, true, None),
         StepOutcome::Interrupted { state, resume_at } => {

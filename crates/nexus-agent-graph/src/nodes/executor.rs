@@ -4417,16 +4417,21 @@ modello piu' capace.",
         // meta_steps sono `add`), quindi qui replichiamo: valori del turno, non
         // cumulativi (la cumulazione e' del finalize/ledger). Senza questa
         // propagazione l'esito nativo aveva SEMPRE total_tokens=0 nel DB (secondo
-        // bug osservato sul primario Rust, oltre all'hollow). `total_tokens` segue la
-        // formula del Python (prompt+completion+cache_*). Su turno error (gateway_errored)
-        // l'usage e' default (zero), parita' col Python che non somma nulla nell'except.
+        // bug osservato sul primario Rust, oltre all'hollow). Su turno error
+        // (gateway_errored) l'usage e' default (zero), parita' col Python che non
+        // somma nulla nell'except.
+        //
+        // `total_tokens` = prompt LORDO + completion. I due conteggi di cache sono
+        // un DETTAGLIO del prompt, non addendi: `prompt_tokens` li comprende gia'
+        // (convenzione unica del sistema, `nexus_gateway::LlmUsage`), quindi
+        // sommarli qui li conterebbe due volte e il totale del turno divergerebbe
+        // da quello che il ledger scrive per la stessa chiamata.
         let usage = &resp.usage;
         let turn_prompt_tokens = usage.prompt_tokens;
         let turn_completion_tokens = usage.completion_tokens;
         let turn_cache_creation = usage.cache_creation_tokens.unwrap_or(0);
         let turn_cache_read = usage.cache_read_tokens.unwrap_or(0);
-        let turn_total_tokens =
-            turn_prompt_tokens + turn_completion_tokens + turn_cache_creation + turn_cache_read;
+        let turn_total_tokens = turn_prompt_tokens + turn_completion_tokens;
         let turn_total_cost = usage.total_cost_usd;
 
         // ── Emissione Usage live (barra contesto / TokenUsageBar) ─────────────
@@ -4438,9 +4443,14 @@ modello piu' capace.",
         // e' del finalize/ledger, non del grafo) -> parita' 1:1 col Python che
         // emette per-turno. Su turno error l'usage e' zero (gateway_errored) e
         // l'emissione e' un no-op informativo (best-effort, l'emit e' infallibile).
+        // I due conteggi di cache viaggiano accanto al prompt lordo come
+        // DETTAGLIO: senza di loro il consumatore che prezza la traccia non puo'
+        // applicare le tariffe ridotte e paga tutto a prezzo pieno di input.
         ctx.emit.emit(SseEvent::Usage {
             prompt_tokens: turn_prompt_tokens,
             completion_tokens: turn_completion_tokens,
+            cache_read_tokens: turn_cache_read,
+            cache_creation_tokens: turn_cache_creation,
             total_tokens: turn_total_tokens,
         });
 
@@ -4728,18 +4738,28 @@ modello piu' capace.",
 
         // ── Contatori anti-runaway CUMULATIVI (reducer overwrite last-write) ──
         // (1) tokens_used_total: LAVORO INCREMENTALE del run, dal segnale
-        //     STRUTTURATO dell'usage (regola M): delta del prompt rispetto al
-        //     turno precedente (solo il contesto NUOVO caricato) + output +
-        //     cache_creation. NON il prompt lordo per-turno: la history viene
-        //     ri-inviata a OGNI turno, quindi cumulare `turn_total_tokens`
-        //     condannava matematicamente i run con contesto grande (run 8c4f5eea:
-        //     history ~50k -> ~8 turni SANI bruciavano il budget 400k -> cascata
-        //     di escalation "non-convergenza" fino al cap -> failed_diagnosed,
-        //     con la correzione post-gate uccisa pre-LLM senza fare lavoro).
+        //     STRUTTURATO dell'usage (regola M): delta del prompt LORDO rispetto
+        //     al turno precedente (solo il contesto NUOVO caricato) + output. NON
+        //     il prompt lordo per-turno: la history viene ri-inviata a OGNI
+        //     turno, quindi cumulare `turn_total_tokens` condannava
+        //     matematicamente i run con contesto grande (run 8c4f5eea: history
+        //     ~50k -> ~8 turni SANI bruciavano il budget 400k -> cascata di
+        //     escalation "non-convergenza" fino al cap -> failed_diagnosed, con
+        //     la correzione post-gate uccisa pre-LLM senza fare lavoro).
+        //     Il delta poggia sulla MONOTONIA del prompt, ed e' vera perche'
+        //     `prompt_tokens` e' il LORDO: comprende i token che il provider ha
+        //     servito dalla propria cache, la cui quota cambia da un turno
+        //     all'altro (caching automatico di openai/deepseek/google/mistral).
+        //     Un prompt "al netto" oscillerebbe con quella quota e darebbe delta
+        //     NEGATIVI che clampano a 0: `tokens_used_total` smetterebbe di
+        //     crescere e i due cap (`run_token_budget`, `run_token_hard_cap`) non
+        //     scatterebbero piu'. Per lo stesso motivo `cache_creation` NON si
+        //     somma a parte: e' gia' dentro il prompt, e sommarlo lo conterebbe
+        //     due volte.
         //     Il runaway vero resta coperto: contesto che esplode = delta grandi,
         //     output ripetuto a raffica = completion cumulate, e il freno di
         //     spesa in dollari (`run_cost_cumulative_usd`) conta comunque il
-        //     costo REALE lordo. Il ramo PRE-LLM del prossimo giro confronta
+        //     costo REALE. Il ramo PRE-LLM del prossimo giro confronta
         //     questo totale con `run_token_budget`. Su turno error
         //     (gateway_errored) l'usage e' default (zero): delta 0 e output 0,
         //     il totale resta invariato, coerente col non-conteggio del ramo
@@ -4756,9 +4776,7 @@ modello piu' capace.",
         let prev_tokens_total = state.tokens_used_total.unwrap_or(0).max(0);
         let prev_turn_prompt = state.prompt_tokens.unwrap_or(0).max(0);
         let incremental_prompt = (turn_prompt_tokens - prev_turn_prompt).max(0);
-        let turn_budget_tokens = incremental_prompt
-            .saturating_add(turn_completion_tokens.max(0))
-            .saturating_add(turn_cache_creation.max(0));
+        let turn_budget_tokens = incremental_prompt.saturating_add(turn_completion_tokens.max(0));
         let new_tokens_total = prev_tokens_total.saturating_add(turn_budget_tokens);
         // Costo cumulativo REALE del run (freno di spesa in dollari): somma il costo
         // del turno (dall'usage, gia' col prezzo del modello del turno) al totale
@@ -4802,6 +4820,9 @@ modello piu' capace.",
             // modello reale del turno (regola H, incidente 2026-07-06).
             effective_context_window: Some(Some(effective_window)),
             // Usage del turno (py:3476-3480), overwrite last-write come il Python.
+            // `prompt_tokens` e' il LORDO: alimenta il delta anti-runaway qui
+            // sopra e il riempimento finestra in UI (`last_prompt_tokens`). I due
+            // conteggi di cache lo dettagliano, per chi deve tariffare.
             prompt_tokens: Some(Some(turn_prompt_tokens)),
             completion_tokens: Some(Some(turn_completion_tokens)),
             cache_creation_tokens: Some(Some(turn_cache_creation)),

@@ -23,7 +23,10 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use nexus_pricing::{calculate_cost, resolve_active_price_in, PriceLookup, UsageUnit};
+use nexus_pricing::{
+    calculate_cost, calculate_cost_breakdown, resolve_active_price_in, CostBreakdown, PriceLookup,
+    TokenUsage, UsageUnit,
+};
 
 use crate::types::{LlmRequest, LlmResponse, MessageContent};
 
@@ -259,6 +262,25 @@ async fn usage_for_scope(
     Ok(row)
 }
 
+/// La INSERT del percorso testuale, come costante e non inline.
+///
+/// Non e' cosmetica: l'elenco delle colonne scritto a mano dentro la funzione e'
+/// il difetto che ha tenuto a zero le quattro colonne di cache su 7.405 righe.
+/// Una colonna dimenticata non e' un errore di compilazione — il valore cade sul
+/// DEFAULT e nessuno se ne accorge. Come costante, un test puo' confrontarla col
+/// testo VERO della migrazione che quelle colonne le ha create (regola O).
+const SQL_INSERT_LEDGER_TESTO: &str = r#"
+        INSERT INTO ai_usage_ledger (
+            user_id, project_id, run_id, provider, model,
+            prompt_tokens, completion_tokens, total_tokens,
+            cache_read_tokens, cache_creation_tokens,
+            input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost,
+            currency, status, details
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'finalized', $17
+        )
+        "#;
+
 /// Registra l'usage effettivo nel ledger come `finalized` (parita' con
 /// `recordUsageToLedger`). No-op se mancano metadati o usage. Best-effort: gli
 /// errori sono loggati ma non interrompono la risposta al chiamante.
@@ -275,9 +297,7 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
 
     let provider = &resp.provider_used;
     let model = &resp.model_used;
-    let prompt_tokens = resp.usage.input_tokens as i64;
-    let completion_tokens = resp.usage.output_tokens as i64;
-    let total_tokens = prompt_tokens + completion_tokens;
+    let tokens = token_usage_from(&resp.usage);
 
     let price = lookup_price(db, provider, model).await;
     // `price_state` e' il segnale STRUTTURATO del perche' di un costo: chi legge il
@@ -286,18 +306,18 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
     // `true` in ENTRAMBI i casi di costo non calcolabile.
     let price_state = price.state_label();
     let price_missing = price.is_missing();
-    let (currency, input_cost, output_cost, total_cost) = match &price {
-        PriceLookup::Priced(p) => {
-            let (i, o, t) = calculate_cost(p, prompt_tokens, completion_tokens);
-            (p.currency.trim().to_uppercase(), i, o, t)
-        }
+    let (currency, costo) = match &price {
+        PriceLookup::Priced(p) => (
+            p.currency.trim().to_uppercase(),
+            calculate_cost_breakdown(p, &tokens),
+        ),
         _ => {
             if matches!(price, PriceLookup::Unknown) {
                 tracing::warn!(
                     provider = %provider,
                     model = %model,
-                    prompt_tokens,
-                    completion_tokens,
+                    prompt_tokens = tokens.prompt_tokens,
+                    completion_tokens = tokens.completion_tokens,
                     "gateway-ledger: prezzo IGNOTO (pricing_state='unknown') -> costo NON calcolabile, \
                      registro 0 esplicito. Il modello non dovrebbe essere routabile: vedi il ciclo \
                      reconcile_disable_price_unknown del catalog_sync"
@@ -308,7 +328,7 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
             // l'INSERT qui sotto fallisce comunque, quindi la stringa vuota non
             // raggiunge una riga persistita.
             let cur = nexus_pricing::platform_currency(db).await.unwrap_or_default();
-            (cur, 0.0, 0.0, 0.0)
+            (cur, costo_nullo())
         }
     };
 
@@ -317,35 +337,33 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
         "feature": req.metadata.feature,
         "price_missing": price_missing,
         "price_state": price_state,
+        // Stato del listino di CACHE, separato da quello del listino base: un
+        // `cache_read_cost` a zero puo' voler dire "nessun token da cache" o
+        // "tariffa non a listino, token fatturati a prezzo pieno di input", e i
+        // due casi non si distinguono dall'importo (regola M).
+        "cache_price_state": costo.cache_price_state(),
     });
 
     // run_id (= request_id nei metadata): abilita il breakdown costo per run /
     // sessione (M71). NULL se il chiamante non lo passa o non e' un UUID valido.
     let run_uuid = Uuid::parse_str(req.metadata.request_id.trim()).ok();
 
-    let res = sqlx::query(
-        r#"
-        INSERT INTO ai_usage_ledger (
-            user_id, project_id, run_id, provider, model,
-            prompt_tokens, completion_tokens, total_tokens,
-            input_cost, output_cost, total_cost,
-            currency, status, details
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'finalized', $13
-        )
-        "#,
-    )
+    let res = sqlx::query(SQL_INSERT_LEDGER_TESTO)
     .bind(user_uuid)
     .bind(project_uuid)
     .bind(run_uuid)
     .bind(provider)
     .bind(model)
-    .bind(prompt_tokens)
-    .bind(completion_tokens)
-    .bind(total_tokens)
-    .bind(input_cost)
-    .bind(output_cost)
-    .bind(total_cost)
+    .bind(tokens.prompt_tokens)
+    .bind(tokens.completion_tokens)
+    .bind(tokens.total_tokens())
+    .bind(tokens.cache_read_tokens)
+    .bind(tokens.cache_creation_tokens)
+    .bind(costo.input_cost)
+    .bind(costo.output_cost)
+    .bind(costo.cache_read_cost)
+    .bind(costo.cache_creation_cost)
+    .bind(costo.total_cost)
     .bind(currency)
     .bind(details)
     .execute(db)
@@ -354,6 +372,39 @@ pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmRes
     if let Err(e) = res {
         // Regola F: solo l'errore SQL, nessun payload.
         tracing::warn!(error = %e, "gateway-ledger: insert ledger fallita (best-effort)");
+    }
+}
+
+/// Dalla `LlmUsage` (gia' normalizzata dall'adapter al prompt LORDO, vedi
+/// `LlmUsage::normalized`) ai token che il listino sa tariffare.
+///
+/// Trasporto e basta: i due contratti hanno la stessa convenzione — prompt
+/// lordo, cache come sottoinsieme — e lo scorporo lo fa `nexus-pricing` al
+/// momento di moltiplicare per le tariffe.
+///
+/// PUNTO UNICO della conversione (regola L): e' l'unico passaggio fra il
+/// contratto del gateway e quello di `nexus-pricing`. Prima le due quantita' di
+/// cache si fermavano qui — venivano lette dagli adapter, propagate fino a
+/// questa funzione e poi semplicemente non nominate nella INSERT, restando al
+/// DEFAULT 0 su tutte le righe del ledger.
+fn token_usage_from(usage: &crate::types::LlmUsage) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: usage.input_tokens as i64,
+        completion_tokens: usage.output_tokens as i64,
+        cache_read_tokens: usage.cache_read_tokens.unwrap_or(0) as i64,
+        cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0) as i64,
+    }
+}
+
+/// Costo non calcolabile: tutte le voci a zero, nessun ripiego da dichiarare.
+fn costo_nullo() -> CostBreakdown {
+    CostBreakdown {
+        input_cost: 0.0,
+        output_cost: 0.0,
+        cache_read_cost: 0.0,
+        cache_creation_cost: 0.0,
+        total_cost: 0.0,
+        cache_tokens_billed_as_input: 0,
     }
 }
 
@@ -612,6 +663,8 @@ async fn inserisci_riga_media(db: &PgPool, r: RigaMedia<'_>) -> Result<(), sqlx:
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, RequestMetadata};
+    // `Row::get` per rileggere le colonne del ledger nel test della giuntura.
+    use sqlx::Row;
 
     // ── Vocabolario del consumo media ──────────────────
     //
@@ -747,5 +800,284 @@ mod tests {
             reason: "token_limit".into(),
         };
         assert_eq!(e.to_string(), "quota_exceeded:user:token_limit");
+    }
+
+    // ── Il ledger e le colonne di cache ────────────────────
+    //
+    // La riga di ledger la scrive una INSERT con l'elenco delle colonne a mano:
+    // una colonna omessa cade sul DEFAULT, e nessun compilatore la reclama. E'
+    // esattamente cosi' che `cache_read_tokens` e `cache_creation_tokens` sono
+    // rimaste a zero su 7.405 chiamate mentre gli adapter le leggevano.
+    //
+    // Il confronto e' col testo VERO della migrazione applicata al database
+    // (regola O), non con una lista ricopiata nel test.
+    const MIGRAZIONE_0129: &str =
+        include_str!("../../../../db/migrations/0129_ledger_cache_columns.sql");
+
+    /// Ogni colonna che la mig 0129 ha aggiunto al ledger deve comparire nella
+    /// INSERT che il gateway esegue davvero.
+    #[test]
+    fn la_insert_del_ledger_nomina_le_colonne_di_cache() {
+        for colonna in [
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "cache_read_cost",
+            "cache_creation_cost",
+        ] {
+            assert!(
+                MIGRAZIONE_0129.contains(colonna),
+                "la migrazione 0129 non crea {colonna}: il test guarda il file sbagliato"
+            );
+            assert!(
+                SQL_INSERT_LEDGER_TESTO.contains(colonna),
+                "la INSERT del ledger non elenca {colonna}: la colonna resterebbe al DEFAULT 0"
+            );
+        }
+        // Un segnaposto per ogni valore bindato: 17 bind, 17 placeholder. Uno
+        // scarto qui e' un errore SQL a runtime, best-effort e quindi solo
+        // loggato — cioe' invisibile.
+        for n in 1..=17 {
+            assert!(
+                SQL_INSERT_LEDGER_TESTO.contains(&format!("${n}")),
+                "placeholder ${n} assente dalla INSERT"
+            );
+        }
+        assert!(
+            !SQL_INSERT_LEDGER_TESTO.contains("$18"),
+            "placeholder di troppo rispetto ai bind"
+        );
+    }
+
+    /// Dalla `LlmUsage` che gli adapter producono alla riga che il ledger
+    /// scrive: i numeri che finiscono nelle colonne, non una struct fabbricata.
+    #[test]
+    fn i_token_di_cache_arrivano_alla_riga_di_ledger() {
+        // Il valore parte dal suo PRODUTTORE (`LlmUsage::normalized`, lo stesso
+        // che chiamano gli adapter), non da un letterale scritto qui.
+        let anthropic = crate::types::LlmUsage::normalized(
+            crate::types::PromptCacheReporting::CachedReportedSeparately,
+            100,
+            20,
+            Some(900),
+            Some(50),
+        );
+        let t = token_usage_from(&anthropic);
+        assert_eq!(t.prompt_tokens, 1_050, "il wire era al netto: 100+900+50");
+        assert_eq!(t.cache_read_tokens, 900);
+        assert_eq!(t.cache_creation_tokens, 50);
+        // `total_tokens` e' prompt lordo + completion: la cache e' gia' dentro.
+        assert_eq!(t.total_tokens(), 1_070);
+
+        let openai = crate::types::LlmUsage::normalized(
+            crate::types::PromptCacheReporting::CachedIncludedInPrompt,
+            1_000,
+            20,
+            Some(900),
+            None,
+        );
+        let t = token_usage_from(&openai);
+        assert_eq!(t.prompt_tokens, 1_000, "il wire era gia' lordo");
+        assert_eq!(t.cache_read_tokens, 900);
+        // Il totale resta 1.020 come prima di questo lavoro: la serie storica
+        // di quote e report non ha un gradino al deploy.
+        assert_eq!(t.total_tokens(), 1_020);
+    }
+
+    /// La CONSEGUENZA sul costo, sulla stessa strada del ledger: con la tariffa
+    /// di cache a listino, i token cached non pagano il prezzo pieno di input.
+    #[test]
+    fn il_costo_della_riga_scorpora_la_cache() {
+        // Listino Anthropic tipico (mig 0403: read 0.1x, creation 1.25x).
+        let price = nexus_pricing::PriceSnapshot {
+            input_cost_per_million_tokens: 3.0,
+            output_cost_per_million_tokens: 15.0,
+            cache_read_cost_per_million_tokens: Some(0.3),
+            cache_creation_cost_per_million_tokens: Some(3.75),
+            currency: "USD".into(),
+        };
+        let usage = crate::types::LlmUsage::normalized(
+            crate::types::PromptCacheReporting::CachedIncludedInPrompt,
+            1_000_000,
+            0,
+            Some(900_000),
+            None,
+        );
+        let tokens = token_usage_from(&usage);
+        let costo = calculate_cost_breakdown(&price, &tokens);
+
+        // Scorporato: 100k a 3.0 + 900k a 0.3 = 0.30 + 0.27 = 0.57.
+        assert!((costo.total_cost - 0.57).abs() < 1e-9, "totale {}", costo.total_cost);
+        assert!((costo.cache_read_cost - 0.27).abs() < 1e-9);
+        assert_eq!(costo.cache_price_state(), "priced");
+
+        // A tariffa piena (la formula di prima) 1M di token costerebbe 3.0: il
+        // test rosseggia se lo scorporo sparisce.
+        let a_tariffa_piena = calculate_cost(&price, tokens.prompt_tokens, 0).2;
+        assert!((a_tariffa_piena - 3.0).abs() < 1e-9);
+        assert!(costo.total_cost < a_tariffa_piena);
+
+        // Senza tariffa a listino il costo torna ESATTAMENTE quello di prima —
+        // mai peggiore — e il ripiego e' dichiarato.
+        let senza_listino_cache = nexus_pricing::PriceSnapshot {
+            cache_read_cost_per_million_tokens: None,
+            cache_creation_cost_per_million_tokens: None,
+            ..price.clone()
+        };
+        let ripiego = calculate_cost_breakdown(&senza_listino_cache, &tokens);
+        assert!((ripiego.total_cost - a_tariffa_piena).abs() < 1e-12);
+        assert_eq!(ripiego.cache_price_state(), "cache_price_missing");
+    }
+
+    // ── La GIUNTURA: dai numeri alle COLONNE ───────────────────
+    //
+    // I tre test qui sopra coprono i PEZZI: la normalizzazione, la conversione
+    // verso il listino, lo scorporo del costo. Nessuno dimostra la giuntura, cioe'
+    // che il valore bindato in posizione N finisca nella colonna che in posizione
+    // N e' dichiarata. Il conteggio dei segnaposto ($1..$17) non lo dimostra: con
+    // quattro conteggi e cinque importi adiacenti e omogenei, uno scambio di
+    // posizione non e' un errore che il compilatore veda, non e' un errore SQL, e
+    // si paga in denaro.
+    //
+    // L'unico modo di dimostrarlo e' percorrere la strada della produzione fino in
+    // fondo e RILEGGERE la riga dal database vero, sullo schema reale applicato dal
+    // META_MIGRATOR (regola O).
+
+    /// Identita' che le FK del ledger esigono (`users`, `projects`) piu' il
+    /// `run_id`, che il gateway deriva dal `request_id`: quello non ha piu' una FK
+    /// — la mig 0276 l'ha tolta perche' i run agentici non stanno in
+    /// `orchestrator_runs` — quindi e' un UUID libero.
+    ///
+    /// Il seeding delle due identita' viene dal punto unico
+    /// [`nexus_test_schema::seed_identita_meta`]: la gemella di questo test in
+    /// `mcp_core::billing` semina le stesse tabelle, e due copie a mano
+    /// divergerebbero alla prima colonna NOT NULL aggiunta.
+    async fn seed_identita(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+        let (user, project) = nexus_test_schema::seed_identita_meta(pool).await;
+        (user, project, Uuid::new_v4())
+    }
+
+    /// Listino con ENTRAMBE le tariffe di cache valorizzate (forma della mig 0403)
+    /// e le quattro tariffe DISTINTE: e' cio' che rende osservabile uno scambio.
+    async fn seed_listino(pool: &PgPool) {
+        sqlx::query(
+            "INSERT INTO ai_price_catalog ( \
+                 provider, model, \
+                 input_cost_per_million_tokens, output_cost_per_million_tokens, \
+                 cache_read_cost_per_million_tokens, cache_creation_cost_per_million_tokens, \
+                 currency, pricing_state \
+             ) VALUES ('anthropic', 'claude-x', 3.0, 15.0, 0.3, 3.75, 'USD', 'priced')",
+        )
+        .execute(pool)
+        .await
+        .expect("seed ai_price_catalog");
+    }
+
+    /// Richiesta con l'identita' che il gateway richiede per contabilizzare.
+    /// Riusa il costruttore dei test esistenti invece di ricopiarlo.
+    fn req_con_identita(project: Uuid, user: Uuid, run: Uuid) -> LlmRequest {
+        let mut r = req(vec!["ciao"], Some(64));
+        r.metadata.tenant_id = project.to_string();
+        r.metadata.user_id = user.to_string();
+        r.metadata.request_id = run.to_string();
+        r
+    }
+
+    /// Risposta come la costruisce un adapter: l'usage nasce dal suo PRODUTTORE
+    /// (`LlmUsage::normalized`), che e' l'unico posto dove si decide se i token di
+    /// cache vanno sommati al prompt per arrivare al lordo.
+    fn resp_anthropic_con_cache() -> LlmResponse {
+        LlmResponse {
+            content: "ok".to_string(),
+            tool_calls: None,
+            usage: crate::types::LlmUsage::normalized(
+                crate::types::PromptCacheReporting::CachedReportedSeparately,
+                1_000_000,
+                400_000,
+                Some(2_000_000),
+                Some(500_000),
+            ),
+            model_used: "claude-x".to_string(),
+            provider_used: "anthropic".to_string(),
+            latency_ms: 7,
+            finish_reason: "stop".to_string(),
+            privacy_rerouted: None,
+            reasoning: None,
+            thinking_signature: None,
+            citations: None,
+        }
+    }
+
+    /// I dodici numeri della riga, ognuno nella sua colonna. Scelti distinti a due
+    /// a due proprio perche' uno scambio non possa passare inosservato.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn record_usage_scrive_ogni_numero_nella_sua_colonna(pool: PgPool) {
+        let (user, project, run) = seed_identita(&pool).await;
+        seed_listino(&pool).await;
+
+        record_usage_to_ledger(
+            &pool,
+            &req_con_identita(project, user, run),
+            &resp_anthropic_con_cache(),
+        )
+        .await;
+
+        let riga = sqlx::query(
+            "SELECT user_id, project_id, provider, model, status, currency, details, \
+                    prompt_tokens, completion_tokens, total_tokens, \
+                    cache_read_tokens, cache_creation_tokens, \
+                    input_cost::float8          AS input_cost, \
+                    output_cost::float8         AS output_cost, \
+                    cache_read_cost::float8     AS cache_read_cost, \
+                    cache_creation_cost::float8 AS cache_creation_cost, \
+                    total_cost::float8          AS total_cost \
+               FROM ai_usage_ledger WHERE run_id = $1",
+        )
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .expect("la riga di ledger deve esistere: l'insert e' best-effort e un errore \
+                 SQL qui sarebbe solo loggato, cioe' invisibile");
+
+        // Identita' e chiavi testuali: anche queste sono bind posizionali.
+        assert_eq!(riga.get::<Uuid, _>("user_id"), user);
+        assert_eq!(riga.get::<Uuid, _>("project_id"), project);
+        assert_eq!(riga.get::<String, _>("provider"), "anthropic");
+        assert_eq!(riga.get::<String, _>("model"), "claude-x");
+        assert_eq!(riga.get::<String, _>("status"), "finalized");
+        assert_eq!(riga.get::<String, _>("currency"), "USD");
+
+        // I quattro CONTEGGI. `prompt_tokens` e' il LORDO (il wire Anthropic era
+        // al netto: 1M + 2M + 0.5M) e i due conteggi di cache ne sono il
+        // dettaglio; il totale e' prompt lordo + completion.
+        assert_eq!(riga.get::<i32, _>("prompt_tokens"), 3_500_000);
+        assert_eq!(riga.get::<i32, _>("completion_tokens"), 400_000);
+        assert_eq!(riga.get::<i64, _>("cache_read_tokens"), 2_000_000);
+        assert_eq!(riga.get::<i64, _>("cache_creation_tokens"), 500_000);
+        assert_eq!(riga.get::<i32, _>("total_tokens"), 3_900_000);
+
+        // I cinque IMPORTI, alle quattro tariffe distinte del listino:
+        // 1M x 3.0, 0.4M x 15.0, 2M x 0.3, 0.5M x 3.75. Il messaggio riporta il
+        // valore LETTO: su uno scambio di bind e' quello che dice quale colonna ha
+        // preso il posto di quale.
+        for (colonna, atteso) in [
+            ("input_cost", 3.0),
+            ("output_cost", 6.0),
+            ("cache_read_cost", 0.6),
+            ("cache_creation_cost", 1.875),
+            ("total_cost", 11.475),
+        ] {
+            let letto: f64 = riga.get(colonna);
+            assert!(
+                (letto - atteso).abs() < 1e-9,
+                "{colonna}: letto {letto}, atteso {atteso}"
+            );
+        }
+
+        // E lo stato del listino, che e' il segnale con cui si distingue uno zero
+        // "gratis" da uno zero "non so quanto costa" (regola M).
+        let details: serde_json::Value = riga.get("details");
+        assert_eq!(details["price_state"], "priced");
+        assert_eq!(details["price_missing"], false);
+        assert_eq!(details["cache_price_state"], "priced");
     }
 }

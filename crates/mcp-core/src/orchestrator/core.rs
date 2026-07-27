@@ -1368,11 +1368,9 @@ impl Orchestrator {
                 anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
             }
         };
-        let actual_usage = UsageNumbers {
-            prompt_tokens: gw_resp.usage.input_tokens as i32,
-            completion_tokens: gw_resp.usage.output_tokens as i32,
-            total_tokens: (gw_resp.usage.input_tokens + gw_resp.usage.output_tokens) as i32,
-        };
+        // Dal punto unico: la costruzione a mano scartava i campi di cache che
+        // `GwUsage` porta gia' (era il terzo percorso che li perdeva).
+        let actual_usage = UsageNumbers::from_gateway(&gw_resp.usage);
         let (_, _, cost, cur) =
             billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
         let gw_completion = json!({"content": gw_resp.content, "metadata": {

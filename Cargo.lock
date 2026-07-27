@@ -2377,6 +2377,7 @@ dependencies = [
  "nexus-auth",
  "nexus-cache",
  "nexus-pricing",
+ "nexus-test-schema",
  "nexus-tool-kit",
  "nexus-types",
  "regex",
@@ -2533,6 +2534,7 @@ name = "nexus-test-schema"
 version = "0.1.0"
 dependencies = [
  "sqlx",
+ "uuid",
 ]
 
 [[package]]

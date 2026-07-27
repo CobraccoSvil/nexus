@@ -1649,9 +1649,12 @@ pub(crate) async fn native_outcome_to_run_result(
         total_tokens: outcome.total_tokens.max(0) as u32,
         total_cost: outcome.total_cost,
         // Lo stato del grafo nativo e' last-write per-turno: outcome.prompt_tokens
-        // E' il prompt dell'ultima iterazione (riempimento contesto corrente).
-        // Va catturato qui, PRIMA che reconcile_run_cost_from_ledger sovrascriva
-        // prompt_tokens col cumulativo di billing del ledger.
+        // E' il prompt LORDO dell'ultima iterazione (riempimento contesto
+        // corrente). Va catturato qui, PRIMA che reconcile_run_cost_from_ledger
+        // sovrascriva prompt_tokens col cumulativo di billing del ledger.
+        //
+        // La finestra la occupa tutto il prompt inviato, cache compresa: la cache
+        // risparmia denaro, non spazio.
         last_prompt_tokens: (outcome.prompt_tokens > 0).then_some(outcome.prompt_tokens as u32),
         // Classe d'errore STRUTTURATA dal grafo (extra.error_class, es.
         // context_overflow — ADR 0016 D2): segnale macchina, mai dal testo.
@@ -7217,6 +7220,60 @@ mod tests_native_mapping {
             r.messages_json.as_deref(),
             Some(r#"[{"role":"user","content":"ciao"}]"#)
         );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn native_mapping_last_prompt_tokens_e_il_prompt_lordo(pool: sqlx::PgPool) {
+        // Il rapporto ctx% (`computeContextFill` in UI) legge `last_prompt_tokens`:
+        // la finestra di contesto la occupa TUTTO il prompt inviato, anche la
+        // parte che il provider ha servito dalla propria cache (la cache
+        // risparmia denaro, non spazio). Un prompt "al netto" dichiarerebbe una
+        // finestra quasi vuota proprio sui run lunghi, gli unici in cui
+        // l'indicatore serve.
+        //
+        // Il test parte dallo STATO DEL GRAFO e attraversa `map_outcome`, il solo
+        // produttore del `NativeRunOutcome` in produzione (regola O). Fabbricare
+        // l'outcome a mano — com'era prima — fissava proprio l'assunto da
+        // verificare: una mutazione di `map_outcome` restava verde su 1356 test.
+        //
+        // MUTAZIONE che lo rende rosso: in `map_outcome`, scorporare la cache dal
+        // prompt (`state.prompt_tokens - cache_read - cache_creation`) -> 500
+        // invece di 41_000, cioe' una finestra dichiarata all'1% del vero.
+        use nexus_agent_graph::state::AgentState;
+        use nexus_graph::outcome::StepOutcome;
+
+        let run = setup_mapping_run(&pool).await;
+        // Lo stato come lo lascia l'executor a fine turno: `prompt_tokens` e' il
+        // LORDO, di cui i due conteggi di cache sono SOTTOINSIEMI (convenzione
+        // unica fissata in `nexus_gateway::LlmUsage::normalized`).
+        let state = AgentState {
+            result: Some("fatto".to_string()),
+            iterations: Some(2),
+            prompt_tokens: Some(41_000),
+            cache_read_tokens: Some(40_000),
+            cache_creation_tokens: Some(500),
+            completion_tokens: Some(1_200),
+            total_tokens: Some(42_200),
+            ..Default::default()
+        };
+
+        let outcome = crate::native_engine::map_outcome(StepOutcome::Completed(state));
+        assert_eq!(
+            outcome.prompt_tokens, 41_000,
+            "map_outcome propaga il prompt LORDO dello stato, senza scorporare la cache"
+        );
+
+        let r = native_outcome_to_run_result(&pool, run, outcome).await;
+        assert_eq!(
+            r.last_prompt_tokens,
+            Some(41_000),
+            "il riempimento della finestra si misura sul prompt LORDO"
+        );
+        assert_eq!(r.prompt_tokens, 41_000);
+        // I totali restano quelli dello stato: prompt lordo + completion. Nessun
+        // consumatore risomma la cache (sarebbe un doppio conteggio).
+        assert_eq!(r.completion_tokens, 1_200);
+        assert_eq!(r.total_tokens, 42_200);
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
