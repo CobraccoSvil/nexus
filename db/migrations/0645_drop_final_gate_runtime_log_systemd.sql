@@ -1,0 +1,33 @@
+-- 0645_drop_final_gate_runtime_log_systemd.sql
+-- Chiude una svista della 0463: la terza chiave della stessa famiglia era rimasta.
+--
+-- Le tre `agent.final_gate.runtime_log_command*` sono state introdotte insieme
+-- dalla 0427 per il criterio `service_logs_clean` del final_gate, e avevano UN solo
+-- consumatore: `_resolve_log_command` in brain/agents/final_gate.py. Con la
+-- rimozione del brain Python (zero-Python) sono rimaste tutte e tre senza lettore.
+--
+-- La 0463 ne ha cancellate due — `runtime_log_command` e
+-- `runtime_log_command_per_project` — e nomina la famiglia per intero nel proprio
+-- razionale (riga 42), ma nella DELETE la terza non compare. Non e' una scelta
+-- deliberata: e' una dimenticanza, e infatti nessun codice Rust legge
+-- `_systemd` piu' di quanto legga le altre due (verificato: zero riferimenti in
+-- crates/ per tutte e tre).
+--
+-- L'effetto era un gate `audit settings` ROSSO in modo permanente: 1 chiave morta
+-- contro una baseline di 0, cioe' `pnpm verify` che fallisce su ogni albero, per
+-- una configurazione che nessuno legge. Un gate che resta rosso per una causa che
+-- non riguarda chi lo esegue e' un gate che si impara a ignorare.
+--
+-- Perche' RIMUOVERE e non riallineare la baseline a 1: la baseline dichiara quanto
+-- debito e' tollerato, e questo non e' debito da tollerare — e' una riga di
+-- configurazione che sopravvive al proprio consumatore. Alzare la baseline
+-- nasconderebbe anche la PROSSIMA chiave morta (regola H: la toppa maschera il
+-- sintomo e disarma il rilevatore).
+--
+-- Se il criterio `service_logs_clean` verra' portato nel grafo Rust, la sua
+-- configurazione tornera' con la migrazione che la cabla, come dichiara la 0463:
+-- "le settings seguono il codice".
+--
+-- Idempotente: DELETE su una chiave gia' assente e' un no-op.
+
+DELETE FROM settings WHERE key = 'agent.final_gate.runtime_log_command_systemd';

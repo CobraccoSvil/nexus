@@ -147,6 +147,59 @@ fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
     })
 }
 
+/// Le chiavi che il CATALOGO DEI SERVIZI dichiara come `port_setting_key`.
+///
+/// Sono lette a runtime da `nexus_service_catalog::resolve_port`, che fa
+/// `get_setting_checked(db, key)` con la chiave presa dal catalogo (regola G):
+/// nel codice non compare alcun literal, quindi il censimento testuale le
+/// dichiarerebbe MORTE pur essendo vive — e cancellarle romperebbe la
+/// risoluzione della porta del servizio (`qdrant_port` e' il caso che ha fatto
+/// arrossire il gate).
+///
+/// Si LEGGONO dal catalogo invece di elencarle in `DYNAMIC_READ_PATTERNS`: una
+/// lista scritta a mano divergerebbe al primo servizio nuovo, che e' esattamente
+/// il difetto che i manifest derivati dal catalogo hanno eliminato. Cosi' ogni
+/// voce futura con `port_setting_key` e' coperta senza toccare questo file.
+///
+/// Degrada a vuoto se il DB non e' raggiungibile (modalita' `--no-db`): la
+/// classificazione resta quella testuale, come per tutto il resto.
+fn port_setting_keys_dal_catalogo() -> HashSet<String> {
+    let mut out = HashSet::new();
+    dotenvy::dotenv().ok();
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return out;
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        return out;
+    };
+    let raw: Option<String> = rt.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&database_url)
+            .await
+            .ok()?;
+        let v = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM settings WHERE key = 'system.services_catalog'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten();
+        pool.close().await;
+        v
+    });
+    let Some(raw) = raw else { return out };
+    if let Ok(Value::Array(voci)) = serde_json::from_str::<Value>(&raw) {
+        for v in voci {
+            if let Some(k) = v.get("port_setting_key").and_then(Value::as_str) {
+                out.insert(k.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn collect_db_live() -> Option<Vec<(String, String)>> {
     let raw = query_settings_live()?;
     // Python: rows[key] = cat su un dict -> ultima categoria vince ma la
@@ -723,6 +776,9 @@ fn classify(
         .map(|(p, _)| Regex::new(p))
         .collect::<Result<_, _>>()?;
     let keep: HashSet<&str> = KEEP_DESPITE_NO_READER.iter().copied().collect();
+    // Chiavi dichiarate dal catalogo servizi come `port_setting_key`: lette a
+    // runtime dalla chiave, mai come literal nel codice (vedi la funzione).
+    let porte_catalogo = port_setting_keys_dal_catalogo();
     let bulk: HashSet<&str> = CATEGORY_BULK_READERS.iter().map(|(c, _)| *c).collect();
 
     // Replica re.Pattern.match: ancorato all'inizio della stringa.
@@ -742,7 +798,7 @@ fn classify(
     let keyset_db: HashSet<&String> = db.iter().map(|(k, _)| k).collect();
 
     for (key, cat) in db.iter() {
-        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, key, cat);
+        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, &porte_catalogo, key, cat);
         let is_runtime = !migrations.contains_key(key) && runtime_match(key);
         classify_db_key(&mut result, migrations, ui_cats, key, cat, via, is_runtime);
     }
@@ -764,6 +820,7 @@ fn read_via(
     keep: &HashSet<&str>,
     dynamic: &[Regex],
     bulk: &HashSet<&str>,
+    porte_catalogo: &HashSet<String>,
     key: &str,
     category: &str,
 ) -> Option<&'static str> {
@@ -784,6 +841,9 @@ fn read_via(
     }
     if dynamic.iter().any(|r| match_at_start(r, key)) {
         return Some("dynamic");
+    }
+    if porte_catalogo.contains(key) {
+        return Some("catalogo-porte");
     }
     if bulk.contains(category) {
         return Some("category");
