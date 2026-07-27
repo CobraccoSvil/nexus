@@ -43,6 +43,31 @@ if (-not (Test-Path $Psql)) {
     $Psql = $cmd.Source
 }
 
+# `cargo` puo' non essere nel PATH: rustup lo installa in `~/.cargo/bin`, che
+# finisce nel PATH del PROFILO UTENTE. Un servizio Windows non eredita quel
+# profilo, quindi lanciando lo script da un runner self-hosted il comando non si
+# trova -- misurato il 2026-07-27: il job falliva con "The term 'cargo' is not
+# recognized" DOPO aver superato precondizioni e credenziale, il che rende il
+# messaggio piu' confuso di quanto la causa meriti.
+#
+# Lo si cerca dove rustup lo mette, e se non c'e' si dice CHE COSA manca e a chi:
+# un "comando non trovato" a meta' script non fa capire che il problema e'
+# l'ambiente di chi lo esegue, non il codice.
+$Cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+if (-not $Cargo) {
+    $candidati = @(
+        (Join-Path $env:CARGO_HOME 'bin\cargo.exe'),
+        (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe')
+    ) | Where-Object { $_ -and (Test-Path $_) }
+    $Cargo = $candidati | Select-Object -First 1
+}
+if (-not $Cargo) {
+    throw ("cargo non trovato ne' nel PATH ne' in ~/.cargo/bin. " +
+           "Se questo script gira da un servizio Windows, quel servizio non eredita " +
+           "il profilo dell'utente che ha installato rustup: eseguilo con l'account " +
+           "di quell'utente, oppure installa la toolchain a livello di macchina.")
+}
+
 function Invoke-Sql([string]$Url, [string]$Sql) {
     $u = [uri]$Url
     $userInfo = $u.UserInfo.Split(':')
@@ -134,13 +159,13 @@ try {
     $argomenti += @("--", "--nocapture")
 
     Write-Host "== test di integrazione (ambiente preteso completo) ==" -ForegroundColor Cyan
-    & cargo @argomenti
+    & $Cargo @argomenti
     if ($LASTEXITCODE -ne 0) { $esitoFinale = $LASTEXITCODE }
 
-    & cargo test -p nexus-auth --test settings_write --test token_firmato_e_accettato -- --nocapture
+    & $Cargo test -p nexus-auth --test settings_write --test token_firmato_e_accettato -- --nocapture
     if ($LASTEXITCODE -ne 0) { $esitoFinale = $LASTEXITCODE }
 
-    & cargo test -p nexus-project-pools --test pool_routing -- --nocapture
+    & $Cargo test -p nexus-project-pools --test pool_routing -- --nocapture
     if ($LASTEXITCODE -ne 0) { $esitoFinale = $LASTEXITCODE }
 }
 finally {
