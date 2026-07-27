@@ -1,0 +1,27 @@
+[package]
+name = "nexus-ledger"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror = "1.0"
+tracing.workspace = true
+uuid.workspace = true
+# Il LISTINO (quanto costa una chiamata) resta il suo punto unico: qui si scrive
+# cio' che quello calcola, non si ricalcola nulla.
+nexus-pricing = { path = "../nexus-pricing" }
+
+[dev-dependencies]
+# Schema META (`db/migrations`) per i `#[sqlx::test]`: la riga si rilegge dal
+# database VERO, sullo schema applicato dalla migrazione, mai da una fixture
+# ricopiata (regola O).
+nexus-test-schema = { path = "../nexus-test-schema" }
+tokio.workspace = true
+
+[lints]
+workspace = true
