@@ -55,11 +55,15 @@ if (-not (Test-Path $Psql)) {
 # l'ambiente di chi lo esegue, non il codice.
 $Cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
 if (-not $Cargo) {
-    $candidati = @(
-        (Join-Path $env:CARGO_HOME 'bin\cargo.exe'),
-        (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe')
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    $Cargo = $candidati | Select-Object -First 1
+    # Le variabili si controllano PRIMA di comporre i percorsi: in un servizio
+    # possono essere entrambe vuote, e `Join-Path` con un argomento null NON
+    # ritorna null — solleva "Cannot bind argument to parameter 'Path'". Cosi' lo
+    # script moriva sulla riga che doveva diagnosticare l'ambiente, prima ancora
+    # delle precondizioni (misurato il 2026-07-27 sul runner come LocalSystem).
+    $candidati = @()
+    if ($env:CARGO_HOME) { $candidati += (Join-Path $env:CARGO_HOME 'bin\cargo.exe') }
+    if ($env:USERPROFILE) { $candidati += (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe') }
+    $Cargo = $candidati | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 if (-not $Cargo) {
     throw ("cargo non trovato ne' nel PATH ne' in ~/.cargo/bin. " +
