@@ -376,32 +376,10 @@ pub fn run(args: &[String]) -> anyhow::Result<i32> {
 
     // Il confronto viene PRIMA della scrittura: un check eseguito dopo il write
     // e' verde per costruzione e non misura nulla.
-    let anomalie = confronta(&piano, &out);
-    if anomalie.is_empty() {
-        println!("disco allineato al piano: nessuna anomalia in {}", out.display());
-    } else {
-        println!("\nanomalie fra piano e {}:", out.display());
-        for a in anomalie.iter() {
-            println!("  {a}");
-        }
-    }
+    let anomalie = riporta_anomalie(&piano, &out);
 
     if o.write {
-        // Verifica che i binari esistano: cattura "hai dimenticato cargo build"
-        // prima di scrivere manifest che punterebbero a file inesistenti.
-        let mancanti: Vec<&ServizioRisolto> = piano
-            .iter()
-            .filter(|s| !Path::new(&s.executable).exists())
-            .collect();
-        if !mancanti.is_empty() {
-            eprintln!("\neseguibili non presenti sul disco:");
-            for s in mancanti.iter() {
-                eprintln!("  - {}: {}", s.winsw_id, s.executable);
-            }
-            bail!("esegui `cargo build` prima di generare i manifest");
-        }
-        scrivi(&piano, &out)?;
-        println!("scritti {} manifest in {}", piano.len(), out.display());
+        applica(&piano, &out)?;
         return Ok(0);
     }
 
