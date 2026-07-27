@@ -376,32 +376,10 @@ pub fn run(args: &[String]) -> anyhow::Result<i32> {
 
     // Il confronto viene PRIMA della scrittura: un check eseguito dopo il write
     // e' verde per costruzione e non misura nulla.
-    let anomalie = confronta(&piano, &out);
-    if anomalie.is_empty() {
-        println!("disco allineato al piano: nessuna anomalia in {}", out.display());
-    } else {
-        println!("\nanomalie fra piano e {}:", out.display());
-        for a in anomalie.iter() {
-            println!("  {a}");
-        }
-    }
+    let anomalie = riporta_anomalie(&piano, &out);
 
     if o.write {
-        // Verifica che i binari esistano: cattura "hai dimenticato cargo build"
-        // prima di scrivere manifest che punterebbero a file inesistenti.
-        let mancanti: Vec<&ServizioRisolto> = piano
-            .iter()
-            .filter(|s| !Path::new(&s.executable).exists())
-            .collect();
-        if !mancanti.is_empty() {
-            eprintln!("\neseguibili non presenti sul disco:");
-            for s in mancanti.iter() {
-                eprintln!("  - {}: {}", s.winsw_id, s.executable);
-            }
-            bail!("esegui `cargo build` prima di generare i manifest");
-        }
-        scrivi(&piano, &out)?;
-        println!("scritti {} manifest in {}", piano.len(), out.display());
+        applica(&piano, &out)?;
         return Ok(0);
     }
 
@@ -429,8 +407,7 @@ fn riporta_anomalie(piano: &[ServizioRisolto], out: &Path) -> Vec<Anomalia> {
     if anomalie.is_empty() {
         println!("disco allineato al piano: nessuna anomalia in {}", out.display());
     } else {
-        println!("
-anomalie fra piano e {}:", out.display());
+        println!("\nanomalie fra piano e {}:", out.display());
         for a in anomalie.iter() {
             println!("  {a}");
         }
@@ -439,15 +416,15 @@ anomalie fra piano e {}:", out.display());
 }
 
 /// Verifica i presupposti e scrive. I binari devono esistere: un manifest che
-/// punta a un file inesistente e' un servizio in crash-loop, non un errore.
+/// punta a un file inesistente e' un servizio in crash-loop, non un errore --
+/// cattura "hai dimenticato `cargo build`" PRIMA di scrivere qualunque file.
 fn applica(piano: &[ServizioRisolto], out: &Path) -> anyhow::Result<()> {
     let mancanti: Vec<&ServizioRisolto> = piano
         .iter()
         .filter(|s| !Path::new(&s.executable).exists())
         .collect();
     if !mancanti.is_empty() {
-        eprintln!("
-eseguibili non presenti sul disco:");
+        eprintln!("\neseguibili non presenti sul disco:");
         for s in mancanti.iter() {
             eprintln!("  - {}: {}", s.winsw_id, s.executable);
         }
@@ -551,6 +528,86 @@ mod tests {
             "argomenti di garnet senza la porta risolta: {:?}",
             garnet.arguments
         );
+    }
+
+    /// Il percorso `--check` MISURATO sui suoi tre esiti, sul piano reale e
+    /// attraverso `riporta_anomalie`: la stessa funzione che chiama `run`, non
+    /// una scorciatoia su `confronta` (regola O).
+    ///
+    /// E' il percorso che avrebbe dovuto accorgersi del difetto originale --
+    /// manifest di crate rimossi dal repo che restavano sul disco -- e che
+    /// nessuna asserzione toccava. MUTAZIONE: fatto ritornare `Vec::new()` da
+    /// `confronta`, il test rosseggia su tutti e tre gli esiti.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn il_confronto_distingue_mancante_allineato_e_orfano(pool: sqlx::PgPool) {
+        let repo = repo_root().expect("repo root");
+        let piano = piano_da_pool(&pool, &repo, "debug", None)
+            .await
+            .expect("il piano sul catalogo vero deve essere producibile");
+
+        // Non `tempfile`: una dir nota, ripulita all'ingresso, rende il test
+        // idempotente anche dopo un fallimento a meta' (regola F).
+        let out = std::env::temp_dir().join("xtask-service-manifests-confronto");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).expect("dir di lavoro");
+
+        // 1. Disco vuoto: ogni servizio del piano manca, e il confronto lo dice
+        //    per nome invece di limitarsi a fallire.
+        let anomalie = riporta_anomalie(&piano, &out);
+        assert_eq!(anomalie.len(), piano.len(), "attesa una MANCANTE per servizio");
+        assert!(
+            anomalie.iter().all(|a| matches!(a, Anomalia::Mancante { .. })),
+            "esiti inattesi su disco vuoto: {anomalie:?}"
+        );
+
+        // 2. Dopo la scrittura il disco e' allineato: e' la condizione che rende
+        //    il gate `--check` verde, e passa dal parse, non dalla stringa emessa.
+        scrivi(&piano, &out).expect("scrittura dei manifest");
+        assert_eq!(
+            riporta_anomalie(&piano, &out),
+            Vec::new(),
+            "manifest appena scritti gia' divergenti dal piano"
+        );
+
+        // 3. Il manifest di un crate rimosso dal repo: il caso reale
+        //    (billing-service) che il generatore precedente lasciava in
+        //    crash-loop senza che nessun gate potesse accorgersene.
+        let orfano = out.join("nexus-billing");
+        std::fs::create_dir_all(&orfano).expect("dir orfana");
+        std::fs::write(
+            orfano.join("nexus-billing.xml"),
+            "<service><id>nexus-billing</id></service>",
+        )
+        .expect("manifest orfano");
+        assert_eq!(
+            riporta_anomalie(&piano, &out),
+            vec![Anomalia::Orfano {
+                id: "nexus-billing".to_string(),
+                path: orfano.display().to_string(),
+            }],
+            "un manifest senza voce di catalogo deve essere ORFANO"
+        );
+        std::fs::remove_dir_all(&orfano).expect("rimozione orfana");
+
+        // 4. Manifest modificato a mano: DIVERGENTE, non "allineato".
+        let primo = &piano[0];
+        let path = out.join(&primo.winsw_id).join(format!("{}.xml", primo.winsw_id));
+        let manomesso =
+            std::fs::read_to_string(&path).expect("lettura").replace(
+                &primo.executable,
+                "C:/altrove/binario-che-nessuno-ha-pianificato.exe",
+            );
+        std::fs::write(&path, manomesso).expect("manomissione");
+        assert_eq!(
+            riporta_anomalie(&piano, &out),
+            vec![Anomalia::Divergente {
+                id: primo.winsw_id.clone(),
+                path: path.display().to_string(),
+            }],
+            "un eseguibile diverso dal piano deve essere DIVERGENTE"
+        );
+
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     /// La radice si risolve dal marker, non dalla directory di invocazione.
