@@ -121,13 +121,10 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
-
       # Stesso motore della produzione (`Migrator` in mcp-core/src/db.rs) e stesso
       # exit code: un set che non si applica ferma il job.
       - name: Apply DB migrations
-        run: sqlx migrate run --source db/migrations --database-url "$DATABASE_URL"
+        run: cargo run --locked -p xtask -- migrate --set meta --apply
 
       # Il role nexus_app lo crea LO SCRIPT DELLA PRODUZIONE, quello che il
       # compose monta come init del container: se un domani cambiano i privilegi,

@@ -114,7 +114,7 @@ mod tests {
         done: bool,
     }
 
-    #[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn put_poi_load_ritorna_stato_identico(pool: PgPool) {
         let cp = PgCheckpointer::new(pool);
         let run_id = Uuid::new_v4();
@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(next, NodeId::Executor, "il next_node deve round-trippare");
     }
 
-    #[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn load_ritorna_il_superstep_massimo(pool: PgPool) {
         let cp = PgCheckpointer::new(pool);
         let run_id = Uuid::new_v4();
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(next, NodeId::End);
     }
 
-    #[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn load_su_run_senza_checkpoint_ritorna_none(pool: PgPool) {
         let cp = PgCheckpointer::new(pool);
         let loaded: Option<(ProbeState, NodeId)> = cp
@@ -174,7 +174,7 @@ mod tests {
         assert!(loaded.is_none());
     }
 
-    #[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
     async fn put_idempotente_sullo_stesso_superstep(pool: PgPool) {
         let cp = PgCheckpointer::new(pool);
         let run_id = Uuid::new_v4();

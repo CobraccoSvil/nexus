@@ -20,7 +20,7 @@
 //! modulo avrebbe prodotto tre copie della stessa decisione, libere di divergere
 //! (esattamente cio' che la regola L vieta). Un crate di supporto, usato come
 //! `dev-dependencies` da chiunque ne abbia bisogno, e' l'unica forma che tiene UN
-//! solo punto di verita' — stesso ruolo che `nexus-test-schema` ha per lo schema
+//! solo punto di verita' — stesso ruolo che `nexus-migrations-embedded` ha per lo schema
 //! di test.
 //!
 //! # Cosa c'e' davvero in CI, misurato (2026-07-26)

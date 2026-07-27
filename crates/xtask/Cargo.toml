@@ -38,7 +38,7 @@ toml = { version = "0.8", features = ["parse"] }
 [dev-dependencies]
 # Il piano si verifica sul catalogo ricostruito dalle migrazioni vere, non su
 # uno fabbricato nel test (regola O).
-nexus-test-schema = { path = "../nexus-test-schema" }
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
 
 [lints]
 workspace = true

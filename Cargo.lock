@@ -2038,6 +2038,7 @@ dependencies = [
  "nexus-http",
  "nexus-mcp-client",
  "nexus-migrations",
+ "nexus-migrations-embedded",
  "nexus-model-eligibility",
  "nexus-orchestrator",
  "nexus-pricing",
@@ -2045,7 +2046,6 @@ dependencies = [
  "nexus-project-pools",
  "nexus-service-catalog",
  "nexus-test-preconditions",
- "nexus-test-schema",
  "nexus-tool-kit",
  "nexus-types",
  "nexus-wiki",
@@ -2253,7 +2253,7 @@ dependencies = [
  "futures",
  "nexus-graph",
  "nexus-graph-derive",
- "nexus-test-schema",
+ "nexus-migrations-embedded",
  "nexus-types",
  "rand 0.8.5",
  "regex",
@@ -2380,8 +2380,8 @@ dependencies = [
  "jsonwebtoken",
  "nexus-auth",
  "nexus-cache",
+ "nexus-migrations-embedded",
  "nexus-pricing",
- "nexus-test-schema",
  "nexus-tool-kit",
  "nexus-types",
  "regex",
@@ -2453,6 +2453,16 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "nexus-migrations-embedded"
+version = "0.1.0"
+dependencies = [
+ "nexus-migrations",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2532,7 +2542,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nexus-auth",
- "nexus-test-schema",
+ "nexus-migrations-embedded",
  "serde",
  "serde_json",
  "sqlx",
@@ -2555,14 +2565,6 @@ name = "nexus-test-preconditions"
 version = "0.1.0"
 dependencies = [
  "sqlx",
-]
-
-[[package]]
-name = "nexus-test-schema"
-version = "0.1.0"
-dependencies = [
- "sqlx",
- "uuid",
 ]
 
 [[package]]
@@ -5809,9 +5811,9 @@ dependencies = [
  "mcp-quality",
  "nexus-auth",
  "nexus-migrations",
+ "nexus-migrations-embedded",
  "nexus-model-eligibility",
  "nexus-service-catalog",
- "nexus-test-schema",
  "regex",
  "serde",
  "serde_json",

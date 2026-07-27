@@ -6,7 +6,7 @@
 //! che lo dichiara
 //!
 //! ```ignore
-//! #[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+//! #[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
 //! ```
 //!
 //! gira sullo schema REALE - colonne, CHECK, indici unici e FK compresi - non su

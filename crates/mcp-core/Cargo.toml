@@ -86,8 +86,8 @@ tempfile = "3"
 [dev-dependencies]
 tempfile = "3"
 # Schema di test del DB-progetto: il migrator del set db/migrations/project
-# (punto unico, regola O). Vedi crates/nexus-test-schema.
-nexus-test-schema = { path = "../nexus-test-schema" }
+# (punto unico, regola O). Vedi crates/nexus-migrations-embedded.
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
 # Precondizioni degli integration test e skip VISIBILE: punto unico di
 # `salta(Motivo)` + REQUIRE_INTEGRATION_TESTS (regole L e O). Vive in un crate
 # perche' mcp-core e' bin-only e nexus-auth/nexus-project-pools sono sue

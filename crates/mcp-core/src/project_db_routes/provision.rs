@@ -584,11 +584,17 @@ async fn project_meta_pool_core(
     .map_err(|e: sqlx::Error| {
         format!("apertura pool DB metadati (progetto {project_id}) fallita: {e}")
     })?;
-    // Schema per-progetto idempotente (db/migrations/project, _sqlx_migrations nel DB-progetto).
-    sqlx::migrate::Migrator::new(std::path::Path::new("db/migrations/project"))
-        .await
-        .map_err(|e| format!("caricamento migrazioni per-progetto fallito: {e}"))?
-        .run(arc.as_ref())
+    // Schema per-progetto idempotente (_sqlx_migrations vive nel DB-progetto).
+    //
+    // Delega al punto unico (regola L): il percorso del set non e' piu' scritto
+    // qui, e l'origine e' quella installata all'avvio del processo invece di un
+    // path relativo alla directory di lavoro. Prima questo ramo e il gemello di
+    // `db.rs` davano verdetti OPPOSTI sulla stessa condizione — qui un errore,
+    // la' un warning e si prosegue — non per una scelta ma perche' erano due
+    // codici diversi scritti da due persone diverse.
+    let origine = nexus_migrations::origine_di_processo()
+        .map_err(|e| format!("origine dei set di migrazione non disponibile: {e}"))?;
+    nexus_migrations::applica(arc.as_ref(), nexus_migrations::Set::Project, origine)
         .await
         .map_err(|e| {
             format!("migrazioni schema per-progetto (progetto {project_id}) fallite: {e}")

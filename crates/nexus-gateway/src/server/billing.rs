@@ -948,11 +948,11 @@ mod tests {
     /// `orchestrator_runs` — quindi e' un UUID libero.
     ///
     /// Il seeding delle due identita' viene dal punto unico
-    /// [`nexus_test_schema::seed_identita_meta`]: la gemella di questo test in
+    /// [`nexus_migrations_embedded::seed_identita_meta`]: la gemella di questo test in
     /// `mcp_core::billing` semina le stesse tabelle, e due copie a mano
     /// divergerebbero alla prima colonna NOT NULL aggiunta.
     async fn seed_identita(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
-        let (user, project) = nexus_test_schema::seed_identita_meta(pool).await;
+        let (user, project) = nexus_migrations_embedded::seed_identita_meta(pool).await;
         (user, project, Uuid::new_v4())
     }
 
@@ -1009,7 +1009,7 @@ mod tests {
 
     /// I dodici numeri della riga, ognuno nella sua colonna. Scelti distinti a due
     /// a due proprio perche' uno scambio non possa passare inosservato.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn record_usage_scrive_ogni_numero_nella_sua_colonna(pool: PgPool) {
         let (user, project, run) = seed_identita(&pool).await;
         seed_listino(&pool).await;

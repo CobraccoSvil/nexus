@@ -1620,7 +1620,7 @@ mod tests {
     /// promoter usa in produzione (regola O), e gira sulle migrazioni reali:
     /// verifica prima che il seed non diverga, poi REINTRODUCE la divergenza
     /// esatta dell'incidente per provare che il codice la sana in lettura.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn i_requisiti_includono_sempre_la_capability_base_dell_intent(pool: sqlx::PgPool) {
         let divergenti: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM nexus_intent_routing_requirements r

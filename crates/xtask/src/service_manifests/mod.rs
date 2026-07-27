@@ -462,7 +462,7 @@ mod tests {
     /// voce di catalogo non ha binario, se il TOML nomina un servizio che non
     /// esiste, o se l'ordine di avvio dimentica un id, il piano fallisce e
     /// questo test rosseggia — prima che qualcuno scriva un manifest.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_piano_reale_e_producibile(pool: sqlx::PgPool) {
         let repo = repo_root().expect("repo root");
         let piano = piano_da_pool(&pool, &repo, "debug", None)
@@ -529,7 +529,7 @@ mod tests {
     /// manifest di crate rimossi dal repo che restavano sul disco -- e che
     /// nessuna asserzione toccava. MUTAZIONE: fatto ritornare `Vec::new()` da
     /// `confronta`, il test rosseggia su tutti e tre gli esiti.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_confronto_distingue_mancante_allineato_e_orfano(pool: sqlx::PgPool) {
         let repo = repo_root().expect("repo root");
         let piano = piano_da_pool(&pool, &repo, "debug", None)

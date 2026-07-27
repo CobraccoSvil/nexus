@@ -20,7 +20,7 @@ nexus-auth = { path = "../nexus-auth" }
 [dev-dependencies]
 # Schema META ricostruito dalle migrazioni vere: i test leggono il catalogo che
 # la produzione legge, non una copia scritta nel test (regola O).
-nexus-test-schema = { path = "../nexus-test-schema" }
+nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
 tokio = { workspace = true }
 
 [lints]

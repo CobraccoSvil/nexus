@@ -9,7 +9,7 @@
 //! raggiungere il suo oggetto per la strada della produzione):
 //!
 //! 1. lo SCHEMA del dominio run/chat viene dalla migrazione reale
-//!    ([`PROJECT_MIGRATOR`], ri-esportato da `nexus-test-schema`), coi seeder
+//!    ([`PROJECT_MIGRATOR`], ri-esportato da `nexus-migrations-embedded`), coi seeder
 //!    `seed_*` che riempiono i NOT NULL e rispettano le FK vere;
 //! 2. le tabelle META non coperte da quel set (a partire da `ai_price_catalog`)
 //!    restano fixture esplicite, ma definite UNA volta sola qui.
@@ -34,13 +34,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Migrator del set `db/migrations/project`, ri-esportato dal punto unico
-/// [`nexus_test_schema`] perche' i `#[sqlx::test]` di questo crate possano
+/// [`nexus_migrations_embedded`] perche' i `#[sqlx::test]` di questo crate possano
 /// scriverlo come `crate::test_support::PROJECT_MIGRATOR`.
 ///
 /// Il perche' (regola O: lo strumento deve raggiungere il suo oggetto per la
 /// stessa strada della produzione) sta nella doc del crate condiviso, insieme al
 /// difetto misurato che l'ha resa necessaria.
-pub(crate) use nexus_test_schema::PROJECT_MIGRATOR;
+pub(crate) use nexus_migrations_embedded::PROJECT_MIGRATOR;
 
 /// Semina una sessione chat (`chat_sessions`, mig project 0001) e ne ritorna l'id.
 ///

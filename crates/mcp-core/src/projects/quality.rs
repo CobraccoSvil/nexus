@@ -1988,7 +1988,7 @@ mod schema_meta {
     /// l'errore invece di ingoiarlo: su uno schema privo di
     /// `nexus_quality_scans` e' il 500 che l'utente vede quando avvia una
     /// scansione. Il test parte da li'.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn la_scansione_qualita_ha_la_sua_tabella(db: PgPool) {
         let project_id = semina_progetto(&db).await;
 
@@ -2011,7 +2011,7 @@ mod schema_meta {
     /// scrive nulla. Per questo il test asserisce sulle RIGHE e sui VALORI
     /// riletti, mai sull'assenza di errore — e li rilegge con la stessa query
     /// che alimenta il pannello Ottimizzazione.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn i_finding_conservano_i_campi_della_passata_vettoriale(db: PgPool) {
         let project_id = semina_progetto(&db).await;
 

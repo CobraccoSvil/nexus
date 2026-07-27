@@ -77,17 +77,30 @@ jobs:
       # Il Postgres del service e' vuoto: i test che girano su schema reale
       # (`#[sqlx::test(migrator = ...)]`) hanno bisogno del set applicato.
       #
-      # Si usa `sqlx migrate run`, cioe' LO STESSO motore della produzione
-      # (`Migrator` in mcp-core/src/db.rs), e l'exit code conta. Il ciclo
-      # precedente era `psql -f "$f" || true`: applicava i file uno per uno e
-      # buttava via ogni errore, quindi un set che non si applica passava
-      # comunque il gate (regola O — lo strumento non raggiungeva il suo
-      # oggetto come la produzione).
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
-
+      # Si usa il COMANDO DEL REPO, non sqlx-cli. Prima qui c'era
+      # `cargo install sqlx-cli --locked` + `sqlx migrate run`: "lo stesso
+      # motore della produzione" era vero per CONVENZIONE — quel --locked
+      # pinnava il lockfile di sqlx-cli, non lo sqlx del workspace, quindi i due
+      # potevano divergere a un aggiornamento senza che nessuno se ne
+      # accorgesse. Ora e' vero per COSTRUZIONE: `xtask migrate` delega a
+      # `nexus-migrations`, lo stesso codice che mcp-core esegue all'avvio.
+      # In piu' sparisce un `cargo install` da ogni run.
       - name: Apply DB migrations
-        run: sqlx migrate run --source db/migrations --database-url "$DATABASE_URL"
+        run: cargo run --locked -p xtask -- migrate --set meta --apply
+
+      # LA SEQUENZA DI BOOTSTRAP, ESEGUITA invece che descritta.
+      #
+      # Su un database vergine esisteva un ciclo: il catalogo dei servizi arriva
+      # dalle migrazioni; le migrazioni le applicava solo mcp-core all'avvio;
+      # per avviarlo come servizio serve il suo manifest; il manifest si genera
+      # leggendo il catalogo. Lo step precedente ha appena applicato il set
+      # SENZA avviare alcun servizio, e questo dimostra che il catalogo e' li' e
+      # il piano dei manifest e' producibile.
+      #
+      # E' l'unica prova che il ciclo resti rotto nel tempo: una nota in un
+      # documento non fallisce quando qualcuno reintroduce la dipendenza.
+      - name: Bootstrap eseguibile (il ciclo catalogo/manifest e' rotto)
+        run: cargo run --locked -p xtask -- service-manifests --dry-run
 
       # Il crate mcp-proto usa prost-build, che richiede il compilatore protobuf
       # `protoc` a build time. Senza, `cargo check/clippy/test` (dentro pnpm

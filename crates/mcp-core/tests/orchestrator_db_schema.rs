@@ -43,7 +43,7 @@ async fn tabelle_plan_act_verify_esistono() {
 /// dubbio storico ("un DB-progetto effimero richiederebbe credenziali del
 /// cluster app") non regge: il migrator gira su qualunque DB vuoto, ed e' lo
 /// stesso che la produzione applica a `<slug>_nexus`.
-#[sqlx::test(migrator = "nexus_test_schema::PROJECT_MIGRATOR")]
+#[sqlx::test(migrator = "nexus_migrations_embedded::PROJECT_MIGRATOR")]
 async fn tabelle_dominio_run_esistono_dopo_le_migrazioni(pool: PgPool) {
     let attese_project = [
         "nexus_agent_plans",

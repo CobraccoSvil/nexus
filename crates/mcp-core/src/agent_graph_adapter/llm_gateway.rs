@@ -1355,7 +1355,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     ///
     /// A tariffa piena sul lordo (3,5M x 3.0 = 10.50, piu' 6.00 di output) il
     /// totale sarebbe 16.50: e' la sovrastima che stringeva il freno di spesa.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn turn_cost_usd_paga_ogni_quantita_alla_sua_tariffa(pool: PgPool) {
         seed_prezzo(&pool, riga_viva("claude-x")).await;
 
@@ -1373,7 +1373,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// Le tre forme in cui il listino NON si applica alla chiamata. In tutte il
     /// costo resta `None`: un numero inventato qui e' peggio dell'assenza, perche'
     /// il cap in dollari lo tratterebbe come speso.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn turn_cost_usd_non_applica_un_listino_che_non_e_suo(pool: PgPool) {
         // La currency di piattaforma e' USD (mig 0294): una riga in EUR non e' il
         // prezzo di questa chiamata.
@@ -1421,7 +1421,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// turno dichiarato gratuito: il freno di spesa lo sommerebbe come nulla e non
     /// scatterebbe mai. La distinzione fra "costa zero" e "non so quanto costa"
     /// vive qui, ed e' l'unica cosa che separa i due esiti.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn turn_cost_usd_scarta_il_prezzo_dichiarato_ignoto(pool: PgPool) {
         seed_prezzo(
             &pool,
@@ -1444,7 +1444,7 @@ rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
     /// Listino non leggibile (DB in errore): `None` e nessun panico. E' il ramo
     /// che tiene il turno in piedi quando la contabilita' non e' disponibile —
     /// far fallire la chiamata LLM per un problema di prezzo sarebbe un outage.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn turn_cost_usd_su_listino_illeggibile_resta_none(pool: PgPool) {
         seed_prezzo(&pool, riga_viva("claude-x")).await;
         // Il prezzo c'e' e sarebbe calcolabile: e' la lettura a rompersi.

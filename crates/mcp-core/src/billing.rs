@@ -1276,11 +1276,11 @@ mod tests {
     /// `orchestrator_runs`) e resta quindi un UUID libero.
     ///
     /// Il seeding delle due identita' viene dal punto unico
-    /// [`nexus_test_schema::seed_identita_meta`], lo stesso che usa la gemella di
+    /// [`nexus_migrations_embedded::seed_identita_meta`], lo stesso che usa la gemella di
     /// questo test nel gateway: lo schema arriva dalla migrazione vera, e la sua
     /// evoluzione si insegue in un posto solo.
     async fn seed_identita(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
-        let (user, project) = nexus_test_schema::seed_identita_meta(pool).await;
+        let (user, project) = nexus_migrations_embedded::seed_identita_meta(pool).await;
         (user, project, Uuid::new_v4())
     }
 
@@ -1311,7 +1311,7 @@ mod tests {
     ///
     /// I dodici valori sono scelti DISTINTI a due a due proprio perche' uno
     /// scambio non possa passare inosservato.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn finalize_usage_scrive_ogni_numero_nella_sua_colonna(pool: PgPool) {
         let (user, project, run) = seed_identita(&pool).await;
         seed_listino(&pool).await;
@@ -1409,7 +1409,7 @@ mod tests {
     /// La 0405 calcolava `input_tokens_gross = prompt + cache_read` e l'hit-rate
     /// sullo stesso denominatore: col prompt lordo quelle formule contano i
     /// cache_read due volte e sottostimano il riuso.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn la_vista_analitica_non_doppia_i_token_di_cache(pool: PgPool) {
         let (user, project, run) = seed_identita(&pool).await;
         seed_listino(&pool).await;
@@ -1464,7 +1464,7 @@ mod tests {
     /// chiamata che la cache non l'ha usata — e solo `details` distingue i due
     /// casi. Senza questa scrittura la meta' di righe prodotta da mcp-core
     /// resterebbe ambigua (regola M).
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn finalize_usage_dichiara_il_ripiego_a_tariffa_piena(pool: PgPool) {
         let (user, project, run) = seed_identita(&pool).await;
         sqlx::query(
@@ -1527,7 +1527,7 @@ mod tests {
     /// concluderebbe che il calcolo del costo e' rotto — mentre a mentire
     /// sarebbe la colonna. Non e' un caso di confine: la tariffa di cache manca
     /// oggi sulla maggioranza dei modelli a catalog.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn la_vista_non_scorpora_la_cache_fatturata_a_tariffa_piena(pool: PgPool) {
         let (user, project, run) = seed_identita(&pool).await;
         sqlx::query(

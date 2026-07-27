@@ -4847,7 +4847,7 @@ mod tests {
     /// MUTAZIONE: rimettendo `CandidateDiversity::PerProvider` la selezione
     /// torna a un solo candidato e l'asserzione fallisce nominando il giudice
     /// unico.
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn un_solo_provider_sano_da_comunque_giudici_distinti(pool: sqlx::PgPool) {
         // Il tier del purpose reale, letto dal seed invece che ricopiato.
         let tier: String = sqlx::query_scalar(
@@ -5001,7 +5001,7 @@ mod tests {
     /// Se il purpose sparisce dal seed il pin non viene applicato e il difetto
     /// torna in silenzio: questo test lo impedisce, girando sulle migrazioni
     /// reali invece che su uno schema ricopiato (regola O).
-    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn il_purpose_dei_revisori_esiste_nel_seed(pool: sqlx::PgPool) {
         let presente: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM nexus_purpose_model WHERE purpose = $1)",
