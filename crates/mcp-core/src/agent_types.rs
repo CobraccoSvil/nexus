@@ -215,6 +215,29 @@ impl AgentRunStatus {
         }
     }
 
+    /// Gli stati NON terminali, nella forma in cui vivono in `agent_runs.status`.
+    ///
+    /// Gemello di [`Self::is_terminal`] per i call site SQL (regola L): una query
+    /// che deve selezionare "run ormai conclusi" filtra su `status <> ALL(...)` di
+    /// QUESTA lista, invece di enumerare i terminali. La lista dei terminali e'
+    /// APERTA — cresce a ogni esito canonico nuovo (`failed_diagnosed`,
+    /// `completed_verified`, ...) — e ricopiarla in SQL significa dimenticarne uno
+    /// al prossimo che si aggiunge; quella dei non-terminali e' chiusa e piccola.
+    /// `interrupted` (scritto dal cleanup di startup) NON e' qui: e' terminale,
+    /// coerentemente con `from_db_str` che lo mappa su `Cancelled`.
+    ///
+    /// Le stringhe NON sono ricopiate: derivano da [`Self::as_str`], che resta
+    /// l'unico posto dove vive la forma persistita di uno stato. La coerenza con
+    /// `is_terminal` non e' affidata alla buona volonta': la verifica
+    /// `stati_non_terminali_db_coerente_con_is_terminal`.
+    pub fn stati_non_terminali_db() -> [&'static str; 3] {
+        [
+            Self::Running.as_str(),
+            Self::AwaitingConfirmation.as_str(),
+            Self::AwaitingSubagents.as_str(),
+        ]
+    }
+
     /// `true` se il run e' terminato con successo (con o senza verifica E2E).
     /// Punto unico della semantica "run riuscito": i call site usano questo invece
     /// di `matches!(status, Completed)`, cosi' l'esito verificato non viene perso.
@@ -1011,5 +1034,43 @@ mod tests {
         // BlockedNeedsInput e' TERMINALE (ADR 0034): run concluso con
         // dichiarazione "serve input"; il prossimo input crea un nuovo run.
         assert!(AgentRunStatus::BlockedNeedsInput.is_terminal());
+    }
+
+    /// `stati_non_terminali_db` e `is_terminal` non devono poter divergere: la
+    /// costante serve ai call site SQL, che non possono chiamare il predicato.
+    /// Enumerando OGNI variante si copre anche il caso pericoloso — qualcuno
+    /// aggiunge uno stato non-terminale e non aggiorna la lista, e una query di
+    /// backstop inizia a trattare come "concluso" un run che sta ancora girando.
+    ///
+    /// Test di mutazione: togliendo `awaiting_subagents` dalla costante (o
+    /// rendendolo terminale in `is_terminal`) questo assert rosseggia nominando
+    /// lo stato divergente.
+    #[test]
+    fn stati_non_terminali_db_coerente_con_is_terminal() {
+        for st in [
+            AgentRunStatus::Running,
+            AgentRunStatus::Completed,
+            AgentRunStatus::AwaitingConfirmation,
+            AgentRunStatus::AwaitingSubagents,
+            AgentRunStatus::Failed,
+            AgentRunStatus::TimedOut,
+            AgentRunStatus::Cancelled,
+            AgentRunStatus::LoopAborted,
+            AgentRunStatus::ProviderUnavailable,
+            AgentRunStatus::CompletedVerified,
+            AgentRunStatus::CompletedUnverified,
+            AgentRunStatus::FailedDiagnosed,
+            AgentRunStatus::BlockedNeedsInput,
+        ] {
+            let nella_lista = AgentRunStatus::stati_non_terminali_db().contains(&st.as_str());
+            assert_eq!(
+                !nella_lista,
+                st.is_terminal(),
+                "'{}': is_terminal={} ma nella lista dei non-terminali={}",
+                st.as_str(),
+                st.is_terminal(),
+                nella_lista
+            );
+        }
     }
 }
