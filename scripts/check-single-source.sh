@@ -670,17 +670,39 @@ fi
 #
 # Le quattro storiche sono immutabili e restano dove sono: il check le esclude
 # per numero e blocca solo le NUOVE.
-stub_hits=""
-for f in db/migrations/*.sql db/migrations/project/*.sql; do
-  [[ -f "$f" ]] || continue
-  case "$(basename "$f")" in 010[4-7]_*) continue ;; esac
-  # corpo = tutto tranne righe vuote e commenti `--`
-  body="$(sed 's/--.*//' "$f" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-  [[ "$body" == "select1;" ]] && stub_hits+="$f"$'\n'
-done
+#
+# La lettura e' un solo processo `awk`, non un loop di fork per file. La versione
+# precedente ne apriva quattro per migrazione (basename, sed, tr, tr): su ~640
+# file e su Windows, dove un fork costa 100-200ms, il check da solo impiegava
+# 4m48s a ogni commit che tocca un .rs — la stessa forma gia' vista in
+# port_enforcer (9.9s -> 21ms sostituendo i fork con una syscall). La regola del
+# corpo utile e' invariata (via da ogni riga il commento `--`, poi ogni spazio,
+# confronto in minuscolo con `select1;`): cambia solo chi la applica.
+#
+# I nomi arrivano ad awk sullo standard input e NON sulla riga di comando: 640
+# path sforano il limite di lunghezza della command line di Windows (32767
+# caratteri), e un `awk ... db/migrations/*.sql` fallirebbe al crescere del set.
+# Un path che non esiste (glob senza match) fa fallire subito `getline`, lascia
+# il corpo vuoto e non produce hit, come faceva prima il test `-f`.
+stub_hits="$(
+  printf '%s\n' db/migrations/*.sql db/migrations/project/*.sql \
+  | awk '
+      /\/010[4-7]_/ { next }   # le quattro storiche: immutabili, escluse per numero
+      {
+        corpo = ""
+        while ((getline riga < $0) > 0) {
+          sub(/--.*/, "", riga)
+          gsub(/[[:space:]]/, "", riga)
+          corpo = corpo riga
+        }
+        close($0)
+        if (tolower(corpo) == "select1;") print
+      }
+    '
+)"
 if [[ -n "$stub_hits" ]]; then
   echo "!! migrazione-stub: migrazione con corpo 'SELECT 1;' (nessuno schema dentro):" >&2
-  printf '%s' "$stub_hits" | sed 's/^/     /' >&2
+  printf '%s\n' "$stub_hits" | sed 's/^/     /' >&2
   echo "   Una migrazione deve contenere il DDL che dichiara, anche se l'oggetto" >&2
   echo "   esiste gia' sul TUO DB: usa IF NOT EXISTS / ADD COLUMN IF NOT EXISTS," >&2
   echo "   cosi' un DB ricostruito da zero lo riceve e uno popolato non cambia." >&2
