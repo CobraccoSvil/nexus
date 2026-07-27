@@ -13,11 +13,24 @@
 //! `pending_tool_uses` azzerato, e l'edge condizionale rimanda all'Executor.
 //! Il run non arriva mai a `End` con una bocciatura correggibile pendente.
 //!
-//! Anti-loop: contatore DEDICATO `review_cycle` (mai `final_gate_cycle`: il
+//! Il rimando e la chiusura sono DICHIARATI (`gate_routing`, regola M), mai
+//! dedotti dallo `stop_reason`: quello lo scrive anche l'executor, e finche'
+//! l'edge lo leggeva, i rami di chiusura di questo nodo (che non lo riscrivono)
+//! venivano instradati come rimandi — il run rientrava nell'executor dopo una
+//! review APPROVATA. Vedi `GateRouting` per la misura sul run 609000c1.
+//!
+//! Anti-loop: contatore DEDICATO `review_gate_cycle` (mai `final_gate_cycle`: il
 //! residuo di un contatore altrui ha gia' prodotto un falso `FailedDiagnosed`,
 //! vedi doc di `FinalGateVerdict`), cap `orchestrator.review_max_correction_cycles`
 //! (DB-driven, regola G, risolto a monte). Al cap la bocciatura diventa
 //! DEFINITIVA (`RejectedFinal`) e il run chiude bocciato — mai un loop.
+//!
+//! Il contatore conta i RIMANDI, non le convocazioni del panel: e' l'unica
+//! grandezza commensurabile col cap, che limita i rimandi. Contando le
+//! convocazioni, una bocciatura preceduta da N approvazioni trovava il contatore
+//! gia' oltre il cap e chiudeva DEFINITIVA senza un solo tentativo di
+//! correzione, e l'etichetta "(n/max)" mostrava un numeratore che il cap non
+//! governava.
 
 use async_trait::async_trait;
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
@@ -27,7 +40,9 @@ use crate::decisions::PanelOutcome;
 use crate::runtime::ports::{
     ReviewPanelReport, ReviewPanelRequest, ReviewSkipReason,
 };
-use crate::state::{AgentState, Message, MessageContent, ReviewGateVerdict, StopReason};
+use crate::state::{
+    AgentState, GateRouting, Message, MessageContent, ReviewGateVerdict, StopReason,
+};
 use crate::state::delta::StateDelta;
 use crate::AgentNodeCtx;
 
@@ -87,8 +102,16 @@ impl ReviewGateNode {
         .await;
     }
 
+    /// Uscita senza giudizio (gate spento, run gia' bocciato in via definitiva):
+    /// il run PROSEGUE verso la chiusura. Dichiara `Chiude` (regola M): senza,
+    /// l'edge ereditava lo `stop_reason` dell'executor e rispediva indietro un
+    /// run che il gate non aveva nemmeno esaminato.
     fn pass_through() -> OpaqueDelta {
-        StateDelta::default().into_opaque()
+        StateDelta {
+            gate_routing: Some(Some(GateRouting::Chiude)),
+            ..Default::default()
+        }
+        .into_opaque()
     }
 
     /// Delta di solo verdetto (nessun rimando): il run prosegue verso la
@@ -97,6 +120,7 @@ impl ReviewGateNode {
         StateDelta {
             review_gate_cycle: cycle.map(Some),
             review_gate_verdict: Some(Some(verdict)),
+            gate_routing: Some(Some(GateRouting::Chiude)),
             ..Default::default()
         }
         .into_opaque()
@@ -182,20 +206,31 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReviewGateNode {
             return Ok(Self::pass_through());
         }
 
-        let cycle = state.review_gate_cycle.unwrap_or(0) + 1;
+        // RIMANDI in correzione gia' effettuati. `review_gate_cycle` conta i
+        // rimandi (cosi' lo documenta il campo, e solo cosi' e' commensurabile
+        // con `review_max_correction_cycles` = "numero massimo di RIMANDI"), NON
+        // le convocazioni del panel: contando le convocazioni, una bocciatura
+        // preceduta da N approvazioni trovava il contatore gia' oltre il cap e
+        // diventava DEFINITIVA senza che il run avesse mai avuto un tentativo di
+        // correzione — accaduto al ciclo 8 del run 609000c1, dove i cicli 4-7
+        // erano tutti `pass`. Ed era la stessa discrepanza a far leggere in UI
+        // "(2/3)" e "(3/3)" con altri cinque cicli a seguire.
+        let rimandi_fatti = state.review_gate_cycle.unwrap_or(0);
         let max_cycles = self.cfg.max_cycles.max(0);
 
-        let panel = match self.convoca(state, cycle).await {
+        let panel = match self.convoca(state, rimandi_fatti + 1).await {
             Ok(panel) => panel,
             Err(delta) => return Ok(delta),
         };
 
         if !panel.verdict.rejects() {
-            return Ok(self.close_not_rejected(state, ctx, cycle, &panel).await);
+            return Ok(self
+                .close_not_rejected(state, ctx, rimandi_fatti, &panel)
+                .await);
         }
-        let definitiva = cycle > max_cycles;
+        let definitiva = rimandi_fatti >= max_cycles;
         Ok(self
-            .boccia(state, ctx, cycle, max_cycles, &panel, definitiva)
+            .boccia(state, ctx, rimandi_fatti, max_cycles, &panel, definitiva)
             .await)
     }
 }
@@ -251,9 +286,10 @@ impl ReviewGateNode {
         &self,
         state: &AgentState,
         ctx: &AgentNodeCtx,
-        cycle: i64,
+        rimandi_fatti: i64,
         panel: &PanelOutcome,
     ) -> OpaqueDelta {
+        let cycle = rimandi_fatti;
         let verdict = if panel.verdict.is_approved() {
             ReviewGateVerdict::Approved
         } else {
@@ -281,8 +317,13 @@ impl ReviewGateNode {
         )
         .await;
         StateDelta {
-            review_gate_cycle: Some(Some(cycle)),
+            // Il contatore NON si tocca: un'approvazione non e' un rimando.
             review_gate_verdict: Some(Some(verdict)),
+            // Dichiarazione esplicita di CHIUSURA (regola M). Senza, l'edge
+            // ereditava lo `stop_reason=ToolUse` dell'executor e rimandava in
+            // correzione un run appena APPROVATO: il ping-pong
+            // `review_gate -> executor` che ha convocato i revisori 8 volte.
+            gate_routing: Some(Some(GateRouting::Chiude)),
             extra: Some(Self::extra_with_panel(state, panel)),
             ..Default::default()
         }
@@ -297,20 +338,29 @@ impl ReviewGateNode {
         &self,
         state: &AgentState,
         ctx: &AgentNodeCtx,
-        cycle: i64,
+        rimandi_fatti: i64,
         max_cycles: i64,
         panel: &PanelOutcome,
         definitiva: bool,
     ) -> OpaqueDelta {
+        // Numero del rimando che questa bocciatura produce. Su bocciatura
+        // definitiva non c'e' nessun nuovo rimando: il contatore resta quello
+        // dei rimandi gia' spesi, e l'etichetta li mostra tutti e soli quelli
+        // (niente piu' `cycle - 1`, aggiustamento che serviva solo perche' il
+        // numeratore contava le convocazioni).
+        let cycle = if definitiva {
+            rimandi_fatti
+        } else {
+            rimandi_fatti + 1
+        };
         let mut payload = serde_json::Map::new();
         payload.insert("cycle".into(), cycle.into());
         payload.insert("max_cycles".into(), max_cycles.into());
         let (titolo, phase) = if definitiva {
             (
                 format!(
-                    "Review NON superata al cap dei tentativi ({}/{}): il run chiude bocciato",
-                    cycle - 1,
-                    max_cycles
+                    "Review NON superata al cap dei tentativi ({cycle}/{max_cycles}): \
+                     il run chiude bocciato"
                 ),
                 "rejected_final",
             )
@@ -351,6 +401,17 @@ impl ReviewGateNode {
             } else {
                 ReviewGateVerdict::PendingCorrection
             })),
+            // La bocciatura DEFINITIVA chiude: e' la dichiarazione che il
+            // commento di modulo prometteva ("il run chiude bocciato, mai un
+            // loop") e che l'edge non poteva vedere finche' instradava sullo
+            // `stop_reason` altrui. Sul run 609000c1 il `rejected_final` del
+            // ciclo 8 fu seguito da altri 10 `task_complete` e da 4 minuti di
+            // giri a vuoto, fino allo Stop dell'utente.
+            gate_routing: Some(Some(if definitiva {
+                GateRouting::Chiude
+            } else {
+                GateRouting::RimandaInCorrezione
+            })),
             extra: Some(Self::extra_with_panel(state, panel)),
             ..Default::default()
         };
@@ -370,7 +431,7 @@ impl ReviewGateNode {
 mod tests {
     use std::sync::Arc;
 
-    use nexus_graph::node::GraphNode;
+    use nexus_graph::node::{GraphNode, NodeId};
     use nexus_graph::GraphState as _;
     use serde_json::{json, Value};
     use sqlx::postgres::PgPoolOptions;
@@ -572,6 +633,150 @@ mod tests {
             "il cycle NON incrementa: nessuna ri-convocazione del panel"
         );
         assert!(!crate::routing::gate_rimanda_in_correzione(&s));
+    }
+
+    /// Porta stub che CONTA le convocazioni: il costo del panel e' il danno
+    /// misurato (10 sub-run di review a pagamento sul run 609000c1), quindi il
+    /// test lo asserisce sul contatore, non su un effetto collaterale.
+    struct CountingPanel {
+        report: ReviewPanelReport,
+        convocazioni: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::ports::ReviewPanelPort for CountingPanel {
+        async fn review(
+            &self,
+            _req: ReviewPanelRequest,
+        ) -> Result<ReviewPanelReport, crate::runtime::ports::PortError> {
+            self.convocazioni
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.report.clone())
+        }
+    }
+
+    /// REGRESSIONE del run 609000c1 (26/07/2026): il ping-pong
+    /// `review_gate -> executor -> review_gate` che ha convocato i revisori 8
+    /// volte e non ha mai chiuso il run.
+    ///
+    /// Lo strumento arriva all'oggetto per la strada della produzione (regola O):
+    /// nodo REALE, edge REALE preso da `build_edges` (la topologia che gira nel
+    /// motore), e stato iniziale copiato dal CHECKPOINT del run — `stop_reason =
+    /// ToolUse` con tool pendenti, cioe' quello che l'executor lascia a ogni
+    /// turno. Il loop qui sotto e' il loop del motore: esegui il nodo, merge,
+    /// risolvi l'edge; se torna all'executor, il gate verra' rieseguito.
+    ///
+    /// MUTAZIONE: rimuovendo `gate_routing: Chiude` da `close_not_rejected` (o
+    /// facendo tornare `gate_rimanda_in_correzione` a `stop_reason == ToolUse`)
+    /// il test fallisce mostrando la convocazione ripetuta: `giri` arriva al cap
+    /// e le convocazioni salgono a 8, esattamente come in produzione.
+    #[tokio::test]
+    async fn approvazione_chiude_e_non_riconvoca_i_revisori() {
+        let convocazioni = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node = ReviewGateNode::new(
+            ReviewGateConfig {
+                enabled: true,
+                max_cycles: 3,
+            },
+            Arc::new(CountingPanel {
+                report: ReviewPanelReport::Convened(panel_approvato()),
+                convocazioni: Arc::clone(&convocazioni),
+            }),
+            Arc::new(StubMetaStepStore::default()),
+        );
+        let edges = crate::graph::build_edges(
+            RoutingConfig::default(),
+            crate::nodes::PlannerConfig::default(),
+            crate::decisions::supervisor::SupervisorConfig::default(),
+        );
+        let edge = edges.get(&NodeId::ReviewGate).expect("edge review_gate");
+
+        // Stato come nel checkpoint 173 del run: l'executor ha appena lasciato
+        // ToolUse + pending, il funnel di chiusura porta al gate.
+        let mut s = AgentState {
+            stop_reason: Some(StopReason::ToolUse),
+            pending_tool_uses: Some(vec![json!({
+                "type": "tool_use", "id": "t1", "name": "read_file", "input": {}
+            })]),
+            ..stato_done()
+        };
+
+        let mut giri = 0;
+        let mut destinazione = loop {
+            giri += 1;
+            let delta = node.run(&s, &ctx_with()).await.expect("nodo ok");
+            s = apply(s, delta);
+            let next = edge.resolve(&s);
+            if next != NodeId::Executor || giri >= 8 {
+                break next;
+            }
+        };
+        // Il gate ha APPROVATO: l'edge deve portare alla chiusura, non
+        // all'executor. In produzione portava all'executor e il run rientrava.
+        assert_eq!(
+            destinazione,
+            NodeId::Reflection,
+            "review approvata: il grafo deve proseguire verso la chiusura, non \
+             rientrare nell'executor"
+        );
+        assert_eq!(giri, 1, "il gate non deve essere rieseguito dopo un'approvazione");
+        assert_eq!(
+            convocazioni.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "i revisori (sub-run A PAGAMENTO) vanno convocati una volta sola: \
+             sul run 609000c1 furono 10 sub-run per $0.058355"
+        );
+
+        // Stessa asserzione per la bocciatura DEFINITIVA (punto b del difetto):
+        // `rejected_final` deve essere terminale. In produzione fu seguita da
+        // altri 10 task_complete e da 4 minuti di giri a vuoto.
+        let definitivo = AgentState {
+            review_gate_verdict: Some(ReviewGateVerdict::RejectedFinal),
+            stop_reason: Some(StopReason::ToolUse),
+            ..stato_done()
+        };
+        let delta = node.run(&definitivo, &ctx_with()).await.expect("nodo ok");
+        let dopo = apply(definitivo, delta);
+        destinazione = edge.resolve(&dopo);
+        assert_eq!(
+            destinazione,
+            NodeId::Reflection,
+            "rejected_final e' DEFINITIVA: il run deve chiudere"
+        );
+    }
+
+    /// Il contatore misura cio' che il cap limita (punto a del difetto): le
+    /// APPROVAZIONI non consumano rimandi. Con il contatore delle convocazioni,
+    /// una bocciatura preceduta da 3 approvazioni trovava `cycle=4 > max=3` e
+    /// diventava DEFINITIVA senza che il run avesse mai avuto un tentativo di
+    /// correzione — ed era la stessa discrepanza a stampare "(2/3)" e "(3/3)" su
+    /// un run che poi mostrava i cicli 4..8.
+    ///
+    /// MUTAZIONE: tornando a contare le convocazioni, il verdetto qui e'
+    /// `RejectedFinal` e l'assert rosseggia.
+    #[tokio::test]
+    async fn le_approvazioni_non_consumano_i_rimandi() {
+        let approva = nodo(3, ReviewPanelReport::Convened(panel_approvato()));
+        let mut s = stato_done();
+        for _ in 0..3 {
+            let delta = approva.run(&s, &ctx_with()).await.expect("nodo ok");
+            s = apply(s, delta);
+        }
+        assert_eq!(
+            s.review_gate_cycle, None,
+            "nessun rimando effettuato: il contatore dei rimandi resta intatto"
+        );
+
+        // Prima bocciatura dopo tre approvazioni: ha diritto al rimando 1/3.
+        let boccia = nodo(3, ReviewPanelReport::Convened(panel_bocciato()));
+        let delta = boccia.run(&s, &ctx_with()).await.expect("nodo ok");
+        let s = apply(s, delta);
+        assert_eq!(
+            s.review_gate_verdict,
+            Some(ReviewGateVerdict::PendingCorrection),
+            "la prima bocciatura deve poter rimandare in correzione"
+        );
+        assert_eq!(s.review_gate_cycle, Some(1), "e' il rimando numero 1");
+        assert!(crate::routing::gate_rimanda_in_correzione(&s));
     }
 
     /// Approvazione: nessun rimando, verdetto Approved, il run chiude pulito.

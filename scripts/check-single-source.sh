@@ -698,7 +698,17 @@ fi
 # Questo check copre tutti i crate con test opportunistici e impedisce sia di
 # rientrare nello skip muto, sia di ri-fondare un secondo punto unico locale.
 #
-# Il pattern esclude le righe di commento (`^[^/]*`): le intestazioni citano
+# Il pattern cerca il LETTERALE `"skip`, non `eprintln!("skip`: uno skip
+# formattato su due righe
+#
+#     eprintln!(
+#         "skip: binary non trovato",
+#     );
+#
+# sfugge a un pattern ancorato alla macro, ed era esattamente la forma di quello
+# in `agent_tools_safety` — che il guard ha percio' dichiarato pulito per due
+# esecuzioni di fila. Cercare la stringa copre entrambe le forme e qualunque altra
+# macro la stampi. Esclude le righe di commento (`^[^/]*`): le intestazioni citano
 # `eprintln!("skip: ...")` per spiegare cosa ha sostituito.
 crate_opportunistici=(
   crates/mcp-core/tests
@@ -709,7 +719,7 @@ skip_muti=""
 while IFS= read -r hit; do
   [[ -n "$hit" ]] && skip_muti+="$hit"$'
 '
-done < <(grep -rnE '^[^/]*eprintln!\("skip' "${crate_opportunistici[@]}" 2>/dev/null || true)
+done < <(grep -rnE '^[^/]*"skip' "${crate_opportunistici[@]}" 2>/dev/null || true)
 
 # Un secondo `fn salta` / `fn db_o_salta` / `fn jwt_o_salta` fuori dal crate
 # autoritativo sarebbe una copia della stessa decisione, libera di divergere: e'

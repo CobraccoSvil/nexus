@@ -13,12 +13,16 @@
 //!     (round-trip `thinking_signature`);
 //!   - Google: `functionDeclarations` mancanti / `thinkingBudget` non a zero /
 //!     `thoughtSignature` non re-inviata;
-//!   - Mistral: HTTP 422 "last role assistant" / trailing assistant nella history.
+//!   - Mistral: HTTP 422 "last role assistant" / trailing assistant nella history;
+//!   - openrouter e groq: nessun adapter dedicato, quindi passano dal GENERICO —
+//!     che di loro non sa niente. E' la strada piu' esposta ai quirk, non la meno
+//!     (groq p.es. risponde 413 su payload grande, caso che nessun provider con
+//!     adapter proprio produce).
 //!
 //! PARAMETRIZZAZIONE: un singolo `async fn esegui_tool_loop(provider, modello)`
 //! contiene tutta la logica dei 2 turni e le asserzioni; ogni provider ha un
 //! `#[tokio::test]` sottile che costruisce il proprio provider concreto e lo
-//! invoca. Cosi' il riquadro di test e' un solo punto unico (regola L) e i 5
+//! invoca. Cosi' il riquadro di test e' un solo punto unico (regola L) e i sette
 //! test sono solo l'innesto provider-specifico.
 //!
 //! # DOVE ARRIVA QUESTO STRUMENTO, E DOVE NO (regola O)
@@ -29,7 +33,7 @@
 //!    --workspace` gira dentro `pnpm verify` (`.github/workflows/verify.yml` ->
 //!    `scripts/verify.sh`), il cui unico `env:` e' `DATABASE_URL`; in TUTTI i
 //!    workflow del repo le occorrenze di `secrets.` sono zero. Nessuna chiave
-//!    provider esiste in quell'ambiente, quindi i 5 test saltavano sempre — e
+//!    provider esiste in quell'ambiente, quindi i test saltavano sempre — e
 //!    uno skip che ritorna verde e' indistinguibile da un successo. Il verde
 //!    "copriva" proprio i 400 che continuavano a costare run in produzione.
 //!    Rimedio: [`chiave_provider`] + [`copertura_live_dichiarata`] (sotto).
@@ -65,7 +69,7 @@
 //! - senza quella variabile il test salta, ma stampa un marker riconoscibile
 //!   (`NEXUS_PROVIDER_LIVE_SKIP <provider> (<ENV_VAR> assente)`) e
 //!   [`copertura_live_dichiarata`] — che gira SEMPRE — dichiara il conteggio
-//!   con la sua premessa (`COPERTURA LIVE PROVIDER: n/5 ...`), su stdout e,
+//!   con la sua premessa (`COPERTURA LIVE PROVIDER: n/7 ...`), su stdout e,
 //!   se `NEXUS_PROVIDER_SKIP_REPORT` e' impostata, su file per un gate.
 //!
 //! Scartato `#[ignore]`: toglierebbe l'esecuzione in locale (dove le chiavi ci
@@ -73,6 +77,16 @@
 //! un verde nel conteggio finale — il difetto da chiudere e' esattamente
 //! quello. Il gate `pnpm verify` NON acquisisce chiamate reali: senza
 //! `REQUIRE_PROVIDER_TESTS` il costo e la flakiness restano zero.
+//!
+//! # CHI NON E' QUI, E PERCHE' (misurato il 2026-07-27)
+//!
+//! La routing matrix ha OTTO provider attivi e il DB ha otto chiavi valorizzate;
+//! questo file ne copre sette. Il mancante e' **perplexity**, che nel registry
+//! dichiara `supports_tools = false`: un tool-loop a due turni gli chiederebbe
+//! cio' che dice di non saper fare, e il test fallirebbe per costruzione invece
+//! di misurare un contratto. Se un giorno servira' coprirlo, il contratto giusto
+//! e' un altro (completamento testuale, e le `citations` che solo lui
+//! restituisce) e va scritto come test suo, non forzato in questo.
 //!
 //! Niente DB: le chiavi runtime stanno nel DB (`settings`), ma un integration
 //! test non deve dipendere da un DB popolato di segreti — la fonte canonica per
@@ -92,7 +106,8 @@ use reqwest::Client;
 
 use nexus_gateway::provider::LlmProvider;
 use nexus_gateway::providers::{
-    AnthropicProvider, DeepSeekProvider, GoogleProvider, MistralProvider, OpenAiProvider,
+    AnthropicProvider, DeepSeekProvider, GenericOpenAiProvider, GoogleProvider, MistralProvider,
+    OpenAiProvider,
 };
 use nexus_gateway::types::{
     LlmContentBlock, LlmMessage, LlmRequest, LlmResponse, LlmToolCall, LlmToolDefinition,
@@ -334,6 +349,9 @@ const PROVIDER_KEYS: &[(&str, &str, Option<&str>)] = &[
     ("anthropic", "ANTHROPIC_API_KEY", None),
     ("mistral", "MISTRAL_API_KEY", None),
     ("openai", "OPENAI_API_KEY", None),
+    // Serviti dall'adapter GENERICO, e proprio per questo qui (vedi sotto).
+    ("openrouter", "OPENROUTER_API_KEY", None),
+    ("groq", "GROQ_API_KEY", None),
 ];
 
 /// Legge la prima env var non vuota fra `primario` e l'eventuale `alias`.
@@ -514,6 +532,68 @@ async fn mistral_tool_loop() {
     };
     let provider = MistralProvider::new(http(), key, None);
     esegui_tool_loop("mistral", &provider, "mistral-small-latest").await;
+}
+
+/// Base URL dei provider senza adapter dedicato. In PRODUZIONE vengono dal
+/// registry nel DB (`nexus_provider_registry.base_url_default`, regola G): qui
+/// sono scritte perche' un integration test non ha il DB, e sono le stesse che il
+/// registry contiene oggi. Se un provider cambiasse endpoint, il test lo
+/// scoprirebbe con un errore di rete — non silenziosamente.
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+
+/// Contesto e tier dichiarati per i due generici: valori di test, non
+/// configurazione (il gateway li legge dal registry). Il tool-loop non li
+/// esercita, servono solo a costruire l'adapter.
+const GENERIC_MAX_CONTEXT: u32 = 128_000;
+
+/// I provider senza codice dedicato passano da [`GenericOpenAiProvider`], che non
+/// sa nulla di loro: e' l'adapter piu' esposto ai quirk, non il meno. Il registry
+/// dichiara `supports_tools = true` per entrambi, quindi il tool-loop e' la
+/// verifica giusta — e finora nessun test lo esercitava su questa strada, benche'
+/// `openrouter` abbia in routing matrix tanti intent quanto anthropic (56) e sia
+/// il provider su cui girano i revisori del panel.
+///
+/// Modello: il piu' usato in matrix fra gli economici (`z-ai/glm-4.7-flash`, 4
+/// intent), non un nome inventato.
+#[tokio::test]
+async fn openrouter_tool_loop() {
+    let Some(key) = chiave_provider("openrouter") else {
+        return;
+    };
+    let provider = GenericOpenAiProvider::new(
+        http(),
+        OPENROUTER_BASE_URL,
+        key,
+        "openrouter",
+        vec![0, 1, 2],
+        GENERIC_MAX_CONTEXT,
+        true,
+    );
+    esegui_tool_loop("openrouter", &provider, "z-ai/glm-4.7-flash").await;
+}
+
+/// Come sopra per groq. Quirk noto e gia' codificato altrove: risponde **413** su
+/// payload troppo grande (vedi il test di `ProviderHttpError` in
+/// `openai_compat.rs`), un caso che nessun provider con adapter dedicato produce.
+///
+/// Modello: `openai/gpt-oss-20b`, il piu' usato in matrix per groq (9 intent) e
+/// il piu' piccolo dei due gpt-oss.
+#[tokio::test]
+async fn groq_tool_loop() {
+    let Some(key) = chiave_provider("groq") else {
+        return;
+    };
+    let provider = GenericOpenAiProvider::new(
+        http(),
+        GROQ_BASE_URL,
+        key,
+        "groq",
+        vec![0, 1, 2],
+        GENERIC_MAX_CONTEXT,
+        true,
+    );
+    esegui_tool_loop("groq", &provider, "openai/gpt-oss-20b").await;
 }
 
 #[tokio::test]

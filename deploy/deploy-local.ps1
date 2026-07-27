@@ -139,6 +139,29 @@ if ($doWeb) {
   if ($LASTEXITCODE -ne 0) { throw 'next build fallito' }
 }
 
+# 2b. MIGRAZIONI, fra la build e l'avvio.
+#
+# Perche' QUI e non altrove: e' il solo punto in cui i binari sono aggiornati e
+# i servizi sono ancora fermi. Applicare lo schema mentre mcp-core gira
+# significherebbe eseguire DDL sotto un processo in esecuzione; applicarlo prima
+# della build userebbe un xtask vecchio.
+#
+# Perche' ESISTE questo passo, dato che mcp-core migra da solo all'avvio: senza,
+# il comando `xtask migrate` resterebbe esercitato solo a mano su Windows, cioe'
+# sull'unico sistema su cui questo progetto gira — e uno strumento che nessuno
+# invoca non e' uno strumento, e' una nota. Con questo passo lo schema e'
+# aggiornato PRIMA che il servizio parta, e un fallimento delle migrazioni si
+# vede qui invece di comparire come un avvio che non riesce.
+#
+# NON e' ridondante rispetto a mcp-core: applicare un set gia' applicato non fa
+# nulla (il registro `_sqlx_migrations` lo sa), quindi il costo e' una lettura.
+if ($doRust -and -not $NoRestart) {
+  Write-Host '== migrazioni schema META ==' -ForegroundColor Cyan
+  Set-Location $ROOT
+  cargo run --quiet -p xtask -- migrate --set meta --apply
+  if ($LASTEXITCODE -ne 0) { throw "migrazioni fallite (exit $LASTEXITCODE): lo stack non viene riavviato su uno schema che non e' quello del codice" }
+}
+
 # 3. START
 if (-not $NoRestart) {
   if (-not $serviziInstallati) {

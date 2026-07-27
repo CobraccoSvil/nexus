@@ -3,8 +3,8 @@ name: provider-live
 # Test di PARITA' PROVIDER contro le API REALI
 # (crates/nexus-gateway/tests/provider_tool_loop.rs).
 #
-# PERCHE' UN JOB A PARTE. Quei test chiamano davvero DeepSeek, Google,
-# Anthropic, Mistral e OpenAI: costano denaro e dipendono da servizi di terzi,
+# PERCHE' UN JOB A PARTE. Quei test chiamano davvero DeepSeek, Google, Anthropic,
+# Mistral, OpenAI, openrouter e groq: costano denaro e dipendono da servizi di terzi,
 # quindi non possono stare nel gate `verify.yml` di ogni push. Ma finche' non
 # girano da nessuna parte, i quirk che dichiarano di catturare (i 400 di DeepSeek
 # e Anthropic sul round-trip thinking/reasoning) restano scoperti mentre la CI
@@ -17,9 +17,13 @@ name: provider-live
 #     (nessun valore in chiaro, regola F);
 #   - segreti presenti -> e' una regressione vera di parita' provider.
 #
-# CADENZA. Settimanale, non nightly: cinque provider per due turni a ogni
+# CADENZA. Settimanale, non nightly: sette provider per due turni a ogni
 # esecuzione: la frequenza e' calibrata sul costo, e `workflow_dispatch` resta
 # disponibile per lanciarlo a mano prima di toccare un adapter provider.
+#
+# NON c'e' perplexity, l'ottavo provider attivo: il registry lo dichiara
+# `supports_tools = false`, quindi un tool-loop gli chiederebbe cio' che dice di
+# non saper fare. Serve un contratto suo (testo + `citations`), non questo.
 #
 # Il crate nexus-gateway non usa macro `sqlx::query!` ne' prost: qui non servono
 # ne' Postgres ne' protoc (a differenza di verify.yml).
@@ -43,6 +47,12 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # openrouter e groq non hanno adapter dedicato: passano dal generico, che di
+      # loro non sa niente. Coperti dal 2026-07-27, quando si e' misurato che la
+      # routing matrix ha OTTO provider attivi e il test ne esercitava cinque —
+      # openrouter con 56 intent, tanti quanto anthropic.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       REQUIRE_PROVIDER_TESTS: "1"
 
     steps:
@@ -55,20 +65,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Dice quali segreti mancano PRIMA di compilare, cosi' il rosso si legge
-      # in due righe invece che nel panic di cinque test. Stampa solo i NOMI.
+      # in due righe invece che nel panic di sette test. Stampa solo i NOMI.
       - name: Diagnostica segreti (solo nomi, nessun valore)
         run: |
           mancanti=""
-          for v in DEEPSEEK_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY OPENAI_API_KEY; do
+          for v in DEEPSEEK_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY MISTRAL_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GROQ_API_KEY; do
             if [ -z "${!v}" ]; then mancanti="$mancanti $v"; fi
           done
           if [ -n "$mancanti" ]; then
             echo "::error::segreti provider non configurati:$mancanti - i test di parita' NON possono coprire i quirk che dichiarano. Configurarli in Settings > Secrets, oppure disattivare questo workflow dichiarando che quella copertura non esiste."
           else
-            echo "tutti i 5 segreti provider sono presenti"
+            echo "tutti i 7 segreti provider sono presenti"
           fi
 
-      # --nocapture: il riepilogo "COPERTURA LIVE PROVIDER: n/5" e i marker
+      # --nocapture: il riepilogo "COPERTURA LIVE PROVIDER: n/7" e i marker
       # NEXUS_PROVIDER_LIVE_SKIP devono restare leggibili nel log del job.
       - name: Test parita' provider (2 turni tool-loop)
         run: cargo test -p nexus-gateway --test provider_tool_loop -- --nocapture

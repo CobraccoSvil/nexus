@@ -19,32 +19,31 @@ name: integration-full
 # script sarebbe firmato da noi con una chiave che ci siamo scelti: proverebbe
 # che sappiamo firmare, non che il servizio accetta i suoi token (regola O).
 #
-# COSA COPRE, e cosa no. Gli obiettivi sono elencati uno per uno nello step
-# finale, non con un `cargo test --workspace`: cosi' l'elenco e' leggibile e
-# nessuno crede che il job copra piu' di quanto copre.
+# COSA COPRE. Gli obiettivi sono elencati uno per uno nello step finale, non con
+# un `cargo test --workspace`: cosi' l'elenco e' leggibile e nessuno crede che il
+# job copra piu' di quanto copre.
 #
-# Restano fuori `m71_cost_breakdown` e `chat_history_run_anchor`. Erano scritti
+# `m71_cost_breakdown` e `chat_history_run_anchor` sono INCLUSI. Erano scritti
 # contro il meta-DB, dove la migrazione 0507 ha decommissionato il dominio
-# chat/run: sono stati riscritti (seminano nel DB-progetto tramite la fixture
-# `tests/progetto`, con la stessa forma che scrive la produzione), ma la loro
-# esecuzione dipende da un token accettato dal servizio, e li' c'e' un difetto
-# aperto: un token emesso da `/internal/dev-login-token`, con firma verificata
-# contro `settings.jwt_secret` E con la sua riga viva in `sessions`, riceve
-# comunque 401 su ogni endpoint autenticato (misurato in locale il 2026-07-26
-# contro un mcp-core in ascolto). Finche' non e' chiuso, includerli qui
-# significherebbe un rosso che non si puo' spegnere — e un rosso perenne si
-# impara a ignorare.
+# chat/run; riscritti per seminare nel DB-progetto (fixture `tests/progetto`,
+# nella forma che scrive la produzione), sono stati verificati E2E in locale il
+# 2026-07-26 contro un mcp-core in ascolto: entrambi verdi, contro-caso compreso.
 #
-# NB: lo stesso difetto colpisce `settings_update_contract` e
-# `agent_runs_endpoints`, che sono inclusi perche' l'ambiente per loro c'e' tutto.
-# Se falliscono con 401, il log di mcp-core ora dice quale dei tre controlli di
-# `validate_token` ha rifiutato il token (firma, scadenza, sessione): e' il
-# segnale che mancava mentre si diagnosticava a mano.
+# Perche' il seed sotto imposta `owner_user_id`: gli handler chiamano
+# `ensure_project_access`, che pretende che l'utente sia owner del progetto o
+# membro. Con un progetto di qualcun altro la risposta e' 403, e il test
+# misurerebbe la propria scelta sbagliata invece del contratto.
 
+# SOLO A MANO, nessuno schedule. Il job costa ~25 minuti (build release di
+# mcp-core) e su un account Free il budget e' 2000 minuti/mese: una esecuzione
+# notturna ne consumerebbe 750, meta' del totale, anche nei giorni in cui nessuno
+# tocca il codice. La stessa lista di test gira in locale a costo zero con
+# `scripts/integration-full-local.ps1`; questo job serve per cio' che la' non si
+# puo' verificare — Linux, DB usa-e-getta, artefatto compilato da zero — e lo si
+# lancia quando quella differenza conta (prima di un rilascio, dopo aver toccato
+# migrazioni o lo script del cluster app).
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 3 * * *" # 03:00 UTC
 
 jobs:
   integration-full:
@@ -218,7 +217,16 @@ jobs:
           # in crates/nexus-auth). L'utente e' quello che il token DICHIARA: e'
           # l'unico che gli handler accetteranno.
           hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
-          sub="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.sub')"
+
+          # Il payload di un JWT e' base64url SENZA padding, e `base64 -d` di
+          # coreutils lo rifiuta ("invalid input") quando la lunghezza non e'
+          # multipla di 4 — cioe' in 2 casi su 4, a seconda del claim `exp` e
+          # dell'id utente. Verificato prima di lanciare il job: senza il padding
+          # qui sotto, `sub` sarebbe vuoto e lo step morirebbe con "claim 'sub'
+          # non leggibile", un rosso che parla del workflow e non dell'ambiente.
+          payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          sub="$(printf '%s' "$payload" | base64 -d | jq -r '.sub')"
           if [ -z "$sub" ] || [ "$sub" = "null" ]; then
             echo "::error::il token non porta un claim 'sub' leggibile"
             exit 1
@@ -229,6 +237,9 @@ jobs:
             ON CONFLICT (id) DO NOTHING;
           INSERT INTO sessions (user_id, token_hash, expires_at)
           VALUES ('$sub', '$hash', NOW() + INTERVAL '2 hours');
+          -- Owner del progetto di prova: senza, ensure_project_access risponde 403
+          -- e i test del dominio chat/run non arrivano al contratto.
+          UPDATE projects SET owner_user_id = '$sub' WHERE slug = 'ci-integration';
           SQL
           echo "NEXUS_TEST_JWT=$token" >> "$GITHUB_ENV"
 
@@ -246,6 +257,8 @@ jobs:
             --test settings_update_contract \
             --test agent_runs_endpoints \
             --test agent_tools_safety \
+            --test chat_history_run_anchor \
+            --test m71_cost_breakdown \
             -- --nocapture
           cargo test -p nexus-auth --test settings_write -- --nocapture
           cargo test -p nexus-project-pools --test pool_routing -- --nocapture

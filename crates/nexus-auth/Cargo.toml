@@ -18,6 +18,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true
+# Il contract test dell'autenticazione firma un token con i claim reali e apre la
+# sua sessione: serve la stessa libreria di date della produzione.
+chrono.workspace = true
 # Precondizioni degli integration test e skip VISIBILE: punto unico di
 # `salta(Motivo)` + REQUIRE_INTEGRATION_TESTS (regole L e O). Vive in un crate
 # perche' mcp-core e' bin-only e nexus-auth/nexus-project-pools sono sue

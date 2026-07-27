@@ -2172,28 +2172,40 @@ pub(crate) async fn convene_council(
 /// in `nexus_purpose_model` ed e' li' che si cambiano (regola G).
 const REVIEW_PANEL_PURPOSE: &str = "reviewer";
 
-/// Lancia gli `n` revisori, ciascuno pinnato su un provider distinto.
+/// Cosa rende due revisori "diversi" per questo panel. Costante NOMINATA, non
+/// un argomento scritto nel punto di chiamata: cosi' il test la legge da qui
+/// invece di ricopiarla, e mutarla in `PerProvider` — il difetto del 26/07 —
+/// fa rosseggiare il test invece di lasciarlo verde su un criterio suo
+/// (regola O).
+const REVIEW_PANEL_DIVERSITY: crate::internal_routing::CandidateDiversity =
+    crate::internal_routing::CandidateDiversity::PerProviderAndModel;
+
+/// Lancia gli `n` revisori, ciascuno pinnato su un GIUDICE distinto.
 ///
 /// Senza pin il routing instrada tutti gli N revisori allo stesso
 /// provider/modello: non e' un quorum, e' UN solo giudizio contato N volte, e
 /// quando quel modello sbaglia il run viene rimandato in correzione fino al cap
 /// dei tentativi con l'apparenza di una verifica plurale. I candidati arrivano
 /// dal purpose, come nel panel multi-provider (regola L).
-///
-/// Round-robin: si mantengono gli N revisori decisi dal dimensionamento e si
-/// ripete un provider solo se ne esistono meno di N, invece di sacrificare la
-/// dimensione del panel alla diversita'.
-/// Provider distinti su cui pinnare i revisori. Vuoto se il purpose non e'
+/// Giudici distinti su cui pinnare i revisori. Vuoto se il purpose non e'
 /// risolvibile: il panel prosegue senza pin, con un WARN che nomina il rischio.
+///
+/// Chiede `PerProviderAndModel`, non `PerProvider`: quando un solo provider e'
+/// sano — il 2026-07-26 openai e anthropic erano in cooldown billing — la dedup
+/// per provider lasciava UN candidato e il panel a due si riduceva a un giudice
+/// solo, benche' quel provider offrisse dieci modelli qualificati nello stesso
+/// tier. Due modelli diversi non sono due provider, ma sono due pareri; uno
+/// solo, riconvocato a ogni ciclo, non lo e' mai.
 async fn candidati_revisori(
     ctx: &AgentToolContext,
     n: usize,
 ) -> Vec<crate::internal_routing::PurposeProviderCandidate> {
-    crate::internal_routing::resolve_purpose_provider_candidates_db(
+    crate::internal_routing::resolve_purpose_provider_candidates_db_by(
         &ctx.core.db,
         REVIEW_PANEL_PURPOSE,
         n,
         1,
+        REVIEW_PANEL_DIVERSITY,
     )
     .await
     .unwrap_or_else(|resolution| {
@@ -2206,20 +2218,27 @@ async fn candidati_revisori(
     })
 }
 
-/// Quanti revisori convocare davvero, dati `richiesti` slot e i candidati
-/// distinti disponibili.
+/// Chi convoca davvero il panel: al piu' `richiesti` GIUDICI distinti, presi
+/// nell'ordine di preferenza dei candidati.
 ///
-/// Mai piu' dei candidati: due revisori sullo STESSO provider e modello non sono
-/// un quorum, sono un giudizio unico contato due volte, e il panel lo
-/// conteggerebbe come se fossero due pareri indipendenti. Meglio un panel piu'
-/// piccolo e onesto che uno grande e finto. Senza candidati (purpose non
-/// risolvibile) si tiene il numero richiesto: i revisori partono senza pin, come
-/// prima del pin per provider.
-fn revisori_effettivi(richiesti: usize, candidati_distinti: usize) -> usize {
-    if candidati_distinti == 0 {
-        return richiesti;
-    }
-    richiesti.min(candidati_distinti)
+/// Mai due revisori sulla stessa coppia (provider, model): non sono un quorum,
+/// sono un giudizio unico contato due volte, e il panel li conteggerebbe come
+/// due pareri indipendenti. Meglio un panel piu' piccolo e onesto che uno grande
+/// e finto.
+///
+/// La garanzia sta QUI, dove il panel si compone, e delega la nozione di "stesso
+/// giudice" al punto unico `giudici_distinti` (regola L). Non si assume che la
+/// selezione abbia gia' deduplicato come serve a un panel (regola O: era proprio
+/// l'assunzione sbagliata — si contava `candidates.len()` credendolo il numero
+/// dei giudici distinti, mentre la fonte deduplicava per solo provider).
+///
+/// Lista vuota = purpose non risolvibile: nessun pin da assegnare, e il numero
+/// dei revisori resta quello richiesto (li instrada il routing).
+fn panel_revisori(
+    candidati: &[crate::internal_routing::PurposeProviderCandidate],
+    richiesti: usize,
+) -> Vec<crate::internal_routing::PurposeProviderCandidate> {
+    crate::internal_routing::giudici_distinti(candidati, richiesti)
 }
 
 /// Chi votera', nell'ordine degli slot. E' l'unico punto che lo sa: gli outcome
@@ -2248,6 +2267,35 @@ fn riferimenti_revisori(
         .collect()
 }
 
+/// Dichiara il taglio del panel: quanti revisori si volevano, quanti ne restano
+/// e soprattutto CHI sono. Il taglio e' dichiarato, non silenzioso.
+///
+/// I nomi non sono decorazione: `convocati=1` da solo non distingue un catalog
+/// povero da un cooldown del giorno, e il 26/07 quella riga di log e' comparsa
+/// sei volte senza far sospettare che dietro ci fosse sempre lo stesso giudice.
+fn dichiara_taglio_panel(
+    panel: &[crate::internal_routing::PurposeProviderCandidate],
+    richiesti: usize,
+    convocati: usize,
+) {
+    if convocati >= richiesti {
+        return;
+    }
+    let giudici: Vec<String> = panel
+        .iter()
+        .map(|c| format!("{}/{}", c.provider, c.model))
+        .collect();
+    tracing::warn!(
+        richiesti,
+        convocati,
+        giudici = ?giudici,
+        purpose = %REVIEW_PANEL_PURPOSE,
+        "review panel ridotto: giudici distinti insufficienti, meglio meno \
+         revisori che due voti dallo stesso provider+modello contati come \
+         indipendenti"
+    );
+}
+
 async fn spawn_reviewers(
     ctx: &AgentToolContext,
     richiesti: usize,
@@ -2256,28 +2304,25 @@ async fn spawn_reviewers(
     assegnati: &mut Vec<nexus_agent_graph::decisions::ReviewerRef>,
 ) -> Vec<Value> {
     let candidates = candidati_revisori(ctx, richiesti).await;
-    // Mai due revisori sullo stesso provider: si riduce il panel invece di
-    // duplicare. Il taglio e' dichiarato, non silenzioso.
-    let n = revisori_effettivi(richiesti, candidates.len());
-    if n < richiesti {
-        tracing::warn!(
-            richiesti,
-            convocati = n,
-            purpose = %REVIEW_PANEL_PURPOSE,
-            "review panel ridotto: provider distinti insufficienti, meglio meno \
-             revisori che due voti dallo stesso modello contati come indipendenti"
-        );
-    }
-    assegnati.extend(riferimenti_revisori(&candidates, n));
+    // Mai due revisori sullo stesso (provider, model): si riduce il panel invece
+    // di duplicare.
+    let panel = panel_revisori(&candidates, richiesti);
+    let n = if panel.is_empty() {
+        richiesti
+    } else {
+        panel.len()
+    };
+    dichiara_taglio_panel(&panel, richiesti, n);
+    assegnati.extend(riferimenti_revisori(&panel, n));
 
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
     spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, move |i| {
         let ctx = ctx.clone();
         let task = task.to_string();
         let expected = expected.to_string();
-        let pin = candidates
-            .get(i)
-            .map(|c| (c.provider.clone(), c.model.clone()));
+        // Lo stesso `panel` che ha prodotto i riferimenti dichiarati a valle:
+        // chi vota e chi risulta aver votato non possono divergere.
+        let pin = panel.get(i).map(|c| (c.provider.clone(), c.model.clone()));
         async move {
             match pin {
                 Some((provider, model)) => {
@@ -4785,21 +4830,164 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
 mod tests {
     use super::*;
 
-    /// REGRESSIONE (2026-07-26, emersa dal campo grazie al campo `reviewers`):
-    /// col round-robin il panel duplicava il revisore quando i provider distinti
-    /// erano meno degli slot. Osservato: due revisori entrambi
-    /// `openrouter/z-ai/glm-4.7-flash`, cioe' un giudizio unico che il quorum
-    /// contava come due pareri indipendenti.
+    /// REGRESSIONE (2026-07-26, osservata sul progetto e2e-todo): con openai e
+    /// anthropic in cooldown billing restava il solo openrouter, la selezione
+    /// deduplicava PER PROVIDER e consegnava UN candidato. Il panel a due si
+    /// riduceva onestamente a uno — e il gate lo riconvocava a ogni ciclo,
+    /// sempre `openrouter/z-ai/glm-4.7-flash`: sei sub-run di review, sei volte
+    /// lo stesso giudice, mentre quel provider offriva DIECI modelli qualificati
+    /// nello stesso tier che nessuno guardava.
+    ///
+    /// Il test parte dai candidati come li produce la produzione
+    /// (`resolve_purpose_provider_candidates_db_by` sul purpose reale, letto
+    /// dalle migrazioni reali), non da una lista scritta a mano: la lista esiste
+    /// gia' altrove, e fabbricarla qui fisserebbe proprio l'assunto in esame
+    /// (regola O).
+    ///
+    /// MUTAZIONE: rimettendo `CandidateDiversity::PerProvider` la selezione
+    /// torna a un solo candidato e l'asserzione fallisce nominando il giudice
+    /// unico.
+    #[sqlx::test(migrator = "nexus_test_schema::META_MIGRATOR")]
+    async fn un_solo_provider_sano_da_comunque_giudici_distinti(pool: sqlx::PgPool) {
+        // Il tier del purpose reale, letto dal seed invece che ricopiato.
+        let tier: String = sqlx::query_scalar(
+            "SELECT tier FROM nexus_purpose_model WHERE purpose = $1 AND tier IS NOT NULL",
+        )
+        .bind(REVIEW_PANEL_PURPOSE)
+        .fetch_one(&pool)
+        .await
+        .expect("il purpose dei revisori deve avere un tier");
+
+        // La condizione del 26/07: openai e anthropic in cooldown billing, un
+        // solo provider eleggibile. Il cooldown non e' riproducibile qui, ma il
+        // suo EFFETTO sul pool si': quei provider non sono selezionabili.
+        sqlx::query("UPDATE ai_price_catalog SET is_enabled = false WHERE provider <> 'openrouter'")
+            .execute(&pool)
+            .await
+            .expect("cooldown degli altri provider");
+
+        // Due modelli distinti dello stesso provider, entrambi idonei al tier
+        // del purpose. Upsert: il catalog seminato dalle migrazioni li contiene
+        // gia', e quello che serve al test e' che siano eleggibili — non che
+        // siano suoi. `last_probe_healthy_at` NON e' decorazione: senza, il
+        // trigger `ai_price_catalog_enforce_probe_before_enable` rimette
+        // `is_enabled=false` con reason `unverified_no_probe`, e il catalog
+        // resterebbe vuoto senza che nulla lo dica. La fixture a mano usata
+        // altrove quel trigger non ce l'ha (regola O: il migratore reale e' piu'
+        // severo dello schema ricopiato).
+        for (model, costo) in [("z-ai/glm-4.7-flash", 0.07), ("qwen/qwen3-235b-a22b-2507", 0.071)] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                    performance_tier, capabilities, input_cost_per_million_tokens, \
+                    output_cost_per_million_tokens, currency, qualification_state, \
+                    last_probe_healthy_at, supports_image_gen, supports_audio_in, \
+                    supports_audio_out, supports_video_gen) \
+                 VALUES ('openrouter', $1, true, true, 'none', $2, '[\"reasoning\"]'::jsonb, \
+                         $3, $3, 'USD', 'qualified', NOW(), false, false, false, false) \
+                 ON CONFLICT (provider, model) DO UPDATE SET \
+                   is_enabled = true, supports_tool_use = true, \
+                   agentic_thinking_policy = 'none', performance_tier = EXCLUDED.performance_tier, \
+                   capabilities = EXCLUDED.capabilities, \
+                   qualified_capabilities = EXCLUDED.capabilities, \
+                   input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens, \
+                   qualification_state = 'qualified', qualification_expires_at = NULL, \
+                   last_probe_healthy_at = NOW(), \
+                   supports_image_gen = false, supports_audio_in = false, \
+                   supports_audio_out = false, supports_video_gen = false, \
+                   auto_disabled_at = NULL, auto_disabled_reason = NULL",
+            )
+            .bind(model)
+            .bind(&tier)
+            .bind(costo)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+
+        let candidati = crate::internal_routing::resolve_purpose_provider_candidates_db_by(
+            &pool,
+            REVIEW_PANEL_PURPOSE,
+            2,
+            1,
+            // Il criterio della PRODUZIONE, non uno scelto qui.
+            REVIEW_PANEL_DIVERSITY,
+        )
+        .await
+        .expect("candidati revisori");
+
+        let panel = panel_revisori(&candidati, 2);
+        let giudici: Vec<String> = panel
+            .iter()
+            .map(|c| format!("{}/{}", c.provider, c.model))
+            .collect();
+        assert_eq!(
+            panel.len(),
+            2,
+            "un provider solo ma piu' modelli qualificati deve dare DUE giudici: \
+             ridursi a uno e riconvocarlo ogni ciclo non e' un quorum piu' piccolo, \
+             e' nessun quorum. Convocati: {giudici:?}"
+        );
+        assert_eq!(
+            panel[0].judge_key().1,
+            "z-ai/glm-4.7-flash",
+            "l'ordine di preferenza (costo) resta quello della selezione: {giudici:?}"
+        );
+    }
+
+    /// La garanzia del panel non dipende da come la fonte ha ordinato o filtrato:
+    /// da candidati che ripetono lo stesso giudice esce un panel RIDOTTO, e i
+    /// convocati sono esattamente le coppie (provider, model) distinte.
+    ///
+    /// Qui la lista e' costruita a mano di proposito: e' l'input patologico che
+    /// la selezione NON produce (il catalog ha un indice unico su provider+model),
+    /// quindi non esiste altrove da cui prenderlo. E' la difesa del punto unico,
+    /// non una riproduzione del percorso di produzione.
     #[test]
-    fn il_panel_non_duplica_mai_lo_stesso_revisore() {
-        // Due slot ma un solo provider distinto: si convoca UN revisore.
-        assert_eq!(revisori_effettivi(2, 1), 1);
-        assert_eq!(revisori_effettivi(3, 2), 2);
+    fn due_istanze_dello_stesso_modello_non_sono_due_giudici() {
+        use crate::internal_routing::PurposeProviderCandidate as C;
+        let c = |p: &str, m: &str| C {
+            provider: p.to_string(),
+            model: m.to_string(),
+            tier: Some("high".to_string()),
+        };
+
+        // Tre slot, tre candidati, ma due sono lo stesso giudice: si convoca in due.
+        let panel = panel_revisori(
+            &[
+                c("openrouter", "z-ai/glm-4.7-flash"),
+                c("openrouter", "z-ai/glm-4.7-flash"),
+                c("openrouter", "z-ai/glm-5.2"),
+            ],
+            3,
+        );
+        assert_eq!(panel.len(), 2, "convocati = giudici distinti: {panel:?}");
+        assert_eq!(panel[1].model, "z-ai/glm-5.2");
+
+        // Stesso modello, provider diverso: sono due giudici (infrastrutture,
+        // quote e versioni distinte), non una duplicazione.
+        let cross = panel_revisori(
+            &[c("openrouter", "z-ai/glm-5.2"), c("zai", "z-ai/glm-5.2")],
+            2,
+        );
+        assert_eq!(cross.len(), 2);
+
+        // Il confronto e' insensibile al caso: la stessa coppia scritta in due
+        // modi resta lo stesso giudice.
+        let maiuscole = panel_revisori(
+            &[c("OpenRouter", "Z-AI/GLM-5.2"), c("openrouter", "z-ai/glm-5.2")],
+            2,
+        );
+        assert_eq!(maiuscole.len(), 1, "{maiuscole:?}");
+
         // Candidati in abbondanza: si tiene la dimensione richiesta.
-        assert_eq!(revisori_effettivi(2, 5), 2);
-        // Nessun candidato (purpose non risolvibile): i revisori partono senza
-        // pin, come prima del pin per provider, e la dimensione resta quella.
-        assert_eq!(revisori_effettivi(3, 0), 3);
+        assert_eq!(
+            panel_revisori(&[c("a", "m1"), c("b", "m2"), c("c", "m3")], 2).len(),
+            2
+        );
+        // Nessun candidato: nessun pin da assegnare (i revisori partono senza,
+        // e li instrada il routing).
+        assert!(panel_revisori(&[], 3).is_empty());
     }
 
     /// REGRESSIONE (2026-07-26): tutti i revisori giravano sullo STESSO

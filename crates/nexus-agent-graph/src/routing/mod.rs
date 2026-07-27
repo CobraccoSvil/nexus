@@ -23,7 +23,7 @@ mod golden_tests;
 pub use config::{effective_recursion_limit, GraphTopologyLimits, RoutingConfig};
 
 use crate::decisions::{structural_unfulfilled_signal, turn_action_oriented};
-use crate::state::{AgentState, AutomationMode, StopReason};
+use crate::state::{AgentState, AutomationMode, GateRouting, StopReason};
 
 /// Nodo-bersaglio di una decisione di routing. Le label serializzate (snake_case)
 /// sono ESATTAMENTE i nomi-nodo che le `route_after_*` Python ritornano come
@@ -348,10 +348,19 @@ pub fn route_after_todo_runner(state: &AgentState, cfg: &RoutingConfig) -> NodeT
 
 /// Predicato UNICO del "gate rimanda in correzione" (regola L): un gate di
 /// chiusura (final_gate, review_gate) che vuole restituire il turno
-/// all'executor lo dichiara con `stop_reason = ToolUse` nel proprio delta; gli
-/// edge decidono da qui, non ognuno con la propria copia del confronto.
+/// all'executor lo DICHIARA con `gate_routing = RimandaInCorrezione` nel proprio
+/// delta; gli edge decidono da qui, non ognuno con la propria copia del
+/// confronto.
+///
+/// La fonte e' un campo di PROPRIETA' del gate (regola M), non piu'
+/// `stop_reason == ToolUse`: quello e' un campo CONDIVISO che scrive anche
+/// l'executor a ogni turno con tool pendenti, e un gate che chiudeva senza
+/// riscriverlo vedeva la propria chiusura letta come un rimando (loop
+/// `review_gate -> executor` del run 609000c1, vedi [`GateRouting`]).
+///
+/// `None` -> `false`: nessuna dichiarazione significa CHIUDI, il ramo sicuro.
 pub fn gate_rimanda_in_correzione(state: &AgentState) -> bool {
-    state.stop_reason == Some(StopReason::ToolUse)
+    state.gate_routing == Some(GateRouting::RimandaInCorrezione)
 }
 
 /// Dopo il final_gate: re-executor se il gate ha rimandato all'executor
@@ -641,22 +650,29 @@ mod tests {
         );
     }
 
-    /// `route_after_final_gate` (final_gate.py:549-551): tool_use -> executor,
-    /// qualunque altro stop_reason (e None) -> learner.
+    /// `route_after_final_gate`: rimando DICHIARATO dal gate -> executor.
     #[test]
-    fn final_gate_tool_use_va_a_executor() {
+    fn final_gate_rimando_dichiarato_va_a_executor() {
         let mut s = base();
-        s.stop_reason = Some(StopReason::ToolUse);
+        s.gate_routing = Some(GateRouting::RimandaInCorrezione);
         assert_eq!(route_after_final_gate(&s), NodeTarget::Executor);
     }
 
+    /// Chiusura dichiarata (e assenza di dichiarazione) -> learner.
+    ///
+    /// Lo `stop_reason = ToolUse` qui e' il RUMORE che l'executor lascia a ogni
+    /// turno con tool pendenti: la sua presenza non deve piu' instradare nulla.
+    /// Finche' l'instradamento lo leggeva, un gate che chiudeva senza riscriverlo
+    /// veniva rispedito all'executor (loop del run 609000c1).
     #[test]
-    fn final_gate_end_turn_va_a_learner() {
+    fn final_gate_chiusura_va_a_learner_anche_con_tool_use_residuo() {
         let mut s = base();
-        s.stop_reason = Some(StopReason::EndTurn);
+        s.gate_routing = Some(GateRouting::Chiude);
+        s.stop_reason = Some(StopReason::ToolUse);
         assert_eq!(route_after_final_gate(&s), NodeTarget::Learner);
-        // stop_reason assente -> learner (parita': != "tool_use").
-        let none = base();
+        // Nessuna dichiarazione -> learner (ramo sicuro: chiudere, non ciclare).
+        let mut none = base();
+        none.stop_reason = Some(StopReason::ToolUse);
         assert_eq!(route_after_final_gate(&none), NodeTarget::Learner);
     }
 }

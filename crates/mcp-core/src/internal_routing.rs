@@ -212,6 +212,57 @@ pub struct PurposeProviderCandidate {
     pub tier: Option<String>,
 }
 
+impl PurposeProviderCandidate {
+    /// Identita' del GIUDICE. Due candidati con la stessa coppia (provider,
+    /// model) sono lo STESSO giudice: due voti da li' non sono un quorum, sono
+    /// un giudizio unico contato due volte. Definizione UNICA (regola L): la
+    /// usano sia la selezione dei candidati sia i panel che li convocano, cosi'
+    /// che "diversi" voglia dire la stessa cosa ai due capi.
+    pub fn judge_key(&self) -> (String, String) {
+        (self.provider.to_lowercase(), self.model.to_lowercase())
+    }
+}
+
+/// Cosa rende due candidati DIVERSI, per chi li chiede. Sono due domande
+/// distinte e vanno dette, non dedotte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateDiversity {
+    /// Un candidato per PROVIDER. E' cio' che serve a failover e cascate: un
+    /// secondo modello dello stesso provider cade insieme al primo, quindi come
+    /// alternativa non vale nulla.
+    PerProvider,
+    /// Coppie (provider, model) DISTINTE, con i provider nuovi PRIMA di un
+    /// secondo modello di un provider gia' preso. E' cio' che serve a un panel
+    /// di GIUDICI: due modelli diversi dello stesso provider sono due pareri —
+    /// meno indipendenti di due provider, molto piu' di niente — mentre due
+    /// istanze dello stesso modello non sono mai due giudici.
+    PerProviderAndModel,
+}
+
+/// Filtra a GIUDICI distinti (chiave [`PurposeProviderCandidate::judge_key`]),
+/// al piu' `limit`, preservando l'ordine di preferenza in ingresso.
+///
+/// PUNTO UNICO (regola L) della nozione "questi sono N pareri, non uno ripetuto
+/// N volte": la usa la selezione dei candidati per comporre il pool, e la usa
+/// chi convoca un panel per non fidarsi ciecamente di quanto lunga sia la lista
+/// che ha ricevuto (regola O: la garanzia sta dove viene dichiarata).
+pub fn giudici_distinti(
+    candidati: &[PurposeProviderCandidate],
+    limit: usize,
+) -> Vec<PurposeProviderCandidate> {
+    let mut out: Vec<PurposeProviderCandidate> = Vec::new();
+    for c in candidati {
+        if out.len() >= limit {
+            break;
+        }
+        if out.iter().any(|g| g.judge_key() == c.judge_key()) {
+            continue;
+        }
+        out.push(c.clone());
+    }
+    out
+}
+
 /// Errore TIPIZZATO della risoluzione (regola M). Vive in `nexus-types` cosi'
 /// che anche i crate a valle dei port (es. `nexus-wiki`) decidano sulla
 /// variante — mai sul testo. Re-export per i call site interni.
@@ -470,6 +521,34 @@ pub async fn resolve_purpose_provider_candidates_db(
     limit: usize,
     min_providers: usize,
 ) -> Result<Vec<PurposeProviderCandidate>, PurposeResolution> {
+    resolve_purpose_provider_candidates_db_by(
+        db,
+        purpose,
+        limit,
+        min_providers,
+        CandidateDiversity::PerProvider,
+    )
+    .await
+}
+
+/// Come [`resolve_purpose_provider_candidates_db`] ma col criterio di diversita'
+/// ESPLICITO. Gemella dichiarata invece che semantica implicita: chi convoca un
+/// panel di giudici e chi cerca un'alternativa di failover vogliono due cose
+/// diverse, e prima questa differenza non era esprimibile.
+///
+/// Il 2026-07-26 il panel di review si e' ridotto a UN revisore — poi convocato
+/// sei volte di fila, sempre `openrouter/z-ai/glm-4.7-flash` — perche' openai e
+/// anthropic erano in cooldown billing e la dedup PER PROVIDER buttava via i
+/// dieci modelli qualificati che openrouter offriva nello stesso tier. Un giudice
+/// solo ripetuto sei volte non e' meno indipendente di due giudici: e' l'assenza
+/// del quorum, con l'apparenza di averlo.
+pub async fn resolve_purpose_provider_candidates_db_by(
+    db: &PgPool,
+    purpose: &str,
+    limit: usize,
+    min_providers: usize,
+    diversity: CandidateDiversity,
+) -> Result<Vec<PurposeProviderCandidate>, PurposeResolution> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -532,23 +611,38 @@ pub async fn resolve_purpose_provider_candidates_db(
         Err(_) => Vec::new(),
     };
 
+    let tutti: Vec<PurposeProviderCandidate> = rows
+        .into_iter()
+        .map(|choice| PurposeProviderCandidate {
+            provider: choice.provider,
+            model: choice.model,
+            tier: choice.effective_tier,
+        })
+        .collect();
+
+    // Primo giro, comune ai due criteri: un modello per provider. La diversita'
+    // di provider e' la piu' preziosa e va spesa per prima.
     let mut seen: Vec<String> = Vec::new();
-    let mut out = Vec::new();
-    for choice in rows {
-        let (provider, model, tier) = (choice.provider, choice.model, choice.effective_tier);
-        let key = provider.to_lowercase();
+    let mut out: Vec<PurposeProviderCandidate> = Vec::new();
+    for c in &tutti {
+        if out.len() >= limit {
+            break;
+        }
+        let key = c.provider.to_lowercase();
         if seen.iter().any(|p| p == &key) {
             continue;
         }
         seen.push(key);
-        out.push(PurposeProviderCandidate {
-            provider,
-            model,
-            tier,
-        });
-        if out.len() >= limit {
-            break;
-        }
+        out.push(c.clone());
+    }
+
+    if diversity == CandidateDiversity::PerProviderAndModel {
+        // Restano slot: si accettano altri modelli dei provider gia' presi,
+        // mai lo stesso giudice due volte. `giudici_distinti` e' il punto unico
+        // che decide cosa "gia' preso" significhi.
+        let mut preferenza = out;
+        preferenza.extend(tutti.iter().cloned());
+        out = giudici_distinti(&preferenza, limit);
     }
     Ok(out)
 }
@@ -1121,6 +1215,149 @@ mod tests {
         // Solo status, senza testo: classificabile (HTTP map).
         let (class, _) = derive_error_class(&payload(None, None, Some(500), None)).unwrap();
         assert_eq!(class, "provider_error");
+    }
+
+    /// I due criteri di diversita' rispondono a domande diverse sullo STESSO
+    /// pool, e la differenza si vede solo quando i provider sani scarseggiano:
+    /// e' la situazione del 2026-07-26 (openai e anthropic in cooldown billing).
+    ///
+    /// `PerProvider` consegna un candidato solo — corretto per un failover, dove
+    /// un secondo modello dello stesso provider cadrebbe insieme al primo, ma
+    /// fatale per un panel di giudici, che si riduce a uno e lo riconvoca a ogni
+    /// ciclo. `PerProviderAndModel` ne consegna due.
+    ///
+    /// MUTAZIONE: se il ramo `PerProviderAndModel` torna a deduplicare per solo
+    /// provider, la prima asserzione fallisce mostrando il candidato unico.
+    #[sqlx::test]
+    async fn la_diversita_richiesta_decide_quanti_candidati(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("nexus_purpose_model");
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('reviewer', 'high', NULL, true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        // Un solo provider sano, tre modelli distinti nel tier richiesto.
+        for (model, costo) in [("glm-4.7-flash", 0.07), ("qwen3-235b", 0.071), ("glm-5.2", 0.42)] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                    performance_tier, capabilities, input_cost_per_million_tokens) \
+                 VALUES ('openrouter', $1, true, true, 'none', 'high', '[\"reasoning\"]'::jsonb, $2)",
+            )
+            .bind(model)
+            .bind(costo)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+
+        let giudici = resolve_purpose_provider_candidates_db_by(
+            &pool,
+            "reviewer",
+            2,
+            1,
+            CandidateDiversity::PerProviderAndModel,
+        )
+        .await
+        .expect("candidati");
+        assert_eq!(
+            giudici.len(),
+            2,
+            "un panel di giudici deve poter usare due modelli dello stesso \
+             provider quando gli altri sono in cooldown: {giudici:?}"
+        );
+        assert_eq!(
+            giudici
+                .iter()
+                .map(|c| c.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["glm-4.7-flash", "qwen3-235b"],
+            "ordine di preferenza (costo) preservato: {giudici:?}"
+        );
+
+        // Contro-caso: chi cerca un'ALTERNATIVA, non un parere, resta a uno.
+        let alternative =
+            resolve_purpose_provider_candidates_db(&pool, "reviewer", 2, 1).await.expect("candidati");
+        assert_eq!(
+            alternative.len(),
+            1,
+            "il criterio storico non cambia per gli altri chiamanti: {alternative:?}"
+        );
+    }
+
+    /// Con piu' provider sani la diversita' di provider viene spesa PRIMA: due
+    /// infrastrutture indipendenti battono due modelli della stessa. Solo dopo,
+    /// se restano slot, si accetta un secondo modello di un provider gia' preso.
+    #[sqlx::test]
+    async fn i_provider_nuovi_vengono_prima_di_un_secondo_modello(pool: sqlx::PgPool) {
+        crate::test_support::create_ai_price_catalog_table(&pool).await;
+        sqlx::query(
+            "CREATE TABLE nexus_purpose_model ( \
+                 purpose TEXT PRIMARY KEY, \
+                 tier TEXT, \
+                 required_capability TEXT, \
+                 requires_tool_use BOOLEAN NOT NULL DEFAULT false \
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("nexus_purpose_model");
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, required_capability, requires_tool_use) \
+             VALUES ('reviewer', 'high', NULL, true)",
+        )
+        .execute(&pool)
+        .await
+        .expect("purpose");
+        // I due piu' economici sono dello stesso provider: senza la preferenza
+        // per i provider nuovi il panel li prenderebbe entrambi, scartando un
+        // giudice su infrastruttura indipendente.
+        for (provider, model, costo) in [
+            ("openrouter", "glm-4.7-flash", 0.07),
+            ("openrouter", "qwen3-235b", 0.071),
+            ("google", "gemini-high", 0.30),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_price_catalog \
+                   (provider, model, is_enabled, supports_tool_use, agentic_thinking_policy, \
+                    performance_tier, capabilities, input_cost_per_million_tokens) \
+                 VALUES ($1, $2, true, true, 'none', 'high', '[\"reasoning\"]'::jsonb, $3)",
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(costo)
+            .execute(&pool)
+            .await
+            .expect("catalog");
+        }
+
+        let giudici = resolve_purpose_provider_candidates_db_by(
+            &pool,
+            "reviewer",
+            2,
+            1,
+            CandidateDiversity::PerProviderAndModel,
+        )
+        .await
+        .expect("candidati");
+        assert_eq!(
+            giudici.iter().map(|c| c.provider.as_str()).collect::<Vec<_>>(),
+            vec!["openrouter", "google"],
+            "due provider distinti battono due modelli dello stesso: {giudici:?}"
+        );
     }
 
     /// Fan-out multi-provider: provider distinti dal catalog, dedup per provider.

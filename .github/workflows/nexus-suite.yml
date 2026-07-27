@@ -15,7 +15,10 @@ on:
       - "infra/sql/**"
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"   # 03:00 UTC nightly
+    # Settimanale e non piu' notturno: su account Free 2000 minuti/mese non
+    # reggono un nightly per workflow. Il livello 6 (Playwright) resta
+    # comunque lanciabile a mano con workflow_dispatch quando serve.
+    - cron: "0 3 * * 1"   # lunedi 03:00 UTC
 
 jobs:
   contract-rust:

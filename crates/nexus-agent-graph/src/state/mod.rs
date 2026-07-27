@@ -90,6 +90,40 @@ pub enum ReviewGateVerdict {
     /// Bocciatura DEFINITIVA: cap dei rimandi raggiunto, il run chiude bocciato.
     RejectedFinal,
 }
+
+/// DECISIONE DI ROUTING dichiarata da un gate di chiusura (final_gate,
+/// review_gate): l'UNICO segnale su cui i loro edge instradano.
+///
+/// Perche' esiste (regola M: lo stato tecnico si legge da un segnale
+/// strutturato, mai dedotto). Prima gli edge dei due gate deducevano il rimando
+/// da `stop_reason == ToolUse`, un campo CONDIVISO che il gate non possiede: lo
+/// scrive anche l'executor a ogni turno con tool pendenti. Il final_gate
+/// riscrive `stop_reason` su OGNI ramo (`EndTurn` quando chiude), quindi la
+/// deduzione per lui tornava; il ReviewGate lo riscriveva solo sul rimando e sui
+/// rami di CHIUSURA (approvazione, bocciatura definitiva, pass-through del
+/// guard) lasciava in piedi il `ToolUse` del turno precedente. L'edge lo leggeva
+/// come "rimanda" e rispediva all'executor un run che il gate aveva appena
+/// dichiarato chiuso.
+///
+/// Misurato sul run 609000c1 (26/07/2026): il checkpoint
+/// alterna `review_gate -> executor -> review_gate` per 107 superstep con
+/// `stop_reason=tool_use` costante, verdetto `approved` ai cicli 4-7 e
+/// `rejected_final` dal ciclo 8 in poi. Nessuno dei due esiti chiude. Il ciclo
+/// si e' rotto solo quando l'utente ha premuto Stop e `stop_reason` e' diventato
+/// `superseded` — cioe' quando il campo su cui l'edge instradava ha smesso, per
+/// una causa ESTERNA al gate, di valere `ToolUse`.
+///
+/// Il default (`None`) e' il ramo SICURO: un gate che non dichiara nulla fa
+/// chiudere il run, non ciclare. L'assenza di dichiarazione puo' al piu'
+/// anticipare una chiusura; non puo' produrre un loop a spesa illimitata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateRouting {
+    /// Il gate ha finito: il run prosegue verso la chiusura (reflection).
+    Chiude,
+    /// Il gate restituisce il turno all'executor per una correzione.
+    RimandaInCorrezione,
+}
 pub use message::{ContentBlock, Message, MessageContent, ToolUse};
 
 /// Modalita' supervisore worker (UI: off / su anomalia / ogni N step / continuo).
@@ -531,6 +565,14 @@ pub struct AgentState {
     /// raggiunto (motore vecchio o run chiuso per altra via).
     #[serde(default)]
     pub review_gate_verdict: Option<ReviewGateVerdict>,
+    /// DECISIONE DI ROUTING dell'ultimo gate di chiusura eseguito (regola M):
+    /// il segnale, di PROPRIETA' del gate, su cui instradano gli edge di
+    /// final_gate e review_gate. Lo scrive OGNI ramo di uscita dei due nodi.
+    /// `None` = nessun gate ancora eseguito -> si chiude (ramo sicuro).
+    /// Vedi [`GateRouting`] per il difetto che ha reso necessario il campo.
+    #[serde(default)]
+    pub gate_routing: Option<GateRouting>,
+
     /// `true` quando il final gate ha PASSATO la verifica E2E (esito canonico
     /// CompletedVerified lato mcp-core). Settato solo sul ramo PASSED del
     /// `final_gate_node`; il ramo forced_close/cap NON lo imposta (resta

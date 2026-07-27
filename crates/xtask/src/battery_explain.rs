@@ -66,7 +66,7 @@ async fn esegui(database_url: String, modello: Option<String>) -> Result<i32> {
         .acquire_timeout(Duration::from_secs(5))
         .connect(&database_url)
         .await
-        .with_context(|| format!("connessione a {}", dichiara_db(&database_url)))?;
+        .with_context(|| format!("connessione a {}", crate::premessa::db_dichiarato(&database_url)))?;
     let premessa = leggi_premessa(&pool, &database_url).await?;
     stampa_premessa(&premessa);
     stampa_scala_relativa(&pool).await;
@@ -134,7 +134,7 @@ async fn leggi_premessa(pool: &PgPool, database_url: &str) -> Result<Premessa> {
         .await
         .context("conteggio ai_price_catalog")?;
     Ok(Premessa {
-        database: dichiara_db(database_url),
+        database: crate::premessa::db_dichiarato(database_url),
         suite: elig::current_suite_version(versioni.iter().map(|(v,)| *v)),
         profili_attivi: versioni.len(),
         catalog_righe,
@@ -155,16 +155,6 @@ async fn setting_dichiarato(pool: &PgPool, key: &str) -> String {
 }
 
 /// La password non entra nell'output: un explain si incolla nei ticket.
-fn dichiara_db(url: &str) -> String {
-    let Some((schema, resto)) = url.split_once("://") else {
-        return "(DATABASE_URL non interpretabile)".into();
-    };
-    let Some((credenziali, host)) = resto.split_once('@') else {
-        return format!("{schema}://{resto}");
-    };
-    let utente = credenziali.split_once(':').map_or(credenziali, |(u, _)| u);
-    format!("{schema}://{utente}@{host}")
-}
 
 fn stampa_premessa(p: &Premessa) {
     println!("xtask battery-explain — eleggibilita' della batteria di qualificazione");
@@ -321,14 +311,14 @@ mod tests {
     #[test]
     fn la_premessa_dichiara_il_db_senza_la_password() {
         assert_eq!(
-            dichiara_db("postgres://nexus:segretissima@localhost:5433/nexus"),
+            crate::premessa::db_dichiarato("postgres://nexus:segretissima@localhost:5433/nexus"),
             "postgres://nexus@localhost:5433/nexus"
         );
         assert_eq!(
-            dichiara_db("postgres://localhost:5433/nexus"),
+            crate::premessa::db_dichiarato("postgres://localhost:5433/nexus"),
             "postgres://localhost:5433/nexus"
         );
-        assert_eq!(dichiara_db("spazzatura"), "(DATABASE_URL non interpretabile)");
+        assert_eq!(crate::premessa::db_dichiarato("spazzatura"), "(DATABASE_URL non interpretabile)");
     }
 
     /// L'explain lega i suoi bind ai segnaposto dichiarati dal crate: se il claim

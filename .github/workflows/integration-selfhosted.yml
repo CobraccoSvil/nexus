@@ -1,0 +1,75 @@
+name: integration-selfhosted
+
+# La verifica di integrazione sul runner self-hosted della macchina di sviluppo.
+#
+# PERCHE' ESISTE. `integration-full.yml` gira su `ubuntu-latest` e consuma minuti
+# Actions: su un account Free il budget e' 2000 al mese e quel job ne costa ~25 a
+# esecuzione, quindi resta a invocazione manuale. Un runner self-hosted invece non
+# consuma minuti — GitHub li conta solo per i runner ospitati — e puo' quindi
+# girare su ogni push senza far scadere nulla.
+#
+# COSA CAMBIA RISPETTO AL JOB IN CLOUD, e perche' servono entrambi:
+#
+#   integration-full (ubuntu)      integration-selfhosted (questa macchina)
+#   ---------------------------    ----------------------------------------
+#   allestisce l'ambiente da zero  usa i servizi gia' in piedi
+#   DB usa-e-getta                 i DB DI SVILUPPO (semina e ripulisce)
+#   artefatto compilato da zero    l'artefatto che c'e'
+#   verifica Linux + init Docker   verifica Windows
+#   costa minuti Actions           gratis
+#
+# Il primo prova che il sistema si tira su da niente; il secondo prova che il
+# codice appena scritto passa i contratti, subito e a ogni push. Un verde qui non
+# sostituisce un verde la': lo dice la colonna "DB usa-e-getta".
+#
+# UN SOLO PUNTO DI VERITA' PER LA LISTA DEI TEST (regola L). Questo job non
+# ripete gli obiettivi uno per uno: invoca `scripts/integration-full-local.ps1`,
+# lo stesso script che si lancia a mano. Se la lista cambia, cambia in un posto —
+# due elenchi paralleli sarebbero divergenti al primo ritocco.
+#
+# PRECONDIZIONE ONESTA: lo script pretende mcp-core in ascolto e i due cluster
+# Postgres attivi. Se la macchina di sviluppo e' spenta o i servizi sono giu', il
+# job FALLISCE dicendo cosa manca — e' il comportamento voluto: un verde che
+# significasse "non ho trovato l'ambiente" sarebbe il difetto che questa serie di
+# commit ha chiuso.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  integration-selfhosted:
+    name: "Integrazione sui servizi di sviluppo"
+    # Le label sono quelle con cui il runner e' registrato: se la macchina e'
+    # spenta il job resta in coda invece di fallire subito, ed e' preferibile —
+    # un job in attesa si vede, un job saltato no.
+    runs-on: [self-hosted, windows, nexus-dev]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Lo script e' PowerShell perche' l'ambiente di sviluppo canonico e'
+      # Windows nativo (vedi CLAUDE.md). Ritorna non-zero se un contratto cade o
+      # se una precondizione manca sotto REQUIRE_INTEGRATION_TESTS=1, che imposta
+      # da se'.
+      #
+      # `-SaltaRelease` esclude `agent_tools_safety`, che ispeziona
+      # `target/release/mcp-core`: il runner fa checkout in una working copy
+      # pulita (`_work/nexus/nexus`), dove quell'artefatto non c'e' e compilarlo
+      # costerebbe ~20 minuti a ogni push. Alla prima esecuzione i suoi 4 test
+      # sono infatti falliti dicendo "artefatto assente" — il meccanismo ha
+      # funzionato, era la configurazione a chiedere l'impossibile.
+      #
+      # COSA RESTA SCOPERTO QUI, e dove e' coperto: che i pattern di safety, le
+      # env del DB-progetto e i tool subagent siano COMPILATI nel binario lo
+      # verifica `integration-full` (ubuntu), che il release lo costruisce da
+      # zero. In locale lo si controlla quando serve:
+      #
+      #     cargo build -p mcp-core --release
+      #     pwsh -File scripts/integration-full-local.ps1
+      #
+      # (senza il flag, cioe' con l'artefatto presente: quattro test in piu').
+      - name: Test di integrazione (servizi locali)
+        shell: powershell
+        run: .\scripts\integration-full-local.ps1 -SaltaRelease

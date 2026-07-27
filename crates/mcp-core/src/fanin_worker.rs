@@ -298,6 +298,33 @@ async fn run_backstop(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Esegue una marcatura del backstop gia' bindata dal chiamante e ne traccia
+/// l'eventuale errore. `false` = fallita, il giro va interrotto e ritentato.
+///
+/// Punto unico (regola L) del "prova a marcare, se fallisce logga e rinuncia al
+/// giro": i tre rami di [`backstop_project`] ripetevano lo stesso blocco parola
+/// per parola, e ogni nuovo criterio di marcatura ne aggiungeva una copia.
+/// `cosa` nomina la marcatura nel log, cosi' il WARN dice QUALE dei tre e' andata
+/// storta invece di un generico "marcatura fallita".
+async fn marca_o_rinuncia(
+    q: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    proj: &PgPool,
+    cosa: &str,
+) -> bool {
+    match q.execute(proj).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "mcp_core::fanin_worker",
+                error = %e,
+                cosa,
+                "fan-in backstop: marcatura fallita (ritento al prossimo giro)"
+            );
+            false
+        }
+    }
+}
+
 /// Backstop di UN progetto: marca gli orfani, trova i padri recuperabili, accoda.
 /// Ritorna il numero di padri accodati (righe INSERT effettive). `meta` = coda;
 /// `proj` = pool del progetto (agent_runs + nexus_subagent_runs).
@@ -319,7 +346,7 @@ async fn backstop_project(
     //      mentre quello a 0 token/0 iter/0 step per >timeout_s viene abortito e la
     //      COUNT del fan-in scende, liberando il padre. Gated dal kill-switch.
     if no_progress.enabled {
-        if let Err(e) = sqlx::query(
+        let q = sqlx::query(
             "UPDATE nexus_subagent_runs s SET status = 'timeout', completed_at = NOW() \
              WHERE s.is_background = true AND s.status IN ('running', 'paused') \
                AND s.created_at < NOW() - make_interval(secs => $1) \
@@ -327,15 +354,8 @@ async fn backstop_project(
                AND NOT EXISTS ( \
                      SELECT 1 FROM agent_steps st WHERE st.run_id = s.id)",
         )
-        .bind(no_progress.timeout_s as f64)
-        .execute(proj)
-        .await
-        {
-            tracing::warn!(
-                target: "mcp_core::fanin_worker",
-                error = %e,
-                "fan-in backstop: marcatura sub-run no-progress fallita (ritento al prossimo giro)"
-            );
+        .bind(no_progress.timeout_s as f64);
+        if !marca_o_rinuncia(q, proj, "background no-progress").await {
             return 0;
         }
     }
@@ -347,20 +367,65 @@ async fn backstop_project(
     //     Complementare al check no-progress: questo colpisce QUALSIASI sub-run
     //     vecchia (anche una che aveva fatto progressi ma e' poi morta), con
     //     timeout piu' lungo.
-    if let Err(e) = sqlx::query(
+    let q = sqlx::query(
         "UPDATE nexus_subagent_runs SET status = 'timeout', completed_at = NOW() \
          WHERE is_background = true AND status IN ('running', 'paused') \
            AND created_at < NOW() - make_interval(secs => $1)",
     )
-    .bind(orphan_timeout_s as f64)
-    .execute(proj)
-    .await
-    {
-        tracing::warn!(
-            target: "mcp_core::fanin_worker",
-            error = %e,
-            "fan-in backstop: marcatura sub-run orfane fallita (ritento al prossimo giro)"
-        );
+    .bind(orphan_timeout_s as f64);
+    if !marca_o_rinuncia(q, proj, "background orfane").await {
+        return 0;
+    }
+
+    // (1c) Sub-run SINCRONI (non background) il cui PADRE e' gia' in stato
+    //      TERMINALE: nessuno li chiudera' mai piu'.
+    //
+    //      I due rami sopra filtrano `is_background = true` — giustamente, per il
+    //      problema che risolvono: liberare un padre sospeso dal fan-in, e un
+    //      figlio sincrono non sospende nessuno. Ma quel filtro lascia scoperto un
+    //      caso diverso: il sincrono e' eseguito DENTRO il turno del padre, quindi
+    //      se il processo muore (deploy, restart) la sua riga resta `running` PER
+    //      SEMPRE. Il `run_reaper` non la salva: riconcilia `agent_runs`, mai
+    //      `nexus_subagent_runs`. Misurati il 27/07 due zombie in produzione: un
+    //      `review` il cui padre risultava `interrupted` DUE SECONDI prima che il
+    //      figlio fosse creato, e un `implement` da 26 ore. Falsano ogni conta di
+    //      "sub-run attivi".
+    //
+    //      Il criterio e' il SEGNALE STRUTTURATO del padre (regola M), non
+    //      l'anzianita' del figlio: un sincrono lento ma con il padre VIVO non
+    //      viene toccato, per quanto vecchio sia. La lista degli stati arriva dal
+    //      punto unico `AgentRunStatus::stati_non_terminali_db` (regola L): qui
+    //      NON si enumerano i terminali, che sono una lista aperta.
+    //
+    //      `orphan_timeout_s` misura da quanto il PADRE e' chiuso, ed e' solo una
+    //      guardia anti-race: senza, un figlio che sta scrivendo il proprio esito
+    //      nello stesso istante in cui il padre viene marcato verrebbe dichiarato
+    //      scaduto un attimo prima di riuscirci. Marcare la riga non uccide alcun
+    //      processo: se il figlio e' vivo e completa, il suo `mark_run` vince.
+    //
+    //      `COALESCE(p.updated_at, p.created_at)`: `agent_runs.updated_at` e'
+    //      NULLABLE SENZA DEFAULT (solo `created_at` ha `now()`), quindi un padre
+    //      mai aggiornato dopo l'INSERT la lascia NULL — e un confronto con NULL
+    //      e' NULL, cioe' la riga non verrebbe MAI selezionata e i suoi figli
+    //      sarebbero immuni al backstop proprio nel caso in cui serve. Il fallback
+    //      su `created_at` (NOT NULL) rende la guardia sempre valutabile.
+    // Legato a una variabile: la query PRESTA l'array e un temporaneo morirebbe
+    // prima dell'`execute` (E0716).
+    let non_terminali = AgentRunStatus::stati_non_terminali_db();
+    let q = sqlx::query(
+        "UPDATE nexus_subagent_runs s SET status = 'timeout', completed_at = NOW() \
+         WHERE s.is_background = false \
+           AND s.status IN ('running', 'paused') \
+           AND EXISTS ( \
+                 SELECT 1 FROM agent_runs p \
+                 WHERE p.id = COALESCE(s.dispatcher_run_id, s.parent_run_id) \
+                   AND p.status <> ALL($1) \
+                   AND COALESCE(p.updated_at, p.created_at) \
+                       < NOW() - make_interval(secs => $2))",
+    )
+    .bind(&non_terminali[..])
+    .bind(orphan_timeout_s as f64);
+    if !marca_o_rinuncia(q, proj, "sincroni col padre terminale").await {
         return 0;
     }
 
@@ -704,12 +769,25 @@ mod tests {
         status: &str,
         eta_min: i64,
     ) -> Uuid {
+        insert_figlio_con(pool, anchor, dispatcher, status, eta_min, true).await
+    }
+
+    /// Gemello parametrico: `background=false` semina un sub-run SINCRONO, quello
+    /// che i rami (1a)/(1b) non toccano per costruzione.
+    async fn insert_figlio_con(
+        pool: &sqlx::PgPool,
+        anchor: Uuid,
+        dispatcher: Uuid,
+        status: &str,
+        eta_min: i64,
+        background: bool,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO nexus_subagent_runs \
                  (id, parent_run_id, dispatcher_run_id, project_id, kind, task_description, \
                   is_background, status, iterations, created_at) \
-             VALUES ($1, $2, $3, gen_random_uuid(), 'coder', 'task di test', true, $4, 0, \
+             VALUES ($1, $2, $3, gen_random_uuid(), 'coder', 'task di test', $6, $4, 0, \
                      NOW() - make_interval(secs => $5))",
         )
         .bind(id)
@@ -717,6 +795,7 @@ mod tests {
         .bind(dispatcher)
         .bind(status)
         .bind((eta_min * 60) as f64)
+        .bind(background)
         .execute(pool)
         .await
         .expect("insert figlio");
@@ -771,6 +850,72 @@ mod tests {
         // Idempotente: un secondo passaggio non duplica (la riga esiste gia').
         let requeued2 = backstop_project(&pool, &pool, 900, NO_PROGRESS_OFF).await;
         assert_eq!(requeued2, 0, "backstop idempotente: nessun duplicato");
+    }
+
+    /// REGRESSIONE (misurata in produzione il 27/07): un sub-run SINCRONO il cui
+    /// padre e' gia' terminale resta `running` per sempre — i rami (1a)/(1b)
+    /// filtrano `is_background = true` e il `run_reaper` non tocca
+    /// `nexus_subagent_runs`. Trovati un `review` da 3 ore (padre `interrupted`
+    /// due secondi PRIMA della creazione del figlio) e un `implement` da 26.
+    ///
+    /// Il test attraversa il backstop REALE sullo schema REALE (PROJECT_MIGRATOR):
+    /// non asserisce la query, asserisce la CONSEGUENZA sullo stato della riga.
+    /// Il caso di controllo e' quello che rende il fix sicuro: padre VIVO ->
+    /// il figlio non si tocca, per quanto vecchio sia.
+    ///
+    /// Test di mutazione: rimuovendo il ramo (1c) il primo assert rosseggia
+    /// ("running"), che e' esattamente lo zombie visto in produzione.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn backstop_chiude_i_sincroni_col_padre_terminale(pool: sqlx::PgPool) {
+        crea_coda_meta(&pool).await;
+        let project = Uuid::new_v4();
+        let session = crea_sessione(&pool, project).await;
+
+        // Padre TERMINALE (lo stato che il run_reaper scrive sui run orfani di un
+        // restart) e figlio SINCRONO rimasto running.
+        let padre_morto = crate::test_support::insert_agent_run(&pool, session, project, "interrupted").await;
+        let orfano = insert_figlio_con(&pool, session, padre_morto, "running", 30, false).await;
+
+        // Padre VIVO e figlio sincrono altrettanto vecchio: il controllo.
+        let padre_vivo = crate::test_support::insert_agent_run(&pool, session, project, "running").await;
+        let al_lavoro = insert_figlio_con(&pool, session, padre_vivo, "running", 30, false).await;
+
+        // Soglia 0: la guardia anti-race non deve mascherare l'effetto misurato.
+        // NB il seeder NON scrive `updated_at` (nullable senza default, come in
+        // produzione per un run mai aggiornato dopo l'INSERT): e' esattamente il
+        // caso che ha scoperto il buco del primo tentativo di fix, dove il
+        // confronto con NULL rendeva i figli immuni. Non si semina il campo per
+        // far passare il test — il codice usa `COALESCE(updated_at, created_at)`.
+        backstop_project(&pool, &pool, 0, NO_PROGRESS_OFF).await;
+
+        let stato = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM nexus_subagent_runs WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("select stato")
+            }
+        };
+
+        assert_eq!(
+            stato(orfano).await,
+            "timeout",
+            "il sincrono col padre TERMINALE va chiuso: senza, resta 'running' per sempre"
+        );
+        assert_eq!(
+            stato(al_lavoro).await,
+            "running",
+            "il sincrono col padre VIVO non si tocca: sta lavorando, l'eta' non e' il criterio"
+        );
+
+        // Idempotente: un secondo giro non riapre nulla.
+        backstop_project(&pool, &pool, 0, NO_PROGRESS_OFF).await;
+        assert_eq!(stato(orfano).await, "timeout");
+        assert_eq!(stato(al_lavoro).await, "running");
     }
 
     /// BUG #3 (parte 2): una sub-run background rimasta `running` orfana (figlio

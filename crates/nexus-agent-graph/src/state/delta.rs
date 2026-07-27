@@ -705,6 +705,13 @@ pub struct StateDelta {
         skip_serializing_if = "Option::is_none"
     )]
     pub review_gate_verdict: Option<Option<crate::state::ReviewGateVerdict>>,
+    /// Vedi `AgentState::gate_routing`.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gate_routing: Option<Option<crate::state::GateRouting>>,
     /// Vedi `AgentState::final_gate_passed`.
     #[serde(
         default,

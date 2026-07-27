@@ -74,7 +74,9 @@ use crate::routing::config::RoutingConfig;
 use crate::routing::signals;
 use crate::runtime::ports::{CriterionResult, CriterionSpec};
 use crate::runtime::AgentNodeCtx;
-use crate::state::{AgentState, FinalGateVerdict, Message, MessageContent, StateDelta, StopReason};
+use crate::state::{
+    AgentState, FinalGateVerdict, GateRouting, Message, MessageContent, StateDelta, StopReason,
+};
 
 /// Pattern di errore di compilazione comuni (TypeScript, Rust, generici).
 /// Replica 1:1 `_BUILD_ERROR_PATTERNS` (`final_gate.py:276-282`). Il conteggio
@@ -927,6 +929,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 stop_reason: Some(Some(StopReason::EndTurn)),
                 final_gate_passed: Some(Some(true)),
                 final_gate_verdict: Some(Some(FinalGateVerdict::Passed)),
+                gate_routing: Some(Some(GateRouting::Chiude)),
                 // Esito ONESTO (regola M): i criteri soft (no_orphan/outputs_exist)
                 // sono passati, ma se il profilo di verifica dell'ambiente manca
                 // NESSUN comando di verifica reale e' stato eseguito. Lo segnaliamo
@@ -991,6 +994,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     // verdetto esplicito il `cycle = max_cycles` qui sopra veniva
                     // letto a valle come "verifica fallita" e un run RIUSCITO
                     // chiudeva FailedDiagnosed.
+                    gate_routing: Some(Some(GateRouting::RimandaInCorrezione)),
                     final_gate_verdict: Some(Some(
                         FinalGateVerdict::ObjectivePassedSignatureMissing,
                     )),
@@ -1055,6 +1059,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                     final_gate_cycle: Some(Some(0)),
                     stop_reason: Some(Some(StopReason::ToolUse)),
                     pending_tool_uses: Some(Some(vec![])),
+                    gate_routing: Some(Some(GateRouting::RimandaInCorrezione)),
                     final_gate_verdict: Some(Some(FinalGateVerdict::EscalationHandoff)),
                     extra: Some(extra_out),
                     ..Default::default()
@@ -1081,6 +1086,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 stop_reason: Some(Some(StopReason::EndTurn)),
                 final_gate_passed: Some(Some(false)),
                 final_gate_verdict: Some(Some(FinalGateVerdict::FailedFinal)),
+                gate_routing: Some(Some(GateRouting::Chiude)),
                 ..Default::default()
             }
             .into_opaque());
@@ -1115,6 +1121,7 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
             pending_tool_uses: Some(Some(vec![])),
             // L'UNICO ramo in cui una ri-verifica e' davvero attesa: se il run
             // muore prima di rientrare, "verifica fallita e non ripetuta" e' vero.
+            gate_routing: Some(Some(GateRouting::RimandaInCorrezione)),
             final_gate_verdict: Some(Some(FinalGateVerdict::FailedPendingCorrection)),
             ..Default::default()
         }
@@ -1123,12 +1130,21 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
 }
 
 impl FinalGateNode {
-    /// Delta pass-through `{}` (`final_gate.py:506`): nessun campo modificato
-    /// (delta vuoto), il flusso prosegue. Distinto dai pass-through di
-    /// reflection (che azzerano due campi a `Some(None)`): qui il Python ritorna
-    /// `{}` letterale, quindi NESSUNA chiave nel delta.
+    /// Delta pass-through (`final_gate.py:506`): il gate non si applica, il
+    /// flusso prosegue verso la chiusura.
+    ///
+    /// Unica chiave nel delta: la DICHIARAZIONE di routing (regola M). Il Python
+    /// ritornava `{}` letterale e il rimando si deduceva dallo `stop_reason`, ma
+    /// quel campo lo scrive anche l'executor: un pass-through muto lasciava
+    /// decidere l'edge a un valore altrui. Dichiarare `Chiude` rende il ramo
+    /// esplicito e impedisce di ereditare il `RimandaInCorrezione` di un
+    /// passaggio precedente.
     fn pass_through() -> OpaqueDelta {
-        StateDelta::default().into_opaque()
+        StateDelta {
+            gate_routing: Some(Some(GateRouting::Chiude)),
+            ..Default::default()
+        }
+        .into_opaque()
     }
 }
 

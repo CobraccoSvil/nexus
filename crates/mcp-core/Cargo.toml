@@ -43,6 +43,12 @@ nexus-types = { path = "../nexus-types" }
 nexus-cache = { path = "../nexus-cache" }
 nexus-project-db = { path = "../nexus-project-db" }
 nexus-project-pools = { path = "../nexus-project-pools" }
+# Forma e lettura del catalogo servizi: punto unico condiviso con xtask, che
+# genera i manifest dallo stesso dato (regola L).
+nexus-service-catalog = { path = "../nexus-service-catalog" }
+# Applicazione dei set di migrazioni: punto unico condiviso con il provisioning
+# dei DB-progetto e con `xtask migrate` (regola L).
+nexus-migrations = { path = "../nexus-migrations" }
 nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-tool-kit = { path = "../nexus-tool-kit" }
 nexus-agent-tools = { path = "../nexus-agent-tools" }
