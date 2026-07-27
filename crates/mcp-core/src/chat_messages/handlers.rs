@@ -762,11 +762,10 @@ pub async fn send_chat_message(
                 supervisor_mode,
                 profile_prompt_block,
                 system_context: system_context.clone(),
-                // Il path agentico non pinna (nessun `pin_provider`): il
-                // provider scelto e' il punto di partenza del routing e il
-                // failover cross-provider resta possibile. Gli basta quindi il
-                // NOME, quale che sia la forza del vincolo.
-                provider_override: provider_choice.provider().map(str::to_string),
+                // La scelta INTERA (nome + forza): nel path agentico il pin non
+                // vive su una singola chiamata ma sul RUN — vincola il fornitore
+                // di tutte le sue chiamate, compreso il ripiego quando una cade.
+                provider_choice: provider_choice.clone(),
                 model_override: effective_model_override.clone(),
                 profile_provider: profile_provider.clone(),
                 profile_model: profile_model.clone(),
@@ -1084,6 +1083,9 @@ async fn try_resume_interrupted_run(
             session_id: session_id_r,
             provider: provider_r.clone(),
             model: model_r.clone(),
+            // Resume: il pin vale per la richiesta in cui l'utente lo da', e
+            // questa non e' quella richiesta.
+            provider_pin: crate::orchestrator::ProviderPin::none(),
             system_text: String::new(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: resume_prompt,
@@ -1610,7 +1612,7 @@ pub async fn resend_chat_message(
                 supervisor_mode: SupervisorMode::default(),
                 profile_prompt_block,
                 system_context: system_context_str,
-                provider_override: provider_choice.provider().map(str::to_string),
+                provider_choice: provider_choice.clone(),
                 model_override: model_override.clone(),
                 profile_provider: None,
                 profile_model: None,

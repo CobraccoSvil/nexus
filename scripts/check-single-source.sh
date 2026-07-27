@@ -150,6 +150,19 @@ assert_single "vocabolario forza-vincolo provider" 'enum ProviderOverrideMode' '
 # (`[ProviderChoice::Pinned]`) documentano il concetto e non coniano nulla.
 assert_single "nascita del pin duro" 'ProviderChoice::Pinned\(' 'crates/mcp-core/src/orchestrator/provider_choice.rs' crates
 
+# Applicazione del vincolo di provider (2026-07-27): "questo fornitore e'
+# ammesso per il run?" e' UNA domanda con UNA risposta. Nel percorso agentico i
+# fornitori nascono in piu' punti — catena di escalation, ripiego cross-provider,
+# upscale di finestra, cambio di tier — e la tentazione, ogni volta che se ne
+# aggiunge uno, e' di scrivere li' il confronto col fornitore scelto. Il primo
+# ramo che se ne dimentica riapre il difetto, e in silenzio: il pin resta
+# dichiarato ovunque mentre il run e' gia' altrove. Il predicato vive nel tipo
+# (`ProviderPin::ammette`), gli adapter lo chiamano, nessuno lo riscrive.
+# Pattern con la parentesi: `fn ammette` da solo pesca anche i nomi che
+# COMINCIANO per "ammette" (c'e' gia' un test `ammette_tier_3_e_context_default`
+# in nexus-gateway), e un guard che grida su un omonimo misura un'altra cosa.
+assert_single "predicato del vincolo provider" 'fn ammette\(' 'crates/mcp-core/src/orchestrator/provider_choice.rs' crates
+
 # Aggregazione problemi ripetitivi (2026-07-09): chiave di gruppo semantica e
 # pipeline dedup+raggruppamento del pannello Problemi. Punto unico:
 # project_workspace/problem_aggregation.rs; get_project_problems delega.
@@ -404,6 +417,34 @@ if [[ -n "$turno_a_mano" ]]; then
   fail=1
 else
   echo "OK turno-dal-produttore: il turno agentico non si fabbrica a mano"
+fi
+
+# ── il vincolo di provider raggiunge le porte del run ────────────────────────
+# Le due porte che possono cambiare fornitore in corsa nascono legate al vincolo
+# dell'utente (`.con_vincolo`) nel punto che le costruisce per il run. Se qualcuno
+# togliesse quella chiamata, il codice COMPILEREBBE e i test delle porte
+# resterebbero verdi (le costruiscono da se'): il vincolo sparirebbe in silenzio,
+# senza errori, cambiando solo il fornitore su cui gira il run. E' il difetto
+# originale, e la giunzione che lo riapre non ha un test suo — `build_native_engine`
+# assembla quattordici impl e richiede DB + ToolRunnerDeps reali. Qui c'e' il
+# presidio che manca li'.
+vincolo_scollegato=""
+for porta in PgEscalationPort CatalogModelUpscalePort; do
+  costruzioni="$(grep -n "${porta}::new(db" crates/mcp-core/src/native_engine.rs 2>/dev/null || true)"
+  if [[ -z "$costruzioni" ]]; then
+    vincolo_scollegato+="  ${porta}: nessuna costruzione trovata in native_engine.rs"$'\n'
+  elif ! grep -q "${porta}::new(db.clone()).con_vincolo(" crates/mcp-core/src/native_engine.rs 2>/dev/null; then
+    vincolo_scollegato+="  ${porta}: costruita senza .con_vincolo(input.provider_pin)"$'\n'
+  fi
+done
+if [[ -n "$vincolo_scollegato" ]]; then
+  echo "!! vincolo-alle-porte: il pin dell'utente non raggiunge chi sceglie il fornitore:" >&2
+  printf '%s' "$vincolo_scollegato" >&2
+  echo "   Senza il vincolo la porta e' libera di ripiegare su un altro fornitore" >&2
+  echo "   mentre la UI continua a dichiarare il pin (ADR 0023, aggiornamento 3)." >&2
+  fail=1
+else
+  echo "OK vincolo-alle-porte: le porte del run nascono col vincolo dell'utente"
 fi
 
 # ── sizing dei pool verso il DB per-progetto ─────────────────────────────────

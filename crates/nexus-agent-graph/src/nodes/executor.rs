@@ -3956,6 +3956,11 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                         target: "nexus_agent_graph::executor",
                         provider = %provider,
                         auto_escalations = cd_escal,
+                        // Distingue le due chiusure che qui coincidono: rete di
+                        // riserva esaurita (campo assente) contro vincolo
+                        // dell'utente (campo valorizzato). Senza, la diagnosi di
+                        // domani legge "nessun provider sano" e cerca un guasto.
+                        pin = self.escalation.pinned_provider().unwrap_or(""),
                         "provider caduto ma nessun provider sano disponibile: chiusura Error"
                     );
                     }
@@ -3991,12 +3996,16 @@ Riprendi tu, su un provider sano: esegui il prossimo step concreto del compito."
                 // os_error=10061)". Il dettaglio tecnico resta nel `tracing::error!`
                 // qui sopra.
                 let err_short = port_error_message(&err);
-                let err_text = match crate::routing::signals::summarize_actions_in_history(&messages) {
-                    Some(w) => format!(
-                        "[Errore provider {provider}: {err_short}]\n\nInterrotto dopo {iters_in} iterazioni. Lavoro svolto finora: {w}."
-                    ),
-                    None => format!("[Errore provider {provider}: {err_short}]"),
-                };
+                let err_text = testo_errore_provider(
+                    &provider,
+                    &err_short,
+                    iters_in,
+                    crate::routing::signals::summarize_actions_in_history(&messages).as_deref(),
+                    // Perche' nessun altro fornitore ha raccolto il lavoro: se il
+                    // run e' vincolato, non e' un guasto della rete di riserva —
+                    // e' la richiesta dell'utente, e va detto con le sue parole.
+                    self.escalation.pinned_provider(),
+                );
                 // provider_used/model_used None: nessuna cascade -> eff = richiesto
                 // (cascade_did_fallback=false -> sticky invariato, == Python).
                 crate::runtime::ports::LlmResponse {
@@ -7233,6 +7242,40 @@ pub(crate) fn port_error_message(err: &PortError) -> String {
     } else {
         msg
     }
+}
+
+/// Il testo che l'utente legge quando il fornitore cade e il run non prosegue.
+///
+/// PURA, e con la nota del vincolo dentro: arrivare qui significa che nessun
+/// sostituto ha raccolto il lavoro, e le due ragioni per cui puo' succedere
+/// portano l'utente in direzioni opposte. Se la rete di riserva e' esaurita, c'e'
+/// un guasto da guardare. Se invece il run era VINCOLATO, non c'e' niente di
+/// rotto: il ripiego non e' stato cercato perche' l'utente lo ha escluso, e
+/// tacerlo lo manderebbe a cercare un guasto inesistente — oppure, peggio, a
+/// concludere che "Forza" non funziona, che e' il difetto da cui tutto questo
+/// e' partito. La frase nomina anche il modo di uscirne, perche' il rimedio e'
+/// un pulsante che l'utente ha gia' sotto gli occhi.
+fn testo_errore_provider(
+    provider: &str,
+    err_short: &str,
+    iters_in: i64,
+    lavoro_svolto: Option<&str>,
+    pinned: Option<&str>,
+) -> String {
+    let mut out = format!("[Errore provider {provider}: {err_short}]");
+    if let Some(w) = lavoro_svolto {
+        out.push_str(&format!(
+            "\n\nInterrotto dopo {iters_in} iterazioni. Lavoro svolto finora: {w}."
+        ));
+    }
+    if let Some(pin) = pinned {
+        out.push_str(&format!(
+            "\n\nIl run era vincolato a {pin} (\"Forza\" attivo): nessun ripiego su \
+             un altro fornitore, come richiesto. Disattiva \"Forza\" per lasciare \
+             che il run continui altrove quando {pin} non risponde."
+        ));
+    }
+    out
 }
 
 fn is_forcing_failure(resp: &crate::runtime::ports::LlmResponse) -> bool {

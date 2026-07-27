@@ -1179,6 +1179,23 @@ pub trait EscalationPort: Send + Sync {
         cause: ProviderFailureCause,
         exclude: &[String],
     ) -> Result<Option<CrossProviderCandidate>, PortError>;
+
+    /// Il fornitore a cui l'utente ha VINCOLATO questo run ("Forza" nel
+    /// composer), se l'ha fatto. `None` = run non vincolato: e' il default, e
+    /// tiene invariata ogni implementazione che non conosce i pin.
+    ///
+    /// NON e' una decisione, ed e' l'unico motivo per cui sta sul trait: la
+    /// scelta di quali candidati siano leciti resta INTERA dentro l'adapter
+    /// (regola L) — se ne uscisse anche solo un pezzo, i nove rami che chiedono
+    /// un candidato a questa porta (sette `escalation_inputs`, due
+    /// `failover_provider`) tornerebbero a decidere ognuno per conto suo. Questo
+    /// metodo serve a DIRLO: quando il ripiego non c'e', l'esecutore deve poter
+    /// scrivere "non l'ho cercato perche' me l'hai vietato" invece di "tutti i
+    /// provider hanno fallito", che sarebbe falso e manderebbe l'utente a
+    /// cercare un guasto che non esiste.
+    fn pinned_provider(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Astrazione della LETTURA della storia delle domande-chiarimento poste

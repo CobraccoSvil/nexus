@@ -526,7 +526,10 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             supervisor_mode: SupervisorMode::None,
             profile_prompt_block: String::new(),
             system_context,
-            provider_override: None,
+            // Un run risvegliato non eredita alcuna scelta di provider: il pin
+            // vale per la richiesta in cui l'utente lo da', e qui non c'e' una
+            // richiesta in corso (vedi `ProviderChoice::resolve`).
+            provider_choice: crate::orchestrator::ProviderChoice::Auto,
             model_override: None,
             profile_provider: None,
             profile_model: None,

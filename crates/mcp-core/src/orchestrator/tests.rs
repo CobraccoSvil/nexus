@@ -959,3 +959,79 @@ fn senza_forzatura_la_resa_non_parla_di_provider_forzati() {
         rendered.message
     );
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Il vincolo che entra nel RUN (percorso agentico: confirm/automatic).
+//
+// Stessa strada dei test qui sopra — corpo JSON -> serde -> parse -> scelta —
+// ma proseguita di un passo: `ProviderPin::from_choice`, cioe' cio' che
+// `spawn_agent_run` mette in `NativeRunInput::provider_pin` e che il motore
+// consegna alle porte del run. Prima di questo passaggio il pin moriva al
+// confine dell'handler, che passava il solo NOME del provider.
+//
+// Il ponte handler -> `SpawnAgentParams` non ha un test suo, e non per
+// dimenticanza: quel campo ora HA IL TIPO della scelta intera
+// (`ProviderChoice`), quindi la regressione da presidiare — passare il nome e
+// perdere la forza — non e' piu' scrivibile. Un tipo che rende impossibile
+// l'errore vale piu' di un test che lo insegue.
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn dal_wire_il_vincolo_del_run_nasce_solo_col_pulsante_forza() {
+    // Col pulsante: il run e' vincolato a quel fornitore.
+    let pinnata = scelta_dal_wire(&wire_chat("deepseek", "pinned"), None);
+    assert_eq!(
+        ProviderPin::from_choice(&pinnata).provider(),
+        Some("deepseek")
+    );
+
+    // Senza pulsante: stesso provider sul wire, nessun vincolo nel run. E' il
+    // caso di gran lunga piu' frequente — la selezione dal dropdown senza
+    // "Forza" — e trasformarlo in vincolo sarebbe il difetto col segno
+    // invertito: ogni cambio di dropdown toglierebbe il fallback a un run
+    // lungo, senza che nessuno l'abbia chiesto.
+    let preferita = scelta_dal_wire(&wire_chat("deepseek", "preferred"), None);
+    assert_eq!(preferita.provider(), Some("deepseek"));
+    assert_eq!(ProviderPin::from_choice(&preferita).provider(), None);
+
+    // Preferenza ricordata dalla sessione, corpo senza scelta: nessun vincolo.
+    // Il run agentico dura a lungo e attraversa i cooldown; un vincolo ereditato
+    // da un dropdown mosso ieri lo fermerebbe senza spiegazione.
+    let ricordata = scelta_dal_wire(r#"{"content":"x"}"#, Some("deepseek"));
+    assert_eq!(ricordata.provider(), Some("deepseek"));
+    assert_eq!(ProviderPin::from_choice(&ricordata).provider(), None);
+
+    // Nessuna scelta da nessuna parte.
+    let auto = scelta_dal_wire(r#"{"content":"x"}"#, None);
+    assert_eq!(ProviderPin::from_choice(&auto).provider(), None);
+}
+
+#[test]
+fn il_vincolo_riconosce_il_fornitore_comunque_sia_scritto() {
+    // Il nome viaggia dal wire e viene confrontato con quello dei candidati,
+    // che arriva dal catalogo: due fonti, due grafie possibili. Un confronto
+    // sensibile al maiuscolo fallirebbe APERTO — ammetterebbe tutti — e il
+    // vincolo sembrerebbe attivo mentre non filtra niente. Il difetto piu'
+    // insidioso di questa famiglia: la UI dice "pinnato", i log dicono
+    // "pinnato", e il run cambia fornitore lo stesso.
+    let scelta = scelta_dal_wire(&wire_chat("DeepSeek", "pinned"), None);
+    let pin = ProviderPin::from_choice(&scelta);
+    assert_eq!(pin.provider(), Some("deepseek"), "normalizzato all'ingresso");
+    assert!(pin.ammette("deepseek"));
+    assert!(pin.ammette("DEEPSEEK"), "il catalogo puo' scriverlo diverso");
+    assert!(pin.ammette("  DeepSeek  "));
+    assert!(!pin.ammette("openai"));
+}
+
+#[test]
+fn senza_vincolo_ogni_fornitore_e_ammesso() {
+    // L'assenza di vincolo non deve restringere NULLA: e' lo stato dei run che
+    // non hanno premuto "Forza", cioe' la quasi totalita'. Se `ammette`
+    // rispondesse `false` su un pin vuoto, il primo fallimento di provider
+    // chiuderebbe ogni run invece di ripiegare.
+    let libero = ProviderPin::none();
+    for fornitore in ["openai", "anthropic", "google", "deepseek", ""] {
+        assert!(libero.ammette(fornitore), "'{fornitore}' deve passare");
+    }
+    assert_eq!(libero.provider(), None);
+}

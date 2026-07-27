@@ -50,7 +50,7 @@ pub(crate) use intent::*;
 pub(crate) use model_routing::*;
 pub(crate) use model_selection::*;
 pub(crate) use neural_client::*;
-pub(crate) use provider_choice::{ProviderChoice, ProviderOverrideMode};
+pub(crate) use provider_choice::{ProviderChoice, ProviderOverrideMode, ProviderPin};
 
 #[derive(Debug, Clone)]
 pub struct ChatAttachment {
