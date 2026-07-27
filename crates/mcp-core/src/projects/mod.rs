@@ -476,49 +476,11 @@ pub(crate) async fn load_projects_base_root(db: &PgPool) -> Result<PathBuf, ApiE
     Ok(canonical)
 }
 
-pub(crate) fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, ApiError> {
-    use nexus_types::workspace_paths::{normalize_into_root, WorkspaceTargetError};
-
-    // Normalizzazione/de-duplicazione nel PUNTO UNICO condiviso con la scrittura
-    // (regola L): gestisce il caso in cui l'LLM passa un path che DUPLICA la
-    // project_root (es. `home/administrator/projects/Foo/src/x.ts`) o la root
-    // assoluta. Prima questo resolver di LETTURA non strippava la root, percio'
-    // `read_file` falliva con "Percorso non trovato" sugli stessi file che
-    // `edit_file` (resolve_write_target, che gia' de-duplicava) aveva scritto.
-    let clean = normalize_into_root(root, relative).map_err(|e| {
-        let status = match e {
-            WorkspaceTargetError::OutsideRoot => StatusCode::FORBIDDEN,
-            WorkspaceTargetError::EmptyPath | WorkspaceTargetError::InvalidChars => {
-                StatusCode::BAD_REQUEST
-            }
-        };
-        api_error(status, e.message())
-    })?;
-
-    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let target = if clean.is_empty() {
-        root_canonical.clone()
-    } else {
-        if relative.trim() != clean {
-            tracing::debug!(
-                original = %relative.trim(),
-                normalized = %clean,
-                "resolve_relative_path: root duplicata/assoluta strippata dal path del tool"
-            );
-        }
-        root_canonical.join(&clean)
-    };
-
-    let canonical = target
-        .canonicalize()
-        .map_err(|_| api_error(StatusCode::NOT_FOUND, "Percorso non trovato"))?;
-
-    if !path_within(&root_canonical, &canonical) {
-        return Err(api_error(StatusCode::FORBIDDEN, "Percorso non autorizzato"));
-    }
-
-    Ok(canonical)
-}
+// Risoluzione path di lettura: l'implementazione vive in
+// `nexus_agent_tools::paths` (i tool file estratti nel crate basso ne dipendono
+// e non possono risalire a mcp-core). Qui resta il path storico `crate::projects::
+// resolve_relative_path`, cosi' i call site e i test sotto non cambiano.
+pub(crate) use nexus_agent_tools::paths::resolve_relative_path;
 
 /// Adapter HTTP del punto unico `nexus_types::workspace_paths` (regola L):
 /// stessa logica, errore neutro mappato su StatusCode per i call site axum.

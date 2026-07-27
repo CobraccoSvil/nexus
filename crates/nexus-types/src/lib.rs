@@ -1,4 +1,4 @@
-use axum::{http::StatusCode, Json};
+use axum::Json;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -31,6 +31,11 @@ pub mod workspace_paths;
 pub use routing_client::resolve_purpose_via_http;
 
 // --- Shared API types ---
+
+/// Re-export dello `StatusCode` che compone [`ApiError`]: chi costruisce un
+/// `ApiError` deve poter nominare il tipo dello status senza dipendere da axum
+/// solo per quello (i crate de-axumizzati che usano `api_error`).
+pub use axum::http::StatusCode;
 
 pub type ApiError = (StatusCode, Json<Value>);
 pub type ApiResult = Result<Json<Value>, ApiError>;
