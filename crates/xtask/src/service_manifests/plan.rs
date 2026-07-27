@@ -374,7 +374,10 @@ mod tests {
         Ambiente {
             repo_root: "R".into(),
             runtime_root: "RT".into(),
-            bin_dir: "R/target/debug".into(),
+            // Sotto runtime_root, non sotto repo_root: i servizi eseguono da una copia,
+            // cosi' `cargo build` non trova mai il proprio .exe lockato. Il valore vero
+            // lo compone `super::ambiente`, coperto dal suo test.
+            bin_dir: "RT/bin/debug".into(),
             exe_ext: ".exe".into(),
             node: Some("node.exe".into()),
             ..Default::default()
@@ -394,7 +397,7 @@ mod tests {
         let bins = BTreeMap::from([("mcp-core".to_string(), "mcp-core".to_string())]);
         let p = plan(&cat, &bins, &[], &ordine(&["nexus-mcp-core"]), &amb()).expect("piano");
         assert_eq!(p.len(), 1);
-        assert_eq!(p[0].executable, "R/target/debug/mcp-core.exe");
+        assert_eq!(p[0].executable, "RT/bin/debug/mcp-core.exe");
         assert_eq!(p[0].working_directory, "R");
         assert!(p[0].arguments.is_empty());
     }

@@ -12,6 +12,14 @@ param([switch]$Rust, [switch]$Web, [switch]$NoStart)
 $ErrorActionPreference = 'Stop'
 $ROOT = 'D:\IDEAI'
 
+# Pubblicazione degli artefatti: punto unico condiviso con deploy-local.ps1.
+# I servizi eseguono da una copia (separazione compila/esegue), quindi fra la
+# build e il riavvio ci deve essere un passo che porta i binari dove dev-start.ps1
+# li cerca — cioe' l'eseguibile dichiarato dal manifest. Senza, questo script
+# ricompilerebbe in target\ e riavvierebbe la copia PRECEDENTE: build verde, stack
+# su, modifica non in esecuzione, nessun messaggio.
+. (Join-Path $PSScriptRoot 'lib\nexus-publish.ps1')
+
 function Initialize-Msvc {
   # IDEMPOTENTE (fix definitivo, regola H): vcvars64.bat APPENDE a PATH. Importare
   # il suo ambiente nella sessione PowerShell a ogni run compone il PATH a ogni
@@ -61,6 +69,18 @@ if ($doWeb) {
   if ($LASTEXITCODE -ne 0) { throw 'next build fallito' }
 }
 Set-Location $ROOT
+
+# 2b. PUBBLICAZIONE — i binari raggiungono la dir da cui i servizi eseguono.
+# Senza questo passo dev-start.ps1 rilancerebbe la copia precedente (legge
+# <executable> dal manifest), e la build appena fatta non entrerebbe mai in
+# esecuzione. Lo stack e' gia' fermo dal passo 1, quindi nessun exe e' lockato.
+if ($doRust) {
+  Write-Host '== pubblicazione artefatti ==' -ForegroundColor Cyan
+  $esito = Publish-NexusArtifacts -BuildDir "$ROOT\target\debug"
+  if ($esito.Pubblicati.Count -eq 0) {
+    throw "nessun artefatto pubblicato in $($esito.PublishDir): lo stack ripartirebbe sulla versione precedente."
+  }
+}
 
 # 3. START
 if (-not $NoStart) {

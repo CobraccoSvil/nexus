@@ -306,12 +306,24 @@ fn ambiente(
     porta_db: Option<u16>,
 ) -> Ambiente {
     let barre = |p: PathBuf| p.display().to_string().replace('\\', "/");
+    let runtime_root = std::env::var("NEXUS_RUNTIME_ROOT")
+        .unwrap_or_else(|_| "D:/IDEAI-runtime".to_string())
+        .replace('\\', "/");
     Ambiente {
         repo_root: barre(repo.to_path_buf()),
-        runtime_root: std::env::var("NEXUS_RUNTIME_ROOT")
-            .unwrap_or_else(|_| "D:/IDEAI-runtime".to_string())
-            .replace('\\', "/"),
-        bin_dir: barre(repo.join("target").join(profilo)),
+        // I servizi eseguono da una directory di RUNTIME, non da `target/`.
+        //
+        // Su Windows un .exe in esecuzione e' lockato: finche' i manifest puntavano a
+        // `target/<profilo>`, qualunque `cargo build` lanciato con lo stack vivo moriva
+        // con "Accesso negato (os error 5)" — ma solo ALLA FINE, dopo aver ricompilato
+        // tutto (misurato: 6m12s buttati per un binario da 115 MB). Il lock rendeva
+        // obbligatorio il ciclo stop-tutto -> build -> start, con elevazione admin,
+        // anche per una modifica di una riga.
+        // Separando le due directory, `cargo build` non incontra mai un file lockato:
+        // il deploy diventa "copia gli artefatti in runtime + restart" (vedi
+        // deploy/deploy-local.ps1), e il dev-loop puo' ricompilare a stack acceso.
+        bin_dir: format!("{runtime_root}/bin/{profilo}"),
+        runtime_root,
         exe_ext: if cfg!(windows) { ".exe" } else { "" }.to_string(),
         node: trova_node(),
         dotenv: leggi_dotenv(repo),
@@ -370,7 +382,7 @@ pub fn run(args: &[String]) -> anyhow::Result<i32> {
     let anomalie = riporta_anomalie(&piano, &out);
 
     if o.write {
-        applica(&piano, &out)?;
+        applica(&piano, &out, &repo, &o.profilo)?;
         return Ok(0);
     }
 
@@ -407,17 +419,44 @@ fn riporta_anomalie(piano: &[ServizioRisolto], out: &Path) -> Vec<Anomalia> {
 }
 
 /// Verifica i presupposti e scrive. I binari devono esistere: un manifest che
-/// punta a un file inesistente e' un servizio in crash-loop, non un errore --
-/// cattura "hai dimenticato `cargo build`" PRIMA di scrivere qualunque file.
-fn applica(piano: &[ServizioRisolto], out: &Path) -> anyhow::Result<()> {
+/// punta a un file inesistente e' un servizio in crash-loop, non un errore.
+///
+/// Il rimedio pero' NON e' sempre `cargo build`. Da quando i servizi eseguono da
+/// una copia, `executable` sta sotto la runtime dir, che cargo non scrive mai:
+/// suggerire la build a chi l'ha appena fatta lo manderebbe in un vicolo cieco
+/// (rieseguirla non cambia nulla). Le due condizioni si distinguono guardando se
+/// il binario esiste nell'albero di build: manca anche li' -> va COMPILATO; c'e'
+/// li' ma non nella runtime dir -> va PUBBLICATO.
+fn applica(piano: &[ServizioRisolto], out: &Path, repo: &Path, profilo: &str) -> anyhow::Result<()> {
     let mancanti: Vec<&ServizioRisolto> = piano
         .iter()
         .filter(|s| !Path::new(&s.executable).exists())
         .collect();
     if !mancanti.is_empty() {
-        eprintln!("\neseguibili non presenti sul disco:");
+        let build_dir = repo.join("target").join(profilo);
+        let da_pubblicare: Vec<&&ServizioRisolto> = mancanti
+            .iter()
+            .filter(|s| {
+                Path::new(&s.executable)
+                    .file_name()
+                    .is_some_and(|n| build_dir.join(n).exists())
+            })
+            .collect();
+        eprintln!("\neseguibili non presenti dove i manifest li dichiarano:");
         for s in mancanti.iter() {
             eprintln!("  - {}: {}", s.winsw_id, s.executable);
+        }
+        if !da_pubblicare.is_empty() {
+            eprintln!(
+                "\n{} di questi esistono in {}: sono compilati ma non pubblicati.",
+                da_pubblicare.len(),
+                build_dir.display()
+            );
+            bail!(
+                "pubblica gli artefatti prima di generare i manifest: \
+                 `.\\deploy\\dev-build.ps1` (stack a processi) oppure \
+                 `.\\deploy\\deploy-local.ps1` (servizi WinSW)"
+            );
         }
         bail!("esegui `cargo build` prima di generare i manifest");
     }
@@ -445,6 +484,27 @@ mod tests {
             Some(5433),
             "i parametri di query non fanno parte dell'host"
         );
+    }
+
+    /// I servizi devono eseguire da `runtime_root`, MAI da `target/`: un .exe
+    /// lockato da un servizio vivo fa fallire `cargo build` con os error 5 dopo
+    /// aver ricompilato tutto. La regressione da catturare e' un `bin_dir` che
+    /// torni a puntare dentro il repo.
+    #[test]
+    fn i_servizi_eseguono_dalla_runtime_root_non_da_target() {
+        let amb = ambiente(Path::new("D:/IDEAI"), "debug", BTreeMap::new(), None);
+        assert!(
+            !amb.bin_dir.contains("/target/"),
+            "bin_dir dentro il repo: `cargo build` troverebbe l'exe lockato ({})",
+            amb.bin_dir
+        );
+        assert!(
+            amb.bin_dir.starts_with(&amb.runtime_root),
+            "bin_dir fuori dalla runtime_root ({} non sotto {})",
+            amb.bin_dir,
+            amb.runtime_root
+        );
+        assert!(amb.bin_dir.ends_with("/debug"), "profilo perso: {}", amb.bin_dir);
     }
 
     #[test]
