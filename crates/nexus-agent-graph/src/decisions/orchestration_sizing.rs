@@ -260,15 +260,32 @@ impl OrchestrationPlan {
 }
 
 /// Floor di quorum per panel: sotto questo numero il panel NON si convoca
-/// (va a 0). Council/debate richiedono pluralita' di lenti (2); la review
-/// funziona anche con 1 revisore (quorum min_valid=1 storico); il floor del
-/// multi-provider e' il suo setting `multi_provider_min` (parametrico).
+/// (va a 0). Tutti i panel che esprimono un giudizio richiedono pluralita' di
+/// lenti (2); il floor del multi-provider e' il suo setting
+/// `multi_provider_min` (parametrico).
+///
+/// La review vale 2 come le altre, e prima valeva 1. Era l'unico panel con
+/// potere di VETO — boccia il lavoro e lo rimanda in correzione fino a
+/// `review_max_correction_cycles` — e insieme l'unico senza floor di quorum:
+/// il potere piu' grande sulla base piu' stretta. Con `review_quorum_min_valid`
+/// a 1 quel voto unico non e' nemmeno mai `Inconclusive`, quindi decide da solo.
+///
+/// Un panel da UNO e' il peggiore dei tre stati possibili: costa quanto una
+/// review vera (un sub-run intero, timeout e token compresi), parla con
+/// l'autorita' di un quorum, ma ha la base di un giudizio unico — lo stesso
+/// danno che la diversita' dei giudici elimina sull'altro asse (26/07: dieci
+/// panel da uno, sempre lo stesso modello). O zero — nessuna review
+/// programmatica, resta la direttiva `<revisione_finale>` — o almeno due.
+///
+/// Non serve un ramo per farlo scendere a 0: `degrade_to_offer` gia' azzera un
+/// panel che non entra nell'offerta (passo B), ed e' il principio dichiarato
+/// dalla mig 0602 ("mai convocato monco").
 fn panel_floor(kind: PanelKind, backstops: &OrchestrationBackstops) -> usize {
     match kind {
         PanelKind::Council => 2,
         PanelKind::MultiProvider => backstops.multi_provider_min.max(1),
         PanelKind::Debate => 2,
-        PanelKind::Review => 1,
+        PanelKind::Review => 2,
     }
 }
 
@@ -727,8 +744,9 @@ mod tests {
 
     #[test]
     fn sotto_floor_il_panel_va_a_zero_mai_monco() {
-        // Offerta = 1: nessun panel con floor 2 puo' vivere; sopravvive solo la
-        // review (floor 1).
+        // Offerta = 1: nessun panel raggiunge il proprio floor di quorum, e
+        // nessuno si convoca. Prima la review sopravviveva a 1 — cioe' monca,
+        // proprio cio' che il nome del test nega.
         let budgets = OrchestrationBudgets {
             cost_remaining_usd: Some(0.25),
             time_remaining_s: None,
@@ -743,9 +761,57 @@ mod tests {
             &backstops(),
             &cfg_on(),
         );
-        assert_eq!(plan.council_figures + plan.review_panel_size + plan.multi_provider_providers + plan.debate_advocates, 1);
-        assert_eq!(plan.review_panel_size, 1);
-        assert!(plan.council_figures == 0 && plan.multi_provider_providers == 0 && plan.debate_advocates == 0);
+        assert_eq!(
+            plan.council_figures
+                + plan.review_panel_size
+                + plan.multi_provider_providers
+                + plan.debate_advocates,
+            0,
+            "un'offerta che non copre nessun quorum non convoca niente: {plan:?}"
+        );
+    }
+
+    /// REGRESSIONE (2026-07-27): la review era l'unico panel con potere di VETO
+    /// e insieme l'unico senza floor di quorum. Un panel da UNO costa quanto un
+    /// quorum e decide come un quorum senza esserlo — con
+    /// `review_quorum_min_valid` a 1 quel voto solo non e' nemmeno mai
+    /// `Inconclusive`. Vale "o zero o almeno due", e la garanzia sta nel floor:
+    /// regge qualunque cosa dicano i profili in `settings` (regola G, la
+    /// configurazione non puo' produrre uno stato che il codice esclude).
+    ///
+    /// MUTAZIONE: riportando `panel_floor(Review)` a 1, la prima asserzione
+    /// fallisce con `review_panel_size == 1`.
+    #[test]
+    fn la_review_non_si_convoca_mai_da_sola() {
+        let piano = |reviewers: usize| {
+            resolve_orchestration_plan(
+                Some(TaskComplexity::Low),
+                false,
+                true,
+                &no_budgets(),
+                &unit(),
+                &PanelDemand {
+                    council_figures: 0,
+                    reviewers,
+                    providers: 0,
+                    advocates: 0,
+                },
+                &backstops(),
+                &cfg_on(),
+            )
+        };
+
+        // Una domanda di UN revisore viene alzata al quorum, non accettata.
+        assert_eq!(
+            piano(1).review_panel_size,
+            2,
+            "un revisore solo non e' un panel: o si sale al quorum o non si convoca"
+        );
+        // Zero resta zero: l'admin ha escluso la review per quella classe
+        // (profilo low, mig 0643) e nessun floor la resuscita.
+        assert_eq!(piano(0).review_panel_size, 0);
+        // Sopra il quorum la domanda passa intatta.
+        assert_eq!(piano(3).review_panel_size, 3);
     }
 
     #[test]
@@ -877,6 +943,15 @@ mod tests {
             &backstops(),
             &cfg_on(),
         );
-        assert_eq!(plan.fanout_parallelism, 3);
+        // La proprieta', non il numero: il totale dipende dai floor di quorum
+        // (qui la domanda di UN revisore sale a 2, vedi `panel_floor`) e un
+        // valore fisso si limiterebbe a fotografarli. Il cap di parallelismo
+        // (6) resta sopra il totale, quindi non e' lui a decidere.
+        let totale = plan.council_figures
+            + plan.review_panel_size
+            + plan.multi_provider_providers
+            + plan.debate_advocates;
+        assert_eq!(plan.fanout_parallelism, totale);
+        assert!(totale <= backstops().fanout_max_parallel);
     }
 }
