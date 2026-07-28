@@ -461,6 +461,10 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         &expected_format,
         None,
         background,
+        // Il dispatch SINGOLO non e' il canale del piano: il todo_runner passa
+        // sempre da `dispatch_subagents` (plurale), che porta `write_scope` per
+        // task. Qui non c'e' uno scope dichiarato da misurare.
+        &[],
     )
     .await
     .to_string()
@@ -566,17 +570,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     } else {
         let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
         for wave in parsed.chunks(max_parallel) {
-            let futs = wave.iter().map(|p| {
-                run_single_subagent(
-                    ctx,
-                    &p.kind,
-                    &p.task,
-                    &p.context_blob,
-                    &p.expected,
-                    None,
-                    false,
-                )
-            });
+            let futs = wave.iter().map(|p| run_parsed_task(ctx, p, None));
             let wave_res = futures::future::join_all(futs).await;
             results.extend(wave_res);
         }
@@ -838,17 +832,7 @@ async fn run_batch_isolated(
                 base_commit: h.base_commit.clone(),
             };
             async move {
-                run_single_subagent(
-                    ctx,
-                    &p.kind,
-                    &p.task,
-                    &p.context_blob,
-                    &p.expected,
-                    Some(&slot),
-                    // Ramo ISOLATO: mai background (l'apply serializzato esige
-                    // sub-run terminati).
-                    false,
-                )
+                run_parsed_task(ctx, p, Some(&slot))
                 .await
             }
         });
@@ -962,6 +946,7 @@ async fn run_batch_background(ctx: &AgentToolContext, parsed: &[ParsedTask]) -> 
                 None,
                 true,
                 None,
+                &p.write_scope,
             )
             .await,
         );
@@ -991,15 +976,7 @@ async fn run_batch_sequential(
         let futs = wave.iter().map(|p| {
             // Degrado dell'isolamento a sequenziale: mai background (questo ramo e'
             // raggiunto solo dal fallback dell'isolato, che esclude il background).
-            run_single_subagent(
-                ctx,
-                &p.kind,
-                &p.task,
-                &p.context_blob,
-                &p.expected,
-                None,
-                false,
-            )
+            run_parsed_task(ctx, p, None)
         });
         let wave_res = futures::future::join_all(futs).await;
         results.extend(wave_res);
@@ -2317,7 +2294,8 @@ async fn spawn_reviewers(
                     .await
                 }
                 None => {
-                    run_single_subagent(&ctx, "review", &task, "", &expected, None, false).await
+                    run_single_subagent(&ctx, "review", &task, "", &expected, None, false, &[])
+                        .await
                 }
             }
         }
@@ -2595,7 +2573,9 @@ async fn spawn_advocates(
             let expected = expected.to_string();
             let kind = kind.clone();
             let task = build_advocate_task(&topic_owned, &assignments_for_make[i], user_task);
-            async move { run_single_subagent(&ctx, &kind, &task, "", &expected, None, false).await }
+            async move {
+                run_single_subagent(&ctx, &kind, &task, "", &expected, None, false, &[]).await
+            }
         },
     )
     .await
@@ -3116,6 +3096,36 @@ pub(crate) struct IsolationSlot {
 /// scrive nel worktree `slot.worktree_path` (ctx isolato: autocommit/reindex
 /// soppressi, PR3) e persiste `worktree_path`/`base_commit`. L'apply dei
 /// cambiamenti alla root e' responsabilita' SERIALIZZATA del chiamante batch.
+/// Esegue un task GIA' PARSATO del batch come sub-run sequenziale. PUNTO UNICO
+/// (regola L) dei tre rami che dispatchano un `ParsedTask`: ondata sequenziale,
+/// ramo isolato (con lo slot worktree) e degrado dall'isolamento.
+///
+/// Erano tre chiamate identiche a [`run_single_subagent`], che passavano gli
+/// stessi sei campi di `p` nello stesso ordine: ogni volta che la firma cambia,
+/// tre punti vanno aggiornati in modo coerente, e basta dimenticarne uno perche'
+/// un ramo dispatchi con un campo in meno senza che nulla lo segnali. Un campo
+/// aggiunto qui raggiunge tutti e tre per costruzione.
+///
+/// `isolation` e' l'unica differenza reale fra i chiamanti; nessuno dei tre e'
+/// mai background (l'apply serializzato del ramo isolato esige sub-run conclusi).
+async fn run_parsed_task(
+    ctx: &AgentToolContext,
+    p: &ParsedTask,
+    isolation: Option<&IsolationSlot>,
+) -> Value {
+    run_single_subagent(
+        ctx,
+        &p.kind,
+        &p.task,
+        &p.context_blob,
+        &p.expected,
+        isolation,
+        false,
+        &p.write_scope,
+    )
+    .await
+}
+
 pub(crate) async fn run_single_subagent(
     ctx: &AgentToolContext,
     kind: &str,
@@ -3124,6 +3134,7 @@ pub(crate) async fn run_single_subagent(
     expected_format: &str,
     isolation: Option<&IsolationSlot>,
     is_background: bool,
+    write_scope: &[String],
 ) -> Value {
     run_single_subagent_inner(
         ctx,
@@ -3134,6 +3145,7 @@ pub(crate) async fn run_single_subagent(
         isolation,
         is_background,
         None,
+        write_scope,
     )
     .await
 }
@@ -3157,6 +3169,9 @@ async fn run_single_subagent_with_model_pin(
         None,
         false,
         Some((provider, model)),
+        // Le figure a modello pinnato (panel di review, consiglio) non eseguono un
+        // passi del piano: non hanno uno scope dichiarato da misurare.
+        &[],
     )
     .await
 }
@@ -3171,6 +3186,7 @@ async fn run_single_subagent_inner(
     isolation: Option<&IsolationSlot>,
     is_background: bool,
     model_pin: Option<(&str, &str)>,
+    write_scope: &[String],
 ) -> Value {
     // FASE PREPARE (guard + INSERT + ensure_child, tutto SINCRONO fail-fast): il
     // punto unico condiviso dal ramo singolo e dal batch background (regola L).
@@ -3183,6 +3199,7 @@ async fn run_single_subagent_inner(
         isolation,
         is_background,
         model_pin,
+        write_scope,
     )
     .await
     {
@@ -3227,6 +3244,7 @@ async fn prepare_subagent_run(
     isolation: Option<&IsolationSlot>,
     is_background: bool,
     model_pin: Option<(&str, &str)>,
+    write_scope: &[String],
 ) -> Result<SubagentExecInputs, Value> {
     let db = &*ctx.core.db;
     let project_id = ctx.core.project_id;
@@ -3439,6 +3457,12 @@ async fn prepare_subagent_run(
         // Il ramo background NON supporta isolamento (vedi doc su tool_dispatch_*):
         // qui `working_root` porta il worktree solo per il ramo sequenziale isolato.
         working_root: isolation.map(|s| s.worktree_path.clone()),
+        // Scope dichiarato dal pianificatore per il passo di piano di questo sub-run. A
+        // differenza di `working_root` viaggia in ENTRAMBI i rami (isolato e
+        // condiviso) e anche in background: e' una misura, e misurare solo il ramo
+        // isolato — che senza il flag di isolamento non scatta mai — vorrebbe dire
+        // non misurare niente e leggere zeri rassicuranti.
+        write_scope: write_scope.to_vec(),
         isolated: isolation.is_some(),
         // Fase D fan-in: il ramo background enqueue il parent al termine se e'
         // l'ultimo figlio background terminale (vedi execute_subagent_run).
@@ -3498,6 +3522,11 @@ struct SubagentExecInputs {
     narration_heartbeat_s: i64,
     /// Root del sub-run (worktree isolato) o `None` (root condivisa / background).
     working_root: Option<std::path::PathBuf>,
+    /// Aree file dichiarate dal pianificatore per il passo di piano di questo sub-run
+    /// (`ParsedTask::write_scope`, che risale a `nexus_agent_todos.write_scope`).
+    /// Scende nel motore e da li' nel ctx dei tool, dove l'hook delle mutazioni
+    /// MISURA quante scritture cadono fuori. Vuoto = non dichiarato.
+    write_scope: Vec<String>,
     /// `true` = ramo isolato (payload narrazione avvio). Il background e' sempre
     /// `false` (isolamento non supportato in background).
     isolated: bool,
@@ -3539,6 +3568,7 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         narration_enabled,
         narration_heartbeat_s,
         working_root,
+        write_scope,
         isolated,
         is_background,
         fanin_parent_run_id,
@@ -3657,6 +3687,11 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // `tool_dispatch_subagents`) -> scrive nel worktree effimero, ctx isolato
         // (autocommit/reindex soppressi, PR3). L'apply serializzato e' del batch.
         working_root,
+        // Lo scope dichiarato per il passo arriva fin dentro il ctx dei tool del
+        // sub-run: e' l'anello senza il quale il confronto non scatterebbe MAI e la
+        // misura si riempirebbe di "non dichiarato" facendo sembrare preciso un
+        // pianificatore che non e' stato misurato.
+        write_scope,
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
         // Un SUB-RUN non ha barriera: i panel a monte sono del coordinatore, non
@@ -4183,7 +4218,7 @@ async fn run_council_figure(
             run_single_subagent_with_model_pin(ctx, kind, task, "", expected, &provider, &model)
                 .await
         }
-        None => run_single_subagent(ctx, kind, task, "", expected, None, false).await,
+        None => run_single_subagent(ctx, kind, task, "", expected, None, false, &[]).await,
     }
 }
 
@@ -4883,7 +4918,8 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
     // ripresa di un singolo sub-run non e' un batch parallelo-che-scrive.
     // Il resume e' SINCRONO (bloccante): riprende un singolo sub-run e ne attende
     // l'esito, non e' un dispatch background.
-    let res = run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None, false).await;
+    let res =
+        run_single_subagent(ctx, &kind, &task, &context_blob, &expected, None, false, &[]).await;
     res.to_string()
 }
 

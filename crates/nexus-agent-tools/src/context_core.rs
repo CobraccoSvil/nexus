@@ -202,4 +202,16 @@ pub struct ToolContextCore {
     /// realmente promossi alla root. Default `false` -> comportamento invariato
     /// (ogni ctx non isolato mantiene autocommit + reindex come oggi).
     pub isolated_subrun: bool,
+    /// Aree file che il PIANIFICATORE ha dichiarato per il task di questo sub-run
+    /// (`nexus_agent_todos.write_scope`), propagate fin qui lungo lo stesso canale
+    /// di `working_root`. Vuoto = nessuno scope dichiarato (run principale, dispatch
+    /// fuori dal percorso a passi di piano, sub-run di un passo che non dichiara nulla).
+    ///
+    /// Serve a MISURARE, non a vincolare: nessun tool rifiuta una scrittura in base
+    /// a questo campo. L'hook `record_mutation` lo confronta col path scritto
+    /// (punto unico `classify_write`) e persiste il verdetto, cosi' "quante
+    /// scritture cadono fuori dallo scope dichiarato" diventa una query invece di
+    /// una congettura. La decisione fra enforcement duro, estensione su richiesta e
+    /// correzione del pianificatore dipende da quel numero, che oggi non esiste.
+    pub write_scope: Vec<String>,
 }

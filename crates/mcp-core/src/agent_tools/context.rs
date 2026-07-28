@@ -111,15 +111,36 @@ impl FileMutationHooks for NeuralFileReindexer {
         after: Option<&'a str>,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            // MISURA (mig 0646), non enforcement: la scrittura e' gia' decisa e
+            // avviene comunque. Qui si registra soltanto se cadeva dentro il
+            // `write_scope` che il pianificatore aveva dichiarato per il passo di piano di
+            // questo sub-run, delegando il verdetto al punto unico `classify_write`
+            // (regola L: la nozione di "dentro uno scope" nasce in un posto solo,
+            // lo stesso che decide la disgiunzione delle wave parallele).
+            //
+            // `core.write_scope` vuoto -> `no_scope_declared`: la riga dichiara di
+            // NON essere misurabile invece di passare per conforme. E' la
+            // differenza fra una misura che si accorge di essere cieca e una che
+            // produce zeri rassicuranti.
+            let verdict =
+                nexus_agent_graph::decisions::classify_write(path, &core.write_scope);
             if let Err(e) = crate::file_mutations::record_mutation(
                 &core.db,
                 core.project_id,
                 core.session_id,
+                // Run corrente: per un sub-run e' l'id del sub-run, cioe' il passo di piano
+                // che sta scrivendo. E' cio' che permette di passare da "quante
+                // scritture" a "su quanti passi".
+                core.run_id,
                 Some(core.user_id),
                 path,
                 tool_name,
                 before,
                 after,
+                crate::file_mutations::ScopeAudit {
+                    verdict: Some(verdict.as_str()),
+                    declared: &core.write_scope,
+                },
             )
             .await
             {

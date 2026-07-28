@@ -442,6 +442,17 @@ impl TodoRunnerNode {
     ///
     /// `extra_context` (vuoto al primo dispatch, `<tentativo_precedente_fallito>`
     /// al retry) e' PREPESO al context_blob.
+    ///
+    /// Il task porta anche il `write_scope` dichiarato dal pianificatore per il
+    /// passo, letto dal Value opaco (`todos_to_values` serializza l'intera struct,
+    /// campo incluso). Alimenta la MISURA delle scritture fuori scope (mig 0646),
+    /// e serve QUI in particolare: questa e' la via del passo-per-volta, cioe'
+    /// quella che prende il traffico ogni volta che il parallelismo non e'
+    /// concesso — e non lo e' quasi mai, perche' `parallel_writers_allowed` esige
+    /// l'isolamento fisico, di default spento. Finche' lo scope viaggiava solo in
+    /// [`Self::dispatch_wave`], misurare voleva dire misurare il ramo che non
+    /// gira: colonna piena di "non dichiarato" e la conclusione, falsa, che il
+    /// pianificatore sia preciso.
     async fn dispatch_one(
         &self,
         state: &AgentState,
@@ -457,14 +468,15 @@ impl TodoRunnerNode {
                 .to_string();
         }
 
-        let task = str_or_empty(todo.get("content")).trim().to_string();
-        let tasks = json!([{
-            "kind": self.cfg.todo_kind(),
-            "task": task,
-            "context": context_blob,
-            "expected_output_format":
-                "riepilogo conciso delle modifiche applicate e dell'esito",
-        }]);
+        // Testo e scope dichiarato, letti insieme dal Value opaco del passo.
+        let (contenuto, scope) = (todo.get("content"), todo.get("write_scope"));
+        let task = str_or_empty(contenuto).trim().to_string();
+        let tasks = json!([subagent_task_json(
+            &self.cfg.todo_kind(),
+            &task,
+            &context_blob,
+            scope.cloned().unwrap_or_else(|| json!([])),
+        )]);
         let call = ToolCall {
             id: uuid::Uuid::new_v4().to_string(),
             name: "dispatch_subagents".to_string(),
@@ -544,19 +556,12 @@ impl TodoRunnerNode {
             let tv = todo_value_of(todos, &t.id);
             let blob = Self::build_context_blob(state, &tv, &prior);
             let task_text = str_or_empty(tv.get("content")).trim().to_string();
-            tasks.push(json!({
-                "kind": self.cfg.todo_kind(),
-                "task": task_text,
-                "context": blob,
-                "expected_output_format":
-                    "riepilogo conciso delle modifiche applicate e dell'esito",
-                // FASE 2 (PR4): aree file dichiarate dal todo. Alimenta il gating
-                // dell'isolamento fisico nel punto unico `tool_dispatch_subagents`
-                // (`subtasks_are_disjoint`). Assente/vuoto (finche' la colonna
-                // `nexus_agent_todos.write_scope` non e' persistita) -> il gating
-                // degrada a sequenziale (sicuro come oggi).
-                "write_scope": t.write_scope,
-            }));
+            tasks.push(subagent_task_json(
+                &self.cfg.todo_kind(),
+                &task_text,
+                &blob,
+                json!(t.write_scope),
+            ));
         }
 
         tracing::info!(
@@ -1012,6 +1017,31 @@ fn end_turn_no_active() -> OpaqueDelta {
         ..Default::default()
     }
     .into_opaque()
+}
+
+/// FORMA del task passato a `dispatch_subagents`. PUNTO UNICO (regola L) dei due
+/// rami che dispatchano un passo: [`TodoRunnerNode::dispatch_one`] (un passo per
+/// volta) e [`TodoRunnerNode::dispatch_wave`] (ondata parallela).
+///
+/// Perche' esiste: finche' i due rami costruivano questo JSON ognuno per conto
+/// proprio, `write_scope` viaggiava SOLO nella wave. Il ramo sequenziale — quello
+/// che prende il traffico ogni volta che il parallelismo non e' concesso, cioe'
+/// quasi sempre, perche' `parallel_writers_allowed` esige l'isolamento fisico di
+/// default spento — lo perdeva per strada. La misura delle scritture fuori scope
+/// (mig 0646) sarebbe stata cieca proprio dove passa il lavoro, e avrebbe
+/// riportato "il pianificatore non sbaglia mai" per non aver misurato nulla.
+/// Un campo aggiunto qui ora raggiunge ENTRAMBI i rami per costruzione.
+///
+/// `write_scope` e' un `Value` gia' pronto (array): la wave lo ha come
+/// `Vec<String>` dalla struct del passo, il ramo singolo dal Value opaco.
+fn subagent_task_json(kind: &str, task: &str, context_blob: &str, write_scope: Value) -> Value {
+    json!({
+        "kind": kind,
+        "task": task,
+        "context": context_blob,
+        "expected_output_format": "riepilogo conciso delle modifiche applicate e dell'esito",
+        "write_scope": write_scope,
+    })
 }
 
 /// Mappa un `PortError` su `NodeError::Failed` del nodo todo_runner.
@@ -1490,6 +1520,100 @@ mod tests {
         let marks = store.marks.lock().unwrap();
         assert!(marks.contains(&("a".to_string(), TodoStatus::InProgress)));
         assert!(marks.contains(&("b".to_string(), TodoStatus::Completed)));
+    }
+
+    // ── MISURA scritture fuori scope: trasporto dello scope dichiarato ───────────
+
+    /// L'anello che, mancando, avrebbe reso CIECA l'intera misura delle scritture
+    /// fuori scope — e senza farlo vedere.
+    ///
+    /// Il percorso e' quello del passo-per-volta (`dispatch_one`), cioe' quello che
+    /// prende il traffico ogni volta che il parallelismo non e' concesso: qui
+    /// `isolation_available=false`, che e' il default di ogni progetto non-git e la
+    /// condizione in cui `parallel_writers_allowed` nega la wave. Finche' lo scope
+    /// viaggiava solo in `dispatch_wave`, misurare le violazioni voleva dire
+    /// misurare il ramo che quasi non gira: la colonna si sarebbe riempita di
+    /// `no_scope_declared` e il numero avrebbe detto "il pianificatore e' preciso"
+    /// quando in realta' non era stato misurato niente.
+    ///
+    /// Il test attraversa il PRODUTTORE (regola O): lo scope non e' costruito a
+    /// mano nel JSON: parte dal campo `write_scope` della struct nello store, passa per
+    /// per `todo_value_of` (che la serializza) e arriva a `dispatch_one`, che e'
+    /// il codice di produzione. Il valore atteso e' un path che non puo' nascere per
+    /// caso, cosi' l'asserzione misura il TRASPORTO del contenuto e non la sola
+    /// presenza della chiave.
+    ///
+    /// Mutazione che rende rosso: togliere la riga `"write_scope": ...` da
+    /// `dispatch_one` -> il campo diventa assente (`Value::Null`), diverso
+    /// dall'array atteso. Da notare che senza quella riga il test NON fallirebbe
+    /// per un array vuoto ma per un campo mancante: sono due esiti distinti, ed e'
+    /// il motivo per cui lo scope del passo qui non e' vuoto.
+    ///
+    /// La chiave `write_scope` e' il contratto col consumatore, `write_scope_of` in
+    /// `mcp-core/src/agent_tools/subagent_native.rs`, che legge esattamente questo
+    /// campo da ciascun elemento di `tasks`.
+    #[tokio::test]
+    async fn dispatch_one_trasporta_lo_scope_dichiarato_dal_todo() {
+        let store = Arc::new(StubTodoStore::with_todos(vec![todo_scoped(
+            "a",
+            TodoStatus::Pending,
+            &[],
+            1,
+            &["crates/api/handlers.rs", "db/migrations"],
+        )]));
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![ok_payload(
+            "fatto", 0.1,
+        )]));
+        let n = node(TodoRunnerConfig::default(), store.clone(), tools.clone());
+        // Isolamento NON disponibile: e' il ramo dispatch_one, quello dominante.
+        let ctx = ctx_with(routing_cfg_on());
+        let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        let seen = tools.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "un solo dispatch per il todo-per-volta");
+        let tasks = seen[0].input["tasks"].as_array().expect("tasks");
+        assert_eq!(tasks.len(), 1, "max_parallel=1 -> un task");
+        assert_eq!(
+            tasks[0]["write_scope"],
+            json!(["crates/api/handlers.rs", "db/migrations"]),
+            "lo scope dichiarato dal todo deve arrivare al dispatch: senza, il \
+             confronto a valle non scatta mai e la misura conta zero violazioni \
+             perche' non misura, non perche' non ce ne siano"
+        );
+    }
+
+    /// Gemello del precedente sul ramo PARALLELO: la wave trasportava gia' lo
+    /// scope, e deve continuare a farlo con la stessa chiave del ramo sequenziale.
+    /// Due rami che chiamano lo stesso consumatore con due nomi diversi sarebbero
+    /// una misura che funziona a meta' — il caso peggiore, perche' il numero
+    /// sembrerebbe plausibile.
+    #[tokio::test]
+    async fn dispatch_wave_trasporta_lo_scope_con_la_stessa_chiave() {
+        let store = Arc::new(StubTodoStore::with_todos(vec![
+            todo_scoped("a", TodoStatus::Pending, &[], 1, &["crates/api"]),
+            todo_scoped("b", TodoStatus::Pending, &[], 2, &["apps/web"]),
+        ]));
+        let payload = json!({"results": [
+            {"status": "completed", "summary": "a", "cost_usd": 0.1},
+            {"status": "completed", "summary": "b", "cost_usd": 0.1},
+        ]});
+        let tools = Arc::new(QueueToolExecutor::with_payloads(vec![payload]));
+        let cfg = TodoRunnerConfig {
+            dag_topological_enabled: true,
+            dag_parallel_min_ready: 2,
+            ..TodoRunnerConfig::default()
+        };
+        let n = node(cfg, store.clone(), tools.clone());
+        let ctx = ctx_isolated(routing_cfg_on());
+        let st = isolated_state(Some("11111111-1111-1111-1111-111111111111"));
+        let _ = apply(st.clone(), n.run(&st, &ctx).await.expect("run ok"));
+
+        let seen = tools.seen.lock().unwrap();
+        let tasks = seen[0].input["tasks"].as_array().expect("tasks");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["write_scope"], json!(["crates/api"]));
+        assert_eq!(tasks[1]["write_scope"], json!(["apps/web"]));
     }
 
     /// GUARD FISICA ANTI-RACE: stesse identiche todo del test precedente (scope

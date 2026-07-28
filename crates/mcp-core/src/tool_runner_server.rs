@@ -160,7 +160,7 @@ impl ToolRunnerService {
     /// STESSO contesto (root_path/permessi/canali) del path gRPC — un solo punto di
     /// costruzione del ctx (regola L), nessuna divergenza di permessi o reindex.
     pub(crate) async fn build_ctx(&self, session_id: Uuid) -> Result<AgentToolContext, Status> {
-        self.build_ctx_with_root(session_id, None).await
+        self.build_ctx_with_root(session_id, None, &[]).await
     }
 
     /// Costruisce il ctx tool per un pre-step legato a un run primario gia' persistito
@@ -189,12 +189,21 @@ impl ToolRunnerService {
     /// `isolated_subrun=false`) -> comportamento invariato: nessun call site di PR3
     /// passa un override (l'accensione e' PR4).
     ///
+    /// `write_scope` sono le aree file che il pianificatore ha dichiarato per il
+    /// task del sub-run: viaggiano lungo lo STESSO canale di `override_root` e
+    /// finiscono nel ctx, dove l'hook `record_mutation` le confronta col path
+    /// scritto per MISURARE quante scritture cadono fuori (nessun enforcement).
+    /// Vuoto (`&[]`) per ogni chiamante che non e' un sub-run di piano -> verdetto
+    /// `no_scope_declared`, che e' il valore onesto: non "tutto in regola" ma
+    /// "questa scrittura non era misurabile".
+    ///
     /// Tutto il resto (project_id, permessi, pool, canali, reindexer) e' risolto
     /// UNA volta qui: `build_ctx` vi delega, nessuna logica duplicata.
     pub(crate) async fn build_ctx_with_root(
         &self,
         session_id: Uuid,
         override_root: Option<&Path>,
+        write_scope: &[String],
     ) -> Result<AgentToolContext, Status> {
         let info = self.resolve_session(session_id).await?;
         let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
@@ -235,6 +244,7 @@ impl ToolRunnerService {
                 }),
                 embedder: Arc::new(self.deps.neural.clone()),
                 isolated_subrun,
+                write_scope: write_scope.to_vec(),
             },
             playwright_channels: self.deps.playwright_channels.clone(),
             neural: self.deps.neural.clone(),

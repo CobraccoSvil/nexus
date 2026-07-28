@@ -1220,6 +1220,8 @@ async fn try_resume_interrupted_run(
             classifier_intent: None,
             run_time_budget_s: None,
             working_root: None,
+            // Nessun passo di piano a monte: nessuno scope dichiarato da misurare.
+            write_scope: Vec::new(),
             // I panel a monte hanno gia' deliberato sul run originale: il resume
             // riprende il lavoro, non riapre la deliberazione.
             pre_run_advisory_synthesis: None,

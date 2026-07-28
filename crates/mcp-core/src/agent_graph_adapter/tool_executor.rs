@@ -50,6 +50,12 @@ pub struct ToolRunnerExecutorAdapter {
     /// passato a `execute` -> `build_ctx_with_root`. `None` (default) -> il ctx usa
     /// la root del progetto risolta dalla sessione: comportamento invariato.
     working_root: Option<PathBuf>,
+    /// Aree file dichiarate dal pianificatore per il task di questo sub-run.
+    /// Campo IMMUTABILE del run, passato a `execute` -> `build_ctx_with_root` ->
+    /// ctx, dove l'hook delle mutazioni MISURA quante scritture cadono fuori.
+    /// Vuoto (default per il run principale e per ogni dispatch fuori dal percorso
+    /// a passi di piano) -> le mutazioni risultano `no_scope_declared`.
+    write_scope: Vec<String>,
     /// Narrazione del run invocante (run_id + canale SSE del run del grafo che
     /// esegue i tool): iniettata nel ctx dei tool, cosi' i tool a lunga durata
     /// (dispatch_subagents) possono emettere meta-step sul run padre mentre
@@ -64,16 +70,20 @@ impl ToolRunnerExecutorAdapter {
     /// - `working_root`: override root del sub-run ISOLATO (FASE 2). `None`
     ///   (default per ogni run non isolato) -> ctx sulla root del progetto,
     ///   comportamento invariato.
+    /// - `write_scope`: aree file dichiarate dal pianificatore per il task del
+    ///   sub-run (misura, non vincolo). Vuoto per il run principale.
     pub fn new(
         deps: ToolRunnerDeps,
         session_id: Uuid,
         working_root: Option<PathBuf>,
+        write_scope: Vec<String>,
         parent_narration: Option<crate::agent_tools::context::ParentNarration>,
     ) -> Self {
         Self {
             deps,
             session_id,
             working_root,
+            write_scope,
             parent_narration,
         }
     }
@@ -94,7 +104,11 @@ impl ToolExecutor for ToolRunnerExecutorAdapter {
         // progetto, `isolated_subrun=false`. Con un override il ctx punta al
         // worktree effimero del sub-run e sopprime autocommit/reindex.
         let mut ctx = svc
-            .build_ctx_with_root(self.session_id, self.working_root.as_deref())
+            .build_ctx_with_root(
+                self.session_id,
+                self.working_root.as_deref(),
+                &self.write_scope,
+            )
             .await
             // Il `Display` di `tonic::Status` stampa la struttura INTERA —
             // `status: Unavailable, message: "...", details: [], metadata:

@@ -236,6 +236,90 @@ fn scopes_overlap(a: &str, b: &str) -> bool {
     longer.starts_with(shorter) && longer.as_bytes().get(shorter.len()) == Some(&b'/')
 }
 
+/// Verdetto della MISURA di una scrittura file rispetto al `write_scope` che il
+/// pianificatore ha dichiarato per il task. E' una misura, NON un enforcement:
+/// nessun ramo di questo codebase rifiuta una scrittura in base a questo valore.
+///
+/// Identificatori canonici in inglese (regola N): sono valori PERSISTITI
+/// (`file_mutations.scope_verdict`) e chiavi di aggregazione delle query, non
+/// etichette da mostrare.
+///
+/// Le varianti sono TRE e non due: [`ScopeVerdict::NoScopeDeclared`] e' la
+/// distinzione che rende la misura leggibile. Senza di essa una colonna piena di
+/// `in_scope` sarebbe indistinguibile da "nessuno ha mai dichiarato niente", e
+/// porterebbe a concludere che il pianificatore e' preciso proprio nel caso in cui
+/// non lo si e' misurato affatto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeVerdict {
+    /// Il task non ha dichiarato alcuno scope normalizzabile: la scrittura NON e'
+    /// misurabile. NON e' una violazione, ed e' l'unico modo per accorgersi che la
+    /// propagazione dello scope e' rotta invece di leggere zeri rassicuranti.
+    NoScopeDeclared,
+    /// Scope dichiarato e path scritto DENTRO almeno uno dei suoi path.
+    InScope,
+    /// Scope dichiarato e path scritto FUORI da ognuno dei suoi path.
+    OutOfScope,
+}
+
+impl ScopeVerdict {
+    /// Identificatore canonico persistito (regola N). Unico punto in cui il
+    /// vocabolario nasce: le query di aggregazione confrontano queste stringhe.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoScopeDeclared => "no_scope_declared",
+            Self::InScope => "in_scope",
+            Self::OutOfScope => "out_of_scope",
+        }
+    }
+}
+
+/// PUNTO UNICO (regola L) della domanda "il path scritto sta DENTRO uno degli
+/// scope dichiarati?". Riusa [`normalize_scope_path`] su ENTRAMBI i lati: se la
+/// normalizzazione fosse riscritta qui nascerebbero due idee diverse di "dentro
+/// uno scope", che e' la regola L violata al primo commit.
+///
+/// Il confronto e' DIREZIONALE, ed e' l'unica differenza rispetto a
+/// [`scopes_overlap`] — simmetrico perche' li' la domanda e' "due aree si
+/// pestano?". Qui la domanda ha un verso: lo scope `src/a` CONTIENE `src/a/b.rs`,
+/// ma lo scope `src/a/b.rs` NON contiene `src/a`. Uno scope che nomina un file
+/// copre quel file soltanto.
+///
+/// Confine di SEGMENTO come in [`scopes_overlap`]: lo scope `src/a` non contiene
+/// `src/ab.rs`. Path non normalizzabile -> `false` (non e' dentro nulla).
+///
+/// Caso a parte, e non teorico: `.` e' la ROOT del progetto. `normalize_scope_path`
+/// riduce `"."` e `"./"` alla stringa `"."`, e un pianificatore che dichiara la root
+/// sta dicendo "tutto il progetto". Senza questo ramo uno scope-root non
+/// conterrebbe NULLA — `"src/a.rs"` non ha prefisso `"."` — e ogni scrittura di quel
+/// task risulterebbe una violazione: il numero si gonfierebbe di falsi positivi
+/// proprio nel caso in cui il piano non ha ristretto niente.
+pub fn path_in_scope(path: &str, scope: &[String]) -> bool {
+    let Some(p) = normalize_scope_path(path) else {
+        return false;
+    };
+    scope.iter().filter_map(|s| normalize_scope_path(s)).any(|s| {
+        s == "." || p == s || (p.starts_with(&s) && p.as_bytes().get(s.len()) == Some(&b'/'))
+    })
+}
+
+/// PUNTO UNICO (regola L) del VERDETTO su una scrittura: distingue "fuori scope"
+/// da "scope mai dichiarato" prima di interrogare [`path_in_scope`].
+///
+/// Uno scope fatto di sole stringhe non normalizzabili (array di stringhe vuote)
+/// NON e' una dichiarazione: classificarlo `out_of_scope` conterebbe come errore
+/// del pianificatore un difetto di forma, e falserebbe il numero che questa misura
+/// esiste per produrre.
+pub fn classify_write(path: &str, scope: &[String]) -> ScopeVerdict {
+    if !scope.iter().any(|s| normalize_scope_path(s).is_some()) {
+        return ScopeVerdict::NoScopeDeclared;
+    }
+    if path_in_scope(path, scope) {
+        ScopeVerdict::InScope
+    } else {
+        ScopeVerdict::OutOfScope
+    }
+}
+
 /// PUNTO UNICO (regola L) della verifica STATICA di DISGIUNZIONE degli scope di
 /// scrittura dichiarati dai sub-task. Funzione PURA (nessun IO, regola M: decide su
 /// segnali strutturati, mai su prosa). Ritorna `true` (parallelizzabile in
@@ -836,5 +920,116 @@ mod tests {
         ]));
         // Stessi separatori misti ma path diversi -> disgiunti.
         assert!(subtasks_are_disjoint(&[sc(&["src\\a"]), sc(&["src\\b"])]));
+    }
+
+    // ── MISURA scritture fuori scope: path_in_scope / classify_write ─────────────
+
+    /// La differenza che giustifica una funzione a se' invece di riusare
+    /// `scopes_overlap`: qui la domanda ha un VERSO. Uno scope-directory contiene
+    /// cio' che sta sotto; uno scope-file non contiene la directory che lo ospita.
+    ///
+    /// Mutazione che rende rosso: implementare `path_in_scope` con
+    /// `scopes_overlap` (simmetrico) -> la seconda asserzione passa da false a true.
+    #[test]
+    fn path_in_scope_e_direzionale_non_simmetrico() {
+        let dir = sc(&["src/a"]);
+        assert!(path_in_scope("src/a/b.rs", &dir), "scope-dir contiene il file");
+        assert!(path_in_scope("src/a", &dir), "il path e' lo scope stesso");
+
+        let file = sc(&["src/a/b.rs"]);
+        assert!(
+            !path_in_scope("src/a", &file),
+            "uno scope che nomina un FILE non contiene la directory che lo ospita"
+        );
+        assert!(
+            !path_in_scope("src/a/c.rs", &file),
+            "uno scope-file copre quel file soltanto"
+        );
+    }
+
+    /// Confine di SEGMENTO, come in `scopes_overlap`: un prefisso di stringa non
+    /// basta. Mutazione che rende rosso: togliere il controllo del byte `/`
+    /// successivo -> `src/ab.rs` finirebbe dentro lo scope `src/a`.
+    #[test]
+    fn path_in_scope_rispetta_il_confine_di_segmento() {
+        let scope = sc(&["src/a"]);
+        assert!(!path_in_scope("src/ab.rs", &scope));
+        assert!(!path_in_scope("src/abc/d.rs", &scope));
+        assert!(path_in_scope("src/a/b/c.rs", &scope), "nidificazione profonda");
+    }
+
+    /// Il riuso di `normalize_scope_path` su ENTRAMBI i lati non e' un dettaglio di
+    /// stile: il path scritto arriva dai tool con i separatori del sistema, lo scope
+    /// arriva da un LLM. Se i due lati normalizzassero in modo diverso, ogni
+    /// scrittura Windows risulterebbe "fuori scope" e la misura conterebbe
+    /// violazioni inesistenti.
+    ///
+    /// Mutazione che rende rosso: confrontare i due lati grezzi.
+    #[test]
+    fn path_in_scope_normalizza_entrambi_i_lati() {
+        // Separatori Windows sul path scritto, `./` e case misto sullo scope.
+        assert!(path_in_scope("crates\\API\\handlers.rs", &sc(&["./Crates/api/"])));
+        assert!(path_in_scope("./src/a/b.rs", &sc(&["src\\a"])));
+    }
+
+    /// Le tre varianti del verdetto, e in particolare la distinzione che rende la
+    /// misura leggibile: scope assente NON e' una violazione.
+    ///
+    /// Mutazione che rende rosso: far collassare `NoScopeDeclared` su `OutOfScope`
+    /// (o su `InScope`) -> la prima o la terza asserzione cade. E' la mutazione che
+    /// conta di piu': entrambi i collassi produrrebbero una misura che sembra
+    /// funzionare — o "il pianificatore sbaglia sempre", o "il pianificatore non
+    /// sbaglia mai" — mentre in realta' non si e' misurato nulla.
+    #[test]
+    fn classify_write_distingue_non_dichiarato_da_violazione() {
+        // Nessuno scope: non misurabile. NON e' una violazione.
+        assert_eq!(
+            classify_write("src/a/b.rs", &[]),
+            ScopeVerdict::NoScopeDeclared
+        );
+        // Scope di sole stringhe non normalizzabili: non e' una dichiarazione.
+        // Contarlo come violazione attribuirebbe al pianificatore un difetto di forma.
+        assert_eq!(
+            classify_write("src/a/b.rs", &sc(&["", "  ", "/"])),
+            ScopeVerdict::NoScopeDeclared
+        );
+        // `.` e `./` NON sono stringhe vuote: normalizzano a ".", cioe' la ROOT.
+        // E' una dichiarazione — larghissima, ma una dichiarazione — quindi ogni
+        // scrittura vi cade DENTRO. Trattarla come una directory di nome "." (il
+        // difetto che questo test ha scoperto) avrebbe contato ogni scrittura di un
+        // task senza restrizioni come una violazione del piano.
+        assert_eq!(
+            classify_write("src/a/b.rs", &sc(&["./"])),
+            ScopeVerdict::InScope
+        );
+        assert_eq!(
+            classify_write("qualunque/cosa.txt", &sc(&["."])),
+            ScopeVerdict::InScope
+        );
+        // Dichiarato e rispettato.
+        assert_eq!(
+            classify_write("crates/api/handlers.rs", &sc(&["crates/api"])),
+            ScopeVerdict::InScope
+        );
+        // Dichiarato e violato: il caso che il numero deve contare.
+        assert_eq!(
+            classify_write("crates/web/router.rs", &sc(&["crates/api"])),
+            ScopeVerdict::OutOfScope
+        );
+        // Piu' path dichiarati: basta che UNO contenga.
+        assert_eq!(
+            classify_write("db/migrations/0646.sql", &sc(&["crates/api", "db"])),
+            ScopeVerdict::InScope
+        );
+    }
+
+    /// Gli identificatori persistiti sono il contratto con la colonna
+    /// `file_mutations.scope_verdict` e col suo CHECK (mig 0646): se cambiano qui
+    /// senza migrazione, ogni INSERT viola il vincolo.
+    #[test]
+    fn scope_verdict_identificatori_canonici() {
+        assert_eq!(ScopeVerdict::NoScopeDeclared.as_str(), "no_scope_declared");
+        assert_eq!(ScopeVerdict::InScope.as_str(), "in_scope");
+        assert_eq!(ScopeVerdict::OutOfScope.as_str(), "out_of_scope");
     }
 }

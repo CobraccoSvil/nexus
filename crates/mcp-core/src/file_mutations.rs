@@ -34,6 +34,80 @@ pub struct RecordedMutation {
     pub id: i64,
 }
 
+/// Misura di una scrittura rispetto al `write_scope` dichiarato dal pianificatore
+/// (mig 0646). Viaggia come UNA cosa sola perche' verdetto e scope dichiarato si
+/// leggono insieme: il verdetto dice CHE il piano ha sbagliato, lo scope dichiarato
+/// dice COME — ed e' quest'ultimo a distinguere un pianificatore che dimentica un
+/// file adiacente da uno che dichiara aree troppo strette.
+///
+/// Il verdetto NON e' calcolato qui: nasce dal punto unico
+/// `nexus_agent_graph::decisions::classify_write` e arriva gia' deciso (regola L).
+#[derive(Debug, Clone, Copy)]
+pub struct ScopeAudit<'a> {
+    /// Identificatore canonico del verdetto (`ScopeVerdict::as_str`), oppure `None`
+    /// per i chiamanti che non partecipano alla misura -> colonna NULL, distinta da
+    /// `'no_scope_declared'` (che invece e' una misura effettuata).
+    pub verdict: Option<&'a str>,
+    /// Scope dichiarato al momento della scrittura, verbatim.
+    pub declared: &'a [String],
+}
+
+impl ScopeAudit<'_> {
+    /// Nessuna misura (chiamante fuori dal percorso agentico, o revert). Entrambe
+    /// le colonne restano NULL.
+    pub fn none() -> Self {
+        Self {
+            verdict: None,
+            declared: &[],
+        }
+    }
+}
+
+/// Parte DERIVATA di una mutazione: operazione semantica, contenuti da salvare
+/// (o scartare per il cap), hash e dimensioni. Nessun IO — il cap arriva gia'
+/// risolto — quindi la regola di troncamento e' isolata e verificabile senza DB.
+struct MutationBody<'a> {
+    op: &'static str,
+    stored_before: Option<&'a str>,
+    stored_after: Option<&'a str>,
+    before_sha: Option<String>,
+    after_sha: Option<String>,
+    before_size: Option<i64>,
+    after_size: Option<i64>,
+}
+
+impl<'a> MutationBody<'a> {
+    /// Deriva op/hash/size e applica il cap di tracking.
+    ///
+    /// Troncamento: se un lato supera `cap` NON salviamo il contenuto (solo
+    /// metadati). `before_content` e' la chiave del revert, quindi troncarlo
+    /// rende la mutazione "non ripristinabile" ma ancora visibile nella UI.
+    fn derive(before: Option<&'a str>, after: Option<&'a str>, cap: i64) -> Self {
+        let op = match (before.is_some(), after.is_some()) {
+            (false, true) => "created",
+            (true, true) => "modified",
+            (true, false) => "deleted",
+            // Non dovrebbe mai accadere (chiamata vuota). Trattato come modified
+            // per non perdere il record; before e after sono entrambi NULL.
+            (false, false) => "modified",
+        };
+        let before_bytes = before.map(str::as_bytes);
+        let after_bytes = after.map(str::as_bytes);
+        let before_size = before_bytes.map(|b| b.len() as i64);
+        let after_size = after_bytes.map(|b| b.len() as i64);
+        let over_cap = |size: Option<i64>| size.map(|s| s > cap).unwrap_or(false);
+        Self {
+            op,
+            stored_before: if over_cap(before_size) { None } else { before },
+            stored_after: if over_cap(after_size) { None } else { after },
+            before_sha: before_bytes.map(sha256_hex),
+            after_sha: after_bytes.map(sha256_hex),
+            before_size,
+            after_size,
+        }
+    }
+}
+
 /// Calcola lo SHA-256 in hex di un blocco di byte.
 fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -58,53 +132,50 @@ async fn max_track_bytes(db: &PgPool) -> i64 {
 /// Fail-loud: se l'INSERT fallisce ritorna l'errore al chiamante. Il chiamante
 /// decide se procedere comunque con la write (per non bloccare l'agente in caso
 /// di tabella momentaneamente irraggiungibile) loggando il problema.
+///
+/// `scope` porta la MISURA delle scritture fuori dallo scope dichiarato dal
+/// pianificatore (mig 0646): e' un'osservazione, non un permesso — nessun ramo di
+/// questa funzione rifiuta una scrittura in base ad essa.
 pub async fn record_mutation(
     db: &PgPool,
     project_id: Uuid,
     session_id: Option<Uuid>,
+    // Run che sta scrivendo. Per un sub-run e' il proxy del passo di piano: senza, "quante
+    // scritture fuori scope" non si puo' trasformare in "su quanti passi", e una
+    // violazione ripetuta da un solo passo sarebbe indistinguibile da molti passi
+    // che sbagliano una volta ciascuno.
+    run_id: Option<Uuid>,
     user_id: Option<Uuid>,
     relative_path: &str,
     tool_name: &str,
     before_content: Option<&str>,
     after_content: Option<&str>,
+    scope: ScopeAudit<'_>,
 ) -> Result<RecordedMutation, sqlx::Error> {
-    let op = match (before_content.is_some(), after_content.is_some()) {
-        (false, true) => "created",
-        (true, true) => "modified",
-        (true, false) => "deleted",
-        // Non dovrebbe mai accadere (chiamata vuota). Trattato come modified
-        // per non perdere il record; before e after sono entrambi NULL.
-        (false, false) => "modified",
-    };
-
-    let before_bytes = before_content.map(str::as_bytes);
-    let after_bytes = after_content.map(str::as_bytes);
-
-    let before_size = before_bytes.map(|b| b.len() as i64);
-    let after_size = after_bytes.map(|b| b.len() as i64);
-    let before_sha = before_bytes.map(sha256_hex);
-    let after_sha = after_bytes.map(sha256_hex);
-
-    // Decisione di troncamento: se uno dei due lati supera il cap, NON salviamo
-    // il contenuto (solo metadati). before_content e' la chiave del revert: se
-    // viene troncato lo stato resta visibile come "non ripristinabile" nella UI.
     let cap = max_track_bytes(db).await;
-    let truncate_before = before_size.map(|s| s > cap).unwrap_or(false);
-    let truncate_after = after_size.map(|s| s > cap).unwrap_or(false);
+    let body = MutationBody::derive(before_content, after_content, cap);
+    let MutationBody {
+        op,
+        stored_before,
+        stored_after,
+        before_sha,
+        after_sha,
+        before_size,
+        after_size,
+    } = body;
 
-    let stored_before: Option<&str> = if truncate_before {
-        None
-    } else {
-        before_content
-    };
-    let stored_after: Option<&str> = if truncate_after { None } else { after_content };
+    // Lo scope dichiarato si persiste SOLO quando c'e' un verdetto: un array senza
+    // verdetto non direbbe nulla che il verdetto non dica gia', e riempirebbe la
+    // colonna di `{}` indistinguibili da "dichiarato vuoto".
+    let declared_scope: Option<Vec<String>> = scope.verdict.map(|_| scope.declared.to_vec());
 
     let row = sqlx::query(
         r#"INSERT INTO file_mutations
             (project_id, session_id, user_id, file_path, tool_name, op,
              before_content, after_content,
-             before_sha256, after_sha256, before_size, after_size)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             before_sha256, after_sha256, before_size, after_size,
+             scope_verdict, declared_write_scope, run_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
            RETURNING id"#,
     )
     .bind(project_id)
@@ -119,6 +190,9 @@ pub async fn record_mutation(
     .bind(after_sha)
     .bind(before_size)
     .bind(after_size)
+    .bind(scope.verdict)
+    .bind(declared_scope)
+    .bind(run_id)
     .fetch_one(db)
     .await?;
 
@@ -375,11 +449,18 @@ pub async fn revert_mutation(
         db,
         project_id,
         session_id,
+        // Il revert non appartiene a un run dell'agente: e' un'azione dell'utente
+        // dal pannello.
+        None,
         user_id,
         &file_path,
         "revert",
         current_str,
         new_after_content.as_deref(),
+        // Un revert e' un'azione dell'utente sul pannello, non una scrittura
+        // dell'agente sotto un piano: misurarlo contro uno scope non avrebbe
+        // oggetto. Colonne NULL, distinte da 'no_scope_declared'.
+        ScopeAudit::none(),
     )
     .await
     {
@@ -430,5 +511,280 @@ pub async fn revert_mutation(
 
     RevertOutcome::Reverted {
         new_mutation_id: recorded.id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_agent_graph::decisions::{classify_write, ScopeVerdict};
+
+    /// Le colonne della misura (mig 0646) esistono sullo schema META REALE e
+    /// `record_mutation` — la funzione di produzione, non una sua copia — vi
+    /// scrive il verdetto e lo scope dichiarato.
+    ///
+    /// Gira sul `META_MIGRATOR`, cioe' sul set `db/migrations` applicato a un DB
+    /// vergine (regola O): se la 0646 dichiarasse una colonna che non crea, o se il
+    /// CHECK non ammettesse un identificatore prodotto da `ScopeVerdict::as_str`,
+    /// questo test lo vedrebbe. Una fixture `CREATE TABLE` scritta a mano no.
+    ///
+    /// Il verdetto NON e' una costante scritta nel test: viene da `classify_write`,
+    /// lo stesso punto unico che lo produce in produzione. Cosi' il test lega il
+    /// vocabolario dell'enum al vincolo della colonna, che e' esattamente il punto
+    /// dove i due potrebbero divergere in silenzio.
+    ///
+    /// Mutazione che rende rosso: rimuovere `scope_verdict` dall'INSERT -> la
+    /// colonna resta NULL e la prima asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn record_mutation_persiste_verdetto_e_scope_dichiarato(pool: PgPool) {
+        let (user_id, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+
+        // Il caso che il numero deve contare: scope dichiarato su `crates/api`, il
+        // sub-run scrive altrove. Costruito perche' l'esito ATTESO differisca da
+        // quello che il sistema produrrebbe senza la misura (colonna NULL) e anche
+        // da quello di uno scope assente ('no_scope_declared').
+        let declared = vec!["crates/api".to_string(), "db/migrations".to_string()];
+        let path = "crates/web/router.rs";
+        let run_id = Uuid::new_v4();
+        let verdict = classify_write(path, &declared);
+        assert_eq!(
+            verdict,
+            ScopeVerdict::OutOfScope,
+            "premessa del test: questa scrittura e' fuori dallo scope dichiarato"
+        );
+
+        let rec = record_mutation(
+            &pool,
+            project_id,
+            None,
+            Some(run_id),
+            Some(user_id),
+            path,
+            "write_file",
+            None,
+            Some("contenuto"),
+            ScopeAudit {
+                verdict: Some(verdict.as_str()),
+                declared: &declared,
+            },
+        )
+        .await
+        .expect("insert con le colonne della misura");
+
+        let (got_verdict, got_scope, got_run): (Option<String>, Option<Vec<String>>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT scope_verdict, declared_write_scope, run_id \
+                   FROM file_mutations WHERE id = $1",
+            )
+            .bind(rec.id)
+            .fetch_one(&pool)
+            .await
+            .expect("riga riletta");
+
+        assert_eq!(got_verdict.as_deref(), Some("out_of_scope"));
+        assert_eq!(
+            got_scope,
+            Some(declared),
+            "lo scope dichiarato si conserva verbatim: dice COME sbagliava il \
+             pianificatore, non solo che sbagliava"
+        );
+        assert_eq!(
+            got_run,
+            Some(run_id),
+            "senza il run non si passa da 'quante scritture' a 'su quanti todo'"
+        );
+    }
+
+    /// Le due assenze NON sono la stessa cosa, e la migrazione le tiene distinte:
+    ///   - `ScopeAudit::none()` (revert, chiamanti fuori dal percorso agentico)
+    ///     -> colonne NULL: la scrittura non partecipa alla misura;
+    ///   - scope vuoto misurato -> `'no_scope_declared'`: la scrittura E' passata
+    ///     dalla misura, che ha potuto dire soltanto "non era dichiarato".
+    ///
+    /// Confonderle e' il modo piu' diretto per leggere una propagazione rotta come
+    /// un pianificatore preciso: la vista `file_mutations_scope_audit` le separa in
+    /// `unmeasured_legacy` e `not_measurable` proprio per questo.
+    ///
+    /// Mutazione che rende rosso: far ritornare a `classify_write` `InScope` per
+    /// scope vuoto -> la seconda asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn assenza_di_misura_e_assenza_di_scope_restano_distinte(pool: PgPool) {
+        let (user_id, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let run_id = Uuid::new_v4();
+
+        // (1) Nessuna misura: colonne NULL.
+        let senza = record_mutation(
+            &pool,
+            project_id,
+            None,
+            Some(run_id),
+            Some(user_id),
+            "a.txt",
+            "revert",
+            None,
+            Some("x"),
+            ScopeAudit::none(),
+        )
+        .await
+        .expect("insert senza misura");
+
+        // (2) Misurata, ma il task non aveva dichiarato nulla.
+        let vuoto: Vec<String> = Vec::new();
+        let misurata = record_mutation(
+            &pool,
+            project_id,
+            None,
+            Some(run_id),
+            Some(user_id),
+            "b.txt",
+            "write_file",
+            None,
+            Some("y"),
+            ScopeAudit {
+                verdict: Some(classify_write("b.txt", &vuoto).as_str()),
+                declared: &vuoto,
+            },
+        )
+        .await
+        .expect("insert misurata");
+
+        let leggi = |id: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<Vec<String>>)>(
+                    "SELECT scope_verdict, declared_write_scope FROM file_mutations WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("riga riletta")
+            }
+        };
+
+        let (v1, s1) = leggi(senza.id).await;
+        assert_eq!(v1, None, "nessuna misura -> verdetto NULL");
+        assert_eq!(s1, None, "nessuna misura -> scope NULL, non array vuoto");
+
+        let (v2, s2) = leggi(misurata.id).await;
+        assert_eq!(v2.as_deref(), Some("no_scope_declared"));
+        assert_eq!(
+            s2,
+            Some(Vec::new()),
+            "misurata senza dichiarazione: array vuoto, distinto da NULL"
+        );
+    }
+
+    /// La vista di aggregazione (mig 0646) e' il punto unico della domanda "quanto
+    /// si scrive fuori scope?", e la sua percentuale si calcola sulle sole
+    /// scritture MISURABILI. Se contasse anche le non misurabili, una propagazione
+    /// rotta si presenterebbe come 0% di violazioni.
+    ///
+    /// Mutazione che rende rosso: togliere il filtro `IN ('in_scope',
+    /// 'out_of_scope')` dal denominatore -> con 1 violazione su 2 misurabili + 2
+    /// non misurabili la percentuale scenderebbe da 50.00 a 25.00.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn vista_aggrega_le_violazioni_sulle_sole_misurabili(pool: PgPool) {
+        let (user_id, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let scope = vec!["crates/api".to_string()];
+        // DUE run distinti, e il primo viola DUE volte. I due conteggi che la vista
+        // deve tenere separati sono cosi' NUMERICAMENTE diversi (2 scritture fuori
+        // scope, ma 1 solo run che sbaglia): se la vista contasse le scritture al
+        // posto dei run — o viceversa — l'asserzione cadrebbe. Con un run per
+        // scrittura i due numeri coinciderebbero e il test passerebbe anche con la
+        // colonna sbagliata.
+        let run_viola = Uuid::new_v4();
+        let run_ok = Uuid::new_v4();
+
+        // 3 misurabili (1 dentro, 2 fuori dallo stesso run) + 1 non misurabile
+        // + 1 non misurata.
+        for (run, path, audit) in [
+            (
+                run_ok,
+                "crates/api/a.rs",
+                ScopeAudit {
+                    verdict: Some(classify_write("crates/api/a.rs", &scope).as_str()),
+                    declared: &scope,
+                },
+            ),
+            (
+                run_viola,
+                "crates/web/b.rs",
+                ScopeAudit {
+                    verdict: Some(classify_write("crates/web/b.rs", &scope).as_str()),
+                    declared: &scope,
+                },
+            ),
+            (
+                run_viola,
+                "apps/web/c.tsx",
+                ScopeAudit {
+                    verdict: Some(classify_write("apps/web/c.tsx", &scope).as_str()),
+                    declared: &scope,
+                },
+            ),
+            (
+                run_ok,
+                "c.rs",
+                ScopeAudit {
+                    verdict: Some(ScopeVerdict::NoScopeDeclared.as_str()),
+                    declared: &[],
+                },
+            ),
+            (run_ok, "d.rs", ScopeAudit::none()),
+        ] {
+            record_mutation(
+                &pool,
+                project_id,
+                None,
+                Some(run),
+                Some(user_id),
+                path,
+                "write_file",
+                None,
+                Some("x"),
+                audit,
+            )
+            .await
+            .expect("insert");
+        }
+
+        // La percentuale e' NUMERIC nella vista (niente arrotondamenti binari); il
+        // test la legge come testo per confrontarla esatta, senza dipendere da una
+        // feature decimale di sqlx.
+        let (total, measured, out_of_scope, runs_out, runs_measured, not_measurable, legacy, pct): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT mutations_total, measured, out_of_scope, runs_out_of_scope, \
+                    runs_measured, not_measurable, unmeasured_legacy, out_of_scope_pct::text \
+               FROM file_mutations_scope_audit WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .expect("vista interrogabile");
+
+        assert_eq!(total, 5);
+        assert_eq!(measured, 3, "solo le tre con scope dichiarato sono misurabili");
+        assert_eq!(out_of_scope, 2, "due SCRITTURE fuori scope");
+        assert_eq!(
+            runs_out, 1,
+            "ma UN SOLO todo che sbaglia: e' la differenza fra 'un piano fatto \
+             male' e 'il pianificatore non sa dichiarare'"
+        );
+        assert_eq!(runs_measured, 2);
+        assert_eq!(not_measurable, 1);
+        assert_eq!(legacy, 1);
+        assert_eq!(
+            pct.as_deref(),
+            Some("66.67"),
+            "2 violazioni su 3 MISURABILI: le non misurabili non diluiscono il dato"
+        );
     }
 }

@@ -287,6 +287,17 @@ pub struct NativeRunInput {
     /// invariato: il ctx usa la root del progetto. In PR3 TUTTI i call site
     /// lasciano `None`; l'accensione (passare `Some`) e' PR4.
     pub working_root: Option<std::path::PathBuf>,
+    /// Aree file che il PIANIFICATORE ha dichiarato per il task di questo run
+    /// (`nexus_agent_todos.write_scope`). Viaggia sullo STESSO canale di
+    /// `working_root` — fino al `ToolRunnerExecutorAdapter` e da li' nel ctx dei
+    /// tool — perche' quel canale e' gia' l'unico che porta al contesto un dato
+    /// deciso a monte del run.
+    ///
+    /// Serve a MISURARE quante scritture cadono fuori dallo scope dichiarato, non
+    /// a impedirle. Vuoto per il run principale, per il resume e per ogni sub-run
+    /// dispatchato fuori dal percorso a passi di piano -> le sue mutazioni sono registrate
+    /// come `no_scope_declared` (non misurabili), che e' diverso da "in regola".
+    pub write_scope: Vec<String>,
     /// Sintesi advisory strutturata prodotta PRIMA del run (panel multi-provider
     /// o consiglio a monte). Seed in `AgentState.extra` per il coordinatore
     /// (regola M: segnale macchina, non parsing del blocco testuale).
@@ -2148,6 +2159,10 @@ async fn build_native_engine(
         // principale/sub-run non isolato) -> ctx sulla root del progetto,
         // comportamento invariato. In PR3 e' sempre `None` (accensione in PR4).
         input.working_root.clone(),
+        // Scope dichiarato dal pianificatore per il task di questo run: scende nel
+        // ctx dei tool, dove l'hook delle mutazioni lo confronta col path scritto.
+        // Vuoto per il run principale -> `no_scope_declared`.
+        input.write_scope.clone(),
         // Narrazione verso QUESTO run: i tool a lunga durata (dispatch_
         // subagents) emettono meta-step di avvio/progresso/chiusura sul
         // canale SSE del run invocante mentre lavorano. Vale anche per i
@@ -3316,6 +3331,7 @@ mod tests {
             run_time_budget_s: None,
             // Test del run principale: nessun isolamento (root del progetto).
             working_root: None,
+            write_scope: Vec::new(),
             pre_run_advisory_synthesis: None,
             pre_run_advisory_source: None,
             // Nessun overlap nei test di costruzione dello stato: la barriera e'

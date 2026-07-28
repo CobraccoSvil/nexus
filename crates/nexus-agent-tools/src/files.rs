@@ -2133,6 +2133,7 @@ mod tests {
             hooks,
             embedder: Arc::new(NoopEmbedder),
             isolated_subrun: false,
+            write_scope: Vec::new(),
         }
     }
 

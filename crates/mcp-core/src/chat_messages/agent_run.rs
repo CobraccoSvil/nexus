@@ -4467,6 +4467,9 @@ pub(crate) async fn spawn_agent_run(
                     // Run principale sulla root del progetto: nessun isolamento
                     // (l'override worktree e' riservato ai sub-run isolati, PR4).
                     working_root: None,
+                    // Il run principale non esegue un passo di piano: nessuno scope dichiarato
+                    // da misurare (le sue mutazioni sono `no_scope_declared`).
+                    write_scope: Vec::new(),
                     pre_run_advisory_synthesis: pre_run_advisory_synthesis_clone.clone(),
                     pre_run_advisory_source: pre_run_advisory_source_clone,
                     advisory_gate: advisory_gate_for_run.clone(),
@@ -4769,6 +4772,8 @@ pub(crate) async fn confirm_native_run(
         run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
+        // Resume del run principale: nessuno scope di piano da misurare.
+        write_scope: Vec::new(),
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
         // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo
@@ -5166,6 +5171,8 @@ pub(crate) async fn resume_fanin(
         run_time_budget_s: None,
         // Resume del run principale sulla root del progetto: nessun isolamento.
         working_root: None,
+        // Resume del run principale: nessuno scope di piano da misurare.
+        write_scope: Vec::new(),
         pre_run_advisory_synthesis: None,
         pre_run_advisory_source: None,
         // RESUME da checkpoint: i panel a monte hanno gia' deliberato nel primo

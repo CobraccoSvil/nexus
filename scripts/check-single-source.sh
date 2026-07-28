@@ -1038,6 +1038,52 @@ else
   echo "OK strictmode-non-si-propaga: nessuna libreria impone StrictMode al chiamante"
 fi
 
+# ── catena-write-scope (2026-07-28) ─────────────────────────────────────────
+# La MISURA delle scritture fuori scope (mig 0646) vale solo se lo scope
+# dichiarato dal pianificatore arriva davvero fino al contesto dei tool. La catena
+# e' fatta di passaggi di campo omonimi — ParsedTask -> SubagentExecInputs ->
+# NativeRunInput -> ToolRunnerExecutorAdapter -> ToolContextCore — che il
+# compilatore verifica nei TIPI ma non nel VALORE: sostituirne uno con
+# `Vec::new()` compila, non rompe alcun test, e rende la misura cieca in silenzio.
+# La colonna si riempirebbe di `no_scope_declared` e il numero direbbe "il
+# pianificatore e' preciso" quando invece non e' stato misurato niente. E' la
+# stessa famiglia della whitelist mai raggiunta dalla produzione e della chiave di
+# qualificazione mai scritta con sette test verdi.
+#
+# Il guard e' testuale e lo dichiara: NON e' un test di esecuzione, e' un
+# ancoraggio sui tre anelli che nessun test attraversa.
+ws_missing=""
+ws_check() { # file regex etichetta
+  grep -qE "$2" "$1" 2>/dev/null || ws_missing+="  $3 ($1)"$'\n'
+}
+ws_check crates/mcp-core/src/agent_tools/subagent_native.rs \
+  'write_scope: write_scope\.to_vec\(\)' \
+  'ParsedTask -> SubagentExecInputs'
+ws_check crates/mcp-core/src/native_engine.rs \
+  'input\.write_scope\.clone\(\)' \
+  'NativeRunInput -> ToolRunnerExecutorAdapter'
+ws_check crates/mcp-core/src/agent_graph_adapter/tool_executor.rs \
+  '&self\.write_scope' \
+  'adapter -> build_ctx_with_root'
+ws_check crates/mcp-core/src/tool_runner_server.rs \
+  'write_scope: write_scope\.to_vec\(\)' \
+  'build_ctx_with_root -> ToolContextCore'
+ws_check crates/nexus-agent-graph/src/nodes/todo_runner.rs \
+  'todo\.get\("write_scope"\)' \
+  'passo di piano -> dispatch_one (il ramo dominante)'
+ws_check crates/nexus-agent-graph/src/nodes/todo_runner.rs \
+  '"write_scope": write_scope' \
+  'subagent_task_json (forma comune ai due rami)'
+if [[ -n "$ws_missing" ]]; then
+  echo "!! catena-write-scope: un anello della propagazione non passa piu' il valore:" >&2
+  printf '%s' "$ws_missing" >&2
+  echo "   Senza quell'anello la misura scope (mig 0646) registra 'no_scope_declared'" >&2
+  echo "   su tutto e sembra dire che il pianificatore non sbaglia mai." >&2
+  fail=1
+else
+  echo "OK catena-write-scope: lo scope dichiarato raggiunge il contesto dei tool"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

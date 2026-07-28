@@ -323,6 +323,7 @@ mod tests {
                 hooks: Arc::new(nexus_agent_tools::context_core::NoopMutationHooks),
                 embedder: Arc::new(nexus_agent_tools::context_core::NoopEmbedder),
                 isolated_subrun: false,
+                write_scope: Vec::new(),
             },
             playwright_channels: crate::playwright_live::new_channels(),
             neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
