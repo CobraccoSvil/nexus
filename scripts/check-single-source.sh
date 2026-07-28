@@ -215,6 +215,54 @@ else
   echo "OK pricing-single-source: listino e currency vivono solo in nexus-pricing"
 fi
 
+# Contabilita' del ledger (2026-07-27): "quale riga si scrive in ai_usage_ledger"
+# e' UNA domanda, e la risposta vive solo in crates/nexus-ledger. Erano QUATTRO
+# scrittori in due crate che non si vedevano, con le SQL tenute gemelle a mano —
+# il commento sopra `SQL_UPDATE_LEDGER_FINALIZE` lo dichiarava: "Gemella di
+# `SQL_INSERT_LEDGER_TESTO` nel gateway". Le divergenze erano gia' in atto e
+# tutte sui soldi:
+#   1. nessuno dei due sapeva dell'altro -> una chiamata lasciava DUE righe
+#      'finalized' (misurato il 27/07/2026: 0.002339 addebitati due volte);
+#   2. `ai_quota_policies.cost_limit` e' NUMERIC e sqlx non lo decodifica in f64:
+#      il gateway aveva il cast ::float8, mcp-core no. Invisibile finche' nessuno
+#      configurava una quota di COSTO, cioe' finche' non c'era una riga da
+#      decodificare;
+#   3. il marker del job batch dichiarava una currency 'EUR' di propria
+#      iniziativa, con la piattaforma su USD.
+# Nessun compilatore poteva vederlo: SQL in stringhe, in crate che non si
+# conoscono.
+#
+# Il guard NON vieta di LEGGERE il ledger: report admin, breakdown per run,
+# viste analitiche e monitor sono letture di presentazione che non decidono
+# nulla. Confina la SCRITTURA (INSERT/UPDATE), che e' dove nasce il denaro.
+#
+# Ambito: i sorgenti. Nei test la garanzia e' di natura diversa (regola O: un
+# test deve attraversare il PRODUTTORE, non ricopiarlo) e non e' un grep a
+# darla; oggi il produttore vero e' raggiungibile — prima non lo era, ed e' il
+# motivo per cui il crate esiste. Caso noto residuo:
+# `crates/mcp-core/tests/m71_cost_breakdown.rs`, che semina righe per verificare
+# un LETTORE (il breakdown costi per run) e non uno scrittore.
+ledger_hits="$(grep -rEn \
+  "(INSERT +INTO|UPDATE) +ai_usage_ledger" \
+  crates \
+  --include='*.rs' \
+  2>/dev/null \
+  | grep -v '^crates/nexus-ledger/' \
+  | grep -v '/tests/' \
+  | grep -vE ':[0-9]+: *(//|/\*|\*)' \
+  || true)"
+if [[ -n "$ledger_hits" ]]; then
+  echo "!! ledger-single-source: scrittura di ai_usage_ledger fuori da nexus-ledger:" >&2
+  echo "$ledger_hits" >&2
+  echo "   Chiama nexus_ledger::{reserve, record_tokens, record_media, insert_marker," >&2
+  echo "   finalize, release, settle}. Le copie storiche divergevano sui soldi:" >&2
+  echo "   due righe finalizzate per una chiamata, una quota di costo illeggibile," >&2
+  echo "   una currency inventata. Tenerne UNA e' il punto." >&2
+  fail=1
+else
+  echo "OK ledger-single-source: il ledger lo scrive solo nexus-ledger"
+fi
+
 # Identificatori canonici (2026-07-09): enum/command identifiers in inglese,
 # niente sinonimi IT negli parser Rust (regola CLAUDE.md sezione N).
 alias_hits="$(grep -rEn \
@@ -615,7 +663,7 @@ fi
 
 # ── schema-di-test-dalla-migrazione (2026-07-22) ─────────────────────────────
 # Lo schema su cui gira un test del dominio run/chat deriva dalla MIGRAZIONE
-# reale (nexus_test_schema::PROJECT_MIGRATOR, il migrator del set
+# reale (nexus_migrations_embedded::PROJECT_MIGRATOR, il migrator del set
 # db/migrations/project che la produzione applica al DB <slug>_nexus), mai da un
 # CREATE TABLE ricopiato a mano nel modulo di test.
 #
@@ -648,7 +696,7 @@ else
     echo "!! schema-di-test: tabella del set project ricreata a mano in un test:" >&2
     printf '%s' "$schema_hits" | sed 's/^/     /' >&2
     echo "   Usa lo schema reale:" >&2
-    echo "     #[sqlx::test(migrator = \"nexus_test_schema::PROJECT_MIGRATOR\")]" >&2
+    echo "     #[sqlx::test(migrator = \"nexus_migrations_embedded::PROJECT_MIGRATOR\")]" >&2
     echo "   e semina le righe coi seeder (mcp_core::test_support::seed_*)." >&2
     fail=1
   else
