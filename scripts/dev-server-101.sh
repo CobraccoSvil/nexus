@@ -234,9 +234,11 @@ verify_deploy() {
     local running_build
     running_build=$(curl -fsS http://127.0.0.1:4000/api/health 2>/dev/null | grep -o '"build_time":"[^"]*"' | cut -d'"' -f4)
     if [ -n "$running_build" ]; then
-      # Il BUILD_TIMESTAMP è il momento di inizio compilazione.
-      # Il binario su disco viene scritto DOPO la compilazione (può essere 2-3 min dopo).
-      # Verifichiamo che build_time del processo attivo sia >= quello salvato nell'ultimo build.
+      # build_time è l'mtime del binario da cui il processo attivo è partito
+      # (letto a runtime, vedi crates/nexus-types/src/build_info.rs): il file
+      # viene scritto DOPO l'inizio della compilazione, quindi è >= BUILD_START
+      # salvato in .last_build_ts. Un "0" significa misura non disponibile e
+      # fallisce il confronto: è voluto, meglio di un numero inventato.
       local expected_build
       expected_build=$(cat "$PROJECT_DIR/.last_build_ts" 2>/dev/null || echo "0")
       if [ "$running_build" -ge "$expected_build" ] 2>/dev/null; then

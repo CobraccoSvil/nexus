@@ -283,6 +283,7 @@ condividere codice (fragile base class).
 | Lettura settings | `nexus-auth::settings` (`get_setting`) |
 | Scrittura settings (aggiorna, non crea: chiave assente -> 404) | `nexus-auth` (`update_setting_value` -> `SettingWriteError{UnknownKey\|Db}` + `status_code()`). Guard `update_setting_value` e `settings INSERT di ripiego` |
 | Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
+| Identita' temporale del binario in esecuzione (`build_time` di `/health`) | `nexus-types/src/build_info.rs` (`running_binary`, mtime del proprio eseguibile letto all'avvio); `HealthSummary::new` popola i campi, il call site non li sceglie. Guard `running_binary` e `build-stamp`. NON incidere timestamp da uno script di build: cargo non lo riesegue a ogni link |
 | Pool DB metadati per-progetto (registry, elenco progetti, directory routing, cache pool) | crate `nexus-project-pools` (separazione sempre attiva, flag rimosso mig 0527); `mcp-core::project_db_routes` delega e vi aggiunge solo provisioning+migrazione |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
 | Completion testuale via gateway per i crate FUORI da mcp-core (admin-service, worker di nexus-orchestrator) | `nexus-types/src/gateway_client.rs` (`gateway_text_complete`). Dentro mcp-core resta `nexus_gateway::NexusGatewayClient`. ADR 0041 |
