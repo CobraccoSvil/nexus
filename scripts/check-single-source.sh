@@ -1084,6 +1084,36 @@ else
   echo "OK catena-write-scope: lo scope dichiarato raggiunge il contesto dei tool"
 fi
 
+# ── estremi-bucket-porte ────────────────────────────────────────────────────
+# Gli estremi del bucket di un progetto si chiedono a `project_bucket_range`, non
+# si ricalcolano. Il motivo non e' l'eleganza: la stessa somma girava in sei punti
+# con DUE convenzioni diverse -- `start + SIZE` (fine ESCLUSA) e `start + SIZE - 1`
+# (INCLUSA) -- e chi confrontava doveva indovinare quale delle due aveva davanti.
+# Una porta di confine cadeva dentro o fuori a seconda del file che la guardava.
+#
+# La dispersione e' anche cio' che ha tenuto nascosto il difetto vero: il predicato
+# che autorizzava una porta a diventare allocazione del progetto non riceveva il
+# `project_id`, quindi la domanda "questa porta e' TUA?" non era proprio ponibile,
+# e nessuno dei sei call site poteva porgliela.
+#
+# Cerca l'aritmetica sul SIZE fuori dal punto unico. Il modulo (`% SIZE`) e il
+# confronto (`< SIZE`) restano leciti: non producono un estremo.
+estremi_hits="$(
+  grep -rnE '(\+[[:space:]]*PROJECT_PORT_BUCKET_SIZE|saturating_add\(PROJECT_PORT_BUCKET_SIZE)' \
+    --include='*.rs' crates 2>/dev/null \
+  | grep -v '^crates/nexus-tool-kit/src/ports.rs:' || true
+)"
+if [[ -n "$estremi_hits" ]]; then
+  echo "!! estremi-bucket-porte: estremi del bucket ricalcolati fuori dal punto unico:" >&2
+  printf '%s\n' "$estremi_hits" | sed 's/^/     /' >&2
+  echo "   Usa project_bucket_range(&project_id) -> (start, end) con end INCLUSO," >&2
+  echo "   o port_in_project_bucket(&project_id, port) se la domanda e' l'appartenenza." >&2
+  echo "   Vedi crates/nexus-tool-kit/src/ports.rs (regola L / ADR 0026)." >&2
+  fail=1
+else
+  echo "OK estremi-bucket-porte: gli estremi del bucket vengono dal punto unico"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

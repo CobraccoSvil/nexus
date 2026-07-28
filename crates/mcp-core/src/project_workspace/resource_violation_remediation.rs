@@ -330,9 +330,8 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         );
         return;
     }
-    let bucket_start = crate::project_workspace::services::project_bucket_start(&project_id);
-    let bucket_end =
-        bucket_start + crate::project_workspace::services::PROJECT_PORT_BUCKET_SIZE - 1;
+    let (bucket_start, bucket_end) =
+        crate::project_workspace::services::project_bucket_range(&project_id);
     let allocations: Vec<(i32, String)> = sqlx::query_as(
         "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1 ORDER BY port",
     )
@@ -574,7 +573,7 @@ async fn close_after_remediation(state: &AppState, project_id: Uuid, run_id: Uui
         return;
     };
     let allocated =
-        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id).await;
+        crate::security::resource_linter::legitimate_ports_for_project(&state.db, project_id).await;
     let root_path = std::path::PathBuf::from(&root);
     let alloc_clone = allocated.clone();
     let findings = tokio::task::spawn_blocking(move || {

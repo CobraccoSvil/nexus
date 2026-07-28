@@ -74,12 +74,10 @@ pub async fn tool_request_port(ctx: &AgentToolContext, input: &Value) -> String 
 /// stato governato e finiva per dedurre porte hardcoded leggendo i sorgenti.
 pub async fn tool_nexus_list_ports(ctx: &AgentToolContext, _input: &Value) -> String {
     use crate::project_workspace::services::{
-        project_bucket_start, PROJECT_PORT_BUCKET_SIZE, PROJECT_PORT_RANGE_END,
-        PROJECT_PORT_RANGE_START,
+        project_bucket_range, PROJECT_PORT_RANGE_END, PROJECT_PORT_RANGE_START,
     };
 
-    let bucket_start = project_bucket_start(&ctx.project_id);
-    let bucket_end = bucket_start + PROJECT_PORT_BUCKET_SIZE - 1;
+    let (bucket_start, bucket_end) = project_bucket_range(&ctx.project_id);
 
     let rows = sqlx::query(
         "SELECT port, label, allocation_mode, service_unit, created_at \
