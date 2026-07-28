@@ -24,6 +24,7 @@
 use anyhow::Context;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::orchestrator::NeuralCoreClient;
@@ -107,6 +108,36 @@ impl ProjectMemories {
         project_id: Uuid,
         query: &str,
     ) -> Self {
+        // `prompt_corrections` vive nel DB del progetto; `settings` e
+        // `project_learning_config`, che il gate legge, restano su meta. La
+        // risoluzione passa dal punto unico del pattern "pool o WARN": DB progetto
+        // irraggiungibile -> contatori saltati, il turno prosegue con le sue
+        // memorie.
+        let cpool = crate::project_db_routes::project_data_pool_or_warn(
+            db,
+            project_id,
+            "memorie di progetto: contatori di recupero",
+        )
+        .await;
+        Self::load_con_pool(db, cpool.as_ref(), recall, project_id, query).await
+    }
+
+    /// Come [`load`](Self::load) ma col pool dei contatori gia' risolto.
+    ///
+    /// Separata per una ragione sola: e' l'ULTIMO confine esterno rimasto dentro
+    /// la catena. Sopra c'e' `MemoryRecall`, che isola embedder e Qdrant; qui si
+    /// isola "da quale DB si scrivono i contatori", che in produzione dipende
+    /// dalla directory di routing e in un test non esiste. Cosi' un test misura
+    /// gate, soglia, taglio E contabilizzazione su un DB vero, sostituendo il solo
+    /// pezzo che non puo' avere - senza fabbricare l'input che vuole verificare
+    /// (regola O).
+    async fn load_con_pool(
+        db: &PgPool,
+        cpool: Option<&PgPool>,
+        recall: &dyn MemoryRecall,
+        project_id: Uuid,
+        query: &str,
+    ) -> Self {
         if !enabled(db, project_id).await {
             return Self::default();
         }
@@ -119,9 +150,23 @@ impl ProjectMemories {
             }
         };
 
-        let (items, retrieved_ids) = collect_from_hits(hits);
-        if !retrieved_ids.is_empty() {
-            bump_retrieval(db, project_id, &retrieved_ids).await;
+        let (mut items, punti_richiamati) = collect_from_hits(hits);
+        if let (false, Some(cpool)) = (punti_richiamati.is_empty(), cpool) {
+            let righe = bump_retrieval(cpool, &punti_richiamati).await;
+            // L'audit del turno porta l'id della RIGA, non piu' una stringa vuota:
+            // lo conosce la query che ha contabilizzato, e costa zero perche' e' la
+            // stessa. Resta vuoto per un punto senza riga corrispondente, che e' il
+            // fatto da vedere e non da nascondere.
+            for item in &mut items {
+                let point_id = item
+                    .get("pointId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let Some(id) = point_id.and_then(|point_id| righe.get(&point_id)) else {
+                    continue;
+                };
+                item["id"] = json!(id.to_string());
+            }
         }
 
         Self { items }
@@ -192,20 +237,26 @@ async fn enabled(db: &PgPool, project_id: Uuid) -> bool {
     .unwrap_or(true)
 }
 
-/// Memorie pertinenti a partire dagli hit, piu' gli id da contabilizzare.
+/// Memorie pertinenti a partire dagli hit, piu' i PUNTI da contabilizzare.
 /// Scarta chi sta sotto [`SOGLIA_PERTINENZA`] e chi non ha testo.
-fn collect_from_hits(hits: Vec<VectorPointHit>) -> (Vec<Value>, Vec<Uuid>) {
+///
+/// Il recupero si contabilizza per `point_id`, che l'hit porta sempre, e non per
+/// un campo scritto dentro il payload. ROOT CAUSE: qui si leggeva
+/// `payload["correction_id"]`, e i tre produttori di quei punti lo scrivevano in
+/// tre modi diversi - la compattazione non lo scriveva affatto, le correzioni
+/// admin ci mettevano l'id del PUNTO invece di quello della riga. Per due delle
+/// tre famiglie il contatore restava dunque a zero per sempre, e il pruner
+/// notturno (`chat_learning`, ramo `unused_ttl`) disattivava dopo 90 giorni
+/// memorie richiamate ogni giorno, cancellandone il punto vettoriale. Il legame
+/// per punto vale per tutte e tre e non dipende da cosa ciascun produttore ha
+/// scritto dentro al payload.
+fn collect_from_hits(hits: Vec<VectorPointHit>) -> (Vec<Value>, Vec<String>) {
     let mut memories = Vec::new();
-    let mut retrieved_ids = Vec::<Uuid>::new();
+    let mut punti_richiamati = Vec::<String>::new();
     for hit in hits {
         if hit.score < SOGLIA_PERTINENZA {
             continue;
         }
-        let correction_id = hit
-            .payload
-            .get("correction_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok());
         let text = hit
             .payload
             .get("text")
@@ -216,48 +267,228 @@ fn collect_from_hits(hits: Vec<VectorPointHit>) -> (Vec<Value>, Vec<Uuid>) {
         if text.is_empty() {
             continue;
         }
-        if let Some(correction_id) = correction_id {
-            retrieved_ids.push(correction_id);
-        }
+        punti_richiamati.push(hit.point_id.clone());
         memories.push(json!({
-            "id": correction_id.map(|value| value.to_string()).unwrap_or_default(),
+            // Vuoto finche' il bump non risolve la riga: l'id vero e' quello di
+            // `prompt_corrections`, e chi lo conosce e' la query che contabilizza.
+            // Prima ci finiva `payload["correction_id"]`, che per le memorie di
+            // sessione non esisteva e per le correzioni admin era l'id del punto:
+            // un id che non identificava alcuna riga.
+            "id": "",
             "text": text,
             "score": hit.score,
             "intent": hit.payload.get("intent").and_then(Value::as_str).unwrap_or("chat"),
             "pointId": hit.point_id,
         }));
     }
-    (memories, retrieved_ids)
+    (memories, punti_richiamati)
 }
 
-/// Contabilizza il recupero delle memorie usate; l'errore resta ignorato
-/// (contatore non critico per la risposta).
+/// Contabilizza il recupero dei punti richiamati e restituisce, per ciascun
+/// punto, l'id della riga contata.
 ///
-/// `prompt_corrections` vive nel DB del progetto (separazione DB); `settings` e
-/// `project_learning_config` restano su meta, e la ricerca vettoriale e'
-/// multi-tenant per payload.
-async fn bump_retrieval(db: &PgPool, project_id: Uuid, retrieved_ids: &[Uuid]) {
-    // Telemetria best-effort: DB progetto non disponibile -> update saltato con
-    // WARN (niente fallback al meta).
-    let cpool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(project_id = %project_id, error = %e, "memorie di progetto: DB progetto non disponibile, bump retrieved_count saltato");
-            return;
-        }
-    };
-    let _ = sqlx::query(
+/// L'aggancio e' `qdrant_point_id`, che ha un UNIQUE INDEX
+/// (`db/migrations/project/0001_chat.sql`) ed e' scritto da tutti e tre i
+/// produttori perche' e' l'id del punto stesso, non un campo che ognuno compila a
+/// modo suo. Il contatore che qui si incrementa non e' telemetria: e' il criterio
+/// con cui la compattazione notturna decide di disattivare una memoria e di
+/// cancellarne il punto vettoriale (ramo `unused_ttl`), operazione irreversibile
+/// lato Qdrant. Un bump che non arriva non e' una metrica mancante: e' una
+/// memoria che l'utente perde.
+///
+/// L'errore SQL resta non fatale per la risposta del turno, ma viene loggato: un
+/// fallimento silenzioso qui e' indistinguibile da "nessuna memoria richiamata",
+/// che e' precisamente il modo in cui il difetto e' rimasto invisibile.
+async fn bump_retrieval(cpool: &PgPool, punti_richiamati: &[String]) -> HashMap<String, Uuid> {
+    let righe = sqlx::query_as::<_, (Uuid, String)>(
         r#"
         UPDATE prompt_corrections
         SET retrieved_count = retrieved_count + 1,
             last_retrieved_at = NOW(),
             updated_at = NOW()
-        WHERE id = ANY($1)
+        WHERE qdrant_point_id = ANY($1)
+        RETURNING id, qdrant_point_id
         "#,
     )
-    .bind(retrieved_ids)
-    .execute(&cpool)
+    .bind(punti_richiamati)
+    .fetch_all(cpool)
     .await;
+
+    match righe {
+        Ok(righe) => righe
+            .into_iter()
+            .map(|(id, point_id)| (point_id, id))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(
+                punti = punti_richiamati.len(),
+                error = %error,
+                "memorie di progetto: contatori di recupero non aggiornati"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Il richiamo di una memoria ne CONTABILIZZA il recupero.
+    //!
+    //! Non e' telemetria: `retrieved_count` e' il criterio con cui la compattazione
+    //! notturna (`chat_learning`, ramo `unused_ttl`) disattiva una memoria e ne
+    //! cancella il punto vettoriale dopo 90 giorni. Finche' il bump si agganciava a
+    //! `payload["correction_id"]`, per le memorie di sessione - che quel campo non
+    //! l'hanno mai avuto - il contatore restava a zero per sempre: il pannello
+    //! "Memoria del progetto" perdeva voci richiamate ogni giorno.
+    //!
+    //! Percio' questi test non guardano il valore di ritorno del richiamo ma la
+    //! CONSEGUENZA nel DB, sulla riga vera, con lo schema della migrazione reale.
+    //! E il payload NON e' scritto qui: viene da
+    //! `chat_sessions::payload_memoria_di_sessione`, cioe' dal produttore. Un test
+    //! che se lo fabbrica resta verde proprio quando produttore e consumatore
+    //! divergono - che e' il modo in cui questo difetto e' rimasto invisibile per
+    //! l'intera vita della feature (regola O).
+
+    use super::recall_di_test::RecallInMemoria;
+    use super::*;
+    use crate::test_support::{seed_chat_session, seed_memoria_di_sessione};
+    use chrono::{DateTime, Utc};
+
+    const DOMANDA: &str = "come si fa il deploy dello stack?";
+    const MEMORIA: &str = "Il deploy locale si fa con deploy/deploy-local.ps1, mai a mano.";
+    const ALTRA_MEMORIA: &str = "Le porte dei servizi si chiedono con request_port.";
+
+    /// La memoria nasce inattiva e l'utente la attiva dal pannello: sul punto
+    /// vettoriale l'effetto e' quello di `vector_memory::set_point_active`, cioe'
+    /// un set PARZIALE del solo campo `active`. Il resto del payload resta quello
+    /// del produttore.
+    fn attivata_dal_pannello(mut payload: Value) -> Value {
+        payload["active"] = json!(true);
+        payload
+    }
+
+    /// Stato dei contatori di una riga, cioe' cio' che il pruner notturno legge.
+    async fn contatori(pool: &PgPool, memory_id: Uuid) -> (i64, Option<DateTime<Utc>>) {
+        sqlx::query_as(
+            "SELECT retrieved_count, last_retrieved_at FROM prompt_corrections WHERE id = $1",
+        )
+        .bind(memory_id)
+        .fetch_one(pool)
+        .await
+        .expect("lettura contatori")
+    }
+
+    /// Semina una memoria attivata e ne restituisce (id di riga, punto indicizzabile).
+    async fn memoria_attiva(pool: &PgPool, project_id: Uuid, text: &str) -> (Uuid, String, Value) {
+        let session_id = seed_chat_session(pool, project_id).await;
+        let point_id = Uuid::new_v4().to_string();
+        let memory_id =
+            seed_memoria_di_sessione(pool, project_id, session_id, &point_id, text).await;
+        let payload = attivata_dal_pannello(crate::chat_sessions::payload_memoria_di_sessione(
+            project_id, session_id, text,
+        ));
+        (memory_id, point_id, payload)
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_richiamo_di_una_memoria_di_sessione_ne_contabilizza_il_recupero(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let (memory_id, point_id, payload) = memoria_attiva(&pool, project_id, MEMORIA).await;
+
+        // Partenza dal DEFAULT dello schema: e' lo stato che il pruner considera
+        // "mai richiamata". Senza questa asserzione un contatore gia' a 1 per altre
+        // ragioni farebbe passare il test senza che il bump sia mai avvenuto.
+        assert_eq!(
+            contatori(&pool, memory_id).await,
+            (0, None),
+            "una memoria appena creata non risulta mai richiamata"
+        );
+
+        let recall = RecallInMemoria::nuovo().con_punto_id(&point_id, 0.91, payload);
+        let memories =
+            ProjectMemories::load_con_pool(&pool, Some(&pool), &recall, project_id, DOMANDA).await;
+
+        assert_eq!(memories.len(), 1, "la memoria attiva non e' stata richiamata");
+
+        let (count, last) = contatori(&pool, memory_id).await;
+        assert_eq!(
+            count, 1,
+            "il richiamo non ha contabilizzato il recupero: con retrieved_count a zero \
+             la compattazione notturna disattiva questa memoria dopo 90 giorni e ne \
+             cancella il punto vettoriale, per quanto la si richiami ogni giorno"
+        );
+        assert!(
+            last.is_some(),
+            "last_retrieved_at non valorizzato: la riga resta indistinguibile da una mai usata"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn si_contabilizza_solo_cio_che_entra_davvero_nel_prompt(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let (pertinente, punto_pertinente, payload_pertinente) =
+            memoria_attiva(&pool, project_id, MEMORIA).await;
+        let (lontana, punto_lontano, payload_lontano) =
+            memoria_attiva(&pool, project_id, ALTRA_MEMORIA).await;
+
+        let recall = RecallInMemoria::nuovo()
+            .con_punto_id(&punto_pertinente, 0.91, payload_pertinente)
+            // Sotto SOGLIA_PERTINENZA: richiamata dal motore, scartata dal gate.
+            .con_punto_id(&punto_lontano, 0.42, payload_lontano);
+
+        ProjectMemories::load_con_pool(&pool, Some(&pool), &recall, project_id, DOMANDA).await;
+
+        assert_eq!(
+            contatori(&pool, pertinente).await.0,
+            1,
+            "la memoria entrata nel prompt non e' stata contata"
+        );
+        // Prova che il bump segue la SELEZIONE e non l'elenco degli hit: contare
+        // anche gli scartati terrebbe in vita memorie che non servono a nessuno.
+        assert_eq!(
+            contatori(&pool, lontana).await.0,
+            0,
+            "contata una memoria che il gate di pertinenza aveva scartato"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn l_audit_del_turno_porta_l_id_della_riga_contata(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let (memory_id, point_id, payload) = memoria_attiva(&pool, project_id, MEMORIA).await;
+
+        let recall = RecallInMemoria::nuovo().con_punto_id(&point_id, 0.91, payload);
+        let memories =
+            ProjectMemories::load_con_pool(&pool, Some(&pool), &recall, project_id, DOMANDA).await;
+
+        // `applied_corrections`: prima ci finiva una stringa vuota per le memorie di
+        // sessione (il payload non portava alcun id di riga) e per le correzioni
+        // admin un id che non identificava alcuna riga.
+        let voci = memories.into_values();
+        let voce = &voci[0];
+        assert_eq!(
+            voce["id"].as_str(),
+            Some(memory_id.to_string().as_str()),
+            "l'audit del turno non porta l'id della riga davvero contabilizzata"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn senza_pool_di_progetto_il_turno_conserva_le_sue_memorie(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let (_, point_id, payload) = memoria_attiva(&pool, project_id, MEMORIA).await;
+
+        let recall = RecallInMemoria::nuovo().con_punto_id(&point_id, 0.91, payload);
+        // DB del progetto irraggiungibile: i contatori si perdono, il turno no.
+        let memories =
+            ProjectMemories::load_con_pool(&pool, None, &recall, project_id, DOMANDA).await;
+
+        assert_eq!(
+            memories.len(),
+            1,
+            "un contatore non scrivibile non deve togliere all'utente le sue memorie"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +522,17 @@ pub(crate) mod recall_di_test {
         pub(crate) fn con_punto(mut self, score: f64, payload: Value) -> Self {
             let id = format!("punto-{}", self.punti.len() + 1);
             self.punti.push((id, score, payload));
+            self
+        }
+
+        /// Come [`con_punto`](Self::con_punto) ma con l'id del punto ESPLICITO.
+        ///
+        /// Serve ai test che verificano la contabilizzazione del recupero: quella
+        /// passa da `qdrant_point_id`, quindi l'id del punto e' cio' che lega
+        /// l'hit alla riga di `prompt_corrections`. Con un id inventato dallo
+        /// store il bump non troverebbe nulla e il test misurerebbe il vuoto.
+        pub(crate) fn con_punto_id(mut self, point_id: &str, score: f64, payload: Value) -> Self {
+            self.punti.push((point_id.to_string(), score, payload));
             self
         }
     }

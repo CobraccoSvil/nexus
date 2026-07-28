@@ -2275,19 +2275,25 @@ async fn vectorize_correction(
         &state.db,
         &rec.point_id,
         &vector,
-        json!({
-            "project_id": target.project_id.to_string(),
-            "correction_id": rec.correction_id.to_string(),
-            "feedback_id": rec.feedback_id.to_string(),
-            "intent": target.intent,
-            "provider": target.provider,
-            "model": target.model,
-            "text": rec.correction_text,
-            "active": true,
-            "status": "open",
-            "created_at": Utc::now().to_rfc3339(),
-            "normalized_hint_hash": rec.normalized_hash,
-        }),
+        // Forma dal costruttore unico: `project_id`, `text` e `active` sono suoi.
+        // `correction_id` resta come dato descrittivo dell'origine, ma non e' piu'
+        // cio' da cui dipende la contabilizzazione del recupero - che passa da
+        // `qdrant_point_id` ed e' percio' uguale per tutte e tre le famiglie.
+        vector_memory::prompt_correction_payload(
+            target.project_id,
+            &rec.correction_text,
+            true,
+            json!({
+                "correction_id": rec.correction_id.to_string(),
+                "feedback_id": rec.feedback_id.to_string(),
+                "intent": target.intent,
+                "provider": target.provider,
+                "model": target.model,
+                "status": "open",
+                "created_at": Utc::now().to_rfc3339(),
+                "normalized_hint_hash": rec.normalized_hash,
+            }),
+        ),
     )
     .await
     .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e.to_string()))

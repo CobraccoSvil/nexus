@@ -1800,12 +1800,18 @@ async fn embed_and_upsert_correction(
         )
     })?;
 
-    let payload = json!({
-        "correction_id": point_id,
-        "text": text,
-        "intent": intent,
-        "project_id": project_id.to_string(),
-    });
+    // Il payload viene dal costruttore unico. Qui si scriveva `active` MAI e
+    // `correction_id` con dentro l'id del PUNTO: la prima omissione rendeva queste
+    // correzioni invisibili al filtro della ricerca (che esige `active = true`),
+    // la seconda faceva contabilizzare il recupero su un id che non identificava
+    // alcuna riga. Ora `active` e' un parametro obbligatorio e il legame con la
+    // riga passa da `qdrant_point_id`.
+    let payload = vector_memory::prompt_correction_payload(
+        project_id,
+        text,
+        true,
+        json!({ "intent": intent }),
+    );
 
     vector_memory::upsert_prompt_correction_point(&state.db, point_id, &embedding, payload)
         .await

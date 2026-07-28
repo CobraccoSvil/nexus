@@ -58,6 +58,43 @@ pub(crate) async fn seed_chat_session(pool: &PgPool, project_id: Uuid) -> Uuid {
     id
 }
 
+/// Semina una memoria di sessione in `prompt_corrections` - una voce del pannello
+/// "Memoria del progetto" - come la scrive `chat_sessions::compact_session_core`,
+/// e ne ritorna l'id di riga.
+///
+/// Le colonne sono quelle della INSERT di produzione, `qdrant_point_id` compreso:
+/// e' l'aggancio (UNIQUE) da cui dipende la contabilizzazione del recupero, e un
+/// seeder che lo omettesse renderebbe verde un test su una riga irraggiungibile.
+/// `retrieved_count` e `last_retrieved_at` NON si passano: restano al DEFAULT
+/// dello schema (0 e NULL), che e' il punto di partenza da misurare.
+pub(crate) async fn seed_memoria_di_sessione(
+    pool: &PgPool,
+    project_id: Uuid,
+    session_id: Uuid,
+    point_id: &str,
+    text: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO prompt_corrections
+            (id, project_id, session_id, intent, correction_text,
+             normalized_hint_hash, qdrant_point_id, active, status, type)
+        VALUES ($1, $2, $3, 'session_memory', $4, $5, $6, true, 'saved', 'session_memory')
+        "#,
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(session_id)
+    .bind(text)
+    .bind(format!("session:{session_id}"))
+    .bind(point_id)
+    .execute(pool)
+    .await
+    .expect("seed prompt_corrections");
+    id
+}
+
 /// Semina un run agentico completo (sessione + riga `agent_runs`) e ne ritorna
 /// l'id. Riempie i NOT NULL reali (`session_id`, `project_id`, `user_id`) che le
 /// fixture a mano ignoravano: `CREATE TABLE agent_runs (id UUID PRIMARY KEY)`

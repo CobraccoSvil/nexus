@@ -509,6 +509,34 @@ async fn structured_work_state(db: &sqlx::PgPool, session_id: Uuid) -> Option<St
     ))
 }
 
+/// Il payload del punto vettoriale di una memoria di sessione: le voci del
+/// pannello "Memoria del progetto".
+///
+/// E' una funzione, e non tre righe dentro [`compact_session_core`], perche' il
+/// suo consumatore vero - il richiamo in `prompt_memories` - deve poter essere
+/// misurato su QUESTA forma e non su una ricopiata a mano in un test (regola O).
+/// Un test che si scrive da se' il payload resta verde anche quando produttore e
+/// consumatore divergono, che e' il modo in cui il difetto dei contatori e'
+/// rimasto invisibile.
+///
+/// La memoria nasce INATTIVA: entra nei prompt solo dopo che l'utente l'ha attivata
+/// dal pannello, e il filtro della ricerca esige `active = true`.
+pub(crate) fn payload_memoria_di_sessione(
+    project_id: Uuid,
+    session_id: Uuid,
+    summary_text: &str,
+) -> serde_json::Value {
+    crate::vector_memory::prompt_correction_payload(
+        project_id,
+        summary_text,
+        false,
+        json!({
+            "session_id": session_id.to_string(),
+            "type": "session_memory",
+        }),
+    )
+}
+
 pub(crate) async fn compact_session_core(
     state: &AppState,
     session_id: Uuid,
@@ -738,14 +766,7 @@ pub(crate) async fn compact_session_core(
             .await
             .map_err(|e| CompactError::internal(format!("Embedding error: {e}")))?;
 
-        // Store in Qdrant via vector_memory
-        let payload = json!({
-            "project_id": project_id.to_string(),
-            "session_id": session_id.to_string(),
-            "type": "session_memory",
-            "active": false,   // inactive until user activates
-            "text": summary_text,
-        });
+        let payload = payload_memoria_di_sessione(project_id, session_id, &summary_text);
         crate::vector_memory::upsert_prompt_correction_point(
             &state.db, &point_id, &vector, payload,
         )
