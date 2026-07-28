@@ -163,6 +163,51 @@ pub fn is_project_registrable_port(project_id: &Uuid, port: u16) -> bool {
     classify_project_port(project_id, port) == PortRegistrability::Registrable
 }
 
+/// L'unico `allocation_mode` che vale come decisione UMANA esplicita, e percio'
+/// l'unico che puo' autorizzare una porta fuori dal bucket del progetto. Gli
+/// altri modi del vocabolario (`auto`, `dynamic`, `existing`, `adopted`, vedi
+/// mig 0114/0146/0434) nascono da automatismi: se autorizzassero, basterebbe che
+/// un automatismo sbagliasse una volta per rendersi lecito da solo.
+pub const ALLOCATION_MODE_MANUAL: &str = "manual";
+
+/// Una riga di `nexus_port_allocations` AUTORIZZA quella porta a quel progetto?
+///
+/// Parte pura del punto unico (regola L): nel bucket -> si', per costruzione;
+/// fuori dal bucket -> solo se qualcuno l'ha decisa a mano.
+pub fn allocation_authorizes_port(project_id: &Uuid, port: u16, mode: &str) -> bool {
+    mode == ALLOCATION_MODE_MANUAL || port_in_project_bucket(project_id, port)
+}
+
+/// PUNTO UNICO (regola L) della domanda "questo progetto puo' usare questa
+/// porta?": vale per il port_enforcer che decide se uccidere un processo, per il
+/// sandbox che decide se lasciar iniettare `PORT`, per il linter che decide se
+/// il sorgente e' in violazione e per il GC che decide se una riga e' un
+/// artefatto.
+///
+/// Prima ognuno rispondeva a modo suo, e le quattro risposte divergevano: il
+/// sandbox accettava una riga di QUALUNQUE modo (quindi un'allocazione `auto`
+/// creata da un automatismo autorizzava se stessa), il GC proteggeva tutto cio'
+/// che stava nel range globale, il linter guardava solo il bucket e non vedeva
+/// le `manual` legittime. Una porta poteva cosi' essere insieme autorizzata e
+/// non autorizzata, a seconda di chi lo chiedeva.
+///
+/// `false` anche su errore DB: nessuna risposta non e' un permesso.
+pub async fn port_authorized_for_project(db: &sqlx::PgPool, project_id: &Uuid, port: u16) -> bool {
+    if port_in_project_bucket(project_id, port) {
+        return true;
+    }
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations \
+         WHERE port = $1 AND project_id = $2 AND allocation_mode = $3)",
+    )
+    .bind(port as i32)
+    .bind(project_id)
+    .bind(ALLOCATION_MODE_MANUAL)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +278,40 @@ mod tests {
             classify_project_port(&progetto, 40000),
             PortRegistrability::OutOfProjectRange
         );
+    }
+
+    /// Il criterio di autorizzazione, dove le quattro risposte divergevano.
+    ///
+    /// Mutazione che rende rosso: far autorizzare qualunque `allocation_mode`
+    /// (com'era nel sandbox) -> la prima asserzione cade, e con essa il fatto che
+    /// un'allocazione nata da un automatismo non possa rendersi lecita.
+    #[test]
+    fn fuori_dal_bucket_autorizza_solo_una_riga_manual() {
+        let progetto = progetto_gestione_spese();
+        // Il caso reale: 20001 registrata 'auto' al progetto sbagliato.
+        assert!(
+            !allocation_authorizes_port(&progetto, 20001, "auto"),
+            "una riga nata da un automatismo non puo' autorizzare se stessa"
+        );
+        for modo in ["auto", "dynamic", "existing", "adopted"] {
+            assert!(
+                !allocation_authorizes_port(&progetto, 20001, modo),
+                "il modo '{modo}' non e' una decisione umana"
+            );
+        }
+        // Una porta decisa a mano vale anche fuori dal bucket: e' il caso
+        // legittimo (run_config storiche, riserve dell'utente).
+        assert!(allocation_authorizes_port(
+            &progetto,
+            20001,
+            ALLOCATION_MODE_MANUAL
+        ));
+        // Nel proprio bucket il modo non conta: e' autorizzata per costruzione.
+        let (start, end) = project_bucket_range(&progetto);
+        for modo in ["auto", "dynamic", ALLOCATION_MODE_MANUAL] {
+            assert!(allocation_authorizes_port(&progetto, start, modo));
+            assert!(allocation_authorizes_port(&progetto, end, modo));
+        }
     }
 
     #[test]

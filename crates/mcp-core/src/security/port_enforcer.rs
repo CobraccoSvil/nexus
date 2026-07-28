@@ -17,8 +17,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::project_workspace::services::{
-    detect_all_port_bindings, port_allocated_to_project, port_in_project_bucket,
-    project_bucket_range,
+    detect_all_port_bindings, port_authorized_for_project, project_bucket_range,
 };
 use crate::security::{record_audit, AuditEntry};
 
@@ -70,18 +69,13 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
             None => continue, // processo non-progetto, skip
         };
 
-        // Controlla se la porta e' lecita per questo progetto (punto unico, regola L)
+        // La porta e' lecita per questo progetto? Punto unico (regola L): nel
+        // bucket, oppure allocata a mano. Una riga `auto`/`dynamic` non salva il
+        // processo, altrimenti basterebbe che un automatismo ne creasse una.
+        if port_authorized_for_project(db, &project_id, b.port).await {
+            continue;
+        }
         let (bucket, bucket_end) = project_bucket_range(&project_id);
-
-        if port_in_project_bucket(&project_id, b.port) {
-            continue; // porta nel bucket: ok
-        }
-
-        // Fuori dal bucket: controlla se e' allocata esplicitamente
-        let owned = port_allocated_to_project(db, b.port, project_id).await;
-        if owned {
-            continue; // allocazione esplicita: ok
-        }
 
         current_violations.push((project_id, b.port as f64));
 

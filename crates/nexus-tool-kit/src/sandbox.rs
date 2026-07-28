@@ -805,30 +805,23 @@ async fn validate_port_for_project(
     project_id: uuid::Uuid,
     port: u16,
 ) -> Result<(), String> {
-    use crate::ports::{port_in_project_bucket, project_bucket_range, NEXUS_RESERVED_PORTS};
+    use crate::ports::{port_authorized_for_project, project_bucket_range, NEXUS_RESERVED_PORTS};
     if NEXUS_RESERVED_PORTS.contains(&port) {
         return Err(format!(
             "porta {port} riservata Nexus (web-ide/microservizi/DB infrastruttura). \
              Usa request_port per allocarne una nel bucket del progetto."
         ));
     }
-    let (bucket_start, bucket_end) = project_bucket_range(&project_id);
-    if !port_in_project_bucket(&project_id, port) {
-        // Tollerata SOLO se gia' allocata a questo progetto (caso run_config legacy)
-        let owned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations WHERE port = $1 AND project_id = $2)",
-        )
-        .bind(port as i32)
-        .bind(project_id)
-        .fetch_one(db)
-        .await
-        .unwrap_or(false);
-        if !owned {
-            return Err(format!(
-                "porta {port} fuori dal bucket del progetto [{bucket_start}, {bucket_end}]. \
-                 Chiama request_port per ottenere una porta valida."
-            ));
-        }
+    // Punto unico (regola L). Prima qui bastava l'ESISTENZA di una riga, di
+    // qualunque `allocation_mode`: un'allocazione nata da un automatismo
+    // autorizzava percio' se stessa, ed era la strada per iniettare una PORT
+    // fuori bucket. Ora fuori dal bucket vale solo una `manual`.
+    if !port_authorized_for_project(db, &project_id, port).await {
+        let (bucket_start, bucket_end) = project_bucket_range(&project_id);
+        return Err(format!(
+            "porta {port} fuori dal bucket del progetto [{bucket_start}, {bucket_end}] e non \
+             allocata a mano. Chiama request_port per ottenere una porta valida."
+        ));
     }
     Ok(())
 }
