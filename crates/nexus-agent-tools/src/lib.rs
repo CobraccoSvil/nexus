@@ -45,6 +45,8 @@ pub mod shadcn_setup;
 // rimosso nel porting a grafo nativo (zero-Python).
 pub mod todos;
 pub mod tool_schema;
+pub mod ui_patterns;
+pub mod ui_reference_search;
 pub mod url_scanner;
 pub mod video_tools;
 pub mod vision_tools;

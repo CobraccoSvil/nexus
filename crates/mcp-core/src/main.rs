@@ -119,6 +119,7 @@ mod test_support;
 mod tool_capability;
 mod tool_runner_server;
 mod trace_store;
+mod ui_clarification;
 mod ui_flags;
 mod vector_memory;
 mod verify_profile;

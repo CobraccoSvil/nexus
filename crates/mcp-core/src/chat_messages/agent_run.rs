@@ -2144,6 +2144,106 @@ async fn apply_disambiguation_reply(
     resolved_intent_hint
 }
 
+/// Meta del messaggio che chiede l'indicazione di stile. `kind` distinto da
+/// `disambiguation_request`: e' anche il segnale che il gate legge per non
+/// richiedere due volte (regola M — l'aver gia' chiesto e' un fatto
+/// registrato, non si deduce dal testo del messaggio).
+fn ui_style_clarification_meta() -> serde_json::Value {
+    json!({
+        "kind": "ui_style_clarification",
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
+        "totalCost": 0.0,
+    })
+}
+
+/// La domanda e' gia' stata posta in questa sessione?
+///
+/// Legge il FATTO dai messaggi (il `kind` nel meta), non dal contenuto: la
+/// risposta dell'utente puo' essere "procedi", che non contiene nulla di
+/// riconoscibile. In caso di errore di lettura risponde `true`, cioe' "non
+/// chiedere": un gate che interrompe il turno deve sbagliare tacendo.
+async fn ui_style_already_asked(msgs_pool: &PgPool, session_id: Uuid) -> bool {
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM chat_messages \
+         WHERE session_id = $1 AND role = 'assistant' \
+           AND metadata->>'kind' = 'ui_style_clarification'",
+    )
+    .bind(session_id)
+    .fetch_one(msgs_pool)
+    .await
+    {
+        Ok(n) => n > 0,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "gate stile UI: storia non leggibile, non chiedo (fail-safe)"
+            );
+            true
+        }
+    }
+}
+
+/// Gate del punto 3: la richiesta costruisce un'interfaccia senza dire come
+/// deve essere? In quel caso ferma il turno e chiede, invece di indovinare.
+///
+/// Riusa il canale della disambiguazione (`SpawnOutcome::Disambiguation`): il
+/// turno si ferma in attesa della risposta senza far partire un secondo giro
+/// LLM. La decisione vive nel punto unico [`crate::ui_clarification`].
+///
+/// Salta in modalita' `Automatic`, come il gate di disambiguazione accanto:
+/// li' l'utente ha chiesto che il sistema agisca anche con incertezza, e una
+/// domanda bloccherebbe i trigger fuori-chat che non hanno un umano davanti.
+async fn ui_style_clarification_outcome(
+    state: &AppState,
+    msgs_pool: &PgPool,
+    params: &SpawnAgentParams,
+    run_id: Uuid,
+) -> Option<SpawnOutcome> {
+    if matches!(params.automation_mode, AutomationMode::Automatic) {
+        return None;
+    }
+    let cfg = crate::ui_clarification::read_config(&state.db).await;
+    if !cfg.enabled {
+        return None;
+    }
+    let facts = crate::ui_clarification::TurnFacts {
+        has_attachments: !params.attachments.is_empty(),
+        already_asked: ui_style_already_asked(msgs_pool, params.session_id).await,
+    };
+    let decision =
+        crate::ui_clarification::needs_style_clarification(&params.content, &cfg, facts);
+    tracing::info!(
+        session_id = %params.session_id,
+        decision = decision.reason_code(),
+        "gate stile UI"
+    );
+    if !decision.should_ask() {
+        return None;
+    }
+
+    let domanda = crate::ui_clarification::clarification_question();
+    let msg_id =
+        insert_disambiguation_message(state, params, &domanda, ui_style_clarification_meta())
+            .await?;
+    nexus_events::dispatcher::emit(
+        &state.project_channels,
+        params.project_id,
+        nexus_events::ProjectEvent::ChatMessageAdded {
+            session_id: params.session_id,
+            message_id: msg_id,
+            role: "assistant".into(),
+            total_tokens: None,
+            total_cost_usd: None,
+        },
+    );
+    state.agent_channels.remove(&run_id);
+    let view = disambiguation_message_view(state, params.project_id, msg_id).await?;
+    Some(SpawnOutcome::Disambiguation(view))
+}
+
 /// Metadata del messaggio di chiarimento.
 ///
 /// Metriche a 0: la disambiguazione non consuma token. Il frontend legge
@@ -4067,6 +4167,14 @@ pub(crate) async fn spawn_agent_run(
     {
         return outcome;
     }
+    // Secondo gate, stessa forma: la richiesta costruisce un'interfaccia senza
+    // dire come deve essere? Dopo il primo, perche' un intent ancora ambiguo va
+    // chiarito prima di ragionare sull'aspetto.
+    if let Some(outcome) =
+        ui_style_clarification_outcome(state, &msgs_pool, &params, run_id).await
+    {
+        return outcome;
+    }
 
     // Routing slot-based (Livello 4 NLU, mig 0133) + override effettivi:
     // vedi `resolve_slot_routing_hit` / `resolve_effective_overrides`.
@@ -5948,18 +6056,15 @@ async fn maybe_convene_council(
     if !deliberate {
         return None;
     }
-    // Selezione figure (DB-driven + routing per ambito): lista vuota -> niente.
+    // Selezione figure (DB-driven + routing per ambito), gia' dimensionata al
+    // target del piano di orchestrazione: il TAGLIO e' un punto unico dentro il
+    // selettore (regola L), che sa distinguere una figura scelta dal task da una
+    // di default. Tagliare qui, dopo, significava scartare sempre la coda —
+    // cioe' proprio le figure d'ambito. `Some(0)` = panel azzerato dal budget
+    // (il meta-step `orchestration_plan` lo documenta) -> lista vuota.
     let cfg = crate::agent_tools::subagent_native::read_council_config(&state.db).await;
-    let mut figures = crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg);
-    // Target del piano di orchestrazione (punto unico orchestration_sizing): la
-    // DECISIONE del numero e' del resolver, qui si applica. 0 = panel azzerato
-    // dal budget: non si convoca (il meta-step `orchestration_plan` lo documenta).
-    if let Some(target) = figure_target {
-        if target == 0 {
-            return None;
-        }
-        figures.truncate(target);
-    }
+    let figures =
+        crate::agent_tools::subagent_native::select_council_figures(user_text, &cfg, figure_target);
     if figures.is_empty() {
         return None;
     }
