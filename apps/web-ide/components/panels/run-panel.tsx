@@ -120,11 +120,13 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const [newPortLabel, setNewPortLabel] = useState("");
   const [portAllocMsg, setPortAllocMsg] = useState("");
 
-  // Cache delle ultime URL note per ogni servizio. Evita lo "sfarfallio" del link
-  // quando il polling porte capita in un istante di transizione (MainPID assente,
-  // backend non riesce a popolare il campo `service` per quel ciclo).
-  // Si svuota la voce quando il servizio diventa inactive/dead.
-  const [serviceUrlCache, setServiceUrlCache] = useState<Record<string, string>>({});
+  // Qui viveva una cache delle ultime URL note per servizio, nata per evitare lo
+  // "sfarfallio" del link nei cicli di polling in cui il backend non popolava
+  // `service`. Rimossa: curava un tremolio e in cambio faceva sopravvivere un
+  // indirizzo alla propria allocazione, cioe' mostrava una porta che il servizio
+  // non aveva (piu'). Un link che appare e sparisce e' fastidioso; un link che
+  // resta e mente manda a debuggare la porta sbagliata. Ora l'URL lo mostra solo
+  // chi ha un'allocazione legata alla propria identita' (project-services-section).
 
   // ── Auto-restart: file modificati dall'ultimo riavvio (persistito in localStorage) ──
   const lastRestartKey = `nexus.lastRestart.${projectId}`;
@@ -231,27 +233,6 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       setDiagResult("resolved");
     }
   }, [services, diagSentFor, diagResult]);
-
-  // Aggiorna il cache delle URL: salva i match trovati, azzera quelli per servizi non più running.
-  useEffect(() => {
-    setServiceUrlCache(prev => {
-      const next: Record<string, string> = {};
-      for (const svc of services) {
-        const isAlive = svc.state === "active" && (svc.sub === "running" || svc.sub === "exited");
-        if (!isAlive) continue; // servizio dead/failed → rimuove dalla cache
-        // Match attuale (stessa logica del rendering)
-        const p =
-          ports.find(pp => pp.service === svc.short)
-          ?? ports.find(pp =>
-            pp.label?.toLowerCase().includes(svc.short.toLowerCase()) ||
-            pp.label?.toLowerCase().includes(svc.unit.replace(".service","").toLowerCase())
-          );
-        const url = p?.url ?? prev[svc.short];
-        if (url) next[svc.short] = url;
-      }
-      return next;
-    });
-  }, [services, ports]);
 
   const handleUninstall = async (svc: ProjectServiceEntry) => {
     if (!await confirmDialog(`Disinstallare il servizio "${svc.short}"?\n\nIl servizio verra' fermato e rimosso dal progetto.\nL'azione e' reversibile reinstallando il servizio dal wizard.`)) return;
@@ -479,7 +460,6 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         managerUnavailable={managerUnavailable}
         managerHint={managerHint}
         ports={ports}
-        serviceUrlCache={serviceUrlCache}
         svcBusy={svcBusy}
         svcMsg={svcMsg}
         batchBusy={batchBusy}

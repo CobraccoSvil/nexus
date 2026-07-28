@@ -12,7 +12,6 @@ interface ProjectServicesSectionProps {
   managerUnavailable?: boolean;
   managerHint?: string;
   ports: PortEntry[];
-  serviceUrlCache: Record<string, string>;
   svcBusy: Record<string, boolean>;
   svcMsg: string;
   batchBusy: boolean;
@@ -39,7 +38,6 @@ export function ProjectServicesSection({
   managerUnavailable,
   managerHint,
   ports,
-  serviceUrlCache,
   svcBusy,
   svcMsg,
   batchBusy,
@@ -190,17 +188,27 @@ export function ProjectServicesSection({
             {services.map(svc => {
           const hasDiag = !!svc.last_error;
           const col = hasDiag ? "#ef4444" : stateColor(svc.state);
-          // Match porta↔servizio: prima per campo `service` esatto (popolato dal backend),
-          // poi fallback per match testuale su label, infine cache della URL già nota
-          // (sopravvive ai cicli di polling in cui il backend non riesce a popolare `service`).
-          const svcPort =
-            ports.find(p => p.service === svc.short)
-            ?? ports.find(p =>
-              p.label?.toLowerCase().includes(svc.short.toLowerCase()) ||
-              p.label?.toLowerCase().includes(svc.unit.replace(".service","").toLowerCase())
-            );
-          const cachedUrl = serviceUrlCache[svc.short];
-          const effectiveUrl = svcPort?.url ?? cachedUrl;
+          // Match porta<->servizio: SOLO per identita' (`service`, che il backend
+          // popola dall'allocazione legata al service_unit). Niente ripieghi.
+          //
+          // Qui prima c'erano due modi di indovinare, e producevano il difetto che
+          // questa riga ora chiude: un servizio mostrato con una porta che non era
+          // la sua. (a) un match testuale `label.includes(short)`, che ri-rispondeva
+          // a mano una domanda che il backend ha gia' un punto unico per rispondere
+          // (`similar_service_labels` / `shared_significant_words`, con i suoi test)
+          // — e la ri-rispondeva peggio; (b) una cache dell'ultima URL vista, che
+          // continuava a mostrare un indirizzo quando l'allocazione non c'era piu'.
+          // Il secondo era il piu' insidioso: non mostrava una porta sbagliata per
+          // errore di calcolo, la mostrava per MEMORIA, cioe' restava plausibile
+          // proprio mentre smetteva di essere vera.
+          //
+          // Senza allocazione legata all'identita' non si stampa nessun indirizzo:
+          // un servizio senza porta certa e' un'informazione, una porta inventata e'
+          // una bugia. Il caso tipico e' il processo avviato fuori dal pannello (un
+          // `npm start` dentro un comando dell'agente): la sua porta e' RILEVATA, non
+          // assegnata, e finche' resta tale non ha un indirizzo da promettere.
+          const svcPort = ports.find(p => p.service === svc.short);
+          const effectiveUrl = svcPort?.url;
           const stateText = svc.crash_loop
             ? "crash-loop (si riavvia continuamente)"
             : stateLabel(svc.state, svc.sub);
@@ -296,6 +304,21 @@ export function ProjectServicesSection({
                   >
                     {effectiveUrl}
                   </a>
+                </div>
+              )}
+              {!effectiveUrl && svc.state === "active" && (
+                // Un servizio ATTIVO senza indirizzo non e' un dettaglio mancante:
+                // sta ascoltando da qualche parte e Nexus non sa dove, perche'
+                // nessuna allocazione porta la sua identita'. Va detto, altrimenti
+                // lo spazio vuoto si legge come "questo servizio non espone nulla".
+                // Sui servizi fermi si tace: li' l'assenza di indirizzo e' ovvia.
+                <div style={{ paddingLeft:21, marginTop:1 }}>
+                  <span
+                    title="Nessuna porta allocata a questo servizio. Succede quando il processo e' stato avviato fuori dal pannello (es. da un comando dell'agente): la porta viene rilevata ma non assegnata, quindi non e' garantita. Riavvialo dal pannello per fargli assegnare una porta stabile."
+                    style={{ fontSize:10,color:tc.textSecondary,fontFamily:'var(--font-mono)' }}
+                  >
+                    porta non allocata
+                  </span>
                 </div>
               )}
               {/* Diagnostica crash-loop: errore, suggerimento e azione AI */}
