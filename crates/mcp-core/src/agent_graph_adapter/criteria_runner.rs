@@ -529,68 +529,34 @@ task_complete (outcome + summary)"
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_uppercase();
-        // Status atteso: int singolo o lista (parita' Python).
-        let expected_statuses: Vec<u16> = match expected.get("status") {
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .filter_map(Value::as_i64)
-                .map(|v| v as u16)
-                .collect(),
-            Some(v) => vec![v.as_i64().unwrap_or(200) as u16],
-            None => vec![200],
+        let expected_statuses = expected_statuses_from(expected.get("status"));
+        let Ok(m) = reqwest::Method::from_bytes(method.as_bytes()) else {
+            return (
+                false,
+                json!({ "error": format!("metodo HTTP invalido: {method}"), "url": url }),
+            );
         };
-        let m = match reqwest::Method::from_bytes(method.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
-                return (
-                    false,
-                    json!({ "error": format!("metodo HTTP invalido: {method}"), "url": url }),
-                )
-            }
-        };
-        let mut rb = self
-            .http_client
-            .request(m, url)
-            .timeout(Duration::from_secs_f64(timeout_s));
-        if let Some(body) = spec.get("body") {
-            match body {
-                Value::Object(_) | Value::Array(_) => rb = rb.json(body),
-                Value::String(s) if !s.is_empty() => rb = rb.body(s.clone()),
-                _ => {}
-            }
-        }
-        if let Some(Value::Object(headers)) = spec.get("headers") {
-            for (k, v) in headers {
-                if let Some(vs) = v.as_str() {
-                    rb = rb.header(k.as_str(), vs);
-                }
-            }
-        }
+        let rb = with_body_and_headers(
+            self.http_client
+                .request(m, url)
+                .timeout(Duration::from_secs_f64(timeout_s)),
+            spec,
+        );
         let resp = match rb.send().await {
             Ok(r) => r,
-            Err(e) => {
-                return (
-                    false,
-                    json!({ "error": format!("http call: {e}"), "url": url }),
-                )
-            }
+            // Servizio spento o irraggiungibile: e' un fallimento della prova,
+            // non un guasto del runner (parita' col try/except Python).
+            Err(e) => return (false, json!({ "error": format!("http call: {e}"), "url": url })),
         };
         let actual = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        let body_excerpt = truncate_chars(&text, 400);
-        let mut passed = expected_statuses.contains(&actual);
-        if let Some(needle) = expected.get("body_contains").and_then(Value::as_str) {
-            passed = passed && text.contains(needle);
-        }
-        (
-            passed,
-            json!({
-                "url": url,
-                "method": method,
-                "status": actual,
-                "expected_status": expected_statuses,
-                "body_excerpt": body_excerpt,
-            }),
+        esito_http(
+            &method,
+            url,
+            &expected_statuses,
+            expected.get("body_contains").and_then(Value::as_str),
+            actual,
+            &text,
         )
     }
 
@@ -774,6 +740,106 @@ impl CriteriaRunner for FinalGateCriteriaRunnerAdapter {
         }
         Ok(out)
     }
+}
+
+/// Status HTTP attesi da un criterio: intero singolo o lista (parita' Python).
+/// Assente o non interpretabile -> `200`, il default storico del criterio.
+fn expected_statuses_from(status: Option<&Value>) -> Vec<u16> {
+    const OK: u16 = 200;
+    match status {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_i64)
+            .map(|v| v as u16)
+            .collect(),
+        Some(v) => vec![v.as_i64().map(|n| n as u16).unwrap_or(OK)],
+        None => vec![OK],
+    }
+}
+
+/// Aggiunge alla richiesta il corpo e gli header dichiarati nella `spec` del
+/// criterio. Un corpo oggetto/array parte come JSON, una stringa non vuota come
+/// corpo grezzo; gli altri tipi non aggiungono nulla.
+fn with_body_and_headers(
+    mut rb: reqwest::RequestBuilder,
+    spec: &Value,
+) -> reqwest::RequestBuilder {
+    if let Some(body) = spec.get("body") {
+        match body {
+            Value::Object(_) | Value::Array(_) => rb = rb.json(body),
+            Value::String(s) if !s.is_empty() => rb = rb.body(s.clone()),
+            _ => {}
+        }
+    }
+    if let Some(Value::Object(headers)) = spec.get("headers") {
+        for (k, v) in headers {
+            if let Some(vs) = v.as_str() {
+                rb = rb.header(k.as_str(), vs);
+            }
+        }
+    }
+    rb
+}
+
+/// Esito di una prova HTTP data la risposta ricevuta. PURA (nessuna rete): si
+/// esercita senza server, e per lo stesso motivo il test che ne verifica il
+/// contenuto puo' partire dal produttore vero invece di fabbricare l'evidence.
+///
+/// La DECISIONE e' lo STATUS (segnale strutturato, regola M). Il corpo entra
+/// nella decisione SOLO se il criterio dichiara `body_contains` — cosa che fanno
+/// i criteri configurati a mano, mai quelli derivati da una dichiarazione
+/// dell'agente; per tutti gli altri e' materiale diagnostico.
+fn esito_http(
+    method: &str,
+    url: &str,
+    expected_statuses: &[u16],
+    body_contains: Option<&str>,
+    actual: u16,
+    text: &str,
+) -> (bool, Value) {
+    let body_excerpt = truncate_chars(text, HTTP_BODY_EXCERPT_CHARS);
+    let mut passed = expected_statuses.contains(&actual);
+    if let Some(needle) = body_contains {
+        passed = passed && text.contains(needle);
+    }
+    let verdict = http_verdict(method, url, actual, expected_statuses, &body_excerpt);
+    (
+        passed,
+        json!({
+            "url": url,
+            "method": method,
+            "status": actual,
+            "expected_status": expected_statuses,
+            "body_excerpt": body_excerpt,
+            "verdict": verdict,
+        }),
+    )
+}
+
+/// Caratteri di corpo della risposta conservati nell'evidence di una prova HTTP.
+const HTTP_BODY_EXCERPT_CHARS: usize = 400;
+
+/// Riga DIAGNOSTICA di una prova HTTP (display), letta da
+/// `final_gate::render_failed_block` — che salta i criteri falliti senza testo.
+/// Senza di essa il gate bocciava una POST 500 e rimandava all'agente un blocco
+/// che non nominava ne' l'URL ne' lo status: un re-loop cieco.
+///
+/// PURA, e non ri-decide nulla: riceve l'esito gia' deciso dallo status (regola
+/// M). Il corpo entra solo come coda diagnostica.
+fn http_verdict(
+    method: &str,
+    url: &str,
+    actual: u16,
+    expected_statuses: &[u16],
+    body_excerpt: &str,
+) -> String {
+    let atteso: Vec<String> = expected_statuses.iter().map(u16::to_string).collect();
+    let coda = if body_excerpt.is_empty() {
+        String::new()
+    } else {
+        format!("\n{body_excerpt}")
+    };
+    format!("{method} {url} -> {actual} (atteso {}){coda}", atteso.join("/"))
 }
 
 /// Taglia una stringa a `max` CARATTERI (non byte: evita di spezzare UTF-8).
@@ -1160,6 +1226,96 @@ mod tests {
         let calls = exec.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], "run_command".to_string());
+    }
+
+    /// Status della prova: la famiglia di successo attesa viene dal PUNTO UNICO
+    /// (`endpoint_probes`), non ricopiata qui — una copia divergerebbe dal
+    /// criterio che il gate costruisce davvero.
+    const SUCCESSI_2XX: &[i64] = nexus_agent_graph::decisions::endpoint_probes::DEFAULT_SUCCESS_STATUSES;
+    const STATUS_500: &str = "500 Internal Server Error";
+    const STATUS_201: &str = "201 Created";
+    const CODICE_500: u16 = 500;
+    /// Byte di richiesta letti prima di rispondere: basta la request-line.
+    const RICHIESTA_MAX_BYTES: usize = 2048;
+
+    /// Server HTTP minimale di test: risponde a ogni richiesta con lo status dato
+    /// e chiude. Ritorna l'URL su cui e' in ascolto. Serve a esercitare il
+    /// PRODUTTORE reale dell'evidence (`check_http`) invece di fabbricarla nel
+    /// test (regola O): e' l'unico modo per sapere se il gate, quando boccia una
+    /// chiamata, sa anche DIRE quale.
+    async fn server_che_risponde(status_line: &'static str, corpo: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind effimero");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; RICHIESTA_MAX_BYTES];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{corpo}",
+                    corpo.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/api/expenses")
+    }
+
+    /// Il caso reale (gestione-spese, 2026-07-28): la POST di creazione risponde
+    /// 500. Il criterio deve FALLIRE e la sua evidence deve nominare metodo, URL
+    /// e status — `final_gate::render_failed_block` salta i criteri falliti senza
+    /// testo, quindi un'evidence muta significa rimandare l'agente a correggere
+    /// senza dirgli cosa.
+    #[sqlx::test]
+    async fn http_post_500_fallisce_e_dice_cosa(pool: PgPool) {
+        let url = server_che_risponde(STATUS_500, r#"{"error":"no such column: date"}"#).await;
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(vec![spec(
+                "http",
+                json!({ "url": url, "method": "POST", "body": {"amount": 12.5} }),
+                json!({ "status": SUCCESSI_2XX }),
+            )])
+            .await
+            .expect("ok");
+        assert!(!res[0].passed, "500 fuori dagli status attesi -> criterio fallito");
+        assert_eq!(res[0].evidence["status"], json!(CODICE_500));
+        let verdict = res[0].evidence["verdict"]
+            .as_str()
+            .expect("evidence.verdict: e' il testo che il gate mostra all'agente");
+        assert!(verdict.contains("POST"), "verdict senza metodo: {verdict}");
+        assert!(verdict.contains("/api/expenses"), "verdict senza URL: {verdict}");
+        assert!(
+            verdict.contains(&CODICE_500.to_string()),
+            "verdict senza status: {verdict}"
+        );
+        // Il corpo entra nell'evidence per la diagnosi, MAI nella decisione
+        // (regola M): l'esito l'ha deciso lo status.
+        assert!(res[0].evidence["body_excerpt"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no such column"));
+    }
+
+    /// Contro-prova: 201 e' nella famiglia 2xx attesa per una creazione.
+    #[sqlx::test]
+    async fn http_post_201_passa(pool: PgPool) {
+        let url = server_che_risponde(STATUS_201, r#"{"id":1}"#).await;
+        let exec = FakeToolExecutor::with(&[]);
+        let runner = FinalGateCriteriaRunnerAdapter::new(exec, pool);
+        let res = runner
+            .run(vec![spec(
+                "http",
+                json!({ "url": url, "method": "POST", "body": {"amount": 12.5} }),
+                json!({ "status": SUCCESSI_2XX }),
+            )])
+            .await
+            .expect("ok");
+        assert!(res[0].passed, "201 e' un successo di creazione");
     }
 
     #[sqlx::test]

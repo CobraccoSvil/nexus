@@ -825,9 +825,10 @@ impl VerifierNode {
     /// Esegue i gate generali (`run_general_gates`, `final_gate.py:381-486`)
     /// DELEGANDO al [`FinalGateNode`] (RIUSO di `build_criteria` + `all_passed`,
     /// regola L: nessuna duplicazione della costruzione). `build_criteria` produce
-    /// i 2 criteri sempre presenti + gli opzionali (service_logs_clean, build,
-    /// http-endpoint) risolti a monte nella `FinalGateConfig`: il fail-closed del
-    /// verifier eredita anche il criterio endpoint senza re-implementarlo. Ritorna
+    /// i 2 criteri sempre presenti + gli opzionali (service_logs_clean, build) e
+    /// le prove `http` — quelle configurate nel progetto e quelle DICHIARATE
+    /// dall'agente in `task_complete.endpoints`: il fail-closed del verifier
+    /// eredita anche le chiamate agli endpoint senza re-implementarle. Ritorna
     /// `(all_passed, results)`.
     async fn run_general_gates(
         &self,

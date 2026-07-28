@@ -116,6 +116,42 @@ mod adr0034_contract_tests {
         );
     }
 
+    /// Stesso legame per gli ENDPOINT dichiarati in `task_complete` (le prove
+    /// HTTP che il final_gate eseguira'): l'enum dei metodi nello schema deve
+    /// coincidere con quello che `endpoint_probes::normalize_endpoints` accetta.
+    /// Un metodo aggiunto solo allo schema sarebbe dichiarato dal modello e
+    /// scartato in silenzio, cioe' un endpoint mai provato con l'aria di una
+    /// verifica — la stessa forma del difetto che ha introdotto questo campo.
+    #[test]
+    fn enum_metodi_endpoint_coerenti_con_normalize() {
+        let v: serde_json::Value =
+            serde_json::from_str(super::AGENT_TOOLS_JSON).expect("catalogo parsa");
+        let tc = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("task_complete"))
+            .expect("task_complete nel catalogo");
+        let metodi = &tc["input_schema"]["properties"]["endpoints"]["items"]["properties"]["method"]
+            ["enum"];
+        let set: std::collections::BTreeSet<String> = metodi
+            .as_array()
+            .expect("enum method array")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .map(str::to_string)
+            .collect();
+        let attesi: std::collections::BTreeSet<String> =
+            nexus_agent_graph::decisions::endpoint_probes::VALID_ENDPOINT_METHODS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(
+            set, attesi,
+            "enum method dello schema divergente da VALID_ENDPOINT_METHODS"
+        );
+    }
+
     /// Stesso legame cross-crate per il canale del REVISORE (Fase B ultracode):
     /// gli enum di `review_verdict` nello schema (verdict, findings.severity)
     /// devono coincidere con quelli del normalizzatore — un valore aggiunto

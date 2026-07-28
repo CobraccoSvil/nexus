@@ -1029,11 +1029,13 @@ async fn load_planner_config(db: &PgPool) -> PlannerConfig {
 /// `agent.no_orphan.min_ratio` + `agent.import_staging_dirs`; `criteria_timeout_s`
 /// = `orchestrator.verifier_timeout_s`).
 ///
-/// Restano al `Default` i campi RISOLTI PER-PROGETTO a monte (regola G), non
-/// ancora portati nella cablatura nativa (gli stessi gia' OFF nel TODO esistente):
-/// `build_command`/`build_working_dir` (`_resolve_build_command`), `log_command`
-/// (`_resolve_log_command`), `endpoint_criterion` (`_resolve_endpoint_check`). Con
-/// `None`/vuoto il criterio corrispondente NON si aggiunge (non blocca, niente
+/// Le prove HTTP funzionali sono risolte QUI dal `project_id` della sessione
+/// (`run_configurations` con `role='endpoint'` e `http_spec`, mig 0455): sono
+/// per-progetto, non per-settings, e restare al `Default` significava non
+/// costruire MAI il criterio.
+///
+/// Resta al `Default` `log_command` (`_resolve_log_command`), non ancora portato
+/// nella cablatura nativa: vuoto = criterio non aggiunto (non blocca, niente
 /// toppa). `build_timeout_s`/`build_output_max_chars` vivono in DB ma servono SOLO
 /// quando `build_command` e' risolto: si leggono comunque per fedelta'.
 /// Config del ReviewGate (gemella del loader del final_gate). Le chiavi sono
@@ -1046,8 +1048,30 @@ async fn load_review_gate_config(db: &PgPool) -> ReviewGateConfig {
     }
 }
 
-async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
+async fn load_final_gate_config(db: &PgPool, project_id: Option<Uuid>) -> FinalGateConfig {
     let d = FinalGateConfig::default();
+    // Prove HTTP funzionali (mig 0455). Il flag e il timeout vivono in DB
+    // (regola G); gli endpoint CONFIGURATI si leggono qui, dove c'e' il pool e
+    // il progetto della sessione — prima restavano al `Default` (`None`) con un
+    // TODO, e la conseguenza non era "un criterio in meno": era che il criterio
+    // HTTP non veniva costruito MAI, in nessun run, e il gate poteva dichiararsi
+    // superato su un'app la cui POST rispondeva 500.
+    let endpoint_check_enabled = setting_bool(
+        db,
+        "agent.final_gate.endpoint_check_enabled",
+        d.endpoint_check_enabled,
+    )
+    .await;
+    let endpoint_timeout_s = setting_f64(
+        db,
+        "agent.final_gate.endpoint_timeout_seconds",
+        d.endpoint_timeout_s,
+    )
+    .await;
+    let endpoint_criteria = match (endpoint_check_enabled, project_id) {
+        (true, Some(pid)) => load_configured_endpoint_criteria(db, pid, endpoint_timeout_s).await,
+        _ => Vec::new(),
+    };
     // Criteri COMANDO (ADR 0036): la catena per-ambiente arriva dal profilo
     // inferito da LLM (`verify_profile::ensure_profile`), risolta in
     // `run_engine` e innestata in `verify_steps` DOPO questo loader (serve
@@ -1089,13 +1113,14 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
         )
         .await,
         // verify_steps/verify_profile_missing innestati in run_engine (profilo
-        // per-ambiente, ADR 0036). log_command / endpoint_criterion restano
-        // risolti per-progetto a monte (non ancora portati): default
-        // vuoto/None (niente criterio, non blocca).
+        // per-ambiente, ADR 0036). `log_command` resta risolto per-progetto a
+        // monte (non ancora portato): vuoto = nessun criterio, non blocca.
         verify_steps: d.verify_steps,
         verify_profile_missing: d.verify_profile_missing,
         log_command: d.log_command,
-        endpoint_criterion: d.endpoint_criterion,
+        endpoint_criteria,
+        endpoint_check_enabled,
+        endpoint_timeout_s,
         design_verify_enabled: setting_bool(
             db,
             "agent.final_gate.design_verify_enabled",
@@ -1127,6 +1152,101 @@ async fn load_final_gate_config(db: &PgPool) -> FinalGateConfig {
         .await,
         max_escalations: setting_i64(db, "agent.executor.max_escalations", d.max_escalations).await,
     }
+}
+
+/// Legge gli endpoint CONFIGURATI del progetto e li traduce in criteri `http`
+/// del final gate: `run_configurations` con `role='endpoint'` e `http_spec`
+/// valorizzato (colonna e settings della mig 0455).
+///
+/// `http_spec` e' `{url, method?, body?, headers?, expected_status?,
+/// body_contains?}`: la parte "come si chiama" finisce nella `spec`, la parte
+/// "cosa ci si aspetta" in `expected`. Una riga senza `url` e' scartata (senza
+/// destinazione non c'e' prova da fare); un errore DB ritorna lista vuota — il
+/// gate non ha allora prove funzionali e lo DICHIARA (regola M), non finge.
+///
+/// La TRADUZIONE della riga sta in [`criterion_from_http_spec`], che e' pura e si
+/// esercita senza un DB addosso.
+async fn load_configured_endpoint_criteria(
+    db: &PgPool,
+    project_id: Uuid,
+    timeout_s: f64,
+) -> Vec<nexus_agent_graph::runtime::ports::CriterionSpec> {
+    let rows: Vec<(serde_json::Value,)> = match sqlx::query_as(
+        "SELECT http_spec FROM run_configurations \
+         WHERE project_id = $1 AND role = 'endpoint' AND http_spec IS NOT NULL \
+         ORDER BY created_at ASC",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "mcp_core::native_engine",
+                error = %e,
+                %project_id,
+                "endpoint configurati non leggibili: il gate restera' senza prove HTTP configurate"
+            );
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .filter_map(|(http_spec,)| criterion_from_http_spec(&http_spec, timeout_s))
+        .collect()
+}
+
+/// Traduce UNA `http_spec` di `run_configurations` in un criterio `http`. PURA.
+///
+/// `http_spec` e' `{url, method?, body?, headers?, expected_status?,
+/// body_contains?}`: la parte "come si chiama" finisce nella `spec`, la parte
+/// "cosa ci si aspetta" in `expected`. `None` se manca `url` — senza destinazione
+/// non c'e' prova da fare.
+///
+/// `expected_status` accetta un intero o una lista (il runner gestisce entrambi);
+/// assente = 200, il default storico del criterio configurato a mano. Nessun
+/// default 2xx qui: quello vale per gli endpoint DICHIARATI dall'agente, che non
+/// scelgono lo status (vedi `decisions::endpoint_probes`).
+/// Status atteso quando la `http_spec` non lo dichiara: il default storico del
+/// criterio configurato a mano.
+const STATUS_ATTESO_DI_DEFAULT: i64 = 200;
+
+fn criterion_from_http_spec(
+    http_spec: &serde_json::Value,
+    timeout_s: f64,
+) -> Option<nexus_agent_graph::runtime::ports::CriterionSpec> {
+    let url = http_spec.get("url").and_then(serde_json::Value::as_str)?;
+    let mut spec = serde_json::Map::new();
+    spec.insert("url".to_string(), serde_json::json!(url));
+    for k in ["method", "body", "headers"] {
+        match http_spec.get(k) {
+            Some(v) if !v.is_null() => {
+                spec.insert(k.to_string(), v.clone());
+            }
+            _ => {}
+        }
+    }
+    // Provenienza nell'evidence: distingue una prova configurata nel progetto da
+    // una dichiarata dall'agente (diagnosi, non decisione).
+    spec.insert("source".to_string(), serde_json::json!("configured"));
+    let mut expected = serde_json::Map::new();
+    expected.insert(
+        "status".to_string(),
+        http_spec
+            .get("expected_status")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(serde_json::json!(STATUS_ATTESO_DI_DEFAULT)),
+    );
+    if let Some(bc) = http_spec.get("body_contains").and_then(|v| v.as_str()) {
+        expected.insert("body_contains".to_string(), serde_json::json!(bc));
+    }
+    Some(nexus_agent_graph::runtime::ports::CriterionSpec {
+        criterion_type: "http".to_string(),
+        spec: serde_json::Value::Object(spec),
+        expected: serde_json::Value::Object(expected),
+        timeout_s: Some(timeout_s),
+    })
 }
 
 /// Costruisce la [`VerifierConfig`] DB-driven (regola G), 1:1 con le chiavi che il
@@ -2277,7 +2397,14 @@ async fn build_native_engine(
     // safe-default se la chiave manca (identico ai `_SAFE_DEFAULTS` del brain): mai
     // come magic fallback (regola G).
     let planner_cfg = load_planner_config(&db).await;
-    let mut final_gate_cfg = load_final_gate_config(&db).await;
+    // Progetto della sessione: serve al final_gate DUE volte — per gli endpoint
+    // configurati (nel loader) e per il profilo di verifica (subito sotto). Una
+    // sola risoluzione (punto unico `resolve_session_project_root`), passata a
+    // entrambi: il loader deve poter costruire il criterio HTTP, e per farlo deve
+    // sapere DI QUALE progetto sta caricando la config.
+    let session_project = resolve_session_project_root(&run_db, &db, input.session_id).await;
+    let mut final_gate_cfg =
+        load_final_gate_config(&db, session_project.as_ref().map(|(pid, _)| *pid)).await;
     let review_gate_cfg = load_review_gate_config(&db).await;
     let verifier_cfg = load_verifier_config(&db).await;
 
@@ -2287,9 +2414,7 @@ async fn build_native_engine(
     // definisce step liberi con flag gate). Qui, risolto a monte del grafo
     // (regola G), si innestano nel final_gate gli step gate=true.
     if final_gate_cfg.enabled {
-        if let Some((pid, root)) =
-            resolve_session_project_root(&run_db, &db, input.session_id).await
-        {
+        if let Some((pid, root)) = session_project.clone() {
             let mut steps = crate::verify_profile::ensure_profile(
                 &db,
                 &deps.tool_runner_deps.neural,
@@ -4264,7 +4389,7 @@ mod tests {
             VerifierConfig::default().max_verify_cycles
         );
 
-        let final_gate = load_final_gate_config(&pool).await;
+        let final_gate = load_final_gate_config(&pool, None).await;
         assert_eq!(final_gate.enabled, FinalGateConfig::default().enabled);
         assert_eq!(final_gate.max_cycles, FinalGateConfig::default().max_cycles);
     }
@@ -4303,7 +4428,7 @@ mod tests {
             "ECONNREFUSED,Traceback",
         )
         .await;
-        let cfg = load_final_gate_config(&pool).await;
+        let cfg = load_final_gate_config(&pool, None).await;
         assert!(!cfg.enabled, "enabled=false dal DB");
         assert_eq!(cfg.max_cycles, 4);
         assert!(!cfg.runtime_check_enabled);
@@ -4314,15 +4439,99 @@ mod tests {
             cfg.runtime_error_patterns,
             vec!["ECONNREFUSED", "Traceback"]
         );
-        // log_command / endpoint_criterion sono risolti per-progetto a monte:
-        // restano vuoto/None dal loader. La catena comandi (ADR 0036) NON e'
-        // del loader: verify_steps/verify_profile_missing sono innestati da
-        // run_engine col profilo per-ambiente (nessun build_command generico,
-        // mig 0508).
+        // log_command resta risolto per-progetto a monte: vuoto dal loader. La
+        // catena comandi (ADR 0036) NON e' del loader: verify_steps/
+        // verify_profile_missing sono innestati da run_engine col profilo
+        // per-ambiente (nessun build_command generico, mig 0508).
         assert!(cfg.log_command.is_empty());
-        assert!(cfg.endpoint_criterion.is_none());
+        // Sessione SENZA progetto: nessun endpoint configurato da leggere.
+        assert!(cfg.endpoint_criteria.is_empty());
         assert!(cfg.verify_steps.is_empty(), "loader non popola la catena");
         assert!(!cfg.verify_profile_missing);
+    }
+
+    /// Il criterio HTTP del final gate esiste per un progetto che ha endpoint
+    /// configurati — partendo da come la config nasce in PRODUZIONE
+    /// (`load_final_gate_config`, il produttore che `run_engine` chiama), non
+    /// costruendo a mano una `FinalGateConfig` con l'endpoint gia' dentro.
+    ///
+    /// E' la differenza che questo difetto ha reso concreta (regola O): il test
+    /// che verificava "`build_criteria` accoda il criterio http quando la config
+    /// ce l'ha" esisteva ed era VERDE, mentre in produzione la config non ce
+    /// l'aveva mai — il campo restava al `Default` con un TODO, e nessun run ha
+    /// mai provato un endpoint. Un test che parte dalla config gia' popolata non
+    /// puo' accorgersene: fissa l'assunto che dovrebbe verificare.
+    ///
+    /// Gira sul `META_MIGRATOR` (schema reale): `run_configurations.http_spec` e
+    /// `role` arrivano dalle migrazioni 0455/0068, non da un CREATE TABLE
+    /// ricopiato che potrebbe divergere.
+    ///
+    /// Mutazione che rende rosso: rimettere `endpoint_criteria: d.endpoint_criteria`
+    /// (cioe' il vuoto del `Default`) nel loader — la lista resta vuota e la prima
+    /// asserzione cade, che e' esattamente lo stato in cui il gate ha dichiarato
+    /// "superato" un'app con la POST rotta.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn final_gate_config_costruisce_i_criteri_http_del_progetto(pool: sqlx::PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        // Due endpoint dello STESSO progetto: la lettura e la SCRITTURA. Il caso
+        // reale aveva la GET verde e la POST 500, quindi un criterio solo (il
+        // vecchio `Option<CriterionSpec>`) non sarebbe bastato comunque.
+        for (label, spec) in [
+            (
+                "api lista spese",
+                serde_json::json!({"url": "http://localhost:24817/api/expenses"}),
+            ),
+            (
+                "api crea spesa",
+                serde_json::json!({
+                    "url": "http://localhost:24817/api/expenses",
+                    "method": "POST",
+                    "body": {"amount": 10, "description": "prova"},
+                    "expected_status": [200, 201],
+                }),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO run_configurations (project_id, label, command, role, http_spec) \
+                 VALUES ($1, $2, 'n/a', 'endpoint', $3)",
+            )
+            .bind(project_id)
+            .bind(label)
+            .bind(&spec)
+            .execute(&pool)
+            .await
+            .expect("insert run_configurations endpoint");
+        }
+
+        let cfg = load_final_gate_config(&pool, Some(project_id)).await;
+        assert_eq!(
+            cfg.endpoint_criteria.len(),
+            2,
+            "un criterio http per endpoint configurato: {:?}",
+            cfg.endpoint_criteria
+        );
+        assert!(cfg
+            .endpoint_criteria
+            .iter()
+            .all(|c| c.criterion_type == "http"));
+        let post = &cfg.endpoint_criteria[1];
+        assert_eq!(post.spec["method"], serde_json::json!("POST"));
+        assert_eq!(post.spec["body"]["amount"], serde_json::json!(10));
+        assert_eq!(post.expected["status"], serde_json::json!([200, 201]));
+        // Timeout dal setting della mig 0455 (default 15s se la chiave manca).
+        assert_eq!(post.timeout_s, Some(15.0));
+
+        // Kill-switch: col check spento il loader non costruisce prove, per
+        // quanti endpoint il progetto abbia configurato. La scrittura passa dal
+        // punto unico `update_setting_value`, che invalida anche la cache dei
+        // settings: una query diretta resterebbe invisibile alla lettura per
+        // tutto il TTL e il test misurerebbe la cache, non il loader.
+        nexus_auth::update_setting_value(&pool, "agent.final_gate.endpoint_check_enabled", "false")
+            .await
+            .expect("la chiave esiste (mig 0455)");
+        let spento = load_final_gate_config(&pool, Some(project_id)).await;
+        assert!(spento.endpoint_criteria.is_empty());
+        assert!(!spento.endpoint_check_enabled);
     }
 
     // ── classify_status / structured_verdict (punto unico esito, regola L/M) ────
