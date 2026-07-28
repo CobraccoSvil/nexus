@@ -1186,6 +1186,64 @@ else
   echo "OK correction-progress: il criterio vive nel punto unico e la porta e' innestata"
 fi
 
+# ── forma-punto-memoria + contatore-memorie-per-punto (2026-07-28) ──────────
+# I punti della collection memorie/correzioni hanno TRE produttori (compattazione
+# di sessione, correzioni admin, correzioni di chat) e devono avere UNA forma.
+# Quando la forma era ricopiata da ciascuno, i tre payload divergevano in
+# silenzio: un punto malformato non da' errore, semplicemente non viene mai
+# richiamato (manco `active`, che il filtro esige) o non viene mai contato.
+#
+# Primo ancoraggio: chi scrive un punto passa dal costruttore unico.
+#
+# Il conteggio dei produttori esaminati viene STAMPATO, e zero produttori e' un
+# FALLIMENTO: un check che tace quando passa e' indistinguibile da un check che
+# non ha trovato il suo oggetto (path rinominato, grep cambiato), e resterebbe
+# verde proprio nel caso in cui ha smesso di guardare (regola O).
+mem_produttori=0
+for f in $(grep -rl --include='*.rs' 'upsert_prompt_correction_point' crates 2>/dev/null || true); do
+  # vector_memory.rs definisce sia l'upsert sia il costruttore.
+  [[ "$f" == "crates/mcp-core/src/vector_memory.rs" ]] && continue
+  mem_produttori=$((mem_produttori + 1))
+  if ! grep -q 'prompt_correction_payload' "$f"; then
+    echo "!! forma-punto-memoria: $f scrive un punto memoria con un payload proprio." >&2
+    echo "   Usare vector_memory::prompt_correction_payload: i campi che la ricerca" >&2
+    echo "   esige (project_id, text, active) sono parametri, non campi da ricordare." >&2
+    fail=1
+  fi
+done
+if [[ "$mem_produttori" -eq 0 ]]; then
+  echo "!! forma-punto-memoria: nessun produttore di punti memoria trovato." >&2
+  echo "   Il check non ha raggiunto il suo oggetto: verificare il nome" >&2
+  echo "   upsert_prompt_correction_point e il percorso crates/." >&2
+  fail=1
+else
+  echo "OK forma-punto-memoria: $mem_produttori produttori passano dal costruttore unico"
+fi
+
+# Secondo ancoraggio: il recupero si contabilizza per PUNTO. E' la regressione
+# appena chiusa: il bump si agganciava a `payload["correction_id"]`, che i tre
+# produttori scrivevano in tre modi (mai, l'id del punto, l'id della riga). Per
+# due famiglie su tre `retrieved_count` restava a zero per sempre, e il pruner
+# notturno di chat_learning (ramo `unused_ttl`) disattivava dopo 90 giorni
+# memorie richiamate ogni giorno, cancellandone il punto vettoriale.
+#
+# La verifica guarda DENTRO il corpo del bump: un grep sul file resterebbe verde
+# con la query spostata o riscritta altrove.
+mem_bump="$(awk '
+  /^async fn bump_retrieval/ { dentro = 1 }
+  dentro && /qdrant_point_id = ANY/ { print "trovato"; exit }
+  dentro && /^}/ { exit }
+' crates/mcp-core/src/prompt_memories.rs 2>/dev/null)"
+if [[ -z "$mem_bump" ]]; then
+  echo "!! contatore-memorie-per-punto: il recupero non si contabilizza piu' per punto." >&2
+  echo "   bump_retrieval deve agganciarsi a qdrant_point_id (UNIQUE), non a un campo" >&2
+  echo "   del payload: quello dipende da quale dei tre produttori ha scritto il punto," >&2
+  echo "   e un contatore fermo a zero fa potare la memoria dopo 90 giorni." >&2
+  fail=1
+else
+  echo "OK contatore-memorie-per-punto: il recupero si contabilizza per qdrant_point_id"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -208,6 +208,43 @@ pub async fn upsert_prompt_correction_point(
     Ok(())
 }
 
+/// Il payload di un punto della collection memorie/correzioni: UNICO costruttore
+/// (regola L), accanto al filtro che quei punti li cerca.
+///
+/// Sta qui, e non presso i tre produttori, perche' forma SCRITTA e forma CERCATA
+/// sono due facce dello stesso accordo: separarle le fa divergere in silenzio, ed
+/// e' esattamente cio' che era successo. I tre chiamanti scrivevano tre forme
+/// diverse e nessuno se ne accorgeva, perche' un punto malformato non da' errore:
+/// semplicemente non viene mai richiamato, o non viene mai contato.
+///
+/// I tre campi che la ricerca esige - `project_id`, `text`, `active` - sono
+/// PARAMETRI, non campi di `extra`: cosi' un produttore non puo' dimenticarli. E'
+/// il difetto che chiudeva `embed_and_upsert_correction`, che ometteva `active` e
+/// produceva correzioni invisibili al filtro [`prompt_correction_filter`], quindi
+/// mai richiamate. `extra` porta cio' che distingue una famiglia dall'altra
+/// (`session_id`, `intent`, `feedback_id`, ...) e viene fuso PRIMA dei campi
+/// vincolanti, che percio' vincono su un `extra` distratto.
+///
+/// NB: l'identita' della riga in `prompt_corrections` non e' un campo di questo
+/// payload. Il legame passa da `qdrant_point_id` (UNIQUE), cioe' dall'id del punto
+/// stesso, che c'e' sempre e non dipende da cosa ciascun produttore ha scritto
+/// dentro - vedi `prompt_memories::bump_retrieval`.
+pub(crate) fn prompt_correction_payload(
+    project_id: Uuid,
+    text: &str,
+    active: bool,
+    extra: Value,
+) -> Value {
+    let mut payload = match extra {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    payload.insert("project_id".to_string(), json!(project_id.to_string()));
+    payload.insert("text".to_string(), json!(text));
+    payload.insert("active".to_string(), json!(active));
+    Value::Object(payload)
+}
+
 /// Filtro della ricerca memorie/correzioni: il progetto corrente E solo i punti
 /// ATTIVI. E' il punto in cui una memoria disattivata dal pannello viene esclusa:
 /// non viene scartata dopo, non viene proprio chiesta.

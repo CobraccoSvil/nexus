@@ -6620,17 +6620,25 @@ mod tests_memorie_di_progetto {
         }
     }
 
-    /// Il payload di un punto memoria: la forma esatta che scrive la
-    /// compattazione (`chat_sessions::compact_session`), `correction_id` incluso
-    /// mai - per questo il bump dei contatori non parte su questa famiglia.
+    /// Il payload di un punto memoria, CHIESTO al produttore
+    /// (`chat_sessions::payload_memoria_di_sessione`) invece che ricopiato qui.
+    ///
+    /// Prima era una copia a mano, e la copia mentiva per omissione: descriveva
+    /// una forma priva di qualunque id di riga senza che nulla, in nessun test,
+    /// misurasse la conseguenza - i contatori di recupero fermi a zero e le
+    /// memorie potate a 90 giorni. Passando dal produttore, il giorno in cui
+    /// quella forma cambia questi test la vedono cambiare.
+    ///
+    /// `active` replica l'attivazione dal pannello, che su Qdrant e' il set
+    /// parziale del solo campo (`vector_memory::set_point_active`).
     fn punto(project_id: Uuid, active: bool, text: &str) -> Value {
-        json!({
-            "project_id": project_id.to_string(),
-            "session_id": Uuid::new_v4().to_string(),
-            "type": "session_memory",
-            "active": active,
-            "text": text,
-        })
+        let mut payload = crate::chat_sessions::payload_memoria_di_sessione(
+            project_id,
+            Uuid::new_v4(),
+            text,
+        );
+        payload["active"] = json!(active);
+        payload
     }
 
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
