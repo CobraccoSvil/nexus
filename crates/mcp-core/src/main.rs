@@ -1489,6 +1489,17 @@ async fn init_infrastructure() -> anyhow::Result<(PgPool, u16)> {
 
     init_tracing();
 
+    // Prima misura utile del processo: quale artefatto sta girando. Legge (e
+    // memoizza) l'mtime del proprio eseguibile ORA, mentre il file e' ancora
+    // quello da cui siamo partiti; lo stesso valore finira' su `/health`.
+    let stamp = nexus_types::build_info::running_binary();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build_time = %stamp.wire_value(),
+        build_time_source = ?stamp.source,
+        "mcp-core: binario in esecuzione"
+    );
+
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable".to_string()
     });
@@ -1714,13 +1725,14 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
         "degraded"
     };
 
-    Json(HealthSummary {
-        service: "mcp-core".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        build_time: env!("BUILD_TIMESTAMP").to_string(),
-        status: status.to_string(),
-        timestamp: Utc::now(),
-        components: domain::ComponentHealth {
+    // `build_time`/`build_time_source` non si passano da qui: li popola
+    // `HealthSummary::new` dal binario in esecuzione (vedi domain.rs).
+    Json(HealthSummary::new(
+        "mcp-core",
+        env!("CARGO_PKG_VERSION"),
+        status,
+        Utc::now(),
+        domain::ComponentHealth {
             database: db_ok,
             redis: redis_ok,
             neural_core: state.orchestrator.neural_healthy().await,
@@ -1734,7 +1746,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
                 .embedder
                 .load(std::sync::atomic::Ordering::Relaxed),
         },
-    })
+    ))
 }
 
 /// Somma token e costo consumati negli ultimi 30 giorni dai record finalizzati di

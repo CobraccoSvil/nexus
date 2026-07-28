@@ -854,6 +854,28 @@ else
   fi
 fi
 
+# --- Identita' del binario in esecuzione (2026-07-27) ---
+# `/health` e' lo strumento con cui si verifica quale artefatto stia girando
+# dopo un deploy. Il valore nasceva in crates/mcp-core/build.rs da
+# SystemTime::now(): cargo riesegue uno script di build solo quando cambiano le
+# dipendenze che lo script DICHIARA, quindi il timestamp restava congelato
+# all'ultima modifica di build.rs mentre il binario veniva ricompilato. Misurato
+# il 27/07/2026: /health dichiarava il 20/07 su un binario linkato quel giorno.
+# Il punto unico legge l'mtime del proprio eseguibile a runtime (regola O).
+assert_single "running_binary" 'pub fn running_binary' 'crates/nexus-types/src/build_info.rs' crates
+
+ts_incisi="$(grep -rlE 'SystemTime::now|Instant::now|rustc-env=BUILD' --include='build.rs' \
+  --exclude-dir=target crates/ 2>/dev/null || true)"
+if [[ -n "$ts_incisi" ]]; then
+  echo "!! build-stamp: uno script di build incide nel binario un valore che scorre nel tempo:" >&2
+  printf '%s' "$ts_incisi" | sed 's/^/     /' >&2
+  echo "   Cargo non riesegue lo script a ogni link: il valore resterebbe indietro" >&2
+  echo "   rispetto al binario. Usare nexus_types::build_info::running_binary()." >&2
+  fail=1
+else
+  echo "OK build-stamp: nessun timestamp inciso da uno script di build"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
