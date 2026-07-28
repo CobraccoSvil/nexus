@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { chatHeadFitsInline } from "../shell/panel-sizing-logic";
+import { rowFitsInline } from "../shell/panel-sizing-logic";
 import { ChatHeadInline } from "./chat-head-inline";
 import { ChatHeadPopover, type ChatHeadPopoverProps } from "./chat-head-popover";
 
@@ -20,7 +20,7 @@ import { ChatHeadPopover, type ChatHeadPopoverProps } from "./chat-head-popover"
  * dentro un host che occupa lo spazio disponibile. `measure()` confronta la
  * larghezza NATURALE della riga (row.scrollWidth, non vincolata perche' i suoi
  * figli non cedono) con lo spazio dell'host (host.clientWidth). La REGOLA di
- * confronto vive nel punto unico chatHeadFitsInline (panel-sizing-logic, regola
+ * confronto vive nel punto unico rowFitsInline (panel-sizing-logic, regola
  * L); qui c'e' solo la misura e il montaggio.
  *
  * Quando misurare, senza dipendere da ResizeObserver: `measure()` gira in un
@@ -47,7 +47,7 @@ export function ChatHead(props: ChatHeadPopoverProps) {
     const host = hostRef.current;
     const row = rowRef.current;
     if (!host || !row) return;
-    setInline((current) => chatHeadFitsInline(host.clientWidth, row.scrollWidth, current));
+    setInline((current) => rowFitsInline(host.clientWidth, row.scrollWidth, current));
   }, []);
 
   // Ad ogni render: cattura i cambi di larghezza dell'host (viewport, divisore) e

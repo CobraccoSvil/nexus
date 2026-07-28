@@ -1,10 +1,21 @@
 "use client";
 
-import { type FormEvent, type KeyboardEvent, type ClipboardEvent, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent,
+  type ClipboardEvent,
+  type RefObject,
+} from "react";
 import type { ChatAttachment } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { IconButton } from "../icon-button";
 import { AutoWidthSelect } from "../auto-width-select";
+import { rowFitsInline } from "../shell/panel-sizing-logic";
 import {
   forceButtonView,
   isProviderPinned,
@@ -136,6 +147,65 @@ export function Composer({
     }
   };
 
+  // La barra dei controlli sta su UNA riga sempre: quando lo spazio non basta le
+  // etichette lasciano il posto ai pittogrammi, invece di mandare a capo il
+  // gruppo di destra (Send/Stop finiva su una seconda riga, sotto tutto il resto).
+  //
+  // Misura, non soglia (regola O): quanto e' larga la barra distesa dipende dalla
+  // lingua e dai controlli condizionali (il pulsante Forza, il select del modello e
+  // l'avviso "pin non rispettato" compaiono solo in certi stati), quindi una
+  // costante in px sarebbe giusta per una configurazione e sbagliata per le altre.
+  // La REGOLA del confronto e' il punto unico rowFitsInline (regola L), lo stesso
+  // che decide riga-o-popover per la testata della chat.
+  //
+  // `largDistesaRef` esiste perche' la misura utile e' sempre quella della forma
+  // DISTESA, e da compatti non e' piu' leggibile dal DOM (la riga renderizzata e'
+  // l'altra). La si registra mentre si e' distesi e la si riusa come termine di
+  // paragone: e' un valore misurato sul rendering vero, solo in un istante
+  // precedente. Chiedere invece "la forma compatta ci sta?" darebbe sempre di si',
+  // e la barra rimbalzerebbe fra le due forme a ogni frame.
+  const barraHostRef = useRef<HTMLDivElement>(null);
+  const barraRigaRef = useRef<HTMLDivElement>(null);
+  const largDistesaRef = useRef(0);
+  const [barraDistesa, setBarraDistesa] = useState(true);
+
+  const misuraBarra = useCallback(() => {
+    const host = barraHostRef.current;
+    const riga = barraRigaRef.current;
+    if (!host || !riga) return;
+    // Da distesi la riga trabocca dall'host (nowrap + figli che non cedono):
+    // scrollWidth e' la sua larghezza naturale. Da compatti sarebbe la larghezza
+    // della forma compatta, che non risponde alla domanda: non si aggiorna.
+    if (barraDistesa) largDistesaRef.current = riga.scrollWidth;
+    setBarraDistesa((corrente) =>
+      rowFitsInline(host.clientWidth, largDistesaRef.current, corrente),
+    );
+  }, [barraDistesa]);
+
+  // A ogni render (il pannello cambia larghezza per il divisore o il viewport, e
+  // i controlli condizionali appaiono e spariscono): rimisura sul DOM aggiornato.
+  // setBarraDistesa fa bail-out se il verdetto non cambia, quindi non innesca loop.
+  useLayoutEffect(() => {
+    misuraBarra();
+  });
+
+  // Rete per i resize puramente CSS, che non passano da un render di questo albero.
+  useEffect(() => {
+    const host = barraHostRef.current;
+    window.addEventListener("resize", misuraBarra);
+    const observer = new ResizeObserver(misuraBarra);
+    if (host) observer.observe(host);
+    return () => {
+      window.removeEventListener("resize", misuraBarra);
+      observer.disconnect();
+    };
+  }, [misuraBarra]);
+
+  // Compatto = la barra non ci sta, OPPURE il pannello e' gia' cosi' stretto che
+  // `compact` vale per tutto il composer. I due non si escludono: il secondo e' una
+  // proprieta' del pannello, il primo di questa riga.
+  const barraCompatta = !barraDistesa || compact;
+
   // Etichette "carine" per i provider noti: SOLO cosmesi, non governano quali
   // provider esistono (la fonte e' availableProviders dal catalog DB, regola G).
   // Un provider nuovo non mappato appare comunque, con label capitalizzato.
@@ -157,9 +227,13 @@ export function Composer({
   if (selectedProvider !== "auto" && !providerValues.includes(selectedProvider)) {
     providerValues.push(selectedProvider);
   }
+  // Solo "Auto" ha una forma breve: il NOME del provider e' l'informazione che si
+  // sta guardando quando se ne sceglie uno a mano, e ridurlo a una sigla
+  // vanificherebbe la scelta. "Auto" invece e' lo stato di riposo, e il fulmine lo
+  // dice per intero.
   const PROVIDER_OPTIONS = providerValues.map((value) =>
     value === "auto"
-      ? { value, label: "⚡ Auto" }
+      ? { value, label: "⚡ Auto", shortLabel: "⚡" }
       : { value, label: providerLabel(value) },
   );
 
@@ -168,8 +242,8 @@ export function Composer({
     border: `1px solid ${tc.border}`,
     background: tc.bgCard,
     color: tc.textSecondary,
-    padding: compact ? "3px 6px" : "4px 8px",
-    fontSize: compact ? 10 : 11,
+    padding: barraCompatta ? "3px 6px" : "4px 8px",
+    fontSize: barraCompatta ? 10 : 11,
     fontFamily: "inherit",
     cursor: "pointer",
     minWidth: 0,
@@ -207,17 +281,23 @@ export function Composer({
     runModel !== selectedModel &&
     isAgentRunning;
 
+  // Le forme brevi devono restare distinguibili FRA LORO: sono lo stato in cui la
+  // barra vive quando la colonna e' stretta, e un pittogramma uguale per due modi
+  // diversi renderebbe invisibile la differenza fra "chiede conferma" ed "esegue
+  // senza fermarsi". Il testo per esteso resta nella tendina e nel title.
   const AUTOMATION_OPTIONS = [
-    { value: "study", label: "Studio" },
-    { value: "confirm", label: "Conferma" },
-    { value: "automatic", label: "Automatico" },
+    { value: "study", label: "Studio", shortLabel: "📖" },
+    { value: "confirm", label: "Conferma", shortLabel: "✋" },
+    { value: "automatic", label: "Automatico", shortLabel: "▶" },
   ] as const;
 
+  // L'occhio dice "supervisore", il segno accanto dice QUANTO spesso guarda: senza
+  // quel secondo carattere i quattro modi collasserebbero nello stesso simbolo.
   const SUPERVISOR_OPTIONS = [
-    { value: "none", label: "👁 Supervisor off" },
-    { value: "anomaly", label: "👁 Su anomalia" },
-    { value: "interleaved", label: "👁 Ogni 5 step" },
-    { value: "continuous", label: "continuo" },
+    { value: "none", label: "👁 Supervisor off", shortLabel: "👁∅" },
+    { value: "anomaly", label: "👁 Su anomalia", shortLabel: "👁!" },
+    { value: "interleaved", label: "👁 Ogni 5 step", shortLabel: "👁5" },
+    { value: "continuous", label: "continuo", shortLabel: "👁∞" },
   ] as const;
 
   const MODEL_OPTIONS = [
@@ -358,12 +438,29 @@ export function Composer({
           </div>
         )}
         <div
+          ref={barraHostRef}
           style={{
             display: "flex",
             alignItems: "center",
-            gap: compact ? 4 : 8,
-            flexWrap: "wrap",
             marginTop: compact ? 4 : 6,
+            // L'host da' la misura dello spazio disponibile (clientWidth) e taglia
+            // il traboccamento della riga distesa nell'istante in cui viene
+            // misurata, prima che il layout effect la faccia collassare.
+            minWidth: 0,
+            overflow: "hidden",
+          }}
+        >
+        <div
+          ref={barraRigaRef}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: barraCompatta ? 4 : 8,
+            // Mai a capo: e' il punto di tutta questa misura. Con "wrap" il gruppo
+            // di destra scivolava su una seconda riga invece di far stringere i
+            // controlli.
+            flexWrap: "nowrap",
+            width: "100%",
           }}
         >
           {hasProject && (
@@ -376,17 +473,21 @@ export function Composer({
                 border: `1px solid ${activeMemoryCount > 0 ? tc.accent : tc.border}`,
                 background: activeMemoryCount > 0 ? `${tc.accent}18` : tc.bgCard,
                 color: activeMemoryCount > 0 ? tc.accent : tc.textSecondary,
-                padding: compact ? "3px 7px" : "4px 10px",
-                fontSize: compact ? 10 : 11,
+                padding: barraCompatta ? "3px 7px" : "4px 10px",
+                fontSize: barraCompatta ? 10 : 11,
                 fontFamily: "inherit",
                 cursor: "pointer",
                 fontWeight: activeMemoryCount > 0 ? 600 : 400,
                 display: "flex",
                 alignItems: "center",
-                gap: compact ? 3 : 5,
+                gap: barraCompatta ? 3 : 5,
+                // I controlli non cedono larghezza: e' cio' che rende `scrollWidth`
+                // la larghezza NATURALE della riga e non una gia' compressa.
+                flexShrink: 0,
+                whiteSpace: "nowrap",
               }}
             >
-              Memoria
+              {barraCompatta ? "🧠" : "Memoria"}
               {activeMemoryCount > 0 && (
                 <span style={{
                   background: tc.accent,
@@ -408,6 +509,7 @@ export function Composer({
             value={selectedProvider}
             options={PROVIDER_OPTIONS}
             onChange={onProviderChange}
+            breve={barraCompatta}
             title={providerSelectTitle(selectedProvider, forceProvider, automationMode)}
             style={{
               ...selectStyle,
@@ -431,11 +533,17 @@ export function Composer({
                 background: isProviderPinnedNow ? "#f9731612" : tc.bgCard,
                 color: isProviderPinnedNow ? "#f97316" : tc.textSecondary,
                 fontWeight: isProviderPinnedNow ? 700 : 500,
+                flexShrink: 0,
+                whiteSpace: "nowrap",
               }}
             >
               {forceButton.label}
             </button>
           )}
+          {/* Senza forma breve, di proposito: il nome del modello e' l'unica cosa
+              che questo controllo dice, e compare solo col pin attivo (raro).
+              Ridurlo a un simbolo lascerebbe l'utente senza sapere su cosa ha
+              pinnato — resta esteso e semmai e' la barra a stringersi altrove. */}
           {isProviderPinnedNow && (
             <AutoWidthSelect
               value={selectedModel}
@@ -459,9 +567,13 @@ export function Composer({
                 background: "rgba(239,68,68,0.10)",
                 color: "#ef4444",
                 fontWeight: 700,
+                flexShrink: 0,
+                whiteSpace: "nowrap",
               }}
             >
-              ⚠ pin non rispettato
+              {/* In compatto resta il solo segnale d'allarme: e' un avviso, il
+                  dettaglio sta nel title (che qui e' gia' esteso). */}
+              {barraCompatta ? "⚠" : "⚠ pin non rispettato"}
             </span>
           )}
           <AutoWidthSelect
@@ -470,6 +582,7 @@ export function Composer({
             onChange={(value) => onAutomationModeChange(value as "study" | "confirm" | "automatic")}
             title={automationTitle}
             ariaLabel="Modalita' automazione"
+            breve={barraCompatta}
             style={{
               ...selectStyle,
               cursor: "pointer",
@@ -489,6 +602,7 @@ export function Composer({
             onChange={(value) => onSupervisorModeChange(value as "none" | "anomaly" | "interleaved" | "continuous")}
             title="Supervisore AI (monitora e corregge l'agente). Non sostituisce Conferma/Automatico: per saltare le approvazioni usa Automatico."
             ariaLabel="Supervisore"
+            breve={barraCompatta}
             style={{
               ...selectStyle,
               border: `1px solid ${supervisorMode !== "none" ? "#8b5cf6" : tc.border}`,
@@ -513,7 +627,12 @@ export function Composer({
           >
             {isListening ? "■" : "\uD83C\uDFA4"}
           </IconButton>
-          <div style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 8 }}>
+          {/* Il gruppo che DEVE restare raggiungibile: e' quello che finiva su una
+              seconda riga. `flexShrink: 0` lo mette al riparo anche quando la
+              misura sbaglia per un frame (es. il primo render prima del layout
+              effect): meglio troncare un controllo a sinistra che il pulsante
+              d'invio. */}
+          <div style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
             {pendingCount > 0 && (
               <span
                 title={`${pendingCount} messaggi in coda: verranno inviati automaticamente al termine del run in corso`}
@@ -531,7 +650,9 @@ export function Composer({
                   whiteSpace: "nowrap",
                 }}
               >
-                {pendingCount} in coda
+                {/* In compatto il conteggio senza la parola: "3" dentro la pillola
+                    accanto allo Stop resta leggibile, e il title spiega. */}
+                {barraCompatta ? pendingCount : `${pendingCount} in coda`}
               </span>
             )}
             {isAgentRunning && onStopAgent ? (
@@ -552,12 +673,15 @@ export function Composer({
                   gap: 5,
                   fontSize: 12,
                   fontWeight: 600,
+                  whiteSpace: "nowrap",
                 }}
               >
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
                   <rect x="1" y="1" width="10" height="10" rx="2"/>
                 </svg>
-                Stop
+                {/* Il quadrato basta a dire "ferma": e' l'icona universale, ed e'
+                    gia' disegnata qui sopra. */}
+                {!barraCompatta && "Stop"}
               </button>
             ) : (
               <IconButton
@@ -571,6 +695,7 @@ export function Composer({
               </IconButton>
             )}
           </div>
+        </div>
         </div>
       </div>
       {attachmentError && (

@@ -35,6 +35,10 @@ interface AutoWidthSelectProps {
    *  comprimerebbe il testo. Misurato sul browser: 19,8-20,5px a prescindere da
    *  testo, font-size e padding (e' il widget, non il contenuto). 22 = margine. */
   arrowWidth?: number;
+  /** Mostra la pillola chiusa nella forma compatta (`shortLabel` dell'opzione
+   *  selezionata). La tendina resta per esteso. Lo decide il chiamante, che e'
+   *  l'unico a sapere se la sua riga ci sta: qui non si misura niente. */
+  breve?: boolean;
 }
 
 /**
@@ -76,12 +80,13 @@ export function AutoWidthSelect({
   disabled,
   required,
   arrowWidth = 22,
+  breve = false,
 }: AutoWidthSelectProps) {
   const controllato = value !== undefined;
   const [valoreInterno, setValoreInterno] = useState(defaultValue);
   const corrente = controllato ? value : valoreInterno;
 
-  const etichetta = etichettaVisibile(options, corrente);
+  const etichetta = etichettaVisibile(options, corrente, breve);
 
   const handleChange = (event: ChangeEvent<HTMLSelectElement>) => {
     if (!controllato) setValoreInterno(event.target.value);
@@ -105,7 +110,13 @@ export function AutoWidthSelect({
           boxSizing: "border-box",
           display: "block",
           whiteSpace: "nowrap",
-          visibility: "hidden",
+          // In forma compatta il fantasma smette di essere solo un metro e diventa
+          // cio' che si vede: disegna lui la pillola con il pittogramma, e il
+          // select gli sta sopra invisibile (vedi sotto). Un <select> nativo mostra
+          // il testo dell'<option> selezionata e non c'e' modo di dargliene uno
+          // diverso senza toccare la tendina: senza questo scambio la pillola
+          // stretta conterrebbe "Automatico" tagliato a meta'.
+          visibility: breve ? "visible" : "hidden",
           pointerEvents: "none",
           // Senza questo, con un maxWidth nello style il fantasma resta capato
           // alla larghezza giusta ma il TESTO trabocca fuori dal suo box, e il
@@ -124,7 +135,7 @@ export function AutoWidthSelect({
         }}
       >
         {etichetta}
-        <span style={{ display: "inline-block", width: arrowWidth }} />
+        <span style={{ display: "inline-block", width: breve ? 0 : arrowWidth }} />
       </span>
       <select
         value={controllato ? value : undefined}
@@ -144,6 +155,12 @@ export function AutoWidthSelect({
           top: 0,
           width: "100%",
           height: "100%",
+          // Compatto: il select resta l'elemento vero (focus, tastiera, tendina
+          // nativa, screen reader) ma smette di dipingere — la pillola sotto e' gia'
+          // disegnata dal fantasma. `opacity` e non `visibility: hidden`, che lo
+          // toglierebbe dal focus e dal puntatore. La tendina aperta la disegna il
+          // sistema operativo e resta visibile e per esteso.
+          ...(breve ? { opacity: 0 } : {}),
         }}
       >
         {options.map((item) =>

@@ -14,8 +14,8 @@ import {
   rightSidebarBounds,
   clampRightWidth,
   mainAreaAvailableWidth,
-  chatHeadFitsInline,
-  CHAT_HEAD_REENTRY_GUARD,
+  rowFitsInline,
+  ROW_REENTRY_GUARD,
 } from "./panel-sizing-logic.ts";
 
 // Larghezze persistite misurate sullo stack dev (workspace layout di Beaty-Book).
@@ -154,41 +154,41 @@ test("clampRightWidth: valori fuori range riportati ai bordi", () => {
   assert.equal(clampRightWidth(9999, 1200, mainAreaAvailableWidth(1200, LEFT_WIDTH, false)), 760);
 });
 
-// chatHeadFitsInline: la REGOLA di confronto testata state-machine. La misura
-// vera (row.scrollWidth vs host.clientWidth) e il rendering riga<->popover sono
+// rowFitsInline: la REGOLA di confronto testata state-machine. La misura
+// vera (row.scrollWidth vs host.clientWidth) e il rendering disteso<->raccolto sono
 // verificati nel browser, non qui: un test che asserisse una soglia senza provare
 // il rendering non proverebbe niente (regola O). Qui si fissa solo la matematica
 // dell'isteresi, cioe' cio' che il browser da solo non mostrerebbe a colpo
 // d'occhio (l'oscillazione al confine).
 
-test("chatHeadFitsInline: senza misura parte dalla riga (default ottimista)", () => {
-  assert.equal(chatHeadFitsInline(0, 0, true), true);
-  assert.equal(chatHeadFitsInline(300, 0, false), true);
-  assert.equal(chatHeadFitsInline(0, 420, true), true);
+test("rowFitsInline: senza misura parte dalla riga (default ottimista)", () => {
+  assert.equal(rowFitsInline(0, 0, true), true);
+  assert.equal(rowFitsInline(300, 0, false), true);
+  assert.equal(rowFitsInline(0, 420, true), true);
 });
 
-test("chatHeadFitsInline: in riga si resta finche' non si sfonda", () => {
+test("rowFitsInline: in riga si resta finche' non si sfonda", () => {
   // naturale <= disponibile: ci sta.
-  assert.equal(chatHeadFitsInline(500, 420, true), true);
-  assert.equal(chatHeadFitsInline(420, 420, true), true);
-  // naturale > disponibile: collassa al popover.
-  assert.equal(chatHeadFitsInline(400, 420, true), false);
+  assert.equal(rowFitsInline(500, 420, true), true);
+  assert.equal(rowFitsInline(420, 420, true), true);
+  // naturale > disponibile: collassa alla forma raccolta.
+  assert.equal(rowFitsInline(400, 420, true), false);
 });
 
-test("chatHeadFitsInline: dal popover si torna in riga solo oltre la banda morta", () => {
+test("rowFitsInline: dalla forma raccolta si torna distesi solo oltre la banda morta", () => {
   const natural = 420;
   // Appena sopra il naturale ma dentro la guard: resta raccolta (niente rientro).
-  assert.equal(chatHeadFitsInline(natural + CHAT_HEAD_REENTRY_GUARD - 1, natural, false), false);
+  assert.equal(rowFitsInline(natural + ROW_REENTRY_GUARD - 1, natural, false), false);
   // Oltre la guard: rientra in riga.
-  assert.equal(chatHeadFitsInline(natural + CHAT_HEAD_REENTRY_GUARD, natural, false), true);
+  assert.equal(rowFitsInline(natural + ROW_REENTRY_GUARD, natural, false), true);
 });
 
-test("chatHeadFitsInline: la banda morta evita l'oscillazione al confine", () => {
+test("rowFitsInline: la banda morta evita l'oscillazione al confine", () => {
   // A una larghezza appena sopra il naturale, lo stato e' STABILE in entrambi i
   // versi: chi e' in riga ci resta, chi e' raccolto NON rientra. Senza isteresi i
   // due si contraddirebbero e un pixel di ResizeObserver farebbe sfarfallare.
   const width = 425;
   const natural = 420;
-  assert.equal(chatHeadFitsInline(width, natural, true), true); // resta in riga
-  assert.equal(chatHeadFitsInline(width, natural, false), false); // resta raccolto
+  assert.equal(rowFitsInline(width, natural, true), true); // resta in riga
+  assert.equal(rowFitsInline(width, natural, false), false); // resta raccolto
 });

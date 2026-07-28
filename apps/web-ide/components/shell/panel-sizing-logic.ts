@@ -116,24 +116,34 @@ export function clampRightWidth(
   return Math.max(min, Math.min(max, width));
 }
 
-// La testata della chat (profilo, sessione, azioni) sta in riga nell'header, o si
-// raccoglie nel popover a comparsa (l'hamburger)?
+// Una riga di controlli ci sta per intero nello spazio che ha, o deve passare
+// alla sua forma raccolta? Due chiamanti oggi, stessa domanda: la testata della
+// chat (riga distesa <-> popover hamburger) e la barra del composer (etichette
+// per esteso <-> sole icone). E' la REGOLA, non la misura: il nome resta
+// generico perche' la domanda non ha niente di specifico all'uno o all'altro
+// (regola L: un secondo confronto copiato-e-adattato divergerebbe).
 //
 // NON e' una soglia fissa in px, e per una ragione precisa: la larghezza naturale
-// della riga dipende dal nome del profilo selezionato e dal titolo della sessione
-// attiva (troncato, ma fino a ~210px), che variano con i dati e con la lingua del
-// progetto (en/es/it). Una costante calibrata su un titolo corto direbbe "ci sta"
-// mentre un titolo lungo sfonda, e viceversa. Percio' il chiamante MISURA sul DOM
+// della riga dipende da cosa contiene — il nome del profilo e il titolo della
+// sessione per la testata, la lingua e i controlli condizionali (pin, modello)
+// per il composer. Una costante calibrata su un caso corto direbbe "ci sta"
+// mentre un caso lungo sfonda, e viceversa. Percio' il chiamante MISURA sul DOM
 // vivo la larghezza naturale della riga renderizzata (scrollWidth, non vincolata) e
 // lo spazio disponibile (clientWidth dell'host), e passa i due numeri qui (regola O:
 // la decisione nasce dalla misura del rendering vero, non da una stima). Questo
 // modulo resta il punto unico (regola L) della REGOLA di confronto.
 //
-// La banda morta CHAT_HEAD_REENTRY_GUARD da' isteresi: senza, a cavallo del confine
-// un pixel di ResizeObserver farebbe oscillare riga<->popover a ogni frame.
-export const CHAT_HEAD_REENTRY_GUARD = 12;
+// `naturalWidth` e' sempre la larghezza della forma DISTESA, anche quando si e'
+// gia' raccolti: e' la sola che risponda a "se mi distendo, ci sto?". Passare la
+// larghezza della forma raccolta (piu' stretta per costruzione) darebbe sempre
+// "ci sta", cioe' un rientro immediato e poi un nuovo collasso — l'oscillazione
+// che l'isteresi qui sotto esiste per impedire.
+//
+// La banda morta ROW_REENTRY_GUARD da' quell'isteresi: senza, a cavallo del confine
+// un pixel di ResizeObserver farebbe oscillare disteso<->raccolto a ogni frame.
+export const ROW_REENTRY_GUARD = 12;
 
-export function chatHeadFitsInline(
+export function rowFitsInline(
   availableWidth: number,
   naturalWidth: number,
   currentlyInline: boolean,
@@ -143,7 +153,7 @@ export function chatHeadFitsInline(
   if (naturalWidth <= 0 || availableWidth <= 0) return true;
   // In riga si resta finche' la riga non sfonda davvero lo spazio disponibile.
   if (currentlyInline) return naturalWidth <= availableWidth;
-  // Gia' raccolta nel popover: si torna in riga solo con un margine, per non
-  // ri-collassare al primo pixel guadagnato.
-  return naturalWidth + CHAT_HEAD_REENTRY_GUARD <= availableWidth;
+  // Gia' raccolta: si torna distesi solo con un margine, per non ri-collassare al
+  // primo pixel guadagnato.
+  return naturalWidth + ROW_REENTRY_GUARD <= availableWidth;
 }

@@ -35,6 +35,36 @@ test("cerca anche dentro i gruppi, non solo fra le opzioni di primo livello", ()
   assert.equal(etichettaVisibile(conGruppi, "s1"), "Revisore");
 });
 
+// Forma compatta: e' la PILLOLA a stringersi, non la tendina. I test misurano
+// quello che il fantasma renderizza, cioe' il valore che detta la larghezza.
+
+test("compatta: la pillola mostra shortLabel, e senza `breve` resta il label esteso", () => {
+  const opzioni = [
+    { value: "study", label: "Studio", shortLabel: "🔍" },
+    { value: "automatic", label: "Automatico", shortLabel: "⚡" },
+  ];
+  assert.equal(etichettaVisibile(opzioni, "automatic", true), "⚡");
+  assert.equal(etichettaVisibile(opzioni, "automatic"), "Automatico");
+});
+
+test("compatta senza shortLabel: resta il label, non una troncatura", () => {
+  // Chi non dichiara la forma breve non la subisce: "Openrouter" e' preferibile a
+  // un "Openro..." deciso d'ufficio, e la riga si stringera' altrove.
+  const opzioni = [{ value: "openrouter", label: "Openrouter" }];
+  assert.equal(etichettaVisibile(opzioni, "openrouter", true), "Openrouter");
+});
+
+test("compatta: vale anche per il ripiego sulla prima opzione (valore orfano)", () => {
+  // Il select nativo mostra comunque la PRIMA opzione: se il ripiego ignorasse
+  // `breve`, la pillola compatta si allargherebbe sul label esteso di un'opzione
+  // che l'utente non ha nemmeno scelto.
+  const opzioni = [
+    { value: "auto", label: "⚡ Auto", shortLabel: "⚡" },
+    { value: "mistral", label: "Mistral" },
+  ];
+  assert.equal(etichettaVisibile(opzioni, "provider-rimosso", true), "⚡");
+});
+
 test("flatten conserva l'ordine di dichiarazione fra opzioni sciolte e gruppi", () => {
   const conGruppi = [
     { value: "a", label: "A" },
