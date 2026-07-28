@@ -1,7 +1,7 @@
 //! Implementazione principale di Orchestrator: orchestrazione
 //! del run agentico, risoluzione provider, prompt e routing.
 
-use serde_json::{json, Value};
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -10,7 +10,6 @@ use crate::{
     domain::OrchestratorAudit,
     nexus_gateway::NexusGatewayClient,
     provider_cooldown::is_provider_in_cooldown,
-    vector_memory,
 };
 
 use super::*;
@@ -1496,15 +1495,22 @@ impl Orchestrator {
                 token_budget,
             );
         }
-        let prompt_corrections = self
-            .load_prompt_corrections(db, project_uuid, &input.message)
-            .await
-            .unwrap_or_default();
+        // Memorie di progetto pertinenti alla domanda, dal punto unico
+        // `prompt_memories` (regola L): lo stesso caricatore che usa il percorso
+        // agentico in `spawn_agent_run`. Prima viveva qui dentro, e questo e'
+        // l'unico ramo che lo raggiungeva.
+        let memories = crate::prompt_memories::ProjectMemories::load(
+            db,
+            &crate::prompt_memories::VectorRecall::new(&self.neural),
+            project_uuid,
+            &input.message,
+        )
+        .await;
         let composed_prompt = Self::compose_prompt(
             db,
             &self.template_cache,
             &context.optimized_prompt,
-            &prompt_corrections,
+            &memories,
             input.automation_mode,
             &input.attachments,
         )
@@ -1529,7 +1535,7 @@ impl Orchestrator {
                 suggested_model.as_deref(),
                 &composed_prompt,
                 token_budget,
-                prompt_corrections.len(),
+                memories.len(),
                 run_id,
                 user_id,
                 project_uuid,
@@ -1600,7 +1606,7 @@ impl Orchestrator {
             "total_tokens": usage.total_tokens,
             "total_cost": total_cost,
             "currency": currency,
-            "applied_corrections": prompt_corrections,
+            "applied_corrections": memories.into_values(),
             "automation_mode": input.automation_mode.as_str(),
             "attachments_count": input.attachments.len(),
         });
@@ -1608,48 +1614,11 @@ impl Orchestrator {
         Ok(OrchestratorResult { payload })
     }
 
-    async fn load_prompt_corrections(
-        &self,
-        db: &PgPool,
-        project_id: Uuid,
-        query: &str,
-    ) -> anyhow::Result<Vec<Value>> {
-        if !prompt_corrections_enabled(db, project_id).await {
-            return Ok(Vec::new());
-        }
-
-        let embedding = match self.neural.embed_text("", query).await {
-            Ok(vector) => vector,
-            Err(error) => {
-                tracing::warn!("Unable to embed query for prompt corrections: {error}");
-                return Ok(Vec::new());
-            }
-        };
-
-        let hits =
-            match vector_memory::search_prompt_correction_points(db, &embedding, project_id, 5)
-                .await
-            {
-                Ok(hits) => hits,
-                Err(error) => {
-                    tracing::warn!("Unable to search prompt corrections: {error}");
-                    return Ok(Vec::new());
-                }
-            };
-
-        let (corrections, correction_ids) = collect_corrections_from_hits(hits);
-        if !correction_ids.is_empty() {
-            bump_correction_retrieval(db, project_id, &correction_ids).await;
-        }
-
-        Ok(corrections)
-    }
-
     async fn compose_prompt(
         db: &PgPool,
         cache: &crate::prompt_templates::TemplateCache,
         base_prompt: &str,
-        corrections: &[Value],
+        memories: &crate::prompt_memories::ProjectMemories,
         automation_mode: AutomationMode,
         attachments: &[ChatAttachment],
     ) -> String {
@@ -1657,7 +1626,7 @@ impl Orchestrator {
         let mode_instruction =
             crate::prompt_templates::get_template_or_default(db, cache, tpl_key).await;
         let mut sections = vec![mode_instruction];
-        if let Some(block) = corrections_section(corrections) {
+        if let Some(block) = memories.section() {
             sections.push(block);
         }
         sections.extend(attachment_sections(attachments));
@@ -1756,112 +1725,6 @@ async fn resolve_web_search_model(
         "ricerca_web: nessun modello web_search disponibile (sonar disabilitato / provider non configurato), fallback al routing normale"
     );
     None
-}
-
-/// Le correzioni di prompt sono attive per questo progetto? Estratta da
-/// [`Orchestrator::load_prompt_corrections`]: richiede il flag globale
-/// (`settings.learning_prompt_corrections_enabled`) E quello di progetto
-/// (`project_learning_config.prompt_corrections_enabled`), entrambi con default
-/// `true` quando assenti o illeggibili — semantica invariata.
-async fn prompt_corrections_enabled(db: &PgPool, project_id: Uuid) -> bool {
-    let globally_enabled = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM settings WHERE key = 'learning_prompt_corrections_enabled'",
-    )
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .map(|value| value.trim().eq_ignore_ascii_case("true"))
-    .unwrap_or(true);
-    if !globally_enabled {
-        return false;
-    }
-
-    sqlx::query_scalar::<_, bool>(
-        r#"
-        SELECT prompt_corrections_enabled
-        FROM project_learning_config
-        WHERE project_id = $1
-        "#,
-    )
-    .bind(project_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(true)
-}
-
-/// Correzioni pertinenti a partire dagli hit Qdrant, piu' gli id da contabilizzare.
-/// Estratta da [`Orchestrator::load_prompt_corrections`]: stessa soglia di score
-/// (0.78), stessi scarti (testo vuoto) e stessa forma del JSON prodotto.
-fn collect_corrections_from_hits(
-    hits: Vec<vector_memory::VectorPointHit>,
-) -> (Vec<Value>, Vec<Uuid>) {
-    let mut corrections = Vec::new();
-    let mut correction_ids = Vec::<Uuid>::new();
-    for hit in hits {
-        if hit.score < 0.78 {
-            continue;
-        }
-        let correction_id = hit
-            .payload
-            .get("correction_id")
-            .and_then(Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok());
-        let text = hit
-            .payload
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if text.is_empty() {
-            continue;
-        }
-        if let Some(correction_id) = correction_id {
-            correction_ids.push(correction_id);
-        }
-        corrections.push(json!({
-            "id": correction_id.map(|value| value.to_string()).unwrap_or_default(),
-            "text": text,
-            "score": hit.score,
-            "intent": hit.payload.get("intent").and_then(Value::as_str).unwrap_or("chat"),
-            "pointId": hit.point_id,
-        }));
-    }
-    (corrections, correction_ids)
-}
-
-/// Contabilizza il recupero delle correzioni usate. Estratta da
-/// [`Orchestrator::load_prompt_corrections`]; l'errore resta ignorato come in
-/// origine (contatore non critico per la risposta).
-///
-/// `prompt_corrections` e' migrata: la tabella vive nel DB del progetto
-/// (separazione DB). `settings` / `project_learning_config` restano su meta
-/// (globale/non migrata); la ricerca Qdrant e' multi-tenant per payload.
-async fn bump_correction_retrieval(db: &PgPool, project_id: Uuid, correction_ids: &[Uuid]) {
-    // Il bump dei contatori e' telemetria best-effort: DB progetto non
-    // disponibile -> update saltato con WARN (niente fallback al meta).
-    let cpool = match crate::project_db_routes::project_data_pool_from(db, project_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(project_id = %project_id, error = %e, "prompt_corrections: DB progetto non disponibile, bump retrieved_count saltato");
-            return;
-        }
-    };
-    let _ = sqlx::query(
-        r#"
-        UPDATE prompt_corrections
-        SET retrieved_count = retrieved_count + 1,
-            last_retrieved_at = NOW(),
-            updated_at = NOW()
-        WHERE id = ANY($1)
-        "#,
-    )
-    .bind(correction_ids)
-    .execute(&cpool)
-    .await;
 }
 
 /// Candidati (provider, model) sani per una richiesta slot-routed, dal punto
@@ -2079,24 +1942,6 @@ async fn fetch_tool_capability_row(
     .await
     .ok()
     .flatten()
-}
-
-/// Blocco "Correzioni note" del prompt composto: `None` quando non c'e' nessuna
-/// correzione con testo. Estratto da `compose_prompt` per contenerne la
-/// lunghezza: formattazione e contenuto del blocco sono invariati.
-fn corrections_section(corrections: &[Value]) -> Option<String> {
-    if corrections.is_empty() {
-        return None;
-    }
-    let mut block = String::from("Correzioni note (da rispettare se pertinenti):\n");
-    for correction in corrections {
-        if let Some(text) = correction.get("text").and_then(Value::as_str) {
-            block.push_str("- ");
-            block.push_str(text.trim());
-            block.push('\n');
-        }
-    }
-    Some(block.trim().to_string())
 }
 
 /// Sezioni allegati del prompt composto (prima i file testuali, poi l'elenco
