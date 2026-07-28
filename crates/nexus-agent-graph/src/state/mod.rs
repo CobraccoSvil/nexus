@@ -89,6 +89,37 @@ pub enum ReviewGateVerdict {
     PendingCorrection,
     /// Bocciatura DEFINITIVA: cap dei rimandi raggiunto, il run chiude bocciato.
     RejectedFinal,
+    /// Bocciatura definitiva in cui NESSUN rimando ha prodotto una modifica:
+    /// l'agente ha risposto ai rilievi senza toccare un file, per tutti i
+    /// tentativi disponibili.
+    ///
+    /// Perche' e' una variante e non una nota: la causa e' diversa da
+    /// [`ReviewGateVerdict::RejectedFinal`] e quindi lo e' anche l'azione
+    /// dell'utente. "Ha provato e non ci e' riuscito" e' un problema di
+    /// difficolta' del rilievo (si guarda il codice); "non ha provato" e' un
+    /// problema del modello o del prompt (si cambia figura, si riformula). Il run
+    /// osservato sul progetto `gestione-spese` (28/07/2026) chiuse col primo
+    /// verdetto mostrando il secondo caso: tre bocciature, zero file toccati,
+    /// 1.243.417 token.
+    ///
+    /// Chi deve solo sapere SE la review ha bocciato usa
+    /// [`ReviewGateVerdict::e_bocciatura_definitiva`], non un match sulla
+    /// variante: e' il punto unico di quella domanda.
+    RejectedNoCorrection,
+}
+
+impl ReviewGateVerdict {
+    /// La bocciatura e' DEFINITIVA (il run chiude bocciato, nessun altro
+    /// rimando): vero per entrambe le nature del rifiuto finale.
+    ///
+    /// PUNTO UNICO (regola L): il guard anti-loop, gli edge e i consumatori
+    /// chiedono qui invece di elencare le varianti. Con l'elenco a mano,
+    /// l'aggiunta di [`ReviewGateVerdict::RejectedNoCorrection`] avrebbe fatto
+    /// ri-convocare il panel a ogni rientro nel funnel di chiusura per l'unico
+    /// esito in cui il panel e' certamente inutile.
+    pub fn e_bocciatura_definitiva(&self) -> bool {
+        matches!(self, Self::RejectedFinal | Self::RejectedNoCorrection)
+    }
 }
 
 /// DECISIONE DI ROUTING dichiarata da un gate di chiusura (final_gate,
@@ -565,6 +596,26 @@ pub struct AgentState {
     /// raggiunto (motore vecchio o run chiuso per altra via).
     #[serde(default)]
     pub review_gate_verdict: Option<ReviewGateVerdict>,
+    /// WATERMARK della misura di progresso: `id` dell'ultima scrittura registrata
+    /// quando e' stato emesso l'ultimo rimando in correzione. Al rientro nel gate
+    /// dice DA DOVE guardare per rispondere a "questo rimando ha prodotto
+    /// qualcosa?" (punto unico del criterio:
+    /// [`crate::decisions::correction_progress`]).
+    ///
+    /// E' un `id` e non un istante: l'orologio dell'applicazione e quello del DB
+    /// non delimitano la stessa finestra. `None` = nessun rimando ancora emesso,
+    /// oppure misura non disponibile (porta assente o in errore) — in entrambi i
+    /// casi il gate ricade sul comportamento storico e convoca.
+    #[serde(default)]
+    pub review_correction_watermark: Option<i64>,
+    /// Quanti rimandi in correzione NON hanno prodotto alcuna modifica ai file.
+    /// Confrontato con `review_gate_cycle` (che conta i rimandi TOTALI) distingue
+    /// "non ha mai provato" da "ha provato e non ci e' riuscito": e' il segnale
+    /// che porta a [`ReviewGateVerdict::RejectedNoCorrection`] e la premessa
+    /// strutturata (regola M) per chi in futuro vorra' cambiare figura al secondo
+    /// giro a vuoto invece di ripetere la stessa richiesta allo stesso modello.
+    #[serde(default)]
+    pub review_correction_no_progress: Option<i64>,
     /// DECISIONE DI ROUTING dell'ultimo gate di chiusura eseguito (regola M):
     /// il segnale, di PROPRIETA' del gate, su cui instradano gli edge di
     /// final_gate e review_gate. Lo scrive OGNI ramo di uscita dei due nodi.

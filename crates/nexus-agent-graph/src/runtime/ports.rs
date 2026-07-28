@@ -575,6 +575,49 @@ pub trait ReviewPanelPort: Send + Sync {
     async fn review(&self, req: ReviewPanelRequest) -> Result<ReviewPanelReport, PortError>;
 }
 
+/// Scritture registrate oltre un watermark, con il watermark aggiornato.
+///
+/// Il watermark e' l'`id` (BIGSERIAL, monotono) dell'ultima scrittura vista, non
+/// un istante: due orologi — quello dell'applicazione e quello del DB — non
+/// definiscono la stessa finestra, e la domanda "dopo il rimando" deve avere una
+/// risposta sola.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteScan {
+    /// Massimo `id` scansionato: si riporta al giro successivo come `after`.
+    /// Quando non c'e' nulla di nuovo resta uguale all'`after` ricevuto.
+    pub watermark: i64,
+    /// I fatti della finestra, nell'ordine in cui sono stati registrati. VUOTO
+    /// quando `after` era `None` (si voleva solo prendere il watermark).
+    pub facts: Vec<crate::decisions::WriteFact>,
+}
+
+/// Porta della MISURA del progresso: "cosa e' stato scritto da questo istante in
+/// poi?". Controparte fattuale di [`ReviewPanelPort`] — quella porta la
+/// convocazione dei giudici, questa il fatto su cui i giudici verrebbero
+/// riconvocati.
+///
+/// CONFINE (regola L): qui SOLO l'I/O (leggere le scritture registrate). Il
+/// GIUDIZIO ("questo conta come correzione?") e' del modulo puro
+/// [`crate::decisions::correction_progress`], che il nodo interroga sui
+/// [`crate::decisions::WriteFact`] ritornati. L'impl NON deve filtrare per hash
+/// diversi: se filtrasse, il criterio vivrebbe in due posti — la query SQL e il
+/// modulo puro — e una riscrittura identica sparirebbe prima di essere contata
+/// come tale, cioe' proprio il caso che la misura esiste per vedere.
+///
+/// NIENTE FAIL-OPEN INVENTATO (regola G/M). Un guasto di lettura propaga
+/// `PortError`: il chiamante lo tratta come "misura non disponibile" e ricade sul
+/// comportamento storico (convoca il panel). Un `Ok(vuoto)` di ripiego direbbe
+/// "nessuna scrittura", cioe' "nessun progresso", e SOPPRIMEREBBE una review
+/// dovuta ogni volta che il DB ha un singhiozzo — il difetto opposto, e piu'
+/// grave, di quello che la misura chiude.
+#[async_trait]
+pub trait MutationProgressPort: Send + Sync {
+    /// `after = Some(id)`: i fatti registrati DOPO `id`, piu' il nuovo watermark.
+    /// `after = None`: nessuna finestra da esaminare, si vuole solo il watermark
+    /// corrente (primo rimando: non c'e' ancora un "prima" con cui confrontare).
+    async fn scan_writes(&self, after: Option<i64>) -> Result<WriteScan, PortError>;
+}
+
 /// Esito di UN run del verifier da persistere su `nexus_agent_verifier_runs`
 /// (`verifier_node._persist_verifier_run`, `verifier_node.py:584-601`). Forma
 /// minimale: i campi della INSERT (`run_id`/`todo_id`/`cycle`/`criteria_results`/

@@ -5174,6 +5174,7 @@ mod tests {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
         }
@@ -6497,6 +6498,7 @@ mod tests {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
         };

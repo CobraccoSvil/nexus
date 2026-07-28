@@ -71,6 +71,12 @@
 //!     porte [`crate::runtime::ports::NextActionsDeriver`] /
 //!     [`crate::runtime::ports::BillingCooldownPort`] /
 //!     [`crate::runtime::ports::ModelUpscalePort`].
+//!   - [`correction_progress`]: PUNTO UNICO di "questo rimando in correzione ha
+//!     prodotto progresso?". Il criterio e' il confronto degli hash del
+//!     contenuto (`before_sha256` != `after_sha256`), mai il conteggio delle
+//!     chiamate ai tool di scrittura ne' la prosa dell'agente (regola M); l'I/O
+//!     e' la porta [`crate::runtime::ports::MutationProgressPort`], che porta i
+//!     fatti e non li giudica.
 //!
 //! Le `route_after_*` NON sono qui: stanno nel PR 2b.
 
@@ -78,6 +84,7 @@ pub mod adversarial_review;
 pub mod advisory_panel;
 pub mod clarify_signature;
 pub mod context_reduction;
+pub mod correction_progress;
 pub mod dag_scheduler;
 pub mod debate_panel;
 pub mod end_turn;
@@ -118,6 +125,9 @@ pub use context_reduction::{
     inject_language_reminder, inject_turn_focus, inject_verification_directive, looks_like_base64,
     should_compress_now, CompressParams, CtxMgmtConfig, HistoryMessage, TokenBrakeConfig,
     AGGRESSIVE_TRUNC_MARKER, LANG_REMINDER_MARKER, RAG_REMINDER_MARKER, VERIFY_DIRECTIVE_MARKER,
+};
+pub use correction_progress::{
+    classify_correction_progress, CorrectionProgress, WriteFact,
 };
 pub use dag_scheduler::{
     compute_ready_layer, descendants, pick_next_todo, should_parallelize, DagConfig, Todo,

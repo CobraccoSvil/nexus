@@ -31,14 +31,39 @@
 //! gia' oltre il cap e chiudeva DEFINITIVA senza un solo tentativo di
 //! correzione, e l'etichetta "(n/max)" mostrava un numeratore che il cap non
 //! governava.
+//!
+//! ## Il contatore misura i tentativi, la porta misura il PROGRESSO (28/07/2026)
+//!
+//! Contare i rimandi non basta: un rimando in cui l'agente non modifica nulla ne
+//! consumava uno esattamente come uno in cui correggeva. Misurato sul progetto
+//! `gestione-spese`: rilievo corretto del panel su `vite.config.js`, tre volte la
+//! risposta "Nessuna azione necessaria. Il task e' stato completato e verificato
+//! nei turni precedenti", tre bocciature, ZERO file toccati, run chiuso al cap
+//! con 1.243.417 token (1.178.170 in ingresso contro 6.138 in uscita) e i due
+//! revisori convocati tre volte sullo stesso identico codice.
+//!
+//! Il gate valutava cio' che l'agente DICEVA; il fatto — ha modificato dei file?
+//! — era gia' registrato in forma strutturata (`file_mutations`, hash del
+//! contenuto) e nessuno lo leggeva. Ora il gate lo legge dalla porta
+//! [`MutationProgressPort`] e ne trae due conseguenze:
+//!
+//!  1. **Non riconvoca il panel** dopo un rimando a vuoto: stesso codice, stesso
+//!     verdetto, spesa certa e inutile (sul run osservato, 2 convocazioni su 3).
+//!  2. **Il rimando smette di essere liquidabile**: il fatto misurato entra nel
+//!     rimando successivo come contestazione opponibile ("nessun file e'
+//!     cambiato"), invece di lasciare che "gia' fatto" valga come risposta.
+//!
+//! Il criterio di cosa sia progresso NON vive qui: e' il punto unico puro
+//! [`crate::decisions::correction_progress`] (regola L), cosi' la stessa domanda
+//! non riceve due risposte diverse dal nodo e dalla query.
 
 use async_trait::async_trait;
 use nexus_graph::node::{GraphNode, NodeError, NodeId};
 use nexus_graph::StateDelta as OpaqueDelta;
 
-use crate::decisions::PanelOutcome;
+use crate::decisions::{classify_correction_progress, CorrectionProgress, PanelOutcome};
 use crate::runtime::ports::{
-    ReviewPanelReport, ReviewPanelRequest, ReviewSkipReason,
+    MutationProgressPort, ReviewPanelReport, ReviewPanelRequest, ReviewSkipReason,
 };
 use crate::state::{
     AgentState, GateRouting, Message, MessageContent, ReviewGateVerdict, StopReason,
@@ -58,12 +83,79 @@ pub struct ReviewGateConfig {
     pub max_cycles: i64,
 }
 
+/// Un rimando che il gate emette SENZA riconvocare il panel, nei numeri che lo
+/// descrivono. Viaggiano come una cosa sola perche' si leggono insieme:
+/// `cycle`/`max_cycles` dicono a che punto del cap siamo, `a_vuoto` quante volte
+/// l'agente non ha prodotto nulla, `progresso` che cosa e' stato misurato — e il
+/// verdetto nasce dal loro rapporto, non da uno di essi.
+#[derive(Debug, Clone, Copy)]
+struct RimandoAVuoto {
+    /// Numero del tentativo mostrato all'agente e in UI.
+    cycle: i64,
+    max_cycles: i64,
+    /// Rimandi che NON hanno prodotto modifiche, questo compreso.
+    a_vuoto: i64,
+    /// Il cap e' raggiunto: il run chiude invece di rimandare.
+    definitiva: bool,
+    progresso: CorrectionProgress,
+}
+
+impl RimandoAVuoto {
+    fn nuovo(
+        state: &AgentState,
+        rimandi_fatti: i64,
+        max_cycles: i64,
+        progresso: CorrectionProgress,
+    ) -> Self {
+        let definitiva = rimandi_fatti >= max_cycles;
+        Self {
+            // Su una chiusura definitiva non nasce un nuovo rimando: il numero
+            // resta quello dei rimandi gia' spesi (stessa regola di `boccia`).
+            cycle: if definitiva {
+                rimandi_fatti
+            } else {
+                rimandi_fatti + 1
+            },
+            max_cycles,
+            a_vuoto: state.review_correction_no_progress.unwrap_or(0) + 1,
+            definitiva,
+            // `rimandi_fatti` non si conserva: serve solo per il confronto con
+            // `a_vuoto`, che e' gia' risolto in `verdetto`.
+            progresso,
+        }
+    }
+
+    /// Verdetto della bocciatura raggiunta per questa via. E' LA decisione del
+    /// ramo: `a_vuoto >= cycle` dice che OGNI tentativo si e' chiuso senza
+    /// toccare un file.
+    ///
+    /// Quando la misura e' mancata per qualche giro il contatore sottostima e si
+    /// cade su [`ReviewGateVerdict::RejectedFinal`], il verdetto storico e
+    /// conservativo: meglio non accusare di inerzia un run che forse aveva
+    /// tentato.
+    fn verdetto(&self) -> ReviewGateVerdict {
+        if !self.definitiva {
+            ReviewGateVerdict::PendingCorrection
+        } else if self.a_vuoto >= self.cycle {
+            ReviewGateVerdict::RejectedNoCorrection
+        } else {
+            ReviewGateVerdict::RejectedFinal
+        }
+    }
+}
+
 pub struct ReviewGateNode {
     cfg: ReviewGateConfig,
     /// Porta del panel (mcp-core convoca i sub-run revisori).
     panel: std::sync::Arc<dyn crate::runtime::ports::ReviewPanelPort>,
     /// Narrazione live (pattern emit+persist, punto unico `emit_phase_meta`).
     meta_steps: std::sync::Arc<dyn crate::runtime::ports::MetaStepStore>,
+    /// Misura del progresso fra un rimando e il successivo. `None` = misura non
+    /// disponibile (grafi di scaffold, fixture topologiche): il gate ricade sul
+    /// comportamento storico e convoca sempre. Mai un default che finge di aver
+    /// misurato: "non lo so" e "non e' cambiato niente" portano a decisioni
+    /// opposte.
+    mutations: Option<std::sync::Arc<dyn MutationProgressPort>>,
 }
 
 impl ReviewGateNode {
@@ -77,7 +169,18 @@ impl ReviewGateNode {
             cfg,
             panel,
             meta_steps,
+            mutations: None,
         }
+    }
+
+    /// Innesta la misura del progresso (mcp-core la implementa su
+    /// `file_mutations`). Senza, il gate si comporta come prima del 28/07/2026.
+    pub fn with_mutation_progress(
+        mut self,
+        port: std::sync::Arc<dyn MutationProgressPort>,
+    ) -> Self {
+        self.mutations = Some(port);
+        self
     }
 
     /// Emissione narrativa del gate (punto unico del kind e del payload:
@@ -137,6 +240,31 @@ impl ReviewGateNode {
         crate::state::delta::put_extra(state, "review_panel_last", panel.to_value())
     }
 
+    /// Elenco dei difetti, PUNTO UNICO del formato: lo usano sia il rimando dopo
+    /// una convocazione sia quello che non riconvoca. Con due rendering, il
+    /// secondo rimando avrebbe descritto gli stessi difetti in un formato diverso
+    /// e l'agente avrebbe avuto motivo di leggerli come rilievi nuovi.
+    fn render_findings(findings: &[serde_json::Value]) -> Vec<String> {
+        let mut lines: Vec<String> = findings
+            .iter()
+            .take(12)
+            .map(|f| {
+                let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+                let severity = f.get("severity").and_then(|v| v.as_str()).unwrap_or("?");
+                let desc = f
+                    .get("description")
+                    .or_else(|| f.get("evidence"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                format!("- [{severity}] {file}: {desc}")
+            })
+            .collect();
+        if findings.len() > 12 {
+            lines.push(format!("- (altri {} findings omessi)", findings.len() - 12));
+        }
+        lines
+    }
+
     /// Blocco di correzione iniettato come messaggio Human (gemello del
     /// `render_failed_block` del final_gate): verdetto + findings con file ed
     /// evidenza, e la consegna esplicita di correggere e ridichiarare.
@@ -149,22 +277,51 @@ impl ReviewGateNode {
             panel.valid,
             panel.total_reviews
         )];
-        for f in panel.findings.iter().take(12) {
-            let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("?");
-            let severity = f.get("severity").and_then(|v| v.as_str()).unwrap_or("?");
-            let desc = f
-                .get("description")
-                .or_else(|| f.get("evidence"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            lines.push(format!("- [{severity}] {file}: {desc}"));
-        }
-        if panel.findings.len() > 12 {
-            lines.push(format!("- (altri {} findings omessi)", panel.findings.len() - 12));
-        }
+        lines.extend(Self::render_findings(&panel.findings));
         lines.push(
             "\nCORREGGI i difetti elencati usando i tool disponibili, poi dichiara di nuovo \
              la chiusura con task_complete. La review verra' ripetuta sulle modifiche."
+                .to_string(),
+        );
+        lines.join("\n")
+    }
+
+    /// Blocco del rimando che NON ha riconvocato il panel: apre col FATTO
+    /// misurato invece che col verdetto, perche' il verdetto l'agente lo ha gia'
+    /// ricevuto e liquidato.
+    ///
+    /// E' la parte che rende il rimando non liquidabile. "Il task e' stato
+    /// completato e verificato nei turni precedenti" e' una tesi sul passato;
+    /// qui c'e' una misura sul presente che la contraddice, e con essa la
+    /// richiesta di un esito verificabile: correggere, oppure dire QUALE rilievo
+    /// e' infondato e perche'. Restano ammesse entrambe le uscite, ma nessuna
+    /// delle due e' "ho gia' fatto".
+    fn render_stalled_block(
+        findings: &[serde_json::Value],
+        progresso: CorrectionProgress,
+        cycle: i64,
+        max_cycles: i64,
+    ) -> String {
+        let fatto = progresso
+            .fatto_opponibile()
+            .unwrap_or_else(|| "nessuna modifica risulta registrata".to_string());
+        let mut lines = vec![format!(
+            "## Il rimando precedente non ha prodotto alcuna correzione \
+             (tentativo {cycle}/{max_cycles})\n\n\
+             Misura sulle scritture registrate di questo run: {fatto}. I difetti \
+             segnalati dalla review sono quindi ancora tutti aperti, e il panel non e' \
+             stato riconvocato: rivedrebbe codice identico.\n\n\
+             Dichiarare che il lavoro era \"gia' fatto nei turni precedenti\" non chiude \
+             questi rilievi: la misura dice che i file non sono cambiati.\n\n\
+             Difetti ancora aperti:"
+        )];
+        lines.extend(Self::render_findings(findings));
+        lines.push(
+            "\nHai due uscite, entrambe verificabili: (1) CORREGGI i difetti con i tool \
+             di scrittura e ridichiara la chiusura con task_complete; (2) se ritieni che \
+             un rilievo sia INFONDATO, dillo indicando quale e portando l'evidenza \
+             (contenuto del file, comportamento atteso) che lo smentisce. Ripetere che il \
+             task e' completo, senza modifiche e senza evidenza, non e' nessuna delle due."
                 .to_string(),
         );
         lines.join("\n")
@@ -202,7 +359,10 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReviewGateNode {
         // modulo ("DEFINITIVA -> il run chiude bocciato, mai un loop") era l'INTENTO;
         // questo guard lo rende vero: il verdetto resta RejectedFinal, si esce senza
         // nuova spesa.
-        if state.review_gate_verdict == Some(ReviewGateVerdict::RejectedFinal) {
+        if state
+            .review_gate_verdict
+            .is_some_and(|v| v.e_bocciatura_definitiva())
+        {
             return Ok(Self::pass_through());
         }
 
@@ -217,6 +377,25 @@ impl GraphNode<AgentState, AgentNodeCtx> for ReviewGateNode {
         // "(2/3)" e "(3/3)" con altri cinque cicli a seguire.
         let rimandi_fatti = state.review_gate_cycle.unwrap_or(0);
         let max_cycles = self.cfg.max_cycles.max(0);
+
+        // Il rimando precedente ha prodotto qualcosa? Se non ha prodotto NULLA, i
+        // revisori guarderebbero lo stesso identico codice ed emetterebbero lo
+        // stesso identico verdetto: la convocazione e' spesa certa e inutile. La
+        // misura vale solo dopo un rimando (`rimandi_fatti > 0`) e solo se e'
+        // disponibile: `None` = non lo sappiamo -> si convoca, come prima.
+        if let Some(progresso) = self.progresso_dal_rimando(state).await {
+            if !progresso.e_progresso() {
+                tracing::info!(
+                    target: "nexus_agent_graph::review_gate",
+                    progresso = progresso.as_str(),
+                    rimandi_fatti,
+                    "review_gate: rimando a vuoto, panel NON riconvocato"
+                );
+                return Ok(self
+                    .rimando_a_vuoto(state, ctx, rimandi_fatti, max_cycles, progresso)
+                    .await);
+            }
+        }
 
         let panel = match self.convoca(state, rimandi_fatti + 1).await {
             Ok(panel) => panel,
@@ -278,6 +457,146 @@ impl ReviewGateNode {
             }
             ReviewPanelReport::Convened(panel) => Ok(panel),
         }
+    }
+
+    /// Progresso prodotto DAL rimando precedente, o `None` quando la domanda non
+    /// si puo' porre.
+    ///
+    /// I tre `None` non sono lo stesso non-detto, ma portano tutti alla stessa
+    /// decisione conservativa (convoca, come prima della misura):
+    ///  - porta assente: il grafo gira senza misura (scaffold, fixture);
+    ///  - nessun watermark: non c'e' un "prima" con cui confrontare. Misurare
+    ///    dall'inizio del run conterebbe come correzione le scritture che hanno
+    ///    PRODOTTO i difetti — un progresso inventato, peggio che nessuna misura;
+    ///  - errore di lettura: non lo sappiamo, e un `Ok(vuoto)` di ripiego direbbe
+    ///    "nessun progresso" sopprimendo una review dovuta (regola G: niente
+    ///    fallback che maschera un guasto).
+    async fn progresso_dal_rimando(&self, state: &AgentState) -> Option<CorrectionProgress> {
+        let port = self.mutations.as_ref()?;
+        let da = state.review_correction_watermark?;
+        match port.scan_writes(Some(da)).await {
+            Ok(scan) => Some(classify_correction_progress(&scan.facts)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::review_gate",
+                    error = %e,
+                    "review_gate: misura del progresso non disponibile, si convoca il panel"
+                );
+                None
+            }
+        }
+    }
+
+    /// Watermark da cui misurare il rimando che si sta per emettere.
+    ///
+    /// Si legge QUI e non all'ingresso del nodo: fra i due istanti c'e' la
+    /// convocazione del panel, e le scritture dei revisori cadrebbero dentro la
+    /// finestra del ciclo di correzione facendo passare per progresso dell'agente
+    /// il lavoro dei suoi giudici.
+    async fn watermark_corrente(&self) -> Option<i64> {
+        let port = self.mutations.as_ref()?;
+        match port.scan_writes(None).await {
+            Ok(scan) => Some(scan.watermark),
+            Err(e) => {
+                tracing::warn!(
+                    target: "nexus_agent_graph::review_gate",
+                    error = %e,
+                    "review_gate: watermark non leggibile, il prossimo rimando non sara' misurato"
+                );
+                None
+            }
+        }
+    }
+
+    /// Rimando (o chiusura) SENZA convocare il panel: dal rimando precedente non
+    /// risulta alcuna modifica ai file.
+    ///
+    /// Consuma un tentativo come qualunque altro rimando — il cap governa i
+    /// rimandi, e questo lo e' — ma non spende un panel. Al cap la bocciatura
+    /// distingue le due cause: se TUTTI i rimandi sono andati a vuoto il run non
+    /// ha mai tentato una correzione, ed e' un esito diverso da "ha tentato e non
+    /// ci e' riuscito".
+    /// Narrazione del rimando a vuoto. `panel_convened: false` nel payload e' il
+    /// dato che rende leggibile in UI il risparmio: la riga REVIEW compare senza
+    /// i revisori sotto, e si vede che il giro non e' costato un panel.
+    async fn narra_a_vuoto(&self, ctx: &AgentNodeCtx, r: &RimandoAVuoto) {
+        let RimandoAVuoto {
+            cycle,
+            max_cycles,
+            a_vuoto,
+            definitiva,
+            progresso,
+        } = *r;
+        let mut payload = serde_json::Map::new();
+        payload.insert("cycle".into(), cycle.into());
+        payload.insert("max_cycles".into(), max_cycles.into());
+        payload.insert("progress".into(), progresso.as_str().into());
+        payload.insert("no_progress_cycles".into(), a_vuoto.into());
+        payload.insert("panel_convened".into(), false.into());
+        let (titolo, phase) = if definitiva {
+            (
+                format!(
+                    "Review NON superata al cap ({cycle}/{max_cycles}): nessuna correzione \
+                     applicata in alcun tentativo"
+                ),
+                "rejected_no_correction",
+            )
+        } else {
+            (
+                format!(
+                    "Rimando senza correzione ({cycle}/{max_cycles}): nessun file modificato, \
+                     panel non riconvocato"
+                ),
+                "stalled",
+            )
+        };
+        payload.insert("phase".into(), phase.into());
+        self.emit(ctx, titolo, payload, None).await;
+    }
+
+    async fn rimando_a_vuoto(
+        &self,
+        state: &AgentState,
+        ctx: &AgentNodeCtx,
+        rimandi_fatti: i64,
+        max_cycles: i64,
+        progresso: CorrectionProgress,
+    ) -> OpaqueDelta {
+        let r = RimandoAVuoto::nuovo(state, rimandi_fatti, max_cycles, progresso);
+        self.narra_a_vuoto(ctx, &r).await;
+
+        // Findings dell'ULTIMA convocazione: sono ancora i difetti aperti, visto
+        // che il codice non e' cambiato. Ripescati da `extra` invece di
+        // riconvocare, che e' esattamente il punto.
+        let findings: Vec<serde_json::Value> = state
+            .extra
+            .get("review_panel_last")
+            .and_then(|v| v.get("findings"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut delta = StateDelta {
+            review_gate_cycle: Some(Some(r.cycle)),
+            review_correction_no_progress: Some(Some(r.a_vuoto)),
+            review_gate_verdict: Some(Some(r.verdetto())),
+            gate_routing: Some(Some(if r.definitiva {
+                GateRouting::Chiude
+            } else {
+                GateRouting::RimandaInCorrezione
+            })),
+            ..Default::default()
+        };
+        if !r.definitiva {
+            let block = Self::render_stalled_block(&findings, progresso, r.cycle, r.max_cycles);
+            delta.messages = Some(vec![Message::Human {
+                content: MessageContent::text(block),
+            }]);
+            delta.stop_reason = Some(Some(StopReason::ToolUse));
+            delta.pending_tool_uses = Some(Some(vec![]));
+            delta.review_correction_watermark = Some(self.watermark_corrente().await);
+        }
+        delta.into_opaque()
     }
 
     /// Esito non-rifiuto (Approved/Inconclusive): il run chiude, verdetto
@@ -381,7 +700,15 @@ impl ReviewGateNode {
         payload.insert("reviewers".into(), panel.reviewers_json());
         self.emit(ctx, titolo, payload, Some(panel.verdict.as_str()))
             .await;
-        Self::boccia_delta(state, cycle, max_cycles, panel, definitiva)
+        // Watermark del rimando che si sta emettendo, letto DOPO la convocazione
+        // (vedi `watermark_corrente`). Sulla bocciatura definitiva non serve:
+        // nessun rimando da misurare.
+        let watermark = if definitiva {
+            None
+        } else {
+            self.watermark_corrente().await
+        };
+        Self::boccia_delta(state, cycle, max_cycles, panel, definitiva, watermark)
     }
 
     /// Delta della bocciatura (puro). Sul rimando: messaggio Human + ToolUse +
@@ -393,6 +720,7 @@ impl ReviewGateNode {
         max_cycles: i64,
         panel: &PanelOutcome,
         definitiva: bool,
+        watermark: Option<i64>,
     ) -> OpaqueDelta {
         let mut delta = StateDelta {
             review_gate_cycle: Some(Some(cycle)),
@@ -422,6 +750,12 @@ impl ReviewGateNode {
             }]);
             delta.stop_reason = Some(Some(StopReason::ToolUse));
             delta.pending_tool_uses = Some(Some(vec![]));
+            // Da qui si misurera' se questo rimando ha prodotto qualcosa. Scritto
+            // sempre, anche `None`: azzerarlo quando la misura non e' disponibile
+            // e' piu' onesto che lasciare in piedi il watermark del rimando
+            // PRECEDENTE, che farebbe leggere come progresso di questo giro le
+            // scritture del giro prima.
+            delta.review_correction_watermark = Some(watermark);
         }
         delta.into_opaque()
     }
@@ -790,6 +1124,354 @@ mod tests {
         let s = apply(stato_done(), delta);
         assert_eq!(s.review_gate_verdict, Some(ReviewGateVerdict::Approved));
         assert!(!crate::routing::gate_rimanda_in_correzione(&s));
+    }
+
+    // ── MISURA DEL PROGRESSO: il ciclo conta i tentativi, ora anche i fatti ────
+
+    /// Porta di misura che risponde con fatti FISSI. Il watermark avanza a ogni
+    /// lettura, cosi' il nodo non puo' passare il test per l'accidente di un
+    /// watermark che resta fermo.
+    struct StubMutations {
+        facts: Vec<crate::decisions::WriteFact>,
+        /// Letture ricevute: prova che il gate misura invece di indovinare.
+        letture: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl MutationProgressPort for StubMutations {
+        async fn scan_writes(
+            &self,
+            after: Option<i64>,
+        ) -> Result<crate::runtime::ports::WriteScan, crate::runtime::ports::PortError> {
+            self.letture
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(match after {
+                // Richiesta del solo watermark (emissione di un rimando).
+                None => crate::runtime::ports::WriteScan {
+                    watermark: 100,
+                    facts: Vec::new(),
+                },
+                Some(w) => crate::runtime::ports::WriteScan {
+                    watermark: w + 1,
+                    facts: self.facts.clone(),
+                },
+            })
+        }
+    }
+
+    /// Porta di misura GUASTA: il DB non risponde.
+    struct MutationsInErrore;
+    #[async_trait::async_trait]
+    impl MutationProgressPort for MutationsInErrore {
+        async fn scan_writes(
+            &self,
+            _after: Option<i64>,
+        ) -> Result<crate::runtime::ports::WriteScan, crate::runtime::ports::PortError> {
+            Err(crate::runtime::ports::PortError::Tool("DB irraggiungibile".into()))
+        }
+    }
+
+    fn scrittura(before: &str, after: &str) -> crate::decisions::WriteFact {
+        crate::decisions::WriteFact {
+            before_sha256: Some(before.to_string()),
+            after_sha256: Some(after.to_string()),
+        }
+    }
+
+    /// Esito di due giri di gate su un panel che boccia sempre: quante volte i
+    /// revisori sono stati convocati, e lo stato finale.
+    ///
+    /// I due giri sono il difetto in miniatura: primo giro -> bocciatura e
+    /// rimando; secondo giro -> il gate rientra dopo che l'executor ha (o non ha)
+    /// corretto. E' il punto in cui la spesa si ripete.
+    async fn due_giri(
+        max_cycles: i64,
+        mutations: Option<Arc<dyn MutationProgressPort>>,
+    ) -> (usize, AgentState) {
+        let convocazioni = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut node = ReviewGateNode::new(
+            ReviewGateConfig {
+                enabled: true,
+                max_cycles,
+            },
+            Arc::new(CountingPanel {
+                report: ReviewPanelReport::Convened(panel_bocciato()),
+                convocazioni: Arc::clone(&convocazioni),
+            }),
+            Arc::new(StubMetaStepStore::default()),
+        );
+        if let Some(port) = mutations {
+            node = node.with_mutation_progress(port);
+        }
+        let mut s = stato_done();
+        for _ in 0..2 {
+            let delta = node.run(&s, &ctx_with()).await.expect("nodo ok");
+            s = apply(s, delta);
+        }
+        (
+            convocazioni.load(std::sync::atomic::Ordering::SeqCst),
+            s,
+        )
+    }
+
+    /// (a) Il rimando HA prodotto una modifica: il panel va riconvocato, perche'
+    /// il codice che deve giudicare e' cambiato.
+    ///
+    /// E' il caso che tiene onesta la misura: un controllo che sopprimesse anche
+    /// questa convocazione romperebbe la review invece di risparmiarla.
+    #[tokio::test]
+    async fn con_mutazione_reale_il_panel_viene_riconvocato() {
+        let (convocazioni, s) = due_giri(
+            3,
+            Some(Arc::new(StubMutations {
+                facts: vec![scrittura("prima", "dopo")],
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        )
+        .await;
+        assert_eq!(
+            convocazioni, 2,
+            "il codice e' cambiato: i revisori devono rivederlo"
+        );
+        assert_eq!(s.review_gate_cycle, Some(2), "due rimandi");
+        assert_eq!(
+            s.review_correction_no_progress, None,
+            "nessun giro a vuoto da contare"
+        );
+    }
+
+    /// (b) Il rimando NON ha prodotto nulla: il panel NON va riconvocato.
+    /// Stesso codice, stesso verdetto — la convocazione e' spesa certa e inutile.
+    /// E' il caso del run osservato: tre convocazioni sullo stesso identico
+    /// codice, 1.243.417 token.
+    ///
+    /// MUTAZIONE: togliere il ramo `if !progresso.e_progresso()` da
+    /// `ReviewGateNode::run` porta le convocazioni da 1 a 2 e questo assert
+    /// rosseggia.
+    #[tokio::test]
+    async fn senza_mutazioni_il_panel_non_viene_riconvocato() {
+        let letture = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (convocazioni, s) = due_giri(
+            3,
+            Some(Arc::new(StubMutations {
+                facts: Vec::new(),
+                letture: Arc::clone(&letture),
+            })),
+        )
+        .await;
+        assert_eq!(
+            convocazioni, 1,
+            "nessun file e' cambiato: i revisori vedrebbero lo stesso codice"
+        );
+        assert!(
+            letture.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "il gate deve aver MISURATO, non dedotto"
+        );
+        // Il tentativo e' comunque consumato: il cap governa i rimandi, e questo
+        // lo e'. Cio' che non si spende e' il panel.
+        assert_eq!(s.review_gate_cycle, Some(2));
+        assert_eq!(s.review_correction_no_progress, Some(1));
+        assert!(
+            crate::routing::gate_rimanda_in_correzione(&s),
+            "sotto il cap si rimanda comunque: l'agente ha ancora tentativi"
+        );
+    }
+
+    /// (c) Il write c'e' stato ma il contenuto e' IDENTICO
+    /// (`before_sha256 == after_sha256`): non e' una correzione, ed e' il modo in
+    /// cui un agente puo' simulare attivita' senza produrne. Un contatore di
+    /// chiamate a `write_file` qui direbbe "ha lavorato".
+    ///
+    /// MUTAZIONE: togliere il ramo `if !progresso.e_progresso()` da
+    /// `ReviewGateNode::run` (o far ritornare `true` costante a
+    /// `WriteFact::cambia_il_contenuto`) porta le convocazioni da 1 a 2.
+    #[tokio::test]
+    async fn riscrittura_identica_non_riconvoca_il_panel() {
+        let (convocazioni, s) = due_giri(
+            3,
+            Some(Arc::new(StubMutations {
+                facts: vec![scrittura("uguale", "uguale"), scrittura("idem", "idem")],
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        )
+        .await;
+        assert_eq!(
+            convocazioni, 1,
+            "due write a contenuto invariato non sono una correzione"
+        );
+        assert_eq!(s.review_correction_no_progress, Some(1));
+        // Il rimando dice all'agente COSA e' stato misurato: senza il fatto, il
+        // messaggio sarebbe di nuovo liquidabile con "gia' fatto".
+        let ultimo_human = s
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Human { content } => Some(content.flatten_text()),
+                _ => None,
+            })
+            .expect("messaggio di rimando presente");
+        assert!(
+            ultimo_human.contains("NESSUNA ha cambiato"),
+            "il rimando deve opporre la misura, non ripetere il verdetto: {ultimo_human}"
+        );
+        assert!(
+            ultimo_human.contains("backend/server.cjs"),
+            "i difetti ancora aperti restano elencati: {ultimo_human}"
+        );
+    }
+
+    /// Punto 4 del difetto: al cap, "non ha mai tentato" e' un esito DIVERSO da
+    /// "ha tentato e non ci e' riuscito", e l'azione dell'utente e' diversa.
+    ///
+    /// Con `max_cycles = 1`: primo giro boccia e rimanda; secondo giro misura il
+    /// vuoto e chiude. Tutti i rimandi (uno) sono andati a vuoto.
+    ///
+    /// MUTAZIONE: far ritornare sempre `RejectedFinal` a `rimando_a_vuoto`
+    /// confonde le due cause e questo assert rosseggia.
+    #[tokio::test]
+    async fn al_cap_senza_una_sola_correzione_l_esito_e_distinto() {
+        let (convocazioni, s) = due_giri(
+            1,
+            Some(Arc::new(StubMutations {
+                facts: Vec::new(),
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        )
+        .await;
+        assert_eq!(convocazioni, 1);
+        assert_eq!(
+            s.review_gate_verdict,
+            Some(ReviewGateVerdict::RejectedNoCorrection),
+            "nessun rimando ha prodotto modifiche: la causa non e' la difficolta' \
+             del rilievo"
+        );
+        assert!(
+            !crate::routing::gate_rimanda_in_correzione(&s),
+            "al cap il run chiude"
+        );
+        assert!(
+            s.review_gate_verdict
+                .expect("verdetto")
+                .e_bocciatura_definitiva(),
+            "resta una bocciatura definitiva: chi chiede solo questo non deve \
+             elencare le varianti"
+        );
+    }
+
+    /// Un tentativo che AVEVA prodotto modifiche esclude la causa "non ha mai
+    /// tentato": al cap si chiude col verdetto storico. Senza questa distinzione
+    /// il nuovo esito diventerebbe un'etichetta appiccicata a ogni bocciatura.
+    ///
+    /// Tre giri con `max_cycles = 2`: (1) boccia -> rimando 1; (2) misura
+    /// PROGRESSO -> riconvoca, boccia -> rimando 2; (3) misura il vuoto -> al cap,
+    /// chiude. Un giro a vuoto su due rimandi.
+    #[tokio::test]
+    async fn un_tentativo_riuscito_esclude_l_esito_senza_correzioni() {
+        struct MutazioniAlternate {
+            chiamate: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl MutationProgressPort for MutazioniAlternate {
+            async fn scan_writes(
+                &self,
+                after: Option<i64>,
+            ) -> Result<crate::runtime::ports::WriteScan, crate::runtime::ports::PortError>
+            {
+                let Some(w) = after else {
+                    return Ok(crate::runtime::ports::WriteScan {
+                        watermark: 100,
+                        facts: Vec::new(),
+                    });
+                };
+                // Prima misura: ha corretto. Seconda: si e' fermato.
+                let n = self
+                    .chiamate
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let facts = if n == 0 {
+                    vec![crate::decisions::WriteFact {
+                        before_sha256: Some("prima".into()),
+                        after_sha256: Some("dopo".into()),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                Ok(crate::runtime::ports::WriteScan {
+                    watermark: w + 1,
+                    facts,
+                })
+            }
+        }
+
+        let convocazioni = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node = ReviewGateNode::new(
+            ReviewGateConfig {
+                enabled: true,
+                max_cycles: 2,
+            },
+            Arc::new(CountingPanel {
+                report: ReviewPanelReport::Convened(panel_bocciato()),
+                convocazioni: Arc::clone(&convocazioni),
+            }),
+            Arc::new(StubMetaStepStore::default()),
+        )
+        .with_mutation_progress(Arc::new(MutazioniAlternate {
+            chiamate: std::sync::atomic::AtomicUsize::new(0),
+        }));
+
+        let mut s = stato_done();
+        for _ in 0..3 {
+            let delta = node.run(&s, &ctx_with()).await.expect("nodo ok");
+            s = apply(s, delta);
+        }
+        assert_eq!(
+            convocazioni.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "il giro con progresso riconvoca, quello a vuoto no"
+        );
+        assert_eq!(s.review_correction_no_progress, Some(1), "un solo giro a vuoto");
+        assert_eq!(
+            s.review_gate_verdict,
+            Some(ReviewGateVerdict::RejectedFinal),
+            "un tentativo aveva prodotto modifiche: la causa e' il rilievo, non l'inerzia"
+        );
+    }
+
+    /// FAIL-SAFE (regola G): misura NON disponibile — porta assente o in errore —
+    /// il gate si comporta come prima e convoca.
+    ///
+    /// E' il verso che conta: un `Ok(vuoto)` di ripiego direbbe "nessun
+    /// progresso" e sopprimerebbe una review dovuta a ogni singhiozzo del DB,
+    /// cioe' il difetto opposto e piu' grave di quello che la misura chiude.
+    #[tokio::test]
+    async fn senza_misura_il_gate_convoca_come_prima() {
+        let (senza_porta, _) = due_giri(3, None).await;
+        assert_eq!(senza_porta, 2, "porta assente: comportamento storico");
+
+        let (porta_guasta, s) = due_giri(3, Some(Arc::new(MutationsInErrore))).await;
+        assert_eq!(porta_guasta, 2, "porta in errore: non si sopprime la review");
+        assert_eq!(
+            s.review_correction_no_progress, None,
+            "un guasto non e' un giro a vuoto dell'agente"
+        );
+    }
+
+    /// Il watermark nasce dal rimando e delimita la finestra della misura. Senza,
+    /// il gate confronterebbe con l'inizio del run e leggerebbe come correzione
+    /// il lavoro che ha PRODOTTO i difetti.
+    #[tokio::test]
+    async fn il_rimando_scrive_il_watermark_da_cui_misurare() {
+        let node = nodo(3, ReviewPanelReport::Convened(panel_bocciato()))
+            .with_mutation_progress(Arc::new(StubMutations {
+                facts: Vec::new(),
+                letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }));
+        let delta = node.run(&stato_done(), &ctx_with()).await.expect("nodo ok");
+        let s = apply(stato_done(), delta);
+        assert_eq!(
+            s.review_correction_watermark,
+            Some(100),
+            "il rimando registra da dove misurare il giro successivo"
+        );
     }
 
     /// Dichiarazione non-done (blocked): il gate non si applica, mai un panel.
