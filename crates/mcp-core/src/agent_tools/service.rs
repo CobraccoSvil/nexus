@@ -160,9 +160,13 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     // stesso scopo. Solo DOPO si valuta refuse_if_same_scope_active: cosi' un
     // riavvio non resta bloccato da PID 12812/child ancora in ascolto mentre il
     // check refuse girava prima della dedup (incidente Vite 31754).
-    dedup_and_cleanup_ports(ctx, &label, &command).await;
+    dedup_and_cleanup_ports(ctx, &label, &command, &work_dir).await;
 
-    if let Some(kind_hint) = derive_kind_hint(&command, &label) {
+    if let Some(kind_hint) = derive_kind_hint(
+        &command,
+        &label,
+        scope_dir(&ctx.root_path, &work_dir).as_deref(),
+    ) {
         if let Some(refuse_msg) = refuse_if_same_scope_active(ctx, kind_hint).await {
             return refuse_msg;
         }
@@ -304,10 +308,17 @@ async fn resolve_service_launch(
         };
 
     // Risoluzione working directory (punto unico riusato anche dal restart).
-    let work_dir = resolve_service_work_dir(ctx, input)?;
+    let work_dir = resolve_service_work_dir(&ctx.root_path, input)?;
 
     // Derivazione label (refuse per scopo: dopo dedup in tool_run_service).
-    let label = resolve_service_label(ctx, input, &command, kind)?;
+    let label = resolve_service_label(
+        input,
+        &command,
+        kind,
+        &ctx.root_path,
+        &work_dir,
+        ctx.project_id,
+    );
 
     Ok(ServiceLaunch {
         command,
@@ -317,41 +328,126 @@ async fn resolve_service_launch(
     })
 }
 
-/// Deriva la label finale del servizio dal parametro esplicito o dallo scopo
-/// (frontend/backend). Il refuse per duplicato attivo e' in `tool_run_service`,
-/// dopo `dedup_and_cleanup_ports`.
+/// IDENTITA' del servizio, mai generica. Il refuse per duplicato attivo e' in
+/// `tool_run_service`, dopo `dedup_and_cleanup_ports`.
+///
+/// La label non e' un'etichetta di comodo: e' l'identita' con cui il servizio
+/// esiste nel resto del sistema. Da lei nascono il nome unit
+/// (`service_unit_name` -> `{slug}-{label}.service`), la riga
+/// `nexus_port_allocations` legata a quell'unit e il match porta<->servizio del
+/// pannello. Una label GENERICA ("Service", "server") non ha nessuna parola che
+/// identifichi uno scopo: `similar_service_labels("Service", "backend")` e'
+/// falso per costruzione, quindi quel servizio non incontra mai la propria
+/// allocazione e il pannello non ha un indirizzo da mostrargli.
+///
+/// Per questo il ripiego storico `unwrap_or("Service")` era il difetto: produceva
+/// esattamente cio' che il filtro sulla riga sopra rifiuta all'agente. Se una
+/// label senza scopo non e' accettabile quando la propone l'agente, non puo'
+/// esserlo quando la sceglie il sistema.
+///
+/// Ordine di derivazione, dal segnale piu' specifico al piu' stabile:
+/// 1. label esplicita dell'agente, se dice qualcosa;
+/// 2. scopo (frontend/backend) dedotto da comando + working directory;
+/// 3. nome della cartella da cui il servizio gira, risalendo fino alla radice
+///    del progetto (la prima che porti una parola propria);
+/// 4. ancoraggio al progetto: brutto ma stabile fra i riavvii e non generico,
+///    quindi capace di ricevere una porta e di conservarla.
 fn resolve_service_label(
-    _ctx: &AgentToolContext,
     input: &Value,
     command: &str,
     kind: &str,
-) -> Result<String, String> {
+    root: &std::path::Path,
+    work_dir: &std::path::Path,
+    project_id: uuid::Uuid,
+) -> String {
     let explicit_label = input
         .get("label")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .filter(|s| !crate::agent_processes::is_generic_service_label(s));
-    let label = explicit_label.unwrap_or("Service").to_string();
+    if let Some(label) = explicit_label {
+        return label.to_string();
+    }
 
-    let kind_hint = derive_kind_hint(command, &label);
-    let label = match (explicit_label, kind_hint) {
-        (None, Some(hint)) if kind == "service" => hint.to_string(),
-        _ => label,
-    };
-    Ok(label)
+    // Un task one-shot (`npm install`, `playwright test`) NON e' un servizio:
+    // non entra nel pannello Servizi (`kind='service'`), non ha unit ne'
+    // allocazione. Dargli l'identita' dedotta dallo scopo lo farebbe collidere
+    // con il servizio omonimo: `stop_similar_running_services`, che gira per
+    // ogni kind, fermerebbe il backend vero perche' l'install gira in backend/.
+    if kind != "service" {
+        return "Service".to_string();
+    }
+
+    if let Some(hint) = derive_kind_hint(command, "", scope_dir(root, work_dir).as_deref()) {
+        return hint.to_string();
+    }
+    identita_dal_percorso(root, work_dir)
+        .unwrap_or_else(|| format!("service-{}", &project_id.simple().to_string()[..8]))
+}
+
+/// Identita' derivata dal PERCORSO: nome della cartella da cui il servizio gira,
+/// risalendo verso la radice del progetto (inclusa) fino alla prima che porti una
+/// parola propria. `services/pagamenti` -> "pagamenti"; working dir sulla radice
+/// -> nome della cartella di progetto ("gestione-spese").
+///
+/// Il vaglio "porta una parola propria" e' `is_generic_service_label` (punto
+/// unico del vocabolario label, regola L): una cartella `app/` o `server/` non
+/// identifica niente piu' di quanto facesse "Service".
+fn identita_dal_percorso(root: &std::path::Path, work_dir: &std::path::Path) -> Option<String> {
+    let sotto_radice = scope_dir(root, work_dir);
+    let mut candidati: Vec<String> = sotto_radice
+        .iter()
+        .flat_map(|rel| rel.components())
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    // Dalla cartella piu' specifica verso la radice: il ruolo sta piu' vicino al
+    // servizio che al progetto. Il nome della cartella di progetto e' l'ultima
+    // carta, non la prima.
+    candidati.reverse();
+    candidati.extend(root.file_name().map(|n| n.to_string_lossy().to_string()));
+    candidati
+        .iter()
+        .map(|nome| normalizza_label(nome))
+        .find(|l| !l.is_empty() && !crate::agent_processes::is_generic_service_label(l))
+}
+
+/// Riduce un nome di cartella a label usabile come identita': minuscolo, solo
+/// `[a-z0-9-]`, il resto separatore. La label finisce dentro il nome unit
+/// `{slug}-{label}.service` e nel path delle API servizi, che rifiutano `/` e
+/// `..` (`control_project_service_windows`).
+fn normalizza_label(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Deduplicazione servizi prima del refuse: ferma processi simili, cleanup
 /// porte orfane, libera LISTEN residuo sullo stesso scopo (zombie/orfani non
 /// tracciati in agent_processes). Delega stop a stop_similar_running_services
 /// (punto unico, regola L).
-async fn dedup_and_cleanup_ports(ctx: &AgentToolContext, label: &str, command: &str) {
+async fn dedup_and_cleanup_ports(
+    ctx: &AgentToolContext,
+    label: &str,
+    command: &str,
+    work_dir: &std::path::Path,
+) {
     let _ =
         crate::agent_processes::stop_similar_running_services(&ctx.db, ctx.project_id, label).await;
     if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
         cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing, label).await;
     }
-    if let Some(kind_hint) = derive_kind_hint(command, label) {
+    if let Some(kind_hint) = derive_kind_hint(
+        command,
+        label,
+        scope_dir(&ctx.root_path, work_dir).as_deref(),
+    ) {
         free_listening_scope_port(ctx, kind_hint).await;
     }
 }
@@ -589,10 +685,22 @@ fn format_started_message(
     msg
 }
 
-/// Deriva lo scopo del servizio (frontend/backend) dal comando o dalla label.
-/// Punto unico della classificazione (regola L): estratto da `tool_run_service`
-/// per non gonfiarne complessita e lunghezza, comportamento invariato.
-fn derive_kind_hint(command: &str, label: &str) -> Option<&'static str> {
+/// Deriva lo scopo del servizio (frontend/backend) dal comando, dalla label o
+/// dalla working directory. Punto unico della classificazione (regola L).
+///
+/// La working directory e' il terzo segnale perche' e' l'unico che resta quando
+/// il comando e' un alias di script (`npm start`, `pnpm serve`, `yarn dev`): li'
+/// il ruolo non sta nel comando, sta nella cartella da cui gira. Cercare altre
+/// stringhe nel comando non chiuderebbe niente: il caso che ha fallito era
+/// `npm start`, il prossimo sara' `pnpm serve`.
+///
+/// `scope_dir` e' la working directory RELATIVA alla radice del progetto (vedi
+/// [`scope_dir`]): il nome della cartella di progetto non e' un segnale di ruolo.
+fn derive_kind_hint(
+    command: &str,
+    label: &str,
+    scope_dir: Option<&std::path::Path>,
+) -> Option<&'static str> {
     let cmd = command.to_lowercase();
     let lbl = label.to_lowercase();
     let is_frontend = cmd.contains("vite")
@@ -619,14 +727,65 @@ fn derive_kind_hint(command: &str, label: &str) -> Option<&'static str> {
     if is_backend {
         return Some("backend");
     }
+    scope_from_work_dir(scope_dir)
+}
+
+/// Scopo dedotto dalle cartelle sotto la radice del progetto. Convenzioni di
+/// layout, non elenco di comandi: `backend/`, `apps/web`, `services/api` dicono
+/// il ruolo di cio' che gira dentro, qualunque sia lo script che lo avvia.
+/// Si guarda dalla cartella piu' specifica verso la radice.
+fn scope_from_work_dir(scope_dir: Option<&std::path::Path>) -> Option<&'static str> {
+    let rel = scope_dir?;
+    for comp in rel.components().rev() {
+        let nome = comp.as_os_str().to_string_lossy().to_lowercase();
+        for parola in nome.split(|c: char| !c.is_ascii_alphanumeric()) {
+            match parola {
+                "frontend" | "client" | "web" | "webapp" | "ui" | "www" => {
+                    return Some("frontend")
+                }
+                "backend" | "server" | "api" | "srv" => return Some("backend"),
+                _ => {}
+            }
+        }
+    }
     None
 }
 
+/// Parte della working directory che sta SOTTO la radice del progetto, `None` se
+/// il servizio gira dalla radice stessa.
+///
+/// Solo quella parte parla del RUOLO del servizio: il nome della cartella di
+/// progetto descrive il progetto intero, e dedurne lo scopo classificherebbe come
+/// "frontend" anche il backend di un progetto chiamato `shop-frontend`.
+///
+/// La radice viene canonicalizzata come fa `resolve_relative_path`, che e' il
+/// produttore di `work_dir`: senza, su Windows il prefisso verbatim (`\\?\D:\...`)
+/// impedirebbe lo strip e la working directory non parlerebbe mai (regola O: la
+/// misura deve raggiungere il suo oggetto per la stessa strada della produzione).
+fn scope_dir(
+    root: &std::path::Path,
+    work_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let root_canonico = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf());
+    work_dir
+        .strip_prefix(&root_canonico)
+        .or_else(|_| work_dir.strip_prefix(root))
+        .ok()
+        .filter(|rel| rel.components().next().is_some())
+        .map(std::path::Path::to_path_buf)
+}
+
 /// Risolve il working directory di un servizio dal parametro `working_dir`,
-/// ricadendo su `root_path` del progetto. In caso di path invalido ritorna
+/// ricadendo sulla radice del progetto. In caso di path invalido ritorna
 /// direttamente il messaggio d'errore da restituire al chiamante.
+///
+/// Prende `root` invece dell'intero contesto perche' e' l'unico campo che usa:
+/// cosi' un test puo' partire dallo STESSO input del tool e attraversare questo
+/// produttore, invece di fabbricarsi la working dir a mano (regola O).
 fn resolve_service_work_dir(
-    ctx: &AgentToolContext,
+    root: &std::path::Path,
     input: &Value,
 ) -> Result<std::path::PathBuf, String> {
     let sub = input
@@ -634,9 +793,9 @@ fn resolve_service_work_dir(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
     let Some(sub) = sub else {
-        return Ok(ctx.root_path.clone());
+        return Ok(root.to_path_buf());
     };
-    match resolve_relative_path(&ctx.root_path, sub) {
+    match resolve_relative_path(root, sub) {
         Ok(p) => Ok(p),
         Err(e) => Err(format!(
             "[Errore percorso: {}]",
@@ -765,6 +924,29 @@ async fn allocate_web_port_env(
     )
     .await
     .map_err(|e| format!("[Errore allocazione porta per servizio '{}': {}]", label, e))?;
+
+    // L'allocazione va LEGATA all'unit del servizio, altrimenti nasce con
+    // `service_unit` NULL e il GC (`cleanup_orphaned_ports`) la rilascia appena il
+    // servizio e' fermo: al riavvio la porta cambia e il pannello non ha piu' un
+    // indirizzo attendibile da mostrare (drift 31792->31798, incidente
+    // Beaty-Book). Il percorso del pannello lo faceva gia'; quello dell'agente no.
+    // Funziona perche' `label` e' ora un'identita' vera: da una generica
+    // ("Service") nascerebbe un unit che nessuna riga di servizio ricostruisce.
+    if let Some(unit) = crate::project_workspace::services::project_service_unit(
+        &ctx.db,
+        ctx.project_id,
+        label,
+    )
+    .await
+    {
+        crate::project_workspace::allocate_port::link_allocation_to_service_unit(
+            &ctx.db,
+            ctx.project_id,
+            label,
+            &unit,
+        )
+        .await;
+    }
 
     let mut env = HashMap::new();
     env.insert("PORT".to_string(), alloc.port.to_string());
@@ -1216,9 +1398,171 @@ fn format_service_row(proc: &crate::agent_processes::ProcessSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_port_from_output, existing_service_action, format_started_message,
-        looks_like_web_service, ExistingServiceAction,
+        derive_kind_hint, detect_port_from_output, existing_service_action, format_started_message,
+        looks_like_web_service, resolve_service_label, resolve_service_work_dir, scope_dir,
+        ExistingServiceAction,
     };
+    use crate::agent_processes::{is_generic_service_label, similar_service_labels};
+    use crate::project_workspace::services::{project_service_slug, service_unit_name};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    /// Radice di progetto REALE (le dir vengono create): `resolve_relative_path`
+    /// canonicalizza e rifiuta i percorsi inesistenti, quindi un test su path
+    /// inventati non attraverserebbe il produttore della working dir.
+    fn progetto(nome: &str, sottocartelle: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join(nome);
+        std::fs::create_dir_all(&root).expect("root");
+        for sub in sottocartelle {
+            std::fs::create_dir_all(root.join(sub)).expect("sub");
+        }
+        (tmp, root)
+    }
+
+    fn id(prefisso: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(&format!("{prefisso}-0000-0000-0000-000000000000")).expect("uuid")
+    }
+
+    /// Identita' come la produce il tool: dallo STESSO input JSON, passando per il
+    /// produttore vero della working dir. Ritorna anche l'unit, che e' la
+    /// conseguenza a valle (`nexus_port_allocations.service_unit`).
+    fn identita(nome_progetto: &str, root: &Path, input: &serde_json::Value, kind: &str) -> (String, String) {
+        let command = input["command"].as_str().unwrap_or_default().to_string();
+        let work_dir = resolve_service_work_dir(root, input).expect("working dir risolta");
+        let label = resolve_service_label(
+            input,
+            &command,
+            kind,
+            root,
+            &work_dir,
+            id("1a2b3c4d"),
+        );
+        let unit = service_unit_name(&project_service_slug(nome_progetto), &label);
+        (label, unit)
+    }
+
+    /// REGRESSIONE (caso reale, progetto gestione-spese): il backend girava con
+    /// `npm start` da `backend/` e finiva etichettato "Service". Da li' in poi non
+    /// poteva piu' avere un indirizzo: l'identita' del servizio e'
+    /// `{slug}-{label}.service` e deve combaciare con
+    /// `nexus_port_allocations.service_unit`, ma una label generica non incontra
+    /// mai la propria allocazione (`similar_service_labels("Service","backend")`
+    /// e' falso per costruzione). Il segnale c'era ed era a portata di mano: la
+    /// cartella da cui il comando gira.
+    #[test]
+    fn npm_start_in_backend_prende_l_identita_che_l_allocazione_usa() {
+        let (_tmp, root) = progetto("gestione-spese", &["backend"]);
+        let input = json!({ "command": "npm start", "working_dir": "backend" });
+
+        let (label, unit) = identita("Gestione Spese", &root, &input, "service");
+
+        assert_eq!(label, "backend", "la working dir dice il ruolo che il comando tace");
+        // La conseguenza: e' l'unit che il pannello ricostruisce dalla label del
+        // processo e a cui `link_allocation_to_service_unit` lega la porta.
+        assert_eq!(unit, "gestione-spese-backend.service");
+        // E il servizio incontra la propria allocazione, che con "Service" non
+        // poteva accadere.
+        assert!(similar_service_labels(&label, "backend"));
+        assert!(!is_generic_service_label(&label));
+    }
+
+    /// Il difetto era il RIPIEGO, non solo la working dir: `unwrap_or("Service")`
+    /// produceva esattamente cio' che il filtro sulla riga sopra rifiuta
+    /// all'agente. Se non c'e' nessun segnale di ruolo, l'identita' si ancora al
+    /// percorso, mai a una parola che il sistema stesso considera vuota.
+    #[test]
+    fn senza_segnali_di_ruolo_l_identita_viene_dal_percorso_mai_generica() {
+        // Comando muto, cartella che non dice un ruolo ma ha un nome proprio.
+        let (_tmp, root) = progetto("gestione-spese", &["services/pagamenti"]);
+        let input = json!({ "command": "npm start", "working_dir": "services/pagamenti" });
+        let (label, _) = identita("Gestione Spese", &root, &input, "service");
+        assert_eq!(label, "pagamenti");
+        assert!(!is_generic_service_label(&label));
+
+        // Servizio che gira dalla radice: resta il nome del progetto.
+        let input = json!({ "command": "npm start" });
+        let (label, unit) = identita("Gestione Spese", &root, &input, "service");
+        assert_eq!(label, "gestione-spese");
+        assert_eq!(unit, "gestione-spese-gestione-spese.service");
+        assert!(!is_generic_service_label(&label));
+    }
+
+    /// Caso limite dichiarato: nemmeno la radice ha una parola propria (cartella
+    /// `app/`). L'identita' si ancora al progetto: brutta da leggere, ma stabile
+    /// fra i riavvii e NON generica, quindi capace di ricevere una porta. Il nome
+    /// generico, quello, si sa gia' che non potra' mai riceverne una.
+    #[test]
+    fn radice_senza_nome_proprio_ancora_l_identita_al_progetto() {
+        let (_tmp, root) = progetto("app", &[]);
+        let input = json!({ "command": "npm start" });
+        let (label, _) = identita("App", &root, &input, "service");
+        assert_eq!(label, "service-1a2b3c4d", "identita' ancorata al progetto");
+        assert!(
+            !is_generic_service_label(&label),
+            "un'identita' che il sistema considera vuota non riceve porte: {label}"
+        );
+    }
+
+    /// La label esplicita dell'agente e' il segnale piu' specifico e vince; ma se
+    /// e' generica non e' un'identita' e non deve sopravvivere al filtro.
+    #[test]
+    fn label_esplicita_vince_se_dice_qualcosa() {
+        let (_tmp, root) = progetto("gestione-spese", &["backend"]);
+
+        let input = json!({ "command": "npm start", "working_dir": "backend", "label": "Checkout API" });
+        let (label, _) = identita("Gestione Spese", &root, &input, "service");
+        assert_eq!(label, "Checkout API");
+
+        // "Service" proposta dall'agente: scartata come quando la sceglieva il
+        // sistema, si ricade sul segnale della working dir.
+        let input = json!({ "command": "npm start", "working_dir": "backend", "label": "Service" });
+        let (label, _) = identita("Gestione Spese", &root, &input, "service");
+        assert_eq!(label, "backend");
+    }
+
+    /// Un task one-shot NON e' un servizio: nessun unit, nessuna allocazione. Dargli
+    /// l'identita' dedotta dallo scopo lo farebbe collidere col servizio omonimo,
+    /// perche' `stop_similar_running_services` gira per ogni kind: un
+    /// `npm install` lanciato in backend/ fermerebbe il backend vero.
+    #[test]
+    fn il_task_one_shot_non_eredita_l_identita_del_servizio() {
+        let (_tmp, root) = progetto("gestione-spese", &["backend"]);
+        let input = json!({ "command": "npm install", "working_dir": "backend" });
+        let (label, _) = identita("Gestione Spese", &root, &input, "task");
+        assert_eq!(label, "Service");
+        assert!(
+            !similar_service_labels(&label, "backend"),
+            "un task non deve deduplicare il servizio backend"
+        );
+    }
+
+    /// Lo scopo dalla working dir e' una convenzione di LAYOUT, non un elenco di
+    /// comandi: vale per `npm start` come per `pnpm serve`. Il nome della cartella
+    /// di progetto invece non e' un segnale di ruolo, altrimenti in un progetto
+    /// `shop-frontend` anche il backend risulterebbe frontend.
+    #[test]
+    fn lo_scopo_viene_dalle_cartelle_sotto_la_radice() {
+        let root = Path::new("/progetti/shop-frontend");
+        let rel = |p: &str| scope_dir(root, &root.join(p));
+
+        assert_eq!(
+            derive_kind_hint("pnpm serve", "", rel("apps/web").as_deref()),
+            Some("frontend")
+        );
+        assert_eq!(
+            derive_kind_hint("yarn start", "", rel("services/api").as_deref()),
+            Some("backend")
+        );
+        // Working dir sulla radice: nessun ruolo, il nome del progetto non conta.
+        assert_eq!(scope_dir(root, root), None);
+        assert_eq!(derive_kind_hint("npm start", "", None), None);
+        // Il comando resta il segnale piu' specifico quando parla.
+        assert_eq!(
+            derive_kind_hint("vite --host", "", rel("services/api").as_deref()),
+            Some("frontend")
+        );
+    }
 
     fn uscita_processo(status: &str, stdout: &str, stderr: &str) -> crate::agent_processes::ProcessOutput {
         crate::agent_processes::ProcessOutput {
