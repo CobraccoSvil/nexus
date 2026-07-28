@@ -297,6 +297,7 @@ condividere codice (fragile base class).
 | Tool mutativo ("questo tool scrive?") | `nexus-agent-graph/src/decisions/hitl.rs` (`is_mutator_tool_name`, `pending_contains_mutator`) su `agent.tools.result_cache_mutators`; gate HITL e barriera advisory delegano |
 | Whitelist runtime dei kind (CSV `orchestrator.subagent_kinds_whitelist`) | `admin-service/src/figures.rs` (`mutate_kinds_whitelist`) |
 | Schema di test del DB-progetto (i `#[sqlx::test]` girano sulla migrazione reale, mai su un `CREATE TABLE` ricopiato) | crate `nexus-migrations-embedded` (`PROJECT_MIGRATOR` = set `db/migrations/project`) + seeder in `mcp-core::test_support` (`seed_chat_session`, `seed_agent_run`, `seed_plan`, `seed_todo`). Guard `schema-di-test` |
+| Fornitore VIETATO a un sub-run («giudice != worker»: un revisore non gira sul fornitore che ha scritto il codice, nemmeno ripiegando) | `mcp-core/src/agent_tools/subagent_native.rs` (`veto_del_giudice`) esprime la regola; `orchestrator/provider_choice.rs` (`ProviderVeto`) la porta, duale NEGATIVO di `ProviderPin` e tipo distinto perche' scambiarli darebbe un run che puo' usare solo il fornitore da evitare. Selezione e ripiego interrogano lo stesso punto: prima il vincolo viveva solo nella selezione e il failover, che conosce i soli provider gia' tentati nel turno, riportava il giudice sul worker. Guard `veto-alle-porte` |
 
 ### Enforcement automatico (la regola e' duratura, non una-tantum)
 
