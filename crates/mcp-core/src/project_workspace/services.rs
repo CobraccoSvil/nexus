@@ -2426,8 +2426,9 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
 // (split 7.4 fase B: sandbox.rs, ora nel crate, ne ha bisogno). Il
 // re-export mantiene validi i path project_workspace::services::* storici.
 pub use nexus_tool_kit::ports::{
-    port_in_project_bucket, project_bucket_range, NEXUS_RESERVED_PORTS,
-    PROJECT_PORT_BUCKET_SIZE, PROJECT_PORT_RANGE_END, PROJECT_PORT_RANGE_START,
+    port_authorized_for_project, port_in_project_bucket, project_bucket_range,
+    NEXUS_RESERVED_PORTS, PROJECT_PORT_BUCKET_SIZE, PROJECT_PORT_RANGE_END,
+    PROJECT_PORT_RANGE_START,
 };
 
 fn stable_hash_u16(input: &str) -> u16 {
@@ -3545,27 +3546,12 @@ fn build_children_map(_known_pids: &[u32]) -> std::collections::HashMap<u32, Vec
     children
 }
 
-/// Verifica se una porta e' allocata ad un progetto specifico in `nexus_port_allocations`.
-pub async fn port_allocated_to_project(
-    db: &sqlx::PgPool,
-    port: u16,
-    project_id: uuid::Uuid,
-) -> bool {
-    // Solo allocazioni MANUAL giustificano una porta fuori dal bucket: le
-    // allocazioni auto/dynamic create da agenti AI per processi che hanno
-    // bindato porte arbitrarie (es. Vite default 5173) NON devono salvare
-    // il processo dal port_enforcer. Altrimenti l'agente puo' aggirare
-    // l'isolamento creando un'allocazione dynamic per qualsiasi porta.
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations \
-         WHERE port = $1 AND project_id = $2 AND allocation_mode = 'manual')",
-    )
-    .bind(port as i32)
-    .bind(project_id)
-    .fetch_one(db)
-    .await
-    .unwrap_or(false)
-}
+// `port_allocated_to_project` viveva qui e rispondeva "questa porta e' allocata
+// a questo progetto?" ammettendo le sole `manual`. Era la risposta GIUSTA, ma
+// data in un posto solo: il sandbox ne dava un'altra (bastava una riga di
+// qualunque modo) e il GC un'altra ancora (bastava il range globale). Il criterio
+// vive ora in `nexus_tool_kit::ports::port_authorized_for_project`, re-esportato
+// qui sopra insieme agli altri (regola L).
 
 #[cfg(test)]
 mod tests {

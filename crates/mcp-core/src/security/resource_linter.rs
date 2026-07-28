@@ -295,30 +295,33 @@ pub fn lint_tree_for_port(
 }
 
 /// Porte che valgono come allocazione LEGITTIMA del progetto: registrate in
-/// `nexus_port_allocations` E dentro il bucket deterministico del progetto.
+/// `nexus_port_allocations` E autorizzate (nel bucket del progetto, oppure
+/// allocate a mano).
 ///
-/// Le due condizioni non sono ridondanti, e il registro da solo non basta: una
-/// riga puo' esistere per una porta del bucket di un ALTRO progetto (accadeva
-/// quando il rilevamento porta-da-output registrava qualunque porta del range
-/// globale). Trattarla come prova di legittimita' chiudeva da sola la violazione
-/// che l'aveva prodotta - il linter taceva proprio sul caso peggiore, e piu' il
-/// sistema sbagliava meno lo segnalava. Il filtro sul bucket toglie al registro
-/// quel potere di autoassoluzione: la riga resta, ma non fa piu' da prova.
+/// Il registro da solo non basta: una riga puo' esistere per una porta del
+/// bucket di un ALTRO progetto (accadeva quando il rilevamento porta-da-output
+/// registrava qualunque porta del range globale). Trattarla come prova di
+/// legittimita' chiudeva da sola la violazione che l'aveva prodotta - il linter
+/// taceva proprio sul caso peggiore, e piu' il sistema sbagliava meno lo
+/// segnalava. Il criterio di autorizzazione toglie al registro quel potere di
+/// autoassoluzione: la riga resta, ma non fa piu' da prova.
+///
+/// Nell'altro verso, una `manual` fuori bucket e' una decisione presa da una
+/// persona: il sorgente che usa quella porta non e' in violazione, e segnalarlo
+/// darebbe una diagnosi che nessuno puo' chiudere.
 pub async fn legitimate_ports_for_project(db: &PgPool, project_id: Uuid) -> HashSet<u32> {
-    sqlx::query_scalar::<_, i32>(
-        "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1",
+    sqlx::query_as::<_, (i32, String)>(
+        "SELECT port::int, allocation_mode FROM nexus_port_allocations WHERE project_id = $1",
     )
     .bind(project_id)
     .fetch_all(db)
     .await
     .unwrap_or_default()
     .into_iter()
-    .filter_map(|p| u16::try_from(p).ok())
-    .filter(|p| {
-        // Criterio dal punto unico (regola L): il bucket non si ricalcola qui.
-        crate::project_workspace::services::port_in_project_bucket(&project_id, *p)
-    })
-    .map(|p| p as u32)
+    .filter_map(|(p, mode)| u16::try_from(p).ok().map(|p| (p, mode)))
+    // Criterio dal punto unico (regola L): qui non si ricalcola nulla.
+    .filter(|(p, mode)| nexus_tool_kit::ports::allocation_authorizes_port(&project_id, *p, mode))
+    .map(|(p, _)| p as u32)
     .collect()
 }
 

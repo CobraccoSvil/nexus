@@ -567,16 +567,19 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     let mut released = 0u64;
     for (project_id, port, service_unit) in rows {
         let p = port as u16;
-        // Le allocazioni NON-manual FUORI dal range Nexus (20000-39999) sono
-        // artefatti: l'auto-detect (scan config / output servizio) ha pescato una
-        // porta infrastrutturale a cui il servizio si CONNETTE (es. 5434 Postgres),
-        // non una porta di progetto. Vanno sempre rilasciate, anche se qualcosa di
-        // ESTRANEO ci ascolta -> saltano le protezioni (tcp_probe + riserva) e
-        // cadono nel DELETE. La chiusura alla fonte e' in register_detected_port.
-        let in_nexus_range = (crate::project_workspace::services::PROJECT_PORT_RANGE_START
-            ..=crate::project_workspace::services::PROJECT_PORT_RANGE_END)
-            .contains(&p);
-        if in_nexus_range {
+        // Le protezioni qui sotto (listener vivo, riserva di un servizio fermo)
+        // dicono "questa allocazione e' viva, non toccarla". Hanno senso solo per
+        // una riga che il progetto ha DIRITTO di avere: applicarle a un artefatto
+        // significa proteggerlo proprio mentre fa danno.
+        //
+        // Il criterio era il range GLOBALE (20000-39999), e prendeva dentro anche
+        // le porte del bucket di un ALTRO progetto: una 5434 (Postgres, dove il
+        // servizio si CONNETTE) cadeva subito, ma una 20001 registrata al progetto
+        // sbagliato restava protetta finche' qualcuno ci ascoltava. Ora il criterio
+        // e' l'AUTORIZZAZIONE (punto unico, regola L): nel proprio bucket, oppure
+        // allocata a mano. Le `manual` non arrivano nemmeno qui, escluse dalla
+        // query. La chiusura alla fonte e' in `register_detected_port`.
+        if nexus_tool_kit::ports::port_authorized_for_project(db, &project_id, p).await {
             // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
             if crate::project_workspace::port_recovery::tcp_probe(p, 200).await {
                 continue;
@@ -999,9 +1002,97 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dev_server_roots_to_kill, dev_server_signature, extract_ports_from_unit_content,
-        windows_unit_backed_by_label,
+        cleanup_orphaned_ports, dev_server_roots_to_kill, dev_server_signature,
+        extract_ports_from_unit_content, windows_unit_backed_by_label,
     };
+
+    /// Il GC proteggeva l'artefatto proprio mentre faceva danno.
+    ///
+    /// Le protezioni (listener vivo, riserva di un servizio fermo) dicono
+    /// "allocazione viva, non toccarla", e si applicavano a tutto cio' che stava
+    /// nel range GLOBALE 20000-39999. Una porta del bucket di un ALTRO progetto ci
+    /// sta dentro: bastava che il processo che l'aveva presa fosse ancora in
+    /// ascolto perche' la riga restasse li' per sempre - e finche' restava, il
+    /// linter e il port_scanner la leggevano come autorizzazione.
+    ///
+    /// Il test tiene un listener VERO su quella porta, perche' e' esattamente la
+    /// condizione in cui prima la riga sopravviveva: senza listener sarebbe stata
+    /// rilasciata anche dal codice vecchio, e il test non misurerebbe nulla
+    /// (regola O).
+    ///
+    /// Mutazione che rende rosso: rimettere il criterio del range globale
+    /// (`PROJECT_PORT_RANGE_START..=PROJECT_PORT_RANGE_END`) al posto
+    /// dell'autorizzazione -> la riga 'auto' torna protetta dal probe e la prima
+    /// asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn il_gc_libera_l_artefatto_in_ascolto_e_rispetta_le_manual(pool: sqlx::PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let (bucket_start, bucket_end) =
+            crate::project_workspace::services::project_bucket_range(&project_id);
+
+        // Una porta del range progetti fuori dal bucket di QUESTO progetto, su cui
+        // si possa davvero ascoltare. Si cerca la prima libera: il range ne ha
+        // ~20000, quindi la ricerca non e' una scommessa.
+        let mut occupata = None;
+        for p in 20000u16..=39999 {
+            if (bucket_start..=bucket_end).contains(&p) {
+                continue;
+            }
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", p)) {
+                occupata = Some((p, l));
+                break;
+            }
+        }
+        let (porta_altrui, _listener) = occupata.expect("una porta libera fuori dal bucket");
+        // La `manual` sta fuori bucket come l'altra: cio' che le distingue e' solo
+        // il modo, cioe' che una persona l'ha decisa.
+        let manuale = if porta_altrui == 20000 { 20001 } else { 20000 };
+        assert!(!(bucket_start..=bucket_end).contains(&manuale));
+
+        // Label distinte: `uq_port_alloc_project_label` (mig 0434) ammette una sola
+        // riga per (progetto, label).
+        for (port, label, mode) in [
+            (porta_altrui as i32, "backend", "auto"),
+            (manuale as i32, "riserva-utente", "manual"),
+        ] {
+            sqlx::query(
+                "INSERT INTO nexus_port_allocations \
+                   (project_id, port, label, allocation_mode, created_at) \
+                 VALUES ($1, $2, $3, $4, NOW() - INTERVAL '1 hour')",
+            )
+            .bind(project_id)
+            .bind(port)
+            .bind(label)
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .expect("seed allocazione");
+        }
+
+        cleanup_orphaned_ports(&pool, 60).await;
+
+        let rimaste: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT port::int, allocation_mode FROM nexus_port_allocations \
+             WHERE project_id = $1 ORDER BY port",
+        )
+        .bind(project_id)
+        .fetch_all(&pool)
+        .await
+        .expect("rilettura allocazioni");
+
+        assert!(
+            !rimaste.iter().any(|(p, _)| *p == porta_altrui as i32),
+            "la riga 'auto' sul bucket altrui e' un artefatto: il listener vivo non \
+             la rende legittima, la rende dannosa. Rimaste: {rimaste:?}"
+        );
+        assert!(
+            rimaste
+                .iter()
+                .any(|(p, m)| *p == manuale as i32 && m == "manual"),
+            "una riserva decisa a mano non si tocca, dentro o fuori dal bucket. \
+             Rimaste: {rimaste:?}"
+        );
+    }
 
     #[test]
     fn windows_unit_backed_by_label_distingue_installato_da_orfano() {
