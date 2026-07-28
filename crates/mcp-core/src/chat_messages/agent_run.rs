@@ -12,7 +12,15 @@ pub(crate) struct SpawnAgentParams {
     pub(crate) supervisor_mode: SupervisorMode,
     pub(crate) profile_prompt_block: String,
     pub(crate) system_context: String,
-    pub(crate) provider_override: Option<String>,
+    /// La scelta di provider della richiesta, INTERA: il nome e quanto vincola.
+    ///
+    /// Era il solo `Option<String>` del nome, e il pin moriva qui — l'handler
+    /// aveva la forza del vincolo e non aveva dove metterla. Il tipo e' lo stesso
+    /// punto unico che nasce nell'handler ([`ProviderChoice`], regola L): il
+    /// nome resta il punto di PARTENZA del routing (legittimo anche per la sola
+    /// preferenza), e il vincolo viaggia con lui invece di essere dedotto piu' a
+    /// valle da "c'e' un provider valorizzato?".
+    pub(crate) provider_choice: ProviderChoice,
     pub(crate) model_override: Option<String>,
     pub(crate) profile_provider: Option<String>,
     pub(crate) profile_model: Option<String>,
@@ -2296,7 +2304,8 @@ pub(crate) async fn spawn_agent_run(
     } else {
         crate::routing_slots::infer_slots_heuristic(&params.content)
     };
-    let slot_routing_hit = if params.provider_override.is_none() && params.model_override.is_none()
+    let slot_routing_hit = if params.provider_choice.provider().is_none()
+        && params.model_override.is_none()
     {
         state
             .orchestrator
@@ -2315,10 +2324,9 @@ pub(crate) async fn spawn_agent_run(
         Some(slot_provider.clone())
     } else {
         params
-            .provider_override
-            .as_ref()
-            .filter(|v| !v.trim().is_empty())
-            .cloned()
+            .provider_choice
+            .provider()
+            .map(str::to_string)
             .or_else(|| {
                 params
                     .profile_provider
@@ -2994,6 +3002,11 @@ pub(crate) async fn spawn_agent_run(
     // LangGraph (Python). Non c'e' piu' un path AgentLoop locale.
     let provider_clone = provider.clone();
     let model_clone = model_str.clone();
+    // Il vincolo della richiesta, verso il run. Nasce dalla scelta dell'utente e
+    // da nient'altro: `ProviderPin::from_choice` e' vuoto per `Auto` e per la
+    // sola preferenza, quindi il routing risolto sopra resta un punto di
+    // partenza a meno che l'utente non abbia premuto "Forza".
+    let provider_pin_clone = crate::orchestrator::ProviderPin::from_choice(&params.provider_choice);
     let initial_msg_clone = initial_msg.clone();
     let system_text_clone = system_text.clone();
     // Clono la routing matrix cache per il loop di fallback dentro lo spawn
@@ -3121,6 +3134,7 @@ pub(crate) async fn spawn_agent_run(
                     session_id: session_id_cp,
                     provider: provider_clone.clone(),
                     model: model_clone.clone(),
+                    provider_pin: provider_pin_clone.clone(),
                     system_text: system_text_clone.clone(),
                     // Chiave del prompt di sistema del run principale: la usa il
                     // ReflectionNode per attribuire la reflection al template.
@@ -4190,6 +4204,9 @@ pub(crate) async fn confirm_native_run(
         session_id,
         provider: provider.clone(),
         model: model.clone(),
+        // Nessun vincolo: qui non c'e' una richiesta utente in corso da cui un
+        // pin possa nascere (il pin non si eredita).
+        provider_pin: crate::orchestrator::ProviderPin::none(),
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
@@ -4581,6 +4598,8 @@ pub(crate) async fn resume_fanin(
         session_id,
         provider,
         model,
+        // Come sopra: nessuna richiesta in corso, nessun vincolo.
+        provider_pin: crate::orchestrator::ProviderPin::none(),
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),

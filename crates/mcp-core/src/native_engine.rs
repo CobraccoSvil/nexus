@@ -180,10 +180,22 @@ pub struct NativeRunInput {
     pub run_id: Uuid,
     /// Id della sessione chat (risolve project/root/permessi per i tool).
     pub session_id: Uuid,
-    /// Provider del turno RISOLTO a monte (routing matrix, regola G).
+    /// Provider del turno RISOLTO a monte (routing matrix, regola G). E' il
+    /// punto di PARTENZA: senza vincolo il run puo' allontanarsene (escalation,
+    /// failover). Con `provider_pin` valorizzato, non puo'.
     pub provider: String,
     /// Modello del turno RISOLTO a monte (regola G).
     pub model: String,
+    /// Il fornitore a cui l'utente ha VINCOLATO questo run ("Forza" nel composer):
+    /// nessuna chiamata del run puo' uscirne, nemmeno quando lui cade.
+    ///
+    /// Distinto da `provider` di proposito: quel campo e' valorizzato SEMPRE
+    /// (e' il routing risolto), quindi non puo' dire nulla sul vincolo — leggerlo
+    /// come tale renderebbe pinnato ogni run. Qui `None` e' il caso normale, ed
+    /// e' anche cio' che passano le superfici senza una richiesta utente in
+    /// corso: resume, rimedi automatici, sub-run (il pin non si eredita, vedi
+    /// [`crate::orchestrator::ProviderChoice::resolve`]).
+    pub provider_pin: crate::orchestrator::ProviderPin,
     /// System prompt completo del run.
     pub system_text: String,
     /// CHIAVE del template di sistema usato (`nexus_prompt_templates.key`), es.
@@ -2185,13 +2197,24 @@ async fn build_native_engine(
     let verifier_runs: Arc<dyn VerifierRunStore> =
         Arc::new(PgVerifierRunStore::new(run_db.clone()));
     let offload: Arc<dyn ContextOffload> = Arc::new(RagContextOffloadAdapter::new(db.clone()));
-    let escalation: Arc<dyn EscalationPort> = Arc::new(PgEscalationPort::new(db.clone()));
+    // Le due porte che possono CAMBIARE fornitore in corsa (scala di modello,
+    // ripiego, upscale di finestra) nascono col vincolo del run addosso: e' il
+    // punto unico (regola L) in cui i candidati sono generati, quindi l'unico in
+    // cui il vincolo va applicato. I nodi che li consumano non sanno del pin e
+    // non devono saperlo: se il filtro vivesse in ognuno di loro, il primo ramo
+    // aggiunto domani lo dimenticherebbe — e in silenzio, perche' un vincolo che
+    // non filtra non da' errori, cambia solo fornitore. Oggi sono undici punti:
+    // sette `escalation_inputs`, due `failover_provider`, `select_upscale_model`
+    // e `select_model_for_tier` dello scale-controller.
+    let escalation: Arc<dyn EscalationPort> =
+        Arc::new(PgEscalationPort::new(db.clone()).con_vincolo(input.provider_pin.clone()));
     let next_actions: Arc<dyn NextActionsDeriver> =
         Arc::new(NextActionsDeriverAdapter::new(db.clone()));
     // Porta billing: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
     // esplorazione riflette lo stato reale dei provider.
     let billing: Arc<dyn BillingCooldownPort> = Arc::new(CooldownBillingPort::new());
-    let upscale: Arc<dyn ModelUpscalePort> = Arc::new(CatalogModelUpscalePort::new(db.clone()));
+    let upscale: Arc<dyn ModelUpscalePort> =
+        Arc::new(CatalogModelUpscalePort::new(db.clone()).con_vincolo(input.provider_pin.clone()));
     // Rolling-summary (intervento 3): riassume i vecchi via LLM economico (modello
     // da `agent.context.rolling_summary_model`, regola G).
     let summary_store: Arc<dyn SummaryStore> = Arc::new(PgSummaryStore::new(db.clone()));
@@ -3247,6 +3270,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             provider: "anthropic".to_string(),
             model: "claude-x".to_string(),
+            provider_pin: crate::orchestrator::ProviderPin::none(),
             system_text: "sei un assistente".to_string(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),

@@ -214,7 +214,12 @@ pub(crate) async fn maybe_trigger_debugger(
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
-        provider_override,
+        // Come sopra (rimedio di sistema): preferenza, mai vincolo.
+        provider_choice: crate::orchestrator::ProviderChoice::resolve(
+            None,
+            crate::orchestrator::ProviderOverrideMode::Preferred,
+            provider_override.as_deref(),
+        ),
         model_override,
         profile_provider: None,
         profile_model: None,

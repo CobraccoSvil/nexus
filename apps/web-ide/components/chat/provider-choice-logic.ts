@@ -83,23 +83,35 @@ export function providerChoiceForSend(input: ProviderChoiceInput): ProviderChoic
 }
 
 /**
- * DOVE ARRIVA IL PIN, OGGI. Il vincolo duro viaggia fino al gateway solo sul
- * turno singolo, cioe' in modalita' `study`. In `confirm` e `automatic`
- * l'handler devia su `spawn_agent_run` e passa il solo NOME del provider:
- * `SpawnAgentParams` non ha un campo che trasporti la FORZA del vincolo, quindi
- * il pin muore al confine dell'handler e da li' in poi il provider e' solo il
- * punto di partenza, con il failover cross-provider dell'esecutore attivo.
+ * FIN DOVE ARRIVA IL PIN. In tutte le modalita' il vincolo e' reale, ma copre
+ * un'estensione diversa, e le frasi qui sotto devono dire quale.
  *
- * Finche' e' cosi', queste funzioni devono dirlo: un tooltip che promette "va
- * solo a X" nella modalita' di default (`confirm`) ripeterebbe in una frase
- * nuova esattamente il difetto che il pin e' nato per chiudere — la UI che
- * dichiara cio' che il backend non fa.
+ * In `study` la richiesta e' una sola: il pin viaggia come `pin_provider` e il
+ * gateway la manda a quel fornitore e basta.
+ *
+ * In `confirm` e `automatic` la richiesta diventa un RUN, cioe' molte chiamate.
+ * Il vincolo viaggia con lui (`SpawnAgentParams.provider_choice` ->
+ * `NativeRunInput.provider_pin`) e lega le porte che potrebbero cambiare
+ * fornitore in corsa: l'escalation resta dentro il fornitore scelto (sale di
+ * modello, non di fornitore), il ripiego cross-provider non viene cercato, e se
+ * il fornitore cade il run si ferma dicendo perche'.
+ *
+ * Con una ECCEZIONE che va detta, perche' l'utente la vede: i sub-agenti di
+ * supporto (figure del consiglio, revisori, worker) NON ereditano il vincolo.
+ * E' una scelta misurata: i loro compiti chiedono quattro fasce di modello
+ * diverse mentre un fornitore ne copre da una a cinque, quindi un vincolo
+ * ereditato lascerebbe muta la maggior parte di loro, e per i revisori sarebbe
+ * anche contrario alla regola che il giudice non sia il lavoratore. Il
+ * fornitore scelto li orienta comunque, ma come preferenza che degrada.
  */
 export type AutomationMode = "study" | "confirm" | "automatic";
 
-/** `true` se in questa modalita' il pin duro arriva davvero al gateway. */
-export function pinArrivaAlGateway(automationMode: AutomationMode): boolean {
-  return automationMode === "study";
+/**
+ * `true` se in questa modalita' la richiesta diventa un run che puo' delegare a
+ * sub-agenti — gli unici che il vincolo non lega.
+ */
+export function runDelegaASubagenti(automationMode: AutomationMode): boolean {
+  return automationMode !== "study";
 }
 
 /** Tooltip del dropdown provider: dice cosa succede DAVVERO in ogni stato. */
@@ -112,11 +124,12 @@ export function providerSelectTitle(
     return "Routing automatico: sceglie il modello migliore per ogni task";
   }
   if (isProviderPinned(selectedProvider, forceProvider)) {
-    if (!pinArrivaAlGateway(automationMode)) {
+    if (runDelegaASubagenti(automationMode)) {
       return (
-        `Provider ${selectedProvider}: il pin vale solo in modalita' Studio. ` +
-        `Qui e' il punto di partenza, e se non risponde il run passa a un altro ` +
-        `fornitore.`
+        `Provider ${selectedProvider} PINNATO: tutte le chiamate del run vanno ` +
+        `solo a lui, nessun ripiego su un altro provider. I sub-agenti di ` +
+        `supporto possono usarne altri. Disattiva "Forza" per lasciare il ` +
+        `fallback, o torna ad Auto per il routing intelligente.`
       );
     }
     return (
@@ -128,8 +141,7 @@ export function providerSelectTitle(
   return (
     `Preferenza ${selectedProvider}: il routing parte da qui ma puo' scegliere ` +
     `un altro provider (fallback attivo). Attiva "Forza" per vincolare la ` +
-    `richiesta a ${selectedProvider}` +
-    (pinArrivaAlGateway(automationMode) ? "." : " nella modalita' Studio.")
+    `richiesta a ${selectedProvider}.`
   );
 }
 
@@ -156,16 +168,14 @@ export function forceButtonView(
   automationMode: AutomationMode,
 ): ForceButtonView {
   if (isProviderPinned(selectedProvider, forceProvider)) {
-    if (!pinArrivaAlGateway(automationMode)) {
-      // Il pulsante resta premuto (lo stato e' dell'utente, non nostro) ma il
-      // segno di spunta no: promettere "va solo a X" qui sarebbe falso, ed e'
-      // la stessa bugia da cui il pin e' nato.
+    if (runDelegaASubagenti(automationMode)) {
       return {
-        label: "Forza",
+        label: "Forza ✓",
         title:
-          `Il pin vale solo in modalita' Studio. In questa modalita' ` +
-          `${selectedProvider} e' il punto di partenza del run, che puo' ` +
-          `passare a un altro fornitore se non risponde.`,
+          `Pin attivo: tutte le chiamate del run vanno solo a ` +
+          `${selectedProvider}, anche quando cade — in quel caso il run si ` +
+          `ferma e lo dice, invece di cambiare fornitore in silenzio. I ` +
+          `sub-agenti di supporto restano liberi di usarne altri.`,
       };
     }
     return {
@@ -179,7 +189,6 @@ export function forceButtonView(
     label: "Forza",
     title:
       `Pin disattivo: ${selectedProvider} e' una preferenza, il routing puo' ` +
-      `scegliere un altro provider se serve (fallback attivo)` +
-      (pinArrivaAlGateway(automationMode) ? "." : "; il pin vale solo in Studio."),
+      `scegliere un altro provider se serve (fallback attivo).`,
   };
 }

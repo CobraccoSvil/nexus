@@ -168,6 +168,58 @@ impl ProviderChoice {
     }
 }
 
+/// Il vincolo duro NEL RUN: "questo run puo' usare solo questo fornitore".
+///
+/// Nasce da [`ProviderChoice::Pinned`] e da nient'altro (`from_choice` e' l'unica
+/// costruzione non vuota), e vive quanto il run: le porte che scelgono un
+/// fornitore lo ricevono alla costruzione, come il client del gateway riceve il
+/// suo `pin_provider`.
+///
+/// PERCHE' UN TIPO E NON UN `Option<String>`. A valle dell'handler girano DUE
+/// nomi di provider con significati opposti — quello di PARTENZA (da cui il
+/// routing muove, e che puo' cambiare) e quello VINCOLANTE (che non puo'
+/// cambiare) — e sono entrambi stringhe. Un `Option<String>` in piu' nelle firme
+/// li renderebbe scambiabili per distrazione, ed e' esattamente lo scambio che
+/// il pin e' nato per impedire. Il tipo porta anche il PUNTO UNICO (regola L)
+/// del confronto: `ammette`, con la stessa normalizzazione con cui il nome e'
+/// entrato — perche' un vincolo che non riconosce "OpenAI" come "openai"
+/// fallisce aperto, cioe' non vincola nulla.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderPin(Option<String>);
+
+impl ProviderPin {
+    /// Nessun vincolo: il routing e' libero. E' lo stato di ogni superficie che
+    /// il pin non lo esprime (resume, worker, sub-run) e della preferenza
+    /// semplice — che infatti NON produce un pin.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Il vincolo della richiesta in corso. Solo `Pinned` vincola: `Preferred`
+    /// e' un punto di partenza, e trasformarlo in vincolo qui rifarebbe, col
+    /// segno invertito, la deduzione da cui nasce questo modulo.
+    pub fn from_choice(choice: &ProviderChoice) -> Self {
+        Self(choice.pinned_provider().map(str::to_string))
+    }
+
+    /// Il provider vincolato, se c'e'. Serve a due cose e a nessun'altra:
+    /// filtrare i candidati e DIRE all'utente perche' non se ne e' scelto un
+    /// altro.
+    pub fn provider(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// `true` se questo run puo' usare `provider`. Senza vincolo ammette tutti
+    /// (un pin assente non deve restringere nulla); col vincolo ammette solo
+    /// lui, confrontato come e' stato normalizzato all'ingresso.
+    pub fn ammette(&self, provider: &str) -> bool {
+        match &self.0 {
+            None => true,
+            Some(pinned) => normalize(Some(provider)).as_deref() == Some(pinned.as_str()),
+        }
+    }
+}
+
 /// Nome provider utilizzabile: trim, scarto del vuoto, lowercase. La
 /// normalizzazione vive qui e non nei chiamanti — era in `Orchestrator::run`, e
 /// ogni altra superficie che leggeva lo stesso campo doveva ricordarsene.

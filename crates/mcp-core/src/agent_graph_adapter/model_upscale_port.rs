@@ -22,12 +22,29 @@ use nexus_agent_graph::runtime::ports::{ModelUpscalePort, PortError, UpscalePick
 pub struct CatalogModelUpscalePort {
     /// Pool Postgres su cui girano i lookup catalog/settings dell'upscale.
     db: PgPool,
+    /// Il fornitore a cui l'utente ha vincolato il run, se l'ha fatto. Vuoto per
+    /// ogni run non vincolato: la porta si comporta come prima.
+    pin: crate::orchestrator::ProviderPin,
 }
 
 impl CatalogModelUpscalePort {
-    /// Costruisce l'adapter sul pool Postgres condiviso.
+    /// Costruisce l'adapter sul pool Postgres condiviso, senza vincolo.
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            pin: crate::orchestrator::ProviderPin::none(),
+        }
+    }
+
+    /// Lega la porta al fornitore scelto dall'utente per questo run.
+    ///
+    /// Anche l'upscale cambia fornitore: sale di tier per guadagnare finestra e
+    /// il modello piu' capiente puo' essere di un altro. E' un cambio meno
+    /// visibile del failover — nessun errore, nessun avviso — e quindi il piu'
+    /// facile da dimenticare quando si applica un vincolo.
+    pub fn con_vincolo(mut self, pin: crate::orchestrator::ProviderPin) -> Self {
+        self.pin = pin;
+        self
     }
 
     /// Tier target dello smart upscale dal setting `agent.upscale.target_tier`
@@ -93,12 +110,21 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
         // `ExactReason` la differenza fra questo `&[tier]` (voluto) e quello di
         // `best_non_agentic_model` (che era un difetto) e' finalmente DICIBILE:
         // prima erano lo stesso identico codice.
-        let req = crate::orchestrator::model_service::ModelRequest::agentic(&tier)
+        let mut req = crate::orchestrator::model_service::ModelRequest::agentic(&tier)
             .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
                 why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
             })
             .rank(crate::orchestrator::model_service::Rank::WidestWindow)
             .min_context_window(required_tokens);
+        // VINCOLO DEL RUN: restringe la ricerca al fornitore scelto, riusando il
+        // pin che il servizio di selezione ha gia' (regola L) invece di
+        // aggiungere qui una seconda nozione di "solo questo provider". Se
+        // dentro il vincolo non c'e' un modello abbastanza capiente, il
+        // fail-open sotto lascia il run sul modello corrente: e' un upscale
+        // mancato, non un run fermo.
+        if let Some(pinned) = self.pin.provider() {
+            req = req.pinned(pinned);
+        }
         let choice = match crate::orchestrator::model_service::select_model(&self.db, &req).await {
             Ok(c) => c,
             // Fail-open invariato: nessun bersaglio -> nessun upscale, non un run
@@ -153,19 +179,23 @@ impl ModelUpscalePort for CatalogModelUpscalePort {
         // di un tier diverso da quello che ha chiesto, in silenzio.
         // `CostFirst`: a tier fissato il piu' economico che soddisfa i vincoli
         // (context_window incluso), is_featured solo come tie-break.
-        let picked = crate::orchestrator::model_service::select_model(
-            &self.db,
-            &crate::orchestrator::model_service::ModelRequest::agentic(tier)
-                .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
-                    why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
-                })
-                .capability(capability)
-                .min_context_window(min_context_window)
-                .exclude(exclude_providers),
-        )
-        .await
-        .ok()
-        .map(|c| (c.provider, c.model));
+        let mut req = crate::orchestrator::model_service::ModelRequest::agentic(tier)
+            .tier_policy(crate::orchestrator::model_service::TierPolicy::Exact {
+                why: crate::orchestrator::model_service::ExactReason::ScaleTarget,
+            })
+            .capability(capability)
+            .min_context_window(min_context_window)
+            .exclude(exclude_providers);
+        // Come sopra: anche il cambio di tier bidirezionale resta dentro il
+        // vincolo. Su fail-open il chiamante annulla il cambio-tier e tiene il
+        // modello corrente, che e' del fornitore giusto.
+        if let Some(pinned) = self.pin.provider() {
+            req = req.pinned(pinned);
+        }
+        let picked = crate::orchestrator::model_service::select_model(&self.db, &req)
+            .await
+            .ok()
+            .map(|c| (c.provider, c.model));
         Ok(picked)
     }
 }
@@ -292,5 +322,80 @@ mod tests {
             .await
             .expect("ok")
             .is_none());
+    }
+
+    // ---- vincolo di provider del run ("Forza" nel composer) ----
+
+    /// Il vincolo come nasce in produzione: dal punto unico
+    /// [`crate::orchestrator::ProviderChoice::resolve`], mai costruito a mano
+    /// (un vincolo coniato fuori di li' e' un vincolo che nessun utente ha
+    /// dato; lo vieta anche il guard `nascita del pin duro`).
+    fn vincolo_utente(provider: &str) -> crate::orchestrator::ProviderPin {
+        crate::orchestrator::ProviderPin::from_choice(
+            &crate::orchestrator::ProviderChoice::resolve(
+                Some(provider),
+                crate::orchestrator::ProviderOverrideMode::Pinned,
+                None,
+            ),
+        )
+    }
+
+    /// Scena dei due test seguenti: nel tier di destinazione il modello con la
+    /// finestra piu' grande e' di un fornitore, e ce n'e' un altro — piu' piccolo
+    /// ma sufficiente — del fornitore vincolato. Senza vincolo vince il primo.
+    async fn scena_due_fornitori_nel_tier(pool: &PgPool) {
+        create_schema(pool).await;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('agent.upscale.target_tier', 'heavy')",
+        )
+        .execute(pool)
+        .await
+        .expect("set tier");
+        sqlx::query(
+            "INSERT INTO ai_price_catalog \
+             (provider, model, supports_tool_use, agentic_thinking_policy, performance_tier, context_window) VALUES \
+             ('openai', 'gpt-enorme', true, 'none', 'heavy', 900000), \
+             ('anthropic', 'claude-ampio', true, 'none', 'heavy', 400000)",
+        )
+        .execute(pool)
+        .await
+        .expect("insert");
+    }
+
+    /// PREMESSA: senza vincolo l'upscale esce dal fornitore e prende la finestra
+    /// piu' grande. Senza questo, il test seguente potrebbe passare perche' il
+    /// candidato dell'altro fornitore non c'era.
+    #[sqlx::test]
+    async fn senza_vincolo_l_upscale_prende_la_finestra_piu_grande(pool: PgPool) {
+        scena_due_fornitori_nel_tier(&pool).await;
+        let port = CatalogModelUpscalePort::new(pool.clone());
+        let pick = port
+            .select_upscale_model("corrente", 300000)
+            .await
+            .expect("ok")
+            .expect("un heavy abbastanza capiente esiste");
+        assert_eq!(pick.provider, "openai");
+        assert_eq!(pick.model, "gpt-enorme");
+    }
+
+    /// L'upscale e' l'altro modo di cambiare fornitore in corsa, e il piu'
+    /// silenzioso: nessun errore, nessun avviso, solo una finestra piu' larga.
+    /// Col run vincolato resta dentro il fornitore scelto, anche se fuori c'e' di
+    /// meglio.
+    #[sqlx::test]
+    async fn vincolo_tiene_l_upscale_dentro_il_fornitore_scelto(pool: PgPool) {
+        scena_due_fornitori_nel_tier(&pool).await;
+        let port =
+            CatalogModelUpscalePort::new(pool.clone()).con_vincolo(vincolo_utente("anthropic"));
+        let pick = port
+            .select_upscale_model("corrente", 300000)
+            .await
+            .expect("ok")
+            .expect("dentro il vincolo c'e' un heavy che regge la finestra richiesta");
+        assert_eq!(
+            pick.provider, "anthropic",
+            "openai ha la finestra piu' grande e vincerebbe: a escluderlo e' solo il vincolo"
+        );
+        assert_eq!(pick.model, "claude-ampio");
     }
 }

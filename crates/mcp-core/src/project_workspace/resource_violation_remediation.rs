@@ -388,7 +388,15 @@ pub(crate) async fn process_open_violations(state: &AppState, project_id: Uuid) 
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
-        provider_override,
+        // Il provider del purpose e' una scelta del SISTEMA, non un ordine
+        // dell'utente: entra come preferenza (il rimedio non deve restare senza
+        // fornitore se quello del purpose e' caduto). Punto unico della scelta,
+        // dove il pin per costruzione non puo' nascere.
+        provider_choice: crate::orchestrator::ProviderChoice::resolve(
+            None,
+            crate::orchestrator::ProviderOverrideMode::Preferred,
+            provider_override.as_deref(),
+        ),
         model_override,
         profile_provider: None,
         profile_model: None,

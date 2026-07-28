@@ -53,12 +53,61 @@ pub struct PgEscalationPort {
     /// Pool Postgres per la lettura della catena di escalation, dei provider
     /// disponibili (`settings`) e per la risoluzione del purpose cross-provider.
     db: PgPool,
+    /// Il fornitore a cui l'utente ha vincolato il run, se l'ha fatto. Vuoto per
+    /// ogni run non vincolato: la porta si comporta come prima.
+    pin: crate::orchestrator::ProviderPin,
 }
 
 impl PgEscalationPort {
-    /// Costruisce l'adapter sul pool Postgres condiviso.
+    /// Costruisce l'adapter sul pool Postgres condiviso, senza vincolo.
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            pin: crate::orchestrator::ProviderPin::none(),
+        }
+    }
+
+    /// Lega la porta al fornitore scelto dall'utente per questo run.
+    ///
+    /// L'adapter e' costruito PER il run (`native_engine`), quindi il vincolo
+    /// puo' vivere qui invece di attraversare i nodi del grafo: chi chiede un
+    /// candidato riceve gia' solo candidati leciti.
+    pub fn con_vincolo(mut self, pin: crate::orchestrator::ProviderPin) -> Self {
+        self.pin = pin;
+        self
+    }
+
+    /// I candidati al RIPIEGO leciti per questo run: il pool del punto unico di
+    /// eleggibilita', meno quelli che il vincolo dell'utente esclude.
+    ///
+    /// Esiste perche' il pool si legge DUE volte (la seconda allentando la
+    /// finestra, quando nessuno regge quella del caduto) e il vincolo va
+    /// applicato a entrambe le letture: scritto due volte, sarebbe bastato
+    /// aggiungere domani una terza lettura senza filtro per rimettere in gioco
+    /// proprio i fornitori che l'utente ha escluso. Senza vincolo e' l'identita'.
+    async fn candidati_ammessi(
+        &self,
+        exclude: &[String],
+        window: i64,
+    ) -> Vec<(String, String, Option<String>)> {
+        let mut pool =
+            crate::orchestrator::model_routing::agentic_failover_candidates(&self.db, exclude, window)
+                .await;
+        let prima = pool.len();
+        pool.retain(|(p, _, _)| self.pin.ammette(p));
+        if pool.len() != prima {
+            tracing::info!(
+                target: "nexus_mcp_core::escalation_port",
+                pin = self.pin.provider().unwrap_or(""),
+                scartati = prima - pool.len(),
+                rimasti = pool.len(),
+                // Il motivo VERO della chiusura che seguira': senza questa riga
+                // il log direbbe "nessun provider sano" e manderebbe la diagnosi
+                // a cercare un guasto dove c'e' solo la scelta dell'utente.
+                "failover_provider: run vincolato dall'utente, candidati fuori dal vincolo scartati"
+            );
+        }
+        pool
     }
 
     /// `true` se il provider e' disponibile runtime (API key configurata in
@@ -386,6 +435,26 @@ impl EscalationPort for PgEscalationPort {
         if let Some(c) = &cross {
             pmt.push((c.provider.clone(), c.model.clone(), c.tier.clone()));
         }
+        // VINCOLO DEL RUN. Un solo filtro sull'insieme unificato: cade il
+        // candidato cross-provider, resta la catena intra (i modelli PIU' FORTI
+        // dello stesso fornitore). E' la parte che tiene in piedi i run lunghi
+        // anche col pin — il vincolo e' sul FORNITORE, non sul modello: se
+        // l'utente ha scelto un fornitore, salire di modello dentro quel
+        // fornitore e' ancora la sua scelta, mentre uscirne non lo e'. Senza
+        // vincolo `ammette` e' sempre vero e l'insieme resta identico.
+        if self.pin.provider().is_some() {
+            let prima = pmt.len();
+            pmt.retain(|(p, _, _)| self.pin.ammette(p));
+            if pmt.len() != prima {
+                tracing::info!(
+                    target: "nexus_mcp_core::escalation_port",
+                    pin = self.pin.provider().unwrap_or(""),
+                    scartati = prima - pmt.len(),
+                    rimasti = pmt.len(),
+                    "escalation_inputs: run vincolato dall'utente, candidati fuori dal vincolo scartati"
+                );
+            }
+        }
 
         let policy = load_governance_policy(&self.db).await;
 
@@ -431,12 +500,7 @@ impl EscalationPort for PgEscalationPort {
         } else {
             0
         };
-        let mut pool = crate::orchestrator::model_routing::agentic_failover_candidates(
-            &self.db,
-            exclude,
-            current_window,
-        )
-        .await;
+        let mut pool = self.candidati_ammessi(exclude, current_window).await;
         // FAIL-OPEN finestra: se il modello caduto era gia' il piu' capiente e nessun
         // candidato regge la sua finestra, il vincolo svuoterebbe il pool -> ritenta
         // senza vincolo. Un failover degradato (finestra piu' piccola) e' meglio di
@@ -449,10 +513,9 @@ impl EscalationPort for PgEscalationPort {
                 "failover_provider: nessun candidato regge la finestra corrente, \
                  ritento senza vincolo finestra (failover degradato > nessun failover)"
             );
-            pool = crate::orchestrator::model_routing::agentic_failover_candidates(
-                &self.db, exclude, 0,
-            )
-            .await;
+            // Si allenta la FINESTRA, mai il vincolo dell'utente: la seconda
+            // lettura passa per lo stesso punto della prima.
+            pool = self.candidati_ammessi(exclude, 0).await;
         }
         if pool.is_empty() {
             return Ok(None);
@@ -474,6 +537,8 @@ impl EscalationPort for PgEscalationPort {
         };
 
         let pick = pick_failover_model(&candidates, cur_tier.as_deref(), &policy);
+        // NB: `pick` non puo' nominare un fornitore fuori dal vincolo — i
+        // candidati sono gia' stati filtrati sopra, prima dell'arricchimento.
         if let Some(ref c) = pick {
             tracing::info!(
                 target: "nexus_mcp_core::escalation_port",
@@ -487,6 +552,12 @@ impl EscalationPort for PgEscalationPort {
             );
         }
         Ok(pick)
+    }
+
+    /// Il vincolo del run, per chi deve SPIEGARLO (vedi il trait). La decisione
+    /// e' gia' stata presa sopra, sui candidati.
+    fn pinned_provider(&self) -> Option<&str> {
+        self.pin.provider()
     }
 }
 
@@ -1225,6 +1296,227 @@ mod tests {
             catena,
             vec!["sano-sopra".to_string()],
             "l'escalation deve salire SOLO su un modello adatto al tool-loop:              'exclude-sopra' (agentic_thinking_policy='exclude') e 'morto-sopra'              (404 dal probe) sono piu' economici e vincerebbero il rank"
+        );
+    }
+
+    // ---- vincolo di provider del run ("Forza" nel composer) ----
+
+    /// Il vincolo come nasce IN PRODUZIONE: dal punto unico
+    /// [`ProviderChoice::resolve`], con l'identificatore canonico che il
+    /// composer manda sul wire. Costruire la variante pinnata a mano
+    /// qui sarebbe fissare l'assunto invece di verificarlo — e il guard
+    /// `nascita del pin duro` di `check-single-source.sh` lo vieta proprio
+    /// perche' un vincolo coniato fuori da `resolve` e' un vincolo che nessun
+    /// utente ha dato.
+    fn vincolo_utente(provider: &str) -> crate::orchestrator::ProviderPin {
+        crate::orchestrator::ProviderPin::from_choice(
+            &crate::orchestrator::ProviderChoice::resolve(
+                Some(provider),
+                crate::orchestrator::ProviderOverrideMode::Pinned,
+                None,
+            ),
+        )
+    }
+
+    /// Come sopra ma col pulsante SPENTO: la selezione dal dropdown resta una
+    /// preferenza e non deve produrre alcun vincolo.
+    fn sola_preferenza(provider: &str) -> crate::orchestrator::ProviderPin {
+        crate::orchestrator::ProviderPin::from_choice(
+            &crate::orchestrator::ProviderChoice::resolve(
+                Some(provider),
+                crate::orchestrator::ProviderOverrideMode::Preferred,
+                None,
+            ),
+        )
+    }
+
+    /// Scena condivisa dai due test sul vincolo in `escalation_inputs`: la coppia
+    /// corrente e' `anthropic/claude-medium`, sopra di lei c'e' un modello dello
+    /// STESSO fornitore (catena intra) e il purpose `loop_fallback_default` porta
+    /// all'UNICO frontier del catalogo, che e' di un ALTRO fornitore (candidato
+    /// cross). Due candidati distinguibili: uno dentro il vincolo, uno fuori.
+    async fn scena_intra_e_cross(pool: &PgPool) {
+        create_schema(pool).await;
+        set_api_key(pool, "anthropic", "sk-live").await;
+        set_api_key(pool, "openai", "sk-live").await;
+        seed_catalog(
+            pool,
+            &[
+                ("anthropic", "claude-medium", "medium", 1.0, true, true),
+                ("anthropic", "claude-heavy", "heavy", 5.0, true, true),
+                ("openai", "gpt-frontier", "frontier", 9.0, true, true),
+            ],
+        )
+        .await;
+        // Il cross-provider si risolve per TIER (regola G): `frontier` esiste solo
+        // su openai, quindi il candidato e' openai e non un secondo anthropic.
+        sqlx::query(
+            "INSERT INTO nexus_purpose_model (purpose, tier, requires_tool_use) \
+             VALUES ('loop_fallback_default', 'frontier', true)",
+        )
+        .execute(pool)
+        .await
+        .expect("purpose loop_fallback_default");
+    }
+
+    /// PREMESSA del test seguente, e non un doppione: senza vincolo il candidato
+    /// cross-provider c'e' davvero. Se un giorno smettesse di esserci (purpose
+    /// non risolto, filtro di eleggibilita' piu' stretto), il test del pin
+    /// resterebbe verde misurando il nulla — passerebbe per assenza del
+    /// candidato, non per il vincolo.
+    #[sqlx::test]
+    async fn senza_vincolo_il_candidato_cross_provider_c_e(pool: PgPool) {
+        scena_intra_e_cross(&pool).await;
+        let port = PgEscalationPort::new(pool.clone());
+        let inputs = port
+            .escalation_inputs(None, Some("anthropic"), Some("claude-medium"))
+            .await
+            .expect("fail-open");
+        let fornitori: Vec<&str> = inputs
+            .candidates
+            .iter()
+            .map(|c| c.provider.as_str())
+            .collect();
+        assert!(
+            fornitori.contains(&"openai"),
+            "senza vincolo l'escalation puo' uscire dal fornitore corrente: {fornitori:?}"
+        );
+        assert!(
+            fornitori.contains(&"anthropic"),
+            "e la catena intra resta comunque: {fornitori:?}"
+        );
+    }
+
+    /// Col run vincolato, l'escalation resta DENTRO il fornitore scelto: cade il
+    /// candidato cross, sopravvive la catena intra (salire di modello dentro il
+    /// fornitore scelto e' ancora la scelta dell'utente). E' la parte che tiene
+    /// in piedi i run lunghi anche col vincolo attivo.
+    #[sqlx::test]
+    async fn vincolo_scarta_il_cross_e_tiene_la_catena_intra(pool: PgPool) {
+        scena_intra_e_cross(&pool).await;
+        let port = PgEscalationPort::new(pool.clone())
+            .con_vincolo(vincolo_utente("anthropic"));
+        let inputs = port
+            .escalation_inputs(None, Some("anthropic"), Some("claude-medium"))
+            .await
+            .expect("fail-open");
+        let fornitori: Vec<&str> = inputs
+            .candidates
+            .iter()
+            .map(|c| c.provider.as_str())
+            .collect();
+        assert!(
+            !fornitori.contains(&"openai"),
+            "il vincolo dell'utente deve togliere il candidato di un altro fornitore: {fornitori:?}"
+        );
+        assert!(
+            !inputs.candidates.is_empty()
+                && inputs.candidates.iter().all(|c| c.provider == "anthropic"),
+            "la catena intra resta: si sale di modello, non di fornitore: {fornitori:?}"
+        );
+    }
+
+    /// Col run vincolato NON esiste un sostituto cross-provider, e la porta lo
+    /// dice con `Ok(None)` anche se il catalogo e' pieno di fornitori sani: il
+    /// ripiego non e' fallito, non e' stato cercato. Il fornitore caduto e'
+    /// quello vincolato (caso normale: e' l'unico che il run puo' usare).
+    #[sqlx::test]
+    async fn vincolo_toglie_il_ripiego_cross_provider(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-flash", "medium", 0.1, true, true),
+                ("deepseek", "deepseek-v4-pro", "high", 1.0, true, true),
+                ("openai", "gpt-sano", "heavy", 2.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone())
+            .con_vincolo(vincolo_utente("google"));
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-3.5-flash"),
+                Some("heavy"),
+                ProviderFailureCause::EmptyCompletion,
+                &["google".to_string()],
+            )
+            .await
+            .expect("fail-open");
+        assert!(
+            pick.is_none(),
+            "col vincolo nessun sostituto e' lecito, per quanti fornitori sani ci siano: {pick:?}"
+        );
+        assert_eq!(
+            port.pinned_provider(),
+            Some("google"),
+            "e la porta lo DICE, cosi' la chat puo' scrivere il motivo vero"
+        );
+    }
+
+    /// Seconda difesa: se a cadere e' un fornitore che NON e' quello vincolato
+    /// (il ramo di uscita anticipata non scatta), il sostituto puo' essere solo
+    /// il vincolato. Senza il filtro sul pool, qui passerebbe openai.
+    #[sqlx::test]
+    async fn vincolo_ammette_solo_il_fornitore_scelto_come_sostituto(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-pro", "high", 1.0, true, true),
+                ("openai", "gpt-sano", "high", 0.5, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone())
+            .con_vincolo(vincolo_utente("deepseek"));
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-3.5-flash"),
+                Some("high"),
+                ProviderFailureCause::EmptyCompletion,
+                &["google".to_string()],
+            )
+            .await
+            .expect("fail-open")
+            .expect("il fornitore vincolato e' sano e non e' fra i gia' provati");
+        assert_eq!(
+            pick.provider, "deepseek",
+            "openai e' piu' economico e vincerebbe la selezione: a escluderlo e' solo il vincolo"
+        );
+    }
+
+    /// Un run NON vincolato passa per lo stesso codice: il filtro deve essere
+    /// l'identita'. E' il controllo che il fix non cambi nulla per chi non ha
+    /// premuto "Forza" — cioe' per la quasi totalita' dei run.
+    #[sqlx::test]
+    async fn senza_vincolo_il_ripiego_resta_quello_di_prima(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[("deepseek", "deepseek-v4-pro", "high", 1.0, true, true)],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone())
+            .con_vincolo(sola_preferenza("anthropic"));
+        let pick = port
+            .failover_provider(
+                Some("google"),
+                Some("gemini-3.5-flash"),
+                Some("high"),
+                ProviderFailureCause::EmptyCompletion,
+                &["google".to_string()],
+            )
+            .await
+            .expect("fail-open")
+            .expect("la preferenza non vincola: il sostituto si trova");
+        assert_eq!(pick.provider, "deepseek");
+        assert_eq!(
+            port.pinned_provider(),
+            None,
+            "una preferenza non e' un vincolo e non deve essere raccontata come tale"
         );
     }
 }

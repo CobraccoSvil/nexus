@@ -1802,10 +1802,66 @@ async fn provider_cooldown_senza_candidato_chiude_error() {
     let out = apply(state, delta);
     // Nessun candidato -> chiusura Error (fallback graceful), sticky invariato.
     assert_eq!(out.stop_reason, Some(StopReason::Error));
-    assert!(out.result.as_deref().unwrap().contains("[Errore provider"));
+    let testo = out.result.as_deref().unwrap();
+    assert!(testo.contains("[Errore provider"));
+    // Rete di riserva esaurita: nessun vincolo da raccontare. La frase sul
+    // vincolo comparirebbe qui solo se il run ne avesse uno — dirla sempre
+    // sarebbe l'errore speculare (spiegare con un divieto una chiusura che il
+    // divieto non ha causato).
+    assert!(
+        !testo.contains("Forza"),
+        "run non vincolato: nessuna menzione del vincolo: {testo}"
+    );
     assert!(out.sticky_provider.is_none());
     assert!(out.pending_tool_uses.unwrap().is_empty());
     assert_eq!(llm.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn run_vincolato_chiude_dicendo_che_il_ripiego_non_e_stato_cercato() {
+    // Il gemello del test qui sopra, con la stessa identica meccanica ma un run
+    // VINCOLATO: il fornitore cade, la porta non offre sostituti (l'adapter
+    // reale, col vincolo, non ne trova per costruzione) e dichiara il vincolo.
+    //
+    // Le due chiusure sono indistinguibili dallo stato — stesso StopReason,
+    // stesso errore del provider — e portano l'utente in direzioni opposte: di
+    // la' un guasto da guardare, qui la sua stessa richiesta. La differenza deve
+    // vivere nel TESTO che legge, altrimenti "Forza" sembra rotto proprio quando
+    // sta funzionando.
+    let rc = Arc::new(StubRunControlStore::default());
+    let esc = Arc::new(StubEscalationPort::con_vincolo("anthropic"));
+    let (n, _m, _s) = node_esc(cfg_resolved(), rc, esc.clone());
+    let llm = Arc::new(StubLlmGateway::with_provider_unavailable(
+        "Nexus Gateway 500: {\"error\":\"tutti i provider hanno fallito -> anthropic \
+(in cooldown, 42s rimanenti)\",\"code\":\"PROVIDER_ERROR\"}",
+    ));
+    let ctx = ctx_with(llm.clone());
+    let state = AgentState {
+        thread_id: Some("r1".into()),
+        messages: vec![human("scrivi il file")],
+        provider_used: Some("anthropic".into()),
+        model_used: Some("claude-x".into()),
+        tools_json: Some(vec![json!({"name": "write_file"})]),
+        ..Default::default()
+    };
+    let delta = n.run(&state, &ctx).await.expect("run NON deve abortire");
+    let out = apply(state, delta);
+    assert_eq!(out.stop_reason, Some(StopReason::Error));
+    let testo = out.result.as_deref().expect("un testo per l'utente");
+    assert!(
+        testo.contains("[Errore provider"),
+        "l'errore del fornitore resta: {testo}"
+    );
+    assert!(
+        testo.contains("vincolato a anthropic"),
+        "la chiusura deve NOMINARE il vincolo e il fornitore: {testo}"
+    );
+    assert!(
+        testo.contains("Forza"),
+        "e il pulsante da cui il vincolo viene, che e' anche il modo di toglierlo: {testo}"
+    );
+    // Il vincolo non promuove nessuno sticky: il run non si e' spostato.
+    assert!(out.sticky_provider.is_none());
 }
 
 #[tokio::test]

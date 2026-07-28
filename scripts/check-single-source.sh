@@ -150,6 +150,19 @@ assert_single "vocabolario forza-vincolo provider" 'enum ProviderOverrideMode' '
 # (`[ProviderChoice::Pinned]`) documentano il concetto e non coniano nulla.
 assert_single "nascita del pin duro" 'ProviderChoice::Pinned\(' 'crates/mcp-core/src/orchestrator/provider_choice.rs' crates
 
+# Applicazione del vincolo di provider (2026-07-27): "questo fornitore e'
+# ammesso per il run?" e' UNA domanda con UNA risposta. Nel percorso agentico i
+# fornitori nascono in piu' punti — catena di escalation, ripiego cross-provider,
+# upscale di finestra, cambio di tier — e la tentazione, ogni volta che se ne
+# aggiunge uno, e' di scrivere li' il confronto col fornitore scelto. Il primo
+# ramo che se ne dimentica riapre il difetto, e in silenzio: il pin resta
+# dichiarato ovunque mentre il run e' gia' altrove. Il predicato vive nel tipo
+# (`ProviderPin::ammette`), gli adapter lo chiamano, nessuno lo riscrive.
+# Pattern con la parentesi: `fn ammette` da solo pesca anche i nomi che
+# COMINCIANO per "ammette" (c'e' gia' un test `ammette_tier_3_e_context_default`
+# in nexus-gateway), e un guard che grida su un omonimo misura un'altra cosa.
+assert_single "predicato del vincolo provider" 'fn ammette\(' 'crates/mcp-core/src/orchestrator/provider_choice.rs' crates
+
 # Aggregazione problemi ripetitivi (2026-07-09): chiave di gruppo semantica e
 # pipeline dedup+raggruppamento del pannello Problemi. Punto unico:
 # project_workspace/problem_aggregation.rs; get_project_problems delega.
@@ -406,6 +419,34 @@ else
   echo "OK turno-dal-produttore: il turno agentico non si fabbrica a mano"
 fi
 
+# ── il vincolo di provider raggiunge le porte del run ────────────────────────
+# Le due porte che possono cambiare fornitore in corsa nascono legate al vincolo
+# dell'utente (`.con_vincolo`) nel punto che le costruisce per il run. Se qualcuno
+# togliesse quella chiamata, il codice COMPILEREBBE e i test delle porte
+# resterebbero verdi (le costruiscono da se'): il vincolo sparirebbe in silenzio,
+# senza errori, cambiando solo il fornitore su cui gira il run. E' il difetto
+# originale, e la giunzione che lo riapre non ha un test suo — `build_native_engine`
+# assembla quattordici impl e richiede DB + ToolRunnerDeps reali. Qui c'e' il
+# presidio che manca li'.
+vincolo_scollegato=""
+for porta in PgEscalationPort CatalogModelUpscalePort; do
+  costruzioni="$(grep -n "${porta}::new(db" crates/mcp-core/src/native_engine.rs 2>/dev/null || true)"
+  if [[ -z "$costruzioni" ]]; then
+    vincolo_scollegato+="  ${porta}: nessuna costruzione trovata in native_engine.rs"$'\n'
+  elif ! grep -q "${porta}::new(db.clone()).con_vincolo(" crates/mcp-core/src/native_engine.rs 2>/dev/null; then
+    vincolo_scollegato+="  ${porta}: costruita senza .con_vincolo(input.provider_pin)"$'\n'
+  fi
+done
+if [[ -n "$vincolo_scollegato" ]]; then
+  echo "!! vincolo-alle-porte: il pin dell'utente non raggiunge chi sceglie il fornitore:" >&2
+  printf '%s' "$vincolo_scollegato" >&2
+  echo "   Senza il vincolo la porta e' libera di ripiegare su un altro fornitore" >&2
+  echo "   mentre la UI continua a dichiarare il pin (ADR 0023, aggiornamento 3)." >&2
+  fail=1
+else
+  echo "OK vincolo-alle-porte: le porte del run nascono col vincolo dell'utente"
+fi
+
 # ── sizing dei pool verso il DB per-progetto ─────────────────────────────────
 # Lo stesso DB <slug>_nexus veniva aperto con due tetti decisi in due punti che
 # si ignoravano: 5 sul percorso caldo di mcp-core, 3 in nexus-project-pools. Una
@@ -629,17 +670,39 @@ fi
 #
 # Le quattro storiche sono immutabili e restano dove sono: il check le esclude
 # per numero e blocca solo le NUOVE.
-stub_hits=""
-for f in db/migrations/*.sql db/migrations/project/*.sql; do
-  [[ -f "$f" ]] || continue
-  case "$(basename "$f")" in 010[4-7]_*) continue ;; esac
-  # corpo = tutto tranne righe vuote e commenti `--`
-  body="$(sed 's/--.*//' "$f" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-  [[ "$body" == "select1;" ]] && stub_hits+="$f"$'\n'
-done
+#
+# La lettura e' un solo processo `awk`, non un loop di fork per file. La versione
+# precedente ne apriva quattro per migrazione (basename, sed, tr, tr): su ~640
+# file e su Windows, dove un fork costa 100-200ms, il check da solo impiegava
+# 4m48s a ogni commit che tocca un .rs — la stessa forma gia' vista in
+# port_enforcer (9.9s -> 21ms sostituendo i fork con una syscall). La regola del
+# corpo utile e' invariata (via da ogni riga il commento `--`, poi ogni spazio,
+# confronto in minuscolo con `select1;`): cambia solo chi la applica.
+#
+# I nomi arrivano ad awk sullo standard input e NON sulla riga di comando: 640
+# path sforano il limite di lunghezza della command line di Windows (32767
+# caratteri), e un `awk ... db/migrations/*.sql` fallirebbe al crescere del set.
+# Un path che non esiste (glob senza match) fa fallire subito `getline`, lascia
+# il corpo vuoto e non produce hit, come faceva prima il test `-f`.
+stub_hits="$(
+  printf '%s\n' db/migrations/*.sql db/migrations/project/*.sql \
+  | awk '
+      /\/010[4-7]_/ { next }   # le quattro storiche: immutabili, escluse per numero
+      {
+        corpo = ""
+        while ((getline riga < $0) > 0) {
+          sub(/--.*/, "", riga)
+          gsub(/[[:space:]]/, "", riga)
+          corpo = corpo riga
+        }
+        close($0)
+        if (tolower(corpo) == "select1;") print
+      }
+    '
+)"
 if [[ -n "$stub_hits" ]]; then
   echo "!! migrazione-stub: migrazione con corpo 'SELECT 1;' (nessuno schema dentro):" >&2
-  printf '%s' "$stub_hits" | sed 's/^/     /' >&2
+  printf '%s\n' "$stub_hits" | sed 's/^/     /' >&2
   echo "   Una migrazione deve contenere il DDL che dichiara, anche se l'oggetto" >&2
   echo "   esiste gia' sul TUO DB: usa IF NOT EXISTS / ADD COLUMN IF NOT EXISTS," >&2
   echo "   cosi' un DB ricostruito da zero lo riceve e uno popolato non cambia." >&2

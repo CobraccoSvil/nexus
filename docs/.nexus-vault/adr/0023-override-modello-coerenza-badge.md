@@ -300,6 +300,63 @@ Frontend (`apps/web-ide/components/chat/provider-choice-logic.test.ts`): il wire
 nei quattro stati del composer e i tooltip verificati INSIEME alla richiesta che
 parte in quello stato.
 
+## Aggiornamento 2026-07-27 (3) — il vincolo vale anche nel percorso agentico
+
+> **Limite chiuso**: i due aggiornamenti precedenti lasciavano il pin efficace
+> solo sul turno singolo (`study`). In `confirm` — il DEFAULT della UI — e in
+> `automatic` la richiesta devia su `spawn_agent_run`, e `SpawnAgentParams`
+> portava il solo NOME del provider: il vincolo moriva al confine dell'handler.
+
+### Perche' era invisibile
+
+Nel percorso agentico OGNI chiamata al gateway e' gia' pinnata al provider
+risolto (`agent_graph_adapter/llm_gateway.rs`), quindi il pin dell'utente
+sembrava rispettato. A cambiare fornitore non e' il gateway: e' l'ESECUTORE, fra
+una chiamata e l'altra — escalation, ripiego su provider caduto, upscale di
+finestra, cambio di tier. Un vincolo che non copre quei punti e' un vincolo che
+vale fino al primo intoppo.
+
+### Cosa vale ora
+
+- `SpawnAgentParams` porta `ProviderChoice` INTERA (non il nome): la regressione
+  "passo il nome e perdo la forza" non e' piu' scrivibile, la impedisce il tipo;
+- il vincolo prosegue in `NativeRunInput::provider_pin` (`ProviderPin`, il tipo
+  che porta anche il PUNTO UNICO del confronto, `ammette`) e da li' nelle DUE
+  porte che possono cambiare fornitore in corsa, costruite PER il run:
+  `PgEscalationPort` e `CatalogModelUpscalePort`. Gli undici rami che chiedono un
+  candidato non sanno del pin: ricevono gia' solo candidati leciti;
+- **l'escalation intra-provider resta viva**: il vincolo e' sul FORNITORE, non
+  sul modello. Il run vincolato puo' ancora salire di modello dentro il fornitore
+  scelto — e' cio' che tiene in piedi i run lunghi;
+- **il ripiego cross-provider non viene cercato**, e la chiusura lo DICE
+  nominando il vincolo e il pulsante da cui viene. Le due chiusure — rete di
+  riserva esaurita contro vincolo esplicito — hanno lo stesso `StopReason` e
+  portano l'utente in direzioni opposte: la differenza vive nel testo.
+
+### Il prezzo, dichiarato
+
+Un run vincolato su un fornitore che cade si FERMA invece di continuare altrove.
+E' l'opposto di quanto deciso in ADR 0033 (dove il pin era imposto a tutti dal
+gateway e un cooldown transitorio di 21s diventava un hard fail), e non lo
+contraddice: li' nessuno aveva chiesto il vincolo, qui l'utente lo ha chiesto in
+quella richiesta. Restano attive entrambe le protezioni di allora — il gateway
+ritenta lo stesso modello con backoff e attende i cooldown transitori brevi
+(≤45s, `RetryPolicy`) — quindi all'esecutore arrivano solo i fallimenti su cui
+insistere non serve. Senza "Forza" non cambia nulla: il default resta la
+preferenza col fallback.
+
+### Il pin NON scende ai sub-agenti (misurato)
+
+Figure del consiglio, revisori e worker non ereditano il vincolo. La misura, dal
+catalogo vivo (`ai_price_catalog` + `nexus_purpose_model` +
+`nexus_subagent_definitions`): i 19 kind chiedono 4 fasce distinte (medium 12,
+light 3, heavy 3, high 1), mentre un fornitore ne copre da 1 a 5 — deepseek una
+sola. Un vincolo ereditato lascerebbe senza modello 16 kind su 19 col fornitore
+peggiore, e un solo cooldown fermerebbe l'intero panel. Per il kind `review`
+sarebbe anche contrario al vincolo piu' forte che gia' vige (giudice != worker).
+Resta la preferenza-forte tier-aware di `resolve_worker_model`, che DEGRADA. La
+scelta e' dichiarata nei tooltip, non nascosta nel codice.
+
 ## Riferimenti
 
 - `apps/web-ide/components/chat-panel.tsx:538-570` (Bug 1)

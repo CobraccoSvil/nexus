@@ -38,17 +38,17 @@ struct PackageJsonRaw {
     workspaces: Option<serde_json::Value>,
 }
 
-/// Risolve il build graph TypeScript.
-pub async fn resolve_typescript(
-    project_id: Uuid,
-    project_root: &Path,
-) -> anyhow::Result<BuildGraphInfo> {
-    let mut sources: Vec<String> = Vec::new();
-    let mut merged_include: HashSet<String> = HashSet::new();
-    let mut merged_exclude: HashSet<String> = HashSet::new();
-    let mut merged_files: HashSet<String> = HashSet::new();
+/// Glob accumulati lungo la traversata dei tsconfig (include/exclude/files).
+#[derive(Debug, Default)]
+struct TsGlobs {
+    include: HashSet<String>,
+    exclude: HashSet<String>,
+    files: HashSet<String>,
+}
 
-    // Lista di candidati tsconfig: principale + varianti note.
+/// Elenca i tsconfig di partenza: principale + varianti note, con
+/// `jsconfig.json` come fallback per progetti JS puri.
+fn collect_tsconfig_candidates(project_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for name in [
         "tsconfig.json",
@@ -74,15 +74,53 @@ pub async fn resolve_typescript(
             project_root.display()
         );
     }
+    Ok(candidates)
+}
 
-    // Per references seguite ricorsivamente (project references TS) usiamo
-    // un set visited globale: previene cicli e duplicazione lavoro.
+/// Accumula include/exclude/files di un singolo tsconfig gia' risolto.
+fn merge_config_globs(merged: &MergedTsConfig, globs: &mut TsGlobs) {
+    for s in &merged.include {
+        globs.include.insert(s.clone());
+    }
+    for s in &merged.exclude {
+        globs.exclude.insert(s.clone());
+    }
+    for s in &merged.files {
+        globs.files.insert(s.clone());
+    }
+}
+
+/// Accoda i target delle project references, risolti relativamente al tsconfig
+/// corrente: il path puo' essere una directory (allora cerca `tsconfig.json`)
+/// oppure un file diretto.
+fn push_reference_targets(base: &Path, references: &[TsReference], queue: &mut Vec<PathBuf>) {
+    for r in references {
+        let candidate = base.join(&r.path);
+        let resolved = if candidate.is_dir() {
+            candidate.join("tsconfig.json")
+        } else {
+            candidate
+        };
+        if resolved.is_file() {
+            queue.push(resolved);
+        }
+    }
+}
+
+/// BFS sui tsconfig: parte dai candidati e segue le project references.
+/// Il set `visited` globale previene cicli e duplicazione di lavoro; un
+/// tsconfig non parsabile viene saltato con un warning.
+async fn traverse_tsconfigs(
+    candidates: Vec<PathBuf>,
+    project_root: &Path,
+    globs: &mut TsGlobs,
+    sources: &mut Vec<String>,
+) {
     let mut visited: HashSet<PathBuf> = HashSet::new();
-    // BFS: parti dai candidati, processa references successive.
-    let mut queue: Vec<PathBuf> = candidates.clone();
+    let mut queue: Vec<PathBuf> = candidates;
     while let Some(cfg_path) = queue.pop() {
         let canonical = cfg_path.canonicalize().unwrap_or_else(|_| cfg_path.clone());
-        if !visited.insert(canonical.clone()) {
+        if !visited.insert(canonical) {
             continue;
         }
         // Parsa la catena extends di QUESTO file.
@@ -99,64 +137,61 @@ pub async fn resolve_typescript(
             }
         };
         sources.push(cfg_path.to_string_lossy().into_owned());
-        for s in &merged.include {
-            merged_include.insert(s.clone());
-        }
-        for s in &merged.exclude {
-            merged_exclude.insert(s.clone());
-        }
-        for s in &merged.files {
-            merged_files.insert(s.clone());
-        }
-        // Project references: risolvi path relativo al tsconfig corrente.
+        merge_config_globs(&merged, globs);
         let base = cfg_path.parent().unwrap_or(project_root);
-        for r in &merged.references {
-            // Path TS reference puo' essere directory (allora cerca tsconfig.json)
-            // o file diretto.
-            let candidate = base.join(&r.path);
-            let resolved = if candidate.is_dir() {
-                candidate.join("tsconfig.json")
-            } else {
-                candidate
-            };
-            if resolved.is_file() {
-                queue.push(resolved);
-            }
-        }
+        push_reference_targets(base, &merged.references, &mut queue);
     }
+}
 
-    // Default TS per `include`: se vuoto, equivale a "**/*".
-    if merged_include.is_empty() && merged_files.is_empty() {
-        merged_include.insert("**/*".to_string());
+/// Default TS: `include` vuoto equivale a "**/*"; `exclude` vuoto prende i
+/// default standard, e node_modules resta escluso anche se non listato.
+fn apply_default_globs(globs: &mut TsGlobs) {
+    if globs.include.is_empty() && globs.files.is_empty() {
+        globs.include.insert("**/*".to_string());
     }
-    // Default `exclude`: TS standard.
-    if merged_exclude.is_empty() {
-        merged_exclude.insert("node_modules/**".to_string());
-        merged_exclude.insert("dist/**".to_string());
-        merged_exclude.insert("build/**".to_string());
-        merged_exclude.insert(".next/**".to_string());
+    if globs.exclude.is_empty() {
+        globs.exclude.insert("node_modules/**".to_string());
+        globs.exclude.insert("dist/**".to_string());
+        globs.exclude.insert("build/**".to_string());
+        globs.exclude.insert(".next/**".to_string());
     } else {
-        // node_modules e dist sono sempre esclusi anche se non listati.
-        merged_exclude.insert("node_modules/**".to_string());
+        globs.exclude.insert("node_modules/**".to_string());
     }
+}
 
-    // Monorepo via package.json workspaces.
-    let mut monorepo_members: Vec<String> = Vec::new();
+/// Membri monorepo dichiarati in `package.json` (`workspaces`).
+async fn collect_package_json_members(
+    project_root: &Path,
+    globs: &mut TsGlobs,
+    sources: &mut Vec<String>,
+) -> Vec<String> {
+    let mut members: Vec<String> = Vec::new();
     let pkg_path = project_root.join("package.json");
     if pkg_path.is_file() {
         sources.push(pkg_path.to_string_lossy().into_owned());
         if let Ok(raw) = tokio::fs::read_to_string(&pkg_path).await {
             if let Ok(pkg) = serde_json::from_str::<PackageJsonRaw>(&raw) {
                 if let Some(ws) = pkg.workspaces {
-                    let patterns = extract_workspace_patterns(&ws);
-                    for pat in patterns {
-                        monorepo_members.push(pat.clone());
-                        merged_include.insert(format!("{}/**", pat.trim_end_matches('/')));
+                    for pat in extract_workspace_patterns(&ws) {
+                        members.push(pat.clone());
+                        globs
+                            .include
+                            .insert(format!("{}/**", pat.trim_end_matches('/')));
                     }
                 }
             }
         }
     }
+    members
+}
+
+/// Membri monorepo dichiarati in `pnpm-workspace.yaml`.
+async fn collect_pnpm_members(
+    project_root: &Path,
+    globs: &mut TsGlobs,
+    sources: &mut Vec<String>,
+) -> Vec<String> {
+    let mut members: Vec<String> = Vec::new();
     let pnpm_path = project_root.join("pnpm-workspace.yaml");
     if pnpm_path.is_file() {
         sources.push(pnpm_path.to_string_lossy().into_owned());
@@ -164,13 +199,19 @@ pub async fn resolve_typescript(
             // Parse minimalista: cerchiamo righe "- pattern" o "packages:" YAML.
             // Non importiamo una dep YAML pesante: il formato e' semplicissimo.
             for pat in parse_pnpm_workspace_packages(&raw) {
-                monorepo_members.push(pat.clone());
-                merged_include.insert(format!("{}/**", pat.trim_end_matches('/')));
+                members.push(pat.clone());
+                globs
+                    .include
+                    .insert(format!("{}/**", pat.trim_end_matches('/')));
             }
         }
     }
+    members
+}
 
-    // Entry point convenzionali.
+/// Entry point: convenzioni note presenti su disco + i `files` espliciti
+/// dichiarati nei tsconfig.
+fn collect_entry_points(project_root: &Path, files: &HashSet<String>) -> Vec<String> {
     let mut entry_points: Vec<String> = Vec::new();
     for ep in [
         "src/main.ts",
@@ -186,13 +227,32 @@ pub async fn resolve_typescript(
             entry_points.push(ep.to_string());
         }
     }
-    // Entry point espliciti da `files`.
-    for f in &merged_files {
+    for f in files {
         entry_points.push(f.clone());
     }
+    entry_points
+}
 
-    let include_globs: Vec<String> = sort_set(&merged_include);
-    let exclude_globs: Vec<String> = sort_set(&merged_exclude);
+/// Risolve il build graph TypeScript.
+pub async fn resolve_typescript(
+    project_id: Uuid,
+    project_root: &Path,
+) -> anyhow::Result<BuildGraphInfo> {
+    let mut sources: Vec<String> = Vec::new();
+    let mut globs = TsGlobs::default();
+
+    let candidates = collect_tsconfig_candidates(project_root)?;
+    traverse_tsconfigs(candidates, project_root, &mut globs, &mut sources).await;
+    apply_default_globs(&mut globs);
+
+    // Monorepo: prima package.json workspaces, poi pnpm-workspace.yaml.
+    let mut monorepo_members =
+        collect_package_json_members(project_root, &mut globs, &mut sources).await;
+    monorepo_members.extend(collect_pnpm_members(project_root, &mut globs, &mut sources).await);
+
+    let entry_points = collect_entry_points(project_root, &globs.files);
+    let include_globs: Vec<String> = sort_set(&globs.include);
+    let exclude_globs: Vec<String> = sort_set(&globs.exclude);
 
     Ok(BuildGraphInfo {
         project_id,

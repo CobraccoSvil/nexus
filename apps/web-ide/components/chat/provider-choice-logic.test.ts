@@ -146,41 +146,83 @@ test("il tooltip del dropdown distingue i tre stati", () => {
   );
 });
 
-// ── dove il pin NON arriva: la frase deve dirlo ─────────────────────────────
+// ── fin dove arriva il pin, in ciascuna modalita' ───────────────────────────
 //
-// Il vincolo duro viaggia fino al gateway solo sul turno singolo (`study`). In
-// `confirm` — che e' il DEFAULT della UI — e in `automatic` l'handler devia su
-// spawn_agent_run e passa il solo nome del provider: il pin muore li' e
-// l'esecutore conserva il failover cross-provider. Promettere "va solo a X" in
-// quelle modalita' sarebbe la stessa bugia da cui il pin e' nato, riscritta in
-// una frase nuova.
+// Il vincolo e' reale in tutte le modalita', ma copre estensioni diverse: in
+// `study` una richiesta sola, in `confirm` (il DEFAULT) e `automatic` l'intero
+// run — tutte le sue chiamate, l'escalation che resta dentro il fornitore, il
+// ripiego che non viene cercato. Prima queste due frasi dicevano "il pin vale
+// solo in modalita' Studio", ed era vero: `SpawnAgentParams` non aveva un campo
+// per la forza del vincolo e il pin moriva al confine dell'handler. Ora ce l'ha
+// (`provider_choice` -> `NativeRunInput.provider_pin` -> le porte del run), e
+// una frase che continuasse a mandare l'utente in Studio sarebbe falsa al
+// contrario: gli negherebbe un vincolo che ha.
 
 for (const modo of ["confirm", "automatic"] as const) {
-  test(`pulsante attivo in ${modo}: la frase dice che il pin vale solo in Studio`, () => {
+  test(`pulsante attivo in ${modo}: il vincolo copre tutte le chiamate del run`, () => {
     const vista = forceButtonView("deepseek", true, modo);
-    assert.match(vista.title, /solo in modalita' Studio/i);
-    assert.match(vista.title, /punto di partenza/i);
+    assert.match(vista.title, /tutte le chiamate del run vanno solo a deepseek/i);
     assert.ok(
-      !/va solo a deepseek/i.test(vista.title),
-      `in ${modo} il run puo' cambiare fornitore: promettere il contrario e' falso`,
+      !/solo in modalita' Studio/i.test(vista.title),
+      `in ${modo} il vincolo c'e': rimandare a Studio negherebbe cio' che il run fa`,
     );
     assert.equal(
       vista.label,
-      "Forza",
-      "senza spunta: il segno di conferma direbbe che il vincolo e' attivo",
+      "Forza ✓",
+      "la spunta segue il vincolo: ora c'e' anche qui",
     );
 
     const titolo = providerSelectTitle("deepseek", true, modo);
-    assert.match(titolo, /solo in modalita' Studio/i);
-    assert.ok(!/PINNATO/.test(titolo));
+    assert.match(titolo, /PINNATO/);
+    assert.match(titolo, /nessun ripiego/i);
+  });
+
+  test(`pulsante attivo in ${modo}: la frase dichiara il limite sui sub-agenti`, () => {
+    // Il limite e' una scelta, non una dimenticanza (i compiti dei sub-agenti
+    // chiedono fasce di modello che un solo fornitore spesso non copre). Una
+    // scelta che l'utente vede — i figli girano su altri fornitori — va
+    // dichiarata qui, o sembrera' che il vincolo perda pezzi.
+    const vista = forceButtonView("deepseek", true, modo);
+    assert.match(vista.title, /sub-agenti/i);
+    assert.match(providerSelectTitle("deepseek", true, modo), /sub-agenti/i);
   });
 }
 
-test("in Studio il pulsante attivo mostra la spunta, altrove no", () => {
-  assert.equal(forceButtonView("deepseek", true, "study").label, "Forza ✓");
-  assert.equal(forceButtonView("deepseek", true, "confirm").label, "Forza");
-  // Spento: nessuna spunta in nessuna modalita'.
-  assert.equal(forceButtonView("deepseek", false, "study").label, "Forza");
+test("in Studio la frase resta sulla singola richiesta", () => {
+  // Nel turno singolo non ci sono ne' run ne' sub-agenti: promettere qualcosa
+  // su di loro sarebbe rumore, e nominare "tutte le chiamate" sarebbe falso.
+  const vista = forceButtonView("deepseek", true, "study");
+  assert.match(vista.title, /la richiesta va solo a deepseek/i);
+  assert.ok(!/sub-agenti/i.test(vista.title));
+  assert.ok(!/tutte le chiamate/i.test(vista.title));
+});
+
+test("il pulsante attivo mostra la spunta in ogni modalita', spento mai", () => {
+  for (const modo of ["study", "confirm", "automatic"] as const) {
+    assert.equal(forceButtonView("deepseek", true, modo).label, "Forza ✓");
+    assert.equal(forceButtonView("deepseek", false, modo).label, "Forza");
+  }
+});
+
+test("nessuna frase manda piu' l'utente in Studio per avere il vincolo", () => {
+  // Guardia contro il ritorno della vecchia promessa in una qualsiasi delle
+  // quattro frasi: era vera prima del fix, sarebbe una bugia adesso.
+  for (const modo of ["study", "confirm", "automatic"] as const) {
+    for (const forza of [true, false]) {
+      assert.ok(
+        !/vale solo in Studio|solo in modalita' Studio/i.test(
+          forceButtonView("deepseek", forza, modo).title,
+        ),
+        `forceButtonView(${forza}, ${modo}) rimanda a Studio`,
+      );
+      assert.ok(
+        !/vale solo in Studio|solo in modalita' Studio/i.test(
+          providerSelectTitle("deepseek", forza, modo),
+        ),
+        `providerSelectTitle(${forza}, ${modo}) rimanda a Studio`,
+      );
+    }
+  }
 });
 
 // ── il predicato che governa colore e badge ─────────────────────────────────

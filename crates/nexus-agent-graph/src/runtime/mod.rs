@@ -689,6 +689,9 @@ pub mod test_doubles {
         /// Se `true`, `escalation_inputs` ritorna un `PortError` (per i test del
         /// mapping fail-open dei chiamanti).
         pub fail: bool,
+        /// Fornitore a cui il run e' VINCOLATO ("Forza"), come lo dichiara
+        /// l'adapter reale. `None` (default) = run libero, comportamento storico.
+        pub pinned: Option<String>,
         /// Chiamate registrate: (intent, provider, model).
         pub seen: Mutex<Vec<(Option<String>, Option<String>, Option<String>)>>,
     }
@@ -735,6 +738,16 @@ pub mod test_doubles {
             Self {
                 failover: Some((provider.to_string(), model.to_string())),
                 failover_tier: Some(tier.to_string()),
+                ..Default::default()
+            }
+        }
+
+        /// Porta di un run VINCOLATO dall'utente: nessun sostituto (l'adapter
+        /// reale, col vincolo, non ne trova per costruzione) e il vincolo
+        /// dichiarato, cosi' il chiamante puo' spiegarne il motivo.
+        pub fn con_vincolo(provider: &str) -> Self {
+            Self {
+                pinned: Some(provider.to_string()),
                 ..Default::default()
             }
         }
@@ -804,6 +817,10 @@ pub mod test_doubles {
                 model: m.clone(),
                 tier: self.failover_tier.clone(),
             }))
+        }
+
+        fn pinned_provider(&self) -> Option<&str> {
+            self.pinned.as_deref()
         }
     }
 

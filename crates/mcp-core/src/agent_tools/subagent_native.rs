@@ -3599,6 +3599,16 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         session_id,
         provider,
         model,
+        // DECISIONE (misurata): il vincolo duro NON scende ai figli. I 19 kind
+        // chiedono 4 tier diversi (medium 12, light 3, heavy 3, high 1) mentre un
+        // provider ne copre da 1 a 5: con deepseek pinnato — 1 tier su 5 nel
+        // catalogo — un pin ereditato lascerebbe senza modello 16 kind su 19, e
+        // un solo fornitore in cooldown fermerebbe l'intero panel. Il provider
+        // scelto per la chat li orienta comunque, ma come preferenza-forte che
+        // degrada (`resolve_worker_model`): il figlio riparte altrove invece di
+        // non partire. Per il kind `review` il vincolo sarebbe anche contrario a
+        // quello piu' forte che gia' vige — il giudice non puo' essere il worker.
+        provider_pin: crate::orchestrator::ProviderPin::none(),
         system_text,
         // Il sub-run porta la chiave della PROPRIA definizione, cosi' le sue
         // reflection sono attribuite al prompt giusto e non a quello del run
@@ -3932,16 +3942,25 @@ async fn resolve_worker_model(
     }
     let purpose = purpose.as_str();
 
-    // Ramo REVIEW: pin IGNORATO, vincolo giudice != worker invariato. Provider del
-    // padre da escludere (astensione da auto-certificazione).
+    // Ramo REVIEW: preferenza IGNORATA, vincolo giudice != worker invariato.
+    // Provider del padre da escludere (astensione da auto-certificazione).
     if kind == "review" {
         let exclude: Vec<String> = parent_provider(db, anchor).await.into_iter().collect();
         return resolve_model_excluding(db, purpose, kind, &exclude).await;
     }
 
-    // Ramo WORKER: se l'utente ha pinnato un provider sulla chat, prova a risolvere
-    // il purpose RISTRETTO a quel provider (preferenza-forte tier-aware).
-    if let Some(pinned) = session_pinned_provider(proj_pool, session_id).await {
+    // Ramo WORKER: il fornitore che la SESSIONE ricorda restringe la risoluzione
+    // del purpose (preferenza-forte tier-aware), e degrada se dentro non c'e' un
+    // modello adatto.
+    //
+    // E' una PREFERENZA, non il vincolo duro del composer: quello vale per la
+    // richiesta in cui l'utente lo da' e si ferma al run principale
+    // (`NativeRunInput::provider_pin`, valorizzato `none` per i sub-run). La
+    // distinzione conta perche' qui il degrado e' la regola — un figlio che non
+    // trova modello nel fornitore preferito riparte altrove — mentre un vincolo
+    // duro, per definizione, non degrada: ereditarlo qui fermerebbe i figli
+    // invece di spostarli.
+    if let Some(pinned) = session_preferred_provider(proj_pool, session_id).await {
         match crate::internal_routing::resolve_purpose_model_db_pinned(db, purpose, Some(&pinned))
             .await
         {
@@ -4147,7 +4166,7 @@ async fn resolve_council_assignments(
     let Some(session_id) = session_id else {
         return nessuna;
     };
-    if session_pinned_provider(proj_pool, session_id).await.is_some() {
+    if session_preferred_provider(proj_pool, session_id).await.is_some() {
         return nessuna;
     }
     let mut exclude: Vec<String> = Vec::new();
@@ -4176,15 +4195,20 @@ async fn resolve_council_assignments(
     out
 }
 
-async fn session_pinned_provider(proj_pool: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
-    let pinned: Option<String> =
+/// Il fornitore che la SESSIONE ricorda (`chat_sessions.preferred_provider`,
+/// scritto dal solo cambio del dropdown). Si chiamava `session_pinned_provider`:
+/// il nome prometteva un vincolo dove c'e' un ricordo, ed e' la stessa confusione
+/// fra "scelto" e "imposto" che ha tenuto il pulsante "Forza" senza effetto per
+/// mesi. Un pin non si legge mai da qui — non si eredita da una sessione.
+async fn session_preferred_provider(proj_pool: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
+    let preferito: Option<String> =
         sqlx::query_scalar("SELECT preferred_provider FROM chat_sessions WHERE id = $1")
             .bind(session_id)
             .fetch_optional(proj_pool)
             .await
             .ok()
             .flatten();
-    pinned.filter(|p| !p.trim().is_empty())
+    preferito.filter(|p| !p.trim().is_empty())
 }
 
 /// Campi comuni della riga `nexus_subagent_runs` (i rami isolato/sequenziale

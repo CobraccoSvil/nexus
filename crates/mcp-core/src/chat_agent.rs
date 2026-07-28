@@ -91,6 +91,228 @@ pub struct ConfirmAgentRunRequest {
     pub approved: bool,
 }
 
+/// Replay degli `agent_steps` gia' persistiti di un run, come eventi SSE
+/// `agent_step`. Passo 1/3 del replay (vedi `collect_replay_events`).
+async fn replay_step_events(proj_pool: &sqlx::PgPool, rid: Uuid) -> Vec<Event> {
+    let mut events: Vec<Event> = Vec::new();
+    if let Ok(rows) = sqlx::query(
+        "SELECT step_index, tool_name, tool_input, tool_result, status, created_at
+         FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
+    )
+    .bind(rid)
+    .fetch_all(proj_pool)
+    .await
+    {
+        for r in rows {
+            let step_index: i32 = r.try_get("step_index").unwrap_or(0);
+            let tool_name: String = r.try_get("tool_name").unwrap_or_default();
+            let tool_input: Value = r.try_get("tool_input").unwrap_or(json!({}));
+            let tool_result: Option<String> = r.try_get("tool_result").unwrap_or(None);
+            let status: String = r.try_get("status").unwrap_or_default();
+            let data = json!({
+                "runId": rid.to_string(),
+                "isFinal": false,
+                "step": {
+                    "stepIndex": step_index,
+                    "toolName": tool_name,
+                    "toolInput": tool_input,
+                    "toolResult": tool_result,
+                    "status": status,
+                },
+            })
+            .to_string();
+            events.push(Event::default().event("agent_step").data(data));
+        }
+    }
+    events
+}
+
+/// Replay dei `nexus_agent_meta_steps` gia' persistiti come eventi SSE
+/// `agent_meta_step`: chiude la stessa race degli step per gli eventi semantici
+/// emessi prima che il client apra lo stream (es. Consiglio delle Competenze).
+/// Fonte strutturata, nessun parsing testo. Passo 2/3 del replay.
+async fn replay_meta_step_events(proj_pool: &sqlx::PgPool, rid: Uuid) -> Vec<Event> {
+    let mut events: Vec<Event> = Vec::new();
+    if let Ok(rows) = sqlx::query(
+        "SELECT kind, title, payload, correlation_id, created_at
+         FROM nexus_agent_meta_steps WHERE run_id = $1 ORDER BY created_at ASC, id ASC",
+    )
+    .bind(rid)
+    .fetch_all(proj_pool)
+    .await
+    {
+        for r in rows {
+            let kind: String = r.try_get("kind").unwrap_or_default();
+            if kind.is_empty() {
+                continue;
+            }
+            let title: String = r.try_get("title").unwrap_or_default();
+            let payload: Value = r.try_get("payload").unwrap_or(json!({}));
+            let correlation_id: Option<String> = r.try_get("correlation_id").unwrap_or(None);
+            let created_at: chrono::DateTime<chrono::Utc> = r
+                .try_get("created_at")
+                .unwrap_or_else(|_| chrono::Utc::now());
+            let data = json!({
+                "runId": rid.to_string(),
+                "metaStep": {
+                    "kind": kind,
+                    "title": title,
+                    "payload": payload,
+                    "correlationId": correlation_id,
+                    "createdAt": created_at.to_rfc3339(),
+                },
+            })
+            .to_string();
+            events.push(Event::default().event("agent_meta_step").data(data));
+        }
+    }
+    events
+}
+
+/// Se il run e' gia' terminato, emette l'evento SSE `agent_final` con lo stato e
+/// la `final_answer` persistiti. Passo 3/3 del replay.
+async fn replay_final_event(proj_pool: &sqlx::PgPool, rid: Uuid) -> Option<Event> {
+    let run_row = sqlx::query("SELECT status, final_answer FROM agent_runs WHERE id = $1")
+        .bind(rid)
+        .fetch_optional(proj_pool)
+        .await
+        .ok()??;
+    let status: String = run_row.try_get("status").unwrap_or_default();
+    // Punto unico (regola L): include gli esiti canonici nuovi
+    // (failed_diagnosed, completed_verified) che il vecchio confronto inline
+    // dimenticava -> un run chiuso con la "determinazione certa" ora viene
+    // riconosciuto come terminato nel replay/recovery.
+    // awaiting_confirmation resta NON terminale (run sospeso con resume HITL):
+    // non si emette agent_final. blocked_needs_input e' TERMINALE (ADR 0034: run
+    // concluso con dichiarazione "serve input") -> il replay emette agent_final
+    // e la UI mostra l'esito onesto.
+    if !crate::agent_types::AgentRunStatus::from_db_str(&status).is_terminal() {
+        return None;
+    }
+    let final_answer: Option<String> = run_row.try_get("final_answer").unwrap_or(None);
+    let data = json!({
+        "runId": rid.to_string(),
+        "isFinal": true,
+        "status": status,
+        "finalAnswer": final_answer,
+    })
+    .to_string();
+    Some(Event::default().event("agent_final").data(data))
+}
+
+/// Blob di replay dal DB per un run: step + meta-step + eventuale `agent_final`.
+///
+/// Chiude la race fra la response POST /messages e l'apertura dello SSE: se
+/// l'agente risponde velocemente (Mistral/Haiku ~500ms) gli eventi live sono
+/// emessi PRIMA che il client si connetta e vanno persi (0 receiver), lasciando
+/// il client con uno stream vuoto. Il replay viene emesso per primo, poi lo
+/// stream prosegue col live broadcast.
+async fn collect_replay_events(meta_db: &sqlx::PgPool, session_id: Uuid, rid: Uuid) -> Vec<Event> {
+    // Separazione DB: agent_steps/agent_runs sono tabelle migrate, instradate
+    // sul pool del progetto risolto via session_id. Il replay e' best-effort:
+    // se il DB del progetto non e' disponibile si salta il replay (WARN) e lo
+    // stream prosegue col solo live broadcast, senza fallback al meta (mig 0527).
+    let proj_pool =
+        match crate::project_db_routes::project_data_pool_by_session_from(meta_db, session_id).await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "agent_stream: DB progetto non disponibile, salto il replay degli step"
+                );
+                return Vec::new();
+            }
+        };
+    let mut events = replay_step_events(&proj_pool, rid).await;
+    events.extend(replay_meta_step_events(&proj_pool, rid).await);
+    events.extend(replay_final_event(&proj_pool, rid).await);
+    events
+}
+
+/// Tipo di evento SSE per un evento live del broadcast agentico.
+///
+/// Lo snapshot dei token cumulativi (meta-step `kind="usage_snapshot"`) e'
+/// mappato a `agent_usage` PRIMA del ramo meta-step generico, cosi' non appare
+/// come card meta-step in chat ma alimenta la barra context live nel frontend.
+fn live_event_type(event: &crate::agent_types::AgentStepEvent) -> &'static str {
+    let is_usage_snapshot = event
+        .meta_step
+        .as_ref()
+        .map(|m| m.kind == "usage_snapshot")
+        .unwrap_or(false);
+    if event.token_delta.is_some() {
+        "agent_token"
+    } else if event.thinking_delta.is_some() {
+        "agent_thinking"
+    } else if is_usage_snapshot {
+        "agent_usage"
+    } else if event.meta_step.is_some() {
+        "agent_meta_step"
+    } else if event.is_final {
+        "agent_final"
+    } else if event.trace.is_some() {
+        "agent_trace"
+    } else {
+        "agent_step"
+    }
+}
+
+/// Payload SSE di un evento live, coerente col tipo deciso da `live_event_type`.
+fn live_event_data(event: &crate::agent_types::AgentStepEvent, event_type: &str) -> String {
+    if event_type == "agent_token" {
+        serde_json::json!({ "delta": event.token_delta }).to_string()
+    } else if event_type == "agent_thinking" {
+        serde_json::json!({ "text": event.thinking_delta }).to_string()
+    } else if event_type == "agent_usage" {
+        // Solo il payload con i token (camelCase gia' pronto).
+        event
+            .meta_step
+            .as_ref()
+            .map(|m| m.payload.to_string())
+            .unwrap_or_else(|| "{}".to_string())
+    } else {
+        serde_json::to_string(event).unwrap_or_default()
+    }
+}
+
+/// Stream SSE degli eventi live: si aggancia al canale broadcast del run
+/// indicato, o al primo canale attivo se `run_id` non e' specificato. Nessun
+/// canale disponibile -> stream vuoto.
+fn live_event_stream(
+    state: &AppState,
+    run_id: Option<Uuid>,
+) -> futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> {
+    // Trova il sender nel DashMap per il run specificato (eventi live)
+    let sender = if let Some(rid) = run_id {
+        state.agent_channels.get(&rid).map(|e| e.value().clone())
+    } else {
+        state
+            .agent_channels
+            .iter()
+            .next()
+            .map(|e| e.value().clone())
+    };
+    match sender {
+        None => Box::pin(stream::empty()),
+        Some(tx) => {
+            let rx = tx.subscribe();
+            let s = BroadcastStream::new(rx).filter_map(|msg| async move {
+                match msg {
+                    Ok(event) => {
+                        let event_type = live_event_type(&event);
+                        let data = live_event_data(&event, event_type);
+                        Some(Ok(Event::default().event(event_type).data(data)))
+                    }
+                    Err(_) => None,
+                }
+            });
+            Box::pin(s)
+        }
+    }
+}
+
 /// SSE: stream degli AgentStepEvent per una sessione (o un run specifico).
 /// Parametro opzionale nella query: ?run_id=<uuid>
 pub async fn agent_stream(
@@ -108,200 +330,14 @@ pub async fn agent_stream(
 
     let run_id: Option<Uuid> = params.get("run_id").and_then(|s| Uuid::parse_str(s).ok());
 
-    // ── REPLAY dal DB ─────────────────────────────────────────────────────
-    // Race condition fix: il client riceve la response POST /messages e POI
-    // apre lo SSE. Se l'agente risponde velocemente (Mistral/Haiku ~500ms),
-    // gli eventi nel broadcast vengono emessi PRIMA che il client si connetta
-    // e sono persi (0 receiver). Il client vede stream vuoto.
-    //
-    // Fix: replay degli step gia' persistiti + final_answer come primo blob
-    // di eventi, POI continua col live broadcast.
-    let mut replay_events: Vec<Event> = Vec::new();
-    // Separazione DB: agent_steps/agent_runs sono tabelle migrate, instradate
-    // sul pool del progetto risolto via session_id. Il replay e' best-effort:
-    // se il DB del progetto non e' disponibile si salta il replay (WARN) e lo
-    // stream prosegue col solo live broadcast, senza fallback al meta (mig 0527).
-    let replay_pool = if run_id.is_some() {
-        match crate::project_db_routes::project_data_pool_by_session_from(&state.db, session_id)
-            .await
-        {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "agent_stream: DB progetto non disponibile, salto il replay degli step"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    if let (Some(rid), Some(proj_pool)) = (run_id, replay_pool) {
-        // Replay step dal DB
-        if let Ok(rows) = sqlx::query(
-            "SELECT step_index, tool_name, tool_input, tool_result, status, created_at
-             FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
-        )
-        .bind(rid)
-        .fetch_all(&proj_pool)
-        .await
-        {
-            for r in rows {
-                let step_index: i32 = r.try_get("step_index").unwrap_or(0);
-                let tool_name: String = r.try_get("tool_name").unwrap_or_default();
-                let tool_input: Value = r.try_get("tool_input").unwrap_or(json!({}));
-                let tool_result: Option<String> = r.try_get("tool_result").unwrap_or(None);
-                let status: String = r.try_get("status").unwrap_or_default();
-                let data = json!({
-                    "runId": rid.to_string(),
-                    "isFinal": false,
-                    "step": {
-                        "stepIndex": step_index,
-                        "toolName": tool_name,
-                        "toolInput": tool_input,
-                        "toolResult": tool_result,
-                        "status": status,
-                    },
-                })
-                .to_string();
-                replay_events.push(Event::default().event("agent_step").data(data));
-            }
-        }
-        // Replay meta-step dal DB: chiude la stessa race degli step per gli
-        // eventi semantici emessi prima che il client apra lo stream (es.
-        // Consiglio delle Competenze). Fonte strutturata, nessun parsing testo.
-        if let Ok(rows) = sqlx::query(
-            "SELECT kind, title, payload, correlation_id, created_at
-             FROM nexus_agent_meta_steps WHERE run_id = $1 ORDER BY created_at ASC, id ASC",
-        )
-        .bind(rid)
-        .fetch_all(&proj_pool)
-        .await
-        {
-            for r in rows {
-                let kind: String = r.try_get("kind").unwrap_or_default();
-                if kind.is_empty() {
-                    continue;
-                }
-                let title: String = r.try_get("title").unwrap_or_default();
-                let payload: Value = r.try_get("payload").unwrap_or(json!({}));
-                let correlation_id: Option<String> = r.try_get("correlation_id").unwrap_or(None);
-                let created_at: chrono::DateTime<chrono::Utc> = r
-                    .try_get("created_at")
-                    .unwrap_or_else(|_| chrono::Utc::now());
-                let data = json!({
-                    "runId": rid.to_string(),
-                    "metaStep": {
-                        "kind": kind,
-                        "title": title,
-                        "payload": payload,
-                        "correlationId": correlation_id,
-                        "createdAt": created_at.to_rfc3339(),
-                    },
-                })
-                .to_string();
-                replay_events.push(Event::default().event("agent_meta_step").data(data));
-            }
-        }
-        // Se il run e' gia' terminato, emette agent_final con final_answer
-        if let Ok(Some(run_row)) =
-            sqlx::query("SELECT status, final_answer FROM agent_runs WHERE id = $1")
-                .bind(rid)
-                .fetch_optional(&proj_pool)
-                .await
-        {
-            let status: String = run_row.try_get("status").unwrap_or_default();
-            // Punto unico (regola L): include gli esiti canonici nuovi
-            // (failed_diagnosed, completed_verified) che il match inline
-            // precedente dimenticava -> un run chiuso con la "determinazione
-            // certa" ora viene riconosciuto come terminato nel replay/recovery.
-            // awaiting_confirmation resta NON terminale (run sospeso con resume
-            // HITL): non si emette agent_final. blocked_needs_input e' TERMINALE
-            // (ADR 0034: run concluso con dichiarazione "serve input") -> il
-            // replay emette agent_final e la UI mostra l'esito onesto.
-            let is_terminal =
-                crate::agent_types::AgentRunStatus::from_db_str(&status).is_terminal();
-            if is_terminal {
-                let final_answer: Option<String> = run_row.try_get("final_answer").unwrap_or(None);
-                let data = json!({
-                    "runId": rid.to_string(),
-                    "isFinal": true,
-                    "status": status,
-                    "finalAnswer": final_answer,
-                })
-                .to_string();
-                replay_events.push(Event::default().event("agent_final").data(data));
-            }
-        }
-    }
-
-    // Trova il sender nel DashMap per il run specificato (eventi live)
-    let sender = if let Some(rid) = run_id {
-        state.agent_channels.get(&rid).map(|e| e.value().clone())
-    } else {
-        state
-            .agent_channels
-            .iter()
-            .next()
-            .map(|e| e.value().clone())
+    // REPLAY dal DB: chiude la race fra POST /messages e apertura dello SSE
+    // (razionale in `collect_replay_events`).
+    let replay_events: Vec<Event> = match run_id {
+        Some(rid) => collect_replay_events(&state.db, session_id, rid).await,
+        None => Vec::new(),
     };
 
-    let live_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
-        match sender {
-            None => Box::pin(stream::empty()),
-            Some(tx) => {
-                let rx = tx.subscribe();
-                let s = BroadcastStream::new(rx).filter_map(|msg| async move {
-                    match msg {
-                        Ok(event) => {
-                            // Snapshot token cumulativi (kind="usage_snapshot"):
-                            // mappato a `agent_usage` PRIMA del ramo meta_step
-                            // generico, cosi' non appare come card meta-step in
-                            // chat ma alimenta la barra context live nel frontend.
-                            let is_usage_snapshot = event
-                                .meta_step
-                                .as_ref()
-                                .map(|m| m.kind == "usage_snapshot")
-                                .unwrap_or(false);
-                            let event_type = if event.token_delta.is_some() {
-                                "agent_token"
-                            } else if event.thinking_delta.is_some() {
-                                "agent_thinking"
-                            } else if is_usage_snapshot {
-                                "agent_usage"
-                            } else if event.meta_step.is_some() {
-                                "agent_meta_step"
-                            } else if event.is_final {
-                                "agent_final"
-                            } else if event.trace.is_some() {
-                                "agent_trace"
-                            } else {
-                                "agent_step"
-                            };
-                            let data = if event_type == "agent_token" {
-                                serde_json::json!({ "delta": event.token_delta }).to_string()
-                            } else if event_type == "agent_thinking" {
-                                serde_json::json!({ "text": event.thinking_delta }).to_string()
-                            } else if event_type == "agent_usage" {
-                                // Solo il payload con i token (camelCase gia' pronto).
-                                event
-                                    .meta_step
-                                    .as_ref()
-                                    .map(|m| m.payload.to_string())
-                                    .unwrap_or_else(|| "{}".to_string())
-                            } else {
-                                serde_json::to_string(&event).unwrap_or_default()
-                            };
-                            Some(Ok(Event::default().event(event_type).data(data)))
-                        }
-                        Err(_) => None,
-                    }
-                });
-                Box::pin(s)
-            }
-        };
+    let live_stream = live_event_stream(&state, run_id);
 
     // Combina replay + live. Replay viene emesso immediatamente (stream::iter),
     // poi il live broadcast prende il sopravvento.

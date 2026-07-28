@@ -581,6 +581,111 @@ pub fn looks_like_base64(s: &str, min_len: usize) -> bool {
     (valid as f64) / (sample_len.max(1) as f64) >= 0.9
 }
 
+/// Accumula in `parts` il testo di `m.content`: la stringa intera, oppure il
+/// campo `text` dei soli blocchi `type == "text"` quando e' una lista (ramo
+/// only-text del Python).
+fn push_content_text_parts(content: &Value, parts: &mut Vec<String>) {
+    match content {
+        Value::String(s) => parts.push(s.clone()),
+        Value::Array(blocks) => {
+            for b in blocks {
+                if let Some(o) = b.as_object() {
+                    if o.get("type").and_then(Value::as_str) == Some("text") {
+                        // str(b.get("text",""))
+                        parts.push(
+                            o.get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Accumula in `parts` la chiave `content` dei blocchi `anthropic_content`, ma
+/// SOLO quando e' una stringa (i blocchi a contenuto strutturato sono ignorati,
+/// come nel Python).
+fn push_anthropic_string_contents(m: &HistoryMessage, parts: &mut Vec<String>) {
+    let Some(blocks) = m.anthropic_blocks() else {
+        return;
+    };
+    for b in blocks {
+        if let Some(o) = b.as_object() {
+            if let Some(Value::String(bc)) = o.get("content") {
+                parts.push(bc.clone());
+            }
+        }
+    }
+}
+
+/// Testo cumulativo di un messaggio, usato per cercare le CITAZIONI del prefisso
+/// di un payload base64 nei messaggi successivi. `join(" ")` come nel Python.
+fn citation_scan_text(m: &HistoryMessage) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    push_content_text_parts(&m.content, &mut parts);
+    push_anthropic_string_contents(m, &mut parts);
+    parts.join(" ")
+}
+
+/// Ritorna il body di `block` se e' un `tool_result` il cui `content` e' una
+/// stringa che sembra base64. `None` in ogni altro caso: blocco da preservare
+/// invariato (include il caso `block` non-oggetto, dove il Python calcolava
+/// `is_tr = false`).
+fn base64_tool_result_body(block: &Value) -> Option<String> {
+    let obj = block.as_object()?;
+    if obj.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return None;
+    }
+    // content deve essere stringa base64.
+    let Some(Value::String(content)) = obj.get("content") else {
+        return None;
+    };
+    if !looks_like_base64(content, 200) {
+        return None;
+    }
+    Some(content.clone())
+}
+
+/// `true` se `prefix` compare nel testo di almeno un messaggio della finestra
+/// che segue `msg_index`, troncata alla fine della history
+/// (`window_hi = min(len, mi+1+max_age)` nel Python). `text_per_msg` ha sempre
+/// la stessa lunghezza della history da cui e' derivato.
+fn prefix_cited_within_window(
+    text_per_msg: &[String],
+    msg_index: usize,
+    max_age: i64,
+    prefix: &str,
+) -> bool {
+    let window_hi = text_per_msg.len().min(msg_index + 1 + max_age as usize);
+    text_per_msg
+        .iter()
+        .take(window_hi)
+        .skip(msg_index + 1)
+        .any(|item| item.contains(prefix))
+}
+
+/// Copia di `block` col solo `content` sostituito dal placeholder
+/// (`{**block, "content": placeholder}`: le altre chiavi sono preservate).
+/// `orig_len` e' la lunghezza in codepoint del body rimosso.
+fn base64_placeholder_block(block: &Value, orig_len: usize) -> Value {
+    let mut nb = block.clone();
+    if let Some(o) = nb.as_object_mut() {
+        o.insert(
+            "content".to_string(),
+            Value::String(format!(
+                "[contenuto base64 originale di {orig_len} byte rimosso \
+dalla history per ottimizzazione context. Se serve rileggilo con il tool \
+originale.]"
+            )),
+        );
+    }
+    nb
+}
+
 /// `_drop_unused_base64_payloads`: sostituisce i body base64 di tool_result
 /// vecchi NON citati nei `max_age` messaggi successivi con un placeholder. Gli
 /// ultimi `keep_recent` (default 2) restano intatti. 1:1 con helpers.py:3208.
@@ -599,41 +704,7 @@ pub fn drop_unused_base64_payloads(
 
     // Testo cumulativo per messaggio (only-text): content str + blocchi text di
     // content-lista + anthropic_content[*].content se stringa. join(" ").
-    let text_per_msg: Vec<String> = messages
-        .iter()
-        .map(|m| {
-            let mut parts: Vec<String> = Vec::new();
-            match &m.content {
-                Value::String(s) => parts.push(s.clone()),
-                Value::Array(blocks) => {
-                    for b in blocks {
-                        if let Some(o) = b.as_object() {
-                            if o.get("type").and_then(Value::as_str) == Some("text") {
-                                // str(b.get("text",""))
-                                parts.push(
-                                    o.get("text")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if let Some(blocks) = m.anthropic_blocks() {
-                for b in blocks {
-                    if let Some(o) = b.as_object() {
-                        if let Some(Value::String(bc)) = o.get("content") {
-                            parts.push(bc.clone());
-                        }
-                    }
-                }
-            }
-            parts.join(" ")
-        })
-        .collect();
+    let text_per_msg: Vec<String> = messages.iter().map(citation_scan_text).collect();
 
     let mut out: Vec<HistoryMessage> = Vec::with_capacity(messages.len());
     for (mi, m) in messages.iter().enumerate() {
@@ -648,57 +719,18 @@ pub fn drop_unused_base64_payloads(
         let mut changed = false;
         let mut new_blocks: Vec<Value> = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let is_tr = block
-                .as_object()
-                .and_then(|o| o.get("type"))
-                .and_then(Value::as_str)
-                == Some("tool_result");
-            if !is_tr {
+            let Some(content) = base64_tool_result_body(block) else {
                 new_blocks.push(block.clone());
                 continue;
-            }
-            // content deve essere stringa base64.
-            let content = match block.as_object().and_then(|o| o.get("content")) {
-                Some(Value::String(s)) => s.clone(),
-                _ => {
-                    new_blocks.push(block.clone());
-                    continue;
-                }
             };
-            if !looks_like_base64(&content, 200) {
-                new_blocks.push(block.clone());
-                continue;
-            }
             // prefix = content[:16] (codepoint).
             let prefix: String = content.chars().take(16).collect();
-            // window_hi = min(len, mi+1+max_age).
-            let window_hi = messages.len().min(mi + 1 + max_age as usize);
-            let mut cited = false;
-            for item in text_per_msg.iter().take(window_hi).skip(mi + 1) {
-                if item.contains(&prefix) {
-                    cited = true;
-                    break;
-                }
-            }
-            if cited {
+            if prefix_cited_within_window(&text_per_msg, mi, max_age, &prefix) {
                 new_blocks.push(block.clone());
                 continue;
             }
             // orig_len = len(content) (codepoint).
-            let orig_len = content.chars().count();
-            // {**block, "content": placeholder} — preserva le altre chiavi.
-            let mut nb = block.clone();
-            if let Some(o) = nb.as_object_mut() {
-                o.insert(
-                    "content".to_string(),
-                    Value::String(format!(
-                        "[contenuto base64 originale di {orig_len} byte rimosso \
-dalla history per ottimizzazione context. Se serve rileggilo con il tool \
-originale.]"
-                    )),
-                );
-            }
-            new_blocks.push(nb);
+            new_blocks.push(base64_placeholder_block(block, content.chars().count()));
             changed = true;
         }
         if changed {

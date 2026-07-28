@@ -1,19 +1,13 @@
 use super::*;
 
-pub async fn list_chat_messages(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(session_id): AxumPath<String>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let session_id = Uuid::parse_str(&session_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
-    let context = load_session_context(&state, session_id, user_id).await?;
-    // Separazione DB: messaggi + agent_runs vivono nel DB del progetto (il
-    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool
-    // e' il punto unico; DB non disponibile -> 503 strutturato (regola M).
-    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await?;
-
+/// Messaggi della sessione gia' in forma view JSON, in ordine cronologico.
+/// Il LEFT JOIN su `agent_runs` porta lo `run_status` del run eventualmente
+/// agganciato al messaggio: funziona perche' dopo il cutover di separazione DB
+/// entrambe le tabelle vivono nello stesso `<slug>_nexus`.
+async fn load_session_message_views(
+    chat_pool: &PgPool,
+    session_id: Uuid,
+) -> Result<Vec<Value>, ApiError> {
     let rows = sqlx::query(
         r#"
         SELECT cm.id, cm.session_id, cm.project_id, cm.role, cm.content, cm.metadata,
@@ -36,8 +30,8 @@ pub async fn list_chat_messages(
         ORDER BY cm.created_at ASC
         "#,
     )
-    .bind(context.session_id)
-    .fetch_all(&chat_pool)
+    .bind(session_id)
+    .fetch_all(chat_pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -46,11 +40,50 @@ pub async fn list_chat_messages(
         let view = to_message_view(row)?;
         messages.push(serde_json::to_value(view).unwrap_or_else(|_| json!({})));
     }
+    Ok(messages)
+}
 
-    // ── Carica in batch gli allegati per tutti i messaggi della sessione ──
-    // Una sola query con JOIN su chat_messages, poi raggruppiamo per message_id
-    // ed iniettiamo l'array `attachments` in ogni elemento di `messages`.
-    let attachments_rows = sqlx::query(
+/// Vista JSON di una riga di `chat_message_attachments`, con il message_id di
+/// raggruppamento. None se manca uno degli identificativi obbligatori
+/// (message_id/id/project_id): la riga va saltata, come faceva il `continue`
+/// del loop originale.
+fn attachment_row_view(row: &sqlx::postgres::PgRow) -> Option<(String, Value)> {
+    let msg_id: Uuid = row.try_get("message_id").ok()?;
+    let att_id: Uuid = row.try_get("id").ok()?;
+    let project_id: Uuid = row.try_get("project_id").ok()?;
+    let kb_note_id: Option<Uuid> = row.try_get("kb_note_id").unwrap_or(None);
+    let indexed_at: Option<DateTime<Utc>> = row.try_get("indexed_at").unwrap_or(None);
+    let created_at: Option<DateTime<Utc>> = row.try_get("created_at").ok();
+    Some((
+        msg_id.to_string(),
+        json!({
+            "id": att_id.to_string(),
+            "messageId": msg_id.to_string(),
+            "projectId": project_id.to_string(),
+            "fileName": row.try_get::<String, _>("file_name").unwrap_or_default(),
+            "filePath": row.try_get::<String, _>("file_path").unwrap_or_default(),
+            "mimeType": row.try_get::<String, _>("mime_type").unwrap_or_default(),
+            "sizeBytes": row.try_get::<i64, _>("size_bytes").unwrap_or(0),
+            "kind": row.try_get::<String, _>("kind").unwrap_or_else(|_| "binary".to_string()),
+            "kbNoteId": kb_note_id.map(|v| v.to_string()),
+            "indexedAt": indexed_at.map(|v| v.to_rfc3339()),
+            "createdAt": created_at.map(|v| v.to_rfc3339()),
+        }),
+    ))
+}
+
+/// Allegati di TUTTI i messaggi della sessione, raggruppati per message_id: una
+/// sola query con JOIN su `chat_messages` invece di N query per messaggio. Il
+/// chiamante inietta poi l'array `attachments` in ogni view.
+///
+/// Regola L: lo shape per-allegato coincide con quello che
+/// `persistence::message_attachments_json` produce per il singolo messaggio.
+/// Consolidare i due richiede di toccare `persistence.rs` (fuori scope qui).
+async fn session_attachments_by_message(
+    chat_pool: &PgPool,
+    session_id: Uuid,
+) -> std::collections::HashMap<String, Vec<Value>> {
+    let rows = sqlx::query(
         r#"
         SELECT cma.id, cma.message_id, cma.project_id, cma.file_name, cma.file_path,
                cma.mime_type, cma.size_bytes, cma.kind, cma.kb_note_id,
@@ -61,50 +94,39 @@ pub async fn list_chat_messages(
         ORDER BY cma.created_at ASC
         "#,
     )
-    .bind(context.session_id)
-    .fetch_all(&chat_pool)
+    .bind(session_id)
+    .fetch_all(chat_pool)
     .await
     .unwrap_or_default();
 
-    let mut attachments_by_msg: std::collections::HashMap<String, Vec<Value>> =
+    let mut by_msg: std::collections::HashMap<String, Vec<Value>> =
         std::collections::HashMap::new();
-    for row in &attachments_rows {
-        let msg_id: Uuid = match row.try_get("message_id") {
-            Ok(v) => v,
-            Err(_) => continue,
+    for row in &rows {
+        let Some((msg_id, view)) = attachment_row_view(row) else {
+            continue;
         };
-        let att_id: Uuid = match row.try_get("id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let project_id: Uuid = match row.try_get("project_id") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let file_name: String = row.try_get("file_name").unwrap_or_default();
-        let file_path: String = row.try_get("file_path").unwrap_or_default();
-        let mime_type: String = row.try_get("mime_type").unwrap_or_default();
-        let size_bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
-        let kind: String = row.try_get("kind").unwrap_or_else(|_| "binary".to_string());
-        let kb_note_id: Option<Uuid> = row.try_get("kb_note_id").unwrap_or(None);
-        let indexed_at: Option<DateTime<Utc>> = row.try_get("indexed_at").unwrap_or(None);
-        let created_at: Option<DateTime<Utc>> = row.try_get("created_at").ok();
-
-        let entry = attachments_by_msg.entry(msg_id.to_string()).or_default();
-        entry.push(json!({
-            "id": att_id.to_string(),
-            "messageId": msg_id.to_string(),
-            "projectId": project_id.to_string(),
-            "fileName": file_name,
-            "filePath": file_path,
-            "mimeType": mime_type,
-            "sizeBytes": size_bytes,
-            "kind": kind,
-            "kbNoteId": kb_note_id.map(|v| v.to_string()),
-            "indexedAt": indexed_at.map(|v| v.to_rfc3339()),
-            "createdAt": created_at.map(|v| v.to_rfc3339()),
-        }));
+        by_msg.entry(msg_id).or_default().push(view);
     }
+    by_msg
+}
+
+pub async fn list_chat_messages(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
+    let context = load_session_context(&state, session_id, user_id).await?;
+    // Separazione DB: messaggi + agent_runs vivono nel DB del progetto (il
+    // JOIN funziona perche' entrambi sono in <slug>_nexus). project_data_pool
+    // e' il punto unico; DB non disponibile -> 503 strutturato (regola M).
+    let chat_pool = crate::project_db_routes::project_data_pool(&state, context.project_id).await?;
+
+    let mut messages = load_session_message_views(&chat_pool, context.session_id).await?;
+    let mut attachments_by_msg =
+        session_attachments_by_message(&chat_pool, context.session_id).await;
 
     for msg in messages.iter_mut() {
         let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or_default();
@@ -120,6 +142,41 @@ pub async fn list_chat_messages(
         "messages": messages
     })))
 }
+/// Run attivo della sessione nello shape `agentRun` della risposta di invio,
+/// con la stessa soglia di recency del gate anti-run-concorrente: se presente,
+/// e' il run avviato dal primo tentativo della POST che il client sta ritentando.
+///
+/// `awaiting_subagents` (Fase D fan-in): il run e' sospeso-VIVO in attesa dei
+/// figli background (gemello di `awaiting_confirmation`), quindi il replay
+/// idempotente deve ritrovarlo come run attivo del primo tentativo.
+async fn active_run_view(session_pool: &PgPool, session_id: Uuid) -> Option<Value> {
+    let active_run: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+        &format!(
+            "SELECT id, status, provider, model FROM agent_runs \
+         WHERE session_id = $1 \
+           AND status IN ({}) \
+           AND created_at > NOW() - INTERVAL '15 minutes' \
+         ORDER BY created_at DESC \
+         LIMIT 1",
+            crate::agent_types::ACTIVE_RUN_STATUS_SQL
+        ),
+    )
+    .bind(session_id)
+    .fetch_optional(session_pool)
+    .await
+    .ok()
+    .flatten();
+
+    active_run.map(|(run_id, status, provider, model)| {
+        json!({
+            "runId": run_id.to_string(),
+            "status": status,
+            "provider": provider.unwrap_or_default(),
+            "model": model.unwrap_or_default(),
+        })
+    })
+}
+
 /// Risposta di replay per una POST /messages ritentata dal client con lo
 /// stesso `clientMessageId` (idempotenza invio, mig progetto 0008). Il
 /// messaggio utente esiste gia': si restituisce quello, allegando l'eventuale
@@ -133,38 +190,7 @@ async fn replay_idempotent_send(
 ) -> ApiResult {
     let user_row = load_message_by_id(&state.db, context.project_id, user_message_id).await?;
     let user_message = to_message_view(&user_row)?;
-
-    // Run attivo della sessione (stessa soglia di recency del gate
-    // anti-run-concorrente): se presente, e' il run avviato dal primo
-    // tentativo di questa stessa POST.
-    let active_run: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
-        // `awaiting_subagents` (Fase D fan-in): il run e' sospeso-VIVO in attesa dei
-        // figli background (gemello di `awaiting_confirmation`), quindi il replay
-        // idempotente deve ritrovarlo come run attivo del primo tentativo.
-        &format!(
-            "SELECT id, status, provider, model FROM agent_runs \
-         WHERE session_id = $1 \
-           AND status IN ({}) \
-           AND created_at > NOW() - INTERVAL '15 minutes' \
-         ORDER BY created_at DESC \
-         LIMIT 1",
-            crate::agent_types::ACTIVE_RUN_STATUS_SQL
-        ),
-    )
-    .bind(context.session_id)
-    .fetch_optional(session_pool)
-    .await
-    .ok()
-    .flatten();
-
-    let agent_run = active_run.map(|(run_id, status, provider, model)| {
-        json!({
-            "runId": run_id.to_string(),
-            "status": status,
-            "provider": provider.unwrap_or_default(),
-            "model": model.unwrap_or_default(),
-        })
-    });
+    let agent_run = active_run_view(session_pool, context.session_id).await;
 
     // Allegati gia' persistiti dal primo tentativo (punto unico
     // message_attachments_json): li restituiamo nello stesso shape del path
@@ -179,6 +205,295 @@ async fn replay_idempotent_send(
         "savedAttachments": saved_attachments,
         "idempotentReplay": true,
     })))
+}
+
+/// Persiste sulla sessione la modalita' esplicitamente scelta nel body
+/// (mig 0371): i run risvegliati (process_resume, service_observer) la
+/// ereditano invece di defaultare a Confirm. Solo quando il body porta un
+/// valore esplicito; un valore non valido e' un 400, non un default silenzioso.
+async fn persist_explicit_automation_mode(
+    session_pool: &PgPool,
+    session_id: Uuid,
+    raw_mode: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(m) = raw_mode.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let mode = AutomationMode::try_parse(Some(m)).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("automation_mode non valido: '{m}'. Valori ammessi: study, confirm, automatic"),
+        )
+    })?;
+    let _ = sqlx::query("UPDATE chat_sessions SET automation_mode = $1 WHERE id = $2")
+        .bind(mode.as_str())
+        .bind(session_id)
+        .execute(session_pool)
+        .await;
+    Ok(())
+}
+
+/// Id del messaggio gia' persistito in questa sessione per il `clientMessageId`
+/// dichiarato dal client (idempotenza invio, mig progetto 0008). `None` se il
+/// client non ha dichiarato la chiave o se il messaggio non risulta persistito.
+async fn existing_client_message(
+    session_pool: &PgPool,
+    session_id: Uuid,
+    client_message_id: Option<Uuid>,
+) -> Result<Option<Uuid>, ApiError> {
+    let Some(client_mid) = client_message_id else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(
+        "SELECT id FROM chat_messages WHERE session_id = $1 AND client_message_id = $2",
+    )
+    .bind(session_id)
+    .bind(client_mid)
+    .fetch_optional(session_pool)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// Gate anti-run-concorrente (con stale detection): una sola generazione
+/// agentica VERAMENTE attiva per sessione. Senza questa guardia due POST
+/// /messages ravvicinate avviavano due run in parallelo e il secondo rubava lo
+/// stream SSE (un messaggio orfano).
+///
+/// "status=running" non implica "vivo": un crash/restart lasciava il run in
+/// 'running' per sempre e la sessione bloccata col 409 fino a cleanup manuale.
+/// Percio' e' attivo solo un run con `created_at` recente (15 minuti: copre con
+/// margine i turni piu' lunghi visti in produzione). I piu' vecchi sono per
+/// definizione stale e li marca 'interrupted' il cleanup di startup (main.rs).
+///
+/// Fix mig 0388: si esclude anche `generation_ended_at IS NOT NULL`. Nel grafo
+/// LangGraph l'ordine terminale e' executor -> reflection -> learner -> END:
+/// end_turn (che libera il pulsante invio) e' emesso a fine executor, ma
+/// reflection_node fa ancora una chiamata LLM di valutazione prima che il run
+/// sia finalizzato. In quella finestra il run e' 'running' ma la generazione e'
+/// di fatto conclusa: senza l'esclusione l'utente vedeva "la chat sembra
+/// libera" e prendeva 409. Un run in awaiting_confirmation NON ha emesso
+/// end_turn (generation_ended_at IS NULL) e resta correttamente bloccante.
+///
+/// `awaiting_subagents` (Fase D fan-in) e' un'interruzione MID-TURN, gemella di
+/// `awaiting_confirmation`: il run e' sospeso-vivo in attesa dei figli
+/// background e NON ha emesso end_turn, quindi deve restare bloccante come
+/// pausa-conferma. Senza, un nuovo messaggio sulla sessione col padre sospeso
+/// avvierebbe un 2o run parallelo che ruba lo stream SSE.
+async fn reject_if_run_active(
+    session_pool: &PgPool,
+    session_id: Uuid,
+    raw_automation_mode: Option<&str>,
+) -> Result<(), ApiError> {
+    if parse_automation_mode(raw_automation_mode) == AutomationMode::Study {
+        return Ok(());
+    }
+    let active_run: Option<Uuid> = sqlx::query_scalar(&format!(
+        "SELECT id FROM agent_runs \
+             WHERE session_id = $1 \
+               AND status IN ({}) \
+               AND created_at > NOW() - INTERVAL '15 minutes' \
+               AND generation_ended_at IS NULL \
+               AND nexus_agent_type IS DISTINCT FROM 'subagent' \
+             LIMIT 1",
+        crate::agent_types::ACTIVE_RUN_STATUS_SQL
+    ))
+    .bind(session_id)
+    .fetch_optional(session_pool)
+    .await
+    .ok()
+    .flatten();
+    if active_run.is_none() {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::CONFLICT,
+        "Un'operazione e' gia' in corso su questa sessione: attendi il completamento del run prima di inviare un nuovo messaggio.",
+    ))
+}
+
+/// Persistenza allegati su filesystem + DB, subito dopo l'INSERT del messaggio
+/// user cosi' tutti i return path successivi (model_reset, model_switch,
+/// resume, DLP, agent_run, run_turn) restituiscono `savedAttachments` al
+/// frontend. Errori filesystem singoli vengono loggati come WARN ma NON
+/// bloccano il turno: l'utente riceve la lista degli allegati effettivamente
+/// persistiti.
+///
+/// Ritorna la lista tipizzata (serve a `enrich_attachments_with_ids` per
+/// popolare gli UUID nel blocco <allegati> del prompt iniziale) e la sua view
+/// JSON.
+async fn persist_user_attachments(
+    state: &AppState,
+    context: &crate::chat_sessions::SessionContext,
+    user_id: Uuid,
+    user_message_id: Uuid,
+    attachments: &[ChatAttachmentRequest],
+) -> (Vec<crate::chat_attachments::SavedAttachment>, Value) {
+    if attachments.is_empty() {
+        return (Vec::new(), json!([]));
+    }
+    let project_ctx =
+        match crate::projects::load_project_context(&state.db, context.project_id, user_id).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %context.project_id,
+                    message_id = %user_message_id,
+                    "load_project_context fallito durante persistenza allegati: {}",
+                    e.1["error"].as_str().unwrap_or("errore sconosciuto")
+                );
+                return (Vec::new(), json!([]));
+            }
+        };
+    let saved = crate::chat_attachments::persist_message_attachments(
+        &state.db,
+        &project_ctx.repository_root_path,
+        context.project_id,
+        user_message_id,
+        attachments,
+    )
+    .await;
+    let json_view = crate::chat_attachments::attachments_to_json(&saved);
+    (saved, json_view)
+}
+
+/// Precedenza modalita' (regola L): workflow d'azione > body > profilo >
+/// sessione persistita (mig 0371) > default colonna.
+///
+/// Workflow d'azione (agent_type_hint valorizzato: pulsanti error-fix dei
+/// pannelli diagnostici via ACTION_AGENT_HINT, service_observer remediation):
+/// sono autonomi PER CONTRATTO (l'utente ha chiesto di RISOLVERE, non di
+/// proporre). Girano sempre in Automatic, a prescindere dalla modalita' di
+/// sessione. Senza questo, l'istruzione DB della modalita' Confirm ("proponi e
+/// chiedi conferma prima di procedere") contraddice il prompt d'azione e il fix
+/// non viene applicato: l'agente descrive la soluzione invece di eseguirla.
+async fn resolve_automation_mode(
+    body: &SendChatMessageRequest,
+    profile_automation: Option<&str>,
+    session_pool: &PgPool,
+    session_id: Uuid,
+) -> Result<AutomationMode, ApiError> {
+    if body
+        .agent_type_hint
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Ok(AutomationMode::Automatic);
+    }
+    let raw = body
+        .automation_mode
+        .as_deref()
+        .or(profile_automation)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(v) = raw else {
+        // chat_sessions e' migrata: la modalita' persistita (mig 0371) va letta
+        // dal pool del progetto gia' risolto dal chiamante, non dal meta (dove
+        // la riga sessione non esiste e tornava sempre il default).
+        return Ok(read_session_automation_mode(session_pool, session_id).await);
+    };
+    AutomationMode::try_parse(Some(v)).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("automation_mode non valido: '{v}'. Valori ammessi: study, confirm, automatic"),
+        )
+    })
+}
+
+/// Messaggio assistant che spiega il blocco DLP, persistito e riletto come
+/// view cosi' l'utente vede il motivo del blocco nell'interfaccia. `None` se
+/// una qualunque delle tre operazioni (insert, rilettura, view) fallisce: il
+/// chiamante ricade sul 403 grezzo, come il path originale.
+async fn dlp_block_message_view(
+    state: &AppState,
+    context: &crate::chat_sessions::SessionContext,
+    user_message_id: Uuid,
+    dlp_msg: &str,
+) -> Option<ChatMessageView> {
+    let err_msg_id = insert_message(
+        &state.db,
+        context.session_id,
+        context.project_id,
+        "assistant",
+        dlp_msg,
+        json!({
+            "provider": "system",
+            "model": "dlp",
+            "intent": "dlp_block",
+        }),
+        Some(user_message_id),
+    )
+    .await
+    .ok()?;
+    let err_row = load_message_by_id(&state.db, context.project_id, err_msg_id)
+        .await
+        .ok()?;
+    to_message_view(&err_row).ok()
+}
+
+/// DLP check (Nexus Sicurezza & Privacy): classifica la sensibilita' del
+/// contenuto utente prima di inviarlo al brain. Va chiamato prima sia di
+/// `spawn_agent_run` sia di `run_turn`, cosi' copre tutti i percorsi
+/// (modalita' agente + studio + fallback).
+///
+/// `Ok(None)` -> nessun blocco, il turno prosegue (tier sotto soglia, policy
+/// che non blocca, oppure warning DLP loggato). `Ok(Some(view))` -> blocco col
+/// messaggio assistant persistito. `Err` -> blocco senza messaggio
+/// persistibile (403 grezzo).
+async fn dlp_gate(
+    state: &AppState,
+    context: &crate::chat_sessions::SessionContext,
+    user_message_id: Uuid,
+    content: &str,
+    provider_override: Option<&str>,
+) -> Result<Option<ChatMessageView>, ApiError> {
+    let tier = crate::dlp::classify_sensitivity(content);
+    if tier < crate::dlp::SensitivityTier::Sensitive {
+        return Ok(None);
+    }
+    // Provider per il check DLP: usa l'override se presente, altrimenti il
+    // primo default dalla routing matrix (DB-driven, niente hardcoded).
+    let matrix_provider: Option<String> = state
+        .orchestrator
+        .routing_matrix
+        .current()
+        .ok()
+        .and_then(|m| m.default_models.keys().next().cloned());
+    let check_provider = provider_override
+        .or(matrix_provider.as_deref())
+        .unwrap_or("system");
+    let Some(dlp_msg) = crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await
+    else {
+        return Ok(None);
+    };
+    if !dlp_msg.contains("DLP Block") {
+        tracing::warn!("DLP: {}", dlp_msg);
+        return Ok(None);
+    }
+    match dlp_block_message_view(state, context, user_message_id, &dlp_msg).await {
+        Some(view) => Ok(Some(view)),
+        None => Err(api_error(StatusCode::FORBIDDEN, dlp_msg)),
+    }
+}
+
+/// Modalita' supervisore dal body; assente o vuota -> `none`.
+fn resolve_supervisor_mode(body: &SendChatMessageRequest) -> Result<SupervisorMode, ApiError> {
+    let Some(v) = body
+        .supervisor_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(SupervisorMode::None);
+    };
+    SupervisorMode::try_parse(v).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "supervisor_mode non valido: '{v}'. Valori ammessi: none, anomaly, interleaved, continuous"
+            ),
+        )
+    })
 }
 
 pub async fn send_chat_message(
@@ -207,61 +522,12 @@ pub async fn send_chat_message(
         ));
     }
 
-    // ── Hardening anti-run-concorrente (con stale detection) ─────────────────
-    // Una sola generazione agentica VERAMENTE attiva per sessione: senza questa
-    // guardia, due POST /messages ravvicinate avviavano due run in parallelo e
-    // il secondo rubava lo stream SSE (un messaggio orfano).
-    //
-    // Fix originale: rifiutavamo se esisteva un run status IN ('running',
-    // 'awaiting_confirmation'). Difetto strutturale: un crash/restart del
-    // backend lasciava il run in 'running' nel DB per sempre -> la sessione
-    // restava bloccata col 409 fino a cleanup manuale. La causa radice e' che
-    // 'status=running' non implica "vivo": serve verificare la recency.
-    //
-    // Fix definitivo: consideriamo attivo solo un run con created_at recente
-    // (entro la soglia di "vita massima ragionevole"). I run piu' vecchi sono
-    // per definizione stale (un turno reale termina entro pochi minuti) e
-    // verranno marcati 'interrupted' dal cleanup di startup (vedi main.rs).
-    // Soglia: 15 minuti — copre i turni piu' lunghi visti in produzione con
-    // largo margine, ma sblocca la chat se qualcosa e' rimasto sospeso.
-    //
-    // Fix mig 0388: si esclude anche `generation_ended_at IS NOT NULL`. Nel grafo
-    // LangGraph l'ordine terminale e' executor -> reflection -> learner -> END:
-    // l'evento end_turn (che libera il pulsante invio nel frontend)
-    // e' emesso a fine executor, MA reflection_node fa ancora una chiamata LLM di
-    // valutazione (secondi) prima che il run sia finalizzato. In quella finestra
-    // il run e' 'running' ma la generazione e' di fatto conclusa: senza questa
-    // esclusione l'utente vedeva "la chat sembra libera" e prendeva 409. Un run in
-    // awaiting_confirmation NON ha emesso end_turn (generation_ended_at IS NULL) e
-    // resta correttamente bloccante (pausa-conferma reale).
-    //
-    // Persiste la modalita' scelta sulla sessione (mig 0371): i run risvegliati
-    // (process_resume, service_observer) la ereditano invece di defaultare a
-    // Confirm. Solo quando il body porta un valore esplicito.
-    if let Some(m) = body
-        .automation_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        match AutomationMode::try_parse(Some(m)) {
-            Ok(mode) => {
-                let _ = sqlx::query("UPDATE chat_sessions SET automation_mode = $1 WHERE id = $2")
-                    .bind(mode.as_str())
-                    .bind(context.session_id)
-                    .execute(&session_pool)
-                    .await;
-            }
-            Err(_) => {
-                return Err(api_error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "automation_mode non valido: '{m}'. Valori ammessi: study, confirm, automatic"
-                    ),
-                ));
-            }
-        }
-    }
+    persist_explicit_automation_mode(
+        &session_pool,
+        context.session_id,
+        body.automation_mode.as_deref(),
+    )
+    .await?;
 
     // ── Idempotenza invio (mig progetto 0008) ────────────────────────────────
     // Retry di rete della stessa POST: il client dichiara clientMessageId. Se
@@ -271,51 +537,18 @@ pub async fn send_chat_message(
     // messaggio ne' avviare un secondo run. DEVE stare PRIMA del gate
     // anti-run-concorrente: il run avviato dal primo tentativo e' proprio
     // quello che il retry deve ritrovare, non un 409.
-    if let Some(client_mid) = body.client_message_id {
-        let existing_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM chat_messages WHERE session_id = $1 AND client_message_id = $2",
-        )
-        .bind(context.session_id)
-        .bind(client_mid)
-        .fetch_optional(&session_pool)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if let Some(existing_id) = existing_id {
-            return replay_idempotent_send(&state, &session_pool, &context, existing_id).await;
-        }
+    if let Some(existing_id) =
+        existing_client_message(&session_pool, context.session_id, body.client_message_id).await?
+    {
+        return replay_idempotent_send(&state, &session_pool, &context, existing_id).await;
     }
 
-    if parse_automation_mode(body.automation_mode.as_deref()) != AutomationMode::Study {
-        let active_run: Option<Uuid> = sqlx::query_scalar(
-            // `awaiting_subagents` (Fase D fan-in) e' un'interruzione MID-TURN, gemella
-            // di `awaiting_confirmation`: il run e' sospeso-vivo in attesa dei figli
-            // background e NON ha emesso end_turn (generation_ended_at IS NULL resta
-            // vero), quindi deve restare bloccante come pausa-conferma. Senza, un nuovo
-            // messaggio sulla sessione col padre sospeso avvierebbe un 2o run parallelo
-            // che ruba lo stream SSE.
-            &format!(
-                "SELECT id FROM agent_runs \
-             WHERE session_id = $1 \
-               AND status IN ({}) \
-               AND created_at > NOW() - INTERVAL '15 minutes' \
-               AND generation_ended_at IS NULL \
-               AND nexus_agent_type IS DISTINCT FROM 'subagent' \
-             LIMIT 1",
-                crate::agent_types::ACTIVE_RUN_STATUS_SQL
-            ),
-        )
-        .bind(context.session_id)
-        .fetch_optional(&session_pool)
-        .await
-        .ok()
-        .flatten();
-        if active_run.is_some() {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                "Un'operazione e' gia' in corso su questa sessione: attendi il completamento del run prima di inviare un nuovo messaggio.",
-            ));
-        }
-    }
+    reject_if_run_active(
+        &session_pool,
+        context.session_id,
+        body.automation_mode.as_deref(),
+    )
+    .await?;
 
     // RC-4 (regola N): il metadata `automationMode` del messaggio riflette il mode
     // PERSISTITO sulla sessione (pool progetto), non un 'confirm' hardcoded. Se il body
@@ -354,15 +587,11 @@ pub async fn send_chat_message(
             // Race stretta: un retry concorrente ha vinto l'INSERT tra il
             // pre-check di idempotenza e questo punto. Il segnale e' l'unique
             // violation strutturata (23505, regola M): si rilegge il messaggio
-            // vincente e si fa replay, mai duplicare.
-            let existing_id: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM chat_messages WHERE session_id = $1 AND client_message_id = $2",
-            )
-            .bind(context.session_id)
-            .bind(body.client_message_id)
-            .fetch_optional(&session_pool)
-            .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            // vincente (stesso punto unico del pre-check) e si fa replay, mai
+            // duplicare.
+            let existing_id =
+                existing_client_message(&session_pool, context.session_id, body.client_message_id)
+                    .await?;
             let Some(existing_id) = existing_id else {
                 return Err(api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -375,44 +604,14 @@ pub async fn send_chat_message(
     let user_row = load_message_by_id(&state.db, context.project_id, user_message_id).await?;
     let user_message = to_message_view(&user_row)?;
 
-    // ── Persistenza allegati su filesystem + DB ──────────────────────────────
-    // Gli allegati vengono salvati subito dopo l'INSERT del messaggio user, cosi'
-    // tutti i return path successivi (model_reset, model_switch, resume, DLP,
-    // agent_run, run_turn) restituiscono `savedAttachments` al frontend.
-    // Errori filesystem singoli vengono loggati come WARN ma NON bloccano il
-    // turno: l'utente riceve la lista degli allegati effettivamente persistiti.
-    // Estraggo `saved_attachments_list` come variabile esplicita per riusarlo
-    // nei successivi `enrich_attachments_with_ids` (necessari per popolare gli
-    // UUID nel blocco <allegati> del prompt iniziale).
-    let mut saved_attachments_list: Vec<crate::chat_attachments::SavedAttachment> = Vec::new();
-    let saved_attachments_json: Value = if body.attachments.is_empty() {
-        json!([])
-    } else {
-        match crate::projects::load_project_context(&state.db, context.project_id, user_id).await {
-            Ok(project_ctx) => {
-                let saved = crate::chat_attachments::persist_message_attachments(
-                    &state.db,
-                    &project_ctx.repository_root_path,
-                    context.project_id,
-                    user_message_id,
-                    &body.attachments,
-                )
-                .await;
-                let json_view = crate::chat_attachments::attachments_to_json(&saved);
-                saved_attachments_list = saved;
-                json_view
-            }
-            Err(e) => {
-                tracing::warn!(
-                    project_id = %context.project_id,
-                    message_id = %user_message_id,
-                    "load_project_context fallito durante persistenza allegati: {}",
-                    e.1["error"].as_str().unwrap_or("errore sconosciuto")
-                );
-                json!([])
-            }
-        }
-    };
+    let (saved_attachments_list, saved_attachments_json) = persist_user_attachments(
+        &state,
+        &context,
+        user_id,
+        user_message_id,
+        &body.attachments,
+    )
+    .await;
 
     spawn_embed_conversation_turn(
         state.orchestrator.neural.clone(),
@@ -560,61 +759,14 @@ pub async fn send_chat_message(
     let (profile_prompt_block, profile_provider, profile_model, profile_automation) =
         fetch_profile_context(&state.db, user_id, &profile_id, &body.content).await;
 
-    // Precedenza modalita' (regola L): workflow d'azione > body > profilo >
-    // sessione persistita (mig 0371) > default colonna.
-    //
-    // Workflow d'azione (agent_type_hint valorizzato: pulsanti error-fix dei
-    // pannelli diagnostici via ACTION_AGENT_HINT, service_observer remediation):
-    // sono autonomi PER CONTRATTO (l'utente ha chiesto di RISOLVERE, non di
-    // proporre). Girano sempre in Automatic, a prescindere dalla modalita' di
-    // sessione. Senza questo, l'istruzione DB della modalita' Confirm ("proponi e
-    // chiedi conferma prima di procedere") contraddice il prompt d'azione e il fix
-    // non viene applicato: l'agente descrive la soluzione invece di eseguirla.
-    let automation_mode = if body
-        .agent_type_hint
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty())
-    {
-        AutomationMode::Automatic
-    } else {
-        match body
-            .automation_mode
-            .as_deref()
-            .or(profile_automation.as_deref())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(v) => AutomationMode::try_parse(Some(v)).map_err(|_| {
-                api_error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "automation_mode non valido: '{v}'. Valori ammessi: study, confirm, automatic"
-                    ),
-                )
-            })?,
-            // chat_sessions e' migrata: la modalita' persistita (mig 0371) va
-            // letta dal pool del progetto gia' risolto sopra, non dal meta
-            // (dove la riga sessione non esiste e tornava sempre il default).
-            None => read_session_automation_mode(&session_pool, context.session_id).await,
-        }
-    };
-    let supervisor_mode = match body
-        .supervisor_mode
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(v) => SupervisorMode::try_parse(v).map_err(|_| {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "supervisor_mode non valido: '{v}'. Valori ammessi: none, anomaly, interleaved, continuous"
-                ),
-            )
-        })?,
-        None => SupervisorMode::None,
-    };
+    let automation_mode = resolve_automation_mode(
+        &body,
+        profile_automation.as_deref(),
+        &session_pool,
+        context.session_id,
+    )
+    .await?;
+    let supervisor_mode = resolve_supervisor_mode(&body)?;
 
     // Fetch user info to build system context
     let github_username: Option<String> =
@@ -685,67 +837,22 @@ pub async fn send_chat_message(
         return Ok(Json(resume_view));
     }
 
-    // ── DLP check (Nexus Sicurezza & Privacy) ────────────────────────────────
-    // Classifica la sensibilità del contenuto utente prima di inviarlo al brain.
-    // Eseguito qui — prima sia di spawn_agent_run sia di run_turn — così copre
-    // tutti i percorsi (modalità agente + studio + fallback).
+    if let Some(err_msg) = dlp_gate(
+        &state,
+        &context,
+        user_message_id,
+        content,
+        provider_choice.provider(),
+    )
+    .await?
     {
-        let tier = crate::dlp::classify_sensitivity(content);
-        if tier >= crate::dlp::SensitivityTier::Sensitive {
-            // Provider per il check DLP: usa l'override se presente, altrimenti
-            // il primo default dalla routing matrix (DB-driven, niente hardcoded).
-            let matrix_provider: Option<String> = state
-                .orchestrator
-                .routing_matrix
-                .current()
-                .ok()
-                .and_then(|m| m.default_models.keys().next().cloned());
-            let check_provider = provider_choice
-                .provider()
-                .or(matrix_provider.as_deref())
-                .unwrap_or("system");
-            if let Some(dlp_msg) =
-                crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await
-            {
-                if dlp_msg.contains("DLP Block") {
-                    // Salva il messaggio di errore come risposta assistant in DB
-                    // così l'utente vede il motivo del blocco nell'interfaccia.
-                    let err_id = insert_message(
-                        &state.db,
-                        context.session_id,
-                        context.project_id,
-                        "assistant",
-                        &dlp_msg,
-                        json!({
-                            "provider": "system",
-                            "model": "dlp",
-                            "intent": "dlp_block",
-                        }),
-                        Some(user_message_id),
-                    )
-                    .await
-                    .ok();
-                    if let Some(err_msg_id) = err_id {
-                        if let Ok(err_row) =
-                            load_message_by_id(&state.db, context.project_id, err_msg_id).await
-                        {
-                            if let Ok(err_msg) = to_message_view(&err_row) {
-                                return Ok(Json(json!({
-                                    "sessionId": context.session_id.to_string(),
-                                    "userMessage": user_message,
-                                    "assistantMessage": err_msg,
-                                    "dlpBlocked": true,
-                                    "savedAttachments": saved_attachments_json.clone(),
-                                })));
-                            }
-                        }
-                    }
-                    return Err(api_error(StatusCode::FORBIDDEN, dlp_msg));
-                } else {
-                    tracing::warn!("DLP: {}", dlp_msg);
-                }
-            }
-        }
+        return Ok(Json(json!({
+            "sessionId": context.session_id.to_string(),
+            "userMessage": user_message,
+            "assistantMessage": err_msg,
+            "dlpBlocked": true,
+            "savedAttachments": saved_attachments_json.clone(),
+        })));
     }
 
     // ── Modalita' agente: dispatcha al loop agente invece del singolo turn ──
@@ -762,11 +869,10 @@ pub async fn send_chat_message(
                 supervisor_mode,
                 profile_prompt_block,
                 system_context: system_context.clone(),
-                // Il path agentico non pinna (nessun `pin_provider`): il
-                // provider scelto e' il punto di partenza del routing e il
-                // failover cross-provider resta possibile. Gli basta quindi il
-                // NOME, quale che sia la forza del vincolo.
-                provider_override: provider_choice.provider().map(str::to_string),
+                // La scelta INTERA (nome + forza): nel path agentico il pin non
+                // vive su una singola chiamata ma sul RUN — vincola il fornitore
+                // di tutte le sue chiamate, compreso il ripiego quando una cade.
+                provider_choice: provider_choice.clone(),
                 model_override: effective_model_override.clone(),
                 profile_provider: profile_provider.clone(),
                 profile_model: profile_model.clone(),
@@ -1084,6 +1190,9 @@ async fn try_resume_interrupted_run(
             session_id: session_id_r,
             provider: provider_r.clone(),
             model: model_r.clone(),
+            // Resume: il pin vale per la richiesta in cui l'utente lo da', e
+            // questa non e' quella richiesta.
+            provider_pin: crate::orchestrator::ProviderPin::none(),
             system_text: String::new(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: resume_prompt,
@@ -1610,7 +1719,7 @@ pub async fn resend_chat_message(
                 supervisor_mode: SupervisorMode::default(),
                 profile_prompt_block,
                 system_context: system_context_str,
-                provider_override: provider_choice.provider().map(str::to_string),
+                provider_choice: provider_choice.clone(),
                 model_override: model_override.clone(),
                 profile_provider: None,
                 profile_model: None,
@@ -1831,30 +1940,57 @@ pub async fn delete_chat_message(
         "messageId": message_id.to_string()
     })))
 }
-pub async fn feedback_error(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(message_id): AxumPath<String>,
-    Json(body): Json<FeedbackErrorRequest>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let message_id = Uuid::parse_str(&message_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
-    let comment = body.comment.trim();
-    if comment.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il commento di errore e' obbligatorio",
-        ));
-    }
+/// Messaggio AI bersaglio di un feedback, gia' caricato e autorizzato.
+///
+/// Punto unico (regola L) del preambolo che `feedback_error` e
+/// `feedback_positive` ripetevano parola per parola: risoluzione del pool,
+/// caricamento riga, controllo proprietario, controllo ruolo, accesso al
+/// progetto, estrazione dei metadata di routing e validazione della FK verso
+/// `orchestrator_runs`.
+struct FeedbackTarget {
+    /// Pool del progetto: chat_messages/chat_sessions/ai_response_feedback/
+    /// prompt_corrections vivono li'. A flag OFF -> meta-DB.
+    pool: PgPool,
+    session_id: Uuid,
+    project_id: Uuid,
+    /// Contenuto della risposta AI (usato per la preview di audit).
+    content: String,
+    metadata: Value,
+    intent: String,
+    provider: Option<String>,
+    model: Option<String>,
+    run_id: Option<Uuid>,
+}
 
-    // Separazione DB: endpoint keyed solo dal message_id. Risolvo il pool del
-    // progetto dalla directory di routing (fallback ricerca + auto-registrazione);
-    // chat_messages/chat_sessions/ai_response_feedback/prompt_corrections vivono
-    // li'. ensure_project_access resta sul meta (globale).
-    let mpool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
+/// Run id da usare come FK verso `orchestrator_runs`.
+///
+/// I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta a
+/// `orchestrator_runs`: se l'ID non esiste li' si scrive NULL invece di far
+/// fallire l'insert (la colonna ammette NULL).
+async fn feedback_orchestrator_run_id(pool: &PgPool, metadata: &Value) -> Option<Uuid> {
+    let raw_run_id = metadata
+        .get("runId")
+        .or_else(|| metadata.get("agentRunId"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
+            .bind(raw_run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+    exists.then_some(raw_run_id)
+}
 
+/// Riga del messaggio bersaglio, con proprietario e ruolo gia' verificati.
+/// `role_error` e' il messaggio del 400 quando il bersaglio non e' un messaggio
+/// assistant (l'unico punto in cui i due handler di feedback divergono).
+async fn fetch_authorized_feedback_row(
+    pool: &PgPool,
+    message_id: Uuid,
+    user_id: Uuid,
+    role_error: &str,
+) -> Result<sqlx::postgres::PgRow, ApiError> {
     let row = sqlx::query(
         r#"
         SELECT
@@ -1871,14 +2007,13 @@ pub async fn feedback_error(
         "#,
     )
     .bind(message_id)
-    .fetch_optional(&mpool)
+    .fetch_optional(pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some(row) = row else {
         return Err(api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"));
     };
-
     let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
     if owner != Some(user_id) {
         return Err(api_error(
@@ -1886,15 +2021,31 @@ pub async fn feedback_error(
             "Messaggio non accessibile",
         ));
     }
-
     let role: String = row.try_get("role").unwrap_or_default();
     if role != "assistant" {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il feedback errore e' consentito solo sui messaggi AI",
-        ));
+        return Err(api_error(StatusCode::BAD_REQUEST, role_error));
     }
+    Ok(row)
+}
 
+/// Carica e autorizza il messaggio AI bersaglio del feedback.
+///
+/// Separazione DB: endpoint keyed solo dal message_id, quindi il pool del
+/// progetto si risolve dalla directory di routing (fallback ricerca +
+/// auto-registrazione). `ensure_project_access` resta sul meta (globale).
+async fn load_feedback_target(
+    state: &AppState,
+    message_id: Uuid,
+    user_id: Uuid,
+    role_error: &str,
+) -> Result<FeedbackTarget, ApiError> {
+    // Separazione DB: endpoint keyed solo dal message_id. Risolvo il pool del
+    // progetto dalla directory di routing (fallback ricerca + auto-registrazione);
+    // chat_messages/chat_sessions/ai_response_feedback/prompt_corrections vivono
+    // li'. DB non disponibile -> 503. ensure_project_access resta sul meta (globale).
+    let pool =
+        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
+    let row = fetch_authorized_feedback_row(&pool, message_id, user_id, role_error).await?;
     let session_id: Uuid = row
         .try_get("session_id")
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1904,50 +2055,39 @@ pub async fn feedback_error(
     ensure_project_access(&state.db, user_id, project_id).await?;
 
     let metadata: Value = row.try_get("metadata").unwrap_or_else(|_| json!({}));
-    let ai_response_content: String = row.try_get("content").unwrap_or_default();
-    let intent = metadata
-        .get("intent")
-        .and_then(Value::as_str)
-        .unwrap_or("chat")
-        .to_lowercase();
-    let provider = metadata
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let model = metadata
-        .get("model")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let raw_run_id = metadata
-        .get("runId")
-        .or_else(|| metadata.get("agentRunId"))
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok());
-    // Verifica esistenza in orchestrator_runs (FK target).
-    // I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta
-    // a `orchestrator_runs`. Se l'ID non esiste li', settiamo NULL invece di
-    // far fallire l'insert (la colonna ammette NULL).
-    let run_id: Option<Uuid> = match raw_run_id {
-        Some(id) => {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
-                    .bind(id)
-                    .fetch_one(&mpool)
-                    .await
-                    .unwrap_or(false);
-            if exists {
-                Some(id)
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
+    let run_id = feedback_orchestrator_run_id(&pool, &metadata).await;
+    Ok(FeedbackTarget {
+        session_id,
+        project_id,
+        content: row.try_get("content").unwrap_or_default(),
+        intent: metadata
+            .get("intent")
+            .and_then(Value::as_str)
+            .unwrap_or("chat")
+            .to_lowercase(),
+        provider: metadata
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model: metadata
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        metadata,
+        run_id,
+        pool,
+    })
+}
 
-    // Recupera il messaggio utente precedente nella stessa sessione:
-    // è la domanda che ha generato questa risposta AI — usata per costruire
-    // un embedding semanticamente ricco che matchi domande simili future.
-    let preceding_user_message: Option<String> = sqlx::query_scalar(
+/// Domanda utente che ha generato la risposta AI: il messaggio user precedente
+/// nella stessa sessione. Serve a costruire un embedding semanticamente ricco
+/// che matchi domande simili future.
+async fn preceding_user_question(
+    pool: &PgPool,
+    session_id: Uuid,
+    message_id: Uuid,
+) -> Option<String> {
+    sqlx::query_scalar(
         r#"
         SELECT content FROM chat_messages
         WHERE session_id = $1
@@ -1959,15 +2099,24 @@ pub async fn feedback_error(
     )
     .bind(session_id)
     .bind(message_id)
-    .fetch_optional(&mpool)
+    .fetch_optional(pool)
     .await
-    .unwrap_or(None);
+    .unwrap_or(None)
+}
 
-    // ── Testo per l'embedding ──────────────────────────────────────────────
-    // Concatena domanda utente + commento di correzione.
-    // Così quando arriva una domanda semanticamente simile in futuro,
-    // il vettore viene trovato con alta similarità.
-    let embed_input = match &preceding_user_message {
+/// Testo per l'embedding e testo della correzione, derivati dalla domanda
+/// utente precedente.
+///
+/// L'embedding concatena domanda + commento: cosi' quando arriva una domanda
+/// semanticamente simile in futuro il vettore viene trovato con alta
+/// similarita'. Il `correction_text` invece e' quello iniettato nel system
+/// prompt, e deve essere una istruzione chiara e azionabile per l'AI.
+fn build_correction_texts(
+    preceding: Option<&String>,
+    comment: &str,
+    intent: &str,
+) -> (String, String) {
+    let embed_input = match preceding {
         Some(q) if !q.is_empty() => format!(
             "{}\n\nCorrezione: {}",
             q.chars().take(800).collect::<String>(),
@@ -1975,10 +2124,7 @@ pub async fn feedback_error(
         ),
         _ => comment.to_string(),
     };
-
-    // ── correction_text: testo che viene iniettato nel system prompt ───────
-    // Deve essere una istruzione chiara e azionabile per l'AI.
-    let correction_text = match &preceding_user_message {
+    let correction_text = match preceding {
         Some(q) if !q.is_empty() => format!(
             "[{}] Quando viene chiesto: «{}» — {}",
             intent,
@@ -1987,14 +2133,29 @@ pub async fn feedback_error(
         ),
         _ => format!("[{}] {}", intent, comment),
     };
+    (embed_input, correction_text)
+}
 
-    // Preview della risposta AI sbagliata (per audit/debug, max 500 chars)
-    let ai_response_preview: String = ai_response_content.chars().take(500).collect();
+/// Identificatori e testi di UNA correzione derivata da un feedback errore.
+struct CorrectionRecord {
+    feedback_id: Uuid,
+    correction_id: Uuid,
+    point_id: String,
+    correction_text: String,
+    normalized_hash: String,
+}
 
-    // ai_response_feedback e prompt_corrections vivono nel DB del progetto (mpool);
-    // registro feedback_id/correction_id in directory dopo l'insert cosi' gli
-    // endpoint admin by-id (review/delete) risolvono il pool.
-    let feedback_id = Uuid::new_v4();
+/// Insert del feedback errore + registrazione in directory: `feedback_id` va
+/// registrato dopo l'insert cosi' gli endpoint admin by-id (review/delete)
+/// risolvono il pool del progetto.
+async fn insert_error_feedback(
+    state: &AppState,
+    target: &FeedbackTarget,
+    feedback_id: Uuid,
+    message_id: Uuid,
+    user_id: Uuid,
+    comment: &str,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO ai_response_feedback (
@@ -2005,31 +2166,37 @@ pub async fn feedback_error(
         "#,
     )
     .bind(feedback_id)
-    .bind(project_id)
-    .bind(session_id)
+    .bind(target.project_id)
+    .bind(target.session_id)
     .bind(message_id)
-    .bind(run_id)
+    .bind(target.run_id)
     .bind(user_id)
-    .bind(&intent)
-    .bind(&provider)
-    .bind(&model)
+    .bind(&target.intent)
+    .bind(&target.provider)
+    .bind(&target.model)
     .bind(comment)
-    .execute(&mpool)
+    .execute(&target.pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::project_db_routes::register_entity_routing(
         &state.db,
         "feedback",
         feedback_id,
-        project_id,
+        target.project_id,
     )
     .await;
+    Ok(())
+}
 
-    let correction_id = Uuid::new_v4();
-    let point_id = correction_id.to_string();
-    let normalized = normalize_text(&correction_text);
-    let normalized_hash = hash_hint(project_id, &intent, &normalized);
-
+/// Insert della correzione + registrazione in directory (stesso motivo di
+/// `insert_error_feedback`: gli endpoint admin by-id devono risolvere il pool).
+async fn insert_prompt_correction(
+    state: &AppState,
+    target: &FeedbackTarget,
+    rec: &CorrectionRecord,
+    message_id: Uuid,
+    metadata: Value,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO prompt_corrections (
@@ -2043,37 +2210,42 @@ pub async fn feedback_error(
         )
         "#,
     )
-    .bind(correction_id)
-    .bind(project_id)
-    .bind(feedback_id)
-    .bind(session_id)
+    .bind(rec.correction_id)
+    .bind(target.project_id)
+    .bind(rec.feedback_id)
+    .bind(target.session_id)
     .bind(message_id)
-    .bind(run_id)
-    .bind(&intent)
-    .bind(&provider)
-    .bind(&model)
-    .bind(&correction_text)
-    .bind(&normalized_hash)
-    .bind(&point_id)
-    .bind(json!({
-        "source": "chat_feedback",
-        "requestedBy": user_id.to_string(),
-        "userComment": comment,
-        "aiResponsePreview": ai_response_preview,
-        "userQuestionPreview": preceding_user_message.as_deref().unwrap_or("").chars().take(300).collect::<String>(),
-    }))
-    .execute(&mpool)
+    .bind(target.run_id)
+    .bind(&target.intent)
+    .bind(&target.provider)
+    .bind(&target.model)
+    .bind(&rec.correction_text)
+    .bind(&rec.normalized_hash)
+    .bind(&rec.point_id)
+    .bind(metadata)
+    .execute(&target.pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::project_db_routes::register_entity_routing(
         &state.db,
         "correction",
-        correction_id,
-        project_id,
+        rec.correction_id,
+        target.project_id,
     )
     .await;
+    Ok(())
+}
 
-    // Guard: se embedder/qdrant sono down, skip vettorializzazione (la correzione e' gia' in DB)
+/// Vettorializzazione della correzione su Qdrant.
+///
+/// Guard: se embedder/qdrant sono down si salta (la correzione e' gia' in DB e
+/// il feedback non deve fallire per una dipendenza di ricerca semantica).
+async fn vectorize_correction(
+    state: &AppState,
+    target: &FeedbackTarget,
+    rec: &CorrectionRecord,
+    embed_input: &str,
+) -> Result<(), ApiError> {
     let qdrant_ok = state
         .dependency_status
         .qdrant
@@ -2088,52 +2260,129 @@ pub async fn feedback_error(
             qdrant_ok,
             embedder_ok
         );
-    } else {
-        let vector = state
-            .orchestrator
-            .embed_text(&embed_input)
-            .await
-            .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e.to_string()))?;
-        vector_memory::upsert_prompt_correction_point(
-            &state.db,
-            &point_id,
-            &vector,
-            json!({
-                "project_id": project_id.to_string(),
-                "correction_id": correction_id.to_string(),
-                "feedback_id": feedback_id.to_string(),
-                "intent": intent,
-                "provider": provider,
-                "model": model,
-                "text": correction_text,
-                "active": true,
-                "status": "open",
-                "created_at": Utc::now().to_rfc3339(),
-                "normalized_hint_hash": normalized_hash,
-            }),
-        )
+        return Ok(());
+    }
+    let vector = state
+        .orchestrator
+        .embed_text(embed_input)
         .await
         .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e.to_string()))?;
-    }
+    vector_memory::upsert_prompt_correction_point(
+        &state.db,
+        &rec.point_id,
+        &vector,
+        json!({
+            "project_id": target.project_id.to_string(),
+            "correction_id": rec.correction_id.to_string(),
+            "feedback_id": rec.feedback_id.to_string(),
+            "intent": target.intent,
+            "provider": target.provider,
+            "model": target.model,
+            "text": rec.correction_text,
+            "active": true,
+            "status": "open",
+            "created_at": Utc::now().to_rfc3339(),
+            "normalized_hint_hash": rec.normalized_hash,
+        }),
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e.to_string()))
+}
+
+/// Metadata di audit/debug della correzione: chi l'ha richiesta, il commento
+/// integrale e le preview troncate della risposta AI sbagliata (500 char) e
+/// della domanda utente (300 char).
+fn correction_audit_metadata(
+    target: &FeedbackTarget,
+    user_id: Uuid,
+    comment: &str,
+    preceding: Option<&str>,
+) -> Value {
+    json!({
+        "source": "chat_feedback",
+        "requestedBy": user_id.to_string(),
+        "userComment": comment,
+        "aiResponsePreview": target.content.chars().take(500).collect::<String>(),
+        "userQuestionPreview": preceding.unwrap_or("").chars().take(300).collect::<String>(),
+    })
+}
+
+/// Registra il feedback errore e la correzione che ne deriva, poi deduplica e
+/// riapplica l'apprendimento di progetto. Ritorna il payload di risposta.
+async fn record_error_feedback(
+    state: &AppState,
+    target: &FeedbackTarget,
+    message_id: Uuid,
+    user_id: Uuid,
+    comment: &str,
+) -> Result<Value, ApiError> {
+    let preceding = preceding_user_question(&target.pool, target.session_id, message_id).await;
+    let (embed_input, correction_text) =
+        build_correction_texts(preceding.as_ref(), comment, &target.intent);
+
+    let feedback_id = Uuid::new_v4();
+    insert_error_feedback(state, target, feedback_id, message_id, user_id, comment).await?;
+
+    let correction_id = Uuid::new_v4();
+    let normalized = normalize_text(&correction_text);
+    let rec = CorrectionRecord {
+        feedback_id,
+        correction_id,
+        point_id: correction_id.to_string(),
+        normalized_hash: hash_hint(target.project_id, &target.intent, &normalized),
+        correction_text,
+    };
+    let correction_metadata =
+        correction_audit_metadata(target, user_id, comment, preceding.as_deref());
+    insert_prompt_correction(state, target, &rec, message_id, correction_metadata).await?;
+    vectorize_correction(state, target, &rec, &embed_input).await?;
 
     let dedup_count = dedup_on_write(
         &state.db,
-        project_id,
-        &intent,
-        &normalized_hash,
+        target.project_id,
+        &target.intent,
+        &rec.normalized_hash,
         correction_id,
     )
     .await?;
     let learning_action =
-        apply_project_learning(&state.db, project_id, user_id, Some(&intent), false).await?;
+        apply_project_learning(&state.db, target.project_id, user_id, Some(&target.intent), false)
+            .await?;
 
-    Ok(Json(json!({
+    Ok(json!({
         "ok": true,
         "feedbackId": feedback_id.to_string(),
         "correctionId": correction_id.to_string(),
         "deduplicatedCount": dedup_count,
         "learning": learning_action
-    })))
+    }))
+}
+
+pub async fn feedback_error(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(message_id): AxumPath<String>,
+    Json(body): Json<FeedbackErrorRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let message_id = Uuid::parse_str(&message_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
+    let comment = body.comment.trim();
+    if comment.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il commento di errore e' obbligatorio",
+        ));
+    }
+    let target = load_feedback_target(
+        &state,
+        message_id,
+        user_id,
+        "Il feedback errore e' consentito solo sui messaggi AI",
+    )
+    .await?;
+    let response = record_error_feedback(&state, &target, message_id, user_id, comment).await?;
+    Ok(Json(response))
 }
 /// Handler feedback positivo (pollice su): conferma esplicita che la risposta AI e' corretta.
 ///
@@ -2156,120 +2405,15 @@ pub async fn feedback_positive(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("");
-
-    // Separazione DB: endpoint keyed solo dal message_id -> pool del progetto via
-    // directory di routing (fallback ricerca). DB non disponibile -> 503.
-    let mpool =
-        crate::project_db_routes::project_data_pool_by_message_from(&state.db, message_id).await?;
-
-    let row = sqlx::query(
-        r#"
-        SELECT
-            m.id,
-            m.session_id,
-            m.project_id,
-            m.role,
-            m.metadata,
-            s.user_id
-        FROM chat_messages m
-        JOIN chat_sessions s ON s.id = m.session_id
-        WHERE m.id = $1
-        "#,
+    let target = load_feedback_target(
+        &state,
+        message_id,
+        user_id,
+        "Il feedback positivo e' consentito solo sui messaggi AI",
     )
-    .bind(message_id)
-    .fetch_optional(&mpool)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .await?;
 
-    let Some(row) = row else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"));
-    };
-
-    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
-    if owner != Some(user_id) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "Messaggio non accessibile",
-        ));
-    }
-
-    let role: String = row.try_get("role").unwrap_or_default();
-    if role != "assistant" {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il feedback positivo e' consentito solo sui messaggi AI",
-        ));
-    }
-
-    let session_id: Uuid = row
-        .try_get("session_id")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let project_id: Uuid = row
-        .try_get("project_id")
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    ensure_project_access(&state.db, user_id, project_id).await?;
-
-    let metadata: Value = row.try_get("metadata").unwrap_or_else(|_| json!({}));
-    let intent = metadata
-        .get("intent")
-        .and_then(Value::as_str)
-        .unwrap_or("chat")
-        .to_lowercase();
-    let provider = metadata
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let model = metadata
-        .get("model")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let raw_run_id = metadata
-        .get("runId")
-        .or_else(|| metadata.get("agentRunId"))
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok());
-    // Verifica esistenza in orchestrator_runs (FK target).
-    // I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta
-    // a `orchestrator_runs`. Se l'ID non esiste li', settiamo NULL invece di
-    // far fallire l'insert (la colonna ammette NULL).
-    let run_id: Option<Uuid> = match raw_run_id {
-        Some(id) => {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
-                    .bind(id)
-                    .fetch_one(&mpool)
-                    .await
-                    .unwrap_or(false);
-            if exists {
-                Some(id)
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
-    let agent_type_hint = metadata
-        .get("agentType")
-        .or_else(|| metadata.get("profile"))
-        .and_then(Value::as_str)
-        .unwrap_or("chat_default")
-        .to_string();
-
-    // Idempotenza: se gia' esiste un feedback positivo per questo messaggio, ritorna quello.
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT id FROM ai_response_feedback
-        WHERE message_id = $1 AND user_id = $2 AND feedback_type = 'positive'
-        LIMIT 1
-        "#,
-    )
-    .bind(message_id)
-    .bind(user_id)
-    .fetch_optional(&mpool)
-    .await
-    .unwrap_or(None);
-
-    if let Some(existing_id) = existing {
+    if let Some(existing_id) = existing_positive_feedback(&target.pool, message_id, user_id).await {
         return Ok(Json(json!({
             "ok": true,
             "feedbackId": existing_id.to_string(),
@@ -2279,6 +2423,54 @@ pub async fn feedback_positive(
     }
 
     let feedback_id = Uuid::new_v4();
+    insert_positive_feedback(&state, &target, feedback_id, message_id, user_id, comment).await?;
+    let new_q_value = reinforce_positive_outcome(&target, message_id);
+
+    Ok(Json(json!({
+        "ok": true,
+        "feedbackId": feedback_id.to_string(),
+        "alreadyRecorded": false,
+        "newQValue": new_q_value,
+    })))
+}
+
+/// Feedback positivo gia' registrato da questo utente su questo messaggio
+/// (idempotenza del pollice su): il chiamante lo restituisce invece di
+/// inserirne un secondo.
+async fn existing_positive_feedback(
+    pool: &PgPool,
+    message_id: Uuid,
+    user_id: Uuid,
+) -> Option<Uuid> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id FROM ai_response_feedback
+        WHERE message_id = $1 AND user_id = $2 AND feedback_type = 'positive'
+        LIMIT 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+}
+
+/// Insert del feedback positivo + registrazione in directory (stesso motivo di
+/// `insert_error_feedback`).
+///
+/// NB: l'INSERT resta gemello di quello del feedback errore ma NON e'
+/// consolidato con esso: `feedback_type`/`status` sono literal SQL e
+/// parametrizzarli richiederebbe di conoscere il tipo esatto delle colonne
+/// (un bind su colonna enum fallirebbe solo a runtime, regola H).
+async fn insert_positive_feedback(
+    state: &AppState,
+    target: &FeedbackTarget,
+    feedback_id: Uuid,
+    message_id: Uuid,
+    user_id: Uuid,
+    comment: &str,
+) -> Result<(), ApiError> {
     // `error_comment` e' NOT NULL nello schema: salva commento utente o sentinel.
     let comment_to_store = if comment.is_empty() {
         "[positive feedback senza commento]".to_string()
@@ -2295,57 +2487,133 @@ pub async fn feedback_positive(
         "#,
     )
     .bind(feedback_id)
-    .bind(project_id)
-    .bind(session_id)
+    .bind(target.project_id)
+    .bind(target.session_id)
     .bind(message_id)
-    .bind(run_id)
+    .bind(target.run_id)
     .bind(user_id)
-    .bind(&intent)
-    .bind(&provider)
-    .bind(&model)
+    .bind(&target.intent)
+    .bind(&target.provider)
+    .bind(&target.model)
     .bind(&comment_to_store)
-    .execute(&mpool)
+    .execute(&target.pool)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::project_db_routes::register_entity_routing(
         &state.db,
         "feedback",
         feedback_id,
-        project_id,
+        target.project_id,
     )
     .await;
+    Ok(())
+}
 
-    // Rinforza Q-learning: reward=1.0 (successo confermato dall'utente).
-    let mut new_q_value: Option<f32> = None;
-    if let Some(bridge) = crate::nexus_bridge::NexusBridge::global() {
-        let task_id = run_id
-            .map(|u| u.to_string())
-            .unwrap_or_else(|| message_id.to_string());
-        let pascal = crate::internal_learning::snake_to_pascal(&agent_type_hint);
-        let agent_type = nexus_orchestrator::AgentType::from_name(&pascal);
-        let q = bridge.record_outcome(
-            &task_id, &intent, agent_type, true, // success
-            1.0,  // reward massimo
-            0,    // duration_ms non disponibile qui
-            None,
-        );
-        new_q_value = Some(q);
-        tracing::info!(
-            "feedback_positive: Q-update task={} intent={} agent={} new_q={}",
-            task_id,
-            intent,
-            pascal,
-            q,
-        );
+/// Rinforza il Q-value con reward massimo: il pollice su e' un successo
+/// confermato dall'utente. `None` se il bridge non e' inizializzato.
+fn reinforce_positive_outcome(target: &FeedbackTarget, message_id: Uuid) -> Option<f32> {
+    let bridge = crate::nexus_bridge::NexusBridge::global()?;
+    let agent_type_hint = target
+        .metadata
+        .get("agentType")
+        .or_else(|| target.metadata.get("profile"))
+        .and_then(Value::as_str)
+        .unwrap_or("chat_default")
+        .to_string();
+    let task_id = target
+        .run_id
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| message_id.to_string());
+    let pascal = crate::internal_learning::snake_to_pascal(&agent_type_hint);
+    let agent_type = nexus_orchestrator::AgentType::from_name(&pascal);
+    let q = bridge.record_outcome(
+        &task_id,
+        &target.intent,
+        agent_type,
+        true, // success
+        1.0,  // reward massimo
+        0,    // duration_ms non disponibile qui
+        None,
+    );
+    tracing::info!(
+        "feedback_positive: Q-update task={} intent={} agent={} new_q={}",
+        task_id,
+        target.intent,
+        pascal,
+        q,
+    );
+    Some(q)
+}
+/// Sessione da riusare per il path legacy: l'ultima aggiornata del progetto per
+/// quell'utente, creata al volo se non esiste.
+///
+/// Separazione DB: `chat_sessions` e' migrata -> il pool del progetto va usato
+/// sia per la ricerca sia per la creazione. Sul meta la ricerca rispondeva
+/// sempre vuoto e ogni chiamata legacy creava una NUOVA sessione.
+async fn legacy_session_id(
+    session_pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> Result<Uuid, ApiError> {
+    let existing_session = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM chat_sessions
+        WHERE project_id = $1
+          AND user_id = $2
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_optional(session_pool)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(session_id) = existing_session {
+        return Ok(session_id);
     }
 
-    Ok(Json(json!({
-        "ok": true,
-        "feedbackId": feedback_id.to_string(),
-        "alreadyRecorded": false,
-        "newQValue": new_q_value,
-    })))
+    let new_session_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat_sessions (id, project_id, user_id, title, status, created_at, updated_at)
+        VALUES ($1, $2, $3, 'Nuova sessione', 'active', NOW(), NOW())
+        "#,
+    )
+    .bind(new_session_id)
+    .bind(project_id)
+    .bind(user_id)
+    .execute(session_pool)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(new_session_id)
 }
+
+/// Risposta del path legacy: shape snake_case storico, contratto pubblico
+/// dell'endpoint (diverso dal camelCase della chat moderna).
+fn legacy_chat_response(
+    assistant_message: ChatMessageView,
+    session_id: Uuid,
+    user_message_id: Uuid,
+) -> Value {
+    json!({
+        "content": assistant_message.content,
+        "provider": assistant_message.provider,
+        "model": assistant_message.model,
+        "tokens_used": assistant_message.total_tokens.unwrap_or(0),
+        "prompt_tokens": assistant_message.prompt_tokens.unwrap_or(0),
+        "completion_tokens": assistant_message.completion_tokens.unwrap_or(0),
+        "total_tokens": assistant_message.total_tokens.unwrap_or(0),
+        "total_cost": assistant_message.total_cost.unwrap_or(0.0),
+        "currency": assistant_message.currency.unwrap_or_else(|| "EUR".to_string()),
+        "quota_status": "ok",
+        "session_id": session_id.to_string(),
+        "request_message_id": user_message_id.to_string(),
+        "assistant_message_id": assistant_message.id,
+    })
+}
+
 pub async fn legacy_chat(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -2360,40 +2628,7 @@ pub async fn legacy_chat(
     // vuoto e ogni chiamata legacy creava una NUOVA sessione.
     let session_pool =
         crate::project_db_routes::project_data_pool_from(&state.db, project_id).await?;
-    let existing_session = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        SELECT id
-        FROM chat_sessions
-        WHERE project_id = $1
-          AND user_id = $2
-        ORDER BY updated_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(project_id)
-    .bind(user_id)
-    .fetch_optional(&session_pool)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let session_id = if let Some(session_id) = existing_session {
-        session_id
-    } else {
-        let new_session_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO chat_sessions (id, project_id, user_id, title, status, created_at, updated_at)
-            VALUES ($1, $2, $3, 'Nuova sessione', 'active', NOW(), NOW())
-            "#,
-        )
-        .bind(new_session_id)
-        .bind(project_id)
-        .bind(user_id)
-        .execute(&session_pool)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        new_session_id
-    };
+    let session_id = legacy_session_id(&session_pool, project_id, user_id).await?;
 
     let user_message_id = insert_message(
         &state.db,
@@ -2428,21 +2663,11 @@ pub async fn legacy_chat(
     )
     .await?;
 
-    Ok(Json(json!({
-        "content": assistant_message.content,
-        "provider": assistant_message.provider,
-        "model": assistant_message.model,
-        "tokens_used": assistant_message.total_tokens.unwrap_or(0),
-        "prompt_tokens": assistant_message.prompt_tokens.unwrap_or(0),
-        "completion_tokens": assistant_message.completion_tokens.unwrap_or(0),
-        "total_tokens": assistant_message.total_tokens.unwrap_or(0),
-        "total_cost": assistant_message.total_cost.unwrap_or(0.0),
-        "currency": assistant_message.currency.unwrap_or_else(|| "EUR".to_string()),
-        "quota_status": "ok",
-        "session_id": session_id.to_string(),
-        "request_message_id": user_message_id.to_string(),
-        "assistant_message_id": assistant_message.id,
-    })))
+    Ok(Json(legacy_chat_response(
+        assistant_message,
+        session_id,
+        user_message_id,
+    )))
 }
 
 // ── Pre-check messaggio ────────────────────────────────────────────────────
@@ -2459,100 +2684,72 @@ pub struct PrecheckRequest {
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<Uuid>,
 }
-pub async fn precheck_chat_message(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Json(body): Json<PrecheckRequest>,
-) -> ApiResult {
-    let _user_id = parse_user_id(&claims)?;
-    let message = body.message.trim();
+/// Verdetto "nessun rilievo": il precheck non deve mai bloccare l'utente, ne'
+/// per messaggi troppo brevi o simili a codice, ne' se il modello non risponde
+/// o risponde fuori formato. Uscita neutra condivisa da tutti quei path.
+fn precheck_pass() -> Value {
+    json!({
+        "ok": true, "correctedText": null,
+        "contextSuggestion": null, "issues": [], "reason": null
+    })
+}
 
-    // Non fare il precheck per messaggi molto brevi
+/// Vero se il messaggio non va sottoposto al precheck: troppo breve, oppure
+/// sembra codice (backtick, fence markdown, path).
+fn precheck_skipped(message: &str) -> bool {
     if message.len() < 15 || message.split_whitespace().count() < 3 {
-        return Ok(Json(json!({
-            "ok": true, "correctedText": null,
-            "contextSuggestion": null, "issues": [], "reason": null
-        })));
+        return true;
     }
-
-    // Non fare il precheck se sembra codice
-    let looks_like_code = message.contains('`')
+    message.contains('`')
         || message.contains("```")
         || message.starts_with('/')
         || message.contains("./")
-        || message.contains(":\\");
-    if looks_like_code {
-        return Ok(Json(json!({
-            "ok": true, "correctedText": null,
-            "contextSuggestion": null, "issues": [], "reason": null
-        })));
-    }
+        || message.contains(":\\")
+}
 
-    let system_prompt = crate::prompt_templates::get_template_or_default(
-        &state.db,
-        &state.template_cache,
-        "chat.precheck_message",
-    )
-    .await;
-
-    // Arricchimento contestuale: se il client passa session_id, il precheck
-    // riceve gli ultimi turni della conversazione. Risolve i falsi-positivi
-    // su follow-up contestuali (es. "riepiloga gli animali" dopo una chat
-    // sugli animali) che in isolamento sembrano "troppo generici" ma in
-    // contesto sono chiarissimi.
-    let effective_message = if let Some(sid) = body.session_id {
-        build_message_with_recent_context_for_classifier(&state.db, sid, message).await
-    } else {
-        message.to_string()
-    };
-
-    let messages_json = serde_json::to_string(&json!([
-        { "role": "user", "content": effective_message }
-    ]))
-    .unwrap_or_default();
-
+/// Testo grezzo del modello di precheck. `None` se il modello non risponde: in
+/// quel caso il chiamante non deve bloccare l'utente.
+async fn precheck_raw_verdict(
+    state: &AppState,
+    messages_json: &str,
+    system_prompt: &str,
+) -> Result<Option<String>, ApiError> {
     // Modello purpose-specific risolto dal PUNTO UNICO tier-only (regola L/G).
     let (provider_pf, model_pf) =
-        crate::internal_routing::resolve_purpose_model(&state, "chat_feedback_generator")
+        crate::internal_routing::resolve_purpose_model(state, "chat_feedback_generator")
             .await
             .into_model("chat_feedback_generator")
             .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
-    let raw = match state
+    let Ok(val) = state
         .orchestrator
         .neural
         .generate_agent_turn(
             &provider_pf,
             &model_pf,
-            &messages_json,
+            messages_json,
             "[]",
             300,
-            &system_prompt,
+            system_prompt,
         )
         .await
-    {
-        Ok(val) => val
-            .get("content")
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        val.get("content")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        Err(_) => {
-            // Se il modello non risponde non bloccare l'utente
-            return Ok(Json(json!({
-                "ok": true, "correctedText": null,
-                "contextSuggestion": null, "issues": [], "reason": null
-            })));
-        }
-    };
+    ))
+}
 
-    // Estrae il JSON anche se il modello ha aggiunto testo prima/dopo
+/// Estrae il verdetto dal testo del modello: isola il JSON anche se il modello
+/// ha aggiunto testo prima/dopo, filtra i campi inutili e ricalcola `ok`.
+fn parse_precheck_verdict(raw: &str, message: &str) -> Value {
     let json_start = raw.find('{').unwrap_or(0);
     let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
-    let parsed: Value = serde_json::from_str(&raw[json_start..json_end]).unwrap_or_else(|_| {
-        json!({
-            "ok": true, "correctedText": null,
-            "contextSuggestion": null, "issues": [], "reason": null
-        })
-    });
+    let parsed: Value =
+        serde_json::from_str(&raw[json_start..json_end]).unwrap_or_else(|_| precheck_pass());
 
     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(true);
     let corrected_text = parsed
@@ -2589,13 +2786,55 @@ pub async fn precheck_chat_message(
             ok
         };
 
-    Ok(Json(json!({
+    json!({
         "ok": effective_ok,
         "correctedText": corrected_text,
         "contextSuggestion": context_suggestion,
         "issues": issues,
         "reason": reason
-    })))
+    })
+}
+
+pub async fn precheck_chat_message(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<PrecheckRequest>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+    let message = body.message.trim();
+
+    if precheck_skipped(message) {
+        return Ok(Json(precheck_pass()));
+    }
+
+    let system_prompt = crate::prompt_templates::get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "chat.precheck_message",
+    )
+    .await;
+
+    // Arricchimento contestuale: se il client passa session_id, il precheck
+    // riceve gli ultimi turni della conversazione. Risolve i falsi-positivi
+    // su follow-up contestuali (es. "riepiloga gli animali" dopo una chat
+    // sugli animali) che in isolamento sembrano "troppo generici" ma in
+    // contesto sono chiarissimi.
+    let effective_message = if let Some(sid) = body.session_id {
+        build_message_with_recent_context_for_classifier(&state.db, sid, message).await
+    } else {
+        message.to_string()
+    };
+
+    let messages_json = serde_json::to_string(&json!([
+        { "role": "user", "content": effective_message }
+    ]))
+    .unwrap_or_default();
+
+    let Some(raw) = precheck_raw_verdict(&state, &messages_json, &system_prompt).await? else {
+        return Ok(Json(precheck_pass()));
+    };
+
+    Ok(Json(parse_precheck_verdict(&raw, message)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2652,48 +2891,50 @@ pub async fn feedback_assist_handler(
     ]))
     .unwrap_or_default();
 
-    // Failover tier-aware (punto unico, regola L): il modello e' risolto dal
-    // resolver a candidati; su fallimento (regola M: neural_value_is_failure —
-    // include content vuoto e "[Error:...]") si prova il prossimo provider. Un
-    // value di fallimento NON diventa MAI il suggerimento (era il leak
-    // "[Error:...]" restituito come suggestion): AllCandidatesFailed -> "".
-    let neural = &state.orchestrator.neural;
-    let suggestion = {
-        use crate::internal_routing::{
-            complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
-        };
-        let attempt = |prov: String, mdl: String| {
-            let messages_json = &messages_json;
-            let system_prompt = &system_prompt;
-            async move {
-                match neural
-                    .generate_agent_turn(&prov, &mdl, messages_json, "[]", 400, system_prompt)
-                    .await
-                {
-                    Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => {
-                        AttemptOutcome::Done(
-                            v.get("content")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .trim()
-                                .trim_matches('"')
-                                .to_string(),
-                        )
-                    }
-                    Ok(_) => AttemptOutcome::Failover,
-                    Err(e) => {
-                        tracing::warn!("feedback_assist LLM error: {e}");
-                        AttemptOutcome::Failover
-                    }
-                }
-            }
-        };
-        match complete_for_purpose_with_failover(&state.db, "chat_title_generator", attempt).await {
-            Ok(s) => s,
-            Err(PurposeFailoverError::AllCandidatesFailed)
-            | Err(PurposeFailoverError::NoCandidate(_)) => String::new(),
-        }
-    };
+    let suggestion = feedback_assist_suggestion(&state, &messages_json, &system_prompt).await;
 
     Ok(Json(json!({ "suggestion": suggestion })))
+}
+
+/// Suggerimento di descrizione anomalia prodotto dal modello.
+///
+/// Failover tier-aware (punto unico, regola L): il modello e' risolto dal
+/// resolver a candidati; su fallimento (regola M: `neural_value_is_failure` —
+/// include content vuoto e "[Error:...]") si prova il prossimo provider. Un
+/// value di fallimento NON diventa MAI il suggerimento (era il leak
+/// "[Error:...]" restituito come suggestion): AllCandidatesFailed -> "".
+async fn feedback_assist_suggestion(
+    state: &AppState,
+    messages_json: &str,
+    system_prompt: &str,
+) -> String {
+    use crate::internal_routing::{
+        complete_for_purpose_with_failover, AttemptOutcome, PurposeFailoverError,
+    };
+    let neural = &state.orchestrator.neural;
+    let attempt = |prov: String, mdl: String| async move {
+        match neural
+            .generate_agent_turn(&prov, &mdl, messages_json, "[]", 400, system_prompt)
+            .await
+        {
+            Ok(v) if !crate::orchestrator::neural_value_is_failure(&v) => AttemptOutcome::Done(
+                v.get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+            Ok(_) => AttemptOutcome::Failover,
+            Err(e) => {
+                tracing::warn!("feedback_assist LLM error: {e}");
+                AttemptOutcome::Failover
+            }
+        }
+    };
+    match complete_for_purpose_with_failover(&state.db, "chat_title_generator", attempt).await {
+        Ok(s) => s,
+        Err(PurposeFailoverError::AllCandidatesFailed)
+        | Err(PurposeFailoverError::NoCandidate(_)) => String::new(),
+    }
 }
