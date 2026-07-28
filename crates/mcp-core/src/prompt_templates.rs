@@ -567,7 +567,7 @@ enum ProviderAttempt {
 /// (comportamento invariato).
 async fn finalize_batch_usage(
     db: &PgPool,
-    reservation: &Option<crate::billing::UsageReservation>,
+    reservation: &Option<crate::billing::Reservation>,
     v: &serde_json::Value,
     prompt_tokens: i32,
     estimated_completion_tokens: i32,
@@ -576,8 +576,29 @@ async fn finalize_batch_usage(
     let usage_numbers =
         crate::billing::extract_usage_numbers(v, prompt_tokens, estimated_completion_tokens);
     if let Some(res) = reservation {
-        if let Err(e) =
-            crate::billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await
+        // Stesso punto unico del percorso chat: oggi questa strada passa per
+        // `NeuralCoreClient::generate_completion`, che manda `GwMetadata::default`
+        // (nessuna identita'), quindi il gateway NON scrive e la prenotazione va
+        // finalizzata. Chiedere lo stesso al punto unico invece di darlo per
+        // scontato costa nulla ed evita che il giorno in cui quei metadata
+        // verranno valorizzati — una riga sola — il doppio addebito rinasca qui.
+        //
+        // Il verdetto su cio' che e' stato dichiarato NON si chiede qui: dipende
+        // da cosa e' stato mandato, e da questo punto la richiesta non e' piu'
+        // visibile — la costruisce `generate_completion`. Sostituirla con
+        // un'ipotesi ("tanto qui l'identita' non c'e' mai") sarebbe la premessa
+        // che si vuole verificare, scritta nel verificatore. Cio' che invece
+        // resta rumoroso in ogni caso e' la dichiarazione ILLEGGIBILE, che
+        // `extract_ledger_declaration` segnala dove nasce.
+        let dichiarazione = crate::billing::extract_ledger_declaration(v);
+        if let Err(e) = crate::billing::settle_usage(
+            db,
+            res,
+            uuid::Uuid::new_v4(),
+            &usage_numbers,
+            &dichiarazione,
+        )
+        .await
         {
             tracing::error!("batch: billing finalize FAILED: {e}");
         }
@@ -595,7 +616,7 @@ async fn reserve_batch_usage(
     model: &str,
     prompt_tokens: i32,
     estimated_completion_tokens: i32,
-) -> Option<crate::billing::UsageReservation> {
+) -> Option<crate::billing::Reservation> {
     match crate::billing::reserve_usage(
         db,
         billing_user_id,
@@ -663,7 +684,7 @@ async fn try_provider_once(
         Err(e) => {
             // In caso di errore, rilascia la riserva (non conteggiare).
             if let Some(res) = &reservation {
-                crate::billing::release_usage(db, res, "provider_error").await;
+                crate::billing::release_usage(db, res, "provider_error", None).await;
             }
             tracing::warn!(
                 "batch: provider {} errore gRPC: {}, marcato broken",
@@ -1009,42 +1030,31 @@ async fn insert_batch_job_marker(
     // Marker “hard” per rendere verificabile che il job è partito e che scrive sul DB giusto.
     // Non dipende da orchestrator_runs/run_id e non blocca il job se fallisce.
     //
-    // La currency viene dal punto unico (regola G): era hardcoded a 'EUR' mentre la
-    // piattaforma e' su USD — quarto scrittore del ledger, e l'unico rimasto a
-    // dichiarare una valuta di propria iniziativa. Riga a costo 0, quindi la valuta
-    // e' vacua, ma "un solo punto per la currency" o e' vero o non lo e'.
-    let marker_id = uuid::Uuid::new_v4();
-    let currency = match nexus_pricing::platform_currency(db).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("batch_assign_tools: marker insert saltato, currency non configurata: {e}");
-            return;
-        }
-    };
-    if let Err(e) = sqlx::query(
-        r#"
-        INSERT INTO ai_usage_ledger (
-            id, user_id, project_id, provider, model,
-            prompt_tokens, completion_tokens, total_tokens,
-            input_cost, output_cost, total_cost, currency,
-            status, details
-        ) VALUES ($1, $2, $3, 'internal', 'batch_assign_tools_job', 0, 0, 0, 0, 0, 0, $5, 'reserved', $4)
-        "#,
+    // Passa dalla stessa INSERT delle altre righe di stima (punto unico
+    // `nexus-ledger`, regola L). Quando era una copia a se' era il QUARTO
+    // scrittore del ledger, e l'unico rimasto a dichiarare una valuta di propria
+    // iniziativa: 'EUR' hardcoded, con la piattaforma su USD. Riga a costo 0,
+    // quindi la valuta e' vacua, ma "un solo punto per la currency" o e' vero o
+    // non lo e'.
+    match nexus_ledger::insert_marker(
+        db,
+        nexus_ledger::Identity {
+            user_id: billing_user_id,
+            project_id: billing_project_id,
+        },
+        "internal",
+        "batch_assign_tools_job",
+        serde_json::json!({
+            "feature": "batch_assign_tools",
+            "event": "job_started",
+        }),
     )
-    .bind(marker_id)
-    .bind(billing_user_id)
-    .bind(billing_project_id)
-    .bind(serde_json::json!({
-        "feature": "batch_assign_tools",
-        "event": "job_started",
-    }))
-    .bind(&currency)
-    .execute(db)
     .await
     {
-        tracing::error!("batch_assign_tools: marker insert FAILED: {e}");
-    } else {
-        tracing::info!("batch_assign_tools: marker inserted ledger_id={marker_id}");
+        Ok(marker_id) => {
+            tracing::info!("batch_assign_tools: marker inserted ledger_id={marker_id}")
+        }
+        Err(e) => tracing::error!("batch_assign_tools: marker insert FAILED: {e}"),
     }
 }
 

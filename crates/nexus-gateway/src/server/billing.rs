@@ -1,86 +1,34 @@
-//! Enforcement quota e registrazione usage nel ledger.
+//! Adapter contabile del gateway: dai TIPI del gateway al punto unico.
 //!
 //! Convenzione Nexus: `tenant_id = project_id` (UUID).
 //!
-//! Regola L: il LISTINO (quanto costa un modello) vive nel punto unico
-//! `nexus-pricing`, non qui. Questo modulo tiene solo cio' che e' suo: la POLICY
-//! di quota e la scrittura del ledger. La differenza conta — la domanda "quanto
-//! costa (provider, model)?" e' una sola, mentre "cosa faccio se non lo so"
-//! dipende dal chiamante, e qui la risposta e' sempre "degrada e annota, mai
-//! respingere la richiesta".
+//! Regola L. Qui non vive piu' ne' il LISTINO (crate `nexus-pricing`: quanto
+//! costa un modello) ne' la CONTABILITA' (crate `nexus-ledger`: quale riga si
+//! scrive, quanto ha consumato uno scope). Resta cio' che e' davvero del
+//! gateway, e che nessun altro puo' fare al posto suo: estrarre dai propri tipi
+//! (`LlmRequest`, `LlmResponse`) l'identita' del chiamante, i token e la stima
+//! del consumo, e tradurre l'esito nel proprio confine HTTP.
 //!
-//! NB storica: una versione precedente di questa doc indicava
-//! `crates/billing-service` come "API interna autoritativa" verso cui far
-//! convergere il gateway alla "Fase 6". Era la direzione sbagliata: quel crate e'
-//! un fork divergente che non scrive alcuna riga di ledger e porta ancora i
-//! difetti (default currency EUR, filtro `is_enabled` sulla contabilita') che
-//! mcp-core aveva gia' corretto. La convergenza e' su `nexus-pricing`.
+//! La differenza conta. Le domande "quale riga scrivo?" e "quanto ha gia'
+//! consumato questo scope?" sono le stesse per chiunque le ponga, e infatti le
+//! due copie — questa e quella di mcp-core — erano tenute gemelle a mano e
+//! divergevano gia' (vedi il doc del crate `nexus-ledger`). La domanda "come si
+//! stimano i token di QUESTA richiesta" invece dipende dai tipi di chi chiede, e
+//! resta qui.
 //!
 //! Regola F: nessun prompt/response/segreto nei log; solo importi/conteggi.
 
 use anyhow::Result;
-use serde_json::json;
 use sqlx::PgPool;
-use uuid::Uuid;
 
-use nexus_pricing::{
-    calculate_cost, calculate_cost_breakdown, resolve_active_price_in, CostBreakdown, PriceLookup,
-    TokenUsage, UsageUnit,
-};
+use nexus_pricing::TokenUsage;
 
-use crate::types::{LlmRequest, LlmResponse, MessageContent};
+use crate::types::{LedgerOutcome, LlmRequest, LlmResponse, MessageContent};
 
-/// Riga di quota attiva (parita' con la query del server.ts).
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct QuotaRow {
-    scope_type: String,
-    token_limit: Option<i64>,
-    cost_limit: Option<f64>,
-    valid_from: chrono::DateTime<chrono::Utc>,
-    valid_to: chrono::DateTime<chrono::Utc>,
-}
-
-/// Quota superata: tradotta in HTTP 403 dal chiamante (come `QUOTA_EXCEEDED` -> 403).
-#[derive(Debug, thiserror::Error)]
-#[error("quota_exceeded:{scope}:{reason}")]
-pub struct QuotaExceeded {
-    pub scope: String,
-    pub reason: String,
-}
-
-/// Listino di (provider, model) + currency di piattaforma, dal punto unico.
-///
-/// DEGRADO ESPLICITO (policy del gateway): se la currency non e' configurata o il
-/// DB del listino non risponde, questa funzione NON propaga l'errore. Il motivo e'
-/// che i suoi chiamanti stanno sul percorso della richiesta: `enforce_quota`
-/// propaga con `?` e il suo errore diventa una richiesta RESPINTA. Far fallire una
-/// chiamata LLM perche' non sappiamo prezzarla sostituirebbe una sottostima con un
-/// outage — un prezzo troppo alto per un problema di contabilita'.
-///
-/// La visibilita' che la regola G esige non viene sacrificata: si ottiene ALL'AVVIO
-/// con `nexus_pricing::assert_configured`, dove fallire e' gratuito, piu' il WARN
-/// qui sotto e `details.price_state` sulla riga di ledger.
-async fn lookup_price(db: &PgPool, provider: &str, model: &str) -> PriceLookup {
-    let currency = match nexus_pricing::platform_currency(db).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "gateway-billing: currency di piattaforma non risolvibile -> costo non calcolabile \
-                 (la richiesta prosegue: vedi assert_configured all'avvio)"
-            );
-            return PriceLookup::NotInCatalog;
-        }
-    };
-    match resolve_active_price_in(db, provider, model, &currency).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(error = %e, provider = %provider, model = %model,
-                "gateway-billing: lettura listino fallita -> costo non calcolabile");
-            PriceLookup::NotInCatalog
-        }
-    }
-}
+// Vocabolario contabile dal punto unico. Ri-esportato perche' i quattro handler
+// media e i confini HTTP lo nominano: `routes.rs` fa `downcast_ref::<QuotaExceeded>()`
+// e costruisce `MediaUsage`, e deve vedere gli STESSI tipi che il ledger scrive.
+pub use nexus_ledger::{MediaKind, MediaUsage, QuantitySource, QuotaExceeded};
 
 /// Stima i token di input dai messaggi (char/4, parita' col server.ts).
 pub fn estimate_prompt_tokens(req: &LlmRequest) -> i64 {
@@ -116,9 +64,28 @@ pub enum QuotaEstimate {
     NonTestuale,
 }
 
-/// Enforce quota PRIMA della chiamata al provider (guardrail). Stima i token e il
-/// costo, somma all'uso corrente del periodo e blocca se sfora un limite attivo.
-/// No-op se mancano `tenant_id`/`user_id` o se non ci sono quote (parita' server.ts).
+/// L'identita' contabile della richiesta, o `None` se non e' utilizzabile.
+///
+/// Cio' che e' del gateway e' sapere DOVE stanno le due stringhe nei propri
+/// tipi; la REGOLA che decide se sono utilizzabili sta nel punto unico
+/// (`nexus_ledger::identity_from_metadata`, regola L), perche' se la pone anche
+/// chi ha prenotato dall'altro lato del wire — sulla richiesta che ha MANDATO —
+/// per sapere se un "non ho scritto" e' legittimo o sospetto. Con la regola
+/// ricopiata qui, quel confronto direbbe soltanto che il gateway e' d'accordo
+/// con se stesso.
+///
+/// `None` non e' un errore: e' il caso reale delle chiamate interne
+/// (`GwMetadata::default`), dove non c'e' nessuno a cui addebitare.
+fn identita(req: &LlmRequest) -> Option<nexus_ledger::Identity> {
+    nexus_ledger::identity_from_metadata(&req.metadata.tenant_id, &req.metadata.user_id)
+}
+
+/// Enforce quota PRIMA della chiamata al provider (guardrail).
+///
+/// No-op se mancano `tenant_id`/`user_id` (parita' server.ts): senza identita'
+/// non c'e' scope a cui applicare un vincolo. La decisione — quali quote sono
+/// attive, quanto e' stato consumato, quale limite e' superato — la prende il
+/// punto unico, la stessa che usa chi prenota.
 pub async fn enforce_quota(
     db: &PgPool,
     req: &LlmRequest,
@@ -126,24 +93,11 @@ pub async fn enforce_quota(
     model: &str,
     stima: QuotaEstimate,
 ) -> Result<()> {
-    let project_id = req.metadata.tenant_id.trim();
-    let user_id = req.metadata.user_id.trim();
-    if project_id.is_empty() || user_id.is_empty() {
-        return Ok(());
-    }
-    let (Ok(project_uuid), Ok(user_uuid)) = (Uuid::parse_str(project_id), Uuid::parse_str(user_id))
-    else {
-        // Metadati non-UUID: il gateway non puo' applicare quote -> passa (no-op).
+    let Some(identity) = identita(req) else {
         return Ok(());
     };
 
-    // Solo per il log della quota superata: se non e' risolvibile lo si dice,
-    // non si inventa una valuta (regola G).
-    let currency = nexus_pricing::platform_currency(db)
-        .await
-        .unwrap_or_else(|_| "currency non configurata".to_string());
-
-    let (estimated_prompt, estimated_completion) = match stima {
+    let (prompt_tokens, completion_tokens) = match stima {
         QuotaEstimate::Testuale => (
             estimate_prompt_tokens(req),
             req.max_tokens.map(|t| t as i64).unwrap_or(0),
@@ -152,238 +106,109 @@ pub async fn enforce_quota(
         // eroderebbe la quota-token del progetto con un numero arbitrario.
         QuotaEstimate::NonTestuale => (0, 0),
     };
-    let estimated_total = estimated_prompt + estimated_completion;
 
-    // Stima per le quote: senza listino resta 0 (non si inventa un prezzo, e
-    // rifiutare qui sarebbe un cambio di policy). Lo zero e' pero' dichiarato,
-    // non implicito: `Unknown` viene loggato perche' una stima a 0 non consuma
-    // quota di costo e lascia sforare in silenzio.
-    let estimated_cost = match lookup_price(db, provider, model).await {
-        PriceLookup::Priced(p) => calculate_cost(&p, estimated_prompt, estimated_completion).2,
-        PriceLookup::Unknown => {
-            tracing::warn!(
-                provider = %provider,
-                model = %model,
-                "gateway-quota: prezzo IGNOTO (pricing_state='unknown') -> stima costo 0, \
-                 la quota di costo non viene consumata per questa chiamata"
-            );
-            0.0
-        }
-        PriceLookup::NotInCatalog => 0.0,
-    };
-
-    let quotas = sqlx::query_as::<_, QuotaRow>(
-        r#"
-        SELECT scope_type, token_limit::bigint AS token_limit, cost_limit::float8 AS cost_limit,
-               valid_from, valid_to
-        FROM ai_quota_policies
-        WHERE is_enabled = TRUE
-          AND valid_from <= NOW()
-          AND valid_to > NOW()
-          AND (
-            (scope_type = 'user' AND user_id = $1) OR
-            (scope_type = 'project' AND project_id = $2) OR
-            (scope_type = 'user_project' AND user_id = $1 AND project_id = $2)
-          )
-        ORDER BY scope_type ASC
-        "#,
-    )
-    .bind(user_uuid)
-    .bind(project_uuid)
-    .fetch_all(db)
-    .await?;
-
-    for q in &quotas {
-        let (used_tokens, used_cost) =
-            usage_for_scope(db, &q.scope_type, user_uuid, project_uuid, q.valid_from, q.valid_to)
-                .await?;
-
-        if let Some(limit) = q.token_limit {
-            if used_tokens + estimated_total > limit {
-                return Err(anyhow::Error::new(QuotaExceeded {
-                    scope: q.scope_type.clone(),
-                    reason: "token_limit".to_string(),
-                }));
-            }
-        }
-        if let Some(limit) = q.cost_limit {
-            if used_cost + estimated_cost > limit {
-                tracing::warn!(
-                    scope = %q.scope_type,
-                    currency = %currency,
-                    provider,
-                    "gateway: quota costo superata"
-                );
-                return Err(anyhow::Error::new(QuotaExceeded {
-                    scope: q.scope_type.clone(),
-                    reason: "cost_limit".to_string(),
-                }));
-            }
-        }
-    }
-
-    Ok(())
+    nexus_ledger::check_quota(db, identity, provider, model, prompt_tokens, completion_tokens).await
 }
-
-/// Uso corrente (token, costo) per uno scope nel periodo del vincolo, su ledger
-/// `reserved`/`finalized`. Parita' con la query del server.ts.
-async fn usage_for_scope(
-    db: &PgPool,
-    scope_type: &str,
-    user_id: Uuid,
-    project_id: Uuid,
-    valid_from: chrono::DateTime<chrono::Utc>,
-    valid_to: chrono::DateTime<chrono::Utc>,
-) -> Result<(i64, f64)> {
-    // La clausola scope discrimina i predicati: usiamo $1/$2 condizionati su scope.
-    let row = sqlx::query_as::<_, (i64, f64)>(
-        r#"
-        SELECT
-            COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
-            COALESCE(SUM(total_cost), 0)::float8 AS cost
-        FROM ai_usage_ledger
-        WHERE status IN ('reserved', 'finalized')
-          AND created_at >= $4
-          AND created_at <  $5
-          AND (
-            ($3 = 'user'         AND user_id = $1) OR
-            ($3 = 'project'      AND project_id = $2) OR
-            ($3 = 'user_project' AND user_id = $1 AND project_id = $2)
-          )
-        "#,
-    )
-    .bind(user_id)
-    .bind(project_id)
-    .bind(scope_type)
-    .bind(valid_from)
-    .bind(valid_to)
-    .fetch_one(db)
-    .await?;
-    Ok(row)
-}
-
-/// La INSERT del percorso testuale, come costante e non inline.
-///
-/// Non e' cosmetica: l'elenco delle colonne scritto a mano dentro la funzione e'
-/// il difetto che ha tenuto a zero le quattro colonne di cache su 7.405 righe.
-/// Una colonna dimenticata non e' un errore di compilazione — il valore cade sul
-/// DEFAULT e nessuno se ne accorge. Come costante, un test puo' confrontarla col
-/// testo VERO della migrazione che quelle colonne le ha create (regola O).
-const SQL_INSERT_LEDGER_TESTO: &str = r#"
-        INSERT INTO ai_usage_ledger (
-            user_id, project_id, run_id, provider, model,
-            prompt_tokens, completion_tokens, total_tokens,
-            cache_read_tokens, cache_creation_tokens,
-            input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost,
-            currency, status, details
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'finalized', $17
-        )
-        "#;
 
 /// Registra l'usage effettivo nel ledger come `finalized` (parita' con
-/// `recordUsageToLedger`). No-op se mancano metadati o usage. Best-effort: gli
-/// errori sono loggati ma non interrompono la risposta al chiamante.
-pub async fn record_usage_to_ledger(db: &PgPool, req: &LlmRequest, resp: &LlmResponse) {
-    let project_id = req.metadata.tenant_id.trim();
-    let user_id = req.metadata.user_id.trim();
-    if project_id.is_empty() || user_id.is_empty() {
-        return;
+/// `recordUsageToLedger`). Best-effort: gli errori sono loggati dal punto unico
+/// ma non interrompono la risposta al chiamante.
+///
+/// RITORNA cosa e' stato fatto ([`LedgerOutcome`]), sempre e in forma
+/// strutturata. Non e' telemetria: e' il segnale (regola M) su cui il chiamante
+/// decide se addebitare a sua volta. I tre esiti non sono deducibili dall'esito
+/// della chiamata LLM, che e' RIUSCITA in tutti e tre:
+///   - `NoIdentity`: `tenant_id`/`user_id` assenti o non-UUID. E' il caso di
+///     `NeuralCoreClient::generate_completion`, che manda `GwMetadata::default`;
+///   - `WriteFailed`: la INSERT e' fallita (DB);
+///   - `Written`: la riga c'e', e porta lei l'addebito.
+///
+/// Nei primi due il chiamante DEVE finalizzare la propria prenotazione, o
+/// l'addebito si perde del tutto; nel terzo deve rilasciarla, o si paga due
+/// volte. Sono decisioni opposte prese sullo stesso "la chiamata e' riuscita":
+/// ecco perche' la risposta non si deduce, si dichiara.
+pub async fn record_usage_to_ledger(
+    db: &PgPool,
+    req: &LlmRequest,
+    resp: &LlmResponse,
+) -> LedgerOutcome {
+    let Some(identity) = identita(req) else {
+        return LedgerOutcome::NoIdentity;
+    };
+    match nexus_ledger::record_tokens(
+        db,
+        identity,
+        &resp.provider_used,
+        &resp.model_used,
+        &token_usage_from(&resp.usage),
+        &req.metadata.request_id,
+        &req.metadata.feature,
+    )
+    .await
+    {
+        Some(entry) => LedgerOutcome::Written(entry),
+        None => LedgerOutcome::WriteFailed,
     }
-    let (Ok(project_uuid), Ok(user_uuid)) = (Uuid::parse_str(project_id), Uuid::parse_str(user_id))
-    else {
+}
+
+/// Scrive il consumo e lo DICHIARA sulla risposta che sta per partire.
+///
+/// Le due cose stanno in una funzione sola perche' separarle E' il difetto: per
+/// tutta la vita del gateway la riga si scriveva e la dichiarazione non
+/// esisteva, cosi' chi aveva prenotato finalizzava anche lei e la chiamata
+/// veniva addebitata due volte (incidente 2026-07-27). Un solo punto (regola L)
+/// che le tiene insieme rende impossibile aggiungere una scrittura muta.
+///
+/// E' anche l'unico modo di TESTARE la pubblicazione: la riga
+/// `response.ledger = ...` viveva dentro la pipeline HTTP completa — provider
+/// reali, routing, redazione — dove nessun test poteva arrivarci, ed era proprio
+/// la riga su cui poggia l'intero fix.
+pub async fn record_and_declare(db: &PgPool, req: &LlmRequest, resp: &mut LlmResponse) {
+    let outcome = record_usage_to_ledger(db, req, resp).await;
+    resp.ledger = Some(outcome);
+}
+
+/// Registra il consumo di una chiamata non-testuale.
+///
+/// Il fallimento dell'identita' si DICE: quando scatta, un consumo reale resta
+/// fuori dalla contabilita', e il silenzio e' esattamente il motivo per cui il
+/// buco e' rimasto aperto tanto a lungo (fino alla mig 0634 queste chiamate non
+/// producevano NESSUNA riga).
+pub async fn record_media_usage_to_ledger(
+    db: &PgPool,
+    req: &LlmRequest,
+    provider_used: &str,
+    model_used: &str,
+    usage: MediaUsage,
+) {
+    let Some(identity) = identita(req) else {
+        tracing::warn!(
+            kind = usage.kind.as_str(),
+            "gateway-ledger: consumo media NON registrato, identita' assente o non-UUID nei metadata"
+        );
         return;
     };
-
-    let provider = &resp.provider_used;
-    let model = &resp.model_used;
-    let tokens = token_usage_from(&resp.usage);
-
-    let price = lookup_price(db, provider, model).await;
-    // `price_state` e' il segnale STRUTTURATO del perche' di un costo: chi legge il
-    // ledger distingue "0 perche' gratis" da "0 perche' non so quanto costa" senza
-    // dedurlo dall'importo. `price_missing` resta per i lettori esistenti ed e'
-    // `true` in ENTRAMBI i casi di costo non calcolabile.
-    let price_state = price.state_label();
-    let price_missing = price.is_missing();
-    let (currency, costo) = match &price {
-        PriceLookup::Priced(p) => (
-            p.currency.trim().to_uppercase(),
-            calculate_cost_breakdown(p, &tokens),
-        ),
-        _ => {
-            if matches!(price, PriceLookup::Unknown) {
-                tracing::warn!(
-                    provider = %provider,
-                    model = %model,
-                    prompt_tokens = tokens.prompt_tokens,
-                    completion_tokens = tokens.completion_tokens,
-                    "gateway-ledger: prezzo IGNOTO (pricing_state='unknown') -> costo NON calcolabile, \
-                     registro 0 esplicito. Il modello non dovrebbe essere routabile: vedi il ciclo \
-                     reconcile_disable_price_unknown del catalog_sync"
-                );
-            }
-            // Costo 0 -> la currency e' vacua, ma la colonna e' NOT NULL: si annota
-            // quella di piattaforma. Se nemmeno quella e' leggibile il DB e' giu' e
-            // l'INSERT qui sotto fallisce comunque, quindi la stringa vuota non
-            // raggiunge una riga persistita.
-            let cur = nexus_pricing::platform_currency(db).await.unwrap_or_default();
-            (cur, costo_nullo())
-        }
-    };
-
-    let details = json!({
-        "request_id": req.metadata.request_id,
-        "feature": req.metadata.feature,
-        "price_missing": price_missing,
-        "price_state": price_state,
-        // Stato del listino di CACHE, separato da quello del listino base: un
-        // `cache_read_cost` a zero puo' voler dire "nessun token da cache" o
-        // "tariffa non a listino, token fatturati a prezzo pieno di input", e i
-        // due casi non si distinguono dall'importo (regola M).
-        "cache_price_state": costo.cache_price_state(),
-    });
-
-    // run_id (= request_id nei metadata): abilita il breakdown costo per run /
-    // sessione (M71). NULL se il chiamante non lo passa o non e' un UUID valido.
-    let run_uuid = Uuid::parse_str(req.metadata.request_id.trim()).ok();
-
-    let res = sqlx::query(SQL_INSERT_LEDGER_TESTO)
-    .bind(user_uuid)
-    .bind(project_uuid)
-    .bind(run_uuid)
-    .bind(provider)
-    .bind(model)
-    .bind(tokens.prompt_tokens)
-    .bind(tokens.completion_tokens)
-    .bind(tokens.total_tokens())
-    .bind(tokens.cache_read_tokens)
-    .bind(tokens.cache_creation_tokens)
-    .bind(costo.input_cost)
-    .bind(costo.output_cost)
-    .bind(costo.cache_read_cost)
-    .bind(costo.cache_creation_cost)
-    .bind(costo.total_cost)
-    .bind(currency)
-    .bind(details)
-    .execute(db)
+    nexus_ledger::record_media(
+        db,
+        identity,
+        provider_used,
+        model_used,
+        &usage,
+        &req.metadata.request_id,
+        &req.metadata.feature,
+    )
     .await;
-
-    if let Err(e) = res {
-        // Regola F: solo l'errore SQL, nessun payload.
-        tracing::warn!(error = %e, "gateway-ledger: insert ledger fallita (best-effort)");
-    }
 }
 
 /// Dalla `LlmUsage` (gia' normalizzata dall'adapter al prompt LORDO, vedi
-/// `LlmUsage::normalized`) ai token che il listino sa tariffare.
+/// `LlmUsage::normalized`) ai token che il ledger registra e il listino tariffa.
 ///
 /// Trasporto e basta: i due contratti hanno la stessa convenzione — prompt
 /// lordo, cache come sottoinsieme — e lo scorporo lo fa `nexus-pricing` al
 /// momento di moltiplicare per le tariffe.
 ///
 /// PUNTO UNICO della conversione (regola L): e' l'unico passaggio fra il
-/// contratto del gateway e quello di `nexus-pricing`. Prima le due quantita' di
+/// contratto del gateway e quello della contabilita'. Prima le due quantita' di
 /// cache si fermavano qui — venivano lette dagli adapter, propagate fino a
 /// questa funzione e poi semplicemente non nominate nella INSERT, restando al
 /// DEFAULT 0 su tutte le righe del ledger.
@@ -396,351 +221,14 @@ fn token_usage_from(usage: &crate::types::LlmUsage) -> TokenUsage {
     }
 }
 
-/// Costo non calcolabile: tutte le voci a zero, nessun ripiego da dichiarare.
-fn costo_nullo() -> CostBreakdown {
-    CostBreakdown {
-        input_cost: 0.0,
-        output_cost: 0.0,
-        cache_read_cost: 0.0,
-        cache_creation_cost: 0.0,
-        total_cost: 0.0,
-        cache_tokens_billed_as_input: 0,
-    }
-}
-
-// ── Consumo delle modalita' non-testuali ──────────────────
-//
-// Image-gen, video-gen, trascrizione e sintesi vocale costano denaro reale e
-// fino alla mig 0634 non producevano NESSUNA riga di ledger: quote e report
-// sottostimavano in silenzio. Non era una dimenticanza — lo schema non aveva
-// modo di dire "3 immagini" o "42 secondi", e i doc-comment dei 4 handler
-// dichiaravano la scelta di non inventare un costo (regola G/H).
-//
-// Ora la quantita' si registra sempre; il COSTO si accende quando
-// `ai_price_catalog_unit` viene popolata. Finche' e' vuota le righe portano 0
-// con `price_state='not_in_catalog'`, che e' un'informazione, non una bugia.
-
-/// Modalita' della chiamata. Finisce in `ai_usage_ledger.usage_kind`, che ha un
-/// CHECK: le stringhe qui sotto devono combaciare con la mig 0634.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MediaKind {
-    Image,
-    Video,
-    /// Audio in ingresso: trascrizione.
-    AudioIn,
-    /// Audio in uscita: sintesi vocale.
-    AudioOut,
-}
-
-impl MediaKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MediaKind::Image => "image",
-            MediaKind::Video => "video",
-            MediaKind::AudioIn => "audio_in",
-            MediaKind::AudioOut => "audio_out",
-        }
-    }
-}
-
-/// Da dove viene la quantita' registrata.
-///
-/// Non e' un dettaglio: nessuno dei quattro provider dichiara oggi quanto ha
-/// prodotto (OpenAI Images scarta l'usage, la trascrizione gira con
-/// `response_format=json` che non porta la durata, il video non riporta i
-/// secondi effettivi). Fatturare cio' che abbiamo CHIESTO e' accettabile, ma chi
-/// legge la riga deve poter distinguere un dato misurato da una stima.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuantitySource {
-    /// Contata sulla risposta del provider.
-    Provider,
-    /// Dedotta da cio' che e' stato richiesto.
-    Request,
-    /// Non conoscibile.
-    None,
-}
-
-impl QuantitySource {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            QuantitySource::Provider => "provider",
-            QuantitySource::Request => "request",
-            QuantitySource::None => "none",
-        }
-    }
-}
-
-/// Quanto e' stato consumato da una chiamata non-testuale.
-#[derive(Debug, Clone)]
-pub struct MediaUsage {
-    pub kind: MediaKind,
-    /// `None` quando la quantita' non e' conoscibile: il CHECK
-    /// `chk_ledger_quantity_coerente` impone che allora `source` sia `None`, cosi'
-    /// "non lo so" non puo' travestirsi da zero.
-    pub quantity: Option<f64>,
-    pub unit: UsageUnit,
-    pub source: QuantitySource,
-}
-
-impl MediaUsage {
-    /// Quantita' contata sulla risposta del provider.
-    pub fn misurata(kind: MediaKind, unit: UsageUnit, quantity: f64) -> Self {
-        Self { kind, quantity: Some(quantity), unit, source: QuantitySource::Provider }
-    }
-
-    /// Quantita' dedotta dalla richiesta (il provider non la dichiara).
-    pub fn da_richiesta(kind: MediaKind, unit: UsageUnit, quantity: f64) -> Self {
-        Self { kind, quantity: Some(quantity), unit, source: QuantitySource::Request }
-    }
-
-    /// Consumo avvenuto ma non quantificabile: la riga si scrive lo stesso
-    /// (chi, cosa, quale modello), senza inventare un numero.
-    pub fn non_quantificabile(kind: MediaKind, unit: UsageUnit) -> Self {
-        Self { kind, quantity: None, unit, source: QuantitySource::None }
-    }
-}
-
-/// `(project_id, user_id)` dai metadata, o `None` se non sono utilizzabili.
-///
-/// Stessa guard del percorso testuale, ma qui il fallimento si DICE: quando
-/// scatta, un consumo reale resta fuori dalla contabilita', e il silenzio e'
-/// esattamente il motivo per cui il buco e' rimasto aperto tanto a lungo.
-fn identita_del_chiamante(req: &LlmRequest, kind: MediaKind) -> Option<(Uuid, Uuid)> {
-    let project_id = req.metadata.tenant_id.trim();
-    let user_id = req.metadata.user_id.trim();
-    if project_id.is_empty() || user_id.is_empty() {
-        tracing::warn!(
-            kind = kind.as_str(),
-            "gateway-ledger: consumo media NON registrato, identita' assente nei metadata"
-        );
-        return None;
-    }
-    match (Uuid::parse_str(project_id), Uuid::parse_str(user_id)) {
-        (Ok(p), Ok(u)) => Some((p, u)),
-        _ => {
-            tracing::warn!(
-                kind = kind.as_str(),
-                "gateway-ledger: consumo media NON registrato, identita' non e' un UUID"
-            );
-            None
-        }
-    }
-}
-
-/// Costo del consumo e stato del listino, come coppia `(costo, price_state)`.
-///
-/// Il costo esiste solo se esistono ENTRAMBI: un listino per quell'unita' E una
-/// quantita' da moltiplicare. Mancando l'uno o l'altra il risultato e' 0
-/// DICHIARATO via `price_state`, mai dedotto — chi legge la riga distingue
-/// "gratis" da "non so quanto costa" senza guardare l'importo.
-async fn prezza_consumo(
-    db: &PgPool,
-    provider: &str,
-    model: &str,
-    usage: &MediaUsage,
-    currency: &str,
-) -> (f64, &'static str) {
-    let price = match nexus_pricing::resolve_unit_price(db, provider, model, usage.unit, currency)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "gateway-ledger: lookup listino per-unita' fallito");
-            nexus_pricing::UnitPriceLookup::NotInCatalog
-        }
-    };
-    let costo = usage.quantity.and_then(|q| price.cost_for(q)).unwrap_or(0.0);
-    (costo, price.state_label())
-}
-
-/// Registra il consumo di una chiamata non-testuale. Gemella di
-/// [`record_usage_to_ledger`] e con le stesse regole: no-op senza identita',
-/// best-effort, `status='finalized'`.
-///
-/// PUNTO UNICO (regola L): i quattro handler media sono copie parallele, e
-/// scrivere il ledger in ognuno avrebbe creato la quinta copia. Qui la logica
-/// sta una volta sola e i chiamanti dichiarano soltanto cosa hanno consumato.
-pub async fn record_media_usage_to_ledger(
-    db: &PgPool,
-    req: &LlmRequest,
-    provider_used: &str,
-    model_used: &str,
-    usage: MediaUsage,
-) {
-    let Some((project_uuid, user_uuid)) = identita_del_chiamante(req, usage.kind) else {
-        return;
-    };
-
-    // Currency prima del prezzo: serve comunque, perche' la colonna e' NOT NULL
-    // senza default (un default hardcoded qui e' gia' costato 3.993 righe orfane
-    // prima della mig 0294).
-    let currency = match nexus_pricing::platform_currency(db).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "gateway-ledger: currency di piattaforma illeggibile, riga media non scritta");
-            return;
-        }
-    };
-
-    let (total_cost, price_state) =
-        prezza_consumo(db, provider_used, model_used, &usage, &currency).await;
-
-    let details = json!({
-        "request_id": req.metadata.request_id,
-        "feature": req.metadata.feature,
-        "price_missing": total_cost == 0.0,
-        "price_state": price_state,
-    });
-
-    let run_uuid = Uuid::parse_str(req.metadata.request_id.trim()).ok();
-
-    let riga = RigaMedia {
-        user_uuid,
-        project_uuid,
-        run_uuid,
-        provider: provider_used,
-        model: model_used,
-        total_cost,
-        currency: &currency,
-        details,
-        usage: &usage,
-    };
-    if let Err(e) = inserisci_riga_media(db, riga).await {
-        tracing::warn!(error = %e, "gateway-ledger: insert ledger media fallita (best-effort)");
-    }
-}
-
-/// Campi di una riga di consumo media, raggruppati per non passare dodici
-/// argomenti sciolti.
-struct RigaMedia<'a> {
-    user_uuid: Uuid,
-    project_uuid: Uuid,
-    run_uuid: Option<Uuid>,
-    provider: &'a str,
-    model: &'a str,
-    total_cost: f64,
-    currency: &'a str,
-    details: serde_json::Value,
-    usage: &'a MediaUsage,
-}
-
-/// L'INSERT vero e proprio.
-///
-/// I costi per-unita' finiscono in `total_cost`: non sono ne' input ne' output, e
-/// spalmarli su una delle due colonne token-oriented direbbe una cosa falsa a chi
-/// le legge. `input_cost`/`output_cost` e i token restano 0 (default di colonna):
-/// per queste righe il consumo vive in `quantity`.
-async fn inserisci_riga_media(db: &PgPool, r: RigaMedia<'_>) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO ai_usage_ledger (
-            user_id, project_id, run_id, provider, model,
-            total_cost, currency, status, details,
-            usage_kind, quantity, quantity_unit, quantity_source
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, 'finalized', $8, $9, $10, $11, $12
-        )
-        "#,
-    )
-    .bind(r.user_uuid)
-    .bind(r.project_uuid)
-    .bind(r.run_uuid)
-    .bind(r.provider)
-    .bind(r.model)
-    .bind(r.total_cost)
-    .bind(r.currency)
-    .bind(r.details)
-    .bind(r.usage.kind.as_str())
-    .bind(r.usage.quantity)
-    .bind(r.usage.quantity.map(|_| r.usage.unit.as_str()))
-    .bind(r.usage.source.as_str())
-    .execute(db)
-    .await
-    .map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, RequestMetadata};
+    use nexus_pricing::{calculate_cost, calculate_cost_breakdown};
     // `Row::get` per rileggere le colonne del ledger nel test della giuntura.
     use sqlx::Row;
-
-    // ── Vocabolario del consumo media ──────────────────
-    //
-    // Le stringhe di `MediaKind`, `QuantitySource` e `UsageUnit` finiscono in
-    // colonne con un CHECK: se divergono dalla migrazione, l'INSERT fallisce a
-    // RUNTIME e il consumo torna invisibile — cioe' il difetto che questo lavoro
-    // ha appena chiuso, di nuovo, senza che nessun test se ne accorga.
-    //
-    // Il testo della migrazione e' incluso a compile-time dal file VERO applicato
-    // al database (regola O): non e' una copia delle costanti riscritta nel test,
-    // che direbbe soltanto che il codice e' uguale a se stesso.
-    const MIGRAZIONE_0634: &str =
-        include_str!("../../../../db/migrations/0634_media_usage_units.sql");
-
-    /// Ogni `usage_kind` che il codice sa produrre deve essere ammesso dal CHECK.
-    #[test]
-    fn i_kind_del_codice_sono_ammessi_dalla_migrazione() {
-        for kind in [
-            MediaKind::Image,
-            MediaKind::Video,
-            MediaKind::AudioIn,
-            MediaKind::AudioOut,
-        ] {
-            let atteso = format!("'{}'", kind.as_str());
-            assert!(
-                MIGRAZIONE_0634.contains(&atteso),
-                "usage_kind {atteso} non compare nella migrazione 0634: l'INSERT fallirebbe sul CHECK"
-            );
-        }
-    }
-
-    /// Idem per la provenienza della quantita'.
-    #[test]
-    fn le_fonti_della_quantita_sono_ammesse_dalla_migrazione() {
-        for source in [
-            QuantitySource::Provider,
-            QuantitySource::Request,
-            QuantitySource::None,
-        ] {
-            let atteso = format!("'{}'", source.as_str());
-            assert!(
-                MIGRAZIONE_0634.contains(&atteso),
-                "quantity_source {atteso} non compare nella migrazione 0634"
-            );
-        }
-    }
-
-    /// E per le unita', che vivono nel crate pricing ma finiscono in due CHECK
-    /// (ledger e listino unitario).
-    #[test]
-    fn le_unita_sono_ammesse_dalla_migrazione() {
-        for unit in [UsageUnit::Image, UsageUnit::Second, UsageUnit::Character] {
-            let atteso = format!("'{}'", unit.as_str());
-            assert!(
-                MIGRAZIONE_0634.contains(&atteso),
-                "quantity_unit {atteso} non compare nella migrazione 0634"
-            );
-        }
-    }
-
-    /// "Non lo so" e "zero" restano distinguibili: il costruttore per il
-    /// consumo non quantificabile non deve produrre una quantita'.
-    #[test]
-    fn non_quantificabile_non_inventa_uno_zero() {
-        let u = MediaUsage::non_quantificabile(MediaKind::AudioIn, UsageUnit::Second);
-        assert_eq!(u.quantity, None);
-        assert_eq!(u.source, QuantitySource::None);
-        // E' la coppia che il CHECK chk_ledger_quantity_coerente impone:
-        // (quantity_source = 'none') = (quantity IS NULL).
-        let misurata = MediaUsage::misurata(MediaKind::Image, UsageUnit::Image, 3.0);
-        assert_eq!(misurata.quantity, Some(3.0));
-        assert_ne!(misurata.source, QuantitySource::None);
-        let stimata = MediaUsage::da_richiesta(MediaKind::Video, UsageUnit::Second, 8.0);
-        assert_eq!(stimata.source, QuantitySource::Request);
-        assert!(stimata.quantity.is_some());
-    }
+    use uuid::Uuid;
 
     fn req(messages: Vec<&str>, max_tokens: Option<u32>) -> LlmRequest {
         LlmRequest {
@@ -781,17 +269,10 @@ mod tests {
         // 9 char -> ceil(9/4) = 3.
         assert_eq!(estimate_prompt_tokens(&req(vec!["123456789"], None)), 3);
         // 8 char -> 2; somma su piu' messaggi.
-        assert_eq!(
-            estimate_prompt_tokens(&req(vec!["1234", "5678"], None)),
-            2
-        );
+        assert_eq!(estimate_prompt_tokens(&req(vec!["1234", "5678"], None)), 2);
         // vuoto -> 0.
         assert_eq!(estimate_prompt_tokens(&req(vec![""], None)), 0);
     }
-
-    // NB: il test `calculate_cost_scala_per_milione` (e il clamp dei token
-    // negativi) vive ora accanto alla funzione, in `nexus-pricing`. Riprodurlo qui
-    // testerebbe una funzione che questo crate non possiede piu'.
 
     #[test]
     fn quota_exceeded_display() {
@@ -802,54 +283,32 @@ mod tests {
         assert_eq!(e.to_string(), "quota_exceeded:user:token_limit");
     }
 
-    // ── Il ledger e le colonne di cache ────────────────────
-    //
-    // La riga di ledger la scrive una INSERT con l'elenco delle colonne a mano:
-    // una colonna omessa cade sul DEFAULT, e nessun compilatore la reclama. E'
-    // esattamente cosi' che `cache_read_tokens` e `cache_creation_tokens` sono
-    // rimaste a zero su 7.405 chiamate mentre gli adapter le leggevano.
-    //
-    // Il confronto e' col testo VERO della migrazione applicata al database
-    // (regola O), non con una lista ricopiata nel test.
-    const MIGRAZIONE_0129: &str =
-        include_str!("../../../../db/migrations/0129_ledger_cache_columns.sql");
-
-    /// Ogni colonna che la mig 0129 ha aggiunto al ledger deve comparire nella
-    /// INSERT che il gateway esegue davvero.
+    /// L'identita' contabile si estrae dai metadata, e i due casi in cui NON si
+    /// estrae sono quelli in cui il gateway non deve scrivere.
     #[test]
-    fn la_insert_del_ledger_nomina_le_colonne_di_cache() {
-        for colonna in [
-            "cache_read_tokens",
-            "cache_creation_tokens",
-            "cache_read_cost",
-            "cache_creation_cost",
-        ] {
-            assert!(
-                MIGRAZIONE_0129.contains(colonna),
-                "la migrazione 0129 non crea {colonna}: il test guarda il file sbagliato"
-            );
-            assert!(
-                SQL_INSERT_LEDGER_TESTO.contains(colonna),
-                "la INSERT del ledger non elenca {colonna}: la colonna resterebbe al DEFAULT 0"
-            );
-        }
-        // Un segnaposto per ogni valore bindato: 17 bind, 17 placeholder. Uno
-        // scarto qui e' un errore SQL a runtime, best-effort e quindi solo
-        // loggato — cioe' invisibile.
-        for n in 1..=17 {
-            assert!(
-                SQL_INSERT_LEDGER_TESTO.contains(&format!("${n}")),
-                "placeholder ${n} assente dalla INSERT"
-            );
-        }
-        assert!(
-            !SQL_INSERT_LEDGER_TESTO.contains("$18"),
-            "placeholder di troppo rispetto ai bind"
-        );
+    fn lidentita_esce_solo_da_metadata_utilizzabili() {
+        // Default dei metadata: nessuna identita'.
+        assert!(identita(&req(vec!["ciao"], None)).is_none());
+
+        // Presenti ma non-UUID: nemmeno.
+        let mut r = req(vec!["ciao"], None);
+        r.metadata.tenant_id = "non-un-uuid".into();
+        r.metadata.user_id = "nemmeno".into();
+        assert!(identita(&r).is_none());
+
+        // Due UUID buoni: tenant_id e' il PROGETTO, user_id l'UTENTE. Lo scambio
+        // dei due non e' un errore di compilazione e addebiterebbe al progetto
+        // sbagliato.
+        let (u, p) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut r = req(vec!["ciao"], None);
+        r.metadata.tenant_id = p.to_string();
+        r.metadata.user_id = u.to_string();
+        let id = identita(&r).expect("identita' valida");
+        assert_eq!(id.project_id, p);
+        assert_eq!(id.user_id, u);
     }
 
-    /// Dalla `LlmUsage` che gli adapter producono alla riga che il ledger
-    /// scrive: i numeri che finiscono nelle colonne, non una struct fabbricata.
+    /// Dalla `LlmUsage` che gli adapter producono ai token che il ledger scrive.
     #[test]
     fn i_token_di_cache_arrivano_alla_riga_di_ledger() {
         // Il valore parte dal suo PRODUTTORE (`LlmUsage::normalized`, lo stesso
@@ -906,7 +365,11 @@ mod tests {
         let costo = calculate_cost_breakdown(&price, &tokens);
 
         // Scorporato: 100k a 3.0 + 900k a 0.3 = 0.30 + 0.27 = 0.57.
-        assert!((costo.total_cost - 0.57).abs() < 1e-9, "totale {}", costo.total_cost);
+        assert!(
+            (costo.total_cost - 0.57).abs() < 1e-9,
+            "totale {}",
+            costo.total_cost
+        );
         assert!((costo.cache_read_cost - 0.27).abs() < 1e-9);
         assert_eq!(costo.cache_price_state(), "priced");
 
@@ -928,36 +391,29 @@ mod tests {
         assert_eq!(ripiego.cache_price_state(), "cache_price_missing");
     }
 
-    // ── La GIUNTURA: dai numeri alle COLONNE ───────────────────
+    // ── La GIUNTURA: dai tipi del gateway alle COLONNE ─────────
     //
-    // I tre test qui sopra coprono i PEZZI: la normalizzazione, la conversione
-    // verso il listino, lo scorporo del costo. Nessuno dimostra la giuntura, cioe'
-    // che il valore bindato in posizione N finisca nella colonna che in posizione
-    // N e' dichiarata. Il conteggio dei segnaposto ($1..$17) non lo dimostra: con
-    // quattro conteggi e cinque importi adiacenti e omogenei, uno scambio di
-    // posizione non e' un errore che il compilatore veda, non e' un errore SQL, e
-    // si paga in denaro.
+    // I test qui sopra coprono i PEZZI: la normalizzazione, la conversione verso
+    // il listino, lo scorporo del costo, l'estrazione dell'identita'. Nessuno
+    // dimostra la giuntura, cioe' che percorrendo l'adapter per intero i valori
+    // finiscano nelle colonne giuste. L'unico modo di dimostrarlo e' percorrere
+    // la strada della produzione fino in fondo e RILEGGERE la riga dal database
+    // vero, sullo schema reale applicato dal META_MIGRATOR (regola O).
     //
-    // L'unico modo di dimostrarlo e' percorrere la strada della produzione fino in
-    // fondo e RILEGGERE la riga dal database vero, sullo schema reale applicato dal
-    // META_MIGRATOR (regola O).
+    // Il gemello di questo test — quello che verifica che davanti a questa riga
+    // nessuno ne aggiunga una seconda — vive in
+    // `crates/nexus-ledger/tests/una_sola_riga_finalizzata.rs`, dove entrambi i
+    // produttori sono raggiungibili.
 
-    /// Identita' che le FK del ledger esigono (`users`, `projects`) piu' il
-    /// `run_id`, che il gateway deriva dal `request_id`: quello non ha piu' una FK
-    /// — la mig 0276 l'ha tolta perche' i run agentici non stanno in
-    /// `orchestrator_runs` — quindi e' un UUID libero.
-    ///
-    /// Il seeding delle due identita' viene dal punto unico
-    /// [`nexus_migrations_embedded::seed_identita_meta`]: la gemella di questo test in
-    /// `mcp_core::billing` semina le stesse tabelle, e due copie a mano
-    /// divergerebbero alla prima colonna NOT NULL aggiunta.
+    /// Identita' che le FK del ledger esigono, dal seeder unico dello schema.
     async fn seed_identita(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
         let (user, project) = nexus_migrations_embedded::seed_identita_meta(pool).await;
         (user, project, Uuid::new_v4())
     }
 
-    /// Listino con ENTRAMBE le tariffe di cache valorizzate (forma della mig 0403)
-    /// e le quattro tariffe DISTINTE: e' cio' che rende osservabile uno scambio.
+    /// Listino con ENTRAMBE le tariffe di cache valorizzate (forma della mig
+    /// 0403) e le quattro tariffe DISTINTE: e' cio' che rende osservabile uno
+    /// scambio di posizione fra i bind.
     async fn seed_listino(pool: &PgPool) {
         sqlx::query(
             "INSERT INTO ai_price_catalog ( \
@@ -973,7 +429,6 @@ mod tests {
     }
 
     /// Richiesta con l'identita' che il gateway richiede per contabilizzare.
-    /// Riusa il costruttore dei test esistenti invece di ricopiarlo.
     fn req_con_identita(project: Uuid, user: Uuid, run: Uuid) -> LlmRequest {
         let mut r = req(vec!["ciao"], Some(64));
         r.metadata.tenant_id = project.to_string();
@@ -983,8 +438,8 @@ mod tests {
     }
 
     /// Risposta come la costruisce un adapter: l'usage nasce dal suo PRODUTTORE
-    /// (`LlmUsage::normalized`), che e' l'unico posto dove si decide se i token di
-    /// cache vanno sommati al prompt per arrivare al lordo.
+    /// (`LlmUsage::normalized`), che e' l'unico posto dove si decide se i token
+    /// di cache vanno sommati al prompt per arrivare al lordo.
     fn resp_anthropic_con_cache() -> LlmResponse {
         LlmResponse {
             content: "ok".to_string(),
@@ -1004,25 +459,24 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger: None,
         }
     }
 
-    /// I dodici numeri della riga, ognuno nella sua colonna. Scelti distinti a due
-    /// a due proprio perche' uno scambio non possa passare inosservato.
+    /// I dodici numeri della riga, ognuno nella sua colonna. Scelti distinti a
+    /// due a due proprio perche' uno scambio non possa passare inosservato.
     #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
     async fn record_usage_scrive_ogni_numero_nella_sua_colonna(pool: PgPool) {
         let (user, project, run) = seed_identita(&pool).await;
         seed_listino(&pool).await;
 
-        record_usage_to_ledger(
-            &pool,
-            &req_con_identita(project, user, run),
-            &resp_anthropic_con_cache(),
-        )
-        .await;
+        // La strada della produzione per intero: si scrive e si DICHIARA sulla
+        // risposta, con la stessa funzione che chiama la pipeline HTTP.
+        let mut resp = resp_anthropic_con_cache();
+        record_and_declare(&pool, &req_con_identita(project, user, run), &mut resp).await;
 
         let riga = sqlx::query(
-            "SELECT user_id, project_id, provider, model, status, currency, details, \
+            "SELECT id, user_id, project_id, provider, model, status, currency, details, \
                     prompt_tokens, completion_tokens, total_tokens, \
                     cache_read_tokens, cache_creation_tokens, \
                     input_cost::float8          AS input_cost, \
@@ -1035,8 +489,10 @@ mod tests {
         .bind(run)
         .fetch_one(&pool)
         .await
-        .expect("la riga di ledger deve esistere: l'insert e' best-effort e un errore \
-                 SQL qui sarebbe solo loggato, cioe' invisibile");
+        .expect(
+            "la riga di ledger deve esistere: l'insert e' best-effort e un errore \
+             SQL qui sarebbe solo loggato, cioe' invisibile",
+        );
 
         // Identita' e chiavi testuali: anche queste sono bind posizionali.
         assert_eq!(riga.get::<Uuid, _>("user_id"), user);
@@ -1057,8 +513,8 @@ mod tests {
 
         // I cinque IMPORTI, alle quattro tariffe distinte del listino:
         // 1M x 3.0, 0.4M x 15.0, 2M x 0.3, 0.5M x 3.75. Il messaggio riporta il
-        // valore LETTO: su uno scambio di bind e' quello che dice quale colonna ha
-        // preso il posto di quale.
+        // valore LETTO: su uno scambio di bind e' quello che dice quale colonna
+        // ha preso il posto di quale.
         for (colonna, atteso) in [
             ("input_cost", 3.0),
             ("output_cost", 6.0),
@@ -1079,5 +535,71 @@ mod tests {
         assert_eq!(details["price_state"], "priced");
         assert_eq!(details["price_missing"], false);
         assert_eq!(details["cache_price_state"], "priced");
+
+        // E cio' che il gateway DICHIARA SULLA RISPOSTA e' la riga che ha
+        // scritto davvero. Non e' una formalita': su questa dichiarazione il
+        // chiamante che ha prenotato decide di NON addebitare una seconda volta
+        // (`nexus_ledger::settle`). Se l'id o l'importo dichiarati non fossero
+        // quelli della riga, la correlazione punterebbe altrove e il costo
+        // mostrato all'utente divergerebbe dal ledger.
+        let dichiarazione = resp
+            .ledger
+            .as_ref()
+            .expect("la pipeline deve dichiarare SEMPRE un esito contabile");
+        assert_eq!(dichiarazione.as_str(), "written");
+        let entry = dichiarazione
+            .entry()
+            .expect("il gateway ha scritto: deve dichiarare la riga");
+        assert_eq!(entry.id, riga.get::<Uuid, _>("id"));
+        assert_eq!(entry.currency, riga.get::<String, _>("currency"));
+        assert!(
+            (entry.total_cost - riga.get::<f64, _>("total_cost")).abs() < 1e-9,
+            "costo dichiarato {} != costo scritto {}",
+            entry.total_cost,
+            riga.get::<f64, _>("total_cost")
+        );
+    }
+
+    /// La domanda che decide se rilasciare una prenotazione e' "il gateway ha
+    /// scritto?", e la risposta NON e' "la chiamata e' riuscita".
+    ///
+    /// Qui la chiamata riesce (la `LlmResponse` e' identica al test sopra) ma i
+    /// metadata non portano identita': e' esattamente cio' che manda
+    /// `NeuralCoreClient::generate_completion` (`GwMetadata::default`). Il
+    /// gateway non scrive nulla, e deve DIRLO: un chiamante che rilasciasse la
+    /// prenotazione fidandosi dell'esito perderebbe l'intero addebito.
+    ///
+    /// E il "non ho scritto" e' DETTO, non taciuto: `no_identity` viaggia sul
+    /// wire, e il silenzio resta libero di significare una cosa sola — un
+    /// gateway che non parla questo contratto.
+    ///
+    /// MUTAZIONE: facendo dichiarare una riga fabbricata prima della guardia
+    /// d'identita', questo test e il suo gemello qui sopra rosseggiano entrambi;
+    /// facendo lasciare `resp.ledger` a `None` invece che a `Some(NoIdentity)`,
+    /// rosseggia la prima asserzione — ed e' il caso in cui il chiamante non puo'
+    /// piu' distinguere una scelta da una build vecchia.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_identita_il_gateway_non_scrive_e_lo_dichiara(pool: PgPool) {
+        seed_listino(&pool).await;
+
+        // `req` senza tenant_id/user_id: la forma di default dei metadata.
+        let mut resp = resp_anthropic_con_cache();
+        record_and_declare(&pool, &req(vec!["ciao"], Some(64)), &mut resp).await;
+
+        let dichiarazione = resp
+            .ledger
+            .as_ref()
+            .expect("anche il 'non ho scritto' va DICHIARATO: il silenzio dice un'altra cosa");
+        assert_eq!(dichiarazione.as_str(), "no_identity");
+        assert!(
+            dichiarazione.entry().is_none(),
+            "senza identita' il gateway non scrive: dichiarare una riga inesistente \
+             autorizzerebbe il chiamante a rilasciare la prenotazione, perdendo l'addebito"
+        );
+        let righe: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_usage_ledger")
+            .fetch_one(&pool)
+            .await
+            .expect("conteggio ledger");
+        assert_eq!(righe, 0, "nessuna riga doveva essere scritta");
     }
 }

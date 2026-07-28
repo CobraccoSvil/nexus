@@ -422,6 +422,13 @@ fn completion_value_from_gw(provider: &str, model: &str, resp: &GwResponse) -> V
         "content": resp.content,
         "metadata": {
             "usage": usage_value_from_gw(resp),
+            // L'esito contabile dichiarato dal gateway viaggia con la completion:
+            // e' cio' che permette al chiamante che ha prenotato di NON addebitare
+            // due volte (`billing::settle_usage`). `null` quando il gateway non ha
+            // dichiarato NULLA — e' l'unica assenza, e a valle non viene
+            // interpretata come "non ho scritto": quello, quando succede, e'
+            // detto (`no_identity` / `write_failed`).
+            "ledger": resp.ledger,
         },
         "error": Value::Null,
         "error_class": Value::Null,
@@ -888,6 +895,7 @@ mod gateway_mapping_tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger: None,
         }
     }
 
@@ -909,12 +917,68 @@ mod gateway_mapping_tests {
         assert_eq!(v["model"], "m-real");
     }
 
+    /// Il giro completo produttore -> consumatore sulla DICHIARAZIONE contabile.
+    ///
+    /// Stessa strada dei token di cache qui sotto, e stessa ragione: la chiave
+    /// `metadata.ledger` la scrive `completion_value_from_gw` e la legge
+    /// `billing::extract_ledger_declaration`, e su quella lettura si decide chi
+    /// addebita. Un test che si scrivesse da solo il JSON direbbe soltanto che
+    /// `serde_json` sa rileggere se stesso (regola O).
+    ///
+    /// MUTAZIONE: rinominando la chiave `"ledger"` nel produttore, tutte e tre le
+    /// asserzioni sull'esito diventano `undeclared` — cioe' "nessuno ha
+    /// addebitato", cioe' la prenotazione viene finalizzata sopra una riga che il
+    /// gateway ha gia' scritto.
+    #[test]
+    fn la_dichiarazione_del_gateway_sopravvive_al_giro() {
+        let riga = nexus_ledger::LedgerEntry {
+            id: uuid::Uuid::new_v4(),
+            total_cost: 0.002339,
+            currency: "USD".into(),
+        };
+
+        // 1. Riga scritta: il consumatore la ritrova, con l'id e l'importo veri.
+        let mut resp = base_resp();
+        resp.ledger = Some(nexus_ledger::LedgerOutcome::Written(riga.clone()));
+        let letta = crate::billing::extract_ledger_declaration(&completion_value_from_gw(
+            "openai", "gpt-x", &resp,
+        ));
+        let entry = letta.entry().expect("la riga dichiarata deve arrivare");
+        assert_eq!(entry.id, riga.id);
+        assert!((entry.total_cost - 0.002339).abs() < 1e-12);
+        assert_eq!(entry.currency, "USD");
+
+        // 2. "Non ho scritto" DETTO: nessuna riga da rilasciare, e non e'
+        //    silenzio — su una chiamata con identita' sarebbe un difetto, e si
+        //    vede.
+        resp.ledger = Some(nexus_ledger::LedgerOutcome::NoIdentity);
+        let letta = crate::billing::extract_ledger_declaration(&completion_value_from_gw(
+            "openai", "gpt-x", &resp,
+        ));
+        assert_eq!(letta.as_str(), "no_identity");
+        assert!(letta.entry().is_none());
+        assert_eq!(
+            letta.audit(true),
+            nexus_ledger::DeclarationAudit::IdentitaPersa
+        );
+
+        // 3. Nessuna dichiarazione: e' l'unica assenza, e resta distinta dalle
+        //    due sopra. E' anche il caso di OGGI su questo percorso, dove
+        //    `NeuralCoreClient` manda `GwMetadata::default`.
+        resp.ledger = None;
+        let letta = crate::billing::extract_ledger_declaration(&completion_value_from_gw(
+            "openai", "gpt-x", &resp,
+        ));
+        assert_eq!(letta.as_str(), "undeclared");
+        assert!(letta.entry().is_none());
+    }
+
     /// Il giro completo produttore -> consumatore sui token di cache.
     ///
     /// Il JSON lo costruisce il produttore VERO (`completion_value_from_gw`) e lo
     /// legge il consumatore VERO (`billing::extract_usage_numbers`): e' la strada
     /// della produzione. Le due chiavi di cache erano gia' scritte qui e venivano
-    /// scartate dall'altro capo, dove `UsageNumbers` non aveva dove metterle.
+    /// scartate dall'altro capo, dove i conteggi non avevano dove finire.
     #[test]
     fn i_token_di_cache_sopravvivono_al_giro_completion_usage_numbers() {
         let mut resp = base_resp();
@@ -931,10 +995,10 @@ mod gateway_mapping_tests {
 
         // Il consumatore le legge (prima si fermavano qui).
         let n = crate::billing::extract_usage_numbers(&v, 0, 0);
-        assert_eq!(n.prompt_tokens, 962);
-        assert_eq!(n.completion_tokens, 34);
-        assert_eq!(n.cache_read_tokens, 900);
-        assert_eq!(n.cache_creation_tokens, 50);
+        assert_eq!(n.tokens.prompt_tokens, 962);
+        assert_eq!(n.tokens.completion_tokens, 34);
+        assert_eq!(n.tokens.cache_read_tokens, 900);
+        assert_eq!(n.tokens.cache_creation_tokens, 50);
         // Il totale e' prompt lordo + completion: la cache e' gia' dentro.
         assert_eq!(n.total_tokens, 996);
     }
@@ -945,8 +1009,8 @@ mod gateway_mapping_tests {
         let v = completion_value_from_gw("openai", "gpt-x", &base_resp());
         assert!(v["metadata"]["usage"].get("cache_read_tokens").is_none());
         let n = crate::billing::extract_usage_numbers(&v, 0, 0);
-        assert_eq!(n.cache_read_tokens, 0);
-        assert_eq!(n.cache_creation_tokens, 0);
+        assert_eq!(n.tokens.cache_read_tokens, 0);
+        assert_eq!(n.tokens.cache_creation_tokens, 0);
         assert_eq!(n.total_tokens, 46);
     }
 

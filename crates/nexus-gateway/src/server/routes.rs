@@ -49,8 +49,8 @@ use crate::types::{
 };
 
 use super::billing::{
-    enforce_quota, record_media_usage_to_ledger, record_usage_to_ledger, MediaKind, MediaUsage,
-    QuotaEstimate, QuotaExceeded,
+    enforce_quota, record_and_declare, record_media_usage_to_ledger, record_usage_to_ledger,
+    MediaKind, MediaUsage, QuotaEstimate, QuotaExceeded,
 };
 use nexus_pricing::UsageUnit;
 use nexus_types::error_presentation::{render_user_error, ErrorDomain, ErrorFacts};
@@ -573,8 +573,17 @@ async fn run_complete(
     // Reidratazione post-flight: ripristina gli originali nei placeholder.
     response = pipeline.rehydrate(&response, &mut map);
 
-    // Telemetria: ledger best-effort (non blocca la risposta).
-    record_usage_to_ledger(&state.db, req, &response).await;
+    // Ledger best-effort (non blocca la risposta). Cio' che si e' fatto della
+    // contabilita' viene DICHIARATO sulla risposta: non e' telemetria, e' il
+    // segnale su cui il chiamante decide di non addebitare una seconda volta la
+    // stessa chiamata (regola M). Prima il gateway scriveva la sua riga in
+    // silenzio e mcp-core, che non poteva saperlo, ne finalizzava una propria:
+    // due righe finalizzate e costo raddoppiato per una sola chiamata.
+    //
+    // Scrittura e dichiarazione sono UNA chiamata sola (regola L): erano due
+    // righe qui dentro, dove nessun test poteva arrivare, e questa era la piu'
+    // importante delle due.
+    record_and_declare(&state.db, req, &mut response).await;
 
     Ok(response)
 }
@@ -1564,6 +1573,10 @@ async fn build_sse_stream(
                         Ok(chunk) => {
                             // Chunk finale con usage + provider + model: scrivi ledger
                             // (parita' col server.ts che registra l'usage dello stream).
+                            // L'esito non viene dichiarato a nessuno: lo streaming
+                            // non ha un chiamante che prenoti, quindi qui non
+                            // esiste il rischio di doppio addebito che il campo
+                            // `ledger` della risposta non-streaming previene.
                             if let (Some(usage), Some(provider), Some(model)) =
                                 (chunk.usage, &chunk.provider_used, &chunk.model_used)
                             {
@@ -1579,8 +1592,9 @@ async fn build_sse_stream(
                                     reasoning: None,
                                     thinking_signature: None,
                                     citations: None,
+                                    ledger: None,
                                 };
-                                record_usage_to_ledger(&state.db, &body, &resp).await;
+                                let _ = record_usage_to_ledger(&state.db, &body, &resp).await;
                             }
                             let payload = serde_json::to_string(&chunk).unwrap_or_default();
                             if tx.send(Ok(Event::default().data(payload))).await.is_err() {
@@ -2862,6 +2876,7 @@ mod tests {
                     reasoning: None,
                     thinking_signature: None,
                     citations: None,
+                    ledger: None,
                 }),
                 // Errori strutturati (status + codice), come i provider reali.
                 Behaviour::ErrBilling => Err(crate::providers::ProviderHttpError {
@@ -2911,6 +2926,7 @@ mod tests {
                             reasoning: None,
                             thinking_signature: None,
                             citations: None,
+                            ledger: None,
                         })
                     }
                 }

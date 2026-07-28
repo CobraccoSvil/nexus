@@ -37,6 +37,10 @@ mcp-db = { path = "../mcp-db" }
 mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }
 nexus-pricing = { path = "../nexus-pricing" }
+# Punto unico della contabilita' di ai_usage_ledger (regola L): prenotazione,
+# chiusura, rilascio e consumo per le quote. Qui restano gli adapter dai tipi di
+# mcp-core e i report admin (letture di presentazione).
+nexus-ledger = { path = "../nexus-ledger" }
 nexus-model-eligibility = { path = "../nexus-model-eligibility" }
 nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
@@ -93,6 +97,15 @@ nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }
 # perche' mcp-core e' bin-only e nexus-auth/nexus-project-pools sono sue
 # dipendenze: nessuno dei tre poteva ospitarlo per gli altri due.
 nexus-test-preconditions = { path = "../nexus-test-preconditions" }
+# SOLO per i test, e per una ragione sola: il confine wire fra i due processi.
+# `GwResponse` e' la struct specchiata a mano di `nexus_gateway::types::LlmResponse`
+# e nulla le tiene allineate — un rename da una parte sola fa arrivare `None` a
+# `settle` a ogni chiamata, cioe' fa rinascere il doppio addebito in silenzio.
+# L'unico test che lo puo' vedere deve serializzare col produttore VERO (regola O),
+# e mcp-core e' bin-only: nessun altro crate puo' vedere GwResponse, quindi il
+# test vive qui e il produttore va portato qui. Nessuna dipendenza di PRODUZIONE
+# viene aggiunta, e non c'e' ciclo: nexus-gateway non dipende da mcp-core.
+nexus-gateway = { path = "../nexus-gateway" }
 
 [features]
 # default: include onnx — l'ambiente locale canonico (WSL, regola "Esecuzione
