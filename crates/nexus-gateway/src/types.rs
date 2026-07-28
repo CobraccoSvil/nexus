@@ -393,6 +393,28 @@ pub struct PrivacyRerouted {
     pub reason: String,
 }
 
+/// Vocabolario contabile del wire, dal punto unico (`nexus-ledger`).
+///
+/// [`LedgerOutcome`] e' il segnale STRUTTURATO (regola M) con cui il gateway
+/// dichiara al chiamante cosa ha fatto della contabilita' di QUESTA chiamata:
+/// `written` (con la [`LedgerEntry`] scritta) e' il permesso di non addebitare
+/// una seconda volta; `no_identity` e `write_failed` sono "non ho scritto" detti
+/// con precisione, e obbligano il chiamante ad addebitare lui.
+///
+/// Nessuno dei due va dedotto dal fatto che la chiamata sia RIUSCITA: la
+/// chiamata riesce in tutti e tre i casi.
+///
+/// L'unico esito non dichiarabile e' il campo ASSENTE, e ora significa una cosa
+/// sola: gateway che non parla questa versione del contratto. NON e' innocuo, e
+/// il chiamante lo tratta come sospetto quando aveva mandato un'identita' valida
+/// (`nexus_ledger::Declaration::audit`) — un gateway di build precedente la riga
+/// l'ha scritta comunque, quindi finalizzare per silenzio addebita due volte.
+///
+/// I tipi vivono nel punto unico e qui sono ri-esportati: e' il vocabolario
+/// CONDIVISO fra i due lati del wire, e finche' erano struct gemelle — una per
+/// lato — nessun compilatore le teneva allineate.
+pub use nexus_ledger::{LedgerEntry, LedgerOutcome};
+
 /// Risposta non-streaming (`LLMResponse`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
@@ -421,6 +443,16 @@ pub struct LlmResponse {
     /// mai estratto dal testo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citations: Option<Vec<String>>,
+    /// Cosa ha fatto il gateway della contabilita' di questa chiamata (vedi
+    /// [`LedgerOutcome`]). La valorizza SOLO la pipeline HTTP, in
+    /// `server::billing::record_and_declare`: i provider non la toccano, ed e'
+    /// per questo che nascono tutte con `None`.
+    ///
+    /// `None` qui dentro significa "non ancora dichiarato". Sul WIRE lo stesso
+    /// `None` sparisce (`skip_serializing_if`) e diventa il silenzio che il
+    /// chiamante legge come `Declaration::Muta`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<LedgerOutcome>,
 }
 
 impl LlmResponse {
@@ -757,6 +789,7 @@ mod tests {
             reasoning: None,
             thinking_signature: None,
             citations: None,
+            ledger: None,
         }
     }
 

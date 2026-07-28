@@ -31,9 +31,6 @@ pub(crate) struct ScoringWeights {
     pub capabilities: f32,
 }
 
-/// Chiave/valore della riga sentinella dei pesi di default.
-const DEFAULT_WEIGHTS_KEY: &str = "*";
-
 static WEIGHTS_CACHE: OnceLock<TtlCache<String, ScoringWeights>> = OnceLock::new();
 
 fn weights_cache() -> &'static TtlCache<String, ScoringWeights> {
@@ -82,12 +79,18 @@ async fn fetch_default_weights(db: &PgPool) -> Result<ScoringWeights, String> {
 /// Pesi di scoring di default, con cache 60s (TtlCache, punto unico cache,
 /// regola L). Usato dal routing slot-based (`select_models_for_requirement`)
 /// e in FASE 2 dalle viste runtime. Regola G: niente pesi hardcoded.
+///
+/// La chiave di cache e' l'identita' del DATABASE (`nexus_auth::pool_identity`,
+/// la stessa della cache dei settings), non una costante: la riga sentinella
+/// esiste in ogni database e i valori possono differire, quindi una chiave
+/// costante servirebbe i pesi del primo lettore a tutti gli altri.
 pub(crate) async fn default_scoring_weights(db: &PgPool) -> Result<ScoringWeights, String> {
-    if let Some(w) = weights_cache().get(DEFAULT_WEIGHTS_KEY) {
+    let ck = nexus_auth::pool_identity(db);
+    if let Some(w) = weights_cache().get(&ck) {
         return Ok(w);
     }
     let w = fetch_default_weights(db).await?;
-    weights_cache().insert(DEFAULT_WEIGHTS_KEY.to_string(), w.clone());
+    weights_cache().insert(ck, w.clone());
     Ok(w)
 }
 
@@ -212,61 +215,51 @@ pub(crate) struct QualificationGate {
     pub exclude_preview: bool,
 }
 
-/// PUNTO UNICO (regola L) della lettura dei flag del gate di qualificazione
-/// (mig 0591/0592). UNA query, cache 60s in-process (stesso pattern di
-/// `agent.enforce_port_allocation`): il routing la consulta a ogni selezione
+/// Chiavi in `settings` dei due flag del gate di qualificazione (mig 0591/0592).
+const ENFORCE_ROUTING_GATE_KEY: &str = "agent.model_qualification.enforce_routing_gate";
+const EXCLUDE_PREVIEW_AGENTIC_KEY: &str = "agent.model_qualification.exclude_preview_agentic";
+
+/// Lettura dei flag del gate di qualificazione (mig 0591/0592) dal PUNTO UNICO
+/// dei settings (`nexus_auth`, regola L), che ha gia' la cache 60s — chiavata
+/// per DATABASE (`user@host:porta/db`). Il routing la consulta a ogni selezione
 /// AGENTICA senza martellare il DB. Chiave assente o illeggibile -> `false`
 /// (comportamento storico: i rollout si accendono SOLO con la riga in settings,
 /// regola G, nessun default nascosto che scavalchi il DB).
+///
+/// Perche' NON ha una cache propria (2026-07-27, causa radice di 6 test flaky).
+/// Qui viveva una cache statica di processo `OnceLock<Mutex<Option<(_, Instant)>>>`
+/// SENZA chiave: memorizzava il valore letto da UN database e lo serviva a
+/// QUALUNQUE altro per 60s. mcp-core interroga piu' database (il meta e un
+/// `<slug>_nexus` per progetto), quindi era un difetto di produzione prima ancora
+/// che di test: il gate del meta poteva decidere una selezione fatta sul DB di un
+/// progetto, e viceversa. Nei test lo stesso difetto era gia' VISIBILE: i
+/// `#[sqlx::test(migrator = "META_MIGRATOR")]` girano su un DB dove la mig 0595
+/// porta `enforce_routing_gate` a `true`, e la loro prima selezione accendeva il
+/// gate per tutti gli altri test del processo — che seminano un catalog
+/// `unqualified` e si vedevano il pool svuotato, con esito dipendente da chi
+/// vinceva la corsa (regole F e O). La gemella `select_model_with_gate` era nata
+/// per aggirare proprio questa cache; ora non c'e' piu' nulla da aggirare.
 pub(crate) async fn qualification_gate(db: &PgPool) -> QualificationGate {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<Option<(QualificationGate, Instant)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock() {
-        if let Some((value, expires_at)) = *guard {
-            if Instant::now() < expires_at {
-                return value;
-            }
-        }
+    QualificationGate {
+        require_qualified: flag_settato(db, ENFORCE_ROUTING_GATE_KEY).await,
+        exclude_preview: flag_settato(db, EXCLUDE_PREVIEW_AGENTIC_KEY).await,
     }
-    fn flag(v: &str) -> bool {
-        matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
-    }
-    let mut value = QualificationGate::default();
-    match sqlx::query_as::<_, (String, String)>(
-        "SELECT key, value FROM settings WHERE key IN (
-            'agent.model_qualification.enforce_routing_gate',
-            'agent.model_qualification.exclude_preview_agentic'
-        )",
-    )
-    .fetch_all(db)
-    .await
-    {
-        Ok(rows) => {
-            for (k, v) in rows {
-                match k.as_str() {
-                    "agent.model_qualification.enforce_routing_gate" => {
-                        value.require_qualified = flag(&v)
-                    }
-                    "agent.model_qualification.exclude_preview_agentic" => {
-                        value.exclude_preview = flag(&v)
-                    }
-                    _ => {}
-                }
-            }
-        }
+}
+
+/// `true` solo se la chiave esiste ed e' accesa. Errore DB o chiave assente ->
+/// `false` (fail-safe storico del gate: nessun rollout si accende da solo).
+async fn flag_settato(db: &PgPool, key: &str) -> bool {
+    match nexus_auth::get_bool_setting(db, key).await {
+        Ok(v) => v.unwrap_or(false),
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "qualification_gate: lettura settings fallita, gate spento"
+                key = %key,
+                "qualification_gate: lettura settings fallita, flag spento"
             );
+            false
         }
     }
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((value, Instant::now() + Duration::from_secs(60)));
-    }
-    value
 }
 
 /// PUNTO UNICO (regola L) del mapping capability -> colonna booleana canonica
@@ -1335,6 +1328,90 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(out.len(), 2);
+    }
+
+    /// REGRESSIONE (2026-07-27): il gate letto per UN database non deve valere
+    /// per un ALTRO. Qui viveva una cache statica di processo senza chiave: il
+    /// primo che leggeva fissava il gate per tutti per 60s.
+    ///
+    /// Nei test l'effetto era misurabile e ricorrente — un
+    /// `#[sqlx::test(migrator = "META_MIGRATOR")]` gira su un DB dove la mig 0595
+    /// accende `enforce_routing_gate`, e da li' in poi ogni altro test del
+    /// processo si vedeva il catalog svuotato (i sei test di `internal_routing`
+    /// falliti/passati a seconda di chi partiva per primo). In produzione era lo
+    /// stesso difetto: mcp-core interroga il DB meta e un `<slug>_nexus` per
+    /// progetto, e la configurazione dell'uno decideva le selezioni dell'altro.
+    ///
+    /// Il test attraversa `qualification_gate` (la funzione della produzione, non
+    /// una sua imitazione) su DUE database vivi nello stesso processo, nell'ordine
+    /// che rompeva: prima quello col flag acceso.
+    ///
+    /// MUTAZIONE: rimettendo una cache di processo non chiavata, la seconda
+    /// lettura torna `require_qualified = true` e l'asserzione fallisce.
+    #[sqlx::test]
+    async fn il_gate_di_un_database_non_decide_per_un_altro(pool: sqlx::PgPool) {
+        use sqlx::postgres::PgPoolOptions;
+
+        // Il DB gemello nasce accanto a quello del fixture, sullo STESSO cluster:
+        // le sue coordinate si derivano dal pool, non da una URL ricopiata. Il
+        // nome e' corto e univoco: quello del fixture occupa gia' i 63 byte che
+        // Postgres concede a un identificatore, e derivarne uno per suffisso
+        // significherebbe farselo TRONCARE addosso — cioe' droppare il database
+        // del test in corso.
+        let opts = pool.connect_options().as_ref().clone();
+        let gemello = format!("gate_iso_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts.clone().database("postgres"))
+            .await
+            .expect("connessione al database di manutenzione");
+        sqlx::query(&format!("CREATE DATABASE \"{gemello}\""))
+            .execute(&admin)
+            .await
+            .expect("creazione del database gemello");
+
+        let pool_gemello = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts.database(&gemello))
+            .await
+            .expect("connessione al database gemello");
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool_gemello)
+            .await
+            .expect("settings del gemello");
+        sqlx::query("INSERT INTO settings (key, value) VALUES ($1, 'true'), ($2, 'true')")
+            .bind(ENFORCE_ROUTING_GATE_KEY)
+            .bind(EXCLUDE_PREVIEW_AGENTIC_KEY)
+            .execute(&pool_gemello)
+            .await
+            .expect("gate acceso nel gemello");
+
+        // Il DB del fixture ha la tabella, ma NESSUNA delle due chiavi: il gate
+        // deve restare spento (fail-safe storico).
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("settings del fixture");
+
+        let acceso = qualification_gate(&pool_gemello).await;
+        assert!(
+            acceso.require_qualified && acceso.exclude_preview,
+            "il gemello ha entrambe le chiavi a 'true': {acceso:?}"
+        );
+
+        let qui = qualification_gate(&pool).await;
+
+        pool_gemello.close().await;
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{gemello}\""))
+            .execute(&admin)
+            .await
+            .expect("rimozione del database gemello");
+
+        assert!(
+            !qui.require_qualified && !qui.exclude_preview,
+            "il gate di un database non puo' decidere per un altro: qui le chiavi \
+             non ci sono e il gate deve restare spento. Ricevuto: {qui:?}"
+        );
     }
 
     #[sqlx::test]

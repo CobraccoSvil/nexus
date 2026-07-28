@@ -693,9 +693,15 @@ pub async fn select_models(
         .collect())
 }
 
-/// Come [`select_model`] ma col gate ESPLICITO. Privata: esiste perche' la cache
-/// del gate (60s, statica e in-process) renderebbe i test dipendenti dall'ordine
-/// di esecuzione. Non e' una porta di servizio per i call site — non e' `pub`.
+/// Come [`select_model`] ma col gate ESPLICITO: serve ai test che devono
+/// esercitare ENTRAMBE le posizioni del gate sullo stesso parco, senza scrivere
+/// la riga in `settings` per accenderlo. Non e' una porta di servizio per i call
+/// site — non e' `pub`.
+///
+/// Nasceva come rimedio a una cache del gate statica e SENZA chiave, che rendeva
+/// i test dipendenti dall'ordine; quella cache non c'e' piu' (vedi
+/// `qualification_gate`), e l'isolamento fra database ora e' strutturale, non
+/// affidato a chi si ricorda di usare questa variante.
 async fn select_model_with_gate(
     db: &PgPool,
     req: &ModelRequest<'_>,

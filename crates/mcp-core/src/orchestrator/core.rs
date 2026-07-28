@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    billing::{self, UsageNumbers},
+    billing::{self, LedgerUsage},
     domain::OrchestratorAudit,
     nexus_gateway::NexusGatewayClient,
     provider_cooldown::is_provider_in_cooldown,
@@ -18,7 +18,7 @@ use super::*;
 /// Esito di un'esecuzione LLM: `(provider, model, completion, usage, cost,
 /// currency)`. Alias interno usato dai due path di esecuzione (gateway/neural)
 /// estratti da `Orchestrator::run`.
-type LlmExecution = (String, String, serde_json::Value, UsageNumbers, f64, String);
+type LlmExecution = (String, String, serde_json::Value, LedgerUsage, f64, String);
 
 impl Orchestrator {
     /// Il gateway e' un parametro OBBLIGATORIO: senza non si puo' chiamare alcun
@@ -1278,6 +1278,17 @@ impl Orchestrator {
         // Il pin serve ancora DOPO che la richiesta e' stata consumata dalla
         // chiamata: e' cio' che rende leggibile il fallimento (nessun ripiego).
         let pin_provider = call.request.pin_provider.clone();
+        // La stessa domanda che si porra' il gateway sulla richiesta che riceve,
+        // posta qui sulla richiesta che PARTE, con la stessa regola (punto unico,
+        // regola L). Non e' una formalita': se l'identita' c'e', un gateway che
+        // poi non dichiara nulla non e' un caso legittimo, e la differenza fra i
+        // due casi vale il doppio del costo della chiamata. Si misura sulla
+        // richiesta VERA, non sul fatto che qui sopra girino due UUID.
+        let identita_inviata = nexus_ledger::identity_from_metadata(
+            &call.request.metadata.tenant_id,
+            &call.request.metadata.user_id,
+        )
+        .is_some();
         let prompt_tokens = mcp_token::count_tokens(composed_prompt) as i32;
         let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
         let reservation = billing::reserve_usage(
@@ -1298,7 +1309,7 @@ impl Orchestrator {
         let gw_resp = match gw.complete(call.request).await {
             Ok(r) => r,
             Err(e) => {
-                billing::release_usage(db, &reservation, "gateway_error").await;
+                billing::release_usage(db, &reservation, "gateway_error", None).await;
                 // La resa nasce QUI, dove si sa ancora che il provider era
                 // forzato, e viaggia come errore tipizzato: il confine HTTP
                 // della chat la rilegge invece di ri-derivarla da una stringa
@@ -1319,9 +1330,47 @@ impl Orchestrator {
         };
         // Dal punto unico: la costruzione a mano scartava i campi di cache che
         // `GwUsage` porta gia' (era il terzo percorso che li perdeva).
-        let actual_usage = UsageNumbers::from_gateway(&gw_resp.usage);
-        let (_, _, cost, cur) =
-            billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
+        let actual_usage = billing::usage_from_gateway(&gw_resp.usage);
+        // Chi addebita questa chiamata lo decide il punto unico, dal segnale che
+        // il gateway emette solo se ha davvero scritto la sua riga: se l'ha
+        // scritta la prenotazione si rilascia (una sola riga finalizzata per
+        // run), altrimenti si finalizza come sempre (nessun addebito perso).
+        let dichiarazione = nexus_ledger::Declaration::dal_wire(gw_resp.ledger.clone());
+        let settlement =
+            billing::settle_usage(db, &reservation, run_id, &actual_usage, &dichiarazione).await?;
+
+        // Il verdetto sulla dichiarazione, confrontata con cio' che e' stato
+        // MANDATO. Il caso che qui va urlato e' il silenzio su una chiamata con
+        // identita' valida: i due servizi sono processi distinti che si
+        // aggiornano in momenti diversi, e un gateway di build precedente la riga
+        // l'ha scritta lo stesso — cioe' questa chiamata la sta pagando due
+        // volte, ed e' esattamente il difetto del 2026-07-27 che ritorna. Finora
+        // non c'era ne' un WARN ne' un contatore: il ritorno del difetto sarebbe
+        // stato invisibile quanto la prima volta.
+        let audit = dichiarazione.audit(identita_inviata);
+        if audit.sospetta() {
+            tracing::warn!(
+                target: "billing",
+                // Regola M: si filtra sui codici, non sulla frase.
+                audit = audit.code(),
+                declared = dichiarazione.as_str(),
+                identity_sent = identita_inviata,
+                charged_by = settlement.charged_by.as_str(),
+                run_id = %run_id,
+                provider = %gw_resp.provider_used,
+                model = %gw_resp.model_used,
+                reservation_ledger_id = %reservation.ledger_id,
+                "billing: dichiarazione contabile SOSPETTA dal gateway — {}",
+                audit.conseguenza()
+            );
+        }
+        // Anche nel caso normale l'esito si porta appresso: e' la riga che, di
+        // fronte a un importo che non torna, dice QUALE delle due guardare —
+        // quella di chi ha eseguito o la prenotazione, che se rilasciata vale
+        // zero. Viaggia sulla riga di log che esiste gia' (sotto), non su una in
+        // piu': `ChargedBy` e' `Copy`, e sopravvive al move di `settlement`.
+        let charged_by = settlement.charged_by;
+        let (cost, cur) = (settlement.total_cost, settlement.currency);
         let gw_completion = json!({"content": gw_resp.content, "metadata": {
             "provider": gw_resp.provider_used, "model": gw_resp.model_used,
             "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason,
@@ -1336,6 +1385,7 @@ impl Orchestrator {
         });
         if let Some(ref pr) = gw_resp.privacy_rerouted {
             tracing::warn!(
+                charged_by = charged_by.as_str(),
                 "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
                 pr.blocked_tier,
                 pr.provider,
@@ -1344,6 +1394,12 @@ impl Orchestrator {
             );
         } else {
             tracing::info!(
+                // `charged_by` viaggia sulla riga che esiste gia': dice quale
+                // delle due righe di ledger porta davvero l'addebito di questa
+                // chiamata — quella del gateway o la prenotazione — e senza di
+                // esso, davanti a un importo che non torna, non si sa nemmeno da
+                // che parte cominciare a cercare.
+                charged_by = charged_by.as_str(),
                 "Nexus Gateway: intent={} provider={} model={} tokens={}",
                 intent,
                 gw_resp.provider_used,
@@ -1539,8 +1595,8 @@ impl Orchestrator {
             "model": model,
             "completion": completion,
             "tokens_saved": context.tokens_saved,
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
+            "prompt_tokens": usage.tokens.prompt_tokens,
+            "completion_tokens": usage.tokens.completion_tokens,
             "total_tokens": usage.total_tokens,
             "total_cost": total_cost,
             "currency": currency,

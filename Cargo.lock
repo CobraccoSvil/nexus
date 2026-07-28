@@ -2034,8 +2034,10 @@ dependencies = [
  "nexus-build-graph",
  "nexus-cache",
  "nexus-events",
+ "nexus-gateway",
  "nexus-graph",
  "nexus-http",
+ "nexus-ledger",
  "nexus-mcp-client",
  "nexus-migrations",
  "nexus-migrations-embedded",
@@ -2385,6 +2387,7 @@ dependencies = [
  "jsonwebtoken",
  "nexus-auth",
  "nexus-cache",
+ "nexus-ledger",
  "nexus-migrations-embedded",
  "nexus-pricing",
  "nexus-tool-kit",
@@ -2434,6 +2437,23 @@ dependencies = [
  "reqwest",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "nexus-ledger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "nexus-migrations-embedded",
+ "nexus-pricing",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
