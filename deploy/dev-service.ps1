@@ -26,6 +26,8 @@ $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
 # Kill + verifica del fatto: punto unico condiviso con dev-stop.ps1/deploy-local.ps1.
 . (Join-Path $PSScriptRoot 'lib\nexus-process.ps1')
+# Lettura dei manifest: punto unico condiviso con dev-start.ps1/nexus-publish.ps1.
+. (Join-Path $PSScriptRoot 'lib\nexus-manifest.ps1')
 
 function Write-Info([string]$msg) { Write-Output $msg }
 function Fail([string]$msg) { [Console]::Error.WriteLine($msg); exit 1 }
@@ -75,18 +77,17 @@ function Start-FromManifest([string]$id) {
   $xmlPath = Join-Path $WINSW "$id\$id.xml"
   if (-not (Test-Path $xmlPath)) { Fail "manifest WinSW mancante: $xmlPath (servizio '$id' non installato ne' avviabile come processo)" }
 
-  [xml]$x = Get-Content $xmlPath -Raw
-  $s = $x.service
-  $exe = $s.executable
-  $cwd = $s.workingdirectory
-  $argLine = if ($s.arguments) { [string]$s.arguments } else { '' }
+  $m = Read-NexusServiceManifest -Path $xmlPath
+  $exe = $m.Executable
+  $cwd = $m.WorkingDirectory
+  $argLine = $m.Arguments
 
   # Env dal manifest solo per il processo che stiamo per lanciare, poi ripristino.
-  $svcEnv = @($s.env | Where-Object { $_ })
+  # Il tag e' opzionale: per i binari Rust l'elenco e' vuoto per costruzione.
   $saved = @{}
-  foreach ($e in $svcEnv) {
-    $saved[$e.name] = [Environment]::GetEnvironmentVariable($e.name, 'Process')
-    Set-Item -Path "env:$($e.name)" -Value $e.value
+  foreach ($e in @($m.Env)) {
+    $saved[$e.Name] = [Environment]::GetEnvironmentVariable($e.Name, 'Process')
+    Set-Item -Path "env:$($e.Name)" -Value $e.Value
   }
   if (-not (Test-Path env:RUST_LOG)) {
     $saved['RUST_LOG'] = $null

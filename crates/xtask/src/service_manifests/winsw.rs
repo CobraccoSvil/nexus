@@ -1,9 +1,13 @@
 //! Emissione e rilettura del manifest WinSW.
 //!
-//! `parse_winsw` estrae ESATTAMENTE i quattro campi che `Start-FromManifest`
+//! `parse_winsw` estrae i quattro campi che `Start-FromManifest`
 //! (deploy/dev-service.ps1) legge davvero: executable, workingdirectory,
-//! arguments, env. Il round-trip serve a verificare che cio' che scriviamo sia
-//! cio' che il consumatore leggera', non che sappiamo rileggere il nostro XML.
+//! arguments, env. Serve al confronto con l'esistente (`--check`), NON a
+//! rappresentare il consumatore: e' una seconda implementazione del lettore, e
+//! un round-trip con essa dimostra solo che sappiamo rileggere il nostro XML.
+//! Che il consumatore lo sappia leggere lo misurano i test marcati `windows`,
+//! che invocano `deploy/lib/nexus-manifest.ps1` — il lettore vero — sull'XML
+//! prodotto qui. La distinzione e' costata sette servizi fermi il 2026-07-28.
 
 use super::plan::ServizioRisolto;
 
@@ -160,8 +164,16 @@ mod tests {
         assert!(emit_winsw(&servizio()).starts_with(MARCATORE));
     }
 
-    /// I manifest gia' sul disco iniziano con il BOM: il lettore deve vederli,
-    /// altrimenti ogni confronto con l'esistente direbbe "divergente" a vuoto.
+    /// Il BOM non deve accecare il lettore, altrimenti ogni confronto con
+    /// l'esistente direbbe "divergente" a vuoto.
+    ///
+    /// PREMESSA CORRETTA il 28/07/2026: qui c'era scritto "i manifest gia' sul
+    /// disco iniziano con il BOM". Era vero dei manifest del vecchio generatore
+    /// PowerShell (`Set-Content -Encoding utf8` in PS 5.1 lo antepone); quelli
+    /// che scriviamo noi no — misurati sul disco, iniziano con `3C 21 2D`, cioe'
+    /// il marcatore. Il test resta valido per i residui e per i file scritti a
+    /// mano, ma non descrive piu' cio' che il generatore produce: una premessa
+    /// non verificata invecchia in silenzio e rende il verde un'opinione.
     #[test]
     fn il_bom_dei_manifest_esistenti_non_acceca_il_lettore() {
         let con_bom = format!("\u{feff}{}", emit_winsw(&servizio()));
@@ -184,5 +196,121 @@ mod tests {
         let xml = emit_winsw(&s);
         assert!(!xml.contains("<arguments>"));
         assert!(parse_winsw(&xml).arguments.is_empty());
+    }
+
+    // ── Il consumatore VERO ───────────────────────────────────────────────────
+    //
+    // I test qui sopra girano tutti contro `parse_winsw`, che NON e' il
+    // consumatore: e' una seconda implementazione del lettore, scritta dalla
+    // stessa mano nello stesso momento del produttore. Un round-trip fra le due
+    // verifica che sappiamo rileggere il nostro XML, non che chi lo consuma lo
+    // sappia leggere — e quando le due copie divergono resta verde (regola O).
+    //
+    // La divergenza e' arrivata il 2026-07-28. `parse_winsw` tollera
+    // `<arguments>` assente (`unwrap_or_default`); il lettore PowerShell faceva
+    // `$s.arguments`, che sotto lo StrictMode propagato da deploy-local.ps1
+    // solleva un'eccezione. Sette servizi su otto non sono partiti dopo un deploy
+    // riuscito, con questa suite verde e col test qui sopra che certificava
+    // proprio l'omissione del tag.
+    //
+    // Da qui in giu' si misura il lettore reale, nelle condizioni reali.
+
+    /// Fa leggere il manifest a `deploy/lib/nexus-manifest.ps1` — il lettore che
+    /// dev-start.ps1 e dev-service.ps1 usano davvero — con StrictMode attivo,
+    /// cioe' nello stato in cui lo mette il deploy.
+    #[cfg(windows)]
+    fn letto_da_powershell(xml: &str, caso: &str) -> (String, String, String, Vec<String>) {
+        const LETTORE: &str = r#"Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+. '@LIB@'
+$m = Read-NexusServiceManifest -Path '@MANIFEST@'
+Write-Output ('EXE=' + $m.Executable)
+Write-Output ('CWD=' + $m.WorkingDirectory)
+Write-Output ('ARGS=' + $m.Arguments)
+foreach ($e in @($m.Env)) { Write-Output ('ENV=' + $e.Name + '=' + $e.Value) }
+"#;
+        let lib = super::super::repo_root()
+            .expect("radice del repository")
+            .join("deploy")
+            .join("lib")
+            .join("nexus-manifest.ps1");
+        assert!(
+            lib.exists(),
+            "il lettore dei manifest non esiste: {}",
+            lib.display()
+        );
+
+        let dir = std::env::temp_dir().join(format!("nexus-manifest-{caso}"));
+        std::fs::create_dir_all(&dir).expect("directory temporanea");
+        let manifest = dir.join("servizio.xml");
+        std::fs::write(&manifest, xml).expect("scrittura manifest");
+        let script = dir.join("leggi.ps1");
+        std::fs::write(
+            &script,
+            LETTORE
+                .replace("@LIB@", &lib.display().to_string())
+                .replace("@MANIFEST@", &manifest.display().to_string()),
+        )
+        .expect("scrittura script");
+
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .output()
+            .expect("esecuzione di powershell.exe");
+        assert!(
+            out.status.success(),
+            "il lettore ha rifiutato il manifest generato:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let testo = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+        let campo = |p: &str| {
+            testo
+                .lines()
+                .find_map(|r| r.strip_prefix(p))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let env = testo
+            .lines()
+            .filter_map(|r| r.strip_prefix("ENV="))
+            .map(str::to_string)
+            .collect();
+        (campo("EXE="), campo("CWD="), campo("ARGS="), env)
+    }
+
+    /// Il caso esatto dell'incidente: mcp-core non ha ne' `<arguments>` ne'
+    /// `<env>`, perche' il generatore li omette quando sono vuoti.
+    ///
+    /// MUTAZIONE: rimettere `$s.arguments` al posto di `SelectSingleNode` nel
+    /// lettore e questo test rosseggia con il messaggio del difetto reale
+    /// ("Impossibile trovare la proprieta' 'arguments' in questo oggetto"),
+    /// mentre l'intera suite Rust qui sopra resta verde.
+    #[cfg(windows)]
+    #[test]
+    fn il_lettore_reale_regge_i_tag_opzionali_omessi_dal_generatore() {
+        let mut s = servizio();
+        s.arguments.clear();
+        s.env.clear();
+        let xml = emit_winsw(&s);
+        let (exe, cwd, args, env) = letto_da_powershell(&xml, "senza-opzionali");
+        assert_eq!(exe, s.executable);
+        assert_eq!(cwd, s.working_directory);
+        assert_eq!(args, "", "un servizio senza argomenti rende la riga vuota");
+        assert!(env.is_empty(), "nessuna variabile attesa, trovate: {env:?}");
+    }
+
+    /// Non basta non esplodere: quando i tag ci sono, i valori devono ARRIVARE.
+    /// Senza questo, un lettore che rendesse sempre stringa vuota passerebbe il
+    /// test qui sopra e lo stack partirebbe con gli argomenti persi (garnet
+    /// senza `--port` si prende la 6379 per default e il difetto resta latente).
+    #[cfg(windows)]
+    #[test]
+    fn il_lettore_reale_rende_i_valori_quando_i_tag_ci_sono() {
+        let s = servizio();
+        let (_, _, args, env) = letto_da_powershell(&emit_winsw(&s), "con-opzionali");
+        assert_eq!(args, "--port 6379");
+        assert_eq!(env, vec!["NODE_ENV=production".to_string()]);
     }
 }

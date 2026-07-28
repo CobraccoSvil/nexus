@@ -23,6 +23,9 @@ $WINSW   = Join-Path $RUNTIME 'winsw'
 $LOGDIR  = Join-Path $RUNTIME 'dev-logs'
 $PIDFILE = Join-Path $RUNTIME 'nexus-dev.pids.json'
 
+# Lettura dei manifest: punto unico condiviso con dev-service.ps1/nexus-publish.ps1.
+. (Join-Path $PSScriptRoot 'lib\nexus-manifest.ps1')
+
 # Ordine di avvio: infra dati -> mcp-core (attende 5s) -> altri Rust -> web-ide.
 $order = @(
   'nexus-qdrant', 'nexus-garnet',
@@ -79,20 +82,20 @@ foreach ($id in $order) {
   $xmlPath = Join-Path $WINSW "$id\$id.xml"
   if (-not (Test-Path $xmlPath)) { Write-Warning "${id}: manifest mancante ($xmlPath), salto."; continue }
   try {
-    [xml]$x = Get-Content $xmlPath -Raw
-    $s = $x.service
-    $exe = $s.executable
-    $cwd = $s.workingdirectory
-    $argLine = if ($s.arguments) { [string]$s.arguments } else { '' }
+    $m = Read-NexusServiceManifest -Path $xmlPath
+    $exe = $m.Executable
+    $cwd = $m.WorkingDirectory
+    $argLine = $m.Arguments
 
-    # Env dal manifest: valorizzata per web-ide, vuota per i binari Rust (che leggono
-    # il .env dalla working dir). Impostata solo per il processo che stiamo per lanciare
-    # e ripristinata subito dopo, per non inquinare i servizi successivi.
-    $svcEnv = @($s.env | Where-Object { $_ })
+    # Env dal manifest: valorizzata per web-ide, ASSENTE per i binari Rust (che
+    # leggono il .env dalla working dir) — il tag e' opzionale e il generatore lo
+    # omette, quindi qui l'elenco vuoto e' il caso normale, non un manifest monco.
+    # Impostata solo per il processo che stiamo per lanciare e ripristinata subito
+    # dopo, per non inquinare i servizi successivi.
     $saved = @{}
-    foreach ($e in $svcEnv) {
-      $saved[$e.name] = [Environment]::GetEnvironmentVariable($e.name, 'Process')
-      Set-Item -Path "env:$($e.name)" -Value $e.value
+    foreach ($e in @($m.Env)) {
+      $saved[$e.Name] = [Environment]::GetEnvironmentVariable($e.Name, 'Process')
+      Set-Item -Path "env:$($e.Name)" -Value $e.Value
     }
 
     # RUST_LOG per il tracing dei binari Rust: i processi ereditano l'ambiente

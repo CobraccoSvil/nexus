@@ -951,6 +951,43 @@ else
   echo "OK cache-di-configurazione-chiavata: nessuna cache statica a chiave costante"
 fi
 
+# ── lettura-manifest-servizio (2026-07-28) ──────────────────────────────────
+# Il manifest WinSW si legge da UN solo posto: deploy/lib/nexus-manifest.ps1.
+# `<arguments>` ed `<env>` sono OPZIONALI e il generatore li omette quando vuoti
+# (test `un_servizio_senza_argomenti_non_emette_il_tag`). Chi rilegge il manifest
+# con l'adapter a proprieta' (`$x.service.arguments`) tratta l'opzionale da
+# obbligatorio e si rompe SOLO sotto StrictMode, cioe' solo per certi percorsi di
+# invocazione: il 28/07/2026 dev-start.ps1 funzionava lanciato a mano e falliva
+# dentro deploy-local.ps1, lasciando 7 servizi su 8 giu' dopo un deploy riuscito.
+man_hits="$(grep -rlE '\[xml\]' --include='*.ps1' deploy/ 2>/dev/null \
+  | grep -v 'deploy/lib/nexus-manifest.ps1' || true)"
+if [[ -n "$man_hits" ]]; then
+  echo "!! lettura-manifest-servizio: il manifest si rilegge fuori dal punto unico:" >&2
+  printf '%s\n' "$man_hits" | sed 's/^/     /' >&2
+  echo "   Delegare a Read-NexusServiceManifest (deploy/lib/nexus-manifest.ps1)," >&2
+  echo "   che legge i tag opzionali con XPath e non dipende da StrictMode." >&2
+  fail=1
+else
+  echo "OK lettura-manifest-servizio: un solo lettore dei manifest WinSW"
+fi
+
+# ── strictmode-non-si-propaga (2026-07-28) ──────────────────────────────────
+# `Set-StrictMode` ha scope DINAMICO: impostato a livello di file in una libreria
+# dot-sourced, vale per il chiamante e per tutto cio' che il chiamante invoca
+# dopo. deploy/lib/nexus-publish.ps1 lo faceva, e deploy-local.ps1 lo propagava
+# fino a dev-start.ps1 — che cosi' cambiava comportamento a seconda di CHI lo
+# aveva lanciato. Una libreria imposta la modalita' dentro le proprie funzioni,
+# dove ha lo scope di cio' che protegge e non detta legge a nessun altro.
+sm_hits="$(grep -rn '^Set-StrictMode' --include='*.ps1' deploy/lib/ 2>/dev/null || true)"
+if [[ -n "$sm_hits" ]]; then
+  echo "!! strictmode-non-si-propaga: una libreria dot-sourced impone la modalita' a valle:" >&2
+  printf '%s\n' "$sm_hits" | sed 's/^/     /' >&2
+  echo "   Spostare Set-StrictMode DENTRO le funzioni che lo richiedono." >&2
+  fail=1
+else
+  echo "OK strictmode-non-si-propaga: nessuna libreria impone StrictMode al chiamante"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

@@ -31,34 +31,40 @@
 #    sono), e soprattutto copierebbe binari il cui servizio nessuno ha fermato:
 #    Copy-Item su un exe vivo fallisce, e fallirebbe a stack gia' fermo.
 
-Set-StrictMode -Version Latest
+# Lettura dei manifest: punto unico condiviso con dev-start.ps1/dev-service.ps1.
+. (Join-Path $PSScriptRoot 'nexus-manifest.ps1')
+
+# NB: `Set-StrictMode` NON si imposta qui a livello di file. Ha scope DINAMICO:
+# essendo questa libreria dot-sourced da deploy-local.ps1, la modalita' si
+# propagava a tutto cio' che deploy-local chiama piu' sotto — incluso
+# dev-start.ps1, che non l'aveva mai chiesta. E' cosi' che l'accesso ormai
+# innocuo `$s.arguments` su un tag opzionale assente e' diventato un'eccezione, e
+# lo stack a processi e' rimasto giu' dopo un deploy riuscito (2026-07-28):
+# dev-start.ps1 funzionava lanciato a mano e falliva dentro il deploy, cioe' il
+# comportamento cambiava col PERCORSO DI INVOCAZIONE. Ogni funzione qui sotto la
+# imposta per se', dove serve e senza imporla a nessun altro.
 
 # Radice di runtime: unico posto in PowerShell che la nomina. Deve combaciare con
 # il default di NEXUS_RUNTIME_ROOT in xtask service-manifests; e' solo il punto di
 # partenza per TROVARE i manifest, non la destinazione della copia (vedi sopra).
 function Get-NexusRuntimeRoot {
+  Set-StrictMode -Version Latest
   if ($env:NEXUS_RUNTIME_ROOT) { return $env:NEXUS_RUNTIME_ROOT }
   return 'D:\IDEAI-runtime'
 }
 
 # I servizi dichiarati dai manifest: id, eseguibile, directory di esecuzione.
 # Un manifest illeggibile e' un errore esplicito, non una riga che sparisce.
+# Chi dichiara un <executable> vuoto viene saltato: sono i manifest ORFANI dei
+# servizi usciti dal repo, che `xtask service-manifests --check` segnala gia'.
 function Get-NexusServiceManifests {
   param([string]$WinswDir)
+  Set-StrictMode -Version Latest
   if (-not $WinswDir) { $WinswDir = Join-Path (Get-NexusRuntimeRoot) 'winsw' }
-  if (-not (Test-Path $WinswDir)) {
-    throw "manifest dei servizi non trovati in $WinswDir. Generarli con: .\deploy\gen-service-manifests.ps1 -Write"
-  }
   $out = @()
-  foreach ($dir in (Get-ChildItem $WinswDir -Directory -ErrorAction SilentlyContinue)) {
-    $xmlPath = Join-Path $dir.FullName "$($dir.Name).xml"
-    if (-not (Test-Path $xmlPath)) { continue }
-    try { $x = [xml](Get-Content $xmlPath -Raw) } catch {
-      throw "manifest illeggibile ${xmlPath}: $($_.Exception.Message)"
-    }
-    $exe = $x.service.executable
-    if (-not $exe) { continue }
-    $out += [pscustomobject]@{ Id = $dir.Name; Executable = $exe; Xml = $xmlPath }
+  foreach ($m in (Get-NexusServiceManifestList -WinswDir $WinswDir)) {
+    if (-not $m.Executable) { continue }
+    $out += [pscustomobject]@{ Id = $m.Dir; Executable = $m.Executable; Xml = $m.Path }
   }
   return $out
 }
@@ -73,6 +79,7 @@ function Get-NexusServiceManifests {
 #     servizi eseguono da target\) e la build a stack acceso fallirebbe col lock.
 function Get-NexusPublishDir {
   param([string]$WinswDir)
+  Set-StrictMode -Version Latest
   $manifests = Get-NexusServiceManifests -WinswDir $WinswDir
   $exeDirs = @()
   foreach ($m in $manifests) {
@@ -121,6 +128,7 @@ function Publish-NexusArtifacts {
     [string]$WinswDir,
     [switch]$Quiet
   )
+  Set-StrictMode -Version Latest
   $publishDir = Get-NexusPublishDir -WinswDir $WinswDir
   if (-not (Test-Path $BuildDir)) {
     throw "directory di build assente ($BuildDir): eseguire prima cargo build."
