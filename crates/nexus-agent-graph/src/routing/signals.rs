@@ -235,6 +235,43 @@ pub fn touched_files_in_history(
     files
 }
 
+/// Tool i cui argomenti possono contenere una chiamata HTTP fatta dal run
+/// (`curl`, `Invoke-WebRequest`, `wget`, un client scritto al volo): sono gli
+/// stessi tool comando gia' tracciati da [`detect_repeated_failed_command`].
+const HTTP_PROBE_TOOLS: &[&str] = &["run_command", "run_service", "run_in_terminal"];
+
+/// Quante chiamate HTTP il run ha esercitato da se': un tool comando il cui
+/// `command` cita un URL `http(s)://`. Serve a UNA sola domanda — *il silenzio
+/// sul fronte funzionale e' sospetto?* — e non a costruire criteri.
+///
+/// La distinzione e' load-bearing. Derivare le prove del gate da qui coprirebbe
+/// solo cio' che l'agente ha GIA' provato, cioe' tipicamente le sole GET: nel
+/// caso reale (gestione-spese, 2026-07-28) avrebbe riprodotto esattamente il
+/// falso positivo — `GET /api/expenses` verde mentre la `POST` rispondeva 500 —
+/// con in piu' l'aria di una verifica. Come RIVELATORE, invece, e' esatto: un run
+/// che ha interrogato un servizio HTTP ne ha uno, e chiudere senza averne provato
+/// nessun endpoint non e' una chiusura verificata (vedi
+/// `FinalGateNode::run`, che in quel caso lo DICHIARA).
+///
+/// Il fatto si legge dall'INPUT del tool (argomento strutturato che il run ha
+/// scritto), non dal testo di una risposta: nessuna deduzione di stato tecnico
+/// dalla prosa (regola M).
+pub fn http_probes_in_history(messages: &[Message]) -> usize {
+    let mut n = 0usize;
+    for m in messages {
+        for (name, input) in message_tool_uses(m) {
+            if !HTTP_PROBE_TOOLS.contains(&name) {
+                continue;
+            }
+            let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
+            if cmd.contains("http://") || cmd.contains("https://") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 //  Detector strutturali su lista messaggi (anti-loop dell'executor)
 //

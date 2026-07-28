@@ -28,9 +28,10 @@
 //! - **La costruzione delle spec criteri** (`final_gate.py:400-470`,
 //!   [`FinalGateNode::build_criteria`]): `no_orphan_imported` (sempre),
 //!   `outputs_exist` (sempre), `service_logs_clean` (se `runtime_check_enabled` +
-//!   `log_command`), `run_command`-build (se `build_command` presente) e
-//!   `http`-endpoint (se `endpoint_criterion` risolto a monte,
-//!   `_resolve_endpoint_check`). Costruzione PURA.
+//!   `log_command`), `run_command`-build (se `build_command` presente) e i
+//!   criteri `http`-endpoint (configurati nel progetto + DICHIARATI dall'agente
+//!   via `task_complete.endpoints`, punto unico
+//!   [`crate::decisions::endpoint_probes`]). Costruzione PURA.
 //! - **`_count_build_errors` + `_BUILD_ERROR_PATTERNS`** (`final_gate.py:276-294`):
 //!   regex TS/rustc/SyntaxError/TypeError/generico, conteggio indicativo. 1:1.
 //! - **`_render_failed_block`** (`final_gate.py:396-493`,
@@ -164,16 +165,25 @@ pub struct FinalGateConfig {
     /// Timeout (s) generale dei criteri non-build (`verifier_timeout_s`, def 30):
     /// passato nel ctx dei criteri (`final_gate.py:313`).
     pub criteria_timeout_s: f64,
-    /// Criterio ENDPOINT HTTP risolto per-progetto (`_resolve_endpoint_check`,
-    /// `final_gate.py:234-302`). `None` = nessun endpoint configurato O check
-    /// disabilitato (N/A: niente criterio, non blocca i progetti senza endpoint).
-    /// Risolto A MONTE (regola G): la lettura DB di `run_configurations`
-    /// (role='endpoint' + `http_spec`) e del setting
-    /// `agent.final_gate.endpoint_check_enabled` resta fuori dal nodo, esattamente
-    /// come `build_command`/`log_command`. La spec arriva pronta nella forma
-    /// `{type:"http", spec:{url, method, body?, headers?}, expected:{status?,
-    /// body_contains?}, timeout_s}` (vedi `_resolve_endpoint_check`).
-    pub endpoint_criterion: Option<CriterionSpec>,
+    /// Criteri ENDPOINT HTTP CONFIGURATI nel progetto, risolti A MONTE (regola G:
+    /// la lettura di `run_configurations` con `role='endpoint'` + `http_spec`
+    /// resta fuori dal nodo, come `log_command`). Lista, non singolo: un CRUD ha
+    /// molti endpoint e quello rotto non e' quasi mai la GET — nel caso reale
+    /// (gestione-spese, 2026-07-28) la GET rispondeva 200 e la POST 500.
+    ///
+    /// Vuota = nessun endpoint configurato o check disabilitato. NON e' l'unica
+    /// fonte: i criteri DICHIARATI dall'agente si aggiungono in
+    /// [`FinalGateNode::build_criteria`] (una config manuale che nessuno compila
+    /// equivale a nessuna verifica — vedi [`crate::decisions::endpoint_probes`]).
+    pub endpoint_criteria: Vec<CriterionSpec>,
+    /// Gate delle prove HTTP funzionali (`agent.final_gate.endpoint_check_enabled`,
+    /// mig 0455, default true). OFF -> nessun criterio `http`, ne' configurato ne'
+    /// dichiarato, e nessuna dichiarazione di verifica funzionale mancante: il
+    /// gate torna al comportamento storico.
+    pub endpoint_check_enabled: bool,
+    /// Timeout (s) di UNA chiamata HTTP del gate
+    /// (`agent.final_gate.endpoint_timeout_seconds`, mig 0455, default 15).
+    pub endpoint_timeout_s: f64,
     /// P5: gate design_verify abilitato (agent.final_gate.design_verify_enabled,
     /// default true). Si applica SOLO se nella history c'e' un nexus_visual_compare
     /// (task figma): None = non-figma -> non blocca.
@@ -253,7 +263,9 @@ impl Default for FinalGateConfig {
             no_orphan_min_ratio: 0.4,
             import_staging_dirs: vec!["figma_export".to_string()],
             criteria_timeout_s: 30.0,
-            endpoint_criterion: None,
+            endpoint_criteria: Vec::new(),
+            endpoint_check_enabled: true,
+            endpoint_timeout_s: 15.0,
             design_verify_enabled: true,
             design_verify_min_score: 70,
             structural_criteria_enabled: true,
@@ -438,8 +450,9 @@ impl FinalGateNode {
     /// PURA: nessun I/O. L'ordine e' load-bearing (riprodotto 1:1):
     /// `no_orphan_imported`, `outputs_exist`, poi opzionali `service_logs_clean`
     /// (se runtime_check_enabled + log_command non vuoto), `run_command`-build
-    /// (se build_command presente) e infine `http`-endpoint (se
-    /// `endpoint_criterion` risolto a monte, `final_gate.py:468-470`).
+    /// (se build_command presente) e infine i criteri `http`-endpoint: quelli
+    /// CONFIGURATI nel progetto (risolti a monte) e quelli DICHIARATI dall'agente
+    /// in `task_complete.endpoints` (ADR 0034), nell'ordine di dichiarazione.
     ///
     /// COPERTURA: questo metodo e' verificato dagli unit test Rust
     /// (`build_criteria_ordine_e_opzionali`), NON dal golden cross-language. Il
@@ -539,12 +552,29 @@ impl FinalGateNode {
             });
         }
 
-        // (5) http-endpoint (chiamata REALE all'endpoint che il task doveva far
-        //     funzionare), se risolto a monte (regola G: `_resolve_endpoint_check`
-        //     resta fuori dal nodo). Ultimo nell'ordine (`final_gate.py:468-470`).
-        //     Risolve "build verde ma login ancora 500" (incidente Beauty-Book).
-        if let Some(endpoint_crit) = &self.cfg.endpoint_criterion {
-            criteria.push(endpoint_crit.clone());
+        // (5) http-endpoint: chiamate REALI agli endpoint che il task doveva far
+        //     funzionare. DUE fonti, entrambe accodate qui nell'ordine
+        //     "configurato prima, dichiarato poi": la configurazione per-progetto
+        //     risolta a monte (regola G) e la DICHIARAZIONE dell'agente
+        //     (`task_complete.endpoints`, ADR 0034), tradotta dal punto unico
+        //     [`crate::decisions::endpoint_probes`] (regola L: qui non si
+        //     ri-decide come si prova un endpoint).
+        //
+        //     Perche' servono entrambe: senza la configurazione un progetto che
+        //     l'ha compilata non verrebbe provato; senza la dichiarazione — il
+        //     caso NORMALE, perche' quella configurazione e' manuale e quasi
+        //     nessuno la compila — non verrebbe provato NIENTE. E' esattamente
+        //     cosi' che il gate ha chiuso "superato" su un'app la cui POST
+        //     rispondeva 500 (gestione-spese, 2026-07-28): la GET, l'unica che
+        //     l'agente aveva provato da se', rispondeva 200.
+        if self.cfg.endpoint_check_enabled {
+            criteria.extend(self.cfg.endpoint_criteria.iter().cloned());
+            criteria.extend(
+                crate::decisions::endpoint_probes::endpoint_criteria_from_declaration(
+                    state.declared_outcome.as_ref(),
+                    self.cfg.endpoint_timeout_s,
+                ),
+            );
         }
 
         // (6) design_verify (P5): per i task figma l'agente non puo' chiudere con
@@ -897,6 +927,30 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
         // CriterionResult{passed:false} (parita' col try/except Python,
         // final_gate.py:381-385) e NON propaga errore.
         let criteria = self.build_criteria(state);
+        // Esito ONESTO sul fronte FUNZIONALE (regola M, gemello di
+        // `verify_profile_missing`): il run ha interrogato un servizio HTTP da se'
+        // — quindi un servizio HTTP c'e' — ma nessun endpoint e' stato dichiarato
+        // ne' configurato, percio' il gate non ne provera' nessuno. Chiudere
+        // "verificato" in questa condizione e' cio' che ha lasciato passare una
+        // POST che rispondeva 500 mentre la GET, la sola provata dall'agente,
+        // rispondeva 200 (gestione-spese, 2026-07-28).
+        let http_probes = signals::http_probes_in_history(&state.messages);
+        let functional_probe_missing = self.cfg.endpoint_check_enabled
+            && !criteria.iter().any(|c| c.criterion_type == "http")
+            && http_probes > 0;
+        if functional_probe_missing && cycle <= 1 {
+            crate::nodes::emit_phase_meta(
+                ctx.emit.as_ref(),
+                self.meta_steps.as_ref(),
+                "final_gate",
+                "Verifica funzionale degli endpoint NON eseguita: nessun endpoint dichiarato in task_complete ne' configurato nel progetto".to_string(),
+                serde_json::json!({
+                    "phase": "endpoints_undeclared",
+                    "http_calls_in_history": http_probes,
+                }),
+            )
+            .await;
+        }
         let results = self
             .criteria
             .run(criteria)
@@ -936,7 +990,12 @@ impl GraphNode<AgentState, AgentNodeCtx> for FinalGateNode {
                 // come "svolto ma non verificato" -> il finalizzatore mappa
                 // CompletedUnverified (distinto da CompletedVerified). Con profilo
                 // presente (verifica eseguita) e' Some(false): esito verificato.
-                final_gate_unverified: Some(Some(self.cfg.verify_profile_missing)),
+                // Stessa cosa sul fronte FUNZIONALE: un'app con un servizio HTTP di
+                // cui nessuno ha provato un endpoint non e' un'app verificata,
+                // per quanto il suo codice compili.
+                final_gate_unverified: Some(Some(
+                    self.cfg.verify_profile_missing || functional_probe_missing,
+                )),
                 ..Default::default()
             }
             .into_opaque());
@@ -1616,9 +1675,9 @@ mod tests {
         assert_eq!(build.timeout_s, Some(180.0));
         assert_eq!(build.expected, json!({ "exit_code": 0 }));
 
-        // Con anche l'endpoint_criterion risolto a monte: 5 criteri, http ULTIMO
-        // nell'ordine (`final_gate.py:468-470`). La spec arriva pronta dal
-        // risolutore DB (`_resolve_endpoint_check`): il nodo la accoda 1:1.
+        // Con anche gli endpoint CONFIGURATI risolti a monte: http ULTIMO
+        // nell'ordine (`final_gate.py:468-470`). Le spec arrivano pronte dal
+        // risolutore DB (`load_configured_endpoint_criteria`): il nodo le accoda 1:1.
         let endpoint = CriterionSpec {
             criterion_type: "http".to_string(),
             spec: json!({ "url": "http://localhost:3000/api/login", "method": "POST" }),
@@ -1628,7 +1687,7 @@ mod tests {
         let cfg3 = FinalGateConfig {
             log_command: "docker compose logs".to_string(),
             verify_steps: profile_steps.clone(),
-            endpoint_criterion: Some(endpoint.clone()),
+            endpoint_criteria: vec![endpoint.clone()],
             ..base_cfg.clone()
         };
         let node3 = node_with(cfg3, Arc::new(StubCriteriaRunner::with_results(vec![])));
@@ -1650,13 +1709,245 @@ mod tests {
 
         // Endpoint risolto SENZA build/log: comunque accodato dopo i 2 sempre-on.
         let cfg4 = FinalGateConfig {
-            endpoint_criterion: Some(endpoint.clone()),
+            endpoint_criteria: vec![endpoint.clone()],
             ..base_cfg.clone()
         };
         let node4 = node_with(cfg4, Arc::new(StubCriteriaRunner::with_results(vec![])));
         let crits4 = node4.build_criteria(&st);
         let types4: Vec<&str> = crits4.iter().map(|c| c.criterion_type.as_str()).collect();
         assert_eq!(types4, vec!["no_orphan_imported", "outputs_exist", "http"]);
+    }
+
+    // ── prove HTTP funzionali: dalla dichiarazione dell'agente ──────────────────
+
+    /// L'app del caso reale: porta assegnata dal bucket di progetto, endpoint di
+    /// lettura e scrittura sulla stessa risorsa.
+    const URL_SPESE: &str = "http://localhost:24817/api/expenses";
+    const URL_HEALTH: &str = "http://localhost:24817/api/health";
+
+    /// Stato di un run che ha creato un CRUD: mutazione fs + una GET provata a
+    /// mano dall'agente (`curl`), esattamente la history del caso reale
+    /// (gestione-spese, 2026-07-28).
+    fn crud_state() -> AgentState {
+        let curl = Message::Ai {
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "c2".into(),
+                name: "run_command".into(),
+                input: json!({"command": format!("curl -s {URL_SPESE}")}),
+                thought_signature: None,
+            }]),
+            tool_calls: vec![],
+            reasoning: None,
+            thinking_signature: None,
+        };
+        let mut st = software_state();
+        st.messages.push(curl);
+        st
+    }
+
+    /// Dichiarazione di chiusura come la produce la PRODUZIONE: l'input grezzo di
+    /// `task_complete` passa dal punto unico `normalize_declared_outcome`, lo
+    /// stesso che scrive `state.declared_outcome` nel tool_dispatch. Costruirla a
+    /// mano fisserebbe l'assunto che il test vuole verificare (regola O).
+    fn declared_from_tool_input(tool_input: Value) -> Value {
+        crate::decisions::tool_dispatch::normalize_declared_outcome(&tool_input)
+            .expect("task_complete valido")
+    }
+
+    #[test]
+    fn endpoint_dichiarati_diventano_criteri_http() {
+        // Il difetto: il criterio HTTP non veniva costruito MAI. Qui si parte da
+        // cio' che l'agente DICHIARA e si verifica che il gate abbia le prove —
+        // inclusa la POST, il metodo che nessuna altra fonte espone (l'agente
+        // aveva provato da se' solo la GET).
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![])),
+        );
+        let mut st = crud_state();
+        st.declared_outcome = Some(declared_from_tool_input(json!({
+            "outcome": "done",
+            "summary": "CRUD spese completo",
+            "endpoints": [
+                {"method": "GET", "url": URL_SPESE},
+                {"method": "POST", "url": URL_SPESE,
+                 "body": {"amount": 12.5, "description": "prova gate", "category": "test"}},
+            ],
+        })));
+        let crits = node.build_criteria(&st);
+        let http: Vec<&CriterionSpec> = crits
+            .iter()
+            .filter(|c| c.criterion_type == "http")
+            .collect();
+        assert_eq!(http.len(), 2, "una prova per endpoint dichiarato: {crits:?}");
+        assert_eq!(http[0].spec["method"], json!("GET"));
+        assert_eq!(http[1].spec["method"], json!("POST"));
+        assert_eq!(http[1].spec["url"], json!(URL_SPESE));
+        // Lo status atteso e' la famiglia 2xx del punto unico (non una lista
+        // ricopiata qui, che divergerebbe): il 500 dell'incidente e' fuori.
+        assert_eq!(
+            http[1].expected["status"],
+            json!(crate::decisions::endpoint_probes::DEFAULT_SUCCESS_STATUSES)
+        );
+        // Regola M: si decide sullo status, il corpo non entra nella decisione.
+        assert!(http[1].expected.get("body_contains").is_none());
+    }
+
+    #[test]
+    fn endpoint_check_off_nessuna_prova() {
+        // Kill-switch DB-driven: OFF -> nessun criterio http, ne' configurato ne'
+        // dichiarato (comportamento storico).
+        let cfg = FinalGateConfig {
+            endpoint_check_enabled: false,
+            endpoint_criteria: vec![CriterionSpec {
+                criterion_type: "http".to_string(),
+                spec: json!({ "url": URL_HEALTH }),
+                expected: json!({ "status": 200 }),
+                timeout_s: Some(15.0),
+            }],
+            ..FinalGateConfig::default()
+        };
+        let node = node_with(cfg, Arc::new(StubCriteriaRunner::with_results(vec![])));
+        let mut st = crud_state();
+        st.declared_outcome = Some(declared_from_tool_input(json!({
+            "outcome": "done",
+            "summary": "fatto",
+            "endpoints": [{"method": "GET", "url": URL_SPESE}],
+        })));
+        assert!(!node
+            .build_criteria(&st)
+            .iter()
+            .any(|c| c.criterion_type == "http"));
+    }
+
+    /// Runner che si comporta come l'applicazione dell'incidente: ogni criterio
+    /// passa, TRANNE la chiamata di scrittura verso `/api/expenses`, che risponde
+    /// 500. Decide sugli spec RICEVUTI, non su una lista fissa: se il gate non
+    /// costruisce la prova, il 500 non lo vede nessuno e il run chiude "superato"
+    /// — che e' esattamente il difetto.
+    struct AppConLaPostRotta;
+
+    #[async_trait]
+    impl crate::runtime::ports::CriteriaRunner for AppConLaPostRotta {
+        async fn run(
+            &self,
+            criteria: Vec<CriterionSpec>,
+        ) -> Result<Vec<CriterionResult>, crate::runtime::ports::PortError> {
+            Ok(criteria
+                .into_iter()
+                .map(|c| {
+                    let scrittura = c.criterion_type == "http"
+                        && c.spec["method"] == json!("POST")
+                        && c.spec["url"]
+                            .as_str()
+                            .unwrap_or("")
+                            .ends_with("/api/expenses");
+                    CriterionResult {
+                        criterion_type: c.criterion_type,
+                        passed: !scrittura,
+                        evidence: if scrittura {
+                            json!({"status": 500, "verdict": "POST /api/expenses -> 500 (atteso 200/201/202/204)"})
+                        } else {
+                            json!({})
+                        },
+                    }
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn la_post_rotta_boccia_il_gate() {
+        // CONSEGUENZA (regola O): non basta che il criterio compaia nella lista,
+        // deve FAR FALLIRE la chiusura. Con la POST che risponde 500 il gate non
+        // chiude "superato": rimanda all'agente il blocco di correzione.
+        let node = node_with(FinalGateConfig::default(), Arc::new(AppConLaPostRotta));
+        let ctx = ctx_with();
+        let mut st = crud_state();
+        st.action_oriented = Some(true);
+        st.tools_json = Some(vec![json!({"name": "write_file"})]);
+        st.declared_outcome = Some(declared_from_tool_input(json!({
+            "outcome": "done",
+            "summary": "CRUD spese completo",
+            "endpoints": [
+                {"method": "GET", "url": URL_SPESE},
+                {"method": "POST", "url": URL_SPESE,
+                 "body": {"amount": 12.5}},
+            ],
+        })));
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(
+            out.stop_reason,
+            Some(StopReason::ToolUse),
+            "una POST che risponde 500 non chiude il turno: torna all'agente"
+        );
+        assert_ne!(
+            out.final_gate_passed,
+            Some(true),
+            "il gate non puo' dichiararsi superato con una scrittura rotta"
+        );
+        assert_eq!(out.final_gate_cycle, Some(1), "ciclo di correzione aperto");
+        // Il blocco iniettato NOMINA la chiamata fallita: senza, il re-loop
+        // sarebbe cieco (l'agente non saprebbe quale endpoint riparare).
+        let ultimo = out.messages.last().expect("messaggio iniettato");
+        let testo = match ultimo {
+            Message::Human { content } => content.flatten_text(),
+            altro => panic!("atteso HumanMessage, trovato {altro:?}"),
+        };
+        assert!(
+            testo.contains("/api/expenses") && testo.contains("500"),
+            "il blocco deve dire cosa e' fallito:\n{testo}"
+        );
+    }
+
+    #[tokio::test]
+    async fn senza_endpoint_dichiarati_la_chiusura_non_e_verificata() {
+        // Se nessuno dichiara endpoint il gate non ne prova nessuno: e' il caso
+        // NORMALE, e va DETTO. Un run che ha interrogato un servizio HTTP da se'
+        // (curl in history) e chiude senza una sola prova funzionale chiude
+        // "svolto ma non verificato", non "verificato".
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![ok_result("outputs_exist")])),
+        );
+        let ctx = ctx_with();
+        let mut st = crud_state();
+        st.declared_outcome = Some(declared_from_tool_input(json!({
+            "outcome": "done",
+            "summary": "CRUD spese completo",
+        })));
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.final_gate_passed, Some(true), "i criteri stubati passano");
+        assert_eq!(
+            out.final_gate_unverified,
+            Some(true),
+            "nessuna prova funzionale eseguita: la chiusura non e' verificata"
+        );
+
+        // Contro-prova: con gli endpoint dichiarati le prove ci sono, e la
+        // chiusura torna a essere verificata.
+        let mut st2 = crud_state();
+        st2.declared_outcome = Some(declared_from_tool_input(json!({
+            "outcome": "done",
+            "summary": "CRUD spese completo",
+            "endpoints": [{"method": "GET", "url": URL_SPESE}],
+        })));
+        let out2 = apply(st2.clone(), node.run(&st2, &ctx).await.expect("run ok"));
+        assert_eq!(out2.final_gate_unverified, Some(false));
+    }
+
+    #[tokio::test]
+    async fn nessuna_attivita_http_nessun_allarme() {
+        // Un run che non ha mai toccato HTTP (refactor, libreria) non deve essere
+        // marcato non-verificato per mancanza di endpoint: non ne ha.
+        let node = node_with(
+            FinalGateConfig::default(),
+            Arc::new(StubCriteriaRunner::with_results(vec![ok_result("outputs_exist")])),
+        );
+        let ctx = ctx_with();
+        let st = software_state();
+        let out = apply(st.clone(), node.run(&st, &ctx).await.expect("run ok"));
+        assert_eq!(out.final_gate_unverified, Some(false));
     }
 
     // ── criteri strutturali (ADR 0018 leva 3) ─────────────────────────────────────

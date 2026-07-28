@@ -169,6 +169,18 @@ pub fn normalize_declared_outcome(tool_input: &Value) -> Result<Value, Declarati
             out.insert("files_touched".to_string(), Value::Array(files));
         }
     }
+    // `endpoints` (ADR 0034): le chiamate HTTP che il lavoro ha reso funzionanti.
+    // A differenza di `files_touched` NON e' solo display: il final_gate le
+    // ESEGUE davvero prima di chiudere (punto unico
+    // [`super::endpoint_probes`], che normalizza e scarta le voci non provabili).
+    // E' l'unica fonte che conosce i metodi di SCRITTURA appena creati — la
+    // history contiene solo cio' che l'agente ha gia' provato, tipicamente le
+    // sole GET, ed e' proprio con una GET verde e una POST 500 che il gate
+    // chiudeva "superato" (incidente gestione-spese, 2026-07-28).
+    let endpoints = super::endpoint_probes::normalize_endpoints(obj.get("endpoints"));
+    if !endpoints.is_empty() {
+        out.insert("endpoints".to_string(), Value::Array(endpoints));
+    }
     Ok(Value::Object(out))
 }
 

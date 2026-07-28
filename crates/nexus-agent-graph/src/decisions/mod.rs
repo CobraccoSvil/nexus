@@ -88,6 +88,7 @@ pub mod correction_progress;
 pub mod dag_scheduler;
 pub mod debate_panel;
 pub mod end_turn;
+pub mod endpoint_probes;
 pub mod escalation;
 pub mod g1_accounting;
 pub mod governance;
