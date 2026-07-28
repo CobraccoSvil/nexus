@@ -3937,6 +3937,61 @@ async fn handle_agent_body_panic(
     insert_panic_chat_message(&panic_pool, ids, panic_msg).await;
 }
 
+/// Le parti del system prompt del run agentico, nell'ordine in cui compaiono.
+/// Le costruisce `spawn_agent_run` (una query o un template ciascuna); la
+/// concatenazione, memorie comprese, e' di [`compose_agent_system_text`].
+pub(crate) struct AgentSystemParts {
+    pub(crate) project_header: String,
+    pub(crate) risorse_block: String,
+    pub(crate) project_custom_instructions: String,
+    pub(crate) automation_instructions: String,
+    pub(crate) o_series_instructions: String,
+    pub(crate) test_instructions: String,
+    pub(crate) profile_prompt_block: String,
+    pub(crate) system_context: String,
+    pub(crate) self_ref_hint: String,
+}
+
+/// Compone il system prompt del run agentico, memorie di progetto INCLUSE.
+///
+/// ROOT CAUSE che l'ha resa necessaria: il caricatore delle memorie viveva su
+/// `Orchestrator::run`, cioe' sul solo percorso del turno singolo (Studio). In
+/// Conferma/Automatico l'handler dispatcha qui e ritorna prima di raggiungerlo,
+/// quindi il pannello "Memoria del progetto" non aveva alcun effetto sui run
+/// agentici. Il caricamento sta DENTRO questa funzione, non nel chiamante: cosi'
+/// il system prompt agentico non e' componibile senza passare dal richiamo, e un
+/// test che ne misura il testo misura anche l'innesto (regola O).
+///
+/// `query` e' il messaggio dell'utente: e' la domanda rispetto a cui una memoria
+/// e' pertinente o no.
+pub(crate) async fn compose_agent_system_text(
+    db: &PgPool,
+    recall: &dyn crate::prompt_memories::MemoryRecall,
+    project_id: Uuid,
+    query: &str,
+    parts: AgentSystemParts,
+) -> String {
+    let memories = crate::prompt_memories::ProjectMemories::load(db, recall, project_id, query)
+        .await
+        .section()
+        // Le parti sono concatenate senza separatore: il blocco si isola da solo.
+        .map(|block| format!("\n{block}\n"))
+        .unwrap_or_default();
+    format!(
+        "{}{}{}{}{}{}{}{}{}{}",
+        parts.project_header,
+        parts.risorse_block,
+        parts.project_custom_instructions,
+        memories,
+        parts.automation_instructions,
+        parts.o_series_instructions,
+        parts.test_instructions,
+        parts.profile_prompt_block,
+        parts.system_context,
+        parts.self_ref_hint
+    )
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `SpawnOutcome::NotStarted` se il progetto non è caricabile (fallback al
 /// singolo turn) e `SpawnOutcome::Disambiguation` se l'intent e' ambiguo (turno
@@ -4212,18 +4267,24 @@ pub(crate) async fn spawn_agent_run(
     // sotto se il consiglio ha gia' parlato (il suo parere e' nel prompt, la
     // direttiva sarebbe rumore). Nel ramo overlap resta: il consiglio non ha
     // ancora deliberato.
-    let mut system_text = format!(
-        "{}{}{}{}{}{}{}{}{}",
-        project_header,
-        risorse_block,
-        project_custom_instructions,
-        automation_instructions,
-        o_series_instructions,
-        test_instructions,
-        params.profile_prompt_block,
-        params.system_context,
-        self_ref_hint
-    );
+    let mut system_text = compose_agent_system_text(
+        &state.db,
+        &crate::prompt_memories::VectorRecall::new(&state.orchestrator.neural),
+        params.project_id,
+        &params.content,
+        AgentSystemParts {
+            project_header,
+            risorse_block,
+            project_custom_instructions,
+            automation_instructions,
+            o_series_instructions,
+            test_instructions,
+            profile_prompt_block: params.profile_prompt_block.clone(),
+            system_context: params.system_context.clone(),
+            self_ref_hint,
+        },
+    )
+    .await;
     // Costruzione del messaggio iniziale arricchito con il contenuto reale
     // degli allegati (ADR 0010/0011/0012 — pre-extraction nel prompt).
     //
@@ -6497,6 +6558,147 @@ async fn build_native_deps(state: &AppState) -> crate::native_engine::NativeDeps
         db: state.db.clone(),
         tool_runner_deps,
         gateway,
+    }
+}
+
+#[cfg(test)]
+mod tests_memorie_di_progetto {
+    //! Il difetto misurato: il pannello "Memoria del progetto" non aveva alcun
+    //! effetto sui run agentici. Le memorie venivano caricate da
+    //! `Orchestrator::run`, raggiungibile solo da `run_turn`, mentre in
+    //! Conferma/Automatico l'handler dispatcha a `spawn_agent_run` e ritorna
+    //! prima. Il caricatore funzionava: era il ramo che non lo chiamava.
+    //!
+    //! Percio' questi test non misurano il caricatore ma la CONSEGUENZA: il
+    //! testo che l'utente ha attivato compare - o non compare - nel system prompt
+    //! composto dal percorso agentico, prodotto da `compose_agent_system_text`
+    //! esattamente come in `spawn_agent_run`.
+    //!
+    //! Il richiamo (embedder + Qdrant) e' l'unico pezzo sostituito, da uno store
+    //! in memoria che APPLICA il filtro vero della produzione invece di
+    //! riscriverlo: vedi `prompt_memories::recall_di_test`. Gate, soglia, taglio,
+    //! forma del blocco e innesto nel prompt sono quelli di produzione.
+
+    use super::{compose_agent_system_text, AgentSystemParts};
+    use crate::prompt_memories::recall_di_test::RecallInMemoria;
+    use serde_json::{json, Value};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    const DOMANDA: &str = "come si fa il deploy dello stack?";
+    const MEMORIA: &str = "Il deploy locale si fa con deploy/deploy-local.ps1, mai a mano.";
+    const ALTRA_MEMORIA: &str = "Le porte dei servizi si chiedono con request_port.";
+
+    /// Le altre parti del prompt agentico, vuote: quelle hanno gia' i loro
+    /// produttori e qui si misura una cosa sola, cioe' se le memorie ci arrivano.
+    fn parti() -> AgentSystemParts {
+        AgentSystemParts {
+            project_header: "PROGETTO: nexus\n".to_string(),
+            risorse_block: String::new(),
+            project_custom_instructions: String::new(),
+            automation_instructions: "MODALITA': automatic\n".to_string(),
+            o_series_instructions: String::new(),
+            test_instructions: String::new(),
+            profile_prompt_block: String::new(),
+            system_context: String::new(),
+            self_ref_hint: String::new(),
+        }
+    }
+
+    /// Il payload di un punto memoria: la forma esatta che scrive la
+    /// compattazione (`chat_sessions::compact_session`), `correction_id` incluso
+    /// mai - per questo il bump dei contatori non parte su questa famiglia.
+    fn punto(project_id: Uuid, active: bool, text: &str) -> Value {
+        json!({
+            "project_id": project_id.to_string(),
+            "session_id": Uuid::new_v4().to_string(),
+            "type": "session_memory",
+            "active": active,
+            "text": text,
+        })
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn una_memoria_attiva_e_pertinente_entra_nel_prompt_agentico(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo().con_punto(0.91, punto(project_id, true, MEMORIA));
+
+        let system = compose_agent_system_text(&pool, &recall, project_id, DOMANDA, parti()).await;
+
+        assert!(
+            system.contains(MEMORIA),
+            "la memoria attiva non e' arrivata nel system prompt agentico: {system}"
+        );
+        // Ci arriva come voce del blocco del punto unico, non appiccicata a caso.
+        // Il TITOLO del blocco non si ricopia qui: e' del punto unico, e una
+        // seconda copia in un test e' una copia che va tenuta allineata a mano.
+        assert!(
+            system.contains(&format!("\n- {MEMORIA}")),
+            "blocco memorie mal formato: {system}"
+        );
+        // Le altre parti restano dove stavano.
+        assert!(system.starts_with("PROGETTO: nexus\n"), "{system}");
+        assert!(system.contains("MODALITA': automatic"), "{system}");
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn una_memoria_disattivata_non_entra_nemmeno_se_e_la_piu_pertinente(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo()
+            .con_punto(0.99, punto(project_id, false, MEMORIA))
+            .con_punto(0.85, punto(project_id, true, ALTRA_MEMORIA));
+
+        let system = compose_agent_system_text(&pool, &recall, project_id, DOMANDA, parti()).await;
+
+        assert!(
+            !system.contains(MEMORIA),
+            "una memoria disattivata dal pannello e' finita nel prompt: {system}"
+        );
+        // Prova che l'esclusione e' dello stato e non del ranking: la memoria
+        // attiva, meno pertinente della disattivata, e' comunque entrata.
+        assert!(system.contains(ALTRA_MEMORIA), "{system}");
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn una_memoria_attiva_ma_lontana_dalla_domanda_non_entra(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo()
+            .con_punto(0.42, punto(project_id, true, ALTRA_MEMORIA))
+            .con_punto(0.90, punto(project_id, true, MEMORIA));
+
+        let system = compose_agent_system_text(&pool, &recall, project_id, DOMANDA, parti()).await;
+
+        assert!(
+            !system.contains(ALTRA_MEMORIA),
+            "una memoria sotto la soglia di pertinenza e' finita nel prompt: {system}"
+        );
+        assert!(system.contains(MEMORIA), "{system}");
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn senza_memorie_pertinenti_il_prompt_non_cambia(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let recall = RecallInMemoria::nuovo();
+
+        let system = compose_agent_system_text(&pool, &recall, project_id, DOMANDA, parti()).await;
+
+        // Uguaglianza esatta: nessun blocco vuoto, nessuna riga in piu'.
+        assert_eq!(system, "PROGETTO: nexus\nMODALITA': automatic\n");
+    }
+
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn le_memorie_di_un_altro_progetto_non_entrano(pool: PgPool) {
+        let project_id = Uuid::new_v4();
+        let altro_progetto = Uuid::new_v4();
+        let recall =
+            RecallInMemoria::nuovo().con_punto(0.95, punto(altro_progetto, true, MEMORIA));
+
+        let system = compose_agent_system_text(&pool, &recall, project_id, DOMANDA, parti()).await;
+
+        assert!(
+            !system.contains(MEMORIA),
+            "la memoria di un altro progetto e' finita nel prompt: {system}"
+        );
     }
 }
 

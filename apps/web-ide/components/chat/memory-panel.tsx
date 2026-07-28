@@ -123,8 +123,9 @@ export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
           lineHeight: 1.5,
         }}>
           💡 Le memorie sono <strong style={{ color: tc.text }}>riassunti di chat compattate</strong>.
-          Quando attive, vengono incluse automaticamente nel contesto dell&apos;AI.
-          Attivale solo quando vuoi che l&apos;AI usi quel contesto.
+          Quando attive, vengono richiamate se pertinenti alla domanda del momento
+          (le più vicine, al massimo cinque). Attivale solo quando vuoi che l&apos;AI
+          possa usare quel contesto.
         </div>
 
         {/* List */}

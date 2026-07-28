@@ -208,6 +208,30 @@ pub async fn upsert_prompt_correction_point(
     Ok(())
 }
 
+/// Filtro della ricerca memorie/correzioni: il progetto corrente E solo i punti
+/// ATTIVI. E' il punto in cui una memoria disattivata dal pannello viene esclusa:
+/// non viene scartata dopo, non viene proprio chiesta.
+///
+/// E' esposto come DATO (regola O) perche' e' dichiarativo verso Qdrant: cosi' un
+/// test lo puo' APPLICARE senza riscriverlo, e se qui sparisse il `must` su
+/// `active` quel test lo vedrebbe. Una seconda copia della regola nello strumento
+/// di misura, invece, resterebbe verde proprio nel caso in cui la produzione
+/// smette di filtrare.
+pub(crate) fn prompt_correction_filter(project_id: Uuid) -> Value {
+    json!({
+        "must": [
+            {
+                "key": "project_id",
+                "match": { "value": project_id.to_string() }
+            },
+            {
+                "key": "active",
+                "match": { "value": true }
+            }
+        ]
+    })
+}
+
 pub async fn search_prompt_correction_points(
     db: &PgPool,
     query_vector: &[f32],
@@ -223,18 +247,7 @@ pub async fn search_prompt_correction_points(
         "limit": top_k.max(1),
         "with_payload": true,
         "with_vector": false,
-        "filter": {
-            "must": [
-                {
-                    "key": "project_id",
-                    "match": { "value": project_id.to_string() }
-                },
-                {
-                    "key": "active",
-                    "match": { "value": true }
-                }
-            ]
-        }
+        "filter": prompt_correction_filter(project_id)
     });
 
     let response = nexus_http::build_client()

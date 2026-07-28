@@ -1084,6 +1084,41 @@ else
   echo "OK catena-write-scope: lo scope dichiarato raggiunge il contesto dei tool"
 fi
 
+# ── memorie-nel-prompt (2026-07-28) ─────────────────────────────────────────
+# Le memorie di progetto hanno DUE consumatori (turno singolo e run agentico) e
+# devono avere UN caricatore. Il difetto che ha creato il punto unico e' proprio
+# la seconda strada che non c'era: il consumo viveva dentro `Orchestrator::run`,
+# raggiungibile solo da `run_turn`, e in Conferma/Automatico l'handler dispatcha
+# a `spawn_agent_run` e ritorna prima — il pannello "Memoria del progetto" non
+# aveva alcun effetto sui run agentici.
+#
+# Due ancoraggi. Primo: la FORMA del blocco vive solo nel punto unico, cosi' un
+# call site non se ne scrive una versione propria.
+assert_single "blocco-memorie-prompt" 'Correzioni note \(da rispettare se pertinenti\)' \
+  'crates/mcp-core/src/prompt_memories.rs' crates
+# Secondo: il caricamento sta DENTRO il compositore del system prompt agentico.
+# Se tornasse nel chiamante, comporre quel prompt senza richiamare le memorie
+# ridiventerebbe possibile — e la regressione sarebbe di nuovo invisibile, perche'
+# un prompt senza memorie e' un prompt perfettamente valido.
+#
+# La verifica guarda DENTRO il corpo di quella funzione, non il file: un
+# `grep` sull'intero sorgente direbbe "OK" anche con la chiamata spostata nei
+# test o in un altro punto, cioe' proprio nel caso che deve intercettare.
+mem_file="crates/mcp-core/src/chat_messages/agent_run.rs"
+mem_innesto="$(awk '
+  /^pub\(crate\) async fn compose_agent_system_text/ { dentro = 1; next }
+  dentro && /ProjectMemories::load/ { print "trovato"; exit }
+  dentro && /^}/ { exit }
+' "$mem_file" 2>/dev/null)"
+if [[ -z "$mem_innesto" ]]; then
+  echo "!! memorie-nel-prompt: il system prompt agentico non passa piu' dal richiamo delle memorie." >&2
+  echo "   Il caricamento deve restare dentro compose_agent_system_text ($mem_file)," >&2
+  echo "   non nel chiamante: li' comporre il prompt senza memorie tornerebbe possibile." >&2
+  fail=1
+else
+  echo "OK memorie-nel-prompt: il percorso agentico richiama le memorie di progetto"
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
