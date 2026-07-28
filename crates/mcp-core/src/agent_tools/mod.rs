@@ -230,4 +230,26 @@ mod adr0034_contract_tests {
             "debate_position deve essere riservato ai sub-agenti"
         );
     }
+
+    /// La ricerca di riferimenti e' l'unico tool che porta dentro contenuto
+    /// scritto fuori da Nexus. Deve restare ai due kind di sola lettura che
+    /// l'hanno in whitelist: nel catalogo del run principale — che scrive file
+    /// ed esegue comandi — un ingresso esterno sarebbe a un passo
+    /// dall'esecuzione.
+    ///
+    /// Il catalogo dei layout NON e' riservato, e questa meta' del test conta
+    /// quanto l'altra: la figura cita il pattern per chiave, e chi implementa
+    /// deve poterne leggere la scheda.
+    #[test]
+    fn la_ricerca_esterna_e_riservata_ma_il_catalogo_layout_no() {
+        let riservati = nexus_agent_tools::tool_schema::SUBAGENT_ONLY_TOOLS;
+        assert!(
+            riservati.contains(&"ui_reference_search"),
+            "la ricerca web non deve stare nel catalogo di chi scrive file"
+        );
+        assert!(
+            !riservati.contains(&"ui_layout_patterns"),
+            "il catalogo dei layout serve anche a chi implementa"
+        );
+    }
 }

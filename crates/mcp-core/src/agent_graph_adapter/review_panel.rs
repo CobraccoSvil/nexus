@@ -83,6 +83,29 @@ impl ReviewPanelAdapter {
         Ok(modified)
     }
 
+    /// La lente di interfaccia va convocata per questa review?
+    ///
+    /// Decide dai FILE MODIFICATI dal run (regola M), non dal testo del task:
+    /// un task che diceva "sistema le spese" puo' aver riscritto tre pagine.
+    /// Vocabolario dal DB (regola G); la REGOLA di riconoscimento e' il punto
+    /// unico `decisions::ui_surface`. Spenta se manca il suo interruttore: un
+    /// revisore in piu' non si accende da solo.
+    async fn lente_ui_attiva(&self, modified: &[String]) -> bool {
+        if !nexus_auth::get_bool_setting(&self.db, "orchestrator.review_ui_lens_enabled")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let suffissi =
+            nexus_auth::get_csv_setting(&self.db, "orchestrator.review_ui_suffixes").await;
+        let segmenti =
+            nexus_auth::get_csv_setting(&self.db, "orchestrator.review_ui_path_segments").await;
+        nexus_agent_graph::decisions::ui_surface::tocca_interfaccia(modified, &suffissi, &segmenti)
+    }
+
     /// Policy del quorum dalle chiavi gia' esistenti (mig 0571/0572).
     async fn quorum_policy(&self) -> nexus_agent_graph::decisions::QuorumPolicy {
         nexus_agent_graph::decisions::QuorumPolicy {
@@ -189,15 +212,17 @@ impl ReviewPanelPort for ReviewPanelAdapter {
              {files_line}\n\nLeggi questi file, verifica correttezza, sicurezza, edge case e \
              regressioni, e dichiara il verdetto con review_verdict."
         );
+        let lente_ui = self.lente_ui_attiva(&modified).await;
         tracing::info!(
             run_id = %run_id,
             reviewers,
             files = modified.len(),
             cycle = req.cycle,
+            lente_ui,
             "review gate: convocazione del panel (dentro il grafo)"
         );
         match crate::agent_tools::subagent_native::convene_review_panel(
-            &ctx, &task, reviewers, &policy,
+            &ctx, &task, reviewers, &policy, lente_ui,
         )
         .await
         {

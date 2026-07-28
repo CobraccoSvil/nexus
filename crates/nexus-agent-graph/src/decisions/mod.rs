@@ -103,6 +103,7 @@ pub mod text_repetition;
 pub mod tiers;
 pub mod tool_dispatch;
 pub mod turn_focus;
+pub mod ui_surface;
 
 pub use adversarial_review::{
     compose_panel_verdict, PanelOutcome, PanelVerdict, QuorumPolicy, ReviewVerdict, ReviewerRef,

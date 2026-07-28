@@ -210,6 +210,28 @@ pub async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Legge un setting che contiene una LISTA separata da virgole: voci con trim,
+/// vuote scartate. Chiave assente o valore vuoto -> lista vuota.
+///
+/// PUNTO UNICO (regola L) del formato CSV dei settings, accanto a
+/// [`get_setting`] di cui e' una lettura specializzata. Il repo tratta molte
+/// chiavi come elenchi — figure del consiglio, keyword d'ambito, kind in
+/// whitelist, suffissi di file — e ogni consumatore si era scritto la propria
+/// `fn csv(...)` locale, identica alle altre. Tre copie sono un formato che
+/// nessuno possiede: basta che una scarti i vuoti e un'altra no perche' un
+/// `a,,b` diventi due liste diverse nello stesso processo.
+pub async fn get_csv_setting(db: &PgPool, key: &str) -> Vec<String> {
+    get_setting(db, key)
+        .await
+        .map(|v| {
+            v.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // Scrittura settings: punto unico (regola L / ADR 0026), accanto alla lettura.
 // Prima la stessa logica viveva duplicata in `mcp-core::settings::update_setting`
 // e `admin-service::settings::update_setting`.

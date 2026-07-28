@@ -66,6 +66,60 @@ pub fn count_sensitive_domain_hits(text: &str, keywords: &[String]) -> usize {
         .count()
 }
 
+/// Il testo tocca una keyword d'ambito, riconosciuta a PAROLA INTERA
+/// (case-insensitive). PURA. PUNTO UNICO del match d'ambito degli assi del
+/// consiglio (regola L).
+///
+/// Distinta dalla gemella [`count_sensitive_domain_hits`], che cerca una
+/// SOTTOSTRINGA: la differenza non e' stilistica, e' il vocabolario che le due
+/// domande possono permettersi. Un vocabolario d'ambito utile contiene parole
+/// corte — `app`, `ui`, `form`, `web`, `log` — e a sottostringa quelle parole
+/// cambiano significato: `log` compare dentro `login`, `web` dentro `webhook`,
+/// `form` dentro `informazioni`, `app` dentro `approccio`. Un task di
+/// autenticazione convocherebbe il sistemista perche' la parola `login`
+/// contiene `log`. Le keyword multi-parola (`dark mode`, `next.js`) funzionano
+/// comunque: il confine si valuta agli estremi dell'intera keyword.
+///
+/// Il gate ad ambito sensibile resta a sottostringa: cambiarlo sposterebbe
+/// QUANDO il consiglio si convoca, che e' una decisione separata da questa e va
+/// misurata per conto suo.
+pub fn touches_domain_keyword(text: &str, keywords: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    keywords.iter().any(|k| {
+        let k = k.trim().to_lowercase();
+        !k.is_empty() && contains_whole_word(&lower, &k)
+    })
+}
+
+/// `haystack` contiene `needle` con confini di parola su entrambi i lati.
+/// Entrambi gia' in minuscolo. Un confine e' l'inizio/fine del testo o un
+/// carattere non alfanumerico: cosi' `un'app`, `(dashboard)` e `layout,` sono
+/// riconosciuti, mentre `approccio` e `automobile` no.
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let prima_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let dopo_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if prima_ok && dopo_ok {
+            return true;
+        }
+        // Avanza di un carattere (non di un byte): il testo e' UTF-8.
+        match haystack[start..].chars().next() {
+            Some(c) => from = start + c.len_utf8(),
+            None => break,
+        }
+    }
+    false
+}
+
 /// Gate ad AMBITO SENSIBILE del consiglio (regola G/H/L, DB-driven): il consiglio
 /// si attiva quando il task tocca ambiti a rischio (auth/sicurezza, pagamenti,
 /// schema/migrazioni DB, azioni distruttive, privacy), rilevati dalle keyword di
@@ -1840,6 +1894,59 @@ pub async fn available_mcp_tools_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kw(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// La ragione per cui questo matcher esiste: a sottostringa, `log` (keyword
+    /// infra reale, mig 0553) trova `login` e un task di autenticazione
+    /// convocherebbe il sistemista.
+    #[test]
+    fn parola_intera_non_scatta_dentro_unaltra_parola() {
+        assert!(count_sensitive_domain_hits("aggiungi il login con OTP", &kw(&["log"])) > 0);
+        assert!(!touches_domain_keyword(
+            "aggiungi il login con OTP",
+            &kw(&["log"])
+        ));
+        assert!(!touches_domain_keyword(
+            "rivedi l'approccio automobilistico",
+            &kw(&["app", "mobile"])
+        ));
+        assert!(!touches_domain_keyword(
+            "registra il webhook e le informazioni",
+            &kw(&["web", "form"])
+        ));
+    }
+
+    #[test]
+    fn parola_intera_riconosce_i_confini_non_alfanumerici() {
+        // Apostrofo, parentesi, punteggiatura e inizio/fine testo.
+        assert!(touches_domain_keyword("creami un'app per le spese", &kw(&["app"])));
+        assert!(touches_domain_keyword("sistema il (layout).", &kw(&["layout"])));
+        assert!(touches_domain_keyword("form", &kw(&["form"])));
+        assert!(touches_domain_keyword("usiamo Next.js lato client", &kw(&["next.js"])));
+        assert!(touches_domain_keyword("attiva la DARK MODE", &kw(&["dark mode"])));
+    }
+
+    #[test]
+    fn parola_intera_ignora_keyword_vuote_e_lista_vuota() {
+        assert!(!touches_domain_keyword("qualunque testo", &kw(&["", "   "])));
+        assert!(!touches_domain_keyword("qualunque testo", &[]));
+    }
+
+    /// L'occorrenza buona puo' arrivare DOPO una scartata: il matcher deve
+    /// continuare a cercare invece di fermarsi alla prima.
+    #[test]
+    fn parola_intera_prosegue_oltre_la_prima_occorrenza_incastonata() {
+        assert!(touches_domain_keyword(
+            "approccio: creami una app",
+            &kw(&["app"])
+        ));
+        // Accentate: il confine si valuta su caratteri, non su byte.
+        assert!(touches_domain_keyword("verifica l'usabilità", &kw(&["usabilità"])));
+        assert!(!touches_domain_keyword("perché", &kw(&["che"])));
+    }
 
     #[test]
     fn template_cache_get_miss_restituisce_none() {

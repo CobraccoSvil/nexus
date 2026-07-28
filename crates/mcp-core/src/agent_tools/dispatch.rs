@@ -14,8 +14,8 @@ use super::{
     archive_tools, attachment_inspector, attachments, audio_tools, command, dev_diagnostics,
     dispatcher, document_tools, figma_tools, files, git, image_tools, knowledge, ports,
     project_db_query, rag_search, sandbox, scaffold_verifier, service, shadcn_setup,
-    subagent_native, testing, todos, tool_not_found, verify, video_tools, vision_tools,
-    visual_compare, AgentToolContext,
+    subagent_native, testing, todos, tool_not_found, ui_patterns, ui_reference_search, verify,
+    video_tools, vision_tools, visual_compare, AgentToolContext,
 };
 
 /// Esegue un tool per conto dell'agente.
@@ -145,6 +145,13 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "dispatcher_update_monitor" => dispatcher::tool_dispatcher_update_monitor(ctx, input).await,
         "dispatcher_highlight_panel" => {
             dispatcher::tool_dispatcher_highlight_panel(ctx, input).await
+        }
+        // ── Catalogo pattern di layout (trasversale ai progetti) ───────────
+        "ui_layout_patterns" => ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await,
+        // Unico tool che guarda FUORI dal progetto: cio' che torna e' DATO, e
+        // arriva gia' dichiarato come non fidato (vedi il modulo).
+        "ui_reference_search" => {
+            ui_reference_search::tool_ui_reference_search(&ctx.core, input).await
         }
         // ── Knowledge Base per-progetto ────────────────────────────────────
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,

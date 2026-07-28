@@ -1190,14 +1190,27 @@ pub(crate) async fn read_advisory_policy(ctx: &AgentToolContext) -> AdvisoryPoli
 /// DATO nel DB (sono `kind`, non nomi-modello).
 pub(crate) struct CouncilConfig {
     /// Figure sempre convocate (trasversali): CSV `orchestrator.council_figures`.
+    /// Sono un DEFAULT cieco: nessun segnale del task le ha scelte.
     pub base_figures: Vec<String>,
-    /// Figure aggiuntive quando il testo tocca ambiti infrastruttura/deploy: CSV
-    /// `orchestrator.council_infra_figures`.
-    pub infra_figures: Vec<String>,
-    /// Keyword d'ambito infrastruttura/deploy (CSV `orchestrator.council_infra_keywords`).
-    pub infra_keywords: Vec<String>,
+    /// Assi d'ambito: ognuno convoca le proprie figure quando il testo del task
+    /// tocca le sue keyword. PUNTO UNICO dell'attivazione per ambito (regola L):
+    /// prima esisteva il solo asse infra, scritto a mano nel selettore; un
+    /// secondo ambito (interfaccia) avrebbe richiesto di ricopiarne il ramo.
+    /// L'elenco degli assi e' un DATO (`orchestrator.council_domain_axes`).
+    pub domain_axes: Vec<CouncilDomainAxis>,
     /// Cap del numero di figure convocate (`orchestrator.council_max_figures`).
     pub max_figures: usize,
+}
+
+/// Un asse d'ambito del consiglio: keyword che lo attivano + figure che convoca.
+pub(crate) struct CouncilDomainAxis {
+    /// Nome dell'asse (`infra`, `ui`, ...): e' il prefisso delle sue chiavi
+    /// `orchestrator.council_<name>_{figures,keywords}` e l'etichetta nei log.
+    pub name: String,
+    /// Keyword d'ambito, match substring case-insensitive.
+    pub keywords: Vec<String>,
+    /// Figure convocate quando l'asse e' attivo.
+    pub figures: Vec<String>,
 }
 
 /// Configurazione DB-driven del panel multi-provider. Il kind e il purpose sono
@@ -1453,19 +1466,37 @@ impl MultiProviderPanelOutcome {
 /// convocazione (fail-closed sulla selezione; la feature va accesa esplicitamente coi
 /// settings di mig 0553 oltre al kill-switch `orchestrator.council_enabled`).
 pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
-    fn csv(v: Option<String>) -> Vec<String> {
-        v.map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    // Formato CSV dei settings: punto unico in `nexus_auth` (regola L).
+    let base = nexus_auth::get_csv_setting(db, "orchestrator.council_figures").await;
+    // Gli assi d'ambito sono un DATO: aggiungerne uno e' una riga di settings,
+    // non un ramo nel selettore (regola G). `infra` resta il default storico se
+    // la chiave manca, cosi' il comportamento pre-esistente non dipende dalla
+    // migrazione che introduce l'elenco.
+    let axis_names = {
+        let declared = nexus_auth::get_csv_setting(db, "orchestrator.council_domain_axes").await;
+        if declared.is_empty() {
+            vec!["infra".to_string()]
+        } else {
+            declared
+        }
+    };
+    let mut domain_axes = Vec::with_capacity(axis_names.len());
+    for name in axis_names {
+        let figures =
+            nexus_auth::get_csv_setting(db, &format!("orchestrator.council_{name}_figures")).await;
+        let keywords =
+            nexus_auth::get_csv_setting(db, &format!("orchestrator.council_{name}_keywords")).await;
+        // Un asse senza figure o senza keyword non puo' convocare nulla: si
+        // scarta qui invece di portarselo dietro come riga muta.
+        if figures.is_empty() || keywords.is_empty() {
+            continue;
+        }
+        domain_axes.push(CouncilDomainAxis {
+            name,
+            keywords,
+            figures,
+        });
     }
-    let base = csv(nexus_auth::get_setting(db, "orchestrator.council_figures").await);
-    let infra = csv(nexus_auth::get_setting(db, "orchestrator.council_infra_figures").await);
-    let infra_keywords =
-        csv(nexus_auth::get_setting(db, "orchestrator.council_infra_keywords").await);
     let max_figures = nexus_auth::get_setting(db, "orchestrator.council_max_figures")
         .await
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1473,35 +1504,65 @@ pub(crate) async fn read_council_config(db: &sqlx::PgPool) -> CouncilConfig {
         .max(1);
     CouncilConfig {
         base_figures: base,
-        infra_figures: infra,
-        infra_keywords,
+        domain_axes,
         max_figures,
     }
 }
 
 /// Selettore PURO (regola L, testabile senza DB) delle figure del consiglio per un
-/// dato testo. Parte dalle figure base; aggiunge le figure infra se il testo tocca
-/// almeno una keyword d'ambito infrastruttura/deploy (riuso del PUNTO UNICO substring
-/// [`crate::prompt_templates::count_sensitive_domain_hits`], regola L). Dedup stabile
-/// + cap `max_figures`.
-pub(crate) fn select_council_figures(user_text: &str, cfg: &CouncilConfig) -> Vec<String> {
-    let mut figures: Vec<String> = Vec::new();
+/// dato testo, gia' DIMENSIONATO al `target` del piano di orchestrazione.
+///
+/// Le figure di un asse d'ambito ATTIVO entrano per prime, e il taglio non le
+/// tocca: le ha scelte un segnale del task (le sue keyword), mentre le base sono
+/// un default cieco. Il `target` decide QUANTE figure in tutto, non quali si
+/// possono perdere: le base riempiono i posti che restano.
+///
+/// Prima il taglio stava in DUE punti — `truncate(max_figures)` qui e
+/// `truncate(target)` nel chiamante — e mordeva sempre la CODA, cioe' proprio le
+/// figure d'ambito. Col profilo `medium` (target 3) e 5 figure base, `sysadmin`
+/// non e' mai stato convocato nemmeno su un task di deploy: la lente scelta dal
+/// testo veniva scartata a favore delle prime tre voci di un CSV. Ogni asse
+/// nuovo avrebbe ereditato lo stesso silenzio.
+///
+/// L'attivazione riusa il PUNTO UNICO del match d'ambito a parola intera
+/// [`crate::prompt_templates::touches_domain_keyword`] (regola L): a
+/// sottostringa un vocabolario d'ambito non e' affidabile — `log` trova
+/// `login`, `app` trova `approccio`.
+/// `target`: `None` = nessun piano (si convoca fino a `max_figures`), `Some(0)`
+/// = panel azzerato dal budget -> nessuna figura.
+pub(crate) fn select_council_figures(
+    user_text: &str,
+    cfg: &CouncilConfig,
+    target: Option<usize>,
+) -> Vec<String> {
     let push = |f: &String, figures: &mut Vec<String>| {
         if !f.is_empty() && !figures.iter().any(|e| e == f) {
             figures.push(f.clone());
         }
     };
-    for f in &cfg.base_figures {
-        push(f, &mut figures);
-    }
-    let touches_infra =
-        crate::prompt_templates::count_sensitive_domain_hits(user_text, &cfg.infra_keywords) > 0;
-    if touches_infra {
-        for f in &cfg.infra_figures {
-            push(f, &mut figures);
+    // Figure degli assi attivi: scelte dal contenuto del task.
+    let mut figures: Vec<String> = Vec::new();
+    for axis in &cfg.domain_axes {
+        if crate::prompt_templates::touches_domain_keyword(user_text, &axis.keywords) {
+            for f in &axis.figures {
+                push(f, &mut figures);
+            }
         }
     }
-    figures.truncate(cfg.max_figures);
+    // Posti totali. Il target puo' ALLARGARSI per ospitare le figure d'ambito
+    // (sono obbligatorie), mai oltre il backstop assoluto `max_figures`.
+    let posti = match target {
+        Some(0) => return Vec::new(),
+        Some(t) => t.max(figures.len()).min(cfg.max_figures),
+        None => cfg.max_figures,
+    };
+    figures.truncate(posti);
+    for f in &cfg.base_figures {
+        if figures.len() >= posti {
+            break;
+        }
+        push(f, &mut figures);
+    }
     figures
 }
 
@@ -2258,13 +2319,55 @@ fn dichiara_taglio_panel(
     );
 }
 
+/// Kind del revisore con la lente di interfaccia. E' una CHIAVE di definizione
+/// nel DB (`nexus_subagent_definitions`), non un modello: prompt, tool e
+/// purpose si cambiano li' (regola G).
+const UI_REVIEWER_KIND: &str = "ui_reviewer";
+
+/// Questo kind GIUDICA il lavoro di qualcun altro? PUNTO UNICO (regola L) della
+/// domanda, interrogato da tutti e tre i luoghi in cui vale «giudice != worker»:
+/// la selezione del modello, il veto che segue il sub-run nel ripiego, e la
+/// costruzione del suo input.
+///
+/// Esiste perche' quella regola era scritta come `kind == "review"` in tre
+/// punti. Finche' il panel aveva un solo tipo di giudice la ripetizione non si
+/// vedeva; il primo giudice con un kind diverso — il revisore di interfaccia —
+/// sarebbe nato SENZA il vincolo, cioe' libero di girare sul fornitore che ha
+/// appena scritto il codice che deve giudicare. Non un difetto nuovo: lo stesso
+/// del 26/07 (dieci revisori sul fornitore del padre), raggiunto per una terza
+/// strada.
+fn e_un_giudice(kind: &str) -> bool {
+    kind == "review" || kind == UI_REVIEWER_KIND
+}
+
+/// I kind dei revisori da convocare, uno per posto disponibile.
+///
+/// La lente di interfaccia, quando serve, sta in TESTA: se i giudici distinti
+/// non bastano il panel si riduce dalla coda, e una lente accesa da un fatto
+/// del run (i file toccati) non deve essere la prima a cadere. Non si SOMMA ai
+/// revisori richiesti — prende il posto di un generico — cosi' accendere la
+/// lente non allarga il costo del panel.
+fn kinds_dei_revisori(richiesti: usize, lente_ui: bool) -> Vec<String> {
+    let n = richiesti.max(1);
+    let mut kinds: Vec<String> = Vec::with_capacity(n);
+    if lente_ui {
+        kinds.push(UI_REVIEWER_KIND.to_string());
+    }
+    while kinds.len() < n {
+        kinds.push("review".to_string());
+    }
+    kinds.truncate(n);
+    kinds
+}
+
 async fn spawn_reviewers(
     ctx: &AgentToolContext,
-    richiesti: usize,
+    kinds: &[String],
     task: &str,
     expected: &str,
     assegnati: &mut Vec<nexus_agent_graph::decisions::ReviewerRef>,
 ) -> Vec<Value> {
+    let richiesti = kinds.len();
     let candidates = candidati_revisori(ctx, richiesti).await;
     // Mai due revisori sullo stesso (provider, model): si riduce il panel invece
     // di duplicare.
@@ -2276,6 +2379,7 @@ async fn spawn_reviewers(
     };
     dichiara_taglio_panel(&panel, richiesti, n);
     assegnati.extend(riferimenti_revisori(&panel, n));
+    let kinds: Vec<String> = kinds.iter().take(n).cloned().collect();
 
     // Stesso punto unico di fan-out del consiglio (regola L, difetto D3).
     spawn_fanout(&ctx.core.db, n, FanoutScope::TopLevel, move |i| {
@@ -2285,17 +2389,17 @@ async fn spawn_reviewers(
         // Lo stesso `panel` che ha prodotto i riferimenti dichiarati a valle:
         // chi vota e chi risulta aver votato non possono divergere.
         let pin = panel.get(i).map(|c| (c.provider.clone(), c.model.clone()));
+        let kind = kinds[i].clone();
         async move {
             match pin {
                 Some((provider, model)) => {
                     run_single_subagent_with_model_pin(
-                        &ctx, "review", &task, "", &expected, &provider, &model,
+                        &ctx, &kind, &task, "", &expected, &provider, &model,
                     )
                     .await
                 }
                 None => {
-                    run_single_subagent(&ctx, "review", &task, "", &expected, None, false, &[])
-                        .await
+                    run_single_subagent(&ctx, &kind, &task, "", &expected, None, false, &[]).await
                 }
             }
         }
@@ -2308,12 +2412,14 @@ pub(crate) async fn convene_review_panel(
     task: &str,
     reviewers: usize,
     policy: &nexus_agent_graph::decisions::QuorumPolicy,
+    lente_ui: bool,
 ) -> Option<nexus_agent_graph::decisions::PanelOutcome> {
     let expected = "Rivedi SOLO le modifiche indicate e chiudi chiamando review_verdict \
                     (verdict pass|fail|needs_changes; findings con file, severity ed evidenza \
                     concreta). Un fail richiede almeno un finding grave con evidenza.";
     let mut assegnati: Vec<nexus_agent_graph::decisions::ReviewerRef> = Vec::new();
-    let results = spawn_reviewers(ctx, reviewers.max(1), task, expected, &mut assegnati).await;
+    let kinds = kinds_dei_revisori(reviewers, lente_ui);
+    let results = spawn_reviewers(ctx, &kinds, task, expected, &mut assegnati).await;
     let outcomes: Vec<Value> = results
         .into_iter()
         .map(|r| r.get("outcome").cloned().unwrap_or(Value::Null))
@@ -3988,7 +4094,7 @@ async fn resolve_worker_model(
 
     // Ramo REVIEW: preferenza IGNORATA, vincolo giudice != worker invariato.
     // Provider del padre da escludere (astensione da auto-certificazione).
-    if kind == "review" {
+    if e_un_giudice(kind) {
         // Stessa regola che vieta il ripiego a valle, letta dallo stesso punto:
         // se qui e la porta di escalation la calcolassero per conto proprio,
         // basterebbe un domani a farle divergere — ed e' la divergenza che ha
@@ -4127,7 +4233,7 @@ async fn veto_del_giudice(
     kind: &str,
     anchor: Uuid,
 ) -> crate::orchestrator::ProviderVeto {
-    if kind != "review" {
+    if !e_un_giudice(kind) {
         return crate::orchestrator::ProviderVeto::none();
     }
     // Padre senza fornitore noto: nessun veto. Non e' un ripiego silenzioso —
@@ -6075,6 +6181,26 @@ mod tests {
         );
     }
 
+    /// Il revisore di INTERFACCIA e' un giudice quanto quello generico, e la
+    /// regola vale per lui allo stesso modo: nel panel di review i due siedono
+    /// affiancati, e uno solo dei due che si astiene dall'auto-certificazione
+    /// non e' una regola, e' un caso.
+    ///
+    /// MUTAZIONE: riportando `e_un_giudice` a `kind == "review"` questo test
+    /// ritorna "alpha", cioe' il fornitore che ha scritto il codice.
+    #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
+    async fn il_revisore_di_interfaccia_esclude_il_provider_del_worker(pool: sqlx::PgPool) {
+        let (parent, def) =
+            seed_review_routing(&pool, "alpha", &[("alpha", "a1"), ("beta", "b1")]).await;
+        let (provider, _model) =
+            resolve_worker_model(&pool, &pool, UI_REVIEWER_KIND, &def, parent, Uuid::new_v4())
+                .await;
+        assert_eq!(
+            provider, "beta",
+            "il revisore di interfaccia deve evitare il provider del worker (alpha)"
+        );
+    }
+
     /// C2 parita': un kind NON review non esclude nulla (il provider del padre e'
     /// ammesso, comportamento invariato).
     #[sqlx::test(migrator = "crate::test_support::PROJECT_MIGRATOR")]
@@ -6827,6 +6953,14 @@ mod tests {
 
     // ─── Consiglio a monte: selezione figure + composizione sintesi ─────────────
 
+    fn axis(name: &str, keywords: &[&str], figures: &[&str]) -> CouncilDomainAxis {
+        CouncilDomainAxis {
+            name: name.to_string(),
+            keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            figures: figures.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     fn council_cfg() -> CouncilConfig {
         CouncilConfig {
             base_figures: vec![
@@ -6835,8 +6969,10 @@ mod tests {
                 "security_engineer".to_string(),
                 "project_manager".to_string(),
             ],
-            infra_figures: vec!["sysadmin".to_string()],
-            infra_keywords: vec!["deploy".to_string(), "docker".to_string()],
+            domain_axes: vec![
+                axis("infra", &["deploy", "docker"], &["sysadmin"]),
+                axis("ui", &["interfaccia", "pagina"], &["ui_ux_designer"]),
+            ],
             max_figures: 6,
         }
     }
@@ -6844,7 +6980,7 @@ mod tests {
     #[test]
     fn select_figures_solo_base_senza_ambito_infra() {
         let cfg = council_cfg();
-        let got = select_council_figures("aggiungi il login con OTP via email", &cfg);
+        let got = select_council_figures("aggiungi il login con OTP via email", &cfg, None);
         assert_eq!(
             got,
             vec![
@@ -6860,12 +6996,65 @@ mod tests {
     #[test]
     fn select_figures_aggiunge_sysadmin_su_ambito_deploy() {
         let cfg = council_cfg();
-        let got = select_council_figures("prepara il deploy con docker in produzione", &cfg);
+        let got = select_council_figures("prepara il deploy con docker in produzione", &cfg, None);
         assert!(
             got.iter().any(|f| f == "sysadmin"),
             "atteso sysadmin: {got:?}"
         );
         assert_eq!(got.len(), 5);
+    }
+
+    /// Il difetto che rendeva MUTA qualunque figura d'ambito: col profilo
+    /// `medium` (target 3) e 5 figure base, il taglio prendeva le prime tre voci
+    /// del CSV e scartava la lente scelta dal testo. Vale per `sysadmin` (che
+    /// esisteva da mig 0553) come per ogni asse aggiunto dopo.
+    #[test]
+    fn target_non_scarta_la_figura_scelta_dal_task() {
+        let cfg = council_cfg();
+        let got =
+            select_council_figures("prepara il deploy con docker in produzione", &cfg, Some(3));
+        assert_eq!(got.len(), 3, "il target dimensiona il panel: {got:?}");
+        assert_eq!(
+            got[0], "sysadmin",
+            "la figura d'ambito entra per prima, non si taglia: {got:?}"
+        );
+        // I posti restanti vanno alle base, nell'ordine dichiarato.
+        assert_eq!(got[1], "functional_analyst");
+        assert_eq!(got[2], "software_architect");
+    }
+
+    /// Due assi attivi insieme: entrambe le lenti entrano, e il target si
+    /// allarga quanto basta a ospitarle (mai oltre `max_figures`).
+    #[test]
+    fn due_assi_attivi_allargano_il_target_fino_al_cap() {
+        let cfg = council_cfg();
+        let got = select_council_figures(
+            "rifai l'interfaccia della pagina e sistema il deploy docker",
+            &cfg,
+            Some(1),
+        );
+        assert_eq!(
+            got,
+            vec!["sysadmin", "ui_ux_designer"],
+            "target 1 ma due figure obbligatorie: {got:?}"
+        );
+    }
+
+    #[test]
+    fn cap_massimo_vince_anche_sulle_figure_dambito() {
+        let cfg = CouncilConfig {
+            base_figures: vec!["functional_analyst".to_string()],
+            domain_axes: vec![axis("ui", &["pagina"], &["ui_ux_designer", "functional_analyst"])],
+            max_figures: 1,
+        };
+        let got = select_council_figures("sistema la pagina", &cfg, Some(5));
+        assert_eq!(got, vec!["ui_ux_designer"], "cap assoluto: {got:?}");
+    }
+
+    #[test]
+    fn target_zero_non_convoca_nessuno() {
+        let cfg = council_cfg();
+        assert!(select_council_figures("rifai la pagina", &cfg, Some(0)).is_empty());
     }
 
     #[test]
@@ -6876,24 +7065,122 @@ mod tests {
                 "software_architect".to_string(),
                 "security_engineer".to_string(),
             ],
-            infra_figures: vec!["security_engineer".to_string(), "sysadmin".to_string()],
-            infra_keywords: vec!["deploy".to_string()],
+            domain_axes: vec![axis(
+                "infra",
+                &["deploy"],
+                &["security_engineer", "sysadmin"],
+            )],
             max_figures: 2,
         };
-        let got = select_council_figures("deploy dell'app", &cfg);
-        // Dedup: software_architect una sola volta; cap 2 -> tronca.
-        assert_eq!(got, vec!["software_architect", "security_engineer"]);
+        let got = select_council_figures("deploy dell'app", &cfg, None);
+        // Dedup: security_engineer una sola volta (asse + base); cap 2 -> tronca.
+        assert_eq!(got, vec!["security_engineer", "sysadmin"]);
+    }
+
+    // ─── Review panel: la lente di interfaccia ─────────────────────────────
+
+    #[test]
+    fn senza_lente_ui_il_panel_resta_di_soli_revisori_generici() {
+        assert_eq!(kinds_dei_revisori(2, false), vec!["review", "review"]);
+    }
+
+    /// La lente PRENDE IL POSTO di un revisore generico invece di sommarsi:
+    /// accenderla non deve allargare il costo del panel.
+    #[test]
+    fn la_lente_ui_non_allarga_il_panel() {
+        let kinds = kinds_dei_revisori(2, true);
+        assert_eq!(kinds.len(), 2, "il panel resta di due: {kinds:?}");
+        assert_eq!(kinds, vec![UI_REVIEWER_KIND, "review"]);
+    }
+
+    /// Sta in testa perche' il panel si riduce dalla CODA quando i giudici
+    /// distinti non bastano (`spawn_reviewers` tronca a `panel.len()`): in
+    /// fondo, la lente accesa dai file toccati sarebbe la prima a sparire, e
+    /// sparirebbe in silenzio.
+    #[test]
+    fn la_lente_ui_sopravvive_al_taglio_del_panel() {
+        let kinds = kinds_dei_revisori(3, true);
+        let ridotto: Vec<String> = kinds.iter().take(1).cloned().collect();
+        assert_eq!(
+            ridotto,
+            vec![UI_REVIEWER_KIND],
+            "col panel ridotto a uno resta la lente pertinente: {kinds:?}"
+        );
+    }
+
+    /// Il caso di campo (28/07, progetto gestione-spese) misurato sul DB VERO:
+    /// settings, vocabolario d'ambito e figure arrivano dalle migrazioni, non da
+    /// una `CouncilConfig` scritta a mano che confermerebbe se stessa (regola O).
+    ///
+    /// La richiesta non nomina l'interfaccia — dice "app", che e' il modo in cui
+    /// un utente la nomina. Col profilo `medium` (target 3) il consiglio deve
+    /// convocare la lente UI, non le prime tre voci del CSV.
+    ///
+    /// MUTAZIONE: togliendo `ui` da `orchestrator.council_domain_axes`, o
+    /// rimettendo il taglio per posizione, l'asserzione fallisce nominando le
+    /// figure convocate.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn richiesta_di_unapp_convoca_la_lente_ui(pool: sqlx::PgPool) {
+        let cfg = read_council_config(&pool).await;
+        assert!(
+            cfg.domain_axes.iter().any(|a| a.name == "ui"),
+            "l'asse ui deve esistere nei settings seminati"
+        );
+
+        let target: usize = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM settings WHERE key = 'orchestrator.sizing_profile_medium'",
+        )
+        .fetch_one(&pool)
+        .await
+        .ok()
+        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+        .and_then(|v| v.get("council_figures").and_then(Value::as_u64))
+        .expect("il profilo medium deve dichiarare council_figures") as usize;
+
+        let figures = select_council_figures(
+            "creami un'app per la gestione delle spese di casa",
+            &cfg,
+            Some(target),
+        );
+        assert!(
+            figures.iter().any(|f| f == "ui_ux_designer"),
+            "convocate {figures:?} (target {target}): nessuno guarda l'interfaccia"
+        );
+        assert_eq!(
+            figures.len(),
+            target,
+            "la lente pertinente prende il posto di una base, non si somma: {figures:?}"
+        );
+    }
+
+    /// L'anello successivo (regola O): il parere della figura deve ARRIVARE nel
+    /// prompt del run che implementa. Parte dall'esito strutturato di un sub-run
+    /// — la forma che `advisory_verdict` produce davvero — e finisce nel blocco
+    /// testuale che viene anteposto al messaggio iniziale.
+    #[test]
+    fn il_vincolo_di_interfaccia_arriva_nel_blocco_del_prompt() {
+        let parere = mock_figure_result(
+            "proceed_with_changes",
+            "la lista spese non rende lo stato vuoto",
+            None,
+        );
+        let synth = compose_council_synthesis(&[parere], &AdvisoryPolicy::default(), 1)
+            .expect("una figura che vota produce una sintesi");
+        let blocco = render_council_synthesis(&synth);
+        assert!(
+            blocco.contains("la lista spese non rende lo stato vuoto"),
+            "il vincolo non arriva a chi implementa: {blocco}"
+        );
     }
 
     #[test]
     fn select_figures_vuoto_se_base_vuota() {
         let cfg = CouncilConfig {
             base_figures: vec![],
-            infra_figures: vec![],
-            infra_keywords: vec![],
+            domain_axes: vec![],
             max_figures: 6,
         };
-        assert!(select_council_figures("qualunque testo", &cfg).is_empty());
+        assert!(select_council_figures("qualunque testo", &cfg, None).is_empty());
     }
 
     #[test]
