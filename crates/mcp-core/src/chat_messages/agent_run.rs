@@ -4433,6 +4433,9 @@ pub(crate) async fn spawn_agent_run(
                     provider: provider_clone.clone(),
                     model: model_clone.clone(),
                     provider_pin: provider_pin_clone.clone(),
+                    // Run principale: nessun veto (la regola giudice != worker
+                    // riguarda i soli sub-run di review).
+                    provider_veto: crate::orchestrator::ProviderVeto::none(),
                     system_text: system_text_clone.clone(),
                     // Chiave del prompt di sistema del run principale: la usa il
                     // ReflectionNode per attribuire la reflection al template.
@@ -4742,6 +4745,8 @@ pub(crate) async fn confirm_native_run(
         // Nessun vincolo: qui non c'e' una richiesta utente in corso da cui un
         // pin possa nascere (il pin non si eredita).
         provider_pin: crate::orchestrator::ProviderPin::none(),
+        // Run principale: nessun veto (vedi `veto_del_giudice`).
+        provider_veto: crate::orchestrator::ProviderVeto::none(),
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),
@@ -5135,6 +5140,8 @@ pub(crate) async fn resume_fanin(
         model,
         // Come sopra: nessuna richiesta in corso, nessun vincolo.
         provider_pin: crate::orchestrator::ProviderPin::none(),
+        // Run principale: nessun veto (vedi `veto_del_giudice`).
+        provider_veto: crate::orchestrator::ProviderVeto::none(),
         system_text: String::new(),
         prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
         initial_msg: String::new(),

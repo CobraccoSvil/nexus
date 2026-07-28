@@ -196,6 +196,17 @@ pub struct NativeRunInput {
     /// corso: resume, rimedi automatici, sub-run (il pin non si eredita, vedi
     /// [`crate::orchestrator::ProviderChoice::resolve`]).
     pub provider_pin: crate::orchestrator::ProviderPin,
+    /// Il fornitore che questo run NON puo' usare, per un vincolo del SISTEMA:
+    /// oggi «giudice != worker» sui sub-run di review.
+    ///
+    /// Distinto da `provider_pin` perche' ha segno OPPOSTO e origine diversa (il
+    /// pin lo chiede l'utente, il veto lo impone l'architettura), e distinto dal
+    /// vincolo che vive nella SELEZIONE del modello perche' deve sopravviverle:
+    /// era proprio la selezione l'unico posto in cui esisteva, e il ripiego a
+    /// valle — che conosce solo i fornitori gia' tentati nel turno — riportava il
+    /// giudice sul fornitore del worker. `none()` per ogni run che non sia un
+    /// giudice.
+    pub provider_veto: crate::orchestrator::ProviderVeto,
     /// System prompt completo del run.
     pub system_text: String,
     /// CHIAVE del template di sistema usato (`nexus_prompt_templates.key`), es.
@@ -2206,8 +2217,11 @@ async fn build_native_engine(
     // non filtra non da' errori, cambia solo fornitore. Oggi sono undici punti:
     // sette `escalation_inputs`, due `failover_provider`, `select_upscale_model`
     // e `select_model_for_tier` dello scale-controller.
-    let escalation: Arc<dyn EscalationPort> =
-        Arc::new(PgEscalationPort::new(db.clone()).con_vincolo(input.provider_pin.clone()));
+    let escalation: Arc<dyn EscalationPort> = Arc::new(
+        PgEscalationPort::new(db.clone())
+            .con_vincolo(input.provider_pin.clone())
+            .con_veto(input.provider_veto.clone()),
+    );
     let next_actions: Arc<dyn NextActionsDeriver> =
         Arc::new(NextActionsDeriverAdapter::new(db.clone()));
     // Porta billing: cooldown LIVE (fonte unica `provider_cooldown`), il fail-fast
@@ -3271,6 +3285,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "claude-x".to_string(),
             provider_pin: crate::orchestrator::ProviderPin::none(),
+            provider_veto: crate::orchestrator::ProviderVeto::none(),
             system_text: "sei un assistente".to_string(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: "Scrivi src/main.rs".to_string(),

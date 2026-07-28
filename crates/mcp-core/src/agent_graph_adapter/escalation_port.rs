@@ -56,14 +56,18 @@ pub struct PgEscalationPort {
     /// Il fornitore a cui l'utente ha vincolato il run, se l'ha fatto. Vuoto per
     /// ogni run non vincolato: la porta si comporta come prima.
     pin: crate::orchestrator::ProviderPin,
+    /// Il fornitore che questo run NON puo' usare, se il sistema lo vieta. Vuoto
+    /// per ogni run che non sia un giudice: la porta si comporta come prima.
+    veto: crate::orchestrator::ProviderVeto,
 }
 
 impl PgEscalationPort {
-    /// Costruisce l'adapter sul pool Postgres condiviso, senza vincolo.
+    /// Costruisce l'adapter sul pool Postgres condiviso, senza vincoli.
     pub fn new(db: PgPool) -> Self {
         Self {
             db,
             pin: crate::orchestrator::ProviderPin::none(),
+            veto: crate::orchestrator::ProviderVeto::none(),
         }
     }
 
@@ -74,6 +78,21 @@ impl PgEscalationPort {
     /// candidato riceve gia' solo candidati leciti.
     pub fn con_vincolo(mut self, pin: crate::orchestrator::ProviderPin) -> Self {
         self.pin = pin;
+        self
+    }
+
+    /// Vieta a questo run un fornitore, per un vincolo che nasce dal SISTEMA e
+    /// non dall'utente: oggi «giudice != worker» per i sub-run di review.
+    ///
+    /// Vive qui, accanto al pin, per la stessa ragione e per una in piu': il
+    /// vincolo esisteva SOLO al momento della selezione del modello
+    /// (`resolve_model_excluding`), mentre il ripiego a valle conosce soltanto i
+    /// fornitori «gia' tentati in questo turno» — e il fornitore del worker non e'
+    /// mai fra quelli. Un giudice poteva quindi ripiegare esattamente sul modello
+    /// che ha scritto il codice da giudicare, perdendo l'indipendenza che e' la
+    /// ragione per cui lo si convoca.
+    pub fn con_veto(mut self, veto: crate::orchestrator::ProviderVeto) -> Self {
+        self.veto = veto;
         self
     }
 
@@ -94,17 +113,22 @@ impl PgEscalationPort {
             crate::orchestrator::model_routing::agentic_failover_candidates(&self.db, exclude, window)
                 .await;
         let prima = pool.len();
-        pool.retain(|(p, _, _)| self.pin.ammette(p));
+        // Il veto insieme al pin, nello stesso punto e sulle stesse DUE letture:
+        // un filtro applicato a una sola delle due rimetterebbe in gioco, alla
+        // seconda, proprio il fornitore che si voleva escludere.
+        pool.retain(|(p, _, _)| self.pin.ammette(p) && self.veto.ammette(p));
         if pool.len() != prima {
             tracing::info!(
                 target: "nexus_mcp_core::escalation_port",
                 pin = self.pin.provider().unwrap_or(""),
+                veto = self.veto.provider().unwrap_or(""),
                 scartati = prima - pool.len(),
                 rimasti = pool.len(),
                 // Il motivo VERO della chiusura che seguira': senza questa riga
                 // il log direbbe "nessun provider sano" e manderebbe la diagnosi
                 // a cercare un guasto dove c'e' solo la scelta dell'utente.
-                "failover_provider: run vincolato dall'utente, candidati fuori dal vincolo scartati"
+                "failover_provider: run vincolato (pin dell'utente e/o veto del sistema), \
+                 candidati fuori dal vincolo scartati"
             );
         }
         pool
@@ -1452,6 +1476,124 @@ mod tests {
             port.pinned_provider(),
             Some("google"),
             "e la porta lo DICE, cosi' la chat puo' scrivere il motivo vero"
+        );
+    }
+
+    /// IL DIFETTO CHE QUESTO CHIUDE: il vincolo «giudice != worker» reggeva alla
+    /// SELEZIONE del modello e cadeva al RIPIEGO. Misurato il 26/07/2026 (run
+    /// 609000c1): 10 revisori scelti su openrouter, le loro trace su
+    /// `deepseek-v4-flash` e `deepseek-v4-pro`, cioe' il fornitore del padre. La
+    /// ragione e' nella firma: il ripiego riceve i fornitori «gia' tentati in
+    /// questo turno», e quello del worker non e' mai fra loro — senza veto,
+    /// deepseek e' un sostituto perfettamente lecito.
+    ///
+    /// `tried` VUOTO non e' una semplificazione del test: e' la condizione esatta
+    /// in cui il difetto si manifesta, cioe' il primo ripiego del turno.
+    ///
+    /// MUTAZIONE: togliendo `&& self.veto.ammette(p)` da `candidati_ammessi`, il
+    /// sostituto torna a essere deepseek e questa asserzione cade.
+    #[sqlx::test]
+    async fn il_veto_tiene_il_giudice_fuori_dal_fornitore_del_worker(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                // deepseek COSTA MENO: e' il candidato che il failover
+                // preferirebbe (`Rank::FailoverSafe` = non-thinking, poi costo).
+                // Se qui fosse il piu' caro, la scelta di openai non proverebbe
+                // il veto ma l'ordinamento.
+                ("deepseek", "deepseek-v4-pro", "high", 0.5, true, true),
+                ("openai", "gpt-sano", "high", 1.0, true, true),
+            ],
+        )
+        .await;
+        // Il worker gira su deepseek: il giudice non puo' finirci, nemmeno ripiegando.
+        let port = PgEscalationPort::new(pool.clone())
+            .con_veto(crate::orchestrator::ProviderVeto::su("deepseek"));
+        let pick = port
+            .failover_provider(
+                Some("openrouter"),
+                Some("glm-4.7-flash"),
+                Some("high"),
+                ProviderFailureCause::EmptyCompletion,
+                &[],
+            )
+            .await
+            .expect("fail-open");
+        assert_eq!(
+            pick.as_ref().map(|c| c.provider.as_str()),
+            Some("openai"),
+            "il ripiego deve prendere l'altro fornitore sano, non quello del worker: {pick:?}"
+        );
+    }
+
+    /// Il veto riconosce il fornitore come lo riconosce il pin: un vincolo che
+    /// non vede "DeepSeek" e "deepseek" come lo stesso nome fallisce APERTO —
+    /// non vieta niente, e il log dice che il veto c'era. Il nome del padre
+    /// arriva da `agent_runs.provider`, che nessuno garantisce minuscolo.
+    ///
+    /// MUTAZIONE: togliendo `normalize(...)` da `ProviderVeto::su` il sostituto
+    /// torna deepseek, con il veto apparentemente attivo.
+    #[sqlx::test]
+    async fn il_veto_riconosce_il_fornitore_a_prescindere_dalle_maiuscole(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-pro", "high", 0.5, true, true),
+                ("openai", "gpt-sano", "high", 1.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone())
+            .con_veto(crate::orchestrator::ProviderVeto::su("DeepSeek"));
+        let pick = port
+            .failover_provider(
+                Some("openrouter"),
+                Some("glm-4.7-flash"),
+                Some("high"),
+                ProviderFailureCause::EmptyCompletion,
+                &[],
+            )
+            .await
+            .expect("fail-open");
+        assert_eq!(
+            pick.as_ref().map(|c| c.provider.as_str()),
+            Some("openai"),
+            "'DeepSeek' e 'deepseek' sono lo stesso fornitore: {pick:?}"
+        );
+    }
+
+    /// Il veto e' una restrizione, non una rottura: senza veto la porta si
+    /// comporta come prima, e il fornitore che il veto escluderebbe resta un
+    /// sostituto lecito. Senza questa coppia, il test sopra passerebbe anche se il
+    /// filtro scartasse tutto indiscriminatamente.
+    #[sqlx::test]
+    async fn senza_veto_il_ripiego_resta_quello_di_prima(pool: PgPool) {
+        create_schema(&pool).await;
+        seed_catalog(
+            &pool,
+            &[
+                ("deepseek", "deepseek-v4-pro", "high", 0.5, true, true),
+                ("openai", "gpt-sano", "high", 1.0, true, true),
+            ],
+        )
+        .await;
+        let port = PgEscalationPort::new(pool.clone());
+        let pick = port
+            .failover_provider(
+                Some("openrouter"),
+                Some("glm-4.7-flash"),
+                Some("high"),
+                ProviderFailureCause::EmptyCompletion,
+                &[],
+            )
+            .await
+            .expect("fail-open");
+        assert_eq!(
+            pick.as_ref().map(|c| c.provider.as_str()),
+            Some("deepseek"),
+            "senza veto il ripiego prende il preferito, cioe' deepseek: {pick:?}.              Se qui uscisse openai, il test gemello non proverebbe il veto ma              l'ordinamento del catalogo"
         );
     }
 

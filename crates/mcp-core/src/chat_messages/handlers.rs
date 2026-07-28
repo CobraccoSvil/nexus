@@ -1193,6 +1193,8 @@ async fn try_resume_interrupted_run(
             // Resume: il pin vale per la richiesta in cui l'utente lo da', e
             // questa non e' quella richiesta.
             provider_pin: crate::orchestrator::ProviderPin::none(),
+            // Resume di un run principale: nessun veto (vedi `veto_del_giudice`).
+            provider_veto: crate::orchestrator::ProviderVeto::none(),
             system_text: String::new(),
             prompt_key: Some(crate::agent_turn_setup::PRIMARY_PROMPT_KEY.to_string()),
             initial_msg: resume_prompt,

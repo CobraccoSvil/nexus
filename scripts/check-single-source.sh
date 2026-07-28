@@ -476,12 +476,31 @@ fi
 # originale, e la giunzione che lo riapre non ha un test suo — `build_native_engine`
 # assembla quattordici impl e richiede DB + ToolRunnerDeps reali. Qui c'e' il
 # presidio che manca li'.
+#
+# LA FINESTRA, e perche' non la contiguita': fino al 28/07 questo check cercava la
+# stringa `${porta}::new(db.clone()).con_vincolo(` su UNA riga. Misurava una FORMA
+# TESTUALE, non il fatto, e ha due modi di sbagliare. Il primo e' rumoroso e si e'
+# manifestato: aggiungendo `.con_veto(...)` alla catena, rustfmt l'ha spezzata su
+# tre righe e il presidio ha respinto un commit in cui il vincolo c'era — con
+# l'effetto peggiore di indurre a piegare il CODICE alla forma che il grep sa
+# leggere. Il secondo e' silenzioso: un presidio che si accontenta della forma si
+# aggira senza volerlo. Ora la chiamata si cerca entro una FINESTRA di righe dalla
+# costruzione, cosi' sopravvive a qualunque riformattazione.
+#
+# La finestra e' 6 e non piu' larga per una ragione misurata: in native_engine.rs
+# le due porte nascono a ~10 righe di distanza, e una finestra che le sconfina
+# dichiarerebbe vincolata una porta leggendo la riga dell'ALTRA — il presidio
+# tornerebbe verde proprio nel caso che deve prendere.
+FINESTRA_VINCOLO=6
 vincolo_scollegato=""
 for porta in PgEscalationPort CatalogModelUpscalePort; do
-  costruzioni="$(grep -n "${porta}::new(db" crates/mcp-core/src/native_engine.rs 2>/dev/null || true)"
-  if [[ -z "$costruzioni" ]]; then
+  # `grep -A` porta con se' le righe successive: la costruzione e le sue chiamate
+  # in catena stanno nello stesso blocco qualunque sia l'andata a capo.
+  blocco="$(grep -A"$FINESTRA_VINCOLO" "${porta}::new(db" \
+    crates/mcp-core/src/native_engine.rs 2>/dev/null || true)"
+  if [[ -z "$blocco" ]]; then
     vincolo_scollegato+="  ${porta}: nessuna costruzione trovata in native_engine.rs"$'\n'
-  elif ! grep -q "${porta}::new(db.clone()).con_vincolo(" crates/mcp-core/src/native_engine.rs 2>/dev/null; then
+  elif ! printf '%s' "$blocco" | grep -q '\.con_vincolo('; then
     vincolo_scollegato+="  ${porta}: costruita senza .con_vincolo(input.provider_pin)"$'\n'
   fi
 done
@@ -493,6 +512,37 @@ if [[ -n "$vincolo_scollegato" ]]; then
   fail=1
 else
   echo "OK vincolo-alle-porte: le porte del run nascono col vincolo dell'utente"
+fi
+
+# ── il veto del sistema raggiunge la porta di escalation ─────────────────────
+# Gemello del check sopra, per il vincolo di segno OPPOSTO: «giudice != worker».
+# La porta di escalation nasce anche col veto (`.con_veto`), altrimenti un sub-run
+# di review che cade ripiega sul fornitore del worker — cioe' il giudice torna a
+# girare sul modello che ha scritto il codice da giudicare. Misurato il 26/07/2026
+# (run 609000c1): 10 revisori scelti su openrouter, le loro trace su
+# deepseek-v4-flash e deepseek-v4-pro, cioe' il fornitore del padre.
+#
+# Serve un presidio SUO per la stessa ragione del vincolo: i test delle porte le
+# costruiscono da se' e resterebbero verdi senza il veto. Solo la porta di
+# escalation: l'upscale sale di modello dentro il tier gia' scelto e non e' la
+# strada da cui il giudice tornava sul worker.
+veto_scollegato=""
+blocco_escalation="$(grep -A"$FINESTRA_VINCOLO" 'PgEscalationPort::new(db' \
+  crates/mcp-core/src/native_engine.rs 2>/dev/null || true)"
+if [[ -z "$blocco_escalation" ]]; then
+  veto_scollegato="  PgEscalationPort: nessuna costruzione trovata in native_engine.rs"
+elif ! printf '%s' "$blocco_escalation" | grep -q '\.con_veto('; then
+  veto_scollegato="  PgEscalationPort: costruita senza .con_veto(input.provider_veto)"
+fi
+if [[ -n "$veto_scollegato" ]]; then
+  echo "!! veto-alle-porte: il veto del sistema non raggiunge chi sceglie il fornitore:" >&2
+  echo "$veto_scollegato" >&2
+  echo "   Senza il veto un sub-run di review puo' ripiegare sul fornitore del" >&2
+  echo "   worker: il giudice torna a girare sul modello che ha scritto il codice." >&2
+  echo "   Punto unico della regola: veto_del_giudice in subagent_native.rs." >&2
+  fail=1
+else
+  echo "OK veto-alle-porte: la porta di escalation nasce col veto del giudice"
 fi
 
 # ── sizing dei pool verso il DB per-progetto ─────────────────────────────────

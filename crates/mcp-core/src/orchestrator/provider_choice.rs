@@ -220,6 +220,56 @@ impl ProviderPin {
     }
 }
 
+/// Il fornitore che un run NON puo' usare: il duale negativo di
+/// [`ProviderPin`], per i vincoli che nascono dal SISTEMA e non dall'utente.
+///
+/// Serve al vincolo "giudice != worker": un revisore che gira sul fornitore che
+/// ha scritto il codice non e' un revisore indipendente, e la review perde il
+/// suo unico valore. Il vincolo esiste gia' al momento della SELEZIONE
+/// (`resolve_model_excluding`), ma li' moriva: il failover a valle vede solo i
+/// provider «gia' tentati in questo turno» e puo' quindi ripiegare proprio su
+/// quello del worker. Misurato il 26/07/2026 (run 609000c1): 10 revisori pinnati
+/// su openrouter, le loro trace su `deepseek-v4-flash` e `deepseek-v4-pro`, cioe'
+/// il fornitore del padre.
+///
+/// E' un tipo e non un `Option<String>` per la stessa ragione del pin: un veto e
+/// un pin sono entrambi «un nome di fornitore» ma hanno segno OPPOSTO, e
+/// scambiarli per distrazione produce il difetto peggiore possibile — un run che
+/// puo' usare SOLO il fornitore che doveva evitare. Il compilatore lo impedisce.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProviderVeto(Option<String>);
+
+impl ProviderVeto {
+    /// Nessun veto: ogni fornitore e' lecito. E' lo stato di ogni run che non sia
+    /// un giudice — worker, figure, resume.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Vieta `provider` a questo run, con la normalizzazione del punto unico:
+    /// un veto che non riconosce "OpenAI" come "openai" fallisce APERTO, cioe'
+    /// non vieta nulla, ed e' indistinguibile da un veto assente.
+    pub fn su(provider: &str) -> Self {
+        Self(normalize(Some(provider)))
+    }
+
+    /// Il fornitore vietato, se c'e'. Serve a filtrare i candidati e a DIRE nei
+    /// log perche' uno di essi e' stato scartato.
+    pub fn provider(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// `true` se questo run puo' usare `provider`. Senza veto ammette tutti; col
+    /// veto ammette tutti TRANNE quello vietato — l'opposto esatto di
+    /// [`ProviderPin::ammette`], con la stessa normalizzazione.
+    pub fn ammette(&self, provider: &str) -> bool {
+        match &self.0 {
+            None => true,
+            Some(vietato) => normalize(Some(provider)).as_deref() != Some(vietato.as_str()),
+        }
+    }
+}
+
 /// Nome provider utilizzabile: trim, scarto del vuoto, lowercase. La
 /// normalizzazione vive qui e non nei chiamanti — era in `Orchestrator::run`, e
 /// ogni altra superficie che leggeva lo stesso campo doveva ricordarsene.

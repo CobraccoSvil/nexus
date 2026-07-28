@@ -3594,6 +3594,9 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
     // success usa invece la provenienza EFFETTIVA da `o` (post-failover).
     let provider_resolved = provider.clone();
     let model_resolved = model.clone();
+    // Prima della costruzione: `native_input` prende possesso di parte di `exec`,
+    // e il veto ha bisogno del pool META che vive dentro il contesto.
+    let provider_veto = veto_del_giudice(&ctx.core.db, &kind, anchor).await;
     let native_input = NativeRunInput {
         run_id: subagent_run_id,
         session_id,
@@ -3609,6 +3612,12 @@ async fn execute_subagent_run(exec: SubagentExecInputs) -> Value {
         // non partire. Per il kind `review` il vincolo sarebbe anche contrario a
         // quello piu' forte che gia' vige — il giudice non puo' essere il worker.
         provider_pin: crate::orchestrator::ProviderPin::none(),
+        // ...e per lo stesso motivo quel vincolo, qui, va nella direzione
+        // OPPOSTA: non «usa questo fornitore» ma «non usare quello del worker»,
+        // e deve valere per tutto il run, non solo per la scelta iniziale del
+        // modello. Senza questa riga il giudice tornava sul fornitore del padre
+        // al primo ripiego.
+        provider_veto,
         system_text,
         // Il sub-run porta la chiave della PROPRIA definizione, cosi' le sue
         // reflection sono attribuite al prompt giusto e non a quello del run
@@ -3945,7 +3954,16 @@ async fn resolve_worker_model(
     // Ramo REVIEW: preferenza IGNORATA, vincolo giudice != worker invariato.
     // Provider del padre da escludere (astensione da auto-certificazione).
     if kind == "review" {
-        let exclude: Vec<String> = parent_provider(db, anchor).await.into_iter().collect();
+        // Stessa regola che vieta il ripiego a valle, letta dallo stesso punto:
+        // se qui e la porta di escalation la calcolassero per conto proprio,
+        // basterebbe un domani a farle divergere — ed e' la divergenza che ha
+        // prodotto il difetto (selezione rispettata, failover no).
+        let exclude: Vec<String> = veto_del_giudice(db, kind, anchor)
+            .await
+            .provider()
+            .map(str::to_string)
+            .into_iter()
+            .collect();
         return resolve_model_excluding(db, purpose, kind, &exclude).await;
     }
 
@@ -4054,6 +4072,40 @@ async fn resolve_model_excluding(
 /// Provider del run PADRE (`agent_runs.provider`) per il vincolo giudice != worker
 /// (Fase C2). `None` se l'anchor non e' un run tracciato (sessione senza riga in
 /// `agent_runs`) o il provider e' vuoto: in tal caso nessuna esclusione.
+/// Il fornitore che un sub-run NON puo' usare: punto unico (regola L) della
+/// regola «giudice != worker».
+///
+/// Esiste perche' la regola aveva DUE vite separate e una sola la applicava. La
+/// selezione del modello escludeva il fornitore del padre
+/// (`resolve_model_excluding`), ma il ripiego a valle no: `failover_provider`
+/// riceve i fornitori «gia' tentati in questo turno», e quello del worker non e'
+/// mai fra loro. Misurato il 26/07/2026 (run 609000c1): 10 revisori scelti su
+/// openrouter, le loro trace su `deepseek-v4-flash` e `deepseek-v4-pro`, cioe' il
+/// fornitore del padre. Il vincolo reggeva alla selezione e cadeva al failover.
+///
+/// Ora la regola si esprime in un posto e la interrogano entrambi i consumatori:
+/// la selezione per non scegliere quel fornitore, la porta di escalation
+/// ([`crate::orchestrator::ProviderVeto`]) per non ripiegarci. Vale solo per
+/// `review`: un worker o una figura non hanno nulla da cui astenersi.
+async fn veto_del_giudice(
+    db: &sqlx::PgPool,
+    kind: &str,
+    anchor: Uuid,
+) -> crate::orchestrator::ProviderVeto {
+    if kind != "review" {
+        return crate::orchestrator::ProviderVeto::none();
+    }
+    // Padre senza fornitore noto: nessun veto. Non e' un ripiego silenzioso —
+    // vietare un nome vuoto escluderebbe TUTTI i candidati (o nessuno, a seconda
+    // del confronto), e in entrambi i casi il motivo non si leggerebbe da nessuna
+    // parte.
+    parent_provider(db, anchor)
+        .await
+        .map_or_else(crate::orchestrator::ProviderVeto::none, |p| {
+            crate::orchestrator::ProviderVeto::su(&p)
+        })
+}
+
 async fn parent_provider(db: &sqlx::PgPool, anchor: Uuid) -> Option<String> {
     let provider: Option<String> =
         sqlx::query_scalar("SELECT provider FROM agent_runs WHERE id = $1")
