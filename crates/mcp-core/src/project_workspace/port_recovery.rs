@@ -16,7 +16,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::services::{project_bucket_start, PROJECT_PORT_BUCKET_SIZE};
+use super::services::project_bucket_range;
 #[cfg(not(windows))]
 use super::services::{read_listening_ports_proc, read_listening_ports_ss};
 
@@ -441,10 +441,7 @@ pub async fn try_free_port(port: u16) -> bool {
 /// PID gia' tracciati in `agent_processes` (status running/starting) e il PID
 /// di mcp-core stesso. Sono "orfani candidati" all'adozione o al cleanup.
 pub async fn scan_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<(u16, u32, String)> {
-    let start = project_bucket_start(&project_id);
-    let end = start
-        .saturating_add(PROJECT_PORT_BUCKET_SIZE)
-        .saturating_sub(1);
+    let (start, end) = project_bucket_range(&project_id);
 
     // Routing separazione DB: `agent_processes` e' una tabella migrata, va letta
     // sul pool del progetto. Non disponibile -> nessun orfano candidato (fail-safe:

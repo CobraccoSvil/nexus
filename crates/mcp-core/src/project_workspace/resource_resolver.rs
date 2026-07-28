@@ -31,7 +31,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::port_recovery::{listening_ports, looks_like_server_process};
-use super::services::{project_bucket_start, PROJECT_PORT_BUCKET_SIZE};
+use super::services::project_bucket_range;
 use crate::port_registry::PortRegistryCache;
 
 /// Provenienza di una `ServiceResource`.
@@ -172,10 +172,7 @@ pub async fn resolve_project_resources(
     registry: &PortRegistryCache,
     project_id: Uuid,
 ) -> ProjectResources {
-    let bucket_start = project_bucket_start(&project_id);
-    let bucket_end = bucket_start
-        .saturating_add(PROJECT_PORT_BUCKET_SIZE)
-        .saturating_sub(1);
+    let (bucket_start, bucket_end) = project_bucket_range(&project_id);
 
     // Verita' di runtime: porte realmente in LISTEN (ss / fallback /proc).
     let listening = listening_ports().await;

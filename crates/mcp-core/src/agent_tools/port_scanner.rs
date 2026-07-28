@@ -480,7 +480,18 @@ async fn allocated_ports_hint(db: &PgPool, project_id: uuid::Uuid) -> String {
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    let ports: Vec<(u32, String)> = rows.into_iter().map(|(p, l)| (p as u32, l)).collect();
+    // Il blocco dice all'agente "usa ESATTAMENTE una di queste": una porta del
+    // bucket altrui finita nel registro sarebbe un consiglio dannoso, non un
+    // dettaglio di elenco. Stesso criterio del punto unico (regola L).
+    let ports: Vec<(u32, String)> = rows
+        .into_iter()
+        .filter(|(p, _)| {
+            u16::try_from(*p).is_ok_and(|p| {
+                crate::project_workspace::services::port_in_project_bucket(&project_id, p)
+            })
+        })
+        .map(|(p, l)| (p as u32, l))
+        .collect();
     render_allocated_hint(&ports)
 }
 
@@ -526,16 +537,12 @@ async fn unallocated_bucket_findings(
     if bucket_ports.is_empty() {
         return None;
     }
-    let allocated: std::collections::HashSet<u32> = sqlx::query_scalar::<_, i32>(
-        "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|p| p as u32)
-    .collect();
+    // Punto unico (regola L): "allocata a questo progetto" vuol dire registrata
+    // E nel bucket del progetto. Con la sola query sul registro, una porta del
+    // bucket altrui gia' registrata (es. dal rilevamento porta-da-output)
+    // autorizzava la scrittura che l'aveva prodotta.
+    let allocated =
+        crate::security::resource_linter::legitimate_ports_for_project(db, project_id).await;
     let unallocated: Vec<PortFinding> = bucket_ports
         .into_iter()
         .filter(|f| !allocated.contains(&f.port))

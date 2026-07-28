@@ -17,8 +17,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::project_workspace::services::{
-    detect_all_port_bindings, port_allocated_to_project, project_bucket_start,
-    PROJECT_PORT_BUCKET_SIZE,
+    detect_all_port_bindings, port_allocated_to_project, port_in_project_bucket,
+    project_bucket_range,
 };
 use crate::security::{record_audit, AuditEntry};
 
@@ -70,11 +70,10 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
             None => continue, // processo non-progetto, skip
         };
 
-        // Controlla se la porta e' lecita per questo progetto
-        let bucket = project_bucket_start(&project_id);
-        let in_bucket = b.port >= bucket && b.port < bucket + PROJECT_PORT_BUCKET_SIZE;
+        // Controlla se la porta e' lecita per questo progetto (punto unico, regola L)
+        let (bucket, bucket_end) = project_bucket_range(&project_id);
 
-        if in_bucket {
+        if port_in_project_bucket(&project_id, b.port) {
             continue; // porta nel bucket: ok
         }
 
@@ -93,7 +92,7 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
             project_id = %project_id,
             program = %b.program,
             bucket_start = bucket,
-            bucket_end = bucket + PROJECT_PORT_BUCKET_SIZE,
+            bucket_end,
             "port_enforcer: violazione rilevata, processo terminato"
         );
 
@@ -112,12 +111,12 @@ async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
                     "port": b.port,
                     "program": b.program,
                     "bucket_start": bucket,
-                    "bucket_end": bucket + PROJECT_PORT_BUCKET_SIZE,
+                    "bucket_end": bucket_end,
                 })),
         );
 
         // Notifica real-time al frontend
-        emit_violation_notification(channels, project_id, b.port, bucket);
+        emit_violation_notification(channels, project_id, b.port);
 
         // Catena di governance (non solo sopprimere l'effetto): localizza il
         // sorgente della porta uccisa, apre la diagnosi policy_violation
@@ -181,7 +180,7 @@ async fn chain_violation_to_remediation(
             .ok()
             .flatten();
     let allocated =
-        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id).await;
+        crate::security::resource_linter::legitimate_ports_for_project(&state.db, project_id).await;
 
     // Localizza il sorgente della porta (best-effort).
     let file_finding = if let Some(root) = root.filter(|r| !r.is_empty()) {
@@ -239,16 +238,17 @@ fn emit_violation_notification(
     channels: &nexus_events::ProjectChannels,
     project_id: Uuid,
     port: u16,
-    bucket_start: u16,
 ) {
-    let bucket_end = bucket_start + PROJECT_PORT_BUCKET_SIZE;
+    // Gli estremi vengono dal punto unico (regola L): il chiamante non li passa,
+    // cosi' non puo' passarne di diversi da quelli su cui si e' deciso il kill.
+    let (bucket_start, bucket_end) = project_bucket_range(&project_id);
     nexus_events::dispatcher::emit(
         channels,
         project_id,
         nexus_events::ProjectEvent::Notification {
             severity: "error".into(),
             message: format!(
-                "Servizio terminato: porta {} fuori dal bucket progetto [{}, {}). \
+                "Servizio terminato: porta {} fuori dal bucket progetto [{}, {}]. \
                  Usa request_port per allocare porte autorizzate.",
                 port, bucket_start, bucket_end
             ),

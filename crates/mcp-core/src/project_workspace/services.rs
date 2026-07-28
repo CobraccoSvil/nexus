@@ -2452,7 +2452,7 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
 // (split 7.4 fase B: sandbox.rs, ora nel crate, ne ha bisogno). Il
 // re-export mantiene validi i path project_workspace::services::* storici.
 pub use nexus_tool_kit::ports::{
-    is_project_registrable_port, project_bucket_start, NEXUS_RESERVED_PORTS,
+    port_in_project_bucket, project_bucket_range, NEXUS_RESERVED_PORTS,
     PROJECT_PORT_BUCKET_SIZE, PROJECT_PORT_RANGE_END, PROJECT_PORT_RANGE_START,
 };
 
@@ -2485,8 +2485,7 @@ pub(super) async fn find_free_project_port(
         .into_iter()
         .collect();
 
-    let start = project_bucket_start(project_id);
-    let end = (start + PROJECT_PORT_BUCKET_SIZE).saturating_sub(1);
+    let (start, end) = project_bucket_range(project_id);
 
     let mut port = start;
     while port <= end {
@@ -2526,8 +2525,7 @@ pub(super) async fn deterministic_project_port_for_key(
     service_key: &str,
     registry: &crate::port_registry::PortRegistryCache,
 ) -> u16 {
-    let start = project_bucket_start(project_id);
-    let end = (start + PROJECT_PORT_BUCKET_SIZE).saturating_sub(1);
+    let (start, end) = project_bucket_range(project_id);
     let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
     let allocated: std::collections::HashSet<u16> = registry
         .current()

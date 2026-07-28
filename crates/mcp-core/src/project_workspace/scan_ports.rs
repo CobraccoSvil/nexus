@@ -138,6 +138,86 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
     detected
 }
 
+/// Divide le porte rilevate nei sorgenti fra quelle registrabili come
+/// allocazione di QUESTO progetto e quelle da scartare, deduplicando per
+/// (porta, label). Funzione pura: la decisione si puo' guardare senza un DB.
+///
+/// Le porte qui vengono LETTE DAI SORGENTI, dove sono qualunque numero l'autore
+/// del progetto abbia scritto. Registrarle senza chiedersi se appartengono al
+/// bucket di questo progetto e' come dare per allocato cio' che si e' soltanto
+/// trovato scritto: la riga in `nexus_port_allocations` vale poi come prova di
+/// legittimita' davanti al linter e al port_enforcer, e chiude da sola la
+/// violazione che l'ha prodotta. Criterio dal punto unico (regola L).
+fn partiziona_porte_rilevate(
+    project_id: &Uuid,
+    detected: &[(i32, String, String)],
+) -> (Vec<(i32, String)>, Vec<(i32, String)>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut da_registrare = Vec::new();
+    let mut scartate = Vec::new();
+    for (port, label, _source) in detected {
+        if !seen.insert((*port, label.clone())) {
+            continue;
+        }
+        let registrabile = u16::try_from(*port).is_ok_and(|p| {
+            crate::project_workspace::services::port_in_project_bucket(project_id, p)
+        });
+        if registrabile {
+            da_registrare.push((*port, label.clone()));
+        } else {
+            scartate.push((*port, label.clone()));
+        }
+    }
+    (da_registrare, scartate)
+}
+
+/// Scrive le allocazioni e ritorna quante righe NUOVE sono nate.
+///
+/// `allocation_mode` ha un vocabolario chiuso da un CHECK (mig 0114, esteso da
+/// 0146 e 0434): auto | manual | dynamic | existing | adopted. Qui stava scritto
+/// 'auto-detected', che quel CHECK non ammette: OGNI insert falliva, e l'errore
+/// veniva inghiottito da un `unwrap_or(false)` che lo faceva sembrare "nessuna
+/// riga nuova". Sul DB di sviluppo, infatti, di righe 'auto-detected' non ce
+/// n'e' mai stata una. 'auto' e' il termine canonico per "rilevata
+/// automaticamente" ed e' gia' quello che usa il rilevamento porta-da-output
+/// (regola N: un solo identificatore per concetto).
+async fn registra_porte(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    porte: &[(i32, String)],
+) -> usize {
+    let mut inserted = 0_usize;
+    for (port, label) in porte {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode)
+            VALUES ($1, $2, $3, 'auto')
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(project_id)
+        .bind(port)
+        .bind(label)
+        .execute(db)
+        .await;
+        match res {
+            Ok(r) if r.rows_affected() > 0 => inserted += 1,
+            // ON CONFLICT DO NOTHING: la porta e' gia' registrata, non e' un errore.
+            Ok(_) => {}
+            // Un fallimento va DETTO. Inghiottirlo e' cio' che ha tenuto nascosto
+            // per intero il malfunzionamento di questa funzione (regola H).
+            Err(e) => tracing::warn!(
+                project_id = %project_id,
+                port,
+                label = %label,
+                error = %e,
+                "insert dell'allocazione porta fallito"
+            ),
+        }
+    }
+    inserted
+}
+
 /// Fix M31: auto-popola la tabella `nexus_port_allocations` con le porte
 /// rilevate scansionando il filesystem. Idempotente via ON CONFLICT DO NOTHING.
 /// Chiamata da `register_project` come spawn-and-forget post-insert.
@@ -154,32 +234,111 @@ pub async fn auto_populate_port_allocations(
         );
         return;
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut inserted = 0_usize;
-    for (port, label, _source) in &detected {
-        let key = (*port, label.clone());
-        if !seen.insert(key) {
-            continue;
-        }
-        let res = sqlx::query(
-            r#"
-            INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode)
-            VALUES ($1, $2, $3, 'auto-detected')
-            ON CONFLICT DO NOTHING
-            "#,
+    let (da_registrare, scartate) = partiziona_porte_rilevate(&project_id, &detected);
+    let inserted = registra_porte(db, project_id, &da_registrare).await;
+    // Cio' che si scarta si dichiara: un conteggio che tace su meta' del lavoro
+    // si legge come "tutto registrato" (regola O). Le porte scartate restano
+    // visibili dove devono, cioe' come violazione sul sorgente che le contiene.
+    let (bucket_start, bucket_end) =
+        crate::project_workspace::services::project_bucket_range(&project_id);
+    tracing::info!(
+        project_id = %project_id,
+        inserted,
+        scartate = scartate.len(),
+        bucket_start,
+        bucket_end,
+        "porte registrate; le scartate stanno fuori dal bucket e vanno migrate via request_port"
+    );
+    if !scartate.is_empty() {
+        tracing::warn!(
+            project_id = %project_id,
+            porte = ?scartate,
+            bucket_start,
+            bucket_end,
+            "porte trovate nei sorgenti ma fuori dal bucket del progetto: NON registrate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L'altra via per cui una porta altrui finiva nel registro: l'import di un
+    /// progetto esistente. Le porte qui vengono LETTE DAI SORGENTI, dove sono
+    /// qualunque numero l'autore abbia scritto, e venivano registrate tutte -
+    /// anche una 3000 o una porta del bucket di un altro progetto. Da quel
+    /// momento la riga faceva da prova di legittimita' e il linter taceva sul
+    /// file che l'aveva prodotta.
+    ///
+    /// Il test attraversa il produttore vero (`compute_detected_ports` sul
+    /// filesystem, poi l'INSERT reale sullo schema META) e guarda la
+    /// conseguenza: quali righe esistono in `nexus_port_allocations`.
+    ///
+    /// Mutazione che rende rossa: togliere il filtro `port_in_project_bucket` da
+    /// `auto_populate_port_allocations` -> la porta fuori bucket ricompare in
+    /// tabella e la seconda asserzione cade.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn import_progetto_non_registra_le_porte_di_altri_bucket(pool: sqlx::PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let (bucket_start, bucket_end) =
+            crate::project_workspace::services::project_bucket_range(&project_id);
+
+        // Un progetto importato come se ne trovano: il frontend con una porta
+        // scelta a mano (3000, per giunta quella della UI di Nexus), il backend
+        // con una porta del bucket assegnato.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\":{\"dev\":\"vite --port 3000\"}}\n",
+        )
+        .expect("package.json radice");
+        std::fs::create_dir_all(dir.path().join("backend")).expect("dir backend");
+        std::fs::write(
+            dir.path().join("backend").join("package.json"),
+            format!("{{\"scripts\":{{\"dev\":\"node server.js --port {bucket_start}\"}}}}\n"),
+        )
+        .expect("package.json backend");
+
+        // Premessa esplicita: il rilevamento le vede entrambe. Il filtro decide
+        // che farne, e senza questa riga il test potrebbe passare per il motivo
+        // sbagliato (nessuna porta trovata affatto).
+        let rilevate = compute_detected_ports(dir.path());
+        assert!(
+            rilevate.iter().any(|(p, _, _)| *p == 3000)
+                && rilevate.iter().any(|(p, _, _)| *p == bucket_start as i32),
+            "il rilevamento deve vedere entrambe le porte: {rilevate:?}"
+        );
+
+        auto_populate_port_allocations(&pool, project_id, dir.path()).await;
+
+        let righe: Vec<(i32, String)> = sqlx::query_as(
+            "SELECT port, allocation_mode FROM nexus_port_allocations \
+             WHERE project_id = $1 ORDER BY port",
         )
         .bind(project_id)
-        .bind(port)
-        .bind(label)
-        .execute(db)
-        .await;
-        if res.map(|r| r.rows_affected() > 0).unwrap_or(false) {
-            inserted += 1;
-        }
+        .fetch_all(&pool)
+        .await
+        .expect("lettura allocazioni");
+        let registrate: Vec<i32> = righe.iter().map(|(p, _)| *p).collect();
+
+        assert!(
+            registrate.contains(&(bucket_start as i32)),
+            "la porta del bucket del progetto va registrata: {righe:?}"
+        );
+        // Il valore scritto deve stare nel vocabolario che il CHECK della tabella
+        // ammette: qui c'era 'auto-detected', che il CHECK rifiuta, e ogni insert
+        // falliva in silenzio. Girando sullo schema META reale (non su un CREATE
+        // TABLE ricopiato) questo test lega il termine al vincolo.
+        assert!(
+            righe.iter().all(|(_, modo)| modo == "auto"),
+            "allocation_mode fuori dal vocabolario della tabella: {righe:?}"
+        );
+        assert!(
+            !registrate.contains(&3000),
+            "3000 non appartiene al bucket {bucket_start}-{bucket_end}: registrarla la \
+             farebbe passare per allocazione legittima e chiuderebbe da sola la \
+             violazione sul package.json che la contiene. Righe: {registrate:?}"
+        );
     }
-    tracing::info!(
-        "auto_populate_port_allocations: {} porte inserite per progetto {}",
-        inserted,
-        project_id
-    );
 }

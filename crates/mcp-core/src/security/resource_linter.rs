@@ -294,8 +294,17 @@ pub fn lint_tree_for_port(
         .collect()
 }
 
-/// Porte allocate di un progetto (fonte unica `nexus_port_allocations`).
-pub async fn allocated_ports_for_project(db: &PgPool, project_id: Uuid) -> HashSet<u32> {
+/// Porte che valgono come allocazione LEGITTIMA del progetto: registrate in
+/// `nexus_port_allocations` E dentro il bucket deterministico del progetto.
+///
+/// Le due condizioni non sono ridondanti, e il registro da solo non basta: una
+/// riga puo' esistere per una porta del bucket di un ALTRO progetto (accadeva
+/// quando il rilevamento porta-da-output registrava qualunque porta del range
+/// globale). Trattarla come prova di legittimita' chiudeva da sola la violazione
+/// che l'aveva prodotta - il linter taceva proprio sul caso peggiore, e piu' il
+/// sistema sbagliava meno lo segnalava. Il filtro sul bucket toglie al registro
+/// quel potere di autoassoluzione: la riga resta, ma non fa piu' da prova.
+pub async fn legitimate_ports_for_project(db: &PgPool, project_id: Uuid) -> HashSet<u32> {
     sqlx::query_scalar::<_, i32>(
         "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1",
     )
@@ -304,6 +313,11 @@ pub async fn allocated_ports_for_project(db: &PgPool, project_id: Uuid) -> HashS
     .await
     .unwrap_or_default()
     .into_iter()
+    .filter_map(|p| u16::try_from(p).ok())
+    .filter(|p| {
+        // Criterio dal punto unico (regola L): il bucket non si ricalcola qui.
+        crate::project_workspace::services::port_in_project_bucket(&project_id, *p)
+    })
     .map(|p| p as u32)
     .collect()
 }
@@ -312,7 +326,7 @@ pub async fn allocated_ports_for_project(db: &PgPool, project_id: Uuid) -> HashS
 /// Ritorna il numero di violazioni aperte (nuove).
 pub async fn lint_project(state: &crate::AppState, project_id: Uuid, root_path: &str) -> usize {
     let db = &state.db;
-    let allocated = allocated_ports_for_project(db, project_id).await;
+    let allocated = legitimate_ports_for_project(db, project_id).await;
     let root = std::path::PathBuf::from(root_path);
     if !root.is_dir() {
         return 0;
@@ -475,7 +489,7 @@ pub async fn revalidate_file_violations(
         return;
     }
 
-    let allocated = allocated_ports_for_project(db, project_id).await;
+    let allocated = legitimate_ports_for_project(db, project_id).await;
     // Contenuto corrente del file (se illeggibile/cancellato: nessun finding,
     // quindi tutte le diagnosi aperte sul file vengono risolte).
     let current = tokio::fs::read_to_string(abs_path)
@@ -752,6 +766,84 @@ mod tests {
         };
         assert!(!presenti.contains(&finding_signature(project_id, &altro_file)));
         assert!(!presenti.contains(&finding_signature(project_id, &altra_porta)));
+    }
+
+    /// Dalla riga nel registro alla conseguenza (regola O): il caso reale di
+    /// "gestione-spese". L'agente aveva scritto a mano `process.env.PORT || 20001`
+    /// e il rilevamento porta-da-output aveva registrato 20001 come allocazione
+    /// del progetto, benche' quella porta appartenga al bucket di un ALTRO. Da
+    /// quel momento il linter taceva: la porta risultava "allocata", cioe' la
+    /// violazione produceva da se' la prova della propria legittimita'.
+    ///
+    /// Il test non asserisce un predicato: parte dalla riga in
+    /// `nexus_port_allocations` sullo schema META REALE e arriva a cio' che quella
+    /// riga deve o non deve poter fare - autorizzare il sorgente che l'ha causata.
+    ///
+    /// Mutazione che rende rosso: togliere il filtro sul bucket da
+    /// `legitimate_ports_for_project` -> `fuori` rientra fra le porte legittime, il
+    /// finding sparisce e le ultime due asserzioni cadono.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn riga_registrata_fuori_bucket_non_autorizza_il_sorgente(pool: PgPool) {
+        let (_user, project_id) = nexus_migrations_embedded::seed_identita_meta(&pool).await;
+        let (bucket_start, bucket_end) =
+            crate::project_workspace::services::project_bucket_range(&project_id);
+
+        // La porta dell'incidente (20001, bucket 20000-20049 di un altro progetto),
+        // a meno che il progetto seminato abbia proprio quel bucket: allora si
+        // prende la prima porta subito dopo il proprio.
+        let fuori: i32 = if bucket_start == crate::project_workspace::services::PROJECT_PORT_RANGE_START
+        {
+            (bucket_end + 1) as i32
+        } else {
+            20001
+        };
+        let dentro: i32 = bucket_start as i32;
+
+        // Le due righe come le scriveva il rilevamento: allocation_mode 'auto',
+        // label del servizio.
+        for (port, label) in [(fuori, "backend"), (dentro, "frontend")] {
+            sqlx::query(
+                "INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode) \
+                 VALUES ($1, $2, $3, 'auto')",
+            )
+            .bind(project_id)
+            .bind(port)
+            .bind(label)
+            .execute(&pool)
+            .await
+            .expect("registrazione della porta rilevata");
+        }
+
+        let legittime = legitimate_ports_for_project(&pool, project_id).await;
+        assert!(
+            legittime.contains(&(dentro as u32)),
+            "la porta del proprio bucket resta un'allocazione valida"
+        );
+        assert!(
+            !legittime.contains(&(fuori as u32)),
+            "la porta {fuori} e' registrata ma sta nel bucket di un altro progetto \
+             ({bucket_start}-{bucket_end}): il registro non puo' farla passare per legittima"
+        );
+
+        // La conseguenza: il sorgente che ha causato la registrazione resta una
+        // violazione, quindi la diagnosi si apre e la remediation parte.
+        let sorgente = format!("const PORT = process.env.PORT || {fuori};\n");
+        let findings = lint_file_content("backend/src/server.js", &sorgente, &legittime);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.port == fuori as u32
+                    && f.kind == ResourceViolationKind::PortBucketNotAllocated),
+            "la porta fuori bucket deve restare segnalata: {findings:?}"
+        );
+
+        // Controprova: la porta legittima non produce rumore, altrimenti il fix
+        // avrebbe solo spostato il difetto dall'altra parte.
+        let sano = format!("const PORT = process.env.PORT || {dentro};\n");
+        assert!(
+            lint_file_content("backend/src/server.js", &sano, &legittime).is_empty(),
+            "una porta allocata nel proprio bucket non e' una violazione"
+        );
     }
 
     #[test]

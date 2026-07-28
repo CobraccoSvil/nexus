@@ -805,17 +805,15 @@ async fn validate_port_for_project(
     project_id: uuid::Uuid,
     port: u16,
 ) -> Result<(), String> {
-    use crate::ports::{project_bucket_start, NEXUS_RESERVED_PORTS, PROJECT_PORT_BUCKET_SIZE};
+    use crate::ports::{port_in_project_bucket, project_bucket_range, NEXUS_RESERVED_PORTS};
     if NEXUS_RESERVED_PORTS.contains(&port) {
         return Err(format!(
             "porta {port} riservata Nexus (web-ide/microservizi/DB infrastruttura). \
              Usa request_port per allocarne una nel bucket del progetto."
         ));
     }
-    let bucket_start = project_bucket_start(&project_id);
-    let bucket_end = bucket_start + PROJECT_PORT_BUCKET_SIZE;
-    let in_bucket = port >= bucket_start && port < bucket_end;
-    if !in_bucket {
+    let (bucket_start, bucket_end) = project_bucket_range(&project_id);
+    if !port_in_project_bucket(&project_id, port) {
         // Tollerata SOLO se gia' allocata a questo progetto (caso run_config legacy)
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations WHERE port = $1 AND project_id = $2)",
@@ -827,7 +825,7 @@ async fn validate_port_for_project(
         .unwrap_or(false);
         if !owned {
             return Err(format!(
-                "porta {port} fuori dal bucket del progetto [{bucket_start}, {bucket_end}). \
+                "porta {port} fuori dal bucket del progetto [{bucket_start}, {bucket_end}]. \
                  Chiama request_port per ottenere una porta valida."
             ));
         }
