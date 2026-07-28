@@ -14,16 +14,17 @@
 //!   - Google: `functionDeclarations` mancanti / `thinkingBudget` non a zero /
 //!     `thoughtSignature` non re-inviata;
 //!   - Mistral: HTTP 422 "last role assistant" / trailing assistant nella history;
-//!   - openrouter e groq: nessun adapter dedicato, quindi passano dal GENERICO —
-//!     che di loro non sa niente. E' la strada piu' esposta ai quirk, non la meno
-//!     (groq p.es. risponde 413 su payload grande, caso che nessun provider con
-//!     adapter proprio produce).
+//!   - openrouter: nessun adapter dedicato, quindi passa dal GENERICO — che di
+//!     lui non sa niente. E' la strada piu' esposta ai quirk, non la meno.
+//!     (Qui stava anche groq, tolto il 28/07/2026: zero intent attivi in matrix.
+//!     Il suo quirk noto, il 413 su payload grande, resta coperto senza chiave
+//!     dal test di `ProviderHttpError` in `openai_compat.rs`.)
 //!
 //! PARAMETRIZZAZIONE: un singolo `async fn esegui_tool_loop(provider, modello)`
 //! contiene tutta la logica dei 2 turni e le asserzioni; ogni provider ha un
 //! `#[tokio::test]` sottile che costruisce il proprio provider concreto e lo
-//! invoca. Cosi' il riquadro di test e' un solo punto unico (regola L) e i sette
-//! test sono solo l'innesto provider-specifico.
+//! invoca. Cosi' il riquadro di test e' un solo punto unico (regola L) e i test
+//! per provider sono solo l'innesto provider-specifico.
 //!
 //! # DOVE ARRIVA QUESTO STRUMENTO, E DOVE NO (regola O)
 //!
@@ -69,7 +70,7 @@
 //! - senza quella variabile il test salta, ma stampa un marker riconoscibile
 //!   (`NEXUS_PROVIDER_LIVE_SKIP <provider> (<ENV_VAR> assente)`) e
 //!   [`copertura_live_dichiarata`] — che gira SEMPRE — dichiara il conteggio
-//!   con la sua premessa (`COPERTURA LIVE PROVIDER: n/7 ...`), su stdout e,
+//!   con la sua premessa (`COPERTURA LIVE PROVIDER: n/<totale> ...`), su stdout e,
 //!   se `NEXUS_PROVIDER_SKIP_REPORT` e' impostata, su file per un gate.
 //!
 //! Scartato `#[ignore]`: toglierebbe l'esecuzione in locale (dove le chiavi ci
@@ -80,9 +81,11 @@
 //!
 //! # CHI NON E' QUI, E PERCHE' (misurato il 2026-07-27)
 //!
-//! La routing matrix ha OTTO provider attivi e il DB ha otto chiavi valorizzate;
-//! questo file ne copre sette. Il mancante e' **perplexity**, che nel registry
-//! dichiara `supports_tools = false`: un tool-loop a due turni gli chiederebbe
+//! Misurato di nuovo il 2026-07-28: i provider con almeno un intent ATTIVO sono
+//! sette (deepseek, google, mistral, openrouter 56 ciascuno; openai 51; anthropic
+//! 16; perplexity 4). Questo file ne copre sei. Il mancante e' **perplexity**, che
+//! nel registry dichiara `supports_tools = false` e nel catalogo non ha nemmeno un
+//! modello con `supports_tool_use` (sonar, sonar-pro, sonar-reasoning-pro): un tool-loop a due turni gli chiederebbe
 //! cio' che dice di non saper fare, e il test fallirebbe per costruzione invece
 //! di misurare un contratto. Se un giorno servira' coprirlo, il contratto giusto
 //! e' un altro (completamento testuale, e le `citations` che solo lui
@@ -349,9 +352,17 @@ const PROVIDER_KEYS: &[(&str, &str, Option<&str>)] = &[
     ("anthropic", "ANTHROPIC_API_KEY", None),
     ("mistral", "MISTRAL_API_KEY", None),
     ("openai", "OPENAI_API_KEY", None),
-    // Serviti dall'adapter GENERICO, e proprio per questo qui (vedi sotto).
+    // Servito dall'adapter GENERICO, e proprio per questo qui (vedi sotto).
     ("openrouter", "OPENROUTER_API_KEY", None),
-    ("groq", "GROQ_API_KEY", None),
+    // groq tolto il 28/07/2026: zero intent attivi in routing matrix.
+    //
+    // Non e' stato sostituito da perplexity, che pure e' attivo (4 intent):
+    // questo file misura il contratto a 2 turni CON TOOL-CALL, e nessuno dei tre
+    // modelli perplexity del catalogo (sonar, sonar-pro, sonar-reasoning-pro)
+    // dichiara `supports_tool_use`. Aggiungerlo qui darebbe un test che non puo'
+    // passare e una credenziale in CI senza un consumatore reale. Coprire
+    // perplexity richiede un test sul contratto che USA davvero — la completion
+    // testuale — non questo.
 ];
 
 /// Legge la prima env var non vuota fra `primario` e l'eventuale `alias`.
@@ -418,7 +429,10 @@ fn richiede_test_live() -> bool {
 /// Regola O, "un numero senza la sua premessa e' un'opinione": i 5 test live
 /// possono essere verdi perche' hanno interrogato le API o perche' non le hanno
 /// mai toccate, e i due casi erano indistinguibili. Questo test rende il
-/// conteggio esplicito nell'output (`COPERTURA LIVE PROVIDER: n/5`), elenca per
+/// conteggio esplicito nell'output (`COPERTURA LIVE PROVIDER: n/<totale>`, dove
+/// il totale e' la lunghezza di PROVIDER_KEYS e non un numero scritto qui: un
+/// numero fisso in un commento invecchia in silenzio, ed e' gia' successo — questa
+/// riga diceva 5 mentre i fornitori erano 7), elenca per
 /// nome i provider scoperti, e sotto `REQUIRE_PROVIDER_TESTS=1` FALLISCE se la
 /// copertura non e' piena.
 #[test]
@@ -540,7 +554,6 @@ async fn mistral_tool_loop() {
 /// registry contiene oggi. Se un provider cambiasse endpoint, il test lo
 /// scoprirebbe con un errore di rete — non silenziosamente.
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
 /// Contesto e tier dichiarati per i due generici: valori di test, non
 /// configurazione (il gateway li legge dal registry). Il tool-loop non li
@@ -573,28 +586,14 @@ async fn openrouter_tool_loop() {
     esegui_tool_loop("openrouter", &provider, "z-ai/glm-4.7-flash").await;
 }
 
-/// Come sopra per groq. Quirk noto e gia' codificato altrove: risponde **413** su
-/// payload troppo grande (vedi il test di `ProviderHttpError` in
-/// `openai_compat.rs`), un caso che nessun provider con adapter dedicato produce.
-///
-/// Modello: `openai/gpt-oss-20b`, il piu' usato in matrix per groq (9 intent) e
-/// il piu' piccolo dei due gpt-oss.
-#[tokio::test]
-async fn groq_tool_loop() {
-    let Some(key) = chiave_provider("groq") else {
-        return;
-    };
-    let provider = GenericOpenAiProvider::new(
-        http(),
-        GROQ_BASE_URL,
-        key,
-        "groq",
-        vec![0, 1, 2],
-        GENERIC_MAX_CONTEXT,
-        true,
-    );
-    esegui_tool_loop("groq", &provider, "openai/gpt-oss-20b").await;
-}
+// Qui stava `groq_tool_loop`, rimosso il 28/07/2026: groq non ha piu' alcun
+// intent ATTIVO nella routing matrix (14 righe, tutte inattive), quindi il test
+// spendeva una credenziale in CI per esercitare un fornitore che il routing non
+// sceglie mai. Il commento diceva "il piu' usato in matrix per groq (9 intent)":
+// una premessa vera quando fu scritta e invecchiata in silenzio.
+// Il quirk che copriva — il 413 su payload grande — resta coperto dove non
+// costa una chiave: il test di `ProviderHttpError` in `openai_compat.rs`.
+// Se groq tornasse attivo, questo test va ripristinato insieme al secret.
 
 #[tokio::test]
 async fn openai_tool_loop() {
