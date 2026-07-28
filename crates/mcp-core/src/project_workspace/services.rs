@@ -315,6 +315,26 @@ pub(crate) fn service_unit_name(slug: &str, label: &str) -> String {
     format!("{slug}-{label}.service")
 }
 
+/// Nome unit di un servizio per chi ha in mano solo il `project_id` (i tool
+/// agente): legge il NOME del progetto e passa dai due punti unici
+/// `project_service_slug` + `service_unit_name`, cosi' l'unit a cui viene legata
+/// l'allocazione porta e' lo STESSO che il pannello ricostruisce dalla label del
+/// processo. `None` se il progetto non e' leggibile: senza nome non esiste unit
+/// da dichiarare, e inventarne uno legherebbe la porta a un'identita' fantasma.
+pub(crate) async fn project_service_unit(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    label: &str,
+) -> Option<String> {
+    let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()?;
+    Some(service_unit_name(&project_service_slug(&name), label))
+}
+
 /// Voci del pannello Servizi Windows a partire dalle righe storiche di
 /// agent_processes (label, status, created_at — ordinate per label,
 /// created_at DESC). Funzione pura testabile (punto unico, regola L):
@@ -797,7 +817,10 @@ async fn allocate_web_service_port_env(
     // GC -> drift 31792->31798, incidente Beaty-Book).
     match super::find_or_allocate_port(&state.db, &state.port_registry, project_id, short).await {
         Ok(alloc) => {
-            let unit_name = format!("{slug}-{short}.service");
+            // Unit dal punto unico (regola L): ricopiare qui il `format!` faceva
+            // vivere la formula in due posti, e il commento di `service_unit_name`
+            // chiede proprio che questo valore combaci con quello del pannello.
+            let unit_name = service_unit_name(slug, short);
             super::allocate_port::link_allocation_to_service_unit(
                 &state.db, project_id, short, &unit_name,
             )
@@ -836,7 +859,10 @@ async fn control_project_service_windows(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     let context = load_project_context(&state.db, project_id, user_id).await?;
-    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
+    // Slug dal punto unico (regola L): la formula ricopiata a mano qui era la
+    // stessa di `project_service_slug`, e due copie della stessa formula sono due
+    // unit divergenti al primo ritocco.
+    let slug = project_service_slug(&context.details.name);
 
     if service.contains('/') || service.contains("..") {
         return Err(api_error(
