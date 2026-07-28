@@ -146,11 +146,22 @@ where
     })
 }
 
+/// SELECT identica al vecchio `psql -c`: key + category, ORDER BY key (la
+/// collation del DB definisce l'ordine, vedi doc sopra). `category` puo' essere
+/// NULL -> Option, mappata a "" dal chiamante come psql in modalita' -t -A.
+///
+/// E' una costante, non un literal inline, perche' il test di regressione pone
+/// la STESSA domanda al DB ricostruito dalle migrazioni: una query ricopiata la'
+/// divergerebbe da questa alla prima modifica, e il test misurerebbe una cosa
+/// diversa da quella che il gate misura (regola O).
+const SQL_SETTINGS_LIVE: &str = "SELECT key, category FROM settings ORDER BY key";
+
+/// Query del catalogo servizi, condivisa con il test per la stessa ragione.
+const SQL_CATALOGO_SERVIZI: &str =
+    "SELECT value FROM settings WHERE key = 'system.services_catalog'";
+
 fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
-    // SELECT identica al vecchio `psql -c`: key + category, ORDER BY key (la
-    // collation del DB definisce l'ordine, vedi doc sopra). `category` puo' essere
-    // NULL -> Option, mappata a "" dal chiamante come psql in modalita' -t -A.
-    query_effimera::<(String, Option<String>)>("SELECT key, category FROM settings ORDER BY key")
+    query_effimera::<(String, Option<String>)>(SQL_SETTINGS_LIVE)
 }
 
 /// Le chiavi che il CATALOGO DEI SERVIZI dichiara come `port_setting_key`.
@@ -170,9 +181,7 @@ fn query_settings_live() -> Option<Vec<(String, Option<String>)>> {
 /// Degrada a vuoto se il DB non e' raggiungibile (modalita' `--no-db`): la
 /// classificazione resta quella testuale, come per tutto il resto.
 fn port_setting_keys_dal_catalogo() -> HashSet<String> {
-    let righe = query_effimera::<(String,)>(
-        "SELECT value FROM settings WHERE key = 'system.services_catalog'",
-    );
+    let righe = query_effimera::<(String,)>(SQL_CATALOGO_SERVIZI);
     match righe.and_then(|r| r.into_iter().next()) {
         Some((raw,)) => port_keys_da_catalogo_json(&raw),
         None => HashSet::new(),
@@ -370,9 +379,18 @@ fn apply_delete_statements(
 
 /// Ritorna (chiavi inserite -> (categoria, file)), chiavi cancellate.
 fn collect_migrations() -> Result<(BTreeMap<String, (String, String)>, BTreeSet<String>)> {
+    collect_migrations_in(&repo_root().join("db").join("migrations"))
+}
+
+/// Come sopra, con la directory delle migrazioni esplicita. La cwd la decide il
+/// wrapper (`cd ROOT`), il test la risolve dal manifest del crate: la directory
+/// e' un parametro perche' lo strumento di misura deve poter dichiarare da dove
+/// guarda, invece di dedurlo da uno stato globale (regola O).
+fn collect_migrations_in(
+    mig_dir: &Path,
+) -> Result<(BTreeMap<String, (String, String)>, BTreeSet<String>)> {
     let mut inserted: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut deleted: BTreeSet<String> = BTreeSet::new();
-    let mig_dir = repo_root().join("db").join("migrations");
 
     let ins_re = Regex::new(
         r"(?is)INSERT\s+INTO\s+settings\s*\(([^)]*)\)\s*VALUES\s*(.*?);",
@@ -382,7 +400,7 @@ fn collect_migrations() -> Result<(BTreeMap<String, (String, String)>, BTreeSet<
     let del_in_re =
         Regex::new(r"(?i)DELETE\s+FROM\s+settings\s+WHERE\s+key\s+IN\s*\(([^)]*)\)")?;
 
-    for sql_file in &list_migration_files(&mig_dir) {
+    for sql_file in &list_migration_files(mig_dir) {
         let text = read_text(sql_file);
         let fname = sql_file
             .file_name()
@@ -760,6 +778,7 @@ fn classify(
     readers: &HashMap<String, Vec<String>>,
     ui_cats: Option<&BTreeSet<String>>,
     quoted: &HashSet<String>,
+    porte_catalogo: &HashSet<String>,
 ) -> Result<Classes> {
     let root = repo_root();
     let dynamic: Vec<Regex> = DYNAMIC_READ_PATTERNS
@@ -771,9 +790,6 @@ fn classify(
         .map(|(p, _)| Regex::new(p))
         .collect::<Result<_, _>>()?;
     let keep: HashSet<&str> = KEEP_DESPITE_NO_READER.iter().copied().collect();
-    // Chiavi dichiarate dal catalogo servizi come `port_setting_key`: lette a
-    // runtime dalla chiave, mai come literal nel codice (vedi la funzione).
-    let porte_catalogo = port_setting_keys_dal_catalogo();
     let bulk: HashSet<&str> = CATEGORY_BULK_READERS.iter().map(|(c, _)| *c).collect();
 
     // Replica re.Pattern.match: ancorato all'inizio della stringa.
@@ -793,7 +809,9 @@ fn classify(
     let keyset_db: HashSet<&String> = db.iter().map(|(k, _)| k).collect();
 
     for (key, cat) in db.iter() {
-        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, &porte_catalogo, key, cat);
+        // Riga lunga di proposito: spezzata sui nove argomenti, `classify`
+        // supera le 50 righe e il gate qualita' la conta come funzione lunga.
+        let via = read_via(&root, readers, quoted, &keep, &dynamic, &bulk, porte_catalogo, key, cat);
         let is_runtime = !migrations.contains_key(key) && runtime_match(key);
         classify_db_key(&mut result, migrations, ui_cats, key, cat, via, is_runtime);
     }
@@ -982,6 +1000,23 @@ fn parse_args(raw: &[String]) -> Args {
     a
 }
 
+/// Chiavi dichiarate dal catalogo servizi come `port_setting_key`: lette a
+/// runtime dalla chiave, mai come literal nel codice (vedi
+/// `port_setting_keys_dal_catalogo`).
+///
+/// L'IO sta qui e non dentro `classify` per due ragioni: in `--no-db` non si
+/// apre alcuna connessione (prima ne partiva una comunque), e il test puo'
+/// classificare col catalogo del DB che sta misurando invece che con quello del
+/// .env di chi esegue. E' una funzione e non un `if` dentro `run` perche' `run`
+/// e' gia' al limite di complessita' che il gate qualita' tollera.
+fn porte_catalogo_se_col_db(no_db: bool) -> HashSet<String> {
+    if no_db {
+        HashSet::new()
+    } else {
+        port_setting_keys_dal_catalogo()
+    }
+}
+
 pub fn run(raw_args: &[String]) -> Result<i32> {
     let args = parse_args(raw_args);
 
@@ -993,6 +1028,7 @@ pub fn run(raw_args: &[String]) -> Result<i32> {
     if db_live.is_none() && !args.no_db {
         eprintln!("AVVISO: DB live non raggiungibile, procedo in modalita --no-db");
     }
+    let porte_catalogo = porte_catalogo_se_col_db(args.no_db);
     let (migrations, _deleted) = collect_migrations()?;
     let code = collect_code_readers()?;
     let ui_cats = collect_ui_categories()?;
@@ -1002,6 +1038,7 @@ pub fn run(raw_args: &[String]) -> Result<i32> {
         &code.readers,
         ui_cats.as_ref(),
         &code.quoted,
+        &porte_catalogo,
     )?;
 
     let summary = build_summary(db_live.as_deref(), &migrations, &code, &ui_cats, &res);
@@ -1286,5 +1323,98 @@ fn compare_gate_counts(
     );
     println!("GATE OK: {cur_repr} <= baseline {base_repr}");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LA REGRESSIONE DA CATTURARE: una chiave che esiste solo perche' il
+    /// catalogo dei servizi la nomina (`port_setting_key`) viene dichiarata
+    /// MORTA. E' il caso che ha fatto arrossire il gate con `qdrant_port` da
+    /// quando i manifest di servizio si derivano dal catalogo (mig 0642), e il
+    /// passo successivo — una migrazione che cancella la chiave "fossile" —
+    /// romperebbe `resolve_port`, cioe' il probe di stato e gli argomenti di
+    /// avvio del servizio.
+    ///
+    /// Nessuno degli input e' fabbricato qui (regola O): il catalogo e le
+    /// settings vengono dal DB ricostruito dalle migrazioni VERE e sono letti
+    /// con le stesse query del gate; le migrazioni dal `db/migrations` del repo;
+    /// la classificazione e' la `classify` di produzione, non una sua imitazione.
+    ///
+    /// `readers`/`quoted` vuoti sono la premessa del difetto — nessun literal
+    /// nel codice per queste chiavi — e rendono l'asserzione piu' severa, non
+    /// piu' debole: se domani qualcuno aggiungesse un literal, il test
+    /// continuerebbe a misurare il solo ramo del catalogo.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn le_porte_dichiarate_dal_catalogo_non_sono_chiavi_morte(pool: sqlx::PgPool) {
+        let repo = crate::service_manifests::repo_root().expect("radice del repo");
+
+        let (raw,): (String,) = sqlx::query_as(SQL_CATALOGO_SERVIZI)
+            .fetch_one(&pool)
+            .await
+            .expect("catalogo servizi nel DB ricostruito dalle migrazioni");
+        let porte = port_keys_da_catalogo_json(&raw);
+        assert!(
+            porte.contains("qdrant_port"),
+            "il catalogo non dichiara piu' qdrant_port fra le porte dei servizi: \
+             o la 0642 e' stata disfatta, o la forma del catalogo e' cambiata e \
+             il parser non la riconosce piu' (in produzione: silenzio, e la \
+             chiave torna a sembrare morta)"
+        );
+
+        let db_live: Vec<(String, String)> =
+            sqlx::query_as::<_, (String, Option<String>)>(SQL_SETTINGS_LIVE)
+                .fetch_all(&pool)
+                .await
+                .expect("settings del DB ricostruito dalle migrazioni")
+                .into_iter()
+                .map(|(k, c)| (k, c.unwrap_or_default()))
+                .collect();
+        let nel_db: HashSet<&String> = db_live.iter().map(|(k, _)| k).collect();
+
+        let (migrations, _deleted) = collect_migrations_in(&repo.join("db").join("migrations"))
+            .expect("migrazioni del repo leggibili");
+
+        let readers: HashMap<String, Vec<String>> = HashMap::new();
+        let quoted: HashSet<String> = HashSet::new();
+        let res = classify(Some(&db_live), &migrations, &readers, None, &quoted, &porte)
+            .expect("classificazione");
+
+        for k in &porte {
+            assert!(
+                nel_db.contains(k),
+                "il catalogo dichiara la porta '{k}' ma nessuna migrazione crea \
+                 quella setting: resolve_port non troverebbe la porta"
+            );
+            assert!(
+                res.viva.map.contains_key(k),
+                "'{k}' e' dichiarata dal catalogo ma non risulta viva: il gate la \
+                 segnalerebbe come morta e il rimedio ovvio (cancellarla) romperebbe \
+                 la risoluzione della porta del servizio"
+            );
+            assert!(!res.morta.map.contains_key(k), "'{k}' classificata morta");
+        }
+
+        // Controprova nel test stesso: e' davvero il ramo del catalogo a tenerle
+        // vive. Tolto quello, `qdrant_port` ricade fra le morte — esattamente il
+        // fatto che il gate segnalava. Senza questa asserzione il test sopra
+        // potrebbe restare verde anche se il ramo sparisse, coperto da un altro
+        // motivo di "vitalita'".
+        let senza_catalogo = classify(
+            Some(&db_live),
+            &migrations,
+            &readers,
+            None,
+            &quoted,
+            &HashSet::new(),
+        )
+        .expect("classificazione senza il ramo del catalogo");
+        assert!(
+            senza_catalogo.morta.map.contains_key("qdrant_port"),
+            "senza il ramo del catalogo qdrant_port non risulta morta: allora il \
+             test sopra non sta misurando quel ramo"
+        );
+    }
 }
 
