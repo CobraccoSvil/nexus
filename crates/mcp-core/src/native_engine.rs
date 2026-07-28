@@ -553,6 +553,16 @@ pub struct NativeRunOutcome {
     /// raggiunto) NON e' un rifiuto: limite infra, non difetto del codice ->
     /// resta `false`.
     pub review_panel_rejected: bool,
+    /// `true` quando la review ha bocciato in via definitiva e NESSUN rimando in
+    /// correzione ha prodotto una modifica ai file (segnale
+    /// `ReviewGateVerdict::RejectedNoCorrection`, misurato sugli hash del
+    /// contenuto in `file_mutations`, mai dedotto dalla prosa dell'agente).
+    ///
+    /// Non e' una gradazione di [`Self::review_panel_rejected`] ma la sua CAUSA,
+    /// e cambia cosa deve fare l'utente: "ha tentato e non ci e' riuscito" e' un
+    /// rilievo difficile (si guarda il codice), "non ha mai tentato" e' un
+    /// problema di modello o di prompt (si cambia figura, si riformula).
+    pub review_panel_no_correction: bool,
     /// Esito dell'ultimo panel (`PanelOutcome::to_value`, trasportato dal
     /// ReviewGate in `extra.review_panel_last`): alimenta la nota onesta nel
     /// resoconto. `None` = panel mai convocato.
@@ -2258,6 +2268,17 @@ async fn build_native_engine(
     ));
     let criteria: Arc<dyn CriteriaRunner> = criteria_adapter.clone();
 
+    // Misura del progresso fra un rimando in correzione e il successivo. Senza,
+    // il ReviewGate riconvoca i revisori anche quando dal rimando precedente non
+    // e' cambiato un byte: tre panel sullo stesso codice, misurati il 28/07/2026.
+    let mutation_progress: Arc<dyn nexus_agent_graph::runtime::ports::MutationProgressPort> =
+        Arc::new(
+            crate::agent_graph_adapter::mutation_progress::MutationProgressAdapter::new(
+                db.clone(),
+                input.session_id,
+            ),
+        );
+
     // Porta del panel di review (ReviewGate).
     let review_panel: Arc<dyn nexus_agent_graph::runtime::ports::ReviewPanelPort> =
         Arc::new(crate::agent_graph_adapter::review_panel::ReviewPanelAdapter::new(
@@ -2489,11 +2510,10 @@ async fn build_native_engine(
             criteria,
             meta_steps.clone(),
         )),
-        review_gate: Arc::new(ReviewGateNode::new(
-            review_gate_cfg,
-            review_panel,
-            meta_steps.clone(),
-        )),
+        review_gate: Arc::new(
+            ReviewGateNode::new(review_gate_cfg, review_panel, meta_steps.clone())
+                .with_mutation_progress(mutation_progress),
+        ),
         reflection: Arc::new(ReflectionNode::new(reflection_cfg)),
         learner: Arc::new(LearnerNode::new()),
     };
@@ -3225,7 +3245,15 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
         // per costruzione: la review aveva bocciato e la ri-review non e'
         // avvenuta (run morto prima di rientrare).
         review_panel_rejected: match state.review_gate_verdict {
-            Some(ReviewGateVerdict::PendingCorrection | ReviewGateVerdict::RejectedFinal) => true,
+            Some(
+                ReviewGateVerdict::PendingCorrection
+                | ReviewGateVerdict::RejectedFinal
+                // Bocciata E mai corretta: e' una bocciatura a tutti gli effetti.
+                // La CAUSA (nessun tentativo ha toccato un file) la porta
+                // `review_panel_no_correction`, che e' un'altra domanda: qui si
+                // risponde solo "la review ha bocciato?".
+                | ReviewGateVerdict::RejectedNoCorrection,
+            ) => true,
             Some(
                 ReviewGateVerdict::Approved
                 | ReviewGateVerdict::NotApplicable
@@ -3234,6 +3262,14 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
             )
             | None => false,
         },
+        // Distinzione di CAUSA (regola M): il run ha chiuso bocciato senza che un
+        // solo rimando producesse una modifica. Diverso da "ha tentato e non ci e'
+        // riuscito", e diversa e' l'azione: li' si guarda il codice, qui il
+        // modello o il prompt.
+        review_panel_no_correction: matches!(
+            state.review_gate_verdict,
+            Some(ReviewGateVerdict::RejectedNoCorrection)
+        ),
         review_panel_last: state.extra.get("review_panel_last").cloned(),
         final_gate_passed: state.final_gate_passed,
         final_gate_unverified: state.final_gate_unverified,
@@ -4358,6 +4394,7 @@ mod tests {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
         }

@@ -1522,7 +1522,7 @@ pub(crate) async fn native_outcome_to_run_result(
             let nota = outcome
                 .review_panel_last
                 .as_ref()
-                .map(render_review_panel_note)
+                .map(|p| render_review_panel_note(p, outcome.review_panel_no_correction))
                 .unwrap_or_else(|| {
                     "**Review adversariale automatica: NON superata.**".to_string()
                 });
@@ -6163,7 +6163,13 @@ pub(crate) async fn review_gate_signals(pool: &PgPool, run_id: Uuid) -> (Vec<Str
 /// approva. Il `Value` e' `PanelOutcome::to_value` trasportato dallo stato del
 /// grafo (`extra.review_panel_last`): stessi campi strutturati, vocabolario di
 /// `PanelVerdict::as_str`. Findings limitati per non gonfiare.
-fn render_review_panel_note(panel: &serde_json::Value) -> String {
+///
+/// `no_correction` distingue la CAUSA della bocciatura definitiva (segnale
+/// strutturato del ReviewGate, misurato sugli hash del contenuto): senza, un run
+/// che non ha mai tentato una correzione e uno che ha tentato e fallito
+/// chiudevano con lo stesso identico resoconto, e l'utente non aveva modo di
+/// sapere quale dei due problemi aveva davanti.
+fn render_review_panel_note(panel: &serde_json::Value, no_correction: bool) -> String {
     let label = match panel.get("verdict").and_then(|v| v.as_str()).unwrap_or("") {
         "fail" => "NON superata (difetti bloccanti)",
         "needs_changes" => "richiede modifiche",
@@ -6198,6 +6204,15 @@ fn render_review_panel_note(panel: &serde_json::Value) -> String {
         let file = f.get("file").and_then(|v| v.as_str()).unwrap_or("");
         s.push_str(&format!("\n- [{sev}] {file}: {desc}"));
         shown += 1;
+    }
+    if no_correction {
+        s.push_str(
+            "\n\n**Nessun tentativo di correzione e' stato applicato**: i rimandi in correzione \
+             si sono chiusi senza che un solo file venisse modificato (misurato sugli hash del \
+             contenuto delle scritture registrate, non sulla risposta dell'agente). I difetti \
+             sopra sono quindi ancora tutti aperti nel codice: non e' che siano stati affrontati \
+             senza successo, non sono stati affrontati.",
+        );
     }
     s.push_str("\n\nControlla e correggi i punti sopra prima di considerare il task concluso.");
     s
@@ -7855,6 +7870,7 @@ mod tests_native_mapping {
             final_gate_unverified: None,
             final_gate_failed_pending: false,
             review_panel_rejected: false,
+            review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
         }

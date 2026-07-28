@@ -69,6 +69,31 @@ impl crate::runtime::ports::ReviewPanelPort for StubReviewPanelPort {
     }
 }
 
+/// Misura del progresso INERTE: `scan_writes` ritorna sempre uno scan vuoto col
+/// watermark che ha ricevuto.
+///
+/// NON e' il degrado da usare in produzione. Uno scan vuoto significa "nessuna
+/// scrittura", che il criterio legge come "nessun progresso": con questa porta
+/// innestata, il gate smetterebbe di riconvocare il panel sempre. In produzione
+/// la porta va OMESSA (`ReviewGateNode::with_mutation_progress` non chiamato),
+/// che e' il "non lo so" corretto e fa ricadere il gate sul comportamento
+/// storico. Vive qui per le fixture topologiche che devono costruire il nodo
+/// completo senza un DB.
+pub struct NullMutationProgressPort;
+
+#[async_trait]
+impl crate::runtime::ports::MutationProgressPort for NullMutationProgressPort {
+    async fn scan_writes(
+        &self,
+        after: Option<i64>,
+    ) -> Result<crate::runtime::ports::WriteScan, PortError> {
+        Ok(crate::runtime::ports::WriteScan {
+            watermark: after.unwrap_or(0),
+            facts: Vec::new(),
+        })
+    }
+}
+
 pub struct StubMetaReasonerPort;
 
 #[async_trait]

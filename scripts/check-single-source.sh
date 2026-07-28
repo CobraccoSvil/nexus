@@ -1147,6 +1147,44 @@ if [[ -n "$estremi_hits" ]]; then
 else
   echo "OK estremi-bucket-porte: gli estremi del bucket vengono dal punto unico"
 fi
+# ── criterio di progresso di una correzione ──────────────────────────────────
+# Due presidi per lo stesso punto unico (regola L):
+#
+# 1. Il CONFRONTO fra gli hash del contenuto vive solo in
+#    `WriteFact::cambia_il_contenuto`. La forma piu' probabile della ricaduta e'
+#    comoda e silenziosa: aggiungere `AND before_sha256 IS DISTINCT FROM
+#    after_sha256` alla query dell'adapter. Il gate resterebbe verde e
+#    perderebbe la distinzione fra "non ha scritto" e "ha riscritto file
+#    identici", che sono due comportamenti diversi dell'agente e vanno detti
+#    come tali nel rimando.
+# 2. La porta dev'essere INNESTATA nel nodo. Senza `.with_mutation_progress(...)`
+#    il ReviewGate torna, in silenzio e con tutti i test verdi, a riconvocare i
+#    revisori su codice non modificato: il difetto del 28/07/2026 (tre panel
+#    sullo stesso codice, 1.243.417 token) e' esattamente uno scollegamento del
+#    genere.
+progresso_hits="$(grep -rEn 'before_sha256' \
+  --include='*.rs' --include='*.sql' --include='*.ts' --include='*.tsx' \
+  crates/ db/ apps/ 2>/dev/null \
+  | grep -E 'after_sha256' \
+  | grep -E '(!=|==|<>|IS DISTINCT FROM|is_distinct)' \
+  | grep -vE '^[^:]+:[0-9]+:\s*(//|#|--|\*)' \
+  | grep -v '^crates/nexus-agent-graph/src/decisions/correction_progress.rs:' \
+  || true)"
+if ! grep -q 'with_mutation_progress(' crates/mcp-core/src/native_engine.rs 2>/dev/null; then
+  progresso_hits="${progresso_hits}
+crates/mcp-core/src/native_engine.rs: ReviewGateNode costruito senza .with_mutation_progress()"
+fi
+if [[ -n "${progresso_hits// /}" ]]; then
+  echo "!! correction-progress: il criterio di progresso e' deciso fuori dal punto unico:" >&2
+  printf '%s\n' "$progresso_hits" >&2
+  echo "   Il confronto degli hash vive in WriteFact::cambia_il_contenuto" >&2
+  echo "   (decisions/correction_progress.rs); la porta MutationProgressPort porta" >&2
+  echo "   i fatti e NON li filtra. Un filtro in SQL rende una riscrittura" >&2
+  echo "   identica indistinguibile da 'non ha scritto niente'." >&2
+  fail=1
+else
+  echo "OK correction-progress: il criterio vive nel punto unico e la porta e' innestata"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2

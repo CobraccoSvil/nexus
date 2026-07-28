@@ -64,5 +64,9 @@ pub mod embedding_store;
 // --- 3 impl FASE 2c: LlmGateway / ToolExecutor / CriteriaRunner ---
 pub mod criteria_runner;
 pub mod review_panel;
+
+// --- misura del progresso fra un rimando in correzione e il successivo:
+//     MutationProgressPort (sopra `file_mutations`, hash del contenuto) ---
+pub mod mutation_progress;
 pub mod llm_gateway;
 pub mod tool_executor;
