@@ -23,8 +23,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::provider::ChunkStream;
 use crate::types::{
     GeneratedImage, ImageGenResponse, LlmRequest, LlmResponse, LlmStreamChunk, LlmToolCall,
-    LlmUsage, PromptCacheKeying, PromptCacheReporting, ToolCallDelta, ToolCallDeltaFunction,
-    ToolFunctionCall, TranscribeResponse,
+    LlmUsage, MessageContent, PromptCacheKeying, PromptCacheReporting, ToolCallDelta,
+    ToolCallDeltaFunction, ToolFunctionCall, TranscribeResponse,
 };
 
 /// Dialetto di reasoning di un endpoint OpenAI-compatibile. Centralizza (regola
@@ -687,7 +687,21 @@ fn prompt_cache_key(req: &LlmRequest) -> String {
         // la forma dei blocchi cambia. Un contenuto non serializzabile non
         // esiste per questi tipi; se mai lo diventasse, saltarlo degrada il
         // raggruppamento, non la correttezza (la chiave e' un hint).
-        if let Ok(bytes) = serde_json::to_vec(&msg.content) {
+        //
+        // Del system entra la sola PARTE STABILE (punto unico
+        // `nexus_types::system_prompt`, regola L): le direttive di turno che il
+        // motore vi appende dietro il confine sono ricalcolate a ogni chiamata, e
+        // includerle rimetterebbe la chiave in movimento — che e' esattamente il
+        // difetto che questa funzione esiste per chiudere. Un system senza
+        // confine resta integralmente stabile, quindi le chiamate che non
+        // appendono nulla hanno la chiave di prima (invariato).
+        let stabile = match &msg.content {
+            MessageContent::Text(s) => {
+                MessageContent::Text(nexus_types::system_prompt::parte_stabile(s).to_string())
+            }
+            altro => altro.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&stabile) {
             hasher.update(&bytes);
         }
         hasher.update([0]);
@@ -1809,6 +1823,41 @@ mod tests {
             prima, dopo,
             "la chiave deve dipendere dalla sola parte stabile del prompt: \
              se si muove con la conversazione non raggruppa niente"
+        );
+    }
+
+    /// Terzo caso del contratto, quello che mancava: il motore APPENDE al system
+    /// direttive ricalcolate a ogni turno (focus del turno, razionale del piano)
+    /// dietro il confine di [`nexus_types::system_prompt`]. La chiave non deve
+    /// muoversi per quelle: se lo fa, ogni turno finisce in un gruppo diverso e
+    /// il raggruppamento non serve a niente — che e' il difetto misurato il
+    /// 29/07/2026 (mistral-medium: 171 chiamate, 3 con cache).
+    #[test]
+    fn la_chiave_resta_ferma_quando_cambia_solo_la_direttiva_di_turno() {
+        use nexus_types::system_prompt::appendi_blocco_di_turno;
+
+        let base = "istruzioni di progetto";
+        let mut t1 = sample_request();
+        t1.messages.insert(
+            0,
+            msg("system", &appendi_blocco_di_turno(base, "FOCUS: scrivi A")),
+        );
+        let mut t2 = sample_request();
+        t2.messages.insert(
+            0,
+            msg("system", &appendi_blocco_di_turno(base, "FOCUS: correggi B")),
+        );
+        // Terzo turno: la direttiva sparisce del tutto (in un loop agentico
+        // succede appena l'ultimo messaggio umano diventa un risultato di tool).
+        let mut t3 = sample_request();
+        t3.messages.insert(0, msg("system", base));
+
+        let k1 = prompt_cache_key(&t1);
+        assert_eq!(k1, prompt_cache_key(&t2), "direttive diverse, stesso gruppo");
+        assert_eq!(
+            k1,
+            prompt_cache_key(&t3),
+            "la direttiva che sparisce non deve cambiare gruppo"
         );
     }
 

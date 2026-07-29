@@ -4100,18 +4100,34 @@ pub(crate) async fn compose_agent_system_text(
         // Le parti sono concatenate senza separatore: il blocco si isola da solo.
         .map(|block| format!("\n{block}\n"))
         .unwrap_or_default();
-    format!(
-        "{}{}{}{}{}{}{}{}{}{}",
-        parts.project_header,
-        parts.risorse_block,
-        parts.project_custom_instructions,
-        memories,
-        parts.automation_instructions,
-        parts.o_series_instructions,
-        parts.test_instructions,
-        parts.profile_prompt_block,
-        parts.system_context,
-        parts.self_ref_hint
+    // L'ordine non e' estetico: e' il tratto di prompt che due run dello stesso
+    // progetto possono condividere. Prima cio' che resta identico fra run, poi
+    // cio' che cambia da un run all'altro — e il criterio sta nel punto unico
+    // `nexus_types::system_prompt` (regola L), non in questa concatenazione.
+    //
+    // Variabili fra run, e perche':
+    //   - `risorse_block`: stato runtime di servizi e porte, cambia appena
+    //     l'agente ne avvia uno. Stava in SECONDA posizione, e da li' rendeva non
+    //     riusabile tutto il system che seguiva.
+    //   - `memories`: dipendono dalla domanda dell'utente (richiamo per
+    //     pertinenza), quindi cambiano a ogni turno di chat.
+    //   - `test_instructions`: derivate dal testo del messaggio.
+    //   - `self_ref_hint`: costruito sulla cronologia della sessione.
+    nexus_types::system_prompt::componi_system_di_run(
+        &[
+            &parts.project_header,
+            &parts.project_custom_instructions,
+            &parts.automation_instructions,
+            &parts.o_series_instructions,
+            &parts.profile_prompt_block,
+            &parts.system_context,
+        ],
+        &[
+            &parts.risorse_block,
+            &memories,
+            &parts.test_instructions,
+            &parts.self_ref_hint,
+        ],
     )
 }
 

@@ -1201,7 +1201,12 @@ fn inietta_piano_razionale(state: &AgentState, system_text: &mut String) {
         block.push(format!("Alternative scartate: {}", alts.join("; ")));
     }
     block.push("</piano_razionale>".to_string());
-    *system_text = format!("{}\n\n{system_text}", block.join("\n"));
+    // DOPO la parte stabile, non in testa: il razionale non esiste al primo turno
+    // e compare quando il piano nasce, quindi anteposto spostava i primi
+    // caratteri del system a run gia' avviato (punto unico della posizione:
+    // `nexus_types::system_prompt`, regola L).
+    *system_text =
+        nexus_types::system_prompt::appendi_blocco_di_turno(system_text, &block.join("\n"));
 }
 
 /// Riga "opzione (scartata: motivo)" di una alternativa del piano; `None` se il

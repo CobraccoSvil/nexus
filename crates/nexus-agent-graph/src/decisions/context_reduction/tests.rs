@@ -359,7 +359,12 @@ fn turn_focus_idempotente_col_marker() {
     )
     .expect("directive");
     let s1 = inject_turn_focus("SYS", &directive);
-    assert!(s1.starts_with(TURN_FOCUS_MARKER));
+    // La directive sta DOPO la parte stabile: e' ricalcolata a ogni turno, e in
+    // testa spostava i primi caratteri del system a ogni chiamata (vedi
+    // `nexus_types::system_prompt`). Divergenza VOLUTA dal golden storico di
+    // parita' col Python, che la anteponeva.
+    assert!(s1.starts_with("SYS"), "la parte stabile resta in testa: {s1}");
+    assert!(s1.contains(TURN_FOCUS_MARKER));
     assert!(s1.contains("### FOCUS DEL TURNO CORRENTE ###"));
     // Idempotenza con marker gia' presente: NON re-iniettare.
     let s2 = inject_turn_focus(&s1, &directive);
