@@ -224,8 +224,130 @@ pub async fn routing_preview(
     }))
 }
 
+/// Legge una tariffa dal JSON LiteLLM e la porta nell'unita' del catalog
+/// (dollari per milione di token). Punto unico della conversione (regola L):
+/// upstream ogni prezzo e' per-token, in tabella e' per-milione, e la
+/// moltiplicazione scritta a mano in piu' punti e' il modo in cui una delle
+/// copie resta indietro di un fattore mille.
+///
+/// Ritorna `None` quando il campo manca o non e' un numero. La distinzione fra
+/// assente e zero e' il punto: per le tariffe di CACHE zero significherebbe
+/// "servito gratis", mentre l'assenza significa "non so" — due cose che il
+/// listino tratta in modo opposto (vedi `nexus_pricing::calculate_cost_breakdown`).
+fn tariffa_per_milione(entry: &Value, campo: &str) -> Option<f64> {
+    entry
+        .get(campo)
+        .and_then(Value::as_f64)
+        .map(|c| c * 1_000_000.0)
+}
+
+/// I campi che il sync porta da una voce del JSON upstream a una riga di catalog.
+/// Struct e non nove argomenti sciolti: `input_cost` e `output_cost` hanno lo
+/// stesso tipo e si scambiano senza che il compilatore se ne accorga.
+pub(crate) struct VoceCatalog<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub input_cost: f64,
+    pub output_cost: f64,
+    pub context_window: i32,
+    pub caps: &'a crate::model_catalog_sync::ClassifiedCaps,
+    /// `None` = la fonte non dichiara la tariffa. NON zero: vedi
+    /// [`tariffa_per_milione`].
+    pub cache_read_cost: Option<f64>,
+    pub cache_creation_cost: Option<f64>,
+}
+
+/// Scrive (o aggiorna) una riga del catalog. Ritorna `true` se la riga e' NUOVA.
+///
+/// Estratta da [`run_catalog_sync`] per essere raggiungibile da un test: finche'
+/// la query viveva dentro il loop, l'unico modo di verificarla era ricopiarla
+/// nel test, cioe' misurare una sua imitazione (regola O).
+///
+/// L'UPDATE dei flag avviene SOLO se `capability_source='auto'` (le righe
+/// `manual` curate da admin/migrazioni sono protette, ADR 0024). I costi e la
+/// finestra si aggiornano sempre.
+///
+/// Il TIER non compare: lo scrive `refresh_tier_prior` (punto unico) dopo questo
+/// upsert, dall'agentic_index della riga (unico seme, mig 0608). All'INSERT
+/// resta NULL — un modello nuovo non ha ancora fatti su cui fondare una fascia,
+/// e NULL e' la verita' (la riga nasce comunque `is_enabled=false` +
+/// `unqualified`, quindi fuori dal pool agentico).
+pub(crate) async fn upsert_voce_catalog(
+    db: &sqlx::PgPool,
+    voce: &VoceCatalog<'_>,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(SQL_UPSERT_VOCE_CATALOG)
+        .bind(voce.provider)
+        .bind(voce.model)
+        .bind(voce.input_cost)
+        .bind(voce.output_cost)
+        .bind(voce.context_window)
+        .bind(voce.caps.supports_tool_use)
+        .bind(voce.caps.supports_vision)
+        .bind(voce.caps.uses_thinking_mode)
+        .bind(voce.caps.agentic_thinking_policy)
+        .bind(voce.cache_read_cost)
+        .bind(voce.cache_creation_cost)
+        .fetch_one(db)
+        .await?;
+    Ok(row.try_get("inserted").unwrap_or(false))
+}
+
+/// La query di [`upsert_voce_catalog`]. Costante e non letterale inline perche'
+/// da sola supera la soglia di lunghezza del gate di qualita': tenerla dentro la
+/// funzione farebbe crescere una funzione che di logica non ne ha.
+const SQL_UPSERT_VOCE_CATALOG: &str = r#"INSERT INTO ai_price_catalog (
+                provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
+                currency, context_window, supports_tool_use, supports_vision,
+                uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
+                performance_tier, tier_source,
+                cache_read_cost_per_million_tokens, cache_creation_cost_per_million_tokens
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2, NULL, NULL,
+                        $10, $11)
+              ON CONFLICT (provider, model) DO UPDATE SET
+                input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
+                output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
+                -- La fonte ARRICCHISCE, non cancella: si aggiorna solo quando
+                -- LiteLLM porta la tariffa. Assegnare EXCLUDED secco azzererebbe a
+                -- NULL i valori curati dalle migrazioni 0130/0403 ogni volta che la
+                -- fonte tace su quel modello, e quei token tornerebbero a tariffa
+                -- piena senza che nessuno lo abbia deciso.
+                cache_read_cost_per_million_tokens = COALESCE(
+                    EXCLUDED.cache_read_cost_per_million_tokens,
+                    ai_price_catalog.cache_read_cost_per_million_tokens),
+                cache_creation_cost_per_million_tokens = COALESCE(
+                    EXCLUDED.cache_creation_cost_per_million_tokens,
+                    ai_price_catalog.cache_creation_cost_per_million_tokens),
+                context_window = EXCLUDED.context_window,
+                supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                         THEN EXCLUDED.supports_tool_use
+                                         ELSE ai_price_catalog.supports_tool_use END,
+                supports_vision = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                       THEN EXCLUDED.supports_vision
+                                       ELSE ai_price_catalog.supports_vision END,
+                uses_thinking_mode = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                          THEN EXCLUDED.uses_thinking_mode
+                                          ELSE ai_price_catalog.uses_thinking_mode END,
+                agentic_thinking_policy = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                          THEN EXCLUDED.agentic_thinking_policy
+                                          ELSE ai_price_catalog.agentic_thinking_policy END,
+                updated_at = NOW()
+              RETURNING (xmax = 0) AS inserted"#;
+
 /// Esegue la sync del catalogo modelli da LiteLLM. Riusabile sia dall'handler
 /// REST che da un task background schedulato.
+///
+/// Le tariffe di prompt-cache (`cache_read_input_token_cost` /
+/// `cache_creation_input_token_cost`) arrivano da QUI, cioe' dalla stessa fonte
+/// da cui gia' arrivavano input e output. Prima venivano solo da migrazioni
+/// scritte a mano che selezionavano per pattern di NOME (`0403`, clausola
+/// `model LIKE 'gemini-2.5%'`): ogni famiglia nuova nasceva senza tariffa e i
+/// suoi token serviti da cache venivano fatturati a prezzo pieno finche'
+/// qualcuno non se ne accorgeva e scriveva la migrazione successiva. Misurato il
+/// 29/07/2026 su `gemini-3.1-flash-lite`: 65.595 token letti da cache in 7
+/// giorni, tutti a tariffa piena, mentre upstream la tariffa c'era (0,025 $/M
+/// contro 0,25 $/M di input). Inseguire i nomi a colpi di migrazione e' la
+/// toppa; leggere il campo dalla fonte e' il fix.
 pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), String> {
     const LITELLM_URL: &str = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
@@ -302,16 +424,17 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         };
         let provider: &str = &provider_owned;
 
-        let input_cost = entry
-            .get("input_cost_per_token")
-            .and_then(Value::as_f64)
-            .map(|c| c * 1_000_000.0)
-            .unwrap_or(0.0);
-        let output_cost = entry
-            .get("output_cost_per_token")
-            .and_then(Value::as_f64)
-            .map(|c| c * 1_000_000.0)
-            .unwrap_or(0.0);
+        // Per input/output l'assenza vale 0.0: la coppia a zero fa saltare la riga
+        // subito sotto, quindi il "non so" si dichiara li' e non entra in tabella.
+        let input_cost = tariffa_per_milione(entry, "input_cost_per_token").unwrap_or(0.0);
+        let output_cost = tariffa_per_milione(entry, "output_cost_per_token").unwrap_or(0.0);
+        // Le tariffe di cache restano `Option`: qui l'assenza NON e' zero. Zero
+        // direbbe "servito gratis" e sottostimerebbe la chiamata; NULL dice "non
+        // so", e il listino lo tratta per quello che e' rimettendo quei token nel
+        // monte a tariffa piena (`nexus_pricing::calculate_cost_breakdown`, campo
+        // `cache_tokens_billed_as_input`).
+        let cache_read_cost = tariffa_per_milione(entry, "cache_read_input_token_cost");
+        let cache_creation_cost = tariffa_per_milione(entry, "cache_creation_input_token_cost");
 
         if input_cost == 0.0 && output_cost == 0.0 {
             skipped += 1;
@@ -375,56 +498,23 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         // (peggio del nome, che ne faceva 64). Era il difetto che stavamo curando,
         // rifatto mentre lo curavamo.
 
-        // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'
-        // (le righe 'manual' curate da admin/migrazioni sono protette, ADR 0024).
-        // I costi/context si aggiornano sempre.
-        //
-        // Il TIER non compare: lo scrive `refresh_tier_prior` (punto unico) dopo
-        // questo upsert, dall'agentic_index della riga (unico seme, mig 0608).
-        // All'INSERT resta NULL — un modello nuovo non ha ancora fatti su cui
-        // fondare una fascia, e NULL e' la verita' (la riga nasce comunque
-        // is_enabled=false + unqualified, quindi fuori dal pool agentico).
-        let result = sqlx::query(
-            r#"INSERT INTO ai_price_catalog (
-                provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
-                currency, context_window, supports_tool_use, supports_vision,
-                uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
-                performance_tier, tier_source
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2, NULL, NULL)
-              ON CONFLICT (provider, model) DO UPDATE SET
-                input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
-                output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
-                context_window = EXCLUDED.context_window,
-                supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                         THEN EXCLUDED.supports_tool_use
-                                         ELSE ai_price_catalog.supports_tool_use END,
-                supports_vision = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                       THEN EXCLUDED.supports_vision
-                                       ELSE ai_price_catalog.supports_vision END,
-                uses_thinking_mode = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                          THEN EXCLUDED.uses_thinking_mode
-                                          ELSE ai_price_catalog.uses_thinking_mode END,
-                agentic_thinking_policy = CASE WHEN ai_price_catalog.capability_source = 'auto'
-                                          THEN EXCLUDED.agentic_thinking_policy
-                                          ELSE ai_price_catalog.agentic_thinking_policy END,
-                updated_at = NOW()
-              RETURNING (xmax = 0) AS inserted"#,
+        let result = upsert_voce_catalog(
+            db,
+            &VoceCatalog {
+                provider,
+                model: model_id,
+                input_cost,
+                output_cost,
+                context_window,
+                caps: &caps,
+                cache_read_cost,
+                cache_creation_cost,
+            },
         )
-        .bind(provider)
-        .bind(model_id)
-        .bind(input_cost)
-        .bind(output_cost)
-        .bind(context_window)
-        .bind(caps.supports_tool_use)
-        .bind(caps.supports_vision)
-        .bind(caps.uses_thinking_mode)
-        .bind(caps.agentic_thinking_policy)
-        .fetch_one(db)
         .await;
 
         match result {
-            Ok(row) => {
-                let inserted: bool = row.try_get("inserted").unwrap_or(false);
+            Ok(inserted) => {
                 if inserted {
                     added += 1;
                 } else {
@@ -883,4 +973,207 @@ pub async fn probe_models_now(State(state): State<AppState>) -> Json<Value> {
         "skipped_provider_cooldown": stats.skipped_provider_cooldown,
         "failure_threshold": threshold,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_catalog_sync::ClassifiedCaps;
+    use nexus_pricing::{calculate_cost_breakdown, PriceSnapshot, TokenUsage};
+    use sqlx::PgPool;
+
+    /// Frammento VERBATIM di `model_prices_and_context_window.json` (letto da
+    /// upstream il 29/07/2026). Non un JSON inventato: l'assunto da verificare e'
+    /// proprio come sono fatti i campi di quella fonte, e riscriverli a mano
+    /// fisserebbe l'assunto invece di misurarlo (regola O).
+    fn voce_gemini_3_1_flash_lite() -> Value {
+        serde_json::json!({
+            "input_cost_per_token": 2.5e-07,
+            "output_cost_per_token": 1.5e-06,
+            "cache_read_input_token_cost": 2.5e-08,
+            "max_input_tokens": 1048576
+        })
+    }
+
+    fn quasi(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn caps() -> ClassifiedCaps {
+        ClassifiedCaps {
+            supports_tool_use: true,
+            supports_vision: false,
+            uses_thinking_mode: false,
+            agentic_thinking_policy: "none",
+        }
+    }
+
+    #[test]
+    fn tariffa_dal_json_litellm_arriva_in_dollari_per_milione() {
+        let voce = voce_gemini_3_1_flash_lite();
+        assert!(quasi(
+            tariffa_per_milione(&voce, "input_cost_per_token").unwrap(),
+            0.25
+        ));
+        // La tariffa che il catalog non aveva: 0,025 $/M contro 0,25 di input,
+        // cioe' il decimo. E' il numero che rendeva sovrastimata ogni chiamata
+        // gemini-3 servita da cache.
+        assert!(quasi(
+            tariffa_per_milione(&voce, "cache_read_input_token_cost").unwrap(),
+            0.025
+        ));
+    }
+
+    /// Il campo ASSENTE deve dare `None`, mai `Some(0.0)`.
+    ///
+    /// E' la distinzione su cui poggia il fix: `cache_creation` non c'e' per
+    /// nessun modello Gemini (il caching implicito non fattura la scrittura), e
+    /// uno zero li' direbbe "scrivere in cache e' gratis" — un'affermazione che
+    /// la fonte non fa.
+    #[test]
+    fn campo_assente_e_ignoranza_non_gratuita() {
+        let voce = voce_gemini_3_1_flash_lite();
+        assert_eq!(
+            tariffa_per_milione(&voce, "cache_creation_input_token_cost"),
+            None
+        );
+        assert_eq!(tariffa_per_milione(&voce, "campo_inesistente"), None);
+    }
+
+    /// La CONSEGUENZA, non la stringa: la tariffa estratta sopra, messa nel
+    /// listino, cambia il costo della chiamata. Senza, i token serviti da cache
+    /// rientrano nel monte a tariffa piena e la stessa chiamata costa oltre
+    /// cinque volte tanto — cio' che il ledger ha registrato per
+    /// `gemini-3.1-flash-lite` finche' la tariffa non c'era.
+    #[test]
+    fn la_tariffa_estratta_sconta_davvero_la_chiamata() {
+        let voce = voce_gemini_3_1_flash_lite();
+        let listino = |cache_read| PriceSnapshot {
+            input_cost_per_million_tokens: tariffa_per_milione(&voce, "input_cost_per_token")
+                .unwrap(),
+            output_cost_per_million_tokens: tariffa_per_milione(&voce, "output_cost_per_token")
+                .unwrap(),
+            cache_read_cost_per_million_tokens: cache_read,
+            cache_creation_cost_per_million_tokens: None,
+            currency: "USD".to_string(),
+        };
+        // Forma misurata sul campo il 29/07/2026: prefisso lungo, quasi tutto
+        // servito da cache, risposta di una riga.
+        let usage = TokenUsage {
+            prompt_tokens: 10_000,
+            completion_tokens: 1,
+            cache_read_tokens: 9_000,
+            cache_creation_tokens: 0,
+        };
+
+        let con = calculate_cost_breakdown(
+            &listino(tariffa_per_milione(&voce, "cache_read_input_token_cost")),
+            &usage,
+        );
+        let senza = calculate_cost_breakdown(&listino(None), &usage);
+
+        assert_eq!(con.cache_tokens_billed_as_input, 0);
+        assert!(quasi(con.cache_read_cost, 9_000.0 / 1e6 * 0.025));
+        // Senza tariffa i token di cache rientrano tutti a prezzo pieno, ed e' il
+        // listino stesso a dichiararlo.
+        assert_eq!(senza.cache_tokens_billed_as_input, 9_000);
+        assert_eq!(senza.cache_read_cost, 0.0);
+        assert!(
+            senza.total_cost > con.total_cost * 5.0,
+            "senza tariffa la stessa chiamata deve costare molto di piu': \
+             con={} senza={}",
+            con.total_cost,
+            senza.total_cost
+        );
+    }
+
+    /// La tariffa deve arrivare IN TABELLA, non solo essere estratta.
+    ///
+    /// Gira sulle migrazioni REALI (`META_MIGRATOR`) e non sulla fixture
+    /// `test_support::create_ai_price_catalog_table`, che e' una copia a mano
+    /// dello schema e le due colonne di cache non le ha nemmeno: un test scritto
+    /// su quella passerebbe descrivendo una tabella che in produzione non esiste
+    /// (regola O). Ed esercita [`upsert_voce_catalog`], cioe' la query VERA:
+    /// ricopiarla qui vorrebbe dire misurare una sua imitazione.
+    ///
+    /// MUTAZIONE: togliere le due colonne dall'INSERT — che e' esattamente lo
+    /// stato in cui il sync e' vissuto finora — fa rosseggiare la prima assert.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn la_tariffa_di_cache_finisce_in_tabella(pool: PgPool) {
+        let caps = caps();
+        let voce = |cache_read| VoceCatalog {
+            provider: "google",
+            model: "gemini-3.1-flash-lite",
+            input_cost: 0.25,
+            output_cost: 1.5,
+            context_window: 1_048_576,
+            caps: &caps,
+            cache_read_cost: cache_read,
+            cache_creation_cost: None,
+        };
+        let leggi = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, Option<f64>>(
+                "SELECT cache_read_cost_per_million_tokens::float8 FROM ai_price_catalog \
+                 WHERE provider = 'google' AND model = 'gemini-3.1-flash-lite'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("riga di catalog")
+        };
+
+        assert!(
+            upsert_voce_catalog(&pool, &voce(Some(0.025)))
+                .await
+                .expect("insert"),
+            "la prima scrittura crea la riga"
+        );
+        assert_eq!(leggi(pool.clone()).await, Some(0.025));
+
+        // La fonte tace su questo modello al giro dopo: il valore gia' in tabella
+        // NON va cancellato. Senza il COALESCE nell'UPDATE, qui si leggerebbe
+        // `None` e quei token tornerebbero a tariffa piena da soli.
+        assert!(
+            !upsert_voce_catalog(&pool, &voce(None)).await.expect("update"),
+            "la seconda scrittura aggiorna, non inserisce"
+        );
+        assert_eq!(leggi(pool.clone()).await, Some(0.025));
+
+        // La fonte parla di nuovo, con un valore diverso: quello vince.
+        upsert_voce_catalog(&pool, &voce(Some(0.011)))
+            .await
+            .expect("update");
+        assert_eq!(leggi(pool.clone()).await, Some(0.011));
+    }
+
+    /// Una riga NUOVA di cui la fonte non dichiara la tariffa nasce con NULL, mai
+    /// con zero: il listino distingue "non so" da "gratis", e il DB deve poter
+    /// portare quella distinzione.
+    #[sqlx::test(migrator = "nexus_migrations_embedded::META_MIGRATOR")]
+    async fn senza_tariffa_la_riga_nasce_con_null(pool: PgPool) {
+        let caps = caps();
+        upsert_voce_catalog(
+            &pool,
+            &VoceCatalog {
+                provider: "google",
+                model: "gemini-3-pro-image",
+                input_cost: 2.0,
+                output_cost: 12.0,
+                context_window: 32_768,
+                caps: &caps,
+                cache_read_cost: None,
+                cache_creation_cost: None,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let letto = sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT cache_read_cost_per_million_tokens::float8 FROM ai_price_catalog \
+             WHERE provider = 'google' AND model = 'gemini-3-pro-image'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("riga di catalog");
+        assert_eq!(letto, None, "l'assenza di tariffa non e' uno zero");
+    }
 }
