@@ -34,6 +34,12 @@ pub struct UiLayoutPattern {
     pub when_to_use: String,
     /// Struttura e gerarchia visiva: quali zone, in che ordine, cosa domina.
     pub structure: String,
+    /// Come si PRESENTA il pattern: densita', gerarchia del testo, comportamento
+    /// a larghezza ridotta. Gemella di `structure` — quella dice dove stanno le
+    /// zone, questa che aspetto hanno — e sta nella stessa scheda perche' chi
+    /// chiede un pattern non deve ricevere meta' risposta. Criteri accertabili
+    /// (misure, conteggi), mai aggettivi: il catalogo non e' un giudice di gusto.
+    pub presentation: String,
     /// Stati OBBLIGATORI da rendere: vuoto, caricamento, errore, e gli altri
     /// che il pattern richiede. E' la parte verificabile del catalogo.
     pub required_states: String,
@@ -49,6 +55,7 @@ impl UiLayoutPattern {
             title: r.try_get("title").unwrap_or_default(),
             when_to_use: r.try_get("when_to_use").unwrap_or_default(),
             structure: r.try_get("structure").unwrap_or_default(),
+            presentation: r.try_get("presentation").unwrap_or_default(),
             required_states: r.try_get("required_states").unwrap_or_default(),
             anti_patterns: r.try_get("anti_patterns").unwrap_or_default(),
         }
@@ -73,6 +80,7 @@ impl UiLayoutPattern {
             "title": self.title,
             "when_to_use": self.when_to_use,
             "structure": self.structure,
+            "presentation": self.presentation,
             "required_states": self.required_states,
             "anti_patterns": self.anti_patterns,
         })
@@ -99,7 +107,7 @@ impl std::fmt::Display for UiPatternError {
 /// Colonne lette, in un posto solo: l'ordine e i nomi valgono per entrambe le
 /// query, cosi' non possono divergere.
 const PATTERN_COLUMNS: &str =
-    "key, app_type, title, when_to_use, structure, required_states, anti_patterns";
+    "key, app_type, title, when_to_use, structure, presentation, required_states, anti_patterns";
 
 /// Carica i pattern attivi, opzionalmente filtrati per `app_type`.
 /// PUNTO UNICO della lettura del catalogo: il tool, e chiunque dopo di lui,
@@ -195,6 +203,7 @@ mod tests {
             title: format!("titolo {key}"),
             when_to_use: "quando serve".to_string(),
             structure: "zona A sopra, zona B sotto".to_string(),
+            presentation: "righe di altezza unica, numeri a destra".to_string(),
             required_states: "vuoto, caricamento, errore".to_string(),
             anti_patterns: "niente tabella senza stato vuoto".to_string(),
         }
@@ -208,15 +217,23 @@ mod tests {
         assert_eq!(v["key"], json!("lista_crud"));
         assert_eq!(v["when_to_use"], json!("quando serve"));
         assert!(v.get("structure").is_none(), "l'indice resta leggero: {v}");
+        assert!(v.get("presentation").is_none());
         assert!(v.get("required_states").is_none());
     }
 
-    /// La scheda completa porta le tre sezioni che rendono il pattern
+    /// La scheda completa porta le quattro sezioni che rendono il pattern
     /// applicabile: senza queste il catalogo tornerebbe a essere un aggettivo.
+    /// `presentation` e' la piu' recente (mig 0655) e la piu' facile da perdere
+    /// per strada: descrive la RESA, che prima non era detta da nessuno — ne'
+    /// dal catalogo, che parlava solo di struttura, ne' dalla lente della figura.
     #[test]
-    fn scheda_completa_porta_struttura_stati_e_antipattern() {
+    fn scheda_completa_porta_struttura_resa_stati_e_antipattern() {
         let v = pattern("dashboard_kpi", "dashboard").to_value();
         assert_eq!(v["structure"], json!("zona A sopra, zona B sotto"));
+        assert_eq!(
+            v["presentation"],
+            json!("righe di altezza unica, numeri a destra")
+        );
         assert_eq!(v["required_states"], json!("vuoto, caricamento, errore"));
         assert_eq!(
             v["anti_patterns"],

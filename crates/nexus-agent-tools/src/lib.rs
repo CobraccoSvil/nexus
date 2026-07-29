@@ -47,6 +47,7 @@ pub mod todos;
 pub mod tool_schema;
 pub mod ui_patterns;
 pub mod ui_reference_search;
+pub mod ui_styling;
 pub mod url_scanner;
 pub mod video_tools;
 pub mod vision_tools;
