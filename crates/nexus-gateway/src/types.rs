@@ -334,6 +334,18 @@ pub enum PromptCacheKeying {
     /// comunque il contenuto reale del prefisso, quindi una chiave troppo larga
     /// puo' solo far perdere un riuso, mai servire il prefisso di un altro.
     RequiresKey,
+    /// L'endpoint e' un instradatore verso fornitori terzi, e il prefisso resta
+    /// caldo su UNO di quelli: senza un identificatore di sessione i turni
+    /// successivi possono atterrare altrove, dove cache non ce n'e'. OpenRouter,
+    /// campo `session_id`.
+    ///
+    /// Stessa domanda di [`Self::RequiresKey`] — «quali chiamate condividono il
+    /// prefisso?» — posta a un livello diverso: li' si sceglie quale cache
+    /// leggere, qui su quale macchina finire. Per questo la chiave e' la stessa
+    /// e cambia solo il nome del campo. Misurato: grok-4.5 riusa il 99% del
+    /// prefisso in ogni prova diretta ma resta all'1,5% su un run reale, dove le
+    /// chiamate sono abbastanza da essere distribuite.
+    RequiresSessionId,
 }
 
 /// Conteggio token consumati.

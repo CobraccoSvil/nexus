@@ -786,10 +786,16 @@ fn build_request_body(
         model: req.model.clone(),
         messages,
         // Solo verso gli endpoint che la richiedono: altrove sarebbe un campo
-        // sconosciuto in un dialetto che non lo documenta.
+        // sconosciuto in un dialetto che non lo documenta. Stessa chiave nei due
+        // casi, perche' la domanda a cui risponde e' la stessa; cambia il campo
+        // perche' cambia chi la legge.
         prompt_cache_key: match cache_keying {
-            PromptCacheKeying::ProviderManaged => None,
             PromptCacheKeying::RequiresKey => Some(prompt_cache_key(req)),
+            PromptCacheKeying::ProviderManaged | PromptCacheKeying::RequiresSessionId => None,
+        },
+        session_id: match cache_keying {
+            PromptCacheKeying::RequiresSessionId => Some(prompt_cache_key(req)),
+            PromptCacheKeying::ProviderManaged | PromptCacheKeying::RequiresKey => None,
         },
         temperature,
         max_tokens,
@@ -1428,6 +1434,12 @@ struct ChatCompletionRequest {
     /// distanza. Omesso per gli altri dialetti.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
+    /// Chiave di instradamento adesivo per gli endpoint che smistano verso
+    /// fornitori terzi: tiene i turni di una stessa conversazione sul fornitore
+    /// che ha gia' il prefisso caldo. Senza, la richiesta funziona lo stesso ma
+    /// si paga il prompt intero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1843,6 +1855,22 @@ mod tests {
         ))
         .expect("serializza");
         assert!(senza.get("prompt_cache_key").is_none());
+        assert!(senza.get("session_id").is_none());
+
+        // L'instradatore riceve la STESSA chiave, ma nel campo che legge lui:
+        // se finissero entrambi, uno dei due sarebbe un campo sconosciuto.
+        let sticky = serde_json::to_value(build_request_body(
+            &req,
+            false,
+            &ResolvedReasoning::none(),
+            PromptCacheKeying::RequiresSessionId,
+        ))
+        .expect("serializza");
+        assert_eq!(sticky.get("session_id").and_then(|v| v.as_str()), Some(chiave));
+        assert!(
+            sticky.get("prompt_cache_key").is_none(),
+            "l'instradatore non conosce prompt_cache_key"
+        );
     }
 
     #[test]
