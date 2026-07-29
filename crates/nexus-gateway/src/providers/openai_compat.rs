@@ -786,12 +786,24 @@ fn build_request_body(
         model: req.model.clone(),
         messages,
         // Solo verso gli endpoint che la richiedono: altrove sarebbe un campo
-        // sconosciuto in un dialetto che non lo documenta. Stessa chiave nei due
-        // casi, perche' la domanda a cui risponde e' la stessa; cambia il campo
+        // sconosciuto in un dialetto che non lo documenta. Stessa chiave in ogni
+        // caso, perche' la domanda a cui risponde e' la stessa; cambia il campo
         // perche' cambia chi la legge.
+        //
+        // Su un INSTRADATORE (RequiresSessionId) i campi servono ENTRAMBI, perche'
+        // i lettori sono DUE: `session_id` lo legge l'instradatore per fissare il
+        // fornitore, `prompt_cache_key` viene inoltrato a quel fornitore, che ci
+        // fissa il proprio server interno. MISURATO su OpenRouter->xAI il
+        // 29/07/2026, 4 chiamate consecutive a prefisso identico: col solo
+        // `session_id` la cache non arriva mai (128 token fissi, il blocco
+        // minimo); col solo `prompt_cache_key` 8704/8797 stabile dal secondo
+        // colpo; con entrambi idem. Il fornitore la cache la gestiva benissimo:
+        // eravamo noi a non dirgli quale conversazione fosse.
         prompt_cache_key: match cache_keying {
-            PromptCacheKeying::RequiresKey => Some(prompt_cache_key(req)),
-            PromptCacheKeying::ProviderManaged | PromptCacheKeying::RequiresSessionId => None,
+            PromptCacheKeying::RequiresKey | PromptCacheKeying::RequiresSessionId => {
+                Some(prompt_cache_key(req))
+            }
+            PromptCacheKeying::ProviderManaged => None,
         },
         session_id: match cache_keying {
             PromptCacheKeying::RequiresSessionId => Some(prompt_cache_key(req)),
@@ -1857,8 +1869,13 @@ mod tests {
         assert!(senza.get("prompt_cache_key").is_none());
         assert!(senza.get("session_id").is_none());
 
-        // L'instradatore riceve la STESSA chiave, ma nel campo che legge lui:
-        // se finissero entrambi, uno dei due sarebbe un campo sconosciuto.
+        // L'instradatore riceve la STESSA chiave in ENTRAMBI i campi, perche' i
+        // lettori sono due: `session_id` fissa il fornitore dentro l'instradatore,
+        // `prompt_cache_key` viene inoltrato a quel fornitore e ci fissa il server.
+        // MISURATO (OpenRouter->xAI, 29/07/2026): col solo session_id la cache non
+        // arrivava mai (128 token fissi su 4 chiamate a prefisso identico); con
+        // prompt_cache_key 8704/8797 stabile dal secondo colpo. Ometterlo qui non
+        // era prudenza: era il difetto.
         let sticky = serde_json::to_value(build_request_body(
             &req,
             false,
@@ -1867,9 +1884,10 @@ mod tests {
         ))
         .expect("serializza");
         assert_eq!(sticky.get("session_id").and_then(|v| v.as_str()), Some(chiave));
-        assert!(
-            sticky.get("prompt_cache_key").is_none(),
-            "l'instradatore non conosce prompt_cache_key"
+        assert_eq!(
+            sticky.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some(chiave),
+            "senza prompt_cache_key il fornitore a valle non riconosce la conversazione"
         );
     }
 

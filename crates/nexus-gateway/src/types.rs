@@ -334,17 +334,19 @@ pub enum PromptCacheKeying {
     /// comunque il contenuto reale del prefisso, quindi una chiave troppo larga
     /// puo' solo far perdere un riuso, mai servire il prefisso di un altro.
     RequiresKey,
-    /// L'endpoint e' un instradatore verso fornitori terzi, e il prefisso resta
-    /// caldo su UNO di quelli: senza un identificatore di sessione i turni
-    /// successivi possono atterrare altrove, dove cache non ce n'e'. OpenRouter,
-    /// campo `session_id`.
+    /// L'endpoint e' un instradatore verso fornitori terzi, e i livelli di
+    /// affinita' sono DUE: quale fornitore (lo fissa `session_id`, letto
+    /// dall'instradatore) e quale macchina DI quel fornitore (lo fissa
+    /// `prompt_cache_key`, che l'instradatore inoltra a valle). OpenRouter.
     ///
-    /// Stessa domanda di [`Self::RequiresKey`] — «quali chiamate condividono il
-    /// prefisso?» — posta a un livello diverso: li' si sceglie quale cache
-    /// leggere, qui su quale macchina finire. Per questo la chiave e' la stessa
-    /// e cambia solo il nome del campo. Misurato: grok-4.5 riusa il 99% del
-    /// prefisso in ogni prova diretta ma resta all'1,5% su un run reale, dove le
-    /// chiamate sono abbastanza da essere distribuite.
+    /// Servono entrambi i campi, con la stessa chiave. MISURATO su
+    /// OpenRouter->xAI (29/07/2026, 4 chiamate consecutive a prefisso
+    /// identico): col solo `session_id` la cache non arrivava MAI — 128 token
+    /// fissi, il blocco minimo — perche' il fornitore era quello giusto ma la
+    /// macchina cambiava a ogni colpo; col solo `prompt_cache_key`, e con
+    /// entrambi, 8704/8797 stabile dal secondo colpo. E' la stessa domanda di
+    /// [`Self::RequiresKey`] — «quali chiamate condividono il prefisso?» —
+    /// posta due volte, una per livello.
     RequiresSessionId,
 }
 
