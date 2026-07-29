@@ -524,7 +524,9 @@ impl ReviewGateNode {
             cycle,
             max_cycles,
             a_vuoto,
-            definitiva,
+            // `definitiva` non basta a scegliere la frase: dice CHE si chiude, non
+            // PERCHE'. La natura del rifiuto la decide `verdetto()`, qui sotto.
+            definitiva: _,
             progresso,
         } = *r;
         let mut payload = serde_json::Map::new();
@@ -533,22 +535,57 @@ impl ReviewGateNode {
         payload.insert("progress".into(), progresso.as_str().into());
         payload.insert("no_progress_cycles".into(), a_vuoto.into());
         payload.insert("panel_convened".into(), false.into());
-        let (titolo, phase) = if definitiva {
-            (
+        // Titolo e `phase` DERIVANO dal verdetto (punto unico
+        // [`RimandoAVuoto::verdetto`]), lo stesso valore che il delta persiste in
+        // `review_gate_verdict`. Ricomporre qui il giudizio dal solo `definitiva`
+        // faceva dire alla riga letta dall'utente l'opposto di cio' che il
+        // verdetto registrava: su `8365a347` (bacheca-attivita, 29/07/2026) il
+        // titolo affermava "nessuna correzione applicata in alcun tentativo"
+        // mentre il payload accanto portava `no_progress_cycles: 1` su 3 cicli, e
+        // il verdetto era `RejectedFinal` — l'agente aveva corretto due volte su
+        // tre. Misurati 5 casi su 9 con la stessa contraddizione.
+        //
+        // Non e' una sfumatura di stile: la doc di [`ReviewGateVerdict::
+        // RejectedNoCorrection`] motiva l'esistenza della variante col fatto che
+        // le due cause portano ad AZIONI diverse — "ha provato e non ci e'
+        // riuscito" si guarda il codice, "non ha provato" si cambia figura o
+        // prompt. Detta con la stessa frase, la distinzione non arriva a chi
+        // legge, che e' l'unico posto in cui serviva.
+        //
+        // Plurale del conteggio: sta FUORI dal match perche' e' formattazione, non
+        // una decisione del ramo — e il blocco che serviva a calcolarlo dentro
+        // spingeva la stringa a sei livelli di indentazione.
+        let giri = if a_vuoto == 1 { "tentativo" } else { "tentativi" };
+        let (titolo, phase) = match r.verdetto() {
+            ReviewGateVerdict::RejectedNoCorrection => (
                 format!(
                     "Review NON superata al cap ({cycle}/{max_cycles}): nessuna correzione \
                      applicata in alcun tentativo"
                 ),
                 "rejected_no_correction",
-            )
-        } else {
-            (
+            ),
+            // Almeno un tentativo ha toccato dei file. Si dichiara il fatto
+            // MISURATO (quanti giri risultano a vuoto) senza affermare che gli
+            // altri abbiano corretto: `RejectedFinal` copre anche il caso in cui
+            // la misura e' mancata per qualche giro e il contatore sottostima
+            // (vedi `verdetto`), e li' "ha corretto" sarebbe un'affermazione che
+            // nessuno ha verificato.
+            ReviewGateVerdict::RejectedFinal => (
+                format!(
+                    "Review NON superata al cap ({cycle}/{max_cycles}): rilievi ancora \
+                     aperti ({a_vuoto} {giri} su {cycle} senza modifiche)"
+                ),
+                "rejected_final",
+            ),
+            // Cap non raggiunto: il run rientra in correzione. E' l'unico altro
+            // esito che `verdetto` produce (`PendingCorrection`).
+            _ => (
                 format!(
                     "Rimando senza correzione ({cycle}/{max_cycles}): nessun file modificato, \
                      panel non riconvocato"
                 ),
                 "stalled",
-            )
+            ),
         };
         payload.insert("phase".into(), phase.into());
         self.emit(ctx, titolo, payload, None).await;
@@ -1365,43 +1402,53 @@ mod tests {
     /// Tre giri con `max_cycles = 2`: (1) boccia -> rimando 1; (2) misura
     /// PROGRESSO -> riconvoca, boccia -> rimando 2; (3) misura il vuoto -> al cap,
     /// chiude. Un giro a vuoto su due rimandi.
-    #[tokio::test]
-    async fn un_tentativo_riuscito_esclude_l_esito_senza_correzioni() {
-        struct MutazioniAlternate {
-            chiamate: std::sync::atomic::AtomicUsize,
-        }
-        #[async_trait::async_trait]
-        impl MutationProgressPort for MutazioniAlternate {
-            async fn scan_writes(
-                &self,
-                after: Option<i64>,
-            ) -> Result<crate::runtime::ports::WriteScan, crate::runtime::ports::PortError>
-            {
-                let Some(w) = after else {
-                    return Ok(crate::runtime::ports::WriteScan {
-                        watermark: 100,
-                        facts: Vec::new(),
-                    });
-                };
-                // Prima misura: ha corretto. Seconda: si e' fermato.
-                let n = self
-                    .chiamate
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let facts = if n == 0 {
-                    vec![crate::decisions::WriteFact {
-                        before_sha256: Some("prima".into()),
-                        after_sha256: Some("dopo".into()),
-                    }]
-                } else {
-                    Vec::new()
-                };
-                Ok(crate::runtime::ports::WriteScan {
-                    watermark: w + 1,
-                    facts,
-                })
+    /// Porta di misura che risponde PROGRESSO alla prima lettura e VUOTO dalle
+    /// successive: e' lo scenario "ha tentato una volta, poi si e' fermato", il
+    /// solo che separa le due nature del rifiuto finale. Sta qui, e non dentro un
+    /// test, perche' la esercitano in due.
+    struct MutazioniAlternate {
+        chiamate: std::sync::atomic::AtomicUsize,
+    }
+    impl MutazioniAlternate {
+        fn nuova() -> Self {
+            Self {
+                chiamate: std::sync::atomic::AtomicUsize::new(0),
             }
         }
+    }
+    #[async_trait::async_trait]
+    impl MutationProgressPort for MutazioniAlternate {
+        async fn scan_writes(
+            &self,
+            after: Option<i64>,
+        ) -> Result<crate::runtime::ports::WriteScan, crate::runtime::ports::PortError> {
+            let Some(w) = after else {
+                return Ok(crate::runtime::ports::WriteScan {
+                    watermark: 100,
+                    facts: Vec::new(),
+                });
+            };
+            // Prima misura: ha corretto. Seconda: si e' fermato.
+            let n = self
+                .chiamate
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let facts = if n == 0 {
+                vec![crate::decisions::WriteFact {
+                    before_sha256: Some("prima".into()),
+                    after_sha256: Some("dopo".into()),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(crate::runtime::ports::WriteScan {
+                watermark: w + 1,
+                facts,
+            })
+        }
+    }
 
+    #[tokio::test]
+    async fn un_tentativo_riuscito_esclude_l_esito_senza_correzioni() {
         let convocazioni = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let node = ReviewGateNode::new(
             ReviewGateConfig {
@@ -1414,9 +1461,7 @@ mod tests {
             }),
             Arc::new(StubMetaStepStore::default()),
         )
-        .with_mutation_progress(Arc::new(MutazioniAlternate {
-            chiamate: std::sync::atomic::AtomicUsize::new(0),
-        }));
+        .with_mutation_progress(Arc::new(MutazioniAlternate::nuova()));
 
         let mut s = stato_done();
         for _ in 0..3 {
@@ -1433,6 +1478,124 @@ mod tests {
             s.review_gate_verdict,
             Some(ReviewGateVerdict::RejectedFinal),
             "un tentativo aveva prodotto modifiche: la causa e' il rilievo, non l'inerzia"
+        );
+    }
+
+    /// La RIGA CHE L'UTENTE LEGGE dice la stessa cosa del verdetto registrato.
+    ///
+    /// Il verdetto strutturato distingueva gia' le due cause; la narrazione no:
+    /// emetteva "nessuna correzione applicata in alcun tentativo" su OGNI chiusura
+    /// al cap, anche quando il payload accanto portava `no_progress_cycles: 1` su
+    /// 3 cicli. Misurato sul progetto `bacheca-attivita` (29/07/2026): 5 run su 9
+    /// chiusi al cap affermavano l'inerzia con la propria misura che la smentiva
+    /// — fra questi `8365a347`, dove l'agente aveva corretto due volte su tre.
+    ///
+    /// Il test riusa lo scenario del precedente, che gia' attraversa il nodo reale
+    /// (regola O), e prosegue fino a CIO' CHE VIENE SCRITTO: fermarsi al verdetto
+    /// e' esattamente il punto cieco che ha lasciato passare il difetto per tre
+    /// giorni, perche' il verdetto era giusto e non e' mai stato lui a mentire.
+    ///
+    /// MUTAZIONE: rimettere `if definitiva` al posto del `match r.verdetto()` in
+    /// `narra_a_vuoto` rende questo test rosso su `phase`, che torna
+    /// `rejected_no_correction`.
+    /// Tre giri di gate con `max_cycles = 2` su un panel che boccia sempre, con
+    /// la misura del progresso data dal chiamante. Ritorna lo stato finale e i
+    /// meta-step NARRATI: i due test che seguono guardano l'uno il verdetto,
+    /// l'altro la riga scritta, e devono vederli nascere dallo stesso giro.
+    async fn tre_giri_narrati(
+        mutations: Arc<dyn MutationProgressPort>,
+    ) -> (AgentState, Vec<Value>) {
+        let meta = Arc::new(StubMetaStepStore::default());
+        let node = ReviewGateNode::new(
+            ReviewGateConfig {
+                enabled: true,
+                max_cycles: 2,
+            },
+            Arc::new(StubPanel(ReviewPanelReport::Convened(panel_bocciato()))),
+            Arc::clone(&meta) as Arc<dyn crate::runtime::ports::MetaStepStore>,
+        )
+        .with_mutation_progress(mutations);
+
+        let mut s = stato_done();
+        for _ in 0..3 {
+            let delta = node.run(&s, &ctx_with()).await.expect("nodo ok");
+            s = apply(s, delta);
+        }
+        let steps = meta.meta_steps.lock().expect("lock meta_steps").clone();
+        (s, steps)
+    }
+
+    #[tokio::test]
+    async fn la_narrazione_al_cap_non_contraddice_il_verdetto() {
+        let (s, steps) = tre_giri_narrati(Arc::new(MutazioniAlternate::nuova())).await;
+
+        // Il verdetto: un tentativo aveva corretto, quindi NON e' inerzia.
+        assert_eq!(
+            s.review_gate_verdict,
+            Some(ReviewGateVerdict::RejectedFinal),
+            "premessa dello scenario"
+        );
+
+        let chiusura = steps
+            .iter()
+            .rev()
+            .find(|m| {
+                m["payload"]["panel_convened"] == serde_json::json!(false)
+                    && m["payload"]["phase"] != serde_json::json!("stalled")
+            })
+            .expect("la chiusura al cap e' stata narrata");
+
+        assert_eq!(
+            chiusura["payload"]["phase"],
+            serde_json::json!("rejected_final"),
+            "la phase deve seguire il verdetto, non il solo fatto che si chiuda"
+        );
+        let titolo = chiusura["title"].as_str().expect("titolo testuale");
+        assert!(
+            !titolo.contains("in alcun tentativo"),
+            "un tentativo aveva corretto: il titolo non puo' negarlo -- {titolo}"
+        );
+        // Il fatto misurato compare, ed e' quello che il payload dichiara.
+        assert!(
+            titolo.contains("1 tentativo su 2"),
+            "il titolo deve portare la misura, non un giudizio generico -- {titolo}"
+        );
+        assert_eq!(
+            chiusura["payload"]["no_progress_cycles"],
+            serde_json::json!(1),
+            "titolo e payload raccontano lo stesso numero"
+        );
+    }
+
+    /// Il verso opposto: quando l'inerzia c'e' DAVVERO, la frase che la denuncia
+    /// resta. Senza questo, "non contraddire il verdetto" si otterrebbe anche
+    /// cancellando la distinzione — cioe' perdendo l'informazione che il ramo
+    /// esiste per dare.
+    #[tokio::test]
+    async fn zero_correzioni_conserva_la_denuncia_di_inerzia() {
+        // Nessuna scrittura, mai: l'agente non ha alzato un dito.
+        let (s, steps) = tre_giri_narrati(Arc::new(StubMutations {
+            facts: Vec::new(),
+            letture: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }))
+        .await;
+
+        assert_eq!(
+            s.review_gate_verdict,
+            Some(ReviewGateVerdict::RejectedNoCorrection),
+            "nessun giro ha toccato un file"
+        );
+        let chiusura = steps
+            .iter()
+            .rev()
+            .find(|m| m["payload"]["phase"] == serde_json::json!("rejected_no_correction"))
+            .expect("la chiusura per inerzia e' narrata come tale");
+        assert!(
+            chiusura["title"]
+                .as_str()
+                .expect("titolo testuale")
+                .contains("in alcun tentativo"),
+            "qui l'affermazione e' vera e deve restare"
         );
     }
 
