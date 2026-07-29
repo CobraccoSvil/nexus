@@ -1347,6 +1347,47 @@ elif [[ "$avvii_bad" -eq 0 ]]; then
   echo "OK iniezione-porta-libera: $avvii percorsi di avvio delegano al punto unico"
 fi
 
+# «Lo stile che il codice dichiara e' applicato?» (2026-07-29, mig 0655)
+#
+# Il criterio vive in un punto solo. Un secondo giudice dello stile — anche
+# scritto meglio — riporterebbe la domanda al problema che il modulo chiude: due
+# risposte diverse alla stessa domanda, e nessuna delle due autorevole.
+assert_single "stile-applicato" 'fn classify_styling' \
+  'crates/nexus-agent-tools/src/ui_styling.rs' crates
+
+# Il guard che conta davvero: nel CRITERIO non entrano nomi di framework.
+#
+# La domanda posta al codice e' «le classi hanno una fonte?», non «c'e'
+# Tailwind?»: Tailwind e' un'istanza, e il giorno in cui il criterio la nomina
+# ricomincia l'inseguimento delle varianti (regola H) — il difetto del 29/07 si
+# ripresenterebbe identico col framework successivo. I nomi stanno in
+# `settings.agent.ui_styling.*`, dove aggiungerne uno e' una riga.
+#
+# Si guardano le sole righe di CODICE fino a `#[cfg(test)]`: nei commenti il
+# nome dell'istanza serve a spiegare il difetto reale, e nei test e' la fixture.
+if [[ -f crates/nexus-agent-tools/src/ui_styling.rs ]]; then
+  if awk '
+    /^#\[cfg\(test\)\]/ { exit }
+    /^[[:space:]]*\/\// { next }
+    /[Tt]ailwind|[Uu]noCSS|unocss|windicss|bootstrap|@mui\/|chakra-ui|@emotion\/|styled-components/ {
+      trovato = 1; print "   riga " NR ": " $0 > "/dev/stderr"
+    }
+    END { exit !trovato }
+  ' crates/nexus-agent-tools/src/ui_styling.rs 2>&1; then
+    echo "!! vocabolario-stile-nel-db: il criterio nomina un framework." >&2
+    echo "   La domanda e' «le classi hanno una fonte?», non «c'e' <framework>?»." >&2
+    echo "   I nomi vivono in settings.agent.ui_styling.utility_frameworks /" >&2
+    echo "   .runtime_packages: aggiungerne uno deve restare una riga, non un deploy." >&2
+    fail=1
+  else
+    echo "OK vocabolario-stile-nel-db: il criterio non nomina nessuna istanza"
+  fi
+else
+  echo "!! vocabolario-stile-nel-db: modulo ui_styling.rs non trovato." >&2
+  echo "   Il check non ha raggiunto il suo oggetto (regola O)." >&2
+  fail=1
+fi
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1

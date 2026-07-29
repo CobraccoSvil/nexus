@@ -14,7 +14,8 @@ use super::{
     archive_tools, attachment_inspector, attachments, audio_tools, command, dev_diagnostics,
     dispatcher, document_tools, figma_tools, files, git, image_tools, knowledge, ports,
     project_db_query, rag_search, sandbox, scaffold_verifier, service, shadcn_setup,
-    subagent_native, testing, todos, tool_not_found, ui_patterns, ui_reference_search, verify,
+    subagent_native, testing, todos, tool_not_found, ui_patterns, ui_reference_search, ui_styling,
+    verify,
     video_tools, vision_tools, visual_compare, AgentToolContext,
 };
 
@@ -148,6 +149,10 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         }
         // ── Catalogo pattern di layout (trasversale ai progetti) ───────────
         "ui_layout_patterns" => ui_patterns::tool_ui_layout_patterns(&ctx.core.db, input).await,
+        // Lo stile DICHIARATO dal codice e' applicato? Fatto misurabile, non
+        // giudizio di gusto: e' la sola voce della lente di interfaccia che un
+        // revisore non puo' verificare leggendo un file per volta.
+        "ui_styling_audit" => ui_styling::tool_ui_styling_audit(&ctx.core, input).await,
         // Unico tool che guarda FUORI dal progetto: cio' che torna e' DATO, e
         // arriva gia' dichiarato come non fidato (vedi il modulo).
         "ui_reference_search" => {
@@ -358,6 +363,56 @@ mod tests {
         assert!(
             out.contains("impossibile rilevare il comando test"),
             "output inatteso da tool_run_tests: {out}"
+        );
+    }
+
+    /// Gemello del precedente per `ui_styling_audit` (mig 0655), e per la stessa
+    /// ragione: il prompt della figura di interfaccia e quello del revisore lo
+    /// PROMETTONO, e un tool promesso senza braccio nel dispatcher torna al
+    /// modello come "Tool non esiste". E' il difetto gia' accaduto due volte in
+    /// questa catena — `run_tests` qui sopra, e `advisory_verdict` perso dalla
+    /// whitelist della figura UI (mig 0653), che l'ha resa muta per un giorno.
+    ///
+    /// Il nome NON e' scritto a mano nell'assert: si legge dal catalogo esposto
+    /// al modello, cosi' il test misura le due estremita' della stessa catena.
+    /// Rinominarne una sola lo fa rosseggiare, che e' esattamente il caso in cui
+    /// oggi nessuno se ne accorgerebbe fino al primo run.
+    ///
+    /// Si passa un `target_dir` inesistente di proposito: il tool rifiuta il
+    /// percorso PRIMA di leggere il vocabolario, quindi la prova che il braccio
+    /// c'e' costa zero. Senza questo accorgimento il test impiegava 150 secondi
+    /// — cinque letture di settings su un pool lazy mai connesso, ciascuna a
+    /// consumare il proprio timeout — e un test lento in una suite condivisa e'
+    /// un costo che pagano tutti, a ogni `pnpm verify`.
+    /// Che il vocabolario mancante produca `vocabolario_assente` e' gia' provato
+    /// dal test del criterio, dove si verifica senza alcuna infrastruttura.
+    #[tokio::test]
+    async fn ui_styling_audit_e_dispatchato_e_non_cade_nel_fallback() {
+        let catalogo: serde_json::Value =
+            serde_json::from_str(nexus_agent_tools::tool_schema::AGENT_TOOLS_JSON)
+                .expect("il catalogo dei tool deve parsare");
+        let nome = catalogo
+            .as_array()
+            .expect("catalogo = array")
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .find(|n| *n == "ui_styling_audit")
+            .expect("ui_styling_audit deve essere esposto al modello nel catalogo");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
+        let out = execute_agent_tool(
+            &ctx,
+            nome,
+            &serde_json::json!({ "target_dir": "cartella_che_non_esiste" }),
+        )
+        .await;
+        // Il messaggio e' del TOOL: se il nome cadesse nel fallback del
+        // dispatcher la risposta sarebbe "Tool ... non esiste" col marker di
+        // errore, e questa asserzione fallirebbe.
+        assert!(
+            out.contains("target_dir 'cartella_che_non_esiste' non esiste nel progetto"),
+            "atteso l'errore del tool sul target_dir, non il fallback del dispatcher: {out}"
         );
     }
 
