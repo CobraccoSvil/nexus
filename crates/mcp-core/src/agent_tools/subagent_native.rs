@@ -5283,6 +5283,8 @@ mod tests {
             review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
+            council_requirements: Vec::new(),
+            council_conformance: None,
         }
     }
 
@@ -6627,6 +6629,8 @@ mod tests {
             review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
+            council_requirements: Vec::new(),
+            council_conformance: None,
         };
         let keys = |v: &Value| -> BTreeSet<String> {
             v.as_object()

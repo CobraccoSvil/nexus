@@ -570,6 +570,28 @@ pub struct NativeRunOutcome {
     /// Azioni in attesa di conferma utente (HITL modalita' Conferma), serializzate
     /// dal grafo in `extra.hitl_pending_actions`. Vuoto se nessuna sospensione HITL.
     pub pending_actions: Vec<serde_json::Value>,
+    /// Requisiti emessi dal Consiglio delle Competenze per QUESTO run, letti dalla
+    /// sintesi pre-run (`extra.pre_run_advisory_synthesis`, campo `requirements`).
+    /// Sono l'INPUT della misura di conformita', non il suo esito: li porta
+    /// `map_outcome` (puro) perche' il riscontro, che ha bisogno di leggere i
+    /// file, avvenga fuori. Vuoto se il Consiglio non ha parlato o non ha posto
+    /// vincoli.
+    ///
+    /// Solo `requirements`: `recommendations` e' l'altra lista della stessa
+    /// sintesi e una raccomandazione non applicata non e' uno scostamento
+    /// (punto unico `decisions::requirement_conformance`).
+    pub council_requirements: Vec<String>,
+    /// ESITO del riscontro dei requisiti sopra, sul contenuto reale dei file.
+    /// `None` quando non c'era nulla da riscontrare (nessun requisito). Mai
+    /// `None` per "non ho potuto guardare": quel caso e' un report con tutti i
+    /// requisiti `unverifiable`, perche' il silenzio e' il difetto che questa
+    /// misura chiude.
+    ///
+    /// TIPIZZATO e non `Value`: il consumatore chiede la nota al punto unico
+    /// (`ConformanceReport::nota`) invece di ricomporla da un JSON: una seconda
+    /// lettura dei conteggi sarebbe una seconda idea di cosa significa
+    /// "applicato" (regola L).
+    pub council_conformance: Option<nexus_agent_graph::decisions::ConformanceReport>,
 }
 
 /// Chiavi del blocco esito STRUTTURATO ([`NativeRunOutcome::structured_verdict`]).
@@ -3014,7 +3036,7 @@ pub async fn run_native(
     input: &NativeRunInput,
 ) -> anyhow::Result<NativeRunOutcome> {
     let outcome = run_engine(deps, input, RunMode::New).await?;
-    Ok(map_outcome(outcome))
+    Ok(map_outcome_con_riscontro(deps, input, outcome).await)
 }
 
 /// RESUME HITL di un run nativo PRIMARIO sospeso su `awaiting_confirmation`.
@@ -3044,7 +3066,7 @@ pub async fn resume_native(
         RunMode::Resume { resume_delta },
     )
     .await?;
-    Ok(map_outcome(outcome))
+    Ok(map_outcome_con_riscontro(deps, input, outcome).await)
 }
 
 /// Costruisce il delta opaco del runtime che sblocca un interrupt HITL: azzera
@@ -3167,7 +3189,7 @@ pub async fn resume_native_fanin(
         RunMode::Resume { resume_delta },
     )
     .await?;
-    Ok(map_outcome(outcome))
+    Ok(map_outcome_con_riscontro(deps, input, outcome).await)
 }
 
 /// Esegue il grafo nativo end-to-end e ritorna lo [`StepOutcome`] COMPLETO (lo
@@ -3427,7 +3449,169 @@ pub(crate) fn map_outcome(outcome: StepOutcome<AgentState>) -> NativeRunOutcome 
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default(),
+        // I requisiti del Consiglio dalla sintesi che il coordinatore ha
+        // ricevuto nel prompt: stesso segnale strutturato, letto qui per essere
+        // RISCONTRATO a run concluso. Il riscontro (I/O sui file) e' in
+        // `verifica_conformita_requisiti`, che questa funzione pura non puo'
+        // fare.
+        council_requirements: state
+            .extra
+            .get(nexus_agent_graph::nodes::PRE_RUN_ADVISORY_SYNTHESIS_KEY)
+            .map(nexus_agent_graph::decisions::requirements_from_synthesis)
+            .unwrap_or_default(),
+        // Lo riempie il chiamante async: qui non si legge nessun file.
+        council_conformance: None,
     }
+}
+
+/// Tetto di dimensione di un file letto per il riscontro dei requisiti. Oltre
+/// questa soglia il file non viene letto e il requisito risulta NON VERIFICABILE
+/// (mai soddisfatto): un requisito che nomina un file da megabyte non e' un
+/// vincolo di configurazione, e caricarlo in memoria per cercarci una stringa
+/// costerebbe piu' della misura.
+const MAX_BYTE_FILE_RISCONTRO: u64 = 2 * 1024 * 1024;
+
+/// Riscontra i requisiti del Consiglio sul CONTENUTO dei file del progetto
+/// (regola M: il fatto, mai la dichiarazione dell'agente che dice di averli
+/// applicati).
+///
+/// DETERMINISTICO e senza LLM: lettura di file e confronto testuale. E' un
+/// vincolo di progetto, non un dettaglio implementativo — i run con rimandi
+/// ripetuti hanno gia' toccato 2,1M token, e un giro di modello per giudicare la
+/// conformita' costerebbe piu' del difetto che chiude. Dove servirebbe un
+/// giudizio semantico, il punto unico marca `unverifiable`.
+///
+/// `None` solo se non c'era nulla da riscontrare. Se i requisiti ci sono ma il
+/// progetto non e' risolvibile, il report esiste e li dichiara tutti non
+/// verificabili: un run che non ha potuto guardare deve dirlo, non tacere.
+async fn verifica_conformita_requisiti(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    requirements: &[String],
+) -> Option<nexus_agent_graph::decisions::ConformanceReport> {
+    if requirements.is_empty() {
+        return None;
+    }
+    let requirements = requirements.to_vec();
+    let report = match radice_progetto_del_run(deps, input).await {
+        None => nexus_agent_graph::decisions::conformance_senza_progetto(&requirements),
+        Some(root) => riscontro_su_disco(root, requirements).await?,
+    };
+    tracing::info!(
+        run_id = %input.run_id,
+        totale = report.verdicts.len(),
+        applicati = report.satisfied(),
+        non_applicati = report.violated(),
+        non_verificabili = report.unverifiable(),
+        "requisiti del Consiglio riscontrati sui file"
+    );
+    Some(report)
+}
+
+/// Il riscontro vero e proprio, fuori dal reattore.
+///
+/// `std::fs` e' bloccante e finisce su un thread apposta: i file sono pochi (al
+/// piu' uno per requisito) e piccoli, ma tenere fermo il reattore per leggerli
+/// sarebbe un costo gratuito. `None` se il task non e' arrivato a termine —
+/// nessun riscontro inventato.
+async fn riscontro_su_disco(
+    root: String,
+    requirements: Vec<String>,
+) -> Option<nexus_agent_graph::decisions::ConformanceReport> {
+    match tokio::task::spawn_blocking(move || {
+        riscontra_requisiti_su_root(std::path::Path::new(&root), &requirements)
+    })
+    .await
+    {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(errore = %e, "riscontro requisiti: lettura file fallita");
+            None
+        }
+    }
+}
+
+/// Radice del progetto su cui risolvere i path dei requisiti, o `None` se non e'
+/// risolvibile.
+///
+/// La catena e' il punto unico `resolve_session_project_root` (regola L). Il pool
+/// del progetto serve solo a questo: e' una query in piu' a run CONCLUSO, e solo
+/// quando il Consiglio ha davvero posto vincoli. Un guasto NON e' silenzioso: il
+/// chiamante lo traduce in un report che dichiara tutti i requisiti non
+/// verificabili, che e' l'informazione onesta ("non ho potuto guardare") invece
+/// del silenzio da cui questo lavoro parte.
+async fn radice_progetto_del_run(deps: &NativeDeps, input: &NativeRunInput) -> Option<String> {
+    match crate::project_db_routes::project_data_pool_by_session_from(&deps.db, input.session_id)
+        .await
+    {
+        Ok(run_db) => resolve_session_project_root(&run_db, &deps.db, input.session_id)
+            .await
+            .map(|(_, root)| root),
+        Err(e) => {
+            tracing::warn!(
+                run_id = %input.run_id,
+                errore = %e,
+                "riscontro requisiti: pool di progetto non risolvibile, restano non verificati"
+            );
+            None
+        }
+    }
+}
+
+/// Riscontra i requisiti sui file di UNA radice di progetto: il punto in cui la
+/// lettura del filesystem incontra il criterio.
+///
+/// `pub(crate)` perche' e' la funzione che gira in produzione dentro
+/// `spawn_blocking`, e i test della catena (stato -> outcome -> resoconto) devono
+/// raggiungerla per la STESSA strada (regola O). Un test che si ricostruisse la
+/// lettura per conto proprio misurerebbe la propria imitazione.
+pub(crate) fn riscontra_requisiti_su_root(
+    root: &std::path::Path,
+    requirements: &[String],
+) -> nexus_agent_graph::decisions::ConformanceReport {
+    nexus_agent_graph::decisions::compose_conformance(requirements, |rel| {
+        leggi_file_di_progetto(root, rel)
+    })
+}
+
+/// Legge UN file del progetto per il riscontro. Porta il FATTO e non lo giudica
+/// (il verdetto e' del punto unico): un errore di lettura e' `Illeggibile`, non
+/// un'assenza — le due cose portano allo stesso esito "non verificabile" ma con
+/// motivi diversi, e chi legge il resoconto deve poterle distinguere.
+fn leggi_file_di_progetto(
+    root: &std::path::Path,
+    relativo: &str,
+) -> nexus_agent_graph::decisions::FileEvidence {
+    use nexus_agent_graph::decisions::FileEvidence;
+    let path = root.join(relativo);
+    match std::fs::metadata(&path) {
+        Err(_) => FileEvidence::Assente,
+        Ok(m) if !m.is_file() => FileEvidence::Assente,
+        Ok(m) if m.len() > MAX_BYTE_FILE_RISCONTRO => FileEvidence::Illeggibile,
+        Ok(_) => match std::fs::read_to_string(&path) {
+            Ok(c) => FileEvidence::Contenuto(c),
+            // Binario o permessi: esiste ma non e' testo su cui cercare.
+            Err(_) => FileEvidence::Illeggibile,
+        },
+    }
+}
+
+/// [`map_outcome`] piu' il riscontro dei requisiti del Consiglio (I/O).
+///
+/// PUNTO UNICO (regola L) della chiusura di un run nativo: i tre ingressi
+/// (`run_native`, `resume_native`, `resume_native_fanin`) passano di qui, cosi'
+/// il riscontro non puo' esserci su una strada e mancare sulle altre — che e'
+/// esattamente il modo in cui una misura smette di misurare senza che nessuno se
+/// ne accorga.
+async fn map_outcome_con_riscontro(
+    deps: &NativeDeps,
+    input: &NativeRunInput,
+    outcome: StepOutcome<AgentState>,
+) -> NativeRunOutcome {
+    let mut mapped = map_outcome(outcome);
+    mapped.council_conformance =
+        verifica_conformita_requisiti(deps, input, &mapped.council_requirements).await;
+    mapped
 }
 
 
@@ -3572,6 +3756,62 @@ mod tests {
         assert_eq!(
             enforcement.get("verdict").and_then(serde_json::Value::as_str),
             Some("proceed_with_changes")
+        );
+    }
+
+    /// L'ANELLO fra chi scrive la sintesi nello stato e chi la rilegge a run
+    /// concluso: la chiave e' UNA sola, e i requisiti la attraversano.
+    ///
+    /// Senza questo test i due lati restano verdi separatamente — `build_initial_state`
+    /// scrive, `map_outcome` legge — e nessuno si accorge se un giorno leggessero
+    /// chiavi diverse o se il campo cambiasse nome nella sintesi: il riscontro
+    /// direbbe "nessun requisito" per sempre, cioe' tornerebbe esattamente al
+    /// silenzio che questo lavoro toglie. E' il modo tipico in cui una misura
+    /// smette di misurare restando verde (regola O).
+    ///
+    /// La sintesi e' quella VERA (prodotta da `compose_advisory_synthesis` sul
+    /// parere di una figura), non un JSON scritto a mano.
+    #[test]
+    fn i_requisiti_del_consiglio_arrivano_dallo_stato_iniziale_all_outcome() {
+        use nexus_agent_graph::decisions::{
+            compose_advisory_synthesis, AdvisoryPolicy, AdvisoryRoster,
+        };
+        // Il valore della porta in UNA sede: il requisito emesso e quello atteso
+        // nell'outcome sono la stessa stringa per costruzione, non due copie che
+        // potrebbero divergere.
+        const REQ: &str = "Rimuovere `port: 33649` da `vite.config.js`";
+        let parere = serde_json::json!({
+            "success": true,
+            "advisory": {
+                "verdict": "block",
+                "risks": [],
+                "requirements": [REQ],
+                "recommendations": ["Aggiungere un health probe"],
+            }
+        });
+        let synth = compose_advisory_synthesis(
+            &[parere],
+            &AdvisoryPolicy::default(),
+            AdvisoryRoster::Convened(1),
+        )
+        .expect("il consiglio ha deliberato");
+
+        let mut input = sample_input();
+        input.pre_run_advisory_synthesis = Some(synth.to_value());
+        input.pre_run_advisory_source = Some("council_synthesis");
+
+        let state = build_initial_state(&input);
+        let out = map_outcome(StepOutcome::Completed(state));
+        assert_eq!(
+            out.council_requirements,
+            vec![REQ.to_string()],
+            "il requisito attraversa lo stato dal prompt del coordinatore al riscontro"
+        );
+        assert!(
+            !out.council_requirements
+                .iter()
+                .any(|r| r.contains("health probe")),
+            "la raccomandazione non e' un requisito e non entra nella misura"
         );
     }
 
@@ -4606,6 +4846,8 @@ mod tests {
             review_panel_no_correction: false,
             review_panel_last: None,
             pending_actions: Vec::new(),
+            council_requirements: Vec::new(),
+            council_conformance: None,
         }
     }
 
