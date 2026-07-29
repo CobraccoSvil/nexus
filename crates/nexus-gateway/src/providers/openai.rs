@@ -18,8 +18,8 @@ use sqlx::PgPool;
 use crate::provider::{ChunkStream, LlmProvider};
 use crate::providers::openai_compat::{OpenAiCompatClient, ReasoningDialect, ResolvedReasoning};
 use crate::types::{
-    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, SensitivityTier, TranscribeRequest,
-    TranscribeResponse, TtsRequest, TtsResponse,
+    ImageGenRequest, ImageGenResponse, LlmRequest, LlmResponse, PromptCacheKeying, SensitivityTier,
+    TranscribeRequest, TranscribeResponse, TtsRequest, TtsResponse,
 };
 
 /// Tier ammessi: pubblico/interno/confidenziale (mai tier 3, riservato a onprem).
@@ -85,7 +85,20 @@ impl OpenAiProvider {
     ) -> Self {
         let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         Self {
-            client: OpenAiCompatClient::new(http, base_url, api_key, "openai"),
+            // CACHE: `prompt_cache_key` e' un parametro dell'API OpenAI, il
+            // dialetto da cui Mistral lo eredita. Ma qui NON e' la differenza
+            // fra cacheare e non cacheare, come invece e' su Mistral: misurato
+            // il 29/07/2026, gpt-4o-mini riusa 11.392 token su 11.469 anche
+            // SENZA la chiave, e con la chiave il risultato e' identico.
+            // La si manda lo stesso perche' e' l'hint di affinita' che il
+            // provider documenta: il riuso automatico dipende da quale nodo
+            // serve la richiesta, e senza chiave quella scelta e' casuale. Che
+            // il caso esista non e' un'ipotesi: nello stesso disegno di prova
+            // mistral-small, che pure cachea da solo, ha riusato il prefisso
+            // una volta su due. Rischio nullo (campo nativo del dialetto),
+            // guadagno atteso sui carichi distribuiti.
+            client: OpenAiCompatClient::new(http, base_url, api_key, "openai")
+                .with_prompt_cache_keying(PromptCacheKeying::RequiresKey),
             db,
             reasoning_effort: TtlCache::new(SETTINGS_TTL),
         }
@@ -251,6 +264,18 @@ mod tests {
 
     fn provider() -> OpenAiProvider {
         OpenAiProvider::new(Client::new(), "sk-test", None)
+    }
+
+    /// OpenAI cachea anche senza la chiave (misurato: 11.392 token su 11.469),
+    /// quindi qui non e' un rimedio a un difetto ma l'hint di affinita' che il
+    /// provider documenta. Resta dichiarato perche' il nodo che serve la
+    /// richiesta altrimenti lo si sceglie a caso: vedi il costruttore.
+    #[test]
+    fn dichiara_la_chiave_di_cache_del_proprio_dialetto() {
+        assert_eq!(
+            provider().client.cache_keying(),
+            PromptCacheKeying::RequiresKey
+        );
     }
 
     #[test]
