@@ -89,6 +89,11 @@ tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` NON e' inclusa in tokio/full: serve il tempo VIRTUALE
+# (`#[tokio::test(start_paused = true)]`) per provare le politiche di attesa
+# senza farle dipendere da quanto e' carica la macchina. Il flaky di
+# `port_recovery` nasceva proprio da un'attesa misurata sul carico.
+tokio = { workspace = true, features = ["test-util"] }
 # Schema di test del DB-progetto: il migrator del set db/migrations/project
 # (punto unico, regola O). Vedi crates/nexus-migrations-embedded.
 nexus-migrations-embedded = { path = "../nexus-migrations-embedded" }

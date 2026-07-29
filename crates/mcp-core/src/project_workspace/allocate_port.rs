@@ -572,26 +572,48 @@ pub async fn web_service_port_env(
         link_allocation_to_service_unit(db, project_id, label, &unit).await;
     }
 
-    if !super::port_recovery::wait_port_bindable(
+    match super::port_recovery::wait_port_bindable(
         alloc.port,
         PORT_BINDABLE_ATTEMPTS,
         PORT_BINDABLE_STEP_MS,
     )
     .await
     {
-        let occupante = super::port_recovery::port_occupant(alloc.port)
-            .await
-            .map(|(pid, prog)| format!("pid {pid} ({prog})"))
-            .unwrap_or_else(|| "occupante non risolvibile".to_string());
-        tracing::warn!(
-            label = %label, port = alloc.port, mode = alloc.mode, occupante = %occupante,
-            "web_service_port_env: la porta del servizio non e' bindabile, avvio non instradato"
-        );
-        return Err(format!(
-            "la porta {} del servizio '{}' e' ancora occupata ({}): fermalo prima di riavviarlo. \
-             Avviarlo ora lo farebbe ripiegare su una porta fuori dal bucket del progetto.",
-            alloc.port, label, occupante
-        ));
+        super::port_recovery::PortBind::Libera => {}
+        // Un occupante c'e' davvero: si nomina e si dice come toglierlo.
+        super::port_recovery::PortBind::Occupata => {
+            let occupante = super::port_recovery::port_occupant(alloc.port)
+                .await
+                .map(|(pid, prog)| format!("pid {pid} ({prog})"))
+                .unwrap_or_else(|| "occupante non risolvibile".to_string());
+            tracing::warn!(
+                label = %label, port = alloc.port, mode = alloc.mode, occupante = %occupante,
+                "web_service_port_env: la porta del servizio e' occupata, avvio non instradato"
+            );
+            return Err(format!(
+                "la porta {} del servizio '{}' e' ancora occupata ({}): fermalo prima di riavviarlo. \
+                 Avviarlo ora lo farebbe ripiegare su una porta fuori dal bucket del progetto.",
+                alloc.port, label, occupante
+            ));
+        }
+        // Il bind e' stato rifiutato per lo stato del SISTEMA, non da un
+        // occupante di questa porta: mandare a cercarne uno (come faceva il
+        // vecchio messaggio, che leggeva ogni errore come "occupata") fa
+        // perdere tempo sul bersaglio sbagliato.
+        esito @ super::port_recovery::PortBind::NonInterrogabile { .. } => {
+            tracing::warn!(
+                label = %label, port = alloc.port, mode = alloc.mode, esito = %esito.descrizione(),
+                "web_service_port_env: bind rifiutato dal sistema, avvio non instradato"
+            );
+            return Err(format!(
+                "la porta {} del servizio '{}' non e' verificabile ({}): non e' un occupante da \
+                 fermare, e' il sistema che ha rifiutato il bind. Avviare senza verifica farebbe \
+                 ripiegare il servizio su una porta fuori dal bucket del progetto.",
+                alloc.port,
+                label,
+                esito.descrizione()
+            ));
+        }
     }
 
     tracing::info!(

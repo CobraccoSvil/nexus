@@ -20,32 +20,114 @@ use super::services::project_bucket_range;
 #[cfg(not(windows))]
 use super::services::{read_listening_ports_proc, read_listening_ports_ss};
 
+/// Esito della domanda «posso legarmi a questa porta ORA?». Tre risposte, non
+/// due, perche' un bind fallito non prova che la porta sia di qualcuno.
+///
+/// MISURATO su Windows il 29/07/2026: a pool di porte effimere esaurito il SO
+/// rifiuta il bind con `WSAENOBUFS` (10055), non con `AddrInUse` (10048).
+/// `bind(..).is_ok()` faceva dei due casi lo stesso `false`, e chi lo leggeva
+/// concludeva "occupata": il messaggio d'errore dell'avvio mandava a cercare un
+/// occupante inesistente («fermalo prima di riavviarlo», con «occupante non
+/// risolvibile» accanto — che era il sintomo, non un dettaglio). E' la regola M
+/// applicata al bind: lo stato tecnico si legge dal codice d'errore del SO, mai
+/// dall'esito appiattito a booleano.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortBind {
+    /// Il bind e' riuscito: la porta e' utilizzabile adesso.
+    Libera,
+    /// Il SO dichiara la porta gia' di qualcun altro (`AddrInUse`). E' l'unico
+    /// esito che autorizza a parlare di un occupante e a cercarlo.
+    Occupata,
+    /// La domanda non ha avuto risposta SULL'OCCUPAZIONE: l'errore riguarda lo
+    /// stato del sistema (porte esaurite, esclusioni di sistema, permessi), non
+    /// questa porta. Non e' un permesso a procedere — non si promette a un
+    /// processo una porta che non si e' potuta verificare — ma non e' nemmeno
+    /// la prova che qualcuno la tenga.
+    NonInterrogabile { codice: Option<i32>, errore: String },
+}
+
+impl PortBind {
+    /// Come si racconta questo esito a chi legge un errore di avvio.
+    pub fn descrizione(&self) -> String {
+        match self {
+            PortBind::Libera => "libera".to_string(),
+            PortBind::Occupata => "occupata da un altro processo".to_string(),
+            PortBind::NonInterrogabile { codice, errore } => format!(
+                "non verificabile: il sistema ha rifiutato il bind ({errore}{})",
+                codice.map(|c| format!(", codice {c}")).unwrap_or_default()
+            ),
+        }
+    }
+}
+
 /// PUNTO UNICO (regola L) della domanda «questa porta e' USABILE ora?»: il bind
 /// e' la domanda che il processo in avvio porra' al SO, e non coincide con
 /// `tcp_probe` (che chiede solo "qualcuno risponde?"). Una porta in TIME_WAIT o
 /// tenuta da un listener che non accetta connessioni non risponde al probe ma
 /// rifiuta il bind: iniettarla come `PORT` fa ripiegare il framework altrove.
+pub async fn probe_bind(port: u16) -> PortBind {
+    classifica_bind(tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await)
+}
+
+/// Traduce la risposta del SO nell'esito. Separata da chi esegue il bind per una
+/// ragione di misura: su `127.0.0.1` non si sa provocare a comando un errore che
+/// NON sia l'occupazione, mentre un bind su un indirizzo non assegnato alla
+/// macchina lo produce sempre. Cosi' il ramo «non riguarda questa porta» si prova
+/// su un errore VERO del SO invece che su uno costruito nel test (regola O).
+fn classifica_bind(esito: std::io::Result<tokio::net::TcpListener>) -> PortBind {
+    match esito {
+        Ok(_) => PortBind::Libera,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => PortBind::Occupata,
+        Err(e) => PortBind::NonInterrogabile {
+            codice: e.raw_os_error(),
+            errore: e.to_string(),
+        },
+    }
+}
+
+/// Sì/no per i call site che devono solo decidere se procedere. Delega a
+/// `probe_bind`: solo `Libera` autorizza, e i due modi di NON essere libera
+/// restano distinti per chi deve spiegarli.
 pub async fn port_bindable(port: u16) -> bool {
-    tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .is_ok()
+    matches!(probe_bind(port).await, PortBind::Libera)
 }
 
 /// Attende che `port` diventi bindabile, fino a `attempts` tentativi distanziati
 /// di `step_ms`. Serve dopo uno stop: il SO puo' impiegare qualche centinaio di
 /// millisecondi a rilasciare il listener del processo appena terminato. Ritorna
-/// false se allo scadere la porta e' ancora occupata — un fatto da dichiarare,
-/// non da aggirare.
-pub async fn wait_port_bindable(port: u16, attempts: u32, step_ms: u64) -> bool {
+/// l'ULTIMO esito osservato — un fatto da dichiarare, non da aggirare, e da
+/// dichiarare per quello che e': "ancora occupata" e "non ho potuto chiedere"
+/// portano l'utente in due direzioni diverse.
+pub async fn wait_port_bindable(port: u16, attempts: u32, step_ms: u64) -> PortBind {
+    attendi_bind(attempts, step_ms, || probe_bind(port)).await
+}
+
+/// Il ciclo di attesa, separato da CHI osserva. La politica (quanti tentativi,
+/// ogni quanto) e' logica nostra e si prova su un osservatore dichiarato; il
+/// contatto col SO sta tutto in `probe_bind`. Senza questa separazione l'unico
+/// modo di provare il ciclo era chiedere al SO una porta libera — cioe' una
+/// risorsa condivisa che il test non possiede, e che chiunque puo' sottrargli.
+async fn attendi_bind<F, Fut>(attempts: u32, step_ms: u64, mut osserva: F) -> PortBind
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = PortBind>,
+{
+    // Irraggiungibile: `.max(1)` garantisce almeno un'osservazione. Resta un
+    // valore onesto invece di un unwrap che qui sarebbe vietato (regola F).
+    let mut ultimo = PortBind::NonInterrogabile {
+        codice: None,
+        errore: "nessun tentativo eseguito".to_string(),
+    };
     for attempt in 0..attempts.max(1) {
-        if port_bindable(port).await {
-            return true;
+        ultimo = osserva().await;
+        if ultimo == PortBind::Libera {
+            return ultimo;
         }
         if attempt + 1 < attempts {
             tokio::time::sleep(Duration::from_millis(step_ms)).await;
         }
     }
-    false
+    ultimo
 }
 
 /// True se la porta accetta una connessione TCP entro `timeout_ms`.
@@ -572,7 +654,7 @@ pub async fn kill_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<u32> {
 
 #[cfg(test)]
 mod stop_verification_tests {
-    use super::process_fully_stopped;
+    use super::{process_fully_stopped, PortBind};
 
     /// La verifica post-kill richiede ENTRAMBE le condizioni: PID morto E porta
     /// libera. Il vecchio flusso (marca 'stopped' e taskkill fire-and-forget)
@@ -595,27 +677,163 @@ mod stop_verification_tests {
     /// promettere a un servizio una porta occupata lo fa ripiegare altrove (Vite
     /// senza strictPort -> porta+1, fuori dal bucket del progetto). Il test usa un
     /// listener reale — la stessa porta che il SO concede o rifiuta in produzione —
-    /// ed e' idempotente: la porta la sceglie il SO (bind su 0).
+    /// e osserva il solo ramo che POSSIEDE: finche' il listener e' vivo quella
+    /// porta e' sua, e la risposta del SO e' certa quante volte la si chieda.
+    ///
+    /// Si verifica anche COME e' occupata, non solo che il bind fallisca: un bind
+    /// fallito non e' di per se' la prova di un occupante (a pool di porte
+    /// effimere esaurito il SO risponde 10055), e la distinzione e' esattamente
+    /// cio' che il chiamante mostra all'utente.
     #[tokio::test]
-    async fn una_porta_occupata_non_e_bindabile() {
+    async fn una_porta_occupata_e_dichiarata_occupata() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind di prova");
         let port = listener.local_addr().expect("local_addr").port();
 
-        assert!(
-            !super::port_bindable(port).await,
-            "porta con un listener attivo: il bind deve fallire"
+        assert_eq!(
+            super::probe_bind(port).await,
+            PortBind::Occupata,
+            "porta con un listener attivo: occupata, non un errore di sistema"
         );
         // Attesa breve: la porta resta occupata, la funzione lo dichiara invece di
         // far passare l'avvio con una promessa falsa.
-        assert!(!super::wait_port_bindable(port, 2, 50).await);
-
-        drop(listener);
-        assert!(
-            super::wait_port_bindable(port, 6, 50).await,
-            "rilasciato il listener la porta torna bindabile"
+        assert_eq!(
+            super::wait_port_bindable(port, 2, 50).await,
+            PortBind::Occupata
         );
+
+        // Il listener e' vivo fino a qui: ogni fatto osservato sopra e' di questo
+        // test, e nessun altro processo puo' averlo cambiato.
+        drop(listener);
+    }
+
+    /// L'altra meta' della distinzione, sul SO vero: un bind rifiutato per un
+    /// motivo che NON e' l'occupazione non deve diventare `Occupata`.
+    ///
+    /// L'errore lo produce il SO, non il test: `192.0.2.1` e' TEST-NET-1
+    /// (RFC 5737) e non e' un indirizzo di questa macchina, quindi il bind
+    /// fallisce sempre — misurato su Windows: `AddrNotAvailable`, os 10049.
+    /// Senza questo caso, riscrivere la classificazione come `Err(_) =>
+    /// Occupata` (cioe' reintrodurre il difetto) lascerebbe verdi tutti gli
+    /// altri test: quello sull'occupazione passa comunque, e quello sul ciclo
+    /// osserva esiti dichiarati dal test invece che il bind vero.
+    #[tokio::test]
+    async fn un_bind_rifiutato_per_altro_non_e_una_porta_occupata() {
+        let esito = tokio::net::TcpListener::bind("192.0.2.1:39999").await;
+        assert!(
+            esito.is_err(),
+            "TEST-NET-1 non e' un indirizzo di questa macchina: il bind deve fallire"
+        );
+
+        let classificato = super::classifica_bind(esito);
+        assert_ne!(
+            classificato,
+            PortBind::Occupata,
+            "un errore che non riguarda questa porta non prova che qualcuno la tenga"
+        );
+        assert!(matches!(classificato, PortBind::NonInterrogabile { .. }));
+    }
+
+    // Il ritorno alla bindabilita' NON si osserva piu' su una porta vera, e non
+    // e' copertura persa: era una misura che non poteva reggere. Rilasciata la
+    // porta, quel numero torna al pool effimero del SO (49152-65535 su Windows)
+    // ed e' di chiunque; il vecchio test lo interrogava per 6x50ms e da quel
+    // tetto DEDUCEVA un fatto — fallendo dentro `pnpm verify` (piu' crate in
+    // parallelo) e passando da solo.
+    //
+    // MISURATO il 29/07/2026 su Windows: il rilascio del listener e' istantaneo
+    // (0 ms su 300 cicli; 0 ms anche dopo una connessione accettata e chiusa,
+    // quindi TIME_WAIT non c'entra). Il tetto non ha dunque mai misurato il
+    // rilascio: misurava il carico della macchina. Alzarlo avrebbe spostato la
+    // soglia lasciando in piedi la dipendenza — e su una porta che nel frattempo
+    // e' di un altro, aspettare di piu' peggiora invece di aiutare.
+    //
+    // In produzione la stessa funzione lavora su porte del BUCKET di progetto
+    // (20000-39999), che il SO non assegna spontaneamente a nessuno: la contesa
+    // che faceva cadere il test non esiste nell'oggetto misurato. Il ciclo si
+    // prova qui per quello che e' — una politica di attesa su un osservatore
+    // dichiarato dal test — col tempo virtuale di tokio, quindi senza dipendere
+    // da quanto e' occupata la macchina (regola O).
+
+    /// Osservatore dichiarato dal test: restituisce gli esiti nell'ordine dato e
+    /// conta quante volte il ciclo ha guardato.
+    fn esiti_dichiarati(
+        esiti: Vec<PortBind>,
+    ) -> (
+        impl FnMut() -> std::future::Ready<PortBind>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let osservazioni = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let contatore = osservazioni.clone();
+        let osserva = move || {
+            let i = contatore.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Esauriti gli esiti dichiarati la porta resta occupata: un test che
+            // finisce gli esiti non deve inciampare in un default "libera".
+            std::future::ready(esiti.get(i).cloned().unwrap_or(PortBind::Occupata))
+        };
+        (osserva, osservazioni)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn il_ciclo_si_ferma_al_primo_esito_libero() {
+        let (osserva, osservazioni) = esiti_dichiarati(vec![
+            PortBind::Occupata,
+            PortBind::Occupata,
+            PortBind::Libera,
+        ]);
+
+        assert_eq!(super::attendi_bind(6, 50, osserva).await, PortBind::Libera);
+        assert_eq!(
+            osservazioni.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "smette appena la porta e' libera, non esaurisce i tentativi"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn esaurita_la_grazia_riporta_l_ultimo_esito() {
+        let (osserva, osservazioni) = esiti_dichiarati(vec![]);
+        let inizio = tokio::time::Instant::now();
+
+        assert_eq!(super::attendi_bind(6, 50, osserva).await, PortBind::Occupata);
+        assert_eq!(
+            osservazioni.load(std::sync::atomic::Ordering::Relaxed),
+            6,
+            "usa tutti i tentativi concessi prima di dichiarare l'esito"
+        );
+        // Cinque pause fra sei tentativi: l'ultima attesa sarebbe tempo speso a
+        // non guardare piu' nulla.
+        assert_eq!(inizio.elapsed(), std::time::Duration::from_millis(250));
+    }
+
+    /// REGRESSIONE del difetto che rendeva cieca la diagnosi: un errore di
+    /// SISTEMA non deve attraversare il ciclo travestito da "porta occupata".
+    /// E' la distinzione su cui il chiamante decide se mandare l'utente a cercare
+    /// un occupante o a guardare lo stato della macchina.
+    #[tokio::test(start_paused = true)]
+    async fn un_errore_di_sistema_non_diventa_porta_occupata() {
+        let sistema_esaurito = PortBind::NonInterrogabile {
+            codice: Some(10055),
+            errore: "WSAENOBUFS".to_string(),
+        };
+        let (osserva, _) = esiti_dichiarati(vec![sistema_esaurito.clone(); 3]);
+
+        let esito = super::attendi_bind(3, 50, osserva).await;
+        assert_eq!(esito, sistema_esaurito);
+        assert_ne!(
+            esito,
+            PortBind::Occupata,
+            "un bind rifiutato dal sistema non prova che la porta sia di qualcuno"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn almeno_un_osservazione_anche_senza_tentativi_concessi() {
+        let (osserva, osservazioni) = esiti_dichiarati(vec![PortBind::Libera]);
+
+        assert_eq!(super::attendi_bind(0, 50, osserva).await, PortBind::Libera);
+        assert_eq!(osservazioni.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
