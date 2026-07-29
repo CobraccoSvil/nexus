@@ -9,6 +9,7 @@ import {
   setTerminalPresence,
 } from "../lib/api-client";
 import { useTheme, useThemeColors } from "../lib/theme";
+import { inFaseRavvicinata, ritardoRiconnessioneMs } from "./terminal-reconnect-logic";
 
 interface TerminalTab {
   id: string;
@@ -109,30 +110,31 @@ function TerminalInstance({
       let handlePaste: ((event: ClipboardEvent) => void) | null = null;
       let disposedLocal = false;
       let retryCount = 0;
-      const MAX_RETRIES = 6;
 
       const exposeDisconnectedWriter = () => {
         onReadyRef.current?.(() => false);
       };
 
       const scheduleReconnect = (reason?: "abnormal" | "crash") => {
+        // Non ci si arrende: il riavvio del backend e' un evento normale, e chi
+        // smetteva di riprovare lasciava un terminale morto con un errore
+        // congelato addosso, da riaprire a mano. Il ritmo vive nel punto unico
+        // ./terminal-reconnect-logic; qui resta il solo "quando riprovo".
+        // Lo smontaggio della scheda ferma tutto via `disposedLocal`.
         if (disposedLocal || reconnectTimer) return;
-        if (retryCount >= MAX_RETRIES) {
-          term.writeln(
-            `\x1b[31m[Terminale non raggiungibile dopo ${MAX_RETRIES} tentativi. ` +
-            `Riapri la scheda per riprovare.]\x1b[0m`,
-          );
-          return;
-        }
-        // Exponential backoff: 1.2s, 2.4s, 4.8s, 9.6s, 19.2s, 30s
-        const delay = Math.min(30000, 1200 * Math.pow(2, retryCount));
+        const delay = ritardoRiconnessioneMs(retryCount);
+        const ravvicinato = inFaseRavvicinata(retryCount);
         retryCount++;
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
           if (!disposedLocal) {
+            // A regime il numero del tentativo e' rumore che scorre: si dice
+            // solo che si sta ancora provando.
             const label = reason === "crash"
               ? "\x1b[90m[Riapertura terminale...]\x1b[0m"
-              : `\x1b[90m[Riconnessione (${retryCount}/${MAX_RETRIES})...]\x1b[0m`;
+              : ravvicinato
+                ? `\x1b[90m[Riconnessione (tentativo ${retryCount})...]\x1b[0m`
+                : "\x1b[90m[Backend non raggiungibile: riprovo ogni 30s...]\x1b[0m";
             term.writeln(label);
             void connectTerminal();
           }
